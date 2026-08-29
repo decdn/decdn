@@ -65,7 +65,7 @@ use iroh::endpoint::WeakConnectionHandle;
 /// seconds, which is why the ceiling sits well above that. Ten seconds is also
 /// short relative to an operator-visible node shutdown, during which an
 /// in-flight abandoned pull is waited out inside `router.shutdown()`.
-const ABANDON_DRAIN_CAP: Duration = Duration::from_secs(10);
+pub const ABANDON_DRAIN_CAP: Duration = Duration::from_secs(10);
 
 /// One step of the drain poll, sized for resolution against the ~75 ms floor
 /// above rather than to finish in a single tick.
