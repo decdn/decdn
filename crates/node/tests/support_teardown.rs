@@ -37,6 +37,10 @@ const CLOSE_DEADLINE: Duration = Duration::from_secs(2);
 /// of parking them until the `.config/nextest.toml` backstop.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What the blocked-task breach gets. Nothing can complete that teardown before
+/// the test releases the task, so this is sized only to be short.
+const REAP_DEADLINE: Duration = Duration::from_millis(300);
+
 /// A task that ends on its own is reaped, not aborted, and its value comes back.
 #[tokio::test(start_paused = true)]
 async fn reap_returns_a_finished_task_value() {
@@ -135,6 +139,39 @@ async fn shutdown_reports_clean_counts() -> anyhow::Result<()> {
     );
     assert_eq!(report.reaped, 1, "the one task must be reaped");
     assert_eq!(report.closed, 1, "the one endpoint must be closed");
+    Ok(())
+}
+
+/// A task that outlives its own abort yields `Ok` with the report short of its
+/// TASK total — the other half of the breach line, and the half that reads as
+/// this fixture's own defect rather than as #1675.
+///
+/// An abort only drops a task's future at its next poll, so a task that never
+/// yields never takes it. `spawn_blocking` is the honest way to park one: it
+/// holds a blocking-pool thread rather than wedging a runtime worker. Waiting
+/// on `started` before the teardown rules out the cancellation path, which
+/// would reap cleanly instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_reports_a_task_that_outlives_its_abort() -> anyhow::Result<()> {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let task = tokio::task::spawn_blocking(move || {
+        let _ = started_tx.send(());
+        // Ends when the sender below drops, not when the abort lands.
+        let _ = release_rx.recv();
+    });
+    started_rx.await?;
+
+    let report = shutdown_within(REAP_DEADLINE, [task], []).await?;
+    assert!(
+        !report.is_clean(),
+        "an unabortable task must be reported as a breach, got: {report:?}"
+    );
+    assert_eq!(
+        report.reaped, 0,
+        "the blocked task must not count as reaped"
+    );
+    drop(release_tx);
     Ok(())
 }
 
