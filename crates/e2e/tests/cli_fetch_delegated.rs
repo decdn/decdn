@@ -228,6 +228,18 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ---- DELEGATE fetches with the capability (`decdn fetch --capability`) ----
+    //
+    // Pin the log scan's lower bound BEFORE the fetch. The redemption this journey
+    // asserts on lands in some block after this one, and an `eth_getLogs` filter
+    // that names no `fromBlock` is not a full-history scan: alloy omits the field
+    // when it is `None` and anvil then reads the range as `latest..latest` — the
+    // head block alone. Anchoring here keeps the scan bounded to this fetch while
+    // still covering every block the redemption can land in.
+    let fetch_from_block = chain
+        .admin()
+        .get_block_number()
+        .await
+        .context("read the pre-fetch block number")?;
     let out = delegate_dir.path().join("blob.bin");
     let fetch_args = delegate_fetch_argv(
         &chain,
@@ -301,24 +313,35 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // A `PoolRedeemed` event names the DELEGATE as the signer (not the owner).
-    let filter = Filter::new()
-        .address(payment_pool)
-        .event_signature(PaymentPool::PoolRedeemed::SIGNATURE_HASH);
-    let logs = chain
-        .admin()
-        .get_logs(&filter)
-        .await
-        .context("get PoolRedeemed logs")?;
-    let names_delegate = logs.iter().any(|log| {
-        PaymentPool::PoolRedeemed::decode_log_data(&log.inner.data).is_ok_and(|e| {
-            e.poolId == pool_id
-                && e.provider == operator
-                && e.lanes.iter().any(|lane| lane.signer == delegate_addr)
-        })
-    });
+    // Polled rather than read once: the reads above prove the redemption's STATE
+    // landed, which does not by itself make its log queryable, so a one-shot miss
+    // here is ambiguous between "no such event" and "not indexed yet".
+    let names_delegate = poll(Duration::from_secs(30), || async {
+        let filter = Filter::new()
+            .address(payment_pool)
+            .event_signature(PaymentPool::PoolRedeemed::SIGNATURE_HASH)
+            .from_block(fetch_from_block);
+        let logs = chain
+            .admin()
+            .get_logs(&filter)
+            .await
+            .context("get PoolRedeemed logs")?;
+        Ok(logs
+            .iter()
+            .any(|log| {
+                PaymentPool::PoolRedeemed::decode_log_data(&log.inner.data).is_ok_and(|e| {
+                    e.poolId == pool_id
+                        && e.provider == operator
+                        && e.lanes.iter().any(|lane| lane.signer == delegate_addr)
+                })
+            })
+            .then_some(()))
+    })
+    .await?;
     anyhow::ensure!(
-        names_delegate,
-        "no PoolRedeemed event named the delegate signer {delegate_addr} on pool {pool_id}"
+        names_delegate.is_some(),
+        "no PoolRedeemed event named the delegate signer {delegate_addr} on pool {pool_id} \
+         from block {fetch_from_block}"
     );
 
     // Owner ≠ signer, on-chain: the OWNER is never a signer on this pool. It funded
