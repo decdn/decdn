@@ -303,6 +303,48 @@ impl ClientHandler {
                 .await;
         }
 
+        // Resolve the lane key early. The seller keys a lane by
+        // `(pool_id, bound_signer, this operator)` (brief §E1): `pool_id` from
+        // the request, the signer from the verified client binding, the provider
+        // from this node's own Ethereum identity. An unbound request cannot name
+        // a lane, so it resolves to `None` — which every downstream gate treats
+        // as "not my business" (it cannot make this node spend, because
+        // `pull_authorized` refuses it before every fill tier).
+        let self_operator = self.eth_signer.address();
+        let lane_key = verified_client.map(|signer| LaneKey {
+            pool_id: B256::from(req.pool_id),
+            signer,
+            provider: self_operator,
+        });
+
+        // The origin presence probe (#1759, gated on the relay policy) and the
+        // cached `getPool` view read are independent network awaits on the open
+        // path. Join them so their latencies overlap instead of serializing
+        // (#1789 item 7): both are required on the happy path, and the probe
+        // itself (a memoized `HEAD`/`HeadObject`) is the kind of backend
+        // round-trip that banks on running beside the RPC read. `pool_status`
+        // (owner + remaining) is read ONCE here and reused by the funder gate,
+        // the capability owner check, and the floor-`M` solvency gates below;
+        // `None` — no pool-view wired, an unknown pool, or a read fault — makes
+        // those fail-open gates fail open (a transient RPC blip must not refuse
+        // paying clients). On a decline
+        // the RPC read is wasted work, but declines are rare.
+        let (origin_presence, pool_status) = tokio::join!(
+            async {
+                if self.relay_foreign_namespaces {
+                    None
+                } else {
+                    Some(self.cache.origin_probe_presence(hash).await)
+                }
+            },
+            async {
+                match self.pool_view.as_ref() {
+                    Some(view) => view.status(B256::from(req.pool_id)).await,
+                    None => None,
+                }
+            },
+        );
+
         // Origin-only policy (#1759). When the operator opts out of foreign
         // relay, the own/foreign decision is backend-authoritative: the request's
         // `namespace_id` is a routing hint, not a trust anchor (ADR 002), so the
@@ -323,8 +365,8 @@ impl ClientHandler {
         // tell a paying client this node's own content is gone and would hide
         // the operator's backend outage — so it surfaces as `InternalError`
         // instead, matching the store-fault handling on the `has()` path below.
-        if !self.relay_foreign_namespaces {
-            match self.cache.origin_probe_presence(hash).await {
+        if let Some(presence) = origin_presence {
+            match presence {
                 decdn_cache::OriginPresence::Present(_) => {}
                 decdn_cache::OriginPresence::Absent => {
                     return self
@@ -348,31 +390,6 @@ impl ClientHandler {
                 }
             }
         }
-
-        // Resolve the lane key early. The seller keys a lane by
-        // `(pool_id, bound_signer, this operator)` (brief §E1): `pool_id` from
-        // the request, the signer from the verified client binding, the provider
-        // from this node's own Ethereum identity. An unbound request cannot name
-        // a lane, so it resolves to `None` — which every downstream gate treats
-        // as "not my business" (it cannot make this node spend, because
-        // `pull_authorized` refuses it before every fill tier).
-        let self_operator = self.eth_signer.address();
-        let lane_key = verified_client.map(|signer| LaneKey {
-            pool_id: B256::from(req.pool_id),
-            signer,
-            provider: self_operator,
-        });
-
-        // Cached `getPool` view (owner + remaining), read ONCE and reused by the
-        // funder gate here, the capability owner check, and the floor-`M` solvency
-        // gates below. `None` — no pool-view wired, an unknown pool, or a read
-        // fault — makes the fail-open gates fail open: a transient RPC blip must
-        // not refuse paying clients, and the open-time hash gates plus the first
-        // voucher's on-chain `redeem` still carry compliance and revenue.
-        let pool_status = match self.pool_view.as_ref() {
-            Some(view) => view.status(B256::from(req.pool_id)).await,
-            None => None,
-        };
 
         // Serve-path origin-blacklist gate (ADR 011 §On Blacklist Event): refuse a
         // pool whose FUNDER (`getPool.owner`) is on the operator's local
