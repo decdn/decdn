@@ -1485,21 +1485,32 @@ impl ClientHandler {
         let domain = &self.voucher_domain;
         let signing_hash = grant.capability.signing_hash(domain);
         let signature = grant.signature.as_bytes();
+        // The lock is held only for the cache lookup/insert — a hash lookup plus
+        // an `IndexMap` shift. The expensive `recover_owner` (secp256k1
+        // ecrecover) runs OUTSIDE the lock, so a burst of distinct
+        // capabilities at session open does not serialize on the cache mutex
+        // and block a Tokio worker for the crypto. Concurrent races on the
+        // same key re-run the recovery and overwrite the entry — duplicate
+        // work under races is acceptable for a deterministic result.
         let recovered = {
             let mut cache = self
                 .capability_verify_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(cached) = cache.get(signing_hash, signature) {
-                cached
-            } else {
-                let outcome = match grant.recover_owner(domain) {
-                    Ok(owner) => CapabilityVerifyOutcome::Owner(owner),
-                    Err(_) => CapabilityVerifyOutcome::Invalid,
-                };
-                cache.insert(signing_hash, signature, outcome);
-                outcome
-            }
+            cache.get(signing_hash, signature)
+        };
+        let recovered = if let Some(outcome) = recovered {
+            outcome
+        } else {
+            let outcome = match grant.recover_owner(domain) {
+                Ok(owner) => CapabilityVerifyOutcome::Owner(owner),
+                Err(_) => CapabilityVerifyOutcome::Invalid,
+            };
+            self.capability_verify_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(signing_hash, signature, outcome);
+            outcome
         };
         match recovered {
             CapabilityVerifyOutcome::Owner(owner) => owner == pool_owner,
