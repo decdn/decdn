@@ -3228,12 +3228,13 @@ async fn build_cache(
     // probe-hold budget once here is sufficient (ADR 005 §Hold budget, #318).
     engine.set_max_probe_holds(cfg.cache.max_probe_holds);
     // Live-origin probe memo (#1130 pt3) — likewise restart-configured once.
-    engine.set_origin_probe_config(
-        std::time::Duration::from_secs(cfg.cache.origin_probe_ttl_sec),
-        std::time::Duration::from_secs(cfg.cache.origin_probe_negative_ttl_sec),
-        std::time::Duration::from_millis(cfg.cache.origin_probe_timeout_ms),
-        usize::try_from(cfg.cache.origin_probe_memo_capacity).unwrap_or(usize::MAX),
-    );
+    engine.set_origin_probe_config(decdn_cache::origin_probe::OriginProbePolicy {
+        positive_ttl: std::time::Duration::from_secs(cfg.cache.origin_probe_ttl_sec),
+        negative_ttl: std::time::Duration::from_secs(cfg.cache.origin_probe_negative_ttl_sec),
+        fault_ttl: std::time::Duration::from_secs(cfg.cache.origin_probe_fault_ttl_sec),
+        timeout: std::time::Duration::from_millis(cfg.cache.origin_probe_timeout_ms),
+        capacity: usize::try_from(cfg.cache.origin_probe_memo_capacity).unwrap_or(usize::MAX),
+    });
     Ok(engine)
 }
 
@@ -3946,6 +3947,8 @@ mod tests {
                 origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
                 origin_probe_negative_ttl_sec:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
+                origin_probe_fault_ttl_sec:
+                    decdn_common::config::DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC,
                 origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
                 origin_probe_memo_capacity:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,

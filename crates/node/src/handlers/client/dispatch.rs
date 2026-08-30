@@ -303,6 +303,20 @@ impl ClientHandler {
                 .await;
         }
 
+        // Resolve the lane key early. The seller keys a lane by
+        // `(pool_id, bound_signer, this operator)` (brief §E1): `pool_id` from
+        // the request, the signer from the verified client binding, the provider
+        // from this node's own Ethereum identity. An unbound request cannot name
+        // a lane, so it resolves to `None` — which every downstream gate treats
+        // as "not my business" (it cannot make this node spend, because
+        // `pull_authorized` refuses it before every fill tier).
+        let self_operator = self.eth_signer.address();
+        let lane_key = verified_client.map(|signer| LaneKey {
+            pool_id: B256::from(req.pool_id),
+            signer,
+            provider: self_operator,
+        });
+
         // Origin-only policy (#1759). When the operator opts out of foreign
         // relay, the own/foreign decision is backend-authoritative: the request's
         // `namespace_id` is a routing hint, not a trust anchor (ADR 002), so the
@@ -349,26 +363,17 @@ impl ClientHandler {
             }
         }
 
-        // Resolve the lane key early. The seller keys a lane by
-        // `(pool_id, bound_signer, this operator)` (brief §E1): `pool_id` from
-        // the request, the signer from the verified client binding, the provider
-        // from this node's own Ethereum identity. An unbound request cannot name
-        // a lane, so it resolves to `None` — which every downstream gate treats
-        // as "not my business" (it cannot make this node spend, because
-        // `pull_authorized` refuses it before every fill tier).
-        let self_operator = self.eth_signer.address();
-        let lane_key = verified_client.map(|signer| LaneKey {
-            pool_id: B256::from(req.pool_id),
-            signer,
-            provider: self_operator,
-        });
-
         // Cached `getPool` view (owner + remaining), read ONCE and reused by the
         // funder gate here, the capability owner check, and the floor-`M` solvency
-        // gates below. `None` — no pool-view wired, an unknown pool, or a read
-        // fault — makes the fail-open gates fail open: a transient RPC blip must
-        // not refuse paying clients, and the open-time hash gates plus the first
-        // voucher's on-chain `redeem` still carry compliance and revenue.
+        // gates below. Read AFTER the origin-only gate, not beside it: the only
+        // wired `PoolView` answers from an in-memory projection with no round-trip
+        // (`PoolProjection::status`), so there is no latency to overlap and a
+        // declined request must not pay for a read it never uses. `None` — no
+        // pool-view wired, an unknown pool (which includes the window before the
+        // watcher has seen it), or a read fault — makes the fail-open gates fail
+        // open: a transient blip must not refuse paying clients, and the open-time
+        // hash gates plus the first voucher's on-chain `redeem` still carry
+        // compliance and revenue.
         let pool_status = match self.pool_view.as_ref() {
             Some(view) => view.status(B256::from(req.pool_id)).await,
             None => None,
@@ -407,8 +412,7 @@ impl ClientHandler {
                 signer,
                 pool_status.map(|s| s.owner),
                 capability,
-            )
-            .await;
+            );
         }
 
         // Resolve the live lane AFTER intake, so a lane just registered from this
@@ -514,433 +518,22 @@ impl ClientHandler {
         // probe) past the size gate, which can't `inspect` a partial blob.
         let mut range_pulled_size: Option<u64> = None;
 
-        // Blob availability gate. A store fault is NOT an absence: `Ok(false)`
-        // means the node genuinely lacks the blob (NotFound / EvictedSinceProbe),
-        // but `Err` is a transient local store failure that must not masquerade
-        // as a signed `NotFound` — a paying client would treat that as
-        // authoritative and stop asking. Surface it as `InternalError` and log.
-        // The initial `None` is unread on every live path (both `Ok` arms below
-        // either shed and return or overwrite it, and `Err` returns too) — kept
-        // anyway so the slot's declared type and its `Drop`-at-fn-scope binding
-        // below read the same as the `lane_slot` admission guard above.
-        #[allow(unused_assignments)]
-        let mut shed_slot: Option<crate::load_shed::ShedSlot> = None;
-        match self.cache.has(hash).await {
-            Ok(true) => {
-                match self
-                    .shed
-                    .try_admit(crate::load_shed::RequestClass::CacheHit, client_node_id)
-                {
-                    Ok(slot) => shed_slot = Some(slot),
-                    Err(reason) => {
-                        tracing::debug!(
-                            ?reason,
-                            %hash,
-                            class = "hit",
-                            "load-shed refusing new serve"
-                        );
-                        return self
-                            .respond_error(
-                                &mut send,
-                                &req,
-                                ServeRejectReason::LoadShedHit,
-                                rate_per_mb,
-                            )
-                            .await;
-                    }
-                }
-            }
-            Ok(false) => {
-                // Eviction is sticky and authoritative — never pull-fill a
-                // hash an operator deliberately evicted (#279).
-                if self.cache.is_evicted(hash) {
-                    return self
-                        .respond_error(
-                            &mut send,
-                            &req,
-                            ServeRejectReason::EvictedSinceProbe,
-                            rate_per_mb,
-                        )
-                        .await;
-                }
-                // The shed gate runs before the channel-ownership refusal below,
-                // so an unbound / unknown-lane request can transiently hold a
-                // `ShedSlot` until that refusal returns it. This is bounded by
-                // the `ConnectionLimiter` global + per-source caps and is
-                // self-limiting: once the node is pressured, further such
-                // requests shed right here without acquiring a slot at all.
-                // Keeping the gate here — ahead of channel-ownership and any
-                // fill — preserves "shed before committing serve resources /
-                // before any origin spend".
-                match self
-                    .shed
-                    .try_admit(crate::load_shed::RequestClass::CacheMiss, client_node_id)
-                {
-                    Ok(slot) => shed_slot = Some(slot),
-                    Err(reason) => {
-                        tracing::debug!(
-                            ?reason,
-                            %hash,
-                            class = "miss",
-                            "load-shed refusing new serve"
-                        );
-                        return self
-                            .respond_error(
-                                &mut send,
-                                &req,
-                                ServeRejectReason::LoadShedMiss,
-                                rate_per_mb,
-                            )
-                            .await;
-                    }
-                }
-                // Node-to-node cache-miss pull-through (#831). Fronting upstream
-                // USDC egress is privileged: gate it on the request PROVING
-                // ownership of the named channel — a verified client binding
-                // (`verified_client`) whose address is the channel's authorized
-                // client. Channel *existence* cannot gate spend (channel ids are
-                // public on-chain via `ChannelOpened`, so any leech could name
-                // one); only proven ownership can. An unbound request, or one
-                // for a channel it does not own, gets a plain `NotFound` and
-                // cannot make this node spend — closing the proxy-abuse /
-                // griefing vector where an unpaid client drains the buyer
-                // deposit. (Multi-hop node→node pulls therefore require the
-                // downstream requester to send a binding; both the direct-client
-                // `decdn fetch` (#1115) and the node→node requester
-                // (`node_origin`, #1117) now do, so chained pull-through works.)
-                // On a successful fill, fall through to the normal size-gate +
-                // delivery path; otherwise it stays a `NotFound`.
-                //
-                // Origin-tier range pull-through (#823, ADR 037 §Origin-tier
-                // pull-through). When the
-                // request is a bounded/offset range, scope the cache-miss origin
-                // fetch to exactly the requested span (fetch `[offset, offset+len)`
-                // + the `{H}.obao4` outboard, bao-verify, import a partial blob)
-                // instead of pulling the whole blob to serve a slice. Gated on
-                // the same pull-authorization as the whole-blob fill. Best-effort:
-                // any decline (unknown origin size, no published outboard, no
-                // `Range` support, verify failure) leaves `range_pulled_size` as
-                // `None` and falls through to the whole-blob path below, which is
-                // always correct (ADR 037 §"Fallback is always correct").
-                // The fault latch (#1129). Declared BEFORE the range tier, not after
-                // it: the range pull can hit a `CacheError::Store` of its own, and a
-                // latch that only starts at the local tier would drop it. Today the
-                // local tier happens to re-detect such a fault (it re-walks the same
-                // origin chain), but that is a coincidence of the current tier
-                // ordering, not an invariant — and this is the one bug the file
-                // exists to prevent. Latch every tier.
-                // Pre-spend deposit floor (#1519). Every fill tier below spends:
-                // the range and local tiers front the operator's own origin
-                // egress, and the buffered tier's `cache.populate` walks the paid
-                // `Peer` origin and fronts real upstream USDC. (The range tier is
-                // own-egress-only because `NodeOrigin` does not implement
-                // `Origin::fetch_range` — `pull_through_range` iterates every
-                // origin with no `local_only` filter, so the day it does, that tier
-                // starts fronting upstream USDC too. Nothing would fail.) All three are gated
-                // on channel OWNERSHIP (`pull_authorized`) and none on solvency,
-                // so before this floor a dust-deposit channel could name N absent
-                // hashes, make the node pay for each, and be refused afterwards by
-                // the serve-path gate — the attacker gains nothing, but the
-                // operator still pays. Refuse here instead, before any of it.
-                //
-                // The floor is one credit window, CAPPED BY THE REQUEST'S SPAN
-                // when the request bounds itself. A bounded range carries
-                // `byte_len`, so its billed size is knowable without `total_bytes`
-                // (align it out to chunk groups exactly as the serve path does —
-                // `export_bao_range_stream` serves the aligned superset). Pricing
-                // such a request at a whole window would refuse a client that can
-                // comfortably pay for the range it asked for, and it would do so
-                // ONLY on a cache miss — the serve gate prices the same request at
-                // the aligned span — so the same request would be served warm and
-                // refused cold. Worse, `decdn fetch` reads a refused resume as a
-                // possibly-stale partial, rewinds to zero and re-pays for the whole
-                // blob, so mispricing a bounded request doubles a user's bill.
-                //
-                // For an UNBOUNDED request (`byte_len == 0`: whole blob, or a tail
-                // from an offset) the billed size genuinely is unknowable pre-fill,
-                // so the window stands. Be clear about the residual that leaves:
-                // this guard prices at `paid = 0`, i.e. the ramp floor — one
-                // chunk (`CHUNK_BYTES`, a fixed 1 MiB) — not the fully-ramped
-                // `credit_max` ceiling (64 MiB by default),
-                // since a cold request has confirmed no payment yet. A channel
-                // funded for the blob but not for a floor chunk is refused
-                // cold and served warm. Closing that needs the origin size probe
-                // to run before the floor, which is a larger change than this one.
-                //
-                // `window.rs` keeps its own guard. Its window is exactly
-                // `self.credit_window(chunk_bytes, 0)` — the same ramp-floor
-                // computation this site uses — so the two guards are redundant at
-                // this floor. It is also the tier that fronts UPSTREAM spend (the
-                // pull leg's `RampPacer`, #1669, paces against the SAME ramp as it
-                // pays). Do not delete it on the strength of this floor alone.
-                //
-                // Pre-spend floor reservation (shared-payment-pool model). Open the
-                // per-pool `FloorReservation` HERE, before any fill tier fronts USDC,
-                // so `remaining − M` must cover this pool's already-committed floor
-                // credit plus this stream's floor before the node spends: see
-                // [`ClientHandler::try_reserve_floor`]. The reserved amount is one
-                // interval (the ramp floor at `paid = 0`), capped by the request's own
-                // aligned span when it bounds itself. A bounded range carries its
-                // `byte_len`, so its span is knowable without `total_bytes`; an
-                // open-ended request (`byte_len == 0`, whole blob or tail) reserves the
-                // full floor — the miss path cannot resolve a tail's span pre-fill, so
-                // an unbounded tail is refused cold and served warm through the
-                // direct-serve gate, which does know `total_bytes`.
-                //
-                // `remaining` comes from the cached `getPool` view resolved above;
-                // a `None` view fails open (the on-chain `redeem` is the backstop).
-                // Skipped for an unknown lane — `pull_authorized` refuses those
-                // before every tier, so no spend happens there anyway.
-                if known_lane.is_some()
-                    && let Some(status) = pool_status
-                {
-                    // Reserve the un-self-funded credit this stream fronts before it
-                    // pays: the ramp floor at `paid = 0` (one chunk normally, the
-                    // full `credit_max` when `credit_ramp_divisor == 0`), span-capped
-                    // for a bounded request. `release_live_repaid` frees it once
-                    // cumulative payment REACHES this reserved amount (see the serve
-                    // loop), so release stays matched to what was reserved at any divisor.
-                    let window = self.credit_window(CHUNK_BYTES, 0);
-                    let reserved_bytes = if req.byte_len > 0 {
-                        aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)
-                    } else {
-                        window
-                    };
-                    let reserved = decdn_incentive::min_payment(reserved_bytes, rate_per_mb);
-                    let pool_id = B256::from(req.pool_id);
-                    match self.try_reserve_floor(pool_id, status.remaining, reserved) {
-                        None => {
-                            let headroom = status
-                                .remaining
-                                .saturating_sub(self.pool_min_remaining_deposit);
-                            self.log_deposit_refusal(pool_id, hash, headroom, reserved);
-                            return self
-                                .respond_error(
-                                    &mut send,
-                                    &req,
-                                    ServeRejectReason::InsufficientDeposit,
-                                    rate_per_mb,
-                                )
-                                .await;
-                        }
-                        Some(guard) => floor_reservation = Some(guard),
-                    }
-                }
-
-                let mut fault_seen = false;
-                if (req.byte_offset > 0 || req.byte_len > 0)
-                    && self.pull_authorized(&req, verified_client)
-                {
-                    let (size, range_outcome) = self.try_range_pull_through(hash, &req).await;
-                    range_pulled_size = size;
-                    fault_seen |= range_outcome.is_fault();
-                }
-
-                let mut locally_filled = false;
-
-                // Own-origin serve-miss via the two decoupled legs.
-                // When the node's OWN configured fs/http/s3 origin can prove it
-                // serves `hash` — it knows the size AND publishes the {H}.obao4
-                // outboard — serve the whole blob by running the local pull leg (fill
-                // the cache from origin) beside the serve leg (stream the filling
-                // cache to the paying client), exactly like the node→node window path
-                // but with NO upstream, NO channel, and NO payment on the ingest side.
-                // Time-to-first-byte does not wait for the whole blob to land.
-                //
-                // Whole-blob only (offset==0 && len==0): ranged/resumed own-origin
-                // serve-miss is not yet wired through the two-leg spine, so a bounded
-                // request never routes here.
-                //
-                // Serviceability is confirmed by `origin_size` +
-                // `origin_fetch_outboard_bytes` (an origin publishes the outboard) —
-                // NOT by proving a Range/206 `fetch_range` works. All three shipped
-                // adapters (fs/http/s3) support Range whenever they publish an
-                // outboard, so this holds in practice; a custom Origin that publishes
-                // an outboard but refuses Range would sign `ok:true` then fail the
-                // stream. Acceptable for the shipped backends within this path's scope.
-                //
-                // Best-effort degrade (ADR 037 §"Fallback is always correct"): no
-                // published outboard / no origin size / no origins => fall through to
-                // `try_local_populate` below.
-                // Once serviceable, `serve_via_backend_origin` claims the fill itself
-                // (`CacheEngine::claim_fill`): the first same-hash miss OWNS
-                // the local origin pull; a concurrent one ATTACHES as an observer and
-                // streams the same filling cache to its own client (no double origin
-                // egress). The registry is range-aware, so this coalescing is not
-                // limited to the whole-blob case.
-                if range_pulled_size.is_none()
-                    && !locally_filled
-                    && req.byte_offset == 0
-                    && req.byte_len == 0
-                    && self.pull_authorized(&req, verified_client)
-                {
-                    match self.cache.origin_size(hash).await {
-                        Ok(Some(total)) => {
-                            match self.cache.origin_fetch_outboard_bytes(hash, total).await {
-                                // Serviceable: size known and an origin publishes the
-                                // outboard. Enter the orchestration directly — it claims
-                                // the fill (owner-or-attach) internally after signing the
-                                // response, so no coalescing decision happens here.
-                                Ok(Some(_)) => {
-                                    // Boxed: the serve future is large
-                                    // (clippy::large_futures). `pull_authorized`
-                                    // (checked in the `if` above) guarantees a
-                                    // lane, so the extraction always matches.
-                                    if let (Some(lk), Some(ln)) = (lane_key, known_lane.as_ref()) {
-                                        return Box::pin(self.serve_via_backend_origin(
-                                            send,
-                                            recv,
-                                            &req,
-                                            hash,
-                                            client_node_id,
-                                            lk,
-                                            ln,
-                                            total,
-                                            pool_status.map(|s| s.remaining),
-                                            rate_per_mb,
-                                            floor_reservation,
-                                        ))
-                                        .await;
-                                    }
-                                }
-                                // Size known but no published outboard — not
-                                // serviceable via the range encoder. Degrade to the
-                                // buffered local populate below.
-                                Ok(None) => {}
-                                // A genuine origin transport fault while fetching the
-                                // outboard. Latch it (#1129) so a later-tier miss
-                                // reports InternalError not NotFound, then fall
-                                // through — another source may still serve.
-                                Err(e) => {
-                                    tracing::debug!(%hash, error = %e, "own-origin outboard probe faulted; falling through");
-                                    fault_seen = true;
-                                }
-                            }
-                        }
-                        // No origin knows the size, or no origin is configured at
-                        // all — both a clean fall-through (degrade). `origin_size`
-                        // already returns Ok(None) for most declines, so only
-                        // NoOrigin and transport faults reach the Err arms.
-                        Ok(None) | Err(CacheError::NoOrigin { .. }) => {}
-                        // Any other origin fault latches `fault_seen` (#1129) so a
-                        // later-tier miss reports InternalError not NotFound.
-                        Err(e) => {
-                            tracing::debug!(%hash, error = %e, "own-origin size probe faulted; falling through");
-                            fault_seen = true;
-                        }
-                    }
-                }
-
-                // Reactive LOCAL-origin populate (#1116). Before any node→node
-                // path, try to fill from the node's OWN configured fs/http/s3
-                // origin (`populate_local` never touches the paid `Peer` origin).
-                // This lets a cache-only operator (node→node disabled) reactively
-                // serve its own content, and — when node→node IS enabled — prefers
-                // the local origin over the paid peer window path for a whole-blob
-                // request the operator can satisfy itself. Gated on the SAME proven
-                // channel ownership as the paid paths (`pull_authorized`): an S3
-                // origin has egress cost, and the following delivery is billed
-                // per-voucher. A local miss leaves the blob absent and falls through
-                // to the node→node branches below, unchanged.
-                //
-                // A local HARD FAULT (#1129 — the operator's own S3/fs origin
-                // errored, rather than simply not having the blob) also falls
-                // through to the node→node branches: another source may legitimately
-                // still serve. But it is LATCHED in `fault_seen`, because if no later
-                // tier fills, the terminal refusal must report a degraded node
-                // (`InternalError`) rather than an empty one (`NotFound`). Every
-                // terminal MISS below therefore goes through
-                // `FillOutcome::miss_reason` — including the window path's leech
-                // shed. (The channel-class refusals — `UnknownChannel`,
-                // `InsufficientDeposit` — keep their own reasons: they are
-                // client-attributable and would refuse regardless of origin
-                // health.)
-                if range_pulled_size.is_none()
-                    && !locally_filled
-                    && let Some(timeout) = self.local_populate
-                    && self.pull_authorized(&req, verified_client)
-                {
-                    let local = self.try_local_populate(hash, timeout).await;
-                    fault_seen |= local.is_fault();
-                    locally_filled = local.is_filled();
-                }
-
-                // Window-paced pull-through (#856, ADR 037) is the preferred path
-                // when its provider is set: instead of buffering the whole
-                // blob via `populate` and only THEN serving (fronting 100% of the
-                // upstream cost before any downstream voucher), it runs the pull
-                // leg (fill the cache from upstream) beside the serve leg (stream
-                // the filling cache to the paying client), so the per-request
-                // speculative exposure is bounded to the ramped credit window
-                // (#1669).
-                //
-                // It requires `byte_offset == 0 && byte_len == 0` (a whole-blob
-                // request). This is a conservative constraint on the ROUTING, not a
-                // limit of the serve leg: `serve_leg` clamps delivery to
-                // `[offset, offset + len)` and bills only the wire it delivers, and
-                // the pull leg is range-minimized (it pulls only
-                // `missing_ranges(offset, len)`), so the two-leg spine is
-                // range-correct. Ranged and resumed serve-miss through that spine is
-                // simply not yet wired end-to-end, so a bounded or resumed request
-                // falls to the buffered path below, which serves exactly the
-                // requested span via `export_range` (#823).
-                if range_pulled_size.is_some() || locally_filled {
-                    // The requested span/blob is already present — a verified
-                    // partial blob from the range pull, or the whole blob just
-                    // filled from a local origin (#1116). Skip the node→node fill
-                    // and fall through to the size gate + delivery (which serves a
-                    // partial via `export_range`).
-                } else if let Some(origin) = self.pull_through_origin.as_ref()
-                    && req.byte_offset == 0
-                    && req.byte_len == 0
-                    && self.pull_authorized(&req, verified_client)
-                {
-                    // Boxed: the serve future is large; keep it off the
-                    // `serve_stream` stack frame (clippy::large_futures). The
-                    // orchestration claims the fill (owner-or-attach) internally after
-                    // signing the response, so two concurrent same-hash misses share one
-                    // upstream pull (no double spend, #305) without a decision here.
-                    // `pull_authorized` (the `if` above) guarantees a lane, so the
-                    // extraction always matches.
-                    if let (Some(lk), Some(ln)) = (lane_key, known_lane.as_ref()) {
-                        return Box::pin(self.serve_via_window_pull_through(
-                            send,
-                            recv,
-                            &req,
-                            hash,
-                            client_node_id,
-                            lk,
-                            ln,
-                            Arc::clone(origin),
-                            pool_status.map(|s| s.remaining),
-                            fault_seen,
-                            rate_per_mb,
-                            floor_reservation,
-                        ))
-                        .await;
-                    }
-                } else {
-                    // Buffered pull-through (#831): used when
-                    // the window provider is unset or for a resumed request.
-                    let buffered = match self.pull_through {
-                        Some(timeout) if self.pull_authorized(&req, verified_client) => {
-                            self.try_pull_through(hash, timeout).await
-                        }
-                        // No pull-through configured, or the request is not
-                        // authorized to make this node spend: nothing was attempted,
-                        // so this tier contributes no new information.
-                        _ => FillOutcome::CleanMiss,
-                    };
-                    if !buffered.is_filled() {
-                        let reason = FillOutcome::miss_reason(fault_seen || buffered.is_fault());
-                        return self
-                            .respond_error(&mut send, &req, reason, rate_per_mb)
-                            .await;
-                    }
-                }
-            }
+        // Blob availability gate. A store fault is NOT an absence: an
+        // `Unavailable` audit means the node genuinely lacks the blob (NotFound
+        // / EvictedSinceProbe), but `Err` is a transient local store failure
+        // that must not masquerade as a signed `NotFound` — a paying client
+        // would treat that as authoritative and stop asking. Surface it as
+        // `InternalError` and log. `serve_audit` also carries the complete
+        // blob's size in the same store contact, so the delivery size gate
+        // below needn't `inspect` again on a cache hit (#1789 item 7 part B).
+        let audit = match self.cache.serve_audit(hash).await {
+            Ok(audit) => audit,
             Err(e) => {
-                tracing::warn!(%hash, error = %e, "cache `has` lookup failed on delivery path");
+                tracing::warn!(
+                    %hash,
+                    error = %e,
+                    "cache `serve_audit` lookup failed on delivery path"
+                );
                 return self
                     .respond_error(
                         &mut send,
@@ -950,6 +543,421 @@ impl ClientHandler {
                     )
                     .await;
             }
+        };
+        let hit_size = audit.hit_size();
+        // The initial `None` is unread on every live path (both branches below
+        // either shed and return or overwrite it, and the audit `Err` returns
+        // too) — kept anyway so the slot's declared type and its
+        // `Drop`-at-fn-scope binding below read the same as the `lane_slot`
+        // admission guard above.
+        #[allow(unused_assignments)]
+        let mut shed_slot: Option<crate::load_shed::ShedSlot> = None;
+        if audit.is_serveable() {
+            match self
+                .shed
+                .try_admit(crate::load_shed::RequestClass::CacheHit, client_node_id)
+            {
+                Ok(slot) => shed_slot = Some(slot),
+                Err(reason) => {
+                    tracing::debug!(
+                        ?reason,
+                        %hash,
+                        class = "hit",
+                        "load-shed refusing new serve"
+                    );
+                    return self
+                        .respond_error(&mut send, &req, ServeRejectReason::LoadShedHit, rate_per_mb)
+                        .await;
+                }
+            }
+        } else {
+            // Eviction is sticky and authoritative — never pull-fill a
+            // hash an operator deliberately evicted (#279).
+            if audit.is_evicted() {
+                return self
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::EvictedSinceProbe,
+                        rate_per_mb,
+                    )
+                    .await;
+            }
+            // The shed gate runs before the channel-ownership refusal below,
+            // so an unbound / unknown-lane request can transiently hold a
+            // `ShedSlot` until that refusal returns it. This is bounded by
+            // the `ConnectionLimiter` global + per-source caps and is
+            // self-limiting: once the node is pressured, further such
+            // requests shed right here without acquiring a slot at all.
+            // Keeping the gate here — ahead of channel-ownership and any
+            // fill — preserves "shed before committing serve resources /
+            // before any origin spend".
+            match self
+                .shed
+                .try_admit(crate::load_shed::RequestClass::CacheMiss, client_node_id)
+            {
+                Ok(slot) => shed_slot = Some(slot),
+                Err(reason) => {
+                    tracing::debug!(
+                        ?reason,
+                        %hash,
+                        class = "miss",
+                        "load-shed refusing new serve"
+                    );
+                    return self
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::LoadShedMiss,
+                            rate_per_mb,
+                        )
+                        .await;
+                }
+            }
+            // Node-to-node cache-miss pull-through (#831). Fronting upstream
+            // USDC egress is privileged: gate it on the request PROVING
+            // ownership of the named channel — a verified client binding
+            // (`verified_client`) whose address is the channel's authorized
+            // client. Channel *existence* cannot gate spend (channel ids are
+            // public on-chain via `ChannelOpened`, so any leech could name
+            // one); only proven ownership can. An unbound request, or one
+            // for a channel it does not own, gets a plain `NotFound` and
+            // cannot make this node spend — closing the proxy-abuse /
+            // griefing vector where an unpaid client drains the buyer
+            // deposit. (Multi-hop node→node pulls therefore require the
+            // downstream requester to send a binding; both the direct-client
+            // `decdn fetch` (#1115) and the node→node requester
+            // (`node_origin`, #1117) now do, so chained pull-through works.)
+            // On a successful fill, fall through to the normal size-gate +
+            // delivery path; otherwise it stays a `NotFound`.
+            //
+            // Origin-tier range pull-through (#823, ADR 037 §Origin-tier
+            // pull-through). When the
+            // request is a bounded/offset range, scope the cache-miss origin
+            // fetch to exactly the requested span (fetch `[offset, offset+len)`
+            // + the `{H}.obao4` outboard, bao-verify, import a partial blob)
+            // instead of pulling the whole blob to serve a slice. Gated on
+            // the same pull-authorization as the whole-blob fill. Best-effort:
+            // any decline (unknown origin size, no published outboard, no
+            // `Range` support, verify failure) leaves `range_pulled_size` as
+            // `None` and falls through to the whole-blob path below, which is
+            // always correct (ADR 037 §"Fallback is always correct").
+            // The fault latch (#1129). Declared BEFORE the range tier, not after
+            // it: the range pull can hit a `CacheError::Store` of its own, and a
+            // latch that only starts at the local tier would drop it. Today the
+            // local tier happens to re-detect such a fault (it re-walks the same
+            // origin chain), but that is a coincidence of the current tier
+            // ordering, not an invariant — and this is the one bug the file
+            // exists to prevent. Latch every tier.
+            // Pre-spend deposit floor (#1519). Every fill tier below spends:
+            // the range and local tiers front the operator's own origin
+            // egress, and the buffered tier's `cache.populate` walks the paid
+            // `Peer` origin and fronts real upstream USDC. (The range tier is
+            // own-egress-only because `NodeOrigin` does not implement
+            // `Origin::fetch_range` — `pull_through_range` iterates every
+            // origin with no `local_only` filter, so the day it does, that tier
+            // starts fronting upstream USDC too. Nothing would fail.) All three are gated
+            // on channel OWNERSHIP (`pull_authorized`) and none on solvency,
+            // so before this floor a dust-deposit channel could name N absent
+            // hashes, make the node pay for each, and be refused afterwards by
+            // the serve-path gate — the attacker gains nothing, but the
+            // operator still pays. Refuse here instead, before any of it.
+            //
+            // The floor is one credit window, CAPPED BY THE REQUEST'S SPAN
+            // when the request bounds itself. A bounded range carries
+            // `byte_len`, so its billed size is knowable without `total_bytes`
+            // (align it out to chunk groups exactly as the serve path does —
+            // `export_bao_range_stream` serves the aligned superset). Pricing
+            // such a request at a whole window would refuse a client that can
+            // comfortably pay for the range it asked for, and it would do so
+            // ONLY on a cache miss — the serve gate prices the same request at
+            // the aligned span — so the same request would be served warm and
+            // refused cold. Worse, `decdn fetch` reads a refused resume as a
+            // possibly-stale partial, rewinds to zero and re-pays for the whole
+            // blob, so mispricing a bounded request doubles a user's bill.
+            //
+            // For an UNBOUNDED request (`byte_len == 0`: whole blob, or a tail
+            // from an offset) the billed size genuinely is unknowable pre-fill,
+            // so the window stands. Be clear about the residual that leaves:
+            // this guard prices at `paid = 0`, i.e. the ramp floor — one
+            // chunk (`CHUNK_BYTES`, a fixed 1 MiB) — not the fully-ramped
+            // `credit_max` ceiling (64 MiB by default),
+            // since a cold request has confirmed no payment yet. A channel
+            // funded for the blob but not for a floor chunk is refused
+            // cold and served warm. Closing that needs the origin size probe
+            // to run before the floor, which is a larger change than this one.
+            //
+            // `window.rs` keeps its own guard. Its window is exactly
+            // `self.credit_window(chunk_bytes, 0)` — the same ramp-floor
+            // computation this site uses — so the two guards are redundant at
+            // this floor. It is also the tier that fronts UPSTREAM spend (the
+            // pull leg's `RampPacer`, #1669, paces against the SAME ramp as it
+            // pays). Do not delete it on the strength of this floor alone.
+            //
+            // Pre-spend floor reservation (shared-payment-pool model). Open the
+            // per-pool `FloorReservation` HERE, before any fill tier fronts USDC,
+            // so `remaining − M` must cover this pool's already-committed floor
+            // credit plus this stream's floor before the node spends: see
+            // [`ClientHandler::try_reserve_floor`]. The reserved amount is one
+            // interval (the ramp floor at `paid = 0`), capped by the request's own
+            // aligned span when it bounds itself. A bounded range carries its
+            // `byte_len`, so its span is knowable without `total_bytes`; an
+            // open-ended request (`byte_len == 0`, whole blob or tail) reserves the
+            // full floor — the miss path cannot resolve a tail's span pre-fill, so
+            // an unbounded tail is refused cold and served warm through the
+            // direct-serve gate, which does know `total_bytes`.
+            //
+            // `remaining` comes from the cached `getPool` view resolved above;
+            // a `None` view fails open (the on-chain `redeem` is the backstop).
+            // Skipped for an unknown lane — `pull_authorized` refuses those
+            // before every tier, so no spend happens there anyway.
+            if known_lane.is_some()
+                && let Some(status) = pool_status
+            {
+                // Reserve the un-self-funded credit this stream fronts before it
+                // pays: the ramp floor at `paid = 0` (one chunk normally, the
+                // full `credit_max` when `credit_ramp_divisor == 0`), span-capped
+                // for a bounded request. `release_live_repaid` frees it once
+                // cumulative payment REACHES this reserved amount (see the serve
+                // loop), so release stays matched to what was reserved at any divisor.
+                let window = self.credit_window(CHUNK_BYTES, 0);
+                let reserved_bytes = if req.byte_len > 0 {
+                    aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)
+                } else {
+                    window
+                };
+                let reserved = decdn_incentive::min_payment(reserved_bytes, rate_per_mb);
+                let pool_id = B256::from(req.pool_id);
+                match self.try_reserve_floor(pool_id, status.remaining, reserved) {
+                    None => {
+                        let headroom = status
+                            .remaining
+                            .saturating_sub(self.pool_min_remaining_deposit);
+                        self.log_deposit_refusal(pool_id, hash, headroom, reserved);
+                        return self
+                            .respond_error(
+                                &mut send,
+                                &req,
+                                ServeRejectReason::InsufficientDeposit,
+                                rate_per_mb,
+                            )
+                            .await;
+                    }
+                    Some(guard) => floor_reservation = Some(guard),
+                }
+            }
+
+            let mut fault_seen = false;
+            if (req.byte_offset > 0 || req.byte_len > 0)
+                && self.pull_authorized(&req, verified_client)
+            {
+                let (size, range_outcome) = self.try_range_pull_through(hash, &req).await;
+                range_pulled_size = size;
+                fault_seen |= range_outcome.is_fault();
+            }
+
+            let mut locally_filled = false;
+
+            // Own-origin serve-miss via the two decoupled legs.
+            // When the node's OWN configured fs/http/s3 origin can prove it
+            // serves `hash` — it knows the size AND publishes the {H}.obao4
+            // outboard — serve the whole blob by running the local pull leg (fill
+            // the cache from origin) beside the serve leg (stream the filling
+            // cache to the paying client), exactly like the node→node window path
+            // but with NO upstream, NO channel, and NO payment on the ingest side.
+            // Time-to-first-byte does not wait for the whole blob to land.
+            //
+            // Whole-blob only (offset==0 && len==0): ranged/resumed own-origin
+            // serve-miss is not yet wired through the two-leg spine, so a bounded
+            // request never routes here.
+            //
+            // Serviceability is confirmed by `origin_size` +
+            // `origin_fetch_outboard_bytes` (an origin publishes the outboard) —
+            // NOT by proving a Range/206 `fetch_range` works. All three shipped
+            // adapters (fs/http/s3) support Range whenever they publish an
+            // outboard, so this holds in practice; a custom Origin that publishes
+            // an outboard but refuses Range would sign `ok:true` then fail the
+            // stream. Acceptable for the shipped backends within this path's scope.
+            //
+            // Best-effort degrade (ADR 037 §"Fallback is always correct"): no
+            // published outboard / no origin size / no origins => fall through to
+            // `try_local_populate` below.
+            // Once serviceable, `serve_via_backend_origin` claims the fill itself
+            // (`CacheEngine::claim_fill`): the first same-hash miss OWNS
+            // the local origin pull; a concurrent one ATTACHES as an observer and
+            // streams the same filling cache to its own client (no double origin
+            // egress). The registry is range-aware, so this coalescing is not
+            // limited to the whole-blob case.
+            if range_pulled_size.is_none()
+                && !locally_filled
+                && req.byte_offset == 0
+                && req.byte_len == 0
+                && self.pull_authorized(&req, verified_client)
+            {
+                match self.cache.origin_size(hash).await {
+                    Ok(Some(total)) => {
+                        match self.cache.origin_fetch_outboard_bytes(hash, total).await {
+                            // Serviceable: size known and an origin publishes the
+                            // outboard. Enter the orchestration directly — it claims
+                            // the fill (owner-or-attach) internally after signing the
+                            // response, so no coalescing decision happens here.
+                            Ok(Some(_)) => {
+                                // Boxed: the serve future is large
+                                // (clippy::large_futures). `pull_authorized`
+                                // (checked in the `if` above) guarantees a
+                                // lane, so the extraction always matches.
+                                if let (Some(lk), Some(ln)) = (lane_key, known_lane.as_ref()) {
+                                    return Box::pin(self.serve_via_backend_origin(
+                                        send,
+                                        recv,
+                                        &req,
+                                        hash,
+                                        client_node_id,
+                                        lk,
+                                        ln,
+                                        total,
+                                        pool_status.map(|s| s.remaining),
+                                        rate_per_mb,
+                                        floor_reservation,
+                                    ))
+                                    .await;
+                                }
+                            }
+                            // Size known but no published outboard — not
+                            // serviceable via the range encoder. Degrade to the
+                            // buffered local populate below.
+                            Ok(None) => {}
+                            // A genuine origin transport fault while fetching the
+                            // outboard. Latch it (#1129) so a later-tier miss
+                            // reports InternalError not NotFound, then fall
+                            // through — another source may still serve.
+                            Err(e) => {
+                                tracing::debug!(%hash, error = %e, "own-origin outboard probe faulted; falling through");
+                                fault_seen = true;
+                            }
+                        }
+                    }
+                    // No origin knows the size, or no origin is configured at
+                    // all — both a clean fall-through (degrade). `origin_size`
+                    // already returns Ok(None) for most declines, so only
+                    // NoOrigin and transport faults reach the Err arms.
+                    Ok(None) | Err(CacheError::NoOrigin { .. }) => {}
+                    // Any other origin fault latches `fault_seen` (#1129) so a
+                    // later-tier miss reports InternalError not NotFound.
+                    Err(e) => {
+                        tracing::debug!(%hash, error = %e, "own-origin size probe faulted; falling through");
+                        fault_seen = true;
+                    }
+                }
+            }
+
+            // Reactive LOCAL-origin populate (#1116). Before any node→node
+            // path, try to fill from the node's OWN configured fs/http/s3
+            // origin (`populate_local` never touches the paid `Peer` origin).
+            // This lets a cache-only operator (node→node disabled) reactively
+            // serve its own content, and — when node→node IS enabled — prefers
+            // the local origin over the paid peer window path for a whole-blob
+            // request the operator can satisfy itself. Gated on the SAME proven
+            // channel ownership as the paid paths (`pull_authorized`): an S3
+            // origin has egress cost, and the following delivery is billed
+            // per-voucher. A local miss leaves the blob absent and falls through
+            // to the node→node branches below, unchanged.
+            //
+            // A local HARD FAULT (#1129 — the operator's own S3/fs origin
+            // errored, rather than simply not having the blob) also falls
+            // through to the node→node branches: another source may legitimately
+            // still serve. But it is LATCHED in `fault_seen`, because if no later
+            // tier fills, the terminal refusal must report a degraded node
+            // (`InternalError`) rather than an empty one (`NotFound`). Every
+            // terminal MISS below therefore goes through
+            // `FillOutcome::miss_reason` — including the window path's leech
+            // shed. (The channel-class refusals — `UnknownChannel`,
+            // `InsufficientDeposit` — keep their own reasons: they are
+            // client-attributable and would refuse regardless of origin
+            // health.)
+            if range_pulled_size.is_none()
+                && !locally_filled
+                && let Some(timeout) = self.local_populate
+                && self.pull_authorized(&req, verified_client)
+            {
+                let local = self.try_local_populate(hash, timeout).await;
+                fault_seen |= local.is_fault();
+                locally_filled = local.is_filled();
+            }
+
+            // Window-paced pull-through (#856, ADR 037) is the preferred path
+            // when its provider is set: instead of buffering the whole
+            // blob via `populate` and only THEN serving (fronting 100% of the
+            // upstream cost before any downstream voucher), it runs the pull
+            // leg (fill the cache from upstream) beside the serve leg (stream
+            // the filling cache to the paying client), so the per-request
+            // speculative exposure is bounded to the ramped credit window
+            // (#1669).
+            //
+            // It requires `byte_offset == 0 && byte_len == 0` (a whole-blob
+            // request). This is a conservative constraint on the ROUTING, not a
+            // limit of the serve leg: `serve_leg` clamps delivery to
+            // `[offset, offset + len)` and bills only the wire it delivers, and
+            // the pull leg is range-minimized (it pulls only
+            // `missing_ranges(offset, len)`), so the two-leg spine is
+            // range-correct. Ranged and resumed serve-miss through that spine is
+            // simply not yet wired end-to-end, so a bounded or resumed request
+            // falls to the buffered path below, which serves exactly the
+            // requested span via `export_range` (#823).
+            if range_pulled_size.is_some() || locally_filled {
+                // The requested span/blob is already present — a verified
+                // partial blob from the range pull, or the whole blob just
+                // filled from a local origin (#1116). Skip the node→node fill
+                // and fall through to the size gate + delivery (which serves a
+                // partial via `export_range`).
+            } else if let Some(origin) = self.pull_through_origin.as_ref()
+                && req.byte_offset == 0
+                && req.byte_len == 0
+                && self.pull_authorized(&req, verified_client)
+            {
+                // Boxed: the serve future is large; keep it off the
+                // `serve_stream` stack frame (clippy::large_futures). The
+                // orchestration claims the fill (owner-or-attach) internally after
+                // signing the response, so two concurrent same-hash misses share one
+                // upstream pull (no double spend, #305) without a decision here.
+                // `pull_authorized` (the `if` above) guarantees a lane, so the
+                // extraction always matches.
+                if let (Some(lk), Some(ln)) = (lane_key, known_lane.as_ref()) {
+                    return Box::pin(self.serve_via_window_pull_through(
+                        send,
+                        recv,
+                        &req,
+                        hash,
+                        client_node_id,
+                        lk,
+                        ln,
+                        Arc::clone(origin),
+                        pool_status.map(|s| s.remaining),
+                        fault_seen,
+                        rate_per_mb,
+                        floor_reservation,
+                    ))
+                    .await;
+                }
+            } else {
+                // Buffered pull-through (#831): used when
+                // the window provider is unset or for a resumed request.
+                let buffered = match self.pull_through {
+                    Some(timeout) if self.pull_authorized(&req, verified_client) => {
+                        self.try_pull_through(hash, timeout).await
+                    }
+                    // No pull-through configured, or the request is not
+                    // authorized to make this node spend: nothing was attempted,
+                    // so this tier contributes no new information.
+                    _ => FillOutcome::CleanMiss,
+                };
+                if !buffered.is_filled() {
+                    let reason = FillOutcome::miss_reason(fault_seen || buffered.is_fault());
+                    return self
+                        .respond_error(&mut send, &req, reason, rate_per_mb)
+                        .await;
+                }
+            }
         }
         // Held at fn scope so the slot lives across `deliver` / `serve_via_*` and
         // releases its admission counters on every exit, including the boxed
@@ -957,18 +965,25 @@ impl ClientHandler {
         let _shed_slot = shed_slot;
 
         // Size gate. An origin-tier range pull (#823) imported only a *partial*
-        // blob, so `inspect`/`has` can't report the whole-blob size — but the
-        // origin size probe already gave us the authoritative total, which the
-        // client needs for resume math. Use it directly in that case. Otherwise
-        // `has` just confirmed the blob is present and complete, so an `inspect`
-        // error — or a `None` size (a `Partial`/`NotFound` status) — is a real
-        // store fault, NOT a zero-length blob. Advertising `total_bytes: 0` for
-        // a non-empty blob would sign a `StreamResponse` the delivery then
-        // contradicts, and the receiver (expecting 0 bytes) would abort on the
-        // first chunk. Surface the fault instead; only a genuinely complete,
-        // zero-length blob yields `total_bytes == 0`.
+        // blob, so `inspect` can't report the whole-blob size — but the origin
+        // size probe already gave us the authoritative total, which the client
+        // needs for resume math. Use it directly in that case. A plain cache hit
+        // carries its size from the `serve_audit` above (#1789 item 7 part B),
+        // so it skips the redundant `inspect` store hop entirely — including a
+        // genuinely empty blob, which audits as serveable at size 0.
+        //
+        // The remaining branch is a miss the fill legs above just completed, so
+        // the blob is on disk now: an `inspect` error — or a `None` size (a
+        // `Partial`/`NotFound` status) — means the fill did not land what it
+        // reported, which is a real store fault and NOT a zero-length blob.
+        // Advertising `total_bytes: 0` for a non-empty blob would sign a
+        // `StreamResponse` the delivery then contradicts, and the receiver
+        // (expecting 0 bytes) would abort on the first chunk. Surface the fault
+        // instead.
         let total_bytes = if let Some(total) = range_pulled_size {
             total
+        } else if let Some(size) = hit_size {
+            size
         } else {
             let size = match self.cache.inspect(hash).await {
                 Ok(preview) => preview.size_bytes,
@@ -987,7 +1002,7 @@ impl ClientHandler {
             let Some(total_bytes) = size else {
                 tracing::warn!(
                     %hash,
-                    "blob present per `has` but `inspect` reports no size; treating as fault"
+                    "just-filled blob reports no size to `inspect`; treating as fault"
                 );
                 return self
                     .respond_error(

@@ -266,6 +266,11 @@ pub struct ResolvedCache {
     /// negative-answer TTL for the origin-probe memo — the bound on how long a
     /// stale `Absent` can hide newly-available own content.
     pub origin_probe_negative_ttl_sec: u64,
+    /// Memo TTL in seconds for a `Fault` answer (#1130 pt3). Default
+    /// [`crate::config::DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC`]. Bounds how long a
+    /// hash that faulted is not re-probed, and is capped by
+    /// `origin_probe_ttl_sec` so a recovered origin is noticed soon.
+    pub origin_probe_fault_ttl_sec: u64,
     /// Per-probe live-`HEAD` ceiling in milliseconds (#1130 pt3). Default
     /// [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]. Keeps a slow origin
     /// off the probe hot path.

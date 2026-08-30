@@ -32,7 +32,7 @@ use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::fill_session::{FillClaim, FillRegistry, FillSession};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
-use crate::origin_probe::{OriginProbeMemo, Presence};
+use crate::origin_probe::{OriginProbeMemo, OriginProbePolicy, Presence};
 use crate::probe_hold::ProbeHoldOutcome;
 use crate::range_pull::{AlignedRange, align_range, encode_verified_range};
 use crate::retry::{
@@ -145,6 +145,7 @@ impl From<Presence> for OriginPresence {
         match presence {
             Presence::Present(size) => OriginPresence::Present(size),
             Presence::Absent => OriginPresence::Absent,
+            Presence::Fault => OriginPresence::Fault,
         }
     }
 }
@@ -321,7 +322,15 @@ struct Inner {
     /// in-memory-only set would silently let evicted content resume serving
     /// after `decdn run` is restarted, which is exactly the failure mode
     /// #279 needs to prevent.
-    evicted: Mutex<HashSet<Hash>>,
+    ///
+    /// Append-only, so the serve-path membership check in
+    /// [`CacheEngine::is_evicted`] is a lock-free load (#1789 item 5) and
+    /// readers never block on the rarer writer. Unlike [`Self::denied`] and
+    /// [`Self::chain_denied`], which are replaced wholesale on a config reload,
+    /// this set may only grow: an operator eviction is a takedown, and a hash
+    /// that stopped being served must not start again. [`MonotoneHashSet`]
+    /// carries that difference.
+    evicted: MonotoneHashSet,
     /// Probe-triggered eviction holds (#318, ADR 005 §Probe-triggered
     /// eviction hold). Maps a held hash to its hold *expiry* instant; a
     /// held hash is invisible to [`CacheEngine::eviction_candidates`] until
@@ -498,6 +507,119 @@ impl Inner {
 // crate (#578) and are imported above. The engine holds its pinned set
 // internally as `HashSet<Hash>` (the iroh-blobs store hash) and converts
 // at the public boundary via `to_store_hash` / `from_store_hash`.
+
+/// Append-only set of hashes with a lock-free read path.
+///
+/// Every published snapshot is a superset of its predecessor. That is the
+/// property [`CacheEngine::is_evicted`] relies on: a takedown observed once is
+/// observed by every later reader, so a lock-free read can never answer
+/// not-evicted for a hash the operator has already evicted.
+///
+/// Writers serialize on `writer`, so the publish is a single uncontended
+/// `Arc` clone-and-swap rather than a CAS retry loop that re-clones the whole
+/// set on every lost race. The clone itself is O(n) in the set's size, which is
+/// the cost this shape accepts to keep the read side free — writes are operator
+/// takedowns and blacklist enforcement, reads are on every serve.
+#[derive(Debug)]
+struct MonotoneHashSet {
+    snapshot: ArcSwap<HashSet<Hash>>,
+    /// Serializes writers so the read-modify-write below is atomic: without it
+    /// the cap check and the "was it already present" answer are both racy.
+    writer: std::sync::Mutex<()>,
+}
+
+impl MonotoneHashSet {
+    fn new(initial: HashSet<Hash>) -> Self {
+        Self {
+            snapshot: ArcSwap::from(Arc::new(initial)),
+            writer: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn contains(&self, hash: Hash) -> bool {
+        self.snapshot.load().contains(&hash)
+    }
+
+    /// The current snapshot, for a caller that needs several questions answered
+    /// against one consistent view.
+    fn snapshot(&self) -> arc_swap::Guard<Arc<HashSet<Hash>>> {
+        self.snapshot.load()
+    }
+
+    /// Add `hash` unless the set already holds it or is at `cap`. Returns
+    /// `false` only when `cap` would be exceeded — an already-present hash is
+    /// a success, since the set already says what the caller wants it to say.
+    ///
+    /// Atomic with respect to other writers, so two concurrent inserts cannot
+    /// both read a set one below `cap` and both land.
+    fn insert_if_absent(&self, hash: Hash, cap: usize) -> bool {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let current = self.snapshot.load();
+        if current.contains(&hash) {
+            return true;
+        }
+        if current.len() >= cap {
+            return false;
+        }
+        let mut next = HashSet::clone(&current);
+        next.insert(hash);
+        drop(current);
+        self.snapshot.store(Arc::new(next));
+        true
+    }
+}
+
+/// Serve-path verdict for one hash, from a single store `status()` call.
+///
+/// Answers in one store contact what the delivery path asks in two —
+/// [`CacheEngine::has`] for presence and [`CacheEngine::inspect`] for size
+/// (#1789 item 7 part B). The variants are the delivery path's own branches,
+/// so a size is reachable only where it is serveable and a refusal can never
+/// be paired with a wire size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeAudit {
+    /// The store reports the blob complete and no gate refuses it (denied /
+    /// chain-denied / evicted) — the same condition [`CacheEngine::has`]
+    /// reports. `size` is the whole-blob wire size, and `0` means a genuinely
+    /// empty blob.
+    Serveable {
+        /// Whole-blob byte size to advertise on the wire.
+        size: u64,
+    },
+    /// Nothing serveable from the local store: the blob is absent, partial, or
+    /// refused by a gate.
+    Unavailable {
+        /// Whether the hash is logically evicted (#279). Mirrors
+        /// [`CacheEngine::is_evicted`], so the miss path tells an eviction
+        /// from a plain miss without a second call.
+        evicted: bool,
+    },
+}
+
+impl ServeAudit {
+    /// Wire size for a warm hit; `None` when the delivery path must fill and
+    /// then size the blob itself.
+    #[must_use]
+    pub const fn hit_size(&self) -> Option<u64> {
+        match self {
+            Self::Serveable { size } => Some(*size),
+            Self::Unavailable { .. } => None,
+        }
+    }
+
+    /// Whether the blob can be served from the local store right now.
+    #[must_use]
+    pub const fn is_serveable(&self) -> bool {
+        matches!(self, Self::Serveable { .. })
+    }
+
+    /// Whether the hash is logically evicted (#279). `false` for a serveable
+    /// hash, since eviction is one of the gates that refuses a serve.
+    #[must_use]
+    pub const fn is_evicted(&self) -> bool {
+        matches!(self, Self::Unavailable { evicted: true })
+    }
+}
 
 /// Read-only snapshot of a hash's local-cache state, returned by
 /// [`CacheEngine::inspect`]. Backs `decdn node evict --dry-run`
@@ -1179,7 +1301,7 @@ impl CacheEngine {
                 origin_probe_memo: Mutex::new(OriginProbeMemo::default()),
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
                 chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
-                evicted: Mutex::new(evicted),
+                evicted: MonotoneHashSet::new(evicted),
                 probe_holds: Mutex::new(HashMap::new()),
                 max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
                 frequency: ArcSwap::from_pointee(None),
@@ -1736,10 +1858,18 @@ impl CacheEngine {
     /// live one — and this layer decides what to remember:
     ///
     /// - `Present(size)` is memoised under the positive TTL;
-    /// - `Fault` is **never memoised** — a fault is transient, so the next
-    ///   probe should retry the backend immediately rather than parrot a cached
-    ///   non-answer, and not caching it does not weaken the flood bound (an
-    ///   attacker's random hashes genuinely 404, they do not fault);
+    /// - `Fault` is memoised under the fault TTL (#1789 item 6). The memo is
+    ///   keyed per hash, so this bounds repeat probes OF THE SAME HASH to one
+    ///   live `HEAD` per fault TTL — the common shape when a client retries a
+    ///   request against a failing origin. It does not bound namespace-wide
+    ///   load: during an outage, N distinct hashes still cost N live `HEAD`s
+    ///   per window. The TTL is graded against its neighbours and the config
+    ///   resolver enforces `negative <= fault <= positive`: patient enough that
+    ///   a retried hash is not re-probed as often as an absence, eager enough
+    ///   that a recovered origin is noticed soon — a memoised fault costs
+    ///   client-visible availability, since the origin-only serve gate answers
+    ///   `InternalError` and the probe/DHT paths report this node holds nothing
+    ///   for as long as it stands.
     /// - `Absent` — every configured origin answered `Ok(None)`, or none is
     ///   configured at all (a node with nothing configured genuinely holds
     ///   nothing, which is not transient) — is memoised under the short
@@ -1763,17 +1893,26 @@ impl CacheEngine {
         };
         // Live probe off the memo lock (never hold it across the await).
         let presence = self.probe_origin_chain(hash, timeout).await;
-        match presence {
-            OriginPresence::Present(size) => {
-                self.probe_memo_lock()
-                    .insert(hash, Presence::Present(size), now);
-            }
-            OriginPresence::Absent => {
-                self.probe_memo_lock().insert(hash, Presence::Absent, now);
-            }
-            // Never memoised — see the doc comment above.
-            OriginPresence::Fault => {}
+        let memo_presence = match presence {
+            OriginPresence::Present(size) => Presence::Present(size),
+            OriginPresence::Absent => Presence::Absent,
+            OriginPresence::Fault => Presence::Fault,
+        };
+        if matches!(presence, OriginPresence::Fault) {
+            // Warn rather than debug: the memo answers the repeats, so this
+            // fires at most once per hash per fault TTL — and it is the only
+            // record
+            // that this node is about to refuse serves and answer probes with
+            // "not held" for content it may well hold. The per-origin errors
+            // behind the fault stay at debug.
+            tracing::warn!(
+                %hash,
+                fault_ttl_secs = self.probe_memo_lock().fault_ttl().as_secs(),
+                "origin probe faulted; memoising the fault — serves for this hash \
+                 answer InternalError and probes answer not-held until it expires"
+            );
         }
+        self.probe_memo_lock().insert(hash, memo_presence, now);
         presence
     }
 
@@ -1793,15 +1932,8 @@ impl CacheEngine {
     /// runtime wiring and swaps the memo wholesale (dropping any warm entries) —
     /// the same "set once, no threading through every test constructor" pattern
     /// as [`Self::set_max_probe_holds`].
-    pub fn set_origin_probe_config(
-        &self,
-        positive_ttl: Duration,
-        negative_ttl: Duration,
-        timeout: Duration,
-        capacity: usize,
-    ) {
-        *self.probe_memo_lock() =
-            OriginProbeMemo::new(positive_ttl, negative_ttl, timeout, capacity);
+    pub fn set_origin_probe_config(&self, policy: OriginProbePolicy) {
+        *self.probe_memo_lock() = OriginProbeMemo::new(policy);
     }
 
     /// Swap in the live *local* denied set from `[content] denied_hashes` (ADR
@@ -1909,6 +2041,41 @@ impl CacheEngine {
             .has(hash)
             .await
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
+    }
+
+    /// Serve-path presence + size audit for `hash` in ONE store actor call.
+    ///
+    /// Answers from a single `BlobStatus` what the delivery path otherwise asks
+    /// in two hops — [`Self::has`] for presence, then [`Self::inspect`] for size
+    /// (#1789 item 7, part B) — saving one store round-trip on every cache hit.
+    /// Presence matches [`Self::has`] exactly: the blob must be `Complete` and
+    /// no gate may refuse it, so a logically-evicted hash is
+    /// [`ServeAudit::Unavailable`] even while the store still holds its bytes.
+    ///
+    /// Unlike [`Self::inspect`], a partial blob reports no size here. `inspect`
+    /// exists to tell an operator how much disk a partial pull occupies; this
+    /// audit answers what may go on the wire, and a partial blob's byte count
+    /// is not that.
+    pub async fn serve_audit(&self, hash: Hash) -> CacheResult<ServeAudit> {
+        let evicted = self.is_evicted(hash);
+        let refused = self.is_denied(hash) || self.is_chain_denied(hash) || evicted;
+        let status = self
+            .inner
+            .store
+            .blobs()
+            .status(hash)
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        match status {
+            iroh_blobs::api::blobs::BlobStatus::Complete { size } if !refused => {
+                Ok(ServeAudit::Serveable { size })
+            }
+            iroh_blobs::api::blobs::BlobStatus::Complete { .. }
+            | iroh_blobs::api::blobs::BlobStatus::NotFound
+            | iroh_blobs::api::blobs::BlobStatus::Partial { .. } => {
+                Ok(ServeAudit::Unavailable { evicted })
+            }
+        }
     }
 
     /// Which chunk ranges of `hash` are present on disk right now.
@@ -2059,30 +2226,25 @@ impl CacheEngine {
     /// caller is the hash-mismatch path in pull-through, which executes on a
     /// request-serving worker that must not stall on disk I/O.
     pub async fn evict(&self, hash: Hash) -> CacheResult<()> {
-        // Pre-check under one lock acquisition: short-circuit on
+        // Lock-free pre-check on a single snapshot: short-circuit on
         // already-evicted (a sequential repeat-evict of the same hash returns
         // here and never re-appends) and reject on cap (DoS bound on an
-        // unbounded public-ish surface). Both checks are best-effort against
-        // concurrency: the lock is released before the append below, so two
-        // evict() calls racing the *same* new hash can each pass and append a
-        // duplicate `evicted.log` line — harmless, since replay folds the log
-        // into a `HashSet`. The cap is likewise a soft DoS bound, not a hard
-        // invariant — going +ε over by a handful of races is fine.
-        {
-            let guard = self
-                .inner
-                .evicted
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if guard.contains(&hash) {
-                return Ok(());
-            }
-            if guard.len() >= MAX_EVICTED_ENTRIES {
-                return Err(CacheError::EvictionLimitExceeded {
-                    limit: MAX_EVICTED_ENTRIES,
-                });
-            }
+        // unbounded public-ish surface). Both checks are advisory against
+        // concurrency — the snapshot is read before the durable append below —
+        // and `insert_if_absent` re-decides both under the write lock, so the
+        // cap is exact and a race on the same new hash appends at most one
+        // duplicate `evicted.log` line (harmless: replay folds the log into a
+        // `HashSet`).
+        let evicted = self.inner.evicted.snapshot();
+        if evicted.contains(&hash) {
+            return Ok(());
         }
+        if evicted.len() >= MAX_EVICTED_ENTRIES {
+            return Err(CacheError::EvictionLimitExceeded {
+                limit: MAX_EVICTED_ENTRIES,
+            });
+        }
+        drop(evicted);
 
         // Persist FIRST, then commit to the in-memory set: a crash between
         // these two steps will at worst replay a successful evict on the
@@ -2105,18 +2267,19 @@ impl CacheEngine {
                 CacheError::Store(anyhow::Error::from(err).context("persist eviction"))
             })?;
 
-        // `unwrap_or_else(PoisonError::into_inner)` rather than the project's
-        // usual `if let Ok(...) = lock()` pattern: a poisoned lock here
-        // would silently skip the in-memory commit and the node would keep
-        // serving the supposedly-evicted blob until the next restart loaded
-        // `evicted.log`. For a DMCA takedown that is the canonical worst
-        // case. Recovering the inner guard preserves the contract that
-        // `evict() -> Ok(())` implies the in-memory set was updated.
-        self.inner
+        // Commit to the in-memory set (#1789 item 5). The publish is a single
+        // atomic swap of a superset, so no reader can observe `Ok(())` here
+        // with the set still excluding `hash`, and the read side never has a
+        // lock that could be poisoned into a "still serving" fallback.
+        if !self
+            .inner
             .evicted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(hash);
+            .insert_if_absent(hash, MAX_EVICTED_ENTRIES)
+        {
+            return Err(CacheError::EvictionLimitExceeded {
+                limit: MAX_EVICTED_ENTRIES,
+            });
+        }
         self.inner.access_times.remove(&hash);
         self.inner
             .segments
@@ -2241,16 +2404,9 @@ impl CacheEngine {
     /// pre-computes a `served` bool so admin can derive `was_present`
     /// without a follow-up [`Self::has`] call.
     ///
-    /// Lock structure: the three in-memory probes hit independent
-    /// synchronization primitives — `evicted` (`Mutex<HashSet>`),
-    /// `access_times` (`DashMap`, one shard), and `pinned` (`ArcSwap`).
-    /// Each is held for an O(1) lookup; merging them into a single
-    /// lock acquisition would require either combining the underlying
-    /// data structures (a much larger refactor that would couple
-    /// unrelated invariants) or holding a coarser lock across the
-    /// async `BlobStatus` call (which would block the `get()` hot
-    /// path on whichever store backend is slower). Same pattern as
-    /// [`Self::eviction_candidates`].
+    /// The three in-memory probes are each an O(1) lookup and none of them
+    /// blocks: `evicted` and `pinned` are `ArcSwap` loads and `access_times` is
+    /// one `DashMap` shard. Same pattern as [`Self::eviction_candidates`].
     pub async fn inspect(&self, hash: Hash) -> CacheResult<EvictionPreview> {
         let status = self
             .inner
@@ -2299,17 +2455,13 @@ impl CacheEngine {
 
     /// Has this hash been logically evicted via [`Self::evict`]?
     ///
-    /// Recovers from a poisoned mutex via [`PoisonError::into_inner`]
-    /// rather than treating poison as "not evicted": a poisoned lock
-    /// returning `false` here would let evicted DMCA-flagged content
-    /// resume serving — exactly what `<cache_dir>/evicted.log`'s
-    /// durability guarantee was designed to prevent.
+    /// Lock-free (#1789 item 5): one `ArcSwap` load and a hash-set probe, so
+    /// the serve-path gate takes no mutex and has no lock-poisoning failure
+    /// mode that could answer not-evicted for a taken-down hash. The write side
+    /// only ever publishes a superset, so an evicted hash is observed evicted
+    /// by every reader that linearizes after the swap.
     pub fn is_evicted(&self, hash: Hash) -> bool {
-        self.inner
-            .evicted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(&hash)
+        self.inner.evicted.contains(hash)
     }
 
     /// Set the probe-hold budget cap from `cache.max_probe_holds` (ADR 005
@@ -5226,13 +5378,14 @@ mod tests {
         assert_eq!(
             engine.origin_probe_presence(hash).await,
             OriginPresence::Fault,
-            "a fault is never memoised",
+            "a fault is memoised under the fault TTL (#1789 item 6)",
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2,
-            "the second probe re-walked the origin chain rather than serving \
-             a cached fault",
+            1,
+            "the second probe served the cached fault rather than re-walking \
+             the origin chain — a steady state re-probes once per fault TTL, \
+             not once per request",
         );
         assert_eq!(
             engine.origin_probe_size(hash).await,
@@ -5327,12 +5480,13 @@ mod tests {
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
         // Tight timeout so the 400 ms origin overruns it.
-        engine.set_origin_probe_config(
-            Duration::from_secs(15),
-            Duration::from_secs(2),
-            Duration::from_millis(20),
-            16,
-        );
+        engine.set_origin_probe_config(OriginProbePolicy {
+            positive_ttl: Duration::from_secs(15),
+            negative_ttl: Duration::from_secs(2),
+            fault_ttl: Duration::from_secs(5),
+            timeout: Duration::from_millis(20),
+            capacity: 16,
+        });
 
         assert_eq!(
             engine.origin_probe_size(hash).await,
@@ -5345,8 +5499,8 @@ mod tests {
     /// `origin_probe_presence` distinguishes `Present`/`Absent`/`Fault`
     /// (#1766): a hash the origin holds is `Present(size)`, a hash it does not
     /// is `Absent`, and a `HEAD` slower than the probe ceiling is `Fault` —
-    /// NOT `Absent` — and is never memoised, so a second probe re-hits the
-    /// backend rather than parroting a cached non-answer.
+    /// NOT `Absent`, so a caller can never sign an authoritative `NotFound`
+    /// off a backend blip.
     #[tokio::test]
     async fn origin_probe_presence_distinguishes_present_absent_and_fault() -> anyhow::Result<()> {
         // `Present`/`Absent` against a fast origin.
@@ -5385,12 +5539,13 @@ mod tests {
         )
         .await?;
         // Tight timeout so the 400 ms origin overruns it.
-        fault_engine.set_origin_probe_config(
-            Duration::from_secs(15),
-            Duration::from_secs(2),
-            Duration::from_millis(20),
-            16,
-        );
+        fault_engine.set_origin_probe_config(OriginProbePolicy {
+            positive_ttl: Duration::from_secs(15),
+            negative_ttl: Duration::from_secs(2),
+            fault_ttl: Duration::from_secs(5),
+            timeout: Duration::from_millis(20),
+            capacity: 16,
+        });
         assert_eq!(
             fault_engine.origin_probe_presence(slow).await,
             OriginPresence::Fault,
@@ -5404,12 +5559,13 @@ mod tests {
         assert_eq!(
             fault_engine.origin_probe_presence(slow).await,
             OriginPresence::Fault,
-            "a fault is never memoised, so the same hash faults again",
+            "a memoised fault still answers Fault",
         );
         assert_eq!(
             slow_calls.load(Ordering::SeqCst),
-            2,
-            "the second probe re-hit the backend rather than serving a cached fault",
+            1,
+            "the second probe served the cached fault instead of re-hitting \
+             the backend (#1789 item 6)",
         );
         Ok(())
     }
@@ -5425,12 +5581,13 @@ mod tests {
         let (origin, _calls) = CountingSizeOrigin::slow(hash, 100, Duration::from_millis(400));
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-        engine.set_origin_probe_config(
-            Duration::from_secs(15),
-            Duration::from_secs(2),
-            Duration::from_millis(20),
-            16,
-        );
+        engine.set_origin_probe_config(OriginProbePolicy {
+            positive_ttl: Duration::from_secs(15),
+            negative_ttl: Duration::from_secs(2),
+            fault_ttl: Duration::from_secs(5),
+            timeout: Duration::from_millis(20),
+            capacity: 16,
+        });
 
         assert_eq!(
             engine.origin_probe_size(hash).await,
@@ -7370,6 +7527,96 @@ mod tests {
         Ok(())
     }
 
+    /// `serve_audit` folds presence + size + eviction into one store contact
+    /// (#1789 item 7 part B) and matches the `has`/`inspect` pairing the
+    /// delivery path would otherwise make: a complete blob is `Serveable` with
+    /// its size, an absent hash is `Unavailable`, and an evicted hash is
+    /// `Unavailable` with `evicted` set so the serve path tells an eviction
+    /// from a plain miss without a second call.
+    #[tokio::test]
+    async fn serve_audit_reports_presence_size_and_eviction() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"a served blob";
+        let origin = StubOrigin::new(payload);
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+        let hash = Hash::new(payload);
+        let unseen = Hash::new(b"never cached");
+
+        anyhow::ensure!(
+            engine.serve_audit(unseen).await? == ServeAudit::Unavailable { evicted: false },
+            "an absent hash is unavailable and not evicted"
+        );
+
+        engine.populate(hash).await?;
+        anyhow::ensure!(
+            engine.serve_audit(hash).await?
+                == ServeAudit::Serveable {
+                    size: payload.len() as u64
+                },
+            "a complete blob is serveable and carries its size"
+        );
+
+        engine.evict(hash).await?;
+        anyhow::ensure!(
+            engine.serve_audit(hash).await? == ServeAudit::Unavailable { evicted: true },
+            "evicted content is unavailable with the eviction surfaced"
+        );
+        Ok(())
+    }
+
+    /// A complete blob that a gate refuses is `Unavailable` and carries NO
+    /// size, so a caller cannot advertise the wire size of content the serve
+    /// path would refuse. `evicted` stays false: a chain-denied hash is a
+    /// different refusal from an eviction and the miss path must not report it
+    /// as `EvictedSinceProbe`.
+    #[tokio::test]
+    async fn serve_audit_withholds_the_size_of_a_denied_blob() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"denied but on disk";
+        let origin = StubOrigin::new(payload);
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+        let hash = Hash::new(payload);
+        engine.populate(hash).await?;
+
+        engine.set_chain_denied_one(hash, true);
+        let audit = engine.serve_audit(hash).await?;
+        anyhow::ensure!(
+            audit == ServeAudit::Unavailable { evicted: false },
+            "a chain-denied blob is unavailable, un-evicted, and sizeless"
+        );
+        anyhow::ensure!(
+            audit.hit_size().is_none(),
+            "a refused blob never yields a wire size"
+        );
+        Ok(())
+    }
+
+    /// A genuinely empty blob is `Serveable { size: 0 }`. The delivery path
+    /// keys its "fill then size it yourself" branch on the absence of a size,
+    /// so a zero-length blob must not read as a miss.
+    #[tokio::test]
+    async fn serve_audit_reports_a_zero_length_blob_as_serveable() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = StubOrigin::new(b"");
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+        let hash = Hash::new(b"");
+        engine.populate(hash).await?;
+
+        let audit = engine.serve_audit(hash).await?;
+        anyhow::ensure!(
+            audit == ServeAudit::Serveable { size: 0 },
+            "an empty blob is serveable at size 0"
+        );
+        anyhow::ensure!(
+            audit.hit_size() == Some(0),
+            "the delivery path reads 0, not a missing size"
+        );
+        Ok(())
+    }
+
     /// Evicting the same hash twice must not append a duplicate line to
     /// `<cache_dir>/evicted.log`. Without this contract a stuck
     /// automation that mass-replays the same DMCA-takedown hash would
@@ -7395,6 +7642,99 @@ mod tests {
         anyhow::ensure!(
             lines_first == 1 && lines_third == 1,
             "expected 1 log line both times, got first={lines_first}, third={lines_third}"
+        );
+        Ok(())
+    }
+
+    /// The lock-free `evicted` set (#1789 item 5) must never lose a write and
+    /// never present a torn view.
+    ///
+    /// CONCURRENT WRITERS are the point: several tasks evict disjoint hashes at
+    /// once, and every one of them must be evicted at the end. A publish that
+    /// read a snapshot, cloned it and stored it without serializing — the
+    /// obvious "one less allocation" rewrite of
+    /// [`MonotoneHashSet::insert_if_absent`] — drops whichever writer lost the
+    /// race, and `evict` would have returned `Ok(())` while the hash kept
+    /// serving. That is a takedown failure, so it is asserted directly.
+    ///
+    /// Readers run alongside on real worker threads and assert monotonicity: a
+    /// hash observed evicted stays evicted. The reader half fails safe (it can
+    /// only under-observe under scheduling pressure), so it also asserts it saw
+    /// something, otherwise a starved reader would assert nothing at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evicted_set_stays_consistent_under_concurrent_evict() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = Arc::new(empty_engine(tmp.path()).await?);
+        let hashes: Vec<Hash> = (0..64)
+            .map(|i| Hash::new(format!("concurrent-evict-{i}").as_bytes()))
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Eight writers over disjoint slices of the hash set, all evicting at
+        // once. A lost update leaves one of the slices un-evicted.
+        let mut writers = Vec::new();
+        for chunk in hashes.chunks(8) {
+            let engine = Arc::clone(&engine);
+            let chunk: Vec<Hash> = chunk.to_vec();
+            writers.push(tokio::spawn(async move {
+                for h in &chunk {
+                    engine.evict(*h).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let engine = Arc::clone(&engine);
+            let hashes = hashes.clone();
+            let stop = Arc::clone(&stop);
+            readers.push(tokio::spawn(async move {
+                let mut saw_evicted = HashSet::new();
+                for _ in 0..50_000 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    for h in &hashes {
+                        if engine.is_evicted(*h) {
+                            saw_evicted.insert(*h);
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Ok::<_, anyhow::Error>(saw_evicted)
+            }));
+        }
+
+        for w in writers {
+            w.await
+                .map_err(|e| anyhow::anyhow!("writer task panicked: {e}"))??;
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        for h in &hashes {
+            anyhow::ensure!(
+                engine.is_evicted(*h),
+                "{h} was evicted by a concurrent writer but is not in the set — lost update"
+            );
+        }
+
+        let mut any_observed = false;
+        for r in readers {
+            let saw = r
+                .await
+                .map_err(|e| anyhow::anyhow!("reader task panicked: {e}"))??;
+            any_observed |= !saw.is_empty();
+            for h in &saw {
+                anyhow::ensure!(
+                    engine.is_evicted(*h),
+                    "reader once saw {h} evicted but it is not evicted at the end — torn view"
+                );
+            }
+        }
+        anyhow::ensure!(
+            any_observed,
+            "no reader observed any eviction — the monotonicity half asserted nothing"
         );
         Ok(())
     }

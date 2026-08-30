@@ -460,6 +460,15 @@ pub struct CacheConfig {
     /// TTL short bounds how long a stale `Absent` can hide newly-available own
     /// content from a probe.
     pub origin_probe_negative_ttl_sec: Option<u64>,
+    /// TTL, in seconds, for a memoised fault live-origin probe answer (#1130
+    /// pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC`]
+    /// (5). Longer than `origin_probe_negative_ttl_sec` because the memo is
+    /// keyed per hash and a client retrying one hash against a failing origin
+    /// is the common shape; shorter than `origin_probe_ttl_sec` because a
+    /// memoised fault refuses paying clients for as long as it stands.
+    /// Rejected unless `origin_probe_negative_ttl_sec <=
+    /// origin_probe_fault_ttl_sec <= origin_probe_ttl_sec`.
+    pub origin_probe_fault_ttl_sec: Option<u64>,
     /// Per-probe ceiling, in milliseconds, on the live-origin `HEAD`/`HeadObject`
     /// (#1130 pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]
     /// (2000). A slow origin must never stall the probe hot path; on timeout the

@@ -199,8 +199,9 @@ pub const DEFAULT_FS_RESCAN_INTERVAL_SEC: u64 = 60;
 // this crate agree from a single source; re-exported here so the existing
 // `crate::config::DEFAULT_ORIGIN_PROBE_*` paths keep resolving.
 pub use decdn_config_types::{
-    DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY, DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
-    DEFAULT_ORIGIN_PROBE_TIMEOUT_MS, DEFAULT_ORIGIN_PROBE_TTL_SEC,
+    DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC, DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
+    DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC, DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
+    DEFAULT_ORIGIN_PROBE_TTL_SEC,
 };
 
 /// Fallback for `cache.relay_foreign_namespaces` (#1759) on a node with no
@@ -1710,6 +1711,31 @@ fn resolve_cache_into(
     let origin_probe_negative_ttl_sec = file
         .and_then(|c| c.origin_probe_negative_ttl_sec)
         .unwrap_or(DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC);
+    let origin_probe_fault_ttl_sec = file
+        .and_then(|c| c.origin_probe_fault_ttl_sec)
+        .unwrap_or(DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC);
+    // The three probe TTLs are one graded policy, not three independent knobs.
+    // A fault must be re-probed at least as eagerly as a positive answer, or a
+    // recovered origin stays hidden behind a stale fault — and the origin-only
+    // serve gate refuses paying clients for as long as it does. It must be at
+    // least as patient as an absence, or memoising it buys nothing over the
+    // negative TTL it would otherwise share. Enforced here so the ordering the
+    // knob docs state is a property of every accepted config, not of the
+    // defaults alone.
+    bag.check_with(
+        origin_probe_negative_ttl_sec <= origin_probe_fault_ttl_sec
+            && origin_probe_fault_ttl_sec <= origin_probe_ttl_sec,
+        "cache.origin_probe_fault_ttl_sec",
+        || {
+            format!(
+                "cache.origin_probe_fault_ttl_sec ({origin_probe_fault_ttl_sec}) must sit \
+                 between cache.origin_probe_negative_ttl_sec \
+                 ({origin_probe_negative_ttl_sec}) and cache.origin_probe_ttl_sec \
+                 ({origin_probe_ttl_sec}) inclusive: a fault is re-probed no less eagerly \
+                 than a positive answer and no more eagerly than an absence"
+            )
+        },
+    );
     let origin_probe_timeout_ms = file
         .and_then(|c| c.origin_probe_timeout_ms)
         .unwrap_or(DEFAULT_ORIGIN_PROBE_TIMEOUT_MS);
@@ -1968,6 +1994,7 @@ fn resolve_cache_into(
         fs_rescan_interval_sec,
         origin_probe_ttl_sec,
         origin_probe_negative_ttl_sec,
+        origin_probe_fault_ttl_sec,
         origin_probe_timeout_ms,
         origin_probe_memo_capacity,
         eviction_high_water_pct,
@@ -4334,6 +4361,60 @@ mod tests {
         assert_eq!(resolved.eviction_target_pct, 80);
         assert_eq!(resolved.eviction_per_sweep_budget, 16);
         assert_eq!(resolved.eviction_tick_secs, 1);
+    }
+
+    /// The three origin-probe TTLs are one graded policy: a fault must be
+    /// re-probed no less eagerly than a positive answer, or a recovered origin
+    /// stays hidden and the origin-only serve gate keeps refusing paying
+    /// clients; and no more eagerly than an absence, or memoising it buys
+    /// nothing. Both ends are rejected rather than clamped — the ordering is
+    /// stated in every knob's docs, so it has to hold for every accepted
+    /// config, not just the defaults.
+    #[test]
+    fn resolve_cache_rejects_unordered_origin_probe_ttls() {
+        let cli = empty_cache_args();
+        let too_long = types::CacheConfig {
+            origin_probe_fault_ttl_sec: Some(3600),
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&too_long), Path::new("/data-dir")).is_err(),
+            "a fault TTL above the positive TTL hides a recovered origin"
+        );
+        let too_short = types::CacheConfig {
+            origin_probe_negative_ttl_sec: Some(30),
+            origin_probe_fault_ttl_sec: Some(5),
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&too_short), Path::new("/data-dir")).is_err(),
+            "a fault TTL below the negative TTL is not a graded policy"
+        );
+        let ordered = types::CacheConfig {
+            origin_probe_ttl_sec: Some(30),
+            origin_probe_negative_ttl_sec: Some(2),
+            origin_probe_fault_ttl_sec: Some(10),
+            ..Default::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&ordered), Path::new("/data-dir"))
+            .expect("an ordered override must resolve");
+        assert_eq!(resolved.origin_probe_fault_ttl_sec, 10);
+    }
+
+    /// The default probe TTLs satisfy the ordering the resolver enforces, so a
+    /// node that touches none of the knobs still starts.
+    #[test]
+    fn resolve_cache_origin_probe_defaults_are_ordered() {
+        let cli = empty_cache_args();
+        let resolved = resolve_cache(&cli, None, Path::new("/data-dir"))
+            .expect("default probe knobs must resolve");
+        assert_eq!(resolved.origin_probe_ttl_sec, 15);
+        assert_eq!(resolved.origin_probe_negative_ttl_sec, 2);
+        assert_eq!(resolved.origin_probe_fault_ttl_sec, 5);
+        assert!(
+            resolved.origin_probe_negative_ttl_sec <= resolved.origin_probe_fault_ttl_sec
+                && resolved.origin_probe_fault_ttl_sec <= resolved.origin_probe_ttl_sec
+        );
     }
 
     /// Defaults keep the pre-ADR-040 behavior: LRU eviction, unconditional

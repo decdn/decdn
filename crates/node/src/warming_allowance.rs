@@ -330,7 +330,7 @@ impl WarmingCreditSink for ChannelWarmingCreditSink {
 pub struct NoopWarmingCreditSink;
 
 impl WarmingCreditSink for NoopWarmingCreditSink {
-    fn credit(&self, _hash: [u8; 32], _units: u64) {}
+    fn credit(&self, _hash: Hash, _units: u64) {}
 }
 
 /// Synchronous [`WarmingCreditSink`] that applies each credit inline to a
