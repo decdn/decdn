@@ -442,6 +442,16 @@ mod tests {
     const H1: Hash = Hash::from_bytes([10u8; 32]);
 
     #[test]
+    fn source_id_round_trips_through_its_accessors() {
+        let raw = [7u8; 32];
+        let id = SourceId::from_bytes(raw);
+        assert_eq!(id.as_bytes(), &raw);
+        assert_eq!(id.to_bytes(), raw);
+        assert_eq!(<[u8; 32]>::from(id), raw);
+        assert_eq!(SourceId::from(raw), id);
+    }
+
+    #[test]
     fn dud_drains_then_blocks() {
         let a = WarmingAllowance::new(1000, 0); // no time refill
         a.debit_speculative(S1, H1, 1000); // bought at full P_buy·mb
