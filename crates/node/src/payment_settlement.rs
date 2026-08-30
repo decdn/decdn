@@ -1270,16 +1270,34 @@ async fn submit_chunk<P: Provider + Clone>(
 }
 
 /// Flush the lane store durable off the async worker (the fsync must not block a
-/// runtime worker). Returns `true` on success; a failure is metered and logged.
-/// A redeem that requires the redeemed-watermark floor (the periodic sweep) skips
-/// its submit when this returns `false`; the forced close/shutdown paths proceed.
-async fn flush_store_durable(store: &Arc<dyn PoolStateStore>, metrics: &Arc<Metrics>) -> bool {
+/// runtime worker). One flush lands the lane frontier AND the buffered
+/// capability rows, so it is the durability floor for both. Returns `true` on
+/// success; a failure is metered and logged.
+///
+/// `strict` says what the caller does with a `false`, and is carried here only
+/// so the log reports the outcome the caller actually takes: the periodic sweep
+/// and hint paths defer their submit, while the forced close/shutdown paths
+/// redeem anyway — with the residual that a `CapabilityReg` can go on-chain
+/// against material that never reached disk.
+async fn flush_store_durable(
+    store: &Arc<dyn PoolStateStore>,
+    metrics: &Arc<Metrics>,
+    strict: bool,
+) -> bool {
     let store = Arc::clone(store);
     match tokio::task::spawn_blocking(move || store.flush()).await {
         Ok(Ok(())) => true,
         Ok(Err(err)) => {
             metrics.lane_flush_failure();
-            warn!(%err, "pre-redeem lane store flush failed; deferring redeem");
+            if strict {
+                warn!(%err, "pre-redeem lane store flush failed; deferring redeem");
+            } else {
+                warn!(
+                    %err,
+                    "pre-redeem lane store flush failed; proceeding on the forced \
+                     close/shutdown path with un-flushed lane and capability state"
+                );
+            }
             false
         }
         Err(join_err) => {
@@ -1314,7 +1332,7 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
     if chunks.is_empty() {
         return;
     }
-    if !flush_store_durable(store, metrics).await && strict_flush {
+    if !flush_store_durable(store, metrics, strict_flush).await && strict_flush {
         return;
     }
     for chunk in chunks {

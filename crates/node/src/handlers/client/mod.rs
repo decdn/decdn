@@ -50,7 +50,6 @@ use decdn_protocol::{
     ALPN_CLIENT, APP_ERR_RATE_LIMITED, CHUNK_BYTES, FrameError, decode_message, encode_message,
     is_unknown_variant, read_frame, write_frame,
 };
-use indexmap::IndexMap;
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
@@ -985,11 +984,14 @@ impl ClientHandlerDeps {
     }
 }
 
-/// `cdn/client/v1` paid-delivery handler.
 /// Capacity of the capability-verification cache (#1789 item 2). Bounded so a
 /// flood of distinct capability sends cannot grow it without limit; `ecrecover`
 /// is expensive enough that a 1024-entry cache still pays for itself across a
 /// client that re-sends the same capability on every request.
+///
+/// The bound is on memory, not on attacker CPU: a flood of distinct garbage
+/// signatures thrashes the entries and still pays one `ecrecover` per miss, so
+/// the cache is a hit-path saving rather than an admission control.
 const CAPABILITY_VERIFY_CACHE_CAPACITY: usize = 1024;
 
 /// Cached outcome of a capability owner recovery: the recovered owner, or
@@ -1015,15 +1017,22 @@ enum CapabilityVerifyOutcome {
 /// malformed" — also deterministic, also cached, so a repeated malformed
 /// capability is not re-recovered either.
 ///
-/// Never consulted across a network hop: a `get` is a hash-lookup + an
-/// `IndexMap` shift under one short lock, mirroring the other bounded LRU
-/// caches (`dht::negative_cache`).
+/// Holds no I/O, and a hit is one hash lookup under one short lock, so the
+/// cache never lengthens the open path it exists to shorten. It carries no TTL — unlike the TTL-anchored `dht::negative_cache`, an entry
+/// lives until the capacity evicts it. That is safe because the value is the
+/// recovered ADDRESS, not a verdict: [`ClientHandler::intake_capability`]
+/// re-compares it against the live pool owner on every call, so an on-chain
+/// owner transfer takes effect immediately.
 #[derive(Debug)]
 struct CapabilityVerifyCache {
-    /// `(signing_hash, signature bytes)` → recovered owner or `Invalid`.
-    /// LRU order: index 0 is the least-recently-used end; a hit moves its key
-    /// to the back, and eviction pops from the front.
-    entries: IndexMap<(B256, [u8; 65]), CapabilityVerifyOutcome>,
+    /// `(signing_hash, signature bytes)` → recovered outcome and the tick at
+    /// which it was last used. Recency lives in the value rather than in the
+    /// map's order, so a hit is one hash lookup and a field write — no
+    /// reordering, no memmove.
+    entries: HashMap<(B256, [u8; 65]), (CapabilityVerifyOutcome, u64)>,
+    /// Monotonic use counter. Only the ORDER of these values matters, and
+    /// `u64` at one tick per capability verification does not wrap.
+    tick: u64,
     cap: usize,
 }
 
@@ -1036,37 +1045,51 @@ impl Default for CapabilityVerifyCache {
 impl CapabilityVerifyCache {
     fn with_capacity(cap: usize) -> Self {
         Self {
-            entries: IndexMap::with_capacity(cap),
+            entries: HashMap::with_capacity(cap),
+            tick: 0,
             cap: cap.max(1),
         }
     }
 
     /// The cached recovery outcome for `(signing_hash, signature)`, or `None`
-    /// on a miss. A hit moves the key to the MRU end.
+    /// on a miss. A hit re-stamps the entry as most-recently-used.
     fn get(&mut self, signing_hash: B256, signature: [u8; 65]) -> Option<CapabilityVerifyOutcome> {
-        let key = (signing_hash, signature);
-        let outcome = self.entries.shift_remove(&key)?;
-        self.entries.insert(key, outcome);
-        Some(outcome)
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        let (outcome, last_used) = self.entries.get_mut(&(signing_hash, signature))?;
+        *last_used = tick;
+        Some(*outcome)
     }
 
-    /// Record `outcome` for `(signing_hash, signature)`, evicting the LRU
-    /// entry when full so the map never exceeds `cap`.
+    /// Record `outcome` for `(signing_hash, signature)`, evicting the
+    /// least-recently-used entry when full.
+    ///
+    /// The eviction scan is linear in `cap`, but it runs only on an insert that
+    /// would overflow — i.e. on a path that has just paid an `ecrecover`, which
+    /// costs orders of magnitude more than a 1024-entry scan. The hit path,
+    /// which is the one this cache exists to shorten, stays O(1).
     fn insert(
         &mut self,
         signing_hash: B256,
         signature: [u8; 65],
         outcome: CapabilityVerifyOutcome,
     ) {
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
         let key = (signing_hash, signature);
-        self.entries.shift_remove(&key);
-        self.entries.insert(key, outcome);
+        if self.entries.insert(key, (outcome, tick)).is_some() {
+            return;
+        }
         while self.entries.len() > self.cap {
-            if let Some(least_recent) = self.entries.keys().next().copied() {
-                self.entries.shift_remove(&least_recent);
-            } else {
+            let Some(least_recent) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(k, _)| *k)
+            else {
                 break;
-            }
+            };
+            self.entries.remove(&least_recent);
         }
     }
 
@@ -1076,6 +1099,7 @@ impl CapabilityVerifyCache {
     }
 }
 
+/// `cdn/client/v1` paid-delivery handler.
 pub struct ClientHandler {
     node_id: PublicKey,
     metrics: Arc<Metrics>,
@@ -1119,14 +1143,20 @@ pub struct ClientHandler {
     /// (ADR 003 §concurrent streams). No call site holds a map entry across an
     /// `.await`, so lane lookup never blocks an unrelated lane's admission.
     lanes: Arc<DashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>>>,
-    /// Atomically-tuned live-lane counter backing `decdn_lanes_open` (#1789
-    /// item 3): `fetch_add` on a real insert, `fetch_sub` on a real remove,
-    /// seeded once at construction from the hydrated map. Replaces walking
-    /// `self.lanes.len()` — and the serializing mutex that walk needed to
-    /// publish a consistent gauge — with a lock-free counter, so the gauge
-    /// never costs an ordered walk of the (possibly large) lane map on the
+    /// Live-lane count backing `decdn_lanes_open` (#1789 item 3): `fetch_add`
+    /// on a real insert, `fetch_sub` on a real remove, seeded once at
+    /// construction from the hydrated map. Holding the count in an atomic keeps
+    /// the gauge off an ordered walk of the (possibly large) lane map on the
     /// registration path.
     lane_count: AtomicUsize,
+    /// Serializes the read-and-publish half of [`Self::tune_lane_gauge`], so
+    /// two concurrent lane-lifecycle calls cannot publish `decdn_lanes_open`
+    /// out of order. The atomic alone fixes the count, not the publication:
+    /// without this the slower task's `set_inbound_lane_snapshot` overwrites a
+    /// fresher lane count with its own staler one, and the gauge stays wrong
+    /// until the next lifecycle event. Held across one atomic RMW and one gauge
+    /// store, never across an `.await` or a map walk.
+    lane_gauge_publish: std::sync::Mutex<()>,
     /// Bounded cache of capability owner-recovery outcomes keyed by the full
     /// signed material (#1789 item 2), so a client that re-sends the same
     /// capability on every request skips the per-request `ecrecover` in
@@ -1298,9 +1328,10 @@ impl ClientHandler {
         // lane, so the seller-side snapshot reports lane count only. Seed the
         // atomic lane counter once at hydrate; `register_lane`/`forget_lane`
         // tune it from then on (#1789 item 3).
-        let lane_count = AtomicUsize::new(map.len());
+        let open_lanes = map.len();
+        let lane_count = AtomicUsize::new(open_lanes);
         deps.metrics
-            .set_inbound_lane_snapshot(lane_count.load(Ordering::Relaxed), U256::ZERO);
+            .set_inbound_lane_snapshot(open_lanes, U256::ZERO);
         // Hydrate the per-pool floor accumulator: no stream is live at boot, so
         // `live_reservation` starts at zero; each pool's persisted `dead_charge`
         // carries forward so a restart does not grant a fresh free-floor budget.
@@ -1347,6 +1378,7 @@ impl ClientHandler {
             pool_view: deps.pool_view,
             lanes: Arc::new(map),
             lane_count,
+            lane_gauge_publish: std::sync::Mutex::new(()),
             capability_verify_cache: std::sync::Mutex::new(CapabilityVerifyCache::default()),
             pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
             floor_loss_store: deps.floor_loss_store,
@@ -1440,38 +1472,10 @@ impl ClientHandler {
         self.pool_view_status(pool_id).await.map(|s| s.owner)
     }
 
-    /// Accept an owner-signed capability presented at session start (ADR 003
-    /// §Capability delegation): verify the owner signature against the on-chain
-    /// pool owner, register the lane so the voucher path serves it, and persist
-    /// the grant so the redeemer can register the signer on its first on-chain
-    /// redemption. `signer` is the request's bound Ethereum address; `pool_id`
-    /// is [`StreamRequest::pool_id`]; `pool_owner` is `getPool.owner` from the
-    /// cached pool-view.
-    ///
-    /// The owner check is authoritative here, not deferred: the on-chain
-    /// `PaymentPool.redeemMany` verifies every capability's owner signature
-    /// against `pools[poolId].owner` and reverts the WHOLE batch on one bad
-    /// grant, which would strand every other lane's redemption in an
-    /// indefinite-retry tick. So a grant whose owner signature does not verify
-    /// against the pool owner is DROPPED — never persisted, never lane-registered.
-    ///
-    /// The verification recovers the 65-byte EOA signature via
-    /// [`SignedCapability::verify_owner`] (canonical-`s` ecrecover, matching the
-    /// contract's verifiable set). Two cases drop rather than persist:
-    /// - `pool_owner` is `None` — no pool-view, an unknown pool, or an RPC fault
-    ///   left the owner unknown, so ownership cannot be confirmed. Intake is
-    ///   best-effort and the client re-sends the capability on its next request.
-    /// - a non-65-byte (contract-wallet / ERC-1271-shaped) owner signature, which
-    ///   cannot be recovered off-chain; this design does not accept contract
-    ///   wallets as pool owners.
-    ///
-    /// Best-effort and off the durability path otherwise: a persist failure never
-    /// fails the stream. Lane registration is idempotent — a re-observed grant for
-    /// an already-tracked lane does NOT reset the accepted-voucher watermark
-    /// (#527); the lane's `cap`/`expiry` are set once at first registration.
-    /// Verify an owner-signed capability's EIP-712 owner signature against the
-    /// pool owner (ADR 003 §Capability delegation), short-circuiting on the
-    /// capability-verification cache (#1789 item 2).
+    /// Recover an owner-signed capability's EIP-712 signer (ADR 003
+    /// §Capability delegation), short-circuiting on the capability-verification
+    /// cache (#1789 item 2). The caller compares the result against the pool
+    /// owner; recovery says who signed, not whether the grant is accepted.
     ///
     /// `ecrecover` is a pure function of `(digest, signature)`, so the
     /// recovered owner for a given signed material is deterministic and can be
@@ -1480,8 +1484,10 @@ impl ClientHandler {
     /// that re-sends the same capability (the documented recovery path) hits
     /// the cache instead of paying a fresh `ecrecover` per request. A
     /// tampered signature is a different key, so it can never be served a
-    /// stale cached owner.
-    fn verify_capability_owner(&self, grant: &SignedCapability, pool_owner: Address) -> bool {
+    /// stale cached owner. Caching the recovered ADDRESS rather than an
+    /// accept/reject verdict is what keeps this sound across an on-chain owner
+    /// transfer: the comparison is re-made against the live owner every call.
+    fn recover_capability_owner(&self, grant: &SignedCapability) -> CapabilityVerifyOutcome {
         let domain = &self.voucher_domain;
         let signing_hash = grant.capability.signing_hash(domain);
         let signature = grant.signature.as_bytes();
@@ -1499,25 +1505,50 @@ impl ClientHandler {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.get(signing_hash, signature)
         };
-        let recovered = if let Some(outcome) = recovered {
-            outcome
-        } else {
-            let outcome = match grant.recover_owner(domain) {
-                Ok(owner) => CapabilityVerifyOutcome::Owner(owner),
-                Err(_) => CapabilityVerifyOutcome::Invalid,
-            };
-            self.capability_verify_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(signing_hash, signature, outcome);
-            outcome
-        };
-        match recovered {
-            CapabilityVerifyOutcome::Owner(owner) => owner == pool_owner,
-            CapabilityVerifyOutcome::Invalid => false,
+        if let Some(outcome) = recovered {
+            return outcome;
         }
+        let outcome = match grant.recover_owner(domain) {
+            Ok(owner) => CapabilityVerifyOutcome::Owner(owner),
+            Err(_) => CapabilityVerifyOutcome::Invalid,
+        };
+        self.capability_verify_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(signing_hash, signature, outcome);
+        outcome
     }
 
+    /// Accept an owner-signed capability presented at session start (ADR 003
+    /// §Capability delegation): verify the owner signature against the on-chain
+    /// pool owner, register the lane so the voucher path serves it, and persist
+    /// the grant so the redeemer can register the signer on its first on-chain
+    /// redemption. `signer` is the request's bound Ethereum address; `pool_id`
+    /// is [`StreamRequest::pool_id`]; `pool_owner` is `getPool.owner` from the
+    /// cached pool-view.
+    ///
+    /// The owner check is authoritative here, not deferred: the on-chain
+    /// `PaymentPool.redeemMany` verifies every capability's owner signature
+    /// against `pools[poolId].owner` and reverts the WHOLE batch on one bad
+    /// grant, which would strand every other lane's redemption in an
+    /// indefinite-retry tick. So a grant whose owner signature does not verify
+    /// against the pool owner is DROPPED — never persisted, never lane-registered.
+    ///
+    /// The verification recovers the 65-byte EOA signature via
+    /// [`Self::recover_capability_owner`] (canonical-`s` ecrecover, matching the
+    /// contract's verifiable set) and compares it to `pool_owner`. Two cases
+    /// drop rather than persist:
+    /// - `pool_owner` is `None` — no pool-view, an unknown pool, or an RPC fault
+    ///   left the owner unknown, so ownership cannot be confirmed. Intake is
+    ///   best-effort and the client re-sends the capability on its next request.
+    /// - a non-65-byte (contract-wallet / ERC-1271-shaped) owner signature, which
+    ///   cannot be recovered off-chain; this design does not accept contract
+    ///   wallets as pool owners.
+    ///
+    /// Best-effort and off the durability path otherwise: a persist failure never
+    /// fails the stream. Lane registration is idempotent — a re-observed grant for
+    /// an already-tracked lane does NOT reset the accepted-voucher watermark
+    /// (#527); the lane's `cap`/`expiry` are set once at first registration.
     #[allow(clippy::cognitive_complexity)] // linear verify → register → persist sequence.
     fn intake_capability(
         &self,
@@ -1556,10 +1587,34 @@ impl ClientHandler {
         };
         // #1789 item 2: the ecrecover is cached keyed by the full signed
         // material, so a client that re-sends the same capability on every
-        // request (the documented recovery path for a lost lane) skips it.
-        if !self.verify_capability_owner(&grant, pool_owner) {
-            tracing::debug!(%pool_id, %signer, "dropping capability: owner verification failed");
-            return;
+        // request (the documented recovery path for a lost lane) skips it. The
+        // two drop reasons stay distinct in the log: a malformed signature is a
+        // client-side signing bug, while a well-formed signature recovering to
+        // the wrong address is operator-actionable — usually a client still
+        // signing against an owner the pool has since transferred away.
+        match self.recover_capability_owner(&grant) {
+            CapabilityVerifyOutcome::Owner(owner) if owner == pool_owner => {}
+            CapabilityVerifyOutcome::Owner(recovered) => {
+                tracing::warn!(
+                    %pool_id,
+                    %signer,
+                    error = %decdn_incentive::capability::CapabilityError::WrongOwner {
+                        expected: pool_owner,
+                        recovered,
+                    },
+                    "dropping capability: owner verification failed"
+                );
+                return;
+            }
+            CapabilityVerifyOutcome::Invalid => {
+                tracing::debug!(
+                    %pool_id,
+                    %signer,
+                    error = %decdn_incentive::capability::CapabilityError::InvalidSignature,
+                    "dropping capability: owner verification failed"
+                );
+                return;
+            }
         }
 
         // The grant is authentic. Register the lane so the voucher path accepts
@@ -1591,9 +1646,7 @@ impl ClientHandler {
             return;
         };
         let owner_sig = capability.owner_signature.clone();
-        if let Err(e) = sink.store_capability(pool_id, signer, spending_cap, expiry, &owner_sig) {
-            tracing::warn!(%pool_id, %signer, error = %e, "capability persist failed");
-        }
+        sink.stage_capability(pool_id, signer, spending_cap, expiry, &owner_sig);
     }
 
     /// Register a lane so the voucher path accepts vouchers for it — its
@@ -1615,11 +1668,12 @@ impl ClientHandler {
         if self.lanes.contains_key(&key) {
             return Ok(());
         }
-        // #1789 item 4: call the store's `record` inline. `record` is a cheap
-        // buffered insert into the store's in-memory working set (the periodic
-        // lane flush is what puts the row on disk) — no `spawn_blocking` hop,
-        // and `register_lane` is no longer off enough of the delivery path to
-        // afford one on the first-capability path that calls it per stream.
+        // #1789 item 4: call the store's `record` inline. `register_lane` sits
+        // ON the per-stream open path (the first capability of every stream
+        // reaches it), so it cannot afford a `spawn_blocking` hop — and does
+        // not need one: `PoolStateStore::record` is contractually non-blocking,
+        // a buffered insert into the store's in-memory working set, with the
+        // periodic lane flush doing the disk work.
         self.channel_state_store.record(&state)?;
 
         let bytes = state.last_bytes_delivered();
@@ -1634,8 +1688,7 @@ impl ClientHandler {
                 active_streams: Arc::new(AtomicU32::new(0)),
                 last_voucher_at: AtomicU64::new(0),
             })));
-            self.lane_count.fetch_add(1, Ordering::Relaxed);
-            self.refresh_lane_metrics();
+            self.tune_lane_gauge(1);
         }
         Ok(())
     }
@@ -1655,8 +1708,7 @@ impl ClientHandler {
         // lifecycle follows the lane automatically — no separate activity-map
         // eviction. Only a real removal tunes the lane gauge down.
         if self.lanes.remove(&key).is_some() {
-            self.lane_count.fetch_sub(1, Ordering::Relaxed);
-            self.refresh_lane_metrics();
+            self.tune_lane_gauge(-1);
         }
         let store = Arc::clone(&self.channel_state_store);
         tokio::task::spawn_blocking(move || store.forget(key))
@@ -2022,12 +2074,28 @@ impl ClientHandler {
         reset_stream(send, recv, APP_ERR_NO_ERROR);
     }
 
-    fn refresh_lane_metrics(&self) {
-        // Deposit is a pool-level, on-chain quantity (getPool), not carried per
-        // lane, so the seller-side snapshot reports lane count only (#1789 item
-        // 3): the atomic counter makes this a direct gauge set — no mutex, no
-        // map walk.
-        let open = self.lane_count.load(Ordering::Relaxed);
+    /// Apply one lane-lifecycle `delta` to the live-lane count and publish the
+    /// resulting `decdn_lanes_open` gauge.
+    ///
+    /// Deposit is a pool-level, on-chain quantity (`getPool`), not carried per
+    /// lane, so the seller-side snapshot reports the lane count only (#1789
+    /// item 3). The count comes from the atomic RMW's own result rather than a
+    /// re-read, and [`Self::lane_gauge_publish`] orders the publish, so the
+    /// gauge always reflects the most recent lifecycle event.
+    fn tune_lane_gauge(&self, delta: isize) {
+        let _publish = self
+            .lane_gauge_publish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let open = if delta >= 0 {
+            self.lane_count
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1)
+        } else {
+            self.lane_count
+                .fetch_sub(1, Ordering::Relaxed)
+                .saturating_sub(1)
+        };
         self.metrics.set_inbound_lane_snapshot(open, U256::ZERO);
     }
 }
@@ -2763,14 +2831,12 @@ mod tests {
         // A duplicate registration is a no-op and must not double-count.
         handler.register_lane(state.clone()).expect("register");
         handler.register_lane(state).expect("register twice");
-        handler.refresh_lane_metrics();
         let encoded = metrics.encode().expect("metrics encode");
         assert!(
             encoded.lines().any(|line| line == "decdn_lanes_open 1"),
             "an idempotent register must not double count"
         );
         handler.forget_lane(lane).await.expect("forget");
-        handler.refresh_lane_metrics();
         let encoded = metrics.encode().expect("metrics encode");
         assert!(
             encoded.lines().any(|line| line == "decdn_lanes_open 0"),
@@ -2780,9 +2846,13 @@ mod tests {
 
     /// #1789 item 3: concurrent registration and removal of many distinct
     /// lanes leaves the gauge exactly equal to the number of lanes still live
-    /// — the atomic counter moves with the real map, whatever the
-    /// interleaving.
-    #[tokio::test]
+    /// — the count moves with the real map, whatever the interleaving.
+    ///
+    /// Multi-threaded on purpose, and the gauge is read WITHOUT a settling
+    /// republish: the publish is the half the atomic does not make safe on its
+    /// own, so a lost `set_inbound_lane_snapshot` ordering leaves a stale value
+    /// that only an extra refresh would paper over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lane_gauge_matches_live_count_after_concurrent_register_and_remove() {
         let metrics = Arc::new(Metrics::new());
         let (handler, _dir) = handler_for_tests(&metrics).await;
@@ -2832,12 +2902,54 @@ mod tests {
         for handle in join {
             handle.await.expect("forget task join");
         }
-        handler.refresh_lane_metrics();
         assert_eq!(handler.lane_count.load(Ordering::Relaxed), 12);
         let encoded = metrics.encode().expect("metrics encode");
         assert!(
             encoded.lines().any(|line| line == "decdn_lanes_open 12"),
             "gauge must reflect the live lane count after concurrent changes"
+        );
+    }
+
+    /// #1789 item 3: racing first-streams on ONE lane count it once. The
+    /// vacant-entry guard is what makes the increment conditional, so a
+    /// regression to an unconditional `fetch_add` drifts the gauge upward
+    /// permanently — `decdn_lanes_open` is alerted on, so a monotonically
+    /// climbing gauge is worse than a wrong-but-settling one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_streams_on_one_lane_count_it_once() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await;
+        let lane = LaneKey {
+            pool_id: B256::repeat_byte(0xA1),
+            signer: Address::repeat_byte(0x11),
+            provider: Address::repeat_byte(0x22),
+        };
+        let mut join = Vec::new();
+        for _ in 0..16 {
+            let handler = Arc::clone(&handler);
+            join.push(tokio::spawn(async move {
+                let state = LaneState::hydrate(
+                    lane.pool_id,
+                    lane.signer,
+                    lane.provider,
+                    U256::from(10u64),
+                    0,
+                    U256::ZERO,
+                    U256::ZERO,
+                    None,
+                    decdn_incentive::LaneChain::NONE,
+                );
+                handler.register_lane(state).expect("register");
+            }));
+        }
+        for handle in join {
+            handle.await.expect("register task join");
+        }
+        assert_eq!(handler.lane_count.load(Ordering::Relaxed), 1);
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.lines().any(|line| line == "decdn_lanes_open 1"),
+            "16 racing registrations of one lane must publish a gauge of 1"
         );
     }
 
@@ -3014,19 +3126,18 @@ mod tests {
     }
 
     impl crate::channel_store::CapabilitySink for RecordingCapabilitySink {
-        fn store_capability(
+        fn stage_capability(
             &self,
             pool_id: B256,
             signer: Address,
             _spending_cap: U256,
             _expiry: u64,
             _owner_sig: &[u8],
-        ) -> Result<(), StoreError> {
+        ) {
             self.recorded
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((pool_id, signer));
-            Ok(())
         }
     }
 
@@ -3202,7 +3313,13 @@ mod tests {
             "a tampered signature is a different key, never served from cache"
         );
         cache.insert(hash, tampered, CapabilityVerifyOutcome::Invalid);
-        // Past capacity the LRU half is evicted; the live halves stay.
+        // Touch the original so it is the MRU entry; the tampered one is now
+        // least-recently-used and is what a third insert must displace.
+        assert_eq!(
+            cache.get(hash, sig),
+            Some(CapabilityVerifyOutcome::Owner(owner)),
+            "the original is still cached before the eviction"
+        );
         let other_hash = B256::repeat_byte(0xCD);
         cache.insert(
             other_hash,
@@ -3210,6 +3327,90 @@ mod tests {
             CapabilityVerifyOutcome::Owner(Address::repeat_byte(0x99)),
         );
         assert_eq!(cache.len(), 2, "capacity is never exceeded");
+        assert_eq!(
+            cache.get(hash, tampered),
+            None,
+            "eviction takes the least-recently-used entry"
+        );
+        assert_eq!(
+            cache.get(hash, sig),
+            Some(CapabilityVerifyOutcome::Owner(owner)),
+            "the recently-used entry survives the eviction"
+        );
+    }
+
+    /// #1789 item 2: a malformed signature is cached as `Invalid` and re-served
+    /// as `Invalid` — never as a recovered owner, and never as a hit that
+    /// bypasses the pool-owner comparison. `recover_owner` rejects high-`s` up
+    /// front (#836) so the off-chain accept-set matches the on-chain verifiable
+    /// set; a regression that mapped a recovery failure onto `Owner(ZERO)` or
+    /// cached a boolean verdict would let a malleable capability through
+    /// off-chain and revert `redeemMany` on-chain.
+    #[allow(clippy::similar_names)] // signer/signed pair up clearly here
+    #[tokio::test]
+    async fn high_s_capability_is_dropped_and_cached_as_invalid() {
+        // secp256k1 group order `n`, for building the malleable high-`s` twin
+        // `(r, n - s, !v)` below. The twin recovers the SAME signer, so a
+        // rejection is specifically about canonicalization (#836), not a wrong
+        // owner.
+        const SECP256K1N: U256 = U256::from_be_bytes([
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
+        ]);
+
+        let metrics = Arc::new(Metrics::new());
+        let owner = PrivateKeySigner::random();
+        let (handler, recorded, _dir) =
+            handler_with_capability_intake(&metrics, owner.address()).await;
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let pool_id = B256::repeat_byte(0x12);
+        let signer = Address::repeat_byte(0x34);
+        let signed = Capability {
+            signer,
+            spending_cap: U256::from(1_000_000u64),
+            pool_id,
+            expiry: 1_900_000_000,
+        }
+        .sign(&owner, &domain)
+        .expect("sign capability");
+        let twin = alloy::primitives::Signature::new(
+            signed.signature.r(),
+            SECP256K1N - signed.signature.s(),
+            !signed.signature.v(),
+        );
+        let bytes = twin.as_bytes();
+
+        let wire = decdn_protocol::client::WireCapability {
+            spending_cap: signed.capability.spending_cap.to_be_bytes(),
+            expiry: signed.capability.expiry,
+            owner_signature: bytes.to_vec(),
+        };
+        handler.intake_capability(pool_id, signer, Some(owner.address()), &wire);
+        handler.intake_capability(pool_id, signer, Some(owner.address()), &wire);
+
+        assert!(
+            recorded.lock().expect("recorded lock").is_empty(),
+            "a malformed capability is never persisted"
+        );
+        assert!(
+            !handler.lanes.contains_key(&LaneKey {
+                pool_id,
+                signer,
+                provider: handler.eth_signer.address(),
+            }),
+            "a malformed capability never registers a lane"
+        );
+        let cached = handler
+            .capability_verify_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(signed.capability.signing_hash(&domain), bytes);
+        assert_eq!(
+            cached,
+            Some(CapabilityVerifyOutcome::Invalid),
+            "the malformed recovery is cached as Invalid, so the repeat skips the ecrecover"
+        );
     }
 
     /// #1789 item 2: a client that re-sends the same capability (the

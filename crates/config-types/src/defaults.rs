@@ -34,12 +34,13 @@ pub const DEFAULT_ORIGIN_PROBE_TTL_SEC: u64 = 15;
 pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC: u64 = 2;
 
 /// Default TTL in seconds for a memoised `Fault` live-origin probe
-/// answer (#1130 pt3). Longer than the `Absent` TTL because a fault is
-/// a backend outage, not a per-hash absence, so re-probing every short
-/// negative window would hammer a failing origin with one `HEAD` per
-/// probe for its whole namespace; shorter than the `Present` TTL so a
-/// recovered origin is re-probed quickly rather than hidden behind a
-/// long stale fault.
+/// answer (#1130 pt3). Longer than the `Absent` TTL because the memo is
+/// keyed per hash and a client retrying one hash against a failing
+/// origin is the common shape — it collapses a hash's repeats, not the
+/// namespace's load. Shorter than the `Present` TTL because a memoised
+/// fault costs client-visible availability until it expires, so a
+/// recovered origin must be re-probed quickly. The config resolver
+/// enforces `negative <= fault <= positive` on operator overrides.
 pub const DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC: u64 = 5;
 
 /// Default per-probe ceiling in milliseconds on the live-origin

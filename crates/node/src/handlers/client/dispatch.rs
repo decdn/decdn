@@ -317,34 +317,6 @@ impl ClientHandler {
             provider: self_operator,
         });
 
-        // The origin presence probe (#1759, gated on the relay policy) and the
-        // cached `getPool` view read are independent network awaits on the open
-        // path. Join them so their latencies overlap instead of serializing
-        // (#1789 item 7): both are required on the happy path, and the probe
-        // itself (a memoized `HEAD`/`HeadObject`) is the kind of backend
-        // round-trip that banks on running beside the RPC read. `pool_status`
-        // (owner + remaining) is read ONCE here and reused by the funder gate,
-        // the capability owner check, and the floor-`M` solvency gates below;
-        // `None` — no pool-view wired, an unknown pool, or a read fault — makes
-        // those fail-open gates fail open (a transient RPC blip must not refuse
-        // paying clients). On a decline
-        // the RPC read is wasted work, but declines are rare.
-        let (origin_presence, pool_status) = tokio::join!(
-            async {
-                if self.relay_foreign_namespaces {
-                    None
-                } else {
-                    Some(self.cache.origin_probe_presence(hash).await)
-                }
-            },
-            async {
-                match self.pool_view.as_ref() {
-                    Some(view) => view.status(B256::from(req.pool_id)).await,
-                    None => None,
-                }
-            },
-        );
-
         // Origin-only policy (#1759). When the operator opts out of foreign
         // relay, the own/foreign decision is backend-authoritative: the request's
         // `namespace_id` is a routing hint, not a trust anchor (ADR 002), so the
@@ -365,8 +337,8 @@ impl ClientHandler {
         // tell a paying client this node's own content is gone and would hide
         // the operator's backend outage — so it surfaces as `InternalError`
         // instead, matching the store-fault handling on the `has()` path below.
-        if let Some(presence) = origin_presence {
-            match presence {
+        if !self.relay_foreign_namespaces {
+            match self.cache.origin_probe_presence(hash).await {
                 decdn_cache::OriginPresence::Present(_) => {}
                 decdn_cache::OriginPresence::Absent => {
                     return self
@@ -390,6 +362,22 @@ impl ClientHandler {
                 }
             }
         }
+
+        // Cached `getPool` view (owner + remaining), read ONCE and reused by the
+        // funder gate here, the capability owner check, and the floor-`M` solvency
+        // gates below. Read AFTER the origin-only gate, not beside it: the only
+        // wired `PoolView` answers from an in-memory projection with no round-trip
+        // (`PoolProjection::status`), so there is no latency to overlap and a
+        // declined request must not pay for a read it never uses. `None` — no
+        // pool-view wired, an unknown pool (which includes the window before the
+        // watcher has seen it), or a read fault — makes the fail-open gates fail
+        // open: a transient blip must not refuse paying clients, and the open-time
+        // hash gates plus the first voucher's on-chain `redeem` still carry
+        // compliance and revenue.
+        let pool_status = match self.pool_view.as_ref() {
+            Some(view) => view.status(B256::from(req.pool_id)).await,
+            None => None,
+        };
 
         // Serve-path origin-blacklist gate (ADR 011 §On Blacklist Event): refuse a
         // pool whose FUNDER (`getPool.owner`) is on the operator's local
@@ -530,18 +518,22 @@ impl ClientHandler {
         // probe) past the size gate, which can't `inspect` a partial blob.
         let mut range_pulled_size: Option<u64> = None;
 
-        // Blob availability gate. A store fault is NOT an absence: `present:
-        // false` means the node genuinely lacks the blob (NotFound /
-        // EvictedSinceProbe), but `Err` is a transient local store failure
+        // Blob availability gate. A store fault is NOT an absence: an
+        // `Unavailable` audit means the node genuinely lacks the blob (NotFound
+        // / EvictedSinceProbe), but `Err` is a transient local store failure
         // that must not masquerade as a signed `NotFound` — a paying client
         // would treat that as authoritative and stop asking. Surface it as
-        // `InternalError` and log. `serve_audit` also returns the complete
+        // `InternalError` and log. `serve_audit` also carries the complete
         // blob's size in the same store contact, so the delivery size gate
         // below needn't `inspect` again on a cache hit (#1789 item 7 part B).
         let audit = match self.cache.serve_audit(hash).await {
             Ok(audit) => audit,
             Err(e) => {
-                tracing::warn!(%hash, error = %e, "cache `has` lookup failed on delivery path");
+                tracing::warn!(
+                    %hash,
+                    error = %e,
+                    "cache `serve_audit` lookup failed on delivery path"
+                );
                 return self
                     .respond_error(
                         &mut send,
@@ -552,7 +544,7 @@ impl ClientHandler {
                     .await;
             }
         };
-        let hit_size = if audit.present { audit.size } else { None };
+        let hit_size = audit.hit_size();
         // The initial `None` is unread on every live path (both branches below
         // either shed and return or overwrite it, and the audit `Err` returns
         // too) — kept anyway so the slot's declared type and its
@@ -560,7 +552,7 @@ impl ClientHandler {
         // admission guard above.
         #[allow(unused_assignments)]
         let mut shed_slot: Option<crate::load_shed::ShedSlot> = None;
-        if audit.present {
+        if audit.is_serveable() {
             match self
                 .shed
                 .try_admit(crate::load_shed::RequestClass::CacheHit, client_node_id)
@@ -581,7 +573,7 @@ impl ClientHandler {
         } else {
             // Eviction is sticky and authoritative — never pull-fill a
             // hash an operator deliberately evicted (#279).
-            if audit.evicted {
+            if audit.is_evicted() {
                 return self
                     .respond_error(
                         &mut send,
@@ -973,19 +965,21 @@ impl ClientHandler {
         let _shed_slot = shed_slot;
 
         // Size gate. An origin-tier range pull (#823) imported only a *partial*
-        // blob, so `inspect`/`has` can't report the whole-blob size — but the
-        // origin size probe already gave us the authoritative total, which the
-        // client needs for resume math. Use it directly in that case. A plain
-        // cache hit carries its size from the `serve_audit` above (#1789 item 7
-        // part B), so we skip the redundant `inspect` store hop entirely. Only a
-        // miss that was just filled (or a partial) needs a fresh `inspect`;
-        // `has` just confirmed the blob is present and complete, so an `inspect`
-        // error — or a `None` size (a `Partial`/`NotFound` status) — is a real
-        // store fault, NOT a zero-length blob. Advertising `total_bytes: 0` for
-        // a non-empty blob would sign a `StreamResponse` the delivery then
-        // contradicts, and the receiver (expecting 0 bytes) would abort on the
-        // first chunk. Surface the fault instead; only a genuinely complete,
-        // zero-length blob yields `total_bytes == 0`.
+        // blob, so `inspect` can't report the whole-blob size — but the origin
+        // size probe already gave us the authoritative total, which the client
+        // needs for resume math. Use it directly in that case. A plain cache hit
+        // carries its size from the `serve_audit` above (#1789 item 7 part B),
+        // so it skips the redundant `inspect` store hop entirely — including a
+        // genuinely empty blob, which audits as serveable at size 0.
+        //
+        // The remaining branch is a miss the fill legs above just completed, so
+        // the blob is on disk now: an `inspect` error — or a `None` size (a
+        // `Partial`/`NotFound` status) — means the fill did not land what it
+        // reported, which is a real store fault and NOT a zero-length blob.
+        // Advertising `total_bytes: 0` for a non-empty blob would sign a
+        // `StreamResponse` the delivery then contradicts, and the receiver
+        // (expecting 0 bytes) would abort on the first chunk. Surface the fault
+        // instead.
         let total_bytes = if let Some(total) = range_pulled_size {
             total
         } else if let Some(size) = hit_size {
@@ -1008,7 +1002,7 @@ impl ClientHandler {
             let Some(total_bytes) = size else {
                 tracing::warn!(
                     %hash,
-                    "blob present per `has` but `inspect` reports no size; treating as fault"
+                    "just-filled blob reports no size to `inspect`; treating as fault"
                 );
                 return self
                     .respond_error(
