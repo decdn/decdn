@@ -199,8 +199,9 @@ pub const DEFAULT_FS_RESCAN_INTERVAL_SEC: u64 = 60;
 // this crate agree from a single source; re-exported here so the existing
 // `crate::config::DEFAULT_ORIGIN_PROBE_*` paths keep resolving.
 pub use decdn_config_types::{
-    DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY, DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
-    DEFAULT_ORIGIN_PROBE_TIMEOUT_MS, DEFAULT_ORIGIN_PROBE_TTL_SEC,
+    DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC, DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
+    DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC, DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
+    DEFAULT_ORIGIN_PROBE_TTL_SEC,
 };
 
 /// Fallback for `cache.relay_foreign_namespaces` (#1759) on a node with no
@@ -1710,6 +1711,9 @@ fn resolve_cache_into(
     let origin_probe_negative_ttl_sec = file
         .and_then(|c| c.origin_probe_negative_ttl_sec)
         .unwrap_or(DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC);
+    let origin_probe_fault_ttl_sec = file
+        .and_then(|c| c.origin_probe_fault_ttl_sec)
+        .unwrap_or(DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC);
     let origin_probe_timeout_ms = file
         .and_then(|c| c.origin_probe_timeout_ms)
         .unwrap_or(DEFAULT_ORIGIN_PROBE_TIMEOUT_MS);
@@ -1968,6 +1972,7 @@ fn resolve_cache_into(
         fs_rescan_interval_sec,
         origin_probe_ttl_sec,
         origin_probe_negative_ttl_sec,
+        origin_probe_fault_ttl_sec,
         origin_probe_timeout_ms,
         origin_probe_memo_capacity,
         eviction_high_water_pct,

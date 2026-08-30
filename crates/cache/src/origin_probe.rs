@@ -35,6 +35,14 @@ pub const DEFAULT_ORIGIN_PROBE_TTL: Duration =
 /// fresh-content dark window.
 pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL: Duration =
     Duration::from_secs(decdn_config_types::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC);
+/// Default fault TTL (`cache.origin_probe_fault_ttl_sec`). Longer than the
+/// negative TTL because a fault is a backend outage for an entire namespace,
+/// not a per-hash absence — re-probing every short negative window would
+/// hammer a failing origin with one `HEAD` per probe across all of its
+/// hashes. Shorter than the positive TTL so a recovered origin is re-probed
+/// promptly rather than hidden behind a long stale fault.
+pub const DEFAULT_ORIGIN_PROBE_FAULT_TTL: Duration =
+    Duration::from_secs(decdn_config_types::DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC);
 /// Default per-probe live-`HEAD` ceiling (`cache.origin_probe_timeout_ms`) — a
 /// slow origin must never stall the probe hot path.
 pub const DEFAULT_ORIGIN_PROBE_TIMEOUT: Duration =
@@ -51,9 +59,15 @@ pub enum Presence {
     /// The origin holds the blob; carries the total byte size for the probe's
     /// `total_bytes`.
     Present(u64),
-    /// No configured origin holds the blob (a `HEAD` 404, an unknown size, a
-    /// transport error, or a timeout — all fold to "don't advertise").
+    /// No configured origin holds the blob (a `HEAD` 404, an unknown size,
+    /// or no origin — an authoritative "don't advertise").
     Absent,
+    /// The probe could not get an authoritative answer: a transport error or
+    /// a timeout (a `HEAD` overrun). Distinct from `Absent` on purpose — a
+    /// caller that would otherwise sign an authoritative `NotFound` must not
+    /// do so on a fault, and a fault is worth memoising under its own TTL so
+    /// a failing origin is not re-probed on every request for its namespace.
+    Fault,
 }
 
 impl Presence {
@@ -62,7 +76,7 @@ impl Presence {
     pub const fn size(self) -> Option<u64> {
         match self {
             Presence::Present(size) => Some(size),
-            Presence::Absent => None,
+            Presence::Absent | Presence::Fault => None,
         }
     }
 }
@@ -73,6 +87,7 @@ pub struct OriginProbeMemo {
     entries: HashMap<Hash, Entry>,
     positive_ttl: Duration,
     negative_ttl: Duration,
+    fault_ttl: Duration,
     timeout: Duration,
     capacity: usize,
 }
@@ -85,13 +100,14 @@ struct Entry {
 }
 
 impl OriginProbeMemo {
-    /// A memo with the given positive TTL, negative TTL, per-probe `HEAD`
-    /// timeout, and capacity. A `capacity` of 0 is treated as 1 so the map can
-    /// always hold the entry it just resolved.
+    /// A memo with the given positive, negative, and fault TTLs, per-probe
+    /// `HEAD` timeout, and capacity. A `capacity` of 0 is treated as 1 so the
+    /// map can always hold the entry it just resolved.
     #[must_use]
     pub fn new(
         positive_ttl: Duration,
         negative_ttl: Duration,
+        fault_ttl: Duration,
         timeout: Duration,
         capacity: usize,
     ) -> Self {
@@ -99,6 +115,7 @@ impl OriginProbeMemo {
             entries: HashMap::new(),
             positive_ttl,
             negative_ttl,
+            fault_ttl,
             timeout,
             capacity: capacity.max(1),
         }
@@ -132,6 +149,7 @@ impl OriginProbeMemo {
         let ttl = match presence {
             Presence::Present(_) => self.positive_ttl,
             Presence::Absent => self.negative_ttl,
+            Presence::Fault => self.fault_ttl,
         };
         let expires_at = now + ttl;
         // Refreshing an existing key never grows the map.
@@ -186,6 +204,7 @@ impl Default for OriginProbeMemo {
         Self::new(
             DEFAULT_ORIGIN_PROBE_TTL,
             DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL,
+            DEFAULT_ORIGIN_PROBE_FAULT_TTL,
             DEFAULT_ORIGIN_PROBE_TIMEOUT,
             DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
         )
@@ -207,6 +226,7 @@ mod tests {
         let mut memo = OriginProbeMemo::new(
             Duration::from_secs(10),
             Duration::from_secs(10),
+            Duration::from_secs(5),
             Duration::from_secs(2),
             16,
         );
@@ -225,6 +245,7 @@ mod tests {
         let mut memo = OriginProbeMemo::new(
             Duration::from_secs(10),
             Duration::from_secs(2),
+            Duration::from_secs(5),
             Duration::from_secs(2),
             16,
         );
@@ -247,6 +268,7 @@ mod tests {
         let mut memo = OriginProbeMemo::new(
             Duration::from_secs(10),
             Duration::from_secs(10),
+            Duration::from_secs(5),
             Duration::from_secs(2),
             16,
         );
@@ -268,6 +290,7 @@ mod tests {
         let mut memo = OriginProbeMemo::new(
             Duration::from_secs(100),
             Duration::from_secs(100),
+            Duration::from_secs(5),
             Duration::from_secs(2),
             cap,
         );
@@ -287,6 +310,7 @@ mod tests {
         let mut memo = OriginProbeMemo::new(
             Duration::from_secs(10),
             Duration::from_secs(10),
+            Duration::from_secs(5),
             Duration::from_secs(2),
             cap,
         );
@@ -310,6 +334,7 @@ mod tests {
         let mut memo = OriginProbeMemo::new(
             Duration::from_secs(10),
             Duration::from_secs(10),
+            Duration::from_secs(5),
             Duration::from_secs(2),
             2,
         );
@@ -330,6 +355,7 @@ mod tests {
         let mut memo = OriginProbeMemo::new(
             Duration::from_secs(10),
             Duration::from_secs(2),
+            Duration::from_secs(5),
             Duration::from_secs(2),
             16,
         );
@@ -352,5 +378,37 @@ mod tests {
     fn presence_size_maps_to_probe_answer() {
         assert_eq!(Presence::Present(42).size(), Some(42));
         assert_eq!(Presence::Absent.size(), None);
+        assert_eq!(
+            Presence::Fault.size(),
+            None,
+            "a fault also leaves has_blob false"
+        );
+    }
+
+    #[test]
+    fn fault_answer_is_memoised_under_the_fault_ttl() {
+        // fault 5s, negative 2s, positive 100s.
+        let mut memo = OriginProbeMemo::new(
+            Duration::from_secs(100),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            16,
+        );
+        let t0 = Instant::now();
+        memo.insert(hash(40), Presence::Fault, t0);
+
+        // Live within the fault TTL but past the shorter negative TTL — a fault
+        // is a backend outage, so it must last longer than a per-hash 404.
+        assert_eq!(
+            memo.get(hash(40), t0 + Duration::from_secs(3)),
+            Some(Presence::Fault),
+            "fault stays memoised past the negative TTL",
+        );
+        assert_eq!(
+            memo.get(hash(40), t0 + Duration::from_secs(6)),
+            None,
+            "fault expires on the fault TTL so a recovered origin is re-probed",
+        );
     }
 }

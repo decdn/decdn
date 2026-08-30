@@ -860,6 +860,8 @@ impl RuntimeReloadState {
                 origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
                 origin_probe_negative_ttl_sec:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
+                origin_probe_fault_ttl_sec:
+                    decdn_common::config::DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC,
                 origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
                 origin_probe_memo_capacity:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
@@ -1197,6 +1199,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         fs_rescan_interval_sec,
         origin_probe_ttl_sec,
         origin_probe_negative_ttl_sec,
+        origin_probe_fault_ttl_sec,
         origin_probe_timeout_ms,
         origin_probe_memo_capacity,
         eviction_high_water_pct,
@@ -1232,6 +1235,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         // of its knobs changing needs a restart.
         || origin_probe_ttl_sec.is_some()
         || origin_probe_negative_ttl_sec.is_some()
+        || origin_probe_fault_ttl_sec.is_some()
         || origin_probe_timeout_ms.is_some()
         || origin_probe_memo_capacity.is_some()
         || eviction_high_water_pct.is_some()
@@ -1363,6 +1367,8 @@ mod tests {
                 origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
                 origin_probe_negative_ttl_sec:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
+                origin_probe_fault_ttl_sec:
+                    decdn_common::config::DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC,
                 origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
                 origin_probe_memo_capacity:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,

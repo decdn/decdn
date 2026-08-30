@@ -33,6 +33,15 @@ pub const DEFAULT_ORIGIN_PROBE_TTL_SEC: u64 = 15;
 /// changes flood cost.
 pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC: u64 = 2;
 
+/// Default TTL in seconds for a memoised `Fault` live-origin probe
+/// answer (#1130 pt3). Longer than the `Absent` TTL because a fault is
+/// a backend outage, not a per-hash absence, so re-probing every short
+/// negative window would hammer a failing origin with one `HEAD` per
+/// probe for its whole namespace; shorter than the `Present` TTL so a
+/// recovered origin is re-probed quickly rather than hidden behind a
+/// long stale fault.
+pub const DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC: u64 = 5;
+
 /// Default per-probe ceiling in milliseconds on the live-origin
 /// `HEAD`/`HeadObject` (#1130 pt3). A slow origin must not stall the
 /// probe hot path; on overrun the probe answers `has_blob: false` and

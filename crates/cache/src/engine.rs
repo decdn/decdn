@@ -145,6 +145,7 @@ impl From<Presence> for OriginPresence {
         match presence {
             Presence::Present(size) => OriginPresence::Present(size),
             Presence::Absent => OriginPresence::Absent,
+            Presence::Fault => OriginPresence::Fault,
         }
     }
 }
@@ -1742,10 +1743,13 @@ impl CacheEngine {
     /// live one — and this layer decides what to remember:
     ///
     /// - `Present(size)` is memoised under the positive TTL;
-    /// - `Fault` is **never memoised** — a fault is transient, so the next
-    ///   probe should retry the backend immediately rather than parrot a cached
-    ///   non-answer, and not caching it does not weaken the flood bound (an
-    ///   attacker's random hashes genuinely 404, they do not fault);
+    /// - `Fault` is memoised under the fault TTL (#1789 item 6): a fault is
+    ///   a backend outage for an entire namespace, so replaying the probe on
+    ///   every request would hammer the failing origin with one live `HEAD`
+    ///   per probe across all of its hashes. Memoising it under a short,
+    ///   distinct TTL bounds that without hiding a recovered origin behind a
+    ///   long stale fault — the fault TTL sits between the negative and
+    ///   positive TTLs.
     /// - `Absent` — every configured origin answered `Ok(None)`, or none is
     ///   configured at all (a node with nothing configured genuinely holds
     ///   nothing, which is not transient) — is memoised under the short
@@ -1769,17 +1773,12 @@ impl CacheEngine {
         };
         // Live probe off the memo lock (never hold it across the await).
         let presence = self.probe_origin_chain(hash, timeout).await;
-        match presence {
-            OriginPresence::Present(size) => {
-                self.probe_memo_lock()
-                    .insert(hash, Presence::Present(size), now);
-            }
-            OriginPresence::Absent => {
-                self.probe_memo_lock().insert(hash, Presence::Absent, now);
-            }
-            // Never memoised — see the doc comment above.
-            OriginPresence::Fault => {}
-        }
+        let memo_presence = match presence {
+            OriginPresence::Present(size) => Presence::Present(size),
+            OriginPresence::Absent => Presence::Absent,
+            OriginPresence::Fault => Presence::Fault,
+        };
+        self.probe_memo_lock().insert(hash, memo_presence, now);
         presence
     }
 
@@ -1803,11 +1802,12 @@ impl CacheEngine {
         &self,
         positive_ttl: Duration,
         negative_ttl: Duration,
+        fault_ttl: Duration,
         timeout: Duration,
         capacity: usize,
     ) {
         *self.probe_memo_lock() =
-            OriginProbeMemo::new(positive_ttl, negative_ttl, timeout, capacity);
+            OriginProbeMemo::new(positive_ttl, negative_ttl, fault_ttl, timeout, capacity);
     }
 
     /// Swap in the live *local* denied set from `[content] denied_hashes` (ADR
@@ -5224,13 +5224,14 @@ mod tests {
         assert_eq!(
             engine.origin_probe_presence(hash).await,
             OriginPresence::Fault,
-            "a fault is never memoised",
+            "a fault is memoised under the fault TTL (#1789 item 6)",
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2,
-            "the second probe re-walked the origin chain rather than serving \
-             a cached fault",
+            1,
+            "the second probe served the cached fault rather than re-walking \
+             the origin chain — a steady state re-probes once per fault TTL, \
+             not once per request",
         );
         assert_eq!(
             engine.origin_probe_size(hash).await,
@@ -5328,6 +5329,7 @@ mod tests {
         engine.set_origin_probe_config(
             Duration::from_secs(15),
             Duration::from_secs(2),
+            Duration::from_secs(5),
             Duration::from_millis(20),
             16,
         );
@@ -5386,6 +5388,7 @@ mod tests {
         fault_engine.set_origin_probe_config(
             Duration::from_secs(15),
             Duration::from_secs(2),
+            Duration::from_secs(5),
             Duration::from_millis(20),
             16,
         );
@@ -5402,12 +5405,13 @@ mod tests {
         assert_eq!(
             fault_engine.origin_probe_presence(slow).await,
             OriginPresence::Fault,
-            "a fault is never memoised, so the same hash faults again",
+            "a memoised fault still answers Fault",
         );
         assert_eq!(
             slow_calls.load(Ordering::SeqCst),
-            2,
-            "the second probe re-hit the backend rather than serving a cached fault",
+            1,
+            "the second probe served the cached fault instead of re-hitting \
+             the backend (#1789 item 6)",
         );
         Ok(())
     }
@@ -5426,6 +5430,7 @@ mod tests {
         engine.set_origin_probe_config(
             Duration::from_secs(15),
             Duration::from_secs(2),
+            Duration::from_secs(5),
             Duration::from_millis(20),
             16,
         );
