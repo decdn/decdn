@@ -7,15 +7,39 @@
 //! each integration binary, so a test living in it would be collected and run once
 //! per binary.
 //!
-//! `start_paused` throughout — the deadline paths assert on behavior rather than on
-//! `support::SHUTDOWN_TIMEOUT`'s value, and the virtual clock auto-advances the
-//! instant every task is idle, so none of this costs wall clock.
+//! `start_paused` for the task-side paths — they assert on behavior rather than
+//! on `support::SHUTDOWN_TIMEOUT`'s value, and the virtual clock auto-advances
+//! the instant every task is idle, so none of that costs wall clock.
+//!
+//! The close paths run on the REAL clock, and pay `CLOSE_DEADLINE` for it. A
+//! paused clock auto-advances past a deadline as soon as the runtime idles,
+//! which manufactures a breach whatever the endpoint is doing — so a paused
+//! close test passes with the stall removed, which is the whole thing it is
+//! supposed to be asserting.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
 mod support;
 
-use support::{reap, shutdown};
+use std::time::Duration;
+
+use iroh::Endpoint;
+use iroh::endpoint::Connection;
+use support::{fresh_key, local_endpoint, reap, shutdown, shutdown_within};
+
+/// How long the close tests give teardown. Real wall clock, so it is sized to
+/// be waited out: orders of magnitude above a healthy loopback close, and far
+/// below `support::SHUTDOWN_TIMEOUT`, which is sized against the drain cap
+/// rather than for being sat through.
+const CLOSE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// A bound on the dial, so a peer that never accepts fails these tests instead
+/// of parking them until the `.config/nextest.toml` backstop.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the blocked-task breach gets. Nothing can complete that teardown before
+/// the test releases the task, so this is sized only to be short.
+const REAP_DEADLINE: Duration = Duration::from_millis(300);
 
 /// A task that ends on its own is reaped, not aborted, and its value comes back.
 #[tokio::test(start_paused = true)]
@@ -100,4 +124,167 @@ async fn shutdown_keeps_the_first_fault() {
         err.to_string().contains("server task 0"),
         "the first fault must be the reported one, got: {err}"
     );
+}
+
+/// Every task reaped and every endpoint closed: the report says so, and its
+/// counts match the totals `shutdown` was handed.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_reports_clean_counts() -> anyhow::Result<()> {
+    let task = tokio::spawn(std::future::pending::<()>());
+    let (ep, _addr) = local_endpoint(fresh_key(), vec![]).await?;
+    let report = shutdown([task], [&ep]).await?;
+    assert!(
+        report.is_clean(),
+        "a quiet teardown must be clean: {report:?}"
+    );
+    assert_eq!(report.reaped, 1, "the one task must be reaped");
+    assert_eq!(report.closed, 1, "the one endpoint must be closed");
+    Ok(())
+}
+
+/// A task that outlives its own abort yields `Ok` with the report short of its
+/// TASK total — the other half of the breach line, and the half that reads as
+/// this fixture's own defect rather than as #1675.
+///
+/// An abort only drops a task's future at its next poll, so a task that never
+/// yields never takes it. `spawn_blocking` is the honest way to park one: it
+/// holds a blocking-pool thread rather than wedging a runtime worker. Waiting
+/// on `started` before the teardown rules out the cancellation path, which
+/// would reap cleanly instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_reports_a_task_that_outlives_its_abort() -> anyhow::Result<()> {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let task = tokio::task::spawn_blocking(move || {
+        let _ = started_tx.send(());
+        // Ends when the sender below drops, not when the abort lands.
+        let _ = release_rx.recv();
+    });
+    started_rx.await?;
+
+    let report = shutdown_within(REAP_DEADLINE, [task], []).await?;
+    assert!(
+        !report.is_clean(),
+        "an unabortable task must be reported as a breach, got: {report:?}"
+    );
+    assert_eq!(
+        report.reaped, 0,
+        "the blocked task must not count as reaped"
+    );
+    drop(release_tx);
+    Ok(())
+}
+
+/// A close that blocks on a never-draining connection still yields `Ok`, with
+/// the report short of its endpoint total — the breach line's data, returned
+/// rather than only printed.
+///
+/// The connection is dialed on a throwaway runtime that is then dropped, which
+/// strands the driver task quinn spawned on it. `Endpoint::close` normally
+/// bounds itself on the connection's own close timer, but that timer is driven
+/// by the same stranded task, so the connection reaches neither drained nor
+/// timed out and the close waits indefinitely. That is the shape
+/// `node_origin::abandon_drain` exists to wait out (#1675).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_reports_a_stalled_close() -> anyhow::Result<()> {
+    let (ep, _conn) = connected_endpoint(ConnDriver::Stranded).await?;
+    let report = shutdown_within(CLOSE_DEADLINE, [], [&ep]).await?;
+    assert!(
+        !report.is_clean(),
+        "the stalled close must be reported as a breach, got: {report:?}"
+    );
+    assert_eq!(
+        report.closed, 0,
+        "the stalled endpoint must not count as closed"
+    );
+    Ok(())
+}
+
+/// The control for the test above: the SAME endpoint, peer and deadline, with
+/// the connection's driver left running, closes cleanly.
+///
+/// Without it the breach test proves nothing — a breach the setup produced for
+/// some unrelated reason would read as coverage of the stranded driver. This is
+/// the test that fails if the stranding stops being what causes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_reports_a_live_close_as_clean() -> anyhow::Result<()> {
+    let (ep, _conn) = connected_endpoint(ConnDriver::Live).await?;
+    let report = shutdown_within(CLOSE_DEADLINE, [], [&ep]).await?;
+    assert!(
+        report.is_clean(),
+        "a driven connection must close inside the deadline, got: {report:?}"
+    );
+    Ok(())
+}
+
+/// Which runtime drives the connection the endpoint under test holds at close.
+#[derive(Clone, Copy)]
+enum ConnDriver {
+    /// Dialed on the test's own runtime, which goes on driving it.
+    Live,
+    /// Dialed on a throwaway runtime that is then dropped, stranding the
+    /// driver: quinn spawns that task on whichever runtime is ambient at
+    /// `connect` time, not on the one the endpoint was bound on.
+    Stranded,
+}
+
+/// Bind an endpoint, dial a peer that holds the connection open, and return the
+/// endpoint with the live `Connection`. The caller keeps the connection, so the
+/// endpoint still tracks an unfinished one when it is closed.
+///
+/// The peer's accept task is detached and parks forever, holding its own
+/// endpoint up for as long as the test needs it. A failed accept needs no
+/// channel of its own: the handshake does not complete without one, so the dial
+/// fails and carries the error.
+///
+/// # Errors
+///
+/// A bind failed, or the dial did not complete within `DIAL_TIMEOUT`.
+async fn connected_endpoint(driver: ConnDriver) -> anyhow::Result<(Endpoint, Connection)> {
+    const ALPN: &[u8] = b"cdn/stall/v1";
+
+    let (ep, _addr) = local_endpoint(fresh_key(), vec![ALPN.to_vec()]).await?;
+    let (peer_ep, peer_addr) = local_endpoint(fresh_key(), vec![ALPN.to_vec()]).await?;
+    let peer_id = peer_ep.id();
+    tokio::spawn(async move {
+        if let Some(incoming) = peer_ep.accept().await
+            && let Ok(connecting) = incoming.accept()
+        {
+            let _held = connecting.await;
+            std::future::pending::<()>().await;
+        }
+    });
+
+    let addr = iroh::EndpointAddr::new(peer_id).with_ip_addr(peer_addr);
+    let conn = match driver {
+        ConnDriver::Live => dial(&ep, addr, ALPN).await?,
+        ConnDriver::Stranded => {
+            let dialer = ep.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                let conn = rt.block_on(dial(&dialer, addr, ALPN))?;
+                // Dropping the runtime strands the driver task quinn spawned on
+                // it, so the connection can never reach drained from here.
+                drop(rt);
+                Ok::<_, anyhow::Error>(conn)
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("the dialing thread panicked"))??
+        }
+    };
+    Ok((ep, conn))
+}
+
+/// Dial `addr` under `DIAL_TIMEOUT`.
+///
+/// # Errors
+///
+/// The dial failed, or did not complete in time.
+async fn dial(ep: &Endpoint, addr: iroh::EndpointAddr, alpn: &[u8]) -> anyhow::Result<Connection> {
+    tokio::time::timeout(DIAL_TIMEOUT, ep.connect(addr, alpn))
+        .await
+        .map_err(|_| anyhow::anyhow!("the dial did not complete within {DIAL_TIMEOUT:?}"))?
+        .map_err(|e| anyhow::anyhow!("dial: {e}"))
 }

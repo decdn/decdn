@@ -88,8 +88,8 @@ pub use lane::{
 };
 pub use pool_open_error::{PoolOpenFailureReason, is_erc20_allowance_shortfall};
 pub use probe_sig::{
-    ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME, SLASH_JUDGE_DOMAIN_VERSION,
-    slash_judge_domain,
+    PROBE_RESPONSE_TYPEHASH, ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME,
+    SLASH_JUDGE_DOMAIN_VERSION, slash_judge_domain,
 };
 pub use rate::{
     BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, floor_micro, min_payment, pool_budget_covers,
@@ -99,7 +99,7 @@ pub use store::{
     CheckpointKey, KeyedCheckpointStore, MemoryPoolFloorLossStore, MemoryPoolStateStore,
     PendingSettle, PendingSettleStore, PoolFloorLossStore, PoolStateStore, StoreError,
 };
-pub use stream_sig::{StreamSlashData, StreamSlashError};
+pub use stream_sig::{STREAM_RESPONSE_TYPEHASH, StreamSlashData, StreamSlashError};
 pub use swap_balancer::BalancerV3Venue;
 pub use swap_math::{max_in_with_slippage, price_impact_bps, swap_top_up};
 pub use swap_uniswap::UniswapV3Venue;

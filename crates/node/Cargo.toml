@@ -123,9 +123,8 @@ alloy-json-rpc = { workspace = true }
 # cdn/client/v1 path (#823/#990). Matches the cache crate's outboard codec.
 # (Promoted to a normal dependency above, #1621 Task 10 — kept documented here
 # since this suite is still the reason it needs to be workspace-versioned.)
-# `tests/client_loopback.rs` constructs a real `ChannelReceiptSink` via
-# `receipt_log::spawn_receipt_writer` (which takes a `CancellationToken`) to
-# prove the paid-delivery hot path never blocks on receipt-log I/O (#803).
+# `tests/dht_bootstrap.rs` drives `dht::publish::run_republish` (which takes a
+# `CancellationToken`) directly to pin the ADR 022 republish schedule.
 # Integration-test crates don't inherit the lib's normal deps, so it is also a
 # dev-dep here.
 tokio-util = { workspace = true }

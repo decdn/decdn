@@ -59,7 +59,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
 use crate::node_origin::NodeOrigin;
-use crate::receipt_log::{DownloadReceipt, ReceiptSink};
+use crate::receipt_log::{RawReceipt, ReceiptSink};
 
 // The paid-delivery methods are split across concern-focused submodules, each
 // a bare `impl ClientHandler` block over the fields defined here. Support
@@ -1068,6 +1068,15 @@ pub struct ClientHandlerDeps {
     /// foreign hash — before any discovery, lane accounting, or spend. `true`
     /// (the default) preserves today's relay behavior.
     pub relay_foreign_namespaces: bool,
+    /// Coarse wall clock for the two reads the voucher-accept path takes under
+    /// the per-lane lock — the capability-expiry gate and the `last_voucher_at`
+    /// stamp (issue #1792 item 4). `None` (the default and every test) means the
+    /// handler builds its own unrefreshed clock, which reads the live wall clock
+    /// on every call — identical to the pre-#1792 behavior. The runtime sets
+    /// `Some` with a refresher running, so each of those two reads becomes a
+    /// relaxed atomic load instead of a `SystemTime::now()` syscall in the
+    /// critical section.
+    pub coarse_clock: Option<Arc<crate::coarse_clock::CoarseClock>>,
 }
 
 impl std::fmt::Debug for ClientHandlerDeps {
@@ -1142,6 +1151,7 @@ impl ClientHandlerDeps {
             )),
             operator_shares: crate::fee_shares::OperatorShares::new(0),
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
+            coarse_clock: None,
         }
     }
 }
@@ -1312,6 +1322,13 @@ pub struct ClientHandler {
     /// [`ClientHandlerDeps::relay_foreign_namespaces`]. Read by the gate at the
     /// top of `serve_stream`.
     relay_foreign_namespaces: bool,
+    /// Coarse wall clock for the voucher-accept path's two under-lock reads —
+    /// the capability-expiry gate and the `last_voucher_at` stamp (issue #1792
+    /// item 4). The runtime supplies one with a background refresher; a handler
+    /// built without one (tests) gets a fresh [`CoarseClock`](crate::coarse_clock::CoarseClock)
+    /// that reads the live wall clock on every call, so behavior is unchanged
+    /// there.
+    coarse_clock: Arc<crate::coarse_clock::CoarseClock>,
 }
 
 impl std::fmt::Debug for ClientHandler {
@@ -1435,6 +1452,11 @@ impl ClientHandler {
             warming_credit: deps.warming_credit,
             operator_shares: deps.operator_shares,
             relay_foreign_namespaces: deps.relay_foreign_namespaces,
+            // A handler with no clock wired (tests) reads the live wall clock on
+            // every call, exactly as before #1792 item 4.
+            coarse_clock: deps
+                .coarse_clock
+                .unwrap_or_else(|| Arc::new(crate::coarse_clock::CoarseClock::new())),
         })
     }
 
@@ -2261,9 +2283,33 @@ enum VoucherStop {
     Rejected,
 }
 
-impl ProtocolHandler for ClientHandler {
+/// Router-facing `ProtocolHandler` for `cdn/client/v1`.
+///
+/// Wraps the shared `Arc<ClientHandler>` so the serve loop can hand every
+/// per-stream task a `'static` clone of the handler and `tokio::spawn` it
+/// (#1788). The iroh [`ProtocolHandler::accept`] signature borrows `&self`, so
+/// the handler itself cannot spawn tasks that outlive the borrow; owning the
+/// `Arc` here and cloning it into `ClientHandler::serve` bridges that gap. The
+/// wrapper is cheap to clone (one `Arc` bump) and the router holds one for the
+/// process lifetime.
+#[derive(Clone, Debug)]
+pub struct ClientProtocol(Arc<ClientHandler>);
+
+impl ClientProtocol {
+    /// The `cdn/client/v1` ALPN this handler answers.
+    pub const ALPN: &'static [u8] = ALPN_CLIENT;
+
+    /// Wrap a shared handler for registration on the iroh `Router`.
+    #[must_use]
+    pub const fn new(handler: Arc<ClientHandler>) -> Self {
+        Self(handler)
+    }
+}
+
+impl ProtocolHandler for ClientProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        self.serve(connection)
+        Arc::clone(&self.0)
+            .serve(connection)
             .await
             .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))
     }

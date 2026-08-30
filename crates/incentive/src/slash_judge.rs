@@ -56,7 +56,7 @@ mod sol_types {
                 bool ok;
                 uint64 ratePerMb;
                 uint64 totalBytes;
-                bytes32 channelId;
+                bytes32 poolId;
                 uint64 timestampUs;
             }
 

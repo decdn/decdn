@@ -161,8 +161,7 @@ contract SlashJudgeTest is Test {
     bytes32 internal constant PROBE_TYPEHASH =
         keccak256("ProbeResponse(bytes32 hash,bool hasBlob,uint64 ratePerMb,uint64 timestampUs)");
     bytes32 internal constant STREAM_TYPEHASH = keccak256(
-        "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,"
-        "bytes32 channelId,uint64 timestampUs)"
+        "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes," "bytes32 poolId,uint64 timestampUs)"
     );
 
     uint64 internal probeTs;
@@ -208,7 +207,7 @@ contract SlashJudgeTest is Test {
             ok: ok,
             ratePerMb: ratePerMb,
             totalBytes: 1_048_576,
-            channelId: bytes32(uint256(1)),
+            poolId: bytes32(uint256(1)),
             timestampUs: ts
         });
     }
@@ -218,8 +217,7 @@ contract SlashJudgeTest is Test {
     }
 
     function _streamStructHash(SlashJudge.StreamMsg memory s) internal pure returns (bytes32) {
-        return
-            keccak256(abi.encode(STREAM_TYPEHASH, s.hash, s.ok, s.ratePerMb, s.totalBytes, s.channelId, s.timestampUs));
+        return keccak256(abi.encode(STREAM_TYPEHASH, s.hash, s.ok, s.ratePerMb, s.totalBytes, s.poolId, s.timestampUs));
     }
 
     function _digest(bytes32 structHash) internal view returns (bytes32) {
@@ -272,6 +270,20 @@ contract SlashJudgeTest is Test {
     function _commitAndMature(bytes32 evidenceHash) internal {
         _commitAs(challenger, evidenceHash);
         vm.warp(block.timestamp + REVEAL_DELAY + 1);
+    }
+
+    // -----------------------------------------------------------------
+    // EIP-712 typing
+    // -----------------------------------------------------------------
+
+    /// Pin both EIP-712 type-hashes to the digests the Rust signers pin
+    /// (`PROBE_RESPONSE_TYPEHASH` / `STREAM_RESPONSE_TYPEHASH` in
+    /// `crates/incentive/src/{probe_sig,stream_sig}.rs`), so a one-sided edit
+    /// of either side's type string fails default CI on both sides (#1843).
+    /// The strings themselves follow ADR 014 § EIP-712 Type Definitions.
+    function test_eip712Typehashes_pinnedAcrossLanguages() public view {
+        assertEq(judge.PROBE_RESPONSE_TYPEHASH(), 0x4638cb019b77f8677ac7015556f19e56f0be5a6a0d9392006a7fb5b8acd587e5);
+        assertEq(judge.STREAM_RESPONSE_TYPEHASH(), 0xc6d9e65c3527b52698988cae3aea61d5d8df64b415de933cc7e9762bc600eb3e);
     }
 
     // -----------------------------------------------------------------

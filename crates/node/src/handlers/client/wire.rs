@@ -8,7 +8,7 @@ use bytes::Bytes;
 use iroh::endpoint::WriteError;
 
 use super::{
-    B256, ClientHandler, ClientMessage, DownloadReceipt, FrameError, Hash, SendStream,
+    B256, ClientHandler, ClientMessage, FrameError, Hash, RawReceipt, SendStream,
     ServeRejectReason, StreamError, StreamRequest, StreamResponse, StreamResponseBody,
     StreamResponseExt, StreamSlashData, U256, VoucherRejectReason, WatermarkBundle, encode_message,
     write_frame,
@@ -28,6 +28,12 @@ impl ClientHandler {
     /// so the log reads in acceptance order and a graceful shutdown writes the tail
     /// (see [`crate::receipt_log`] §Durability).
     ///
+    /// What crosses the seam is a [`RawReceipt`]: the two 64-char hex renders,
+    /// the `uint256` decimal render, and the `SystemTime::now()` read all happen
+    /// downstream in the background writer, not here (#1792 item 2). So on the
+    /// delivery path this is a few `Copy` field moves and a non-blocking
+    /// `try_send` — no allocation, no formatting, no syscall.
+    ///
     /// The `voucher_amount` is widened to a `uint256` from the `u64` wire
     /// amount (the pool voucher's cumulative amount — its sole ordering key,
     /// there is no nonce); `client_node_id` is the iroh node id of the paying
@@ -39,14 +45,7 @@ impl ClientHandler {
         client_node_id: B256,
         wire_amount: u64,
     ) {
-        let voucher_amount = U256::from(wire_amount);
-        let receipt = DownloadReceipt::new(
-            &hash,
-            delta_bytes,
-            &client_node_id.0,
-            voucher_amount,
-            crate::payment_settlement::unix_now(),
-        );
+        let receipt = RawReceipt::new(hash, delta_bytes, client_node_id.0, U256::from(wire_amount));
         self.receipt_sink.record(receipt);
     }
 

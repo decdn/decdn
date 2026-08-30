@@ -86,10 +86,10 @@ use alloy::primitives::U256;
 use iroh_blobs::Hash;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::metrics::Metrics;
+use crate::stop_handle::StopHandle;
 
 /// File name of the receipt log within `data_dir`. Canonical name lives in
 /// `decdn_common` so the daemon writer and the `config validate` summary can't
@@ -105,10 +105,13 @@ const RECEIPT_LOG_FILE_MODE: u32 = 0o600;
 
 /// One durable record of a served-and-paid blob (issue #248).
 ///
-/// Written at the voucher-acceptance point, so every receipt corresponds to a
-/// cumulative payment the node verified and committed. All identifier fields
-/// are lower-hex strings (no `0x` prefix) so the log is self-describing and
-/// greppable without a schema:
+/// The on-disk shape. The paid-delivery path captures a [`RawReceipt`] at the
+/// voucher-acceptance point and the background writer renders it into this
+/// value (`RawReceipt::render`, #1792 item 2), so every receipt still
+/// corresponds to a cumulative payment the node verified and committed — the
+/// rendering just happens off the hot path. All identifier fields are lower-hex
+/// strings (no `0x` prefix) so the log is self-describing and greppable without
+/// a schema:
 ///
 /// - `hash` — BLAKE3 content hash of the delivered blob (raw 32 bytes, hex).
 /// - `client_node_id` — iroh `NodeId` (ed25519 public key) of the paying peer
@@ -121,7 +124,9 @@ const RECEIPT_LOG_FILE_MODE: u32 = 0o600;
 ///
 /// `size` is the byte count covered by *this* payment proof (the newly
 /// delivered, now-paid bytes), and `timestamp_secs` is the node's wall-clock
-/// Unix time (seconds) at acceptance.
+/// Unix time (seconds) read where the receipt is rendered — the background
+/// writer stamps it as it dequeues, which lags the acceptance point only by the
+/// queue-drain latency (#1792 item 2).
 ///
 /// # Invariants
 ///
@@ -158,10 +163,11 @@ pub struct DownloadReceipt {
     client_node_id: String,
     /// Accepted voucher cumulative amount, decimal `uint256` string.
     voucher_amount: String,
-    /// Node wall-clock Unix time (seconds) at voucher acceptance. The wire key
-    /// stays `timestamp` (preserved via `#[serde(rename)]`) so the on-disk JSONL
-    /// format is byte-identical to the original; the Rust field name carries the
-    /// unit explicitly.
+    /// Node wall-clock Unix time (seconds), stamped by the background writer as
+    /// it renders the receipt (#1792 item 2) — the acceptance point plus the
+    /// queue-drain latency. The wire key stays `timestamp` (preserved via
+    /// `#[serde(rename)]`) so the on-disk JSONL format is byte-identical to the
+    /// original; the Rust field name carries the unit explicitly.
     #[serde(rename = "timestamp")]
     timestamp_secs: u64,
 }
@@ -222,6 +228,66 @@ impl DownloadReceipt {
     #[must_use]
     pub const fn timestamp_secs(&self) -> u64 {
         self.timestamp_secs
+    }
+}
+
+/// One receipt as the paid-delivery hot path produces it: raw typed
+/// identifiers, no rendering and no clock read.
+///
+/// This is what [`ReceiptSink::record`] takes and what rides the writer queue,
+/// so enqueuing a receipt on the delivery path is a handful of `Copy` field
+/// moves — no hex encoding, no `U256` decimal formatting, and no
+/// `SystemTime::now()` (issue #1792 item 2). The background writer
+/// ([`spawn_receipt_writer`]) turns it into the on-disk [`DownloadReceipt`] via
+/// `RawReceipt::render`, which is where the two 64-char hex renders, the
+/// decimal-`uint256` render, and the acceptance timestamp are applied — off the
+/// hot path, in the same task that already owns the disk write (#803).
+#[derive(Debug, Clone, Copy)]
+pub struct RawReceipt {
+    /// BLAKE3 content hash of the delivered blob.
+    hash: Hash,
+    /// Bytes covered by this payment proof (the newly paid delivery).
+    size: u64,
+    /// Raw 32-byte iroh `NodeId` (ed25519 public key) of the paying peer.
+    client_node_id: [u8; 32],
+    /// Accepted voucher cumulative amount (its sole ordering key; no nonce).
+    voucher_amount: U256,
+}
+
+impl RawReceipt {
+    /// Capture the typed delivery-path values with no rendering. Cheap enough to
+    /// build inline on the paid-delivery path — every field is `Copy`.
+    #[must_use]
+    pub const fn new(
+        hash: Hash,
+        size: u64,
+        client_node_id: [u8; 32],
+        voucher_amount: U256,
+    ) -> Self {
+        Self {
+            hash,
+            size,
+            client_node_id,
+            voucher_amount,
+        }
+    }
+
+    /// Render this raw receipt into its on-disk [`DownloadReceipt`] form,
+    /// stamping `timestamp_secs`. This is where the hex and decimal-`uint256`
+    /// rendering happens; callers run it off the delivery path (the background
+    /// writer, or the inline test/loopback sink), so the hot path never pays for
+    /// it. `timestamp_secs` is read where `render` is called — for the
+    /// background writer that is the moment the receipt is dequeued, which lags
+    /// acceptance only by the queue-drain latency and preserves FIFO order.
+    #[must_use]
+    fn render(self, timestamp_secs: u64) -> DownloadReceipt {
+        DownloadReceipt::new(
+            &self.hash,
+            self.size,
+            &self.client_node_id,
+            self.voucher_amount,
+            timestamp_secs,
+        )
     }
 }
 
@@ -571,7 +637,7 @@ impl ReceiptLog for NoopReceiptLog {
     }
 }
 
-/// Non-blocking enqueue boundary for [`DownloadReceipt`]s on the paid-delivery
+/// Non-blocking enqueue boundary for [`RawReceipt`]s on the paid-delivery
 /// hot path (#803).
 ///
 /// The voucher-accept path records a receipt through this seam as each voucher
@@ -581,11 +647,15 @@ impl ReceiptLog for NoopReceiptLog {
 /// already advanced the lane watermark. The runtime uses [`ChannelReceiptSink`]
 /// (hands off to the background [`spawn_receipt_writer`] task); tests use a
 /// synchronous fake behind [`DirectReceiptSink`].
+///
+/// The seam carries a [`RawReceipt`], not the rendered [`DownloadReceipt`]: the
+/// hex/decimal rendering and the timestamp are applied downstream, off the hot
+/// path (#1792 item 2).
 pub trait ReceiptSink: Send + Sync {
     /// Best-effort, non-blocking record of one receipt. Never blocks the caller
     /// on disk and never fails delivery — a sink that cannot accept the receipt
     /// drops it.
-    fn record(&self, receipt: DownloadReceipt);
+    fn record(&self, receipt: RawReceipt);
 }
 
 /// Capacity of the receipt-writer queue. Receipts are roughly one per voucher
@@ -605,7 +675,7 @@ pub const RECEIPT_LOG_CAPACITY: usize = 1024;
 /// drain has already run, or is bounded by the shutdown deadline).
 #[derive(Clone)]
 pub struct ChannelReceiptSink {
-    tx: mpsc::Sender<DownloadReceipt>,
+    tx: mpsc::Sender<RawReceipt>,
     metrics: Arc<Metrics>,
 }
 
@@ -618,7 +688,7 @@ impl std::fmt::Debug for ChannelReceiptSink {
 }
 
 impl ReceiptSink for ChannelReceiptSink {
-    fn record(&self, receipt: DownloadReceipt) {
+    fn record(&self, receipt: RawReceipt) {
         match self.tx.try_send(receipt) {
             // Enqueued — the background writer will append it.
             Ok(()) => {}
@@ -674,15 +744,19 @@ impl std::fmt::Debug for DirectReceiptSink {
 }
 
 impl ReceiptSink for DirectReceiptSink {
-    fn record(&self, receipt: DownloadReceipt) {
+    fn record(&self, receipt: RawReceipt) {
+        // Render inline (this fake appends on the caller's thread anyway) with a
+        // timestamp read here, mirroring where the background writer reads it.
+        let rendered = receipt.render(crate::payment_settlement::unix_now());
         // Audit-only and non-fatal, matching the background writer's handling.
-        let _ = self.0.append(&receipt);
+        let _ = self.0.append(&rendered);
     }
 }
 
 /// Spawn the single background task that owns the on-disk [`ReceiptLog`] and
 /// drains the receipt queue, returning the [`ReceiptSink`] the delivery path
-/// enqueues through plus the task `JoinHandle` for graceful shutdown.
+/// enqueues through plus the [`StopHandle`] that stops the task at graceful
+/// shutdown.
 ///
 /// Decouples the audit write from the paid-delivery hot path (#803): the
 /// voucher-accept path does only a non-blocking [`ReceiptSink::record`] (a
@@ -693,17 +767,19 @@ impl ReceiptSink for DirectReceiptSink {
 /// caller of [`ReceiptLog::append`], so the log's internal mutex sees no
 /// cross-stream contention.
 ///
-/// On `shutdown` cancellation (fired after the router has drained, so no further
-/// receipts are produced) the task flushes whatever is already enqueued and
-/// exits; await the returned handle within the shutdown deadline to preserve the
-/// audit tail.
+/// On its stop signal ([`StopHandle::cancel`], fired after the router has
+/// drained, so no further receipts are produced) the task flushes whatever is
+/// already enqueued and exits; complete [`StopHandle::shutdown`] within the
+/// shutdown deadline to preserve the audit tail. The `StopHandle` owns the stop
+/// token beside the task handle, so the join cannot hang on sinks that outlive
+/// shutdown — [`crate::handlers::client::ClientHandler`] holds one for the
+/// whole runtime.
 pub fn spawn_receipt_writer(
     log: Arc<dyn ReceiptLog>,
     metrics: Arc<Metrics>,
-    shutdown: CancellationToken,
-) -> (Arc<dyn ReceiptSink>, JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel(RECEIPT_LOG_CAPACITY);
-    let handle = tokio::spawn(receipt_writer_loop(rx, log, shutdown));
+) -> (Arc<dyn ReceiptSink>, StopHandle) {
+    let (tx, rx) = mpsc::channel::<RawReceipt>(RECEIPT_LOG_CAPACITY);
+    let handle = StopHandle::spawn(move |shutdown| receipt_writer_loop(rx, log, shutdown));
     (Arc::new(ChannelReceiptSink { tx, metrics }), handle)
 }
 
@@ -711,7 +787,7 @@ pub fn spawn_receipt_writer(
 /// Appends each receipt FIFO until the queue closes or `shutdown` fires, then
 /// flushes the already-enqueued tail before returning.
 async fn receipt_writer_loop(
-    mut rx: mpsc::Receiver<DownloadReceipt>,
+    mut rx: mpsc::Receiver<RawReceipt>,
     log: Arc<dyn ReceiptLog>,
     shutdown: CancellationToken,
 ) {
@@ -737,17 +813,28 @@ async fn receipt_writer_loop(
     tracing::debug!("download-receipt writer drained and stopped");
 }
 
-/// Append one receipt on the blocking pool, logging a non-fatal failure.
+/// Render one raw receipt and append it on the blocking pool, logging a
+/// non-fatal failure.
 ///
-/// Offloaded to [`tokio::task::spawn_blocking`] so the synchronous
-/// `write_all`/`flush` (and any disk stall under a full or slow `data_dir`)
-/// runs on the blocking pool, never on a runtime worker. The single writer
-/// awaits each append before the next, preserving receipt order. An append
-/// error is non-fatal — the payment already advanced the lane watermark — so it
-/// is logged at `warn` and the loop continues.
-async fn append_one(log: &Arc<dyn ReceiptLog>, receipt: DownloadReceipt) {
+/// The delivery task only enqueued a [`RawReceipt`]; the hex/decimal rendering
+/// happens here (#1792 item 2), off the paid-delivery path. The timestamp is
+/// read at dequeue — so it lags the acceptance point only by the queue-drain
+/// latency and stays in FIFO order — while the render itself runs *inside* the
+/// [`tokio::task::spawn_blocking`] closure, so no formatting or allocation
+/// touches a runtime worker thread either.
+///
+/// The blocking pool is also where the synchronous `write_all`/`flush` (and any
+/// disk stall under a full or slow `data_dir`) runs, never on a runtime worker.
+/// The single writer awaits each append before the next, preserving receipt
+/// order. An append error is non-fatal — the payment already advanced the lane
+/// watermark — so it is logged at `warn` and the loop continues.
+async fn append_one(log: &Arc<dyn ReceiptLog>, raw: RawReceipt) {
+    // Stamp at dequeue so the timestamp reflects acceptance order; the render
+    // that consumes it runs on the blocking pool below.
+    let stamped_at = crate::payment_settlement::unix_now();
     let log = Arc::clone(log);
     let join = tokio::task::spawn_blocking(move || {
+        let receipt = raw.render(stamped_at);
         let res = log.append(&receipt);
         (res, receipt)
     })
@@ -807,6 +894,18 @@ mod tests {
         )
     }
 
+    /// The [`RawReceipt`] the delivery path enqueues, mirroring [`sample`]'s
+    /// identifiers minus the timestamp (the background writer stamps that). Used
+    /// by the sink-level tests, which feed the seam a raw receipt.
+    fn raw_sample(byte: u8) -> RawReceipt {
+        RawReceipt::new(
+            Hash::from_bytes([byte; 32]),
+            u64::from(byte) * 1024,
+            [byte ^ 0xff; 32],
+            U256::from(byte),
+        )
+    }
+
     /// In-memory [`ReceiptLog`] for the writer tests: records every appended
     /// receipt and (optionally) returns an error for any whose `size` is in
     /// `fail_sizes`, without recording it — so a test can prove the writer loop
@@ -842,27 +941,35 @@ mod tests {
     async fn writer_drains_all_queued_receipts_then_stops_on_cancel() -> anyhow::Result<()> {
         let log = Arc::new(RecordingLog::default());
         let metrics = Arc::new(Metrics::new());
-        let token = CancellationToken::new();
-        let (sink, handle) = spawn_receipt_writer(
-            Arc::clone(&log) as Arc<dyn ReceiptLog>,
-            metrics,
-            token.clone(),
-        );
+        let (sink, handle) = spawn_receipt_writer(Arc::clone(&log) as Arc<dyn ReceiptLog>, metrics);
         for tag in 0..8u8 {
-            sink.record(sample(tag));
+            sink.record(raw_sample(tag));
         }
-        token.cancel();
-        handle.await?;
+        handle.shutdown().await?;
         let seen = log.snapshot();
         anyhow::ensure!(
             seen.len() == 8,
             "expected 8 drained receipts, got {}",
             seen.len()
         );
+        // The writer stamps the timestamp itself, so identity is checked on the
+        // fields the raw receipt carried through the render, ignoring the
+        // timestamp value; `sample(tag)` is the same identity with a fixed stamp.
         for (i, tag) in (0..8u8).enumerate() {
+            let Some(got) = seen.get(i) else {
+                anyhow::bail!("missing drained receipt at {i}");
+            };
+            let want = sample(tag);
             anyhow::ensure!(
-                seen.get(i) == Some(&sample(tag)),
-                "receipt {i} out of FIFO order"
+                got.size() == want.size()
+                    && got.hash() == want.hash()
+                    && got.client_node_id() == want.client_node_id()
+                    && got.voucher_amount() == want.voucher_amount(),
+                "receipt {i} identity/order not preserved through render: {got:?}"
+            );
+            anyhow::ensure!(
+                got.timestamp_secs() > 0,
+                "the writer must stamp a wall-clock timestamp on receipt {i}"
             );
         }
         Ok(())
@@ -878,17 +985,11 @@ mod tests {
             ..RecordingLog::default()
         });
         let metrics = Arc::new(Metrics::new());
-        let token = CancellationToken::new();
-        let (sink, handle) = spawn_receipt_writer(
-            Arc::clone(&log) as Arc<dyn ReceiptLog>,
-            metrics,
-            token.clone(),
-        );
+        let (sink, handle) = spawn_receipt_writer(Arc::clone(&log) as Arc<dyn ReceiptLog>, metrics);
         for tag in 0..5u8 {
-            sink.record(sample(tag));
+            sink.record(raw_sample(tag));
         }
-        token.cancel();
-        handle.await?;
+        handle.shutdown().await?;
         let seen = log.snapshot();
         let sizes: Vec<u64> = seen.iter().map(DownloadReceipt::size).collect();
         anyhow::ensure!(
@@ -910,8 +1011,8 @@ mod tests {
             tx,
             metrics: Arc::clone(&metrics),
         };
-        sink.record(sample(1)); // fills the single slot
-        sink.record(sample(2)); // full → dropped + counted
+        sink.record(raw_sample(1)); // fills the single slot
+        sink.record(raw_sample(2)); // full → dropped + counted
         let text = metrics.encode()?;
         anyhow::ensure!(
             text.lines()
@@ -934,7 +1035,7 @@ mod tests {
             tx,
             metrics: Arc::clone(&metrics),
         };
-        sink.record(sample(1)); // closed → dropped, uncounted
+        sink.record(raw_sample(1)); // closed → dropped, uncounted
         let text = metrics.encode()?;
         anyhow::ensure!(
             text.lines()

@@ -24,7 +24,7 @@ use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
 use decdn_common::config::ResolvedSecurity;
 use decdn_incentive::PoolStateStore;
 use decdn_node::dispatch::ConnectionLimiter;
-use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
+use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps, ClientProtocol};
 use decdn_node::metrics::Metrics;
 use decdn_node::receipt_log::{DirectReceiptSink, DownloadReceipt, ReceiptLog, ReceiptSink};
 use decdn_protocol::client::ClientMessage;
@@ -140,8 +140,8 @@ pub async fn local_endpoint(
 
 /// How long teardown has, in total, to reap every task and drain every endpoint.
 ///
-/// It must CLEAR `node_origin::abandon_drain::ABANDON_DRAIN_CAP` (10s), not match
-/// it — 1.5× that cap, which is the sole derivation of the number. An abandoned
+/// It must CLEAR `node_origin::ABANDON_DRAIN_CAP` (10s), not match it — 1.5×
+/// that cap, which is the sole derivation of the number. An abandoned
 /// pull leg runs its drain on its own runtime thread, waiting up to that cap for
 /// its upstream connections to reach their drained state, and [`Endpoint::close`]
 /// blocks on the same event. So the first close IS attempted under an equal
@@ -152,6 +152,41 @@ pub async fn local_endpoint(
 /// whole budget, so the two readings stay distinguishable; it still sits far below
 /// the `.config/nextest.toml` backstop.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The 1.5× margin above is the whole point of the constant, so it is pinned
+/// here rather than left to the prose. A `SHUTDOWN_TIMEOUT` that merely CLEARS
+/// the drain cap still lets a ceilinged drain consume nearly the whole budget,
+/// collapsing the two readings the margin exists to keep distinguishable.
+/// Nanoseconds, so a sub-second change to either side still counts.
+const _: () = assert!(
+    SHUTDOWN_TIMEOUT.as_nanos() >= decdn_node::node_origin::ABANDON_DRAIN_CAP.as_nanos() * 3 / 2
+);
+
+/// What [`shutdown`] actually did, so a caller can assert on a breach rather
+/// than only see the warning line.
+///
+/// The counts carry their own denominators. A bare `closed` says nothing on its
+/// own — `1` is clean for one endpoint and a breach for two — so the totals ride
+/// along and [`ShutdownReport::is_clean`] is what callers assert on.
+#[derive(Debug, Clone, Copy)]
+pub struct ShutdownReport {
+    /// Tasks joined before the deadline, whether they ended on their own,
+    /// took the abort, or panicked.
+    pub reaped: usize,
+    /// Tasks passed in.
+    pub of_tasks: usize,
+    /// Endpoints closed before the deadline.
+    pub closed: usize,
+    /// Endpoints passed in.
+    pub of_endpoints: usize,
+}
+
+impl ShutdownReport {
+    /// Every task reaped and every endpoint closed inside the deadline.
+    pub const fn is_clean(&self) -> bool {
+        self.reaped == self.of_tasks && self.closed == self.of_endpoints
+    }
+}
 
 /// Own a test's whole iroh teardown: abort `tasks`, reap them, then close
 /// `endpoints` — all under one shared deadline.
@@ -203,20 +238,46 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 ///
 /// [`JoinError::is_cancelled`]: tokio::task::JoinError::is_cancelled
 ///
+/// # Returns
+///
+/// The [`ShutdownReport`] — the reaped/closed counts against their totals, so a
+/// caller can assert on a breach with [`ShutdownReport::is_clean`]. A breach (a
+/// deadline exceeded) is still `Ok`: it is a warning, not a failure, and the
+/// report carries the shortfall. A breach that also caught a panicking task
+/// returns the panic instead, and the counts are dropped with it.
+///
 /// # Errors
 ///
 /// A server task that panicked.
 pub async fn shutdown<const N: usize, const M: usize>(
     tasks: [tokio::task::JoinHandle<()>; N],
     endpoints: [&Endpoint; M],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ShutdownReport> {
+    shutdown_within(SHUTDOWN_TIMEOUT, tasks, endpoints).await
+}
+
+/// [`shutdown`] under a caller-chosen deadline.
+///
+/// Only the teardown helpers' own suite needs this: a test that PROVES the
+/// breach path must wait the deadline out in real time, and [`SHUTDOWN_TIMEOUT`]
+/// is sized for the drain cap rather than for being waited on. Every other
+/// caller wants [`shutdown`].
+///
+/// # Errors
+///
+/// A server task that panicked.
+pub async fn shutdown_within<const N: usize, const M: usize>(
+    deadline: Duration,
+    tasks: [tokio::task::JoinHandle<()>; N],
+    endpoints: [&Endpoint; M],
+) -> anyhow::Result<ShutdownReport> {
     for task in &tasks {
         task.abort();
     }
     let mut reaped = 0usize;
     let mut closed = 0usize;
     let mut fault: Option<anyhow::Error> = None;
-    let within = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+    let within = tokio::time::timeout(deadline, async {
         for task in tasks {
             match task.await {
                 Ok(()) => {}
@@ -241,11 +302,19 @@ pub async fn shutdown<const N: usize, const M: usize>(
     .await;
     if within.is_err() {
         eprintln!(
-            "shutdown: teardown exceeded {SHUTDOWN_TIMEOUT:?} \
+            "shutdown: teardown exceeded {deadline:?} \
              ({reaped}/{N} tasks reaped, {closed}/{M} endpoints closed)"
         );
     }
-    fault.map_or(Ok(()), Err)
+    fault.map_or(
+        Ok(ShutdownReport {
+            reaped,
+            of_tasks: N,
+            closed,
+            of_endpoints: M,
+        }),
+        Err,
+    )
 }
 
 /// Join a ONE-SHOT server task under the same deadline [`shutdown`] uses, and
@@ -651,7 +720,7 @@ pub fn spawn_server(
                 continue;
             };
             let Ok(conn) = connecting.await else { continue };
-            let _ = handler.accept(conn).await;
+            let _ = ClientProtocol::new(Arc::clone(&handler)).accept(conn).await;
         }
     })
 }
