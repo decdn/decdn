@@ -77,11 +77,23 @@ impl SourceId {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Consume into the inner bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
 }
 
 impl From<[u8; 32]> for SourceId {
     fn from(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+}
+
+impl From<SourceId> for [u8; 32] {
+    fn from(value: SourceId) -> Self {
+        value.0
     }
 }
 
