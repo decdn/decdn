@@ -889,8 +889,10 @@ pub struct ClientHandlerDeps {
     /// each clean serve the handler enqueues the realized operator margin for the
     /// source that speculatively warmed the blob (a no-op for an untagged /
     /// non-speculative hash), so the stream task never waits on the ledger lock.
-    /// Defaults to an inline sink over a fresh zero-budget allowance (tests): a
-    /// fresh allowance tags nothing, so its credit is inert.
+    /// Defaults to the inert [`crate::warming_allowance::NoopWarmingCreditSink`];
+    /// the runtime overwrites it with the channel sink from
+    /// [`crate::warming_allowance::spawn_warming_creditor`], and a handler left
+    /// with the default simply applies no warming credit.
     pub warming_credit: Arc<dyn crate::warming_allowance::WarmingCreditSink>,
     /// Live operator fee-share (basis points) cell (`FeeRouter.getShares()[0]`), the
     /// `(1 − f)` numerator the ADR 041 serve credit realizes. Defaults to zero
@@ -974,9 +976,7 @@ impl ClientHandlerDeps {
             idle_timeout: None,
             pool_recheck_interval: None,
             floor_loss_store: None,
-            warming_credit: Arc::new(crate::warming_allowance::DirectWarmingCreditSink::new(
-                Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
-            )),
+            warming_credit: Arc::new(crate::warming_allowance::NoopWarmingCreditSink),
             operator_shares: crate::fee_shares::OperatorShares::new(0),
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
             coarse_clock: None,

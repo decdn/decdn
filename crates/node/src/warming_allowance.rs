@@ -24,8 +24,8 @@
 //! stream task ends its serve with a non-blocking
 //! [`WarmingCreditSink::credit`], and the single background task from
 //! [`spawn_warming_creditor`] applies the credit to the ledger. Tests use the
-//! inline [`DirectWarmingCreditSink`] to keep the credit observable
-//! synchronously.
+//! inline `DirectWarmingCreditSink` (a `test-support` type) to keep the credit
+//! observable synchronously.
 //!
 //! The bucket ledger is a plain `Mutex<HashMap>` and every operation on it is
 //! O(1) — nothing iterates under the lock. The seam is not there to escape a
@@ -203,7 +203,8 @@ pub const WARMING_CREDIT_CAPACITY: usize = 1024;
 /// eviction driver take that lock on their own cadences, and a serve completion
 /// queued behind either keeps the stream's lane slot and floor reservation
 /// alive for no reason. The runtime uses the channel sink from
-/// [`spawn_warming_creditor`]; tests use [`DirectWarmingCreditSink`].
+/// [`spawn_warming_creditor`]; tests use the `test-support`
+/// `DirectWarmingCreditSink`.
 ///
 /// An implementation that defers the credit MUST resolve the hash's source
 /// before it hands the credit off, and carry the source rather than the hash.
@@ -274,20 +275,36 @@ impl WarmingCreditSink for ChannelWarmingCreditSink {
     }
 }
 
+/// A [`WarmingCreditSink`] that drops every credit. It is the inert default a
+/// fresh [`crate::handlers::client::ClientHandlerDeps`] carries before the
+/// runtime overwrites it with the channel sink from [`spawn_warming_creditor`].
+/// A handler left with this default applies no warming credit, which only keeps
+/// each source's ledger more conservative — the same safe direction a full or
+/// closed aggregator queue takes.
+#[derive(Debug, Default)]
+pub struct NoopWarmingCreditSink;
+
+impl WarmingCreditSink for NoopWarmingCreditSink {
+    fn credit(&self, _hash: [u8; 32], _units: u64) {}
+}
+
 /// Synchronous [`WarmingCreditSink`] that applies each credit inline to a
 /// [`WarmingAllowance`]. Test and loopback support only: it lets a test read the
 /// ledger right after a serve instead of polling for a background drain.
 ///
 /// It deliberately *violates* the [`WarmingCreditSink`] non-blocking contract
 /// (it takes the ledger lock on the caller's thread), so it must never be wired
-/// onto the serve path. The type and constructor stay `pub` only because the
-/// cross-crate integration tests in `tests/` cannot see `#[cfg(test)]` items;
-/// the field is private and the type is `#[doc(hidden)]` so it does not read as
-/// a production knob.
+/// onto the serve path. The `test-support` feature gate keeps it out of every
+/// production build: it compiles only for this crate's own tests and for the
+/// cross-crate integration tests in `tests/`, which cannot see `#[cfg(test)]`
+/// items. The field is private and the type is `#[doc(hidden)]` so it does not
+/// read as a production knob.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct DirectWarmingCreditSink(Arc<WarmingAllowance>);
 
+#[cfg(any(test, feature = "test-support"))]
 impl DirectWarmingCreditSink {
     /// Wrap a ledger as an inline-crediting sink. Test and loopback use only —
     /// see the type docs; never wire this onto the serve path.
@@ -297,6 +314,7 @@ impl DirectWarmingCreditSink {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl WarmingCreditSink for DirectWarmingCreditSink {
     fn credit(&self, hash: [u8; 32], units: u64) {
         self.0.credit_serve(hash, units);

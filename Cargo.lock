@@ -2877,6 +2877,7 @@ dependencies = [
  "decdn-client-pull",
  "decdn-common",
  "decdn-incentive",
+ "decdn-node",
  "decdn-protocol",
  "decdn-reputation",
  "dirs",
