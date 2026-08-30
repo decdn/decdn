@@ -125,12 +125,24 @@ pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
 /// wide-fan-out publishers lowers it; one serving single-signer pools raises it
 /// toward `10_000`, where the sub-cap becomes the pool ceiling.
 pub const DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS: u64 = 2_500;
-/// Default ceiling on the per-signer floor sub-cap: `16` ramp-start credit windows.
-/// The window is what a signer's honest need is denominated in — one admission
-/// reserves at most one window, and a paying stream releases it — so sixteen leaves
-/// room for a highly concurrent publisher while keeping the damage one compromised
-/// session key can do constant rather than proportional to the pool's deposit.
-pub const DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS: u64 = 16;
+/// Default ceiling on the per-signer floor sub-cap: `0`, meaning no ceiling, so the
+/// share alone bounds a signer.
+///
+/// The ceiling is sound and available — set a window count to enable it — but it is
+/// off by default because it interacts badly with `dead_charge`, which is permanent
+/// until the pool is reclaimed on-chain. An admitted stream that fails without
+/// delivering folds a FULL window into that permanent total, and a client retrying a
+/// cold node accrues one such window per attempt. A ceiling of `k` windows therefore
+/// turns `k` transient warm-up failures into a permanent lockout for that signer,
+/// and the client's own retry loop is what spends the budget it then needs.
+///
+/// No constant escapes that: the burn is bounded only by the pool's headroom, not by
+/// anything the ceiling can be sized against. Enabling it by default would trade a
+/// fan-out bound for an availability failure on ordinary cold starts. Sizing the
+/// ceiling for its real job — bounding one signer's *concurrent* un-vouchered
+/// exposure — requires separating that from the cumulative abandonment budget the
+/// same number currently also serves.
+pub const DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS: u64 = 0;
 /// Basis-point denominator for [`DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS`] and the
 /// bound the resolver enforces on a configured share.
 pub const BPS_DENOMINATOR: u64 = 10_000;
