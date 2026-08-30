@@ -789,16 +789,28 @@ impl PoolStateStore for PersistentPoolStateStore {
             let slot = self.lanes.get(key).map(|entry| entry.value().clone());
             match slot {
                 Some(LaneSlot::Live(state)) => {
-                    let encoded =
-                        postcard::to_allocvec(&StoredLaneState::from(&state)).map_err(|err| {
-                            StoreError::Codec(format!("postcard encode failed: {err}"))
-                        })?;
-                    writes.push((*key, encoded));
+                    match postcard::to_allocvec(&StoredLaneState::from(&state)) {
+                        Ok(encoded) => writes.push((*key, encoded)),
+                        Err(err) => {
+                            // Nothing has been committed yet, but the drain
+                            // already emptied these keys out of the work-list.
+                            // Re-push every drained key so the next flush retries
+                            // them — an early return here without the re-push
+                            // would leave the un-encoded lanes permanently
+                            // "clean" and never reach disk.
+                            for key in &drained {
+                                self.dirty.push(*key);
+                            }
+                            return Err(StoreError::Codec(format!(
+                                "postcard encode failed: {err}"
+                            )));
+                        }
+                    }
                 }
                 Some(LaneSlot::Tombstoned) => tombstones.push(*key),
-                // A key present in the work-list but absent from `lanes` cannot
-                // happen — a slot is only ever inserted or tombstoned, never
-                // removed except by this flush after its commit succeeds.
+                // Drained key with no slot: a `forget` re-pushed this key after a
+                // flush reaped its tombstone via `remove_if`, so the row is
+                // already gone. Nothing to write or delete — skip it.
                 None => {}
             }
         }
