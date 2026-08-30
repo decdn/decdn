@@ -510,9 +510,21 @@ async fn provisioned_origin(
 }
 
 /// The `(pull_timeout, stall_timeout)` every test that does not care about the deadline gate
-/// runs with — generous enough that a loaded runner never trips them.
+/// runs with.
+///
+/// These bounds exist to stop a wedged fixture from hanging, not to be measured against: no
+/// test that uses them asserts on either one firing. So they are sized to be UNREACHABLE by a
+/// pull that is making honest progress, however slowly, and 20s was not — a fixture that costs
+/// 1.3s uncontended has been seen taking 21.4s and ending on the stall bound, both on the
+/// coverage-instrumented four-core CI runner and in an ordinary local whole-package run. The
+/// real backstop for a genuine wedge is the `.config/nextest.toml` per-test cap (180s for this
+/// package), which these stay clear of at a minute apiece.
+///
+/// Tests that ASSERT on the deadline gate pass their own budgets and must not use these — two
+/// of them feed the same values to `selection::outer_pull_deadline` and check what it derives,
+/// so widening these would put the config and that derivation out of step.
 const DEFAULT_TEST_PULL_DEADLINES: (Duration, Duration) =
-    (Duration::from_secs(20), Duration::from_secs(20));
+    (Duration::from_mins(1), Duration::from_mins(1));
 
 /// Like [`provisioned_origin`], but the caller picks the node-origin
 /// deadline budgets.
@@ -789,6 +801,11 @@ async fn build_origin_with_probe_caches(
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
+            // Taken verbatim from the caller. Two fixtures feed the same budgets to
+            // `selection::outer_pull_deadline` and assert on what it derives, so a
+            // margin applied behind the caller's back would put the config and that
+            // derivation out of step. Callers that want a generous bound ask for it
+            // by name — see [`DEFAULT_TEST_PULL_DEADLINES`].
             pull_timeout,
             stall_timeout,
             max_blob_size_bytes,
@@ -1499,8 +1516,10 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
-            pull_timeout: Duration::from_secs(20),
-            stall_timeout: Duration::from_secs(20),
+            // Generous by intent, like [`DEFAULT_TEST_PULL_DEADLINES`]: a loaded
+            // runner must not end a pull this fixture is not measuring.
+            pull_timeout: DEFAULT_TEST_PULL_DEADLINES.0,
+            stall_timeout: DEFAULT_TEST_PULL_DEADLINES.1,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
             working_deposit: U256::ZERO,
@@ -9058,8 +9077,10 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
-            pull_timeout: Duration::from_secs(20),
-            stall_timeout: Duration::from_secs(20),
+            // Generous by intent, like [`DEFAULT_TEST_PULL_DEADLINES`]: a loaded
+            // runner must not end a pull this fixture is not measuring.
+            pull_timeout: DEFAULT_TEST_PULL_DEADLINES.0,
+            stall_timeout: DEFAULT_TEST_PULL_DEADLINES.1,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
@@ -10772,8 +10793,10 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
-            pull_timeout: Duration::from_secs(20),
-            stall_timeout: Duration::from_secs(20),
+            // Generous by intent, like [`DEFAULT_TEST_PULL_DEADLINES`]: a loaded
+            // runner must not end a pull this fixture is not measuring.
+            pull_timeout: DEFAULT_TEST_PULL_DEADLINES.0,
+            stall_timeout: DEFAULT_TEST_PULL_DEADLINES.1,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
@@ -12070,8 +12093,10 @@ async fn build_origin_economics(
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
-            pull_timeout: Duration::from_secs(20),
-            stall_timeout: Duration::from_secs(20),
+            // Generous by intent, like [`DEFAULT_TEST_PULL_DEADLINES`]: a loaded
+            // runner must not end a pull this fixture is not measuring.
+            pull_timeout: DEFAULT_TEST_PULL_DEADLINES.0,
+            stall_timeout: DEFAULT_TEST_PULL_DEADLINES.1,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
             working_deposit: U256::ZERO,

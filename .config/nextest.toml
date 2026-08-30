@@ -13,12 +13,23 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# Retries are scoped to the suites below, never set globally. A retry turns a red
+# run into a reported FLAKY line rather than hiding it, and a genuinely broken
+# test still exhausts every attempt and fails — but a FLAKY line is a defect
+# signal to triage, not noise to skim past. Everything outside those suites is
+# deterministic and must stay a hard failure on the first attempt.
+
 # The anvil-backed e2e journeys boot anvil, deploy the full protocol, and drive
 # daemon subprocesses, so they are legitimately slower than an in-process unit
 # test. Give the package more headroom before the same backstop applies.
 [[profile.default.overrides]]
 filter = 'package(decdn-e2e)'
 slow-timeout = { period = "120s", terminate-after = 5 }
+# Each journey boots its own anvil and shells out to `forge`, two tests at a time
+# on a four-core runner. That contention is what the `ci_scaled` forge budgets in
+# `crates/e2e/src/chain.rs` already absorb; a deploy that still blows the whole
+# `2 x ci_scaled(60s)` ladder has lost a scheduling race, not found a defect.
+retries = 2
 
 # The two anvil-backed `decdn-node` targets boot anvil, shell out to `forge`, and
 # drive real node code against a live chain, so they are legitimately slower than
@@ -32,6 +43,8 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'binary(anvil_settlement_e2e) + binary(anvil_bringup_shutdown_e2e)'
 slow-timeout = { period = "120s", terminate-after = 8 }
+# Same anvil + `forge` contention as the journeys above.
+retries = 2
 
 # The in-process `decdn-node` suite tears its iroh fixtures down through
 # `tests/support::shutdown`, which bounds its own work and names the stage it
@@ -52,3 +65,21 @@ slow-timeout = { period = "120s", terminate-after = 8 }
 filter = 'package(decdn-node) - binary(anvil_settlement_e2e) - binary(anvil_bringup_shutdown_e2e)'
 slow-timeout = { period = "60s", terminate-after = 3 }
 success-output = "final"
+# These fixtures drive live iroh endpoints against wall-clock budgets, so a
+# starved runner can end a pull that was making honest progress. The budgets a
+# test does not measure are sized to be unreachable
+# (`node_origin_pull::DEFAULT_TEST_PULL_DEADLINES`); this is the backstop for what
+# that does not cover. Read a FLAKY line here as a defect signal — several of
+# these fixtures assert on concurrency, and a real race would also present as an
+# intermittent failure.
+retries = 2
+
+# `node_origin_pull` holds 65 `#[tokio::test(flavor = "multi_thread")]` fixtures,
+# each sizing its runtime to the host's core count. Left alone, nextest schedules
+# four of them at once on a four-core runner and the resulting ~16 worker threads
+# plus live iroh endpoints starve each other badly enough to trip streaming
+# deadlines. Claiming two slots per test halves that co-scheduling where it is
+# scarce and costs nothing on a developer box, where slots are plentiful.
+[[profile.default.overrides]]
+filter = 'binary(node_origin_pull)'
+threads-required = 2
