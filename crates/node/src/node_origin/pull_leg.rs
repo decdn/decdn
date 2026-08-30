@@ -338,7 +338,7 @@ impl NodeOrigin {
         // ceiling BEFORE opening a channel. A skip folds into the walk as `BelowMargin`.
         let heat = heat_of(deps, hash_bytes);
         let (econ_rate_ceiling, speculative) =
-            match economic_ceiling(deps, candidate.node_id, heat, candidate.rate_per_mb) {
+            match economic_ceiling(deps, candidate.node_id.into(), heat, candidate.rate_per_mb) {
                 EconGate::Allow {
                     rate_ceiling,
                     speculative,
@@ -648,8 +648,8 @@ pub(crate) async fn run_pull_leg(
                 // gaps), accounted in whole MB at the candidate's buy rate.
                 if speculative {
                     deps.config.warming.debit_speculative(
-                        *pk.as_bytes(),
-                        hash_bytes,
+                        (*pk.as_bytes()).into(),
+                        Hash::from_bytes(hash_bytes),
                         buy_rate_per_mb.saturating_mul(mb_of(gap_bytes)),
                     );
                 }

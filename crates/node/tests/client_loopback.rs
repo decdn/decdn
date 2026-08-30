@@ -8247,9 +8247,15 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
     let warming = Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
         1000, 0,
     ));
-    warming.debit_speculative([0xAAu8; 32], [0xBBu8; 32], u64::MAX);
+    warming.debit_speculative(
+        decdn_node::warming_allowance::SourceId::from_bytes([0xAAu8; 32]),
+        decdn_cache::Hash::from_bytes([0xBBu8; 32]),
+        u64::MAX,
+    );
     anyhow::ensure!(
-        !warming.available([0xAAu8; 32]),
+        !warming.available(decdn_node::warming_allowance::SourceId::from_bytes(
+            [0xAAu8; 32]
+        )),
         "precondition: the source must read as fully spent"
     );
 
@@ -8321,7 +8327,8 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
 #[tokio::test(flavor = "multi_thread")]
 async fn a_completed_serve_credits_the_source_through_the_background_aggregator()
 -> anyhow::Result<()> {
-    const SOURCE: [u8; 32] = [0xA1u8; 32];
+    const SOURCE: decdn_node::warming_allowance::SourceId =
+        decdn_node::warming_allowance::SourceId::from_bytes([0xA1u8; 32]);
     const OP_BPS: u16 = 6000;
 
     let payload = vec![0x5Cu8; 64 * 1024];
@@ -8342,7 +8349,7 @@ async fn a_completed_serve_credits_the_source_through_the_background_aggregator(
     let warming = Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
         1_000_000, 0,
     ));
-    warming.debit_speculative(SOURCE, *hash.as_bytes(), 1);
+    warming.debit_speculative(SOURCE, hash, 1);
     anyhow::ensure!(
         !warming.available(SOURCE),
         "precondition: the speculative buy must leave the source spent"
