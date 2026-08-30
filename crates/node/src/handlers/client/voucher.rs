@@ -259,8 +259,13 @@ impl ClientHandler {
 
         // Advance in-memory, then record to the buffered store (a cheap map write;
         // durability is the background flush's job). A poisoned store mutex is the
-        // only failure path and is treated as a serve fault.
-        guard.state = verified.next_state.clone();
+        // only failure path and is treated as a serve fault. The candidate state
+        // MOVES into the lane and `record` borrows it from there, so this proof
+        // clones `LaneState` once (inside the store) rather than twice — the
+        // remaining clone is the store's own and is the buffer resharding's to
+        // remove (issue #1792 item 3; `verified.{new_bytes,amount}` are `Copy`, so
+        // the partial move leaves them readable below).
+        guard.state = verified.next_state;
         guard.bytes_delivered_cumulative = verified.new_bytes;
         // This stream now knows which chain the payer is metering against, so a
         // bare reveal arriving on it afterwards is placeable. A sealed voucher
@@ -275,7 +280,7 @@ impl ClientHandler {
         let (new_credited, credited_bytes) =
             credit_advance(guard.paid_credited, delta_bytes, verified.new_bytes)?;
         guard.paid_credited = new_credited;
-        if let Err(e) = self.channel_state_store.record(&verified.next_state) {
+        if let Err(e) = self.channel_state_store.record(&guard.state) {
             drop(guard);
             return Err(anyhow::anyhow!("lane store record failed: {e}"));
         }
@@ -399,7 +404,12 @@ impl ClientHandler {
         }
 
         let owed_bytes = next_state.owed_bytes();
-        guard.state = next_state.clone();
+        // Compute the receipt amount (an O(1) read) BEFORE moving the candidate
+        // into the lane, so the move can avoid a second full `LaneState` clone
+        // this reveal (issue #1792 item 3). The store's own clone inside `record`
+        // remains, to be removed with the buffer resharding.
+        let amount = u64::try_from(next_state.owed()).unwrap_or(u64::MAX);
+        guard.state = next_state;
         guard.bytes_delivered_cumulative = owed_bytes;
         // The same rule #1 cap the voucher path uses, against the CHAIN-EXTENDED
         // frontier: a reveal is what pays for these bytes, so they are as settled
@@ -407,7 +417,7 @@ impl ClientHandler {
         let (new_credited, credited_bytes) =
             credit_advance(guard.paid_credited, delta_bytes, owed_bytes)?;
         guard.paid_credited = new_credited;
-        if let Err(e) = self.channel_state_store.record(&next_state) {
+        if let Err(e) = self.channel_state_store.record(&guard.state) {
             drop(guard);
             return Err(anyhow::anyhow!("lane store record failed: {e}"));
         }
@@ -429,8 +439,8 @@ impl ClientHandler {
         // does not reach that far. `credited_bytes` is what the lane actually
         // charged for, which is what an audit log must say (#248/#803). Gated the
         // same way, so a reveal that advanced the frontier but credited nothing
-        // against the cap logs no payment.
-        let amount = u64::try_from(next_state.owed()).unwrap_or(u64::MAX);
+        // against the cap logs no payment. `amount` is the lane's new total claim,
+        // computed above before the candidate moved into the lane.
         if credited_bytes > 0 {
             self.record_receipt(hash, credited_bytes, client_node_id, amount);
         }
