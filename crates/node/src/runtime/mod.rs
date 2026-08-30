@@ -1282,6 +1282,19 @@ async fn build_chain_and_handlers(
         U256::from(cfg.blockchain.pool_min_remaining_deposit_micro_usdc),
         Arc::clone(&shed_controller),
     );
+    // Coarse wall clock (issue #1792 item 4): a background task refreshes an
+    // atomic every 500 ms so the voucher-accept path's two under-lock reads — the
+    // capability-expiry gate and the `last_voucher_at` liveness stamp — cost a
+    // relaxed atomic load instead of a `SystemTime::now()` syscall inside the
+    // per-lane critical section. The refresher holds only a `Weak`, so it
+    // self-terminates when the handler (the clock's last owner) drops at
+    // shutdown and needs no stop handle.
+    let coarse_clock = Arc::new(crate::coarse_clock::CoarseClock::new());
+    crate::coarse_clock::CoarseClock::spawn_refresher(
+        &coarse_clock,
+        std::time::Duration::from_millis(500),
+    );
+    client_deps.coarse_clock = Some(coarse_clock);
     // Owner-signed capability intake (ADR 003 §Capability delegation): the serve
     // gate persists a presented capability so the redeemer registers the signer
     // on first redemption. Same redb file every lane record lives in.

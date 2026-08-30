@@ -901,6 +901,15 @@ pub struct ClientHandlerDeps {
     /// foreign hash — before any discovery, lane accounting, or spend. `true`
     /// (the default) preserves today's relay behavior.
     pub relay_foreign_namespaces: bool,
+    /// Coarse wall clock for the two reads the voucher-accept path takes under
+    /// the per-lane lock — the capability-expiry gate and the `last_voucher_at`
+    /// stamp (issue #1792 item 4). `None` (the default and every test) means the
+    /// handler builds its own unrefreshed clock, which reads the live wall clock
+    /// on every call — identical to the pre-#1792 behavior. The runtime sets
+    /// `Some` with a refresher running, so each of those two reads becomes a
+    /// relaxed atomic load instead of a `SystemTime::now()` syscall in the
+    /// critical section.
+    pub coarse_clock: Option<Arc<crate::coarse_clock::CoarseClock>>,
 }
 
 impl std::fmt::Debug for ClientHandlerDeps {
@@ -970,6 +979,7 @@ impl ClientHandlerDeps {
             )),
             operator_shares: crate::fee_shares::OperatorShares::new(0),
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
+            coarse_clock: None,
         }
     }
 }
@@ -1135,6 +1145,13 @@ pub struct ClientHandler {
     /// [`ClientHandlerDeps::relay_foreign_namespaces`]. Read by the gate at the
     /// top of `serve_stream`.
     relay_foreign_namespaces: bool,
+    /// Coarse wall clock for the voucher-accept path's two under-lock reads —
+    /// the capability-expiry gate and the `last_voucher_at` stamp (issue #1792
+    /// item 4). The runtime supplies one with a background refresher; a handler
+    /// built without one (tests) gets a fresh [`CoarseClock`](crate::coarse_clock::CoarseClock)
+    /// that reads the live wall clock on every call, so behavior is unchanged
+    /// there.
+    coarse_clock: Arc<crate::coarse_clock::CoarseClock>,
 }
 
 impl std::fmt::Debug for ClientHandler {
@@ -1249,6 +1266,11 @@ impl ClientHandler {
             warming_credit: deps.warming_credit,
             operator_shares: deps.operator_shares,
             relay_foreign_namespaces: deps.relay_foreign_namespaces,
+            // A handler with no clock wired (tests) reads the live wall clock on
+            // every call, exactly as before #1792 item 4.
+            coarse_clock: deps
+                .coarse_clock
+                .unwrap_or_else(|| Arc::new(crate::coarse_clock::CoarseClock::new())),
         })
     }
 
