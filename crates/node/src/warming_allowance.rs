@@ -56,7 +56,7 @@ use crate::stop_handle::StopHandle;
 /// The bonded upstream seller node a speculative warming buy is charged to.
 ///
 /// A 32-byte node identity, kept distinct at the type level from a content
-/// [`Hash`] so the serve-vindicated accounting can never transpose the two: the
+/// [`struct@Hash`] so the serve-vindicated accounting can never transpose the two: the
 /// seam passes a source and a hash side by side, and both are 32 bytes wide.
 /// [`WarmingAllowance`] keys every ledger and tag on this type, so a caller that
 /// swaps the arguments of [`WarmingAllowance::debit_speculative`] no longer
