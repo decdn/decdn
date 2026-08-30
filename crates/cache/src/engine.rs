@@ -321,7 +321,13 @@ struct Inner {
     /// in-memory-only set would silently let evicted content resume serving
     /// after `decdn run` is restarted, which is exactly the failure mode
     /// #279 needs to prevent.
-    evicted: Mutex<HashSet<Hash>>,
+    ///
+    /// Holds the set in an `ArcSwap` like [`Self::denied`] (#1789 item 5), so
+    /// the serve-path membership check in [`CacheEngine::is_evicted`] is a
+    /// lock-free load. The set is written only by [`CacheEngine::evict`] (an
+    /// `rcu` swap after the durable log append), so readers never block on the
+    /// rarer writer.
+    evicted: ArcSwap<HashSet<Hash>>,
     /// Probe-triggered eviction holds (#318, ADR 005 §Probe-triggered
     /// eviction hold). Maps a held hash to its hold *expiry* instant; a
     /// held hash is invisible to [`CacheEngine::eviction_candidates`] until
@@ -1179,7 +1185,7 @@ impl CacheEngine {
                 origin_probe_memo: Mutex::new(OriginProbeMemo::default()),
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
                 chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
-                evicted: Mutex::new(evicted),
+                evicted: ArcSwap::from(Arc::new(evicted)),
                 probe_holds: Mutex::new(HashMap::new()),
                 max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
                 frequency: ArcSwap::from_pointee(None),
@@ -2059,29 +2065,24 @@ impl CacheEngine {
     /// caller is the hash-mismatch path in pull-through, which executes on a
     /// request-serving worker that must not stall on disk I/O.
     pub async fn evict(&self, hash: Hash) -> CacheResult<()> {
-        // Pre-check under one lock acquisition: short-circuit on
+        // Lock-free pre-check on a single `ArcSwap` load: short-circuit on
         // already-evicted (a sequential repeat-evict of the same hash returns
         // here and never re-appends) and reject on cap (DoS bound on an
         // unbounded public-ish surface). Both checks are best-effort against
-        // concurrency: the lock is released before the append below, so two
-        // evict() calls racing the *same* new hash can each pass and append a
-        // duplicate `evicted.log` line — harmless, since replay folds the log
-        // into a `HashSet`. The cap is likewise a soft DoS bound, not a hard
-        // invariant — going +ε over by a handful of races is fine.
-        {
-            let guard = self
-                .inner
-                .evicted
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if guard.contains(&hash) {
-                return Ok(());
-            }
-            if guard.len() >= MAX_EVICTED_ENTRIES {
-                return Err(CacheError::EvictionLimitExceeded {
-                    limit: MAX_EVICTED_ENTRIES,
-                });
-            }
+        // concurrency: the load is released before the durable append below,
+        // so two evict() calls racing the *same* new hash can each pass and
+        // append a duplicate `evicted.log` line — harmless, since replay
+        // folds the log into a `HashSet`. The cap is likewise a soft DoS
+        // bound, not a hard invariant — going +ε over by a handful of races
+        // is fine.
+        let evicted = self.inner.evicted.load();
+        if evicted.contains(&hash) {
+            return Ok(());
+        }
+        if evicted.len() >= MAX_EVICTED_ENTRIES {
+            return Err(CacheError::EvictionLimitExceeded {
+                limit: MAX_EVICTED_ENTRIES,
+            });
         }
 
         // Persist FIRST, then commit to the in-memory set: a crash between
@@ -2105,18 +2106,17 @@ impl CacheEngine {
                 CacheError::Store(anyhow::Error::from(err).context("persist eviction"))
             })?;
 
-        // `unwrap_or_else(PoisonError::into_inner)` rather than the project's
-        // usual `if let Ok(...) = lock()` pattern: a poisoned lock here
-        // would silently skip the in-memory commit and the node would keep
-        // serving the supposedly-evicted blob until the next restart loaded
-        // `evicted.log`. For a DMCA takedown that is the canonical worst
-        // case. Recovering the inner guard preserves the contract that
-        // `evict() -> Ok(())` implies the in-memory set was updated.
-        self.inner
-            .evicted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(hash);
+        // Commit to the in-memory set via an `rcu` swap (#1789 item 5): the
+        // new set is a clone of the current snapshot with `hash` added, and is
+        // atomically swapped in. Unlike a `Mutex` write this can never be
+        // observed returning `Ok(())` with the set still excluding `hash`,
+        // and unlike a poisoned mutex there is no "poisoned ⇒ still serving"
+        // fallback to worry about.
+        self.inner.evicted.rcu(|set| {
+            let mut next = HashSet::clone(set);
+            next.insert(hash);
+            next
+        });
         self.inner.access_times.remove(&hash);
         self.inner
             .segments
@@ -2242,9 +2242,9 @@ impl CacheEngine {
     /// without a follow-up [`Self::has`] call.
     ///
     /// Lock structure: the three in-memory probes hit independent
-    /// synchronization primitives — `evicted` (`Mutex<HashSet>`),
-    /// `access_times` (`DashMap`, one shard), and `pinned` (`ArcSwap`).
-    /// Each is held for an O(1) lookup; merging them into a single
+    /// synchronization primitives — `evicted` (`ArcSwap`, lock-free since
+    /// #1789 item 5), `access_times` (`DashMap`, one shard), and `pinned`
+    /// (`ArcSwap`). Each is an O(1) lookup; merging them into a single
     /// lock acquisition would require either combining the underlying
     /// data structures (a much larger refactor that would couple
     /// unrelated invariants) or holding a coarser lock across the
@@ -2299,17 +2299,15 @@ impl CacheEngine {
 
     /// Has this hash been logically evicted via [`Self::evict`]?
     ///
-    /// Recovers from a poisoned mutex via [`PoisonError::into_inner`]
-    /// rather than treating poison as "not evicted": a poisoned lock
-    /// returning `false` here would let evicted DMCA-flagged content
-    /// resume serving — exactly what `<cache_dir>/evicted.log`'s
-    /// durability guarantee was designed to prevent.
+    /// Lock-free since #1789 item 5: an `ArcSwap` load and a hash-set probe,
+    /// so the serve-path gate never takes a mutex. The write side only ever
+    /// swaps in a superset (via [`Self::evict`]'s `rcu`), so an evicted
+    /// hash is observed evicted by every reader that linearizes after the
+    /// swap — there is no "poisoned lock returns not-evicted" failure mode to
+    /// guard against, which was the reason the `Mutex` needed
+    /// `PoisonError::into_inner` recovery.
     pub fn is_evicted(&self, hash: Hash) -> bool {
-        self.inner
-            .evicted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(&hash)
+        self.inner.evicted.load().contains(&hash)
     }
 
     /// Set the probe-hold budget cap from `cache.max_probe_holds` (ADR 005
@@ -7396,6 +7394,76 @@ mod tests {
             lines_first == 1 && lines_third == 1,
             "expected 1 log line both times, got first={lines_first}, third={lines_third}"
         );
+        Ok(())
+    }
+
+    /// The lock-free `evicted` set (#1789 item 5) must never present a torn
+    /// view to concurrent readers. `evict` swaps in a strict superset via
+    /// `rcu`, so a hash a reader once observed evicted stays evicted for the
+    /// rest of that reader's life. Readers run on real worker threads, read
+    /// until the writer finishes (or a hard iteration cap), and so exercise
+    /// `is_evicted` in parallel with `rcu` writes; a buggy lock-free
+    /// wrapper (a torn read, a partial publish that lets a hash flip back to
+    /// not-evicted) surfaces here as a reader seeing an observed hash
+    /// revert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evicted_set_stays_consistent_under_concurrent_evict() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = Arc::new(empty_engine(tmp.path()).await?);
+        let hashes: Vec<Hash> = (0..64)
+            .map(|i| Hash::new(format!("concurrent-evict-{i}").as_bytes()))
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writer: tokio::task::JoinHandle<anyhow::Result<()>> = {
+            let engine = Arc::clone(&engine);
+            let hashes = hashes.clone();
+            tokio::spawn(async move {
+                for h in &hashes {
+                    engine.evict(*h).await?;
+                }
+                Ok(())
+            })
+        };
+
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let engine = Arc::clone(&engine);
+            let hashes = hashes.clone();
+            let stop = Arc::clone(&stop);
+            readers.push(tokio::spawn(async move {
+                let mut saw_evicted = HashSet::new();
+                for _ in 0..50_000 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    for h in &hashes {
+                        if engine.is_evicted(*h) {
+                            saw_evicted.insert(*h);
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Ok::<_, anyhow::Error>(saw_evicted)
+            }));
+        }
+
+        writer
+            .await
+            .map_err(|e| anyhow::anyhow!("writer task panicked: {e}"))??;
+        stop.store(true, Ordering::Relaxed);
+
+        for r in readers {
+            let saw = r
+                .await
+                .map_err(|e| anyhow::anyhow!("reader task panicked: {e}"))??;
+            for h in &saw {
+                anyhow::ensure!(
+                    engine.is_evicted(*h),
+                    "reader once saw {h} evicted but it is not evicted at the end — torn view"
+                );
+            }
+        }
         Ok(())
     }
 
