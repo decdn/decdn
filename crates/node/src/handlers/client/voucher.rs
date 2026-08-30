@@ -358,40 +358,60 @@ impl ClientHandler {
             return Ok(VoucherStop::Rejected);
         };
 
+        // Optimistic PayWord walk (issue #1792 item 5). Rule 2 still holds — the
+        // frontier a reveal walks from is the frontier it advances, and two
+        // streams that both advanced the same frontier would lose one reveal — so
+        // the advance itself stays atomic under the lock. What moves OFF the lock
+        // is the walk: snapshot the frontier (O(1), hashes nothing), release the
+        // lock, run the up-to-255-keccak `verify_forward` with no lane contention,
+        // then re-lock and apply. `advance_preimage_verified` trusts that walk
+        // while the frontier is unchanged and re-hashes under the lock on the rare
+        // same-lane race, so a payer releasing sparse indices can no longer make
+        // sibling streams wait out its keccak walk (ADR 005 §Payment lanes). A
+        // reveal at or below the frontier hashes nothing at all, on either path.
+        let index = preimage.index;
+        let reveal = B256::from(preimage.preimage);
+        let walked = {
+            let guard = lane.lock().await;
+            guard.state.preimage_frontier(root, index)
+        };
+        let walked_ok = match walked {
+            Some((verified_index, tip)) => {
+                decdn_incentive::chain::verify_forward(reveal, index - verified_index, tip)
+            }
+            // Nothing to walk (folds nothing); the value is unused — the apply
+            // returns the covered outcome before it consults `walked_ok`.
+            None => false,
+        };
+
         let mut guard = lane.lock().await;
-        // Rule 2, under the lock for the same reason the voucher path is: the
-        // frontier this walks from is the frontier it advances, and two streams
-        // reading the same frontier and both advancing would lose one reveal.
-        // The walk itself is `index − verified` keccaks, bounded at 255 by the
-        // index type, and zero for a reveal at or below the frontier.
-        let (next_state, applied) =
-            match guard
-                .state
-                .advance_preimage(root, preimage.index, B256::from(preimage.preimage))
-            {
-                Ok(advanced) => advanced,
-                Err(e) => {
-                    let Ok(reason) = voucher_reject_reason(&e) else {
-                        drop(guard);
-                        return Err(anyhow::anyhow!(
-                            "advance_preimage touches no store; unexpected RetrySignal"
-                        ));
-                    };
-                    // A hash-chain mismatch is terminal and carries no watermark
-                    // bundle: a preimage has no signature of its own, and a payment
-                    // watermark cannot repair a wrong seed or a wrong chain. But this
-                    // path can also raise `SpendingCapExhausted`, when the reveal
-                    // would push the claim past the capability's cap — and that one
-                    // IS recoverable, by exactly the route a voucher takes: the payer
-                    // reads the bundle, raises the cap, and resumes. So ask the same
-                    // gate the voucher path asks rather than assuming; it answers
-                    // `None` for every chain-specific reason on its own.
-                    let bundle = Self::watermark_bundle_for_reject(reason, &guard.state);
+        let (next_state, applied) = match guard
+            .state
+            .advance_preimage_verified(root, index, reveal, walked, walked_ok)
+        {
+            Ok(advanced) => advanced,
+            Err(e) => {
+                let Ok(reason) = voucher_reject_reason(&e) else {
                     drop(guard);
-                    self.write_reject(send, reason, bundle).await?;
-                    return Ok(VoucherStop::Rejected);
-                }
-            };
+                    return Err(anyhow::anyhow!(
+                        "advance_preimage_verified touches no store; unexpected RetrySignal"
+                    ));
+                };
+                // A hash-chain mismatch is terminal and carries no watermark
+                // bundle: a preimage has no signature of its own, and a payment
+                // watermark cannot repair a wrong seed or a wrong chain. But this
+                // path can also raise `SpendingCapExhausted`, when the reveal
+                // would push the claim past the capability's cap — and that one
+                // IS recoverable, by exactly the route a voucher takes: the payer
+                // reads the bundle, raises the cap, and resumes. So ask the same
+                // gate the voucher path asks rather than assuming; it answers
+                // `None` for every chain-specific reason on its own.
+                let bundle = Self::watermark_bundle_for_reject(reason, &guard.state);
+                drop(guard);
+                self.write_reject(send, reason, bundle).await?;
+                return Ok(VoucherStop::Rejected);
+            }
+        };
 
         // A reveal that advanced nothing — at or below the frontier, or naming a
         // superseded epoch — is benign, exactly like an already-satisfied
