@@ -461,7 +461,9 @@ impl LaneState {
     /// # Errors
     ///
     /// [`PoolError::BadPreimage`] when the value does not reach the tracked tip
-    /// in `index − verified` steps.
+    /// in `index − verified` steps; [`PoolError::CapExceeded`] when the reveal
+    /// would push the claim past the capability's cap (both raised by
+    /// [`Self::advance_preimage_verified`], which this delegates to).
     pub fn advance_preimage(
         &self,
         root: B256,
