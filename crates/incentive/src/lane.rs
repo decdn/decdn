@@ -468,13 +468,82 @@ impl LaneState {
         index: u8,
         preimage: B256,
     ) -> Result<(Self, PreimageApplied), PoolError> {
+        // The single-lock convenience form: snapshot the frontier, hash forward,
+        // and apply, all against the same `self`. The node's serve path instead
+        // splits these so the keccak walk runs OUTSIDE the per-lane lock (issue
+        // #1792 item 5, [`Self::preimage_frontier`] /
+        // [`Self::advance_preimage_verified`]); this is what the incentive-crate
+        // tests exercise and what any caller without a lock to shed still uses.
+        let walked = self.preimage_frontier(root, index);
+        let walked_ok = match walked {
+            Some((verified_index, tip)) => {
+                crate::chain::verify_forward(preimage, index - verified_index, tip)
+            }
+            // No walk is needed (folds nothing); `advance_preimage_verified`
+            // returns the covered outcome before it consults `walked_ok`.
+            None => false,
+        };
+        self.advance_preimage_verified(root, index, preimage, walked, walked_ok)
+    }
+
+    /// The frontier a reveal at `index` on epoch `root` must hash forward to, or
+    /// `None` when the reveal folds nothing — the root is not the one this lane
+    /// meters against, or `index` sits at or below the tracked frontier.
+    ///
+    /// The seller-side optimistic-walk snapshot (issue #1792 item 5): read this
+    /// under the per-lane lock (it is O(1) and hashes nothing), run
+    /// [`crate::chain::verify_forward`] OUTSIDE the lock against the returned
+    /// `(verified_index, tip)`, then re-lock and commit through
+    /// [`Self::advance_preimage_verified`]. This keeps the up-to-255-keccak walk
+    /// off the lock a payer can otherwise stretch with sparse indices — the same
+    /// discipline the buyer half keeps off its issuance lock.
+    #[must_use]
+    pub fn preimage_frontier(&self, root: B256, index: u8) -> Option<(u8, B256)> {
+        let target = self.chain_slot(root)?;
+        (index > target.verified_index).then_some((target.verified_index, target.tip))
+    }
+
+    /// Fold a preimage whose forward walk the caller ALREADY ran (off the lane
+    /// lock) into the lane, returning the advanced successor and what it added.
+    ///
+    /// `walked` is the `(verified_index, tip)` the caller hashed against —
+    /// [`Self::preimage_frontier`]'s return — and `walked_ok` is what
+    /// [`crate::chain::verify_forward`] answered for it. The caller's result is
+    /// trusted ONLY while the lane's live frontier still equals `walked`: a
+    /// concurrent same-lane sibling that advanced the chain in the gap moved the
+    /// frontier, so this re-hashes against the live tip under the lock (the rare
+    /// race). A reveal a sibling already covered folds nothing, exactly as
+    /// [`Self::advance_preimage`]'s at-or-below-frontier case does. Every other
+    /// check — the tracked-root gate and the spending-cap gate — is O(1) and
+    /// stays under the lock.
+    ///
+    /// # Errors
+    ///
+    /// [`PoolError::BadPreimage`] when the value does not reach the live tip in
+    /// `index − verified` steps; [`PoolError::CapExceeded`] when the reveal would
+    /// push the claim past the capability's cap.
+    pub fn advance_preimage_verified(
+        &self,
+        root: B256,
+        index: u8,
+        preimage: B256,
+        walked: Option<(u8, B256)>,
+        walked_ok: bool,
+    ) -> Result<(Self, PreimageApplied), PoolError> {
         let Some(target) = self.chain_slot(root) else {
             return Ok((self.clone(), PreimageApplied::ZERO));
         };
         if index <= target.verified_index {
             return Ok((self.clone(), PreimageApplied::ZERO));
         }
-        if !crate::chain::verify_forward(preimage, index - target.verified_index, target.tip) {
+        // Trust the off-lock walk only if the frontier it hashed against is still
+        // current; otherwise (a sibling advanced the lane, or the caller walked
+        // nothing) re-hash against the live tip here, under the lock.
+        let verified = match walked {
+            Some((wv, wtip)) if wv == target.verified_index && wtip == target.tip => walked_ok,
+            _ => crate::chain::verify_forward(preimage, index - target.verified_index, target.tip),
+        };
+        if !verified {
             return Err(PoolError::BadPreimage {
                 index,
                 verified: target.verified_index,
@@ -1392,6 +1461,146 @@ mod tests {
         let (next, applied) = state.advance_preimage(root(), 7, reveal(7))?;
         anyhow::ensure!(applied.amount_delta() == U256::from(7 * PRICE));
         anyhow::ensure!(next.owed() == U256::from(1_000 + 7 * PRICE));
+        Ok(())
+    }
+
+    // --- Optimistic off-lock PayWord walk (issue #1792 item 5) ---------------
+
+    /// `preimage_frontier` names the `(verified_index, tip)` a reveal must hash
+    /// to, and reports `None` for anything that folds nothing — a covered index,
+    /// or a root the lane does not meter.
+    #[test]
+    fn preimage_frontier_names_the_walk_target_or_none() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        // Fresh epoch: index 3 walks from the root at index 0.
+        anyhow::ensure!(state.preimage_frontier(root(), 3) == Some((0, root())));
+        // A root this lane does not track folds nothing.
+        anyhow::ensure!(
+            state
+                .preimage_frontier(B256::repeat_byte(0xEE), 3)
+                .is_none()
+        );
+
+        let (state, _) = state.advance_preimage(root(), 5, reveal(5))?;
+        // At/below the frontier is covered — no walk.
+        anyhow::ensure!(state.preimage_frontier(root(), 5).is_none());
+        anyhow::ensure!(state.preimage_frontier(root(), 3).is_none());
+        // Above it walks from the live tip at the live index.
+        anyhow::ensure!(state.preimage_frontier(root(), 9) == Some((5, reveal(5))));
+        Ok(())
+    }
+
+    /// The happy path: a walk run against the CURRENT frontier is trusted, and
+    /// `advance_preimage_verified` yields exactly what the single-lock
+    /// `advance_preimage` does.
+    #[test]
+    fn a_verified_walk_against_the_live_frontier_matches_the_single_lock_form() -> anyhow::Result<()>
+    {
+        let (signer, mut state, domain, store) = fixture();
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        let walked = state.preimage_frontier(root(), 4);
+        let (wv, wtip) = walked.expect("index 4 needs a walk on a fresh epoch");
+        let ok = crate::chain::verify_forward(reveal(4), 4 - wv, wtip);
+        anyhow::ensure!(ok, "the honest reveal must verify");
+
+        let (opt_next, opt_applied) =
+            state.advance_preimage_verified(root(), 4, reveal(4), walked, ok)?;
+        let (ref_next, ref_applied) = state.advance_preimage(root(), 4, reveal(4))?;
+        anyhow::ensure!(
+            opt_next == ref_next,
+            "optimistic apply diverged from the single-lock form"
+        );
+        anyhow::ensure!(opt_applied.amount_delta() == ref_applied.amount_delta());
+        anyhow::ensure!(opt_next.chain().verified_index == 4);
+        Ok(())
+    }
+
+    /// The race: a sibling advanced the lane while this reveal was hashing, so the
+    /// snapshot `walked` no longer matches the live frontier. The stale walk is
+    /// discarded and re-hashed under the lock against the live tip, so the reveal
+    /// still lands correctly — the apply is never wrong, only occasionally re-walks.
+    #[test]
+    fn a_stale_walk_is_re_hashed_against_the_live_frontier() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        // This stream snapshots the fresh frontier for a walk to index 5.
+        let stale = state.preimage_frontier(root(), 5);
+        anyhow::ensure!(stale == Some((0, root())));
+        let stale_ok = crate::chain::verify_forward(reveal(5), 5, root());
+
+        // A sibling advances the lane to index 3 before this stream re-locks.
+        let (advanced, _) = state.advance_preimage(root(), 3, reveal(3))?;
+
+        // Applied against the ADVANCED lane, the stale snapshot no longer matches
+        // the live frontier `(3, reveal(3))`, so the value is re-hashed under the
+        // lock and the reveal still lands at index 5.
+        let (next, applied) =
+            advanced.advance_preimage_verified(root(), 5, reveal(5), stale, stale_ok)?;
+        anyhow::ensure!(next.chain().verified_index == 5);
+        anyhow::ensure!(next.chain().tip == reveal(5));
+        // It credits only the 5→3 = 2 steps the lane had not yet covered.
+        anyhow::ensure!(applied.amount_delta() == U256::from(2 * PRICE));
+        Ok(())
+    }
+
+    /// Safety of the trust gate: a `walked_ok = true` claimed against a STALE
+    /// frontier cannot smuggle in a bad preimage. Because the snapshot no longer
+    /// matches the live frontier, the caller's word is ignored and the value is
+    /// re-hashed under the lock — where the wrong preimage is caught.
+    #[test]
+    fn a_true_verdict_on_a_stale_frontier_cannot_bypass_the_walk() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        let stale = state.preimage_frontier(root(), 5);
+        let (advanced, _) = state.advance_preimage(root(), 3, reveal(3))?;
+
+        // A wrong preimage, but the caller lies that it verified — against the now
+        // stale snapshot. The re-hash under the lock rejects it anyway.
+        let foreign = B256::repeat_byte(0xAB);
+        let err = err_of(advanced.advance_preimage_verified(root(), 5, foreign, stale, true))?;
+        anyhow::ensure!(
+            matches!(err, PoolError::BadPreimage { .. }),
+            "a stale true verdict must not bypass the walk: {err:?}"
+        );
+        Ok(())
+    }
+
+    /// A covered reveal folds nothing regardless of what the caller walked — the
+    /// tracked-root and at-or-below-frontier gates run before `walked_ok` is
+    /// consulted, so a `None` walk with `false` verdict is still benign.
+    #[test]
+    fn a_covered_reveal_ignores_the_walk_verdict() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        let (advanced, _) = state.advance_preimage(root(), 5, reveal(5))?;
+        let (next, applied) =
+            advanced.advance_preimage_verified(root(), 3, reveal(3), None, false)?;
+        anyhow::ensure!(!applied.advanced(), "a covered reveal folds nothing");
+        anyhow::ensure!(
+            next.chain().verified_index == 5,
+            "the frontier is untouched"
+        );
         Ok(())
     }
 
