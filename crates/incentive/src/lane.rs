@@ -1508,7 +1508,9 @@ mod tests {
             &store,
         )?;
         let walked = state.preimage_frontier(root(), 4);
-        let (wv, wtip) = walked.expect("index 4 needs a walk on a fresh epoch");
+        let Some((wv, wtip)) = walked else {
+            anyhow::bail!("index 4 needs a walk on a fresh epoch");
+        };
         let ok = crate::chain::verify_forward(reveal(4), 4 - wv, wtip);
         anyhow::ensure!(ok, "the honest reveal must verify");
 
