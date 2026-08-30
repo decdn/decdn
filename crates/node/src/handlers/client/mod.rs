@@ -50,6 +50,7 @@ use decdn_protocol::{
     ALPN_CLIENT, APP_ERR_RATE_LIMITED, CHUNK_BYTES, FrameError, decode_message, encode_message,
     is_unknown_variant, read_frame, write_frame,
 };
+use indexmap::IndexMap;
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
@@ -985,6 +986,96 @@ impl ClientHandlerDeps {
 }
 
 /// `cdn/client/v1` paid-delivery handler.
+/// Capacity of the capability-verification cache (#1789 item 2). Bounded so a
+/// flood of distinct capability sends cannot grow it without limit; `ecrecover`
+/// is expensive enough that a 1024-entry cache still pays for itself across a
+/// client that re-sends the same capability on every request.
+const CAPABILITY_VERIFY_CACHE_CAPACITY: usize = 1024;
+
+/// Cached outcome of a capability owner recovery: the recovered owner, or
+/// `Invalid` for a signature that does not recover (high-`s`, bad recovery
+/// id). Both are deterministic per `(digest, signature)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityVerifyOutcome {
+    /// `ecrecover` succeeded and recovered this owner.
+    Owner(Address),
+    /// The signature is malformed and recovers nothing (deterministic).
+    Invalid,
+}
+
+/// Bounded LRU cache of capability owner-recovery outcomes, keyed by the full
+/// signed material `(EIP-712 signing hash, signature bytes)`.
+///
+/// Ownership verification in [`ClientHandler::intake_capability`] runs
+/// `ecrecover` on every capability-carrying request; `ecrecover` is a pure
+/// function of `(digest, signature)`, so the same signed material always
+/// recovers the same owner and the result can be cached deterministically.
+/// Entry is only ever made for the canonical 65-byte EOA signature shape the
+/// intake path already accepts; an `Invalid` value means "this signature is
+/// malformed" — also deterministic, also cached, so a repeated malformed
+/// capability is not re-recovered either.
+///
+/// Never consulted across a network hop: a `get` is a hash-lookup + an
+/// `IndexMap` shift under one short lock, mirroring the other bounded LRU
+/// caches (`dht::negative_cache`).
+#[derive(Debug)]
+struct CapabilityVerifyCache {
+    /// `(signing_hash, signature bytes)` → recovered owner or `Invalid`.
+    /// LRU order: index 0 is the least-recently-used end; a hit moves its key
+    /// to the back, and eviction pops from the front.
+    entries: IndexMap<(B256, [u8; 65]), CapabilityVerifyOutcome>,
+    cap: usize,
+}
+
+impl Default for CapabilityVerifyCache {
+    fn default() -> Self {
+        Self::with_capacity(CAPABILITY_VERIFY_CACHE_CAPACITY)
+    }
+}
+
+impl CapabilityVerifyCache {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            entries: IndexMap::with_capacity(cap),
+            cap: cap.max(1),
+        }
+    }
+
+    /// The cached recovery outcome for `(signing_hash, signature)`, or `None`
+    /// on a miss. A hit moves the key to the MRU end.
+    fn get(&mut self, signing_hash: B256, signature: [u8; 65]) -> Option<CapabilityVerifyOutcome> {
+        let key = (signing_hash, signature);
+        let outcome = self.entries.shift_remove(&key)?;
+        self.entries.insert(key, outcome);
+        Some(outcome)
+    }
+
+    /// Record `outcome` for `(signing_hash, signature)`, evicting the LRU
+    /// entry when full so the map never exceeds `cap`.
+    fn insert(
+        &mut self,
+        signing_hash: B256,
+        signature: [u8; 65],
+        outcome: CapabilityVerifyOutcome,
+    ) {
+        let key = (signing_hash, signature);
+        self.entries.shift_remove(&key);
+        self.entries.insert(key, outcome);
+        while self.entries.len() > self.cap {
+            if let Some(least_recent) = self.entries.keys().next().copied() {
+                self.entries.shift_remove(&least_recent);
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 pub struct ClientHandler {
     node_id: PublicKey,
     metrics: Arc<Metrics>,
@@ -1033,6 +1124,11 @@ pub struct ClientHandler {
     /// overwrites a fresher lane count with its own staler read. Held across a map
     /// length read and one gauge set, never across an `.await`.
     lane_metrics_refresh: Mutex<()>,
+    /// Bounded cache of capability owner-recovery outcomes keyed by the full
+    /// signed material (#1789 item 2), so a client that re-sends the same
+    /// capability on every request skips the per-request `ecrecover` in
+    /// [`ClientHandler::intake_capability`].
+    capability_verify_cache: std::sync::Mutex<CapabilityVerifyCache>,
     /// Per-pool floor-credit accumulator (ADR 003 §Pool solvency). Guards an O(1)
     /// map only and is never held across `.await` — a plain `std::sync::Mutex`, so
     /// a [`FloorReservation`]'s `Drop` can reconcile under it (a tokio mutex cannot
@@ -1245,6 +1341,7 @@ impl ClientHandler {
             pool_view: deps.pool_view,
             lanes: Arc::new(map),
             lane_metrics_refresh: Mutex::new(()),
+            capability_verify_cache: std::sync::Mutex::new(CapabilityVerifyCache::default()),
             pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
             floor_loss_store: deps.floor_loss_store,
             redeem_hint: deps.redeem_hint,
@@ -1366,6 +1463,44 @@ impl ClientHandler {
     /// fails the stream. Lane registration is idempotent — a re-observed grant for
     /// an already-tracked lane does NOT reset the accepted-voucher watermark
     /// (#527); the lane's `cap`/`expiry` are set once at first registration.
+    /// Verify an owner-signed capability's EIP-712 owner signature against the
+    /// pool owner (ADR 003 §Capability delegation), short-circuiting on the
+    /// capability-verification cache (#1789 item 2).
+    ///
+    /// `ecrecover` is a pure function of `(digest, signature)`, so the
+    /// recovered owner for a given signed material is deterministic and can be
+    /// cached safely: [`Self::capability_verify_cache`] maps the full
+    /// `(signing hash, signature bytes)` to the recovered owner, and a client
+    /// that re-sends the same capability (the documented recovery path) hits
+    /// the cache instead of paying a fresh `ecrecover` per request. A
+    /// tampered signature is a different key, so it can never be served a
+    /// stale cached owner.
+    fn verify_capability_owner(&self, grant: &SignedCapability, pool_owner: Address) -> bool {
+        let domain = &self.voucher_domain;
+        let signing_hash = grant.capability.signing_hash(domain);
+        let signature = grant.signature.as_bytes();
+        let recovered = {
+            let mut cache = self
+                .capability_verify_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = cache.get(signing_hash, signature) {
+                cached
+            } else {
+                let outcome = match grant.recover_owner(domain) {
+                    Ok(owner) => CapabilityVerifyOutcome::Owner(owner),
+                    Err(_) => CapabilityVerifyOutcome::Invalid,
+                };
+                cache.insert(signing_hash, signature, outcome);
+                outcome
+            }
+        };
+        match recovered {
+            CapabilityVerifyOutcome::Owner(owner) => owner == pool_owner,
+            CapabilityVerifyOutcome::Invalid => false,
+        }
+    }
+
     #[allow(clippy::cognitive_complexity)] // linear verify → register → persist sequence.
     async fn intake_capability(
         &self,
@@ -1402,8 +1537,11 @@ impl ClientHandler {
             },
             signature,
         };
-        if let Err(e) = grant.verify_owner(pool_owner, &self.voucher_domain) {
-            tracing::debug!(%pool_id, %signer, error = %e, "dropping capability: owner verification failed");
+        // #1789 item 2: the ecrecover is cached keyed by the full signed
+        // material, so a client that re-sends the same capability on every
+        // request (the documented recovery path for a lost lane) skips it.
+        if !self.verify_capability_owner(&grant, pool_owner) {
+            tracing::debug!(%pool_id, %signer, "dropping capability: owner verification failed");
             return;
         }
 
@@ -2951,6 +3089,147 @@ mod tests {
         assert!(
             handler.lanes.contains_key(&lane_key),
             "a correct-owner capability registers its lane so vouchers can be served"
+        );
+    }
+
+    /// #1789 item 2: the verification cache returns the cached recovery for an
+    /// identical repeat, treats a tampered signature as a miss (ecrecover is
+    /// keyed on the full signed material, so a different signature can never
+    /// be served a stale owner), and never lets the map exceed its capacity.
+    #[test]
+    fn capability_verify_cache_repeat_hits_tampered_misses_and_is_bounded() {
+        let mut cache = CapabilityVerifyCache::with_capacity(2);
+        let hash = B256::repeat_byte(0xAB);
+        let sig = [0x10u8; 65];
+        let owner = Address::repeat_byte(0x42);
+        assert_eq!(cache.get(hash, sig), None, "a cold lookup misses");
+        cache.insert(hash, sig, CapabilityVerifyOutcome::Owner(owner));
+        assert_eq!(
+            cache.get(hash, sig),
+            Some(CapabilityVerifyOutcome::Owner(owner)),
+            "an identical repeat hits the cache"
+        );
+        let tampered = {
+            let mut bytes = sig;
+            bytes[0] ^= 0x01;
+            bytes
+        };
+        assert_eq!(
+            cache.get(hash, tampered),
+            None,
+            "a tampered signature is a different key, never served from cache"
+        );
+        cache.insert(hash, tampered, CapabilityVerifyOutcome::Invalid);
+        // Past capacity the LRU half is evicted; the live halves stay.
+        let other_hash = B256::repeat_byte(0xCD);
+        cache.insert(
+            other_hash,
+            [0x20u8; 65],
+            CapabilityVerifyOutcome::Owner(Address::repeat_byte(0x99)),
+        );
+        assert_eq!(cache.len(), 2, "capacity is never exceeded");
+    }
+
+    /// #1789 item 2: a client that re-sends the same capability (the
+    /// documented recovery path) hits the verification cache instead of paying a
+    /// fresh `ecrecover`, and the repeated persist still dedups to one sink
+    /// write (item 1). A tampered re-send — same payload, different signature
+    /// — misses the cache, re-verifies, and is dropped.
+    #[allow(clippy::similar_names)] // signer/signed/signature pair up clearly here
+    #[tokio::test]
+    async fn repeat_capability_send_hits_verify_cache_and_dedups_the_persist() {
+        let metrics = Arc::new(Metrics::new());
+        let owner = PrivateKeySigner::random();
+        let (handler, recorded, _dir) =
+            handler_with_capability_intake(&metrics, owner.address()).await;
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let pool_id = B256::repeat_byte(0x12);
+        let signer = Address::repeat_byte(0x34);
+        let signed = Capability {
+            signer,
+            spending_cap: U256::from(1_000_000u64),
+            pool_id,
+            expiry: 1_900_000_000,
+        }
+        .sign(&owner, &domain)
+        .expect("sign capability");
+        let wire = decdn_protocol::client::WireCapability {
+            spending_cap: signed.capability.spending_cap.to_be_bytes(),
+            expiry: signed.capability.expiry,
+            owner_signature: signed.signature.as_bytes().to_vec(),
+        };
+
+        handler
+            .intake_capability(pool_id, signer, Some(owner.address()), &wire)
+            .await;
+        handler
+            .intake_capability(pool_id, signer, Some(owner.address()), &wire)
+            .await;
+        let cache_len = handler
+            .capability_verify_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(
+            cache_len, 1,
+            "the identical repeat must hit the verification cache"
+        );
+        // The fake sink records every call — the repeat-dedup itself sits in the
+        // real store's `put_capability` (covered by `channel_store` tests) — so
+        // what this pins is that repeated intake stays correct and cheap, with
+        // one cache entry for the grant.
+        assert_eq!(
+            recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2,
+            "both intakes reach the sink; the store layer dedups the write"
+        );
+        assert!(handler.lanes.contains_key(&LaneKey {
+            pool_id,
+            signer,
+            provider: handler.eth_signer.address(),
+        }));
+
+        // A tampered re-send: the SAME capability payload signed by a
+        // different key — a well-formed signature that is a distinct cache
+        // key, so it is a miss, re-verifies, recovers a different owner, and
+        // is dropped rather than accepted on the strength of the earlier
+        // grant.
+        let other = PrivateKeySigner::random();
+        let forged = Capability {
+            signer,
+            spending_cap: signed.capability.spending_cap,
+            pool_id,
+            expiry: signed.capability.expiry,
+        }
+        .sign(&other, &domain)
+        .expect("sign capability");
+        let forged_wire = decdn_protocol::client::WireCapability {
+            spending_cap: forged.capability.spending_cap.to_be_bytes(),
+            expiry: forged.capability.expiry,
+            owner_signature: forged.signature.as_bytes().to_vec(),
+        };
+        handler
+            .intake_capability(pool_id, signer, Some(owner.address()), &forged_wire)
+            .await;
+        assert_eq!(
+            handler
+                .capability_verify_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2,
+            "the forged signature records its own (new) key"
+        );
+        assert_eq!(
+            recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2,
+            "the forged re-send is dropped before the sink; no extra write"
         );
     }
 
