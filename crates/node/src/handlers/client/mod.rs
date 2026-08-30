@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -1119,11 +1119,14 @@ pub struct ClientHandler {
     /// (ADR 003 §concurrent streams). No call site holds a map entry across an
     /// `.await`, so lane lookup never blocks an unrelated lane's admission.
     lanes: Arc<DashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>>>,
-    /// Serializes `refresh_lane_metrics`, so two concurrent lane-lifecycle calls
-    /// cannot publish the gauge out of order — without it the slower task
-    /// overwrites a fresher lane count with its own staler read. Held across a map
-    /// length read and one gauge set, never across an `.await`.
-    lane_metrics_refresh: Mutex<()>,
+    /// Atomically-tuned live-lane counter backing `decdn_lanes_open` (#1789
+    /// item 3): `fetch_add` on a real insert, `fetch_sub` on a real remove,
+    /// seeded once at construction from the hydrated map. Replaces walking
+    /// `self.lanes.len()` — and the serializing mutex that walk needed to
+    /// publish a consistent gauge — with a lock-free counter, so the gauge
+    /// never costs an ordered walk of the (possibly large) lane map on the
+    /// registration path.
+    lane_count: AtomicUsize,
     /// Bounded cache of capability owner-recovery outcomes keyed by the full
     /// signed material (#1789 item 2), so a client that re-sends the same
     /// capability on every request skips the per-request `ecrecover` in
@@ -1292,9 +1295,12 @@ impl ClientHandler {
             );
         }
         // Deposit is a pool-level, on-chain quantity (getPool), not carried per
-        // lane, so the seller-side snapshot reports lane count only.
+        // lane, so the seller-side snapshot reports lane count only. Seed the
+        // atomic lane counter once at hydrate; `register_lane`/`forget_lane`
+        // tune it from then on (#1789 item 3).
+        let lane_count = AtomicUsize::new(map.len());
         deps.metrics
-            .set_inbound_lane_snapshot(map.len(), U256::ZERO);
+            .set_inbound_lane_snapshot(lane_count.load(Ordering::Relaxed), U256::ZERO);
         // Hydrate the per-pool floor accumulator: no stream is live at boot, so
         // `live_reservation` starts at zero; each pool's persisted `dead_charge`
         // carries forward so a restart does not grant a fresh free-floor budget.
@@ -1340,7 +1346,7 @@ impl ClientHandler {
             capability_sink: deps.capability_sink,
             pool_view: deps.pool_view,
             lanes: Arc::new(map),
-            lane_metrics_refresh: Mutex::new(()),
+            lane_count,
             capability_verify_cache: std::sync::Mutex::new(CapabilityVerifyCache::default()),
             pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
             floor_loss_store: deps.floor_loss_store,
@@ -1502,7 +1508,7 @@ impl ClientHandler {
     }
 
     #[allow(clippy::cognitive_complexity)] // linear verify → register → persist sequence.
-    async fn intake_capability(
+    fn intake_capability(
         &self,
         pool_id: B256,
         signer: Address,
@@ -1560,7 +1566,7 @@ impl ClientHandler {
             None,
             decdn_incentive::LaneChain::NONE,
         );
-        if let Err(e) = self.register_lane(lane).await {
+        if let Err(e) = self.register_lane(lane) {
             tracing::warn!(%pool_id, %signer, error = %e, "lane registration failed; the request refuses as an unknown lane and the client retries");
         }
 
@@ -1592,35 +1598,34 @@ impl ClientHandler {
     ///
     /// # Errors
     ///
-    /// Propagates a [`StoreError`] if the store record fails, or if the blocking
-    /// store task fails to join (a panic inside the store, or the runtime shutting
-    /// down mid-call). The caller logs and retries.
-    pub async fn register_lane(&self, state: LaneState) -> Result<(), StoreError> {
+    /// Propagates a [`StoreError`] if the store `record` fails.
+    pub fn register_lane(&self, state: LaneState) -> Result<(), StoreError> {
         let key = state.key();
         if self.lanes.contains_key(&key) {
             return Ok(());
         }
-        // `record` inserts into the store's buffered working set; the periodic
-        // lane flush is what puts the row on disk. `PoolStateStore` is a
-        // synchronous seam, so a runtime caller invokes it from the blocking
-        // pool — registration is off the delivery path and can afford the hop.
-        let store = Arc::clone(&self.channel_state_store);
-        let to_persist = state.clone();
-        tokio::task::spawn_blocking(move || store.record(&to_persist))
-            .await
-            .map_err(|e| StoreError::Backend(format!("register_lane join: {e}")))??;
+        // #1789 item 4: call the store's `record` inline. `record` is a cheap
+        // buffered insert into the store's in-memory working set (the periodic
+        // lane flush is what puts the row on disk) — no `spawn_blocking` hop,
+        // and `register_lane` is no longer off enough of the delivery path to
+        // afford one on the first-capability path that calls it per stream.
+        self.channel_state_store.record(&state)?;
 
         let bytes = state.last_bytes_delivered();
-        self.lanes.entry(key).or_insert_with(|| {
-            Arc::new(Mutex::new(LaneDeliveryState {
+        // Only a REAL insertion (a vacant slot) tunes the lane gauge — the
+        // entry guard is atomic, so racing first-streams on one lane still
+        // count it once.
+        if let dashmap::mapref::entry::Entry::Vacant(entry) = self.lanes.entry(key) {
+            entry.insert(Arc::new(Mutex::new(LaneDeliveryState {
                 state,
                 bytes_delivered_cumulative: bytes,
                 paid_credited: bytes,
                 active_streams: Arc::new(AtomicU32::new(0)),
                 last_voucher_at: AtomicU64::new(0),
-            }))
-        });
-        self.refresh_lane_metrics().await;
+            })));
+            self.lane_count.fetch_add(1, Ordering::Relaxed);
+            self.refresh_lane_metrics();
+        }
         Ok(())
     }
 
@@ -1637,9 +1642,11 @@ impl ClientHandler {
         // Removing the lane row drops its `last_voucher_at` stamp with it (issue
         // #1733): the timestamp lives on the lane's delivery state, so its
         // lifecycle follows the lane automatically — no separate activity-map
-        // eviction.
-        self.lanes.remove(&key);
-        self.refresh_lane_metrics().await;
+        // eviction. Only a real removal tunes the lane gauge down.
+        if self.lanes.remove(&key).is_some() {
+            self.lane_count.fetch_sub(1, Ordering::Relaxed);
+            self.refresh_lane_metrics();
+        }
         let store = Arc::clone(&self.channel_state_store);
         tokio::task::spawn_blocking(move || store.forget(key))
             .await
@@ -2004,11 +2011,12 @@ impl ClientHandler {
         reset_stream(send, recv, APP_ERR_NO_ERROR);
     }
 
-    async fn refresh_lane_metrics(&self) {
-        let _refresh = self.lane_metrics_refresh.lock().await;
-        let open = self.lanes.len();
+    fn refresh_lane_metrics(&self) {
         // Deposit is a pool-level, on-chain quantity (getPool), not carried per
-        // lane, so the seller-side snapshot reports lane count only.
+        // lane, so the seller-side snapshot reports lane count only (#1789 item
+        // 3): the atomic counter makes this a direct gauge set — no mutex, no
+        // map walk.
+        let open = self.lane_count.load(Ordering::Relaxed);
         self.metrics.set_inbound_lane_snapshot(open, U256::ZERO);
     }
 }
@@ -2639,9 +2647,7 @@ mod tests {
                 None,
                 decdn_incentive::LaneChain::NONE,
             );
-            register.push(tokio::spawn(
-                async move { handler.register_lane(state).await },
-            ));
+            register.push(tokio::spawn(async move { handler.register_lane(state) }));
         }
         for task in register {
             task.await.expect("join").expect("register_lane");
@@ -2718,9 +2724,11 @@ mod tests {
         );
     }
 
-    /// The seller-side lane-count gauge tracks the live `lanes` map. Deposit is a
-    /// pool-level on-chain quantity (getPool), not carried per lane, so the
-    /// snapshot reports the open-lane count only.
+    /// The seller-side lane-count gauge tracks the live `lanes` map through the
+    /// atomic counter (#1789 item 3): registering a lane publishes 1,
+    /// forgetting it publishes 0 again. Deposit is a pool-level on-chain
+    /// quantity (getPool), not carried per lane, so the snapshot reports the
+    /// open-lane count only.
     #[tokio::test]
     async fn lane_count_gauge_tracks_the_live_map() {
         let metrics = Arc::new(Metrics::new());
@@ -2730,10 +2738,54 @@ mod tests {
             signer: Address::repeat_byte(0x11),
             provider: Address::repeat_byte(0x22),
         };
-        handler.lanes.insert(
-            lane,
-            Arc::new(Mutex::new(LaneDeliveryState {
-                state: LaneState::hydrate(
+        let state = LaneState::hydrate(
+            lane.pool_id,
+            lane.signer,
+            lane.provider,
+            U256::from(10u64),
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+            decdn_incentive::LaneChain::NONE,
+        );
+        // A duplicate registration is a no-op and must not double-count.
+        handler.register_lane(state.clone()).expect("register");
+        handler.register_lane(state).expect("register twice");
+        handler.refresh_lane_metrics();
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.lines().any(|line| line == "decdn_lanes_open 1"),
+            "an idempotent register must not double count"
+        );
+        handler.forget_lane(lane).await.expect("forget");
+        handler.refresh_lane_metrics();
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.lines().any(|line| line == "decdn_lanes_open 0"),
+            "forget must tune the gauge back down"
+        );
+    }
+
+    /// #1789 item 3: concurrent registration and removal of many distinct
+    /// lanes leaves the gauge exactly equal to the number of lanes still live
+    /// — the atomic counter moves with the real map, whatever the
+    /// interleaving.
+    #[tokio::test]
+    async fn lane_gauge_matches_live_count_after_concurrent_register_and_remove() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await;
+        let provider = Address::repeat_byte(0x22);
+        let mut join = Vec::new();
+        for i in 0u8..24 {
+            let handler = Arc::clone(&handler);
+            join.push(tokio::spawn(async move {
+                let lane = LaneKey {
+                    pool_id: B256::repeat_byte(i + 0xA0),
+                    signer: Address::repeat_byte(i + 0x01),
+                    provider,
+                };
+                let state = LaneState::hydrate(
                     lane.pool_id,
                     lane.signer,
                     lane.provider,
@@ -2743,16 +2795,39 @@ mod tests {
                     U256::ZERO,
                     None,
                     decdn_incentive::LaneChain::NONE,
-                ),
-                bytes_delivered_cumulative: U256::ZERO,
-                paid_credited: U256::ZERO,
-                active_streams: Arc::new(AtomicU32::new(0)),
-                last_voucher_at: AtomicU64::new(0),
-            })),
-        );
-        handler.refresh_lane_metrics().await;
+                );
+                handler.register_lane(state).expect("register");
+            }));
+        }
+        for handle in join {
+            handle.await.expect("register task join");
+        }
+        assert_eq!(handler.lane_count.load(Ordering::Relaxed), 24);
+        // Forget half of them, concurrently.
+        let mut join = Vec::new();
+        for i in 0u8..12 {
+            let handler = Arc::clone(&handler);
+            join.push(tokio::spawn(async move {
+                handler
+                    .forget_lane(LaneKey {
+                        pool_id: B256::repeat_byte(i + 0xA0),
+                        signer: Address::repeat_byte(i + 0x01),
+                        provider,
+                    })
+                    .await
+                    .expect("forget");
+            }));
+        }
+        for handle in join {
+            handle.await.expect("forget task join");
+        }
+        handler.refresh_lane_metrics();
+        assert_eq!(handler.lane_count.load(Ordering::Relaxed), 12);
         let encoded = metrics.encode().expect("metrics encode");
-        assert!(encoded.lines().any(|line| line == "decdn_lanes_open 1"));
+        assert!(
+            encoded.lines().any(|line| line == "decdn_lanes_open 12"),
+            "gauge must reflect the live lane count after concurrent changes"
+        );
     }
 
     #[test]
@@ -3058,9 +3133,7 @@ mod tests {
 
         // A capability signed by a NON-owner is dropped: not persisted, no lane.
         let bad = make_wire(&PrivateKeySigner::random());
-        handler
-            .intake_capability(pool_id, signer, Some(owner.address()), &bad)
-            .await;
+        handler.intake_capability(pool_id, signer, Some(owner.address()), &bad);
         assert!(
             recorded
                 .lock()
@@ -3075,9 +3148,7 @@ mod tests {
 
         // The correct owner's capability is persisted and registers the lane.
         let good = make_wire(&owner);
-        handler
-            .intake_capability(pool_id, signer, Some(owner.address()), &good)
-            .await;
+        handler.intake_capability(pool_id, signer, Some(owner.address()), &good);
         assert_eq!(
             recorded
                 .lock()
@@ -3159,12 +3230,8 @@ mod tests {
             owner_signature: signed.signature.as_bytes().to_vec(),
         };
 
-        handler
-            .intake_capability(pool_id, signer, Some(owner.address()), &wire)
-            .await;
-        handler
-            .intake_capability(pool_id, signer, Some(owner.address()), &wire)
-            .await;
+        handler.intake_capability(pool_id, signer, Some(owner.address()), &wire);
+        handler.intake_capability(pool_id, signer, Some(owner.address()), &wire);
         let cache_len = handler
             .capability_verify_cache
             .lock()
@@ -3211,9 +3278,7 @@ mod tests {
             expiry: forged.capability.expiry,
             owner_signature: forged.signature.as_bytes().to_vec(),
         };
-        handler
-            .intake_capability(pool_id, signer, Some(owner.address()), &forged_wire)
-            .await;
+        handler.intake_capability(pool_id, signer, Some(owner.address()), &forged_wire);
         assert_eq!(
             handler
                 .capability_verify_cache

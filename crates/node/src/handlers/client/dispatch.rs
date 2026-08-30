@@ -407,8 +407,7 @@ impl ClientHandler {
                 signer,
                 pool_status.map(|s| s.owner),
                 capability,
-            )
-            .await;
+            );
         }
 
         // Resolve the live lane AFTER intake, so a lane just registered from this

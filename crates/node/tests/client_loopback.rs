@@ -6816,9 +6816,7 @@ async fn register_lane_is_idempotent_and_preserves_watermark() -> anyhow::Result
     )?;
 
     // A re-observed registration arrives as a fresh (zero-watermark) lane.
-    handler
-        .register_lane(fresh_lane(client, U256::from(10_000_000u64)))
-        .await?;
+    handler.register_lane(fresh_lane(client, U256::from(10_000_000u64)))?;
 
     let after = store
         .get(lane_key(client))?
