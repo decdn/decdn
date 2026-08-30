@@ -518,6 +518,30 @@ impl Inner {
 /// follow-up GC sweep in #518) still reports its on-disk size here.
 /// That keeps dry-run honest about disk reclaim potential rather than
 /// hiding it once the operator has flipped the evicted flag.
+/// Result of [`CacheEngine::serve_audit`]: presence and size for a hash in a
+/// single store-film read. Mirrors the serve path's two separate queries
+/// ([`CacheEngine::has`] + [`CacheEngine::inspect`]) so the delivery path can
+/// make one store contact instead of two (#1789 item 7 part B).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ServeAudit {
+    /// Whether the blob is present and serveable: the store reports it
+    /// complete AND it is not refused (denied / chain-denied / evicted) —
+    /// the same semantic [`CacheEngine::has`] returns.
+    pub present: bool,
+    /// Whether the hash is logically evicted (#279). Mirrors
+    /// [`CacheEngine::is_evicted`]; lets the miss path tell an eviction from
+    /// a plain miss without a second call.
+    pub evicted: bool,
+    /// Byte size a complete blob would report for the wire — mirrors what
+    /// [`CacheEngine::inspect`] returns for a complete blob. `None` for a
+    /// partial or absent blob, so `(present == true, size == None)` is a
+    /// genuine store anomaly, not a zero-length blob.
+    pub size: Option<u64>,
+}
+
+/// Result of [`CacheEngine::eviction_candidates`] / [`CacheEngine::inspect`].
+/// One row per candidate hash, used for admin dry-runs and the `decdn node
+/// inspect` (#1130) report.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EvictionPreview {
     /// Bytes the iroh-blobs store reports for this hash. `None` when the
@@ -1915,6 +1939,39 @@ impl CacheEngine {
             .has(hash)
             .await
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
+    }
+
+    /// Serve-path presence + size audit for `hash` in ONE store actor call.
+    ///
+    /// Folds what the delivery path previously did as two separate hops —
+    /// [`Self::has`] (presence) followed by [`Self::inspect`] (size) — into a
+    /// single `BlobStatus` (#1789 item 7, part B), saving one store round-trip
+    /// on every cache hit. Semantics match [`Self::has`]: a logically-evicted
+    /// hash reports `present: false` even if the store still holds the bytes,
+    /// and `present` requires the blob to be `Complete`. `size` mirrors what
+    /// [`Self::inspect`] would report for a complete blob; a partial or absent
+    /// blob yields `size: None` exactly as `inspect` does, so a caller can
+    /// tell a genuine anomaly (present but no size) from a plain miss.
+    pub async fn serve_audit(&self, hash: Hash) -> CacheResult<ServeAudit> {
+        let evicted = self.is_evicted(hash);
+        let refused = self.is_denied(hash) || self.is_chain_denied(hash) || evicted;
+        let status = self
+            .inner
+            .store
+            .blobs()
+            .status(hash)
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        let (complete, size) = match status {
+            iroh_blobs::api::blobs::BlobStatus::NotFound
+            | iroh_blobs::api::blobs::BlobStatus::Partial { .. } => (false, None),
+            iroh_blobs::api::blobs::BlobStatus::Complete { size } => (true, Some(size)),
+        };
+        Ok(ServeAudit {
+            present: complete && !refused,
+            evicted,
+            size,
+        })
     }
 
     /// Which chunk ranges of `hash` are present on disk right now.
@@ -7370,6 +7427,43 @@ mod tests {
         // `decdn node evict` ahead of time as a precaution.
         engine.evict(unknown).await?;
         anyhow::ensure!(engine.is_evicted(unknown), "evict flag not set");
+        Ok(())
+    }
+
+    /// `serve_audit` folds presence + size + eviction into one store contact
+    /// (#1789 item 7 part B), and mirrors the `has`/`inspect` pairing it
+    /// replaces: a complete blob is present with its size, an absent hash is
+    /// not present, and an evicted hash reports not-present with `evicted`
+    /// set so the serve path can tell an eviction from a plain miss without a
+    /// second call.
+    #[tokio::test]
+    async fn serve_audit_reports_presence_size_and_eviction() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"a served blob";
+        let origin = StubOrigin::new(payload);
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+        let hash = Hash::new(payload);
+        let unseen = Hash::new(b"never cached");
+
+        let absent = engine.serve_audit(unseen).await?;
+        anyhow::ensure!(!absent.present, "an absent hash is not present");
+        anyhow::ensure!(absent.size.is_none(), "an absent hash has no size");
+        anyhow::ensure!(!absent.evicted, "an absent hash is not evicted");
+
+        engine.populate(hash).await?;
+        let audit = engine.serve_audit(hash).await?;
+        anyhow::ensure!(audit.present, "a complete blob is present");
+        anyhow::ensure!(
+            audit.size == Some(payload.len() as u64),
+            "a complete blob carries its size"
+        );
+        anyhow::ensure!(!audit.evicted, "a live blob is not evicted");
+
+        engine.evict(hash).await?;
+        let audit = engine.serve_audit(hash).await?;
+        anyhow::ensure!(!audit.present, "evicted content is not present");
+        anyhow::ensure!(audit.evicted, "the eviction is surfaced");
         Ok(())
     }
 
