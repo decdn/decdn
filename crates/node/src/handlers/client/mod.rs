@@ -974,9 +974,7 @@ impl ClientHandlerDeps {
             idle_timeout: None,
             pool_recheck_interval: None,
             floor_loss_store: None,
-            warming_credit: Arc::new(crate::warming_allowance::DirectWarmingCreditSink::new(
-                Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
-            )),
+            warming_credit: Arc::new(crate::warming_allowance::NoopWarmingCreditSink),
             operator_shares: crate::fee_shares::OperatorShares::new(0),
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
             coarse_clock: None,
