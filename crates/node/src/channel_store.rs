@@ -35,9 +35,12 @@
 //!
 //! [ADR 003 §Off-chain voucher state persistence]: ../../../adr/003-payments.md
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+
+use crossbeam_queue::SegQueue;
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 
 use alloy::primitives::{Address, B256, U256};
 use decdn_common::identity;
@@ -351,31 +354,58 @@ impl StoredLaneState {
     }
 }
 
-/// In-memory working set for the lane (frontier) table. The map is the
-/// authoritative copy after `open()` hydrates it from disk; `record`/`forget`
-/// mutate it and mark `dirty`/`tombstones`, and `flush` drains those into one
-/// fsynced redb transaction. `dirty` and `tombstones` are disjoint: `record`
-/// clears a key's tombstone, `forget` clears its dirty mark.
-#[derive(Debug, Default)]
-struct LaneBuffer {
-    lanes: HashMap<LaneKey, LaneState>,
-    dirty: HashSet<LaneKey>,
-    tombstones: HashSet<LaneKey>,
+/// One lane's slot in the in-memory working set.
+///
+/// `Live` holds the authoritative frontier. `Tombstoned` marks a `forget`-ten
+/// lane whose on-disk row is not yet deleted — it stays in the map (rather than
+/// being removed) so `flush` learns to delete the row, and so a `record` that
+/// resurrects the lane in the same window is decided under the entry's shard
+/// lock rather than racing a separate tombstone set. Reads treat `Tombstoned`
+/// as absent.
+///
+/// The `Live` variant carries a full [`LaneState`] inline — no `Box`. That is
+/// the point: a stored lane clones out with a memcpy on every `record`/`get`,
+/// the hot serve path, and boxing would trade that for a heap indirection on
+/// exactly the frequent variant to shrink the rare `Tombstoned` one. Tombstones
+/// are transient (the next flush reaps them), so the size skew never
+/// accumulates.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+enum LaneSlot {
+    Live(LaneState),
+    Tombstoned,
 }
 
 /// `redb`-backed persistent implementation of [`PoolStateStore`].
 ///
 /// Construct via [`PersistentPoolStateStore::open`]. The database is
 /// owned for the lifetime of this value; drop closes the handle. The lane
-/// table is buffered in memory: `record`/`forget` mutate the buffer only, and
-/// a caller must call [`PoolStateStore::flush`] to commit it to disk. The
+/// table is buffered in memory: `record`/`forget` mutate the working set only,
+/// and a caller must call [`PoolStateStore::flush`] to commit it to disk. The
 /// store is thread-safe — redb serialises writes internally via
 /// single-writer transactions, and reads are MVCC.
+///
+/// The working set is a [`DashMap`] rather than one mutex-guarded map, so a
+/// `record` on the paid-delivery path locks only its own lane's shard — no lane
+/// serialises on another, and settlement's `load_all`/`get` no longer contend
+/// with `record` (issue #1792 item 1). Each entry's shard lock is the per-lane
+/// critical section that keeps a `record`/`forget` race decidable, the role the
+/// single buffer mutex played for the whole map.
 #[derive(Debug)]
 pub struct PersistentPoolStateStore {
     db: Database,
     path: PathBuf,
-    buffer: Mutex<LaneBuffer>,
+    /// The per-lane working set, hydrated from disk at `open()`.
+    lanes: DashMap<LaneKey, LaneSlot>,
+    /// Lock-free work-list of lanes changed since the last flush.
+    /// `record`/`forget`/`set_registered_until` push their key; `flush` drains
+    /// it and re-reads each slot from `lanes` (the source of truth), so a
+    /// duplicate or a since-superseded key is harmless. Draining the queue —
+    /// rather than clearing a shared dirty set in place — is what bounds the
+    /// durable watermark's lag to one flush interval across a concurrent
+    /// `record` (ADR 003 §Off-chain voucher state persistence): a `record` that
+    /// lands after a key is drained pushes it afresh and is captured next flush.
+    dirty: SegQueue<LaneKey>,
 }
 
 impl PersistentPoolStateStore {
@@ -496,27 +526,25 @@ impl PersistentPoolStateStore {
         Ok(Self {
             db,
             path,
-            buffer: Mutex::new(LaneBuffer {
-                lanes,
-                dirty: HashSet::new(),
-                tombstones: HashSet::new(),
-            }),
+            lanes,
+            dirty: SegQueue::new(),
         })
     }
 
-    /// Read the whole lane table into an in-memory map at open. A corrupt or
-    /// forward-schema record aborts startup (running past it would reopen the
-    /// issue #527 voucher-replay window).
-    fn hydrate_lanes(db: &Database) -> Result<HashMap<LaneKey, LaneState>, StoreError> {
+    /// Read the whole lane table into the in-memory working set at open. A
+    /// corrupt or forward-schema record aborts startup (running past it would
+    /// reopen the issue #527 voucher-replay window). Every hydrated lane enters
+    /// as [`LaneSlot::Live`].
+    fn hydrate_lanes(db: &Database) -> Result<DashMap<LaneKey, LaneSlot>, StoreError> {
         let read_txn = db
             .begin_read()
             .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
         let table = match read_txn.open_table(LANE_TABLE) {
             Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(DashMap::new()),
             Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
         };
-        let mut out = HashMap::new();
+        let out = DashMap::new();
         let iter = table
             .iter()
             .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
@@ -525,17 +553,9 @@ impl PersistentPoolStateStore {
                 entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
             let key_bytes: [u8; LANE_KEY_LEN] = *key_guard.value();
             let state = decode_record(&key_bytes, value_guard.value())?;
-            out.insert(state.key(), state);
+            out.insert(state.key(), LaneSlot::Live(state));
         }
         Ok(out)
-    }
-
-    /// Lock the working-set buffer, mapping a poisoned mutex to a backend error
-    /// (anti-panic policy — never `unwrap` the guard).
-    fn lock_buffer(&self) -> Result<std::sync::MutexGuard<'_, LaneBuffer>, StoreError> {
-        self.buffer
-            .lock()
-            .map_err(|err| StoreError::Backend(format!("lane buffer mutex poisoned: {err}")))
     }
 
     /// Operator-facing logging for the chmod-failure cleanup branch. Extracted
@@ -665,121 +685,158 @@ fn decode_record(
 
 impl PoolStateStore for PersistentPoolStateStore {
     /// Every persisted lane, from the in-memory working set hydrated at `open()`.
+    /// Tombstoned slots (a `forget`-ten lane not yet flushed) read as absent.
     fn load_all(&self) -> Result<Vec<LaneState>, StoreError> {
-        let buf = self.lock_buffer()?;
-        Ok(buf.lanes.values().cloned().collect())
+        Ok(self
+            .lanes
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                LaneSlot::Live(state) => Some(state.clone()),
+                LaneSlot::Tombstoned => None,
+            })
+            .collect())
     }
 
     fn get(&self, key: LaneKey) -> Result<Option<LaneState>, StoreError> {
-        let buf = self.lock_buffer()?;
-        Ok(buf.lanes.get(&key).cloned())
+        Ok(self.lanes.get(&key).and_then(|entry| match entry.value() {
+            LaneSlot::Live(state) => Some(state.clone()),
+            LaneSlot::Tombstoned => None,
+        }))
     }
 
     /// Advance the in-memory lane state and mark it dirty. Durability is the
     /// background flush's job (ADR 003 §Off-chain voucher state persistence).
+    /// Locks only this lane's [`DashMap`] shard; concurrent `record`s on other
+    /// lanes proceed in parallel.
     fn record(&self, state: &LaneState) -> Result<(), StoreError> {
         let key = state.key();
-        let mut buf = self.lock_buffer()?;
         let mut next = state.clone();
-        if let Some(existing) = buf.lanes.get(&key) {
-            next.registered_until = next.registered_until.max(existing.registered_until);
+        match self.lanes.entry(key) {
+            Entry::Occupied(mut occ) => {
+                if let LaneSlot::Live(existing) = occ.get() {
+                    next.registered_until = next.registered_until.max(existing.registered_until);
+                }
+                occ.insert(LaneSlot::Live(next));
+            }
+            Entry::Vacant(vac) => {
+                vac.insert(LaneSlot::Live(next));
+            }
         }
-        buf.lanes.insert(key, next);
-        buf.tombstones.remove(&key);
-        buf.dirty.insert(key);
+        self.dirty.push(key);
         Ok(())
     }
 
     /// Raise this lane's observed on-chain registration expiry, monotonically —
     /// touches ONLY `registered_until`, never the replay-critical `last_*`
     /// tuple, so it cannot race a concurrent voucher `record` into a lost
-    /// update. A no-op for a lane with no record. Buffered like `record`;
+    /// update. A no-op for a lane with no live record. Buffered like `record`;
     /// durability is the next `flush`'s job.
     fn set_registered_until(&self, key: LaneKey, registered_until: u64) -> Result<(), StoreError> {
-        let mut buf = self.lock_buffer()?;
-        let Some(state) = buf.lanes.get_mut(&key) else {
+        let Some(mut slot) = self.lanes.get_mut(&key) else {
+            return Ok(());
+        };
+        let LaneSlot::Live(state) = slot.value_mut() else {
             return Ok(());
         };
         if registered_until > state.registered_until {
             state.registered_until = registered_until;
-            buf.dirty.insert(key);
+            self.dirty.push(key);
         }
         Ok(())
     }
 
-    /// Drop the lane from the working set and mark it for deletion on the next
-    /// flush. Idempotent.
+    /// Tombstone the lane so reads treat it as absent and the next flush deletes
+    /// its on-disk row. Idempotent. The slot stays in the map (as a tombstone)
+    /// so a concurrent `record` resurrecting the lane is decided under the same
+    /// shard lock rather than racing a separate set.
     fn forget(&self, key: LaneKey) -> Result<(), StoreError> {
-        let mut buf = self.lock_buffer()?;
-        buf.lanes.remove(&key);
-        buf.dirty.remove(&key);
-        buf.tombstones.insert(key);
+        self.lanes.insert(key, LaneSlot::Tombstoned);
+        self.dirty.push(key);
         Ok(())
     }
 
     /// Write every dirty lane and apply every tombstone in ONE fsynced redb
     /// transaction. Idempotent — a no-op when clean.
     ///
-    /// Double-buffered: the dirty lanes are encoded and the tombstones copied
-    /// out **under the buffer lock**, the snapshotted marks are cleared, and the
-    /// lock is released **before** the fsynced commit. So the ~1–10 ms fsync
-    /// runs with no lock held and a concurrent `record` (a cheap map insert)
-    /// never waits on disk I/O. `postcard` encoding also happens in the snapshot
-    /// step, off the fsync's critical path.
+    /// Double-buffered: the dirty work-list is drained and each lane's slot is
+    /// cloned out (a cheap memcpy — [`LaneState`] holds no heap fields), then
+    /// encoded, all off the fsync's critical path. The ~1–10 ms fsynced commit
+    /// holds no lane shard lock, so a concurrent `record` (a single-shard map
+    /// insert) never waits on disk I/O.
     ///
-    /// A `record` that lands after the snapshot re-marks its lane dirty and is
-    /// captured by the next flush; the store only needs a monotonic floor, and
-    /// the frontier is documented "safe to lose" on a crash (ADR 003 §Off-chain
-    /// voucher state persistence), so a slightly older value now and a newer one
-    /// one cadence later is correct. Snapshot and clear are one locked critical
-    /// section, so clearing the whole dirty/tombstone sets there drops only the
-    /// snapshotted keys — a re-mark can only happen after the lock is released.
+    /// A `record` that lands after its key is drained pushes the key afresh and
+    /// is captured by the next flush; the store only needs a monotonic floor,
+    /// and the frontier is documented "safe to lose" on a crash (ADR 003
+    /// §Off-chain voucher state persistence), so a slightly older value now and a
+    /// newer one one cadence later is correct.
     fn flush(&self) -> Result<(), StoreError> {
-        let mut snapshot = {
-            let mut buf = self.lock_buffer()?;
-            if buf.dirty.is_empty() && buf.tombstones.is_empty() {
-                return Ok(());
+        // Drain the work-list, deduplicating: a lane touched N times since the
+        // last flush sits in the queue N times, but we re-read its slot once.
+        let mut drained: HashSet<LaneKey> = HashSet::new();
+        while let Some(key) = self.dirty.pop() {
+            drained.insert(key);
+        }
+        if drained.is_empty() {
+            return Ok(());
+        }
+
+        let mut writes: Vec<(LaneKey, Vec<u8>)> = Vec::new();
+        let mut tombstones: Vec<LaneKey> = Vec::new();
+        for key in &drained {
+            // Clone the slot out under the shard lock, then release it before
+            // encoding so a concurrent `record` on this lane never waits on the
+            // postcard encode.
+            let slot = self.lanes.get(key).map(|entry| entry.value().clone());
+            match slot {
+                Some(LaneSlot::Live(state)) => {
+                    let encoded =
+                        postcard::to_allocvec(&StoredLaneState::from(&state)).map_err(|err| {
+                            StoreError::Codec(format!("postcard encode failed: {err}"))
+                        })?;
+                    writes.push((*key, encoded));
+                }
+                Some(LaneSlot::Tombstoned) => tombstones.push(*key),
+                // A key present in the work-list but absent from `lanes` cannot
+                // happen — a slot is only ever inserted or tombstoned, never
+                // removed except by this flush after its commit succeeds.
+                None => {}
             }
-            let mut writes: Vec<(LaneKey, Vec<u8>)> = Vec::with_capacity(buf.dirty.len());
-            for key in &buf.dirty {
-                let Some(state) = buf.lanes.get(key) else {
-                    continue;
-                };
-                let encoded = postcard::to_allocvec(&StoredLaneState::from(state))
-                    .map_err(|err| StoreError::Codec(format!("postcard encode failed: {err}")))?;
-                writes.push((*key, encoded));
-            }
-            let tombstones: Vec<LaneKey> = buf.tombstones.iter().copied().collect();
-            buf.dirty.clear();
-            buf.tombstones.clear();
-            FlushSnapshot { writes, tombstones }
-        };
+        }
+        let mut snapshot = FlushSnapshot { writes, tombstones };
         // Both batches reach redb in ascending key order; see
-        // [`FlushSnapshot::sort_by_table_key`]. The sort runs with the buffer
-        // lock released, off the fsync's critical path.
+        // [`FlushSnapshot::sort_by_table_key`].
         snapshot.sort_by_table_key();
 
-        // Fsynced commit with NO buffer lock held.
+        // Fsynced commit with NO lane shard lock held.
         if let Err(err) = self.commit_snapshot(&snapshot) {
-            // The commit failed after the marks were cleared. Re-mark the
+            // The commit failed after the work-list was drained. Re-push the
             // snapshotted keys so the next flush retries them (the background
-            // flusher logs "retrying next tick"). Re-mark only where the buffer
-            // invariant still holds so a concurrent `record`/`forget` that
-            // already superseded a key keeps its newer intent — a best-effort
-            // step, so a poisoned lock here is logged, not allowed to mask the
-            // commit error the caller must see.
-            if let Err(remark_err) = self.remark_after_failed_commit(&snapshot) {
-                tracing::warn!(%remark_err, "re-marking lanes after a failed flush commit failed");
+            // flusher logs "retrying next tick"). A concurrent `record`/`forget`
+            // that superseded a key in the meantime keeps its newer slot; the
+            // re-pushed key just re-reads whatever `lanes` now holds.
+            for (key, _) in &snapshot.writes {
+                self.dirty.push(*key);
+            }
+            for key in &snapshot.tombstones {
+                self.dirty.push(*key);
             }
             return Err(err);
+        }
+
+        // Commit succeeded: reap tombstoned slots whose row is now gone. Guard
+        // with `remove_if` so a `record` that resurrected the lane to `Live`
+        // after the snapshot keeps its slot (and its freshly-pushed dirty mark).
+        for key in &snapshot.tombstones {
+            self.lanes
+                .remove_if(key, |_, slot| matches!(slot, LaneSlot::Tombstoned));
         }
         Ok(())
     }
 }
 
-/// Encoded dirty writes and tombstone keys copied out of the buffer under the
-/// lock, so [`PersistentPoolStateStore::flush`] can run its fsynced commit with
-/// the lock released.
+/// Encoded dirty writes and tombstone keys resolved from the drained work-list,
+/// so [`PersistentPoolStateStore::flush`] can run its fsynced commit with no lane
+/// shard lock held.
 struct FlushSnapshot {
     writes: Vec<(LaneKey, Vec<u8>)>,
     tombstones: Vec<LaneKey>,
@@ -801,10 +858,11 @@ impl FlushSnapshot {
     ///
     /// Sorting the encoded key rather than an `Ord` on [`LaneKey`] keeps the
     /// sort key and the redb key the same value, so a change to the key layout
-    /// cannot make the two disagree. `dirty` and `tombstones` are disjoint (see
-    /// [`LaneBuffer`]), so the insert run and the remove run never meet on one
-    /// key, and sorting both leaves the whole flush deterministic — the buffer
-    /// holds them in `HashSet`s, whose iteration order carries no meaning.
+    /// cannot make the two disagree. `writes` and `tombstones` are disjoint —
+    /// each drained key resolves to exactly one of a live slot or a tombstone —
+    /// so the insert run and the remove run never meet on one key, and sorting
+    /// both leaves the whole flush deterministic even though the work-list drains
+    /// through a `HashSet` whose iteration order carries no meaning.
     fn sort_by_table_key(&mut self) {
         self.writes
             .sort_by_cached_key(|(lane, _)| lane_key_bytes(lane));
@@ -813,8 +871,8 @@ impl FlushSnapshot {
 }
 
 impl PersistentPoolStateStore {
-    /// Apply a [`FlushSnapshot`] in ONE fsynced redb transaction. Holds no
-    /// buffer lock — every value was already encoded during the snapshot. Both
+    /// Apply a [`FlushSnapshot`] in ONE fsynced redb transaction. Holds no lane
+    /// shard lock — every value was already encoded during the snapshot. Both
     /// batches arrive in ascending table-key order, so the insert loop appends
     /// rightward through the B-tree.
     fn commit_snapshot(&self, snapshot: &FlushSnapshot) -> Result<(), StoreError> {
@@ -845,28 +903,6 @@ impl PersistentPoolStateStore {
         write_txn
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
-        Ok(())
-    }
-
-    /// Re-mark a failed commit's snapshotted keys so the next flush retries them.
-    /// `lanes` membership is the arbiter of a key's current intent: a snapshotted
-    /// write re-marks dirty only while its lane still exists (a concurrent
-    /// `forget` removed it and owns the newer tombstone), and a snapshotted
-    /// tombstone re-marks only while its lane is still absent (a concurrent
-    /// `record` resurrected it and owns the newer write). This preserves the
-    /// `dirty`/`tombstones` disjointness invariant.
-    fn remark_after_failed_commit(&self, snapshot: &FlushSnapshot) -> Result<(), StoreError> {
-        let mut buf = self.lock_buffer()?;
-        for (key, _) in &snapshot.writes {
-            if buf.lanes.contains_key(key) {
-                buf.dirty.insert(*key);
-            }
-        }
-        for key in &snapshot.tombstones {
-            if !buf.lanes.contains_key(key) {
-                buf.tombstones.insert(*key);
-            }
-        }
         Ok(())
     }
 }
@@ -1948,7 +1984,7 @@ mod tests {
             tx.commit()?;
         }
         // Hydration at open() reads the whole table, so reopen to pick up the
-        // record this test wrote directly (bypassing the buffer).
+        // record this test wrote directly (bypassing the working set).
         let store = PersistentPoolStateStore::open(dir.path())?;
         let all = store.load_all()?;
         anyhow::ensure!(all.len() == 1);
@@ -2330,13 +2366,13 @@ mod tests {
     }
 
     /// [`FlushSnapshot::sort_by_table_key`] puts both batches in redb key order,
-    /// keeps every entry, and keeps each encoded value with its own key. The buffer
-    /// hands the snapshot over in `HashSet` order, so this is the only place the
-    /// ordering is observable — redb reads a table back sorted whatever order it
-    /// was written in.
+    /// keeps every entry, and keeps each encoded value with its own key. `flush`
+    /// builds the snapshot from a work-list drained through a `HashSet`, so this
+    /// is the only place the ordering is fixed — redb reads a table back sorted
+    /// whatever order it was written in.
     #[test]
     fn flush_snapshot_sorts_into_table_key_order() -> anyhow::Result<()> {
-        // Disjoint key sets, as `dirty` and `tombstones` are in the buffer.
+        // Disjoint key sets, as `writes` and `tombstones` are in a snapshot.
         let written: Vec<LaneKey> = (0u8..8).map(|i| mk_lane(i, 0xC0, 10).key()).collect();
         let forgotten: Vec<LaneKey> = (8u8..14).map(|i| mk_lane(i, 0xC0, 10).key()).collect();
         let mut snapshot = FlushSnapshot {
@@ -2380,11 +2416,12 @@ mod tests {
     /// hydrates whole at the next open, and it lands in redb packed rather than
     /// sprawling.
     ///
-    /// `record` marks lanes in a `HashSet`, so a test cannot choose the order the
-    /// snapshot is built in — only [`FlushSnapshot::sort_by_table_key`] decides what
-    /// redb sees. The `leaf_pages` bound is therefore the one assertion that ties
-    /// `flush` to that sort: unsorted `HashSet` order measures 65-68 pages here and
-    /// sorted measures 47, so dropping the call from `flush` trips the bound.
+    /// `record` pushes lanes onto a work-list drained through a `HashSet`, so a
+    /// test cannot choose the order the snapshot is built in — only
+    /// [`FlushSnapshot::sort_by_table_key`] decides what redb sees. The
+    /// `leaf_pages` bound is therefore the one assertion that ties `flush` to that
+    /// sort: unsorted order measures 65-68 pages here and sorted measures 47, so
+    /// dropping the call from `flush` trips the bound.
     #[test]
     fn flush_of_a_large_batch_lands_packed_and_round_trips() -> anyhow::Result<()> {
         use redb::ReadableTableMetadata as _;
@@ -2482,10 +2519,10 @@ mod tests {
         Ok(())
     }
 
-    /// The double-buffer only needs a monotonic floor: a record that advances a
-    /// lane after a prior flush is re-marked dirty and the newer value reaches
-    /// disk on the next flush. Models the "record lands after the snapshot"
-    /// case — the mark set after one flush is honored by the next.
+    /// The store only needs a monotonic floor: a record that advances a lane
+    /// after a prior flush pushes its key afresh and the newer value reaches disk
+    /// on the next flush. Models the "record lands after the work-list is
+    /// drained" case — the key pushed after one flush is honored by the next.
     #[test]
     fn monotonic_remark_after_flush_reaches_disk() -> anyhow::Result<()> {
         let dir = data_dir()?;
@@ -2509,9 +2546,9 @@ mod tests {
     }
 
     /// Records made concurrently with a continuous stream of flushes are never
-    /// blocked into a wedge and never lost: with the fsync no longer holding the
-    /// buffer lock, a `record` that lands mid-commit re-marks its lane and a
-    /// later flush captures it. After the writers finish and one final flush
+    /// blocked into a wedge and never lost: the fsync holds no lane shard lock,
+    /// so a `record` that lands mid-commit pushes its lane onto the work-list and
+    /// a later flush captures it. After the writers finish and one final flush
     /// runs, every lane's last (highest) watermark is on disk.
     #[test]
     fn concurrent_records_during_flush_are_not_lost() -> anyhow::Result<()> {

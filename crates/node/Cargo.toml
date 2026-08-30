@@ -55,6 +55,7 @@ decdn-common = { workspace = true }
 alloy = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
+crossbeam-queue = { workspace = true }
 futures-util = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
