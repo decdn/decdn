@@ -1290,7 +1290,7 @@ impl ClientHandler {
             .saturating_div(10_000);
         let mb = served_bytes.div_ceil(decdn_protocol::MB_BYTES);
         self.warming_credit
-            .credit(*hash.as_bytes(), mb.saturating_mul(margin_per_mb));
+            .credit(hash, mb.saturating_mul(margin_per_mb));
     }
 
     /// The wall-clock cadence for the mid-stream pool-solvency re-check (ADR 003

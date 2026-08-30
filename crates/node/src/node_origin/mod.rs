@@ -1204,7 +1204,7 @@ enum EconGate {
 /// quote merely above the amortized floor is allowed but flagged speculative.
 fn economic_ceiling(
     deps: &NodeOriginDeps,
-    source: [u8; 32],
+    source: crate::warming_allowance::SourceId,
     heat: u32,
     candidate_rate: u64,
 ) -> EconGate {
@@ -1380,7 +1380,7 @@ async fn pull_from_candidate(
     // BEFORE opening a channel. A skip folds into the walk as `BelowMargin`.
     let heat = heat_of(deps, hash_bytes);
     let (rate_ceiling, speculative) =
-        match economic_ceiling(deps, candidate.node_id, heat, candidate.rate_per_mb) {
+        match economic_ceiling(deps, candidate.node_id.into(), heat, candidate.rate_per_mb) {
             EconGate::Allow {
                 rate_ceiling,
                 speculative,
@@ -1675,8 +1675,8 @@ async fn pull_from_candidate(
             // by the full buy cost (whole MB at the candidate's buy rate).
             if speculative {
                 deps.config.warming.debit_speculative(
-                    candidate.node_id,
-                    hash_bytes,
+                    candidate.node_id.into(),
+                    Hash::from_bytes(hash_bytes),
                     candidate.rate_per_mb.saturating_mul(mb_of(total_bytes)),
                 );
             }

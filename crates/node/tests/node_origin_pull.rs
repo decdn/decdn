@@ -12638,7 +12638,8 @@ async fn attack_b_dud_flood_is_bounded_and_vindication_works() -> Result<()> {
 
     // Source A: the first buy is a dud — bought at market, served exactly once.
     let src1_sk = fresh_key();
-    let src1_id_bytes = *src1_sk.public().as_bytes();
+    let src1_id_bytes =
+        decdn_node::warming_allowance::SourceId::from_bytes(*src1_sk.public().as_bytes());
     let (first_admitted, _) = attack_b_attempt(
         src1_sk.clone(),
         0xB1,
@@ -12685,7 +12686,8 @@ async fn attack_b_dud_flood_is_bounded_and_vindication_works() -> Result<()> {
 
     // An independent second source: untouched by A's flood.
     let src2_sk = fresh_key();
-    let src2_id_bytes = *src2_sk.public().as_bytes();
+    let src2_id_bytes =
+        decdn_node::warming_allowance::SourceId::from_bytes(*src2_sk.public().as_bytes());
     anyhow::ensure!(
         warming.available(src2_id_bytes),
         "an independent source must read available before it is ever touched"
@@ -12710,7 +12712,8 @@ async fn attack_b_dud_flood_is_bounded_and_vindication_works() -> Result<()> {
     // (b) Vindication: a THIRD source, bought once and served TWICE, nets
     // positive and stays warm.
     let src3_sk = fresh_key();
-    let src3_id_bytes = *src3_sk.public().as_bytes();
+    let src3_id_bytes =
+        decdn_node::warming_allowance::SourceId::from_bytes(*src3_sk.public().as_bytes());
     let (vindicated_admitted, _) = attack_b_attempt(
         src3_sk,
         0xD1,

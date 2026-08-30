@@ -46,11 +46,44 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use dashmap::DashMap;
+use decdn_cache::Hash;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::metrics::Metrics;
 use crate::stop_handle::StopHandle;
+
+/// The bonded upstream seller node a speculative warming buy is charged to.
+///
+/// A 32-byte node identity, kept distinct at the type level from a content
+/// [`Hash`] so the serve-vindicated accounting can never transpose the two: the
+/// seam passes a source and a hash side by side, and both are 32 bytes wide.
+/// [`WarmingAllowance`] keys every ledger and tag on this type, so a caller that
+/// swaps the arguments of [`WarmingAllowance::debit_speculative`] no longer
+/// compiles.
+#[repr(transparent)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct SourceId([u8; 32]);
+
+impl SourceId {
+    /// Wrap a raw node id. `const` so callers can build one in const contexts.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the inner bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for SourceId {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
 
 /// One source node's warming ledger. `remaining` is a signed, zero-centered net
 /// P&L: negative means the source is in the hole (blocked), positive means it
@@ -72,7 +105,7 @@ impl Bucket {
 
 #[derive(Debug)]
 struct State {
-    buckets: HashMap<[u8; 32], Bucket>,
+    buckets: HashMap<SourceId, Bucket>,
 }
 
 /// Bounds speculative warming losses per upstream source node.
@@ -86,7 +119,7 @@ pub struct WarmingAllowance {
     /// Which source speculatively bought each hash. Kept outside `state` so the
     /// serve path can resolve a hash's source without taking the bucket lock —
     /// see [`Self::source_for`], the first half of every deferred credit.
-    source_of: DashMap<[u8; 32], [u8; 32]>,
+    source_of: DashMap<Hash, SourceId>,
 }
 
 impl WarmingAllowance {
@@ -116,7 +149,7 @@ impl WarmingAllowance {
     /// source with no recorded activity has never spent anything and is
     /// available; an existing ledger is available only while its net P&L is
     /// still positive.
-    pub fn available(&self, source: [u8; 32]) -> bool {
+    pub fn available(&self, source: SourceId) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match state.buckets.get_mut(&source) {
             Some(bucket) => {
@@ -139,7 +172,7 @@ impl WarmingAllowance {
     /// it, which is what the accounting wants. The reverse order would let a
     /// serve see a committed debit with no tag yet and silently drop its
     /// credit.
-    pub fn debit_speculative(&self, source: [u8; 32], hash: [u8; 32], units: u64) {
+    pub fn debit_speculative(&self, source: SourceId, hash: Hash, units: u64) {
         self.source_of.insert(hash, source);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let bucket = state.buckets.entry(source).or_insert_with(Bucket::fresh);
@@ -158,14 +191,14 @@ impl WarmingAllowance {
     /// the source that was tagged at serve time, so that a credit applied later
     /// cannot follow a tag that changed in between.
     #[must_use]
-    pub fn source_for(&self, hash: [u8; 32]) -> Option<[u8; 32]> {
+    pub fn source_for(&self, hash: Hash) -> Option<SourceId> {
         self.source_of.get(&hash).map(|e| *e.value())
     }
 
     /// Credits `units` of realized margin directly to `source`, capped at
     /// `+budget`. The half of [`Self::credit_serve`] that touches the ledger,
     /// split out so a deferred credit can resolve its source first.
-    pub fn credit_source(&self, source: [u8; 32], units: u64) {
+    pub fn credit_source(&self, source: SourceId, units: u64) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let bucket = state.buckets.entry(source).or_insert_with(Bucket::fresh);
         self.refill(bucket);
@@ -176,7 +209,7 @@ impl WarmingAllowance {
     /// Credits the realized margin of a serve back to the source that
     /// speculatively bought `hash`. No-op if `hash` has no known source
     /// (never warmed, or forgotten since). The gain is capped at `+budget`.
-    pub fn credit_serve(&self, hash: [u8; 32], units: u64) {
+    pub fn credit_serve(&self, hash: Hash, units: u64) {
         if let Some(source) = self.source_for(hash) {
             self.credit_source(source, units);
         }
@@ -184,7 +217,7 @@ impl WarmingAllowance {
 
     /// Drops the hash-to-source tag, e.g. on cache eviction, so a stale hash
     /// can never credit a ledger again.
-    pub fn forget(&self, hash: [u8; 32]) {
+    pub fn forget(&self, hash: Hash) {
         self.source_of.remove(&hash);
     }
 }
@@ -213,7 +246,7 @@ pub const WARMING_CREDIT_CAPACITY: usize = 1024;
 pub trait WarmingCreditSink: Send + Sync {
     /// Best-effort, non-blocking credit of `units` for a clean serve of `hash`.
     /// Never blocks the caller on the bucket lock and never fails the serve.
-    fn credit(&self, hash: [u8; 32], units: u64);
+    fn credit(&self, hash: Hash, units: u64);
 }
 
 /// Production [`WarmingCreditSink`]: resolves the hash's source, then enqueues
@@ -233,7 +266,7 @@ pub trait WarmingCreditSink: Send + Sync {
 /// source to blocked. The two are indistinguishable from here, so the first
 /// occurrence warns and the rest stay quiet.
 struct ChannelWarmingCreditSink {
-    tx: mpsc::Sender<([u8; 32], u64)>,
+    tx: mpsc::Sender<(SourceId, u64)>,
     allowance: Arc<WarmingAllowance>,
     metrics: Arc<Metrics>,
     /// Latches on the first `Closed`, so a dead aggregator warns once instead of
@@ -242,7 +275,7 @@ struct ChannelWarmingCreditSink {
 }
 
 impl WarmingCreditSink for ChannelWarmingCreditSink {
-    fn credit(&self, hash: [u8; 32], units: u64) {
+    fn credit(&self, hash: Hash, units: u64) {
         // Bind the credit to the source tagged right now: the aggregator applies
         // it later, by which time an eviction and a re-warm could have retagged
         // the hash to someone else.
@@ -298,7 +331,7 @@ impl DirectWarmingCreditSink {
 }
 
 impl WarmingCreditSink for DirectWarmingCreditSink {
-    fn credit(&self, hash: [u8; 32], units: u64) {
+    fn credit(&self, hash: Hash, units: u64) {
         self.0.credit_serve(hash, units);
     }
 }
@@ -343,7 +376,7 @@ pub fn spawn_warming_creditor(
 /// then flushes the already-enqueued tail so a credit that made it into the
 /// queue before teardown still lands.
 async fn warming_creditor_loop(
-    mut rx: mpsc::Receiver<([u8; 32], u64)>,
+    mut rx: mpsc::Receiver<(SourceId, u64)>,
     allowance: Arc<WarmingAllowance>,
     shutdown: CancellationToken,
 ) {
@@ -392,9 +425,9 @@ mod tests {
         false
     }
 
-    const S1: [u8; 32] = [1u8; 32];
-    const S2: [u8; 32] = [2u8; 32];
-    const H1: [u8; 32] = [10u8; 32];
+    const S1: SourceId = SourceId::from_bytes([1u8; 32]);
+    const S2: SourceId = SourceId::from_bytes([2u8; 32]);
+    const H1: Hash = Hash::from_bytes([10u8; 32]);
 
     #[test]
     fn dud_drains_then_blocks() {

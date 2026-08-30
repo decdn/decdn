@@ -546,7 +546,7 @@ impl AdminRpcServer for AdminRpcImpl {
             // ADR 041: drop the warming tag for the evicted hash, so a later
             // reuse of this slot can never credit a stale source's allowance.
             if let Some(warming) = self.state.warming.as_ref() {
-                warming.forget(*hash.as_bytes());
+                warming.forget(hash);
             }
         }
 
