@@ -9,7 +9,7 @@ use futures_util::{Stream, StreamExt};
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::voucher::StreamAnchor;
-use super::wire::{FrameAccountingFault, drain_frame};
+use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, FloorReservation,
     Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VoucherRejectReason,
@@ -39,14 +39,12 @@ type BaoExportStream = Pin<Box<dyn Stream<Item = CacheResult<Bytes>> + Send>>;
 ///   straight to `StreamEnd` rather than send a zero-length frame first.
 struct ChunkFramer {
     stream: BaoExportStream,
-    /// Export bytes not yet cut into a frame, as a queue of reference-counted
-    /// chunks. The queue holds `O(target)` bytes (target + one export item at
-    /// most), never `O(blob size)`, which is the whole point of the type.
-    /// `Bytes` chunks are kept `Bytes`-native so a spanning frame can be sent
-    /// via a vectored QUIC write without copying payload bytes.
-    queue: VecDeque<Bytes>,
-    /// Total bytes currently queued.
-    queued: usize,
+    /// Export bytes not yet cut into a frame. The queue holds `O(target)` bytes
+    /// (target + one export item at most), never `O(blob size)`, which is the whole
+    /// point of the type. [`FrameQueue`] keeps the running byte count in step with
+    /// the chunks and keeps them `Bytes`-native, so a spanning frame rides a vectored
+    /// QUIC write without copying payload bytes.
+    queue: FrameQueue,
     /// The export stream has yielded its last item; `queue` is all that remains.
     drained: bool,
     /// The export faulted. Terminal: `queue` is cleared and no further frame is
@@ -72,26 +70,24 @@ impl ChunkFramer {
     fn new(stream: BaoExportStream, hash: Hash) -> Self {
         Self {
             stream,
-            queue: VecDeque::new(),
-            queued: 0,
+            queue: FrameQueue::new(),
             drained: false,
             faulted: false,
             hash,
         }
     }
 
-    /// The next wire frame as a set of `Bytes` chunks, totalling up to `target`
-    /// bytes (or the shorter final remainder once the export is exhausted), then
-    /// `None`.
+    /// The next wire frame as a [`FrameChunks`], totalling up to `target` bytes (or
+    /// the shorter final remainder once the export is exhausted), then `None`.
     ///
-    /// The `usize` beside the chunks is their total byte count, which is both what
-    /// the frame header declares to the client and what the serve loop bills for.
+    /// [`FrameChunks::total`] is the frame's total byte count, which is both what the
+    /// frame header declares to the client and what the serve loop bills for.
     ///
-    /// This is the zero-copy serve path: the returned `Vec<Bytes>` holds
-    /// reference-counted slices of the export items, so the caller can send them
-    /// via a single vectored QUIC write alongside a small stack-encoded header
-    /// without copying payload bytes. A frame that straddles two export items
-    /// splits the boundary item with `Bytes::split_to`, which is also zero-copy.
+    /// This is the zero-copy serve path: the frame holds reference-counted slices of
+    /// the export items, so the caller can send them via a single vectored QUIC write
+    /// alongside a small stack-encoded header without copying payload bytes. A frame
+    /// that straddles two export items splits the boundary item with
+    /// `Bytes::split_to`, which is also zero-copy.
     ///
     /// `target` is a per-call argument, not a field, because the serve loop
     /// clamps it to the credit window's remaining room. The window bound is
@@ -107,46 +103,35 @@ impl ChunkFramer {
     /// caller must abort the delivery (skipping `StreamEnd`) so the client sees a
     /// short delivery and does not pay the closing voucher.
     ///
-    /// Also errors on a `target` of zero, on a `queued`/`queue` desync, and on any
-    /// call after a fault. Those three are node-side bugs rather than store faults,
-    /// but the caller's response is the same: abort without `StreamEnd`. A fault is
-    /// terminal — the queue is dropped and later calls error rather than answering
-    /// `None`, because `None` is how the serve loop learns the blob is complete.
-    async fn next_frame_chunks(
-        &mut self,
-        target: usize,
-    ) -> anyhow::Result<Option<(Vec<Bytes>, usize)>> {
+    /// Also errors on a `target` of zero and on any call after a fault. Both are
+    /// node-side bugs rather than store faults, but the caller's response is the
+    /// same: abort without `StreamEnd`. A fault is terminal — the queue is dropped
+    /// and later calls error rather than answering `None`, because `None` is how the
+    /// serve loop learns the blob is complete.
+    async fn next_frame_chunks(&mut self, target: usize) -> anyhow::Result<Option<FrameChunks>> {
         if self.faulted {
             anyhow::bail!("bao export already faulted; refusing to serve further frames");
         }
         // A zero target can never cut a frame. On an empty queue it would answer
         // `None`, which the serve loop reads as a fully delivered blob and follows
-        // with `StreamEnd` over a truncated delivery; on a non-empty one the cut
-        // below refuses, but names a `queued`/`queue` desync — the wrong cause.
-        // `frame_target` never returns zero: every term it minimizes over is at
-        // least one, and the room term floors at a bao chunk group. This restates
-        // that floor where the damage would otherwise be silent or misattributed.
+        // with `StreamEnd` over a truncated delivery. `frame_target` never returns
+        // zero: every term it minimizes over is at least one, and the room term
+        // floors at a bao chunk group. This restates that floor where the damage
+        // would otherwise be silent.
         if target == 0 {
             tracing::error!(hash = %self.hash, "serve loop asked for a zero-length frame");
             return Err(anyhow::Error::new(FrameAccountingFault)
                 .context("refusing to cut a zero-length frame"));
         }
-        while !self.drained && self.queued < target {
+        while !self.drained && self.queue.len() < target {
             match self.stream.next().await {
-                Some(Ok(bytes)) => {
-                    let len = bytes.len();
-                    if len > 0 {
-                        self.queued = self.queued.saturating_add(len);
-                        self.queue.push_back(bytes);
-                    }
-                }
+                Some(Ok(bytes)) => self.queue.push(bytes),
                 Some(Err(e)) => {
                     // Poison, and drop the buffered remainder: this delivery is
                     // over, so any further frame would bill for a transfer that
                     // cannot complete.
                     self.faulted = true;
                     self.queue.clear();
-                    self.queued = 0;
                     tracing::error!(
                         hash = %self.hash,
                         error = %e,
@@ -158,33 +143,10 @@ impl ChunkFramer {
                 None => self.drained = true,
             }
         }
-        if self.queued == 0 {
-            // `None` is how the serve loop learns the blob is complete, so it must
-            // rest on the queue itself and not only on its counter: an under-counting
-            // `queued` would end a truncated delivery with `StreamEnd` and collect the
-            // closing voucher for it.
-            anyhow::ensure!(
-                self.queue.is_empty(),
-                "queued reads 0 with {} chunks still queued; refusing to report the \
-                 blob as fully delivered",
-                self.queue.len()
-            );
-            return Ok(None);
-        }
-        let Some(frame) = drain_frame(&mut self.queue, &mut self.queued, target) else {
-            tracing::error!(
-                hash = %self.hash,
-                queued = self.queued,
-                target,
-                "queued byte count disagrees with the queue; refusing to cut a frame"
-            );
-            return Err(anyhow::Error::new(FrameAccountingFault).context(format!(
-                "cut no chunks from {} queued bytes at target {target}; refusing to \
-                 report the blob as fully delivered",
-                self.queued
-            )));
-        };
-        Ok(Some(frame))
+        // `cut` returns `None` exactly when the queue is empty, which is how the serve
+        // loop learns the blob is complete; the queue holds its count in step with its
+        // bytes, so an empty queue is a genuinely delivered blob and never a desync.
+        Ok(self.queue.cut(target))
     }
 
     /// Test-only coalescing view of [`Self::next_frame_chunks`], for assertions that
@@ -192,17 +154,17 @@ impl ChunkFramer {
     /// spans several queued chunks.
     #[cfg(test)]
     async fn next_frame(&mut self, target: usize) -> anyhow::Result<Option<Bytes>> {
-        let Some((chunks, total)) = self.next_frame_chunks(target).await? else {
+        let Some(frame) = self.next_frame_chunks(target).await? else {
             return Ok(None);
         };
-        if chunks.len() == 1 {
+        let chunks = frame.chunks();
+        if let [only] = chunks {
             // Single chunk — no copy.
-            let mut iter = chunks.into_iter();
-            return Ok(iter.next());
+            return Ok(Some(only.clone()));
         }
-        let mut out = bytes::BytesMut::with_capacity(total);
+        let mut out = bytes::BytesMut::with_capacity(frame.total());
         for c in chunks {
-            out.extend_from_slice(&c);
+            out.extend_from_slice(c);
         }
         Ok(Some(out.freeze()))
     }
@@ -359,12 +321,11 @@ impl ClientHandler {
                 if delivered.saturating_sub(paid) >= window {
                     break;
                 }
-                let Some((chunk_vec, clen)) = next_chunk.take() else {
+                let Some(frame) = next_chunk.take() else {
                     break;
                 };
-                let len = clen as u64;
-                self.write_chunk_payload_multi(send, &chunk_vec, clen)
-                    .await?;
+                let len = frame.total() as u64;
+                self.write_chunk_payload_multi(send, &frame).await?;
                 delivered = delivered.saturating_add(len);
                 self.shed.record_egress(len);
                 unvouchered = unvouchered.saturating_add(len);
@@ -713,11 +674,13 @@ mod tests {
         let items = vec![vec![1u8; 64], vec![2u8; 64], vec![3u8; 64], vec![4u8; 64]];
         let mut framer = ChunkFramer::new(stream_of(items), Hash::new(b"spanning-test"));
 
-        let (chunks, total) = framer
+        let frame = framer
             .next_frame_chunks(200)
             .await?
             .ok_or_else(|| anyhow::anyhow!("expected a frame"))?;
+        let total = frame.total();
         anyhow::ensure!(total == 200, "expected a full 200-byte frame, got {total}");
+        let chunks = frame.chunks();
         anyhow::ensure!(
             chunks.len() == 4,
             "a frame over four export items must stay four slices, got {}",
@@ -787,8 +750,10 @@ mod tests {
             err.to_string().contains("already faulted"),
             "the second call must refuse by name, not re-report the export fault: {err}"
         );
-        anyhow::ensure!(framer.queued == 0, "a fault drops the queued bytes");
-        anyhow::ensure!(framer.queue.is_empty(), "a fault clears the queue");
+        anyhow::ensure!(
+            framer.queue.is_empty(),
+            "a fault clears the queue and drops the queued bytes"
+        );
         Ok(())
     }
 }

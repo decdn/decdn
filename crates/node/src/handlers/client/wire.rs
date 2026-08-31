@@ -264,11 +264,9 @@ impl ClientHandler {
     pub(super) async fn write_chunk_payload_multi(
         &self,
         send: &mut SendStream,
-        payload_chunks: &[Bytes],
-        total_len: usize,
+        frame: &FrameChunks,
     ) -> anyhow::Result<()> {
-        let bufs =
-            chunk_frame_bufs(payload_chunks, total_len).map_err(|e| self.meter_frame_fault(e))?;
+        let bufs = chunk_frame_bufs(frame).map_err(|e| self.meter_frame_fault(e))?;
         self.write_chunk_bufs(send, bufs).await
     }
 }
@@ -283,36 +281,20 @@ impl ClientHandler {
 /// equal `encode_chunk_frame(&concat)` + `write_frame`, pinned by
 /// `chunk_frame_bufs_match_the_single_buffer_encoder`.
 ///
+/// A [`FrameChunks`] is non-empty and its `total` counts exactly the bytes in its
+/// chunks: [`FrameQueue::cut`] is its only constructor and computes the total from
+/// the same items it puts in the frame, so the empty-payload and count-mismatch
+/// refusals live in that construction invariant, not here. `total` is what the
+/// header declares to the client *and* what the serve loop bills for.
+///
 /// # Errors
 ///
-/// An empty `payload_chunks`, or one whose lengths do not sum to `total_len`. Both
-/// mean the framer's byte accounting disagrees with the bytes it handed over —
-/// `total_len` is what the header declares to the client *and* what the serve loop
-/// bills for, so a mismatch must not reach the wire. A `total_len` of zero and a
-/// frame past [`decdn_protocol::framing::MAX_MESSAGE_SIZE`] are both refused one
-/// door further down, by `encode_chunk_frame_headers`' own ADR 005 floor and ADR 013
-/// ceiling; neither is reachable while `payment.frame_target_bytes` is capped at one
-/// payment chunk.
-pub(super) fn chunk_frame_bufs(
-    payload_chunks: &[Bytes],
-    total_len: usize,
-) -> anyhow::Result<Vec<Bytes>> {
-    if payload_chunks.is_empty() {
-        tracing::error!(total_len, "framer handed over an empty chunk payload");
-        return Err(anyhow::Error::new(FrameAccountingFault)
-            .context("refusing to serve an empty chunk payload"));
-    }
-    let actual: usize = payload_chunks.iter().map(Bytes::len).sum();
-    if actual != total_len {
-        tracing::error!(
-            actual,
-            total_len,
-            "framer byte count disagrees with its chunks"
-        );
-        return Err(anyhow::Error::new(FrameAccountingFault).context(format!(
-            "payload_chunks sum {actual} does not match total_len {total_len}"
-        )));
-    }
+/// A `total` past [`decdn_protocol::framing::MAX_MESSAGE_SIZE`] is refused one door
+/// further down, by `encode_chunk_frame_headers`' own ADR 013 ceiling; the ADR 005
+/// empty-frame floor lives there too. Neither is reachable while
+/// `payment.frame_target_bytes` is capped at one payment chunk.
+pub(super) fn chunk_frame_bufs(frame: &FrameChunks) -> anyhow::Result<Vec<Bytes>> {
+    let total_len = frame.total;
     let mut hdr = [0u8; decdn_protocol::client::CHUNK_FRAME_HEADERS_MAX];
     let hdr_len =
         decdn_protocol::client::encode_chunk_frame_headers(total_len, &mut hdr).map_err(|e| {
@@ -328,9 +310,9 @@ pub(super) fn chunk_frame_bufs(
         return Err(anyhow::Error::new(FrameAccountingFault)
             .context(format!("chunk header length {hdr_len} exceeds its buffer")));
     };
-    let mut bufs = Vec::with_capacity(payload_chunks.len().saturating_add(1));
+    let mut bufs = Vec::with_capacity(frame.chunks.len().saturating_add(1));
     bufs.push(Bytes::copy_from_slice(header));
-    bufs.extend_from_slice(payload_chunks);
+    bufs.extend_from_slice(&frame.chunks);
     Ok(bufs)
 }
 
@@ -370,9 +352,8 @@ fn write_chunk_error(e: WriteError) -> anyhow::Error {
 }
 
 /// A serve-side refusal caused by the node's own byte accounting rather than by the
-/// store, the encoder, or the peer: a zero frame target, a `queued`/`queue` desync, a
-/// payload whose chunks disagree with the length its header would declare, or a
-/// header the encoder refused.
+/// store, the encoder, or the peer: a zero frame target, or a header the encoder
+/// refused.
 ///
 /// Every one of those is correct to refuse and therefore silent — the delivery just
 /// ends, which reads to an operator as a client that hung up. Carrying the cause as a
@@ -443,64 +424,140 @@ impl std::fmt::Display for ClientPaymentFault {
 
 impl std::error::Error for ClientPaymentFault {}
 
-/// Cut up to `target` bytes off the front of `queue` into the `Bytes` slices that
-/// make up one wire frame, returning them and their total. `queued` is the queue's
-/// running byte count and drops by exactly what is taken.
+/// A queue of not-yet-framed export bytes plus its running byte count, holding the
+/// two in step so a frame is cut from a count that always matches the bytes present.
 ///
-/// Nothing is copied: whole items move across, and a frame that ends mid-item splits
-/// it with `Bytes::split_to`, which reslices the same allocation.
-///
-/// `None` when `target.min(*queued)` is zero. Both framers hold `queued` in lockstep
-/// with `queue` and pass `target >= 1`, so for them that means an empty queue — one
-/// of them seeing `None` with bytes still queued is looking at a bookkeeping bug, not
-/// at the end of the blob.
-pub(super) fn drain_frame(
-    queue: &mut VecDeque<Bytes>,
-    queued: &mut usize,
-    target: usize,
-) -> Option<(Vec<Bytes>, usize)> {
-    let mut remaining = target.min(*queued);
-    let mut out: Vec<Bytes> = Vec::with_capacity(queue.len().min(remaining));
-    let mut total = 0usize;
-    while remaining > 0 {
-        let front_len = queue.front().map_or(0, Bytes::len);
-        if front_len == 0 {
-            break;
-        }
-        // `checked_sub`, not `saturating_sub`: clamping `queued` to zero behind a
-        // desync is what would let a later call answer `None` and end a truncated
-        // delivery with `StreamEnd`. Stopping here instead yields a short frame whose
-        // header and billing both match the bytes actually moved, and leaves `queued`
-        // non-zero so the caller's own guard names the desync.
-        if front_len <= remaining {
-            let (Some(next_queued), Some(bytes)) =
-                (queued.checked_sub(front_len), queue.pop_front())
-            else {
-                break;
-            };
-            remaining = remaining.saturating_sub(front_len);
-            total = total.saturating_add(front_len);
-            *queued = next_queued;
-            out.push(bytes);
-        } else {
-            // Check before the split: `split_to` mutates the queue, so bailing after
-            // it would drop the bytes it took.
-            let (Some(next_queued), Some(front)) =
-                (queued.checked_sub(remaining), queue.front_mut())
-            else {
-                break;
-            };
-            let taken = front.split_to(remaining);
-            total = total.saturating_add(taken.len());
-            *queued = next_queued;
-            out.push(taken);
-            remaining = 0;
+/// Both serve framers (`ChunkFramer` on the cache-hit leg and
+/// [`super::serve_encoder::CoherentFrameProducer`] on the miss leg) buffer export
+/// items here until they hold a frame's worth. [`Self::push`] drops empty items, so
+/// `queued == 0` holds exactly when `queue` is empty — the desync the framers once
+/// guarded by hand cannot arise. The bytes stay `Bytes`-native so a spanning frame
+/// rides a vectored QUIC write without a coalescing copy.
+pub(super) struct FrameQueue {
+    /// Export bytes not yet cut into a frame, as reference-counted chunks.
+    queue: VecDeque<Bytes>,
+    /// Total bytes currently queued. Equals the sum of the chunk lengths.
+    queued: usize,
+}
+
+impl FrameQueue {
+    pub(super) const fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            queued: 0,
         }
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some((out, total))
+
+    /// Queue one export item, keeping the byte count in step. An empty item is
+    /// dropped: admitting it would let `queued == 0` coexist with a non-empty queue,
+    /// the desync the type exists to rule out.
+    pub(super) fn push(&mut self, b: Bytes) {
+        let len = b.len();
+        if len > 0 {
+            self.queued = self.queued.saturating_add(len);
+            self.queue.push_back(b);
+        }
+    }
+
+    /// The queued byte count — what a `target`-sized cut measures itself against.
+    pub(super) const fn len(&self) -> usize {
+        self.queued
+    }
+
+    /// Whether the queue holds no bytes. Equal to `queue.is_empty()` by
+    /// construction, since empties never enter and the count moves with the bytes.
+    /// The framers read the same fact through [`Self::cut`] returning `None`, so this
+    /// backs the tests that pin the count/queue equivalence directly.
+    #[cfg(test)]
+    pub(super) const fn is_empty(&self) -> bool {
+        self.queued == 0
+    }
+
+    /// Drop every queued byte and reset the count. The fault path: a framer that
+    /// abandons its delivery clears the buffered remainder so no later cut bills for
+    /// a transfer that can never complete.
+    pub(super) fn clear(&mut self) {
+        self.queue.clear();
+        self.queued = 0;
+    }
+
+    /// Cut up to `target` bytes off the front of the queue into the `Bytes` slices
+    /// that make up one wire frame.
+    ///
+    /// Nothing is copied: whole items move across, and a frame that ends mid-item
+    /// splits it with `Bytes::split_to`, which reslices the same allocation.
+    ///
+    /// `None` only when the queue is empty. For a caller passing `target >= 1`,
+    /// `target.min(queued) == 0` implies `queued == 0`, so `None` is the end of the
+    /// blob and never a bookkeeping fault — that path is unrepresentable now the
+    /// count is held in step with the bytes.
+    pub(super) fn cut(&mut self, target: usize) -> Option<FrameChunks> {
+        let mut remaining = target.min(self.queued);
+        let mut chunks: Vec<Bytes> = Vec::with_capacity(self.queue.len().min(remaining));
+        let mut total = 0usize;
+        while remaining > 0 {
+            let front_len = self.queue.front().map_or(0, Bytes::len);
+            // Empties never enter the queue, so a zero front only shows up if the
+            // queue is already empty, which `remaining > 0` rules out; the branch is
+            // dead but keeps the loop total on well-defined ground.
+            if front_len == 0 {
+                break;
+            }
+            if front_len <= remaining {
+                let Some(bytes) = self.queue.pop_front() else {
+                    break;
+                };
+                remaining -= front_len;
+                total = total.saturating_add(front_len);
+                self.queued -= front_len;
+                chunks.push(bytes);
+            } else {
+                // Split before touching the count: `split_to` mutates the queue, so
+                // the bytes it takes must be accounted whatever happens next.
+                let Some(front) = self.queue.front_mut() else {
+                    break;
+                };
+                let taken = front.split_to(remaining);
+                let taken_len = taken.len();
+                total = total.saturating_add(taken_len);
+                self.queued -= taken_len;
+                chunks.push(taken);
+                remaining = 0;
+            }
+        }
+        if chunks.is_empty() {
+            None
+        } else {
+            Some(FrameChunks { chunks, total })
+        }
+    }
+}
+
+/// One wire frame's worth of payload: the `Bytes` slices that make it up and their
+/// total byte count, cut off a [`FrameQueue`].
+///
+/// [`FrameQueue::cut`] is the only constructor, and it computes `total` from the
+/// same items it moves into `chunks`, so `total` equals the sum of the chunk lengths
+/// by construction. That is what lets [`chunk_frame_bufs`] drop the empty-payload and
+/// count-mismatch guards: a `FrameChunks` whose header would misdeclare its own bytes
+/// cannot be built.
+#[derive(Debug)]
+pub(super) struct FrameChunks {
+    chunks: Vec<Bytes>,
+    total: usize,
+}
+
+impl FrameChunks {
+    /// The frame's total byte count — what its header declares to the client and
+    /// what the serve loop bills for.
+    pub(super) const fn total(&self) -> usize {
+        self.total
+    }
+
+    /// The raw payload slices, for tests that assert the zero-copy split.
+    #[cfg(test)]
+    pub(super) fn chunks(&self) -> &[Bytes] {
+        &self.chunks
     }
 }
 
@@ -515,7 +572,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        ClientPaymentFault, FrameError, PeerFault, WriteError, chunk_frame_bufs, drain_frame,
+        ClientPaymentFault, FrameError, FrameQueue, PeerFault, WriteError, chunk_frame_bufs,
         is_peer_attributable, write_chunk_error, write_frame_error,
     };
 
@@ -597,7 +654,15 @@ mod tests {
                     .collect();
                 let total: usize = chunks.iter().map(Bytes::len).sum();
 
-                let bufs = chunk_frame_bufs(&chunks, total)?;
+                // Build the frame the only way production does: push the items onto a
+                // `FrameQueue`, then cut all of them into one `FrameChunks`.
+                let mut fq = FrameQueue::new();
+                for c in &chunks {
+                    fq.push(c.clone());
+                }
+                let frame = fq.cut(total).expect("a non-empty queue cuts a frame");
+
+                let bufs = chunk_frame_bufs(&frame)?;
                 let mut via_bufs = Vec::new();
                 for b in &bufs {
                     via_bufs.extend_from_slice(b);
@@ -625,134 +690,115 @@ mod tests {
         Ok(())
     }
 
-    /// `total_len` is both what the header declares to the client and what the serve
-    /// loop bills for, so a framer whose byte count disagrees with the bytes it
-    /// handed over must fail loudly here rather than put a mislabelled frame on the
-    /// wire and charge for it.
+    /// `push` drops an empty item so the byte count never desyncs from the queue.
+    /// This is what makes `is_empty()` (count `== 0`) and an empty `queue` the same
+    /// statement, which is what lets `cut` treat `None` as the end of the blob rather
+    /// than a bookkeeping fault.
     #[test]
-    fn chunk_frame_bufs_refuses_a_payload_that_does_not_match_its_length() {
-        let chunks = vec![Bytes::from_static(b"abcd"), Bytes::from_static(b"ef")];
-        assert!(chunk_frame_bufs(&chunks, 6).is_ok(), "6 is the true sum");
-        assert!(chunk_frame_bufs(&chunks, 5).is_err(), "under-count refused");
-        assert!(chunk_frame_bufs(&chunks, 7).is_err(), "over-count refused");
-        // ADR 005 §Non-empty chunk (#1088), at the last door before the wire.
-        assert!(chunk_frame_bufs(&[], 0).is_err(), "no chunks at all");
-        assert!(
-            chunk_frame_bufs(&[Bytes::new()], 0).is_err(),
-            "one empty chunk is still a zero-length frame"
-        );
+    fn push_drops_empties_so_the_count_never_desyncs() {
+        let mut fq = FrameQueue::new();
+        assert!(fq.is_empty());
+        assert_eq!(fq.len(), 0);
+
+        fq.push(Bytes::new());
+        assert!(fq.is_empty(), "an empty item leaves the queue empty");
+        assert_eq!(fq.len(), 0, "and leaves the count at zero");
+
+        fq.push(Bytes::from_static(b"abcd"));
+        fq.push(Bytes::new());
+        assert_eq!(fq.len(), 4, "the empty push between real ones is a no-op");
+        assert!(!fq.is_empty());
     }
 
     /// Cutting a frame moves whole items and splits only the one the frame ends in,
-    /// leaving `queued` equal to the bytes still in the queue.
+    /// leaving `len()` equal to the bytes still queued.
     ///
     /// The chunk COUNTS are the load-bearing assertions. `total` is computed from the
     /// same lengths a sum over the result would re-add, so checking one against the
     /// other proves nothing; what the zero-copy path actually rests on is that a frame
     /// spanning two queued items arrives as two `Bytes` rather than one coalesced
-    /// buffer. A `drain_frame` rewritten to concatenate would satisfy every other
-    /// assertion in this file.
+    /// buffer. A `cut` rewritten to concatenate would satisfy every other assertion in
+    /// this file.
     #[test]
-    fn drain_frame_cuts_at_the_target_and_keeps_the_remainder() {
-        let mut queue: std::collections::VecDeque<Bytes> =
-            [Bytes::from_static(b"aaaa"), Bytes::from_static(b"bbbb")]
-                .into_iter()
-                .collect();
-        let mut queued = 8usize;
+    fn cut_cuts_at_the_target_and_keeps_the_remainder() {
+        let mut fq = FrameQueue::new();
+        fq.push(Bytes::from_static(b"aaaa"));
+        fq.push(Bytes::from_static(b"bbbb"));
+        assert_eq!(fq.len(), 8, "len tracks the pushed bytes");
 
-        let (chunks, total) = drain_frame(&mut queue, &mut queued, 6).expect("6 of 8 bytes");
-        assert_eq!(total, 6);
+        let frame = fq.cut(6).expect("6 of 8 bytes");
+        assert_eq!(frame.total(), 6);
         assert_eq!(
-            chunks.len(),
+            frame.chunks().len(),
             2,
             "a frame spanning two items must stay two uncopied slices"
         );
         assert_eq!(
-            chunks.concat(),
+            frame.chunks().concat(),
             b"aaaabb",
             "the cut is an in-order prefix of the queue"
         );
-        assert_eq!(queued, 2, "the split remainder stays queued");
+        assert_eq!(fq.len(), 2, "the split remainder stays queued");
 
-        let (rest, rest_total) = drain_frame(&mut queue, &mut queued, 6).expect("the remainder");
-        assert_eq!(rest_total, 2, "a short final frame, not a padded one");
-        assert_eq!(rest.len(), 1, "the remainder is what is left of one item");
-        assert_eq!(rest.concat(), b"bb");
-        assert_eq!(queued, 0);
-
-        assert!(
-            drain_frame(&mut queue, &mut queued, 6).is_none(),
-            "an empty queue is the only `None`"
+        let rest = fq.cut(6).expect("the remainder");
+        assert_eq!(rest.total(), 2, "a short final frame, not a padded one");
+        assert_eq!(
+            rest.chunks().len(),
+            1,
+            "the remainder is what is left of one item"
         );
+        assert_eq!(rest.chunks().concat(), b"bb");
+        assert_eq!(fq.len(), 0);
+
+        assert!(fq.cut(6).is_none(), "an empty queue is the only `None`");
     }
 
     /// A frame that ends exactly on an item boundary takes whole items and splits
     /// nothing — the case where an off-by-one in the `front_len <= remaining` branch
     /// would show up as a spurious extra chunk or a dropped byte.
     #[test]
-    fn drain_frame_ends_on_an_item_boundary_without_splitting() {
-        let mut queue: std::collections::VecDeque<Bytes> = (0..4u8)
-            .map(|i| Bytes::from(vec![i; 4]))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .collect();
-        let mut queued = 16usize;
+    fn cut_ends_on_an_item_boundary_without_splitting() {
+        let mut fq = FrameQueue::new();
+        for i in 0..4u8 {
+            fq.push(Bytes::from(vec![i; 4]));
+        }
+        assert_eq!(fq.len(), 16);
 
-        let (chunks, total) = drain_frame(&mut queue, &mut queued, 8).expect("two whole items");
-        assert_eq!(total, 8);
-        assert_eq!(chunks.len(), 2, "two items moved whole, none split");
-        assert_eq!(chunks.concat(), [0, 0, 0, 0, 1, 1, 1, 1]);
-        assert_eq!(queued, 8);
-        assert_eq!(queue.len(), 2, "the untouched items stay whole");
+        let frame = fq.cut(8).expect("two whole items");
+        assert_eq!(frame.total(), 8);
+        assert_eq!(frame.chunks().len(), 2, "two items moved whole, none split");
+        assert_eq!(frame.chunks().concat(), [0, 0, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(fq.len(), 8, "the untouched items stay queued whole");
     }
 
     /// A target past everything queued yields one short frame of exactly what is
     /// there, not a parked call and not a padded frame.
     #[test]
-    fn drain_frame_takes_everything_when_the_target_exceeds_the_queue() {
-        let mut queue: std::collections::VecDeque<Bytes> =
-            [Bytes::from_static(b"ab"), Bytes::from_static(b"cde")]
-                .into_iter()
-                .collect();
-        let mut queued = 5usize;
+    fn cut_takes_everything_when_the_target_exceeds_the_queue() {
+        let mut fq = FrameQueue::new();
+        fq.push(Bytes::from_static(b"ab"));
+        fq.push(Bytes::from_static(b"cde"));
+        assert_eq!(fq.len(), 5);
 
-        let (chunks, total) = drain_frame(&mut queue, &mut queued, 1024).expect("all 5 bytes");
-        assert_eq!(total, 5);
-        assert_eq!(chunks.len(), 2, "both items ride uncopied");
-        assert_eq!(chunks.concat(), b"abcde");
-        assert_eq!(queued, 0);
-        assert!(queue.is_empty());
+        let frame = fq.cut(1024).expect("all 5 bytes");
+        assert_eq!(frame.total(), 5);
+        assert_eq!(frame.chunks().len(), 2, "both items ride uncopied");
+        assert_eq!(frame.chunks().concat(), b"abcde");
+        assert!(fq.is_empty());
     }
 
-    /// A `queued` that under-counts the queue must not be clamped to zero: that is the
-    /// direction that would let a later call answer `None`, which the serve loops read
-    /// as a fully delivered blob and follow with `StreamEnd` over a truncation.
-    ///
-    /// Unreachable while both framers keep the two in lockstep. Pinned because the
-    /// failure is otherwise self-consistent and silent — the short frame it produces
-    /// is correctly labelled and correctly billed.
+    /// `cut` returns `None` only on an empty queue. Because `push` never admits an
+    /// empty item, `len() == 0` and an empty queue are the same state, so the
+    /// under-counting desync a hand-maintained counter could reach — which would end a
+    /// truncated delivery with `StreamEnd` — is unrepresentable here by construction.
     #[test]
-    fn drain_frame_leaves_an_under_counting_queued_non_zero() {
-        let mut queue: std::collections::VecDeque<Bytes> =
-            [Bytes::from_static(b"aaaa"), Bytes::from_static(b"bbbb")]
-                .into_iter()
-                .collect();
-        // Deliberately wrong: 8 bytes are queued, the counter claims 4.
-        let mut queued = 4usize;
+    fn cut_is_none_only_on_an_empty_queue() {
+        let mut fq = FrameQueue::new();
+        assert!(fq.cut(8).is_none(), "an empty queue cuts nothing");
 
-        let (chunks, total) = drain_frame(&mut queue, &mut queued, 8).expect("what it can cut");
-        assert_eq!(total, 4, "it cuts only what the counter admits");
-        assert_eq!(chunks.concat(), b"aaaa");
-        assert_eq!(queued, 0);
-        // The bytes it could not account for are still there, so the next call cuts
-        // rather than reporting the blob complete.
-        assert!(
-            drain_frame(&mut queue, &mut queued, 8).is_none(),
-            "a zero counter cuts nothing"
-        );
-        assert!(
-            !queue.is_empty(),
-            "the unaccounted bytes are not silently lost"
-        );
+        fq.push(Bytes::from_static(b"xy"));
+        assert!(fq.cut(8).is_some(), "a non-empty queue always cuts");
+        assert!(fq.is_empty());
+        assert!(fq.cut(8).is_none(), "drained again, back to `None`");
     }
 }
