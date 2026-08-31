@@ -98,12 +98,19 @@ impl std::error::Error for FillError {}
 
 /// The pre-order outboard buffer + a per-node "captured" flag. Guarded together;
 /// the lock is never held across an await.
+///
+/// Both vectors are allocated lazily on the first capture (see
+/// [`HashOutboard::write_pair`]), not at construction: empty ⇒ nothing captured
+/// yet, which [`HashOutboard::try_load`] reads as "absent" exactly as an all-false
+/// `captured` did. This keeps the MB-scale zeroing for a large blob off the global
+/// registry lock that [`HashOutboard::new`] runs under.
 #[derive(Debug)]
 struct OutboardState {
-    /// `tree.outboard_size()` bytes: node `n`'s pair lives at
-    /// `tree.pre_order_offset(n) * 64`.
+    /// `tree.outboard_size()` bytes once sized: node `n`'s pair lives at
+    /// `tree.pre_order_offset(n) * 64`. Empty until the first capture sizes it.
     bytes: Vec<u8>,
     /// `captured[i]` is set once node index `i` (its `pre_order_offset`) is saved.
+    /// Empty until the first capture sizes it, alongside `bytes`.
     captured: Vec<bool>,
 }
 
@@ -132,17 +139,21 @@ pub struct HashOutboard {
 
 impl HashOutboard {
     /// Build the empty outboard for a `total_bytes`-byte blob rooted at `root`.
+    ///
+    /// O(1): the `tree.outboard_size()`-byte buffer is NOT allocated here — the
+    /// first [`Self::write_pair`] sizes it under the per-hash `state` lock. This
+    /// keeps a session's outboard construction under the global [`FillRegistry`]
+    /// lock free of MB-scale zeroing, so one large-blob claim no longer stalls
+    /// every other hash's claim/wakeup for the allocation duration, and a session
+    /// that only adopts the canonical outboard allocates nothing to discard.
     #[must_use]
     fn new(root: blake3::Hash, total_bytes: u64) -> Arc<Self> {
-        let tree = BaoTree::new(total_bytes, IROH_BLOCK_SIZE);
-        let size = usize::try_from(tree.outboard_size()).unwrap_or(usize::MAX);
-        let nodes = size / HASH_PAIR_BYTES;
         Arc::new(Self {
-            tree,
+            tree: BaoTree::new(total_bytes, IROH_BLOCK_SIZE),
             root,
             state: StdMutex::new(OutboardState {
-                bytes: vec![0u8; size],
-                captured: vec![false; nodes],
+                bytes: Vec::new(),
+                captured: Vec::new(),
             }),
             captured: Notify::new(),
             liveness: Arc::new(Notify::new()),
@@ -170,6 +181,16 @@ impl HashOutboard {
         let Ok(idx) = usize::try_from(offset) else {
             return false; // offset beyond usize: no addressable slot
         };
+        // Lazily size the outboard on the first capture, under this per-hash
+        // `state` lock rather than the global registry lock `new` runs under. A
+        // real interior node (a `Some` offset) implies `outboard_size() >= 64`, so
+        // an empty buffer here always means "not yet sized", never a zero-node
+        // tree. Sized exactly once: every later capture sees a non-empty buffer.
+        if state.bytes.is_empty() {
+            let size = usize::try_from(self.tree.outboard_size()).unwrap_or(usize::MAX);
+            state.bytes = vec![0u8; size];
+            state.captured = vec![false; size / HASH_PAIR_BYTES];
+        }
         let byte_off = idx.saturating_mul(HASH_PAIR_BYTES);
         let (l, r) = pair;
         let bytes_written = if let Some(slot) =
@@ -1057,6 +1078,31 @@ mod tests {
         for (node, pair) in saved {
             assert_eq!(reader.load(node).await.unwrap(), Some(pair));
         }
+    }
+
+    #[tokio::test]
+    async fn outboard_buffer_is_allocated_lazily_on_first_capture() {
+        // A freshly built session (as `make_session` builds one under the global
+        // registry lock) must allocate no outboard buffer — the MB-scale zeroing
+        // is deferred to the first capture, off that lock.
+        let session = FillSession::new(h(0xDD), TOTAL);
+        assert!(
+            session.outboard().state.lock().unwrap().bytes.is_empty(),
+            "construction allocates no outboard buffer under the registry lock"
+        );
+
+        // The first capture sizes the buffer to the full pre-order outboard.
+        let tree = BaoTree::new(TOTAL, IROH_BLOCK_SIZE);
+        let node = tree
+            .pre_order_nodes_iter()
+            .find(|n| tree.pre_order_offset(*n).is_some())
+            .expect("an interior node exists");
+        session.capture(node, (h(1), h(2)));
+        assert_eq!(
+            session.outboard().state.lock().unwrap().bytes.len() as u64,
+            tree.outboard_size(),
+            "the first capture sizes the buffer to the whole outboard"
+        );
     }
 
     #[tokio::test]
