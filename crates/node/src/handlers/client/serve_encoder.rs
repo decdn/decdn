@@ -67,6 +67,13 @@ struct AwaitingDataReader {
     /// The per-hash liveness signal, snapshot at construction: notified whenever any
     /// fill of this hash ends or is cancelled, so a parked read re-checks liveness.
     liveness: Arc<Notify>,
+    /// The blob's present chunk ranges as last reported by `watch` — the absolute
+    /// bitfield each watch item carries, not a delta. A read answers coverage
+    /// against this local snapshot instead of a per-leaf `missing_ranges` store
+    /// round trip; the watch only advances as the pull fills, so this grows
+    /// monotonically and the encoder's forward walk reads each landed leaf with no
+    /// store hop. Empty until the watch yields its first snapshot.
+    present: ChunkRanges,
 }
 
 impl AwaitingDataReader {
@@ -78,10 +85,25 @@ impl AwaitingDataReader {
             watch: None,
             session,
             liveness,
+            present: ChunkRanges::empty(),
         }
     }
 
-    /// Does the store currently hold the whole byte range `[offset, offset + len)`?
+    /// Does the local present-range snapshot already cover chunk `range`, and is the
+    /// hash not refused? Pure in-memory: the coverage test is a `ChunkRanges`
+    /// subtraction and [`NodeRangedStore::refuses`] reads only lock-free sets, so
+    /// this is the zero-store-hop fast path a served leaf takes once the pull has
+    /// filled it. Refusing an evicted/blacklisted hash here mirrors the guard the
+    /// store's own `present_ranges` applies, so a mid-fill takedown reads as
+    /// not-present exactly as before — just without the store round trip.
+    fn covers_locally(&self, range: &ChunkRanges) -> bool {
+        !self.store.refuses() && (range.clone() - &self.present).is_empty()
+    }
+
+    /// Authoritative store-backed presence probe for `[offset, offset + len)`, used
+    /// only to settle the rare race where a fill retires between the liveness and
+    /// outcome reads — not on the per-leaf hot path, which answers from
+    /// [`Self::covers_locally`].
     ///
     /// Takes `&mut self` (though it mutates nothing) so the future holds a
     /// `&mut AwaitingDataReader` rather than `&AwaitingDataReader` across the store
@@ -114,7 +136,10 @@ impl AsyncSliceReader for AwaitingDataReader {
                 ))
             })?;
         loop {
-            if self.present_covers(offset, need).await? {
+            // Fast path: answer coverage from the watch's last snapshot, no store
+            // hop. Empty until the watch yields, so the first read for a leaf falls
+            // through to open the watch and await its first item below.
+            if self.covers_locally(&range) {
                 break;
             }
 
@@ -180,19 +205,22 @@ impl AsyncSliceReader for AwaitingDataReader {
                 }
             }
 
-            // Await the next present-range advance vs the pull ending, then re-check.
+            // Await the next present-range advance vs the pull ending. Each watch
+            // item is the blob's absolute present ranges; fold it into the local
+            // snapshot so the next loop answers coverage without a store hop.
             let advanced = async {
                 match self.watch.as_mut() {
-                    Some(w) => w.next().await.map(|_ranges| ()),
+                    Some(w) => w.next().await,
                     None => None,
                 }
             };
             tokio::select! {
                 biased;
                 () = ended.as_mut() => {}
-                closed = advanced => {
-                    if closed.is_none() {
-                        self.watch = None; // watch stream ended; re-open next pass
+                yielded = advanced => {
+                    match yielded {
+                        Some(ranges) => self.present = ranges,
+                        None => self.watch = None, // watch stream ended; re-open next pass
                     }
                 }
             }
@@ -867,6 +895,42 @@ mod tests {
             served,
             reference.as_ref(),
             "the coalesced two-pull serve of [2g,5g) is byte-identical to a single-pull encode"
+        );
+    }
+
+    /// The per-leaf coverage check answers from the local watch snapshot with no
+    /// store round trip, and folds in the takedown gate: an empty snapshot covers
+    /// nothing, a snapshot that includes the range covers it, and an evicted hash
+    /// reads as not-present — mirroring the store's own `present_ranges` guard.
+    #[tokio::test]
+    async fn covers_locally_answers_from_snapshot_and_refuses_takedown() {
+        let total = 4 * G;
+        let (root, _plaintext, _outboard) = synth_blob(total as usize);
+        let hash = Hash::from(root);
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await.unwrap();
+        let session = FillSession::new(bao_tree::blake3::Hash::from(root), total);
+        let store = NodeRangedStore::new(engine.clone(), hash, total);
+        let mut reader = super::AwaitingDataReader::new(store, total, session);
+
+        let range = align_range(0, G, total).unwrap().chunk_ranges().clone();
+        assert!(
+            !reader.covers_locally(&range),
+            "an empty snapshot covers nothing"
+        );
+
+        // The watch would set `present`; simulate its snapshot covering [0, G).
+        reader.present = range.clone();
+        assert!(
+            reader.covers_locally(&range),
+            "covered once the snapshot includes the range"
+        );
+
+        // A takedown makes the range read as not-present with no store hop.
+        engine.evict(hash).await.unwrap();
+        assert!(
+            !reader.covers_locally(&range),
+            "an evicted hash is refused locally, mirroring present_ranges"
         );
     }
 }
