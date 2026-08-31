@@ -1,10 +1,10 @@
 //! `redb`-backed persistent [`BuyerPoolStore`] for client-side use (#940).
 //!
 //! A client (`decdn fetch`) has no seller state, so it gets a **buyer-only**
-//! store: its own `buyer-pools.redb`, one table. The node instead keeps its
-//! buyer table inside a combined `lanes.redb` alongside the seller,
-//! pending-settle, and watcher-checkpoint tables, because `redb` forbids two
-//! `Database` handles on one file.
+//! store: its own `buyer-pools.redb`, one table. The node keeps its buyer table
+//! in its own `buyer.redb` — one of the per-family files its lane store opens,
+//! so a buyer top-up commits on a writer slot separate from the seller lane
+//! flush.
 //!
 //! That file ownership — plus the guards on [`RedbBuyerPoolStore::open`] — is
 //! **all** this module contributes. The record codec and every table

@@ -429,9 +429,10 @@ async fn build_infra(
     // The one redb-backed store implements the voucher-state trait (for the
     // handler + #527 replay guard), the pending-settle trait (for the on-chain
     // settlement sweep, PR #743 review), and the buyer-channel trait (#744).
-    // Derive trait-object handles from the single concrete store so all tables
-    // share one open file and one fsync discipline; `concrete_channel_store`
-    // stays bound for the buyer handle built further below.
+    // Derive trait-object handles from the single concrete store so every write
+    // family shares one open store and one fsync discipline (each family commits
+    // on its own per-family redb file); `concrete_channel_store` stays bound for
+    // the buyer handle built further below.
     let channel_state_store: Arc<dyn PoolStateStore> = concrete_channel_store.clone();
     // Debounce the scan-checkpoint writes (#784, keyed in #1092): each persisted
     // watcher (settlement `ChannelOpened`, origin `Origin`) advances its cursor
@@ -3233,12 +3234,13 @@ async fn build_cache(
     // probe-hold budget once here is sufficient (ADR 005 §Hold budget, #318).
     engine.set_max_probe_holds(cfg.cache.max_probe_holds);
     // Live-origin probe memo (#1130 pt3) — likewise restart-configured once.
-    engine.set_origin_probe_config(
-        std::time::Duration::from_secs(cfg.cache.origin_probe_ttl_sec),
-        std::time::Duration::from_secs(cfg.cache.origin_probe_negative_ttl_sec),
-        std::time::Duration::from_millis(cfg.cache.origin_probe_timeout_ms),
-        usize::try_from(cfg.cache.origin_probe_memo_capacity).unwrap_or(usize::MAX),
-    );
+    engine.set_origin_probe_config(decdn_cache::origin_probe::OriginProbePolicy {
+        positive_ttl: std::time::Duration::from_secs(cfg.cache.origin_probe_ttl_sec),
+        negative_ttl: std::time::Duration::from_secs(cfg.cache.origin_probe_negative_ttl_sec),
+        fault_ttl: std::time::Duration::from_secs(cfg.cache.origin_probe_fault_ttl_sec),
+        timeout: std::time::Duration::from_millis(cfg.cache.origin_probe_timeout_ms),
+        capacity: usize::try_from(cfg.cache.origin_probe_memo_capacity).unwrap_or(usize::MAX),
+    });
     Ok(engine)
 }
 
@@ -3953,6 +3955,8 @@ mod tests {
                 origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
                 origin_probe_negative_ttl_sec:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
+                origin_probe_fault_ttl_sec:
+                    decdn_common::config::DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC,
                 origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
                 origin_probe_memo_capacity:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,

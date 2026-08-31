@@ -430,10 +430,14 @@ impl HolderSnapshot {
 /// this node owns, committed but with its insert event dropped, is in neither
 /// half without it. `Fault` is skipped rather than admitted: a transport blip
 /// must not turn into an advertisement for content the serve path might then
-/// refuse, and faults are not memoised, so the next sweep retries. Skipping is
-/// still a hash this node holds and does not announce, so each one counts
-/// toward `origin_probe_faults` — otherwise an origin-only node drops its own
-/// store-only content on a blip and reports a healthy snapshot.
+/// refuse. A fault is memoised for `cache.origin_probe_fault_ttl_sec`, so a
+/// sweep landing inside that window re-reads the same fault rather than
+/// re-probing — the hash stays out of the announce set until the memo expires,
+/// which bounds how long a blip suppresses it and is why the fault TTL is
+/// capped below the positive TTL. Skipping is still a hash this node holds and
+/// does not announce, so each one counts toward `origin_probe_faults` —
+/// otherwise an origin-only node drops its own store-only content on a blip and
+/// reports a healthy snapshot.
 ///
 /// Never fails: a store-walk error degrades to the origin-held half rather than
 /// yielding nothing, because a partial announce strictly beats none. Every way

@@ -646,7 +646,7 @@ impl ReceiptLog for NoopReceiptLog {
 /// receipt (best-effort, audit-only) rather than stall the payment, which
 /// already advanced the lane watermark. The runtime uses [`ChannelReceiptSink`]
 /// (hands off to the background [`spawn_receipt_writer`] task); tests use a
-/// synchronous fake behind [`DirectReceiptSink`].
+/// synchronous fake behind the `test-support` `DirectReceiptSink`.
 ///
 /// The seam carries a [`RawReceipt`], not the rendered [`DownloadReceipt`]: the
 /// hex/decimal rendering and the timestamp are applied downstream, off the hot
@@ -720,13 +720,16 @@ impl ReceiptSink for ChannelReceiptSink {
 ///
 /// It deliberately *violates* the [`ReceiptSink`] non-blocking contract (it
 /// appends inline on the caller's thread), so it must never be wired onto the
-/// paid-delivery path. The type and constructor stay `pub` only because the
-/// cross-crate integration tests in `tests/` cannot see `#[cfg(test)]` items;
-/// the field is private and the type is `#[doc(hidden)]` so it does not read as
-/// a production knob.
+/// paid-delivery path. The `test-support` feature gate keeps it out of every
+/// production build: it compiles only for this crate's own tests and for the
+/// cross-crate integration tests in `tests/`, which cannot see `#[cfg(test)]`
+/// items. The field is private and the type is `#[doc(hidden)]` so it does not
+/// read as a production knob.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub struct DirectReceiptSink(Arc<dyn ReceiptLog>);
 
+#[cfg(any(test, feature = "test-support"))]
 impl DirectReceiptSink {
     /// Wrap a synchronous [`ReceiptLog`] as an inline-appending sink. Test and
     /// loopback use only — see the type docs; never wire this onto the
@@ -737,12 +740,14 @@ impl DirectReceiptSink {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl std::fmt::Debug for DirectReceiptSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DirectReceiptSink").finish_non_exhaustive()
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ReceiptSink for DirectReceiptSink {
     fn record(&self, receipt: RawReceipt) {
         // Render inline (this fake appends on the caller's thread anyway) with a

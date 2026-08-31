@@ -32,6 +32,16 @@ otlp = [
 # `insert_raw_buyer_record` seam (the #763 reconciliation e2e seeds an
 # undecodable row through it).
 anvil-e2e = ["decdn-incentive/test-util"]
+# Compiles the inline, contract-violating sink fakes (`DirectWarmingCreditSink`,
+# `DirectReceiptSink`) that let a test read the warming ledger / receipt log
+# synchronously right after a serve. Both deliberately break their trait's
+# non-blocking contract, so the gate keeps them out of every production build —
+# a normal `cargo build -p decdn-node` cannot link them onto the serve path. The
+# lib's own `#[cfg(test)]` build reaches them through the `any(test, …)` arm; the
+# cross-crate integration tests reach them through the self dev-dependency below,
+# which turns this feature on for the lib they link (a `cfg(test)` does not
+# cross the crate boundary).
+test-support = []
 
 [dependencies]
 decdn-protocol = { workspace = true }
@@ -55,6 +65,7 @@ decdn-common = { workspace = true }
 alloy = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
+crossbeam-queue = { workspace = true }
 futures-util = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
@@ -89,6 +100,12 @@ opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Self dev-dependency that turns on `test-support` for the `decdn-node` library
+# the integration tests in `tests/` link, so they can name the gated
+# `DirectWarmingCreditSink` / `DirectReceiptSink` fakes. A cross-crate `cfg(test)`
+# does not propagate, so the feature — not `cfg(test)` — is what exposes them
+# here; same shape as the `test-util` dev-deps below.
+decdn-node = { path = ".", features = ["test-support"] }
 # Enable the client-pull test helpers (`stream_fetch`, `PullDeadlines::whole_transfer`) for
 # the loopback/e2e suites. Dev-only, so a normal `cargo build -p decdn-node` never sees them
 # and a production caller cannot reach the zero-stall/uncapped deadline shape (#1145 review).

@@ -988,7 +988,7 @@ async fn evict(cache: &CacheEngine, warming: &Arc<WarmingAllowance>, hash: Hash)
             info!(%hash, "evicted blacklisted blob (ADR 011 compliance)");
             // ADR 041: drop the warming tag for the evicted hash, so a later
             // reuse of this slot can never credit a stale source's allowance.
-            warming.forget(*hash.as_bytes());
+            warming.forget(hash);
             true
         }
         Err(err) => {
@@ -1780,11 +1780,11 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         let mut sink = enforcing_sink(&[true], &metrics).await?;
         let h = hash(0x57);
-        let source = [9u8; 32];
+        let source = crate::warming_allowance::SourceId::from_bytes([9u8; 32]);
         sink.state.add_entry(US, h);
 
         // Tag the hash as speculatively bought from `source`, fully draining it.
-        sink.warming.debit_speculative(source, *h.as_bytes(), 1000);
+        sink.warming.debit_speculative(source, h, 1000);
         assert!(
             !sink.warming.available(source),
             "the speculative buy must drain the source"
@@ -1803,7 +1803,7 @@ mod tests {
 
         // If the tag survived the takedown, this credit would refill `source`.
         // With the tag forgotten, `credit_serve` is a documented no-op.
-        sink.warming.credit_serve(*h.as_bytes(), 600);
+        sink.warming.credit_serve(h, 600);
         assert!(
             !sink.warming.available(source),
             "a credit against a forgotten tag must not resurrect the source's allowance"

@@ -607,17 +607,18 @@ fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `record_loss` racing the periodic lane flush on the SHARED `lanes.redb` file
-/// (#1783). #1780 aborts (rather than fsyncs) `record_loss`'s no-op write
-/// precisely because it contends with the voucher flush on this file, yet the two
-/// paths were never driven concurrently. Three tasks interleave on redb's
-/// exclusive writer slot: a lane driving 50 monotonic vouchers through
+/// `record_loss` running concurrently with the periodic lane flush (#1783).
+/// Floor-loss writes and lane writes now land in separate redb files
+/// (`floor-loss.redb` and `lanes.redb`), so they no longer share a writer slot;
+/// `record_loss` still aborts (rather than fsyncs) its no-op write, which saves
+/// the fsync and keeps it off `floor-loss.redb`'s own writer slot (#1780). Three
+/// tasks run concurrently: a lane driving 50 monotonic vouchers through
 /// `apply_voucher` (each a buffered lane write), a pool walking its dead-charge
 /// total upward through raising and non-raising (abort-path) `record_loss` calls,
 /// and a pool cycling record/forget. Lane state, the monotonic loss total, and
 /// the forget tombstone must each land intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn record_loss_races_the_lane_flush_on_the_shared_file() -> anyhow::Result<()> {
+async fn record_loss_races_the_lane_flush() -> anyhow::Result<()> {
     use decdn_incentive::PoolFloorLossStore;
 
     let dir = data_dir()?;

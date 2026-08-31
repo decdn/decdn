@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -11,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use bao_tree::ChunkRanges;
+use bao_tree::io::BaoContentItem;
+use bao_tree::io::fsm::{ResponseDecoder, ResponseDecoderNext};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures_util::StreamExt;
@@ -18,7 +21,6 @@ use iroh_blobs::api::blobs::EncodedItem;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::fs::options::Options as FsStoreOptions;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
-use iroh_blobs::util::RecvStream;
 use iroh_blobs::{Hash, HashAndFormat};
 use iroh_io::AsyncStreamReader;
 use tokio::sync::{Notify, broadcast};
@@ -32,7 +34,7 @@ use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::fill_session::{FillClaim, FillRegistry, FillSession};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
-use crate::origin_probe::{OriginProbeMemo, Presence};
+use crate::origin_probe::{OriginProbeMemo, OriginProbePolicy, Presence};
 use crate::probe_hold::ProbeHoldOutcome;
 use crate::range_pull::{AlignedRange, align_range, encode_verified_range};
 use crate::retry::{
@@ -145,6 +147,7 @@ impl From<Presence> for OriginPresence {
         match presence {
             Presence::Present(size) => OriginPresence::Present(size),
             Presence::Absent => OriginPresence::Absent,
+            Presence::Fault => OriginPresence::Fault,
         }
     }
 }
@@ -197,6 +200,16 @@ struct Inner {
     /// its result. Recency is advisory input to eviction ordering, and a hash
     /// missed by one sweep is seen by the next.
     access_times: DashMap<Hash, Instant>,
+    /// Hashes whose `decdn-partial-` protecting tag this process has already
+    /// written and not observed dropped. A partial's protection only needs the
+    /// tag to EXIST, and the name is deterministic per hash, so re-admitting more
+    /// ranges of the same blob need not re-issue the store write — one fill can
+    /// admit hundreds of ranges. [`CacheEngine::protect_partial`] short-circuits on
+    /// a present entry; [`CacheEngine::drop_named_tags_for`] removes the entry
+    /// before deleting the tag, so the next admit re-protects. Lock-free
+    /// (`DashMap`) so it never serializes the admit hot path. Starts empty each
+    /// process, so the first admit after restart harmlessly re-sets the tag once.
+    partial_protected: DashMap<Hash, ()>,
     /// In-flight pull-through requests. When a pull is in progress for a hash,
     /// subsequent callers wait on the [`Notify`] rather than issuing a
     /// duplicate origin fetch (coalescing, fixes #305).
@@ -321,7 +334,15 @@ struct Inner {
     /// in-memory-only set would silently let evicted content resume serving
     /// after `decdn run` is restarted, which is exactly the failure mode
     /// #279 needs to prevent.
-    evicted: Mutex<HashSet<Hash>>,
+    ///
+    /// Append-only, so the serve-path membership check in
+    /// [`CacheEngine::is_evicted`] is a lock-free load (#1789 item 5) and
+    /// readers never block on the rarer writer. Unlike [`Self::denied`] and
+    /// [`Self::chain_denied`], which are replaced wholesale on a config reload,
+    /// this set may only grow: an operator eviction is a takedown, and a hash
+    /// that stopped being served must not start again. [`MonotoneHashSet`]
+    /// carries that difference.
+    evicted: MonotoneHashSet,
     /// Probe-triggered eviction holds (#318, ADR 005 §Probe-triggered
     /// eviction hold). Maps a held hash to its hold *expiry* instant; a
     /// held hash is invisible to [`CacheEngine::eviction_candidates`] until
@@ -498,6 +519,119 @@ impl Inner {
 // crate (#578) and are imported above. The engine holds its pinned set
 // internally as `HashSet<Hash>` (the iroh-blobs store hash) and converts
 // at the public boundary via `to_store_hash` / `from_store_hash`.
+
+/// Append-only set of hashes with a lock-free read path.
+///
+/// Every published snapshot is a superset of its predecessor. That is the
+/// property [`CacheEngine::is_evicted`] relies on: a takedown observed once is
+/// observed by every later reader, so a lock-free read can never answer
+/// not-evicted for a hash the operator has already evicted.
+///
+/// Writers serialize on `writer`, so the publish is a single uncontended
+/// `Arc` clone-and-swap rather than a CAS retry loop that re-clones the whole
+/// set on every lost race. The clone itself is O(n) in the set's size, which is
+/// the cost this shape accepts to keep the read side free — writes are operator
+/// takedowns and blacklist enforcement, reads are on every serve.
+#[derive(Debug)]
+struct MonotoneHashSet {
+    snapshot: ArcSwap<HashSet<Hash>>,
+    /// Serializes writers so the read-modify-write below is atomic: without it
+    /// the cap check and the "was it already present" answer are both racy.
+    writer: std::sync::Mutex<()>,
+}
+
+impl MonotoneHashSet {
+    fn new(initial: HashSet<Hash>) -> Self {
+        Self {
+            snapshot: ArcSwap::from(Arc::new(initial)),
+            writer: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn contains(&self, hash: Hash) -> bool {
+        self.snapshot.load().contains(&hash)
+    }
+
+    /// The current snapshot, for a caller that needs several questions answered
+    /// against one consistent view.
+    fn snapshot(&self) -> arc_swap::Guard<Arc<HashSet<Hash>>> {
+        self.snapshot.load()
+    }
+
+    /// Add `hash` unless the set already holds it or is at `cap`. Returns
+    /// `false` only when `cap` would be exceeded — an already-present hash is
+    /// a success, since the set already says what the caller wants it to say.
+    ///
+    /// Atomic with respect to other writers, so two concurrent inserts cannot
+    /// both read a set one below `cap` and both land.
+    fn insert_if_absent(&self, hash: Hash, cap: usize) -> bool {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let current = self.snapshot.load();
+        if current.contains(&hash) {
+            return true;
+        }
+        if current.len() >= cap {
+            return false;
+        }
+        let mut next = HashSet::clone(&current);
+        next.insert(hash);
+        drop(current);
+        self.snapshot.store(Arc::new(next));
+        true
+    }
+}
+
+/// Serve-path verdict for one hash, from a single store `status()` call.
+///
+/// Answers in one store contact what the delivery path asks in two —
+/// [`CacheEngine::has`] for presence and [`CacheEngine::inspect`] for size
+/// (#1789 item 7 part B). The variants are the delivery path's own branches,
+/// so a size is reachable only where it is serveable and a refusal can never
+/// be paired with a wire size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeAudit {
+    /// The store reports the blob complete and no gate refuses it (denied /
+    /// chain-denied / evicted) — the same condition [`CacheEngine::has`]
+    /// reports. `size` is the whole-blob wire size, and `0` means a genuinely
+    /// empty blob.
+    Serveable {
+        /// Whole-blob byte size to advertise on the wire.
+        size: u64,
+    },
+    /// Nothing serveable from the local store: the blob is absent, partial, or
+    /// refused by a gate.
+    Unavailable {
+        /// Whether the hash is logically evicted (#279). Mirrors
+        /// [`CacheEngine::is_evicted`], so the miss path tells an eviction
+        /// from a plain miss without a second call.
+        evicted: bool,
+    },
+}
+
+impl ServeAudit {
+    /// Wire size for a warm hit; `None` when the delivery path must fill and
+    /// then size the blob itself.
+    #[must_use]
+    pub const fn hit_size(&self) -> Option<u64> {
+        match self {
+            Self::Serveable { size } => Some(*size),
+            Self::Unavailable { .. } => None,
+        }
+    }
+
+    /// Whether the blob can be served from the local store right now.
+    #[must_use]
+    pub const fn is_serveable(&self) -> bool {
+        matches!(self, Self::Serveable { .. })
+    }
+
+    /// Whether the hash is logically evicted (#279). `false` for a serveable
+    /// hash, since eviction is one of the gates that refuses a serve.
+    #[must_use]
+    pub const fn is_evicted(&self) -> bool {
+        matches!(self, Self::Unavailable { evicted: true })
+    }
+}
 
 /// Read-only snapshot of a hash's local-cache state, returned by
 /// [`CacheEngine::inspect`]. Backs `decdn node evict --dry-run`
@@ -1166,6 +1300,7 @@ impl CacheEngine {
                 breakers,
                 max_blob_bytes,
                 access_times: DashMap::new(),
+                partial_protected: DashMap::new(),
                 inflight: Mutex::new(HashMap::new()),
                 inflight_poison_logged: AtomicBool::new(false),
                 pinned: ArcSwap::from(Arc::new(
@@ -1179,7 +1314,7 @@ impl CacheEngine {
                 origin_probe_memo: Mutex::new(OriginProbeMemo::default()),
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
                 chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
-                evicted: Mutex::new(evicted),
+                evicted: MonotoneHashSet::new(evicted),
                 probe_holds: Mutex::new(HashMap::new()),
                 max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
                 frequency: ArcSwap::from_pointee(None),
@@ -1736,10 +1871,18 @@ impl CacheEngine {
     /// live one — and this layer decides what to remember:
     ///
     /// - `Present(size)` is memoised under the positive TTL;
-    /// - `Fault` is **never memoised** — a fault is transient, so the next
-    ///   probe should retry the backend immediately rather than parrot a cached
-    ///   non-answer, and not caching it does not weaken the flood bound (an
-    ///   attacker's random hashes genuinely 404, they do not fault);
+    /// - `Fault` is memoised under the fault TTL (#1789 item 6). The memo is
+    ///   keyed per hash, so this bounds repeat probes OF THE SAME HASH to one
+    ///   live `HEAD` per fault TTL — the common shape when a client retries a
+    ///   request against a failing origin. It does not bound namespace-wide
+    ///   load: during an outage, N distinct hashes still cost N live `HEAD`s
+    ///   per window. The TTL is graded against its neighbours and the config
+    ///   resolver enforces `negative <= fault <= positive`: patient enough that
+    ///   a retried hash is not re-probed as often as an absence, eager enough
+    ///   that a recovered origin is noticed soon — a memoised fault costs
+    ///   client-visible availability, since the origin-only serve gate answers
+    ///   `InternalError` and the probe/DHT paths report this node holds nothing
+    ///   for as long as it stands.
     /// - `Absent` — every configured origin answered `Ok(None)`, or none is
     ///   configured at all (a node with nothing configured genuinely holds
     ///   nothing, which is not transient) — is memoised under the short
@@ -1763,17 +1906,26 @@ impl CacheEngine {
         };
         // Live probe off the memo lock (never hold it across the await).
         let presence = self.probe_origin_chain(hash, timeout).await;
-        match presence {
-            OriginPresence::Present(size) => {
-                self.probe_memo_lock()
-                    .insert(hash, Presence::Present(size), now);
-            }
-            OriginPresence::Absent => {
-                self.probe_memo_lock().insert(hash, Presence::Absent, now);
-            }
-            // Never memoised — see the doc comment above.
-            OriginPresence::Fault => {}
+        let memo_presence = match presence {
+            OriginPresence::Present(size) => Presence::Present(size),
+            OriginPresence::Absent => Presence::Absent,
+            OriginPresence::Fault => Presence::Fault,
+        };
+        if matches!(presence, OriginPresence::Fault) {
+            // Warn rather than debug: the memo answers the repeats, so this
+            // fires at most once per hash per fault TTL — and it is the only
+            // record
+            // that this node is about to refuse serves and answer probes with
+            // "not held" for content it may well hold. The per-origin errors
+            // behind the fault stay at debug.
+            tracing::warn!(
+                %hash,
+                fault_ttl_secs = self.probe_memo_lock().fault_ttl().as_secs(),
+                "origin probe faulted; memoising the fault — serves for this hash \
+                 answer InternalError and probes answer not-held until it expires"
+            );
         }
+        self.probe_memo_lock().insert(hash, memo_presence, now);
         presence
     }
 
@@ -1793,15 +1945,8 @@ impl CacheEngine {
     /// runtime wiring and swaps the memo wholesale (dropping any warm entries) —
     /// the same "set once, no threading through every test constructor" pattern
     /// as [`Self::set_max_probe_holds`].
-    pub fn set_origin_probe_config(
-        &self,
-        positive_ttl: Duration,
-        negative_ttl: Duration,
-        timeout: Duration,
-        capacity: usize,
-    ) {
-        *self.probe_memo_lock() =
-            OriginProbeMemo::new(positive_ttl, negative_ttl, timeout, capacity);
+    pub fn set_origin_probe_config(&self, policy: OriginProbePolicy) {
+        *self.probe_memo_lock() = OriginProbeMemo::new(policy);
     }
 
     /// Swap in the live *local* denied set from `[content] denied_hashes` (ADR
@@ -1909,6 +2054,41 @@ impl CacheEngine {
             .has(hash)
             .await
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
+    }
+
+    /// Serve-path presence + size audit for `hash` in ONE store actor call.
+    ///
+    /// Answers from a single `BlobStatus` what the delivery path otherwise asks
+    /// in two hops — [`Self::has`] for presence, then [`Self::inspect`] for size
+    /// (#1789 item 7, part B) — saving one store round-trip on every cache hit.
+    /// Presence matches [`Self::has`] exactly: the blob must be `Complete` and
+    /// no gate may refuse it, so a logically-evicted hash is
+    /// [`ServeAudit::Unavailable`] even while the store still holds its bytes.
+    ///
+    /// Unlike [`Self::inspect`], a partial blob reports no size here. `inspect`
+    /// exists to tell an operator how much disk a partial pull occupies; this
+    /// audit answers what may go on the wire, and a partial blob's byte count
+    /// is not that.
+    pub async fn serve_audit(&self, hash: Hash) -> CacheResult<ServeAudit> {
+        let evicted = self.is_evicted(hash);
+        let refused = self.is_denied(hash) || self.is_chain_denied(hash) || evicted;
+        let status = self
+            .inner
+            .store
+            .blobs()
+            .status(hash)
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        match status {
+            iroh_blobs::api::blobs::BlobStatus::Complete { size } if !refused => {
+                Ok(ServeAudit::Serveable { size })
+            }
+            iroh_blobs::api::blobs::BlobStatus::Complete { .. }
+            | iroh_blobs::api::blobs::BlobStatus::NotFound
+            | iroh_blobs::api::blobs::BlobStatus::Partial { .. } => {
+                Ok(ServeAudit::Unavailable { evicted })
+            }
+        }
     }
 
     /// Which chunk ranges of `hash` are present on disk right now.
@@ -2059,30 +2239,25 @@ impl CacheEngine {
     /// caller is the hash-mismatch path in pull-through, which executes on a
     /// request-serving worker that must not stall on disk I/O.
     pub async fn evict(&self, hash: Hash) -> CacheResult<()> {
-        // Pre-check under one lock acquisition: short-circuit on
+        // Lock-free pre-check on a single snapshot: short-circuit on
         // already-evicted (a sequential repeat-evict of the same hash returns
         // here and never re-appends) and reject on cap (DoS bound on an
-        // unbounded public-ish surface). Both checks are best-effort against
-        // concurrency: the lock is released before the append below, so two
-        // evict() calls racing the *same* new hash can each pass and append a
-        // duplicate `evicted.log` line — harmless, since replay folds the log
-        // into a `HashSet`. The cap is likewise a soft DoS bound, not a hard
-        // invariant — going +ε over by a handful of races is fine.
-        {
-            let guard = self
-                .inner
-                .evicted
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if guard.contains(&hash) {
-                return Ok(());
-            }
-            if guard.len() >= MAX_EVICTED_ENTRIES {
-                return Err(CacheError::EvictionLimitExceeded {
-                    limit: MAX_EVICTED_ENTRIES,
-                });
-            }
+        // unbounded public-ish surface). Both checks are advisory against
+        // concurrency — the snapshot is read before the durable append below —
+        // and `insert_if_absent` re-decides both under the write lock, so the
+        // cap is exact and a race on the same new hash appends at most one
+        // duplicate `evicted.log` line (harmless: replay folds the log into a
+        // `HashSet`).
+        let evicted = self.inner.evicted.snapshot();
+        if evicted.contains(&hash) {
+            return Ok(());
         }
+        if evicted.len() >= MAX_EVICTED_ENTRIES {
+            return Err(CacheError::EvictionLimitExceeded {
+                limit: MAX_EVICTED_ENTRIES,
+            });
+        }
+        drop(evicted);
 
         // Persist FIRST, then commit to the in-memory set: a crash between
         // these two steps will at worst replay a successful evict on the
@@ -2105,18 +2280,19 @@ impl CacheEngine {
                 CacheError::Store(anyhow::Error::from(err).context("persist eviction"))
             })?;
 
-        // `unwrap_or_else(PoisonError::into_inner)` rather than the project's
-        // usual `if let Ok(...) = lock()` pattern: a poisoned lock here
-        // would silently skip the in-memory commit and the node would keep
-        // serving the supposedly-evicted blob until the next restart loaded
-        // `evicted.log`. For a DMCA takedown that is the canonical worst
-        // case. Recovering the inner guard preserves the contract that
-        // `evict() -> Ok(())` implies the in-memory set was updated.
-        self.inner
+        // Commit to the in-memory set (#1789 item 5). The publish is a single
+        // atomic swap of a superset, so no reader can observe `Ok(())` here
+        // with the set still excluding `hash`, and the read side never has a
+        // lock that could be poisoned into a "still serving" fallback.
+        if !self
+            .inner
             .evicted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(hash);
+            .insert_if_absent(hash, MAX_EVICTED_ENTRIES)
+        {
+            return Err(CacheError::EvictionLimitExceeded {
+                limit: MAX_EVICTED_ENTRIES,
+            });
+        }
         self.inner.access_times.remove(&hash);
         self.inner
             .segments
@@ -2173,7 +2349,26 @@ impl CacheEngine {
     /// hash and removes it. A GC sweep in the sub-second window between
     /// `import_bao_bytes` and this `set` is bounded by the GC interval and
     /// self-heals on the next admit. #1607.
+    ///
+    /// The tag only needs to EXIST, so once this process has written it (tracked
+    /// in `partial_protected`) the store write is skipped — a single fill admits
+    /// many ranges, and only the first need pay the tag write. The memo is cleared
+    /// whenever the tag is dropped (`drop_named_tags_for`), so a re-admit after an
+    /// eviction re-protects.
+    ///
+    /// The memo is a best-effort optimization, not a memo↔tag invariant: the
+    /// `contains_key`/`insert` here and the `remove` in `drop_named_tags_for` are
+    /// not atomic against the store, so a `protect_partial` racing a concurrent
+    /// evict of the same hash can leave the memo set while the tag was deleted.
+    /// That never affects served correctness — served bytes are hash-verified, and
+    /// an operator takedown blocks serving through the logical evicted set, not
+    /// through this tag (see `evict`). Its only cost is that such a partial may go
+    /// unprotected and be GC-reclaimed, which self-corrects on the next pull.
+    /// Concurrent first-admits merely repeat one idempotent `set`.
     async fn protect_partial(&self, hash: Hash) -> CacheResult<()> {
+        if self.inner.partial_protected.contains_key(&hash) {
+            return Ok(());
+        }
         let name = format!("decdn-partial-{hash}");
         self.inner
             .store
@@ -2182,7 +2377,9 @@ impl CacheEngine {
             .await
             .map_err(|e| {
                 CacheError::Store(anyhow::Error::from(e).context("protect_partial: tags().set"))
-            })
+            })?;
+        self.inner.partial_protected.insert(hash, ());
+        Ok(())
     }
 
     /// Delete every named tag pointing at `hash`, making the underlying
@@ -2204,6 +2401,14 @@ impl CacheEngine {
     /// tag lookup, so this lists every tag and filters in Rust. Fine at
     /// operator-evict / mismatch rates; not something to call on a hot path.
     async fn drop_named_tags_for(&self, hash: Hash) -> CacheResult<u64> {
+        // Invalidate the partial-protection memo before touching the store, so a
+        // later admit re-issues the protecting tag rather than trusting a stale
+        // "already protected" entry for the tag we are removing. Clearing it up
+        // front (not after the deletes) also means a delete failure mid-loop still
+        // leaves the memo clear, so a re-admit re-protects. This is best-effort,
+        // not atomic against a concurrent `protect_partial` of the same hash — the
+        // race is benign for the reasons documented on `protect_partial`.
+        self.inner.partial_protected.remove(&hash);
         let tags = self.inner.store.tags();
         // Collect matching names before deleting so the (immutable) list
         // stream is fully drained before any delete call — keeps the two
@@ -2241,16 +2446,9 @@ impl CacheEngine {
     /// pre-computes a `served` bool so admin can derive `was_present`
     /// without a follow-up [`Self::has`] call.
     ///
-    /// Lock structure: the three in-memory probes hit independent
-    /// synchronization primitives — `evicted` (`Mutex<HashSet>`),
-    /// `access_times` (`DashMap`, one shard), and `pinned` (`ArcSwap`).
-    /// Each is held for an O(1) lookup; merging them into a single
-    /// lock acquisition would require either combining the underlying
-    /// data structures (a much larger refactor that would couple
-    /// unrelated invariants) or holding a coarser lock across the
-    /// async `BlobStatus` call (which would block the `get()` hot
-    /// path on whichever store backend is slower). Same pattern as
-    /// [`Self::eviction_candidates`].
+    /// The three in-memory probes are each an O(1) lookup and none of them
+    /// blocks: `evicted` and `pinned` are `ArcSwap` loads and `access_times` is
+    /// one `DashMap` shard. Same pattern as [`Self::eviction_candidates`].
     pub async fn inspect(&self, hash: Hash) -> CacheResult<EvictionPreview> {
         let status = self
             .inner
@@ -2299,17 +2497,13 @@ impl CacheEngine {
 
     /// Has this hash been logically evicted via [`Self::evict`]?
     ///
-    /// Recovers from a poisoned mutex via [`PoisonError::into_inner`]
-    /// rather than treating poison as "not evicted": a poisoned lock
-    /// returning `false` here would let evicted DMCA-flagged content
-    /// resume serving — exactly what `<cache_dir>/evicted.log`'s
-    /// durability guarantee was designed to prevent.
+    /// Lock-free (#1789 item 5): one `ArcSwap` load and a hash-set probe, so
+    /// the serve-path gate takes no mutex and has no lock-poisoning failure
+    /// mode that could answer not-evicted for a taken-down hash. The write side
+    /// only ever publishes a superset, so an evicted hash is observed evicted
+    /// by every reader that linearizes after the swap.
     pub fn is_evicted(&self, hash: Hash) -> bool {
-        self.inner
-            .evicted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(&hash)
+        self.inner.evicted.contains(hash)
     }
 
     /// Set the probe-hold budget cap from `cache.max_probe_holds` (ADR 005
@@ -3150,28 +3344,30 @@ impl CacheEngine {
     }
 
     /// Stream the header-less bao for `chunk_ranges` of `hash` (a `total_bytes`
-    /// blob) off `reader` into the cache as a **partial**,
-    /// O(chunk-group), verifying against the root incrementally. Returns the
-    /// drained `reader` (for `BlobSource::finish`). A bounded mpsc
-    /// channel feeds a `ChannelRecvStream` that iroh-blobs
-    /// `import_bao_reader` decodes and verifies concurrently with the caller's
-    /// read loop, so memory stays O(one channel's worth of chunks) rather than
-    /// O(range size).
+    /// blob) off `reader` into the cache as a **partial**, O(chunk-group),
+    /// verifying against the root incrementally. Returns the drained `reader`
+    /// (for `BlobSource::finish`).
     ///
-    /// The wire the caller forwards is header-less (ADR 038) — unlike
-    /// `import_bao_reader`'s own `recv_exact(&mut size)` convention, which
-    /// expects an 8-byte LE size prefix as the first bytes on the stream. This
-    /// method supplies that prefix itself, from the trusted `total_bytes`
-    /// (the signed whole-blob size), rather than reading it off `reader`.
+    /// Drives `bao_tree`'s [`ResponseDecoder`] directly over the header-less wire
+    /// (ADR 038 — the size is the trusted `total_bytes`, not an in-band prefix),
+    /// forwarding each decoded [`BaoContentItem`] to iroh-blobs' `import_bao`
+    /// handle. The decoder pulls one chunk at a time and the import channel
+    /// backpressures, so memory stays O(one item), not O(range size).
+    ///
+    /// When a serve leg shares this fill (`session`), the decoder's `Parent` items
+    /// ARE the outboard proof nodes, so they are captured into the shared session
+    /// in the SAME decode pass — no post-admit `export_bao` read-back that would
+    /// re-stream the whole range through the store actor a second time (#1790 item
+    /// 4). Front-to-back admits union to the whole tree.
     ///
     /// # Errors
     ///
     /// - [`CacheError::VerifyFailed`] — the decoder rejected a chunk group or
     ///   parent hash against the root `hash`: the forwarded bytes are corrupt
     ///   (a lying upstream). Nothing is admitted.
-    /// - [`CacheError::Store`] — a local store fault, an import-task join
-    ///   fault, or a read fault on `reader` itself (distinct from corruption —
-    ///   see `classify_import_bao_reader_error`).
+    /// - [`CacheError::Store`] — a local store fault, an import-channel fault, or a
+    ///   truncated/short feed off `reader` (distinct from corruption — see
+    ///   `classify_admit_decode_error`).
     ///
     /// The `reader` is carried on BOTH result arms: `Ok(reader)` on success and
     /// `Err((reader, err))` on failure. The error arm hands it back so the
@@ -3187,118 +3383,140 @@ impl CacheEngine {
         hash: Hash,
         chunk_ranges: ChunkRanges,
         total_bytes: u64,
-        mut reader: R,
+        reader: R,
         session: Option<&Arc<crate::FillSession>>,
     ) -> Result<R, (R, CacheError)>
     where
         R: AsyncStreamReader + Send,
     {
-        // Retain the admitted ranges so the serve-leg outboard capture below can
-        // re-read exactly the proof nodes iroh-blobs emitted for them (the import
-        // moves `chunk_ranges` into the store task).
-        let capture_ranges = session.is_some().then(|| chunk_ranges.clone());
-        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(ADMIT_STREAM_CHANNEL_CAP);
-        let engine = self.clone();
-        let import = tokio::spawn(async move {
-            engine
-                .inner
-                .store
-                .blobs()
-                .import_bao_reader(hash, chunk_ranges, ChannelRecvStream::new(rx))
-                .await
-        });
-
-        // Inject the 8-byte LE size prefix `import_bao_reader` expects as the
-        // first thing its `RecvStream` yields — the wire itself carries no
-        // in-band header (ADR 038), so it comes from the signed `total_bytes`
-        // instead of a read off `reader`.
-        let mut read_err = None;
-        if tx
-            .send(Bytes::copy_from_slice(&total_bytes.to_le_bytes()))
-            .await
-            .is_ok()
-        {
-            loop {
-                match reader.read_bytes(ADMIT_STREAM_READ_LEN).await {
-                    Ok(chunk) if chunk.is_empty() => break,
-                    Ok(chunk) => {
-                        if tx.send(chunk).await.is_err() {
-                            // The import task ended before this chunk landed —
-                            // its outcome (awaited below) explains why.
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        read_err = Some(e);
-                        break;
-                    }
-                }
+        let Some(size) = NonZeroU64::new(total_bytes) else {
+            // An empty blob has no bao to decode. Mirror iroh-blobs' own
+            // `import_bao_reader`: the canonical empty hash is a no-op success
+            // (nothing to import, store, or protect), while a zero size under any
+            // other hash is an upstream inconsistency (the signed `total_bytes`
+            // disagrees with a non-empty content hash) — a Store-class fault, as
+            // before.
+            if hash == Hash::EMPTY {
+                return Ok(reader);
             }
-        }
-        // Drop the sender to end the fed stream, whether the loop ended on EOF,
-        // a closed import task, or a read fault.
-        drop(tx);
+            return Err((
+                reader,
+                CacheError::Store(anyhow::anyhow!(
+                    "admit_bao_stream: zero total_bytes for non-empty hash {hash}"
+                )),
+            ));
+        };
+        let tree = bao_tree::BaoTree::new(total_bytes, crate::range_pull::IROH_BLOCK_SIZE);
+        let capture = session.is_some();
 
-        let outcome = match import.await {
-            Ok(outcome) => outcome,
+        let handle = match self
+            .inner
+            .store
+            .blobs()
+            .import_bao(hash, size, ADMIT_BAO_LOCAL_UPDATE_CAP)
+            .await
+        {
+            Ok(handle) => handle,
             Err(e) => {
                 return Err((
                     reader,
-                    CacheError::Store(anyhow::anyhow!(
-                        "admit_bao_stream: import task join failed: {e}"
-                    )),
+                    CacheError::Store(
+                        anyhow::Error::from(e).context("admit_bao_stream: import_bao"),
+                    ),
                 ));
             }
         };
+        // Split the handle so the decode driver owns the item sender while the store
+        // result is awaited concurrently. The sender is bounded, so both halves must
+        // make progress together — fully draining the driver before awaiting the
+        // result would deadlock once the channel fills.
+        let tx = handle.tx;
+        let rx = handle.rx;
 
-        if let Some(e) = read_err {
-            // A local fault reading `reader`, independent of the import
-            // task's outcome — surface it rather than whatever (likely
-            // truncated-feed) outcome the import task landed on. Hand the reader
-            // back so the caller can recover any parked typed peer fault.
-            return Err((
-                reader,
-                CacheError::Store(
-                    anyhow::Error::from(e).context("admit_bao_stream: reader read_bytes failed"),
-                ),
-            ));
-        }
-
-        match outcome {
-            Ok(_drained) => {
-                // ADR 040: consult the admission policy, then label the segment
-                // only after `protect_partial` succeeds, so a failed protect
-                // leaves no stale membership entry for an unprotected blob. Under
-                // the default `AlwaysAdmit` the segment is `Main`, so
-                // `set_segment` is a no-op — membership is pure in-memory
-                // metadata, no tag I/O.
-                let admission_ctx = crate::policy::AdmissionContext {
-                    hash,
-                    known_size: Some(total_bytes),
-                };
-                let segment = self.admission_segment(&admission_ctx);
-                if let Err(e) = self.protect_partial(hash).await {
-                    return Err((reader, e));
-                }
-                self.set_segment(hash, segment);
-                // The range's data is now cached; capture its outboard proof nodes
-                // into the serve leg's shared session (no-op when no serve leg reads
-                // beside this pull). Front-to-back admits union to the whole tree.
-                // The bytes were just admitted, so this reads the store we just wrote;
-                // an `export_bao` fault here is a genuine store fault, surfaced as one.
-                if let (Some(session), Some(ranges)) = (session, capture_ranges.as_ref()) {
-                    let pairs = match self.outboard_pairs(hash, ranges).await {
-                        Ok(pairs) => pairs,
-                        Err(e) => return Err((reader, e)),
-                    };
-                    for (node, pair) in pairs {
-                        session.capture(node, pair);
+        let driver = async move {
+            let mut decoder = ResponseDecoder::new(hash.into(), chunk_ranges, tree, reader);
+            let mut pairs = Vec::new();
+            loop {
+                match decoder.next().await {
+                    ResponseDecoderNext::More((rest, item)) => {
+                        let item = match item {
+                            Ok(item) => item,
+                            // A decode/verify fault (corrupt bytes) or a truncated
+                            // feed. Recover the reader and surface the decoder's
+                            // `io::Error` for classification.
+                            Err(e) => break (rest.finish(), Err(std::io::Error::from(e))),
+                        };
+                        // The `Parent` items ARE the outboard proof nodes; capture
+                        // them for the serve leg here, in the one decode pass, rather
+                        // than re-reading them back out of the store afterwards.
+                        if capture && let BaoContentItem::Parent(parent) = &item {
+                            pairs.push((parent.node, parent.pair));
+                        }
+                        if tx.send(item).await.is_err() {
+                            // The store import ended before this item landed — its
+                            // result (awaited below) explains why. Recover the reader.
+                            break (rest.finish(), Ok(pairs));
+                        }
+                        decoder = rest;
                     }
+                    ResponseDecoderNext::Done(reader) => break (reader, Ok(pairs)),
                 }
-                Ok(reader)
             }
-            Err(e) => Err((reader, classify_import_bao_reader_error(hash, e))),
+            // `tx` drops here, ending the fed item stream so the store finalizes.
+        };
+        // Await the store's result concurrently with the decode: the item channel is
+        // bounded, so the store must drain it while the driver fills it.
+        let ((reader, decode_res), store_res) = tokio::join!(driver, rx);
+
+        // A decode/verify fault names the real cause (corrupt upstream vs truncated
+        // feed) and wins over the store side.
+        let pairs = match decode_res {
+            Ok(pairs) => pairs,
+            Err(io_err) => return Err((reader, classify_admit_decode_error(hash, io_err))),
+        };
+        // Then the store's own result, or a dropped receiver (the store task died).
+        match store_res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err((
+                    reader,
+                    CacheError::Store(
+                        anyhow::Error::from(e).context("admit_bao_stream: store import"),
+                    ),
+                ));
+            }
+            Err(_recv) => {
+                return Err((
+                    reader,
+                    CacheError::Store(anyhow::anyhow!(
+                        "admit_bao_stream: import result channel dropped"
+                    )),
+                ));
+            }
         }
+
+        // ADR 040: consult the admission policy, then label the segment only after
+        // `protect_partial` succeeds, so a failed protect leaves no stale membership
+        // entry for an unprotected blob. Under the default `AlwaysAdmit` the segment
+        // is `Main`, so `set_segment` is a no-op — membership is pure in-memory
+        // metadata, no tag I/O.
+        let admission_ctx = crate::policy::AdmissionContext {
+            hash,
+            known_size: Some(total_bytes),
+        };
+        let segment = self.admission_segment(&admission_ctx);
+        if let Err(e) = self.protect_partial(hash).await {
+            return Err((reader, e));
+        }
+        self.set_segment(hash, segment);
+        // Wake parked serve legs once for the whole admit, not per node: a large
+        // range carries many proof nodes, and a per-node notify storm scales the
+        // wakeups with proof-node count for no gain. `pairs` is empty when no serve
+        // leg shares this fill.
+        if let Some(session) = session {
+            session.capture_many(pairs);
+        }
+        Ok(reader)
     }
 
     /// Best-effort total byte size of `hash` from the configured origins, for
@@ -4671,129 +4889,27 @@ enum StreamCommitOutcome {
     Store(anyhow::Error),
 }
 
-/// Backpressure bound on the [`CacheEngine::admit_bao_stream`] feeder channel:
-/// at most this many caller-pushed chunks may be in flight to the store-import
-/// task before the feed awaits. Small enough to cap resident memory (a handful
-/// of `cdn/client/v1` chunks), large enough that the store import and the
-/// network forward overlap rather than ping-ponging one chunk at a time.
-const ADMIT_STREAM_CHANNEL_CAP: usize = 8;
+/// Bound on the store's `import_bao` local update queue for
+/// [`CacheEngine::admit_bao_stream`]: at most this many decoded [`BaoContentItem`]s
+/// may be in flight to the store before the decode driver awaits. Small enough to
+/// cap resident memory (a handful of `cdn/client/v1` chunks), large enough that the
+/// store import and the decode overlap rather than ping-ponging one item at a time.
+const ADMIT_BAO_LOCAL_UPDATE_CAP: usize = 8;
 
-/// Read granularity [`CacheEngine::admit_bao_stream`] uses to drain its
-/// upstream `reader` into the feeder channel. Arbitrary — the
-/// [`ChannelRecvStream`]/decoder side re-buffers to whatever boundaries the
-/// bao tree needs — chosen as a plain streaming-I/O size, not tied to
-/// `CHUNK_GROUP_BYTES`.
-const ADMIT_STREAM_READ_LEN: usize = 64 * 1024;
-
-/// Classify a [`iroh_blobs::api::RequestError`] from
-/// [`CacheEngine::admit_bao_stream`]'s `import_bao_reader` call. A genuine bao
-/// verify rejection (chunk-group or parent hash mismatch) is surfaced by
-/// `bao-tree`'s decoder as an `io::Error` of kind `InvalidData` (see
-/// `bao_tree::io::error::DecodeError`'s `From<DecodeError> for io::Error`); a
-/// truncated/short feed instead surfaces `UnexpectedEof`, and any other
-/// failure is a genuinely local store/transport fault. Walking the error
-/// chain (rather than pattern-matching the `#[stack_error]`-derived
-/// `RequestError`/`Error` shapes directly) is robust to how many wrapper
-/// layers iroh-blobs interposes.
-fn classify_import_bao_reader_error(hash: Hash, e: iroh_blobs::api::RequestError) -> CacheError {
-    let err = anyhow::Error::from(e).context("admit_bao_stream: import_bao_reader failed");
-    let verify_failed = err
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::InvalidData);
-    if verify_failed {
+/// Classify the `io::Error` [`CacheEngine::admit_bao_stream`]'s decoder surfaces. A
+/// genuine bao verify rejection (chunk-group or parent hash mismatch) is an
+/// `io::Error` of kind `InvalidData` (see `bao_tree::io::error::DecodeError`'s
+/// `From<DecodeError> for io::Error`); a truncated/short feed instead surfaces
+/// `UnexpectedEof`, and any other failure is a genuinely local read/transport
+/// fault. Only the mismatch is a corrupt-upstream `VerifyFailed`; everything else
+/// is transport-class `Store`.
+fn classify_admit_decode_error(hash: Hash, e: std::io::Error) -> CacheError {
+    if e.kind() == std::io::ErrorKind::InvalidData {
         CacheError::VerifyFailed { expected: hash }
     } else {
-        CacheError::Store(err)
+        CacheError::Store(anyhow::Error::from(e).context("admit_bao_stream: decode/feed failed"))
     }
 }
-
-/// A [`RecvStream`] backed by the [`CacheEngine::admit_bao_stream`] feeder
-/// channel. The caller pushes the header-less bao interleaved stream it forwards
-/// from the upstream (the content size is supplied out of band as an 8-byte size
-/// prefix, ADR 038); this adapter hands those bytes to iroh-blobs'
-/// `import_bao_reader`, which verifies + decodes them to plaintext for the store
-/// import (#915, ADR 038 §Serve side).
-struct ChannelRecvStream {
-    rx: tokio::sync::mpsc::Receiver<Bytes>,
-    buf: BytesMut,
-}
-
-impl ChannelRecvStream {
-    fn new(rx: tokio::sync::mpsc::Receiver<Bytes>) -> Self {
-        Self {
-            rx,
-            buf: BytesMut::new(),
-        }
-    }
-
-    /// Pull from the channel until `buf` holds at least `n` bytes or it closes.
-    async fn fill_to(&mut self, n: usize) {
-        while self.buf.len() < n {
-            match self.rx.recv().await {
-                Some(b) => self.buf.extend_from_slice(&b),
-                None => break,
-            }
-        }
-    }
-
-    fn eof() -> std::io::Error {
-        std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "tee feeder channel closed before the requested bytes arrived",
-        )
-    }
-}
-
-impl RecvStream for ChannelRecvStream {
-    async fn recv_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
-        if self.buf.is_empty()
-            && let Some(b) = self.rx.recv().await
-        {
-            self.buf.extend_from_slice(&b);
-        }
-        // A drained-and-closed channel yields a zero-length `Bytes`, which the
-        // `bao-tree` reader reads as clean EOF (not an error) — the correct signal
-        // for a feed that ended (`admit_bao_stream` dropped its sender). A feed
-        // that ends mid-tree surfaces as this same short read to the decoder, which
-        // then fails with `ParentNotFound`/`LeafNotFound` — the transport-class
-        // truncated-mid-tree path (`classify_import_bao_reader_error`), distinct
-        // from a genuine group hash mismatch.
-        let take = self.buf.len().min(len);
-        Ok(self.buf.split_to(take).freeze())
-    }
-
-    async fn recv_bytes_exact(&mut self, len: usize) -> std::io::Result<Bytes> {
-        self.fill_to(len).await;
-        if self.buf.len() < len {
-            return Err(Self::eof());
-        }
-        Ok(self.buf.split_to(len).freeze())
-    }
-
-    async fn recv_exact(&mut self, target: &mut [u8]) -> std::io::Result<()> {
-        self.fill_to(target.len()).await;
-        if self.buf.len() < target.len() {
-            return Err(Self::eof());
-        }
-        let head = self.buf.split_to(target.len());
-        target.copy_from_slice(&head);
-        Ok(())
-    }
-
-    // `stop`/`id` are inert by design: this reader is backed by an in-process
-    // mpsc channel, not a real QUIC stream. There is no peer to send a STOP_SENDING
-    // frame to (the producer ends the fill by dropping its sender), and there is no
-    // wire stream id — `0` is a stable placeholder the decoder never keys on.
-    fn stop(&mut self, _code: iroh::endpoint::VarInt) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn id(&self) -> u64 {
-        0
-    }
-}
-
 /// True when the body-phase `io::Error` wraps a typed
 /// [`BlobTooLargeMarker`] — meaning the cap (engine-level
 /// `count_and_cap_stream`, adapter-level HTTP chunk cap, or the
@@ -5226,13 +5342,14 @@ mod tests {
         assert_eq!(
             engine.origin_probe_presence(hash).await,
             OriginPresence::Fault,
-            "a fault is never memoised",
+            "a fault is memoised under the fault TTL (#1789 item 6)",
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2,
-            "the second probe re-walked the origin chain rather than serving \
-             a cached fault",
+            1,
+            "the second probe served the cached fault rather than re-walking \
+             the origin chain — a steady state re-probes once per fault TTL, \
+             not once per request",
         );
         assert_eq!(
             engine.origin_probe_size(hash).await,
@@ -5327,12 +5444,13 @@ mod tests {
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
         // Tight timeout so the 400 ms origin overruns it.
-        engine.set_origin_probe_config(
-            Duration::from_secs(15),
-            Duration::from_secs(2),
-            Duration::from_millis(20),
-            16,
-        );
+        engine.set_origin_probe_config(OriginProbePolicy {
+            positive_ttl: Duration::from_secs(15),
+            negative_ttl: Duration::from_secs(2),
+            fault_ttl: Duration::from_secs(5),
+            timeout: Duration::from_millis(20),
+            capacity: 16,
+        });
 
         assert_eq!(
             engine.origin_probe_size(hash).await,
@@ -5345,8 +5463,8 @@ mod tests {
     /// `origin_probe_presence` distinguishes `Present`/`Absent`/`Fault`
     /// (#1766): a hash the origin holds is `Present(size)`, a hash it does not
     /// is `Absent`, and a `HEAD` slower than the probe ceiling is `Fault` —
-    /// NOT `Absent` — and is never memoised, so a second probe re-hits the
-    /// backend rather than parroting a cached non-answer.
+    /// NOT `Absent`, so a caller can never sign an authoritative `NotFound`
+    /// off a backend blip.
     #[tokio::test]
     async fn origin_probe_presence_distinguishes_present_absent_and_fault() -> anyhow::Result<()> {
         // `Present`/`Absent` against a fast origin.
@@ -5385,12 +5503,13 @@ mod tests {
         )
         .await?;
         // Tight timeout so the 400 ms origin overruns it.
-        fault_engine.set_origin_probe_config(
-            Duration::from_secs(15),
-            Duration::from_secs(2),
-            Duration::from_millis(20),
-            16,
-        );
+        fault_engine.set_origin_probe_config(OriginProbePolicy {
+            positive_ttl: Duration::from_secs(15),
+            negative_ttl: Duration::from_secs(2),
+            fault_ttl: Duration::from_secs(5),
+            timeout: Duration::from_millis(20),
+            capacity: 16,
+        });
         assert_eq!(
             fault_engine.origin_probe_presence(slow).await,
             OriginPresence::Fault,
@@ -5404,12 +5523,13 @@ mod tests {
         assert_eq!(
             fault_engine.origin_probe_presence(slow).await,
             OriginPresence::Fault,
-            "a fault is never memoised, so the same hash faults again",
+            "a memoised fault still answers Fault",
         );
         assert_eq!(
             slow_calls.load(Ordering::SeqCst),
-            2,
-            "the second probe re-hit the backend rather than serving a cached fault",
+            1,
+            "the second probe served the cached fault instead of re-hitting \
+             the backend (#1789 item 6)",
         );
         Ok(())
     }
@@ -5425,12 +5545,13 @@ mod tests {
         let (origin, _calls) = CountingSizeOrigin::slow(hash, 100, Duration::from_millis(400));
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-        engine.set_origin_probe_config(
-            Duration::from_secs(15),
-            Duration::from_secs(2),
-            Duration::from_millis(20),
-            16,
-        );
+        engine.set_origin_probe_config(OriginProbePolicy {
+            positive_ttl: Duration::from_secs(15),
+            negative_ttl: Duration::from_secs(2),
+            fault_ttl: Duration::from_secs(5),
+            timeout: Duration::from_millis(20),
+            capacity: 16,
+        });
 
         assert_eq!(
             engine.origin_probe_size(hash).await,
@@ -7370,6 +7491,96 @@ mod tests {
         Ok(())
     }
 
+    /// `serve_audit` folds presence + size + eviction into one store contact
+    /// (#1789 item 7 part B) and matches the `has`/`inspect` pairing the
+    /// delivery path would otherwise make: a complete blob is `Serveable` with
+    /// its size, an absent hash is `Unavailable`, and an evicted hash is
+    /// `Unavailable` with `evicted` set so the serve path tells an eviction
+    /// from a plain miss without a second call.
+    #[tokio::test]
+    async fn serve_audit_reports_presence_size_and_eviction() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"a served blob";
+        let origin = StubOrigin::new(payload);
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+        let hash = Hash::new(payload);
+        let unseen = Hash::new(b"never cached");
+
+        anyhow::ensure!(
+            engine.serve_audit(unseen).await? == ServeAudit::Unavailable { evicted: false },
+            "an absent hash is unavailable and not evicted"
+        );
+
+        engine.populate(hash).await?;
+        anyhow::ensure!(
+            engine.serve_audit(hash).await?
+                == ServeAudit::Serveable {
+                    size: payload.len() as u64
+                },
+            "a complete blob is serveable and carries its size"
+        );
+
+        engine.evict(hash).await?;
+        anyhow::ensure!(
+            engine.serve_audit(hash).await? == ServeAudit::Unavailable { evicted: true },
+            "evicted content is unavailable with the eviction surfaced"
+        );
+        Ok(())
+    }
+
+    /// A complete blob that a gate refuses is `Unavailable` and carries NO
+    /// size, so a caller cannot advertise the wire size of content the serve
+    /// path would refuse. `evicted` stays false: a chain-denied hash is a
+    /// different refusal from an eviction and the miss path must not report it
+    /// as `EvictedSinceProbe`.
+    #[tokio::test]
+    async fn serve_audit_withholds_the_size_of_a_denied_blob() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"denied but on disk";
+        let origin = StubOrigin::new(payload);
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+        let hash = Hash::new(payload);
+        engine.populate(hash).await?;
+
+        engine.set_chain_denied_one(hash, true);
+        let audit = engine.serve_audit(hash).await?;
+        anyhow::ensure!(
+            audit == ServeAudit::Unavailable { evicted: false },
+            "a chain-denied blob is unavailable, un-evicted, and sizeless"
+        );
+        anyhow::ensure!(
+            audit.hit_size().is_none(),
+            "a refused blob never yields a wire size"
+        );
+        Ok(())
+    }
+
+    /// A genuinely empty blob is `Serveable { size: 0 }`. The delivery path
+    /// keys its "fill then size it yourself" branch on the absence of a size,
+    /// so a zero-length blob must not read as a miss.
+    #[tokio::test]
+    async fn serve_audit_reports_a_zero_length_blob_as_serveable() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = StubOrigin::new(b"");
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+        let hash = Hash::new(b"");
+        engine.populate(hash).await?;
+
+        let audit = engine.serve_audit(hash).await?;
+        anyhow::ensure!(
+            audit == ServeAudit::Serveable { size: 0 },
+            "an empty blob is serveable at size 0"
+        );
+        anyhow::ensure!(
+            audit.hit_size() == Some(0),
+            "the delivery path reads 0, not a missing size"
+        );
+        Ok(())
+    }
+
     /// Evicting the same hash twice must not append a duplicate line to
     /// `<cache_dir>/evicted.log`. Without this contract a stuck
     /// automation that mass-replays the same DMCA-takedown hash would
@@ -7395,6 +7606,99 @@ mod tests {
         anyhow::ensure!(
             lines_first == 1 && lines_third == 1,
             "expected 1 log line both times, got first={lines_first}, third={lines_third}"
+        );
+        Ok(())
+    }
+
+    /// The lock-free `evicted` set (#1789 item 5) must never lose a write and
+    /// never present a torn view.
+    ///
+    /// CONCURRENT WRITERS are the point: several tasks evict disjoint hashes at
+    /// once, and every one of them must be evicted at the end. A publish that
+    /// read a snapshot, cloned it and stored it without serializing — the
+    /// obvious "one less allocation" rewrite of
+    /// [`MonotoneHashSet::insert_if_absent`] — drops whichever writer lost the
+    /// race, and `evict` would have returned `Ok(())` while the hash kept
+    /// serving. That is a takedown failure, so it is asserted directly.
+    ///
+    /// Readers run alongside on real worker threads and assert monotonicity: a
+    /// hash observed evicted stays evicted. The reader half fails safe (it can
+    /// only under-observe under scheduling pressure), so it also asserts it saw
+    /// something, otherwise a starved reader would assert nothing at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evicted_set_stays_consistent_under_concurrent_evict() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = Arc::new(empty_engine(tmp.path()).await?);
+        let hashes: Vec<Hash> = (0..64)
+            .map(|i| Hash::new(format!("concurrent-evict-{i}").as_bytes()))
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Eight writers over disjoint slices of the hash set, all evicting at
+        // once. A lost update leaves one of the slices un-evicted.
+        let mut writers = Vec::new();
+        for chunk in hashes.chunks(8) {
+            let engine = Arc::clone(&engine);
+            let chunk: Vec<Hash> = chunk.to_vec();
+            writers.push(tokio::spawn(async move {
+                for h in &chunk {
+                    engine.evict(*h).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let engine = Arc::clone(&engine);
+            let hashes = hashes.clone();
+            let stop = Arc::clone(&stop);
+            readers.push(tokio::spawn(async move {
+                let mut saw_evicted = HashSet::new();
+                for _ in 0..50_000 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    for h in &hashes {
+                        if engine.is_evicted(*h) {
+                            saw_evicted.insert(*h);
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Ok::<_, anyhow::Error>(saw_evicted)
+            }));
+        }
+
+        for w in writers {
+            w.await
+                .map_err(|e| anyhow::anyhow!("writer task panicked: {e}"))??;
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        for h in &hashes {
+            anyhow::ensure!(
+                engine.is_evicted(*h),
+                "{h} was evicted by a concurrent writer but is not in the set — lost update"
+            );
+        }
+
+        let mut any_observed = false;
+        for r in readers {
+            let saw = r
+                .await
+                .map_err(|e| anyhow::anyhow!("reader task panicked: {e}"))??;
+            any_observed |= !saw.is_empty();
+            for h in &saw {
+                anyhow::ensure!(
+                    engine.is_evicted(*h),
+                    "reader once saw {h} evicted but it is not evicted at the end — torn view"
+                );
+            }
+        }
+        anyhow::ensure!(
+            any_observed,
+            "no reader observed any eviction — the monotonicity half asserted nothing"
         );
         Ok(())
     }
@@ -8614,6 +8918,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn protect_partial_skips_store_write_when_memoized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        // First admit writes the protecting tag and memoizes it.
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        engine.admit_bao(hash, ranges, bao).await.unwrap();
+        assert_eq!(count_tags_for(&engine, hash).await, 1);
+        assert!(engine.inner.partial_protected.contains_key(&hash));
+
+        // Delete the tag directly at the store, leaving the memo intact. A
+        // memoized `protect_partial` must short-circuit and NOT re-create it —
+        // proving it skipped the redundant store write on re-admit.
+        let name = format!("decdn-partial-{hash}");
+        engine
+            .inner
+            .store
+            .tags()
+            .delete(name.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(count_tags_for(&engine, hash).await, 0);
+        engine.protect_partial(hash).await.unwrap();
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            0,
+            "a memoized protect_partial must skip the store write"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_tags_reinvalidates_protect_memo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        engine.admit_bao(hash, ranges, bao).await.unwrap();
+        assert!(engine.inner.partial_protected.contains_key(&hash));
+
+        // The tag-drop path clears the memo, so a re-admit re-protects rather
+        // than trusting a stale entry for a tag that no longer exists.
+        engine.drop_named_tags_for(hash).await.unwrap();
+        assert_eq!(count_tags_for(&engine, hash).await, 0);
+        assert!(
+            !engine.inner.partial_protected.contains_key(&hash),
+            "dropping the tag must invalidate the memo"
+        );
+        engine.protect_partial(hash).await.unwrap();
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            1,
+            "protect_partial re-creates the tag after the memo is invalidated"
+        );
+    }
+
     // -- admit_bao_stream — O(chunk-group) streaming range admit --
 
     #[tokio::test]
@@ -8647,6 +9013,76 @@ mod tests {
             count_tags_for(&engine, hash).await,
             1,
             "streaming admit creates exactly one protecting tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_bao_stream_captures_proof_into_the_session_during_import() {
+        // With a serve leg attached, the decode pass captures the range's proof
+        // nodes straight into the shared session — no post-admit `export_bao`
+        // read-back. Prove the captured set equals exactly what the read-back would
+        // have recovered, so a serve leg reads back an identical outboard.
+        use bao_tree::io::fsm::Outboard;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        let header_less = bao.slice(8..);
+
+        let session = crate::FillSession::new(bao_tree::blake3::Hash::from(root), total);
+        engine
+            .admit_bao_stream(hash, ranges.clone(), total, header_less, Some(&session))
+            .await
+            .map_err(|(_reader, e)| e)
+            .unwrap();
+
+        // The proof nodes an `export_bao` read-back would recover for this range.
+        let expected = engine.outboard_pairs(hash, &ranges).await.unwrap();
+        assert!(
+            !expected.is_empty(),
+            "the admitted range spans interior proof nodes"
+        );
+        // Every one was captured into the session during import: a reader minted
+        // from the session loads each without awaiting a further fill.
+        let mut reader = session.outboard_reader();
+        for (node, pair) in expected {
+            assert_eq!(
+                reader.load(node).await.unwrap(),
+                Some(pair),
+                "node {node:?} was captured during import"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admit_bao_stream_handles_zero_total_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+
+        // The canonical empty blob is a no-op success: nothing to decode or admit.
+        engine
+            .admit_bao_stream(Hash::EMPTY, ChunkRanges::empty(), 0, Bytes::new(), None)
+            .await
+            .map_err(|(_reader, e)| e)
+            .expect("admitting the empty blob is a no-op success");
+
+        // A zero size under any OTHER hash is an upstream inconsistency (the signed
+        // total_bytes disagrees with a non-empty content hash) — a Store fault.
+        let (_reader, err) = engine
+            .admit_bao_stream(
+                Hash::from([9u8; 32]),
+                ChunkRanges::empty(),
+                0,
+                Bytes::new(),
+                None,
+            )
+            .await
+            .expect_err("zero size under a non-empty hash is rejected");
+        assert!(
+            matches!(err, CacheError::Store(_)),
+            "expected Store, got {err:?}"
         );
     }
 

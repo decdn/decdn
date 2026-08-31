@@ -45,6 +45,11 @@ pub trait PoolStateStore: Send + Sync {
     /// returning `Ok`. Frontier state is safe to lose on a crash (an honest
     /// client resumes forward; an un-redeemed replay is still on-chain-payable).
     ///
+    /// Implementations MUST NOT block: this is called inline on the per-stream
+    /// open path, on a runtime worker, with no timeout around it. An
+    /// implementation that does I/O here stalls a worker for the duration and
+    /// the latency is attributed nowhere.
+    ///
     /// Callers MUST pass a `LaneState` whose `last_*` tuple is a non-strict
     /// monotonic successor of any previously-recorded state for the same
     /// [`LaneKey`]. The trait does not re-validate this —

@@ -176,7 +176,7 @@ async fn sweep(
                 metrics.evictions.inc();
                 // ADR 041: drop the warming tag for the evicted hash, so a later
                 // reuse of this slot can never credit a stale source's allowance.
-                warming.forget(*hash.as_bytes());
+                warming.forget(hash);
             }
             Err(err) => {
                 tracing::warn!(%hash, %err, "eviction driver: release_for_eviction failed; skipping hash");

@@ -61,9 +61,22 @@ impl BuyerLedgers {
     /// away a ledger a concurrent pull is issuing through.
     pub fn get_or_seed(&self, key: LaneKey, seed: Cumulative) -> Arc<PoolLedger> {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        // Bound cardinality by dropping this provider's OTHER lanes — but only those no pull
-        // still holds, so a stale/rotated key cannot evict a live ledger.
-        live.retain(|k, l| k.provider != key.provider || *k == key || Arc::strong_count(l) > 1);
+        // Hot path — the lane already exists (every concurrent miss after the first on it):
+        // one map probe, no scan. This is what a well-connected node does on almost every
+        // pull, so the O(lanes) prune below must NOT sit on it.
+        if let Some(ledger) = live.get(&key) {
+            return Arc::clone(ledger);
+        }
+        // Cold path — a genuinely new lane (first pull to this provider, or a rotation).
+        // Only here do we bound cardinality by dropping this provider's OTHER lanes, and
+        // only those no pull still holds, so a stale/rotated key cannot evict a live ledger.
+        // Running the prune solely on insert keeps the reuse path O(1) while holding the
+        // exact same bound: a rotated lane is dropped the next time its provider opens a new
+        // one. It must never drop a still-held ledger, because that ledger's in-memory
+        // watermark can be ahead of the persisted row (written on redeem, not issue) —
+        // re-seeding from the row would rewind it and re-create the collision this type
+        // prevents.
+        live.retain(|k, l| k.provider != key.provider || Arc::strong_count(l) > 1);
         Arc::clone(
             live.entry(key)
                 .or_insert_with(|| Arc::new(PoolLedger::new(seed))),
