@@ -150,10 +150,14 @@ impl HashOutboard {
     }
 
     /// Write one internal node's `(left, right)` hash pair into `state`, returning
-    /// whether a slot was written — `false` for a leaf, which has no outboard slot.
-    /// Idempotent: re-saving a node (a re-admitted range) overwrites with the same
-    /// bytes. Does NOT notify; the caller wakes parked readers once the batch is in,
-    /// so an N-node admit fires `captured` a single time rather than N.
+    /// whether the pair was actually persisted. `false` for a leaf (no outboard
+    /// slot), an offset past `usize`, or a slot outside the buffers — nothing was
+    /// stored, so the caller must NOT wake readers on its behalf. `true` only once
+    /// both the hash bytes and the captured flag are set, which is exactly the state
+    /// [`Self::try_load`] reads back. Idempotent: re-saving a node (a re-admitted
+    /// range) overwrites with the same bytes. Does NOT notify; the caller wakes
+    /// parked readers once the batch is in, so an N-node admit fires `captured` a
+    /// single time rather than N.
     fn write_pair(
         &self,
         state: &mut OutboardState,
@@ -163,19 +167,28 @@ impl HashOutboard {
         let Some(offset) = self.tree.pre_order_offset(node) else {
             return false; // leaf: no hash pair in the outboard
         };
-        let idx = usize::try_from(offset).unwrap_or(usize::MAX);
+        let Ok(idx) = usize::try_from(offset) else {
+            return false; // offset beyond usize: no addressable slot
+        };
         let byte_off = idx.saturating_mul(HASH_PAIR_BYTES);
         let (l, r) = pair;
-        if let Some(slot) = state.bytes.get_mut(byte_off..byte_off + HASH_PAIR_BYTES)
+        let bytes_written = if let Some(slot) =
+            state.bytes.get_mut(byte_off..byte_off + HASH_PAIR_BYTES)
             && let Some((left, right)) = slot.split_at_mut_checked(32)
         {
             left.copy_from_slice(l.as_bytes());
             right.copy_from_slice(r.as_bytes());
-        }
-        if let Some(flag) = state.captured.get_mut(idx) {
+            true
+        } else {
+            false
+        };
+        let flag_set = if let Some(flag) = state.captured.get_mut(idx) {
             *flag = true;
-        }
-        true
+            true
+        } else {
+            false
+        };
+        bytes_written && flag_set
     }
 
     /// Capture one internal node's `(left, right)` hash pair, then wake parked
