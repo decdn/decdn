@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -11,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use bao_tree::ChunkRanges;
+use bao_tree::io::BaoContentItem;
+use bao_tree::io::fsm::{ResponseDecoder, ResponseDecoderNext};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures_util::StreamExt;
@@ -18,7 +21,6 @@ use iroh_blobs::api::blobs::EncodedItem;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::fs::options::Options as FsStoreOptions;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
-use iroh_blobs::util::RecvStream;
 use iroh_blobs::{Hash, HashAndFormat};
 use iroh_io::AsyncStreamReader;
 use tokio::sync::{Notify, broadcast};
@@ -3342,28 +3344,30 @@ impl CacheEngine {
     }
 
     /// Stream the header-less bao for `chunk_ranges` of `hash` (a `total_bytes`
-    /// blob) off `reader` into the cache as a **partial**,
-    /// O(chunk-group), verifying against the root incrementally. Returns the
-    /// drained `reader` (for `BlobSource::finish`). A bounded mpsc
-    /// channel feeds a `ChannelRecvStream` that iroh-blobs
-    /// `import_bao_reader` decodes and verifies concurrently with the caller's
-    /// read loop, so memory stays O(one channel's worth of chunks) rather than
-    /// O(range size).
+    /// blob) off `reader` into the cache as a **partial**, O(chunk-group),
+    /// verifying against the root incrementally. Returns the drained `reader`
+    /// (for `BlobSource::finish`).
     ///
-    /// The wire the caller forwards is header-less (ADR 038) — unlike
-    /// `import_bao_reader`'s own `recv_exact(&mut size)` convention, which
-    /// expects an 8-byte LE size prefix as the first bytes on the stream. This
-    /// method supplies that prefix itself, from the trusted `total_bytes`
-    /// (the signed whole-blob size), rather than reading it off `reader`.
+    /// Drives `bao_tree`'s [`ResponseDecoder`] directly over the header-less wire
+    /// (ADR 038 — the size is the trusted `total_bytes`, not an in-band prefix),
+    /// forwarding each decoded [`BaoContentItem`] to iroh-blobs' `import_bao`
+    /// handle. The decoder pulls one chunk at a time and the import channel
+    /// backpressures, so memory stays O(one item), not O(range size).
+    ///
+    /// When a serve leg shares this fill (`session`), the decoder's `Parent` items
+    /// ARE the outboard proof nodes, so they are captured into the shared session
+    /// in the SAME decode pass — no post-admit `export_bao` read-back that would
+    /// re-stream the whole range through the store actor a second time (#1790 item
+    /// 4). Front-to-back admits union to the whole tree.
     ///
     /// # Errors
     ///
     /// - [`CacheError::VerifyFailed`] — the decoder rejected a chunk group or
     ///   parent hash against the root `hash`: the forwarded bytes are corrupt
     ///   (a lying upstream). Nothing is admitted.
-    /// - [`CacheError::Store`] — a local store fault, an import-task join
-    ///   fault, or a read fault on `reader` itself (distinct from corruption —
-    ///   see `classify_import_bao_reader_error`).
+    /// - [`CacheError::Store`] — a local store fault, an import-channel fault, or a
+    ///   truncated/short feed off `reader` (distinct from corruption — see
+    ///   `classify_admit_decode_error`).
     ///
     /// The `reader` is carried on BOTH result arms: `Ok(reader)` on success and
     /// `Err((reader, err))` on failure. The error arm hands it back so the
@@ -3379,119 +3383,131 @@ impl CacheEngine {
         hash: Hash,
         chunk_ranges: ChunkRanges,
         total_bytes: u64,
-        mut reader: R,
+        reader: R,
         session: Option<&Arc<crate::FillSession>>,
     ) -> Result<R, (R, CacheError)>
     where
         R: AsyncStreamReader + Send,
     {
-        // Retain the admitted ranges so the serve-leg outboard capture below can
-        // re-read exactly the proof nodes iroh-blobs emitted for them (the import
-        // moves `chunk_ranges` into the store task).
-        let capture_ranges = session.is_some().then(|| chunk_ranges.clone());
-        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(ADMIT_STREAM_CHANNEL_CAP);
-        let engine = self.clone();
-        let import = tokio::spawn(async move {
-            engine
-                .inner
-                .store
-                .blobs()
-                .import_bao_reader(hash, chunk_ranges, ChannelRecvStream::new(rx))
-                .await
-        });
+        let Some(size) = NonZeroU64::new(total_bytes) else {
+            return Err((
+                reader,
+                CacheError::Store(anyhow::anyhow!(
+                    "admit_bao_stream: zero total_bytes for {hash}"
+                )),
+            ));
+        };
+        let tree = bao_tree::BaoTree::new(total_bytes, crate::range_pull::IROH_BLOCK_SIZE);
+        let capture = session.is_some();
 
-        // Inject the 8-byte LE size prefix `import_bao_reader` expects as the
-        // first thing its `RecvStream` yields — the wire itself carries no
-        // in-band header (ADR 038), so it comes from the signed `total_bytes`
-        // instead of a read off `reader`.
-        let mut read_err = None;
-        if tx
-            .send(Bytes::copy_from_slice(&total_bytes.to_le_bytes()))
+        let handle = match self
+            .inner
+            .store
+            .blobs()
+            .import_bao(hash, size, ADMIT_BAO_LOCAL_UPDATE_CAP)
             .await
-            .is_ok()
         {
-            loop {
-                match reader.read_bytes(ADMIT_STREAM_READ_LEN).await {
-                    Ok(chunk) if chunk.is_empty() => break,
-                    Ok(chunk) => {
-                        if tx.send(chunk).await.is_err() {
-                            // The import task ended before this chunk landed —
-                            // its outcome (awaited below) explains why.
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        read_err = Some(e);
-                        break;
-                    }
-                }
-            }
-        }
-        // Drop the sender to end the fed stream, whether the loop ended on EOF,
-        // a closed import task, or a read fault.
-        drop(tx);
-
-        let outcome = match import.await {
-            Ok(outcome) => outcome,
+            Ok(handle) => handle,
             Err(e) => {
                 return Err((
                     reader,
-                    CacheError::Store(anyhow::anyhow!(
-                        "admit_bao_stream: import task join failed: {e}"
-                    )),
+                    CacheError::Store(
+                        anyhow::Error::from(e).context("admit_bao_stream: import_bao"),
+                    ),
                 ));
             }
         };
+        // Split the handle so the decode driver owns the item sender while the store
+        // result is awaited concurrently. The sender is bounded, so both halves must
+        // make progress together — fully draining the driver before awaiting the
+        // result would deadlock once the channel fills.
+        let tx = handle.tx;
+        let rx = handle.rx;
 
-        if let Some(e) = read_err {
-            // A local fault reading `reader`, independent of the import
-            // task's outcome — surface it rather than whatever (likely
-            // truncated-feed) outcome the import task landed on. Hand the reader
-            // back so the caller can recover any parked typed peer fault.
-            return Err((
-                reader,
-                CacheError::Store(
-                    anyhow::Error::from(e).context("admit_bao_stream: reader read_bytes failed"),
-                ),
-            ));
-        }
-
-        match outcome {
-            Ok(_drained) => {
-                // ADR 040: consult the admission policy, then label the segment
-                // only after `protect_partial` succeeds, so a failed protect
-                // leaves no stale membership entry for an unprotected blob. Under
-                // the default `AlwaysAdmit` the segment is `Main`, so
-                // `set_segment` is a no-op — membership is pure in-memory
-                // metadata, no tag I/O.
-                let admission_ctx = crate::policy::AdmissionContext {
-                    hash,
-                    known_size: Some(total_bytes),
-                };
-                let segment = self.admission_segment(&admission_ctx);
-                if let Err(e) = self.protect_partial(hash).await {
-                    return Err((reader, e));
+        let driver = async move {
+            let mut decoder = ResponseDecoder::new(hash.into(), chunk_ranges, tree, reader);
+            let mut pairs = Vec::new();
+            loop {
+                match decoder.next().await {
+                    ResponseDecoderNext::More((rest, item)) => {
+                        let item = match item {
+                            Ok(item) => item,
+                            // A decode/verify fault (corrupt bytes) or a truncated
+                            // feed. Recover the reader and surface the decoder's
+                            // `io::Error` for classification.
+                            Err(e) => break (rest.finish(), Err(std::io::Error::from(e))),
+                        };
+                        // The `Parent` items ARE the outboard proof nodes; capture
+                        // them for the serve leg here, in the one decode pass, rather
+                        // than re-reading them back out of the store afterwards.
+                        if capture && let BaoContentItem::Parent(parent) = &item {
+                            pairs.push((parent.node, parent.pair));
+                        }
+                        if tx.send(item).await.is_err() {
+                            // The store import ended before this item landed — its
+                            // result (awaited below) explains why. Recover the reader.
+                            break (rest.finish(), Ok(pairs));
+                        }
+                        decoder = rest;
+                    }
+                    ResponseDecoderNext::Done(reader) => break (reader, Ok(pairs)),
                 }
-                self.set_segment(hash, segment);
-                // The range's data is now cached; capture its outboard proof nodes
-                // into the serve leg's shared session (no-op when no serve leg reads
-                // beside this pull). Front-to-back admits union to the whole tree.
-                // The bytes were just admitted, so this reads the store we just wrote;
-                // an `export_bao` fault here is a genuine store fault, surfaced as one.
-                if let (Some(session), Some(ranges)) = (session, capture_ranges.as_ref()) {
-                    let pairs = match self.outboard_pairs(hash, ranges).await {
-                        Ok(pairs) => pairs,
-                        Err(e) => return Err((reader, e)),
-                    };
-                    // Wake parked serve legs once for the whole admit, not per node:
-                    // a large range carries many proof nodes, and a per-node notify
-                    // storm scales the wakeups with proof-node count for no gain.
-                    session.capture_many(pairs);
-                }
-                Ok(reader)
             }
-            Err(e) => Err((reader, classify_import_bao_reader_error(hash, e))),
+            // `tx` drops here, ending the fed item stream so the store finalizes.
+        };
+        // Await the store's result concurrently with the decode: the item channel is
+        // bounded, so the store must drain it while the driver fills it.
+        let ((reader, decode_res), store_res) = tokio::join!(driver, rx);
+
+        // A decode/verify fault names the real cause (corrupt upstream vs truncated
+        // feed) and wins over the store side.
+        let pairs = match decode_res {
+            Ok(pairs) => pairs,
+            Err(io_err) => return Err((reader, classify_admit_decode_error(hash, io_err))),
+        };
+        // Then the store's own result, or a dropped receiver (the store task died).
+        match store_res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err((
+                    reader,
+                    CacheError::Store(
+                        anyhow::Error::from(e).context("admit_bao_stream: store import"),
+                    ),
+                ));
+            }
+            Err(_recv) => {
+                return Err((
+                    reader,
+                    CacheError::Store(anyhow::anyhow!(
+                        "admit_bao_stream: import result channel dropped"
+                    )),
+                ));
+            }
         }
+
+        // ADR 040: consult the admission policy, then label the segment only after
+        // `protect_partial` succeeds, so a failed protect leaves no stale membership
+        // entry for an unprotected blob. Under the default `AlwaysAdmit` the segment
+        // is `Main`, so `set_segment` is a no-op — membership is pure in-memory
+        // metadata, no tag I/O.
+        let admission_ctx = crate::policy::AdmissionContext {
+            hash,
+            known_size: Some(total_bytes),
+        };
+        let segment = self.admission_segment(&admission_ctx);
+        if let Err(e) = self.protect_partial(hash).await {
+            return Err((reader, e));
+        }
+        self.set_segment(hash, segment);
+        // Wake parked serve legs once for the whole admit, not per node: a large
+        // range carries many proof nodes, and a per-node notify storm scales the
+        // wakeups with proof-node count for no gain. `pairs` is empty when no serve
+        // leg shares this fill.
+        if let Some(session) = session {
+            session.capture_many(pairs);
+        }
+        Ok(reader)
     }
 
     /// Best-effort total byte size of `hash` from the configured origins, for
@@ -4864,129 +4880,27 @@ enum StreamCommitOutcome {
     Store(anyhow::Error),
 }
 
-/// Backpressure bound on the [`CacheEngine::admit_bao_stream`] feeder channel:
-/// at most this many caller-pushed chunks may be in flight to the store-import
-/// task before the feed awaits. Small enough to cap resident memory (a handful
-/// of `cdn/client/v1` chunks), large enough that the store import and the
-/// network forward overlap rather than ping-ponging one chunk at a time.
-const ADMIT_STREAM_CHANNEL_CAP: usize = 8;
+/// Bound on the store's `import_bao` local update queue for
+/// [`CacheEngine::admit_bao_stream`]: at most this many decoded [`BaoContentItem`]s
+/// may be in flight to the store before the decode driver awaits. Small enough to
+/// cap resident memory (a handful of `cdn/client/v1` chunks), large enough that the
+/// store import and the decode overlap rather than ping-ponging one item at a time.
+const ADMIT_BAO_LOCAL_UPDATE_CAP: usize = 8;
 
-/// Read granularity [`CacheEngine::admit_bao_stream`] uses to drain its
-/// upstream `reader` into the feeder channel. Arbitrary — the
-/// [`ChannelRecvStream`]/decoder side re-buffers to whatever boundaries the
-/// bao tree needs — chosen as a plain streaming-I/O size, not tied to
-/// `CHUNK_GROUP_BYTES`.
-const ADMIT_STREAM_READ_LEN: usize = 64 * 1024;
-
-/// Classify a [`iroh_blobs::api::RequestError`] from
-/// [`CacheEngine::admit_bao_stream`]'s `import_bao_reader` call. A genuine bao
-/// verify rejection (chunk-group or parent hash mismatch) is surfaced by
-/// `bao-tree`'s decoder as an `io::Error` of kind `InvalidData` (see
-/// `bao_tree::io::error::DecodeError`'s `From<DecodeError> for io::Error`); a
-/// truncated/short feed instead surfaces `UnexpectedEof`, and any other
-/// failure is a genuinely local store/transport fault. Walking the error
-/// chain (rather than pattern-matching the `#[stack_error]`-derived
-/// `RequestError`/`Error` shapes directly) is robust to how many wrapper
-/// layers iroh-blobs interposes.
-fn classify_import_bao_reader_error(hash: Hash, e: iroh_blobs::api::RequestError) -> CacheError {
-    let err = anyhow::Error::from(e).context("admit_bao_stream: import_bao_reader failed");
-    let verify_failed = err
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::InvalidData);
-    if verify_failed {
+/// Classify the `io::Error` [`CacheEngine::admit_bao_stream`]'s decoder surfaces. A
+/// genuine bao verify rejection (chunk-group or parent hash mismatch) is an
+/// `io::Error` of kind `InvalidData` (see `bao_tree::io::error::DecodeError`'s
+/// `From<DecodeError> for io::Error`); a truncated/short feed instead surfaces
+/// `UnexpectedEof`, and any other failure is a genuinely local read/transport
+/// fault. Only the mismatch is a corrupt-upstream `VerifyFailed`; everything else
+/// is transport-class `Store`.
+fn classify_admit_decode_error(hash: Hash, e: std::io::Error) -> CacheError {
+    if e.kind() == std::io::ErrorKind::InvalidData {
         CacheError::VerifyFailed { expected: hash }
     } else {
-        CacheError::Store(err)
+        CacheError::Store(anyhow::Error::from(e).context("admit_bao_stream: decode/feed failed"))
     }
 }
-
-/// A [`RecvStream`] backed by the [`CacheEngine::admit_bao_stream`] feeder
-/// channel. The caller pushes the header-less bao interleaved stream it forwards
-/// from the upstream (the content size is supplied out of band as an 8-byte size
-/// prefix, ADR 038); this adapter hands those bytes to iroh-blobs'
-/// `import_bao_reader`, which verifies + decodes them to plaintext for the store
-/// import (#915, ADR 038 §Serve side).
-struct ChannelRecvStream {
-    rx: tokio::sync::mpsc::Receiver<Bytes>,
-    buf: BytesMut,
-}
-
-impl ChannelRecvStream {
-    fn new(rx: tokio::sync::mpsc::Receiver<Bytes>) -> Self {
-        Self {
-            rx,
-            buf: BytesMut::new(),
-        }
-    }
-
-    /// Pull from the channel until `buf` holds at least `n` bytes or it closes.
-    async fn fill_to(&mut self, n: usize) {
-        while self.buf.len() < n {
-            match self.rx.recv().await {
-                Some(b) => self.buf.extend_from_slice(&b),
-                None => break,
-            }
-        }
-    }
-
-    fn eof() -> std::io::Error {
-        std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "tee feeder channel closed before the requested bytes arrived",
-        )
-    }
-}
-
-impl RecvStream for ChannelRecvStream {
-    async fn recv_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
-        if self.buf.is_empty()
-            && let Some(b) = self.rx.recv().await
-        {
-            self.buf.extend_from_slice(&b);
-        }
-        // A drained-and-closed channel yields a zero-length `Bytes`, which the
-        // `bao-tree` reader reads as clean EOF (not an error) — the correct signal
-        // for a feed that ended (`admit_bao_stream` dropped its sender). A feed
-        // that ends mid-tree surfaces as this same short read to the decoder, which
-        // then fails with `ParentNotFound`/`LeafNotFound` — the transport-class
-        // truncated-mid-tree path (`classify_import_bao_reader_error`), distinct
-        // from a genuine group hash mismatch.
-        let take = self.buf.len().min(len);
-        Ok(self.buf.split_to(take).freeze())
-    }
-
-    async fn recv_bytes_exact(&mut self, len: usize) -> std::io::Result<Bytes> {
-        self.fill_to(len).await;
-        if self.buf.len() < len {
-            return Err(Self::eof());
-        }
-        Ok(self.buf.split_to(len).freeze())
-    }
-
-    async fn recv_exact(&mut self, target: &mut [u8]) -> std::io::Result<()> {
-        self.fill_to(target.len()).await;
-        if self.buf.len() < target.len() {
-            return Err(Self::eof());
-        }
-        let head = self.buf.split_to(target.len());
-        target.copy_from_slice(&head);
-        Ok(())
-    }
-
-    // `stop`/`id` are inert by design: this reader is backed by an in-process
-    // mpsc channel, not a real QUIC stream. There is no peer to send a STOP_SENDING
-    // frame to (the producer ends the fill by dropping its sender), and there is no
-    // wire stream id — `0` is a stable placeholder the decoder never keys on.
-    fn stop(&mut self, _code: iroh::endpoint::VarInt) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn id(&self) -> u64 {
-        0
-    }
-}
-
 /// True when the body-phase `io::Error` wraps a typed
 /// [`BlobTooLargeMarker`] — meaning the cap (engine-level
 /// `count_and_cap_stream`, adapter-level HTTP chunk cap, or the
@@ -9091,6 +9005,46 @@ mod tests {
             1,
             "streaming admit creates exactly one protecting tag"
         );
+    }
+
+    #[tokio::test]
+    async fn admit_bao_stream_captures_proof_into_the_session_during_import() {
+        // With a serve leg attached, the decode pass captures the range's proof
+        // nodes straight into the shared session — no post-admit `export_bao`
+        // read-back. Prove the captured set equals exactly what the read-back would
+        // have recovered, so a serve leg reads back an identical outboard.
+        use bao_tree::io::fsm::Outboard;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        let header_less = bao.slice(8..);
+
+        let session = crate::FillSession::new(bao_tree::blake3::Hash::from(root), total);
+        engine
+            .admit_bao_stream(hash, ranges.clone(), total, header_less, Some(&session))
+            .await
+            .map_err(|(_reader, e)| e)
+            .unwrap();
+
+        // The proof nodes an `export_bao` read-back would recover for this range.
+        let expected = engine.outboard_pairs(hash, &ranges).await.unwrap();
+        assert!(
+            !expected.is_empty(),
+            "the admitted range spans interior proof nodes"
+        );
+        // Every one was captured into the session during import: a reader minted
+        // from the session loads each without awaiting a further fill.
+        let mut reader = session.outboard_reader();
+        for (node, pair) in expected {
+            assert_eq!(
+                reader.load(node).await.unwrap(),
+                Some(pair),
+                "node {node:?} was captured during import"
+            );
+        }
     }
 
     #[tokio::test]
