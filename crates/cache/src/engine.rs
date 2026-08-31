@@ -3443,9 +3443,10 @@ impl CacheEngine {
                         Ok(pairs) => pairs,
                         Err(e) => return Err((reader, e)),
                     };
-                    for (node, pair) in pairs {
-                        session.capture(node, pair);
-                    }
+                    // Wake parked serve legs once for the whole admit, not per node:
+                    // a large range carries many proof nodes, and a per-node notify
+                    // storm scales the wakeups with proof-node count for no gain.
+                    session.capture_many(pairs);
                 }
                 Ok(reader)
             }

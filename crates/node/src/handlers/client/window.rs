@@ -752,9 +752,8 @@ impl ClientHandler {
                 .outboard_pairs(hash, present.chunk_ranges())
                 .await
         {
-            for (node, pair) in pairs {
-                session.capture(node, pair);
-            }
+            // Seed the whole held-range proof under one wake, not one per node.
+            session.capture_many(pairs);
         }
     }
 }

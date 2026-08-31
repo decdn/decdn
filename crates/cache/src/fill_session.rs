@@ -149,29 +149,66 @@ impl HashOutboard {
         })
     }
 
-    /// Capture one internal node's `(left, right)` hash pair. Idempotent: re-saving
-    /// a node (a re-admitted range) overwrites with the same bytes and re-notifies,
-    /// which is harmless. A `node` with no outboard slot (a leaf) is ignored.
-    fn capture(&self, node: TreeNode, pair: (blake3::Hash, blake3::Hash)) {
+    /// Write one internal node's `(left, right)` hash pair into `state`, returning
+    /// whether a slot was written — `false` for a leaf, which has no outboard slot.
+    /// Idempotent: re-saving a node (a re-admitted range) overwrites with the same
+    /// bytes. Does NOT notify; the caller wakes parked readers once the batch is in,
+    /// so an N-node admit fires `captured` a single time rather than N.
+    fn write_pair(
+        &self,
+        state: &mut OutboardState,
+        node: TreeNode,
+        pair: (blake3::Hash, blake3::Hash),
+    ) -> bool {
         let Some(offset) = self.tree.pre_order_offset(node) else {
-            return; // leaf: no hash pair in the outboard
+            return false; // leaf: no hash pair in the outboard
         };
         let idx = usize::try_from(offset).unwrap_or(usize::MAX);
         let byte_off = idx.saturating_mul(HASH_PAIR_BYTES);
+        let (l, r) = pair;
+        if let Some(slot) = state.bytes.get_mut(byte_off..byte_off + HASH_PAIR_BYTES)
+            && let Some((left, right)) = slot.split_at_mut_checked(32)
         {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let (l, r) = pair;
-            if let Some(slot) = state.bytes.get_mut(byte_off..byte_off + HASH_PAIR_BYTES)
-                && let Some((left, right)) = slot.split_at_mut_checked(32)
-            {
-                left.copy_from_slice(l.as_bytes());
-                right.copy_from_slice(r.as_bytes());
-            }
-            if let Some(flag) = state.captured.get_mut(idx) {
-                *flag = true;
-            }
+            left.copy_from_slice(l.as_bytes());
+            right.copy_from_slice(r.as_bytes());
         }
-        self.captured.notify_waiters();
+        if let Some(flag) = state.captured.get_mut(idx) {
+            *flag = true;
+        }
+        true
+    }
+
+    /// Capture one internal node's `(left, right)` hash pair, then wake parked
+    /// readers. A `node` with no outboard slot (a leaf) is ignored and does not notify.
+    fn capture(&self, node: TreeNode, pair: (blake3::Hash, blake3::Hash)) {
+        let wrote = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            self.write_pair(&mut state, node, pair)
+        };
+        if wrote {
+            self.captured.notify_waiters();
+        }
+    }
+
+    /// Capture a whole admit's worth of node pairs under one lock acquisition, then
+    /// fire `captured` exactly once. A serve leg parked on any of these nodes reads
+    /// them all back the same as a per-node [`Self::capture`] loop would, but every
+    /// parked reader wakes once per admit instead of once per node — the admit-time
+    /// notify no longer scales with the number of proof nodes it carries. Leaves are
+    /// ignored; the notify fires only if at least one internal node was written.
+    fn capture_many(
+        &self,
+        pairs: impl IntoIterator<Item = (TreeNode, (blake3::Hash, blake3::Hash))>,
+    ) {
+        let wrote = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            pairs.into_iter().fold(false, |acc, (node, pair)| {
+                self.write_pair(&mut state, node, pair) || acc
+            })
+        };
+        if wrote {
+            self.captured.notify_waiters();
+        }
     }
 
     /// Read node `idx`'s captured pair, or `None` if not captured yet. Never holds
@@ -437,6 +474,17 @@ impl FillSession {
     /// one shared buffer accumulates the whole tree's proof.
     pub fn capture(&self, node: TreeNode, pair: (blake3::Hash, blake3::Hash)) {
         self.outboard().capture(node, pair);
+    }
+
+    /// Capture a whole admit's node pairs into the per-hash outboard in one shot,
+    /// waking parked serve legs once for the batch rather than once per node. The
+    /// admit path collects an admitted range's proof nodes and hands them here, so a
+    /// large range's fill no longer fires a wake per node it carries.
+    pub fn capture_many(
+        &self,
+        pairs: impl IntoIterator<Item = (TreeNode, (blake3::Hash, blake3::Hash))>,
+    ) {
+        self.outboard().capture_many(pairs);
     }
 
     /// Record the pull leg's terminal outcome and wake parked readers. Idempotent
@@ -996,6 +1044,50 @@ mod tests {
         for (node, pair) in saved {
             assert_eq!(reader.load(node).await.unwrap(), Some(pair));
         }
+    }
+
+    #[tokio::test]
+    async fn capture_many_round_trips_each_internal_node() {
+        // One batched `capture_many` must land every pair a per-node `capture` loop
+        // would, so a serve leg reads back the whole tree the same way.
+        let session = FillSession::new(h(0xBB), TOTAL);
+        let mut reader = session.outboard_reader();
+        let tree = BaoTree::new(TOTAL, IROH_BLOCK_SIZE);
+
+        let mut batch = Vec::new();
+        for (i, node) in tree.pre_order_nodes_iter().enumerate() {
+            if tree.pre_order_offset(node).is_some() {
+                let tag = u8::try_from(i % 251).unwrap();
+                batch.push((node, (h(tag), h(tag.wrapping_add(101)))));
+            }
+        }
+        session.capture_many(batch.clone());
+        for (node, pair) in batch {
+            assert_eq!(reader.load(node).await.unwrap(), Some(pair));
+        }
+    }
+
+    #[tokio::test]
+    async fn load_awaits_then_resolves_on_capture_many() {
+        // A parked reader must wake from the batch's single notify, not only from a
+        // per-node one — the notify fires once for the whole admit.
+        let session = FillSession::new(h(0xCC), TOTAL);
+        let mut reader = session.outboard_reader();
+        let tree = BaoTree::new(TOTAL, IROH_BLOCK_SIZE);
+        let node = tree
+            .pre_order_nodes_iter()
+            .find(|n| tree.pre_order_offset(*n).is_some())
+            .expect("an interior node exists");
+        let pair = (h(7), h(9));
+
+        let load = tokio::spawn(async move { reader.load(node).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !load.is_finished(),
+            "load must park until the node is captured"
+        );
+        session.capture_many([(node, pair)]);
+        assert_eq!(load.await.unwrap().unwrap(), Some(pair));
     }
 
     #[tokio::test]
