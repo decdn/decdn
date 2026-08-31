@@ -1237,15 +1237,13 @@ async fn build_chain_and_handlers(
         }
     }
 
-    // Build the paid-delivery handler from a single deps literal (#1254): every
-    // optional wiring hook above is supplied at construction, not via a setter chain.
     // ADR 011 deny-set. Taken from the reload state rather than built here, so
     // the handler and the SIGHUP / `decdn node reload` path hold the SAME `Arc`
     // — a denylist entry added to the config file takes effect on reload with no
     // handler rebuild and no restart, which is what makes it usable against a
-    // one-hour statutory clock. Passed into `new()` as a required argument: it
-    // is a compliance gate, so a construction site that forgets to wire it must
-    // not silently degrade to "deny nothing".
+    // one-hour statutory clock. It is a compliance gate, so the deps literal
+    // below names it like every other field: a wiring site that drops it fails
+    // to compile rather than silently degrading to "deny nothing".
     let content_denylist = reload_state.content_denylist();
     // Redeem-hint channel (#327), created outside `PoolSettlementService::bootstrap`
     // so the sender can be cloned into the handler deps below while the service
@@ -1262,27 +1260,6 @@ async fn build_chain_and_handlers(
     // reach the SAME controller.
     let shed_controller = crate::load_shed::LoadShedController::from_config(&cfg.load_shed);
     reload_state.attach_load_shed(Some(Arc::clone(&shed_controller)));
-    let mut client_deps = crate::handlers::client::ClientHandlerDeps::new(
-        infra.secret_key.public(),
-        Arc::clone(&infra.node_metrics),
-        Arc::clone(&infra.limiter),
-        infra.cache.clone(),
-        Arc::clone(&infra.eth_signer),
-        slash_domain.clone(),
-        voucher_domain.clone(),
-        bind_domain.clone(),
-        Arc::clone(&infra.channel_state_store),
-        Arc::clone(&infra.receipt_sink),
-        cfg.payment.rate_per_mb,
-        rate_bounds.clone(),
-        cfg.cache
-            .max_blob_size_mb
-            .saturating_mul(decdn_protocol::MB_BYTES),
-        MAX_CLIENT_STREAMS,
-        Arc::clone(&content_denylist),
-        U256::from(cfg.blockchain.pool_min_remaining_deposit_micro_usdc),
-        Arc::clone(&shed_controller),
-    );
     // Coarse wall clock (issue #1792 item 4): a background task refreshes an
     // atomic every 500 ms so the voucher-accept path's two under-lock reads — the
     // capability-expiry gate and the `last_voucher_at` liveness stamp — cost a
@@ -1295,43 +1272,12 @@ async fn build_chain_and_handlers(
         &coarse_clock,
         std::time::Duration::from_millis(500),
     );
-    client_deps.coarse_clock = Some(coarse_clock);
-    // Owner-signed capability intake (ADR 003 §Capability delegation): the serve
-    // gate persists a presented capability so the redeemer registers the signer
-    // on first redemption. Same redb file every lane record lives in.
-    client_deps.capability_sink =
-        Some(Arc::clone(&infra.concrete_channel_store)
-            as Arc<dyn crate::channel_store::CapabilitySink>);
-    // Durable floor dead-charge, keyed `(pool, signer)` (ADR 003 §Pool solvency):
-    // the same redb store that holds every lane record also mirrors each signer's
-    // unrecoverable floor loss against each pool, so a restart reloads it rather
-    // than granting a fresh free-floor budget.
-    client_deps.floor_loss_store =
-        Some(Arc::clone(&infra.concrete_channel_store)
-            as Arc<dyn decdn_incentive::PoolFloorLossStore>);
-    // Per-signer floor sub-cap (ADR 003 §Pool solvency, per-signer floor
-    // isolation): the node's own bad-debt budget per capability-holder, underneath
-    // the per-pool `remaining − M` ceiling.
-    client_deps.pool_floor_signer_share_bps = cfg.blockchain.pool_floor_signer_share_bps;
-    client_deps.pool_floor_signer_max_windows = cfg.blockchain.pool_floor_signer_max_windows;
     // Event-fed pool view (owner + remaining) for the floor-`M` solvency gate and
     // the ADR 011 funder gate. The settlement watcher below folds every
     // `PaymentPool` event into this projection, so a serve request reads
     // `{owner, remaining}` in-memory — no per-serve `getPool` `eth_call`. The same
     // instance is handed to the settlement service (its watcher is the writer).
     let pool_view = crate::pool_view::PoolProjection::new();
-    client_deps.pool_view =
-        Some(Arc::new(pool_view.clone()) as Arc<dyn crate::pool_view::PoolView>);
-    client_deps.local_populate = local_populate;
-    client_deps.pull_through = pull_through;
-    client_deps.pull_through_origin = pull_through_origin;
-    // Downstream credit-window ramp (ADR 003 §Credit window, #1477, #1669).
-    client_deps.credit_max = cfg.payment.credit_max;
-    client_deps.frame_target_bytes = cfg.payment.frame_target_bytes;
-    client_deps.credit_ramp_divisor = cfg.payment.credit_ramp_divisor;
-    // Hint the settlement service on each accepted voucher so a lane's accrued
-    // claim is planned into a chunk promptly rather than waiting the self-tick.
-    client_deps.redeem_hint = Some(redeem_tx.clone());
     // ADR 041 serve-credit inputs: a non-blocking sink in front of the SAME warming
     // allowance the buy loop debits and the eviction path forgets, plus the live
     // operator fee-share cell. The background aggregator behind the sink is what
@@ -1341,10 +1287,73 @@ async fn build_chain_and_handlers(
         Arc::clone(&warming),
         Arc::clone(&infra.node_metrics),
     );
-    client_deps.warming_credit = warming_credit;
-    client_deps.operator_shares = operator_shares.clone();
-    // Origin-only policy (#1759): backend-authoritative own/foreign decision.
-    client_deps.relay_foreign_namespaces = cfg.cache.relay_foreign_namespaces;
+    // One exhaustive literal, never a setter chain (#1254). Every field is named
+    // here, so adding one to `ClientHandlerDeps` fails this call site rather than
+    // defaulting silently, and deleting a wiring line is a missing-field error
+    // instead of a live node that quietly runs the inert default. That matters
+    // most for the economic hooks: a dropped `warming_credit` degrades to
+    // `NoopWarmingCreditSink` and a dropped `operator_shares` to a zero share,
+    // and both lose money on a real node while every test stays green.
+    let client_deps = crate::handlers::client::ClientHandlerDeps {
+        node_id: infra.secret_key.public(),
+        metrics: Arc::clone(&infra.node_metrics),
+        limiter: Arc::clone(&infra.limiter),
+        shed: Arc::clone(&shed_controller),
+        cache: infra.cache.clone(),
+        eth_signer: Arc::clone(&infra.eth_signer),
+        slash_domain: slash_domain.clone(),
+        voucher_domain: voucher_domain.clone(),
+        bind_domain: bind_domain.clone(),
+        channel_state_store: Arc::clone(&infra.channel_state_store),
+        receipt_sink: Arc::clone(&infra.receipt_sink),
+        // Owner-signed capability intake (ADR 003 §Capability delegation): the
+        // serve gate persists a presented capability so the redeemer registers
+        // the signer on first redemption. Same redb file every lane record
+        // lives in.
+        capability_sink: Some(Arc::clone(&infra.concrete_channel_store)
+            as Arc<dyn crate::channel_store::CapabilitySink>),
+        pool_view: Some(Arc::new(pool_view.clone()) as Arc<dyn crate::pool_view::PoolView>),
+        pool_min_remaining_deposit: U256::from(
+            cfg.blockchain.pool_min_remaining_deposit_micro_usdc,
+        ),
+        rate_per_mb: cfg.payment.rate_per_mb,
+        rate_bounds: rate_bounds.clone(),
+        max_blob_size_bytes: cfg
+            .cache
+            .max_blob_size_mb
+            .saturating_mul(decdn_protocol::MB_BYTES),
+        max_concurrent_streams: MAX_CLIENT_STREAMS,
+        content_deny: Arc::clone(&content_denylist),
+        // Hint the settlement service on each accepted voucher so a lane's
+        // accrued claim is planned into a chunk promptly rather than waiting the
+        // self-tick.
+        redeem_hint: Some(redeem_tx.clone()),
+        pull_through,
+        local_populate,
+        pull_through_origin,
+        // Downstream credit-window ramp (ADR 003 §Credit window, #1477, #1669).
+        credit_max: cfg.payment.credit_max,
+        credit_ramp_divisor: cfg.payment.credit_ramp_divisor,
+        frame_target_bytes: cfg.payment.frame_target_bytes,
+        idle_timeout: None,
+        pool_recheck_interval: None,
+        // Durable floor dead-charge, keyed `(pool, signer)` (ADR 003 §Pool
+        // solvency): the same redb store that holds every lane record also
+        // mirrors each signer's unrecoverable floor loss against each pool, so a
+        // restart reloads it rather than granting a fresh free-floor budget.
+        floor_loss_store: Some(Arc::clone(&infra.concrete_channel_store)
+            as Arc<dyn decdn_incentive::PoolFloorLossStore>),
+        // Per-signer floor sub-cap (ADR 003 §Pool solvency, per-signer floor
+        // isolation): the node's own bad-debt budget per capability-holder,
+        // underneath the per-pool `remaining − M` ceiling.
+        pool_floor_signer_share_bps: cfg.blockchain.pool_floor_signer_share_bps,
+        pool_floor_signer_max_windows: cfg.blockchain.pool_floor_signer_max_windows,
+        warming_credit,
+        operator_shares: operator_shares.clone(),
+        // Origin-only policy (#1759): backend-authoritative own/foreign decision.
+        relay_foreign_namespaces: cfg.cache.relay_foreign_namespaces,
+        coarse_clock: Some(coarse_clock),
+    };
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider

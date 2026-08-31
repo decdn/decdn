@@ -30,15 +30,17 @@
 //!   (`SHARDS / cols`) — the same `1 / cols` a single wide sketch gives, because
 //!   the shard slice and the row slices are disjoint bytes of a uniform hash.
 //!
-//! The per-row rate is what carries over exactly; the *whole-sketch* error rate
-//! does not. A count-min sketch over-reports only when two keys collide in all
-//! `ROWS` rows, and sharding correlates the rows — they collide all-or-nothing
-//! on the shard match. So the full-collision probability goes from `cols^-ROWS`
-//! to `SHARDS^(ROWS-1) / cols^ROWS`, a factor of `SHARDS^(ROWS-1)`. At the
-//! shipped sizing (`cols = 65536`, [`SHARDS`] `= 16`) that is `5e-20` against
-//! `2e-16`: both far below any rate that can move a decision. It matters only if
-//! `cache.tinylfu.sketch_bytes` is cut by orders of magnitude or [`SHARDS`] is
-//! raised a long way, so read it as the bound to check before either move.
+//! The over-report rate carries over as exactly as the per-row rate does. The
+//! sketch reads a key hotter than it is when every one of its `ROWS` counters
+//! also holds some other key's count. The polluting keys need not be the same
+//! one across rows, so "two keys collide in all `ROWS` rows" is a far rarer
+//! event that does not bound the error — do not size the sketch from it. For
+//! `N` live keys the rate is `(1 - e^(-N / cols))^ROWS`, and [`SHARDS`] cancels
+//! out: a shard divides the columns and the keys in the same proportion. So
+//! sharding costs nothing in accuracy and the width alone sets it. The rate
+//! turns on `N / cols`, which holds the shipped `cols = 65536` under one
+//! percent out to roughly 25000 live keys. See
+//! [`super::tinylfu::TinyLfuEstimator::new`] for the sizing and its floor.
 use crate::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -446,7 +448,10 @@ mod tests {
             !others.is_empty(),
             "some key must route outside the hot shard"
         );
-        let window = 64 * usize::try_from(AGING_WINDOW_PER_COL).unwrap_or(usize::MAX);
+        // Read the realized window off the sketch, never a local copy: a change
+        // to SHARDS moves the realized width, and a stale copy would drive less
+        // than a full window and silently test nothing.
+        let window = usize::try_from(s.window)?;
         for n in 0..window {
             if let Some(k) = others.get(n % others.len()) {
                 s.increment(k);

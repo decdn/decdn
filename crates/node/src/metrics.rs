@@ -483,6 +483,15 @@ pub struct DecdnMetrics {
     /// source will drift to blocked. Operator-visible name:
     /// `decdn_warming_credits_dropped_total`.
     pub warming_credits_dropped: Counter,
+    /// ADR 041 warming serve credits the aggregator applied to a source ledger.
+    /// The success sibling of `warming_credits_dropped`, and the reason a zero
+    /// drop count means something: zero drops beside zero applies is a node
+    /// whose serve path never reached the ledger at all — an unwired
+    /// [`crate::warming_allowance::WarmingCreditSink`] leaves the inert
+    /// `NoopWarmingCreditSink` in place, which drops nothing because it enqueues
+    /// nothing. A node serving tagged blobs must show this climbing.
+    /// Operator-visible name: `decdn_warming_credits_applied_total`.
+    pub warming_credits_applied: Counter,
     /// Redemption attempts (`try_redeem`) that returned an error — a failed
     /// `getChannel`/`withdraw` RPC or receipt wait (#751). Each is otherwise
     /// only a single `warn!`; a sustained rate means accrued earnings are not
@@ -1795,6 +1804,11 @@ recorders! {
     /// drop is conservative (the source ledger stays more negative than
     /// reality), but a sustained rate throttles speculative warming.
     warming_credit_dropped => warming_credits_dropped.inc();
+
+    /// An ADR 041 warming serve credit reached the ledger. Paired with
+    /// `warming_credit_dropped` so an operator can tell "no credits dropped"
+    /// from "no credits at all".
+    warming_credit_applied => warming_credits_applied.inc();
 
     /// A redemption attempt (`try_redeem`) failed with an RPC/receipt error
     /// (#751). Pairs with the `warn!` in `redeemer_loop`.
@@ -3283,6 +3297,29 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_warming_credits_dropped_total", 1),
             "expected one dropped-warming-credit event:\n{text}"
+        );
+    }
+
+    #[test]
+    fn warming_credits_applied_metric_starts_at_zero_and_increments() {
+        // ADR 041. The success sibling of the dropped counter: an operator
+        // reading zero drops needs this to tell a healthy node from one whose
+        // serve path never reached the ledger. A handler left with
+        // `NoopWarmingCreditSink` enqueues nothing, so it drops nothing — both
+        // counters sit at zero and only this one makes that legible.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_warming_credits_applied_total", 0),
+            "warming-credit-applied counter should be exposed at zero on a fresh registry:\n{text}"
+        );
+
+        metrics.warming_credit_applied();
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_warming_credits_applied_total", 1),
+            "expected one applied warming credit:\n{text}"
         );
     }
 

@@ -292,19 +292,22 @@ pub const DEFAULT_TINYLFU_SKETCH_BYTES: usize = 262_144;
 /// One `u8` per counter over the sketch's four rows means `cols = bytes / 4`,
 /// so this floor buys 4096 columns.
 ///
-/// It is set from an over-report target. A count-min sketch reports a key
-/// hotter than it is only when another key collides with it in every row. The
-/// sketch shards its columns, and the shard match is all-or-nothing across the
-/// rows, so that whole-sketch rate is `SHARDS^(ROWS-1) / cols^ROWS` rather than
-/// `cols^-ROWS`. At 4096 columns it is `1.5e-11` per pair of live hashes, which
-/// keeps a node holding `10_000` of them below `1e-3` expected false-hot pairs.
+/// It is set from an over-report target. A count-min sketch reads a key hotter
+/// than it is when every one of its four row counters also holds some other
+/// key's count — the polluting keys need not be the same one across rows, so
+/// the far rarer "one twin collides in all four rows" event does not bound the
+/// error. For `N` live hashes over `cols` columns the rate is
+/// `(1 - e^(-N / cols))^4`. Sharding cancels out of that expression: a shard
+/// divides the columns and the hashes in the same proportion, so the width
+/// alone sets the accuracy.
 ///
-/// Two things to hold onto before moving this number. The rate grows as
-/// `N^2 / cols^4` in the live-hash count, so this is a floor and not a
-/// recommendation — a node holding `100_000` blobs wants
-/// [`DEFAULT_TINYLFU_SKETCH_BYTES`], 16 times wider. And it is only the
-/// whole-sketch rate that sharding inflates: the per-row collision rate is
-/// `1 / cols` whether the sketch is sharded or not.
+/// Because the rate turns only on `N / cols`, a target rate fixes a hash count
+/// proportional to the width — about `0.38 * cols` live hashes hold it under
+/// one percent. This floor is therefore good for roughly `1_500` hashes and
+/// [`DEFAULT_TINYLFU_SKETCH_BYTES`] for roughly `25_000`; a node holding more
+/// needs a proportionally wider sketch, not a fixed step up. Counts are an
+/// upper bound, since the sketch counts every hash it observes between
+/// halvings rather than only the resident ones.
 pub const MIN_TINYLFU_SKETCH_BYTES: usize = 16_384;
 // A default below its own floor would make every node that ships without a
 // `[cache.tinylfu]` block fail to start.
@@ -1982,12 +1985,15 @@ fn resolve_cache_into(
     let tinylfu_promotion_threshold = tinylfu_file
         .and_then(|t| t.promotion_threshold)
         .unwrap_or(DEFAULT_TINYLFU_PROMOTION_THRESHOLD);
-    // `sketch_bytes / 4` is the sketch's column count, and the rate at which it
-    // reports a cold blob as hot grows as the fourth power of that count
-    // shrinking. Reject an undersized one at load, never clamp (ADR 040
-    // §Configuration surface). The check does not consult the policy selectors:
-    // a knob that is wrong stays wrong when an operator switches to `tinylfu`,
-    // and the two checks below are unconditional for the same reason.
+    // `sketch_bytes / 4` is the sketch's column count, and the over-report rate
+    // `(1 - e^(-N / cols))^4` climbs steeply as that count shrinks. Reject an
+    // undersized one at load, never clamp (ADR 040 §Configuration surface).
+    // The check does not consult the policy selectors, and for `sketch_bytes`
+    // that is not a precaution: the estimator is also built when
+    // `serve_economics.policy` is `margin`, which is the default, so this knob
+    // sizes a live sketch on a node whose selectors are `lru`/`always`. The two
+    // checks below gate genuinely selector-only knobs, and are unconditional so
+    // that a value which is wrong stays rejected when an operator switches.
     bag.check_with(
         tinylfu_sketch_bytes >= MIN_TINYLFU_SKETCH_BYTES,
         "cache.tinylfu.sketch_bytes",
@@ -1995,9 +2001,11 @@ fn resolve_cache_into(
             format!(
                 "cache.tinylfu.sketch_bytes ({tinylfu_sketch_bytes}) must be >= \
                  {MIN_TINYLFU_SKETCH_BYTES}: a narrower sketch reports cold blobs \
-                 as hot often enough to move admission and eviction decisions. \
-                 It is validated whether or not a policy selector names \
-                 \"tinylfu\"."
+                 as hot often enough to move admission, eviction and \
+                 serve-economics decisions. It applies whether or not a policy \
+                 selector names \"tinylfu\" — the default \
+                 cache.serve_economics.policy = \"margin\" builds the same \
+                 sketch."
             )
         },
     );
@@ -4657,8 +4665,9 @@ mod tests {
         );
 
         // Validation does not consult the policy selectors (ADR 040
-        // §Configuration surface): a knob that is wrong under `always` is still
-        // wrong the day an operator switches to `tinylfu`.
+        // §Configuration surface). For `sketch_bytes` the selectors are not even
+        // the only gate: the default `serve_economics.policy = "margin"` builds
+        // the same estimator, so an `always` node runs this sketch for real.
         let inert = sized(MIN_TINYLFU_SKETCH_BYTES - 1, "always")
             .unwrap_or_else(|| "resolved without error".to_string());
         assert!(

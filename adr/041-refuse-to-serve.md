@@ -109,9 +109,13 @@ serve's last step then never waits on the allowance ledger. A full queue drops
 the credit. A drop leaves the source more negative than its true profit and
 loss. It can only throttle warming from that source. It can never over-fund the
 source, and the time refill forgives it.
-`decdn_warming_credits_dropped_total` counts every drop. Eviction forgets the
-tag. A blob re-served two or more times fully refunds
-its buy, so an honest source stays warm; a blob served once nets the fee skim as a
+`decdn_warming_credits_dropped_total` counts every drop, and
+`decdn_warming_credits_applied_total` counts every credit that reaches the
+ledger. An operator reads the two together. A node that is not wired to a
+credit sink enqueues nothing, so it also drops nothing. Zero drops beside a
+climbing apply count is a healthy node. Zero of both is a node that never
+credits at all. Eviction forgets the tag. A blob re-served two or more times
+fully refunds its buy, so an honest source stays warm; a blob served once nets the fee skim as a
 loss and stays drained, so a source that keeps selling duds is cut off. A slow
 time refill forgives a transient bad patch. While a source's allowance is
 positive, the node warms from it at the market price; once the allowance is spent,
@@ -275,7 +279,9 @@ deposit.
 - Serve credits are best-effort. A full queue drops a credit. A shutdown
   discards the credits that the drain deadline does not reach. Every drop is
   conservative, and the node counts it. A source can still read as more drained
-  than its true profit and loss.
+  than its true profit and loss. `decdn_warming_credits_applied_total` is the
+  counter that makes a zero drop count readable, because a serve path that
+  reaches no ledger drops nothing either.
 
 ## Acceptance Criteria
 

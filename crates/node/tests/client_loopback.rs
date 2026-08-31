@@ -8464,10 +8464,15 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
 /// real paid fetch, and polls because the apply is asynchronous by design.
 ///
 /// Scope: the test builds its own deps and spawns its own aggregator, so it
-/// covers the chain, not the runtime's wiring of it. A regression that dropped
-/// `build_chain_and_handlers`' assignment of `warming_credit` leaves this green
-/// — the handler would fall back to the no-op default, and every serve credit in
-/// production would vanish with the drop counter still reading zero.
+/// covers the chain, not the runtime's wiring of it. Two things outside this
+/// test cover that instead. `build_chain_and_handlers` names every
+/// `ClientHandlerDeps` field in one exhaustive literal, so dropping the
+/// `warming_credit` line is a missing-field compile error rather than a silent
+/// fall back to `NoopWarmingCreditSink`. And a node that did fall back would
+/// enqueue nothing and so drop nothing, which is why
+/// `decdn_warming_credits_applied_total` exists beside the drop counter: on a
+/// live node the two read together tell "no credits lost" apart from "no
+/// credits at all".
 #[tokio::test(flavor = "multi_thread")]
 async fn a_completed_serve_credits_the_source_through_the_background_aggregator()
 -> anyhow::Result<()> {

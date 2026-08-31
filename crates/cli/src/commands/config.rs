@@ -998,7 +998,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # node_pull_stall_timeout_sec = 20         # per-upstream INACTIVITY timeout while streaming (#1134); the clock resets on every byte, so it trips only on a silent upstream — not on a large blob or a slow link. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (167.5s at defaults)
 # eviction_policy = "lru"                  # ADR 040: "lru" or "tinylfu"; restart-required
 # admission_policy = "always"              # ADR 040: "always" or "tinylfu"; restart-required
-# [cache.tinylfu]                          # W-TinyLFU tuning (ADR 040); consulted only when eviction_policy or admission_policy above is "tinylfu"
+# [cache.tinylfu]                          # W-TinyLFU tuning (ADR 040); promotion_threshold/probation_target_pct apply only under a "tinylfu" selector, but sketch_bytes also sizes the serve_economics "margin" heat estimator (the default), so it is live on a stock node
 # sketch_bytes = 262144                    # count-min sketch size, shared by admission and eviction; minimum 16384
 # promotion_threshold = 2                  # prior sightings before a probation member promotes to main
 # probation_target_pct = 10                # % of cache_size_mb the probation segment is capped to; bounds [1,50]

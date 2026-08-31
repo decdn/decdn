@@ -233,8 +233,9 @@ impl WarmingAllowance {
     }
 
     /// Credits `units` of realized margin directly to `source`, capped at
-    /// `+budget`. The half of [`Self::credit_serve`] that touches the ledger,
-    /// split out so a deferred credit can resolve its source first.
+    /// `+budget`. This is the ledger half of a serve credit; resolving the
+    /// hash's source is a separate step the caller takes first, so a credit
+    /// applied later still pays the source its tag named at serve time.
     fn credit_source(&self, source: SourceId, units: u64) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let bucket = state.buckets.entry(source).or_insert_with(Bucket::fresh);
@@ -280,8 +281,9 @@ pub const WARMING_CREDIT_CAPACITY: usize = 1024;
 /// is O(1), so the hazard is not a long hold — it is that a serve completion
 /// which waits for the lock at all keeps the stream's lane slot and floor
 /// reservation alive for the length of the wait. The buy loop holds that lock
-/// on the cache-miss path and the aggregator holds it to apply credits; a serve
-/// arriving in either window pays for it. The runtime uses the channel sink from
+/// on the cache-miss path and the aggregator holds it to apply credits, so a
+/// serve that took the lock and arrived in either window would pay for it. That
+/// is the cost this contract exists to refuse. The runtime uses the channel sink from
 /// [`spawn_warming_creditor`]; tests use the `test-support`
 /// `DirectWarmingCreditSink`.
 ///
@@ -423,7 +425,8 @@ pub fn spawn_warming_creditor(
     let (tx, rx) = mpsc::channel(WARMING_CREDIT_CAPACITY);
     let handle = {
         let allowance = Arc::clone(&allowance);
-        StopHandle::spawn(move |shutdown| warming_creditor_loop(rx, allowance, shutdown))
+        let metrics = Arc::clone(&metrics);
+        StopHandle::spawn(move |shutdown| warming_creditor_loop(rx, allowance, metrics, shutdown))
     };
     (
         Arc::new(ChannelWarmingCreditSink {
@@ -440,16 +443,26 @@ pub fn spawn_warming_creditor(
 /// Applies each credit FIFO until `shutdown` fires or every sink is dropped,
 /// then flushes the already-enqueued tail so a credit that made it into the
 /// queue before teardown still lands.
+///
+/// Each applied credit bumps [`Metrics::warming_credit_applied`]. That is the
+/// counter an operator reads beside the drop counter: a serve path that never
+/// reaches the ledger drops nothing, so zero drops only means something next to
+/// a non-zero apply count.
 async fn warming_creditor_loop(
     mut rx: mpsc::Receiver<(SourceId, u64)>,
     allowance: Arc<WarmingAllowance>,
+    metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) {
+    let apply = |source, units| {
+        allowance.credit_source(source, units);
+        metrics.warming_credit_applied();
+    };
     loop {
         tokio::select! {
             biased;
             maybe = rx.recv() => match maybe {
-                Some((source, units)) => allowance.credit_source(source, units),
+                Some((source, units)) => apply(source, units),
                 None => break,
             },
             () = shutdown.cancelled() => break,
@@ -457,7 +470,7 @@ async fn warming_creditor_loop(
     }
     rx.close();
     while let Some((source, units)) = rx.recv().await {
-        allowance.credit_source(source, units);
+        apply(source, units);
     }
     tracing::debug!("warming-credit aggregator drained and stopped");
 }

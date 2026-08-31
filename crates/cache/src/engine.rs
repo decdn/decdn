@@ -6610,9 +6610,19 @@ mod tests {
     /// a quiet map too. Scheduling decides whether a given round lands one, so
     /// rounds repeat until one does; the no-candidate-lost invariant is checked
     /// on every round either way.
+    ///
+    /// Each round writes into its own [`ROUND_STRIDE`]-wide key range, and the
+    /// range is asserted wide enough to hold that round's writes. Sharing one
+    /// range would make the witness vacuous from round two on: nothing evicts
+    /// the previous round's keys from `access_times`, so every later round would
+    /// "find" keys that were already there before its walk started, and a run
+    /// where the walk never overlapped the writer would report success.
     #[tokio::test]
     async fn a_scan_never_loses_a_candidate_to_a_concurrent_record() -> anyhow::Result<()> {
         const WRITER_BASE: u32 = 1_000_000;
+        /// Keys per round. Rounds must not share keys (see the docstring), and
+        /// a round that outran this would start reusing the next round's range.
+        const ROUND_STRIDE: u32 = 10_000_000;
         let tmp = tempfile::tempdir()?;
         let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
 
@@ -6624,7 +6634,8 @@ mod tests {
         }
 
         let mut overlapped = false;
-        for _ in 0..16 {
+        for round in 0..16u32 {
+            let base = WRITER_BASE.saturating_add(round.saturating_mul(ROUND_STRIDE));
             // Hammer the map with fresh hashes for the duration of the walk.
             let stop = Arc::new(AtomicBool::new(false));
             let written = Arc::new(AtomicU64::new(0));
@@ -6633,7 +6644,7 @@ mod tests {
                 let stop = Arc::clone(&stop);
                 let written = Arc::clone(&written);
                 std::thread::spawn(move || {
-                    let mut i = WRITER_BASE;
+                    let mut i = base;
                     while !stop.load(Ordering::Relaxed) {
                         engine.observe_hit(Hash::new(i.to_le_bytes()));
                         written.fetch_add(1, Ordering::Relaxed);
@@ -6655,9 +6666,10 @@ mod tests {
                 std::thread::yield_now();
             }
 
-            // The writer bumps its counter *after* the insert lands, so keys
-            // `[before, after)` are exactly those it could have written while
-            // the walk was running.
+            // The writer bumps its counter *after* the insert lands, so a key
+            // index below `before` is certainly already in the map and one at or
+            // above `after` is certainly not yet. Index `before` itself is the
+            // ambiguous one, which is why the witness range below skips it.
             let before = written.load(Ordering::Relaxed);
             let candidates = engine.eviction_candidates();
             let after = written.load(Ordering::Relaxed);
@@ -6674,10 +6686,18 @@ mod tests {
                 seeded.len()
             );
 
+            anyhow::ensure!(
+                after < u64::from(ROUND_STRIDE),
+                "round wrote {after} keys, overrunning its {ROUND_STRIDE}-key range"
+            );
+
             // Did this round's walk actually see a record that landed inside it?
-            let during: HashSet<Hash> = (before..after)
+            // The writer bumps its counter *after* the insert lands, so at the
+            // instant `before` was read the key at index `before` may already be
+            // in the map — skip it and start at the first index that cannot be.
+            let during: HashSet<Hash> = (before.saturating_add(1)..after)
                 .filter_map(|n| u32::try_from(n).ok())
-                .map(|n| Hash::new(WRITER_BASE.saturating_add(n).to_le_bytes()))
+                .map(|n| Hash::new(base.saturating_add(n).to_le_bytes()))
                 .collect();
             overlapped |= candidates.iter().any(|(h, _)| during.contains(h));
             if overlapped {
