@@ -594,7 +594,7 @@ impl PersistentPoolStateStore {
                 return Err(StoreError::Corrupt {
                     pool_id: None,
                     detail: format!(
-                        "lane state store file at {} is empty (length 0). \
+                        "redb store file at {} is empty (length 0). \
                          This is either a manual truncation or a filesystem rollback, \
                          either of which silently discards durable payment state \
                          (for lanes.redb this re-opens the issue #527 voucher-replay window). \
@@ -625,7 +625,7 @@ impl PersistentPoolStateStore {
 
         let db = Database::create(path).map_err(|err| {
             StoreError::Backend(format!(
-                "failed to open lane state store file at {}: {err}. \
+                "failed to open redb store file at {}: {err}. \
                  Removing the file forfeits its durability guard \
                  — restore from backup or investigate the corruption.",
                 path.display()
