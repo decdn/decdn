@@ -198,6 +198,16 @@ struct Inner {
     /// its result. Recency is advisory input to eviction ordering, and a hash
     /// missed by one sweep is seen by the next.
     access_times: DashMap<Hash, Instant>,
+    /// Hashes whose `decdn-partial-` protecting tag this process has already
+    /// written and not observed dropped. A partial's protection only needs the
+    /// tag to EXIST, and the name is deterministic per hash, so re-admitting more
+    /// ranges of the same blob need not re-issue the store write — one fill can
+    /// admit hundreds of ranges. [`CacheEngine::protect_partial`] short-circuits on
+    /// a present entry; [`CacheEngine::drop_named_tags_for`] removes the entry
+    /// before deleting the tag, so the next admit re-protects. Lock-free
+    /// (`DashMap`) so it never serializes the admit hot path. Starts empty each
+    /// process, so the first admit after restart harmlessly re-sets the tag once.
+    partial_protected: DashMap<Hash, ()>,
     /// In-flight pull-through requests. When a pull is in progress for a hash,
     /// subsequent callers wait on the [`Notify`] rather than issuing a
     /// duplicate origin fetch (coalescing, fixes #305).
@@ -1288,6 +1298,7 @@ impl CacheEngine {
                 breakers,
                 max_blob_bytes,
                 access_times: DashMap::new(),
+                partial_protected: DashMap::new(),
                 inflight: Mutex::new(HashMap::new()),
                 inflight_poison_logged: AtomicBool::new(false),
                 pinned: ArcSwap::from(Arc::new(
@@ -2336,7 +2347,17 @@ impl CacheEngine {
     /// hash and removes it. A GC sweep in the sub-second window between
     /// `import_bao_bytes` and this `set` is bounded by the GC interval and
     /// self-heals on the next admit. #1607.
+    ///
+    /// The tag only needs to EXIST, so once this process has written it (tracked
+    /// in `partial_protected`) the store write is skipped — a single fill admits
+    /// many ranges, and only the first need pay the tag write. The memo is cleared
+    /// whenever the tag is dropped (`drop_named_tags_for`), so a re-admit after an
+    /// eviction re-protects. GC never removes a set tag, so a live memo entry
+    /// always reflects a live tag.
     async fn protect_partial(&self, hash: Hash) -> CacheResult<()> {
+        if self.inner.partial_protected.contains_key(&hash) {
+            return Ok(());
+        }
         let name = format!("decdn-partial-{hash}");
         self.inner
             .store
@@ -2345,7 +2366,9 @@ impl CacheEngine {
             .await
             .map_err(|e| {
                 CacheError::Store(anyhow::Error::from(e).context("protect_partial: tags().set"))
-            })
+            })?;
+        self.inner.partial_protected.insert(hash, ());
+        Ok(())
     }
 
     /// Delete every named tag pointing at `hash`, making the underlying
@@ -2367,6 +2390,10 @@ impl CacheEngine {
     /// tag lookup, so this lists every tag and filters in Rust. Fine at
     /// operator-evict / mismatch rates; not something to call on a hot path.
     async fn drop_named_tags_for(&self, hash: Hash) -> CacheResult<u64> {
+        // Invalidate the partial-protection memo before touching the store, so a
+        // concurrent or later admit re-issues the protecting tag rather than
+        // trusting a stale "already protected" entry for a tag we are removing.
+        self.inner.partial_protected.remove(&hash);
         let tags = self.inner.store.tags();
         // Collect matching names before deleting so the (immutable) list
         // stream is fully drained before any delete call — keeps the two
@@ -8952,6 +8979,68 @@ mod tests {
             count_tags_for(&engine, hash).await,
             1,
             "re-admit does not proliferate tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn protect_partial_skips_store_write_when_memoized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        // First admit writes the protecting tag and memoizes it.
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        engine.admit_bao(hash, ranges, bao).await.unwrap();
+        assert_eq!(count_tags_for(&engine, hash).await, 1);
+        assert!(engine.inner.partial_protected.contains_key(&hash));
+
+        // Delete the tag directly at the store, leaving the memo intact. A
+        // memoized `protect_partial` must short-circuit and NOT re-create it —
+        // proving it skipped the redundant store write on re-admit.
+        let name = format!("decdn-partial-{hash}");
+        engine
+            .inner
+            .store
+            .tags()
+            .delete(name.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(count_tags_for(&engine, hash).await, 0);
+        engine.protect_partial(hash).await.unwrap();
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            0,
+            "a memoized protect_partial must skip the store write"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_tags_reinvalidates_protect_memo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        engine.admit_bao(hash, ranges, bao).await.unwrap();
+        assert!(engine.inner.partial_protected.contains_key(&hash));
+
+        // The tag-drop path clears the memo, so a re-admit re-protects rather
+        // than trusting a stale entry for a tag that no longer exists.
+        engine.drop_named_tags_for(hash).await.unwrap();
+        assert_eq!(count_tags_for(&engine, hash).await, 0);
+        assert!(
+            !engine.inner.partial_protected.contains_key(&hash),
+            "dropping the tag must invalidate the memo"
+        );
+        engine.protect_partial(hash).await.unwrap();
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            1,
+            "protect_partial re-creates the tag after the memo is invalidated"
         );
     }
 
