@@ -429,9 +429,10 @@ async fn build_infra(
     // The one redb-backed store implements the voucher-state trait (for the
     // handler + #527 replay guard), the pending-settle trait (for the on-chain
     // settlement sweep, PR #743 review), and the buyer-channel trait (#744).
-    // Derive trait-object handles from the single concrete store so all tables
-    // share one open file and one fsync discipline; `concrete_channel_store`
-    // stays bound for the buyer handle built further below.
+    // Derive trait-object handles from the single concrete store so every write
+    // family shares one open store and one fsync discipline (each family commits
+    // on its own per-family redb file); `concrete_channel_store` stays bound for
+    // the buyer handle built further below.
     let channel_state_store: Arc<dyn PoolStateStore> = concrete_channel_store.clone();
     // Debounce the scan-checkpoint writes (#784, keyed in #1092): each persisted
     // watcher (settlement `ChannelOpened`, origin `Origin`) advances its cursor

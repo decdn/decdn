@@ -1,7 +1,28 @@
 //! Disk-backed `PoolStateStore` for the node runtime.
 //!
-//! Implements [`PoolStateStore`] against a single `redb` database file at
-//! `<data_dir>/lanes.redb`. The lane table is buffered in memory: `open()`
+//! Implements [`PoolStateStore`] against a set of `redb` database files under
+//! `<data_dir>`, one file per durable write family:
+//!
+//! - `lanes.redb` — seller lane frontier (`lane_state_v1`) and the owner-signed
+//!   capability rows (`capability_v1`), which the flush commits in one
+//!   transaction.
+//! - `settle.redb` — the seller and buyer pending-settle sets.
+//! - `floor-loss.redb` — per-pool dead-charge totals and their forget
+//!   tombstones, committed in one transaction so a `record_loss` orders against
+//!   a `forget_loss` on this file's writer slot.
+//! - `checkpoint.redb` — the settlement watcher's scan checkpoints.
+//! - `buyer.redb` — the buyer pool state and its owner index.
+//!
+//! Each file has its own `redb` write-transaction slot, so a commit in one
+//! family never waits on an unrelated commit in another: the periodic lane
+//! flush, a settlement checkpoint, a floor-loss write on abnormal stream end,
+//! and a buyer top-up all proceed on independent writer slots. Families are
+//! never written in one transaction — `redb` forbids a transaction spanning two
+//! `Database` handles — so a crash between two family commits can leave them at
+//! different watermarks, which every family already tolerates (each records and
+//! recovers on its own terms).
+//!
+//! The lane table is buffered in memory: `open()`
 //! hydrates the working set from disk, `record`/`forget` mutate that working
 //! set only, and an explicit `flush()` call writes every dirty lane and
 //! applies every tombstone in one fsynced commit (redb's default
@@ -47,9 +68,8 @@
 //! not: its record codec and every one of its operations live in
 //! [`decdn_incentive::buyer_pool_table`], shared with the client's
 //! `RedbBuyerPoolStore` (#1246). This file contributes only the buyer table's
-//! wiring — it lives in *this* `lanes.redb`, alongside the seller,
-//! pending-settle, and watcher-checkpoint tables, because redb forbids two
-//! `Database` handles on one file.
+//! wiring — the node holds it in its own `buyer.redb`, so a buyer top-up
+//! commits on a writer slot separate from the seller lane flush.
 //!
 //! [ADR 003 §Off-chain voucher state persistence]: ../../../adr/003-payments.md
 
@@ -74,8 +94,20 @@ use decdn_incentive::{
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-/// File name of the redb database within `data_dir`.
+/// File name of the seller lane + capability redb database within `data_dir`.
 const LANES_DB_FILE: &str = "lanes.redb";
+
+/// File name of the pending-settle redb database (seller and buyer sets).
+const SETTLE_DB_FILE: &str = "settle.redb";
+
+/// File name of the floor-loss redb database (dead-charge totals + tombstones).
+const FLOOR_LOSS_DB_FILE: &str = "floor-loss.redb";
+
+/// File name of the settlement-watcher checkpoint redb database.
+const CHECKPOINT_DB_FILE: &str = "checkpoint.redb";
+
+/// File name of the buyer pool redb database (buyer state + owner index).
+const BUYER_DB_FILE: &str = "buyer.redb";
 
 /// Byte width of a [`LaneKey`] on disk: `pool_id ‖ signer ‖ provider` =
 /// `32 + 20 + 20`.
@@ -410,12 +442,13 @@ enum LaneSlot {
 
 /// `redb`-backed persistent implementation of [`PoolStateStore`].
 ///
-/// Construct via [`PersistentPoolStateStore::open`]. The database is
-/// owned for the lifetime of this value; drop closes the handle. The lane
-/// table is buffered in memory: `record`/`forget` mutate the working set only,
-/// and a caller must call [`PoolStateStore::flush`] to commit it to disk. The
-/// store is thread-safe — redb serialises writes internally via
-/// single-writer transactions, and reads are MVCC.
+/// Construct via [`PersistentPoolStateStore::open`]. One `redb::Database` per
+/// write family is owned for the lifetime of this value; drop closes every
+/// handle. The lane table is buffered in memory: `record`/`forget` mutate the
+/// working set only, and a caller must call [`PoolStateStore::flush`] to commit
+/// it to disk. The store is thread-safe — each redb file serialises its own
+/// writes via single-writer transactions, families commit on independent writer
+/// slots, and reads are MVCC.
 ///
 /// The working set is a [`DashMap`] rather than one mutex-guarded map, so a
 /// `record` on the paid-delivery path locks only its own lane's shard — no lane
@@ -425,7 +458,18 @@ enum LaneSlot {
 /// single buffer mutex played for the whole map.
 #[derive(Debug)]
 pub struct PersistentPoolStateStore {
-    db: Database,
+    /// Seller lane frontier + capability rows (`lanes.redb`). The periodic
+    /// flush commits both tables here in one transaction.
+    lanes_db: Database,
+    /// Seller + buyer pending-settle sets (`settle.redb`).
+    settle_db: Database,
+    /// Per-pool floor-loss totals + forget tombstones (`floor-loss.redb`).
+    floor_loss_db: Database,
+    /// Settlement-watcher scan checkpoints (`checkpoint.redb`).
+    checkpoint_db: Database,
+    /// Buyer pool state + owner index (`buyer.redb`).
+    buyer_db: Database,
+    /// Path of the lane store file (`lanes.redb`); returned by [`Self::path`].
     path: PathBuf,
     /// The per-lane working set, hydrated from disk at `open()`.
     lanes: DashMap<LaneKey, LaneSlot>,
@@ -485,7 +529,7 @@ impl PersistentPoolStateStore {
     /// file-mode hardening.
     pub(crate) fn open_with<F>(data_dir: &Path, chmod_fn: F) -> Result<Self, StoreError>
     where
-        F: FnOnce(&Path) -> Result<(), StoreError>,
+        F: Fn(&Path) -> Result<(), StoreError>,
     {
         identity::ensure_data_dir(data_dir).map_err(|err| {
             StoreError::Backend(format!(
@@ -494,29 +538,68 @@ impl PersistentPoolStateStore {
             ))
         })?;
 
+        // One hardened redb file per write family. `lanes.redb` opens first so a
+        // corrupt or empty lane store — the file that guards the issue #527
+        // voucher-replay window — is the one that aborts bring-up, and every
+        // integration test that fault-injects that window names this file.
         let path = data_dir.join(LANES_DB_FILE);
+        let lanes_db = Self::open_hardened_db(&path, &chmod_fn)?;
+        let settle_db = Self::open_hardened_db(&data_dir.join(SETTLE_DB_FILE), &chmod_fn)?;
+        let floor_loss_db = Self::open_hardened_db(&data_dir.join(FLOOR_LOSS_DB_FILE), &chmod_fn)?;
+        let checkpoint_db = Self::open_hardened_db(&data_dir.join(CHECKPOINT_DB_FILE), &chmod_fn)?;
+        let buyer_db = Self::open_hardened_db(&data_dir.join(BUYER_DB_FILE), &chmod_fn)?;
 
-        // Reject a zero-length file. `redb::Database::create` treats both "file
-        // does not exist" and "file exists but is empty" as "create a fresh
-        // database" — so a `truncate -s 0 lanes.redb` (or a filesystem rollback
-        // that nukes content but preserves the inode) would start with an empty
-        // store and silently reopen the issue #527 replay window.
-        //
-        // We also record whether the file pre-existed so a subsequent chmod
-        // failure can distinguish "we just created this file" (safe to remove on
-        // cleanup) from "the operator has months of voucher state here" (MUST
-        // NOT remove on a transient permission error). The TOCTOU window between
-        // this stat and `Database::create` is closed via `OpenOptions::create_new`.
-        let file_existed_before_open = match std::fs::metadata(&path) {
+        let lanes = Self::hydrate_lanes(&lanes_db)?;
+        let caps = Self::hydrate_capabilities(&lanes_db)?;
+        Ok(Self {
+            lanes_db,
+            settle_db,
+            floor_loss_db,
+            checkpoint_db,
+            buyer_db,
+            path,
+            lanes,
+            dirty: SegQueue::new(),
+            caps,
+            dirty_caps: SegQueue::new(),
+        })
+    }
+
+    /// Open (or create) one hardened redb file at `path`, applying the empty-file
+    /// guard, TOCTOU-safe create, and `0o600` tightening every lane-store family
+    /// file gets. Each family lives in its own file so its commits take an
+    /// independent `redb` writer slot.
+    ///
+    /// Rejects a zero-length file: `redb::Database::create` treats both "file
+    /// does not exist" and "file exists but is empty" as "create a fresh
+    /// database" — so a `truncate -s 0` (or a filesystem rollback that nukes
+    /// content but preserves the inode) would start with an empty store. For
+    /// `lanes.redb` that silently reopens the issue #527 voucher-replay window;
+    /// for the other families it silently re-grants budget the lost rows bounded
+    /// (a dropped floor-loss row re-grants free-floor budget, a dropped
+    /// pending-settle entry forgets an in-flight redemption).
+    ///
+    /// On a chmod failure the cleanup depends on whether the file pre-existed
+    /// this call: a freshly-created file is removed so the next start sees a
+    /// clean state; a pre-existing file (real payment state on disk) is
+    /// preserved, because a transient chmod failure on a read-only mount or NFS
+    /// must not delete live state. The TOCTOU window between the stat and
+    /// `Database::create` is closed via `OpenOptions::create_new`.
+    fn open_hardened_db<F>(path: &Path, chmod_fn: &F) -> Result<Database, StoreError>
+    where
+        F: Fn(&Path) -> Result<(), StoreError>,
+    {
+        let file_existed_before_open = match std::fs::metadata(path) {
             Ok(meta) if meta.len() == 0 => {
                 return Err(StoreError::Corrupt {
                     pool_id: None,
                     detail: format!(
-                        "lane state store at {} is empty (length 0). \
+                        "redb store file at {} is empty (length 0). \
                          This is either a manual truncation or a filesystem rollback, \
-                         either of which silently re-opens the issue #527 voucher-replay window. \
+                         either of which silently discards durable payment state \
+                         (for lanes.redb this re-opens the issue #527 voucher-replay window). \
                          Restore from backup, or delete the file deliberately to start fresh \
-                         (forfeiting prior voucher history).",
+                         (forfeiting prior history).",
                         path.display()
                     ),
                 });
@@ -526,7 +609,7 @@ impl PersistentPoolStateStore {
                 match std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
-                    .open(&path)
+                    .open(path)
                 {
                     Ok(file) => {
                         // Drop the handle immediately; redb opens its own.
@@ -540,40 +623,25 @@ impl PersistentPoolStateStore {
             Err(err) => return Err(StoreError::Io(err)),
         };
 
-        let db = Database::create(&path).map_err(|err| {
+        let db = Database::create(path).map_err(|err| {
             StoreError::Backend(format!(
-                "failed to open lane state store at {}: {err}. \
-                 Removing the file forfeits the issue #527 voucher-replay guard \
+                "failed to open redb store file at {}: {err}. \
+                 Removing the file forfeits its durability guard \
                  — restore from backup or investigate the corruption.",
                 path.display()
             ))
         })?;
 
-        // If the permission tighten fails, behaviour depends on whether the file
-        // existed before this `open` call. Fresh file: remove it so the next
-        // start sees a clean state. Pre-existing file (real voucher state on
-        // disk): do NOT remove — a transient chmod failure on a read-only mount
-        // or NFS would otherwise delete the live store and silently reopen the
-        // issue #527 replay window.
-        if let Err(chmod_err) = chmod_fn(&path) {
+        if let Err(chmod_err) = chmod_fn(path) {
             // `drop(db)` is load-bearing on Windows: NTFS holds a mandatory
             // exclusive lock on the file handle, so `remove_file` below would
             // error with sharing-violation if the handle outlives.
             drop(db);
-            Self::handle_chmod_failure(&path, &chmod_err, file_existed_before_open);
+            Self::handle_chmod_failure(path, &chmod_err, file_existed_before_open);
             return Err(chmod_err);
         }
 
-        let lanes = Self::hydrate_lanes(&db)?;
-        let caps = Self::hydrate_capabilities(&db)?;
-        Ok(Self {
-            db,
-            path,
-            lanes,
-            dirty: SegQueue::new(),
-            caps,
-            dirty_caps: SegQueue::new(),
-        })
+        Ok(db)
     }
 
     /// Read the whole lane table into the in-memory working set at open. A
@@ -1052,7 +1120,7 @@ impl PersistentPoolStateStore {
     /// rightward through the B-trees.
     fn commit_snapshot(&self, snapshot: &FlushSnapshot) -> Result<(), StoreError> {
         let mut write_txn = self
-            .db
+            .lanes_db
             .begin_write()
             .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
         write_txn
@@ -1259,7 +1327,7 @@ impl PersistentPoolStateStore {
     ///
     /// [`StoreError::Backend`] if the write or durable commit fails.
     pub fn insert_raw_buyer_record(&self, pool_id: PoolId, bytes: &[u8]) -> Result<(), StoreError> {
-        BuyerPoolTable::new(&self.db).insert_raw(pool_id, bytes)
+        BuyerPoolTable::new(&self.buyer_db).insert_raw(pool_id, bytes)
     }
 }
 
@@ -1284,7 +1352,7 @@ impl BuyerPoolStoreHandle {
     ///
     /// Not `const` — it derefs the `Arc`, which const fns cannot do.
     fn table(&self) -> BuyerPoolTable<'_> {
-        BuyerPoolTable::new(&self.inner.db)
+        BuyerPoolTable::new(&self.inner.buyer_db)
     }
 }
 
@@ -1348,7 +1416,7 @@ impl PersistentPoolStateStore {
     ) -> Result<(), StoreError> {
         let key: [u8; 32] = entry.pool_id.into();
         let mut write_txn = self
-            .db
+            .settle_db
             .begin_write()
             .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
         // Force fsync-on-commit, same durability discipline as the other tables: the
@@ -1379,7 +1447,7 @@ impl PersistentPoolStateStore {
         table_def: TableDefinition<&[u8; 32], u64>,
     ) -> Result<Vec<PendingSettle>, StoreError> {
         let read_txn = self
-            .db
+            .settle_db
             .begin_read()
             .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
         let table = match read_txn.open_table(table_def) {
@@ -1412,7 +1480,7 @@ impl PersistentPoolStateStore {
         let key: [u8; 32] = pool_id.into();
         {
             let read_txn = self
-                .db
+                .settle_db
                 .begin_read()
                 .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
             match read_txn.open_table(table_def) {
@@ -1423,7 +1491,7 @@ impl PersistentPoolStateStore {
         }
 
         let mut write_txn = self
-            .db
+            .settle_db
             .begin_write()
             .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
         write_txn
@@ -1482,7 +1550,7 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
     fn record_loss(&self, pool_id: B256, micro_usdc: u128) -> Result<(), StoreError> {
         let key: [u8; 32] = pool_id.into();
         let mut write_txn = self
-            .db
+            .floor_loss_db
             .begin_write()
             .map_err(|e| floor_loss_backend_err("begin_write", Some(pool_id), e))?;
         // Force fsync-on-commit, same durability discipline as the other
@@ -1535,14 +1603,14 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
             }
         };
         // Nothing changed, so abort rather than fsync a transaction that holds no
-        // change. This is sound only because every writer of this file commits with
-        // `Durability::Immediate`: `existing` is therefore already durable and at or
-        // above what this call asks for (or the pool is tombstoned and the write is
-        // stale), so the postcondition holds without a write. A `Durability::None`
-        // writer anywhere in this file breaks that. Aborting does not free redb's
-        // writer slot any earlier than a commit would — the slot was taken at
-        // `begin_write` — it saves the fsync, which is what contends with the
-        // periodic voucher flush on this shared file.
+        // change. This is sound only because every writer of `floor-loss.redb`
+        // commits with `Durability::Immediate`: `existing` is therefore already
+        // durable and at or above what this call asks for (or the pool is
+        // tombstoned and the write is stale), so the postcondition holds without a
+        // write. A `Durability::None` writer on this file breaks that. Aborting does
+        // not free redb's writer slot any earlier than a commit would — the slot was
+        // taken at `begin_write` — it saves the fsync, which is what serializes this
+        // call against the other floor-loss writers on `floor-loss.redb`'s slot.
         if !advanced {
             return write_txn
                 .abort()
@@ -1556,11 +1624,11 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
 
     fn load_losses(&self) -> Result<Vec<(B256, u128)>, StoreError> {
         let read_txn = self
-            .db
+            .floor_loss_db
             .begin_read()
             .map_err(|e| floor_loss_backend_err("begin_read", None, e))?;
         // A never-written table means no pool has accrued a dead charge yet —
-        // first-boot tolerance, matching the other tables in this file.
+        // first-boot tolerance, matching every family table in the store.
         let table = match read_txn.open_table(POOL_FLOOR_LOSS_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1581,7 +1649,7 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
     fn forget_loss(&self, pool_id: B256) -> Result<(), StoreError> {
         let key: [u8; 32] = pool_id.into();
         let mut write_txn = self
-            .db
+            .floor_loss_db
             .begin_write()
             .map_err(|e| floor_loss_backend_err("begin_write", Some(pool_id), e))?;
         write_txn
@@ -1622,7 +1690,7 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
         // imply a tombstone — any committed `record_loss` creates it empty as
         // a side effect of its check — that case also takes the no-op abort.
         let mut write_txn = self
-            .db
+            .floor_loss_db
             .begin_write()
             .map_err(|e| floor_loss_backend_err("begin_write", None, e))?;
         write_txn
@@ -1714,7 +1782,7 @@ impl PendingSettleStore for BuyerPendingSettleStoreHandle {
 impl KeyedCheckpointStore for PersistentPoolStateStore {
     fn load_checkpoint(&self, key: CheckpointKey) -> Result<Option<u64>, StoreError> {
         let read_txn = self
-            .db
+            .checkpoint_db
             .begin_read()
             .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
         // A never-written checkpoint table means "no prior scan" — first boot.
@@ -1731,7 +1799,7 @@ impl KeyedCheckpointStore for PersistentPoolStateStore {
 
     fn record_checkpoint(&self, key: CheckpointKey, block: u64) -> Result<(), StoreError> {
         let mut write_txn = self
-            .db
+            .checkpoint_db
             .begin_write()
             .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
         // Force fsync-on-commit, same durability discipline as the other tables.
@@ -2365,12 +2433,23 @@ mod tests {
     fn file_mode_is_owner_only() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let dir = data_dir()?;
-        let store = PersistentPoolStateStore::open(dir.path())?;
-        let mode = std::fs::metadata(store.path())?.permissions().mode() & 0o777;
-        anyhow::ensure!(
-            mode == DB_FILE_MODE,
-            "file mode {mode:o} != expected {DB_FILE_MODE:o}"
-        );
+        let _store = PersistentPoolStateStore::open(dir.path())?;
+        // Every family file is hardened to 0o600, not just the lane store.
+        for file in [
+            LANES_DB_FILE,
+            SETTLE_DB_FILE,
+            FLOOR_LOSS_DB_FILE,
+            CHECKPOINT_DB_FILE,
+            BUYER_DB_FILE,
+        ] {
+            let path = dir.path().join(file);
+            anyhow::ensure!(path.exists(), "{file} must be created at open()");
+            let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+            anyhow::ensure!(
+                mode == DB_FILE_MODE,
+                "{file} mode {mode:o} != expected {DB_FILE_MODE:o}"
+            );
+        }
         Ok(())
     }
 
@@ -2380,15 +2459,16 @@ mod tests {
     #[test]
     fn fresh_file_chmod_failure_removes_file() -> anyhow::Result<()> {
         let dir = data_dir()?;
-        let chmod_failed = std::io::Error::other("simulated chmod failure");
         let path_buf = dir.path().join(LANES_DB_FILE);
         anyhow::ensure!(!path_buf.exists(), "precondition: file does not exist");
 
-        let path_for_closure = path_buf.clone();
-        let err = PersistentPoolStateStore::open_with(dir.path(), |_path| {
+        // `open_with` now hardens one file per family, so `chmod_fn` is `Fn`: it
+        // builds a fresh error each call rather than moving a captured one out.
+        // Failing on the first file (lanes.redb) aborts the open there.
+        let err = PersistentPoolStateStore::open_with(dir.path(), |path| {
             Err(StoreError::PermissionTighten {
-                path: path_for_closure.clone(),
-                source: chmod_failed,
+                path: path.to_path_buf(),
+                source: std::io::Error::other("simulated chmod failure"),
             })
         })
         .err()
@@ -2428,10 +2508,11 @@ mod tests {
         );
         let size_before = std::fs::metadata(&path_buf)?.len();
 
-        let path_for_closure = path_buf.clone();
-        let err = PersistentPoolStateStore::open_with(dir.path(), move |_path| {
+        // `chmod_fn` is `Fn` (see `fresh_file_chmod_failure_removes_file`): fail on
+        // whichever family file is offered, building a fresh error each call.
+        let err = PersistentPoolStateStore::open_with(dir.path(), |path| {
             Err(StoreError::PermissionTighten {
-                path: path_for_closure,
+                path: path.to_path_buf(),
                 source: std::io::Error::other("simulated EROFS"),
             })
         })
@@ -2477,7 +2558,7 @@ mod tests {
         let encoded = postcard::to_allocvec(&forward)?;
         {
             let store = PersistentPoolStateStore::open(dir.path())?;
-            let mut wtx = store.db.begin_write()?;
+            let mut wtx = store.lanes_db.begin_write()?;
             wtx.set_durability(Durability::Immediate)?;
             {
                 let mut table = wtx.open_table(LANE_TABLE)?;
@@ -2509,7 +2590,7 @@ mod tests {
         encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
         {
             let store = PersistentPoolStateStore::open(dir.path())?;
-            let mut tx = store.db.begin_write()?;
+            let mut tx = store.lanes_db.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
             {
                 let mut t = tx.open_table(LANE_TABLE)?;
@@ -2540,7 +2621,7 @@ mod tests {
         let encoded = postcard::to_allocvec(&stored)?;
         {
             let store = PersistentPoolStateStore::open(dir.path())?;
-            let mut tx = store.db.begin_write()?;
+            let mut tx = store.lanes_db.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
             {
                 let mut t = tx.open_table(LANE_TABLE)?;
@@ -2574,7 +2655,7 @@ mod tests {
         let key_bytes = capability_key_bytes(pool_id, signer);
         {
             let store = PersistentPoolStateStore::open(dir.path())?;
-            let mut tx = store.db.begin_write()?;
+            let mut tx = store.lanes_db.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
             {
                 let mut table = tx.open_table(CAPABILITY_TABLE)?;
@@ -3053,7 +3134,7 @@ mod tests {
             anyhow::ensure!(got == *lane, "each lane round-trips to its own record");
         }
 
-        let read_txn = store.db.begin_read()?;
+        let read_txn = store.lanes_db.begin_read()?;
         let leaf_pages = read_txn.open_table(LANE_TABLE)?.stats()?.leaf_pages();
         anyhow::ensure!(
             leaf_pages <= 55,

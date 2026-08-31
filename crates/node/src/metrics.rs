@@ -554,8 +554,8 @@ pub struct DecdnMetrics {
     /// hands the affected pools back free-floor budget they already consumed),
     /// and a failed forget leaves the closed pool's row with no tombstone, open
     /// to permanent re-insertion by a late persist (#1781's error-path
-    /// residual). A sustained rate usually means the shared
-    /// `lanes.redb` file refuses writes (a prior failed commit latches redb
+    /// residual). A sustained rate usually means the
+    /// `floor-loss.redb` file refuses writes (a prior failed commit latches redb
     /// until the file is closed and reopened — restart the node) or is corrupt;
     /// pairs with the per-failure `warn!`/`error!` lines ("floor dead-charge
     /// persist failed" / "pool dead-charge forget failed"). Operator-visible
