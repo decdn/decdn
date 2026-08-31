@@ -186,8 +186,13 @@ impl HashOutboard {
         // real interior node (a `Some` offset) implies `outboard_size() >= 64`, so
         // an empty buffer here always means "not yet sized", never a zero-node
         // tree. Sized exactly once: every later capture sees a non-empty buffer.
+        // Bail if the size is not `usize`-representable rather than allocating
+        // `usize::MAX` — the same "not addressable, not capturable" degrade as the
+        // `idx` guard above, never a process-aborting allocation.
         if state.bytes.is_empty() {
-            let size = usize::try_from(self.tree.outboard_size()).unwrap_or(usize::MAX);
+            let Ok(size) = usize::try_from(self.tree.outboard_size()) else {
+                return false;
+            };
             state.bytes = vec![0u8; size];
             state.captured = vec![false; size / HASH_PAIR_BYTES];
         }
