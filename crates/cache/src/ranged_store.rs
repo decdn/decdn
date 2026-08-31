@@ -49,6 +49,16 @@ impl NodeRangedStore {
     pub const fn engine(&self) -> &CacheEngine {
         &self.engine
     }
+
+    /// Does a deny/blacklist/evict gate currently refuse this hash? A pure
+    /// in-memory check ([`CacheEngine::refuses`] reads only lock-free sets, no
+    /// store hop), so the serve encoder can fold takedown into its per-leaf
+    /// presence check without a store round trip. Mirrors the guard
+    /// [`CacheEngine::present_ranges`] applies before it answers presence.
+    #[must_use]
+    pub fn refuses(&self) -> bool {
+        self.engine.refuses(self.hash)
+    }
 }
 
 fn backend<E: std::error::Error + Send + Sync + 'static>(e: E) -> RangedStoreError {
