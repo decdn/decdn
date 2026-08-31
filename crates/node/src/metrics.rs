@@ -1113,7 +1113,10 @@ pub struct DecdnMetrics {
     ///
     /// It does not distinguish them, so a spike cannot be attributed to a layer
     /// from this series alone — the log line at the refusal site is what says
-    /// which. Wire-indistinguishable from `cache_miss` (signed as `NotFound`), so
+    /// which. Guards (1) and (3) also split by CAP: both run the two-level floor
+    /// check, and its per-signer arm bumps `serve_stream_rejected_signer_floor_at_cap`
+    /// instead, so this counter is the pool-ceiling half of them.
+    /// Wire-indistinguishable from `cache_miss` (signed as `NotFound`), so
     /// this server-side counter is the only place the *reason* lives at all — now
     /// more load-bearing, since a third refusal path routes through it.
     /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
@@ -1126,6 +1129,22 @@ pub struct DecdnMetrics {
     /// experiencing sustained concurrency pressure. Visible name:
     /// `decdn_serve_stream_rejected_lane_at_capacity_total`.
     pub serve_stream_rejected_lane_at_capacity: Counter,
+    /// Delivery refused because ONE capability signer's un-vouchered floor credit
+    /// — its live reservations plus its permanent `dead_charge` — already fills
+    /// its share of the pool budget, while the pool itself can still pay (ADR 003
+    /// §Pool solvency, per-signer floor isolation). Wire-indistinguishable from
+    /// `insufficient_deposit` (both signed as `NotFound`), so this counter is the
+    /// only place the distinction lives — a rising value means one signer holds its
+    /// whole share un-vouchered while the pool as a whole is solvent, either by
+    /// abandoning streams or by running more concurrent un-vouchered streams than
+    /// its share covers. Wire-indistinguishable from `insufficient_deposit` (both
+    /// sign as `NotFound`, so a prober cannot map a pool's floor consumption), so
+    /// this counter is the only place the distinction survives — and the two
+    /// remedies differ: a pool shortfall clears with a top-up, a signer at its
+    /// share does not.
+    /// Visible name:
+    /// `decdn_serve_stream_rejected_signer_floor_at_cap_total`.
+    pub serve_stream_rejected_signer_floor_at_cap: Counter,
     /// Delivery refused because the requested bounded range
     /// `[byte_offset, byte_offset + byte_len)` is out of bounds for the blob
     /// (ADR 005 §Bounded byte ranges: the node MUST reject an overflowing or
@@ -1947,6 +1966,11 @@ recorders! {
     /// too many concurrent same-lane streams in flight and the pool's
     /// refundable floor cannot cover the reserved cost of another.
     serve_stream_rejected_lane_at_capacity => serve_stream_rejected_lane_at_capacity.inc();
+
+    /// Record a `serve_stream` delivery refused because this capability signer's
+    /// un-vouchered floor credit already fills its share of the pool budget,
+    /// while the pool as a whole can still pay.
+    serve_stream_rejected_signer_floor_at_cap => serve_stream_rejected_signer_floor_at_cap.inc();
 
     /// Record a `serve_stream` delivery refused because the requested bounded
     /// range is out of bounds for the blob (ADR 005 §Bounded byte ranges).
@@ -3154,6 +3178,7 @@ mod tests {
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
             "decdn_serve_stream_rejected_lane_at_capacity_total",
+            "decdn_serve_stream_rejected_signer_floor_at_cap_total",
             // Completed in #1520. These four always exported (the fields have
             // existed as long as their siblings) — what was missing was any
             // assertion pinning it, so a rename could have silently broken a
@@ -3180,6 +3205,7 @@ mod tests {
         metrics.serve_stream_rejected_owner_mismatch();
         metrics.serve_stream_rejected_insufficient_deposit();
         metrics.serve_stream_rejected_lane_at_capacity();
+        metrics.serve_stream_rejected_signer_floor_at_cap();
         metrics.serve_stream_rejected_range_not_satisfiable();
         metrics.serve_stream_rejected_hash_denied();
         metrics.serve_stream_rejected_chain_hash_denied();

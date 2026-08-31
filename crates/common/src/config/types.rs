@@ -270,6 +270,49 @@ pub struct BlockchainConfig {
     /// scale; sizing this precisely per ADR 003 is governance/ops policy, not a
     /// build-time constant.
     pub pool_min_remaining_deposit_micro_usdc: Option<u64>,
+    /// Share of a pool's refundable headroom (`remaining − M`), in basis points,
+    /// that any ONE capability signer may hold as un-vouchered floor credit
+    /// (ADR 003 § Pool solvency, per-signer floor isolation). The node bounds a
+    /// signer's live reservations plus its permanent `dead_charge` to
+    /// `clamp((remaining − M) · bps / 10_000, one credit window,
+    /// pool_floor_signer_max_windows × one credit window)`, underneath the
+    /// pool-wide `remaining − M` ceiling, so one capability-holder that opens and
+    /// abandons streams cannot take the whole pool's floor budget from its
+    /// co-tenants. The credit window is one chunk normally, and at
+    /// `credit_ramp_divisor == 0` it is `credit_max` raised to one chunk.
+    ///
+    /// This throttles unpaid credit, not paid throughput: a signer that pays its
+    /// vouchers releases that stream's reservation, so its share recycles and a
+    /// stream already under way is never slowed. What the share does bound is how
+    /// many streams one signer may hold un-vouchered at once — roughly
+    /// `share ÷ one credit window` concurrently.
+    ///
+    /// Node-local risk policy — it needs no pool-owner cooperation. Must be in
+    /// `1..=10_000`. `10_000` lifts the SHARE to the whole headroom; with
+    /// `pool_floor_signer_max_windows = 0` that makes the sub-cap a no-op, and
+    /// otherwise the window ceiling still binds. Absent => default (`2500`, a
+    /// quarter of the headroom each).
+    pub pool_floor_signer_share_bps: Option<u64>,
+    /// Absolute ceiling on the per-signer floor sub-cap, counted in ramp-start
+    /// credit windows (ADR 003 § Pool solvency, per-signer floor isolation). The cap
+    /// is `clamp(share, one window, this × one window)`.
+    ///
+    /// The window is the unit actually being rationed. A signer's legitimate need for
+    /// un-vouchered floor credit does not scale with the pool's size: every admission
+    /// reserves at most one window per stream, and a paying stream releases its
+    /// reservation as soon as it covers it, so honest need is `concurrent
+    /// un-vouchered streams × one window` whether the pool holds ten dollars or a
+    /// hundred thousand. Without this ceiling a share alone is loose in both
+    /// directions on a large pool: one session key could hold millions of windows,
+    /// while a constant `10_000 / share_bps` keys would still strand the whole floor.
+    ///
+    /// `0` disables the ceiling, leaving the share as the only bound. Absent =>
+    /// default (`0`): the ceiling is opt-in because `dead_charge` is permanent
+    /// until the pool is reclaimed, so a client retrying a cold node burns one
+    /// window per attempt and a ceiling of `k` turns `k` warm-up failures into a
+    /// permanent lockout for that session key. See
+    /// `DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS`.
+    pub pool_floor_signer_max_windows: Option<u64>,
     /// USDC bond-funding swap venue for `decdn setup --pay-bond-with usdc`
     /// (#991). One of `uniswap-v3` / `balancer-v3`. Absent => no swap (the
     /// operator funds the bond in TOKEN directly). Consumed only by the CLI

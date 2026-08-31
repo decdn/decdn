@@ -840,6 +840,8 @@ impl RuntimeReloadState {
                 buyer_working_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
                 pool_min_remaining_deposit_micro_usdc: 1_000_000,
+                pool_floor_signer_share_bps: 10_000,
+                pool_floor_signer_max_windows: 0,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 content_blacklist_address: None,
                 content_blacklist_poll_interval_sec: 600,
@@ -1124,7 +1126,10 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         warn_ignored("network.* (bind_port, relay_urls, relay_url, discovery)");
     }
     if file.blockchain.is_some() {
-        warn_ignored("blockchain.* (rpc_url, eth_keystore, contract addresses)");
+        warn_ignored(
+            "blockchain.* (rpc_url, eth_keystore, contract addresses, \
+             pool_floor_signer_share_bps, pool_floor_signer_max_windows)",
+        );
     }
     if file
         .cache
@@ -1347,6 +1352,8 @@ mod tests {
                 buyer_working_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
                 pool_min_remaining_deposit_micro_usdc: 1_000_000,
+                pool_floor_signer_share_bps: 10_000,
+                pool_floor_signer_max_windows: 0,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 content_blacklist_address: None,
                 content_blacklist_poll_interval_sec: 600,

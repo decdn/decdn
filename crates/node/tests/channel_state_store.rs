@@ -629,6 +629,8 @@ async fn record_loss_races_the_lane_flush() -> anyhow::Result<()> {
     let lane_pool = b256!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let loss_pool = b256!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     let churn_pool = b256!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    let loss_signer = address!("00000000000000000000000000000000000000a1");
+    let churn_signer = address!("00000000000000000000000000000000000000b2");
 
     let lane_task = {
         let store = Arc::clone(&store);
@@ -648,10 +650,10 @@ async fn record_loss_races_the_lane_flush() -> anyhow::Result<()> {
         let store = Arc::clone(&store);
         tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
             for i in 1u128..=200 {
-                store.record_loss(loss_pool, i * 10)?;
+                store.record_loss(loss_pool, loss_signer, i * 10)?;
                 // Non-raising total: the no-op abort path, interleaved with the
                 // lane flush's committing writes on the same file.
-                store.record_loss(loss_pool, 5)?;
+                store.record_loss(loss_pool, loss_signer, 5)?;
             }
             Ok(())
         })
@@ -661,7 +663,7 @@ async fn record_loss_races_the_lane_flush() -> anyhow::Result<()> {
         let store = Arc::clone(&store);
         tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
             for i in 1u128..=50 {
-                store.record_loss(churn_pool, i)?;
+                store.record_loss(churn_pool, churn_signer, i)?;
                 store.forget_loss(churn_pool)?;
             }
             Ok(())
@@ -680,7 +682,7 @@ async fn record_loss_races_the_lane_flush() -> anyhow::Result<()> {
     );
     let losses = store.load_losses()?;
     anyhow::ensure!(
-        losses == vec![(loss_pool, 2_000u128)],
+        losses == vec![(loss_pool, loss_signer, 2_000u128)],
         "the loss total must settle on its monotonic maximum and the churned pool \
          must stay forgotten, got {losses:?}"
     );
@@ -706,13 +708,19 @@ fn floor_loss_restart_hydrates_the_monotonic_maximum() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let survivor = b256!("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
     let reclaimed = b256!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+    let signer_a = address!("00000000000000000000000000000000000000a1");
+    let signer_b = address!("00000000000000000000000000000000000000b2");
     {
         let store = PersistentPoolStateStore::open(dir.path())?;
-        store.record_loss(survivor, 5_000)?;
-        store.record_loss(survivor, 3_000)?; // late, smaller: out-of-order drop
-        store.record_loss(reclaimed, 700)?;
+        store.record_loss(survivor, signer_a, 5_000)?;
+        store.record_loss(survivor, signer_a, 3_000)?; // late, smaller: out-of-order drop
+        // A co-tenant on the SAME pool holds its own row: per-signer isolation is
+        // what has to survive the restart, not just a pool-wide total.
+        store.record_loss(survivor, signer_b, 900)?;
+        store.record_loss(reclaimed, signer_a, 700)?;
+        store.record_loss(reclaimed, signer_b, 800)?;
         store.forget_loss(reclaimed)?;
-        store.record_loss(reclaimed, 700)?; // late persist after the forget
+        store.record_loss(reclaimed, signer_a, 700)?; // late persist after the forget
     }
     // "Restart": reopen the same file, sweep tombstones as bring-up does, hydrate.
     let store = PersistentPoolStateStore::open(dir.path())?;
@@ -720,9 +728,16 @@ fn floor_loss_restart_hydrates_the_monotonic_maximum() -> anyhow::Result<()> {
         store.sweep_forgotten()? == 1,
         "the reclaimed pool's tombstone survives the restart for the boot sweep"
     );
+    let mut hydrated = store.load_losses()?;
+    hydrated.sort_by_key(|&(_, signer, _)| signer);
     anyhow::ensure!(
-        store.load_losses()? == vec![(survivor, 5_000u128)],
-        "hydration must see the monotonic maximum, and nothing for the reclaimed pool"
+        hydrated
+            == vec![
+                (survivor, signer_a, 5_000u128),
+                (survivor, signer_b, 900u128)
+            ],
+        "hydration must see each signer's monotonic maximum, and nothing for the \
+         reclaimed pool whose every signer row went with it, got {hydrated:?}"
     );
     Ok(())
 }

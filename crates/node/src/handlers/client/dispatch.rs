@@ -4,10 +4,10 @@
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
-    FirstMessage, FloorReservation, Hash, LaneKey, LaneSlot, OwnedSemaphorePermit,
-    REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason,
-    StreamReadError, StreamResponseBody, U256, VarInt, read_first_message, reset_stream,
-    verify_binding,
+    FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey, LaneSlot,
+    OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream,
+    ServeRejectReason, StreamReadError, StreamResponseBody, U256, VarInt, read_first_message,
+    reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
 use std::sync::atomic::Ordering;
@@ -712,6 +712,7 @@ impl ClientHandler {
             // Skipped for an unknown lane — `pull_authorized` refuses those
             // before every tier, so no spend happens there anyway.
             if known_lane.is_some()
+                && let Some(key) = lane_key
                 && let Some(status) = pool_status
             {
                 // Reserve the un-self-funded credit this stream fronts before it
@@ -728,22 +729,34 @@ impl ClientHandler {
                 };
                 let reserved = decdn_incentive::min_payment(reserved_bytes, rate_per_mb);
                 let pool_id = B256::from(req.pool_id);
-                match self.try_reserve_floor(pool_id, status.remaining, reserved) {
-                    None => {
-                        let headroom = status
-                            .remaining
-                            .saturating_sub(self.pool_min_remaining_deposit);
-                        self.log_deposit_refusal(pool_id, hash, headroom, reserved);
+                match self.try_reserve_floor(
+                    pool_id,
+                    key.signer,
+                    status.remaining,
+                    rate_per_mb,
+                    reserved,
+                ) {
+                    Err(refusal) => {
+                        self.log_floor_refusal(
+                            refusal,
+                            FloorRefusalSite {
+                                pool_id,
+                                signer: key.signer,
+                                hash,
+                                remaining: status.remaining,
+                                ceiling: reserved,
+                            },
+                        );
                         return self
                             .respond_error(
                                 &mut send,
                                 &req,
-                                ServeRejectReason::InsufficientDeposit,
+                                ServeRejectReason::from(refusal),
                                 rate_per_mb,
                             )
                             .await;
                     }
-                    Some(guard) => floor_reservation = Some(guard),
+                    Ok(guard) => floor_reservation = Some(guard),
                 }
             }
 
@@ -1102,13 +1115,15 @@ impl ClientHandler {
         // A direct-serve HIT reaches this gate with no reservation yet (the miss
         // legs, which spend, open theirs pre-fill above). Open it HERE, span-capped
         // to `guard_bytes`, via [`ClientHandler::try_reserve_floor`] — its
-        // `remaining − M ≥ committed + reserved` check both admits the stream and
-        // bounds the pool's cumulative cross-lane floor credit. A miss-fill stream
+        // two-level check — `remaining − M ≥ committed + reserved` pool-wide, and
+        // this signer's own share — both admits the stream and bounds the pool's
+        // cumulative cross-lane floor credit. A miss-fill stream
         // already holds its reservation, so re-validate solvency against the pool's
         // already-committed floor credit (`live_reservation + dead_charge`) via
         // [`ClientHandler::pool_budget_covers_reserve`] with `new_reserve = 0` — the
-        // same stateful check the mid-stream gate applies, so a `dead_charge` that
-        // grew since the reservation refuses here rather than serving a free interval.
+        // same stateful check the mid-stream gate applies, so a pool-wide
+        // `dead_charge` that grew since the reservation refuses here rather than
+        // serving a free interval.
         //
         // `remaining` comes from the cached `getPool` view resolved above; a `None`
         // view fails open (the on-chain `redeem` is the backstop). Either way, refuse
@@ -1123,35 +1138,54 @@ impl ClientHandler {
         if let Some(status) = pool_status {
             let refused = if floor_reservation.is_none() {
                 let reserved = decdn_incentive::min_payment(guard_bytes, rate_per_mb);
-                match self.try_reserve_floor(B256::from(req.pool_id), status.remaining, reserved) {
-                    Some(guard) => {
+                match self.try_reserve_floor(
+                    B256::from(req.pool_id),
+                    lane_key.signer,
+                    status.remaining,
+                    rate_per_mb,
+                    reserved,
+                ) {
+                    Ok(guard) => {
                         floor_reservation = Some(guard);
-                        false
+                        None
                     }
-                    None => true,
+                    Err(refusal) => Some(refusal),
                 }
             } else {
-                !self.pool_budget_covers_reserve(
+                // A miss-fill stream already holds its reservation, counted at both
+                // levels, so this re-validates rather than reserves (`new_reserve =
+                // 0`) — and at the POOL level only, for the reason
+                // [`ClientHandler::pool_budget_covers_reserve`] gives: the signer's
+                // cap is a share of `remaining − M` and shrinks as co-tenants draw
+                // the pool down, so re-testing an already-admitted reservation
+                // against it refuses a stream the sub-cap let through. Here that is
+                // strictly worse than serving: the fill already fronted upstream
+                // USDC, so refusing loses that spend AND folds the full reservation
+                // into the signer's permanent dead charge. The sub-cap did its job
+                // pre-fill; this gate only asks whether the pool can still pay.
+                (!self.pool_budget_covers_reserve(
                     B256::from(req.pool_id),
                     status.remaining,
                     U256::ZERO,
-                )
+                ))
+                .then_some(FloorRefusal::PoolExhausted)
             };
-            if refused {
-                let headroom = status
-                    .remaining
-                    .saturating_sub(self.pool_min_remaining_deposit);
-                self.log_deposit_refusal(
-                    B256::from(req.pool_id),
-                    hash,
-                    headroom,
-                    decdn_incentive::min_payment(guard_bytes, rate_per_mb),
+            if let Some(refusal) = refused {
+                self.log_floor_refusal(
+                    refusal,
+                    FloorRefusalSite {
+                        pool_id: B256::from(req.pool_id),
+                        signer: lane_key.signer,
+                        hash,
+                        remaining: status.remaining,
+                        ceiling: decdn_incentive::min_payment(guard_bytes, rate_per_mb),
+                    },
                 );
                 return self
                     .respond_error(
                         &mut send,
                         &req,
-                        ServeRejectReason::InsufficientDeposit,
+                        ServeRejectReason::from(refusal),
                         rate_per_mb,
                     )
                     .await;

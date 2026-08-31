@@ -1,4 +1,4 @@
-//! Live anvil-backed e2e for the per-pool floor-credit bound: the seller keeps
+//! Live anvil-backed e2e for the per-pool floor-credit ceiling: the seller keeps
 //! serving a pool's free ramp-floor credit only while the pool's on-chain
 //! `remaining` minus the configured refundable minimum `M`
 //! (`pool_min_remaining_deposit_micro_usdc`) can still cover what is already
@@ -7,7 +7,15 @@
 //! journey proves it end to end against a real anvil chain, a real
 //! `decdn-node` daemon, and the real paid `cdn/client/v1` wire — including one
 //! lane whose blob is not in the cache at open, so the fill path folds its
-//! `dead_charge` into the same per-pool accumulator as the already-warm path.
+//! `dead_charge` into the same pool total as the already-warm path.
+//!
+//! This journey exercises the POOL-WIDE ceiling only. Each of its three lanes is a
+//! distinct signer drawing exactly one floor, which sits inside every signer's own
+//! sub-cap (ADR 003 § Pool solvency, per-signer floor isolation — the sub-cap
+//! clamps up to one credit window), so the third lane's refusal is the pool
+//! ceiling and nothing else. The per-signer sub-cap is covered in
+//! `crates/node/tests/client_loopback.rs`
+//! (`one_signer_at_its_share_does_not_lock_out_a_co_tenant`).
 //!
 //! That lane reaches the client through the buffered `try_local_populate` route,
 //! not `serve_leg`: `seed_origin_blob` writes `{H}` without a `{H}.obao4`, so the

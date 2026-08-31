@@ -437,8 +437,8 @@ impl ClientHandler {
                     // Observable stop (symmetric with the takedown re-check below): this
                     // terminates a paying miss-leg delivery, and `dead_charge` only grows.
                     tracing::warn!(
-                        pool_id = %lane_key.pool_id, %hash,
-                        "mid-stream PoolExhausted: pool can no longer fund committed floor credit; owner should top up the deposit"
+                        pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
+                        "mid-stream PoolExhausted: pool can no longer fund the floor credit committed across its signers; owner should top up the deposit. This is the POOL level — stopped_signer names the terminated stream, not the cause; a per-signer sub-cap refusal never reaches here"
                     );
                     return Ok(());
                 }

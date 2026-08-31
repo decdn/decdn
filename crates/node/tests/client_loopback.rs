@@ -4920,6 +4920,28 @@ async fn spawn_pool_server_with_loss(
     tokio::task::JoinHandle<()>,
     Arc<decdn_incentive::MemoryPoolFloorLossStore>,
 )> {
+    // `10_000` bps: the per-signer sub-cap is at least the pool's whole headroom,
+    // so the pool ceiling is the only floor bound these tests exercise.
+    let (target, ep, task, loss, _metrics) =
+        spawn_pool_server_with_signer_share(cache, store, remaining, 10_000).await?;
+    Ok((target, ep, task, loss))
+}
+
+/// [`spawn_pool_server_with_loss`] with an explicit per-signer floor share in
+/// basis points (ADR 003 §Pool solvency, per-signer floor isolation), so a test
+/// can exercise the sub-cap rather than only the per-pool ceiling.
+async fn spawn_pool_server_with_signer_share(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+    remaining: U256,
+    pool_floor_signer_share_bps: u64,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<decdn_incentive::MemoryPoolFloorLossStore>,
+    Arc<Metrics>,
+)> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = operator_signer();
@@ -4941,12 +4963,27 @@ async fn spawn_pool_server_with_loss(
             deps.credit_max = decdn_common::config::DEFAULT_CREDIT_MAX;
             deps.credit_ramp_divisor = decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR;
             deps.floor_loss_store = Some(loss_dyn);
+            deps.pool_floor_signer_share_bps = pool_floor_signer_share_bps;
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, server_ep, server_task, loss))
+    Ok((target, server_ep, server_task, loss, metrics))
+}
+
+/// Fold a [`decdn_incentive::PoolFloorLossStore::load_losses`] dump into
+/// [`pool_id`]'s total dead charge. Rows are keyed per `(pool, signer)` since the
+/// per-signer floor sub-cap (ADR 003 §Pool solvency), and the pool total is their
+/// sum — so a test that asserts a pool-level charge sums rather than picks a row,
+/// and stays correct when more than one signer contributes.
+fn pool_dead_charge_total(
+    rows: Vec<(alloy::primitives::B256, alloy::primitives::Address, u128)>,
+) -> u128 {
+    rows.into_iter()
+        .filter(|&(pool, _, _)| pool == pool_id())
+        .map(|(_, _, micro)| micro)
+        .fold(0u128, u128::saturating_add)
 }
 
 /// Poll `loss` until [`pool_id`]'s recorded dead charge in `µUSDC` reaches the target
@@ -4961,11 +4998,7 @@ async fn await_pool_dead_charge(
     use decdn_incentive::PoolFloorLossStore as _;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let current = loss
-            .load_losses()?
-            .into_iter()
-            .find(|(pool, _)| *pool == pool_id())
-            .map_or(0u128, |(_, micro)| micro);
+        let current = pool_dead_charge_total(loss.load_losses()?);
         if current == want {
             return Ok(());
         }
@@ -5092,6 +5125,114 @@ async fn sequential_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
     );
 
     conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// CORE security property (per-signer isolation, #1841): one signer that opens and
+/// abandons streams is locked out by its OWN share of the pool's free-floor budget,
+/// while a co-tenant signer on the SAME pool is still served. The abandoning
+/// signer's `dead_charge` is charged to its own entry, so it exhausts that signer's
+/// share without reaching the co-tenant's.
+///
+/// `remaining = 4 floors + slack`, `M = 0`, share `2500` bps: a quarter of the
+/// headroom is one floor, so each signer's sub-cap is one floor. Signer A withholds
+/// one floor and disconnects, filling its own share; its SECOND attempt is refused
+/// even though three floors of pool headroom remain untouched. Signer B, which has
+/// spent nothing, is admitted from its own share at that same instant — which is
+/// only possible if the accumulator carries a signer dimension.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_signer_at_its_share_does_not_lock_out_a_co_tenant() -> anyhow::Result<()> {
+    // > one interval so each lane parks after its floor rather than finishing.
+    let payload = vec![0x7Cu8; 6 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    // Four floors of headroom at a quarter share => one floor per signer, which is
+    // exactly the one-credit-window clamp, so the share is what binds either way.
+    let remaining = U256::from(u128::from(HARNESS_FLOOR_COST) * 4 + 2);
+    let (store, signers) = store_with_distinct_lanes(2)?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    let (target, server_ep, server_task, loss, metrics) =
+        spawn_pool_server_with_signer_share(cache, store_dyn, remaining, 2_500).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let signer_a = signers
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing signer A"))?;
+    let signer_b = signers
+        .get(1)
+        .ok_or_else(|| anyhow::anyhow!("missing signer B"))?;
+
+    // Signer A takes its one free floor and vanishes, filling its own share.
+    let conn = client_ep
+        .connect(target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect A: {e}"))?;
+    let ext = binding_ext(signer_a, client_node_id)?;
+    let (send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"withhold");
+    await_pool_dead_charge(&loss, u128::from(HARNESS_FLOOR_COST)).await?;
+
+    // A's SECOND attempt is refused: its share is spent. Three floors of pool
+    // headroom are still free, so nothing but the sub-cap can be refusing it.
+    let conn_a2 = client_ep
+        .connect(target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect A again: {e}"))?;
+    let ext_a2 = binding_ext(signer_a, client_node_id)?;
+    let (refusal, refusal_ext) =
+        open_expecting_refusal(&conn_a2, *hash.as_bytes(), Some(&ext_a2)).await?;
+    anyhow::ensure!(
+        !refusal.body.ok,
+        "a signer that filled its own share must be refused while the pool can still pay"
+    );
+    anyhow::ensure!(
+        matches!(
+            refusal_ext.error,
+            Some(decdn_protocol::client::StreamError::NotFound)
+        ),
+        "the sub-cap refusal collapses to NotFound on the wire, got {:?}",
+        refusal_ext.error
+    );
+    conn_a2.close(0u32.into(), b"capped");
+    // The wire code is deliberately the same for both caps, so the per-reason
+    // counter is the ONLY place the distinction survives — and the two remedies it
+    // separates are opposite (top up the pool, versus rotate the session key).
+    // Pin both directions: the sub-cap fired, and the deposit arm did not.
+    let encoded = metrics.encode()?;
+    for line in [
+        "decdn_serve_stream_rejected_signer_floor_at_cap_total 1",
+        "decdn_serve_stream_rejected_insufficient_deposit_total 0",
+    ] {
+        anyhow::ensure!(
+            metric_line_present(&encoded, line),
+            "expected metric line `{line}`; counters were:\n{}",
+            encoded
+                .lines()
+                .filter(|l| l.starts_with("decdn_serve_stream_rejected"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // Signer B, a co-tenant on the SAME pool, is served from its own share.
+    let conn_b = client_ep
+        .connect(target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect B: {e}"))?;
+    let ext_b = binding_ext(signer_b, client_node_id)?;
+    let (send_b, mut recv_b) = open_paid_stream(&conn_b, *hash.as_bytes(), Some(&ext_b)).await?;
+    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv_b).await?;
+    drop(send_b);
+    drop(recv_b);
+    conn_b.close(0u32.into(), b"done");
+
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
@@ -9240,11 +9381,7 @@ async fn await_persistent_pool_dead_charge(
     use decdn_incentive::PoolFloorLossStore as _;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let current = store
-            .load_losses()?
-            .into_iter()
-            .find(|(pool, _)| *pool == pool_id())
-            .map_or(0u128, |(_, micro)| micro);
+        let current = pool_dead_charge_total(store.load_losses()?);
         if current == want {
             return Ok(());
         }
@@ -9336,14 +9473,24 @@ async fn dead_charge_persists_across_restart() -> anyhow::Result<()> {
 
     // The reopened store shows the persisted dead_charge on its own, independent
     // of whatever handler #2 hydrates internally.
-    let persisted = reopened
-        .load_losses()?
-        .into_iter()
-        .find(|(pool, _)| *pool == pool_id())
-        .map(|(_, micro)| micro);
+    let persisted = pool_dead_charge_total(reopened.load_losses()?);
     anyhow::ensure!(
-        persisted == Some(u128::from(HARNESS_FLOOR_COST)),
+        persisted == u128::from(HARNESS_FLOOR_COST),
         "expected the durable dead_charge to survive reopen, got {persisted:?}"
+    );
+    // And it survives keyed by SIGNER, not merely as a pool total: the per-signer
+    // sub-cap (ADR 003 §Pool solvency) is only carried across a restart if the
+    // durable row remembers which capability-holder owes the charge. A row keyed
+    // by pool alone would rehydrate every signer's share as one undifferentiated
+    // pool total and lose the isolation.
+    let rows = reopened.load_losses()?;
+    anyhow::ensure!(
+        rows == vec![(
+            pool_id(),
+            signer_a.address(),
+            u128::from(HARNESS_FLOOR_COST)
+        )],
+        "the dead charge must reload against the signer that incurred it, got {rows:?}"
     );
 
     reopened.record(&fresh_lane(signer_b.address(), U256::from(10_000_000u64)))?;
