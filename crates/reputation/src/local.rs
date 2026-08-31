@@ -237,13 +237,14 @@ impl LocalReputation {
         })
     }
 
-    /// The shard holding `peer`'s entry, chosen by the first key byte. `None` is
-    /// unreachable — the index is taken modulo the shard count, which is exactly
-    /// the vector's length — but returning it keeps this off the `indexing`
-    /// lint and lets callers fall back to a neutral answer rather than panic.
+    /// The shard holding `peer`'s entry, chosen by the first key byte. Both
+    /// lookups are `.first()`/`.get()` rather than indexing, so the anti-panic
+    /// `indexing_slicing` lint has nothing to flag; `None` is unreachable (a key
+    /// is 32 bytes and the index is taken modulo the shard count, which is the
+    /// vector's length) but lets callers fall back to a neutral answer.
     fn shard_for(&self, peer: &NodeId) -> Option<&RwLock<HashMap<NodeId, Entry>>> {
-        let idx = usize::from(peer.as_bytes()[0]) % SHARD_COUNT;
-        self.scores.get(idx)
+        let first = *peer.as_bytes().first()?;
+        self.scores.get(usize::from(first) % SHARD_COUNT)
     }
 
     /// Fold an outcome into the peer's score and return the new value.
