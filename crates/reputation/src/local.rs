@@ -27,6 +27,14 @@ const DEFAULT_DECAY_HALF_LIFE_SECS: u64 = 3 * 24 * 3600; // 259_200
 /// §Score Decay).
 const SECONDS_PER_WEEK: f64 = 7.0 * 24.0 * 3600.0;
 
+/// Number of independent score shards. Peers are spread across shards by the
+/// first byte of their [`NodeId`] (uniformly distributed for an Ed25519 key), so
+/// a `score()` read on the selection hot path locks one shard, and the periodic
+/// `evict()` sweep walks shards one at a time instead of holding a single global
+/// write lock across an O(peers) scan. A concurrent miss then contends only with
+/// the ~1/N of peers sharing its shard, not the whole peer set.
+const SHARD_COUNT: usize = 16;
+
 /// Eviction candidates must be within this band of neutral (ADR 008
 /// §Score Decay: converge within 0.05 of neutral).
 const EVICT_NEUTRAL_BAND: f64 = 0.05;
@@ -192,11 +200,15 @@ struct Entry {
 /// read-lock, writes a write-lock. Idle scores decay toward neutral lazily at
 /// read time (ADR 008 §Score Decay). No persistence and no network
 /// aggregation per ADR 008 §14a.
+///
+/// The peer map is split into `SHARD_COUNT` independently-locked shards so
+/// per-candidate reads during ranking and the periodic maintenance sweep do not
+/// serialize on one global lock.
 #[derive(Debug)]
 pub struct LocalReputation {
     config: LocalReputationConfig,
     clock: Arc<dyn Clock>,
-    scores: RwLock<HashMap<NodeId, Entry>>,
+    scores: Vec<RwLock<HashMap<NodeId, Entry>>>,
 }
 
 impl LocalReputation {
@@ -219,8 +231,20 @@ impl LocalReputation {
         Ok(Self {
             config,
             clock,
-            scores: RwLock::new(HashMap::new()),
+            scores: (0..SHARD_COUNT)
+                .map(|_| RwLock::new(HashMap::new()))
+                .collect(),
         })
+    }
+
+    /// The shard holding `peer`'s entry, chosen by the first key byte. Both
+    /// lookups are `.first()`/`.get()` rather than indexing, so the anti-panic
+    /// `indexing_slicing` lint has nothing to flag; `None` is unreachable (a key
+    /// is 32 bytes and the index is taken modulo the shard count, which is the
+    /// vector's length) but lets callers fall back to a neutral answer.
+    fn shard_for(&self, peer: &NodeId) -> Option<&RwLock<HashMap<NodeId, Entry>>> {
+        let first = *peer.as_bytes().first()?;
+        self.scores.get(usize::from(first) % SHARD_COUNT)
     }
 
     /// Fold an outcome into the peer's score and return the new value.
@@ -232,11 +256,13 @@ impl LocalReputation {
     pub fn record(&self, peer: NodeId, outcome: Outcome) -> f64 {
         let sample = self.interaction_score(outcome);
         let now = self.clock.now_secs();
+        let Some(shard) = self.shard_for(&peer) else {
+            return sample;
+        };
         // Poison recovery: the only writer is this method, and the map entry
         // is mutated only after all arithmetic. A panic earlier in the
         // function leaves the map structurally intact.
-        let mut guard = self
-            .scores
+        let mut guard = shard
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = guard.entry(peer).or_insert(Entry {
@@ -259,9 +285,11 @@ impl LocalReputation {
     /// §Score Decay), or [`LocalReputationConfig::initial_score`] if unseen.
     pub fn score(&self, peer: NodeId) -> f64 {
         let now = self.clock.now_secs();
+        let Some(shard) = self.shard_for(&peer) else {
+            return self.config.initial_score;
+        };
         // Poison recovery: read-only path; cannot itself corrupt state.
-        let guard = self
-            .scores
+        let guard = shard
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.get(&peer).map_or(self.config.initial_score, |e| {
@@ -273,15 +301,19 @@ impl LocalReputation {
     /// (ADR 008 §Score Decay). Allocates.
     pub fn snapshot(&self) -> Vec<(NodeId, f64)> {
         let now = self.clock.now_secs();
+        let mut out = Vec::new();
         // Poison recovery: read-only path; same reasoning as `score`.
-        let guard = self
-            .scores
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard
-            .iter()
-            .map(|(k, e)| (*k, self.decay(e.score, e.last_update_secs, now)))
-            .collect()
+        for shard in &self.scores {
+            let guard = shard
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            out.extend(
+                guard
+                    .iter()
+                    .map(|(k, e)| (*k, self.decay(e.score, e.last_update_secs, now))),
+            );
+        }
+        out
     }
 
     /// Drop entries whose decayed score has converged within `EVICT_NEUTRAL_BAND`
@@ -294,17 +326,21 @@ impl LocalReputation {
     pub fn evict(&self) {
         let now = self.clock.now_secs();
         let neutral = self.config.initial_score;
-        let mut guard = self
-            .scores
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.retain(|_, e| {
-            let decayed = self.decay(e.score, e.last_update_secs, now);
-            #[allow(clippy::cast_precision_loss)]
-            let idle_weeks = now.saturating_sub(e.last_update_secs) as f64 / SECONDS_PER_WEEK;
-            let near_neutral = (decayed - neutral).abs() <= EVICT_NEUTRAL_BAND;
-            !(near_neutral && idle_weeks > EVICT_IDLE_WEEKS)
-        });
+        // Sweep shard by shard: each write lock is held only across its own
+        // shard's retain, so a maintenance pass never blocks a `score()` read on
+        // a different shard.
+        for shard in &self.scores {
+            let mut guard = shard
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.retain(|_, e| {
+                let decayed = self.decay(e.score, e.last_update_secs, now);
+                #[allow(clippy::cast_precision_loss)]
+                let idle_weeks = now.saturating_sub(e.last_update_secs) as f64 / SECONDS_PER_WEEK;
+                let near_neutral = (decayed - neutral).abs() <= EVICT_NEUTRAL_BAND;
+                !(near_neutral && idle_weeks > EVICT_IDLE_WEEKS)
+            });
+        }
     }
 
     /// Closed-form half-life decay toward neutral (ADR 008 §Score Decay):

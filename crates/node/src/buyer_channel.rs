@@ -479,7 +479,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             return pin_ctx(&state, &self.signer, &self.voucher_domain, provider_addr);
         }
 
-        let open = self.join_or_spawn_open()?;
+        let open = self.join_or_spawn_open();
 
         match tokio::time::timeout(budget, open).await {
             // Still running. The task owns the tx; hand the caller a typed "not
@@ -548,20 +548,20 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// callers cannot both decide to spawn; the task holds a [`SlotGuard`] that
     /// frees the slot when it ends (any path).
     ///
-    /// # Errors
-    ///
-    /// A poisoned `topup_in_flight` lock — reported as this node's fault, since
-    /// every future top-up would fail here.
-    fn join_or_spawn_topup(&self, pool_id: PoolId, additional: U256) -> Result<SharedTopUp> {
-        let mut slot = self.topup_in_flight.lock().map_err(|err| {
-            self.metrics.buyer_topup_failure();
-            error!(%err, "topup_in_flight mutex poisoned; this node must be restarted");
-            anyhow::anyhow!("topup_in_flight mutex poisoned: {err}").context(LocalPullFault)
-        })?;
+    fn join_or_spawn_topup(&self, pool_id: PoolId, additional: U256) -> SharedTopUp {
+        // Recover the slot on poison rather than treat a prior holder's panic as
+        // node-fatal (as [`SlotGuard`]'s own Drop does): the guarded value is a
+        // single `Option<Shared…>` move that cannot tear, so the worst a panic
+        // leaves is a stale slot this call overwrites. Refusing here would wedge
+        // ALL funding node-wide for one unrelated panic.
+        let mut slot = self
+            .topup_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(existing) = slot.as_ref() {
             debug!(%pool_id, "joining a pool topUp already in flight");
-            return Ok(existing.clone());
+            return existing.clone();
         }
 
         let handles = self.funding_handles();
@@ -585,28 +585,22 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         });
         let shared = fut.shared();
         *slot = Some(shared.clone());
-        Ok(shared)
+        shared
     }
 
     /// Join the in-flight `openPool`, or spawn one. The one pool the node owns is
     /// opened at most once; concurrent misses join the single running open.
-    ///
-    /// # Errors
-    ///
-    /// A poisoned `open_in_flight` lock — reported as this node's fault
-    /// ([`OpenReported`] + [`LocalPullFault`]), since every future open would fail.
-    fn join_or_spawn_open(&self) -> Result<SharedOpen> {
-        let mut slot = self.open_in_flight.lock().map_err(|err| {
-            self.metrics.node_pull_pool_open_failure();
-            error!(%err, "open_in_flight mutex poisoned; this node must be restarted");
-            anyhow::anyhow!("open_in_flight mutex poisoned: {err}")
-                .context(OpenReported)
-                .context(LocalPullFault)
-        })?;
+    fn join_or_spawn_open(&self) -> SharedOpen {
+        // Recover on poison rather than treat one panic as node-fatal — see
+        // [`Self::join_or_spawn_topup`] for why the slot is safe to recover.
+        let mut slot = self
+            .open_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(existing) = slot.as_ref() {
             debug!("joining an openPool already in flight");
-            return Ok(existing.clone());
+            return existing.clone();
         }
 
         let contract = self.contract.clone();
@@ -646,7 +640,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         });
         let shared = fut.shared();
         *slot = Some(shared.clone());
-        Ok(shared)
+        shared
     }
 
     /// Persist the cumulative voucher totals after a delivery exchange so a later
@@ -748,7 +742,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         if additional.is_zero() {
             return Ok(state.deposit);
         }
-        match self.join_or_spawn_topup(state.pool_id, additional)?.await {
+        match self.join_or_spawn_topup(state.pool_id, additional).await {
             Ok(DepositOutcome::Added(new_deposit)) => {
                 info!(
                     pool_id = %state.pool_id,

@@ -104,7 +104,9 @@ use crate::dht::{
     ProbedProvider, StakerSet,
 };
 use crate::metrics::Metrics;
-use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_candidates};
+use crate::selection::{
+    Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_EARLY_EXIT_CANDIDATES, PROBE_TIMEOUT, rank_candidates,
+};
 
 /// Record a buyer channel open/reuse failure on `err` to the metrics in `deps`,
 /// emitting a structured-log line with the failure-class `reason` (#966).
@@ -749,6 +751,7 @@ async fn probe_and_rank(
     providers: Vec<DhtNodeId>,
     hash_bytes: [u8; 32],
 ) -> Vec<Candidate> {
+    use futures_util::stream::StreamExt;
     let now_secs = crate::payment_settlement::unix_now();
     let target = DhtHash::from_bytes(hash_bytes);
     // Probe candidates CONCURRENTLY so the probe phase is bounded by a single
@@ -757,7 +760,7 @@ async fn probe_and_rank(
     // provider is even tried. `probe_candidate`'s side effects (reputation
     // record, negative-cache insert) are all behind locks, so concurrent runs
     // are safe; ranking afterwards makes result order irrelevant.
-    let probes = providers
+    let mut probes: futures_util::stream::FuturesUnordered<_> = providers
         .into_iter()
         // Drop peers already known to answer "no" for THIS hash within the TTL.
         // `find_providers` applies the same filter, but only to what the DHT lookup
@@ -778,12 +781,26 @@ async fn probe_and_rank(
         // burning a candidate slot each time.
         .filter(|peer| !deps.provider_is_wedged(peer, now_secs))
         .take(deps.config.probe_fanout)
-        .map(|peer| probe_candidate(deps, peer, hash_bytes));
-    let candidates: Vec<Candidate> = futures_util::future::join_all(probes)
-        .await
-        .into_iter()
-        .flatten()
+        .map(|peer| probe_candidate(deps, peer, hash_bytes))
         .collect();
+    // Collect answers as they arrive and stop early once enough good candidates are in
+    // hand: waiting on `join_all` would pace the whole round to the SLOWEST probe — a dead
+    // peer that only resolves at its `PROBE_TIMEOUT` — even when the fastest few already
+    // answered. `PROBE_TIMEOUT` still bounds each probe, so a sparse round that never reaches
+    // the early-exit count simply drains to the ceiling; a healthy round selects at the speed
+    // of its fastest good answers.
+    let mut candidates: Vec<Candidate> = Vec::new();
+    while let Some(result) = probes.next().await {
+        if let Some(candidate) = result {
+            candidates.push(candidate);
+            if candidates.len() >= PROBE_EARLY_EXIT_CANDIDATES {
+                break;
+            }
+        }
+    }
+    // Cancel any probes still pending: the loop has enough (or the set is drained). Their
+    // reputation / negative-cache side effects simply do not run for peers we never needed.
+    drop(probes);
     let ranked = rank(candidates);
     // ADR 001 §Probe cache: retain the top 10 by selection score, so a repeat
     // miss for this hash inside the TTL skips the lookup and the probe fanout.
