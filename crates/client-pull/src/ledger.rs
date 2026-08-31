@@ -7,6 +7,7 @@
 //! one provider never serialize their payments behind each other's round trips.
 
 use std::future::Future;
+use std::time::Duration;
 
 use alloy::primitives::{B256, U256};
 use decdn_incentive::chain::{CHUNK_BYTES, MAX_CHAIN_LENGTH};
@@ -392,7 +393,24 @@ pub struct PoolLedger {
     /// Locked AFTER `epoch` wherever both are taken, which is the only order
     /// either is ever acquired in.
     retired: std::sync::Mutex<Displaced>,
+    /// Ceiling on a single voucher send. The issuance lock is held across the
+    /// send on purpose — vouchers must reach the node in strict cumulative order
+    /// — but that means one send is on the critical path of EVERY concurrent
+    /// pull sharing this lane. Without a bound, an upstream that stops reading
+    /// wedges issuance for the whole lane forever, and no error is ever raised,
+    /// so per-blob failover never fires. When a send exceeds this the method
+    /// returns an error, releasing the lock and letting the pull leg fail over
+    /// to another provider. A timed-out send is treated exactly like any other
+    /// ambiguous send: the voucher stays armed and `settlement` settles high.
+    send_deadline: Duration,
 }
+
+/// Default ceiling on one voucher send (see [`PoolLedger::send_deadline`]). A
+/// voucher or preimage is a tiny frame on a low-volume stream, so a send that
+/// takes this long means the upstream has stopped acknowledging at the
+/// transport level, not that it is merely slow. Generous enough never to fire on
+/// a healthy-but-loaded peer, short enough to bound the wedge into a failover.
+pub const VOUCHER_SEND_DEADLINE: Duration = Duration::from_secs(20);
 
 impl PoolLedger {
     /// Build a ledger seeded from the lane's persisted cumulative state (the
@@ -419,6 +437,34 @@ impl PoolLedger {
             }),
             epoch: std::sync::Mutex::new(None),
             retired: std::sync::Mutex::new(Displaced::Nothing),
+            send_deadline: VOUCHER_SEND_DEADLINE,
+        }
+    }
+
+    /// Override the per-send voucher-send deadline. Used by tests to exercise
+    /// the timeout without waiting the production ceiling; production ledgers
+    /// keep `VOUCHER_SEND_DEADLINE`.
+    #[must_use]
+    pub const fn with_send_deadline(mut self, send_deadline: Duration) -> Self {
+        self.send_deadline = send_deadline;
+        self
+    }
+
+    /// Run one voucher send under [`PoolLedger::send_deadline`]. On timeout it
+    /// returns an error rather than blocking the issuance lock forever, so a
+    /// stalled upstream becomes a bounded per-blob failover instead of a
+    /// lane-wide wedge. The caller treats the error like any send failure: the
+    /// armed voucher is left in place and `committed` does not advance.
+    async fn under_deadline<Fut>(&self, send: Fut) -> anyhow::Result<()>
+    where
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
+        match tokio::time::timeout(self.send_deadline, send).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "voucher send exceeded {:?}; failing the lane to trigger failover",
+                self.send_deadline
+            )),
         }
     }
 
@@ -531,7 +577,7 @@ impl PoolLedger {
         // advance: a send failure is as ambiguous as a drop, so `settlement`
         // settles high. A rejection is NOT an issuance outcome — it arrives later
         // as a `StreamError` message and is disarmed via `resolve_reject`.
-        exchange(next, commit).await?;
+        self.under_deadline(exchange(next, commit)).await?;
         // The send succeeded: commit optimistically. The accrual is now folded
         // into the signed anchor, so it resets to zero — and the previous pair
         // is remembered so a later `resolve_reject` can un-commit exactly this
@@ -588,7 +634,7 @@ impl PoolLedger {
             return Ok(None);
         };
         let anchor = self.pipeline().committed;
-        exchange(anchor, commit).await?;
+        self.under_deadline(exchange(anchor, commit)).await?;
         Ok(Some(commit.chain_root))
     }
 
@@ -714,7 +760,7 @@ impl PoolLedger {
             )
         };
 
-        exchange(released).await?;
+        self.under_deadline(exchange(released)).await?;
 
         // The reveal is out. Advance the lane's worth by exactly one chunk on
         // both axes — the node credits the same, because it derives both from
@@ -996,6 +1042,43 @@ mod tests {
         assert_eq!(ledger.committed(), Cumulative::default());
         // But it settles HIGH — the send is ambiguous, so the voucher stays armed.
         assert_eq!(ledger.settlement().bytes, U256::from(100u64));
+        Ok(())
+    }
+
+    /// A send that stalls past the lane's deadline fails the issue with an error
+    /// — releasing the issuance lock so the pull leg fails over — rather than
+    /// blocking every concurrent pull on the lane forever. The stalled voucher is
+    /// treated as any ambiguous send: it stays armed and `settlement` settles
+    /// high, while `committed` does not advance.
+    #[tokio::test]
+    async fn a_send_past_the_deadline_errors_instead_of_wedging() -> anyhow::Result<()> {
+        let ledger =
+            PoolLedger::new(Cumulative::default()).with_send_deadline(Duration::from_millis(20));
+        let result = ledger
+            .issue(100, 10, EpochAction::Keep, |_next, _chain| {
+                // Upstream stopped reading: this send never completes.
+                std::future::pending::<anyhow::Result<()>>()
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "a send past the deadline must surface an error, not hang"
+        );
+        assert_eq!(
+            ledger.committed(),
+            Cumulative::default(),
+            "a timed-out send never advances the committed watermark"
+        );
+        assert_eq!(
+            ledger.settlement().bytes,
+            U256::from(100u64),
+            "an ambiguous timed-out send settles high on the armed voucher"
+        );
+
+        // The lock is free again: a subsequent issue on the same ledger proceeds.
+        ledger
+            .issue(100, 10, EpochAction::Keep, |_next, _chain| async { Ok(()) })
+            .await?;
         Ok(())
     }
 
