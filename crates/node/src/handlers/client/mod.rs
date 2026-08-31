@@ -3947,7 +3947,7 @@ mod tests {
 
     /// A failed drop-time persist bumps `floor_loss_persist_failures` (#1782) —
     /// the only alertable signal that dead charges have stopped reaching disk
-    /// (e.g. redb latching writes after a failed commit on the shared file) and
+    /// (e.g. redb latching writes after a failed commit on `floor-loss.redb`) and
     /// that a restart would re-grant pools their consumed free-floor budget.
     #[test]
     fn floor_persist_failure_bumps_the_counter() -> anyhow::Result<()> {
