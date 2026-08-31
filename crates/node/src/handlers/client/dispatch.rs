@@ -4,7 +4,7 @@
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
-    FirstMessage, FloorRefusalSite, FloorReservation, Hash, LaneKey, LaneSlot,
+    FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey, LaneSlot,
     OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream,
     ServeRejectReason, StreamReadError, StreamResponseBody, U256, VarInt, read_first_message,
     reset_stream, verify_binding,
@@ -744,7 +744,6 @@ impl ClientHandler {
                                 signer: key.signer,
                                 hash,
                                 remaining: status.remaining,
-                                rate_per_mb,
                                 ceiling: reserved,
                             },
                         );
@@ -1121,9 +1120,10 @@ impl ClientHandler {
         // cumulative cross-lane floor credit. A miss-fill stream
         // already holds its reservation, so re-validate solvency against the pool's
         // already-committed floor credit (`live_reservation + dead_charge`) via
-        // [`ClientHandler::floor_budget_covers`] with `new_reserve = 0` — the
-        // same stateful check the mid-stream gate applies, so a `dead_charge` that
-        // grew since the reservation refuses here rather than serving a free interval.
+        // [`ClientHandler::pool_budget_covers_reserve`] with `new_reserve = 0` — the
+        // same stateful check the mid-stream gate applies, so a pool-wide
+        // `dead_charge` that grew since the reservation refuses here rather than
+        // serving a free interval.
         //
         // `remaining` comes from the cached `getPool` view resolved above; a `None`
         // view fails open (the on-chain `redeem` is the backstop). Either way, refuse
@@ -1154,20 +1154,21 @@ impl ClientHandler {
             } else {
                 // A miss-fill stream already holds its reservation, counted at both
                 // levels, so this re-validates rather than reserves (`new_reserve =
-                // 0`). It still reports WHICH cap moved against it since the last
-                // check: a `dead_charge` that grew on this signer refuses as
-                // `SignerFloorAtCap`, one that grew pool-wide as
-                // `InsufficientDeposit`. Collapsing the two here would blind the
-                // per-reason metric on the miss path — the tier that fronts real
-                // upstream USDC, and so the one the sub-cap most exists to bound.
-                self.floor_budget_covers(
+                // 0`) — and at the POOL level only, for the reason
+                // [`ClientHandler::pool_budget_covers_reserve`] gives: the signer's
+                // cap is a share of `remaining − M` and shrinks as co-tenants draw
+                // the pool down, so re-testing an already-admitted reservation
+                // against it refuses a stream the sub-cap let through. Here that is
+                // strictly worse than serving: the fill already fronted upstream
+                // USDC, so refusing loses that spend AND folds the full reservation
+                // into the signer's permanent dead charge. The sub-cap did its job
+                // pre-fill; this gate only asks whether the pool can still pay.
+                (!self.pool_budget_covers_reserve(
                     B256::from(req.pool_id),
-                    lane_key.signer,
                     status.remaining,
-                    rate_per_mb,
                     U256::ZERO,
-                )
-                .err()
+                ))
+                .then_some(FloorRefusal::PoolExhausted)
             };
             if let Some(refusal) = refused {
                 self.log_floor_refusal(
@@ -1177,7 +1178,6 @@ impl ClientHandler {
                         signer: lane_key.signer,
                         hash,
                         remaining: status.remaining,
-                        rate_per_mb,
                         ceiling: decdn_incentive::min_payment(guard_bytes, rate_per_mb),
                     },
                 );

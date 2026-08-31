@@ -4922,7 +4922,9 @@ async fn spawn_pool_server_with_loss(
 )> {
     // `10_000` bps: the per-signer sub-cap is at least the pool's whole headroom,
     // so the pool ceiling is the only floor bound these tests exercise.
-    spawn_pool_server_with_signer_share(cache, store, remaining, 10_000).await
+    let (target, ep, task, loss, _metrics) =
+        spawn_pool_server_with_signer_share(cache, store, remaining, 10_000).await?;
+    Ok((target, ep, task, loss))
 }
 
 /// [`spawn_pool_server_with_loss`] with an explicit per-signer floor share in
@@ -4938,6 +4940,7 @@ async fn spawn_pool_server_with_signer_share(
     Endpoint,
     tokio::task::JoinHandle<()>,
     Arc<decdn_incentive::MemoryPoolFloorLossStore>,
+    Arc<Metrics>,
 )> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
@@ -4966,7 +4969,7 @@ async fn spawn_pool_server_with_signer_share(
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, server_ep, server_task, loss))
+    Ok((target, server_ep, server_task, loss, metrics))
 }
 
 /// Fold a [`decdn_incentive::PoolFloorLossStore::load_losses`] dump into
@@ -5149,7 +5152,7 @@ async fn one_signer_at_its_share_does_not_lock_out_a_co_tenant() -> anyhow::Resu
     let remaining = U256::from(u128::from(HARNESS_FLOOR_COST) * 4 + 2);
     let (store, signers) = store_with_distinct_lanes(2)?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    let (target, server_ep, server_task, loss) =
+    let (target, server_ep, server_task, loss, metrics) =
         spawn_pool_server_with_signer_share(cache, store_dyn, remaining, 2_500).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -5197,6 +5200,25 @@ async fn one_signer_at_its_share_does_not_lock_out_a_co_tenant() -> anyhow::Resu
         refusal_ext.error
     );
     conn_a2.close(0u32.into(), b"capped");
+    // The wire code is deliberately the same for both caps, so the per-reason
+    // counter is the ONLY place the distinction survives — and the two remedies it
+    // separates are opposite (top up the pool, versus rotate the session key).
+    // Pin both directions: the sub-cap fired, and the deposit arm did not.
+    let encoded = metrics.encode()?;
+    for line in [
+        "decdn_serve_stream_rejected_signer_floor_at_cap_total 1",
+        "decdn_serve_stream_rejected_insufficient_deposit_total 0",
+    ] {
+        anyhow::ensure!(
+            metric_line_present(&encoded, line),
+            "expected metric line `{line}`; counters were:\n{}",
+            encoded
+                .lines()
+                .filter(|l| l.starts_with("decdn_serve_stream_rejected"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 
     // Signer B, a co-tenant on the SAME pool, is served from its own share.
     let conn_b = client_ep

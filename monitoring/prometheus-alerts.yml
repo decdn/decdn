@@ -367,6 +367,10 @@ groups:
       # route here: it has its own
       # `decdn_serve_stream_rejected_signer_floor_at_cap_total`, so this rule stays
       # a pool-solvency signal and its two causes below remain the whole story.
+      # That sibling counter is deliberately NOT alerted: a signer at its share is
+      # a per-counterparty condition on a solvent node, not a node-health fault, so
+      # it is dashboard- and log-only (see docs/runbook.md cause 3). Alerting it
+      # would page an operator for one client's abandoned streams.
       #
       # A raw rate, not a ratio, because the node exports no serve-ATTEMPT counter:
       # `decdn_serve_stream_rejected_*` is a per-reason family with no success

@@ -179,7 +179,14 @@ const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
 /// un-vouchered serve-time exposure that appears in no on-chain quantity and so
 /// must be persisted here to survive a restart. The signer dimension carries the
 /// per-signer sub-cap across a restart; a pool's total is the sum of its signer
-/// rows. Lives in the same database file as [`LANE_TABLE`].
+/// rows.
+///
+/// The name carries a version because a redb table's key type is part of its
+/// identity: reopening a 32-byte-keyed table under a 52-byte key fails
+/// `TableTypeMismatch` at bring-up. Pre-launch there is nothing to migrate, so a
+/// `pool_floor_loss_v1` table left in a development store is deleted at open by
+/// [`PersistentPoolStateStore::drop_superseded_floor_loss_table`] rather than read — the reset is then a deliberate, logged act instead of a
+/// silent empty load that reads exactly like a first boot.
 ///
 /// Key: `pool_id ‖ signer` (`[u8; 52]`, see [`pool_signer_key_bytes`]). Value:
 /// the accumulated `µUSDC` total as a native redb `u128` — no postcard envelope,
@@ -187,6 +194,12 @@ const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
 /// scalar encoding for a single fixed-width number.
 const POOL_FLOOR_LOSS_TABLE: TableDefinition<&[u8; POOL_SIGNER_KEY_LEN], u128> =
     TableDefinition::new("pool_floor_loss_v2");
+
+/// The superseded per-pool floor-loss table, keyed by `pool_id` alone. Nothing
+/// reads it; [`PersistentPoolStateStore::drop_superseded_floor_loss_table`] deletes
+/// it at open so a development store carrying one does not keep dead rows forever.
+const SUPERSEDED_POOL_FLOOR_LOSS_TABLE: TableDefinition<&[u8; 32], u128> =
+    TableDefinition::new("pool_floor_loss_v1");
 
 /// redb table of tombstones for pools whose floor-loss rows were
 /// [`PoolFloorLossStore::forget_loss`]-ed. A reservation drop reads its
@@ -562,6 +575,7 @@ impl PersistentPoolStateStore {
         let lanes_db = Self::open_hardened_db(&path, &chmod_fn)?;
         let settle_db = Self::open_hardened_db(&data_dir.join(SETTLE_DB_FILE), &chmod_fn)?;
         let floor_loss_db = Self::open_hardened_db(&data_dir.join(FLOOR_LOSS_DB_FILE), &chmod_fn)?;
+        Self::drop_superseded_floor_loss_table(&floor_loss_db)?;
         let checkpoint_db = Self::open_hardened_db(&data_dir.join(CHECKPOINT_DB_FILE), &chmod_fn)?;
         let buyer_db = Self::open_hardened_db(&data_dir.join(BUYER_DB_FILE), &chmod_fn)?;
 
@@ -586,6 +600,35 @@ impl PersistentPoolStateStore {
     /// file gets. Each family lives in its own file so its commits take an
     /// independent `redb` writer slot.
     ///
+    /// Delete the superseded 32-byte-keyed `pool_floor_loss_v1` table if the store
+    /// still carries one. The live table is keyed by `(pool_id, signer)`, and a
+    /// redb table's key type is part of its identity, so the wider key needs a new
+    /// name; leaving the old table in place would keep its rows readable by nothing
+    /// and make the reset indistinguishable from a first boot. Pre-launch there is
+    /// no migration to run, so the rows are dropped — but loudly, because they are
+    /// dead charges that will not be re-accrued.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] when the delete transaction fails.
+    fn drop_superseded_floor_loss_table(db: &Database) -> Result<(), StoreError> {
+        let txn = db
+            .begin_write()
+            .map_err(|e| floor_loss_backend_err("begin_write (v1 drop)", None, e))?;
+        let dropped = txn
+            .delete_table(SUPERSEDED_POOL_FLOOR_LOSS_TABLE)
+            .map_err(|e| floor_loss_backend_err("delete_table (v1)", None, e))?;
+        txn.commit()
+            .map_err(|e| floor_loss_backend_err("commit (v1 drop)", None, e))?;
+        if dropped {
+            tracing::warn!(
+                table = "pool_floor_loss_v1",
+                "dropped the superseded per-pool floor-loss table; its dead charges do not \
+                 carry into the per-signer table and those pools start with a fresh floor budget"
+            );
+        }
+        Ok(())
+    }
+
     /// Rejects a zero-length file: `redb::Database::create` treats both "file
     /// does not exist" and "file exists but is empty" as "create a fresh
     /// database" — so a `truncate -s 0` (or a filesystem rollback that nukes
@@ -1567,8 +1610,11 @@ fn floor_loss_backend_err(
 /// the table, so the keys are collected first — the same collect-then-remove shape
 /// [`PoolFloorLossStore::sweep_forgotten`] uses. Every row implies at least one
 /// admitted floor charge against the pool, so the count is bounded by
-/// `remaining − M` divided by one floor — small for an honest pool, and bounded by
-/// the pool's own budget for one that sprays signer identities.
+/// `remaining − M` divided by one credit window. That is small for an honest pool,
+/// whose signers pay and prune. It is NOT small for one that sprays signer
+/// identities: a large deposit admits a row per window of headroom, so the bound is
+/// the pool's budget rather than any modest constant. Minting a signer needs an
+/// owner signature, which is what keeps this off the anonymous-abuse path.
 fn remove_pool_floor_rows(
     table: &mut redb::Table<'_, &'static [u8; POOL_SIGNER_KEY_LEN], u128>,
     pool_id: B256,

@@ -141,7 +141,7 @@ pub const DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS: u64 = 2_500;
 /// fan-out bound for an availability failure on ordinary cold starts. Sizing the
 /// ceiling for its real job — bounding one signer's *concurrent* un-vouchered
 /// exposure — requires separating that from the cumulative abandonment budget the
-/// same number currently also serves.
+/// same number also serves.
 pub const DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS: u64 = 0;
 /// Basis-point denominator for [`DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS`] and the
 /// bound the resolver enforces on a configured share.
@@ -1596,7 +1596,8 @@ fn resolve_blockchain_into(
             format!(
                 "blockchain.pool_floor_signer_share_bps {bound} (0 clamps to the same \
                  one-credit-window floor as 1, so it cannot express \"no sub-cap\"; \
-                 {BPS_DENOMINATOR} lifts the sub-cap to the per-pool ceiling, i.e. a no-op)"
+                 {BPS_DENOMINATOR} lifts the share to the whole headroom, a no-op only \
+                 while pool_floor_signer_max_windows is 0)"
             )
         },
     );
@@ -9537,14 +9538,18 @@ swap_pool_address = \"0xPool\"
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        // Literals, not the constants: asserting a value against the constant it
+        // came from passes whatever the constant says, and the shipped defaults are
+        // documented in four places that have to agree with it.
+        assert_eq!(resolved.pool_floor_signer_share_bps, 2_500);
+        assert_eq!(DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS, 2_500);
         assert_eq!(
-            resolved.pool_floor_signer_share_bps,
-            DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS
+            resolved.pool_floor_signer_max_windows, 0,
+            "the window ceiling ships off — a cold-start retry loop burns one \
+             permanent window per attempt, so a ceiling of k locks a session key \
+             out after k warm-up failures"
         );
-        assert_eq!(
-            resolved.pool_floor_signer_max_windows,
-            DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS
-        );
+        assert_eq!(DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS, 0);
 
         let explicit = types::BlockchainConfig {
             pool_floor_signer_share_bps: Some(10_000),

@@ -1137,7 +1137,11 @@ pub struct DecdnMetrics {
     /// only place the distinction lives — a rising value means one signer holds its
     /// whole share un-vouchered while the pool as a whole is solvent, either by
     /// abandoning streams or by running more concurrent un-vouchered streams than
-    /// its share covers.
+    /// its share covers. Wire-indistinguishable from `insufficient_deposit` (both
+    /// sign as `NotFound`, so a prober cannot map a pool's floor consumption), so
+    /// this counter is the only place the distinction survives — and the two
+    /// remedies differ: a pool shortfall clears with a top-up, a signer at its
+    /// share does not.
     /// Visible name:
     /// `decdn_serve_stream_rejected_signer_floor_at_cap_total`.
     pub serve_stream_rejected_signer_floor_at_cap: Counter,

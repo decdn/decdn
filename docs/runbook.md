@@ -399,6 +399,10 @@ revenue flat while requests arrive; `decdn fetch` against this node returns
 - `decdn_serve_stream_rejected_signer_floor_at_cap_total`, the sibling counter for
   a refusal where the pool is solvent but ONE capability signer has filled its share
   of the un-vouchered floor. It rises while `…insufficient_deposit_total` stays flat.
+  This counter has **no alert rule**: it is dashboard- and log-only, so cause 3
+  below is found by looking, not by being paged. The node's own `warn!` for it runs
+  on a separate 5-minute window from the deposit line above, so neither arm can
+  starve the other or mix its `suppressed` count.
 - Grafana panel **Payment-class serve refusals (all collapse to NotFound)**. Its
   series are a subset of the ten reject reasons that share that one wire code, so
   a client cannot distinguish them and the server-side counters are the only place
@@ -423,7 +427,10 @@ alone cannot tell the first two apart — this is why the log line exists:
    `dead_charge` is permanent until the pool is reclaimed on-chain, so a top-up does
    NOT clear it: the client rotates its session key, or the operator raises
    `blockchain.pool_floor_signer_share_bps` if the signer is honest and highly
-   concurrent.
+   concurrent. That knob is **restart-required** — `blockchain.*` is not a reload
+   section, so `decdn node reload` neither applies nor validates a new value, and a
+   value out of `1..=10_000` fails at the next start rather than at the reload.
+   Rotating the session key is the remedy that takes effect immediately.
 
 A fourth, rarer cause: the operator's own
 `blockchain.buyer_working_deposit_micro_usdc` is too small for the *upstream*

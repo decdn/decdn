@@ -1126,7 +1126,10 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         warn_ignored("network.* (bind_port, relay_urls, relay_url, discovery)");
     }
     if file.blockchain.is_some() {
-        warn_ignored("blockchain.* (rpc_url, eth_keystore, contract addresses)");
+        warn_ignored(
+            "blockchain.* (rpc_url, eth_keystore, contract addresses, \
+             pool_floor_signer_share_bps, pool_floor_signer_max_windows)",
+        );
     }
     if file
         .cache

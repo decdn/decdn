@@ -186,11 +186,14 @@ pub struct ResolvedBlockchain {
     /// Share of a pool's refundable headroom (`remaining − M`), in basis points,
     /// that any one capability signer may hold as un-vouchered floor credit
     /// (ADR 003 § Pool solvency, per-signer floor isolation). Guaranteed in
-    /// `1..=10_000` (the resolver rejects anything else). Defaults to `2500`.
+    /// `1..=10_000` (the resolver rejects anything else); the guarantee holds only
+    /// for a value the resolver produced. Defaults to `2500`.
     pub pool_floor_signer_share_bps: u64,
     /// Absolute ceiling on the per-signer floor sub-cap, in ramp-start credit
     /// windows (ADR 003 § Pool solvency, per-signer floor isolation). `0` disables
-    /// the ceiling. Defaults to `16`.
+    /// the ceiling, which is the default — see
+    /// `decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS` for why it is
+    /// opt-in.
     pub pool_floor_signer_max_windows: u64,
 }
 
