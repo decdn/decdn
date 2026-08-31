@@ -202,15 +202,14 @@ impl ClientHandler {
                 if delivered.saturating_sub(paid) >= window {
                     break;
                 }
-                let Some((chunk_vec, clen)) = next_chunk.take() else {
+                let Some(frame) = next_chunk.take() else {
                     break;
                 };
-                let clen_u64 = clen as u64;
+                let clen_u64 = frame.total() as u64;
                 // Assemble before the write, and outside the metered block: a framing
                 // fault here is the node's own bug, and metering it as a client
                 // abandon would file it under the peer's behaviour.
-                let bufs =
-                    chunk_frame_bufs(&chunk_vec, clen).map_err(|e| self.meter_frame_fault(e))?;
+                let bufs = chunk_frame_bufs(&frame).map_err(|e| self.meter_frame_fault(e))?;
                 // A downstream drop surfaces here as `Err` (#856 client-disconnect
                 // shape); meter the client-abandon, then propagate so the caller drops
                 // the pull leg.

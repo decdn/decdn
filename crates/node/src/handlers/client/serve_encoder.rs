@@ -22,7 +22,6 @@
 //! is `Send` (the iroh accept bound): the cache streams are `Send`, held only behind
 //! `&mut self`.
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -38,7 +37,7 @@ use futures_util::StreamExt;
 use iroh_io::{AsyncSliceReader, AsyncStreamWriter};
 use tokio::sync::{Notify, mpsc};
 
-use super::wire::{FrameAccountingFault, drain_frame};
+use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
 
 /// How long the data reader polls for the store to MATERIALIZE the blob (admit its
 /// first chunk group) before a present-range watch can be opened.
@@ -276,10 +275,9 @@ pub(super) struct CoherentFrameProducer {
     enc: Option<Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>>,
     rx: mpsc::Receiver<Bytes>,
     /// Queue of encoded bytes not yet cut into a frame, kept `Bytes`-native for a
-    /// vectored QUIC write without copying payload bytes.
-    queue: VecDeque<Bytes>,
-    /// Total bytes currently queued.
-    queued: usize,
+    /// vectored QUIC write without copying payload bytes. [`FrameQueue`] holds its
+    /// byte count in step with the chunks.
+    queue: FrameQueue,
     /// The encode faulted. Terminal: the queue is cleared and no further frame is
     /// ever cut — not because the queued bytes are suspect, but because the delivery
     /// is being abandoned, so cutting another frame would bill the client for a
@@ -346,51 +344,47 @@ impl CoherentFrameProducer {
         Ok(Self {
             enc: Some(enc),
             rx,
-            queue: VecDeque::new(),
-            queued: 0,
+            queue: FrameQueue::new(),
             faulted: false,
             hash,
         })
     }
 
-    /// The next wire frame as a set of `Bytes` chunks, totalling up to `target`
-    /// bytes (or the shorter final remainder), then `None` once the whole range
-    /// is delivered.
+    /// The next wire frame as a [`FrameChunks`], totalling up to `target` bytes (or
+    /// the shorter final remainder), then `None` once the whole range is delivered.
     ///
-    /// Zero-copy: returned `Vec<Bytes>` holds reference-counted slices of the
-    /// encoder's output, so the caller can send them via a single vectored QUIC
-    /// write without copying payload bytes. The `usize` beside them is their total
-    /// byte count, which is both what the frame header declares to the client and
-    /// what the serve leg bills for.
+    /// Zero-copy: the frame holds reference-counted slices of the encoder's output,
+    /// so the caller can send them via a single vectored QUIC write without copying
+    /// payload bytes. [`FrameChunks::total`] is their total byte count, which is both
+    /// what the frame header declares to the client and what the serve leg bills for.
     ///
     /// # Errors
     ///
     /// An encode fault (a gap the pull could not fill, or a proof/verify error), a
-    /// `target` of zero, a `queued`/`queue` desync, or any call after a fault. A
-    /// fault is terminal — the queue is dropped and later calls error rather than
-    /// answering `None`, because `None` is how the serve leg learns the range is
-    /// complete. On any of these the serve leg must not send `StreamEnd`.
+    /// `target` of zero, or any call after a fault. A fault is terminal — the queue
+    /// is dropped and later calls error rather than answering `None`, because `None`
+    /// is how the serve leg learns the range is complete. On any of these the serve
+    /// leg must not send `StreamEnd`.
     pub(super) async fn next_frame_chunks(
         &mut self,
         target: usize,
-    ) -> anyhow::Result<Option<(Vec<Bytes>, usize)>> {
+    ) -> anyhow::Result<Option<FrameChunks>> {
         if self.faulted {
             anyhow::bail!("coherent encode already faulted; refusing to serve further frames");
         }
         // A zero target can never cut a frame: it short-circuits below before the
-        // encoder is pumped even once, and `cut` then refuses — but names a
-        // `queued`/`queue` desync, which is the wrong cause. `frame_target` never
-        // returns zero: every term it minimizes over is at least one, and the room
-        // term floors at a bao chunk group. This restates that floor where the
-        // failure would otherwise be misattributed.
+        // encoder is pumped even once. `frame_target` never returns zero: every term
+        // it minimizes over is at least one, and the room term floors at a bao chunk
+        // group. This restates that floor where the failure would otherwise be silent.
         if target == 0 {
             tracing::error!(hash = %self.hash, "serve leg asked for a zero-length frame");
             return Err(anyhow::Error::new(FrameAccountingFault)
                 .context("refusing to cut a zero-length frame"));
         }
         loop {
-            if self.queued >= target {
-                return self.cut(target);
+            if self.queue.len() >= target {
+                // `len >= target >= 1`, so the queue is non-empty and `cut` is `Some`.
+                return Ok(self.queue.cut(target));
             }
             let pumped = match self.pump().await {
                 Ok(v) => v,
@@ -403,51 +397,16 @@ impl CoherentFrameProducer {
                     return Err(e);
                 }
             };
-            if let Some(bytes) = pumped {
-                let len = bytes.len();
-                if len > 0 {
-                    self.queued = self.queued.saturating_add(len);
-                    self.queue.push_back(bytes);
-                }
-            } else {
-                // Encoder finished and channel drained: flush any final partial
-                // frame, then signal completion.
-                if self.queued == 0 {
-                    // `None` is how the serve leg learns the range is complete, so it
-                    // must rest on the queue itself and not only on its counter: an
-                    // under-counting `queued` would end a truncated delivery with
-                    // `StreamEnd` and collect the closing voucher for it.
-                    anyhow::ensure!(
-                        self.queue.is_empty(),
-                        "queued reads 0 with {} chunks still queued; refusing to \
-                         report the range as fully delivered",
-                        self.queue.len()
-                    );
-                    return Ok(None);
-                }
-                return self.cut(self.queued);
+            match pumped {
+                Some(bytes) => self.queue.push(bytes),
+                // Encoder finished and channel drained: flush any final partial frame,
+                // then signal completion. `cut` returns `None` exactly when the queue
+                // is empty, which is how the serve leg learns the range is complete;
+                // the queue holds its count in step with its bytes, so an empty queue
+                // is a genuinely delivered range and never a desync.
+                None => return Ok(self.queue.cut(self.queue.len())),
             }
         }
-    }
-
-    /// Cut one frame of up to `take` bytes off the queue, which holds at least one
-    /// byte. `None` from [`drain_frame`] there is a `queued`/`queue` desync, and
-    /// returning it would tell the serve leg the range is fully delivered.
-    fn cut(&mut self, take: usize) -> anyhow::Result<Option<(Vec<Bytes>, usize)>> {
-        let Some(frame) = drain_frame(&mut self.queue, &mut self.queued, take) else {
-            tracing::error!(
-                hash = %self.hash,
-                queued = self.queued,
-                target = take,
-                "queued byte count disagrees with the queue; refusing to cut a frame"
-            );
-            return Err(anyhow::Error::new(FrameAccountingFault).context(format!(
-                "cut no chunks from {} queued bytes at target {take}; refusing to \
-                 report the range as fully delivered",
-                self.queued
-            )));
-        };
-        Ok(Some(frame))
     }
 
     /// Test-only coalescing view of [`Self::next_frame_chunks`], for assertions that
@@ -455,16 +414,16 @@ impl CoherentFrameProducer {
     /// spans several queued chunks.
     #[cfg(test)]
     pub(super) async fn next_frame(&mut self, target: usize) -> anyhow::Result<Option<Bytes>> {
-        let Some((chunks, total)) = self.next_frame_chunks(target).await? else {
+        let Some(frame) = self.next_frame_chunks(target).await? else {
             return Ok(None);
         };
-        if chunks.len() == 1 {
-            let mut iter = chunks.into_iter();
-            return Ok(iter.next());
+        let chunks = frame.chunks();
+        if let [only] = chunks {
+            return Ok(Some(only.clone()));
         }
-        let mut out = bytes::BytesMut::with_capacity(total);
+        let mut out = bytes::BytesMut::with_capacity(frame.total());
         for c in chunks {
-            out.extend_from_slice(&c);
+            out.extend_from_slice(c);
         }
         Ok(Some(out.freeze()))
     }
@@ -520,7 +479,6 @@ impl CoherentFrameProducer {
     fn poison(&mut self, e: &anyhow::Error) {
         self.faulted = true;
         self.queue.clear();
-        self.queued = 0;
         tracing::error!(
             hash = %self.hash,
             error = %e,
@@ -679,8 +637,10 @@ mod tests {
             err.to_string().contains("already faulted"),
             "the second call must refuse, not report the range delivered: {err}"
         );
-        assert_eq!(producer.queued, 0, "a fault drops the queued bytes");
-        assert!(producer.queue.is_empty(), "a fault clears the queue");
+        assert!(
+            producer.queue.is_empty(),
+            "a fault clears the queue and drops the queued bytes"
+        );
     }
 
     /// A frame wider than one encoder output chunk must arrive as several `Bytes`.
@@ -709,11 +669,12 @@ mod tests {
         let store = NodeRangedStore::new(engine.clone(), hash, total);
         let mut producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total)
             .expect("align");
-        let (chunks, frame_total) = producer
+        let frame = producer
             .next_frame_chunks(total as usize)
             .await
             .expect("the encode runs")
             .expect("a frame");
+        let chunks = frame.chunks();
         assert!(
             chunks.len() > 1,
             "a whole-range frame must stay several uncopied slices, got {}",
@@ -721,7 +682,7 @@ mod tests {
         );
         assert_eq!(
             chunks.iter().map(Bytes::len).sum::<usize>(),
-            frame_total,
+            frame.total(),
             "the reported total counts the bytes actually handed over"
         );
     }
