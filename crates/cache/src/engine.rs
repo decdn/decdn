@@ -2352,8 +2352,17 @@ impl CacheEngine {
     /// in `partial_protected`) the store write is skipped — a single fill admits
     /// many ranges, and only the first need pay the tag write. The memo is cleared
     /// whenever the tag is dropped (`drop_named_tags_for`), so a re-admit after an
-    /// eviction re-protects. GC never removes a set tag, so a live memo entry
-    /// always reflects a live tag.
+    /// eviction re-protects.
+    ///
+    /// The memo is a best-effort optimization, not a memo↔tag invariant: the
+    /// `contains_key`/`insert` here and the `remove` in `drop_named_tags_for` are
+    /// not atomic against the store, so a `protect_partial` racing a concurrent
+    /// evict of the same hash can leave the memo set while the tag was deleted.
+    /// That never affects served correctness — served bytes are hash-verified, and
+    /// an operator takedown blocks serving through the logical evicted set, not
+    /// through this tag (see `evict`). Its only cost is that such a partial may go
+    /// unprotected and be GC-reclaimed, which self-corrects on the next pull.
+    /// Concurrent first-admits merely repeat one idempotent `set`.
     async fn protect_partial(&self, hash: Hash) -> CacheResult<()> {
         if self.inner.partial_protected.contains_key(&hash) {
             return Ok(());
@@ -2391,8 +2400,12 @@ impl CacheEngine {
     /// operator-evict / mismatch rates; not something to call on a hot path.
     async fn drop_named_tags_for(&self, hash: Hash) -> CacheResult<u64> {
         // Invalidate the partial-protection memo before touching the store, so a
-        // concurrent or later admit re-issues the protecting tag rather than
-        // trusting a stale "already protected" entry for a tag we are removing.
+        // later admit re-issues the protecting tag rather than trusting a stale
+        // "already protected" entry for the tag we are removing. Clearing it up
+        // front (not after the deletes) also means a delete failure mid-loop still
+        // leaves the memo clear, so a re-admit re-protects. This is best-effort,
+        // not atomic against a concurrent `protect_partial` of the same hash — the
+        // race is benign for the reasons documented on `protect_partial`.
         self.inner.partial_protected.remove(&hash);
         let tags = self.inner.store.tags();
         // Collect matching names before deleting so the (immutable) list
