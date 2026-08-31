@@ -29,10 +29,17 @@
 //!
 //! The bucket ledger is a plain `Mutex<HashMap>` and every operation on it is
 //! O(1) — nothing iterates under the lock. The seam is not there to escape a
-//! long hold; it is there so a serve's final step joins no queue at all behind
-//! the buy loop and the eviction driver, which take that lock on their own
-//! cadences while a stream is still holding its lane slot and floor
-//! reservation.
+//! long hold. It is there so a serve's final step joins no queue at all: a
+//! stream that has finished its bytes still holds its lane slot and its floor
+//! reservation until that step returns, so waiting on a lock somebody else
+//! happens to hold costs a serve slot for the length of the wait.
+//!
+//! Two things take that lock in the shipped wiring. The buy loop takes it on
+//! the cache-miss path — [`WarmingAllowance::available`] to gate a speculative
+//! pull, then [`WarmingAllowance::debit_speculative`] when one goes ahead. The
+//! aggregator takes it to apply each queued credit. Eviction does not: its only
+//! contact with the allowance is [`WarmingAllowance::forget`], which touches the
+//! tag map alone.
 //!
 //! The hash-to-source tags live outside that lock in a [`DashMap`], so the
 //! serve path resolves the source itself and enqueues `(source, units)`. That
@@ -123,6 +130,23 @@ struct State {
 /// Bounds speculative warming losses per upstream source node.
 ///
 /// See the module docs for the serve-vindicated accounting model.
+///
+/// # Poisoning
+///
+/// Every acquisition of `state` recovers the inner value rather than
+/// propagating the poison. The whole of each critical section is a `HashMap`
+/// entry insert, an `Instant` read (`Instant::elapsed` saturates rather than
+/// panicking), and saturating `i64` arithmetic, so there is no reachable unwind
+/// and recovered state is never torn.
+///
+/// Recovering is also the safe direction on each of the three paths that take
+/// the lock, which is why it is uniform here rather than split per method.
+/// Skipping a [`Self::debit_speculative`] would let a source buy speculatively
+/// without paying the grief cap for it, and skipping the aggregator's apply
+/// would strand a serve's realized margin. Refusing on [`Self::available`] is
+/// the conservative direction for that one call, but it blocks every
+/// speculative buy node-wide for the process lifetime with no signal, which is
+/// a worse operational failure than the unreachable one it guards against.
 #[derive(Debug)]
 pub struct WarmingAllowance {
     budget: i64,
@@ -199,18 +223,19 @@ impl WarmingAllowance {
     /// The source that speculatively bought `hash`, or `None` if the hash was
     /// never warmed or has since been forgotten.
     ///
-    /// One lock-free shard read. The serve path calls this to bind a credit to
-    /// the source that was tagged at serve time, so that a credit applied later
-    /// cannot follow a tag that changed in between.
+    /// One shard-scoped read on the tag map, never the bucket lock. The serve
+    /// path calls this to bind a credit to the source that was tagged at serve
+    /// time, so that a credit applied later cannot follow a tag that changed in
+    /// between.
     #[must_use]
-    pub fn source_for(&self, hash: Hash) -> Option<SourceId> {
+    fn source_for(&self, hash: Hash) -> Option<SourceId> {
         self.source_of.get(&hash).map(|e| *e.value())
     }
 
     /// Credits `units` of realized margin directly to `source`, capped at
     /// `+budget`. The half of [`Self::credit_serve`] that touches the ledger,
     /// split out so a deferred credit can resolve its source first.
-    pub fn credit_source(&self, source: SourceId, units: u64) {
+    fn credit_source(&self, source: SourceId, units: u64) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let bucket = state.buckets.entry(source).or_insert_with(Bucket::fresh);
         self.refill(bucket);
@@ -221,7 +246,15 @@ impl WarmingAllowance {
     /// Credits the realized margin of a serve back to the source that
     /// speculatively bought `hash`. No-op if `hash` has no known source
     /// (never warmed, or forgotten since). The gain is capped at `+budget`.
-    pub fn credit_serve(&self, hash: Hash, units: u64) {
+    ///
+    /// Resolving the source and applying the credit in one step is what the
+    /// shipped serve path must not do — it binds the source at apply time, so
+    /// an eviction and a re-warm in between would pay the wrong source. The
+    /// production path splits the two across the sink and the aggregator
+    /// instead, which leaves this used only by `DirectWarmingCreditSink` and
+    /// the tests that assert against it. It carries their gate for that reason.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn credit_serve(&self, hash: Hash, units: u64) {
         if let Some(source) = self.source_for(hash) {
             self.credit_source(source, units);
         }
@@ -244,10 +277,11 @@ pub const WARMING_CREDIT_CAPACITY: usize = 1024;
 ///
 /// A stream task calls [`Self::credit`] as its last act on a clean completion,
 /// so the implementation MUST NOT take the bucket lock. Every ledger operation
-/// is O(1), so the hazard is not a long hold — it is that the buy loop and the
-/// eviction driver take that lock on their own cadences, and a serve completion
-/// queued behind either keeps the stream's lane slot and floor reservation
-/// alive for no reason. The runtime uses the channel sink from
+/// is O(1), so the hazard is not a long hold — it is that a serve completion
+/// which waits for the lock at all keeps the stream's lane slot and floor
+/// reservation alive for the length of the wait. The buy loop holds that lock
+/// on the cache-miss path and the aggregator holds it to apply credits; a serve
+/// arriving in either window pays for it. The runtime uses the channel sink from
 /// [`spawn_warming_creditor`]; tests use the `test-support`
 /// `DirectWarmingCreditSink`.
 ///
@@ -371,9 +405,10 @@ impl WarmingCreditSink for DirectWarmingCreditSink {
 /// enqueues through and the [`StopHandle`] that stops the task.
 ///
 /// This is what takes the bucket lock off the stream task (see the module
-/// Seam): a serve completion resolves the source from a lock-free tag map and
-/// does one bounded `try_send`, and this task takes the lock instead, behind
-/// whichever pass of the buy loop or the eviction driver holds it.
+/// Seam): a serve completion resolves the source from the tag map — one shard
+/// read, never the bucket lock — and does one bounded `try_send`. This task
+/// takes the bucket lock instead, where waiting behind the buy loop costs a
+/// queued credit rather than a held lane slot.
 ///
 /// The handle is returned rather than detached so shutdown can await the drain
 /// and a task that died is visible as a join error instead of as credits that
@@ -516,10 +551,11 @@ mod tests {
 
     /// A serve completion's credit must not wait on the ledger lock.
     ///
-    /// The buy loop and the eviction driver take that lock for whole passes of
-    /// their own bookkeeping. The credit goes over a bounded channel, so it
-    /// lands while a pass holds the ledger; applying it inline on the stream
-    /// task would make the serve's final step wait for that pass to finish.
+    /// The buy loop takes that lock on the cache-miss path, so a serve can
+    /// finish while it is held. The credit goes over a bounded channel and lands
+    /// anyway; applying it inline on the stream task would make the serve's
+    /// final step wait for the holder to be done, with the stream's lane slot
+    /// and floor reservation still charged for the wait.
     #[tokio::test]
     async fn credit_does_not_wait_on_the_ledger_lock() {
         let allowance = Arc::new(WarmingAllowance::new(1000, 0));

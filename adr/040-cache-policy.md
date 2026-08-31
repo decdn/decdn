@@ -112,7 +112,7 @@ eviction's sweep-time ranking and promotion decision both read the same
 buffered frequency signal.
 
 The shipped estimator is W-TinyLFU, implemented in-tree with no external
-dependency: a count-min sketch with periodic halving for aging, sized to a
+dependency: a count-min sketch that ages by halving its counters, sized to a
 fixed in-process memory budget (`sketch_bytes`). It is not durable. State is
 lost on restart, matching the empty-on-boot behavior of `lru` recency
 tracking.
@@ -140,6 +140,16 @@ compare estimates on one scale: admission tests an estimate against a node-wide
 threshold, and eviction ranks candidates from different shards against each
 other. A shard clocked on its own traffic would age at a rate set by key skew,
 and two blobs of equal true frequency would then get different estimates.
+
+The node catches a counter up to the clock when it reads the counter. It does
+not age counters continuously. A ranking pass reads each candidate separately.
+The pass carries one halving of skew for each window boundary it crosses.
+
+A halving that applies evenly across a pass cannot invert the ranking. It only
+creates ties. Two candidates read on opposite sides of a boundary can misorder.
+Estimates within a factor of two can swap. The window is `cols * 10`
+observations, so a sweep crosses a boundary rarely. The next sweep reads both
+candidates on one side of the boundary and corrects the order.
 
 ### Probationary admission (mechanism C)
 
@@ -212,8 +222,8 @@ exists, range reclaim is future work, external to this ADR.
 admission_policy = "always"     # "always" | "tinylfu"   (default "always")
 eviction_policy  = "lru"        # "lru"    | "tinylfu"   (default "lru")
 
-[cache.tinylfu]                 # inert unless a selector = "tinylfu"
-sketch_bytes         = 262144
+[cache.tinylfu]                 # unused unless a selector = "tinylfu"
+sketch_bytes         = 262144   # minimum 16384
 promotion_threshold  = 2
 probation_target_pct = 10
 aging_halflife_sec   = 600
@@ -224,6 +234,21 @@ aging_halflife_sec   = 600
 itself. An unknown selector name is a config error at load; there is no
 silent fallback. The `[cache.tinylfu]` parameters resolve but stay unused
 when neither selector names `tinylfu`.
+
+The node validates those parameters whether or not a selector names
+`tinylfu`. A parameter that is out of range stays out of range when an
+operator switches the selector later. The node rejects it at load. It never
+clamps it to a working value, because a clamp hides the mistake.
+
+`sketch_bytes` carries a floor of 16384 bytes. The sketch holds one counter
+per byte, over four rows, so the floor buys 4096 columns. The floor comes
+from an over-report target. The sketch reports a blob hotter than it is only
+when another blob collides with it in every row. The sketch shards its
+columns, and a shard match applies to all rows at once, so the whole-sketch
+rate is `SHARDS^(ROWS-1) / cols^ROWS`. At 4096 columns that rate is `1.5e-11`
+for each pair of live blobs. A node that holds 10000 blobs then expects fewer
+than `1e-3` false-hot pairs. The rate grows with the square of the blob count,
+so a larger node needs a wider sketch. The default is 16 times the floor.
 
 Cache policy is node-local. A node's disk is its own resource. Policy
 selection is operator configuration, not a governance or consensus

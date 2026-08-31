@@ -103,7 +103,14 @@ profit and loss. A speculative buy of a blob from a source — one that clears o
 because of the market-price band, not the profit-guarantee price — debits that
 source's allowance by the buy cost and tags the blob with its source. Every serve
 of a tagged blob credits the source's allowance the realized margin, capped at
-`B`. Eviction forgets the tag. A blob re-served two or more times fully refunds
+`B`. The node applies that credit off the serve path. A serve puts the credit on
+a bounded queue. A background task takes it off the queue and applies it. The
+serve's last step then never waits on the allowance ledger. A full queue drops
+the credit. A drop leaves the source more negative than its true profit and
+loss. It can only throttle warming from that source. It can never over-fund the
+source, and the time refill forgives it.
+`decdn_warming_credits_dropped_total` counts every drop. Eviction forgets the
+tag. A blob re-served two or more times fully refunds
 its buy, so an honest source stays warm; a blob served once nets the fee skim as a
 loss and stays drained, so a source that keeps selling duds is cut off. A slow
 time refill forgives a transient bad patch. While a source's allowance is
@@ -265,6 +272,10 @@ deposit.
   runs; a blob commands only the market price until it warms.
 - Neither the estimate nor the allowance is durable. After a restart a hot blob
   re-enters at the market price and each source's allowance resets to full.
+- Serve credits are best-effort. A full queue drops a credit. A shutdown
+  discards the credits that the drain deadline does not reach. Every drop is
+  conservative, and the node counts it. A source can still read as more drained
+  than its true profit and loss.
 
 ## Acceptance Criteria
 
@@ -279,9 +290,11 @@ deposit.
    allowance, so warming works on a flat market; once the source's allowance is
    spent, its cold blobs clear only at `amortized`.
 4. Each source (a seller node identity) has a warming allowance capped at `B`; a
-   speculative buy debits it, and each re-serve of a source-tagged blob credits it
-   (serve-vindicated), with a slow time refill. The allowance is keyed on the
-   source node, not the client.
+   speculative buy debits it, and each re-serve of a source-tagged blob enqueues
+   a credit for it (serve-vindicated), with a slow time refill. The allowance is
+   keyed on the source node, not the client. A credit binds to the source that
+   the tag names at serve time. A re-warm from a different source before the
+   node applies the credit cannot redirect it.
 5. `max_buy` composes with `cache.max_rate_per_mb` by the lower-of rule and is
    enforced at buy commit, so a higher rate in a signed response aborts the leg.
 6. The operator share comes from the `FeeRouter` shares, seeded at startup and

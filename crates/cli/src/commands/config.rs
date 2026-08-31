@@ -999,10 +999,10 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # eviction_policy = "lru"                  # ADR 040: "lru" or "tinylfu"; restart-required
 # admission_policy = "always"              # ADR 040: "always" or "tinylfu"; restart-required
 # [cache.tinylfu]                          # W-TinyLFU tuning (ADR 040); consulted only when eviction_policy or admission_policy above is "tinylfu"
-# sketch_bytes = 262144                    # count-min sketch size, shared by admission and eviction
+# sketch_bytes = 262144                    # count-min sketch size, shared by admission and eviction; minimum 16384
 # promotion_threshold = 2                  # prior sightings before a probation member promotes to main
 # probation_target_pct = 10                # % of cache_size_mb the probation segment is capped to; bounds [1,50]
-# aging_halflife_sec = 600                 # reserved: not yet consulted by the shipped sketch (fixed sample-count reset)
+# aging_halflife_sec = 600                 # reserved: not yet consulted by the shipped sketch (fixed observation-count window)
 # [cache.serve_economics]                  # refuse-to-serve economics (ADR 041)
 # policy = "margin"                        # "off" or "margin"
 # discount = 0.5                           # (0.0, 1.0]; discount applied to the sell price for the margin gate

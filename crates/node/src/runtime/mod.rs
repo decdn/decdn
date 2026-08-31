@@ -1335,7 +1335,8 @@ async fn build_chain_and_handlers(
     // ADR 041 serve-credit inputs: a non-blocking sink in front of the SAME warming
     // allowance the buy loop debits and the eviction path forgets, plus the live
     // operator fee-share cell. The background aggregator behind the sink is what
-    // keeps a serve's final step off the bucket lock those two passes take.
+    // keeps a serve's final step off the bucket lock the buy loop takes. Eviction
+    // shares the allowance but not that lock — `forget` touches the tag map only.
     let (warming_credit, warming_creditor) = crate::warming_allowance::spawn_warming_creditor(
         Arc::clone(&warming),
         Arc::clone(&infra.node_metrics),

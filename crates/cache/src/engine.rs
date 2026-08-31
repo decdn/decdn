@@ -6594,51 +6594,99 @@ mod tests {
 
     /// A concurrent record must not make the eviction sweep *lose* a candidate.
     ///
-    /// The sharded walk gave up point-in-time atomicity on purpose: a record
-    /// landing mid-walk may or may not appear. What it must never do is drop a
+    /// The sharded walk is not point-in-time, by design: a record landing
+    /// mid-walk may or may not appear. What it must never do is drop a
     /// hash that was already in the map when the walk started, because
     /// `eviction_candidates` is the only source of eviction candidates — a hash
     /// silently skipped by every sweep is a blob that is never reclaimed, which
     /// is unbounded disk growth. `DashMap::iter` holds each shard's read guard
     /// for that shard's traversal, so a concurrent insert can add to a shard the
     /// walk has not reached but cannot remove from one it has. This pins that.
+    ///
+    /// A round only counts once its result carries a hash the writer produced
+    /// *after the walk began* — the writer's counter is sampled either side of
+    /// the walk, and only that window's keys are accepted as witnesses. A key
+    /// written before the walk started proves nothing: the walk would find it in
+    /// a quiet map too. Scheduling decides whether a given round lands one, so
+    /// rounds repeat until one does; the no-candidate-lost invariant is checked
+    /// on every round either way.
     #[tokio::test]
     async fn a_scan_never_loses_a_candidate_to_a_concurrent_record() -> anyhow::Result<()> {
+        const WRITER_BASE: u32 = 1_000_000;
         let tmp = tempfile::tempdir()?;
         let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
 
-        // Seed enough hashes to spread across every shard.
-        let seeded: Vec<Hash> = (0..512u32).map(|i| Hash::new(i.to_le_bytes())).collect();
+        // Seed enough hashes to spread across every shard and to give the walk
+        // enough work that a concurrent writer can get inside it.
+        let seeded: Vec<Hash> = (0..4096u32).map(|i| Hash::new(i.to_le_bytes())).collect();
         for h in &seeded {
             engine.inner.access_times.insert(*h, Instant::now());
         }
 
-        // Hammer the map with fresh hashes for the duration of the walk.
-        let stop = Arc::new(AtomicBool::new(false));
-        let writer = {
-            let engine = engine.clone();
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                let mut i = 1_000_000u32;
-                while !stop.load(Ordering::Relaxed) {
-                    engine.observe_hit(Hash::new(i.to_le_bytes()));
-                    i = i.saturating_add(1);
-                }
-            })
-        };
+        let mut overlapped = false;
+        for _ in 0..16 {
+            // Hammer the map with fresh hashes for the duration of the walk.
+            let stop = Arc::new(AtomicBool::new(false));
+            let written = Arc::new(AtomicU64::new(0));
+            let writer = {
+                let engine = engine.clone();
+                let stop = Arc::clone(&stop);
+                let written = Arc::clone(&written);
+                std::thread::spawn(move || {
+                    let mut i = WRITER_BASE;
+                    while !stop.load(Ordering::Relaxed) {
+                        engine.observe_hit(Hash::new(i.to_le_bytes()));
+                        written.fetch_add(1, Ordering::Relaxed);
+                        i = i.saturating_add(1);
+                    }
+                })
+            };
 
-        let candidates = engine.eviction_candidates();
-        stop.store(true, Ordering::Relaxed);
-        anyhow::ensure!(writer.join().is_ok(), "the recording thread panicked");
+            // Do not start the walk until the writer is provably running, or the
+            // scan can finish before the thread is even scheduled. Bounded, so a
+            // writer that dies before its first record fails the test instead of
+            // hanging it with the panic trapped in an unjoined thread.
+            let spin_deadline = Instant::now() + Duration::from_secs(10);
+            while written.load(Ordering::Relaxed) == 0 {
+                anyhow::ensure!(
+                    Instant::now() < spin_deadline,
+                    "the recording thread never recorded an access"
+                );
+                std::thread::yield_now();
+            }
 
-        let missing = seeded
-            .iter()
-            .filter(|h| !candidates.contains_key(h))
-            .count();
+            // The writer bumps its counter *after* the insert lands, so keys
+            // `[before, after)` are exactly those it could have written while
+            // the walk was running.
+            let before = written.load(Ordering::Relaxed);
+            let candidates = engine.eviction_candidates();
+            let after = written.load(Ordering::Relaxed);
+            stop.store(true, Ordering::Relaxed);
+            anyhow::ensure!(writer.join().is_ok(), "the recording thread panicked");
+
+            let missing = seeded
+                .iter()
+                .filter(|h| !candidates.contains_key(h))
+                .count();
+            anyhow::ensure!(
+                missing == 0,
+                "the sweep dropped {missing} of {} pre-existing candidates",
+                seeded.len()
+            );
+
+            // Did this round's walk actually see a record that landed inside it?
+            let during: HashSet<Hash> = (before..after)
+                .filter_map(|n| u32::try_from(n).ok())
+                .map(|n| Hash::new(WRITER_BASE.saturating_add(n).to_le_bytes()))
+                .collect();
+            overlapped |= candidates.iter().any(|(h, _)| during.contains(h));
+            if overlapped {
+                break;
+            }
+        }
         anyhow::ensure!(
-            missing == 0,
-            "the sweep dropped {missing} of {} pre-existing candidates",
-            seeded.len()
+            overlapped,
+            "no round overlapped the writer, so the walk was never concurrent"
         );
         Ok(())
     }

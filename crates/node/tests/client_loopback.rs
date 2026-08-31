@@ -8457,12 +8457,17 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
 /// just through the inline test sink.
 ///
 /// Every other ADR 041 test here reads the ledger synchronously and so uses
-/// `DirectWarmingCreditSink`. That leaves the production wiring
+/// `DirectWarmingCreditSink`. That leaves the shipped chain
 /// (`credit_warming_serve` -> resolve the source -> `try_send` -> aggregator ->
-/// `credit_source`) proven by unit tests alone: a regression that dropped the
-/// runtime's `spawn_warming_creditor` call, or an aggregator that never drained,
-/// would keep every one of them green. This drives the real sink end-to-end over
-/// a real paid fetch, and polls because the apply is asynchronous by design.
+/// `credit_source`) proven by unit tests alone: an aggregator that never drained
+/// would keep every one of them green. This drives that chain end-to-end over a
+/// real paid fetch, and polls because the apply is asynchronous by design.
+///
+/// Scope: the test builds its own deps and spawns its own aggregator, so it
+/// covers the chain, not the runtime's wiring of it. A regression that dropped
+/// `build_chain_and_handlers`' assignment of `warming_credit` leaves this green
+/// — the handler would fall back to the no-op default, and every serve credit in
+/// production would vanish with the drop counter still reading zero.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_completed_serve_credits_the_source_through_the_background_aggregator()
 -> anyhow::Result<()> {

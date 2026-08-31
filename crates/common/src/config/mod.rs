@@ -287,6 +287,28 @@ pub const DEFAULT_EVICTION_POLICY: &str = "lru";
 pub const DEFAULT_ADMISSION_POLICY: &str = "always";
 /// Default `cache.tinylfu.sketch_bytes` (ADR 040).
 pub const DEFAULT_TINYLFU_SKETCH_BYTES: usize = 262_144;
+/// Floor for `cache.tinylfu.sketch_bytes` (ADR 040 §Configuration surface).
+///
+/// One `u8` per counter over the sketch's four rows means `cols = bytes / 4`,
+/// so this floor buys 4096 columns.
+///
+/// It is set from an over-report target. A count-min sketch reports a key
+/// hotter than it is only when another key collides with it in every row. The
+/// sketch shards its columns, and the shard match is all-or-nothing across the
+/// rows, so that whole-sketch rate is `SHARDS^(ROWS-1) / cols^ROWS` rather than
+/// `cols^-ROWS`. At 4096 columns it is `1.5e-11` per pair of live hashes, which
+/// keeps a node holding `10_000` of them below `1e-3` expected false-hot pairs.
+///
+/// Two things to hold onto before moving this number. The rate grows as
+/// `N^2 / cols^4` in the live-hash count, so this is a floor and not a
+/// recommendation — a node holding `100_000` blobs wants
+/// [`DEFAULT_TINYLFU_SKETCH_BYTES`], 16 times wider. And it is only the
+/// whole-sketch rate that sharding inflates: the per-row collision rate is
+/// `1 / cols` whether the sketch is sharded or not.
+pub const MIN_TINYLFU_SKETCH_BYTES: usize = 16_384;
+// A default below its own floor would make every node that ships without a
+// `[cache.tinylfu]` block fail to start.
+const _: () = assert!(DEFAULT_TINYLFU_SKETCH_BYTES >= MIN_TINYLFU_SKETCH_BYTES);
 /// Default `cache.tinylfu.promotion_threshold` (ADR 040).
 pub const DEFAULT_TINYLFU_PROMOTION_THRESHOLD: u32 = 2;
 /// Default `cache.tinylfu.probation_target_pct` (ADR 040).
@@ -1960,6 +1982,25 @@ fn resolve_cache_into(
     let tinylfu_promotion_threshold = tinylfu_file
         .and_then(|t| t.promotion_threshold)
         .unwrap_or(DEFAULT_TINYLFU_PROMOTION_THRESHOLD);
+    // `sketch_bytes / 4` is the sketch's column count, and the rate at which it
+    // reports a cold blob as hot grows as the fourth power of that count
+    // shrinking. Reject an undersized one at load, never clamp (ADR 040
+    // §Configuration surface). The check does not consult the policy selectors:
+    // a knob that is wrong stays wrong when an operator switches to `tinylfu`,
+    // and the two checks below are unconditional for the same reason.
+    bag.check_with(
+        tinylfu_sketch_bytes >= MIN_TINYLFU_SKETCH_BYTES,
+        "cache.tinylfu.sketch_bytes",
+        || {
+            format!(
+                "cache.tinylfu.sketch_bytes ({tinylfu_sketch_bytes}) must be >= \
+                 {MIN_TINYLFU_SKETCH_BYTES}: a narrower sketch reports cold blobs \
+                 as hot often enough to move admission and eviction decisions. \
+                 It is validated whether or not a policy selector names \
+                 \"tinylfu\"."
+            )
+        },
+    );
     // `promotion_threshold` counts prior sightings before a probation member
     // admits to `Main`; zero is nonsensical — it would make admission
     // always-`Main` and promote everything, defeating probationary admission.
@@ -4576,6 +4617,53 @@ mod tests {
         assert!(
             resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
             "promotion_threshold = 0 must be rejected"
+        );
+    }
+
+    /// `sketch_bytes` below the floor buys too few columns per shard for the
+    /// estimates to separate distinct blobs, so the resolver rejects it rather
+    /// than clamping (ADR 040 §Configuration surface).
+    #[test]
+    fn resolve_cache_rejects_an_undersized_sketch() {
+        let sized = |bytes: usize, admission: &str| {
+            let cli = empty_cache_args();
+            let toml = types::CacheConfig {
+                admission_policy: Some(admission.to_string()),
+                tinylfu: Some(types::TinyLfuConfig {
+                    sketch_bytes: Some(bytes),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir"))
+                .err()
+                .map(|e| e.to_string())
+        };
+
+        // Name the knob in the assertion: the resolver bags every check into one
+        // error, so a bare `is_err()` would pass on any unrelated failure.
+        let err = sized(MIN_TINYLFU_SKETCH_BYTES - 1, "tinylfu")
+            .unwrap_or_else(|| "resolved without error".to_string());
+        assert!(
+            err.contains("cache.tinylfu.sketch_bytes"),
+            "the floor rejection must name the knob, got: {err}"
+        );
+
+        // The floor itself resolves — an off-by-one to `>` would reject the
+        // exact value the docs tell an operator is allowed.
+        assert!(
+            sized(MIN_TINYLFU_SKETCH_BYTES, "tinylfu").is_none(),
+            "the documented minimum must be accepted"
+        );
+
+        // Validation does not consult the policy selectors (ADR 040
+        // §Configuration surface): a knob that is wrong under `always` is still
+        // wrong the day an operator switches to `tinylfu`.
+        let inert = sized(MIN_TINYLFU_SKETCH_BYTES - 1, "always")
+            .unwrap_or_else(|| "resolved without error".to_string());
+        assert!(
+            inert.contains("cache.tinylfu.sketch_bytes"),
+            "the floor applies whether or not a selector names tinylfu, got: {inert}"
         );
     }
 

@@ -674,7 +674,8 @@ pub struct TinyLfuConfig {
     /// Reserved: half-life in seconds for aging the frequency sketch. Absent
     /// => [`crate::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC`] (600).
     /// Currently resolved and stored but not consulted — the shipped sketch
-    /// ages via a fixed sample-count reset rather than a wall-clock half-life.
+    /// ages on a fixed observation-count window rather than a wall-clock
+    /// half-life.
     pub aging_halflife_sec: Option<u64>,
 }
 
