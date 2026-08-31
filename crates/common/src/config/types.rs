@@ -572,25 +572,34 @@ pub struct CacheConfig {
     /// allowance, so the fallback loop reaches every ranked candidate (#859).
     ///
     /// It does NOT bound the streaming stage (#1134) — that is
-    /// [`Self::node_pull_stall_timeout_sec`]. A wall clock over the bytes would
+    /// [`Self::node_pull_stall_window_sec`]. A wall clock over the bytes would
     /// cap the blob size a node can pull through at roughly
     /// `this × link speed`.
     pub node_pull_timeout_sec: Option<u64>,
-    /// Inactivity timeout in seconds for the STREAMING stage of an upstream pull
-    /// (#1134). Absent => [`crate::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`]
-    /// (20). The clock resets on every byte received, so this trips only when an
-    /// upstream goes silent mid-transfer — never because a blob is large or a link
-    /// is slow. It is what makes a pull of any size safe to leave uncapped.
+    /// Throughput-floor window in seconds for the STREAMING stage of an upstream pull
+    /// (#1797). Absent => [`crate::config::DEFAULT_NODE_PULL_STALL_WINDOW_SEC`] (20). Bytes
+    /// read off the QUIC stream are counted sub-frame, and the pull aborts when the bytes
+    /// across the trailing window fall below [`Self::node_pull_min_throughput_bps`] — so the
+    /// signal is frame-size-independent and indifferent to blob size. It is what makes a pull
+    /// of any size safe to leave uncapped.
     ///
-    /// Tune it against upstream responsiveness, not content size: too low and a
-    /// brief network hiccup abandons a healthy transfer (and scores the upstream
-    /// `Unreachable`); too high and a dead upstream is held onto for longer than
-    /// necessary before the fallback loop moves on.
+    /// Tune it against upstream responsiveness, not content size: too short and a brief
+    /// network hiccup abandons a healthy transfer; too long and a dead upstream is held onto
+    /// for longer than necessary before the fallback loop moves on. The abort is
+    /// requester-local policy and does NOT score the upstream's reputation (#1797).
     ///
-    /// "Longer" is multiplied, not added. A silent candidate costs one full window of
-    /// this, and the derived outer deadline budgets that for EVERY candidate, so a second
-    /// here is ~3 seconds of worst-case client wait on a total miss (167.5 s at defaults).
-    pub node_pull_stall_timeout_sec: Option<u64>,
+    /// "Longer" is multiplied, not added. A silent candidate costs one full window of this,
+    /// and the derived outer deadline budgets that for EVERY candidate, so a second here is
+    /// ~3 seconds of worst-case client wait on a total miss (167.5 s at defaults).
+    pub node_pull_stall_window_sec: Option<u64>,
+    /// Minimum sustained upstream throughput in bytes per second over
+    /// [`Self::node_pull_stall_window_sec`] (#1797). Absent =>
+    /// [`crate::config::DEFAULT_NODE_PULL_MIN_THROUGHPUT_BPS`] (4096). A stream whose
+    /// throughput stays below this floor for a full window is abandoned — catching both a
+    /// wedged upstream (throughput to zero) and a slow drip (a trickle that never trips a
+    /// bare idle timeout). `0` disables the throughput test and leaves pure idle detection:
+    /// at least one byte per window.
+    pub node_pull_min_throughput_bps: Option<u64>,
     /// Cache eviction policy selector (ADR 040). Absent =>
     /// [`crate::config::DEFAULT_EVICTION_POLICY`] (`"lru"`). Must be `"lru"` or
     /// `"tinylfu"`; an unrecognized name is rejected at config load rather than

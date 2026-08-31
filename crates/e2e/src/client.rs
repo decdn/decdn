@@ -256,7 +256,7 @@ impl ClientFixture {
                 // Loopback fixture: wall clock on the open, inactivity on the
                 // stream, no overall cap (#1134). Both budgets are non-zero literals, so
                 // the `ZeroBudget` arm is unreachable here — propagate rather than unwrap.
-                PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
+                PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30), 4096)?,
                 0,
                 0,
                 &mut progress,
@@ -403,7 +403,7 @@ impl ClientFixture {
             namespace_id.to_be_bytes(),
             byte_offset,
             TIMESTAMP_US,
-            PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
+            PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30), 4096)?,
             0,
             0,
             &mut progress,
@@ -752,7 +752,7 @@ impl ClientFixture {
             decdn_protocol::client::NO_NAMESPACE,
             0,
             timestamp_us,
-            PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
+            PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30), 4096)?,
             0,
             0,
             &mut VoucherProgress::default(),

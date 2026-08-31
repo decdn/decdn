@@ -332,18 +332,18 @@ pub const DEFAULT_NODE_PULL_PROBE_FANOUT: usize = 5;
 ///
 /// It does NOT cover the buyer-channel open, which precedes it on its own 5 s budget
 /// (`CHANNEL_OPEN_CALLER_BUDGET`), nor the streaming that follows it, which is bounded by
-/// inactivity ([`DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`]). All three are sequential stages
-/// of ONE candidate attempt, and the node derives the overall pull-through deadline as
-/// `MAX_PROVIDER_ATTEMPTS × (channel open + this + stall) + a fixed discovery allowance`,
+/// the throughput floor ([`DEFAULT_NODE_PULL_STALL_WINDOW_SEC`]). All three are sequential
+/// stages of ONE candidate attempt, and the node derives the overall pull-through deadline
+/// as `MAX_PROVIDER_ATTEMPTS × (channel open + this + window) + a fixed discovery allowance`,
 /// so the fallback loop can reach every ranked candidate before the serving path gives up
 /// (#859).
 ///
 /// Raising this to give a slow L2 more room does nothing: that is the channel open, on the
 /// budget named above.
 pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
-/// Default INACTIVITY bound (seconds) on the streaming stage of an upstream pull
-/// (#1134). The clock resets on every byte received, so it trips only when an
-/// upstream falls silent — never because a blob is large or a link is slow.
+/// Default THROUGHPUT-FLOOR window (seconds) on the streaming stage of an upstream pull
+/// (#1797). Bytes are counted off the QUIC stream sub-frame, so it trips only when
+/// throughput falls below the floor — never because a blob is large or a frame is big.
 ///
 /// Set equal to [`DEFAULT_NODE_PULL_TIMEOUT_SEC`] because both answer the same
 /// question ("how long do we wait on an unresponsive upstream?"), just at
@@ -357,7 +357,12 @@ pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 /// loop never reaches the others (#859, and the reason this knob is an argument to that
 /// function). So each second added here adds ~3 to the worst-case wait a client can see on
 /// a total miss: 167.5 s at defaults.
-pub const DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC: u64 = 20;
+pub const DEFAULT_NODE_PULL_STALL_WINDOW_SEC: u64 = 20;
+/// Default minimum sustained upstream throughput (bytes/sec) over
+/// [`DEFAULT_NODE_PULL_STALL_WINDOW_SEC`] (#1797). At ~40× a 100 B/s drip and far below any
+/// honest link, it catches a slow-drip wedge without tripping on a genuinely slow client.
+/// `0` disables the throughput test and leaves pure idle detection (one byte per window).
+pub const DEFAULT_NODE_PULL_MIN_THROUGHPUT_BPS: u64 = 4096;
 
 /// Default downstream credit-window ceiling (ADR 003 §Credit window): 64 MiB. A
 /// stream's window ramps from one chunk toward this cap in proportion to what
@@ -1854,24 +1859,25 @@ fn resolve_cache_into(
         "cache.node_pull_timeout_sec must be > 0 (a 0 budget abandons every upstream \
          before its handshake can complete, so no pull can ever succeed)",
     );
-    let node_pull_stall_timeout_sec = file
-        .and_then(|c| c.node_pull_stall_timeout_sec)
-        .unwrap_or(DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC);
-    // Rejecting 0 here matters more than it does for most knobs, because #1134 made
-    // a stall REPUTATION-AFFECTING. A 0 budget trips `PullStalled` on the first poll
-    // of every streaming read, and `classify_pull_failure` scores that `Unreachable`
-    // into the local per-peer EWMA (ADR 008). So a single fat-fingered value would
-    // not merely break this node: it would score every honest peer it touches as
-    // unreachable. Contrast the sibling knob `node_pull_timeout_sec`: a bad value
-    // there trips `PullTimeout`, which is exonerating, so its blast radius stops at the
-    // local node.
+    let node_pull_stall_window_sec = file
+        .and_then(|c| c.node_pull_stall_window_sec)
+        .unwrap_or(DEFAULT_NODE_PULL_STALL_WINDOW_SEC);
+    // A 0 window makes the throughput floor demand progress over no time at all, so it
+    // trips on the first poll of every streaming read and abandons every upstream before a
+    // byte can arrive. The abort is non-attributable (#1797), so a fat-fingered value here
+    // does not defame peers the way the pre-#1797 zero stall did — but it still wedges this
+    // node's pull path, so it is rejected at load.
     bag.check(
-        node_pull_stall_timeout_sec > 0,
-        "cache.node_pull_stall_timeout_sec",
-        "cache.node_pull_stall_timeout_sec must be > 0 (a 0 budget marks every \
-         upstream as stalled on the first read, scoring every honest peer as \
-         unreachable)",
+        node_pull_stall_window_sec > 0,
+        "cache.node_pull_stall_window_sec",
+        "cache.node_pull_stall_window_sec must be > 0 (a 0 window makes the throughput \
+         floor unsatisfiable, abandoning every upstream on the first read)",
     );
+    // The floor RATE may legitimately be 0 — that is idle-detection mode (one byte per
+    // window) — so only the window duration is bounded below.
+    let node_pull_min_throughput_bps = file
+        .and_then(|c| c.node_pull_min_throughput_bps)
+        .unwrap_or(DEFAULT_NODE_PULL_MIN_THROUGHPUT_BPS);
     // Cache admission/eviction policy selectors (ADR 040). Unknown names are
     // rejected here, at config load — never a silent fallback to the default
     // policy, which would mask an operator typo behind quietly-unchanged
@@ -2007,7 +2013,8 @@ fn resolve_cache_into(
         relay_foreign_namespaces,
         node_pull_probe_fanout,
         node_pull_timeout_sec,
-        node_pull_stall_timeout_sec,
+        node_pull_stall_window_sec,
+        node_pull_min_throughput_bps,
         eviction_policy,
         admission_policy,
         tinylfu: ResolvedTinyLfu {
@@ -4300,21 +4307,21 @@ mod tests {
         Ok(())
     }
 
-    /// A zero stall budget is the most dangerous value in this file (#1134 review).
-    /// `PullStalled` SCORES the peer, and `record_outcome` writes the local
-    /// per-peer EWMA (ADR 008). So a `0` here would not merely break this node: it
-    /// would trip on the first poll of every streaming read and score every
-    /// honest peer the node touches as `Unreachable`.
+    /// A zero throughput-floor window wedges this node's pull path (#1797): the floor demands
+    /// progress over no time at all, so it trips on the first poll of every streaming read and
+    /// abandons every upstream before a byte can arrive. The abort is non-attributable, so it
+    /// no longer defames peers the way a zero stall once did — but a node that can never
+    /// complete a pull is still a broken node, so the window must be rejected at load.
     #[test]
-    fn resolve_cache_rejects_zero_stall_timeout() {
+    fn resolve_cache_rejects_zero_stall_window() {
         let cli = empty_cache_args();
         let toml = types::CacheConfig {
-            node_pull_stall_timeout_sec: Some(0),
+            node_pull_stall_window_sec: Some(0),
             ..Default::default()
         };
         assert!(
             resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
-            "a 0 stall budget must be rejected: it would score every honest peer as unreachable"
+            "a 0 window must be rejected: the throughput floor would abandon every upstream"
         );
     }
 

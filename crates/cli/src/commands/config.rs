@@ -262,10 +262,11 @@ pub fn write_validate_summary<W: std::io::Write>(
     if resolved.cache.node_to_node_pull_through_enabled {
         writeln!(
             w,
-            "  node_to_node_pull:        enabled (probe_fanout={}, pull_timeout_sec={}, stall_timeout_sec={})",
+            "  node_to_node_pull:        enabled (probe_fanout={}, pull_timeout_sec={}, stall_window_sec={}, min_throughput_bps={})",
             resolved.cache.node_pull_probe_fanout,
             resolved.cache.node_pull_timeout_sec,
-            resolved.cache.node_pull_stall_timeout_sec
+            resolved.cache.node_pull_stall_window_sec,
+            resolved.cache.node_pull_min_throughput_bps
         )?;
     } else {
         writeln!(w, "  node_to_node_pull:        disabled")?;
@@ -982,8 +983,9 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # node_to_node_pull_through_enabled = false # paid cache-miss pull from upstream nodes (#831, ADR 001/022); OFF by default
 # relay_foreign_namespaces = true          # relay content this node's own backend does not hold (#1759); default is role-derived — origin-only (false) when a [cache.origin]/[[cache.origins]] backend is configured, relay (true) when none is; set explicitly to override
 # node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
-# node_pull_timeout_sec = 20               # per-upstream STREAM-OPEN timeout (connect/handshake/response) on a node-to-node miss; NOT the channel open, which has its own 5s budget. The overall pull-through deadline is derived from this, the channel-open budget, and the stall timeout, so every ranked upstream can be tried before falling back (#831, #859)
-# node_pull_stall_timeout_sec = 20         # per-upstream INACTIVITY timeout while streaming (#1134); the clock resets on every byte, so it trips only on a silent upstream — not on a large blob or a slow link. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (167.5s at defaults)
+# node_pull_timeout_sec = 20               # per-upstream STREAM-OPEN timeout (connect/handshake/response) on a node-to-node miss; NOT the channel open, which has its own 5s budget. The overall pull-through deadline is derived from this, the channel-open budget, and the stall window, so every ranked upstream can be tried before falling back (#831, #859)
+# node_pull_stall_window_sec = 20          # per-upstream THROUGHPUT-FLOOR window while streaming (#1797); bytes are counted off the stream sub-frame, so it trips only when throughput falls below the floor — not on a large blob or a big frame. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (167.5s at defaults)
+# node_pull_min_throughput_bps = 4096      # minimum sustained upstream throughput (bytes/sec) over node_pull_stall_window_sec (#1797); catches a slow-drip wedge. 0 = idle detection only (one byte per window). The abort is requester-local and does not score the upstream's reputation
 # eviction_policy = "lru"                  # ADR 040: "lru" or "tinylfu"; restart-required
 # admission_policy = "always"              # ADR 040: "always" or "tinylfu"; restart-required
 # [cache.tinylfu]                          # W-TinyLFU tuning (ADR 040); consulted only when eviction_policy or admission_policy above is "tinylfu"
@@ -1278,7 +1280,8 @@ mod tests {
             relay_foreign_namespaces,
             node_pull_probe_fanout,
             node_pull_timeout_sec,
-            node_pull_stall_timeout_sec,
+            node_pull_stall_window_sec,
+            node_pull_min_throughput_bps,
             eviction_policy,
             admission_policy,
             tinylfu,
@@ -1340,8 +1343,12 @@ mod tests {
             ("node_pull_probe_fanout =", node_pull_probe_fanout.is_none()),
             ("node_pull_timeout_sec =", node_pull_timeout_sec.is_none()),
             (
-                "node_pull_stall_timeout_sec =",
-                node_pull_stall_timeout_sec.is_none(),
+                "node_pull_stall_window_sec =",
+                node_pull_stall_window_sec.is_none(),
+            ),
+            (
+                "node_pull_min_throughput_bps =",
+                node_pull_min_throughput_bps.is_none(),
             ),
             ("eviction_policy =", eviction_policy.is_none()),
             ("admission_policy =", admission_policy.is_none()),

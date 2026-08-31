@@ -1,13 +1,13 @@
 //! Client-only multi-source fetch orchestration (spec §5.3): fan a request out
-//! across several paid [`BlobSource`](crate::source::BlobSource)s that all write
-//! into ONE shared [`IngestStore`](crate::source::IngestStore), assembling a
+//! across several paid [`BlobSource`]s that all write
+//! into ONE shared [`IngestStore`], assembling a
 //! byte-identical blob.
 //!
-//! One worker future per source drives [`fill_gap`](crate::driver::fill_gap)
+//! One worker future per source drives [`fill_gap`]
 //! over the request's gap-set. The gap-set is split into large,
 //! bao-group-aligned contiguous segments (one per source), and a freed source
 //! does not idle: it *steals* the aligned second half of the largest range
-//! still in flight ([`steal_split`](crate::segment::steal_split)), so a fast
+//! still in flight ([`steal_split`]), so a fast
 //! source keeps helping a slow one.
 //!
 //! # Lane correctness — one unit per source

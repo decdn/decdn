@@ -530,8 +530,8 @@ const DEFAULT_TEST_PULL_DEADLINES: (Duration, Duration) =
 /// deadline budgets.
 ///
 /// The interesting value is a ZERO one. `NodeOriginConfig::deadlines()` refuses it and marks
-/// the error `LocalPullFault`, because a zero stall would trip `PullStalled` on the first
-/// poll of every read and score `Unreachable` against every honest peer this node touches.
+/// the error `LocalPullFault`, because a zero window makes the throughput floor unsatisfiable
+/// and would abandon every upstream on the first poll of every read (#1797).
 ///
 /// It is the one local fault a test can induce at OPEN time, which is what makes it the only
 /// handle a WIRE-level test has on the #1560 path: the fault has to land before the
@@ -807,7 +807,8 @@ async fn build_origin_with_probe_caches(
             // derivation out of step. Callers that want a generous bound ask for it
             // by name — see [`DEFAULT_TEST_PULL_DEADLINES`].
             pull_timeout,
-            stall_timeout,
+            stall_window: stall_timeout,
+            min_throughput_bps: 0,
             max_blob_size_bytes,
             max_rate_per_mb: 0,
             working_deposit,
@@ -959,7 +960,8 @@ async fn build_origin_multi_hash(
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout,
-            stall_timeout,
+            stall_window: stall_timeout,
+            min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
@@ -1519,7 +1521,8 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
             // Generous by intent, like [`DEFAULT_TEST_PULL_DEADLINES`]: a loaded
             // runner must not end a pull this fixture is not measuring.
             pull_timeout: DEFAULT_TEST_PULL_DEADLINES.0,
-            stall_timeout: DEFAULT_TEST_PULL_DEADLINES.1,
+            stall_window: DEFAULT_TEST_PULL_DEADLINES.1,
+            min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
             working_deposit: U256::ZERO,
@@ -4406,26 +4409,26 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
     Ok(())
 }
 
-/// #1134: an upstream that opens honestly and then goes SILENT mid-stream must be
-/// abandoned on the INACTIVITY budget and SCORED for it.
+/// #1797: an upstream that opens honestly and then goes SILENT mid-stream must be
+/// abandoned on the THROUGHPUT FLOOR — classified as a stall, but NON-ATTRIBUTABLE.
 ///
-/// This is the only test that behaviourally separates `PullStalled` from
-/// `PullTimeout`, and the separation is the point of the whole deadline split:
+/// This test separates `PullStalled` from `PullTimeout` as METRICS, and pins that
+/// neither scores the peer:
 ///
-/// - `PullTimeout` is OUR wall clock expiring. It fires on healthy transfers (a
-///   big blob, a slow link), so it must NOT tar the peer — and
+/// - `PullTimeout` is the floor firing before the first byte — our own budget, which
+///   scales with blob size, so it must not tar the peer;
 ///   `node_origin_pull_falls_through_a_stalled_candidate` pins that exoneration.
-/// - `PullStalled` is the peer going quiet while we wait, with the deadline reset
-///   on every byte of progress. It cannot fire on a healthy transfer, so it is
-///   real evidence of an unreachable peer — and must score exactly like one.
+/// - `PullStalled` is the floor firing after bytes have flowed. Under #1797 it is
+///   ALSO non-attributable: a stream that falls below the floor may be slow for
+///   reasons the peer cannot be blamed for, and a throughput signal is spoofable, so
+///   it is metered and the `(peer, hash)` pair is suppressed but reputation is left
+///   untouched.
 ///
-/// Before the split, this failure shape produced a `PullTimeout` (the whole-blob
-/// deadline) and the silent peer was exonerated. Reverting `pull_from_candidate`
-/// to `PullDeadlines::whole_transfer(pull_timeout)` restores that: the stalled
-/// counter stays 0 and the score stays neutral.
+/// So the two differ only in which counter increments; the score stays neutral either
+/// way.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
-async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> {
+async fn node_origin_mid_stream_silence_does_not_score_stalled_upstream() -> Result<()> {
     // Advertise a big blob but send only a few frames, so the receive loop is left
     // genuinely waiting for the rest.
     let payload = vec![0x7Du8; PAYLOAD_LEN];
@@ -4508,15 +4511,16 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
     // The stall was CLASSIFIED as a stall, not as our own deadline firing.
     assert_counter(&b_metrics, "node_pull_stalled_total", 1)?;
     assert_counter(&b_metrics, "node_pull_timeout_total", 0)?;
-    // …and scored: the peer answered, took our request, and then stopped
-    // delivering. Unlike every other exonerated arm, THIS one tars the provider.
-    assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
+    // …but NOT scored (#1797): a throughput-floor abort is requester-local policy, the same
+    // non-attributable class as `PullTimeout`. No `Unreachable` outcome is recorded.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
     assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
 
+    // The local score is untouched — the peer keeps its neutral default.
     anyhow::ensure!(
-        local_rep.score(a_id) < 0.5,
-        "a mid-stream stall must drop the local score below neutral, got {}",
+        (local_rep.score(a_id) - 0.5).abs() < 1e-9,
+        "a mid-stream stall must NOT move the local score off neutral (#1797), got {}",
         local_rep.score(a_id)
     );
 
@@ -4524,28 +4528,26 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
     Ok(())
 }
 
-/// The mirror image of the test above, and the line between them is the whole point: a peer
-/// that never sent a FIRST byte must NOT be scored `Unreachable` (#1145 review).
+/// The mirror image of the test above, and the line between them is which METRIC the abort
+/// increments: a peer that never sent a FIRST byte is classified `PullTimeout`, not
+/// `PullStalled` (#1145 review, #1797). Neither scores the peer.
 ///
-/// `PullStalled` earns the right to score a peer `Unreachable` from the deadline's reset — a clock
-/// that resets on every byte can only fire on a peer that stopped delivering. That argument
-/// needs a byte to have arrived. Before the first one there has been no reset, and the clock
-/// is measuring something else entirely: the server's TIME TO FIRST BYTE, which scales with
-/// blob size, because the serve path writes the `StreamResponse` and only then materialises
-/// the whole bao wire encoding (`export_bao_range`) before it can emit chunk #1.
+/// The split at the first byte is about attribution language, not reputation. Before the
+/// first byte the throughput floor is measuring the server's TIME TO FIRST BYTE, which scales
+/// with blob size, because the serve path writes the `StreamResponse` and only then
+/// materialises the whole bao wire encoding (`export_bao_range`) before it can emit chunk #1.
 ///
 /// So a 1 GiB blob — the default `max_blob_size_mb` — read off a cold disk, or served by a
-/// node already streaming to several peers, could blow the 20 s default stall budget doing
-/// exactly what it was asked. The requester then scored it `Unreachable`: a local EWMA hit
-/// against an honest server, for the crime of being big.
+/// node already streaming to several peers, can exceed the 20 s default window doing exactly
+/// what it was asked. That wait is our own budget, not the peer's fault, so it counts as
+/// `PullTimeout`.
 ///
-/// The fix gives that wait the same verdict the OPEN stage already gives an identical wait —
-/// `PullTimeout`, exonerating — on the same grounds: a bound of ours elapsing over bounded
-/// server work says nothing about the peer. Nothing is given up that the open stage has not
-/// already given up, and the pull still fails and still yields the candidate slot.
+/// Under #1797 the post-first-byte case (`PullStalled`) is ALSO non-attributable, so the two
+/// verdicts differ only in which counter increments — this test pins the `PullTimeout` half,
+/// its sibling above pins the `PullStalled` half, and both assert the score stays neutral.
 ///
-/// Zero prefix chunks is the entire fixture. Its sibling above sends three, and must still
-/// score — the two together pin the boundary at exactly one byte.
+/// Zero prefix chunks is the entire fixture. Its sibling above sends three; the two together
+/// pin the metric boundary at exactly one byte.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -> Result<()> {
@@ -9080,7 +9082,8 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
             // Generous by intent, like [`DEFAULT_TEST_PULL_DEADLINES`]: a loaded
             // runner must not end a pull this fixture is not measuring.
             pull_timeout: DEFAULT_TEST_PULL_DEADLINES.0,
-            stall_timeout: DEFAULT_TEST_PULL_DEADLINES.1,
+            stall_window: DEFAULT_TEST_PULL_DEADLINES.1,
+            min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
@@ -10796,7 +10799,8 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
             // Generous by intent, like [`DEFAULT_TEST_PULL_DEADLINES`]: a loaded
             // runner must not end a pull this fixture is not measuring.
             pull_timeout: DEFAULT_TEST_PULL_DEADLINES.0,
-            stall_timeout: DEFAULT_TEST_PULL_DEADLINES.1,
+            stall_window: DEFAULT_TEST_PULL_DEADLINES.1,
+            min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
@@ -12096,7 +12100,8 @@ async fn build_origin_economics(
             // Generous by intent, like [`DEFAULT_TEST_PULL_DEADLINES`]: a loaded
             // runner must not end a pull this fixture is not measuring.
             pull_timeout: DEFAULT_TEST_PULL_DEADLINES.0,
-            stall_timeout: DEFAULT_TEST_PULL_DEADLINES.1,
+            stall_window: DEFAULT_TEST_PULL_DEADLINES.1,
+            min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
             working_deposit: U256::ZERO,

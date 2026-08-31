@@ -111,7 +111,9 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
             node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
             node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
-            node_pull_stall_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
+            node_pull_stall_window_sec: decdn_common::config::DEFAULT_NODE_PULL_STALL_WINDOW_SEC,
+            node_pull_min_throughput_bps:
+                decdn_common::config::DEFAULT_NODE_PULL_MIN_THROUGHPUT_BPS,
             eviction_policy: decdn_common::config::DEFAULT_EVICTION_POLICY.to_string(),
             admission_policy: decdn_common::config::DEFAULT_ADMISSION_POLICY.to_string(),
             tinylfu: decdn_common::config::ResolvedTinyLfu {

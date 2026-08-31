@@ -814,16 +814,15 @@ pub struct DecdnMetrics {
     /// It fires on **two** budgets, and they have different remedies (#1145 review):
     ///
     /// - the STREAM-OPEN stage exceeding `node_pull_timeout_sec`; and
-    /// - a pull that has received no first byte within `node_pull_stall_timeout_sec`. Before
-    ///   the first chunk, that clock is measuring the server's time-to-FIRST-byte, which
-    ///   scales with blob size (the serve path materialises the whole bao encoding before it
-    ///   can emit chunk #1) — so it is our deadline, not the peer's fault, and it lands here
-    ///   rather than on `node_pull_stalled_total`.
+    /// - a pull that has received no first byte within `node_pull_stall_window_sec`. Before
+    ///   the first chunk, the throughput floor is measuring the server's time-to-FIRST-byte,
+    ///   which scales with blob size (the serve path materialises the whole bao encoding
+    ///   before it can emit chunk #1) — so it is our deadline, not the peer's fault, and it
+    ///   lands here rather than on `node_pull_stalled_total`.
     ///
     /// A sustained rate therefore means one of those two is too tight for the upstreams this
-    /// node selects — and for the large-blob case it is `node_pull_stall_timeout_sec`, not
-    /// `node_pull_timeout_sec`, that wants raising. (The doc named only the latter, which is
-    /// the wrong knob for the flagship scenario it described.)
+    /// node selects — and for the large-blob case it is `node_pull_stall_window_sec`, not
+    /// `node_pull_timeout_sec`, that wants raising.
     ///
     /// The peer is not scored, but it IS suppressed briefly: see `REFUSAL_SUPPRESSION_TTL`.
     /// Exonerating a peer and ignoring it are different things, and a peer that accepts a
@@ -898,13 +897,15 @@ pub struct DecdnMetrics {
     /// peer health first; a small fraction is the healthy "that peer did not
     /// have it".
     pub node_pull_refused_unattributable: Counter,
-    /// `decdn_node_pull_stalled_total` (#1134): an upstream went silent mid-stream
-    /// — no byte of progress within `node_pull_stall_timeout_sec` — so the pull was
-    /// abandoned. UNLIKE `node_pull_timeout` (our own budget expiring, which is not
-    /// evidence about the peer), this one DOES tar the provider's reputation: the
-    /// clock resets on every byte received, so it can only fire on a provider that
-    /// stopped delivering while we waited. A sustained rate points at flaky
-    /// upstreams or a `node_pull_stall_timeout_sec` too tight for the network.
+    /// `decdn_node_pull_stalled_total` (#1797): an upstream's throughput fell below the
+    /// floor mid-stream — the bytes across `node_pull_stall_window_sec` dropped under
+    /// `node_pull_min_throughput_bps` — so the pull was abandoned after at least one byte had
+    /// arrived. Split from `node_pull_timeout` (the same abort before the first byte) only as
+    /// a metric: BOTH are requester-local policy and neither tars the provider's reputation,
+    /// because a sub-floor stream may be slow for reasons the peer cannot be blamed for and a
+    /// throughput signal is spoofable. A sustained rate points at flaky upstreams or a
+    /// `node_pull_min_throughput_bps` too high (or `node_pull_stall_window_sec` too tight)
+    /// for the network.
     pub node_pull_stalled: Counter,
     /// `decdn_node_pull_local_fault_total` (#1145 review): a pull failed for a reason
     /// that is OURS — a broken signer, an encode fault, a bad range computation, an

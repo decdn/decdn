@@ -88,7 +88,7 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 
 /// Outer deadline for a node-to-node pull-through, derived from the two configured
 /// per-candidate budgets: the stream-open timeout (`cache.node_pull_timeout_sec`) and
-/// the streaming inactivity timeout (`cache.node_pull_stall_timeout_sec`).
+/// the streaming throughput-floor window (`cache.node_pull_stall_window_sec`).
 ///
 /// The delivery handler wraps the whole `discover → probe → rank → pull` fetch
 /// in a single `tokio::time::timeout`. For the sequential `MAX_PROVIDER_ATTEMPTS`
@@ -106,7 +106,7 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 /// 2. the **stream open** — connect → handshake → verified `StreamResponse`,
 ///    bounded by `per_candidate` (#1134); then
 /// 3. **streaming**, which for a peer that opens honestly and then goes SILENT costs
-///    one full inactivity window (`stall`) before the pull gives up on it (#1134).
+///    one full throughput-floor window (`stall`) before the pull gives up on it (#1797).
 ///
 /// So the worst case for a candidate is `CHANNEL_OPEN_CALLER_BUDGET + per_candidate + stall`,
 /// and that is what this must budget `MAX_PROVIDER_ATTEMPTS` of, plus
@@ -116,9 +116,9 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 /// cache against a slow L2 burn the whole deadline on candidates #1 and #2 and never
 /// dial #3. Covering the channel open but not the stall window would leave the same hole
 /// for a peer that goes silent mid-stream instead of failing to open — and a worse one,
-/// because `stall` is operator-tunable: at `node_pull_stall_timeout_sec = 120` a single
+/// because `stall` is operator-tunable: at `node_pull_stall_window_sec = 120` a single
 /// silent candidate outlasts a two-term deadline on its own. Taking `stall` as an
-/// argument keeps this deadline in step with `node_pull_stall_timeout_sec`.
+/// argument keeps this deadline in step with `node_pull_stall_window_sec`.
 ///
 /// # What this deadline does not bound
 ///
@@ -460,7 +460,7 @@ mod tests {
     //
     // `stall` is swept independently of `per` because it is the term an operator can
     // raise on its own: a formula that ignores it looks fine at defaults and starves the
-    // loop at `node_pull_stall_timeout_sec = 120`.
+    // loop at `node_pull_stall_window_sec = 120`.
     #[test]
     fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
         let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
@@ -505,7 +505,7 @@ mod tests {
     // nodes and asserts the lookup is cut off before it reaches a record six hops away.
 
     // The defaults an operator actually runs: `node_pull_timeout_sec = 20` and
-    // `node_pull_stall_timeout_sec = 20` (both `DEFAULT_*` in decdn-common, which this
+    // `node_pull_stall_window_sec = 20` (both `DEFAULT_*` in decdn-common, which this
     // crate does not depend on — hence the literals). Pinned because the worst-case client
     // wait is a user-visible number RESTATED IN PROSE elsewhere, and it moved three times
     // while the formula was corrected — most recently when the slack stopped being a guess
@@ -516,7 +516,7 @@ mod tests {
     // comment named the wrong ones ("the CLI help and the metrics docs"; the metrics docs
     // never quoted it):
     //
-    //   - `common::config` (the `node_pull_timeout_sec` / `node_pull_stall_timeout_sec` docs)
+    //   - `common::config` (the `node_pull_timeout_sec` / `node_pull_stall_window_sec` docs)
     //   - `cli::commands::config` (the DEFAULT_CONFIG template)
     #[test]
     fn outer_pull_deadline_at_defaults_is_167_5s() {

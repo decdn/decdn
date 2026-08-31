@@ -603,9 +603,10 @@ impl StreamResponse {
 /// with no frame sent first (#1054).
 ///
 /// That is a fact about unrelated code, and it could change without anyone noticing
-/// which invariant they had just removed — while the reputation system
-/// depends on it, since a false `PullStalled` scores an honest peer as unreachable. That
-/// is too much weight for a convention, so the type carries the floor instead: the field
+/// which invariant they had just removed — while the requester's byte-progress stall
+/// detector depends on it (#1797): an empty frame advances neither the byte counter nor the
+/// voucher accounting, so a run of them would drive the receive loop without making progress.
+/// That is too much weight for a convention, so the type carries the floor instead: the field
 /// is private, both `ChunkData` doors reject an empty payload, and the
 /// `encode_chunk_*` helpers — which build no `ChunkData`, and among them
 /// [`encode_chunk_frame_headers`] is the door both serve paths use — restate the same
@@ -614,7 +615,7 @@ impl StreamResponse {
 #[serde(try_from = "ChunkDataWire")]
 pub struct ChunkData {
     /// Sequential blob bytes, at least one. Private: see the type's docs — this
-    /// is the invariant the inactivity deadline and, through it, `PullStalled` rest on.
+    /// is the invariant the requester's byte-progress stall detector rests on (#1797).
     bytes: Vec<u8>,
 }
 

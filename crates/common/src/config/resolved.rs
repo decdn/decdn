@@ -327,13 +327,18 @@ pub struct ResolvedCache {
     /// (#831). Default [`crate::config::DEFAULT_NODE_PULL_TIMEOUT_SEC`].
     ///
     /// Bounds the OPEN stage only; the streaming stage is bounded by
-    /// [`Self::node_pull_stall_timeout_sec`] (#1134).
+    /// [`Self::node_pull_stall_window_sec`] and [`Self::node_pull_min_throughput_bps`]
+    /// (#1797).
     pub node_pull_timeout_sec: u64,
-    /// Inactivity bound (seconds) on the streaming stage of an upstream pull; the
-    /// clock resets on every byte received, so it trips only on a silent upstream,
-    /// never on a large blob or a slow link (#1134). Default
-    /// [`crate::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`].
-    pub node_pull_stall_timeout_sec: u64,
+    /// Throughput-floor window (seconds) on the streaming stage of an upstream pull; bytes
+    /// are counted off the QUIC stream sub-frame, so it trips only when throughput falls
+    /// below the floor, never on a large blob (#1797). Default
+    /// [`crate::config::DEFAULT_NODE_PULL_STALL_WINDOW_SEC`].
+    pub node_pull_stall_window_sec: u64,
+    /// Minimum sustained upstream throughput (bytes/sec) over `node_pull_stall_window_sec`;
+    /// `0` = idle detection only (#1797). Default
+    /// [`crate::config::DEFAULT_NODE_PULL_MIN_THROUGHPUT_BPS`].
+    pub node_pull_min_throughput_bps: u64,
     /// Cache eviction policy selector (ADR 040). `"lru"` or `"tinylfu"`.
     /// Default [`crate::config::DEFAULT_EVICTION_POLICY`].
     pub eviction_policy: String,
