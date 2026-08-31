@@ -3390,10 +3390,19 @@ impl CacheEngine {
         R: AsyncStreamReader + Send,
     {
         let Some(size) = NonZeroU64::new(total_bytes) else {
+            // An empty blob has no bao to decode. Mirror iroh-blobs' own
+            // `import_bao_reader`: the canonical empty hash is a no-op success
+            // (nothing to import, store, or protect), while a zero size under any
+            // other hash is an upstream inconsistency (the signed `total_bytes`
+            // disagrees with a non-empty content hash) — a Store-class fault, as
+            // before.
+            if hash == Hash::EMPTY {
+                return Ok(reader);
+            }
             return Err((
                 reader,
                 CacheError::Store(anyhow::anyhow!(
-                    "admit_bao_stream: zero total_bytes for {hash}"
+                    "admit_bao_stream: zero total_bytes for non-empty hash {hash}"
                 )),
             ));
         };
@@ -9045,6 +9054,36 @@ mod tests {
                 "node {node:?} was captured during import"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn admit_bao_stream_handles_zero_total_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+
+        // The canonical empty blob is a no-op success: nothing to decode or admit.
+        engine
+            .admit_bao_stream(Hash::EMPTY, ChunkRanges::empty(), 0, Bytes::new(), None)
+            .await
+            .map_err(|(_reader, e)| e)
+            .expect("admitting the empty blob is a no-op success");
+
+        // A zero size under any OTHER hash is an upstream inconsistency (the signed
+        // total_bytes disagrees with a non-empty content hash) — a Store fault.
+        let (_reader, err) = engine
+            .admit_bao_stream(
+                Hash::from([9u8; 32]),
+                ChunkRanges::empty(),
+                0,
+                Bytes::new(),
+                None,
+            )
+            .await
+            .expect_err("zero size under a non-empty hash is rejected");
+        assert!(
+            matches!(err, CacheError::Store(_)),
+            "expected Store, got {err:?}"
+        );
     }
 
     #[tokio::test]
