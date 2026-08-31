@@ -47,14 +47,17 @@ struct FindValueRequest {
     requester: NodeId,    // caller's NodeId (for routing table update)
 }
 
-/// A coarse map of which DISCOVERY_BLOCK_BYTES (64 MiB) blocks of a blob a
-/// holder has verified in full. Bit `i` set ⇒ block `i` = bytes
-/// `[i·64MiB, min((i+1)·64MiB, total))` is present and root-verified. The
+/// A coarse map of which DISCOVERY_BLOCK_BYTES (64 MiB) blocks of a blob the
+/// sender will serve. Bit `i` set ⇒ the sender serves block `i` = bytes
+/// `[i·64MiB, min((i+1)·64MiB, total))`: either a cached, root-verified block,
+/// or — when the sender is an origin-serve-capable source for `H` — any block,
+/// which it warms and verifies against `H` on delivery. An origin knows the
+/// total size (it read it to answer at all), so it sets every bit. The
 /// granularity is decoupled from the 16 KiB bao verification granularity:
 /// coarse enough to keep records and probe frames small, fine enough to expose
-/// genuine disjointness between holders. An empty bitmap means "holds no
-/// verified discovery block" (a sub-block fragment reports empty and is not
-/// advertised); an all-ones bitmap means a full holder.
+/// genuine disjointness between holders. An empty bitmap means the sender
+/// serves no full block (a sub-block, non-origin fragment reports empty and is
+/// not advertised); an all-ones bitmap means a full holder or an origin.
 struct Coverage {
     blocks: Vec<u8>,         // bit-packed, little-endian block index
 }
@@ -219,7 +222,9 @@ A holder that has only some 64 MiB blocks of `H` is serving supply: disjoint blo
 
 **Probe response — fresh authority.** `cdn/probe/v1` carries the same 64 MiB coverage bitmap as an **unsigned** field in the probe extension ([ADR 013 § Tier 1](013-schema-evolution.md#adr-013-schema-evolution)), derived per-probe from the holder's live bitfield, so it is always current. A requester confirms coverage here before it commits a payment lane for a range.
 
-**The signed set stays frozen — no contract change.** The signed probe fields `{hash, has_blob, rate_per_mb, timestamp_us}` are unchanged ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). `has_blob` is redefined as "holds ≥1 verified 64 MiB block of `H`" — equivalently, the coverage bitmap is non-empty — which the contract's existing `hasBlob == true` possession check covers unchanged. The block granularity aligns the possession bool with what discovery can route on: a node that advertises has at least one full block to serve. A holder of only a sub-block fragment signs `has_blob: false` and is not discoverable, but serving any range of a blacklisted blob still signs `ok: true` over `H` in the `StreamResponse`, dispositive on its own, so every actual serve stays fully slashable regardless of the possession bool. No slash offense reads coverage detail, so the bitmap is unsigned; that also keeps the 64 MiB granularity a freely tunable knob rather than a typehash-frozen field.
+**The signed set stays frozen — no contract change.** The signed probe fields `{hash, has_blob, rate_per_mb, timestamp_us}` are unchanged ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). `has_blob` is redefined as "will serve ≥1 full 64 MiB block of `H`" — a cached, root-verified block, or any block when the node is an origin-serve-capable source — which is equivalently "the coverage bitmap is non-empty" and which the contract's existing `hasBlob == true` possession check covers unchanged. The block granularity aligns the possession bool with what discovery can route on: a node that advertises has at least one full block it will serve. A non-origin holder of only a sub-block fragment signs `has_blob: false` and is not discoverable, but serving any range of a blacklisted blob still signs `ok: true` over `H` in the `StreamResponse`, dispositive on its own, so every actual serve stays fully slashable regardless of the possession bool. No slash offense reads coverage detail, so the bitmap is unsigned; that also keeps the 64 MiB granularity a freely tunable knob rather than a typehash-frozen field.
+
+An **origin-serve-capable** node — one that answers `has_blob` from its origin backend (an enumerable origin-held entry, or a live size probe) rather than from cache — sets every bit: it read the total size to answer at all, so it knows the block count, and it will serve any block by warming and verifying it against `H` on delivery. So `coverage` states what the sender will serve, not only what it has cached: a cache holder advertises its cached blocks, an origin advertises all of them, and a node that is both advertises all. This keeps the biconditional exact and never asks a non-origin to serve a block it lacks.
 
 **Consistency rule.** `has_blob` and the coverage bitmap are two views of one fact, so they agree by definition: **`has_blob: true` ⟺ the bitmap is non-empty.** Either mismatch is malformed — `has_blob: false` with a non-empty bitmap, or `has_blob: true` with an empty one — and requesters MUST reject such a response and score it a protocol violation ([ADR 008](008-reputation.md#adr-008-reputation-system)), the same posture as the mandatory-`slash_sig` rule ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). The signed bool stays authoritative: a node cannot advertise via the unsigned bitmap while keeping its signed possession claim false, because compliant clients ignore such probes and the node earns nothing without signing stream evidence.
 
@@ -355,7 +360,7 @@ The `coverage` field on `Provider` / `StoreRequest` / `BatchStoreRequest` likewi
 19. The re-publish scheduler groups the hashes due in a drain cycle by receiver (each hash's K+3 closest nodes) and sends each receiver its due set as one or more `BatchStoreRequest`s, split at the 256-hash cap. `BatchStore` / `BatchStoreAck` are part of `cdn/dht/v1`; every node implements them, so there is no per-hash fallback path.
 20. A publisher that drops cache-commit events re-derives the set of hashes it advertises and seeds each unscheduled hash with an independent `uniform(0, 40 min)` draw. A hash already scheduled keeps its existing due time and gets no second entry. A drop observed after a re-derivation started causes a further re-derivation. An immediate bulk re-publish on this path is non-conforming.
 21. A node publishes a STORE for `H` once it holds ≥1 verified 64 MiB block, not only on `Complete`. The `StoreRequest` / `Provider` / `BatchStoreRequest` carries a `coverage` bitmap at 64 MiB block granularity, and `FindValueResponse` returns `Provider { node, coverage }` per holder. The `FindValueRequest` carries no range.
-22. A `cdn/probe/v1` response carries the holder's live coverage bitmap as an unsigned field; the signed set `{hash, has_blob, rate_per_mb, timestamp_us}` is unchanged, and `has_blob` is true iff the node holds ≥1 verified 64 MiB block of `H` (equivalently, its coverage bitmap is non-empty). No contract change is required.
+22. A `cdn/probe/v1` response carries the holder's live coverage bitmap as an unsigned field; the signed set `{hash, has_blob, rate_per_mb, timestamp_us}` is unchanged, and `has_blob` is true iff the node will serve ≥1 full 64 MiB block of `H` — a cached verified block, or any block when the node is origin-serve-capable (an origin sets every bit from the size it already read) — equivalently, its coverage bitmap is non-empty. No contract change is required.
 23. A probe response whose `has_blob` and coverage bitmap disagree — `has_blob: false` with a non-empty bitmap, or `has_blob: true` with an empty one — is malformed: the requester rejects it and scores a protocol violation. A holder cannot earn by advertising coverage while signing `has_blob: false`.
 24. A partial holder serves any 64 MiB block it has verified over `cdn/client/v1`, and a request for a block it lacks falls to the warm-on-miss origin chain — the serve path is no longer gated on `Complete`.
 25. A cache-missing node composes `H` by assigning disjoint blocks across covering partial holders (the [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1) scheduler on its pull leg), demand-windowed to the serve frontier, warming any uncovered block once from origin; it becomes a full holder only when demand consumes the whole blob.
