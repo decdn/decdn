@@ -249,12 +249,19 @@ impl PoolFloorState {
     /// counters are exactly the fold of the signer rows. Checked under
     /// `debug_assert!` rather than derived on every read, because the pool total is
     /// read on each admission under the accumulator lock.
+    ///
+    /// The two counters are compared SEPARATELY, not as their sum. `dead_charge` is
+    /// permanent and persisted while `live_reservation` is ephemeral, so a fold that
+    /// moved an amount into the wrong one of the two is the bug worth catching — and
+    /// comparing `committed()` at each level would let exactly that through.
     fn levels_agree(&self) -> bool {
-        self.committed()
-            == self
-                .signers
+        let fold = |pick: fn(&SignerFloorState) -> U256| {
+            self.signers
                 .values()
-                .fold(U256::ZERO, |acc, lane| acc.saturating_add(lane.committed()))
+                .fold(U256::ZERO, |acc, lane| acc.saturating_add(pick(lane)))
+        };
+        self.live_reservation == fold(|lane| lane.live_reservation)
+            && self.dead_charge == fold(|lane| lane.dead_charge)
     }
 
     /// The entry a reservation guard may reconcile against: present under `pool_id`
@@ -569,17 +576,64 @@ impl Drop for FloorReservation {
                 return;
             }
             // The worker is gone — its task was aborted, or the runtime is past the
-            // point where it can run one. Fall through and write inline rather than
-            // lose the value: the alternative is this signer getting its whole share
-            // back on the next boot.
-            tracing::debug!(
+            // point where it can run one. Write the value some other way rather than
+            // lose it: the alternative is this signer getting its whole share back on
+            // the next boot. Counted and warned because a live handler whose worker
+            // has died is an anomaly, and this is the only place it is visible before
+            // the shutdown flush notices.
+            self.metrics.floor_loss_persist_failure();
+            tracing::warn!(
                 %pool_id, %signer, micro,
-                "floor persist worker is gone; writing the dead charge inline"
+                "floor persist worker is gone; writing the dead charge off the worker"
             );
+            // Still off the reactor if a runtime remains: `record_loss` commits with
+            // `Durability::Immediate`, so running it here would put an fsync on a
+            // tokio worker thread inside a `Drop` — precisely under the mass-drop
+            // conditions that got the worker killed. The handle is watched so a
+            // cancelled write is counted like any other.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let store = Arc::clone(&store);
+                let metrics = Arc::clone(&self.metrics);
+                let write = handle.spawn_blocking(move || {
+                    persist_loss(&store, &metrics, pool_id, signer, micro);
+                });
+                let watch_metrics = Arc::clone(&self.metrics);
+                handle.spawn(async move {
+                    if let Err(e) = write.await {
+                        note_join_failure(&watch_metrics, pool_id, signer, &e);
+                    }
+                });
+                return;
+            }
         }
-        // Either no worker was ever started (a drop outside any runtime, i.e. a sync
-        // unit test) or the send above found it gone.
+        // No runtime at all: a drop outside one, i.e. a sync unit test, or a fallback
+        // taken after the runtime is gone. Nothing left to offload to.
         persist_loss(&store, &self.metrics, pool_id, signer, micro);
+    }
+}
+
+/// Ask the worker to acknowledge everything queued so far, and account for it not
+/// answering.
+///
+/// Split from [`ClientHandler::flush_floor_persists`] so the failure paths can be
+/// driven against a worker that is deliberately gone — the state a runtime teardown
+/// or an aborted task leaves, and the one where the accounting matters.
+async fn flush_queued_writes(
+    tx: &tokio::sync::mpsc::UnboundedSender<FloorLossWrite>,
+    metrics: &Metrics,
+) {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    if tx.send(FloorLossWrite::Flush(ack_tx)).is_err() {
+        metrics.floor_loss_persist_failure();
+        tracing::warn!("floor persist worker is gone; queued dead charges did not reach disk");
+        return;
+    }
+    if ack_rx.await.is_err() {
+        metrics.floor_loss_persist_failure();
+        tracing::warn!(
+            "floor persist worker stopped before acknowledging the shutdown flush; \
+             queued dead charges may not have reached disk"
+        );
     }
 }
 
@@ -1062,22 +1116,20 @@ impl ClientHandler {
     /// queued and this is the last write before the process exits. The worker
     /// processes in order, so the ack proves the whole backlog landed.
     ///
-    /// Best-effort, like the writes themselves. No worker (a handler built outside
-    /// any runtime, or without a floor-loss store) has nothing to wait for; a worker
-    /// that is already gone took its queue with it, which is the same lost-persist
-    /// residual a crash leaves and is already counted at the write.
+    /// Best-effort, like the writes themselves: no worker (a handler built outside
+    /// any runtime, or without a floor-loss store) has nothing to wait for.
+    ///
+    /// A worker that is gone, or that stops before acknowledging, took an unknown
+    /// number of queued writes with it. Those are counted HERE. A `Record` accepted
+    /// by the channel is counted at neither `persist_loss` nor `note_join_failure` —
+    /// both of those see only writes the worker actually attempted — so without this
+    /// bump an entire lost backlog would leave `floor_loss_persist_failures` flat
+    /// while every signer on the node regains its floor budget on the next boot.
     pub(crate) async fn flush_floor_persists(&self) {
         let Some(tx) = self.floor_persist_tx.as_ref() else {
             return;
         };
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        if tx.send(FloorLossWrite::Flush(ack_tx)).is_err() {
-            tracing::warn!("floor persist worker is gone; shutdown flush skipped");
-            return;
-        }
-        if ack_rx.await.is_err() {
-            tracing::warn!("floor persist worker stopped before acknowledging the shutdown flush");
-        }
+        flush_queued_writes(tx, &self.metrics).await;
     }
 
     /// Drop a reclaimed pool's floor-credit accounting: remove its in-memory
@@ -1149,14 +1201,24 @@ mod tests {
             .get(&pool)
             .cloned()
             .unwrap_or_default();
-        let folded = st
-            .signers
-            .values()
-            .fold(U256::ZERO, |acc, s| acc.saturating_add(s.committed()));
+        let fold = |pick: fn(&SignerFloorState) -> U256| {
+            st.signers
+                .values()
+                .fold(U256::ZERO, |acc, lane| acc.saturating_add(pick(lane)))
+        };
+        // Both counters, separately — see [`PoolFloorState::levels_agree`] for why
+        // comparing their sum would miss a live-to-dead mix-up.
+        let live = fold(|lane| lane.live_reservation);
+        let dead = fold(|lane| lane.dead_charge);
         anyhow::ensure!(
-            st.committed() == folded,
-            "{when}: the pool total ({}) must stay the sum of its signer rows ({folded})",
-            st.committed()
+            st.live_reservation == live,
+            "{when}: pool live_reservation ({}) must stay the sum of its signer rows ({live})",
+            st.live_reservation
+        );
+        anyhow::ensure!(
+            st.dead_charge == dead,
+            "{when}: pool dead_charge ({}) must stay the sum of its signer rows ({dead})",
+            st.dead_charge
         );
         Ok(())
     }
@@ -2547,6 +2609,73 @@ mod tests {
                 .encode()?
                 .contains("decdn_floor_loss_persist_failures_total 1"),
             "a persist that never completed must bump the failure counter"
+        );
+        Ok(())
+    }
+
+    /// `levels_agree` compares the two counters SEPARATELY, so a fold that moved an
+    /// amount into the wrong one at one level is caught.
+    ///
+    /// Comparing `committed()` (live + dead) at each level would pass this state,
+    /// which is the case worth catching: `dead_charge` is permanent and persisted
+    /// while `live_reservation` is released on every clean stream, so a mix-up
+    /// between them survives forever and re-grants budget on the next boot.
+    ///
+    /// Built through the mutators — the fields are private and the whole point is
+    /// that no caller can reach them — then verified against a hand-built split that
+    /// the sum comparison would accept.
+    #[test]
+    fn levels_agree_rejects_a_live_to_dead_mix_up() -> anyhow::Result<()> {
+        let floor = decdn_incentive::floor_micro(1000);
+        let mut state = PoolFloorState::default();
+        state.charge_live(TEST_SIGNER, floor);
+        anyhow::ensure!(
+            state.levels_agree(),
+            "a plain charge keeps both levels equal"
+        );
+
+        // The shape a one-sided fold leaves behind: the pool total has moved the
+        // amount from live to dead, the signer row has not. `committed()` is `floor`
+        // on both sides, so the summed comparison sees nothing wrong.
+        let mut skewed = PoolFloorState::default();
+        skewed.charge_live(TEST_SIGNER, floor);
+        skewed.live_reservation = U256::ZERO;
+        skewed.dead_charge = floor;
+        anyhow::ensure!(
+            skewed.committed()
+                == skewed
+                    .signers
+                    .values()
+                    .fold(U256::ZERO, |acc, lane| acc.saturating_add(lane.committed())),
+            "the summed comparison must accept this state — that is why it is not the check"
+        );
+        anyhow::ensure!(
+            !skewed.levels_agree(),
+            "comparing the counters separately must reject a live-to-dead mix-up"
+        );
+        Ok(())
+    }
+
+    /// A shutdown flush that cannot reach its worker is COUNTED, not merely warned.
+    ///
+    /// A `Record` the channel accepted is counted at neither `persist_loss` nor
+    /// `note_join_failure` — both see only writes the worker attempted — so a lost
+    /// backlog would otherwise leave `floor_loss_persist_failures` flat while every
+    /// signer on the node regains its floor budget on the next boot. That counter is
+    /// what `DecdnFloorLossPersistFailures` alerts on.
+    #[tokio::test]
+    async fn a_flush_that_cannot_reach_its_worker_is_counted() -> anyhow::Result<()> {
+        let metrics = Metrics::new();
+        // A live sender whose receiver is gone: the state a runtime teardown or an
+        // aborted worker task leaves behind, with an unknown backlog already queued.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<FloorLossWrite>();
+        drop(rx);
+        flush_queued_writes(&tx, &metrics).await;
+        anyhow::ensure!(
+            metrics
+                .encode()?
+                .contains("decdn_floor_loss_persist_failures_total 1"),
+            "a flush that cannot be acknowledged must bump the failure counter"
         );
         Ok(())
     }

@@ -2629,7 +2629,24 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // `FloorReservation` has dropped and queued whatever dead charge it folded; this
     // waits for that backlog to reach disk. A write lost here would hand its signer
     // back a share of the pool's free-floor budget on the next boot.
-    client_handler.flush_floor_persists().await;
+    //
+    // Bounded, unlike the cache flush below: the backlog is one `Durability::Immediate`
+    // commit per queued write processed serially, and a `spawn_blocking` issued once
+    // the blocking pool is shutting down yields a handle that never resolves — so an
+    // unbounded await here can hang shutdown outright rather than merely slow it. A
+    // timeout is counted as a persist failure because the consequence is the same as
+    // a failed write: the durable total stays behind the in-memory one.
+    if tokio::time::timeout(SHUTDOWN_DEADLINE, client_handler.flush_floor_persists())
+        .await
+        .is_err()
+    {
+        node_metrics.floor_loss_persist_failure();
+        tracing::warn!(
+            deadline = ?SHUTDOWN_DEADLINE,
+            "floor-loss persist drain overran the shutdown deadline; queued dead \
+             charges may not have reached disk"
+        );
+    }
 
     // Final durable flush before stop, so the last interval of frontier lands.
     // The router has drained and the redeem sweep above already ran, so the
