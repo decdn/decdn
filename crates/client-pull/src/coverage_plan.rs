@@ -7,8 +7,11 @@
 //! source flip costs a fresh lane and a mid-stream serve pause), while the
 //! client's multi-source scheduler wants to SPREAD across every admitted
 //! source so all lanes run concurrently. [`plan_covered_runs`] and
-//! [`spread_segments`] are the two assigners; [`covering_sources`] is the
-//! shared best-ranked lookup both build on.
+//! [`spread_segments`] are the two assigners: the node's sticky
+//! [`plan_covered_runs`] builds on the shared best-ranked lookup
+//! [`covering_sources`], while [`spread_segments`] needs every covering
+//! source per block (not just the best-ranked one) and so runs its own
+//! per-block candidate scan.
 //!
 //! Value ranking (`rank`) is always the existing unified selection score
 //! (ADR 001: rate + RTT + reputation) — passed in as source indices, best
@@ -388,6 +391,73 @@ mod tests {
         assert!(!uncovered.is_empty());
         let expected = block_chunks(1);
         assert_eq!(uncovered, expected);
+    }
+
+    /// Union of the given discovery blocks' full chunk ranges — a `gap` that
+    /// is a strict subset of the blob (some blocks already held, so their
+    /// chunks are absent from the gap).
+    fn gap_of_blocks(blocks: &[u32]) -> ChunkRanges {
+        blocks
+            .iter()
+            .fold(ChunkRanges::empty(), |acc, &b| acc | block_chunks(b))
+    }
+
+    #[test]
+    fn concentrate_a_gap_skipped_block_breaks_run_contiguity() {
+        // 3-block blob; gap covers blocks 0 and 2 only — block 1 is already
+        // held, so its chunks are NOT in the gap and the walk skips it. A
+        // single source covers all three blocks. Even though the same
+        // source covers both block 0 and block 2, the skipped block 1 in
+        // between must NOT let them coalesce into one run: block 0 and
+        // block 2 are not byte-adjacent in the output, so merging them
+        // would silently claim bytes (block 1) that were never in the gap
+        // and don't need fetching.
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let sources = vec![SourceCoverage {
+            source_ix: 0,
+            coverage: cov(3, &[0, 1, 2]),
+        }];
+        let gap = gap_of_blocks(&[0, 2]);
+        let (runs, uncovered) = plan_covered_runs(&gap, total, &sources, &[0]);
+        assert_eq!(
+            runs,
+            vec![
+                CoveredRun {
+                    offset: 0,
+                    len: DISCOVERY_BLOCK_BYTES,
+                    source_ix: 0,
+                },
+                CoveredRun {
+                    offset: 2 * DISCOVERY_BLOCK_BYTES,
+                    len: DISCOVERY_BLOCK_BYTES,
+                    source_ix: 0,
+                },
+            ],
+            "block 1 is skipped (not in the gap), so blocks 0 and 2 must NOT coalesce"
+        );
+        assert!(uncovered.is_empty());
+    }
+
+    #[test]
+    fn concentrate_gap_of_a_single_middle_block_yields_one_run() {
+        // gap covers only block 1 (blocks 0 and 2 already held); a source
+        // covering all three blocks yields exactly one run, for block 1.
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let sources = vec![SourceCoverage {
+            source_ix: 0,
+            coverage: cov(3, &[0, 1, 2]),
+        }];
+        let gap = gap_of_blocks(&[1]);
+        let (runs, uncovered) = plan_covered_runs(&gap, total, &sources, &[0]);
+        assert_eq!(
+            runs,
+            vec![CoveredRun {
+                offset: DISCOVERY_BLOCK_BYTES,
+                len: DISCOVERY_BLOCK_BYTES,
+                source_ix: 0,
+            }]
+        );
+        assert!(uncovered.is_empty());
     }
 
     #[test]
