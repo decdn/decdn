@@ -9412,6 +9412,69 @@ mod tests {
         );
     }
 
+    /// Advertise (`coverage`) and serve (`partial_hit_size`, mirrored here via
+    /// `present_ranges` + `missing_ranges` — the exact sequence it now runs)
+    /// must AGREE on a front-prefix partial (#1506 C3).
+    ///
+    /// Before the fix, `partial_hit_size` sized the blob from `inspect`'s
+    /// `status()`-derived `size_bytes`, which iroh-blobs leaves `None` for a
+    /// `Partial` blob until its FINAL chunk validates — so on a front-prefix
+    /// partial (block 0 present, no tail) it returned `None` and the serve
+    /// gate declined, even though `coverage` (sized from the `observe()`
+    /// bitfield) had already advertised block 0 as covered. This test fails
+    /// before the fix: `coverage` covers block 0 but the size source used by
+    /// serve is `0`/unknown, so no size agreement is possible.
+    #[tokio::test]
+    async fn partial_hit_size_source_agrees_with_coverage_on_front_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * crate::CHUNK_GROUP_BYTES;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        let (hash, block0_ranges, block0_bao) = bao_for(
+            root,
+            &plaintext,
+            outboard,
+            0,
+            decdn_protocol::DISCOVERY_BLOCK_BYTES,
+            total,
+        );
+        engine
+            .admit_bao(hash, block0_ranges, block0_bao)
+            .await
+            .unwrap();
+
+        let status = engine.inner.store.blobs().status(hash).await.unwrap();
+        assert!(
+            matches!(
+                status,
+                iroh_blobs::api::blobs::BlobStatus::Partial { size: None }
+            ),
+            "front-only partial must NOT have a status()-known size yet, got {status:?}"
+        );
+
+        // Advertise side: coverage() says block 0 is covered.
+        let cov = engine.coverage(hash).await.unwrap();
+        assert!(cov.covers(0), "advertise: block 0 is fully present");
+
+        // Serve side: partial_hit_size's exact logic — bitfield size, then a
+        // fully-present check for a range inside block 0.
+        let present = engine.present_ranges(hash).await.unwrap();
+        let size = present.size();
+        assert_ne!(size, 0, "serve: the bitfield must know the blob's size");
+        let byte_offset = 0;
+        let byte_len = decdn_protocol::DISCOVERY_BLOCK_BYTES;
+        let missing = engine
+            .missing_ranges(hash, byte_offset, byte_len, size)
+            .await
+            .unwrap();
+        assert!(
+            missing.is_empty(),
+            "serve: block 0's byte range is fully present, so partial_hit_size must return \
+             Some(size), agreeing with advertise's coverage(0)"
+        );
+    }
+
     /// An origin that admits the blob into the store itself (as the ported
     /// `NodeOrigin` does) and returns `AlreadyAdmitted`; the engine must then
     /// serve it from the store without re-ingesting.

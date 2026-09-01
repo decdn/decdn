@@ -253,30 +253,38 @@ impl ClientHandler {
     /// skip straight to the size gate + delivery instead of running the
     /// miss-path fill legs; `None` otherwise.
     ///
-    /// `None` covers three cases the caller treats identically — this is a
-    /// best-effort optimization, never a decline path, so every one of them
-    /// falls through to the ordinary miss path unchanged: the requested span
-    /// is genuinely not fully cached, the local `inspect` failed, or the
-    /// blob's size is not yet knowable. That last case is a real limitation:
-    /// iroh-blobs only reports a `Partial` blob's size once its FINAL chunk
-    /// is present, so a non-origin front-prefix partial (holds the front, not
-    /// the tail) can't size its range here even though it may hold the
-    /// requested bytes. Closing that needs size persistence independent of
-    /// the store's own bookkeeping, which is out of scope.
+    /// `None` covers two cases the caller treats identically — this is a
+    /// best-effort optimization, never a decline path, so both fall through
+    /// to the ordinary miss path unchanged: the requested span is genuinely
+    /// not fully cached, or the hash is absent/evicted/refused.
+    ///
+    /// The size comes from the `observe()` bitfield
+    /// ([`CacheEngine::present_ranges`](super::CacheEngine::present_ranges)),
+    /// the SAME source [`CacheEngine::coverage`](super::CacheEngine::coverage)
+    /// sizes a partial from when deciding what to advertise. Unlike
+    /// `status()`/`inspect`, the bitfield knows a `Partial` blob's size as
+    /// soon as any chunk carries it, not only once the FINAL chunk validates
+    /// — so a front-prefix partial (holds the front, not the tail) sizes its
+    /// range here too, matching what it already advertises as covered.
+    /// Sizing serve and advertise from two different sources previously let
+    /// the node advertise a block it then refused to serve (#1506 C3).
     ///
     /// Reuses [`CacheEngine::missing_ranges`](super::CacheEngine::missing_ranges)'s
     /// own size contract — the same `blob_size` source
     /// [`Self::try_range_pull_through`] resolves via
     /// [`CacheEngine::origin_size`](super::CacheEngine::origin_size) for the
     /// ORIGIN-backed case; here the size comes from the LOCAL store's own
-    /// `inspect`, since a purely local partial has no origin to probe.
+    /// bitfield, since a purely local partial has no origin to probe.
     pub(super) async fn partial_hit_size(
         &self,
         hash: Hash,
         byte_offset: u64,
         byte_len: u64,
     ) -> Option<u64> {
-        let size = self.cache.inspect(hash).await.ok()?.size_bytes?;
+        let size = self.cache.present_ranges(hash).await.ok()?.size();
+        if size == 0 {
+            return None;
+        }
         let missing = self
             .cache
             .missing_ranges(hash, byte_offset, byte_len, size)
