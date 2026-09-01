@@ -144,12 +144,12 @@ pub struct CacheArgs {
     #[arg(long, value_name = "DIR", env = "DECDN_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
 
-    /// Maximum cache size in megabytes [default: 10240].
+    /// Maximum cache size in megabytes [default: 102400 (100 GB)].
     #[arg(long, value_name = "MB", env = "DECDN_CACHE_SIZE_MB")]
     pub cache_size_mb: Option<u64>,
 
-    /// Maximum single blob size in megabytes [default: 1024]. Must be
-    /// strictly less than `cache_size_mb`.
+    /// Maximum single blob size in megabytes [default: 51200 (50 GB), capped to
+    /// `cache_size_mb`]. Must not exceed `cache_size_mb`; `0` = unlimited.
     #[arg(long, value_name = "MB", env = "DECDN_MAX_BLOB_SIZE_MB")]
     pub max_blob_size_mb: Option<u64>,
 
