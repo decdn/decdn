@@ -1714,6 +1714,123 @@ mod tests {
         Ok(())
     }
 
+    /// Deterministic pseudo-random plaintext plus its bao pre-order outboard,
+    /// mirroring `decdn_cache::engine::tests::synth_blob` — that helper is
+    /// private to the `cache` crate, so this is a from-scratch build over
+    /// the same public `bao_tree` primitive.
+    fn synth_blob(len: usize) -> ([u8; 32], Vec<u8>, bytes::Bytes) {
+        let mut plaintext = vec![0u8; len];
+        let mut x: u32 = 0x9e37_79b9;
+        for b in &mut plaintext {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x.to_le_bytes()[0];
+        }
+        let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
+            &plaintext,
+            decdn_bao_range::IROH_BLOCK_SIZE,
+        );
+        (*ob.root.as_bytes(), plaintext, bytes::Bytes::from(ob.data))
+    }
+
+    /// A verified, ready-to-`admit_bao` bao encoding of `[off, off+len)` of a
+    /// `total`-byte blob rooted at `root`, using the public
+    /// `decdn_bao_range::{align_range, encode_verified_range}` seam — the same
+    /// verification path a real ranged pull goes through, just fed synthetic
+    /// content instead of a network origin. Mirrors
+    /// `decdn_cache::engine::tests::bao_for` (also private to `cache`).
+    fn bao_for(
+        root: [u8; 32],
+        plaintext: &[u8],
+        outboard: bytes::Bytes,
+        off: u64,
+        len: u64,
+        total: u64,
+    ) -> (decdn_cache::Hash, bao_tree::ChunkRanges, bytes::Bytes) {
+        let aligned = decdn_bao_range::align_range(off, len, total).expect("range within blob");
+        let s = usize::try_from(aligned.fetch_start()).expect("fetch_start fits usize");
+        let e = usize::try_from(aligned.fetch_end()).expect("fetch_end fits usize");
+        let encoded = decdn_bao_range::encode_verified_range(
+            root,
+            &aligned,
+            plaintext.get(s..e).expect("aligned range within plaintext"),
+            outboard,
+        )
+        .expect("synthetic range verifies against its own root");
+        (
+            decdn_cache::Hash::from(root),
+            aligned.chunk_ranges().clone(),
+            encoded,
+        )
+    }
+
+    /// The advertise-gate relax (#1506): `cache_still_holds` must admit a
+    /// PARTIAL holder — one that has verified at least one
+    /// [`decdn_protocol::DISCOVERY_BLOCK_BYTES`] discovery block but is
+    /// neither `Complete` nor origin-held — into the announce set. Before the
+    /// relax, `cache_still_holds` asked `CacheEngine::has` (`Complete`-only),
+    /// which would have answered `Some(false)` for exactly this fixture: the
+    /// blob spans two discovery blocks and only the first is admitted.
+    #[tokio::test]
+    async fn cache_still_holds_accepts_a_partial_holder_with_at_least_one_verified_block()
+    -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let cache = decdn_cache::CacheEngine::open(tmp.path(), vec![], 16).await?;
+
+        // Two discovery blocks: block 0 is admitted whole, block 1's middle
+        // group is left missing — a genuine partial, not a rounding
+        // artifact. iroh-blobs only reports a `Partial` blob's size once its
+        // FINAL chunk is present (see the sibling `decdn-cache` coverage
+        // test this mirrors), so the trailing group is admitted separately
+        // to establish the validated size while block 1 stays uncovered.
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * group;
+        let (root, plaintext, outboard) =
+            synth_blob(usize::try_from(total).expect("test blob size fits usize"));
+        let (hash, block0_ranges, block0_bao) = bao_for(
+            root,
+            &plaintext,
+            outboard.clone(),
+            0,
+            decdn_protocol::DISCOVERY_BLOCK_BYTES,
+            total,
+        );
+        cache.admit_bao(hash, block0_ranges, block0_bao).await?;
+        let (_, tail_ranges, tail_bao) =
+            bao_for(root, &plaintext, outboard, total - group, group, total);
+        cache.admit_bao(hash, tail_ranges, tail_bao).await?;
+
+        assert!(
+            !cache.present_ranges(hash).await?.is_complete(),
+            "fixture precondition: block 1's middle group was never admitted, \
+             so this is a genuine partial"
+        );
+        let cov = cache.coverage(hash).await?;
+        assert!(!cov.is_empty(), "fixture precondition: block 0 is covered");
+        assert!(
+            !cov.covers(1),
+            "fixture precondition: block 1 must NOT be covered"
+        );
+        // This is what makes the fixture prove the relax: under the OLD
+        // `cache.has()` (`Complete`-only) gate, `cache_still_holds` would
+        // have answered `Some(false)` for this exact holder.
+        assert!(
+            !cache.has(hash).await?,
+            "fixture precondition: this holder is NOT Complete — the old gate \
+             would have dropped it"
+        );
+
+        let content_hash = ContentHash::from_bytes(*hash.as_bytes());
+        assert_eq!(
+            cache_still_holds(&cache, &content_hash).await,
+            Some(true),
+            "a partial holder with >=1 verified block must be in the announce set — \
+             the old Complete-only `cache.has()` gate would have answered Some(false) here"
+        );
+        Ok(())
+    }
+
     /// A store fault at the due-time gate answers neither way (#1815): folding
     /// it into `Some(false)` would have the tick path `unschedule` the hash —
     /// dropping it from the announce set for the process lifetime on a
