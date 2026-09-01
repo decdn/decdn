@@ -19,7 +19,7 @@ use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_client_pull::buyer_pool::open_pool;
 use decdn_client_pull::{
-    BlobTooLargeClaim, HashMismatch, PoolContext, PullDeadlines, UpstreamRefused,
+    BlobTooLarge, HashMismatch, PoolContext, PullDeadlines, UpstreamRefused,
     UpstreamVoucherRejected, VoucherProgress, sign_client_binding, stream_fetch_tracked,
 };
 use decdn_incentive::payment_pool::PaymentPool;
@@ -896,7 +896,7 @@ fn signed_to_wire_capability(signed: &SignedCapability) -> WireCapability {
 /// fallthrough.
 ///
 /// Everything else is terminal: a corrupt delivery (`HashMismatch`), a buyer-side
-/// size-cap rejection (`BlobTooLargeClaim`), any other mid-stream voucher
+/// received-byte size-cap abort (`BlobTooLarge`), any other mid-stream voucher
 /// rejection (`UpstreamVoucherRejected` — e.g. an `AmountRegression` left by
 /// one-sided ack loss, deposit exhaustion, or a `SpendingCapExhausted`), or a refusal by
 /// which the node reports itself degraded / the blob over its own ceiling.
@@ -907,8 +907,7 @@ fn signed_to_wire_capability(signed: &SignedCapability) -> WireCapability {
 /// every one of them — including a hard `InternalError` — was retried to the
 /// deadline.
 fn is_retryable(err: &anyhow::Error) -> bool {
-    if err.downcast_ref::<HashMismatch>().is_some()
-        || err.downcast_ref::<BlobTooLargeClaim>().is_some()
+    if err.downcast_ref::<HashMismatch>().is_some() || err.downcast_ref::<BlobTooLarge>().is_some()
     {
         return false;
     }

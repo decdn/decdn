@@ -30,8 +30,15 @@ pub use types::FileConfig;
 
 /// Default QUIC bind port.
 const DEFAULT_BIND_PORT: u16 = 4433;
-/// Default maximum cache size in megabytes (10 GB).
-const DEFAULT_CACHE_SIZE_MB: u64 = 10_240;
+/// Default maximum cache size in megabytes (100 GB) — sized for the large-file
+/// (AI model) wedge, where a node holds many multi-GB shards.
+const DEFAULT_CACHE_SIZE_MB: u64 = 102_400;
+/// Default largest single blob admitted (50 GB), when `max_blob_size_mb` is unset.
+/// Comfortably holds the largest model shard the chunked-manifest wedge delivers
+/// while capping the RAM the buffered miss tier spends on one pull. Clamped down to
+/// `cache_size_mb` at resolve time, so the `max_blob_size_mb <= cache_size_mb`
+/// invariant holds even when an operator shrinks the cache below this.
+const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 51_200;
 /// Default rate per MB in USDC base units ($0.00001/MB).
 const DEFAULT_RATE_PER_MB: u64 = 10;
 /// Default Prometheus metrics port. Exposed publicly so `decdn node top`
@@ -1706,14 +1713,15 @@ fn resolve_cache_into(
         .or_else(|| file.and_then(|c| c.cache_size_mb))
         .unwrap_or(DEFAULT_CACHE_SIZE_MB);
 
-    // Unset => the disk budget itself. A node admits any blob its cache can
-    // hold; operators who want a tighter per-blob bound (for example to cap the
-    // RAM the buffered miss tier spends on one pull) set it explicitly below
-    // `cache_size_mb`.
+    // Unset => `DEFAULT_MAX_BLOB_SIZE_MB` (50 GB), clamped to `cache_size_mb` so a
+    // node with a smaller-than-default cache still resolves a valid ceiling rather
+    // than tripping the `max_blob <= cache_size` invariant below. Operators who want
+    // a different per-blob bound (for example to hold a larger monolithic blob, or to
+    // cap the RAM the buffered miss tier spends on one pull) set it explicitly.
     let max_blob_size_mb = cli
         .max_blob_size_mb
         .or_else(|| file.and_then(|c| c.max_blob_size_mb))
-        .unwrap_or(cache_size_mb);
+        .unwrap_or_else(|| DEFAULT_MAX_BLOB_SIZE_MB.min(cache_size_mb));
 
     // Buyer-side absolute per-MB rate ceiling (#1375); `0` = unlimited (the
     // default). CLI/env override wins over the file, matching every other knob.
@@ -7323,8 +7331,9 @@ swap_pool_address = \"0xPool\"
     #[test]
     fn resolve_cache_defaults_satisfy_invariant() -> anyhow::Result<()> {
         // Regression guard: the resolved defaults must satisfy the load-time
-        // `max_blob_size_mb <= cache_size_mb` invariant. The default is
-        // equality (unset => cache_size_mb).
+        // `max_blob_size_mb <= cache_size_mb` invariant. The default blob ceiling
+        // (`DEFAULT_MAX_BLOB_SIZE_MB`, clamped to the cache size) sits below the
+        // default cache budget, so this holds.
         let cli = cache_cli(None, None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
@@ -9881,8 +9890,24 @@ swap_pool_address = \"0xPool\"
         let cli = empty_cache_args();
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         assert_eq!(resolved.cache_size_mb, DEFAULT_CACHE_SIZE_MB);
-        // Unset `max_blob_size_mb` defaults to the disk budget itself.
-        assert_eq!(resolved.max_blob_size_mb, DEFAULT_CACHE_SIZE_MB);
+        // Unset `max_blob_size_mb` defaults to `DEFAULT_MAX_BLOB_SIZE_MB` (below the
+        // default cache budget, so the clamp is a no-op here).
+        assert_eq!(resolved.max_blob_size_mb, DEFAULT_MAX_BLOB_SIZE_MB);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_default_blob_size_clamps_to_a_small_cache() -> anyhow::Result<()> {
+        // A cache smaller than `DEFAULT_MAX_BLOB_SIZE_MB` with `max_blob_size_mb`
+        // unset must resolve the blob ceiling DOWN to the cache size, not the 50 GB
+        // default — otherwise the `max_blob <= cache_size` invariant would trip on a
+        // perfectly valid small-cache config.
+        let small = DEFAULT_MAX_BLOB_SIZE_MB / 2;
+        let cli = cache_cli(Some(small), None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        assert_eq!(resolved.cache_size_mb, small);
+        assert_eq!(resolved.max_blob_size_mb, small);
+        anyhow::ensure!(resolved.max_blob_size_mb <= resolved.cache_size_mb);
         Ok(())
     }
 

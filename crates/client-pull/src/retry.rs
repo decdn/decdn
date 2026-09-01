@@ -10,7 +10,7 @@
 //! provider or lane can fix it, while a delivery fault is a property of one
 //! provider's leg and is worth retrying against another.
 
-use crate::{BlobTooLargeClaim, UpstreamRefused, UpstreamVoucherRejected};
+use crate::{BlobTooLarge, UpstreamRefused, UpstreamVoucherRejected};
 use decdn_protocol::client::StreamError;
 
 /// Whether a failed delivery attempt should fall over to the next candidate
@@ -42,8 +42,9 @@ pub enum RetryDisposition {
 ///   driver has already exhausted any wallet-less watermark self-heal.
 /// - [`StreamError::OriginBlacklisted`] is **terminal** — the pool's funder is
 ///   refused under this address everywhere.
-/// - A [`BlobTooLargeClaim`] is **terminal** — the blob is BLAKE3-addressed, so
-///   its size is identical whoever serves it, and it stays over the client's cap.
+/// - A [`crate::BlobTooLarge`] is **terminal** — the blob is BLAKE3-addressed, so
+///   its size is identical whoever serves it, and its received bytes stay over the
+///   client's cap.
 /// - Every other refusal ([`StreamError::NotFound`], `Overloaded`,
 ///   `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`, `HashBlacklisted`)
 ///   and every non-refusal error — a stall (the progress deadline tripped), a
@@ -65,7 +66,7 @@ pub fn retry_disposition(err: &anyhow::Error) -> RetryDisposition {
     use RetryDisposition::{RetryElsewhere, Terminal};
 
     if err.downcast_ref::<UpstreamVoucherRejected>().is_some()
-        || err.downcast_ref::<BlobTooLargeClaim>().is_some()
+        || err.downcast_ref::<BlobTooLarge>().is_some()
     {
         return Terminal;
     }
@@ -82,7 +83,7 @@ pub fn retry_disposition(err: &anyhow::Error) -> RetryDisposition {
 mod tests {
     use super::{RetryDisposition, retry_disposition};
     use crate::driver::PoolExhausted;
-    use crate::{BlobTooLargeClaim, UpstreamRefused, UpstreamVoucherRejected};
+    use crate::{BlobTooLarge, UpstreamRefused, UpstreamVoucherRejected};
     use decdn_protocol::client::StreamError;
 
     /// The refusal these tests classify, built the way the fetch path builds it:
@@ -112,12 +113,12 @@ mod tests {
         assert_eq!(retry_disposition(&err), RetryDisposition::Terminal);
     }
 
-    /// The client's own size cap, tripped by the server-signed `total_bytes`, is
+    /// The client's own size cap, tripped by the bytes that actually arrived, is
     /// terminal — the blob is content-addressed, so its size is the same anywhere.
     #[test]
-    fn blob_too_large_claim_is_terminal() {
-        let err = anyhow::Error::new(BlobTooLargeClaim {
-            claimed: 1 << 40,
+    fn blob_too_large_is_terminal() {
+        let err = anyhow::Error::new(BlobTooLarge {
+            received: 1 << 40,
             ceiling: 1 << 20,
         });
         assert_eq!(retry_disposition(&err), RetryDisposition::Terminal);

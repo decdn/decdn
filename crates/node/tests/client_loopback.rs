@@ -5574,25 +5574,28 @@ async fn client_blob_too_large_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Buyer-side size gate (#840): the inverse of `client_blob_too_large_is_refused`.
-/// The server has no ceiling and is willing to serve an 8 KiB blob, but the
-/// *buyer* passes its own `max_blob_size_bytes`. The buyer must reject the
-/// server's oversized `total_bytes` claim before entering the receive loop, so
-/// no bytes are buffered or paid (see `fetch_inner`'s ceiling gate for why
-/// `StreamResponse::validate()` alone is insufficient).
+/// Buyer-side received-byte cap (#1895): the buyer never refuses on the server's
+/// *claimed* `total_bytes` — the claim is peer-controlled and unverified
+/// (`StreamResponse::validate()` does not bound it). Instead it enters the receive
+/// loop and aborts with `BlobTooLarge` once the cumulative RECEIVED bytes cross
+/// `max_blob_size_bytes`. Here the whole 8 KiB blob crosses a 4 KiB ceiling inside
+/// a single sub-interval frame, so the cap trips before the first 1 MiB payment
+/// boundary: the buyer aborts having paid nothing, but only because no voucher
+/// interval elapsed — not because it pre-judged the claim.
 #[tokio::test(flavor = "multi_thread")]
-async fn buyer_rejects_oversized_total_bytes() -> anyhow::Result<()> {
+async fn buyer_aborts_oversized_small_blob_without_paying() -> anyhow::Result<()> {
     let payload = vec![0x5Au8; 8192];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
-    // Server ceiling 0 (unlimited) — it would happily serve all 8192 bytes.
+    // Server ceiling 0 (unlimited) — it honestly serves all 8192 bytes.
     let (target, server_eth, server_ep, server_task) =
         spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
     let mut progress = VoucherProgress::default();
-    // Buyer ceiling 4096 < 8192 promised → reject before buffering.
+    // Buyer ceiling 4096 < the 8192 bytes that actually arrive → the received
+    // bytes trip the cap.
     let err = stream_fetch_tracked(
         &client_ep,
         target,
@@ -5610,16 +5613,78 @@ async fn buyer_rejects_oversized_total_bytes() -> anyhow::Result<()> {
     )
     .await
     .err()
-    .ok_or_else(|| anyhow::anyhow!("oversized total_bytes must be refused by the buyer"))?;
+    .ok_or_else(|| anyhow::anyhow!("received bytes over the ceiling must abort the fetch"))?;
     anyhow::ensure!(
         err.to_string().contains("BlobTooLarge"),
         "error should surface the buyer-side BlobTooLarge ceiling: {err}"
     );
-    // Rejected before the receive loop: no voucher was ever acked/paid.
+    // The blob is smaller than one 1 MiB payment interval, so the cap trips before
+    // any voucher boundary: nothing is paid.
     anyhow::ensure!(
         progress.advanced().is_none(),
-        "no voucher should be paid when the buyer rejects up front: {:?}",
+        "a sub-interval oversized blob aborts before the first voucher: {:?}",
         progress.advanced()
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// Buyer-side received-byte cap, payment leg (#1895): a blob genuinely larger than
+/// the ceiling is streamed and PAID for up to roughly one ceiling's worth before
+/// the cumulative RECEIVED bytes trip the cap — the "honest giant" residual cost.
+/// The pre-#1895 up-front claim gate paid nothing here; this test pins that the
+/// buyer now (a) enters the receive loop despite an over-ceiling `total_bytes`,
+/// (b) pays for the bytes it actually took, and (c) never pays past the ceiling.
+#[tokio::test(flavor = "multi_thread")]
+async fn buyer_pays_for_received_bytes_then_aborts_over_ceiling() -> anyhow::Result<()> {
+    let payload = vec![0x5Bu8; 4 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    // Server ceiling 0 (unlimited) — it honestly serves the whole 4 MiB blob.
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, signer, deposit);
+    let mut progress = VoucherProgress::default();
+    // Ceiling ~2.4 MiB: two 1 MiB payment intervals clear before the cumulative
+    // received bytes cross the ceiling and trip the cap.
+    let ceiling: u64 = 2_500_000;
+    let err = stream_fetch_tracked(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        0x00c2,
+        PullDeadlines::whole_transfer(Duration::from_secs(10)),
+        ceiling,
+        0,
+        &mut progress,
+    )
+    .await
+    .err()
+    .ok_or_else(|| {
+        anyhow::anyhow!("an oversized blob must abort once received bytes cross the ceiling")
+    })?;
+    anyhow::ensure!(
+        err.to_string().contains("BlobTooLarge"),
+        "the received-byte cap must surface BlobTooLarge: {err}"
+    );
+    // The cap fires on RECEIVED bytes, so the buyer paid for the prefix it took —
+    // never the inflated claim, and (unlike the pre-#1895 up-front gate) never
+    // nothing: the watermark advanced.
+    let (bytes, _amount) = progress.advanced().ok_or_else(|| {
+        anyhow::anyhow!("the buyer must pay for the bytes it actually received before aborting")
+    })?;
+    // ...and the spend is bounded: it never pays a voucher past the ceiling.
+    anyhow::ensure!(
+        bytes <= U256::from(ceiling),
+        "the buyer must not pay past the ceiling, paid {bytes}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
