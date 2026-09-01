@@ -732,11 +732,14 @@ async fn discover(
     namespace_id: U256,
 ) -> Vec<DhtNodeId> {
     let target = DhtHash::from_bytes(hash_bytes);
-    // `find_providers` now carries each holder's range-keyed `Coverage`
-    // alongside its `NodeId` (ADR 039-adjacent partial-holder discovery).
-    // This PR only wires the data layer through; the coverage is dropped
-    // here and picked back up by a later PR that ranks/selects candidates
-    // by which blocks they can serve.
+    // `find_providers` carries each holder's range-keyed `Coverage` alongside
+    // its `NodeId` (ADR 039-adjacent partial-holder discovery) — a STALE
+    // DHT-lookup hint, not a live observation. It is dropped here rather than
+    // used to prune candidates before probing: the authoritative coverage a
+    // ranked candidate carries onward comes from its fresh `ProbeResponseExt`
+    // instead (`probe_candidate`, #1506). A later task may use this hint to
+    // skip probing a candidate whose stale coverage already misses the whole
+    // pull range; today every discovered candidate is still probed.
     let providers: Vec<DhtNodeId> = crate::dht::find_providers(
         &deps.endpoint,
         &deps.routing_table,
@@ -974,6 +977,11 @@ async fn probe_candidate(
         // must be resolved here (retry, or drop the candidate) rather than
         // passed through as `0`; see `Candidate::stake`.
         stake: 0,
+        // The fresh, probe-confirmed coverage (#1506) — never the stale DHT
+        // hint `discover` drops. The `consistent_with` check above already
+        // guarantees this is non-empty whenever `has_blob` is true, which is
+        // the only way execution reaches here.
+        coverage: resp_ext.coverage,
     })
 }
 
@@ -1049,6 +1057,16 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             region,
             // See `probe_candidate` above: `0` is a placeholder, not a lookup.
             stake: 0,
+            // `PositiveProbeCache` deliberately stores only the ADR 001 triple
+            // `(node_id, rate_per_mb, rtt)` — see its module doc's "no evidence
+            // retention" invariant, enforced in part by `ProbedProvider` staying
+            // `Copy`, which a `Coverage` (a `Vec<u8>`) cannot join. A cache hit
+            // therefore carries no fresh coverage to attach; `empty()` here is a
+            // placeholder, not an observation, exactly like `stake: 0` above.
+            // Harmless today because coverage is not yet consumed by the pull
+            // loop (#1506); a future range-aware cache-hit path must resolve
+            // this rather than let a real holder's coverage silently read empty.
+            coverage: decdn_protocol::Coverage::empty(),
         });
     }
     if candidates.is_empty() {

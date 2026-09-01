@@ -9,6 +9,8 @@ use rand::RngExt;
 use std::collections::HashSet;
 use std::time::Duration;
 
+use decdn_protocol::Coverage;
+
 use crate::dht::lookup::{DEFAULT_ROUND_TIMEOUT, MAX_LOOKUP_ROUNDS};
 
 /// Maximum providers to attempt before reporting a fetch failure to the
@@ -192,6 +194,13 @@ pub struct Candidate {
     /// integration is deferred; see ADR 019 for the capacity-bond interface
     /// that will.
     pub stake: u64,
+    /// Which discovery blocks (`decdn_protocol::coverage`) this candidate is
+    /// confirmed to hold, per its fresh `ProbeResponseExt.coverage` (#1506).
+    /// This is the PROBE-confirmed value, never the stale DHT-lookup hint —
+    /// discovery's ranking and selection consume only what a live probe just
+    /// verified. Ranking itself ignores this field; it rides alongside the
+    /// rank/RTT/rate fields for a range-aware caller to read after selection.
+    pub coverage: Coverage,
 }
 
 /// A candidate paired with its computed selection score. Lower score is better.
@@ -687,6 +696,7 @@ mod tests {
             reputation: rep,
             region: "US".to_string(),
             stake: 0,
+            coverage: Coverage::empty(),
         }
     }
 
@@ -698,6 +708,40 @@ mod tests {
     fn with_stake(mut c: Candidate, stake: u64) -> Candidate {
         c.stake = stake;
         c
+    }
+
+    fn with_coverage(mut c: Candidate, coverage: Coverage) -> Candidate {
+        c.coverage = coverage;
+        c
+    }
+
+    /// #1506: `rank_candidates` must carry each candidate's fresh
+    /// probe-confirmed coverage through unchanged — ranking reorders on
+    /// score alone, but the caller downstream (the ranged-drive loop, a
+    /// later task) needs to read which blocks each ranked candidate holds.
+    /// Two providers with disjoint single-block coverage ({block0} vs
+    /// {block1}) pin that the field rides alongside the candidate rather
+    /// than being dropped or averaged during ranking.
+    #[test]
+    fn rank_candidates_carries_each_candidates_fresh_probe_coverage() {
+        let block0 = Coverage::from_block_indices(2, [0].into_iter());
+        let block1 = Coverage::from_block_indices(2, [1].into_iter());
+        // Distinct scores so ordering is deterministic without the tie-breaker.
+        let holder0 = with_coverage(make_candidate(1, 100, 10, 1.0), block0.clone());
+        let holder1 = with_coverage(make_candidate(2, 200, 10, 1.0), block1.clone());
+        let out = rank_candidates(vec![holder0, holder1]);
+
+        assert_eq!(out.len(), 2);
+        let ranked0 = out
+            .iter()
+            .find(|r| r.candidate.node_id[0] == 1)
+            .expect("holder0 present in ranked output");
+        let ranked1 = out
+            .iter()
+            .find(|r| r.candidate.node_id[0] == 2)
+            .expect("holder1 present in ranked output");
+        assert_eq!(ranked0.candidate.coverage, block0);
+        assert_eq!(ranked1.candidate.coverage, block1);
     }
 
     #[test]
