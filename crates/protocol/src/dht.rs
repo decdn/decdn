@@ -41,6 +41,7 @@
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
+use crate::coverage::Coverage;
 use crate::identity::{ContentHash, NodeId};
 
 /// Wire-level maximum number of providers a [`FindValueResponse`] may carry
@@ -210,6 +211,24 @@ pub struct FindValueRequest {
     pub requester: NodeId,
 }
 
+/// A known holder of a content hash, plus which [`Coverage`] blocks it
+/// reports being able to serve (range-keyed discovery). Carried in
+/// [`FindValueResponse::providers`].
+///
+/// `coverage` is unsigned and responder-controlled, like the rest of a DHT
+/// record — see the module docs' authentication-model note. A lying
+/// responder can only ever cost the requester a wasted probe against a
+/// provider that turns out not to hold what it claimed; it cannot forge a
+/// record for a `node` it doesn't control (the STORE-time `holder ==
+/// authenticated NodeId` check still applies).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provider {
+    /// The holder's `NodeId`.
+    pub node: NodeId,
+    /// Discovery blocks this holder reports covering.
+    pub coverage: Coverage,
+}
+
 /// Response to a [`FindValueRequest`] (ADR 022 §Message Types).
 ///
 /// `providers` is the responder's known holders for `hash` (may be empty);
@@ -223,10 +242,11 @@ pub struct FindValueRequest {
 pub struct FindValueResponse {
     /// Echoes the requested hash.
     pub hash: ContentHash,
-    /// Nodes known to hold this hash. May be empty. Capped at
-    /// [`MAX_PROVIDERS_PER_HASH`]; oversize values fail decode.
+    /// Nodes known to hold this hash, with per-holder coverage. May be
+    /// empty. Capped at [`MAX_PROVIDERS_PER_HASH`]; oversize values fail
+    /// decode.
     #[serde(deserialize_with = "deserialize_providers")]
-    pub providers: Vec<NodeId>,
+    pub providers: Vec<Provider>,
     /// K closest nodes to `hash` in the responder's routing table. The
     /// [`CloserNodes`] type enforces the [`MAX_CLOSER_NODES`] cap at
     /// construction and decode; oversize values fail decode.
@@ -241,13 +261,15 @@ pub struct FindValueResponse {
 /// `holder` equals the authenticated `NodeId` of the inbound QUIC connection.
 /// Records are never relayed peer-to-peer; if that changes, a per-record
 /// signature MUST be reintroduced (see module docs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreRequest {
     /// BLAKE3 hash of the content being advertised.
     pub hash: ContentHash,
     /// The `NodeId` claiming to hold this hash. MUST equal the authenticated
     /// QUIC `NodeId` of the connection; the receiver rejects mismatches.
     pub holder: NodeId,
+    /// Discovery blocks the holder reports covering for `hash`.
+    pub coverage: Coverage,
 }
 
 /// Optional [`FindValueResponse`] extension fields, carried as trailing bytes
@@ -306,7 +328,7 @@ pub fn encode_store_request(
     req: &StoreRequest,
     ext: Option<&StoreRequestExt>,
 ) -> Result<Vec<u8>, postcard::Error> {
-    let mut buf = postcard::to_allocvec(&DhtMessage::Store(*req))?;
+    let mut buf = postcard::to_allocvec(&DhtMessage::Store(req.clone()))?;
     if let Some(ext) = ext {
         buf.extend_from_slice(&postcard::to_allocvec(ext)?);
     }
@@ -407,12 +429,12 @@ pub struct FindNodeResponse {
 /// two-stage rate-limit accounting live in the `decdn-node` handler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchStoreRequest {
-    /// Hashes being published in this batch. Capped at
+    /// `(hash, coverage)` pairs being published in this batch. Capped at
     /// [`MAX_BATCH_STORE_HASHES`] (ADR 022 §STORE Flow); oversize values fail
     /// decode (the handler maps that to `MALFORMED_MESSAGE` 0x03 per
     /// ADR 013).
-    #[serde(deserialize_with = "deserialize_batch_hashes")]
-    pub hashes: Vec<ContentHash>,
+    #[serde(deserialize_with = "deserialize_batch_entries")]
+    pub entries: Vec<(ContentHash, Coverage)>,
     /// Single holder for the batch. Per ADR 022 §STORE Flow the receiver
     /// checks this once against the authenticated QUIC `NodeId`; the
     /// per-hash check is skipped because the field is batch-level.
@@ -420,7 +442,7 @@ pub struct BatchStoreRequest {
 }
 
 /// Per-hash acknowledgement for a [`BatchStoreRequest`] (ADR 022 §STORE
-/// Flow). `results[i]` corresponds to `BatchStoreRequest.hashes[i]`.
+/// Flow). `results[i]` corresponds to `BatchStoreRequest.entries[i]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchStoreAck {
     /// One `bool` per request hash, in request order. Capped at
@@ -436,18 +458,18 @@ pub struct BatchStoreAck {
 // `deserialize_with` so the postcard positional layout stays
 // derive-driven — no mirror struct, no `Deserialize` impl drift risk.
 
-fn deserialize_providers<'de, D>(d: D) -> Result<Vec<NodeId>, D::Error>
+fn deserialize_providers<'de, D>(d: D) -> Result<Vec<Provider>, D::Error>
 where
     D: Deserializer<'de>,
 {
     deserialize_bounded_vec(d, MAX_PROVIDERS_PER_HASH, "providers")
 }
 
-fn deserialize_batch_hashes<'de, D>(d: D) -> Result<Vec<ContentHash>, D::Error>
+fn deserialize_batch_entries<'de, D>(d: D) -> Result<Vec<(ContentHash, Coverage)>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(d, MAX_BATCH_STORE_HASHES, "hashes")
+    deserialize_bounded_vec(d, MAX_BATCH_STORE_HASHES, "entries")
 }
 
 fn deserialize_batch_results<'de, D>(d: D) -> Result<Vec<bool>, D::Error>
@@ -474,9 +496,11 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    // `T` is `#[serde(transparent)]` over `[u8; 32]` (or a bare `[u8; 32]`),
-    // so the decoded length and per-element bytes are identical to the raw
-    // wire form; the cap is the only thing this hook adds.
+    // `T` is either `#[serde(transparent)]` over `[u8; 32]` (a bare `NodeId`
+    // or `ContentHash`) or a small fixed-shape struct built from such types
+    // (`Provider`, `(ContentHash, Coverage)`), so the decoded length and
+    // per-element bytes are identical to the raw wire form; the cap is the
+    // only thing this hook adds.
     //
     // Allocation safety (#845): the cap is enforced *after* `Vec::deserialize`,
     // so a malicious peer's length prefix is untrusted at the point of decode.
@@ -520,6 +544,14 @@ mod tests {
         CloserNodes::try_new(nodes).expect("test closer_nodes within MAX_CLOSER_NODES")
     }
 
+    /// A `Provider` holding `node` with a one-block-full `Coverage`.
+    fn provider(node: NodeId) -> Provider {
+        Provider {
+            node,
+            coverage: Coverage::full(1),
+        }
+    }
+
     fn sample_find_value_request() -> FindValueRequest {
         FindValueRequest {
             hash: ch(0x11),
@@ -530,7 +562,7 @@ mod tests {
     fn sample_find_value_response() -> FindValueResponse {
         FindValueResponse {
             hash: ch(0x11),
-            providers: vec![nid(0x33), nid(0x44)],
+            providers: vec![provider(nid(0x33)), provider(nid(0x44))],
             closer_nodes: closer(vec![nid(0x55)]),
         }
     }
@@ -539,6 +571,7 @@ mod tests {
         StoreRequest {
             hash: ch(0x66),
             holder: nid(0x77),
+            coverage: Coverage::full(1),
         }
     }
 
@@ -565,7 +598,7 @@ mod tests {
 
     fn sample_batch_store_request() -> BatchStoreRequest {
         BatchStoreRequest {
-            hashes: vec![ch(0xCC), ch(0xDD)],
+            entries: vec![(ch(0xCC), Coverage::full(1)), (ch(0xDD), Coverage::empty())],
             holder: nid(0xEE),
         }
     }
@@ -800,7 +833,9 @@ mod tests {
     fn find_value_response_max_framed_size_under_ceiling() -> Result<(), postcard::Error> {
         let inner = FindValueResponse {
             hash: ch(0xFF),
-            providers: vec![nid(0xCD); MAX_PROVIDERS_PER_HASH],
+            providers: (0..MAX_PROVIDERS_PER_HASH)
+                .map(|_| provider(nid(0xCD)))
+                .collect(),
             closer_nodes: closer(vec![nid(0xCD); MAX_CLOSER_NODES]),
         };
         let msg = DhtMessage::FindValueResponse(inner.clone());
@@ -812,23 +847,28 @@ mod tests {
             .expect("payload length must fit in u32 for framing varint");
         let length_prefix_len = postcard::to_allocvec(&payload_len_u32)?.len();
         let framed_len = payload.len() + length_prefix_len;
-        // 1 (enum discriminant) + 32 (hash) + 1 (len varint, 50 fits in 1B)
-        // + 50×32 (providers) + 1 (len varint, 20 fits in 1B) + 20×32 (closer)
-        // = 1 + 32 + 1 + 1600 + 1 + 640 = 2275 B inner; + ~2B varint length
-        // prefix = ~2277 B on the wire. Round up to 2.3 KB ceiling.
+        // 1 (enum discriminant) + 32 (hash) + 1 (providers len varint, 50 fits
+        // 1B) + 50×34 (providers: 32B `NodeId` + 2B `Coverage` — a
+        // single-block-covering `Coverage` encodes as a 1-byte varint length
+        // + 1 payload byte) = 1700 + 1 (closer len varint, 20 fits 1B) +
+        // 20×32 (closer) = 640 → 1 + 32 + 1 + 1700 + 1 + 640 = 2375 B inner;
+        // + ~2B varint length prefix = ~2377 B on the wire. Range-keyed
+        // discovery (this module's `Provider.coverage` field) grew the
+        // per-provider cost from 32B to 34B over the plain-`NodeId` shape
+        // the original 2.3 KB ADR 022 ceiling assumed; round up to 2.45 KB.
         assert!(
-            framed_len <= 2_300,
-            "framed max DhtMessage::FindValueResponse = {framed_len} B exceeds 2.3 KB ADR 022 ceiling"
+            framed_len <= 2_450,
+            "framed max DhtMessage::FindValueResponse = {framed_len} B exceeds the 2.45 KB ceiling"
         );
         // Lower-bound guard: a future regression that drops `providers` or
         // `closer_nodes` from the wire shape would shrink the encoded
-        // size well below the ADR's modeled payload (~2.27 KB) without
-        // failing the upper-bound assert. Pin the lower bound at 2 KB so
-        // any accidental field removal trips the test loudly.
+        // size well below the modeled payload (~2.38 KB) without failing
+        // the upper-bound assert. Pin the lower bound at 2.3 KB so any
+        // accidental field removal trips the test loudly.
         assert!(
-            framed_len > 2_000,
+            framed_len > 2_300,
             "framed max DhtMessage::FindValueResponse shrank to {framed_len} B \
-             — has the wire shape lost providers/closer_nodes?"
+             — has the wire shape lost providers/closer_nodes/coverage?"
         );
         // Sanity: round-trips through the outer enum.
         let decoded: DhtMessage = postcard::from_bytes(&payload)?;
@@ -843,7 +883,9 @@ mod tests {
         // rather than allocate the oversize Vec.
         let msg = FindValueResponse {
             hash: ch(0xFF),
-            providers: vec![nid(0xCD); MAX_PROVIDERS_PER_HASH + 1],
+            providers: (0..=MAX_PROVIDERS_PER_HASH)
+                .map(|_| provider(nid(0xCD)))
+                .collect(),
             closer_nodes: CloserNodes::default(),
         };
         let bytes = postcard::to_allocvec(&msg)?;
@@ -908,7 +950,7 @@ mod tests {
     #[test]
     fn batch_store_request_decode_rejects_oversize_hashes() -> Result<(), postcard::Error> {
         let msg = BatchStoreRequest {
-            hashes: vec![ch(0xCD); MAX_BATCH_STORE_HASHES + 1],
+            entries: vec![(ch(0xCD), Coverage::empty()); MAX_BATCH_STORE_HASHES + 1],
             holder: nid(0),
         };
         let bytes = postcard::to_allocvec(&msg)?;
@@ -937,7 +979,9 @@ mod tests {
     fn caps_accept_exactly_max() -> Result<(), postcard::Error> {
         let resp = FindValueResponse {
             hash: ch(0),
-            providers: vec![nid(0); MAX_PROVIDERS_PER_HASH],
+            providers: (0..MAX_PROVIDERS_PER_HASH)
+                .map(|_| provider(nid(0)))
+                .collect(),
             closer_nodes: closer(vec![nid(0); MAX_CLOSER_NODES]),
         };
         let bytes = postcard::to_allocvec(&resp)?;
@@ -945,12 +989,12 @@ mod tests {
         assert_eq!(decoded.providers.len(), MAX_PROVIDERS_PER_HASH);
         assert_eq!(decoded.closer_nodes.len(), MAX_CLOSER_NODES);
         let batch = BatchStoreRequest {
-            hashes: vec![ch(0); MAX_BATCH_STORE_HASHES],
+            entries: vec![(ch(0), Coverage::empty()); MAX_BATCH_STORE_HASHES],
             holder: nid(0),
         };
         let bytes = postcard::to_allocvec(&batch)?;
         let decoded: BatchStoreRequest = postcard::from_bytes(&bytes)?;
-        assert_eq!(decoded.hashes.len(), MAX_BATCH_STORE_HASHES);
+        assert_eq!(decoded.entries.len(), MAX_BATCH_STORE_HASHES);
         Ok(())
     }
 

@@ -34,8 +34,8 @@ use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::dht::DhtHandler;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::{
-    ALPN_DHT, ContentHash, NodeId, decode_message, dht as wire, encode_message, read_frame,
-    write_frame,
+    ALPN_DHT, ContentHash, Coverage, NodeId, decode_message, dht as wire, encode_message,
+    read_frame, write_frame,
 };
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
@@ -648,10 +648,10 @@ mod adr_013_error_codes {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            hashes: vec![
-                ContentHash::from_bytes([0x01u8; 32]),
-                ContentHash::from_bytes([0x02u8; 32]),
-                ContentHash::from_bytes([0x03u8; 32]),
+            entries: vec![
+                (ContentHash::from_bytes([0x01u8; 32]), Coverage::full(1)),
+                (ContentHash::from_bytes([0x02u8; 32]), Coverage::full(1)),
+                (ContentHash::from_bytes([0x03u8; 32]), Coverage::full(1)),
             ],
             // Claim a holder that is NOT the authenticated client id.
             holder: NodeId::from_bytes([0xAB; 32]),
@@ -693,8 +693,8 @@ mod adr_013_error_codes {
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         // 257 hashes > the 256 wire cap.
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            hashes: vec![
-                ContentHash::from_bytes([0x07u8; 32]);
+            entries: vec![
+                (ContentHash::from_bytes([0x07u8; 32]), Coverage::full(1));
                 decdn_protocol::dht::MAX_BATCH_STORE_HASHES + 1
             ],
             holder: NodeId::from_bytes(*client_ep.id().as_bytes()),
@@ -820,8 +820,10 @@ mod store_admission {
     use super::*;
 
     /// Spin up a DHT server where the client is in the active-staker
-    /// set, then issue one `Store` and one `FindValue` and verify the
-    /// stored holder comes back in `providers`.
+    /// set, then issue one `Store` — advertising a PARTIAL holder (only
+    /// discovery block 0 of a 3-block blob) — and one `FindValue`, and
+    /// verify the stored holder AND its `Coverage` come back in
+    /// `providers` (range-keyed discovery, ADR 039-adjacent).
     #[tokio::test(flavor = "multi_thread")]
     #[allow(clippy::too_many_lines)] // Linear setup → Store → FindValue → assert flow; splitting into helpers loses the readable narrative.
     async fn store_then_find_value_roundtrip_for_staked_publisher() -> anyhow::Result<()> {
@@ -880,6 +882,8 @@ mod store_admission {
             .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
 
         let target_hash = ContentHash::from_bytes([0xAAu8; 32]);
+        // Partial holder: only block 0 of a (hypothetical) 3-block blob.
+        let partial_coverage = Coverage::from_block_indices(3, [0].into_iter());
 
         // Store the record.
         {
@@ -890,6 +894,7 @@ mod store_admission {
             let req = wire::DhtMessage::Store(wire::StoreRequest {
                 hash: target_hash,
                 holder: NodeId::from_bytes(*client_id.as_bytes()),
+                coverage: partial_coverage.clone(),
             });
             let payload = encode_message(&req)?;
             write_frame(&mut s, &payload).await?;
@@ -926,9 +931,20 @@ mod store_admission {
             assert_eq!(resp.hash, target_hash);
             assert_eq!(
                 resp.providers,
-                vec![NodeId::from_bytes(*client_id.as_bytes())],
-                "stored holder must appear in providers"
+                vec![wire::Provider {
+                    node: NodeId::from_bytes(*client_id.as_bytes()),
+                    coverage: partial_coverage.clone(),
+                }],
+                "stored holder and its partial coverage must survive the RecordStore \
+                 round-trip and come back in providers"
             );
+            // Spell out the coverage assertion beyond struct equality: block 0
+            // is covered, blocks 1 and 2 (the rest of the 3-block blob) are not
+            // — this is a genuine partial holder, not an accidental full one.
+            let got_coverage = &resp.providers[0].coverage;
+            assert!(got_coverage.covers(0), "block 0 must be covered");
+            assert!(!got_coverage.covers(1), "block 1 must NOT be covered");
+            assert!(!got_coverage.covers(2), "block 2 must NOT be covered");
         }
 
         conn.close(0u32.into(), b"bye");
@@ -998,6 +1014,7 @@ mod store_admission {
         let req = wire::DhtMessage::Store(wire::StoreRequest {
             hash: ContentHash::from_bytes([0xCCu8; 32]),
             holder: NodeId::from_bytes(*client_ep.id().as_bytes()),
+            coverage: Coverage::full(1),
         });
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
@@ -1091,6 +1108,7 @@ mod store_admission {
         let req = wire::DhtMessage::Store(wire::StoreRequest {
             hash: ContentHash::from_bytes([0xDDu8; 32]),
             holder: NodeId::from_bytes(fake_holder), // != client_id
+            coverage: Coverage::full(1),
         });
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
@@ -1188,7 +1206,10 @@ mod batch_store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            hashes: hashes.into_iter().map(ContentHash::from_bytes).collect(),
+            entries: hashes
+                .into_iter()
+                .map(|h| (ContentHash::from_bytes(h), Coverage::full(1)))
+                .collect(),
             holder: NodeId::from_bytes(*client_id.as_bytes()),
         });
         let payload = encode_message(&req)?;
@@ -1242,7 +1263,8 @@ mod batch_store_admission {
             assert!(
                 store
                     .providers_at(&ContentHash::from_bytes(*h), 0)
-                    .contains(&holder),
+                    .iter()
+                    .any(|p| p.node == holder),
                 "hash {h:?} must be in the record store after a batch admit"
             );
         }
@@ -1264,7 +1286,8 @@ mod batch_store_admission {
                 .lock()
                 .expect("records lock")
                 .providers_at(&ContentHash::from_bytes([0x42u8; 32]), 0)
-                .contains(&holder)
+                .iter()
+                .any(|p| p.node == holder)
         );
         Ok(())
     }
@@ -1322,9 +1345,9 @@ mod batch_store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            hashes: vec![
-                ContentHash::from_bytes([0x01u8; 32]),
-                ContentHash::from_bytes([0x02u8; 32]),
+            entries: vec![
+                (ContentHash::from_bytes([0x01u8; 32]), Coverage::full(1)),
+                (ContentHash::from_bytes([0x02u8; 32]), Coverage::full(1)),
             ],
             holder: NodeId::from_bytes([0xAB; 32]), // != authenticated client id
         });
@@ -1409,9 +1432,9 @@ mod batch_store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            hashes: vec![
-                ContentHash::from_bytes([0x01u8; 32]),
-                ContentHash::from_bytes([0x02u8; 32]),
+            entries: vec![
+                (ContentHash::from_bytes([0x01u8; 32]), Coverage::full(1)),
+                (ContentHash::from_bytes([0x02u8; 32]), Coverage::full(1)),
             ],
             holder: NodeId::from_bytes(*client_sk.public().as_bytes()),
         });
@@ -1478,14 +1501,16 @@ mod batch_store_admission {
             assert!(
                 store
                     .providers_at(&ContentHash::from_bytes(*h), 0)
-                    .contains(&holder)
+                    .iter()
+                    .any(|p| p.node == holder)
             );
         }
         for h in hashes.iter().skip(4) {
             assert!(
                 !store
                     .providers_at(&ContentHash::from_bytes(*h), 0)
-                    .contains(&holder),
+                    .iter()
+                    .any(|p| p.node == holder),
                 "deferred hash {h:?} must NOT be inserted"
             );
         }
@@ -1571,7 +1596,7 @@ mod batch_store_client {
             hashes
                 .iter()
                 .copied()
-                .map(ContentHash::from_bytes)
+                .map(|h| (ContentHash::from_bytes(h), Coverage::full(1)))
                 .collect(),
             NodeId::from_bytes(holder),
         )

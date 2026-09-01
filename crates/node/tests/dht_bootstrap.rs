@@ -33,7 +33,7 @@ use decdn_node::dht::{
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::dht::DhtHandler;
 use decdn_node::metrics::Metrics;
-use decdn_protocol::{ALPN_DHT, ContentHash, NodeId};
+use decdn_protocol::{ALPN_DHT, ContentHash, Coverage, NodeId};
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
 
@@ -276,6 +276,7 @@ async fn client_store_lands_record_at_server() -> anyhow::Result<()> {
         target,
         hash,
         NodeId::from_bytes(*client_id.as_bytes()),
+        Coverage::full(1),
     )
     .await?;
     assert!(ack.accepted, "staked publisher's Store must be accepted");

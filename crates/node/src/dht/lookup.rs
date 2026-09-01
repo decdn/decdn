@@ -42,7 +42,8 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use indexmap::IndexSet;
+use decdn_protocol::Coverage;
+use indexmap::IndexMap;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use rand::seq::SliceRandom;
 use tokio::task::JoinSet;
@@ -142,7 +143,7 @@ pub async fn find_providers(
     target: Hash,
     cfg: LookupConfig,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Vec<NodeId> {
+) -> Vec<(NodeId, Coverage)> {
     let ctx = LookupCtx {
         endpoint,
         staker_set: staker_set.as_ref(),
@@ -330,11 +331,24 @@ fn fold_response(
 ) -> bool {
     let kept_closer = filter_xor_closer(resp.closer_nodes.into_inner(), target, &responder);
     let kept_closer = filter_active_stakers(kept_closer, staker_set);
-    let kept_providers = filter_active_stakers(resp.providers, staker_set);
-    let kept_providers = filter_negative_cache(kept_providers, target, negative_cache);
 
-    for p in kept_providers {
-        state.record_provider(p);
+    // Filters 2 and 3 apply to `providers` exactly as they do to
+    // `closer_nodes` above, but `providers` carries `Coverage` alongside
+    // each `NodeId` and the shared filters operate on bare `NodeId`s — run
+    // them over the extracted ids, then keep only the `Provider`s whose id
+    // survived, so `coverage` rides along to `record_provider` rather than
+    // being dropped by a `Vec<NodeId>` round-trip.
+    let provider_ids: Vec<NodeId> = resp.providers.iter().map(|p| p.node).collect();
+    let kept_ids = filter_active_stakers(provider_ids, staker_set);
+    let kept_ids = filter_negative_cache(kept_ids, target, negative_cache);
+    let kept_ids: HashSet<NodeId> = kept_ids.into_iter().collect();
+
+    for p in resp
+        .providers
+        .into_iter()
+        .filter(|p| kept_ids.contains(&p.node))
+    {
+        state.record_provider(p.node, p.coverage);
     }
     let mut observed_closer = false;
     for c in kept_closer {
@@ -411,9 +425,10 @@ struct LookupState {
     /// `iter().next()` yields the closest unqueried candidate.
     candidates: BTreeMap<[u8; NODE_ID_LEN], NodeId>,
     queried: HashSet<NodeId>,
-    /// Survivor set, deduplicated. Insertion order preserved;
-    /// randomisation happens at return time.
-    providers: IndexSet<NodeId>,
+    /// Survivor set, deduplicated by `NodeId`, keyed to its most recently
+    /// folded `Coverage`. Insertion order preserved; randomisation happens
+    /// at return time.
+    providers: IndexMap<NodeId, Coverage>,
     /// Smallest XOR distance among queried nodes so far. New
     /// candidates only count as "closer" if they beat this.
     best_queried_distance: [u8; NODE_ID_LEN],
@@ -433,7 +448,7 @@ impl LookupState {
             requester_id,
             candidates: BTreeMap::new(),
             queried: HashSet::new(),
-            providers: IndexSet::new(),
+            providers: IndexMap::new(),
             best_queried_distance: [0xFFu8; NODE_ID_LEN],
             k: cfg.k.get(),
             alpha: cfg.alpha.get(),
@@ -494,14 +509,16 @@ impl LookupState {
         picked
     }
 
-    /// Insert `peer` into the provider survivor set if not already
-    /// present. Rejects `requester_id`. `IndexSet::insert` handles
-    /// dedup and insertion-order preservation in one step.
-    fn record_provider(&mut self, peer: NodeId) {
+    /// Insert `peer` into the provider survivor set (or refresh its
+    /// coverage if already present). Rejects `requester_id`.
+    /// `IndexMap::insert` handles dedup and insertion-order preservation —
+    /// re-inserting an existing key updates its value in place without
+    /// moving it — in one step.
+    fn record_provider(&mut self, peer: NodeId, coverage: Coverage) {
         if peer == self.requester_id {
             return;
         }
-        self.providers.insert(peer);
+        self.providers.insert(peer, coverage);
     }
 
     fn have_enough_providers(&self) -> bool {
@@ -519,8 +536,8 @@ impl LookupState {
     /// randomisation of the *surviving* set — shuffle precedes
     /// truncation so the truncated K is a random sample, not a
     /// deterministic prefix.
-    fn into_randomised_providers(self) -> Vec<NodeId> {
-        let mut providers: Vec<NodeId> = self.providers.into_iter().collect();
+    fn into_randomised_providers(self) -> Vec<(NodeId, Coverage)> {
+        let mut providers: Vec<(NodeId, Coverage)> = self.providers.into_iter().collect();
         providers.shuffle(&mut rand::rng());
         providers.truncate(self.k);
         providers
@@ -552,6 +569,18 @@ mod tests {
     }
     fn nz(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).expect("test literal is non-zero")
+    }
+    /// A one-block-full `Coverage`, used by every test that doesn't care
+    /// about the specific coverage value.
+    fn cov() -> Coverage {
+        Coverage::full(1)
+    }
+    /// A wire `Provider` for `node` with `cov()`.
+    fn provider(node: NodeId) -> decdn_protocol::dht::Provider {
+        decdn_protocol::dht::Provider {
+            node,
+            coverage: cov(),
+        }
     }
 
     #[test]
@@ -631,10 +660,10 @@ mod tests {
         let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
         let cfg = LookupConfig::default();
         let mut state = LookupState::new(&routing, &h(0), nid(0xFF), cfg);
-        state.record_provider(nid(1));
-        state.record_provider(nid(2));
-        state.record_provider(nid(1));
-        let providers_in_order: Vec<NodeId> = state.providers.iter().copied().collect();
+        state.record_provider(nid(1), cov());
+        state.record_provider(nid(2), cov());
+        state.record_provider(nid(1), cov());
+        let providers_in_order: Vec<NodeId> = state.providers.keys().copied().collect();
         assert_eq!(providers_in_order, vec![nid(1), nid(2)]);
     }
 
@@ -658,15 +687,16 @@ mod tests {
             };
             let mut state = LookupState::new(&routing, &h(0), nid(0xFF), cfg);
             for &p in &canonical {
-                state.record_provider(p);
+                state.record_provider(p, cov());
             }
             let out = state.into_randomised_providers();
             assert_eq!(out.len(), 10);
             assert!(
-                out.iter().all(|p| canonical.contains(p)),
+                out.iter().all(|(p, _)| canonical.contains(p)),
                 "shuffle invented elements not in the canonical set"
             );
-            seen_orderings.insert(out);
+            let ids: Vec<NodeId> = out.into_iter().map(|(p, _)| p).collect();
+            seen_orderings.insert(ids);
         }
         assert!(
             seen_orderings.len() >= 8,
@@ -701,7 +731,7 @@ mod tests {
         // ADR 022 § Lookup integrity only `providers` is filtered.
         let resp = decdn_protocol::dht::FindValueResponse {
             hash: target,
-            providers: vec![nid(0x05), nid(0x10)],
+            providers: vec![provider(nid(0x05)), provider(nid(0x10))],
             closer_nodes: closer(vec![nid(0x05), nid(0x10)]),
         };
         fold_response(
@@ -740,7 +770,7 @@ mod tests {
         // (0x07 > 0x05 in XOR to target=0x00), so Filter 1 drops it.
         let resp = decdn_protocol::dht::FindValueResponse {
             hash: target,
-            providers: vec![nid(0x07)],
+            providers: vec![provider(nid(0x07))],
             closer_nodes: closer(vec![nid(0x07)]),
         };
         let observed_closer = fold_response(
@@ -754,7 +784,7 @@ mod tests {
 
         assert!(!observed_closer, "no candidate was strictly closer");
         assert_eq!(state.providers.len(), 1, "provider must still be folded");
-        assert!(state.providers.contains(&nid(0x07)));
+        assert!(state.providers.contains_key(&nid(0x07)));
     }
 
     /// Drives F1 + F2 + F3 + `LookupState`'s self-filter on a single
@@ -789,7 +819,12 @@ mod tests {
         let resp = decdn_protocol::dht::FindValueResponse {
             hash: target,
             // providers: [self, non-staked, neg-cached, survivor]
-            providers: vec![requester, nid(0x05), nid(0x10), nid(0x12)],
+            providers: vec![
+                provider(requester),
+                provider(nid(0x05)),
+                provider(nid(0x10)),
+                provider(nid(0x12)),
+            ],
             // closer_nodes: [self, non-staked, neg-cached (kept!),
             //                not-strictly-closer (0x80 > 0x40),
             //                survivor]
@@ -806,7 +841,7 @@ mod tests {
 
         // Providers: F2 drops 0x05, F3 drops 0x10, self-filter
         // drops requester → only 0x12 survives.
-        let providers: Vec<NodeId> = state.providers.iter().copied().collect();
+        let providers: Vec<NodeId> = state.providers.keys().copied().collect();
         assert_eq!(providers, vec![nid(0x12)]);
 
         // Closer_nodes: F1 drops 0x80, F2 drops 0x05, self-filter
@@ -829,11 +864,11 @@ mod tests {
         };
         let mut state = LookupState::new(&routing, &h(0), nid(0xFF), cfg);
         assert!(!state.have_enough_providers());
-        state.record_provider(nid(1));
+        state.record_provider(nid(1), cov());
         assert!(!state.have_enough_providers());
-        state.record_provider(nid(2));
+        state.record_provider(nid(2), cov());
         assert!(state.have_enough_providers());
-        state.record_provider(nid(3));
+        state.record_provider(nid(3), cov());
         assert!(state.have_enough_providers());
     }
 
@@ -851,12 +886,12 @@ mod tests {
         // Both methods silently no-op for self.
         assert!(!state.add_candidate(me));
         assert!(state.candidates.is_empty());
-        state.record_provider(me);
+        state.record_provider(me, cov());
         assert!(state.providers.is_empty());
 
         // Non-self still flows through.
         assert!(state.add_candidate(nid(0x42)));
-        state.record_provider(nid(0x43));
+        state.record_provider(nid(0x43), cov());
         assert_eq!(state.candidates.len(), 1);
         assert_eq!(state.providers.len(), 1);
     }

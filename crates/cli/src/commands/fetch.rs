@@ -385,6 +385,18 @@ pub(crate) async fn probe_and_order(
             );
             continue;
         }
+        // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
+        // construction on an honest responder — neither field is signed, and
+        // an inconsistency has no attributable author, so drop the candidate
+        // rather than score it (same reasoning as an unrecovered `slash_sig`
+        // above).
+        if !resp_ext.consistent_with(resp.body.has_blob) {
+            eprintln!(
+                "warning: dropping a probe response from {} with has_blob/coverage mismatch",
+                cand.node_id
+            );
+            continue;
+        }
         if resp.body.has_blob {
             holders.push(discovery::Probed {
                 candidate: cand.clone(),

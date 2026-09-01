@@ -4,6 +4,7 @@
 //! and defines the shared vocabulary used by all other deCDN crates.
 
 pub mod client;
+pub mod coverage;
 pub mod dht;
 pub mod framing;
 pub mod identity;
@@ -17,6 +18,7 @@ pub use client::{
     encode_chunk_frame, encode_stream_request, encode_stream_response, parse_stream_request_ext,
     parse_stream_response_ext,
 };
+pub use coverage::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 pub use dht::{
     BatchStoreAck, BatchStoreRequest, CloserNodes, CloserNodesError, DhtMessage, FindNodeRequest,
     FindNodeResponse, FindValueRequest, FindValueResponse, FindValueResponseExt,

@@ -1761,7 +1761,7 @@ mod tests {
     fn seeded_dht_handles() -> DhtStatusHandles {
         use crate::dht::routing::NodeId;
         use crate::dht::{ConfigStakerSet, RecordStore, RecordStoreConfig, RepublishScheduler};
-        use decdn_protocol::ContentHash;
+        use decdn_protocol::{ContentHash, Coverage};
 
         // self_id = all-zero; p_high lands in bucket 255 (top bit set),
         // p_low in bucket 0 (only the lowest bit differs).
@@ -1783,6 +1783,7 @@ mod tests {
         store.insert_at(
             NodeId::from_bytes([5u8; 32]),
             ContentHash::from_bytes([7u8; 32]),
+            Coverage::full(1),
             1_000,
         );
 

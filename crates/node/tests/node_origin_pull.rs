@@ -57,8 +57,8 @@ use decdn_protocol::message::{
     ProbeResponse, ProbeResponseBody, ProbeResponseExt, encode_probe_response,
 };
 use decdn_protocol::{
-    ALPN_CLIENT, ALPN_PROBE, CHUNK_BYTES, ContentHash, MB_BYTES, ProbeMessage, decode_message,
-    encode_message, encode_stream_request, read_frame, write_frame,
+    ALPN_CLIENT, ALPN_PROBE, CHUNK_BYTES, ContentHash, Coverage, MB_BYTES, ProbeMessage,
+    decode_message, encode_message, encode_stream_request, read_frame, write_frame,
 };
 use decdn_reputation::{LocalReputation, LocalReputationConfig};
 use iroh::EndpointAddr;
@@ -379,6 +379,7 @@ async fn answer_probe(
         &resp,
         Some(&ProbeResponseExt {
             total_bytes: Some(total_bytes),
+            coverage: Coverage::full(decdn_protocol::num_blocks(total_bytes)),
         }),
     )
     .map_err(|e| anyhow::anyhow!("encode probe response: {e}"))?;

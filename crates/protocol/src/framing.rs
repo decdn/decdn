@@ -632,6 +632,7 @@ mod tests {
         // — which is the property the two-phase pattern rests on end to end.
         let ext = crate::message::ProbeResponseExt {
             total_bytes: Some(1_700_000),
+            coverage: crate::Coverage::empty(),
         };
         let ProbeMessage::Response(body) = &resp else {
             unreachable!("resp is a Response")

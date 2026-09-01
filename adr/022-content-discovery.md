@@ -247,11 +247,11 @@ The registry-seeded peer list participates in DHT lookups immediately, so there 
 
 ### DHT Bandwidth Analysis
 
-Per-RPC wire costs (32B hashes and NodeIds, varint framing, QUIC stream overhead):
+Per-RPC wire costs (32B hashes and NodeIds, varint framing, QUIC stream overhead). Each `FindValue` provider carries a range-keyed `Coverage` bitmap alongside its `NodeId` (§ Content Records and TTL), which puts a single-block holder's per-provider cost at ~34B rather than a bare NodeId's 32B:
 
 | RPC | Request | Response | Round-trip typical |
 |-----|---------|----------|--------------------|
-| FindValue | ~100B | ~500B typical, ~2.3 KB max (50 providers + 20 closer_nodes) | ~600B |
+| FindValue | ~100B | ~500B typical, ~2.45 KB max (50 providers × 34B + 20 closer_nodes × 32B) | ~600B |
 | Store | ~100B | ~70B `StoreAck` | ~170B |
 | FindNode | ~100B | ~700B (20 closer_nodes) | ~800B |
 

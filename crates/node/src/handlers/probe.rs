@@ -10,9 +10,9 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, Hash, ProbeHoldOutcome};
 use decdn_incentive::ProbeSlashData;
 use decdn_protocol::{
-    ALPN_PROBE, APP_ERR_RATE_LIMITED, FrameError, ProbeMessage, ProbeResponseBody,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, Coverage, FrameError, ProbeMessage, ProbeResponseBody,
     ProbeResponseExt, decode_message, encode_probe_response, is_unknown_variant,
-    message::ProbeResponse, read_frame, write_frame,
+    message::ProbeResponse, num_blocks, read_frame, write_frame,
 };
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
@@ -354,6 +354,17 @@ impl ProbeHandler {
             None => false,
         };
 
+        // Tracks whether the eventual `has_blob: true` (if any) is store- or
+        // origin-sourced, and whether the operator has explicitly opted the
+        // store out of advertisement (`max_probe_holds == 0`) — both feed the
+        // final coverage derivation below, after `has_blob`/`total_bytes`
+        // settle. `store_present` mirrors the store branch's own verdict
+        // *before* the origin fold below can flip a `false` to `true`, so a
+        // post-fold `true` with `!store_present` unambiguously means "the
+        // origin, not the store, is why we can serve this".
+        let mut store_present = false;
+        let mut holds_disabled = false;
+
         let (has_blob, total_bytes) = if self.relay_foreign_namespaces {
             // Probe-triggered eviction hold (ADR 005 §Probe-triggered eviction
             // hold). The hold is **best-effort**: a node answers `has_blob: true`
@@ -435,6 +446,7 @@ impl ProbeHandler {
                         // `max_probe_holds == 0`.
                         self.metrics
                             .probe_hold_unavailable(ProbeHoldUnavailableReason::Disabled);
+                        holds_disabled = true;
                         (false, None)
                     }
                     // Blob genuinely absent, operator-evicted, or refused
@@ -456,6 +468,7 @@ impl ProbeHandler {
                     }
                 }
             };
+            store_present = has_blob;
 
             // Origin-held fallback (#1130). If the store can't back a
             // `has_blob: true` — the blob was never pulled into it, holds are
@@ -505,6 +518,61 @@ impl ProbeHandler {
                 None => (false, None),
             }
         };
+
+        // Final will-serve coverage (#1506): `has_blob` is redefined from
+        // "holds the whole blob" to "will serve at least one discovery
+        // block", so it is derived FROM `coverage` rather than the other way
+        // around — the two are a biconditional by construction, never two
+        // independently-set fields that could drift apart.
+        //
+        // - Origin-sourced (`has_blob` flipped true by the fold above, not by
+        //   the store branch): an origin serves every block and already
+        //   handed us the size via `total_bytes`, so it is all-ones.
+        // - Store-sourced or absent, and NOT the operator's explicit
+        //   `max_probe_holds == 0` opt-out: read the cache's own
+        //   cached-block bitmap. This is what upgrades a partial (non-
+        //   `Complete`) holder from the old `has_blob: false` to an honest
+        //   partial advertisement — `try_probe_hold`'s `has()` gate above
+        //   only recognizes `Complete` blobs, but a partial holder that
+        //   covers at least one block can still serve it.
+        // - `max_probe_holds == 0`: the operator opted the STORE out of
+        //   advertisement; honor that by forcing empty rather than letting a
+        //   cached partial leak back in under it (origin-held content is
+        //   unaffected — it never reaches this arm because it is already
+        //   `is_origin_sourced`).
+        let is_origin_sourced = has_blob && !store_present;
+        let coverage = if is_origin_sourced {
+            total_bytes.map_or_else(Coverage::empty, |size| Coverage::full(num_blocks(size)))
+        } else if holds_disabled || !self.relay_foreign_namespaces {
+            // `holds_disabled`: the operator's explicit store opt-out (above).
+            // `!self.relay_foreign_namespaces`: the origin-only policy (ADR
+            // 002, #1759) — presence there is decided purely by the backend
+            // probe, and a store hit for a blob outside this node's own
+            // origin must stay unadvertised (a later serve decline on it
+            // would read as "advertised but didn't serve", the reputation
+            // hazard that policy closes). Consulting the cache's coverage
+            // here would leak exactly that hit back in.
+            Coverage::empty()
+        } else {
+            match self.cache.coverage(hash).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        %hash,
+                        "cache error deriving probe coverage; advertising none"
+                    );
+                    Coverage::empty()
+                }
+            }
+        };
+        let has_blob = !coverage.is_empty();
+        debug_assert_eq!(
+            has_blob,
+            !coverage.is_empty(),
+            "has_blob must be the coverage biconditional by construction"
+        );
+
         // On the shed path no hold was attempted, so the value sampled for
         // the gate is still current — reuse it instead of re-acquiring the
         // lock and sweeping again. Off that path a hold may have been taken,
@@ -564,10 +632,14 @@ impl ProbeHandler {
         };
 
         let resp = ProbeResponse { body, slash_sig };
-        // `total_bytes` is unsigned, so it rides in the trailing extension rather
-        // than the signed base (ADR 013 §Tier 1). Two-phase encode: a receiver that
-        // predates a future extension field stops at the end of the base.
-        let ext = ProbeResponseExt { total_bytes };
+        // `total_bytes` and `coverage` are unsigned, so they ride in the trailing
+        // extension rather than the signed base (ADR 013 §Tier 1). Two-phase
+        // encode: a receiver that predates a future extension field stops at the
+        // end of the base.
+        let ext = ProbeResponseExt {
+            total_bytes,
+            coverage,
+        };
 
         let payload = encode_probe_response(&resp, Some(&ext))
             .map_err(|e| anyhow::anyhow!("probe encode failed: {e}"))?;

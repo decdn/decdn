@@ -483,7 +483,7 @@ impl DhtHandler {
         }
         self.metrics.dht_batch_store_received();
 
-        let n = req.hashes.len();
+        let n = req.entries.len();
         // Step 2: stage-2 token accounting. `k` hashes get per-hash
         // processing; the rest are deferred (`false`) by the rate limit.
         let extra = n.saturating_sub(1);
@@ -535,14 +535,14 @@ impl DhtHandler {
             None
         };
         let mut results = Vec::with_capacity(n);
-        for (i, hash) in req.hashes.into_iter().enumerate() {
+        for (i, (hash, coverage)) in req.entries.into_iter().enumerate() {
             // Tail beyond the rate-limit budget: deferred, no processing.
             if i >= k {
                 results.push(false);
                 continue;
             }
             let accepted = if let Some(store) = store_guard.as_mut() {
-                let outcome = store.insert_at(req.holder, hash, now_us);
+                let outcome = store.insert_at(req.holder, hash, coverage, now_us);
                 if outcome.accepted() {
                     self.metrics.dht_store_accepted();
                     true
@@ -614,7 +614,7 @@ impl DhtHandler {
         // Step 3: receiver-anchored insert with all the cap rules.
         let now_us = now_us();
         let outcome = if let Ok(mut store) = self.records.lock() {
-            Some(store.insert_at(req.holder, req.hash, now_us))
+            Some(store.insert_at(req.holder, req.hash, req.coverage, now_us))
         } else {
             // Poisoned record-store mutex: respond `accepted: false`
             // so the publisher backs off rather than retrying into a

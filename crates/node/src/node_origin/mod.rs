@@ -732,7 +732,12 @@ async fn discover(
     namespace_id: U256,
 ) -> Vec<DhtNodeId> {
     let target = DhtHash::from_bytes(hash_bytes);
-    let providers = crate::dht::find_providers(
+    // `find_providers` now carries each holder's range-keyed `Coverage`
+    // alongside its `NodeId` (ADR 039-adjacent partial-holder discovery).
+    // This PR only wires the data layer through; the coverage is dropped
+    // here and picked back up by a later PR that ranks/selects candidates
+    // by which blocks they can serve.
+    let providers: Vec<DhtNodeId> = crate::dht::find_providers(
         &deps.endpoint,
         &deps.routing_table,
         &deps.staker_set,
@@ -742,7 +747,10 @@ async fn discover(
         deps.config.lookup,
         Some(&deps.metrics),
     )
-    .await;
+    .await
+    .into_iter()
+    .map(|(node, _coverage)| node)
+    .collect();
     if providers.is_empty() {
         deps.origin_directory.lookup_origins(namespace_id).await
     } else {
@@ -862,7 +870,7 @@ async fn probe_candidate(
         return None;
     };
     let probe_ts = now_micros();
-    let (resp, _resp_ext, rtt_ms) = match probe_once(
+    let (resp, resp_ext, rtt_ms) = match probe_once(
         &deps.endpoint,
         EndpointAddr::new(pk),
         hash_bytes,
@@ -901,6 +909,18 @@ async fn probe_candidate(
         probe_ts,
     ) {
         debug!(%err, "node-origin: dropping an unverifiable probe response");
+        return None;
+    }
+    // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
+    // construction on an honest responder. Neither field is in the signed
+    // set (`coverage` is unsigned, and this mismatch has no attributable
+    // author to slash — same reasoning as an unrecovered `slash_sig` above),
+    // so a violation is dropped rather than scored to reputation.
+    if !resp_ext.consistent_with(resp.body.has_blob) {
+        debug!(
+            has_blob = resp.body.has_blob,
+            "node-origin: dropping a probe response with has_blob/coverage mismatch"
+        );
         return None;
     }
     if !resp.body.has_blob {

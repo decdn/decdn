@@ -62,6 +62,7 @@ use crate::dht::chain_projection::with_lock;
 use crate::dht::client;
 use crate::dht::routing::{NodeId, RoutingTable};
 use decdn_protocol::ContentHash;
+use decdn_protocol::Coverage;
 use decdn_protocol::dht::MAX_BATCH_STORE_HASHES;
 
 /// Number of receivers per republish (ADR 022 §STORE Flow step 1:
@@ -823,7 +824,7 @@ pub async fn run_republish(
                         // discoverable for up to 50 minutes — the
                         // exact failure mode the eager publish
                         // closes.
-                        publish_hash(&endpoint, self_node_id, &routing, hash_bytes).await;
+                        publish_hash(&endpoint, self_node_id, &routing, &cache, hash_bytes).await;
                         scheduler.schedule_steady(hash_bytes);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -914,8 +915,9 @@ pub async fn run_republish(
                     // next cycle.
                     let ep = endpoint.clone();
                     let routing = Arc::clone(&routing);
+                    let cache_cloned = cache.clone();
                     tokio::spawn(async move {
-                        publish_batch(&ep, self_node_id, &routing, &held).await;
+                        publish_batch(&ep, self_node_id, &routing, &cache_cloned, &held).await;
                     });
                 }
             }
@@ -923,18 +925,21 @@ pub async fn run_republish(
     }
 }
 
-/// Whether this node would still answer `has_blob` for `hash` — `Some(true)`
-/// or `Some(false)` when the caches can answer, `None` when the store query
-/// faulted and the question has no answer. The due-time gate that stops the
-/// scheduler from re-publishing content LRU drift or an operator-evict already
-/// removed.
+/// Whether this node would still advertise `hash` — `Some(true)` when it
+/// holds at least one verified discovery block (ADR 039-adjacent partial-
+/// holder discovery; a partial holder is advertise-eligible, not just a
+/// `Complete` one), `Some(false)` when it holds none, `None` when the store
+/// query faulted and the question has no answer. The due-time gate that
+/// stops the scheduler from re-publishing content LRU drift or an
+/// operator-evict already removed.
 ///
-/// Origin-held counts, not just the local store. `CacheEngine::has` consults
-/// only the iroh-blobs store, but the probe path advertises origin-held content
-/// through `origin_held_size` — so a filesystem or pinned-origin hash that was
-/// never imported would be advertised at probe time and yet dropped here at its
-/// first due time, publishing no `Store` at all. Both bulk seeds feed exactly
-/// that content in, so a store-only check silently discards what they schedule.
+/// Origin-held counts, not just the local store. `CacheEngine::coverage`
+/// derives its bitmap from cached blocks only, but the probe path
+/// advertises origin-held content through `origin_held_size` — so a
+/// filesystem or pinned-origin hash that was never imported would be
+/// advertised at probe time and yet dropped here at its first due time,
+/// publishing no `Store` at all. Both bulk seeds feed exactly that content
+/// in, so a cache-only check silently discards what they schedule.
 ///
 /// A store error is `None`, never `Some(false)`: eviction is the only honest
 /// reason to stop republishing, and a fault is not eviction evidence. Folding
@@ -944,6 +949,11 @@ pub async fn run_republish(
 ///
 /// Both reads are in-memory or local; the live origin probe is deliberately not
 /// used, because this runs per hash per republish cycle.
+///
+/// Known limitation: a non-origin front-prefix partial with unknown size
+/// derives to an empty `Coverage` (see [`decdn_cache::CacheEngine::coverage`]),
+/// so it reports `Some(false)` here and never publishes a `Store` until a
+/// later size-persistence follow-up fixes the derivation.
 async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash) -> Option<bool> {
     let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
     if cache.refuses(h) {
@@ -955,8 +965,8 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash)
     if cache.origin_held_size(h).is_some() {
         return Some(true);
     }
-    match cache.has(h).await {
-        Ok(held) => Some(held),
+    match cache.coverage(h).await {
+        Ok(coverage) => Some(!coverage.is_empty()),
         Err(err) => {
             tracing::debug!(
                 hash = ?hash,
@@ -971,12 +981,18 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash)
 /// Send a `Store` to the K+3 closest peers for `hash` in parallel.
 /// Failures are logged at debug level — a missed receiver in this cycle
 /// will be retried on the next cycle (or on the next cold start).
+///
+/// `coverage` is derived once, up front — every receiver gets the same
+/// snapshot of what this node can currently serve for `hash` rather than a
+/// per-RPC re-derivation that could drift mid-fan-out.
 async fn publish_hash(
     endpoint: &Endpoint,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
+    cache: &decdn_cache::CacheEngine,
     hash: ContentHash,
 ) {
+    let coverage = fetch_coverage(cache, hash).await;
     let targets: Vec<NodeId> = with_lock(routing, "dht routing table", |table| {
         // ADR 022 §STORE Flow line 128 specifies K+3 (= 23) closest
         // nodes — the three positions beyond K are overflow targets
@@ -995,6 +1011,7 @@ async fn publish_hash(
     let mut handles = Vec::with_capacity(targets.len());
     for peer in targets {
         let endpoint_cloned = endpoint.clone();
+        let coverage_cloned = coverage.clone();
         handles.push(tokio::spawn(async move {
             let target_pk = match PublicKey::from_bytes(peer.as_bytes()) {
                 Ok(k) => k,
@@ -1008,7 +1025,7 @@ async fn publish_hash(
                 }
             };
             let addr = EndpointAddr::new(target_pk);
-            match client::store(&endpoint_cloned, addr, hash, self_node_id).await {
+            match client::store(&endpoint_cloned, addr, hash, self_node_id, coverage_cloned).await {
                 Ok(ack) if ack.accepted => {}
                 Ok(_) => {
                     tracing::debug!(
@@ -1030,6 +1047,26 @@ async fn publish_hash(
     }
     for h in handles {
         let _ = h.await;
+    }
+}
+
+/// Derive `hash`'s current [`Coverage`] from the cache, folding any store
+/// fault into [`Coverage::empty`] — a republish that can't answer the
+/// coverage question advertises nothing for this cycle rather than
+/// blocking on it; the hash stays scheduled and retries next cycle via the
+/// `cache_still_holds` due-time gate.
+async fn fetch_coverage(cache: &decdn_cache::CacheEngine, hash: ContentHash) -> Coverage {
+    let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
+    match cache.coverage(h).await {
+        Ok(coverage) => coverage,
+        Err(err) => {
+            tracing::debug!(
+                hash = ?hash,
+                error = %err,
+                "dht republish: coverage query faulted; publishing empty coverage this cycle"
+            );
+            Coverage::empty()
+        }
     }
 }
 
@@ -1063,6 +1100,7 @@ async fn publish_batch(
     endpoint: &Endpoint,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
+    cache: &decdn_cache::CacheEngine,
     hashes: &[ContentHash],
 ) {
     let groups = with_lock(routing, "dht routing table", |table| {
@@ -1073,9 +1111,19 @@ async fn publish_batch(
         // Nothing to do this cycle; the scheduler will retry.
         return;
     }
+    // Derive each hash's coverage once, up front, and share it across every
+    // receiver's batch — the same rationale as `publish_hash`'s single
+    // snapshot: every receiver of a given hash this cycle sees the same
+    // coverage rather than a per-batch re-derivation that could drift.
+    let mut coverage_by_hash = HashMap::with_capacity(hashes.len());
+    for &hash in hashes {
+        coverage_by_hash.insert(hash, fetch_coverage(cache, hash).await);
+    }
+    let coverage_by_hash = Arc::new(coverage_by_hash);
     let mut handles = Vec::with_capacity(groups.len());
     for (peer, peer_hashes) in groups {
         let endpoint_cloned = endpoint.clone();
+        let coverage_by_hash = Arc::clone(&coverage_by_hash);
         handles.push(tokio::spawn(async move {
             let target_pk = match PublicKey::from_bytes(peer.as_bytes()) {
                 Ok(k) => k,
@@ -1090,7 +1138,14 @@ async fn publish_batch(
             };
             let addr = EndpointAddr::new(target_pk);
             for chunk in peer_hashes.chunks(MAX_BATCH_STORE_HASHES) {
-                match client::batch_store(&endpoint_cloned, addr.clone(), chunk.to_vec(), self_node_id)
+                let entries: Vec<(ContentHash, Coverage)> = chunk
+                    .iter()
+                    .map(|h| {
+                        let coverage = coverage_by_hash.get(h).cloned().unwrap_or_else(Coverage::empty);
+                        (*h, coverage)
+                    })
+                    .collect();
+                match client::batch_store(&endpoint_cloned, addr.clone(), entries, self_node_id)
                     .await
                 {
                     Ok(ack) => {
@@ -1655,6 +1710,123 @@ mod tests {
             cache_still_holds(&cache, &absent).await,
             Some(false),
             "content held nowhere must still be dropped"
+        );
+        Ok(())
+    }
+
+    /// Deterministic pseudo-random plaintext plus its bao pre-order outboard,
+    /// mirroring `decdn_cache::engine::tests::synth_blob` — that helper is
+    /// private to the `cache` crate, so this is a from-scratch build over
+    /// the same public `bao_tree` primitive.
+    fn synth_blob(len: usize) -> ([u8; 32], Vec<u8>, bytes::Bytes) {
+        let mut plaintext = vec![0u8; len];
+        let mut x: u32 = 0x9e37_79b9;
+        for b in &mut plaintext {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x.to_le_bytes()[0];
+        }
+        let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
+            &plaintext,
+            decdn_bao_range::IROH_BLOCK_SIZE,
+        );
+        (*ob.root.as_bytes(), plaintext, bytes::Bytes::from(ob.data))
+    }
+
+    /// A verified, ready-to-`admit_bao` bao encoding of `[off, off+len)` of a
+    /// `total`-byte blob rooted at `root`, using the public
+    /// `decdn_bao_range::{align_range, encode_verified_range}` seam — the same
+    /// verification path a real ranged pull goes through, just fed synthetic
+    /// content instead of a network origin. Mirrors
+    /// `decdn_cache::engine::tests::bao_for` (also private to `cache`).
+    fn bao_for(
+        root: [u8; 32],
+        plaintext: &[u8],
+        outboard: bytes::Bytes,
+        off: u64,
+        len: u64,
+        total: u64,
+    ) -> (decdn_cache::Hash, bao_tree::ChunkRanges, bytes::Bytes) {
+        let aligned = decdn_bao_range::align_range(off, len, total).expect("range within blob");
+        let s = usize::try_from(aligned.fetch_start()).expect("fetch_start fits usize");
+        let e = usize::try_from(aligned.fetch_end()).expect("fetch_end fits usize");
+        let encoded = decdn_bao_range::encode_verified_range(
+            root,
+            &aligned,
+            plaintext.get(s..e).expect("aligned range within plaintext"),
+            outboard,
+        )
+        .expect("synthetic range verifies against its own root");
+        (
+            decdn_cache::Hash::from(root),
+            aligned.chunk_ranges().clone(),
+            encoded,
+        )
+    }
+
+    /// The advertise-gate relax (#1506): `cache_still_holds` must admit a
+    /// PARTIAL holder — one that has verified at least one
+    /// [`decdn_protocol::DISCOVERY_BLOCK_BYTES`] discovery block but is
+    /// neither `Complete` nor origin-held — into the announce set. Before the
+    /// relax, `cache_still_holds` asked `CacheEngine::has` (`Complete`-only),
+    /// which would have answered `Some(false)` for exactly this fixture: the
+    /// blob spans two discovery blocks and only the first is admitted.
+    #[tokio::test]
+    async fn cache_still_holds_accepts_a_partial_holder_with_at_least_one_verified_block()
+    -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let cache = decdn_cache::CacheEngine::open(tmp.path(), vec![], 16).await?;
+
+        // Two discovery blocks: block 0 is admitted whole, block 1's middle
+        // group is left missing — a genuine partial, not a rounding
+        // artifact. iroh-blobs only reports a `Partial` blob's size once its
+        // FINAL chunk is present (see the sibling `decdn-cache` coverage
+        // test this mirrors), so the trailing group is admitted separately
+        // to establish the validated size while block 1 stays uncovered.
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * group;
+        let (root, plaintext, outboard) =
+            synth_blob(usize::try_from(total).expect("test blob size fits usize"));
+        let (hash, block0_ranges, block0_bao) = bao_for(
+            root,
+            &plaintext,
+            outboard.clone(),
+            0,
+            decdn_protocol::DISCOVERY_BLOCK_BYTES,
+            total,
+        );
+        cache.admit_bao(hash, block0_ranges, block0_bao).await?;
+        let (_, tail_ranges, tail_bao) =
+            bao_for(root, &plaintext, outboard, total - group, group, total);
+        cache.admit_bao(hash, tail_ranges, tail_bao).await?;
+
+        assert!(
+            !cache.present_ranges(hash).await?.is_complete(),
+            "fixture precondition: block 1's middle group was never admitted, \
+             so this is a genuine partial"
+        );
+        let cov = cache.coverage(hash).await?;
+        assert!(!cov.is_empty(), "fixture precondition: block 0 is covered");
+        assert!(
+            !cov.covers(1),
+            "fixture precondition: block 1 must NOT be covered"
+        );
+        // This is what makes the fixture prove the relax: under the OLD
+        // `cache.has()` (`Complete`-only) gate, `cache_still_holds` would
+        // have answered `Some(false)` for this exact holder.
+        assert!(
+            !cache.has(hash).await?,
+            "fixture precondition: this holder is NOT Complete — the old gate \
+             would have dropped it"
+        );
+
+        let content_hash = ContentHash::from_bytes(*hash.as_bytes());
+        assert_eq!(
+            cache_still_holds(&cache, &content_hash).await,
+            Some(true),
+            "a partial holder with >=1 verified block must be in the announce set — \
+             the old Complete-only `cache.has()` gate would have answered Some(false) here"
         );
         Ok(())
     }

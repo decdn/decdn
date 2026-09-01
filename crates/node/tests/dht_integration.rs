@@ -75,7 +75,7 @@ use decdn_node::dht::{
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::dht::DhtHandler;
 use decdn_node::metrics::Metrics;
-use decdn_protocol::{ALPN_DHT, ContentHash, NodeId};
+use decdn_protocol::{ALPN_DHT, ContentHash, Coverage, NodeId};
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
 
@@ -332,6 +332,7 @@ fn insert_record(records: &Mutex<RecordStore>, hash: [u8; 32], holder: [u8; 32])
     let outcome = guard.insert_at(
         NodeId::from_bytes(holder),
         ContentHash::from_bytes(hash),
+        Coverage::full(1),
         receive_us,
     );
     assert!(
@@ -464,7 +465,10 @@ async fn find_providers_converges_after_peer_departs() -> anyhow::Result<()> {
 
     assert_eq!(
         providers,
-        vec![NodeId::from_bytes(*provider.id.as_bytes())],
+        vec![(
+            NodeId::from_bytes(*provider.id.as_bytes()),
+            Coverage::full(1)
+        )],
         "lookup must converge to the surviving provider after a departure"
     );
 
@@ -553,11 +557,14 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
 
     assert_eq!(
         providers,
-        vec![NodeId::from_bytes(*provider.id.as_bytes())],
+        vec![(
+            NodeId::from_bytes(*provider.id.as_bytes()),
+            Coverage::full(1)
+        )],
         "lookup must converge to the reachable provider despite the closest peer being dead"
     );
     assert!(
-        !providers.contains(&dead_id),
+        !providers.iter().any(|(node, _)| *node == dead_id),
         "the unreachable peer must never appear as a provider"
     );
 
@@ -622,7 +629,7 @@ async fn find_providers_converges_via_closer_nodes_second_round() -> anyhow::Res
 
     assert_eq!(
         providers,
-        vec![holder_id],
+        vec![(holder_id, Coverage::full(1))],
         "lookup must follow the seed's closer_node to the holder and converge"
     );
 
@@ -721,7 +728,7 @@ async fn find_providers_stops_suppressing_once_the_negative_entry_expires() -> a
     .await;
     assert_eq!(
         recovered,
-        vec![provider_node],
+        vec![(provider_node, Coverage::full(1))],
         "expired negative entry must not poison the follow-up lookup"
     );
     assert!(
