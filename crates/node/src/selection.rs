@@ -33,19 +33,28 @@ pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 /// then visible in one file, which is what stops the next one from being guessed.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// How many blob-holding candidates a probe round collects before it stops
-/// waiting on the rest. [`PROBE_TIMEOUT`] stays the ceiling — a sparse round that
-/// never reaches this count still waits it out — but when this many good
-/// providers have already answered, the round selects among them instead of
+/// How many blob-holding candidates a SINGLE-SOURCE probe round collects before
+/// it stops waiting on the rest. [`PROBE_TIMEOUT`] stays the ceiling — a sparse
+/// round that never reaches this count still waits it out — but when this many
+/// good providers have already answered, the round selects among them instead of
 /// waiting the full window for a straggler or a dead peer that will only time
 /// out. The count leaves at least one alternate in hand for per-blob failover
 /// while keeping cold-miss discovery latency at the speed of the fastest good
 /// answers rather than the ceiling. ADR 001 § Probe response collection.
 ///
-/// Equal to [`MAX_PROVIDER_ATTEMPTS`] on purpose: the pull loop tries at most
-/// that many providers, so collecting that many viable candidates already fills
-/// the failover budget — waiting for more only serves stragglers the loop would
-/// never reach.
+/// Equal to [`MAX_PROVIDER_ATTEMPTS`] on purpose: the single-source pull loop
+/// tries at most that many providers, so collecting that many viable candidates
+/// already fills the failover budget — waiting for more only serves stragglers
+/// the loop would never reach.
+///
+/// This fixed count is CORRECT only when one working provider is enough — the
+/// buffered single-source pull. The ranged-drive assembly path (#1506, ADR 039)
+/// needs a candidate set whose coverage UNION spans the requested range, not a
+/// fixed count: three responders that all hold discovery block 0 do not cover a
+/// three-block blob, yet stopping at this count would drop the block-1/block-2
+/// holders in the same fanout. That path gathers by coverage union instead (see
+/// `node_origin::probe_and_rank`'s `ProbeGather::CoverageUnion`), bounded only by
+/// the probe fanout.
 pub const PROBE_EARLY_EXIT_CANDIDATES: usize = MAX_PROVIDER_ATTEMPTS;
 
 /// One-time headroom added on top of the `MAX_PROVIDER_ATTEMPTS` sequential per-candidate

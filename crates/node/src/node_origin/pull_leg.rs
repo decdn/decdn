@@ -66,9 +66,10 @@ use super::funder::NodeFunder;
 use super::funder::{SETTLE_POLL_STEP, settle_wait_budget};
 use super::ranged_pull::{AssembleOutcome, RunOutcome, RunSink, assemble};
 use super::{
-    EconGate, NodeOrigin, NodeOriginDeps, PullMiss, PullOutcome, SettleOnDrop, bind_upstream_ctx,
-    cached_candidates, classify_pull_failure, discover, economic_ceiling, heat_of, lane_ledger,
-    mb_of, now_micros, probe_and_rank, record_outcome, record_pool_open_failure,
+    EconGate, NodeOrigin, NodeOriginDeps, ProbeGather, PullMiss, PullOutcome, SettleOnDrop,
+    bind_upstream_ctx, cached_candidates, classify_pull_failure, discover, economic_ceiling,
+    heat_of, lane_ledger, mb_of, now_micros, probe_and_rank, record_outcome,
+    record_pool_open_failure,
 };
 use crate::client_requester::{
     PoolContext, PullDeadlines, open_progressive_pull as open_progressive_upstream,
@@ -269,7 +270,11 @@ impl NodeOrigin {
         if !attempt_metered {
             deps.metrics.node_pull_attempt();
         }
-        let ranked = probe_and_rank(deps, providers, hash_bytes).await;
+        // The ranged-drive assembly (#1506) plans over the coverage UNION of these
+        // candidates, so the probe round must gather holders until their union spans
+        // the blob — not stop at a fixed count that could miss the holders of the
+        // still-uncovered blocks.
+        let ranked = probe_and_rank(deps, providers, hash_bytes, ProbeGather::CoverageUnion).await;
         let outcome = self
             .handshake_from_candidates(deps, &ranked, hash_bytes, namespace_id, budget)
             .await;
@@ -453,9 +458,12 @@ impl NodeOrigin {
 /// verified bytes, so the replacement lane resumes at the gap and re-pays nothing
 /// (#1682). A TERMINAL fault (a shared-pool voucher rejection, an origin blacklist,
 /// an over-cap blob) ends the whole assembly. A still-missing range no surviving
-/// candidate covers ends it as a miss — the pre-#1506 signed `NotFound` (origins
-/// advertise all-ones coverage, so an admitted origin candidate makes this
-/// unreachable).
+/// candidate covers ends it as an `Unavailable` outcome (origins advertise all-ones
+/// coverage, so an admitted origin candidate makes this unreachable). This function
+/// runs on the pull thread the serve leg spawns AFTER it has already signed and sent
+/// `ok: true`, so none of these failure outcomes reaches the client as a signed
+/// `NotFound` — they surface as a truncated stream (`session.mark_ended(Err(..))`
+/// stops the fill and the serve encoder ends short).
 ///
 /// Records each provider's terminal outcome to reputation as its run ends, and the
 /// whole assembly's terminal outcome via the shared [`FillSession::mark_ended`]. A
@@ -628,6 +636,15 @@ impl RunSink for PeerRunSink<'_> {
     // `pull_from_candidate` twin does. Splitting it would scatter one linear flow.
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     async fn drive_run(&self, run: CoveredRun) -> RunOutcome {
+        // Cancellation before the lane open (#1506). Each run now opens its OWN lane
+        // — `open_or_reuse_pool` can escrow a fresh `openChannel` or fire a proactive
+        // `topUp`, and `bind_upstream_ctx` / `missing_ranges` run before the `drive`
+        // `select!` that watches `cancel`. A serve leg that already finished (client
+        // gone, shutdown) must not land an on-chain tx for nobody, so stop the loop
+        // cleanly here rather than after opening.
+        if self.cancel.is_cancelled() {
+            return RunOutcome::Cancelled;
+        }
         let Some(candidate) = self.candidates.get(run.source_ix) else {
             // Cannot happen — `source_ix` is a live index into `candidates` — but
             // drop the source rather than panic (anti-panic policy).

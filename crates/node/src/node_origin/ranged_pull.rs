@@ -29,6 +29,19 @@ use decdn_cache::FillError;
 use decdn_client_pull::{CoveredRun, SourceCoverage, plan_covered_runs};
 use decdn_protocol::Coverage;
 
+use crate::selection::MAX_PROVIDER_ATTEMPTS;
+
+/// Upper bound on source reassignments across one assembly (#1506).
+///
+/// The reassign tail drops a faulted source and re-plans the remainder onto a
+/// survivor; each such round costs the replacement source a resolve, an economic
+/// gate, a pool open, a dial, and a drain, all in front of a client whose stream
+/// is already open. Without a cap the loop would walk EVERY survivor — up to the
+/// ten a probe-cache hit carries — churning that many opens on a pathological set.
+/// Bounded to [`MAX_PROVIDER_ATTEMPTS`], the same budget the single-source
+/// failover loop and [`super::pull_leg`]'s header handshake spend.
+const MAX_REASSIGN_ATTEMPTS: usize = MAX_PROVIDER_ATTEMPTS;
+
 /// One run's terminal disposition, as the driving sink saw it.
 pub(crate) enum RunOutcome {
     /// The run's `[offset, offset+len)` is fully present in the store now.
@@ -53,8 +66,14 @@ pub(crate) enum AssembleOutcome {
     /// Some still-missing range no surviving candidate covers. Origins advertise
     /// all-ones coverage, so an admitted origin candidate makes this
     /// unreachable; without one it means the blob is not fully available across
-    /// the known holders. The caller answers it exactly as the pre-#1506
-    /// single-source miss did (a signed `NotFound`).
+    /// the known holders. This runs on the serve-miss pull thread, which the serve
+    /// leg spawns only AFTER it has already signed and sent `ok: true` (the
+    /// response commits to `total_bytes` before any byte is pulled). So this
+    /// surfaces to the client as a TRUNCATED stream — the leg fills nothing and
+    /// the serve encoder ends short — not as a signed `NotFound`. A pre-serve
+    /// coverage-union refusal would be needed to answer `NotFound` here, and the
+    /// coverage-union probe gather (#1506) narrows how often the gap is uncoverable
+    /// in the first place rather than adding one.
     Unavailable,
     /// A run faulted terminally; propagate the fault to the serve leg.
     Terminal(FillError),
@@ -93,6 +112,18 @@ pub(crate) trait RunSink {
 /// the remainder. Terminates on a fully-present gap ([`AssembleOutcome::Complete`]),
 /// an uncovered range ([`AssembleOutcome::Unavailable`]), a terminal fault, or
 /// cancellation.
+///
+/// Two guards keep the loop finite even under a driver that violates the
+/// reassign-only completion contract:
+///
+/// - **No-progress guard.** `surviving` shrinks only on a reassign, so a round
+///   that reports every run [`RunOutcome::Filled`] yet does NOT shrink the gap
+///   would re-plan an identical round forever. When a round drops no source and
+///   the gap does not shrink, the assembly ends [`AssembleOutcome::Unavailable`]
+///   rather than spin.
+/// - **Reassign budget.** At most [`MAX_REASSIGN_ATTEMPTS`] sources are dropped
+///   and re-planned before the assembly ends `Unavailable`, so a pathological set
+///   cannot churn one lane open per survivor.
 pub(crate) async fn assemble<S: RunSink>(
     sink: &S,
     coverage: &[Coverage],
@@ -103,6 +134,12 @@ pub(crate) async fn assemble<S: RunSink>(
     // Surviving candidate indices, best-first. A source that faults
     // non-terminally is dropped from here and never re-planned.
     let mut surviving: Vec<usize> = (0..coverage.len()).collect();
+    // The prior round's gap measure and whether it dropped a source — the two
+    // inputs the no-progress guard reads.
+    let mut prev_gap_chunks: Option<u64> = None;
+    let mut dropped_last_round = false;
+    // Sources dropped so far, bounded by `MAX_REASSIGN_ATTEMPTS`.
+    let mut reassigns = 0usize;
     loop {
         let gap = sink.missing(offset, len).await;
         if gap.is_empty() {
@@ -113,6 +150,16 @@ pub(crate) async fn assemble<S: RunSink>(
             // left to try. Wire-identical to the no-provider miss.
             return AssembleOutcome::Unavailable;
         }
+        let gap_chunks = chunk_count(&gap);
+        // No-progress guard: a round that dropped no source and did not shrink the
+        // gap will re-plan identically next round. End rather than spin.
+        if let Some(prev) = prev_gap_chunks
+            && !dropped_last_round
+            && gap_chunks >= prev
+        {
+            return AssembleOutcome::Unavailable;
+        }
+        prev_gap_chunks = Some(gap_chunks);
         let sources: Vec<SourceCoverage> = surviving
             .iter()
             .filter_map(|&ix| {
@@ -146,13 +193,37 @@ pub(crate) async fn assemble<S: RunSink>(
         match faulted {
             // Every planned run filled its range; the runs partition the gap, so
             // the next `missing` is empty and the loop returns `Complete`.
-            None => {}
+            None => dropped_last_round = false,
             // Drop the faulted source and re-plan. The store keeps the verified
             // bytes, so `missing` next round excludes them: no re-fetch, no
-            // re-pay.
-            Some(ix) => surviving.retain(|&s| s != ix),
+            // re-pay. Bounded by the reassign budget so a pathological set cannot
+            // churn one lane open per survivor.
+            Some(ix) => {
+                reassigns += 1;
+                if reassigns >= MAX_REASSIGN_ATTEMPTS {
+                    return AssembleOutcome::Unavailable;
+                }
+                surviving.retain(|&s| s != ix);
+                dropped_last_round = true;
+            }
         }
     }
+}
+
+/// Total chunks a bounded [`ChunkRanges`] gap covers — the monotone measure the
+/// no-progress guard compares across rounds. A serve-miss gap is always bounded
+/// (`missing` derives it from a finite `[offset, offset + len)`), so every
+/// boundary pairs; an unpaired open-ended run contributes nothing.
+fn chunk_count(gap: &ChunkRanges) -> u64 {
+    let boundaries = gap.boundaries();
+    let mut it = boundaries.iter();
+    let mut sum = 0u64;
+    while let Some(a) = it.next() {
+        if let Some(b) = it.next() {
+            sum = sum.saturating_add(b.0.saturating_sub(a.0));
+        }
+    }
+    sum
 }
 
 #[cfg(test)]
@@ -164,7 +235,7 @@ mod tests {
     use decdn_client_pull::CoveredRun;
     use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
-    use super::{AssembleOutcome, RunOutcome, RunSink, assemble};
+    use super::{AssembleOutcome, MAX_REASSIGN_ATTEMPTS, RunOutcome, RunSink, assemble};
 
     const BAO_CHUNK_BYTES: u64 = 1024;
 
@@ -212,6 +283,11 @@ mod tests {
         Reassign,
         /// Report `Terminal`.
         Terminal,
+        /// Report `Filled` having admitted NOTHING — a driver that violates the
+        /// reassign-only completion contract. STICKY (never consumed from the
+        /// script), so the run keeps reporting no-progress `Filled` and the loop
+        /// would spin without the no-progress guard.
+        FilledNothing,
     }
 
     impl FakeSink {
@@ -259,12 +335,20 @@ mod tests {
             self.driven
                 .borrow_mut()
                 .push((run.source_ix, run.offset, run.len));
-            let disposition = self
-                .script
-                .borrow_mut()
-                .get_mut(&run.source_ix)
-                .and_then(|seq| (!seq.is_empty()).then(|| seq.remove(0)))
-                .unwrap_or(Disposition::Fill);
+            let disposition = {
+                let mut script = self.script.borrow_mut();
+                match script.get_mut(&run.source_ix) {
+                    Some(seq) => {
+                        let next = seq.first().copied().unwrap_or(Disposition::Fill);
+                        // Every disposition but the sticky no-progress one is consumed.
+                        if !matches!(next, Disposition::FilledNothing) && !seq.is_empty() {
+                            seq.remove(0);
+                        }
+                        next
+                    }
+                    None => Disposition::Fill,
+                }
+            };
             let blocks = self.run_blocks(run);
             match disposition {
                 Disposition::Fill => {
@@ -281,6 +365,8 @@ mod tests {
                 Disposition::Terminal => {
                     RunOutcome::Terminal(decdn_cache::FillError::new("scripted terminal"))
                 }
+                // Reports Filled while admitting nothing: the gap does not shrink.
+                Disposition::FilledNothing => RunOutcome::Filled,
             }
         }
     }
@@ -374,6 +460,46 @@ mod tests {
 
         let outcome = assemble(&sink, &coverage, 0, total, total).await;
         assert!(matches!(outcome, AssembleOutcome::Unavailable));
+    }
+
+    /// No-progress guard (#1506 I2): a source that reports `Filled` while
+    /// admitting NOTHING does not shrink the gap and is never dropped, so the loop
+    /// would re-plan an identical round forever. The guard ends it `Unavailable`
+    /// after the first fruitless round instead of spinning.
+    #[tokio::test]
+    async fn filled_without_progress_terminates_instead_of_spinning() {
+        let total = DISCOVERY_BLOCK_BYTES;
+        // The only holder covers the only block but keeps reporting Filled while
+        // admitting nothing (sticky disposition).
+        let sink = FakeSink::new(total).script(0, &[Disposition::FilledNothing]);
+        let coverage = vec![cov(1, &[0])];
+
+        let outcome = assemble(&sink, &coverage, 0, total, total).await;
+        assert!(matches!(outcome, AssembleOutcome::Unavailable));
+        // Ended after ONE fruitless run rather than re-driving it forever.
+        assert_eq!(sink.driven.borrow().len(), 1);
+    }
+
+    /// Reassign budget (#1506 I4): a set of holders that all cover the range but
+    /// all fault non-terminally cannot churn one lane open per survivor — the loop
+    /// drops at most `MAX_REASSIGN_ATTEMPTS` sources before ending `Unavailable`.
+    #[tokio::test]
+    async fn reassign_budget_caps_lane_churn() {
+        let total = DISCOVERY_BLOCK_BYTES;
+        // Eight holders, each covering the only block, each faulting non-terminally
+        // with nothing admitted. Without the budget the loop would drive all eight.
+        let holders = 8usize;
+        let mut sink = FakeSink::new(total);
+        let mut coverage = Vec::new();
+        for ix in 0..holders {
+            sink = sink.script(ix, &[Disposition::Reassign]);
+            coverage.push(cov(1, &[0]));
+        }
+
+        let outcome = assemble(&sink, &coverage, 0, total, total).await;
+        assert!(matches!(outcome, AssembleOutcome::Unavailable));
+        // Exactly `MAX_REASSIGN_ATTEMPTS` lanes were opened, not one per holder.
+        assert_eq!(sink.driven.borrow().len(), MAX_REASSIGN_ATTEMPTS);
     }
 
     /// Runs are driven strictly in offset order and one at a time (sequential

@@ -109,6 +109,21 @@ use crate::selection::{
     Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_EARLY_EXIT_CANDIDATES, PROBE_TIMEOUT, rank_candidates,
 };
 
+/// How a probe round decides it has collected enough holders (#1506).
+#[derive(Clone, Copy)]
+pub(crate) enum ProbeGather {
+    /// Single-source failover: stop once [`PROBE_EARLY_EXIT_CANDIDATES`] holders
+    /// answer, because the single-source pull loop tries at most that many.
+    EarlyExit,
+    /// Ranged assembly: stop once the admitted holders' coverage UNION spans the
+    /// blob, so a set of partial holders whose fastest answers all cover the same
+    /// discovery block is not mistaken for enough. A holder that reports its blob
+    /// size (`ProbeResponseExt.total_bytes`) pins the block count the union must
+    /// span; absent any size the round drains to the probe-fanout ceiling. Either
+    /// way the fanout `take` is the upper bound, so the gather stays bounded.
+    CoverageUnion,
+}
+
 /// Record a buyer channel open/reuse failure on `err` to the metrics in `deps`,
 /// emitting a structured-log line with the failure-class `reason` (#966).
 ///
@@ -661,8 +676,9 @@ impl Origin for NodeOrigin {
             if !attempt_metered {
                 deps.metrics.node_pull_attempt();
             }
-            // Writes the probe cache at its tail.
-            let ranked = probe_and_rank(deps, providers, hash_bytes).await;
+            // Writes the probe cache at its tail. The buffered fill is a
+            // single-source pull (`try_pull`), so one working holder is enough.
+            let ranked = probe_and_rank(deps, providers, hash_bytes, ProbeGather::EarlyExit).await;
             match try_pull(&deps_lock, deps, &ranked, hash_bytes, budget)
                 .await
                 .payload
@@ -769,6 +785,7 @@ async fn probe_and_rank(
     deps: &NodeOriginDeps,
     providers: Vec<DhtNodeId>,
     hash_bytes: [u8; 32],
+    gather: ProbeGather,
 ) -> Vec<Candidate> {
     use futures_util::stream::StreamExt;
     let now_secs = crate::payment_settlement::unix_now();
@@ -806,13 +823,47 @@ async fn probe_and_rank(
     // hand: waiting on `join_all` would pace the whole round to the SLOWEST probe — a dead
     // peer that only resolves at its `PROBE_TIMEOUT` — even when the fastest few already
     // answered. `PROBE_TIMEOUT` still bounds each probe, so a sparse round that never reaches
-    // the early-exit count simply drains to the ceiling; a healthy round selects at the speed
+    // the stop condition simply drains to the ceiling; a healthy round selects at the speed
     // of its fastest good answers.
+    //
+    // The stop condition depends on `gather`: [`ProbeGather::EarlyExit`] stops at a fixed
+    // count of holders (single-source failover), while [`ProbeGather::CoverageUnion`] stops
+    // once the admitted holders' coverage union spans the blob (ranged assembly, #1506) — a
+    // set of partial holders whose fastest answers all cover the same block must not stop
+    // short of the holders that cover the rest.
     let mut candidates: Vec<Candidate> = Vec::new();
+    // Union tracking, used only by `CoverageUnion`: the covered discovery blocks seen so far
+    // and the largest block count a holder has reported for this blob.
+    let mut union_blocks: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut target_blocks: u32 = 0;
     while let Some(result) = probes.next().await {
-        if let Some(candidate) = result {
-            candidates.push(candidate);
-            if candidates.len() >= PROBE_EARLY_EXIT_CANDIDATES {
+        if let Some((candidate, total_bytes)) = result {
+            let done = match gather {
+                ProbeGather::EarlyExit => {
+                    candidates.push(candidate);
+                    candidates.len() >= PROBE_EARLY_EXIT_CANDIDATES
+                }
+                ProbeGather::CoverageUnion => {
+                    // A holder's own reported size pins how many blocks the blob has;
+                    // ignore its coverage bits past that (untrusted wire may set spurious
+                    // high bits — see `Coverage`).
+                    if let Some(bytes) = total_bytes {
+                        let holder_blocks = decdn_protocol::num_blocks(bytes);
+                        target_blocks = target_blocks.max(holder_blocks);
+                        for block in candidate.coverage.covered_blocks() {
+                            if block < holder_blocks {
+                                union_blocks.insert(block);
+                            }
+                        }
+                    }
+                    candidates.push(candidate);
+                    // Complete once every block `0..target_blocks` is in the union. With no
+                    // holder-reported size (`target_blocks == 0`) this stays false and the
+                    // round drains to the probe-fanout ceiling.
+                    target_blocks > 0 && (0..target_blocks).all(|b| union_blocks.contains(&b))
+                }
+            };
+            if done {
                 break;
             }
         }
@@ -856,10 +907,11 @@ fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
         .collect()
 }
 
-/// Probe a single provider, returning a ranked-ready [`Candidate`] iff it
-/// responds, validates, and reports holding the blob. Side effects: a failed
-/// probe scores the provider [`Outcome::Unreachable`]; a reachable-but-absent
-/// provider is recorded in the negative-probe cache.
+/// Probe a single provider, returning a ranked-ready [`Candidate`] paired with
+/// the holder's reported blob size (`ProbeResponseExt.total_bytes`, for the
+/// coverage-union gather) iff it responds, validates, and reports holding the
+/// blob. Side effects: a failed probe scores the provider [`Outcome::Unreachable`];
+/// a reachable-but-absent provider is recorded in the negative-probe cache.
 // Straight-line probe → classify → build; the tracing macros and the three
 // sequential drop-conditions inflate the cognitive-complexity metric past the
 // threshold (same inflation noted in `chain_staker_set`), and splitting the
@@ -869,7 +921,7 @@ async fn probe_candidate(
     deps: &NodeOriginDeps,
     peer: DhtNodeId,
     hash_bytes: [u8; 32],
-) -> Option<Candidate> {
+) -> Option<(Candidate, Option<u64>)> {
     let Ok(pk) = PublicKey::from_bytes(peer.as_bytes()) else {
         // A staker-filtered routing entry should always decode; a failure
         // implies upstream state corruption — skip rather than panic.
@@ -966,26 +1018,33 @@ async fn probe_candidate(
         deps.metrics.node_region_latency_penalty();
         deps.local_rep.record(pk, Outcome::RegionLatencyMismatch);
     }
-    Some(Candidate {
-        node_id: *peer.as_bytes(),
-        rate_per_mb: resp.body.rate_per_mb,
-        rtt_ms: rtt,
-        reputation: peer_reputation(deps, pk),
-        // Drives the geo-diversity tie-break tier (selection.rs) and the
-        // latency-vs-claim penalty above.
-        region,
-        // No on-chain stake lookup is wired yet (#1470 / ADR 019). `0` is a
-        // placeholder here, not an observation — which is exactly why tier 2 is
-        // a uniform no-op until the lookup lands. When it does, a failed read
-        // must be resolved here (retry, or drop the candidate) rather than
-        // passed through as `0`; see `Candidate::stake`.
-        stake: 0,
-        // The fresh, probe-confirmed coverage (#1506) — never the stale DHT
-        // hint `discover` drops. The `consistent_with` check above already
-        // guarantees this is non-empty whenever `has_blob` is true, which is
-        // the only way execution reaches here.
-        coverage: resp_ext.coverage,
-    })
+    // The holder's reported blob size (`ProbeResponseExt.total_bytes`), read
+    // before `coverage` is moved into the candidate. The coverage-union gather
+    // (#1506) uses it to know how many discovery blocks the union must span.
+    let total_bytes = resp_ext.total_bytes;
+    Some((
+        Candidate {
+            node_id: *peer.as_bytes(),
+            rate_per_mb: resp.body.rate_per_mb,
+            rtt_ms: rtt,
+            reputation: peer_reputation(deps, pk),
+            // Drives the geo-diversity tie-break tier (selection.rs) and the
+            // latency-vs-claim penalty above.
+            region,
+            // No on-chain stake lookup is wired yet (#1470 / ADR 019). `0` is a
+            // placeholder here, not an observation — which is exactly why tier 2 is
+            // a uniform no-op until the lookup lands. When it does, a failed read
+            // must be resolved here (retry, or drop the candidate) rather than
+            // passed through as `0`; see `Candidate::stake`.
+            stake: 0,
+            // The fresh, probe-confirmed coverage (#1506) — never the stale DHT
+            // hint `discover` drops. The `consistent_with` check above already
+            // guarantees this is non-empty whenever `has_blob` is true, which is
+            // the only way execution reaches here.
+            coverage: resp_ext.coverage,
+        },
+        total_bytes,
+    ))
 }
 
 /// Rebuild ranked [`Candidate`]s from a probe-cache hit (ADR 001 §Probe cache).
