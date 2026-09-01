@@ -230,9 +230,13 @@ pub struct ClientFetchArgs {
     /// larger than you expect. For `bundle pull` this is the per-entry ceiling.
     ///
     /// This is a user budget guard, not a memory safeguard: the streaming pull
-    /// writes to the on-disk ranged store, allocates only for received bytes, and
-    /// a provider that over-claims `total_bytes` fails bao verification against
-    /// the requested hash regardless of this value.
+    /// writes to the on-disk ranged store and buffers only received bytes in
+    /// memory, so RAM stays bounded whatever the claim, and a provider that
+    /// over-claims `total_bytes` fails bao verification against the requested hash
+    /// regardless of this value. One on-disk cost does scale with the claim: the
+    /// store pre-sizes a sparse bao outboard sidecar (~0.4% of `total_bytes`) via
+    /// `set_len`, so an absurd claim can still surface a local disk or quota error
+    /// before verification rejects it. Set a nonzero ceiling to bound that.
     #[arg(long, value_name = "MB", default_value_t = 0)]
     pub max_blob_mb: u64,
 
