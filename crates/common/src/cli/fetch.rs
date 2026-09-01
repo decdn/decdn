@@ -223,12 +223,23 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "MICRO_USDC")]
     pub working_deposit_micro_usdc: Option<u64>,
 
-    /// Reject a delivery whose claimed total size exceeds this many MiB
-    /// **before** buffering it — guards client memory against a provider that
-    /// over-claims `total_bytes`. Defaults to 1024 MiB (the node's default
-    /// serve ceiling); raise it to fetch larger blobs. For `bundle pull` this is
-    /// the per-entry ceiling.
-    #[arg(long, value_name = "MB", default_value_t = 1024)]
+    /// Client-side size ceiling: refuse a delivery whose claimed total size
+    /// exceeds this many MiB before pulling any bytes. Defaults to 1 TiB
+    /// (1,048,576 MiB) — far above any real blob, so `decdn fetch` and
+    /// `bundle pull` download normal content by its hash without tuning, yet low
+    /// enough to bound what a provider's over-claimed `total_bytes` can cost
+    /// locally. Lower it as a tighter budget guard, or set `0` to disable the
+    /// ceiling entirely. For `bundle pull` this is the per-entry ceiling.
+    ///
+    /// The cost it bounds is on disk, not memory: the streaming pull buffers only
+    /// received bytes in RAM, so RAM stays bounded whatever the claim, and a
+    /// provider that over-claims `total_bytes` fails bao verification against the
+    /// requested hash regardless of this value. But the ranged store pre-sizes a
+    /// sparse bao outboard sidecar (~0.4% of `total_bytes`) via `set_len` at
+    /// creation, so without a ceiling an absurd claim could surface a local disk
+    /// or quota error before verification rejects it. This gate caps that pre-size
+    /// (1 TiB → ~4 GiB) by refusing the claim first.
+    #[arg(long, value_name = "MB", default_value_t = 1_048_576)]
     pub max_blob_mb: u64,
 
     /// Refuse a provider that quotes a per-MB rate above this many USDC base units
@@ -334,7 +345,7 @@ impl ClientFetchArgs {
     /// It cannot simply be removed, though, because inactivity is not liveness: the stall
     /// clock resets on ANY byte, so a provider trickling one byte per stall window would
     /// hang the fetch forever with no error. The default is therefore deliberately
-    /// generous — far above any honest transfer under `--max-blob-mb`.
+    /// generous — far above any honest transfer of a typical blob.
     ///
     /// Returns a `Duration`, not an `Option<Duration>`. `--timeout-ms` has a default and clap
     /// rejects a zero, so the cap is ALWAYS present on this path; an `Option` here would be
@@ -693,8 +704,8 @@ mod tests {
         assert!(TestCli::try_parse_from(["test", "--stall-timeout-ms", "0"]).is_err());
     }
 
-    /// `--max-blob-mb` is a memory ceiling, nothing more. It does not scale the
-    /// timeout: a size flag has no business setting a deadline (#1134).
+    /// `--max-blob-mb` is an optional size ceiling, nothing more. It does not scale
+    /// the timeout: a size flag has no business setting a deadline (#1134).
     #[test]
     fn max_blob_mb_does_not_influence_the_deadlines() {
         let small = parse(&["--max-blob-mb", "1"]);
