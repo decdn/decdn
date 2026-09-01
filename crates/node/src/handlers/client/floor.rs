@@ -41,8 +41,8 @@ use super::{
 /// Returns the store's error if the tombstone sweep or the row load fails.
 pub(super) fn hydrate(
     store: Option<&Arc<dyn decdn_incentive::PoolFloorLossStore>>,
-) -> anyhow::Result<HashMap<B256, PoolFloorState>> {
-    let mut pool_floor: HashMap<B256, PoolFloorState> = HashMap::new();
+) -> anyhow::Result<FloorAccumulator> {
+    let mut pool_floor = FloorAccumulator::default();
     let Some(store) = store else {
         return Ok(pool_floor);
     };
@@ -64,12 +64,82 @@ pub(super) fn hydrate(
         micro_usdc,
     } in store.load_losses()?
     {
-        pool_floor
-            .entry(pool_id)
-            .or_default()
-            .hydrate_dead(signer, U256::from(micro_usdc));
+        pool_floor.hydrate_dead(pool_id, signer, U256::from(micro_usdc));
     }
     Ok(pool_floor)
+}
+
+/// Every pool's floor-credit accounting, keyed by `pool_id`.
+///
+/// A newtype rather than a bare `HashMap` because the map is the last way to break
+/// the invariant the entries themselves protect: `PoolFloorState::default()` mints a
+/// fresh epoch and zero counters, so a stray `entry(pool).or_default()` would wipe a
+/// pool's permanent `dead_charge` and orphan every guard holding the old epoch —
+/// their reservations would then never be released. Wrapping the map keeps `Default`
+/// reachable only from here, and the operations below are the whole surface.
+#[derive(Debug, Default)]
+pub(super) struct FloorAccumulator(HashMap<B256, PoolFloorState>);
+
+impl FloorAccumulator {
+    /// Floor credit committed across every signer on `pool_id`; a pool with no entry
+    /// has committed nothing.
+    fn committed(&self, pool_id: B256) -> U256 {
+        self.0
+            .get(&pool_id)
+            .map_or(U256::ZERO, PoolFloorState::committed)
+    }
+
+    /// The pool's committed total and `signer`'s share of it, read together under one
+    /// borrow. Reads through `get`, never `entry`, so a refused admission leaves no
+    /// row behind and a client probing a full pool with fresh signer keys cannot grow
+    /// the map.
+    fn committed_split(&self, pool_id: B256, signer: Address) -> (U256, U256) {
+        self.0
+            .get(&pool_id)
+            .map_or((U256::ZERO, U256::ZERO), |state| {
+                (state.committed(), state.signer_committed(signer))
+            })
+    }
+
+    /// Charge `amount` of live reservation to `(pool_id, signer)`, creating the pool
+    /// entry if this is its first, and return the generation the charge landed in. A
+    /// [`FloorReservation`] carries that stamp so it can only reconcile against the
+    /// same generation.
+    fn charge_live(&mut self, pool_id: B256, signer: Address, amount: U256) -> u64 {
+        let entry = self.0.entry(pool_id).or_default();
+        entry.charge_live(signer, amount);
+        entry.epoch
+    }
+
+    /// The entry a reservation guard may reconcile against: present under `pool_id`
+    /// AND stamped with the generation the guard charged.
+    ///
+    /// A missing entry means the pool was reclaimed
+    /// ([`ClientHandler::forget_pool_floor`] removed it) and the live reservation went
+    /// with it; re-inserting would resurrect a row for a closed pool that nothing
+    /// removes again — the in-memory face of #1781. A present entry with a DIFFERENT
+    /// stamp is a later generation, re-entered by an admission that ran after the
+    /// remove: subtracting from it would report a reservation this guard never charged
+    /// to it, and folding into it would put this stream's dead charge on a signer row
+    /// that outlives the pool it served. Both cases reconcile against nothing.
+    fn entry_for_epoch(&mut self, pool_id: B256, epoch: u64) -> Option<&mut PoolFloorState> {
+        self.0
+            .get_mut(&pool_id)
+            .filter(|entry| entry.epoch == epoch)
+    }
+
+    /// Fold one persisted row's cumulative dead charge in at bring-up.
+    fn hydrate_dead(&mut self, pool_id: B256, signer: Address, amount: U256) {
+        self.0
+            .entry(pool_id)
+            .or_default()
+            .hydrate_dead(signer, amount);
+    }
+
+    /// Drop a reclaimed pool's whole entry, signer rows and all.
+    fn forget(&mut self, pool_id: B256) {
+        self.0.remove(&pool_id);
+    }
 }
 
 /// One capability signer's share of a pool's floor-credit accounting (ADR 003
@@ -78,7 +148,7 @@ pub(super) fn hydrate(
 /// in-flight streams currently reserve, `dead_charge` its cumulative
 /// unrecoverable floor loss.
 #[derive(Debug, Default, Clone, Copy)]
-pub(super) struct SignerFloorState {
+struct SignerFloorState {
     live_reservation: U256,
     dead_charge: U256,
 }
@@ -108,13 +178,14 @@ impl SignerFloorState {
 /// fold in debug builds. Bring-up rebuilds the pool total the same way, by folding
 /// the persisted signer rows ([`hydrate`]).
 #[derive(Debug, Clone)]
-pub(super) struct PoolFloorState {
+struct PoolFloorState {
     live_reservation: U256,
     dead_charge: U256,
     signers: HashMap<Address, SignerFloorState>,
     /// Generation stamp, unique across every entry this process creates. A
-    /// [`FloorReservation`] copies it at charge time and [`Self::reconcile`]
-    /// compares it, so a guard whose pool was reclaimed
+    /// [`FloorReservation`] copies it at charge time and
+    /// [`FloorAccumulator::entry_for_epoch`] compares it, so a guard whose pool was
+    /// reclaimed
     /// ([`ClientHandler::forget_pool_floor`] removed the entry) and whose `pool_id`
     /// a later admission then re-entered reconciles against nothing, rather than
     /// decrementing counters it never contributed to and folding its dead charge
@@ -193,18 +264,24 @@ impl PoolFloorState {
         debug_assert!(self.levels_agree(), "charge_live left the two levels apart");
     }
 
-    /// Release `amount` of live reservation from this pool and from `signer`'s row,
-    /// then drop the row if it has fallen to nothing.
+    /// Release `amount` of live reservation from `signer`'s row and the same quantity
+    /// from the pool total, then drop the row if it has fallen to nothing.
     ///
-    /// `get_mut` at the signer level, not `entry().or_default()`: a release has
-    /// nothing to create. A missing row means [`Self::prune_spent`] already took it,
-    /// which it does only at zero, so defaulting one in would be a no-op that leaves
-    /// an empty row behind.
+    /// The pool moves by exactly what the row gave up, which is what makes the
+    /// invariant hold by construction rather than by argument. Releasing `amount`
+    /// from the pool unconditionally would take it out of the co-tenants' share
+    /// whenever the row is absent or holds less — and a row IS absent once
+    /// [`Self::prune_spent`] has taken it, which it does at zero.
+    ///
+    /// `get_mut`, not `entry().or_default()`: a release has nothing to create, and
+    /// defaulting one in would leave an empty row behind.
     fn release_live(&mut self, signer: Address, amount: U256) {
-        self.live_reservation = self.live_reservation.saturating_sub(amount);
-        if let Some(lane) = self.signers.get_mut(&signer) {
-            lane.live_reservation = lane.live_reservation.saturating_sub(amount);
-        }
+        let released = self.signers.get_mut(&signer).map_or(U256::ZERO, |lane| {
+            let taken = lane.live_reservation.min(amount);
+            lane.live_reservation = lane.live_reservation.saturating_sub(taken);
+            taken
+        });
+        self.live_reservation = self.live_reservation.saturating_sub(released);
         self.prune_spent(signer);
         debug_assert!(
             self.levels_agree(),
@@ -216,18 +293,29 @@ impl PoolFloorState {
     /// permanent dead charge, at both levels, returning the SIGNER's new dead total.
     ///
     /// That return is what gets persisted: the pool total is the sum of its signer
-    /// rows, so bring-up rebuilds it by folding them ([`hydrate`]). `entry()` rather
-    /// than `get_mut()` at the signer level because the fold must not be dropped:
-    /// the row is present unless `prune_spent` took it, which it cannot while the
-    /// unrepaid guard calling this holds a non-zero reservation, and defaulting keeps
-    /// the charge if that reasoning ever stops holding.
+    /// rows, so bring-up rebuilds it by folding them ([`hydrate`]).
+    ///
+    /// Both counters move the pool by exactly what the row moved, so the invariant
+    /// holds by construction. `dead_add` is added at both levels unconditionally —
+    /// a dead charge is never dropped — while the live release is clamped to what
+    /// the row actually holds, for the reason [`Self::release_live`] gives.
+    ///
+    /// `entry()` rather than `get_mut()`: the fold must not be lost. The row is
+    /// present unless `prune_spent` took it, which it cannot while the unrepaid guard
+    /// calling this holds a non-zero reservation, and defaulting keeps the charge if
+    /// that reasoning ever stops holding.
     fn fold_dead(&mut self, signer: Address, live_release: U256, dead_add: U256) -> U256 {
-        self.live_reservation = self.live_reservation.saturating_sub(live_release);
-        self.dead_charge = self.dead_charge.saturating_add(dead_add);
+        debug_assert!(
+            dead_add <= live_release,
+            "a fold cannot charge more than the reservation it releases"
+        );
         let lane = self.signers.entry(signer).or_default();
-        lane.live_reservation = lane.live_reservation.saturating_sub(live_release);
+        let released = lane.live_reservation.min(live_release);
+        lane.live_reservation = lane.live_reservation.saturating_sub(released);
         lane.dead_charge = lane.dead_charge.saturating_add(dead_add);
         let signer_dead = lane.dead_charge;
+        self.live_reservation = self.live_reservation.saturating_sub(released);
+        self.dead_charge = self.dead_charge.saturating_add(dead_add);
         self.prune_spent(signer);
         debug_assert!(self.levels_agree(), "fold_dead left the two levels apart");
         signer_dead
@@ -263,40 +351,125 @@ impl PoolFloorState {
         self.live_reservation == fold(|lane| lane.live_reservation)
             && self.dead_charge == fold(|lane| lane.dead_charge)
     }
+}
 
-    /// The entry a reservation guard may reconcile against: present under `pool_id`
-    /// AND stamped with the generation the guard charged.
+/// How a dropped [`FloorReservation`] makes its dead charge durable.
+///
+/// One type rather than a `store` and a `persist_tx` that must agree: a sender with
+/// no store behind it is meaningless, and as two independent `Option`s that state is
+/// representable — a guard would return before ever reaching the send and discard the
+/// value silently, which is exactly the lost persist the durable copy exists to
+/// prevent. Here it cannot be spelled.
+#[derive(Clone)]
+pub(super) enum FloorPersist {
+    /// No floor-loss store is configured, so nothing is persisted and a restart grants
+    /// every pool a fresh budget. The in-memory accumulator is still authoritative for
+    /// the running process.
+    Off,
+    /// A store but no worker: no runtime to spawn one onto, i.e. a sync unit test.
+    /// Drop writes on its own thread.
+    Inline(Arc<dyn decdn_incentive::PoolFloorLossStore>),
+    /// The normal path. Drop hands the new total to the worker and returns; the store
+    /// is kept for the fallback if the worker turns out to be gone.
+    Worker {
+        tx: tokio::sync::mpsc::UnboundedSender<FloorLossWrite>,
+        store: Arc<dyn decdn_incentive::PoolFloorLossStore>,
+    },
+}
+
+impl FloorPersist {
+    /// The worker's mailbox, when one is running. `None` for [`Self::Off`] and
+    /// [`Self::Inline`], which have no queue to drain.
+    const fn sender(&self) -> Option<&tokio::sync::mpsc::UnboundedSender<FloorLossWrite>> {
+        match self {
+            Self::Worker { tx, .. } => Some(tx),
+            Self::Off | Self::Inline(_) => None,
+        }
+    }
+
+    /// Pick the strategy: a worker when there is both a store to write to and a
+    /// runtime to spawn one onto, an inline write when there is a store but no
+    /// runtime, and nothing at all when no store is configured.
+    pub(super) fn new(
+        store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
+        metrics: &Arc<Metrics>,
+    ) -> Self {
+        let Some(store) = store else {
+            return Self::Off;
+        };
+        match start_persist_worker(&store, metrics) {
+            Some(tx) => Self::Worker { tx, store },
+            None => Self::Inline(store),
+        }
+    }
+
+    /// Make `micro` — the lane's new CUMULATIVE dead total — durable.
     ///
-    /// A missing entry means the pool was reclaimed ([`ClientHandler::forget_pool_floor`]
-    /// removed it) and the live reservation went with it; re-inserting would
-    /// resurrect a row for a closed pool that nothing removes again — the in-memory
-    /// face of #1781. A present entry with a DIFFERENT stamp is a later generation,
-    /// re-entered by an admission that ran after the remove: subtracting from it
-    /// would report a reservation this guard never charged to it, and folding into it
-    /// would put this stream's dead charge on a signer row that outlives the pool it
-    /// served. Both cases reconcile against nothing.
-    fn reconcile(
-        map: &mut HashMap<B256, PoolFloorState>,
-        pool_id: B256,
-        epoch: u64,
-    ) -> Option<&mut Self> {
-        map.get_mut(&pool_id).filter(|entry| entry.epoch == epoch)
+    /// Called from a `Drop`, so it never blocks and never awaits. The worker path is
+    /// a `send`; everything else is a fallback that still gets the value to disk,
+    /// because losing it hands this signer its whole share back on the next boot.
+    fn write(&self, metrics: &Arc<Metrics>, pool_id: B256, signer: Address, micro: u128) {
+        let store = match self {
+            Self::Off => return,
+            Self::Inline(store) => store,
+            Self::Worker { tx, store } => {
+                let queued = tx
+                    .send(FloorLossWrite::Record {
+                        pool_id,
+                        signer,
+                        micro_usdc: micro,
+                    })
+                    .is_ok();
+                if queued {
+                    return;
+                }
+                // The worker is gone — its task was aborted, or the runtime is past
+                // the point where it can run one. Counted and warned because a live
+                // handler whose worker has died is an anomaly, and this is the only
+                // place it shows before the shutdown flush notices.
+                metrics.floor_loss_persist_failure();
+                tracing::warn!(
+                    %pool_id, %signer, micro,
+                    "floor persist worker is gone; writing the dead charge off the worker"
+                );
+                store
+            }
+        };
+        // Keep the fsync off the reactor while a runtime remains: `record_loss`
+        // commits with `Durability::Immediate`, so writing here would block a tokio
+        // worker thread inside a `Drop` — precisely under the mass-drop conditions
+        // that kill workers. The handle is watched, so a cancelled write is counted
+        // like any other.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let store = Arc::clone(store);
+            let write_metrics = Arc::clone(metrics);
+            let write = handle.spawn_blocking(move || {
+                persist_loss(&store, &write_metrics, pool_id, signer, micro);
+            });
+            let watch_metrics = Arc::clone(metrics);
+            handle.spawn(async move {
+                if let Err(e) = write.await {
+                    note_join_failure(&watch_metrics, pool_id, signer, &e);
+                }
+            });
+            return;
+        }
+        // No runtime at all: a drop outside one, i.e. a sync unit test.
+        persist_loss(store, metrics, pool_id, signer, micro);
     }
 }
 
 /// What a [`FloorReservation`] needs from the handler that opened it: the shared
-/// accumulator, the durable store and its failure counter, and the channel its drop
-/// hands the new dead total to.
+/// accumulator, how to persist, and the counter both persist paths report through.
 ///
 /// Bundled rather than passed positionally because every field is plumbing the guard
 /// only forwards — none of them varies per reservation — so a call site reads as
-/// "one guard against this handler's accumulator", not as five arguments in an order
-/// that must be remembered.
+/// "one guard against this handler's accumulator", not as arguments in an order that
+/// must be remembered.
 struct FloorGuardDeps {
-    map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
-    store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
+    map: Arc<std::sync::Mutex<FloorAccumulator>>,
+    persist: FloorPersist,
     metrics: Arc<Metrics>,
-    persist_tx: Option<tokio::sync::mpsc::UnboundedSender<FloorLossWrite>>,
 }
 
 /// RAII hold for one stream's span-capped reservation against a pool's budget.
@@ -316,11 +489,9 @@ struct FloorGuardDeps {
 #[must_use = "dropping the guard at once folds the FULL reservation into the pool's \
               permanent dead charge, as an abnormal exit"]
 pub(super) struct FloorReservation {
-    map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
-    store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
-    /// Where the drop-time persist goes when a [`spawn_persist_worker`] is running.
-    /// `None` outside any runtime (a sync unit test), where drop writes inline.
-    persist_tx: Option<tokio::sync::mpsc::UnboundedSender<FloorLossWrite>>,
+    map: Arc<std::sync::Mutex<FloorAccumulator>>,
+    /// How this guard's drop makes its dead charge durable.
+    persist: FloorPersist,
     /// Failure accounting for the best-effort drop-time persist
     /// (`floor_loss_persist_failures`, #1782). Held by the guard because the
     /// persist outlives the serve path that opened it.
@@ -367,7 +538,7 @@ impl FloorReservation {
     /// via [`Self::new_charged`].
     #[cfg(test)]
     fn reserve(
-        map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
+        map: Arc<std::sync::Mutex<FloorAccumulator>>,
         store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
         metrics: Arc<Metrics>,
         pool_id: B256,
@@ -378,20 +549,16 @@ impl FloorReservation {
             let mut guard = map
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let entry = guard.entry(pool_id).or_default();
-            entry.charge_live(signer, reserved);
-            entry.epoch
+            guard.charge_live(pool_id, signer, reserved)
         };
-        // Same rule the handler applies: a worker when there is a store to write to
-        // and a runtime to spawn onto, inline otherwise. Matching it here is what
-        // keeps the tests that use this form exercising the real drop dispatch —
-        // notably the ones that need `Drop` to RETURN before the write lands.
-        let persist_tx = start_persist_worker(store.as_ref(), &metrics);
+        // Same rule the handler applies, so the tests using this form exercise the
+        // real drop dispatch — notably the ones that need `Drop` to RETURN before
+        // the write lands.
+        let persist = FloorPersist::new(store, &metrics);
         let deps = FloorGuardDeps {
             map,
-            store,
+            persist,
             metrics,
-            persist_tx,
         };
         Self::new_charged(deps, pool_id, signer, reserved, epoch)
     }
@@ -412,15 +579,13 @@ impl FloorReservation {
     ) -> Self {
         let FloorGuardDeps {
             map,
-            store,
+            persist,
             metrics,
-            persist_tx,
         } = deps;
         Self {
             map,
-            store,
+            persist,
             metrics,
-            persist_tx,
             pool_id,
             epoch,
             signer,
@@ -462,9 +627,9 @@ impl FloorReservation {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Both levels move together, through the one mutator — a release that
         // touched only the pool total would leave the signer's share permanently
-        // consumed by a stream that paid for it. See [`PoolFloorState::reconcile`]
+        // consumed by a stream that paid for it. See [`FloorAccumulator::entry_for_epoch`]
         // for why a missing or differently-stamped entry reconciles against nothing.
-        if let Some(entry) = PoolFloorState::reconcile(&mut guard, self.pool_id, self.epoch) {
+        if let Some(entry) = guard.entry_for_epoch(self.pool_id, self.epoch) {
             entry.release_live(self.signer, self.reserved);
         }
     }
@@ -531,11 +696,10 @@ impl Drop for FloorReservation {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // A reclaimed or re-entered pool reconciles against nothing — see
-            // [`PoolFloorState::reconcile`] — so skip the whole reconcile rather
+            // [`FloorAccumulator::entry_for_epoch`] — so skip the whole reconcile rather
             // than resurrecting a row `forget` deleted or charging a later
             // generation.
-            let Some(entry) = PoolFloorState::reconcile(&mut guard, self.pool_id, self.epoch)
-            else {
+            let Some(entry) = guard.entry_for_epoch(self.pool_id, self.epoch) else {
                 return;
             };
             entry.fold_dead(self.signer, self.reserved, dead_add)
@@ -558,57 +722,12 @@ impl Drop for FloorReservation {
         // write cancelled with the runtime — which is when guards drop en masse —
         // would leave the durable total behind the in-memory one with nothing
         // logged and nothing counted. The worker owns that outcome instead.
-        let Some(store) = self.store.clone() else {
-            return;
-        };
-        let pool_id = self.pool_id;
-        let signer = self.signer;
-        let micro = snapshot.saturating_to::<u128>();
-        if let Some(tx) = self.persist_tx.as_ref() {
-            let queued = tx
-                .send(FloorLossWrite::Record {
-                    pool_id,
-                    signer,
-                    micro_usdc: micro,
-                })
-                .is_ok();
-            if queued {
-                return;
-            }
-            // The worker is gone — its task was aborted, or the runtime is past the
-            // point where it can run one. Write the value some other way rather than
-            // lose it: the alternative is this signer getting its whole share back on
-            // the next boot. Counted and warned because a live handler whose worker
-            // has died is an anomaly, and this is the only place it is visible before
-            // the shutdown flush notices.
-            self.metrics.floor_loss_persist_failure();
-            tracing::warn!(
-                %pool_id, %signer, micro,
-                "floor persist worker is gone; writing the dead charge off the worker"
-            );
-            // Still off the reactor if a runtime remains: `record_loss` commits with
-            // `Durability::Immediate`, so running it here would put an fsync on a
-            // tokio worker thread inside a `Drop` — precisely under the mass-drop
-            // conditions that got the worker killed. The handle is watched so a
-            // cancelled write is counted like any other.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let store = Arc::clone(&store);
-                let metrics = Arc::clone(&self.metrics);
-                let write = handle.spawn_blocking(move || {
-                    persist_loss(&store, &metrics, pool_id, signer, micro);
-                });
-                let watch_metrics = Arc::clone(&self.metrics);
-                handle.spawn(async move {
-                    if let Err(e) = write.await {
-                        note_join_failure(&watch_metrics, pool_id, signer, &e);
-                    }
-                });
-                return;
-            }
-        }
-        // No runtime at all: a drop outside one, i.e. a sync unit test, or a fallback
-        // taken after the runtime is gone. Nothing left to offload to.
-        persist_loss(&store, &self.metrics, pool_id, signer, micro);
+        self.persist.write(
+            &self.metrics,
+            self.pool_id,
+            self.signer,
+            snapshot.saturating_to::<u128>(),
+        );
     }
 }
 
@@ -637,16 +756,15 @@ async fn flush_queued_writes(
     }
 }
 
-/// Start the floor-loss persist worker, if there is anything for it to do.
+/// Start the floor-loss persist worker, if there is a runtime to spawn it onto.
 ///
-/// `None` — so every drop writes inline — when no floor-loss store is configured, or
-/// when there is no runtime to spawn onto (a sync unit test). Called once, at handler
-/// construction.
-pub(super) fn start_persist_worker(
-    store: Option<&Arc<dyn decdn_incentive::PoolFloorLossStore>>,
+/// `None` — so every drop writes inline — outside any runtime, i.e. a sync unit test.
+/// [`FloorPersist::new`] is the only caller and has already established there is a
+/// store worth writing to.
+fn start_persist_worker(
+    store: &Arc<dyn decdn_incentive::PoolFloorLossStore>,
     metrics: &Arc<Metrics>,
 ) -> Option<tokio::sync::mpsc::UnboundedSender<FloorLossWrite>> {
-    let store = store?;
     if tokio::runtime::Handle::try_current().is_err() {
         return None;
     }
@@ -761,7 +879,16 @@ fn note_join_failure(
     err: &tokio::task::JoinError,
 ) {
     metrics.floor_loss_persist_failure();
-    tracing::warn!(%pool_id, %signer, error = %err, "floor dead-charge persist join failed");
+    if err.is_panic() {
+        // A panic means `record_loss` or a store impl is broken — a defect to chase,
+        // not the shutdown artifact a cancellation is.
+        tracing::error!(
+            %pool_id, %signer, error = %err,
+            "floor dead-charge persist panicked in the blocking pool"
+        );
+    } else {
+        tracing::warn!(%pool_id, %signer, error = %err, "floor dead-charge persist cancelled");
+    }
 }
 
 /// Count one failed floor-loss write and say whether the payment store is corrupt.
@@ -1022,9 +1149,7 @@ impl ClientHandler {
                 .pool_floor
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard
-                .get(&pool_id)
-                .map_or(U256::ZERO, PoolFloorState::committed)
+            guard.committed(pool_id)
         };
         decdn_incentive::pool_budget_covers(
             remaining,
@@ -1068,10 +1193,7 @@ impl ClientHandler {
             // Read through `get`, not `entry().or_default()`: a refused admission
             // must leave no pool or signer row behind, so a client probing a full
             // pool with fresh signer keys cannot grow the map.
-            let (committed, signer_committed) =
-                guard.get(&pool_id).map_or((U256::ZERO, U256::ZERO), |s| {
-                    (s.committed(), s.signer_committed(signer))
-                });
+            let (committed, signer_committed) = guard.committed_split(pool_id, signer);
             // Pool ceiling first: it is the solvency bound, and it is what an
             // operator reads as "this pool cannot pay".
             if !decdn_incentive::pool_budget_covers(
@@ -1085,9 +1207,7 @@ impl ClientHandler {
             if signer_committed.saturating_add(reserved) > signer_cap {
                 return Err(FloorRefusal::SignerAtCap { signer_cap });
             }
-            let entry = guard.entry(pool_id).or_default();
-            entry.charge_live(signer, reserved);
-            epoch = entry.epoch;
+            epoch = guard.charge_live(pool_id, signer, reserved);
         }
         Ok(FloorReservation::new_charged(
             self.floor_guard_deps(),
@@ -1103,9 +1223,8 @@ impl ClientHandler {
     fn floor_guard_deps(&self) -> FloorGuardDeps {
         FloorGuardDeps {
             map: Arc::clone(&self.pool_floor),
-            store: self.floor_loss_store.clone(),
+            persist: self.floor_persist.clone(),
             metrics: Arc::clone(&self.metrics),
-            persist_tx: self.floor_persist_tx.clone(),
         }
     }
 
@@ -1126,7 +1245,7 @@ impl ClientHandler {
     /// bump an entire lost backlog would leave `floor_loss_persist_failures` flat
     /// while every signer on the node regains its floor budget on the next boot.
     pub(crate) async fn flush_floor_persists(&self) {
-        let Some(tx) = self.floor_persist_tx.as_ref() else {
+        let Some(tx) = self.floor_persist.sender() else {
             return;
         };
         flush_queued_writes(tx, &self.metrics).await;
@@ -1150,7 +1269,7 @@ impl ClientHandler {
                 .pool_floor
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.remove(&pool_id);
+            guard.forget(pool_id);
         }
         let Some(store) = self.floor_loss_store.clone() else {
             return;
@@ -1182,8 +1301,8 @@ mod tests {
     /// Lock the floor map for a test assertion, surfacing a poisoned lock as an
     /// `anyhow` error rather than panicking (the anti-panic policy holds in tests).
     fn lock_floor(
-        map: &Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
-    ) -> anyhow::Result<std::sync::MutexGuard<'_, HashMap<B256, PoolFloorState>>> {
+        map: &Arc<std::sync::Mutex<FloorAccumulator>>,
+    ) -> anyhow::Result<std::sync::MutexGuard<'_, FloorAccumulator>> {
         map.lock()
             .map_err(|e| anyhow::anyhow!("floor map poisoned: {e}"))
     }
@@ -1198,6 +1317,7 @@ mod tests {
         when: &str,
     ) -> anyhow::Result<()> {
         let st = lock_floor(&handler.pool_floor)?
+            .0
             .get(&pool)
             .cloned()
             .unwrap_or_default();
@@ -1230,8 +1350,8 @@ mod tests {
     #[test]
     fn floor_reservation_reconciles_partial_loss_on_drop() -> anyhow::Result<()> {
         use decdn_incentive::PoolFloorLossStore as _;
-        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let map: Arc<std::sync::Mutex<FloorAccumulator>> =
+            Arc::new(std::sync::Mutex::new(FloorAccumulator::default()));
         let store = Arc::new(decdn_incentive::MemoryPoolFloorLossStore::new());
         let pool = B256::repeat_byte(0x5A);
         let floor = decdn_incentive::floor_micro(1000);
@@ -1246,7 +1366,7 @@ mod tests {
                 floor,
             );
             // Live reservation is held while the guard lives.
-            let live = lock_floor(&map)?.get(&pool).map(|s| s.live_reservation);
+            let live = lock_floor(&map)?.0.get(&pool).map(|s| s.live_reservation);
             anyhow::ensure!(
                 live == Some(floor),
                 "live reservation is held while the guard lives"
@@ -1255,7 +1375,7 @@ mod tests {
             res.note_unpaid(quarter);
             res.mark_settled();
         } // drop → reconcile: live released, dead_charge = min(floor, unpaid) = floor/4
-        let st = lock_floor(&map)?.get(&pool).cloned().unwrap_or_default();
+        let st = lock_floor(&map)?.0.get(&pool).cloned().unwrap_or_default();
         anyhow::ensure!(
             st.live_reservation == U256::ZERO,
             "live reservation is released on drop"
@@ -1283,8 +1403,8 @@ mod tests {
     /// delivered yet the node already fronted upstream USDC (C3, ADR 003 §Pool solvency).
     #[test]
     fn floor_reservation_abnormal_exit_folds_full_reserved() -> anyhow::Result<()> {
-        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let map: Arc<std::sync::Mutex<FloorAccumulator>> =
+            Arc::new(std::sync::Mutex::new(FloorAccumulator::default()));
         let pool = B256::repeat_byte(0x5B);
         let floor = decdn_incentive::floor_micro(1000);
         {
@@ -1300,7 +1420,7 @@ mod tests {
             // is never marked settled.
             res.note_unpaid(U256::ZERO);
         } // drop → conservative: dead_charge = full reserved despite unpaid == 0
-        let st = lock_floor(&map)?.get(&pool).cloned().unwrap_or_default();
+        let st = lock_floor(&map)?.0.get(&pool).cloned().unwrap_or_default();
         anyhow::ensure!(
             st.live_reservation == U256::ZERO,
             "live reservation is released even on an abnormal exit"
@@ -1322,8 +1442,8 @@ mod tests {
     /// innocent pool's floor credit.
     #[test]
     fn floor_reservation_refused_unspent_folds_no_dead_charge() -> anyhow::Result<()> {
-        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let map: Arc<std::sync::Mutex<FloorAccumulator>> =
+            Arc::new(std::sync::Mutex::new(FloorAccumulator::default()));
         let pool = B256::repeat_byte(0x5C);
         let floor = decdn_incentive::floor_micro(1000);
         {
@@ -1335,7 +1455,7 @@ mod tests {
                 TEST_SIGNER,
                 floor,
             );
-            let live = lock_floor(&map)?.get(&pool).map(|s| s.live_reservation);
+            let live = lock_floor(&map)?.0.get(&pool).map(|s| s.live_reservation);
             anyhow::ensure!(
                 live == Some(floor),
                 "live reservation is held while the guard lives"
@@ -1343,7 +1463,7 @@ mod tests {
             // Refused before any spend — release cleanly, never marked settled.
             res.release_unspent();
         } // drop → no-op: release_unspent already freed the live reservation
-        let st = lock_floor(&map)?.get(&pool).cloned().unwrap_or_default();
+        let st = lock_floor(&map)?.0.get(&pool).cloned().unwrap_or_default();
         anyhow::ensure!(
             st.live_reservation == U256::ZERO,
             "the live reservation is released by release_unspent"
@@ -1569,6 +1689,7 @@ mod tests {
         // The pool total folds BOTH rows: three floors of dead charge, which no
         // single signer's row accounts for.
         let dead = lock_floor(&handler.pool_floor)?
+            .0
             .get(&pool)
             .map(|s| s.dead_charge);
         anyhow::ensure!(
@@ -1606,7 +1727,7 @@ mod tests {
             "a pool that cannot cover one floor refuses"
         );
         anyhow::ensure!(
-            !lock_floor(&handler.pool_floor)?.contains_key(&pool),
+            !lock_floor(&handler.pool_floor)?.0.contains_key(&pool),
             "a pool-ceiling refusal creates no pool entry"
         );
 
@@ -1640,6 +1761,7 @@ mod tests {
             );
         }
         let signers = lock_floor(&handler.pool_floor)?
+            .0
             .get(&pool)
             .map(|s| s.signers.len());
         anyhow::ensure!(
@@ -1657,8 +1779,8 @@ mod tests {
     /// direction that over-admits.
     #[test]
     fn a_stale_guard_does_not_reconcile_against_a_re_entered_pool() -> anyhow::Result<()> {
-        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let map: Arc<std::sync::Mutex<FloorAccumulator>> =
+            Arc::new(std::sync::Mutex::new(FloorAccumulator::default()));
         let pool = B256::repeat_byte(0x39);
         let floor = decdn_incentive::floor_micro(1000);
 
@@ -1671,7 +1793,7 @@ mod tests {
             floor,
         );
         // The pool is reclaimed on-chain: its whole entry goes, signer rows and all.
-        lock_floor(&map)?.remove(&pool);
+        lock_floor(&map)?.0.remove(&pool);
         // A later admission re-enters the same key — the cached `getPool` view can
         // still show headroom for a moment after the reclaim lands.
         let fresh = FloorReservation::reserve(
@@ -1684,7 +1806,7 @@ mod tests {
         );
         drop(stale);
 
-        let st = lock_floor(&map)?.get(&pool).cloned().unwrap_or_default();
+        let st = lock_floor(&map)?.0.get(&pool).cloned().unwrap_or_default();
         anyhow::ensure!(
             st.live_reservation == floor,
             "the stale drop must not release the new entry's live reservation"
@@ -1740,6 +1862,7 @@ mod tests {
         }
         {
             let st = lock_floor(&handler.pool_floor)?
+                .0
                 .get(&pool)
                 .cloned()
                 .unwrap_or_default();
@@ -2081,7 +2204,8 @@ mod tests {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("floor map poisoned: {e}"))?;
             anyhow::ensure!(
-                map.get(&pool)
+                map.0
+                    .get(&pool)
                     .is_some_and(|s| s.signers.contains_key(&TEST_SIGNER)),
                 "the row exists while the reservation is live"
             );
@@ -2094,7 +2218,7 @@ mod tests {
             .pool_floor
             .lock()
             .map_err(|e| anyhow::anyhow!("floor map poisoned: {e}"))?;
-        let entry = map.get(&pool).cloned().unwrap_or_default();
+        let entry = map.0.get(&pool).cloned().unwrap_or_default();
         anyhow::ensure!(
             !entry.signers.contains_key(&TEST_SIGNER),
             "a signer that committed nothing must not keep a row for the pool's lifetime"
@@ -2252,8 +2376,8 @@ mod tests {
     /// reservation immediately and leaves no `dead_charge` — the drop is a no-op.
     #[test]
     fn floor_reservation_repaid_leaves_no_dead_charge() -> anyhow::Result<()> {
-        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let map: Arc<std::sync::Mutex<FloorAccumulator>> =
+            Arc::new(std::sync::Mutex::new(FloorAccumulator::default()));
         let pool = B256::repeat_byte(0x5B);
         let floor = decdn_incentive::floor_micro(1000);
         {
@@ -2266,13 +2390,13 @@ mod tests {
                 floor,
             );
             res.release_live_repaid(); // paid ≥ floor
-            let live = lock_floor(&map)?.get(&pool).map(|s| s.live_reservation);
+            let live = lock_floor(&map)?.0.get(&pool).map(|s| s.live_reservation);
             anyhow::ensure!(
                 live == Some(U256::ZERO),
                 "live reservation is freed the moment the floor is repaid"
             );
         } // drop is a no-op: already repaid
-        let st = lock_floor(&map)?.get(&pool).cloned().unwrap_or_default();
+        let st = lock_floor(&map)?.0.get(&pool).cloned().unwrap_or_default();
         anyhow::ensure!(
             st.dead_charge == U256::ZERO,
             "a repaid reservation folds no dead charge"
@@ -2288,8 +2412,8 @@ mod tests {
     /// process lifetime, collecting `dead_charge` from any later drop.
     #[test]
     fn repaid_release_after_forget_does_not_resurrect_entry() -> anyhow::Result<()> {
-        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let map: Arc<std::sync::Mutex<FloorAccumulator>> =
+            Arc::new(std::sync::Mutex::new(FloorAccumulator::default()));
         let pool = B256::repeat_byte(0x5F);
         let floor = decdn_incentive::floor_micro(1000);
         let res = FloorReservation::reserve(
@@ -2302,15 +2426,15 @@ mod tests {
         );
         // The pool closes mid-stream: the same in-memory remove
         // `forget_pool_floor` performs.
-        lock_floor(&map)?.remove(&pool);
+        lock_floor(&map)?.0.remove(&pool);
         res.release_live_repaid();
         anyhow::ensure!(
-            lock_floor(&map)?.get(&pool).is_none(),
+            !lock_floor(&map)?.0.contains_key(&pool),
             "a repaid release on a reclaimed pool must not re-insert its entry"
         );
         drop(res);
         anyhow::ensure!(
-            lock_floor(&map)?.get(&pool).is_none(),
+            !lock_floor(&map)?.0.contains_key(&pool),
             "the subsequent drop leaves the reclaimed pool absent too"
         );
         Ok(())
@@ -2338,8 +2462,8 @@ mod tests {
     /// monotonicity test drives the store directly, without its caller (#1783).
     #[test]
     fn floor_reservation_sequential_drops_accumulate_dead_charge() -> anyhow::Result<()> {
-        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let map: Arc<std::sync::Mutex<FloorAccumulator>> =
+            Arc::new(std::sync::Mutex::new(FloorAccumulator::default()));
         let store = Arc::new(decdn_incentive::MemoryPoolFloorLossStore::new());
         let metrics = Arc::new(Metrics::new());
         let pool = B256::repeat_byte(0x5C);
@@ -2369,7 +2493,7 @@ mod tests {
             );
         } // abnormal (never settled): folds the FULL reserved floor on top
         let want = quarter.saturating_add(floor);
-        let st = lock_floor(&map)?.get(&pool).cloned().unwrap_or_default();
+        let st = lock_floor(&map)?.0.get(&pool).cloned().unwrap_or_default();
         anyhow::ensure!(
             st.dead_charge == want,
             "the second drop folds onto the first's total, not over it"
@@ -2476,8 +2600,8 @@ mod tests {
     /// pool, rehydrated on every later boot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn late_drop_persist_after_forget_does_not_resurrect_row() -> anyhow::Result<()> {
-        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let map: Arc<std::sync::Mutex<FloorAccumulator>> =
+            Arc::new(std::sync::Mutex::new(FloorAccumulator::default()));
         let store = Arc::new(GatedLossStore::new());
         let pool = B256::repeat_byte(0x5D);
         let floor = decdn_incentive::floor_micro(1000);
@@ -2498,7 +2622,7 @@ mod tests {
             let mut guard = map
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.remove(&pool);
+            guard.0.remove(&pool);
         }
         decdn_incentive::PoolFloorLossStore::forget_loss(&*store, pool)
             .map_err(|e| anyhow::anyhow!("forget_loss: {e}"))?;
@@ -2562,8 +2686,8 @@ mod tests {
     fn a_drop_with_no_persist_worker_still_writes_inline() -> anyhow::Result<()> {
         let metrics = Arc::new(Metrics::new());
         let store = Arc::new(decdn_incentive::MemoryPoolFloorLossStore::new());
-        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let map: Arc<std::sync::Mutex<FloorAccumulator>> =
+            Arc::new(std::sync::Mutex::new(FloorAccumulator::default()));
         let pool = B256::repeat_byte(0x72);
         let floor = decdn_incentive::floor_micro(1000);
         {
@@ -2708,8 +2832,8 @@ mod tests {
                 Ok(0)
             }
         }
-        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let map: Arc<std::sync::Mutex<FloorAccumulator>> =
+            Arc::new(std::sync::Mutex::new(FloorAccumulator::default()));
         let metrics = Arc::new(Metrics::new());
         let pool = B256::repeat_byte(0x5E);
         let floor = decdn_incentive::floor_micro(1000);
