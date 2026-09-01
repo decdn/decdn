@@ -803,6 +803,14 @@ where
     if lanes.is_empty() {
         anyhow::bail!("multi_source_fetch requires at least one source lane");
     }
+    // Defensively enforce `max_sources`. The caller's admission
+    // (`admit_sources`, ADR 001) already caps the set to `max_sources` before
+    // building lanes, and `lanes` arrives in rank order — so this is a no-op on
+    // the normal path, but it keeps the config knob authoritative if a caller
+    // ever passes an un-capped lane set, keeping the highest-ranked lanes.
+    let lanes = lanes
+        .get(..lanes.len().min(ms.max_sources.max(1)))
+        .unwrap_or(lanes);
     // The premise the whole payment model rests on, checked rather than trusted:
     // one lane per on-chain provider. Two lanes sharing a provider share a
     // `(signer, provider)` watermark, and their concurrent voucher streams

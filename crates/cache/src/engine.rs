@@ -2204,11 +2204,14 @@ impl CacheEngine {
     /// mirroring [`Self::present_ranges`]'s guards.
     ///
     /// A block is covered iff every chunk in its byte span is present: this
-    /// reads `status()` for the blob's size (a `NotFound` or unknown-size
-    /// `Partial` reports no blocks), then diffs each block's chunk range
-    /// against [`Self::present_ranges`] the same way [`Self::missing_ranges`]
-    /// diffs a requested range — a block with any missing chunk is not
-    /// covered.
+    /// reads the blob's size from the `observe()` bitfield (via
+    /// [`Self::present_ranges`]), then diffs each block's chunk range against
+    /// the present ranges the same way [`Self::missing_ranges`] diffs a
+    /// requested range — a block with any missing chunk is not covered. The
+    /// bitfield knows the size as soon as any chunk carries it, so a
+    /// front-prefix partial with no validated tail still reports its covered
+    /// blocks (where `status()` would leave the size unknown until the last
+    /// chunk). A `NotFound`, evicted, or refused hash reports no blocks.
     pub async fn coverage(&self, hash: Hash) -> CacheResult<decdn_protocol::Coverage> {
         // One bao leaf chunk is 1024 bytes (`bao_tree::ChunkNum`'s unit); one
         // discovery block is 65536 chunks (64 MiB).
