@@ -697,6 +697,7 @@ pub struct EvictionPreview {
 pub struct PresentRanges {
     ranges: ChunkRanges,
     complete: bool,
+    size: u64,
 }
 
 impl PresentRanges {
@@ -704,6 +705,7 @@ impl PresentRanges {
         Self {
             ranges: ChunkRanges::empty(),
             complete: false,
+            size: 0,
         }
     }
 
@@ -723,6 +725,17 @@ impl PresentRanges {
     #[must_use]
     pub const fn chunk_ranges(&self) -> &ChunkRanges {
         &self.ranges
+    }
+
+    /// The blob's total size in bytes, from the `observe()` bitfield.
+    ///
+    /// Unlike `status()`, which iroh-blobs leaves unknown for a partial blob
+    /// until its LAST chunk validates, the bitfield knows the full size as
+    /// soon as any chunk carries it (a front-prefix partial with no tail
+    /// still reports it here). `0` for an absent/evicted/refused hash.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
     }
 }
 
@@ -2128,6 +2141,7 @@ impl CacheEngine {
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
         Ok(PresentRanges {
             complete: bitfield.is_complete(),
+            size: bitfield.size(),
             ranges: bitfield.ranges,
         })
     }
@@ -2204,21 +2218,14 @@ impl CacheEngine {
         if self.refuses(hash) {
             return Ok(decdn_protocol::Coverage::empty());
         }
-        let status = self
-            .inner
-            .store
-            .blobs()
-            .status(hash)
-            .await
-            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
-        let size = match status {
-            iroh_blobs::api::blobs::BlobStatus::NotFound => {
-                return Ok(decdn_protocol::Coverage::empty());
-            }
-            iroh_blobs::api::blobs::BlobStatus::Partial { size } => size.unwrap_or(0),
-            iroh_blobs::api::blobs::BlobStatus::Complete { size } => size,
-        };
+        // The size comes from the `observe()` bitfield (via `present_ranges`),
+        // not `status()`: iroh-blobs leaves a partial blob's size unknown
+        // until its LAST chunk validates, but the bitfield already knows it
+        // as soon as any chunk carries it — so a front-prefix partial with no
+        // tail still derives a non-empty coverage here. `present_ranges`
+        // already handles the absent/evicted guards (size 0 there too).
         let present = self.present_ranges(hash).await?;
+        let size = present.size();
         let present = present.chunk_ranges();
         let total_chunks = size.div_ceil(BAO_CHUNK_BYTES);
         let total_blocks = decdn_protocol::num_blocks(size);
@@ -9316,6 +9323,90 @@ mod tests {
         let cov = engine.coverage(hash).await.unwrap();
         assert!(cov.covers(0), "block 0 was admitted in full");
         assert!(!cov.covers(1), "block 1's middle group is missing");
+    }
+
+    // -- #1506 Task 0 spike: does the observe() bitfield know the full size --
+    // -- of a front-prefix partial before status() does? --
+
+    #[tokio::test]
+    async fn spike_bitfield_size_known_before_status_size_on_front_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        // Front-fill only: admit block 0 and NEVER admit the trailing group,
+        // so iroh-blobs never sees the blob's final chunk and `status()`
+        // never learns the size.
+        let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * crate::CHUNK_GROUP_BYTES;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        let (hash, block0_ranges, block0_bao) = bao_for(
+            root,
+            &plaintext,
+            outboard,
+            0,
+            decdn_protocol::DISCOVERY_BLOCK_BYTES,
+            total,
+        );
+        engine
+            .admit_bao(hash, block0_ranges, block0_bao)
+            .await
+            .unwrap();
+
+        let status = engine.inner.store.blobs().status(hash).await.unwrap();
+        assert!(
+            matches!(
+                status,
+                iroh_blobs::api::blobs::BlobStatus::Partial { size: None }
+            ),
+            "front-only partial must NOT have a status()-known size yet, got {status:?}"
+        );
+
+        let bitfield = engine.inner.store.blobs().observe(hash).await.unwrap();
+        assert_eq!(
+            bitfield.size(),
+            total,
+            "observe()'s bitfield must already know the full synthetic blob size"
+        );
+    }
+
+    /// A front-prefix partial (block 0 present, no tail, `status()` size
+    /// still unknown) must still advertise coverage for block 0: the size
+    /// used to derive discovery blocks comes from the `observe()` bitfield
+    /// (via [`CacheEngine::present_ranges`]), not from `status()`, which
+    /// iroh-blobs leaves `None` until the blob's last chunk validates.
+    #[tokio::test]
+    async fn coverage_of_front_partial_covers_block_zero_before_status_knows_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * crate::CHUNK_GROUP_BYTES;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        let (hash, block0_ranges, block0_bao) = bao_for(
+            root,
+            &plaintext,
+            outboard,
+            0,
+            decdn_protocol::DISCOVERY_BLOCK_BYTES,
+            total,
+        );
+        engine
+            .admit_bao(hash, block0_ranges, block0_bao)
+            .await
+            .unwrap();
+
+        let status = engine.inner.store.blobs().status(hash).await.unwrap();
+        assert!(
+            matches!(
+                status,
+                iroh_blobs::api::blobs::BlobStatus::Partial { size: None }
+            ),
+            "front-only partial must NOT have a status()-known size yet, got {status:?}"
+        );
+
+        let cov = engine.coverage(hash).await.unwrap();
+        assert!(
+            cov.covers(0),
+            "block 0 is fully present; coverage must not depend on status()'s size"
+        );
     }
 
     /// An origin that admits the blob into the store itself (as the ported
