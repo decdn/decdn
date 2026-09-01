@@ -187,15 +187,15 @@ impl ClientHandler {
             }
         };
 
-        // (4) Size gate on the claimed total (peeked or upstream-handshaked).
-        // (`open_pull_leg` already refuses an oversized header via its
-        // `max_blob_size_bytes`; this is a belt-and-braces wire-reason check.)
-        if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
-            release_reservation_unspent(floor_reservation.as_ref());
-            return self
-                .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
-                .await;
-        }
+        // (4) No size gate on the CLAIMED total (#1895): `total_bytes` is the peer's
+        // signed but unverified handshake value, so refusing on it would let a holder
+        // inflate a small blob's size to make every finite-ceiling relay refuse to
+        // pull/cache/serve while it monopolises the traffic. The `max_blob_size_bytes`
+        // ceiling is enforced instead on the bytes that ACTUALLY arrive, inside the
+        // pull leg's receive loop (`UpstreamPull::next_chunk`), which aborts the fill
+        // once received bytes cross it. A lie is inert (it cannot produce bytes that
+        // verify against the true root); an honest giant is streamed and paid for only
+        // up to one ceiling before the fill aborts and the serve fails a gap.
 
         // (5) The signed `StreamResponse` commits to `total_bytes` (now known). It is
         // deferred to step (7), AFTER the fill is claimed — so a peeked geometry that
@@ -524,15 +524,13 @@ impl ClientHandler {
                 .await;
         }
 
-        // (3) Size gate on the origin-claimed total (belt-and-braces: dispatch's
-        // `origin_size` probe already produced `total_bytes`; refuse an oversized
-        // blob with the wire-parity reason before signing anything).
-        if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
-            release_reservation_unspent(floor_reservation.as_ref());
-            return self
-                .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
-                .await;
-        }
+        // (3) No size gate on the origin-claimed total (#1895): this own-origin leg
+        // has no untrusted counterparty, but the ceiling still binds on RECEIVED bytes
+        // for wire-parity with the peer path. Its local pull leg's admission enforces
+        // the engine cap on the bytes it actually stores, so an over-ceiling origin
+        // blob fails the fill there rather than being refused up front on the probe
+        // size. Keeping both legs' ceiling-on-received keeps `max_blob_size_mb` one
+        // consistent rule across the serve-miss tiers.
 
         // (4) Sign + send the response up front — it commits to `total_bytes`,
         // which the caller already read from the origin size probe, and to the

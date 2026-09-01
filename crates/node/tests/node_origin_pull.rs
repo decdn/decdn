@@ -506,6 +506,7 @@ async fn provisioned_origin(
         providers,
         addr_map,
         DEFAULT_TEST_PULL_DEADLINES,
+        0,
     )
     .await
 }
@@ -554,6 +555,7 @@ async fn provisioned_origin_with_deadlines(
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     (pull_timeout, stall_timeout): (Duration, Duration),
+    max_blob_size_bytes: u64,
 ) -> (
     NodeOrigin,
     CacheEngine,
@@ -580,7 +582,7 @@ async fn provisioned_origin_with_deadlines(
         addr_map,
         pull_timeout,
         stall_timeout,
-        0,
+        max_blob_size_bytes,
     )
     .await;
     (origin, engine, recorded, engine_tmp)
@@ -6045,22 +6047,25 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
     Ok(())
 }
 
-/// #840 over the real orchestration: an honest upstream holds and would serve a
-/// blob larger than B's `max_blob_size` ceiling. The buyer must reject the
-/// oversized `total_bytes` claim before buffering — the fetch is a clean
-/// `NotFound`, the `node_pull_too_large` counter moves, and (crucially) the
-/// provider is NOT scored: a buyer-side ceiling is OUR policy, not the provider's
-/// fault, so no observation is emitted and its local score stays neutral.
+/// #1895 over the real orchestration: an honest upstream holds and serves a blob
+/// larger than B's `max_blob_size` ceiling. B does NOT refuse on the signed
+/// `total_bytes` claim — it pulls, and the fill aborts once the RECEIVED bytes
+/// cross the ceiling. The fetch still surfaces a clean `NotFound`, the
+/// `node_pull_too_large` counter moves, and (crucially) the provider is NOT scored:
+/// a buyer-side ceiling is OUR policy, not the provider's fault, so no observation
+/// is emitted and its local score stays neutral. B pays the upstream for the bytes
+/// it actually received before aborting (bounded to roughly one ceiling), which
+/// this test does not assert on — only that the refusal is clean and unscored.
 ///
 /// This exercises `pull_from_candidate` passing `deps.config.max_blob_size_bytes`
 /// (the loopback test calls `stream_fetch_tracked` directly and bypasses it).
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
-async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()> {
+async fn node_origin_oversized_blob_aborts_on_received_bytes_without_scoring() -> Result<()> {
     let payload = vec![0xABu8; PAYLOAD_LEN];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
-    // Buyer ceiling well below the 1.5 MiB blob → the gate fires.
+    // Buyer ceiling well below the 1.5 MiB blob → the received bytes cross it.
     let ceiling: u64 = 1_048_576;
     anyhow::ensure!(total_bytes > ceiling, "fixture must exceed the ceiling");
 
@@ -6150,7 +6155,7 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
         .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
     anyhow::ensure!(
         matches!(got, OriginFetch::NotFound),
-        "an over-ceiling claim must not surface bytes (NotFound)"
+        "an over-ceiling blob must abort the fill and surface no bytes (NotFound)"
     );
     // The provider is NOT tarred: no observation, score stays at the neutral 0.5.
     anyhow::ensure!(
@@ -6925,6 +6930,7 @@ async fn build_node_b_with_leaves(
         providers,
         addr_map,
         node_pull_deadlines,
+        max_blob_size_bytes,
     )
     .await;
 
@@ -8838,17 +8844,23 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Result<()> {
-    // #856 step (4): the fused serve opens the upstream pull, reads `total_bytes`
-    // from the signed header, and — if it exceeds this node's `max_blob_size_bytes`
-    // — signs `BlobTooLarge` (wire `NotFound`), abandons BOTH the upstream pull and
-    // the cache tee, and forwards nothing. The regression this guards: a dropped
-    // size gate would fuse-serve an over-ceiling blob; a forgotten `tee.abandon()`
-    // on this arm would strand the in-flight tee claim for the hash. We assert the
-    // refusal, the `blob_too_large` metric, that no voucher was paid upstream
-    // (channel opened, zero bytes pulled), and that nothing was cached.
-    let payload = vec![0xB1u8; PAYLOAD_LEN];
+async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Result<()> {
+    // #1895: the fused serve no longer refuses on the upstream's signed `total_bytes`
+    // claim. B signs `ok: true`, opens the upstream pull, and forwards while filling —
+    // but the pull leg's receive loop enforces `max_blob_size_bytes` on the bytes that
+    // ACTUALLY arrive, so it ABORTS once cumulative received bytes cross the ceiling.
+    // The regression this guards: a claim-based refusal would let a holder inflate a
+    // small blob's size to make B (and every finite-ceiling relay) refuse to
+    // cache/serve while it monopolises the traffic; enforcing on received bytes makes
+    // the lie inert while still capping an honest giant. A forgotten tee release on
+    // the abort arm would strand the in-flight claim for the hash. We assert: the
+    // leaf's fetch fails (B aborted mid-serve), B's upstream spend stays bounded to
+    // roughly one ceiling (NOT the whole blob), nothing is promoted into B's cache,
+    // the too-large pull counter moves, and the aborted fill releases its tee claim so
+    // an identical retry is not wedged.
+    let payload = vec![0xB1u8; 4 * 1024 * 1024];
     let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let ab_channel_id = B256::repeat_byte(0xA6);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -8857,10 +8869,9 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x6F);
-    // 1 MiB ceiling, below the 1.5 MiB blob, so the SIZE gate trips — but the
-    // deposit guard (ceiling = min_payment(one chunk, RATE)) passes
-    // against the funded leaf, so we exercise step (4), not the step (1) deposit
-    // guard.
+    // 1 MiB ceiling, far below the 4 MiB blob, so the RECEIVED bytes cross it well
+    // before the whole blob is pulled. The deposit guard passes against the funded
+    // leaf, so we exercise the received-byte cap, not a deposit refusal.
     let max_blob_size_bytes = 1024 * 1024;
     let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
@@ -8896,21 +8907,47 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
     .is_err();
     anyhow::ensure!(
         refused,
-        "an upstream blob over the size ceiling must be refused (signed NotFound), not fused-served"
+        "an upstream blob over the size ceiling must abort the fused serve mid-stream, not complete"
     );
-    anyhow::ensure!(
-        progress_log(&recorded)?.is_empty(),
-        "the size gate must abort before any voucher is paid upstream, got {:?}",
-        progress_log(&recorded)?
-    );
+
+    // Wait for B's pull leg to SETTLE (it writes the upstream watermark this test
+    // reads); a sleep that returns first leaves the log empty, which reads as a spend
+    // of zero and passes the bound below while proving nothing.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let settled = loop {
+        if let Some(&(_, bytes, _)) = progress_log(&recorded)?.last() {
+            break bytes;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "B never recorded an upstream watermark: the pull leg did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
     anyhow::ensure!(
         !cache_b.has(hash).await?,
-        "an oversized-upstream refusal must not promote the blob into B's cache"
+        "an oversized-upstream abort must not promote the blob into B's cache"
     );
-    assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 1)?;
-    // The tee claim was released on the abort arm: a second request for the SAME
-    // hash is not wedged on a stranded in-flight entry — it reaches the size gate
-    // again and is refused identically (a leaked tee would instead hang/coalesce).
+    // B paid the upstream for the received prefix — bounded to roughly one ceiling plus
+    // the speculative pull window, never the whole 4 MiB blob.
+    let upstream_bytes: u64 = u64::try_from(settled).unwrap_or(u64::MAX);
+    let bound_content = max_blob_size_bytes.saturating_add(decdn_client_pull::PULL_WINDOW_FLOOR);
+    let bound_wire = support::bao_wire_len(total_bytes, 0, bound_content);
+    anyhow::ensure!(
+        upstream_bytes > 0,
+        "B must pay the upstream for the bytes it actually received before aborting"
+    );
+    anyhow::ensure!(
+        upstream_bytes <= bound_wire,
+        "B's upstream spend ({upstream_bytes} wire) must stay bounded to ~one ceiling \
+         ({bound_content} content = {bound_wire} wire), not the whole blob"
+    );
+    assert_counter(&b_metrics, "node_pull_too_large_total", 1)?;
+
+    // The tee claim was released on the abort arm: an identical retry is not wedged on
+    // a stranded in-flight entry — it reaches the received-byte cap again and aborts
+    // identically (a leaked tee would instead hang/coalesce).
     let retry_sk = fresh_key();
     let retry_node_id = B256::from(*retry_sk.public().as_bytes());
     let (retry_ep, _) = local_endpoint(retry_sk, vec![]).await?;
@@ -8929,9 +8966,9 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
     .is_err();
     anyhow::ensure!(
         refused_again,
-        "a repeat request for the same hash must be refused again, not wedged on a stranded tee claim"
+        "a repeat request for the same hash must abort again, not wedge on a stranded tee claim"
     );
-    assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 2)?;
+    assert_counter(&b_metrics, "node_pull_too_large_total", 2)?;
 
     shutdown([task_a, task_b], [&retry_ep, &leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
