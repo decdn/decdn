@@ -76,6 +76,32 @@ fn run_from(source_ix: usize, start_block: u32, last_block: u32, total_bytes: u6
     }
 }
 
+/// Does `coverage` include every discovery block the byte range
+/// `[start, start + len)` intersects (clamped to `total_bytes`)?
+///
+/// The scheduler's coverage-filtered steal (#1506) uses this to decide
+/// whether a freed source may take a given remaining range: a source may only
+/// claim a range it can serve in full, never a partial cover that would leave
+/// a hole another lane must still fill.
+#[must_use]
+pub(crate) fn covers_byte_range(
+    coverage: &Coverage,
+    start: u64,
+    len: u64,
+    total_bytes: u64,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let end = start.saturating_add(len).min(total_bytes);
+    if end <= start {
+        return true;
+    }
+    let first_block = u32::try_from(start / DISCOVERY_BLOCK_BYTES).unwrap_or(u32::MAX);
+    let last_block = u32::try_from((end - 1) / DISCOVERY_BLOCK_BYTES).unwrap_or(u32::MAX);
+    (first_block..=last_block).all(|b| coverage.covers(b))
+}
+
 /// The best-`rank`ed source index whose coverage includes `block`, or `None`
 /// if no source in `rank` covers it.
 ///
@@ -283,6 +309,40 @@ mod tests {
         // Rank B (1) ahead of A (0): B wins even though A is index 0.
         assert_eq!(covering_sources(0, &sources, &[1, 0]), Some(1));
         assert_eq!(covering_sources(0, &sources, &[0, 1]), Some(0));
+    }
+
+    #[test]
+    fn covers_byte_range_true_only_when_every_intersected_block_is_covered() {
+        let coverage = cov(3, &[0, 1]);
+        // Wholly inside block 0: covered.
+        assert!(covers_byte_range(
+            &coverage,
+            0,
+            DISCOVERY_BLOCK_BYTES / 2,
+            3 * DISCOVERY_BLOCK_BYTES
+        ));
+        // Spans blocks 0 and 1, both covered.
+        assert!(covers_byte_range(
+            &coverage,
+            0,
+            2 * DISCOVERY_BLOCK_BYTES,
+            3 * DISCOVERY_BLOCK_BYTES
+        ));
+        // Spans blocks 1 and 2; block 2 is NOT covered, so the whole range is
+        // rejected even though most of it is covered.
+        assert!(!covers_byte_range(
+            &coverage,
+            DISCOVERY_BLOCK_BYTES,
+            2 * DISCOVERY_BLOCK_BYTES,
+            3 * DISCOVERY_BLOCK_BYTES
+        ));
+        // A zero-length range is trivially covered.
+        assert!(covers_byte_range(
+            &coverage,
+            0,
+            0,
+            3 * DISCOVERY_BLOCK_BYTES
+        ));
     }
 
     #[test]

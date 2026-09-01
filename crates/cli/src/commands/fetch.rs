@@ -1654,12 +1654,21 @@ where
 
     // Borrow each lane's owned `PeerSource` into a scheduler `SourceLane`, cloning
     // its `ctx`/`ledger` handles. `lanes` outlives `source_lanes`.
+    //
+    // This path admits candidates by `NodeCandidate` (pre-probe), not by the
+    // probed `Coverage` a `cdn/probe/v1` round trip would report (#1506's B1),
+    // so every lane is treated as a full holder here — the same assumption
+    // this fan-out always made. Wiring the real per-holder `Coverage` through
+    // this call site is a follow-up, not part of the coverage-aware scheduler
+    // itself.
+    let full_coverage = decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total_bytes));
     let source_lanes: Vec<SourceLane<'_, PeerSource<'_>>> = lanes
         .iter()
         .map(|l| SourceLane {
             source: &l.source,
             ctx: Arc::clone(&l.ctx),
             ledger: Arc::clone(&l.ledger),
+            coverage: full_coverage.clone(),
         })
         .collect();
 

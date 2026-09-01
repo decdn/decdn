@@ -1,8 +1,10 @@
-//! Pure segmentation and tail-steal helpers for the multi-source scheduler
-//! (spec §5.3). No I/O, no async: split a gap-set into bao-aligned contiguous
-//! segments, and pick-and-split the largest remaining range for a freed source
-//! to steal. Every returned range is chunk-group aligned so it is
-//! independently bao-verifiable.
+//! Pure byte-range helpers for the multi-source scheduler (spec §5.3, #1506).
+//! No I/O, no async. WHICH source gets WHICH discovery block is the coverage
+//! planner's job ([`crate::coverage_plan::spread_segments`]); this module only
+//! turns one planner-assigned run into fetchable `AlignedRange`s
+//! (`split_evenly`) and picks-and-splits the largest remaining range a freed
+//! source covers, for it to steal (`steal_split`). Every returned range is
+//! chunk-group aligned so it is independently bao-verifiable.
 
 use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, RangeVerifyError, align_range};
 
@@ -40,8 +42,8 @@ pub(crate) const MIN_SPLIT_SIZE: u64 = 16 * 1024 * 1024;
 /// [`RangeVerifyError::RangeOutOfBounds`] for a span whose `start` is at or
 /// past `total_bytes`, or whose raw (pre-rounding) end exceeds `total_bytes` —
 /// the same error `align_range` itself raises for an out-of-bounds request, so
-/// callers of [`initial_segments`]/[`steal_split`] see one consistent error
-/// type regardless of which stage rejected the input.
+/// [`steal_split`] sees one consistent error type regardless of which stage
+/// rejected the input.
 fn canonicalize_ranges(
     spans: &[(u64, u64)],
     total_bytes: u64,
@@ -86,76 +88,80 @@ fn canonicalize_ranges(
     Ok(merged)
 }
 
-/// Split the gap-set into up to `n` contiguous bao-aligned segments of roughly
-/// equal total size. Never returns an empty segment; may return fewer than `n`
-/// when the gap-set is small or a group-aligned split would otherwise degenerate.
+/// Split `[start, start + len)` into up to `k` roughly-equal, chunk-group
+/// aligned pieces. Never returns an empty piece; may return fewer than `k`
+/// when the span is small or a group-aligned split would otherwise degenerate.
 ///
-/// The gap-set is first [canonicalized](canonicalize_ranges) to whole,
-/// disjoint, group-aligned spans, and every returned segment lies wholly
-/// within one canonical span — so segments are pairwise non-overlapping by
-/// construction, never straddling a boundary another segment also claims. A
-/// segment may include up to one chunk group of boundary-adjacent bytes the
-/// buyer already holds (see [`canonicalize_ranges`]); fetching that group
-/// again is redundant but idempotent, never double-counted by the store. The
-/// `n` cap is enforced per-canonical-span: once the running count reaches `n`,
-/// the rest of the CURRENT span folds into its final segment. A gap-set
-/// fragmented into more than `n` disjoint spans therefore yields one segment
-/// per remaining span beyond that — exact coverage is never sacrificed to
-/// honor the cap exactly.
+/// The coverage planner ([`crate::coverage_plan::spread_segments`]) assigns
+/// whole 64 MiB discovery blocks, one run per source — coarser than this. When
+/// `k` sources all cover the SAME run whole (the planner had to pick just one
+/// of them, e.g. a blob no bigger than one discovery block, so several full
+/// holders tie on it), splitting the run further here — with NO
+/// [`MIN_SPLIT_SIZE`] floor, unlike [`steal_split`] — is what keeps every one
+/// of them fetching from the start, exactly as the old byte-count-only
+/// initial split always did before coverage existed. The caller is
+/// responsible for choosing `k` no larger than the number of sources that
+/// actually cover the whole `[start, start + len)` span; splitting past that
+/// would hand a piece to a source the scheduler's own coverage filter
+/// (`Work::pick`) would then have to refuse.
 ///
 /// # Errors
 ///
 /// Propagates [`decdn_bao_range::RangeVerifyError`] from `align_range` (an
-/// out-of-bounds gap against `total_bytes`).
-pub(crate) fn initial_segments(
-    gaps: &[(u64, u64)],
-    n: usize,
+/// out-of-bounds span against `total_bytes`).
+pub(crate) fn split_evenly(
+    start: u64,
+    len: u64,
+    k: usize,
     total_bytes: u64,
 ) -> anyhow::Result<Vec<AlignedRange>> {
-    let canon = canonicalize_ranges(gaps, total_bytes)?;
-    let total_gap: u64 = canon.iter().map(|&(s, e)| e - s).sum();
-    if total_gap == 0 || n == 0 {
+    if len == 0 || k == 0 {
         return Ok(Vec::new());
     }
-    let target = total_gap.div_ceil(n as u64).max(1);
+    let Some(end) = start.checked_add(len) else {
+        anyhow::bail!("split_evenly: start + len overflows for start={start} len={len}");
+    };
+    let target = len.div_ceil(k as u64).max(1);
     let mut out: Vec<AlignedRange> = Vec::new();
-    for &(start, end) in &canon {
-        let mut off = start;
-        while off < end {
-            // Once the segment cap is reached, fold the rest of THIS span (and
-            // any later spans) into the final segment so coverage stays exact —
-            // never silently drop the remainder.
-            let want = if out.len() + 1 >= n {
-                end - off
-            } else {
-                target.min(end - off)
-            };
-            let seg = align_range(off, want, total_bytes)?;
-            // `end` is itself a chunk-group boundary (canonicalize_ranges), so a
-            // group-aligned ceiling from `off` can never land past it — this is
-            // a defensive clamp, not a correctness-load-bearing one.
-            let seg_end = seg.fetch_end().min(end);
-            if seg_end <= off {
-                // A degenerate zero-width step (would only occur at a span of
-                // width 0, which the outer `while off < end` already excludes).
-                break;
-            }
-            let aligned = if seg_end == seg.fetch_end() {
-                seg
-            } else {
-                align_range(off, seg_end - off, total_bytes)?
-            };
-            out.push(aligned);
-            off = seg_end;
+    let mut off = start;
+    while off < end {
+        // Once the piece cap is reached, fold the remainder into the final
+        // piece so coverage stays exact — never silently drop the remainder.
+        let want = if out.len() + 1 >= k {
+            end - off
+        } else {
+            target.min(end - off)
+        };
+        let seg = align_range(off, want, total_bytes)?;
+        let seg_end = seg.fetch_end().min(end);
+        if seg_end <= off {
+            // A degenerate zero-width step (only possible at a zero-width
+            // span, which the outer `while off < end` already excludes).
+            break;
         }
+        let aligned = if seg_end == seg.fetch_end() {
+            seg
+        } else {
+            align_range(off, seg_end - off, total_bytes)?
+        };
+        out.push(aligned);
+        off = seg_end;
     }
     Ok(out)
 }
 
-/// Pick the largest remaining range and, if it is at least [`MIN_SPLIT_SIZE`],
-/// return its index in `remaining` together with its aligned second half for a
-/// freed source to steal. Returns `None` when nothing remaining is worth a fresh
-/// stream.
+/// Pick the largest remaining range this source COVERS and, if it is at least
+/// [`MIN_SPLIT_SIZE`], return its index in `remaining` together with its
+/// aligned second half for a freed source to steal. Returns `None` when
+/// nothing remaining — among the ranges `covers` accepts — is worth a fresh
+/// stream, including when `covers` accepts nothing at all (the freed source
+/// parks rather than stealing a range it cannot serve, #1506).
+///
+/// `covers(start, len)` is the freed source's coverage predicate: a candidate
+/// range is a steal target only when it returns `true` for it. Filtering
+/// happens BEFORE the largest-range argmax, so a source with narrow coverage
+/// never steals a huge range it cannot fully deliver just because it happens
+/// to be the biggest one in flight.
 ///
 /// The INDEX is returned, not just the half, so the caller trims the range this
 /// function actually split. Re-deriving the argmax at the call site couples two
@@ -165,9 +171,7 @@ pub(crate) fn initial_segments(
 ///
 /// The chosen range is first [canonicalized](canonicalize_ranges) to its
 /// enclosing group boundaries, so the returned half never rounds up past the
-/// range's true end into bytes a neighboring segment already owns — the same
-/// hazard [`initial_segments`] guards against, and the same up-to-one-group
-/// boundary-adjacent over-fetch trade-off applies here.
+/// range's true end into bytes a neighboring segment already owns.
 ///
 /// # Errors
 ///
@@ -177,10 +181,12 @@ pub(crate) fn initial_segments(
 pub(crate) fn steal_split(
     remaining: &[(u64, u64)],
     total_bytes: u64,
+    covers: impl Fn(u64, u64) -> bool,
 ) -> anyhow::Result<Option<(usize, AlignedRange)>> {
     let Some((victim, &(start, len))) = remaining
         .iter()
         .enumerate()
+        .filter(|&(_, &(s, l))| covers(s, l))
         .max_by_key(|&(_, &(_, len))| len)
     else {
         return Ok(None);
@@ -214,11 +220,13 @@ pub(crate) fn steal_split(
 )] // tests
 mod tests {
     #[test]
-    fn initial_segments_splits_contiguous_gap_into_n_aligned_parts() -> anyhow::Result<()> {
-        let total = 64 * 1024 * 1024;
-        let segs = super::initial_segments(&[(0, total)], 4, total)?;
-        assert_eq!(segs.len(), 4);
-        // Contiguous, non-overlapping, group-aligned, covering [0,total).
+    fn split_evenly_splits_a_span_into_k_aligned_pieces_below_no_size_floor() -> anyhow::Result<()>
+    {
+        // 8 MiB is far below `MIN_SPLIT_SIZE` (16 MiB) — `split_evenly` has no
+        // such floor, unlike `steal_split`, so it still splits.
+        let total = 8 * 1024 * 1024;
+        let segs = super::split_evenly(0, total, 2, total)?;
+        assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].fetch_start(), 0);
         let last = segs.last().expect("nonempty");
         assert_eq!(last.fetch_end(), total);
@@ -230,12 +238,31 @@ mod tests {
     }
 
     #[test]
-    fn initial_segments_caps_at_available_gap_count() -> anyhow::Result<()> {
-        // A single 8 MiB gap with n=4 yields at most gaps sized >= one group each,
-        // never more segments than make sense; every segment is non-empty.
-        let segs = super::initial_segments(&[(0, 8 * 1024 * 1024)], 4, 8 * 1024 * 1024)?;
+    fn split_evenly_caps_at_the_span_size() -> anyhow::Result<()> {
+        // A single 8 MiB span with k=4 yields at most pieces sized >= one
+        // group each, never more pieces than make sense; every piece is
+        // non-empty.
+        let segs = super::split_evenly(0, 8 * 1024 * 1024, 4, 8 * 1024 * 1024)?;
         assert!(!segs.is_empty() && segs.len() <= 4);
         assert!(segs.iter().all(|s| s.fetch_end() > s.fetch_start()));
+        Ok(())
+    }
+
+    #[test]
+    fn split_evenly_k_one_returns_the_whole_span_as_one_piece() -> anyhow::Result<()> {
+        let total = 20 * 1024 * 1024;
+        let segs = super::split_evenly(0, total, 1, total)?;
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].fetch_start(), 0);
+        assert_eq!(segs[0].fetch_end(), total);
+        Ok(())
+    }
+
+    #[test]
+    fn split_evenly_zero_len_or_zero_k_returns_nothing() -> anyhow::Result<()> {
+        let total = 20 * 1024 * 1024;
+        assert!(super::split_evenly(0, 0, 4, total)?.is_empty());
+        assert!(super::split_evenly(0, total, 0, total)?.is_empty());
         Ok(())
     }
 
@@ -246,6 +273,7 @@ mod tests {
         let stolen = super::steal_split(
             &[(0, 4 * 1024 * 1024), (10 * 1024 * 1024, 40 * 1024 * 1024)],
             total,
+            |_, _| true,
         )?
         .expect("above floor");
         let (victim, stolen) = stolen;
@@ -262,50 +290,43 @@ mod tests {
     fn steal_split_returns_none_below_floor() -> anyhow::Result<()> {
         let total = 100 * 1024 * 1024;
         // Largest remaining is 8 MiB < 16 MiB floor -> don't steal.
-        assert!(super::steal_split(&[(0, 8 * 1024 * 1024)], total)?.is_none());
+        assert!(super::steal_split(&[(0, 8 * 1024 * 1024)], total, |_, _| true)?.is_none());
         Ok(())
     }
 
     #[test]
-    fn initial_segments_two_gaps_separated_by_less_than_one_group_never_overlap()
+    fn steal_split_declines_a_range_the_predicate_rejects_even_when_it_is_the_largest()
     -> anyhow::Result<()> {
-        // Two gaps separated by 4 KiB of held data — less than the 16 KiB chunk
-        // group. Canonicalization must merge them into one span before
-        // splitting, so no returned segment can straddle into the other gap's
-        // territory and overlap a segment covering it.
-        let total = 8 * 1024 * 1024;
-        let gap_a = (0, 5 * 1024 * 1024 + 3 * 1024);
-        let gap_b = (5 * 1024 * 1024 + 4 * 1024, 1024 * 1024);
-        let segs = super::initial_segments(&[gap_a, gap_b], 4, total)?;
-        assert!(!segs.is_empty());
-        for s in &segs {
-            assert_eq!(s.fetch_start() % (16 * 1024), 0);
-            assert_eq!(s.fetch_end() % (16 * 1024), 0);
-        }
-        for w in segs.windows(2) {
-            assert!(
-                w[1].fetch_start() >= w[0].fetch_end(),
-                "segments must not overlap: {:?} then {:?}",
-                w[0],
-                w[1]
-            );
-        }
-        // Coverage reaches the (group-aligned) end of the canonicalized set.
-        let last = segs.last().expect("nonempty");
-        let canon_end = (gap_b.0 + gap_b.1).div_ceil(16 * 1024) * (16 * 1024);
-        assert_eq!(last.fetch_end(), canon_end.min(total));
+        let total = 100 * 1024 * 1024;
+        // The 40 MiB range is by far the largest, but the predicate rejects it
+        // (models a freed source whose coverage does not include it) — the 20
+        // MiB range is the largest ACCEPTED one and must be the one split.
+        let accepted_start = 60 * 1024 * 1024;
+        let stolen = super::steal_split(
+            &[
+                (0, 20 * 1024 * 1024),
+                (accepted_start, 40 * 1024 * 1024),
+                (10 * 1024 * 1024, 4 * 1024 * 1024),
+            ],
+            total,
+            |s, _| s != accepted_start,
+        )?
+        .expect("the 20 MiB range clears the floor and is accepted");
+        let (victim, _) = stolen;
+        assert_eq!(
+            victim, 0,
+            "the accepted 20 MiB range, not the rejected 40 MiB one"
+        );
         Ok(())
     }
 
     #[test]
-    fn initial_segments_single_unaligned_gap_last_end_is_group_aligned() -> anyhow::Result<()> {
-        let total = 16 * 1024 * 1024;
-        let gap = (0, 5 * 1024 * 1024 + 3 * 1024);
-        let segs = super::initial_segments(&[gap], 4, total)?;
-        let last = segs.last().expect("nonempty");
-        assert_eq!(last.fetch_end() % (16 * 1024), 0);
-        let enclosing_group_end = (gap.0 + gap.1).div_ceil(16 * 1024) * (16 * 1024);
-        assert!(last.fetch_end() <= enclosing_group_end.min(total));
+    fn steal_split_returns_none_when_predicate_accepts_nothing() -> anyhow::Result<()> {
+        let total = 100 * 1024 * 1024;
+        // A single large, otherwise-stealable range, but the predicate covers
+        // nothing — the freed source parks rather than stealing what it cannot
+        // serve.
+        assert!(super::steal_split(&[(0, 40 * 1024 * 1024)], total, |_, _| false)?.is_none());
         Ok(())
     }
 
@@ -316,50 +337,16 @@ mod tests {
         // true end of the range (not the blob) is what must bound the steal.
         let range = (0, 20 * 1024 * 1024 + 3 * 1024);
         let total = 64 * 1024 * 1024;
-        let (_, stolen) = super::steal_split(&[range], total)?.expect("above floor");
+        let (_, stolen) = super::steal_split(&[range], total, |_, _| true)?.expect("above floor");
         let enclosing_group_end = (range.0 + range.1).div_ceil(16 * 1024) * (16 * 1024);
         assert!(stolen.fetch_end() <= enclosing_group_end.min(total));
         Ok(())
     }
 
     #[test]
-    fn initial_segments_rejects_a_gap_starting_at_or_past_total_bytes() {
-        let total = 4 * 1024 * 1024;
-        // The gap's start is exactly at the blob's end — entirely out of bounds.
-        let result = super::initial_segments(&[(total, 4096)], 4, total);
-        assert!(
-            result.is_err(),
-            "gap starting at total_bytes must be rejected, not dropped"
-        );
-    }
-
-    #[test]
-    fn initial_segments_rejects_a_gap_extending_past_total_bytes() {
-        let total = 4 * 1024 * 1024;
-        // The gap starts in-bounds but its raw (pre-rounding) end overruns the blob.
-        let result = super::initial_segments(&[(total - 1024, 4096)], 4, total);
-        assert!(
-            result.is_err(),
-            "gap whose raw end exceeds total_bytes must be rejected, not truncated"
-        );
-    }
-
-    #[test]
-    fn initial_segments_accepts_a_legitimate_final_partial_group_gap() -> anyhow::Result<()> {
-        // The gap's raw end exactly equals total_bytes, so rounding UP to the
-        // next group boundary and then clamping to total_bytes is the blob's
-        // own partial last group — legitimate, not out-of-bounds.
-        let total = 5 * 1024 * 1024 + 3 * 1024;
-        let segs = super::initial_segments(&[(0, total)], 4, total)?;
-        let last = segs.last().expect("nonempty");
-        assert_eq!(last.fetch_end(), total);
-        Ok(())
-    }
-
-    #[test]
     fn steal_split_rejects_a_range_starting_at_or_past_total_bytes() {
         let total = 4 * 1024 * 1024;
-        let result = super::steal_split(&[(total, 16 * 1024 * 1024)], total);
+        let result = super::steal_split(&[(total, 16 * 1024 * 1024)], total, |_, _| true);
         assert!(
             result.is_err(),
             "range starting at total_bytes must be rejected, not dropped"
@@ -369,7 +356,7 @@ mod tests {
     #[test]
     fn steal_split_rejects_a_range_extending_past_total_bytes() {
         let total = 20 * 1024 * 1024;
-        let result = super::steal_split(&[(total - 1024, 16 * 1024 * 1024)], total);
+        let result = super::steal_split(&[(total - 1024, 16 * 1024 * 1024)], total, |_, _| true);
         assert!(
             result.is_err(),
             "range whose raw end exceeds total_bytes must be rejected, not truncated"
