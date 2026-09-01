@@ -2124,8 +2124,8 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
 
 /// A finished stream releases its lane slot: after the first same-lane stream
 /// settles and its `LaneSlot` drops, a later same-lane open on the same
-/// one-floor budget is admitted again. Uses the exact fixture and `remaining =
-/// 50` tuning as `second_same_lane_stream_refused_when_budget_covers_one` above
+/// one-floor budget is admitted again. Uses the exact fixture and one-credit-window
+/// `remaining` as `second_same_lane_stream_refused_when_budget_covers_one` above
 /// — it proves the counter decrements on release, not merely that a fresh lane
 /// admits; a leaked slot would refuse (or wedge, since the first stream never
 /// existed to steal capacity from) the second open here.
@@ -2262,7 +2262,7 @@ async fn single_same_lane_stream_admitted_unchanged() -> anyhow::Result<()> {
 /// Two simultaneous same-lane opens on a one-floor budget: the lane lock
 /// serializes admission, so exactly one is admitted and the other refused with
 /// `NotFound` — no TOCTOU double-admit. Both requests fit the budget alone
-/// (guards 30 and 20 under `remaining = 50`), so admitting both would only be
+/// (each priced under one credit window), so admitting both would only be
 /// possible if the two opens raced past the gate without serializing; which one
 /// wins is scheduling-dependent and is deliberately not asserted.
 #[tokio::test(flavor = "multi_thread")]
@@ -5205,6 +5205,7 @@ async fn one_signer_at_its_share_does_not_lock_out_a_co_tenant() -> anyhow::Resu
     // separates are opposite (top up the pool, versus rotate the session key).
     // Pin both directions: the sub-cap fired, and the deposit arm did not.
     ensure_only_the_sub_cap_refused(&metrics)?;
+    ensure_floor_gates_were_not_skipped(&metrics)?;
 
     // Signer B, a co-tenant on the SAME pool, is served from its own share.
     let conn_b = client_ep
@@ -5469,9 +5470,27 @@ async fn rejected_first_voucher_still_records_dead_charge() -> anyhow::Result<()
     Ok(())
 }
 
-/// True if `encoded` (`OpenMetrics` text from `Metrics::encode`) contains `line`
-/// as a full line — mirrors the `has_metric_line` helper in `metrics.rs` so the
-/// reject counters are asserted on an exact `name value` match, not a substring.
+/// Assert the floor gates were NOT skipped: every fixture here wires a pool view that
+/// always answers, so the fail-open counter must read zero.
+///
+/// The direction that matters. An inverted `is_none()` at the resolve site, or the
+/// bump migrating above the `match`, would leave this counter climbing on a healthy
+/// node — and `docs/runbook.md` tells operators to read a sustained rate as a lagging
+/// chain watcher, so the cost of getting it backwards is a wild goose chase.
+fn ensure_floor_gates_were_not_skipped(metrics: &Metrics) -> anyhow::Result<()> {
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&encoded, "decdn_floor_gate_skipped_no_pool_view_total 0"),
+        "a wired pool view must never count as a skipped floor gate; counters were:\n{}",
+        encoded
+            .lines()
+            .filter(|l| l.starts_with("decdn_floor_gate_skipped"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    Ok(())
+}
+
 /// Assert exactly one per-signer sub-cap refusal was counted and no pool-ceiling
 /// refusal was.
 ///
@@ -5498,6 +5517,9 @@ fn ensure_only_the_sub_cap_refused(metrics: &Metrics) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// True if `encoded` (`OpenMetrics` text from `Metrics::encode`) contains `line`
+/// as a full line — mirrors the `has_metric_line` helper in `metrics.rs` so the
+/// counters are asserted on an exact `name value` match, not a substring.
 fn metric_line_present(encoded: &str, line: &str) -> bool {
     encoded.lines().any(|l| l == line)
 }
@@ -9692,6 +9714,7 @@ async fn per_signer_dead_charge_gates_admission_across_restart() -> anyhow::Resu
     // sub-cap arm fired and the pool-ceiling arm did not. Without this pair the test
     // would pass on a hydration that dumped A's charge into the pool total.
     ensure_only_the_sub_cap_refused(&metrics_b)?;
+    ensure_floor_gates_were_not_skipped(&metrics_b)?;
 
     // Signer B, untouched before the restart, is served from its own share.
     let conn_b = client_ep_b

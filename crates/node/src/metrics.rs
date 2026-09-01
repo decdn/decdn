@@ -570,8 +570,12 @@ pub struct DecdnMetrics {
     /// persist failed" / "pool dead-charge forget failed"). Operator-visible
     /// name: `decdn_floor_loss_persist_failures_total`.
     pub floor_loss_persist_failures: Counter,
-    /// `serve_stream` requests served with the floor-credit gates SKIPPED, because
-    /// the cached `getPool` view answered `None` for the named pool.
+    /// `serve_stream` requests that reached the pool-view resolve and found no view
+    /// answer for the named pool, so the floor-credit gates are SKIPPED.
+    ///
+    /// Not "requests served": the bump sits at the resolve, ahead of the
+    /// origin-blacklist, lane-concurrency, availability, size and floor gates, so a
+    /// request refused by any of those still counts here.
     ///
     /// The skip is a deliberate fail-open: a transient blip in the chain watcher
     /// must not refuse paying clients, and the open-time hash gates plus the first
@@ -588,8 +592,7 @@ pub struct DecdnMetrics {
     /// Counted once per REQUEST at the single point the view is resolved, not once
     /// per gate: one `None` skips four gates (the origin-funder gate, the
     /// lane-concurrency gate, and both floor gates) and degrades two serve paths, so
-    /// this is an upper bound on floor gates actually skipped — a request refused
-    /// earlier for another reason still counts here.
+    /// this is an upper bound on floor gates actually skipped.
     ///
     /// It conflates the three ways the view answers `None`: no pool view wired, a
     /// pool the watcher has not seen yet, and a read fault. In production the view

@@ -229,7 +229,7 @@ impl PoolFloorState {
     ///
     /// Safe against a live guard: a repaid guard's `Drop` returns before touching
     /// the map at all, and an unrepaid guard holds `live_reservation > 0` — every
-    /// admission reserves at least one chunk at the on-chain-floored rate, so a
+    /// admission reserves a non-zero span at a rate the chain floors above zero, so a
     /// reservation is never zero — and neither can have its row pruned out from
     /// under it.
     fn prune_spent(&mut self, signer: Address) {
@@ -464,8 +464,8 @@ impl FloorPersist {
 ///
 /// Bundled rather than passed positionally because every field is plumbing the guard
 /// only forwards — none of them varies per reservation — so a call site reads as
-/// "one guard against this handler's accumulator", not as arguments in an order that
-/// must be remembered.
+/// "one guard against this handler's accumulator", not as three arguments in an
+/// order that must be remembered.
 struct FloorGuardDeps {
     map: Arc<std::sync::Mutex<FloorAccumulator>>,
     persist: FloorPersist,
@@ -474,18 +474,22 @@ struct FloorGuardDeps {
 
 /// RAII hold for one stream's span-capped reservation against a pool's budget.
 ///
-/// Construction (`FloorReservation::reserve`, test-only) charges the reserved
-/// amount to the pool's
-/// `live_reservation`. The serve loop keeps the current unpaid `µUSDC` updated via
-/// [`Self::note_unpaid`], and calls [`Self::release_live_repaid`] once THIS stream's
-/// cumulative payment reaches a floor — which frees the live reservation
-/// immediately. On drop (every exit path — success, `?`, disconnect, panic) the
-/// guard releases the live reservation if it was not already repaid and folds the
-/// last-noted unpaid amount (capped at the reserved amount) into the durable
-/// `dead_charge`,
-/// then persists the new dead total best-effort. Mirrors [`super::LaneSlot`]: the
-/// reservation is owned by the guard and never adjusted by hand, and every counter
-/// update saturates.
+/// [`ClientHandler::try_reserve_floor`] charges the reserved amount to the pool's
+/// `live_reservation` and hands back the guard. The serve loop keeps the current
+/// unpaid `µUSDC` updated via [`Self::note_unpaid`], and calls
+/// [`Self::release_if_repaid`] once THIS stream's cumulative payment reaches what was
+/// reserved — which frees the live reservation immediately.
+///
+/// On drop (every exit path — success, `?`, disconnect, panic) a guard that was not
+/// already repaid releases its live reservation and folds a dead charge whose size
+/// depends on how the stream ended: a stream marked settled folds only its
+/// proportional unpaid tail, and an ABNORMAL exit folds the FULL reservation. That
+/// second branch is the conservative direction the sequential abuse bound rests on,
+/// and it is what `#[must_use]` below is warning about. The new dead total is then
+/// made durable through [`FloorPersist`].
+///
+/// Mirrors [`super::LaneSlot`]: the reservation is owned by the guard and never
+/// adjusted by hand, and every counter update saturates.
 #[must_use = "dropping the guard at once folds the FULL reservation into the pool's \
               permanent dead charge, as an abnormal exit"]
 pub(super) struct FloorReservation {
@@ -760,7 +764,9 @@ async fn flush_queued_writes(
 ///
 /// `None` — so every drop writes inline — outside any runtime, i.e. a sync unit test.
 /// [`FloorPersist::new`] is the only caller and has already established there is a
-/// store worth writing to.
+/// store worth writing to. Called once per handler, and once per guard by the
+/// test-only `FloorReservation::reserve` (it is `#[cfg(test)]`, so rustdoc cannot
+/// link it).
 fn start_persist_worker(
     store: &Arc<dyn decdn_incentive::PoolFloorLossStore>,
     metrics: &Arc<Metrics>,
@@ -1320,7 +1326,13 @@ mod tests {
             .0
             .get(&pool)
             .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                // `unwrap_or_default()` here would synthesize an empty state whose
+                // `0 == 0` folds trivially, so a regression that REMOVED the entry
+                // would report success — and would mint a `POOL_FLOOR_EPOCH` from
+                // inside an assertion.
+                anyhow::anyhow!("{when}: the pool entry is gone, so there is nothing to agree")
+            })?;
         let fold = |pick: fn(&SignerFloorState) -> U256| {
             st.signers
                 .values()
@@ -1911,6 +1923,11 @@ mod tests {
     /// Each thread names a DISTINCT signer at a `10_000` bps share, so the sub-cap is
     /// a no-op and the pool ceiling is unambiguously what refuses. The barrier makes
     /// the threads collide inside the same lock acquisition rather than queueing.
+    /// Detection is probabilistic, and the suite retries: the barrier makes the
+    /// racers collide, it does not guarantee they land in the same stale window. A
+    /// correct implementation can never fail this, but a broken one can pass it on a
+    /// loaded runner, so read a FLAKY line here as the defect signal
+    /// `.config/nextest.toml` says it is rather than as noise.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_admissions_cannot_over_commit_the_pool_ceiling() -> anyhow::Result<()> {
         const RACERS: usize = 8;
@@ -1968,6 +1985,11 @@ mod tests {
     /// The pool-ceiling twin above cannot cover this: the two caps are separate tests
     /// under the same lock hold, and a check-then-reserve split on the signer arm
     /// alone would let two streams past one share while the pool stayed solvent.
+    /// Detection is probabilistic, and the suite retries: the barrier makes the
+    /// racers collide, it does not guarantee they land in the same stale window. A
+    /// correct implementation can never fail this, but a broken one can pass it on a
+    /// loaded runner, so read a FLAKY line here as the defect signal
+    /// `.config/nextest.toml` says it is rather than as noise.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_admissions_cannot_over_commit_one_signers_share() -> anyhow::Result<()> {
         const RACERS: usize = 8;
@@ -2643,16 +2665,23 @@ mod tests {
         Ok(())
     }
 
-    /// A drop inside a runtime reaches the store through the persist worker, and
-    /// `flush_floor_persists` is what makes that observable at a point in time.
+    /// `flush_floor_persists` WAITS for the queued writes; it does not merely happen
+    /// to run after them.
     ///
-    /// The drop-time write is queued, not awaited — `Drop` cannot await — so without
-    /// the flush a test could only poll. The flush is also the shutdown contract:
-    /// the worker processes in order, so an ack proves every earlier write landed.
+    /// The drop-time write is queued, not awaited — `Drop` cannot await — so a test
+    /// that queues, flushes and then reads would pass on timing alone even if the
+    /// flush were `async {}`. `GatedLossStore` removes the timing: the queued writes
+    /// cannot complete until released, so a flush that returns before the release did
+    /// not wait. That ordering is the whole of the shutdown contract in
+    /// `runtime::shutdown`, and the reason the worker is serial.
+    ///
+    /// The release is driven by its own task rather than by this one, so no assertion
+    /// sits between the gate and the release: a failure here fails, it does not strand
+    /// the worker's blocking thread on the turnstile and hang.
     #[tokio::test(flavor = "multi_thread")]
-    async fn queued_persists_are_durable_once_flushed() -> anyhow::Result<()> {
+    async fn the_flush_waits_for_every_queued_write() -> anyhow::Result<()> {
         let metrics = Arc::new(Metrics::new());
-        let store = Arc::new(decdn_incentive::MemoryPoolFloorLossStore::new());
+        let store = Arc::new(GatedLossStore::new());
         let (handler, _dir) =
             handler_for_tests_with_floor_store(&metrics, 10_000, store.clone()).await;
         let pool = B256::repeat_byte(0x71);
@@ -2660,28 +2689,50 @@ mod tests {
         let remaining = floor.saturating_mul(U256::from(4u64));
 
         // Two abandoned streams on one signer: each folds its full reservation, and
-        // the SECOND write carries the cumulative total, so the row ends at both.
+        // the SECOND write carries the cumulative total, so the row ends at twice the
+        // floor. Both park in the store's turnstile.
         for _ in 0..2 {
             let _abandoned = handler
                 .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, floor)
                 .map_err(|e| anyhow::anyhow!("admission refused: {e:?}"))?;
         }
+
+        let released = Arc::new(AtomicBool::new(false));
+        let unblock = tokio::spawn({
+            let store = Arc::clone(&store);
+            let released = Arc::clone(&released);
+            async move {
+                // Long enough that a flush which does not wait resolves first.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                released.store(true, Ordering::SeqCst);
+                store.release();
+            }
+        });
+
         handler.flush_floor_persists().await;
+        let waited = released.load(Ordering::SeqCst);
+        unblock
+            .await
+            .map_err(|e| anyhow::anyhow!("release task: {e}"))?;
+        anyhow::ensure!(
+            waited,
+            "the flush resolved before its queued writes were unblocked, so it did \
+             not wait for them"
+        );
         anyhow::ensure!(
             persisted_loss(&*store, pool)? == Some(floor.saturating_mul(U256::from(2u64)).to()),
-            "both queued drops must be durable once the flush acknowledges"
+            "every queued drop must be durable by the time the flush acknowledges"
         );
         Ok(())
     }
 
-    /// A drop whose persist worker is gone writes inline rather than losing the
-    /// value.
+    /// A drop with no persist worker at all writes on its own thread.
     ///
-    /// The worker's task dies with the runtime, and guards drop en masse exactly
-    /// then. A lost write is not a lost log line: the durable total falls behind the
-    /// in-memory one, so the next boot hands that signer back the share this write
-    /// was recording. Driven through a handler built with no runtime, which is the
-    /// same `persist_tx == None` state.
+    /// The `FloorPersist::Inline` case: a store to write to, but no runtime to have
+    /// spawned a worker onto. Distinct from a worker that existed and died, which
+    /// reaches the send first — `a_drop_whose_worker_died_still_persists_and_counts_it`
+    /// covers that one. Either way the value must reach disk, because losing it hands
+    /// this signer its whole share back on the next boot.
     #[test]
     fn a_drop_with_no_persist_worker_still_writes_inline() -> anyhow::Result<()> {
         let metrics = Arc::new(Metrics::new());
@@ -2800,6 +2851,131 @@ mod tests {
                 .encode()?
                 .contains("decdn_floor_loss_persist_failures_total 1"),
             "a flush that cannot be acknowledged must bump the failure counter"
+        );
+        Ok(())
+    }
+
+    /// A store that fails exactly one of the two reads `hydrate` makes, so each
+    /// fail-closed path can be driven on its own.
+    struct HydrateFailsOn {
+        sweep: bool,
+        load: bool,
+    }
+
+    impl decdn_incentive::PoolFloorLossStore for HydrateFailsOn {
+        fn record_loss(
+            &self,
+            _: B256,
+            _: Address,
+            _: u128,
+        ) -> Result<(), decdn_incentive::StoreError> {
+            Ok(())
+        }
+        fn load_losses(
+            &self,
+        ) -> Result<Vec<decdn_incentive::FloorLoss>, decdn_incentive::StoreError> {
+            if self.load {
+                return Err(decdn_incentive::StoreError::Backend("injected".into()));
+            }
+            Ok(Vec::new())
+        }
+        fn forget_loss(&self, _: B256) -> Result<(), decdn_incentive::StoreError> {
+            Ok(())
+        }
+        fn sweep_forgotten(&self) -> Result<usize, decdn_incentive::StoreError> {
+            if self.sweep {
+                return Err(decdn_incentive::StoreError::Backend("injected".into()));
+            }
+            Ok(0)
+        }
+    }
+
+    /// Bring-up fails CLOSED when the floor-loss store cannot be read.
+    ///
+    /// Coming up on an empty accumulator would re-grant every pool — and every signer
+    /// on it — the whole free-floor budget it had already consumed, which is the
+    /// withhold-then-restart escape the durable copy exists to close. A genuine first
+    /// boot returns `Ok(vec![])` (the table simply does not exist yet), so an error
+    /// reaching here is a real store fault and the node must refuse to start rather
+    /// than serve on a budget it cannot account for.
+    ///
+    /// Both reads are covered: swapping either `?` for `.unwrap_or_default()` passes
+    /// the rest of the suite.
+    #[test]
+    fn hydrate_refuses_to_come_up_when_the_store_cannot_be_read() -> anyhow::Result<()> {
+        for (sweep, load, which) in [
+            (true, false, "sweep_forgotten"),
+            (false, true, "load_losses"),
+        ] {
+            let store: Arc<dyn decdn_incentive::PoolFloorLossStore> =
+                Arc::new(HydrateFailsOn { sweep, load });
+            anyhow::ensure!(
+                hydrate(Some(&store)).is_err(),
+                "a failing {which} must fail bring-up, not start on an empty accumulator"
+            );
+        }
+        // The control: a store that answers both reads comes up, so the assertions
+        // above are about the failure and not about the fixture.
+        let healthy: Arc<dyn decdn_incentive::PoolFloorLossStore> = Arc::new(HydrateFailsOn {
+            sweep: false,
+            load: false,
+        });
+        anyhow::ensure!(
+            hydrate(Some(&healthy)).is_ok(),
+            "a store that answers both reads must come up"
+        );
+        Ok(())
+    }
+
+    /// A drop whose worker is GONE — the sender still live, the receiver dropped —
+    /// still gets its dead charge to disk, and counts the degraded path.
+    ///
+    /// This is the state a runtime teardown or an aborted worker task leaves, and it
+    /// is when guards drop en masse. Distinct from having no worker at all: that one
+    /// never reaches the send. Losing the value here hands this signer its whole
+    /// share back on the next boot.
+    #[test]
+    fn a_drop_whose_worker_died_still_persists_and_counts_it() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(decdn_incentive::MemoryPoolFloorLossStore::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<FloorLossWrite>();
+        drop(rx);
+        let map: Arc<std::sync::Mutex<FloorAccumulator>> =
+            Arc::new(std::sync::Mutex::new(FloorAccumulator::default()));
+        let pool = B256::repeat_byte(0x74);
+        let floor = decdn_incentive::floor_micro(1000);
+        let epoch = {
+            let mut guard = lock_floor(&map)?;
+            guard.charge_live(pool, TEST_SIGNER, floor)
+        };
+        {
+            let _abandoned = FloorReservation::new_charged(
+                FloorGuardDeps {
+                    map: Arc::clone(&map),
+                    persist: FloorPersist::Worker {
+                        tx: tx.clone(),
+                        store: store.clone(),
+                    },
+                    metrics: Arc::clone(&metrics),
+                },
+                pool,
+                TEST_SIGNER,
+                floor,
+                epoch,
+            );
+        }
+        // No runtime here, so the fallback writes on this thread and the assertion
+        // needs no wait.
+        anyhow::ensure!(
+            persisted_loss(&*store, pool)? == Some(floor.to()),
+            "a drop whose worker is gone must still get the dead charge to disk"
+        );
+        anyhow::ensure!(
+            metrics
+                .encode()?
+                .contains("decdn_floor_loss_persist_failures_total 1"),
+            "and must count the degraded path, which is otherwise invisible until \
+             the shutdown flush"
         );
         Ok(())
     }
