@@ -1225,7 +1225,7 @@ async fn build_chain_and_handlers(
         // `NodeOrigin` being provisioned; an unprovisioned origin just makes the
         // `get` a fast miss.
         let per_candidate = Duration::from_secs(cfg.cache.node_pull_timeout_sec);
-        let stall = Duration::from_secs(cfg.cache.node_pull_stall_timeout_sec);
+        let stall = Duration::from_secs(cfg.cache.node_pull_stall_window_sec);
         let outer_deadline = crate::selection::outer_pull_deadline(per_candidate, stall);
         pull_through = Some(outer_deadline);
         // Window-paced pull-through (#856, ADR 037): when the `NodeOrigin` is
@@ -2033,7 +2033,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let node_origin_config = crate::node_origin::NodeOriginConfig {
         probe_fanout: cfg.cache.node_pull_probe_fanout,
         pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
-        stall_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_stall_timeout_sec),
+        stall_window: std::time::Duration::from_secs(cfg.cache.node_pull_stall_window_sec),
+        min_throughput_bps: cfg.cache.node_pull_min_throughput_bps,
         max_blob_size_bytes: cfg
             .cache
             .max_blob_size_mb
@@ -3980,8 +3981,10 @@ mod tests {
                 relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
                 node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
-                node_pull_stall_timeout_sec:
-                    decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
+                node_pull_stall_window_sec:
+                    decdn_common::config::DEFAULT_NODE_PULL_STALL_WINDOW_SEC,
+                node_pull_min_throughput_bps:
+                    decdn_common::config::DEFAULT_NODE_PULL_MIN_THROUGHPUT_BPS,
                 eviction_policy: decdn_common::config::DEFAULT_EVICTION_POLICY.to_string(),
                 admission_policy: decdn_common::config::DEFAULT_ADMISSION_POLICY.to_string(),
                 tinylfu: decdn_common::config::ResolvedTinyLfu {

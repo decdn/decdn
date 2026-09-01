@@ -257,12 +257,16 @@ pub struct NodeOriginConfig {
     /// slow L2 more room does nothing. That the two are sequential stages is exactly why
     /// `outer_pull_deadline` budgets both, plus the stall window, for every candidate.
     pub pull_timeout: Duration,
-    /// INACTIVITY bound on the STREAMING stage (#1134). Reset on every byte
-    /// received, so it trips only on a silent upstream — never on a large blob or
-    /// a slow link. Deliberately not a wall clock: bounding the bytes by wall clock
-    /// caps the blob size this node can pull through at `pull_timeout × link
-    /// speed`, which is the bug this avoids.
-    pub stall_timeout: Duration,
+    /// THROUGHPUT-FLOOR window on the STREAMING stage (#1797). Bytes are counted off the
+    /// QUIC stream sub-frame, so a pull aborts only when throughput over this window falls
+    /// below [`Self::min_throughput_bps`] — never on a large blob or a big frame.
+    /// Deliberately not a wall clock: bounding the bytes by wall clock caps the blob size
+    /// this node can pull through at `pull_timeout × link speed`, which is the bug this
+    /// avoids.
+    pub stall_window: Duration,
+    /// Minimum sustained upstream throughput (bytes/sec) over [`Self::stall_window`]; `0`
+    /// disables the throughput test and leaves idle detection (#1797).
+    pub min_throughput_bps: u64,
     /// Buyer-side blob-size ceiling (`cache.max_blob_size_mb` × MB), `0` = unlimited.
     /// Mirrors the serving-side `BlobTooLarge` gate; rejects an oversized server
     /// `total_bytes` claim before buffering (#840).
@@ -353,23 +357,26 @@ fn region_latency_penalty_applies(own_region: Option<&str>, claimed: &str, rtt_m
 }
 
 impl NodeOriginConfig {
-    /// The stage bounds for one upstream pull: a wall clock on the open, inactivity on the
-    /// stream, no overall cap (#1134).
+    /// The stage bounds for one upstream pull: a wall clock on the open, a throughput floor
+    /// on the stream, no overall cap (#1797).
     ///
     /// # Errors
     ///
-    /// `DeadlineError::ZeroBudget` if either budget is zero. `config`'s own validator
+    /// `DeadlineError::ZeroBudget` if either duration is zero. `config`'s own validator
     /// already rejects that at startup, so this is the second lock on a door that must not
-    /// open: a zero stall trips `PullStalled` on the first poll of every streaming read, and
-    /// `PullStalled` scores `Unreachable` against the peer — so the failure mode is not a node that stops
-    /// working, it is a node that silently defames every honest peer it touches. Both call
-    /// sites route it to [`LocalPullFault`], which meters it as OUR emergency and scores no
-    /// peer (#1145 review).
+    /// open: a zero window makes the throughput floor unsatisfiable and abandons every
+    /// upstream on its first read. Both call sites route the error to [`LocalPullFault`],
+    /// which meters it as OUR emergency and scores no peer (#1145 review).
     fn deadlines(&self) -> anyhow::Result<PullDeadlines> {
-        PullDeadlines::new(self.pull_timeout, self.stall_timeout).map_err(|err| {
+        PullDeadlines::new(
+            self.pull_timeout,
+            self.stall_window,
+            self.min_throughput_bps,
+        )
+        .map_err(|err| {
             anyhow::anyhow!(
                 "node pull deadlines are unusable ({err}); \
-                 check cache.node_pull_timeout_sec and cache.node_pull_stall_timeout_sec"
+                     check cache.node_pull_timeout_sec and cache.node_pull_stall_window_sec"
             )
             .context(LocalPullFault)
         })
@@ -2302,15 +2309,19 @@ fn classify_pull_failure(
             suppress(Some(REFUSAL_SUPPRESSION_TTL));
             debug!(%provider_addr, %err, "node-origin: pull hit our local deadline; suppressing briefly, not tarring upstream reputation");
         }
-        // Unlike `OurDeadline`, this DOES score the peer, and that split is the whole reason
-        // the two sentinels exist. A whole-transfer deadline could not tell a dead peer from
-        // a big blob on a slow link, so it fired on healthy transfers and had to be
-        // exonerating. A stall deadline resets on every byte, so it can only fire on a
-        // provider that stopped delivering — which is what `Unreachable` means (#1134).
+        // A throughput-floor abort is non-attributable (#1797), the same class as
+        // `OurDeadline`: a stream that falls below the floor may be slow because of the link,
+        // congestion, or our own slow consumption, none of which the peer can be blamed for,
+        // and a throughput signal is spoofable in both directions (ADR 005 §Non-empty, ADR
+        // 008). So it is metered and the `(peer, hash)` pair is suppressed — which stops a
+        // peer that accepts a stream and then stalls from burning a candidate slot on every
+        // miss — but no `Outcome` is recorded and reputation is untouched. `PullStalled` and
+        // `PullTimeout` stay distinct metrics; the only difference from `OurDeadline` here is
+        // the counter.
         PullVerdict::Stalled => {
             deps.metrics.node_pull_stalled();
-            debug!(%provider_addr, %err, "node-origin: upstream stalled mid-stream; scoring unreachable");
-            record_outcome(deps, pk, &Outcome::Unreachable);
+            suppress(Some(REFUSAL_SUPPRESSION_TTL));
+            debug!(%provider_addr, %err, "node-origin: upstream fell below the throughput floor; suppressing briefly, not tarring upstream reputation");
         }
         // Our payment-side fault — the provider is not scored (#857). What separates this arm
         // from the retryable one below is what it costs the LANE.

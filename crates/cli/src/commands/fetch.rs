@@ -828,6 +828,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let deadlines = PullDeadlines::capped(
         common.stall_timeout(),
         common.stall_timeout(),
+        common.min_throughput_bps(),
         common.hard_cap(),
     )?;
 
@@ -2266,6 +2267,7 @@ mod tests {
             max_blob_mb: 1024,
             max_rate_per_mb: 0,
             stall_timeout_ms: 30_000,
+            min_throughput_bps: 4096,
             timeout_ms: 3_600_000,
             capability: None,
             capability_file: None,

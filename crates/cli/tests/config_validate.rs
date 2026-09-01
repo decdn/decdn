@@ -385,7 +385,9 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
             node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
             node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
-            node_pull_stall_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
+            node_pull_stall_window_sec: decdn_common::config::DEFAULT_NODE_PULL_STALL_WINDOW_SEC,
+            node_pull_min_throughput_bps:
+                decdn_common::config::DEFAULT_NODE_PULL_MIN_THROUGHPUT_BPS,
             eviction_policy: decdn_common::config::DEFAULT_EVICTION_POLICY.to_string(),
             admission_policy: decdn_common::config::DEFAULT_ADMISSION_POLICY.to_string(),
             tinylfu: decdn_common::config::ResolvedTinyLfu {
@@ -449,7 +451,8 @@ fn summary_reports_the_pull_through_deadlines_when_enabled() -> anyhow::Result<(
     let cfg = sample_resolved(|c| {
         c.cache.node_to_node_pull_through_enabled = true;
         c.cache.node_pull_timeout_sec = 25;
-        c.cache.node_pull_stall_timeout_sec = 15;
+        c.cache.node_pull_stall_window_sec = 15;
+        c.cache.node_pull_min_throughput_bps = 2048;
     });
     let out = render(None, &cfg)?;
     anyhow::ensure!(
@@ -457,9 +460,13 @@ fn summary_reports_the_pull_through_deadlines_when_enabled() -> anyhow::Result<(
         "the summary must report the resolved stream-open budget: {out}"
     );
     anyhow::ensure!(
-        out.contains("stall_timeout_sec=15"),
-        "the summary must report the resolved inactivity budget — it is the primary health \
-         signal, and it is a term of the derived outer deadline: {out}"
+        out.contains("stall_window_sec=15"),
+        "the summary must report the resolved throughput-floor window — it is the primary \
+         health signal, and it is a term of the derived outer deadline: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("min_throughput_bps=2048"),
+        "the summary must report the resolved throughput floor: {out}"
     );
     Ok(())
 }

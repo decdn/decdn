@@ -607,6 +607,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             deadlines: PullDeadlines::capped(
                 self.common.stall_timeout(),
                 self.common.stall_timeout(),
+                self.common.min_throughput_bps(),
                 self.common.hard_cap(),
             )?,
         })

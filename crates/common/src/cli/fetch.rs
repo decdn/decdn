@@ -241,17 +241,24 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "UNITS", default_value_t = 0)]
     pub max_rate_per_mb: u64,
 
-    /// Abandon a fetch when the provider sends no data for this long, in
-    /// milliseconds. This is the primary timeout (#1134): the clock resets on
-    /// every byte received, so it catches a dead or stalled provider — what a
-    /// timeout is *for* — without penalising transfer size or link speed. A
-    /// 700 MiB blob on a slow link keeps going as long as bytes keep arriving.
-    /// For `bundle pull` this applies per entry.
+    /// Trailing window, in milliseconds, over which the fetch measures upstream throughput
+    /// (#1797). This is the primary timeout: bytes are counted off the QUIC stream sub-frame,
+    /// and the fetch is abandoned when the bytes across this window fall below
+    /// `--min-throughput-bps`. Frame-size-independent, so a 700 MiB blob on a slow link keeps
+    /// going as long as it stays above the floor. For `bundle pull` this applies per entry.
     ///
-    /// Must be non-zero: at 0 the deadline elapses on the first poll and every fetch
-    /// fails instantly.
+    /// Must be non-zero: at 0 the throughput floor is unsatisfiable and every fetch fails
+    /// instantly.
     #[arg(long, value_name = "MS", default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub stall_timeout_ms: u64,
+
+    /// Minimum sustained upstream throughput in bytes per second over `--stall-timeout-ms`
+    /// (#1797). A stream that stays below this floor for a full window is abandoned — catching
+    /// both a wedged provider (throughput to zero) and a slow drip (a trickle that never trips
+    /// a bare idle timeout). `0` disables the throughput test and leaves pure idle detection:
+    /// at least one byte per window. For `bundle pull` this applies per entry.
+    #[arg(long, value_name = "BPS", default_value_t = 4096)]
+    pub min_throughput_bps: u64,
 
     /// Hard cap on the total wall-clock time of the `CapacityBond` registry read, and
     /// separately of a single blob fetch, in milliseconds. Defaults to 1 hour. For
@@ -296,14 +303,21 @@ pub struct ClientFetchArgs {
 }
 
 impl ClientFetchArgs {
-    /// Inactivity bound for the streaming stage — the primary timeout (#1134).
+    /// Throughput-floor window for the streaming stage — the primary timeout (#1797).
     ///
     /// Returned as its own value (rather than a `decdn_client_pull::PullDeadlines`)
     /// because `decdn-common` is upstream of the pull crate in the dependency flow;
-    /// the CLI assembles the two halves into a `PullDeadlines`.
+    /// the CLI assembles the halves into a `PullDeadlines`.
     #[must_use]
     pub const fn stall_timeout(&self) -> Duration {
         Duration::from_millis(self.stall_timeout_ms)
+    }
+
+    /// Minimum sustained upstream throughput (bytes/sec) over [`Self::stall_timeout`]; `0` =
+    /// idle detection only (#1797). Assembled with the window into a `PullDeadlines`.
+    #[must_use]
+    pub const fn min_throughput_bps(&self) -> u64 {
+        self.min_throughput_bps
     }
 
     /// Overall wall-clock cap on one blob fetch — always present, so a fetch always
@@ -364,8 +378,8 @@ impl ClientFetchArgs {
     /// WHOLE exchange, and both CLI call sites build `PullDeadlines` with the open bound
     /// ALSO set from `--stall-timeout-ms` (a node that accepts a connection and never
     /// answers is as dead as one that stops mid-stream, so the same budget answers both).
-    /// So before the stall clock even starts, up to `stall_timeout_ms` may already have
-    /// gone on the open — and `PullStalled` can only fire if the cap outlasts both:
+    /// So before the streaming window even starts, up to `stall_timeout_ms` may already have
+    /// gone on the open — and the throughput floor can only fire if the cap outlasts both:
     ///
     /// ```text
     /// timeout_ms > open (= stall_timeout_ms) + stall_timeout_ms  =  2 × stall_timeout_ms
@@ -377,8 +391,8 @@ impl ClientFetchArgs {
     ///
     /// # This is the early check, not the enforcement
     ///
-    /// `PullDeadlines::capped` is what actually enforces `hard_cap > open + stall`, on the
-    /// type that holds all three values, and both CLI call sites go through it (#1145
+    /// `PullDeadlines::capped` is what actually enforces `hard_cap > open + window`, on the
+    /// type that holds the values, and both CLI call sites go through it (#1145
     /// review). This exists so the user gets the error at argument-parse time — naming the
     /// flags they typed — rather than several frames into a fetch.
     ///
@@ -400,8 +414,8 @@ impl ClientFetchArgs {
         anyhow::ensure!(
             self.timeout_ms > need,
             "--timeout-ms ({}) must exceed twice --stall-timeout-ms ({} × 2 = {}): the hard \
-             cap bounds the whole exchange, and the open stage is bounded by the SAME stall \
-             budget — so below that, the cap always elapses before the inactivity deadline \
+             cap bounds the whole exchange, and the open stage is bounded by the SAME window \
+             budget — so below that, the cap always elapses before the throughput floor \
              can fire and a stalled provider could never be detected",
             self.timeout_ms,
             self.stall_timeout_ms,

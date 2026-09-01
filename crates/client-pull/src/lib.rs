@@ -44,6 +44,10 @@ mod ledger;
 pub mod pacer;
 /// Reusable `cdn/probe/v1` client.
 pub mod probe;
+/// Sub-frame byte-progress observation (#1797): a `ProgressReader` that tallies bytes
+/// off the QUIC stream beneath the message decode, and the `ThroughputFloor` that judges
+/// those bytes against a minimum rate over a trailing window.
+mod progress;
 /// Wallet-filled HTTP provider builder for opening/settling payment channels.
 pub mod provider;
 /// Client-side [`decdn_bao_range::RangedStore`] backend (#1621): a
@@ -53,9 +57,6 @@ pub mod ranged_store;
 /// failure is terminal or worth retrying against another provider/lane. Shared by
 /// the CLI single-source loop and the multi-source scheduler.
 pub mod retry;
-/// Client-only multi-source fetch scheduler (spec §5.3): fan a request across
-/// several paid sources over one shared store, with bao-aligned segmentation
-/// and tail-stealing. Drives [`driver::fill_gap`] per range.
 mod scheduler;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
 /// (spec §5.3): no I/O, no async.
@@ -962,22 +963,23 @@ impl std::fmt::Display for LocalPullFault {
 
 impl std::error::Error for LocalPullFault {}
 
-/// The bounds on a pull, each matched to the stage it governs (#1134).
+/// The bounds on a pull, each matched to the stage it governs (#1134, #1797).
 ///
-/// The two are not interchangeable, and conflating them is the bug this type
-/// exists to prevent. A single whole-transfer deadline is
-/// mostly useless as a health signal: it has to be sized against `blob size ×
-/// link speed`, so it kills legitimate large or slow-but-healthy transfers while
-/// a value small enough to catch a dead peer quickly cannot serve a big blob at
-/// all. The operator ends up tuning a number that has nothing to do with node
-/// health.
+/// A single whole-transfer deadline is mostly useless as a health signal: it has to be
+/// sized against `blob size × link speed`, so it kills legitimate large or slow-but-healthy
+/// transfers while a value small enough to catch a dead peer quickly cannot serve a big blob
+/// at all. The operator ends up tuning a number that has nothing to do with node health.
 ///
 /// Split by stage instead:
 ///
-/// - **`stall`** bounds the STREAMING stage by INACTIVITY. It resets on every byte
-///   of progress, so it trips only when the provider goes unresponsive — the thing
-///   a timeout should catch — and is indifferent to transfer size and link speed.
-///   This is the primary mechanism.
+/// - **`window` + `floor_bps`** bound the STREAMING stage by THROUGHPUT. The requester
+///   counts bytes read off the QUIC stream (sub-frame, so the measure is frame-size
+///   independent) and trips when the bytes across the trailing `window` fall below
+///   `floor_bps · window`. This catches both a wedge (throughput drops to zero) and a
+///   slow drip (throughput below the floor), and is indifferent to transfer size and link
+///   speed. `floor_bps == 0` leaves pure idle detection: at least one byte per window.
+///   This is the primary mechanism. The abort is requester-local policy and does not score
+///   the peer.
 /// - **`hard_cap`** is an optional overall wall-clock escape hatch, `None` by
 ///   default. It exists for a caller that must bound total runtime regardless; it
 ///   is not how a stalled peer is detected.
@@ -994,42 +996,47 @@ impl std::error::Error for LocalPullFault {}
 /// pull forever. `open` exists so that cannot be expressed.
 /// # The relational invariant
 ///
-/// `hard_cap`, when set, must STRICTLY EXCEED `open + stall`. Both clocks below run inside
+/// `hard_cap`, when set, must STRICTLY EXCEED `open + window`. Both clocks below run inside
 /// the cap's, and in the worst case consecutively — the open can legitimately consume its
-/// whole budget before the inactivity clock even starts — so a cap that does not outlast
-/// both means the cap always fires first and [`PullStalled`] can never fire under it. The
-/// pull then looks fully configured while its peer-health signal is dead.
+/// whole budget before the streaming stage begins, and the floor needs one full `window` to
+/// fire — so a cap that does not outlast both means the cap always fires first and the
+/// throughput floor can never trip under it. The pull then looks fully configured while its
+/// peer-health signal is dead.
 ///
 /// [`Self::capped`] is fallible and the fields are private BECAUSE of that (#1145 review).
 /// The invariant belongs on this type: with `pub` fields, callers build it with a struct
-/// literal and the only check is a hardcoded `timeout > 2 × stall` in the CLI's
+/// literal and the only check is a hardcoded `timeout > 2 × window` in the CLI's
 /// `ClientFetchArgs::validate`, correct only because those call sites set `open` from the same
-/// knob as `stall`. Adding an
+/// knob as `window`. Adding an
 /// `--open-timeout-ms` flag would have made it silently wrong, in the direction that reopens
-/// the hole. The invariant belongs to the type that has the three values.
+/// the hole. The invariant belongs to the type that has the values.
 #[derive(Debug, Clone, Copy)]
 pub struct PullDeadlines {
     /// Wall-clock bound on the open stage: dial, request, and the signed
     /// `StreamResponse`. Bounded work — a slow one is a stall.
     open: Duration,
-    /// Inactivity bound on the streaming stage. Reset on every byte of progress.
-    stall: Duration,
+    /// Trailing window over which the streaming-stage throughput floor is measured.
+    window: Duration,
+    /// Minimum bytes-per-second the streaming stage must sustain over `window`. `0`
+    /// disables the throughput test and leaves pure idle detection (one byte per window).
+    floor_bps: u64,
     /// Optional overall wall-clock cap on the whole exchange. `None` = uncapped;
-    /// `open` and `stall` between them are what keep an uncapped pull from hanging.
+    /// `open` and `window` between them are what keep an uncapped pull from hanging.
     hard_cap: Option<Duration>,
 }
 
-/// A [`PullDeadlines`] whose bounds cannot do their job. Carries the three values so a CLI
+/// A [`PullDeadlines`] whose bounds cannot do their job. Carries the values so a CLI
 /// can render the arithmetic back to the user rather than just saying "invalid".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeadlineError {
     /// A zero budget elapses on its first poll, so the stage it bounds can never run.
     ZeroBudget,
-    /// The cap does not outlast `open + stall`, so it always fires first and the stall
-    /// bound — the only signal that says anything about the PEER — can never fire.
+    /// The cap does not outlast `open + window`, so it always fires first and the
+    /// throughput floor — the signal that a healthy stream is still making progress —
+    /// can never fire.
     CapCannotOutlastItsStages {
         open: Duration,
-        stall: Duration,
+        window: Duration,
         hard_cap: Duration,
     },
 }
@@ -1040,12 +1047,12 @@ impl std::fmt::Display for DeadlineError {
             Self::ZeroBudget => write!(f, "a deadline of zero elapses before any work can run"),
             Self::CapCannotOutlastItsStages {
                 open,
-                stall,
+                window,
                 hard_cap,
             } => write!(
                 f,
                 "the overall cap ({hard_cap:?}) must exceed the open bound ({open:?}) plus the \
-                 stall bound ({stall:?}): both run inside it and in the worst case \
+                 throughput-floor window ({window:?}): both run inside it and in the worst case \
                  consecutively, so below that the cap always elapses first and a stalled \
                  provider can never be detected"
             ),
@@ -1062,25 +1069,29 @@ impl PullDeadlines {
     ///
     /// # Errors
     ///
-    /// [`DeadlineError::ZeroBudget`] for a zero `open` or `stall`.
+    /// [`DeadlineError::ZeroBudget`] for a zero `open` or `window`. `floor_bps` may be zero
+    /// (idle-detection mode: one byte per window).
     ///
-    /// A zero `open` or `stall` must fail here, not pass. One might argue it is a bound that
+    /// A zero `open` or `window` must fail here, not pass. One might argue it is a bound that
     /// fires too EAGERLY — loud, immediately obvious — rather than one that silently never
-    /// fires. That is exactly backwards: `config` says so, a zero stall "trips
-    /// `PullStalled` on the first poll of every streaming read … it would score every
-    /// honest peer it touches as `Unreachable`."
+    /// fires. That is exactly backwards: a zero window makes the throughput floor demand
+    /// progress over no time at all, so the streaming stage can never satisfy it.
     ///
-    /// A zero stall is not loud. It is a node quietly scoring every peer it touches as
-    /// unreachable, at full speed. The only thing standing between config and that state was
-    /// a `> 0` check in a resolver in another crate — the same advisory-invariant shape
-    /// `ChunkData` had before #1088, and the reason this type owns its bounds at all.
-    pub const fn new(open: Duration, stall: Duration) -> Result<Self, DeadlineError> {
-        if open.is_zero() || stall.is_zero() {
+    /// The only thing standing between config and that state was a `> 0` check in a resolver
+    /// in another crate — the same advisory-invariant shape `ChunkData` had before #1088, and
+    /// the reason this type owns its bounds at all.
+    pub const fn new(
+        open: Duration,
+        window: Duration,
+        floor_bps: u64,
+    ) -> Result<Self, DeadlineError> {
+        if open.is_zero() || window.is_zero() {
             return Err(DeadlineError::ZeroBudget);
         }
         Ok(Self {
             open,
-            stall,
+            window,
+            floor_bps,
             hard_cap: None,
         })
     }
@@ -1090,26 +1101,28 @@ impl PullDeadlines {
     /// # Errors
     ///
     /// [`DeadlineError::CapCannotOutlastItsStages`] if `hard_cap` does not strictly exceed
-    /// `open + stall`, and [`DeadlineError::ZeroBudget`] for a zero `open` or `stall`. See
+    /// `open + window`, and [`DeadlineError::ZeroBudget`] for a zero `open` or `window`. See
     /// the type's own docs for why this is the one constructor that must be fallible.
     pub fn capped(
         open: Duration,
-        stall: Duration,
+        window: Duration,
+        floor_bps: u64,
         hard_cap: Duration,
     ) -> Result<Self, DeadlineError> {
-        if open.is_zero() || stall.is_zero() {
+        if open.is_zero() || window.is_zero() {
             return Err(DeadlineError::ZeroBudget);
         }
-        if hard_cap <= open.saturating_add(stall) {
+        if hard_cap <= open.saturating_add(window) {
             return Err(DeadlineError::CapCannotOutlastItsStages {
                 open,
-                stall,
+                window,
                 hard_cap,
             });
         }
         Ok(Self {
             open,
-            stall,
+            window,
+            floor_bps,
             hard_cap: Some(hard_cap),
         })
     }
@@ -1120,10 +1133,16 @@ impl PullDeadlines {
         self.open
     }
 
-    /// The streaming-stage inactivity bound.
+    /// The streaming-stage throughput-floor window.
     #[must_use]
-    pub const fn stall(&self) -> Duration {
-        self.stall
+    pub const fn window(&self) -> Duration {
+        self.window
+    }
+
+    /// The streaming-stage throughput floor, in bytes per second. `0` = idle detection only.
+    #[must_use]
+    pub const fn floor_bps(&self) -> u64 {
+        self.floor_bps
     }
 
     /// The overall cap, if any.
@@ -1133,21 +1152,22 @@ impl PullDeadlines {
     }
 
     /// The single-deadline shape: one budget serving as the open bound, the
-    /// stall bound, AND the overall cap. **Test-only — do not reach for this in
+    /// streaming window, AND the overall cap, with the throughput floor disabled
+    /// (`floor_bps == 0`, idle detection only). **Test-only — do not reach for this in
     /// production.** That conflation is exactly what #1134 set out to remove, and the
     /// name reads far more like a legitimate policy choice than it is.
     ///
     /// Note what it quietly costs, beyond re-introducing the size-coupled deadline:
-    /// because `hard_cap == stall`, and the cap's clock starts at the top of the whole
-    /// exchange while the stall clock starts only once the open has completed, **the hard
-    /// cap always elapses first — so [`PullStalled`] can never fire under it.** A pull
+    /// because `hard_cap == window`, and the cap's clock starts at the top of the whole
+    /// exchange while the streaming window starts only once the open has completed, **the
+    /// hard cap always elapses first — so [`PullStalled`] can never fire under it.** A pull
     /// built this way silently cannot detect a stalled peer, and so cannot score one.
     /// Every loopback test using this helper is exercising a pull with the stall
     /// signal disabled; the stall path is covered by
-    /// `node_origin_mid_stream_silence_scores_stalled_upstream`, which builds its
+    /// `node_origin_mid_stream_silence_does_not_score_stalled_upstream`, which builds its
     /// deadlines explicitly.
     ///
-    /// That is a statement about the BUFFERED path, where `with_hard_cap` wraps the whole
+    /// That is a statement about the BUFFERED path, where the cap wraps the whole
     /// exchange. The progressive path never consults `hard_cap` at all (see
     /// [`open_progressive_pull`]), so a `whole_transfer` used there would leave `PullStalled`
     /// perfectly able to fire — which is not a reprieve, just a different reason not to
@@ -1158,8 +1178,8 @@ impl PullDeadlines {
     ///
     /// TEST-ONLY, and now unrepresentable in production by construction: gated behind the
     /// `test-util` feature (#1145 review), so a production caller cannot name it and reach for
-    /// the zero-stall / uncapped state — it wants [`Self::new`] (stall-bounded) or
-    /// [`Self::capped`] (stall-bounded with a leak guard). Used by the loopback helper
+    /// the disabled-floor / uncapped state — it wants [`Self::new`] (floor-bounded) or
+    /// [`Self::capped`] (floor-bounded with a leak guard). Used by the loopback helper
     /// `stream_fetch` and directly by the `client_loopback` suite, whose blobs are small
     /// enough that none of this matters.
     #[cfg(any(test, feature = "test-util"))]
@@ -1167,7 +1187,8 @@ impl PullDeadlines {
     pub const fn whole_transfer(timeout: Duration) -> Self {
         Self {
             open: timeout,
-            stall: timeout,
+            window: timeout,
+            floor_bps: 0,
             hard_cap: Some(timeout),
         }
     }
@@ -1332,7 +1353,8 @@ pub async fn stream_fetch_tracked_with_progress(
             max_blob_size_bytes,
             max_rate_per_mb,
             deadlines.open,
-            deadlines.stall,
+            deadlines.window,
+            deadlines.floor_bps,
             &ledger,
             on_progress,
         ),
@@ -1424,7 +1446,8 @@ pub async fn stream_fetch_shared(
             max_blob_size_bytes,
             max_rate_per_mb,
             deadlines.open,
-            deadlines.stall,
+            deadlines.window,
+            deadlines.floor_bps,
             ledger,
             // Shared concurrent pulls interleave many blobs on one channel; a
             // single unified byte-progress readout would be meaningless, so this
@@ -1643,7 +1666,8 @@ async fn fetch_inner(
     max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     open: Duration,
-    stall: Duration,
+    window: Duration,
+    floor_bps: u64,
     ledger: &PoolLedger,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Bytes> {
@@ -1661,7 +1685,8 @@ async fn fetch_inner(
             max_blob_size_bytes,
             max_rate_per_mb,
             open,
-            stall,
+            window,
+            floor_bps,
             ledger,
             on_progress,
         )
@@ -1908,7 +1933,8 @@ async fn fetch_inner_once(
     max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     open: Duration,
-    stall: Duration,
+    window: Duration,
+    floor_bps: u64,
     ledger: &PoolLedger,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Bytes> {
@@ -1993,7 +2019,8 @@ async fn fetch_inner_once(
         ledger,
         rate_per_mb,
         expected_wire,
-        stall,
+        window,
+        floor_bps,
         on_progress,
     )
     .await?;
@@ -2047,14 +2074,25 @@ fn aligned_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow
 /// the decoder, not here). Enforces `ChunkData`'s non-empty FLOOR (#1088) — an
 /// oversized frame is refused earlier still, by the framing layer's
 /// `MAX_MESSAGE_SIZE`, before it allocates — plus the `cumulative <= expected_wire_bytes` overrun guard
-/// (ADR 005 §`cdn/client/v1`). The floor is the load-bearing one: it is what lets the
-/// inactivity deadline below rest on frame arrival, since an empty frame would refresh
-/// the clock while advancing nothing.
+/// (ADR 005 §`cdn/client/v1`). The non-empty floor ties every frame to payload, so a run of
+/// empty frames cannot drive this loop while `cumulative` and the voucher accounting stand
+/// still.
 ///
-/// `stall` bounds this loop by INACTIVITY (#1134): every read must land within
-/// `stall` of the last byte of progress, so the loop is bounded no matter how
-/// large the blob or how slow the link, and a silent upstream is abandoned
-/// promptly rather than left to the QUIC idle timeout.
+/// `window` + `floor_bps` bound this loop by THROUGHPUT (#1797): bytes are counted off the
+/// QUIC stream sub-frame through a `ProgressReader`, and a `ThroughputFloor` aborts when
+/// the bytes across the trailing `window` fall below `floor_bps · window` (below one byte
+/// when `floor_bps == 0`). The signal is frame-size-independent, so a large frame arriving
+/// slowly but continuously is not mistaken for a stall, and a slow drip below the floor is
+/// caught even though frames keep arriving. The abort is requester-local policy: before the
+/// first byte it is [`PullTimeout`] (our own budget, blob-size-dependent), after bytes it is
+/// [`PullStalled`]; neither scores the peer.
+/// How often the throughput floor samples the byte counter: a fraction of the window, so a
+/// stall is detected within roughly one extra sample period beyond the window, floored at
+/// 100 ms so a tiny window cannot spin the sampler.
+fn stall_sample_period(window: Duration) -> Duration {
+    (window / 8).max(Duration::from_millis(100))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_and_pay(
     send: &mut SendStream,
@@ -2063,7 +2101,8 @@ async fn receive_and_pay(
     ledger: &PoolLedger,
     rate_per_mb: u64,
     expected_wire_bytes: u64,
-    stall: Duration,
+    window: Duration,
+    floor_bps: u64,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<(BytesMut, u64)> {
     let mut buf = BytesMut::new();
@@ -2075,65 +2114,64 @@ async fn receive_and_pay(
     let mut unproved: u64 = 0;
     // This stream's anchor: which epoch it has told the node about.
     let mut meter = StreamMeter::default();
-    // The inactivity deadline (#1134). Reset only inside the `ChunkData` arm below —
-    // never on a non-chunk frame — and a `ChunkData` that exists carries at least one
-    // byte, because `ChunkData::new` and the decode gate are the only ways to obtain
-    // one (#1088). So every refresh of this clock is paid for in bytes, which is the
-    // property `PullStalled` rests on: a peer cannot hold the deadline open with padding.
-    let mut deadline = tokio::time::Instant::now() + stall;
+    // Byte-progress stall detection (#1797). The `ProgressReader` tallies bytes off the
+    // QUIC stream sub-frame into `counter`; the `ThroughputFloor` reads that counter on a
+    // sampling tick and aborts when throughput over the trailing window drops below the
+    // floor. Because the counter moves on bytes, not on decoded frames, a large frame
+    // arriving slowly is not mistaken for a stall.
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut reader = progress::ProgressReader::new(recv, Arc::clone(&counter));
+    let mut floor = progress::ThroughputFloor::new(
+        progress::FloorConfig { window, floor_bps },
+        Arc::clone(&counter),
+        tokio::time::Instant::now(),
+    );
+    let mut sampler = tokio::time::interval(stall_sample_period(window));
+    sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        let msg = tokio::time::timeout_at(deadline, read_client_message(recv))
-            .await
-            // Which fault this is depends on whether a byte has EVER arrived (#1145 review).
-            //
-            // `PullStalled` scores the peer `Unreachable` in the local per-peer EWMA (ADR 008)
-            // — and it earns that right from the reset above: a clock that
-            // resets on every byte can only fire on a peer that stopped delivering. That
-            // reasoning holds for every chunk but the first, where no byte has reset it yet
-            // and the clock is measuring something else entirely.
-            //
-            // What it measures before the first chunk is the server's time-to-first-byte,
-            // and that scales with BLOB SIZE: the serve path writes the `StreamResponse`
-            // first, then materialises the whole bao wire encoding via `export_bao_range`
-            // before it can emit chunk #1. A 1 GiB blob off a cold disk can exceed the 20 s
-            // default — so an honest server, doing exactly what it was asked, would be scored
-            // unreachable for being big.
-            //
-            // A wait on bounded-but-unpredictable server work is what the OPEN stage already
-            // is, and the open bound already answers this the right way: it raises
-            // `PullTimeout`, which is exonerating, on the grounds that our own budget
-            // elapsing says nothing about the peer. This is the same wait one stage later, so
-            // it gets the same answer. Nothing is lost that the open stage has not already
-            // given up: a peer that accepts and then says nothing is unscored there too, and
-            // it still fails the pull and yields the candidate slot.
-            //
-            // The alternative — keeping the peer-blaming verdict and widening the budget —
-            // cannot work, because no fixed budget can separate "large blob, honest server"
-            // from "dead peer" when the honest case is unbounded in blob size.
-            //
-            // But be precise about what this does and does not fix (#1145 review). It fixes
-            // the ATTRIBUTION: an honest server with a slow first byte is not scored
-            // as unreachable. It does NOT make that blob fetchable. The pull still fails —
-            // a blob whose server-side materialisation exceeds the stall window is
-            // unfetchable on this path. The real repair is on the SERVE side:
-            // `export_bao_range` returns an
-            // owned `Bytes`, materialising the entire bao encoding before chunk #1 goes out,
-            // so TTFB scales with blob size by construction. Streaming it incrementally is
-            // what would actually close #1122/#1132; until then this comment must not be read
-            // as claiming the 708 MB blob now works.
-            //
-            // A `PullTimeout` here is metered and, since #1145, SUPPRESSED for
-            // `REFUSAL_SUPPRESSION_TTL` — reputation-neutral, but it stops a peer that
-            // accepts a stream and then says nothing from burning a candidate slot on every
-            // miss forever.
-            .map_err(|_| {
-                if cumulative == 0 {
-                    anyhow::Error::new(PullTimeout { after: stall })
-                } else {
-                    anyhow::Error::new(PullStalled { after: stall })
+        // Read the next frame while the sampler ticks. The floor is judged only when a read
+        // is slow enough that the tick wins the `select!`; a healthy stream keeps the read
+        // arm ready and the floor rarely runs. `biased` cannot starve the floor: the read arm
+        // is ready only once a whole frame has come off the wire, which is byte progress the
+        // counter has already recorded, and the very next poll finds the following frame
+        // incomplete unless the sender is outrunning this loop. Skipping the tick therefore
+        // means throughput above the floor, which is the case the floor would clear anyway.
+        // The read future is pinned and polled across
+        // ticks rather than recreated each tick: `read_client_message` is not
+        // cancellation-safe (`read_frame` fills a frame with `read_exact`), so dropping it
+        // mid-frame would lose the bytes already read and desynchronise the stream. It is
+        // dropped only when the floor aborts (#1797).
+        let msg = {
+            let read = read_client_message(&mut reader);
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    biased;
+                    r = &mut read => break r?,
+                    _ = sampler.tick() => {
+                        // Which fault this is depends on whether a byte has EVER arrived (#1145
+                        // review). Before the first byte the floor is measuring the server's
+                        // time-to-first-byte, which scales with BLOB SIZE (the serve path
+                        // materialises the whole bao wire encoding via `export_bao_range` before
+                        // chunk #1) — that is our own budget, not the peer's fault, so it raises
+                        // the exonerating `PullTimeout`. After bytes have flowed it raises
+                        // `PullStalled`. Neither scores the peer: a throughput abort is
+                        // requester-local policy (ADR 005 §Retry behavior, ADR 008), metered and
+                        // suppressed on the node path but never folded into reputation.
+                        if let progress::FloorVerdict::Stalled =
+                            floor.evaluate(tokio::time::Instant::now())
+                        {
+                            return Err(if cumulative == 0 {
+                                anyhow::Error::new(PullTimeout { after: window })
+                            } else {
+                                anyhow::Error::new(PullStalled { after: window })
+                            });
+                        }
+                    }
                 }
-            })??;
+            }
+        };
         match msg {
             ClientMessage::ChunkData(chunk) => {
                 // The running total must not exceed what the response promised —
@@ -2147,10 +2185,6 @@ async fn receive_and_pay(
                         "server sent {cumulative} bytes, more than the {expected_wire_bytes} promised"
                     );
                 }
-                // Bytes arrived: the upstream is alive, so extend the inactivity
-                // deadline. It also extends after a completed voucher round trip below;
-                // both sites are inside this arm, and reaching this arm means bytes.
-                deadline = tokio::time::Instant::now() + stall;
                 buf.extend_from_slice(chunk.bytes());
                 // Surface delivery progress after each chunk. `cumulative` and
                 // `expected_wire_bytes` are both wire bytes, so the readout is
@@ -2166,6 +2200,11 @@ async fn receive_and_pay(
                 // at zero. Nothing is acknowledged: continued delivery IS
                 // acceptance (ADR 005), so the loop keeps reading and only a
                 // rejection (a mid-stream `StreamError`) ever comes back.
+                //
+                // Gate the floor across our own payment. While we owe the covering proof the
+                // node legitimately pauses delivery (ADR 005 §Payment pacing), so that pause
+                // is self-inflicted, not a sender stall — exclude it from the window (#1797).
+                floor.pause(tokio::time::Instant::now());
                 unproved = meter
                     .pay(
                         send,
@@ -2176,6 +2215,7 @@ async fn receive_and_pay(
                         cumulative >= expected_wire_bytes,
                     )
                     .await?;
+                floor.resume(tokio::time::Instant::now());
             }
             // Acceptance is implicit — continued delivery IS acceptance (ADR 005),
             // so there is no positive ack to consume. Only a rejection is signalled,
@@ -2331,17 +2371,16 @@ pub struct UpstreamPullHeader {
 /// in its per-candidate budget, but that is belt-and-braces: leaving the bound to
 /// the caller is what let the buffered handshake ship unbounded once already.
 ///
-/// The streaming `next_chunk`/`finish` reads are bounded here, by INACTIVITY: each
-/// read must land within `stall` of the last byte of progress. Before that they had
-/// no application-level bound at all — a silent upstream was left to the QUIC idle
-/// timeout, with only the loop's window pacing (it recoups a downstream voucher
-/// every window, so it cannot run unboundedly ahead of unpaid demand) standing
-/// between a wedged peer and an indefinitely-held serve task.
+/// The streaming `next_chunk`/`finish` reads are bounded here, by a THROUGHPUT FLOOR
+/// (#1797): bytes are counted off the QUIC stream sub-frame, and a read is abandoned when
+/// the bytes across the trailing `window` fall below `floor_bps · window`. The detector
+/// persists across reads, so its window spans the whole stream rather than one call, and a
+/// self-inflicted window-pacing pause is excluded from the window.
 ///
 /// A wall clock would be the wrong bound to reach for here: this type exists to
 /// stream blobs of any size, so any fixed deadline would either kill a healthy
-/// large transfer or be too loose to catch a dead one. Inactivity is indifferent
-/// to size and link speed.
+/// large transfer or be too loose to catch a dead one. A byte-throughput floor is
+/// indifferent to size and link speed, and frame-size-independent.
 pub struct UpstreamPull {
     conn: iroh::endpoint::Connection,
     send: SendStream,
@@ -2356,8 +2395,17 @@ pub struct UpstreamPull {
     rate_per_mb: u64,
     /// This stream's chain anchor — which epoch it has told the upstream about.
     meter: StreamMeter,
-    /// Inactivity budget for every streaming read (#1134). Reset on byte progress.
-    stall: Duration,
+    /// Throughput-floor window for every streaming read (#1797). Names the `after` on a
+    /// [`PullStalled`] / [`PullTimeout`]; the floor itself owns the window and floor rate.
+    window: Duration,
+    /// Bytes read off the QUIC stream so far, tallied sub-frame by the `ProgressReader`
+    /// each `next_chunk`/`finish` read wraps `recv` in. The floor reads this counter.
+    progress_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// The byte-progress stall detector, persisted across reads so its window spans the
+    /// whole stream, not one `next_chunk` call.
+    floor: progress::ThroughputFloor,
+    /// The floor's sampling tick.
+    sampler: tokio::time::Interval,
     /// Promised **wire** bytes for this stream: the bao-encoded size of the
     /// chunk-group-aligned range (content plus interleaved proof, ADR 038), not
     /// the content-byte remainder. Bounds the receive loop and the closing voucher.
@@ -2399,9 +2447,9 @@ impl std::fmt::Debug for UpstreamPull {
 /// The open stage is bounded by `deadlines.open`, inside the shared `open_stream`
 /// helper — NOT left to the caller (#1134). `node_origin` additionally wraps this
 /// call in its per-candidate budget, which is belt-and-braces rather than the sole
-/// bound. `deadlines.stall` is the INACTIVITY budget the returned [`UpstreamPull`]
-/// carries into every streaming read; `deadlines.hard_cap` is not consulted here
-/// (the caller owns the streaming lifetime on this path).
+/// bound. `deadlines.window` and `deadlines.floor_bps` are the throughput floor the returned
+/// [`UpstreamPull`] carries into every streaming read; `deadlines.hard_cap` is not consulted
+/// here (the caller owns the streaming lifetime on this path).
 ///
 /// `ledger` is the CHANNEL's voucher ledger, not this pull's: pass the same
 /// `Arc<PoolLedger>` to every concurrent pull on one channel, exactly as with
@@ -2435,7 +2483,8 @@ pub async fn open_progressive_pull(
     // connection already live. `None` for a caller with no such hazard.
     on_connect: Option<&DialObserver<'_>>,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-    let stall = deadlines.stall;
+    let window = deadlines.window;
+    let floor_bps = deadlines.floor_bps;
     let (conn, send, recv, resp, resp_ext) = open_stream(
         endpoint,
         target,
@@ -2499,8 +2548,19 @@ pub async fn open_progressive_pull(
         rate_per_mb,
         interval_bytes: CHUNK_BYTES,
     };
+    let progress_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let floor = progress::ThroughputFloor::new(
+        progress::FloorConfig { window, floor_bps },
+        Arc::clone(&progress_counter),
+        tokio::time::Instant::now(),
+    );
+    let mut sampler = tokio::time::interval(stall_sample_period(window));
+    sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let pull = UpstreamPull {
-        stall,
+        window,
+        progress_counter,
+        floor,
+        sampler,
         conn,
         send,
         recv,
@@ -2559,6 +2619,47 @@ impl UpstreamPull {
             .await
     }
 
+    /// Read one message under the persistent throughput floor (#1797). Wraps `recv` in a
+    /// `ProgressReader` feeding the shared counter, and races the read against
+    /// the floor's sampling tick: a read slow enough to lose the race is judged, and a
+    /// sub-floor window aborts with [`PullTimeout`] before the first byte (our own
+    /// blob-size-dependent budget) or [`PullStalled`] after it — neither scores the peer.
+    async fn read_under_floor(&mut self) -> anyhow::Result<ClientMessage> {
+        let cumulative = self.cumulative;
+        let window = self.window;
+        let recv = &mut self.recv;
+        let sampler = &mut self.sampler;
+        let floor = &mut self.floor;
+        let mut reader = progress::ProgressReader::new(recv, Arc::clone(&self.progress_counter));
+        // Pin ONE read future and poll it across ticks. `read_client_message` is not
+        // cancellation-safe — `read_frame` fills a frame with `read_exact`, so dropping the
+        // future mid-frame loses the bytes already consumed and desynchronises the stream.
+        // Recreating it per tick would corrupt every frame that spans a tick; the pinned
+        // future is dropped only when the floor actually aborts (#1797). `biased` cannot
+        // starve the floor: a ready read arm means a whole frame arrived, which is byte
+        // progress the counter already holds, so a skipped tick only ever coincides with
+        // throughput the floor would clear.
+        let read = read_client_message(&mut reader);
+        tokio::pin!(read);
+        loop {
+            tokio::select! {
+                biased;
+                r = &mut read => return r,
+                _ = sampler.tick() => {
+                    if let progress::FloorVerdict::Stalled =
+                        floor.evaluate(tokio::time::Instant::now())
+                    {
+                        return Err(if cumulative == 0 {
+                            anyhow::Error::new(PullTimeout { after: window })
+                        } else {
+                            anyhow::Error::new(PullStalled { after: window })
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     /// Read the next `ChunkData`, paying the upstream at each voucher-interval
     /// boundary (and a closing voucher once all promised bytes have arrived),
     /// and return the chunk for the caller to forward downstream + tee to cache.
@@ -2568,12 +2669,11 @@ impl UpstreamPull {
     ///
     /// More bytes than promised, a mid-stream `StreamError` (typed [`UpstreamRefused`]), an
     /// unexpected message, a [`UpstreamVoucherRejected`] / transport error while paying, or —
-    /// on the inactivity clock — [`PullStalled`] once bytes have flowed, or [`PullTimeout`] if
-    /// the stall budget elapses before the first byte (`cumulative == 0`). A malformed
-    /// `ChunkData` is not raised here: an empty payload is rejected at decode by
-    /// `ChunkData`'s `serde(try_from)` (#1088) and an oversized frame by the framing
-    /// layer's `MAX_MESSAGE_SIZE` before it allocates, so both surface out of
-    /// `read_client_message`.
+    /// on the throughput floor — [`PullStalled`] once bytes have flowed, or [`PullTimeout`] if
+    /// the floor trips before the first byte (`cumulative == 0`). A malformed `ChunkData` is
+    /// not raised here: an empty payload is rejected at decode by `ChunkData`'s
+    /// `serde(try_from)` (#1088) and an oversized frame by the framing layer's
+    /// `MAX_MESSAGE_SIZE` before it allocates, so both surface out of `read_client_message`.
     pub async fn next_chunk(&mut self) -> anyhow::Result<Option<Bytes>> {
         if self.ended {
             return Ok(None);
@@ -2583,34 +2683,21 @@ impl UpstreamPull {
         // 005), so every message either carries a chunk, ends the stream, or is a
         // mid-stream error/unexpected frame; none is skipped.
         {
-            // The inactivity bound (#1134). A per-read budget IS the stall budget here:
-            // every read that succeeds either carries bytes (#1088 bans empty
-            // `ChunkData`) or terminates the stream, so there is no frame a peer can
-            // send to hold this open without making progress. The clock starts when we
-            // begin waiting, not when the last chunk landed, so the caller's
-            // downstream-forward time is not charged against the upstream's budget.
-            let msg = tokio::time::timeout(self.stall, read_client_message(&mut self.recv))
-                .await
-                // Before the first byte this is the server's time-to-first-byte, which
-                // scales with blob size, not an inactivity signal — so it is OUR
-                // deadline, not the peer's fault. Same reasoning, and the same split, as
-                // the buffered loop in `receive_and_pay`; see the long comment there
-                // (#1145 review).
-                .map_err(|_| {
-                    if self.cumulative == 0 {
-                        anyhow::Error::new(PullTimeout { after: self.stall })
-                    } else {
-                        anyhow::Error::new(PullStalled { after: self.stall })
-                    }
-                })??;
+            // Byte-progress bound (#1797): the read is judged by the persistent throughput
+            // floor, which counts bytes off the QUIC stream sub-frame. A `ChunkData` carries
+            // at least one byte (#1088 bans empty frames), so every frame is a unit of
+            // progress. The floor's window spans the whole stream, not this call, and the
+            // caller's downstream-forward time is not charged against it — the counter only
+            // moves on bytes the reader pulls.
+            let msg = self.read_under_floor().await?;
             match msg {
                 ClientMessage::ChunkData(chunk) => {
                     // The payload is bounded on both sides by construction (#1088): the
-                    // ceiling caps per-frame allocation, and the non-empty floor keeps
-                    // every frame a unit of progress, so a peer cannot refresh the
-                    // inactivity deadline above with a run of empty frames. This path
-                    // has no belt-and-braces byte-progress check behind that floor, and
-                    // does not need one now the floor is structural.
+                    // ceiling caps per-frame allocation, and the non-empty floor ties every
+                    // frame to payload, so a peer cannot advance this loop with a run of
+                    // empty frames that move neither `cumulative` nor the voucher
+                    // accounting. This path has no belt-and-braces payload check behind
+                    // that floor, and does not need one now the floor is structural.
                     let chunk_len = chunk.bytes().len() as u64;
                     self.cumulative = self.cumulative.saturating_add(chunk_len);
                     if self.cumulative > self.expected_wire_bytes {
@@ -2632,7 +2719,12 @@ impl UpstreamPull {
                     // on a later `next_chunk`/`finish` read.
                     let unproved = self.unproved;
                     let complete = self.cumulative >= self.expected_wire_bytes;
+                    // Gate the floor across our own payment: while we owe the covering proof
+                    // the upstream legitimately pauses (ADR 005 §Payment pacing), so that
+                    // pause is self-inflicted, not a sender stall (#1797).
+                    self.floor.pause(tokio::time::Instant::now());
                     self.unproved = self.pay_one(unproved, complete).await?;
+                    self.floor.resume(tokio::time::Instant::now());
                     Ok(Some(Bytes::from(chunk.into_bytes())))
                 }
                 // A mid-stream `StreamError` is either a `VoucherRejected` (our
@@ -2666,11 +2758,9 @@ impl UpstreamPull {
     /// if the upstream goes silent before `StreamEnd`.
     pub async fn finish(mut self) -> anyhow::Result<VoucherProgress> {
         while !self.ended {
-            // Same inactivity bound as `next_chunk` (#1134): an upstream that
-            // never sends its `StreamEnd` must not hold the drain open forever.
-            let msg = tokio::time::timeout(self.stall, read_client_message(&mut self.recv))
-                .await
-                .map_err(|_| anyhow::Error::new(PullStalled { after: self.stall }))??;
+            // Same byte-progress bound as `next_chunk` (#1797): an upstream that never sends
+            // its `StreamEnd` must not hold the drain open forever.
+            let msg = self.read_under_floor().await?;
             match msg {
                 ClientMessage::StreamEnd => self.ended = true,
                 ClientMessage::ChunkData(_) => {
@@ -3113,7 +3203,9 @@ async fn read_stream_response(
     Ok((response, ext))
 }
 
-async fn read_client_message(recv: &mut RecvStream) -> anyhow::Result<ClientMessage> {
+async fn read_client_message<R: tokio::io::AsyncRead + Unpin>(
+    recv: &mut R,
+) -> anyhow::Result<ClientMessage> {
     let frame = read_frame(recv)
         .await
         .map_err(|e| anyhow::anyhow!("frame read failed: {e}"))?;
@@ -3182,34 +3274,41 @@ mod tests {
         use std::time::Duration;
 
         let open = Duration::from_secs(5);
-        let stall = Duration::from_secs(5);
+        let window = Duration::from_secs(5);
+        let floor = 4096;
 
-        // At and below `open + stall` the cap always wins the race, so `PullStalled` — the
-        // only signal that says anything about the PEER — could never fire.
-        for cap in [Duration::from_secs(1), stall, open + stall] {
+        // At and below `open + window` the cap always wins the race, so the throughput floor
+        // — the signal that a healthy stream is still making progress — could never fire.
+        for cap in [Duration::from_secs(1), window, open + window] {
             assert!(
                 matches!(
-                    PullDeadlines::capped(open, stall, cap),
+                    PullDeadlines::capped(open, window, floor, cap),
                     Err(DeadlineError::CapCannotOutlastItsStages { .. })
                 ),
-                "a cap of {cap:?} against open {open:?} + stall {stall:?} leaves the stall \
-                 bound unable to fire, and must not be constructible"
+                "a cap of {cap:?} against open {open:?} + window {window:?} leaves the floor \
+                 unable to fire, and must not be constructible"
             );
         }
 
-        // One tick past it, the inactivity deadline can actually fire.
+        // One tick past it, the throughput floor can actually fire.
         assert!(
-            PullDeadlines::capped(open, stall, open + stall + Duration::from_millis(1)).is_ok(),
-            "past open + stall the stall bound can fire, so this is a legitimate pull"
+            PullDeadlines::capped(
+                open,
+                window,
+                floor,
+                open + window + Duration::from_millis(1)
+            )
+            .is_ok(),
+            "past open + window the floor can fire, so this is a legitimate pull"
         );
 
         // A zero budget elapses on its first poll: the stage it bounds can never run.
         assert!(matches!(
-            PullDeadlines::capped(Duration::ZERO, stall, Duration::from_mins(1)),
+            PullDeadlines::capped(Duration::ZERO, window, floor, Duration::from_mins(1)),
             Err(DeadlineError::ZeroBudget)
         ));
         assert!(matches!(
-            PullDeadlines::capped(open, Duration::ZERO, Duration::from_mins(1)),
+            PullDeadlines::capped(open, Duration::ZERO, floor, Duration::from_mins(1)),
             Err(DeadlineError::ZeroBudget)
         ));
     }
@@ -3217,15 +3316,13 @@ mod tests {
     /// `new` must refuse a zero budget too — and it is the constructor that MATTERS, because
     /// it is the one every production pull takes (#1145 review).
     ///
-    /// It was infallible, on the reasoning that a zero bound "fires too EAGERLY — loud, and
-    /// immediately obvious". It is the opposite of loud. A zero `stall` trips `PullStalled`
-    /// on the first poll of every streaming read, and `PullStalled` is the verdict that
-    /// scores a peer `Unreachable` in the local per-peer EWMA. So the failure mode is not a
-    /// node that visibly stops working; it is a node that quietly defames every honest peer
-    /// it touches, as fast as it can dial them.
+    /// A zero `window` makes the throughput floor demand progress over no time at all, so the
+    /// streaming stage can never satisfy it and every honest read aborts on its first poll.
+    /// The floor rate itself may legitimately be zero — that is idle-detection mode (one byte
+    /// per window) — so only the durations are checked.
     ///
-    /// `capped` refused this from the start. The invariant belongs to the type, not to a
-    /// resolver in another crate that a caller has to remember to run.
+    /// The invariant belongs to the type, not to a resolver in another crate that a caller
+    /// has to remember to run.
     #[test]
     fn new_refuses_a_zero_budget_on_the_path_every_production_pull_takes() {
         use super::{DeadlineError, PullDeadlines};
@@ -3233,19 +3330,23 @@ mod tests {
 
         assert!(
             matches!(
-                PullDeadlines::new(Duration::ZERO, Duration::from_secs(20)),
+                PullDeadlines::new(Duration::ZERO, Duration::from_secs(20), 4096),
                 Err(DeadlineError::ZeroBudget)
             ),
             "a zero open bound means the open stage can never complete"
         );
         assert!(
             matches!(
-                PullDeadlines::new(Duration::from_secs(20), Duration::ZERO),
+                PullDeadlines::new(Duration::from_secs(20), Duration::ZERO, 4096),
                 Err(DeadlineError::ZeroBudget)
             ),
-            "a zero stall bound scores `Unreachable` about every honest peer it touches"
+            "a zero window makes the throughput floor unsatisfiable on every read"
         );
-        assert!(PullDeadlines::new(Duration::from_secs(20), Duration::from_secs(20)).is_ok());
+        assert!(PullDeadlines::new(Duration::from_secs(20), Duration::from_secs(20), 4096).is_ok());
+        assert!(
+            PullDeadlines::new(Duration::from_secs(20), Duration::from_secs(20), 0).is_ok(),
+            "a zero floor rate is idle-detection mode, not an invalid budget"
+        );
     }
 
     /// `aligned_wire_len`'s new `byte_len` parameter must actually bound the

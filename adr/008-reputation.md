@@ -47,6 +47,8 @@ Normalization: `speed_score = clamp(ln(1 + actual_bps) / ln(1 + reference_bps), 
 
 EWMA with alpha=0.1 means recent interactions matter more but old interactions still contribute.
 
+A throughput-floor or inactivity abort on the pull path produces no interaction outcome and never updates the EWMA. A pull that the requester abandons because its throughput fell below the floor is requester-local policy, the same class as an unsigned timeout: the slowness may come from the link, congestion, or the requester's own consumption, and a throughput signal is spoofable, so it is not evidence about the peer. The requester still stops using that peer for that blob — a local, reputation-neutral suppression — but the peer keeps its score. See [ADR 005 § Retry behavior](005-protocol.md#adr-005-wire-protocol).
+
 ### Score Decay
 
 Scores decay toward neutral (0.5) over time without new data, so a peer that stops being used drifts back to unopinionated rather than holding a stale high or low score. The node applies closed-form half-life decay at read time, from the last update:
