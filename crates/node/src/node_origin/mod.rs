@@ -862,7 +862,7 @@ async fn probe_candidate(
         return None;
     };
     let probe_ts = now_micros();
-    let (resp, _resp_ext, rtt_ms) = match probe_once(
+    let (resp, resp_ext, rtt_ms) = match probe_once(
         &deps.endpoint,
         EndpointAddr::new(pk),
         hash_bytes,
@@ -901,6 +901,18 @@ async fn probe_candidate(
         probe_ts,
     ) {
         debug!(%err, "node-origin: dropping an unverifiable probe response");
+        return None;
+    }
+    // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
+    // construction on an honest responder. Neither field is in the signed
+    // set (`coverage` is unsigned, and this mismatch has no attributable
+    // author to slash — same reasoning as an unrecovered `slash_sig` above),
+    // so a violation is dropped rather than scored to reputation.
+    if !resp_ext.consistent_with(resp.body.has_blob) {
+        debug!(
+            has_blob = resp.body.has_blob,
+            "node-origin: dropping a probe response with has_blob/coverage mismatch"
+        );
         return None;
     }
     if !resp.body.has_blob {

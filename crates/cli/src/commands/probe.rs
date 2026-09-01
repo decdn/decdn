@@ -194,7 +194,14 @@ mod tests {
                 },
                 slash_sig: vec![0xCD; SLASH_SIG_LEN],
             },
-            decdn_protocol::ProbeResponseExt { total_bytes },
+            decdn_protocol::ProbeResponseExt {
+                total_bytes,
+                coverage: if has_blob {
+                    decdn_protocol::Coverage::full(1)
+                } else {
+                    decdn_protocol::Coverage::empty()
+                },
+            },
         )
     }
 

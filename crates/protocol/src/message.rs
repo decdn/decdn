@@ -256,6 +256,30 @@ pub struct ProbeResponseExt {
     /// known so requesters can estimate cost before opening a payment pool.
     /// Unsigned: treat it as a sizing hint, never as a commitment.
     pub total_bytes: Option<u64>,
+    /// Which discovery blocks (`decdn_protocol::coverage`) this node will
+    /// serve. Unsigned: treat it as a hint, never as a commitment. A
+    /// requester MUST treat `body.has_blob` and `coverage.is_empty()` as a
+    /// biconditional — see the consistency check at the probe consumer — and
+    /// drop a response where they disagree rather than trust either field
+    /// alone.
+    pub coverage: crate::Coverage,
+}
+
+impl ProbeResponseExt {
+    /// Does this ext's `coverage` agree with the signed body's `has_blob`
+    /// (ADR 013 §Tier 1; #1506)? An honest responder's `has_blob` and
+    /// `coverage.is_empty()` are a biconditional by construction (the probe
+    /// handler derives `has_blob` FROM `coverage`, never the other way
+    /// round), so any disagreement means a malformed or dishonest response.
+    ///
+    /// Neither field is in the signed set, so a mismatch has no attributable
+    /// author to slash: a requester finding `false` here MUST drop the
+    /// candidate rather than admit it, and must NOT score it to local
+    /// reputation — the same treatment an unrecovered `slash_sig` gets.
+    #[must_use]
+    pub fn consistent_with(&self, has_blob: bool) -> bool {
+        has_blob != self.coverage.is_empty()
+    }
 }
 
 /// Signed fields of a [`ProbeResponse`]. Layout is frozen per ADR 013 — future
@@ -400,6 +424,7 @@ mod tests {
     fn sample_ext() -> ProbeResponseExt {
         ProbeResponseExt {
             total_bytes: Some(4096),
+            coverage: crate::Coverage::from_block_indices(2, [0].into_iter()),
         }
     }
 
@@ -492,6 +517,38 @@ mod tests {
         let decoded: ProbeMessage = postcard::from_bytes(&bytes)?;
         assert_eq!(decoded, msg);
         Ok(())
+    }
+
+    #[test]
+    fn consistent_with_accepts_matching_pairs() {
+        assert!(
+            ProbeResponseExt {
+                total_bytes: Some(4096),
+                coverage: crate::Coverage::full(1),
+            }
+            .consistent_with(true),
+            "has_blob:true + non-empty coverage must be consistent"
+        );
+        assert!(
+            ProbeResponseExt::default().consistent_with(false),
+            "has_blob:false + empty (default) coverage must be consistent"
+        );
+    }
+
+    #[test]
+    fn consistent_with_rejects_mismatched_pairs() {
+        assert!(
+            !ProbeResponseExt {
+                total_bytes: Some(4096),
+                coverage: crate::Coverage::full(1),
+            }
+            .consistent_with(false),
+            "has_blob:false with non-empty coverage must be flagged inconsistent"
+        );
+        assert!(
+            !ProbeResponseExt::default().consistent_with(true),
+            "has_blob:true with empty coverage must be flagged inconsistent"
+        );
     }
 
     #[test]
@@ -712,12 +769,14 @@ mod tests {
             &resp,
             Some(&ProbeResponseExt {
                 total_bytes: Some(7),
+                coverage: crate::Coverage::empty(),
             }),
         )?;
         let mut expected_framed = vec![1u8]; // ProbeMessage::Response discriminant
         expected_framed.extend_from_slice(&expected);
         expected_framed.push(1u8); // total_bytes = Some
         expected_framed.push(7u8); // total_bytes varint
+        expected_framed.push(0u8); // coverage: empty Vec<u8> length-prefix (0)
         assert_eq!(framed, expected_framed);
         Ok(())
     }

@@ -13,7 +13,9 @@ use std::time::Duration;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Signature};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
+use bao_tree::io::outboard::PreOrderMemOutboard;
+use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
+use decdn_cache::{CHUNK_GROUP_BYTES, CacheEngine, FilesystemOrigin, Hash};
 use decdn_common::config::ResolvedSecurity;
 use decdn_incentive::ProbeSlashData;
 use decdn_node::dht::routing::NodeId;
@@ -24,10 +26,10 @@ use decdn_node::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer}
 use decdn_node::metrics::Metrics;
 use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{
-    ALPN_PROBE, APP_ERR_RATE_LIMITED, MAX_MESSAGE_SIZE, ProbeMessage, ProbeResponseExt,
-    SLASH_SIG_LEN, decode_message, encode_message,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, Coverage, DISCOVERY_BLOCK_BYTES, MAX_MESSAGE_SIZE,
+    ProbeMessage, ProbeResponseExt, SLASH_SIG_LEN, decode_message, encode_message,
     message::{ProbeRequest, ProbeResponse, ProbeResponseBody},
-    parse_probe_response_ext, read_frame, write_frame,
+    num_blocks, parse_probe_response_ext, read_frame, write_frame,
 };
 use iroh::endpoint::{
     ApplicationClose, Connection, ConnectionError, IdleTimeout, QuicTransportConfig, ReadError,
@@ -163,6 +165,79 @@ async fn cache_with_own_and_foreign(
     cache.rescan_origins().await;
 
     Ok((cache, own_hash, foreign_hash, origin_dir, cache_dir))
+}
+
+/// Deterministic pseudo-random payload of `len` bytes (xorshift32), matching
+/// the synthesis `decdn-cache`'s own coverage tests use — content doesn't
+/// matter here, only that it hashes and bao-verifies consistently.
+fn synth_blob(len: usize) -> ([u8; 32], Vec<u8>, bytes::Bytes) {
+    let mut plaintext = vec![0u8; len];
+    let mut x: u32 = 0x9e37_79b9;
+    for b in &mut plaintext {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes()[0];
+    }
+    let ob = PreOrderMemOutboard::create(&plaintext, IROH_BLOCK_SIZE);
+    (*ob.root.as_bytes(), plaintext, bytes::Bytes::from(ob.data))
+}
+
+/// Encode the header-less interleaved bao for `[off, off + len)` of a blob
+/// with the given `root`/`plaintext`/`outboard`/`total` size — the same
+/// `admit_bao`-ready shape `decdn-cache`'s own tests build, reimplemented
+/// here off the crate's public `range_pull` helpers (the cache crate's own
+/// `synth_blob`/`bao_for` are private test-only fns, not exported).
+fn bao_for(
+    root: [u8; 32],
+    plaintext: &[u8],
+    outboard: bytes::Bytes,
+    off: u64,
+    len: u64,
+    total: u64,
+) -> anyhow::Result<(Hash, bao_tree::ChunkRanges, bytes::Bytes)> {
+    let aligned = align_range(off, len, total)?;
+    let s = usize::try_from(aligned.fetch_start())?;
+    let e = usize::try_from(aligned.fetch_end())?;
+    let slice = plaintext
+        .get(s..e)
+        .ok_or_else(|| anyhow::anyhow!("aligned range out of bounds"))?;
+    let encoded = encode_verified_range(root, &aligned, slice, outboard)?;
+    Ok((Hash::from(root), aligned.chunk_ranges().clone(), encoded))
+}
+
+/// Open an origin-less cache and admit a **partial** two-discovery-block blob
+/// into it: block 0 (`[0, DISCOVERY_BLOCK_BYTES)`) admitted in full, plus the
+/// blob's trailing chunk group (which is what lets iroh-blobs learn the
+/// `Partial` blob's total size — it only reports one once the FINAL chunk is
+/// present), while block 1's middle group is left missing. This is the
+/// "cached partial holder" shape #1506 exists to advertise: a store that
+/// holds ≥1 discovery block but is not `Complete`, so the OLD
+/// `Complete`-gated `has_blob` would report `false` for it.
+async fn cache_with_partial_two_block_blob()
+-> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir)> {
+    let cache_dir = tempfile::tempdir()?;
+    let cache = CacheEngine::open(cache_dir.path(), vec![], 16).await?;
+
+    let group = CHUNK_GROUP_BYTES;
+    let total = DISCOVERY_BLOCK_BYTES + 3 * group;
+    let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+
+    let (hash, block0_ranges, block0_bao) = bao_for(
+        root,
+        &plaintext,
+        outboard.clone(),
+        0,
+        DISCOVERY_BLOCK_BYTES,
+        total,
+    )?;
+    cache.admit_bao(hash, block0_ranges, block0_bao).await?;
+
+    let (_, tail_ranges, tail_bao) =
+        bao_for(root, &plaintext, outboard, total - group, group, total)?;
+    cache.admit_bao(hash, tail_ranges, tail_bao).await?;
+
+    Ok((cache, hash, cache_dir))
 }
 
 /// Parse the integer value of an `OpenMetrics` counter/gauge line
@@ -1159,6 +1234,125 @@ async fn probe_has_blob_true_for_cached_blob() -> anyhow::Result<()> {
         resp_ext.total_bytes
     );
     anyhow::ensure!(resp.body.hash == *hash.as_bytes(), "hash echoed");
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+    Ok(())
+}
+
+/// #1506: `has_blob` is redefined from "holds the whole blob" to "will serve
+/// at least one discovery block". A node holding only discovery block 0 of a
+/// two-block blob (never `Complete`, so the OLD `Complete`-gated `has_blob`
+/// answered `false`) now signs `has_blob: true`, and the extension's
+/// `coverage` matches the cache's own derivation exactly: block 0 covered,
+/// block 1 not.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_has_blob_true_and_partial_coverage_for_cached_partial_holder() -> anyhow::Result<()>
+{
+    let (cache, hash, _cache_tmp) = cache_with_partial_two_block_blob().await?;
+    // Cross-check against the cache's own derivation directly (Task 1) so
+    // this test also catches the handler quietly diverging from it.
+    let direct_coverage = cache.coverage(hash).await?;
+    anyhow::ensure!(direct_coverage.covers(0) && !direct_coverage.covers(1));
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let (handler, signer, domain) = build_handler(server_id, 7, &metrics, limiter, cache);
+
+    let req = ProbeRequest {
+        hash: *hash.as_bytes(),
+        timestamp_us: 0xf00d,
+    };
+    let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
+
+    anyhow::ensure!(
+        resp.body.has_blob,
+        "a partial holder covering >=1 block must report has_blob=true (#1506), \
+         not just a Complete holder"
+    );
+    anyhow::ensure!(
+        resp_ext.coverage.covers(0),
+        "block 0 was admitted in full and must be advertised as covered"
+    );
+    anyhow::ensure!(
+        !resp_ext.coverage.covers(1),
+        "block 1's middle group was never admitted and must not be advertised"
+    );
+    anyhow::ensure!(
+        resp_ext.coverage == direct_coverage,
+        "the handler's advertised coverage must match the cache's own derivation exactly"
+    );
+    anyhow::ensure!(
+        resp_ext.consistent_with(resp.body.has_blob),
+        "has_blob and coverage.is_empty() must be a biconditional"
+    );
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+    Ok(())
+}
+
+/// #1506: an origin-serve-capable node (origin-held index or live origin size
+/// probe) that holds NOTHING in its local cache signs `has_blob: true` with
+/// all-ones `coverage` — an origin serves every block and already knows the
+/// size. This is the origin all-ones case: distinct from the cached-partial
+/// case above, and from the pre-#1506 behavior (which never populated
+/// `coverage` at all).
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_origin_held_advertises_full_coverage_without_caching() -> anyhow::Result<()> {
+    let payload = b"origin-held content this node has never pulled into its own cache";
+    let origin_dir = tempfile::tempdir()?;
+    let hash = Hash::new(payload);
+    let hex = hash.to_hex();
+    let shard = hex
+        .get(..2)
+        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+    let dir = origin_dir.path().join(shard);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(hex.as_str()), payload)?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache = CacheEngine::open(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+    // Deliberately no `cache.get(hash)` — the store must stay empty; presence
+    // comes only from the fs-origin index (#1130).
+    anyhow::ensure!(
+        !cache.has(hash).await?,
+        "the store must hold nothing for this test to exercise the origin-held path"
+    );
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let (handler, signer, domain) = build_handler(server_id, 7, &metrics, limiter, cache);
+
+    let req = ProbeRequest {
+        hash: *hash.as_bytes(),
+        timestamp_us: 0xbeef,
+    };
+    let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
+
+    anyhow::ensure!(
+        resp.body.has_blob,
+        "an origin-held blob must be advertised even though nothing is cached"
+    );
+    anyhow::ensure!(
+        resp_ext.total_bytes == Some(payload.len() as u64),
+        "origin content's total_bytes should report the backend size, got {:?}",
+        resp_ext.total_bytes
+    );
+    anyhow::ensure!(
+        resp_ext.coverage == Coverage::full(num_blocks(payload.len() as u64)),
+        "an origin can serve every block, so coverage must be all-ones"
+    );
+    anyhow::ensure!(
+        resp_ext.consistent_with(resp.body.has_blob),
+        "has_blob and coverage.is_empty() must be a biconditional"
+    );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
     Ok(())
 }
