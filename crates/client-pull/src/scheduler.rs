@@ -172,6 +172,19 @@ async fn cancelled(handle: &CancelHandle) {
     }
 }
 
+/// One planned run staged for seeding into `pending`, with the piece count it
+/// will split into. `max_pieces` bounds the split to what is useful for THIS run —
+/// the number of lanes that hold it whole — while the seeding loop's global budget
+/// (`lanes.len()`) decides how much of that headroom each run actually uses.
+/// `pieces` starts at one contiguous span and only grows to reach otherwise-idle
+/// lanes.
+struct RunSeed {
+    offset: u64,
+    len: u64,
+    max_pieces: usize,
+    pieces: usize,
+}
+
 /// Bytes of `[start, start+len)` the store still misses — this worker's range is
 /// disjoint from every peer's, so this reflects only its own delivery frontier.
 /// An error reads as "no observable progress" (`u64::MAX`), which trips the
@@ -865,25 +878,52 @@ where
     // residual-missing "all sources failed" check below — the same "not
     // available from this source set" outcome an orphaned mid-fetch range
     // takes via `Work::retire`.
-    // Fan a run out further when MULTIPLE lanes cover it whole (#1506). The
-    // planner assigns one run to one lane at 64 MiB discovery-block
-    // granularity; when a blob (or a run) is no bigger than one block, every
-    // full holder ties on it and the planner can only pick one. Without this,
-    // a request small enough to fit one block would engage just a single
-    // lane no matter how many lanes hold it — the coverage planner's
-    // granularity regressing the pre-#1506 eager, byte-count-only fan-out
-    // that always split across every engaged lane from the start. `k` is
-    // exactly the count of lanes that cover the WHOLE run — never more, so
-    // every piece `split_evenly` hands out stays inside every one of those
-    // lanes' coverage and `Work::pick`'s filter never has to refuse it.
-    let mut pending: VecDeque<AlignedRange> = VecDeque::with_capacity(runs.len());
-    for run in runs {
-        let k = lane_coverage
-            .iter()
-            .filter(|c| covers_byte_range(c, run.offset, run.len, total_bytes))
-            .count()
-            .max(1);
-        for seg in split_evenly(run.offset, run.len, k, total_bytes)? {
+    // Seed `pending` from the contiguous, gap-clamped runs, splitting further
+    // ONLY to reach otherwise-idle lanes (#1506). The eager fan-out is a GLOBAL
+    // budget — at most one contiguous span per lane — not a per-run multiplier: a
+    // large multi-block gap already plans ~one run per source, so it seeds ~N spans
+    // and never `blocks × N`. A gap that planned FEWER runs than lanes (a small
+    // gap, or a resume tail, where several full holders tied and the planner could
+    // pick only one per block) is split largest-first until every lane has a span,
+    // or no run can usefully split any further. A run is split at most as many ways
+    // as lanes hold it WHOLE, so every piece stays inside its holders' coverage and
+    // `Work::pick`'s filter never has to refuse it; `split_evenly` keeps each piece
+    // chunk-group aligned (never sub-group), which is the only floor the eager split
+    // needs — it deliberately splits below `steal_split`'s `MIN_SPLIT_SIZE` so a
+    // small blob no bigger than one block still engages every full holder from the
+    // start, exactly as the pre-#1506 byte-count fan-out did.
+    let mut seeds: Vec<RunSeed> = runs
+        .iter()
+        .map(|run| {
+            let holders = lane_coverage
+                .iter()
+                .filter(|c| covers_byte_range(c, run.offset, run.len, total_bytes))
+                .count()
+                .max(1);
+            RunSeed {
+                offset: run.offset,
+                len: run.len,
+                max_pieces: holders,
+                pieces: 1,
+            }
+        })
+        .collect();
+    let mut spare = lanes.len().saturating_sub(seeds.len());
+    while spare > 0 {
+        // The still-splittable run whose next split yields the largest piece.
+        let Some(seed) = seeds
+            .iter_mut()
+            .filter(|s| s.pieces < s.max_pieces)
+            .max_by_key(|s| s.len / u64::try_from(s.pieces + 1).unwrap_or(u64::MAX))
+        else {
+            break;
+        };
+        seed.pieces += 1;
+        spare -= 1;
+    }
+    let mut pending: VecDeque<AlignedRange> = VecDeque::with_capacity(seeds.len());
+    for seed in &seeds {
+        for seg in split_evenly(seed.offset, seed.len, seed.pieces, total_bytes)? {
             pending.push_back(seg);
         }
     }
@@ -1175,6 +1215,74 @@ mod tests {
         assert!(
             src_a.opened_bytes() + src_b.opened_bytes() >= data.len() as u64,
             "the two sources together must cover the whole blob"
+        );
+        Ok(())
+    }
+
+    /// Fan-out geometry (#1506): a large multi-block gap across N full holders
+    /// seeds ~N contiguous spans — one per holder — never `blocks × N`. Before the
+    /// fix the client planner assigned one run per block and the scheduler split
+    /// each run by holder count, opening `blocks × N` streams (here 3 × 3 = 9) for a
+    /// blob that needs only N. Every holder still contributes.
+    #[tokio::test]
+    async fn large_multi_block_gap_seeds_about_one_span_per_holder() -> anyhow::Result<()> {
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let data = blob(total as usize);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_c = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let src_c = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_c));
+        let root = src_a.root();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+        let lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+            lane(&src_c, Arc::clone(&ledger_c), 0xC3),
+        ];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(
+            std::fs::read(dir.path().join("b"))?,
+            data,
+            "assembled byte-identical across the fan-out"
+        );
+        let opens =
+            src_a.opened_ranges().len() + src_b.opened_ranges().len() + src_c.opened_ranges().len();
+        // ~N = 3 spans, one per holder. The old `blocks × N` seeding opened 9. Allow
+        // a little slack for an opportunistic tail-steal, but stay well under 9.
+        assert!(
+            opens <= 6,
+            "fan-out seeds ~N contiguous spans, not blocks × N: {opens} opens across 3 holders"
+        );
+        assert!(
+            src_a.opened_bytes() > 0 && src_b.opened_bytes() > 0 && src_c.opened_bytes() > 0,
+            "every holder contributes: a={} b={} c={}",
+            src_a.opened_bytes(),
+            src_b.opened_bytes(),
+            src_c.opened_bytes()
         );
         Ok(())
     }

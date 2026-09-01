@@ -38,9 +38,13 @@ pub struct SourceCoverage {
     pub coverage: Coverage,
 }
 
-/// One contiguous byte run assigned to one source. `offset`/`len` are
-/// discovery-block-aligned (64 MiB multiples), except a run touching the
-/// blob's tail, whose `len` is clamped to `total_bytes`.
+/// One contiguous byte run assigned to one source. `offset`/`len` are CLAMPED to
+/// the gap being fetched intersected with the request — a run spans only bytes
+/// that are actually missing and requested, never the whole discovery block(s) it
+/// falls in (#1506 C2). It therefore starts and ends on the gap's own chunk
+/// boundaries, and a run reaching the blob's tail has its end clamped to
+/// `total_bytes`. A run whose block span was covered by the gap in full is exactly
+/// that block span; one covering a partial in-block slice is exactly that slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoveredRun {
     pub offset: u64,
@@ -53,6 +57,31 @@ fn block_offset(block: u32) -> u64 {
     u64::from(block) * DISCOVERY_BLOCK_BYTES
 }
 
+/// The tight byte extent of `gap` within `[lo, hi)`: the lowest missing byte at or
+/// after `lo` through the highest missing byte before `hi`, the end clamped to
+/// `hi`. `None` when `gap` misses nothing in `[lo, hi)`.
+///
+/// A planned run is clamped to this so it covers only the in-gap, in-request bytes
+/// of its discovery block(s) — never the whole block. Without the clamp a `Mixed`
+/// remainder of, say, `[65 MiB, 66 MiB)` would plan a whole-block `[64 MiB, 128 MiB)`
+/// run and pull (and pay for) 63 MiB no one asked for, including bytes an attached
+/// sibling claim owns and is concurrently pulling (#1506 C2).
+fn gap_extent(gap: &ChunkRanges, lo: u64, hi: u64) -> Option<(u64, u64)> {
+    if hi <= lo {
+        return None;
+    }
+    let lo_chunk = lo / BAO_CHUNK_BYTES;
+    let hi_chunk = hi.div_ceil(BAO_CHUNK_BYTES);
+    let window = ChunkRanges::from(ChunkNum(lo_chunk)..ChunkNum(hi_chunk));
+    let intersect = gap & &window;
+    let bounds = intersect.boundaries();
+    let first = bounds.first()?;
+    let last = bounds.last()?;
+    let start = first.0.saturating_mul(BAO_CHUNK_BYTES).max(lo);
+    let end = last.0.saturating_mul(BAO_CHUNK_BYTES).min(hi);
+    (end > start).then_some((start, end))
+}
+
 /// The chunk-range span of discovery block `block`: `block * 65536` through
 /// `(block + 1) * 65536`, exclusive, in [`ChunkNum`] units.
 fn block_chunks(block: u32) -> ChunkRanges {
@@ -62,13 +91,24 @@ fn block_chunks(block: u32) -> ChunkRanges {
 }
 
 /// Build the [`CoveredRun`] spanning discovery blocks `[start_block,
-/// last_block]` inclusive, clamping its end to `total_bytes` for a run that
-/// reaches the blob's final (possibly partial) block.
-fn run_from(source_ix: usize, start_block: u32, last_block: u32, total_bytes: u64) -> CoveredRun {
-    let offset = block_offset(start_block);
-    let end = block_offset(last_block)
+/// last_block]` inclusive, CLAMPED to the byte extent `gap` actually misses
+/// inside that block span (#1506 C2). A block span the gap covers in full yields
+/// the whole block span (its end clamped to `total_bytes`); one the gap touches
+/// only partially yields exactly the in-gap slice. Every block in `[start_block,
+/// last_block]` intersects the gap by construction, so the extent is non-empty;
+/// the whole block span is a defensive fallback that never triggers.
+fn run_from(
+    source_ix: usize,
+    start_block: u32,
+    last_block: u32,
+    total_bytes: u64,
+    gap: &ChunkRanges,
+) -> CoveredRun {
+    let block_lo = block_offset(start_block);
+    let block_hi = block_offset(last_block)
         .saturating_add(DISCOVERY_BLOCK_BYTES)
         .min(total_bytes);
+    let (offset, end) = gap_extent(gap, block_lo, block_hi).unwrap_or((block_lo, block_hi));
     CoveredRun {
         offset,
         len: end.saturating_sub(offset),
@@ -166,37 +206,47 @@ pub fn plan_covered_runs(
                     Some((cur_src, start, block))
                 }
                 Some((cur_src, start, last)) => {
-                    runs.push(run_from(cur_src, start, last, total_bytes));
+                    runs.push(run_from(cur_src, start, last, total_bytes, gap));
                     Some((src, block, block))
                 }
                 None => Some((src, block, block)),
             };
         } else {
             if let Some((cur_src, start, last)) = current.take() {
-                runs.push(run_from(cur_src, start, last, total_bytes));
+                runs.push(run_from(cur_src, start, last, total_bytes, gap));
             }
             uncovered |= &chunks & gap;
         }
     }
     if let Some((cur_src, start, last)) = current.take() {
-        runs.push(run_from(cur_src, start, last, total_bytes));
+        runs.push(run_from(cur_src, start, last, total_bytes, gap));
     }
 
     (runs, uncovered)
 }
 
 /// Client planner: spread across every covering source so all lanes run
-/// concurrently (#1506).
+/// concurrently, in CONTIGUOUS runs so a large gap plans about one run per source
+/// rather than one per block (#1506).
 ///
-/// For each `gap`-intersecting discovery block, collects the sources that
-/// cover it (its candidates). Blocks are then assigned rarest-candidate
-/// first — a block only one source can serve is locked in before any
-/// ambiguous block competes for that source — and each assignment goes to
-/// whichever candidate currently holds the fewest assigned blocks (a
-/// size-balanced share), tied-broken by `rank`. A block no source covers
-/// contributes its gap-intersecting chunks to `uncovered`. Contiguous
-/// same-source blocks (in real block-index order) coalesce into one
-/// [`CoveredRun`], exactly as [`plan_covered_runs`] does.
+/// For each `gap`-intersecting discovery block, collects the sources that cover
+/// it (its candidates). Blocks are then walked in offset order and assigned
+/// STICKILY: the current run's source keeps the next block while it still covers
+/// it and has not yet filled its fair share (`ceil(covered_blocks / sources)`),
+/// so contiguous blocks land on one source and coalesce into one multi-block
+/// [`CoveredRun`]. When the current source cannot take a block — it does not cover
+/// it, or its share is full — the block goes to whichever candidate currently
+/// holds the fewest assigned blocks (spreading the load), tied-broken by `rank`.
+/// A block only one source covers always lands on that source, whatever its share.
+/// A block no source covers contributes its gap-intersecting chunks to
+/// `uncovered`. Runs are then clamped to the gap exactly as [`plan_covered_runs`]
+/// does.
+///
+/// The share cap is what turns the old block-by-block round-robin — which
+/// fragmented a whole-blob fan-out across N full holders into one single-block
+/// run per block (then `blocks × N` scheduler segments) — into ~N contiguous runs,
+/// one span per holder. A gap smaller than the source count still spreads across
+/// as many lanes as it has blocks.
 #[must_use]
 pub fn spread_segments(
     gap: &ChunkRanges,
@@ -227,28 +277,32 @@ pub fn spread_segments(
         }
     }
 
-    // Assign rarest-covered blocks first, tie-broken by original (offset)
-    // order — Rust's `sort_by_key` is stable — so a block only one source
-    // covers is locked in before any ambiguous block competes for that
-    // source's share.
-    let mut order: Vec<usize> = (0..candidates_by_block.len()).collect();
-    order.sort_by_key(|&i| candidates_by_block.get(i).map_or(0, |(_, c)| c.len()));
-
-    let mut assigned_count: HashMap<usize, u32> = HashMap::new();
+    // Sticky, share-capped assignment in offset order. `target_share` is the
+    // largest number of blocks one source is asked to hold before the walk moves
+    // on to a fresh source; keeping it as the sticky bound is what produces
+    // contiguous multi-block runs (one span per source) instead of a round-robin
+    // fragment per block.
+    let n_sources = sources.len().max(1);
+    let target_share = candidates_by_block.len().div_ceil(n_sources).max(1);
+    let mut assigned_count: HashMap<usize, usize> = HashMap::new();
     let mut assignment: HashMap<u32, usize> = HashMap::new();
-    for i in order {
-        let Some((block, candidates)) = candidates_by_block.get(i) else {
-            continue;
-        };
-        let Some(&chosen) = candidates.iter().min_by_key(|&&src| {
-            let load = assigned_count.get(&src).copied().unwrap_or(0);
-            let rank_pos = rank.iter().position(|&r| r == src).unwrap_or(usize::MAX);
-            (load, rank_pos)
-        }) else {
-            continue;
-        };
-        assignment.insert(*block, chosen);
-        *assigned_count.entry(chosen).or_insert(0) += 1;
+    let mut current: Option<usize> = None;
+    for (block, candidates) in &candidates_by_block {
+        let stick = current.filter(|src| {
+            candidates.contains(src) && assigned_count.get(src).copied().unwrap_or(0) < target_share
+        });
+        let chosen = stick.or_else(|| {
+            candidates.iter().copied().min_by_key(|src| {
+                let load = assigned_count.get(src).copied().unwrap_or(0);
+                let rank_pos = rank.iter().position(|&r| r == *src).unwrap_or(usize::MAX);
+                (load, rank_pos)
+            })
+        });
+        if let Some(src) = chosen {
+            assignment.insert(*block, src);
+            *assigned_count.entry(src).or_insert(0) += 1;
+            current = Some(src);
+        }
     }
 
     let mut runs = Vec::new();
@@ -262,7 +316,7 @@ pub fn spread_segments(
                     Some((cur_src, start, block))
                 }
                 Some((cur_src, start, last)) => {
-                    runs.push(run_from(cur_src, start, last, total_bytes));
+                    runs.push(run_from(cur_src, start, last, total_bytes, gap));
                     Some((src, block, block))
                 }
                 None => Some((src, block, block)),
@@ -270,12 +324,12 @@ pub fn spread_segments(
         } else if is_uncovered.contains(&block)
             && let Some((cur_src, start, last)) = current.take()
         {
-            runs.push(run_from(cur_src, start, last, total_bytes));
+            runs.push(run_from(cur_src, start, last, total_bytes, gap));
         }
         // else: block does not intersect `gap` — leave `current` untouched.
     }
     if let Some((cur_src, start, last)) = current.take() {
-        runs.push(run_from(cur_src, start, last, total_bytes));
+        runs.push(run_from(cur_src, start, last, total_bytes, gap));
     }
 
     (runs, uncovered)
@@ -562,5 +616,112 @@ mod tests {
             .find(|r| r.offset == DISCOVERY_BLOCK_BYTES)
             .expect("block 1 covered");
         assert_eq!(block1_run.source_ix, 1);
+    }
+
+    /// A gap of exactly `[65 MiB, 66 MiB)` — a 1 MiB slice wholly inside block 1 —
+    /// yields a run of exactly `(65 MiB, 1 MiB)` from BOTH planners, never the
+    /// whole 64 MiB block (#1506 C2). Without the clamp the node would pull and pay
+    /// for 63 MiB no one asked for, including bytes an attached sibling owns.
+    fn slice_gap(from: u64, to: u64) -> ChunkRanges {
+        ChunkRanges::from(ChunkNum(from / BAO_CHUNK_BYTES)..ChunkNum(to / BAO_CHUNK_BYTES))
+    }
+
+    #[test]
+    fn concentrate_clamps_a_run_to_a_partial_in_block_gap() {
+        let mib = 1024 * 1024;
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let sources = vec![SourceCoverage {
+            source_ix: 0,
+            coverage: cov(2, &[0, 1]),
+        }];
+        let gap = slice_gap(65 * mib, 66 * mib);
+        let (runs, uncovered) = plan_covered_runs(&gap, total, &sources, &[0]);
+        assert_eq!(
+            runs,
+            vec![CoveredRun {
+                offset: 65 * mib,
+                len: mib,
+                source_ix: 0,
+            }],
+            "run clamped to the gap slice, not the whole 64 MiB block"
+        );
+        assert!(uncovered.is_empty());
+    }
+
+    #[test]
+    fn spread_clamps_a_run_to_a_partial_in_block_gap() {
+        let mib = 1024 * 1024;
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let sources = vec![SourceCoverage {
+            source_ix: 0,
+            coverage: cov(2, &[0, 1]),
+        }];
+        let gap = slice_gap(65 * mib, 66 * mib);
+        let (runs, uncovered) = spread_segments(&gap, total, &sources, &[0]);
+        assert_eq!(
+            runs,
+            vec![CoveredRun {
+                offset: 65 * mib,
+                len: mib,
+                source_ix: 0,
+            }],
+            "run clamped to the gap slice, not the whole 64 MiB block"
+        );
+        assert!(uncovered.is_empty());
+    }
+
+    #[test]
+    fn spread_gives_each_full_holder_one_contiguous_run_not_one_per_block() {
+        // 8-block blob, 4 sources each holding the WHOLE blob. The old block-by-block
+        // round-robin fragmented this into 8 single-block runs (then `blocks × N`
+        // scheduler segments); the contiguous spread hands each holder ONE
+        // contiguous multi-block run — ~N runs, not ~B (#1506 fan-out).
+        let total = 8 * DISCOVERY_BLOCK_BYTES;
+        let all: Vec<u32> = (0..8).collect();
+        let sources: Vec<SourceCoverage> = (0..4)
+            .map(|ix| SourceCoverage {
+                source_ix: ix,
+                coverage: cov(8, &all),
+            })
+            .collect();
+        let (runs, uncovered) = spread_segments(&whole_gap(total), total, &sources, &[0, 1, 2, 3]);
+        assert!(uncovered.is_empty());
+        assert_eq!(
+            runs.len(),
+            4,
+            "one contiguous run per full holder: {runs:?}"
+        );
+        let sources_used: HashSet<usize> = runs.iter().map(|r| r.source_ix).collect();
+        assert_eq!(sources_used.len(), 4, "every holder engaged: {runs:?}");
+        for r in &runs {
+            assert_eq!(
+                r.len,
+                2 * DISCOVERY_BLOCK_BYTES,
+                "each run is the contiguous 2-block share: {runs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spread_resume_tail_still_engages_multiple_lanes() {
+        // Resume: only blocks 6 and 7 (a 2-block tail) of an 8-block blob remain,
+        // held by 4 full holders. The tail must still spread across ≥2 lanes rather
+        // than collapse onto one (#1506 fan-out defect 2).
+        let total = 8 * DISCOVERY_BLOCK_BYTES;
+        let all: Vec<u32> = (0..8).collect();
+        let sources: Vec<SourceCoverage> = (0..4)
+            .map(|ix| SourceCoverage {
+                source_ix: ix,
+                coverage: cov(8, &all),
+            })
+            .collect();
+        let gap = gap_of_blocks(&[6, 7]);
+        let (runs, uncovered) = spread_segments(&gap, total, &sources, &[0, 1, 2, 3]);
+        assert!(uncovered.is_empty());
+        let sources_used: HashSet<usize> = runs.iter().map(|r| r.source_ix).collect();
+        assert!(
+            sources_used.len() >= 2,
+            "the tail spreads across ≥2 lanes: {runs:?}"
+        );
     }
 }
