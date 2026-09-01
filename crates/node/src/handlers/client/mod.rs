@@ -1618,10 +1618,17 @@ impl ClientHandler {
             // so refuse to come up instead.
             // The pool total is the SUM of its signer rows, so fold rather than
             // insert: one pool contributes as many rows as it has signers that ever
-            // accrued a charge.
-            for (pool_id, signer, micro) in store.load_losses()? {
+            // accrued a charge. Each row's `micro_usdc` is that lane's cumulative
+            // total, never a delta, so folding rows is correct and folding one row
+            // twice is not.
+            for decdn_incentive::FloorLoss {
+                pool_id,
+                signer,
+                micro_usdc,
+            } in store.load_losses()?
+            {
                 let entry: &mut PoolFloorState = pool_floor.entry(pool_id).or_default();
-                let dead = U256::from(micro);
+                let dead = U256::from(micro_usdc);
                 entry.dead_charge = entry.dead_charge.saturating_add(dead);
                 let lane = entry.signers.entry(signer).or_default();
                 lane.dead_charge = lane.dead_charge.saturating_add(dead);
@@ -4157,7 +4164,7 @@ mod tests {
             .load_losses()
             .map_err(|e| anyhow::anyhow!("load_losses: {e}"))?
             .first()
-            .map(|&(_, _, v)| v);
+            .map(|l| l.micro_usdc);
         anyhow::ensure!(
             persisted == Some(quarter.to::<u128>()),
             "the new dead total is persisted best-effort on drop"
@@ -5215,8 +5222,8 @@ mod tests {
             .load_losses()
             .map_err(|e| anyhow::anyhow!("load_losses: {e}"))?
             .into_iter()
-            .find(|&(id, signer, _)| id == pool && signer == TEST_SIGNER)
-            .map(|(_, _, micro)| micro))
+            .find(|l| l.pool_id == pool && l.signer == TEST_SIGNER)
+            .map(|l| l.micro_usdc))
     }
 
     /// Two withheld streams on ONE pool, each reconciled through the real `Drop`
@@ -5339,7 +5346,9 @@ mod tests {
             result
         }
 
-        fn load_losses(&self) -> Result<Vec<(B256, Address, u128)>, decdn_incentive::StoreError> {
+        fn load_losses(
+            &self,
+        ) -> Result<Vec<decdn_incentive::FloorLoss>, decdn_incentive::StoreError> {
             self.inner.load_losses()
         }
 
@@ -5424,7 +5433,7 @@ mod tests {
             }
             fn load_losses(
                 &self,
-            ) -> Result<Vec<(B256, Address, u128)>, decdn_incentive::StoreError> {
+            ) -> Result<Vec<decdn_incentive::FloorLoss>, decdn_incentive::StoreError> {
                 Ok(Vec::new())
             }
             fn forget_loss(&self, _: B256) -> Result<(), decdn_incentive::StoreError> {

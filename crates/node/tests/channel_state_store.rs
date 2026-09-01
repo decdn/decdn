@@ -682,7 +682,12 @@ async fn record_loss_races_the_lane_flush() -> anyhow::Result<()> {
     );
     let losses = store.load_losses()?;
     anyhow::ensure!(
-        losses == vec![(loss_pool, loss_signer, 2_000u128)],
+        losses
+            == vec![decdn_incentive::FloorLoss {
+                pool_id: loss_pool,
+                signer: loss_signer,
+                micro_usdc: 2_000
+            }],
         "the loss total must settle on its monotonic maximum and the churned pool \
          must stay forgotten, got {losses:?}"
     );
@@ -729,12 +734,20 @@ fn floor_loss_restart_hydrates_the_monotonic_maximum() -> anyhow::Result<()> {
         "the reclaimed pool's tombstone survives the restart for the boot sweep"
     );
     let mut hydrated = store.load_losses()?;
-    hydrated.sort_by_key(|&(_, signer, _)| signer);
+    hydrated.sort_by_key(|l| l.signer);
     anyhow::ensure!(
         hydrated
             == vec![
-                (survivor, signer_a, 5_000u128),
-                (survivor, signer_b, 900u128)
+                decdn_incentive::FloorLoss {
+                    pool_id: survivor,
+                    signer: signer_a,
+                    micro_usdc: 5_000
+                },
+                decdn_incentive::FloorLoss {
+                    pool_id: survivor,
+                    signer: signer_b,
+                    micro_usdc: 900
+                }
             ],
         "hydration must see each signer's monotonic maximum, and nothing for the \
          reclaimed pool whose every signer row went with it, got {hydrated:?}"

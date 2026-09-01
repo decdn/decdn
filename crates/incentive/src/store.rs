@@ -129,6 +129,25 @@ pub struct PendingSettle {
     pub settle_after: u64,
 }
 
+/// One `(pool_id, signer)` lane's persisted floor-credit loss — the `dead_charge`
+/// of ADR 003 §Pool solvency, as [`PoolFloorLossStore::load_losses`] returns it.
+///
+/// A named row rather than a bare tuple because the two `B256`-adjacent fields and
+/// the amount are otherwise positional at every call site, and because the amount's
+/// meaning is not self-evident: see [`FloorLoss::micro_usdc`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloorLoss {
+    /// The pool the loss was incurred against.
+    pub pool_id: B256,
+    /// The capability signer that incurred it. The per-signer sub-cap reads this
+    /// lane's own total, so the pool total alone would not restore isolation.
+    pub signer: Address,
+    /// The lane's CUMULATIVE dead charge in `µUSDC`, not a delta. The monotonic
+    /// raise [`PoolFloorLossStore::record_loss`] promises is defined on this total,
+    /// and a reader folds one pool's rows to rebuild its pool-wide total.
+    pub micro_usdc: u128,
+}
+
 /// Durable set of pools closed by this node that await finalization (#327).
 /// Separate from [`PoolStateStore`] because a settle needs only the pool id and
 /// a timestamp gate — not the voucher state — and the lifecycles differ.
@@ -432,7 +451,11 @@ impl PoolStateStore for MemoryPoolStateStore {
 /// already satisfies it.
 pub trait PoolFloorLossStore: Send + Sync {
     /// Raise this `(pool_id, signer)` lane's cumulative dead-charge total to
-    /// `micro_usdc`. A total at or below the stored one is a no-op, so a late,
+    /// `micro_usdc`. Takes the lane and the amount unpacked rather than a
+    /// [`FloorLoss`]: this addresses one lane the caller already holds, while
+    /// `FloorLoss` names a row the store hands back, and letting a loaded row be
+    /// passed straight back in would read as a write that means something.
+    /// A total at or below the stored one is a no-op, so a late,
     /// smaller write cannot regress the row and re-grant already-consumed
     /// free-floor budget. A pool that was [`PoolFloorLossStore::forget_loss`]-ed is
     /// also a no-op for every one of its signers: the pool is closed, so the write
@@ -453,7 +476,7 @@ pub trait PoolFloorLossStore: Send + Sync {
     ///
     /// # Errors
     /// Returns [`StoreError`] if the backing store is unreadable.
-    fn load_losses(&self) -> Result<Vec<(B256, Address, u128)>, StoreError>;
+    fn load_losses(&self) -> Result<Vec<FloorLoss>, StoreError>;
 
     /// Drop EVERY signer row of a pool (on pool close/reclaim) and tombstone the
     /// pool id, so an in-flight `record_loss` that lands after this call cannot
@@ -533,7 +556,7 @@ impl PoolFloorLossStore for MemoryPoolFloorLossStore {
         Ok(())
     }
 
-    fn load_losses(&self) -> Result<Vec<(B256, Address, u128)>, StoreError> {
+    fn load_losses(&self) -> Result<Vec<FloorLoss>, StoreError> {
         let guard = self
             .inner
             .lock()
@@ -541,7 +564,11 @@ impl PoolFloorLossStore for MemoryPoolFloorLossStore {
         Ok(guard
             .totals
             .iter()
-            .map(|(&(pool_id, signer), &micro)| (pool_id, signer, micro))
+            .map(|(&(pool_id, signer), &micro_usdc)| FloorLoss {
+                pool_id,
+                signer,
+                micro_usdc,
+            })
             .collect())
     }
 
@@ -718,13 +745,34 @@ mod tests {
         // A second signer on pool `a` is a SEPARATE row, not a raise of the first.
         store.record_loss(a, s2, 90)?;
         let mut all = store.load_losses()?;
-        all.sort_by_key(|&(pool, signer, _)| (pool, signer));
+        all.sort_by_key(|l| (l.pool_id, l.signer));
         anyhow::ensure!(all.len() == 3);
-        anyhow::ensure!(all.first() == Some(&(a, s1, 800u128)));
-        anyhow::ensure!(all.get(1) == Some(&(a, s2, 90u128)));
+        anyhow::ensure!(
+            all.first()
+                == Some(&FloorLoss {
+                    pool_id: a,
+                    signer: s1,
+                    micro_usdc: 800
+                })
+        );
+        anyhow::ensure!(
+            all.get(1)
+                == Some(&FloorLoss {
+                    pool_id: a,
+                    signer: s2,
+                    micro_usdc: 90
+                })
+        );
         // Forgetting the pool drops EVERY signer row it holds, and only those.
         store.forget_loss(a)?;
-        anyhow::ensure!(store.load_losses()? == vec![(b, s1, 4_000_000u128)]);
+        anyhow::ensure!(
+            store.load_losses()?
+                == vec![FloorLoss {
+                    pool_id: b,
+                    signer: s1,
+                    micro_usdc: 4_000_000
+                }]
+        );
         // Forgetting an already-forgotten pool is a no-op.
         store.forget_loss(a)?;
         Ok(())
@@ -741,14 +789,41 @@ mod tests {
         let pool = b256!("0000000000000000000000000000000000000000000000000000000000000077");
         store.record_loss(pool, s1, 5_000)?;
         store.record_loss(pool, s1, 10)?;
-        anyhow::ensure!(store.load_losses()? == vec![(pool, s1, 5_000u128)]);
+        anyhow::ensure!(
+            store.load_losses()?
+                == vec![FloorLoss {
+                    pool_id: pool,
+                    signer: s1,
+                    micro_usdc: 5_000
+                }]
+        );
         store.record_loss(pool, s1, 5_001)?;
-        anyhow::ensure!(store.load_losses()? == vec![(pool, s1, 5_001u128)]);
+        anyhow::ensure!(
+            store.load_losses()?
+                == vec![FloorLoss {
+                    pool_id: pool,
+                    signer: s1,
+                    micro_usdc: 5_001
+                }]
+        );
         // A smaller total for a DIFFERENT signer is its own row, not a regression.
         store.record_loss(pool, s2, 10)?;
         let mut all = store.load_losses()?;
-        all.sort_by_key(|&(_, signer, _)| signer);
-        anyhow::ensure!(all == vec![(pool, s1, 5_001u128), (pool, s2, 10u128)]);
+        all.sort_by_key(|l| l.signer);
+        anyhow::ensure!(
+            all == vec![
+                FloorLoss {
+                    pool_id: pool,
+                    signer: s1,
+                    micro_usdc: 5_001
+                },
+                FloorLoss {
+                    pool_id: pool,
+                    signer: s2,
+                    micro_usdc: 10
+                }
+            ]
+        );
         Ok(())
     }
 
@@ -782,7 +857,14 @@ mod tests {
         // After the bring-up sweep the pool id accepts writes again; at bring-up no
         // stale persist can exist, and a reclaimed pool id never recurs.
         store.record_loss(pool, s1, 10)?;
-        anyhow::ensure!(store.load_losses()? == vec![(pool, s1, 10u128)]);
+        anyhow::ensure!(
+            store.load_losses()?
+                == vec![FloorLoss {
+                    pool_id: pool,
+                    signer: s1,
+                    micro_usdc: 10
+                }]
+        );
         Ok(())
     }
 }

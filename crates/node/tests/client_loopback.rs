@@ -4978,12 +4978,10 @@ async fn spawn_pool_server_with_signer_share(
 /// per-signer floor sub-cap (ADR 003 §Pool solvency), and the pool total is their
 /// sum — so a test that asserts a pool-level charge sums rather than picks a row,
 /// and stays correct when more than one signer contributes.
-fn pool_dead_charge_total(
-    rows: Vec<(alloy::primitives::B256, alloy::primitives::Address, u128)>,
-) -> u128 {
+fn pool_dead_charge_total(rows: Vec<decdn_incentive::FloorLoss>) -> u128 {
     rows.into_iter()
-        .filter(|&(pool, _, _)| pool == pool_id())
-        .map(|(_, _, micro)| micro)
+        .filter(|l| l.pool_id == pool_id())
+        .map(|l| l.micro_usdc)
         .fold(0u128, u128::saturating_add)
 }
 
@@ -9527,11 +9525,11 @@ async fn dead_charge_persists_across_restart() -> anyhow::Result<()> {
     // pool total and lose the isolation.
     let rows = reopened.load_losses()?;
     anyhow::ensure!(
-        rows == vec![(
-            pool_id(),
-            signer_a.address(),
-            u128::from(HARNESS_FLOOR_COST)
-        )],
+        rows == vec![decdn_incentive::FloorLoss {
+            pool_id: pool_id(),
+            signer: signer_a.address(),
+            micro_usdc: u128::from(HARNESS_FLOOR_COST)
+        }],
         "the dead charge must reload against the signer that incurred it, got {rows:?}"
     );
 
@@ -9648,11 +9646,11 @@ async fn per_signer_dead_charge_gates_admission_across_restart() -> anyhow::Resu
     let reopened = Arc::new(PersistentPoolStateStore::open(dir.path())?);
     let rows = reopened.load_losses()?;
     anyhow::ensure!(
-        rows == vec![(
-            pool_id(),
-            signer_a.address(),
-            u128::from(HARNESS_FLOOR_COST)
-        )],
+        rows == vec![decdn_incentive::FloorLoss {
+            pool_id: pool_id(),
+            signer: signer_a.address(),
+            micro_usdc: u128::from(HARNESS_FLOOR_COST)
+        }],
         "the durable row must name the signer that incurred the charge, got {rows:?}"
     );
 

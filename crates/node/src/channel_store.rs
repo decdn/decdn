@@ -1722,7 +1722,7 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
         Ok(())
     }
 
-    fn load_losses(&self) -> Result<Vec<(B256, Address, u128)>, StoreError> {
+    fn load_losses(&self) -> Result<Vec<decdn_incentive::FloorLoss>, StoreError> {
         let read_txn = self
             .floor_loss_db
             .begin_read()
@@ -1742,7 +1742,11 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
             let (key_guard, value_guard) =
                 entry.map_err(|e| floor_loss_backend_err("iter entry", None, e))?;
             let (pool_id, signer) = pool_signer_key_parts(key_guard.value());
-            out.push((pool_id, signer, value_guard.value()));
+            out.push(decdn_incentive::FloorLoss {
+                pool_id,
+                signer,
+                micro_usdc: value_guard.value(),
+            });
         }
         Ok(out)
     }
@@ -2860,19 +2864,51 @@ mod tests {
         );
         store.record_loss(pool, s1, 5_000)?;
         store.record_loss(pool, s1, 10)?;
-        anyhow::ensure!(store.load_losses()? == vec![(pool, s1, 5_000u128)]);
+        anyhow::ensure!(
+            store.load_losses()?
+                == vec![decdn_incentive::FloorLoss {
+                    pool_id: pool,
+                    signer: s1,
+                    micro_usdc: 5_000
+                }]
+        );
         // An equal total is a no-op too, and must not disturb the row.
         store.record_loss(pool, s1, 5_000)?;
-        anyhow::ensure!(store.load_losses()? == vec![(pool, s1, 5_000u128)]);
+        anyhow::ensure!(
+            store.load_losses()?
+                == vec![decdn_incentive::FloorLoss {
+                    pool_id: pool,
+                    signer: s1,
+                    micro_usdc: 5_000
+                }]
+        );
         store.record_loss(pool, s1, 5_001)?;
-        anyhow::ensure!(store.load_losses()? == vec![(pool, s1, 5_001u128)]);
+        anyhow::ensure!(
+            store.load_losses()?
+                == vec![decdn_incentive::FloorLoss {
+                    pool_id: pool,
+                    signer: s1,
+                    micro_usdc: 5_001
+                }]
+        );
         // A SECOND signer on the same pool is its own row: a total far below the
         // first signer's is not a regression, and monotonicity is per lane.
         store.record_loss(pool, s2, 7)?;
         let mut both = store.load_losses()?;
-        both.sort_by_key(|&(_, signer, _)| signer);
+        both.sort_by_key(|l| l.signer);
         anyhow::ensure!(
-            both == vec![(pool, s1, 5_001u128), (pool, s2, 7u128)],
+            both == vec![
+                decdn_incentive::FloorLoss {
+                    pool_id: pool,
+                    signer: s1,
+                    micro_usdc: 5_001
+                },
+                decdn_incentive::FloorLoss {
+                    pool_id: pool,
+                    signer: s2,
+                    micro_usdc: 7
+                }
+            ],
             "per-signer rows are independent, not one pool-wide total"
         );
         // Forget is terminal AND pool-wide: the delete drops every signer row and
@@ -2889,7 +2925,12 @@ mod tests {
         anyhow::ensure!(store.sweep_forgotten()? == 1, "one tombstone swept");
         store.record_loss(pool, s1, 10)?;
         anyhow::ensure!(
-            store.load_losses()? == vec![(pool, s1, 10u128)],
+            store.load_losses()?
+                == vec![decdn_incentive::FloorLoss {
+                    pool_id: pool,
+                    signer: s1,
+                    micro_usdc: 10
+                }],
             "after the bring-up sweep the pool id accepts writes again"
         );
         store.forget_loss(pool)?;
@@ -2920,7 +2961,14 @@ mod tests {
             store.record_loss(pool, s1, 10)?;
         }
         let store = PersistentPoolStateStore::open(dir.path())?;
-        anyhow::ensure!(store.load_losses()? == vec![(pool, s1, 5_000u128)]);
+        anyhow::ensure!(
+            store.load_losses()?
+                == vec![decdn_incentive::FloorLoss {
+                    pool_id: pool,
+                    signer: s1,
+                    micro_usdc: 5_000
+                }]
+        );
         Ok(())
     }
 
@@ -2948,13 +2996,23 @@ mod tests {
         store.record_loss(closed, s1, 700)?;
         store.record_loss(closed, s2, 800)?;
         anyhow::ensure!(
-            store.load_losses()? == vec![(live, s1, 900u128)],
+            store.load_losses()?
+                == vec![decdn_incentive::FloorLoss {
+                    pool_id: live,
+                    signer: s1,
+                    micro_usdc: 900
+                }],
             "the tombstone survives the reopen and blocks the late write for every signer"
         );
         anyhow::ensure!(store.sweep_forgotten()? == 1, "the boot sweep reclaims it");
         anyhow::ensure!(store.sweep_forgotten()? == 0, "sweep is idempotent");
         anyhow::ensure!(
-            store.load_losses()? == vec![(live, s1, 900u128)],
+            store.load_losses()?
+                == vec![decdn_incentive::FloorLoss {
+                    pool_id: live,
+                    signer: s1,
+                    micro_usdc: 900
+                }],
             "the sweep does not disturb live rows"
         );
         Ok(())
@@ -2984,9 +3042,20 @@ mod tests {
 
         store.forget_loss(pool)?;
         let mut left = store.load_losses()?;
-        left.sort_by_key(|&(_, signer, _)| signer);
+        left.sort_by_key(|l| l.signer);
         anyhow::ensure!(
-            left == vec![(neighbour, lowest, 33u128), (neighbour, highest, 44u128)],
+            left == vec![
+                decdn_incentive::FloorLoss {
+                    pool_id: neighbour,
+                    signer: lowest,
+                    micro_usdc: 33
+                },
+                decdn_incentive::FloorLoss {
+                    pool_id: neighbour,
+                    signer: highest,
+                    micro_usdc: 44
+                }
+            ],
             "forget must clear the pool's rows at both bounds and neither neighbour's, got {left:?}"
         );
         Ok(())
@@ -3064,7 +3133,12 @@ mod tests {
             .max()
             .ok_or_else(|| anyhow::anyhow!("empty value set"))?;
         anyhow::ensure!(
-            store.load_losses()? == vec![(pool, s1, want)],
+            store.load_losses()?
+                == vec![decdn_incentive::FloorLoss {
+                    pool_id: pool,
+                    signer: s1,
+                    micro_usdc: want
+                }],
             "interleaved writers settle on the maximum, not the last write"
         );
         Ok(())
@@ -3090,20 +3164,46 @@ mod tests {
         // Reopen over the SAME path — the value must survive the durable commit.
         let store = PersistentPoolStateStore::open(dir.path())?;
         let mut all = store.load_losses()?;
-        all.sort_by_key(|&(id, signer, _)| (id, signer));
+        all.sort_by_key(|l| (l.pool_id, l.signer));
         anyhow::ensure!(all.len() == 3, "overwrite must not add a row");
         let first = all.first().ok_or_else(|| anyhow::anyhow!("missing [0]"))?;
         let second = all.get(1).ok_or_else(|| anyhow::anyhow!("missing [1]"))?;
         let third = all.get(2).ok_or_else(|| anyhow::anyhow!("missing [2]"))?;
-        anyhow::ensure!(*first == (a_pool, s1, 999_999_999_999_999u128));
-        anyhow::ensure!(*second == (a_pool, s2, 7u128));
-        anyhow::ensure!(*third == (b_pool, s1, 42u128));
+        anyhow::ensure!(
+            *first
+                == decdn_incentive::FloorLoss {
+                    pool_id: a_pool,
+                    signer: s1,
+                    micro_usdc: 999_999_999_999_999
+                }
+        );
+        anyhow::ensure!(
+            *second
+                == decdn_incentive::FloorLoss {
+                    pool_id: a_pool,
+                    signer: s2,
+                    micro_usdc: 7
+                }
+        );
+        anyhow::ensure!(
+            *third
+                == decdn_incentive::FloorLoss {
+                    pool_id: b_pool,
+                    signer: s1,
+                    micro_usdc: 42
+                }
+        );
 
         // forget clears EVERY signer row of the pool, and forget on a
         // never-recorded pool is a no-op.
         store.forget_loss(a_pool)?;
         anyhow::ensure!(
-            store.load_losses()? == vec![(b_pool, s1, 42u128)],
+            store.load_losses()?
+                == vec![decdn_incentive::FloorLoss {
+                    pool_id: b_pool,
+                    signer: s1,
+                    micro_usdc: 42
+                }],
             "forget clears both of pool a's signer rows and neither of pool b's"
         );
         store.forget_loss(b_pool)?;
