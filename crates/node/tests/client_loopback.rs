@@ -2038,13 +2038,14 @@ async fn concurrent_same_lane_streams_aggregate_across_the_chunk_boundary() -> a
 /// stream and refuses a concurrent second with `NotFound` (the wire collapse of
 /// `LaneAtCapacity`), while the admitted stream still delivers and settles.
 ///
-/// `remaining = 50`: covers the first stream's own 3 MiB guard (cost 30, so the
-/// base floor-M gate admits it) plus one credit-window floor (`HARNESS_FLOOR_COST
-/// = 40`) — but not a second stream's 2 MiB guard (cost 20) stacked on top of the
-/// floor already charged for the first, still-active stream (20 + 40 = 60 > 50).
-/// This is the exactly-one-floor headroom the admission cap enforces: `remaining`
-/// covers `min_payment(floor, rate)` (40) but not `min_payment(guard_b + floor,
-/// rate)` (60).
+/// `remaining = min_payment(CHUNK_BYTES, RATE_PER_MB) + 2 = 12`, `M = 0`: one
+/// credit-window floor (`10`) plus slack too small to buy a second. The first
+/// stream is admitted — the lane holds no other active stream, so the lane cap
+/// does not apply, and its own 512 KiB span prices at `5 ≤ 12`. The second finds
+/// one stream already active, so the lane cap sizes its reservation at BOTH
+/// streams' floors — `min_payment(2 × CHUNK_BYTES, RATE_PER_MB) = 20 > 12` — and
+/// refuses. This is the exactly-one-floor headroom the admission cap enforces:
+/// `remaining` covers one credit window but never two concurrently.
 #[tokio::test(flavor = "multi_thread")]
 async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Result<()> {
     // Each blob stays inside ONE chunk of wire, so the whole delivery rides the
@@ -5048,13 +5049,14 @@ async fn send_bad_signature_voucher(
 /// gives away is bounded to ~`remaining − M`, NOT `lanes × floor`, even as every
 /// lane disconnects between admissions.
 ///
-/// `remaining` covers exactly `affordable_floors` floors, `M = 0`, so the
-/// pool can fund `140 / 40 = 3` floors of un-vouchered credit. Each round opens a
-/// DISTINCT-signer lane on its OWN connection, reads exactly one floor, withholds
-/// its voucher, and disconnects — so the stream's `FloorReservation` drops and
-/// folds one floor (`40`) into the pool's DURABLE `dead_charge`. The test waits for
-/// the loss store to confirm the fold before the next admission, so the counts are
-/// exact. After three such lanes the pool has `dead_charge = 120`, and a FOURTH
+/// `remaining` covers exactly `affordable_floors` floors, `M = 0`, so the pool can
+/// fund three floors of un-vouchered credit — `3 × HARNESS_FLOOR_COST (10) + 2 = 32`
+/// `µUSDC`, the slack too small to buy a fourth. Each round opens a DISTINCT-signer
+/// lane on its OWN connection, reads exactly one floor, withholds its voucher, and
+/// disconnects — so the stream's `FloorReservation` drops and folds one floor (`10`)
+/// into the pool's DURABLE `dead_charge`. The test waits for the loss store to
+/// confirm the fold before the next admission, so the counts are exact. After three
+/// such lanes the pool has `dead_charge = 30`, and a FOURTH
 /// distinct lane is refused `NotFound` at admission — proving the bound survives
 /// each lane's disconnect. Without the durable `dead_charge`, a disconnected lane
 /// would release its whole reservation and the pool would re-admit fresh lanes
@@ -5080,7 +5082,7 @@ async fn sequential_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let client_node_id = B256::from(*client_ep.id().as_bytes());
 
-    // Three lanes each take one free floor and vanish; `dead_charge` climbs 40 → 120.
+    // Three lanes each take one free floor and vanish; `dead_charge` climbs 10 → 30.
     for (i, signer) in signers.iter().take(affordable_floors as usize).enumerate() {
         let conn = client_ep
             .connect(target.clone(), ALPN_CLIENT)
@@ -5099,8 +5101,8 @@ async fn sequential_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
         await_pool_dead_charge(&loss, expected).await?;
     }
 
-    // The fourth DISTINCT lane is refused: `dead_charge (120) + floor (40) > remaining
-    // − M (140)`. A durable bound the three disconnects could not reset.
+    // The fourth DISTINCT lane is refused: `dead_charge (30) + floor (10) > remaining
+    // − M (32)`. A durable bound the three disconnects could not reset.
     let last = signers
         .get(affordable_floors as usize)
         .ok_or_else(|| anyhow::anyhow!("missing the fourth lane signer"))?;
@@ -5204,21 +5206,7 @@ async fn one_signer_at_its_share_does_not_lock_out_a_co_tenant() -> anyhow::Resu
     // counter is the ONLY place the distinction survives — and the two remedies it
     // separates are opposite (top up the pool, versus rotate the session key).
     // Pin both directions: the sub-cap fired, and the deposit arm did not.
-    let encoded = metrics.encode()?;
-    for line in [
-        "decdn_serve_stream_rejected_signer_floor_at_cap_total 1",
-        "decdn_serve_stream_rejected_insufficient_deposit_total 0",
-    ] {
-        anyhow::ensure!(
-            metric_line_present(&encoded, line),
-            "expected metric line `{line}`; counters were:\n{}",
-            encoded
-                .lines()
-                .filter(|l| l.starts_with("decdn_serve_stream_rejected"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
+    ensure_only_the_sub_cap_refused(&metrics)?;
 
     // Signer B, a co-tenant on the SAME pool, is served from its own share.
     let conn_b = client_ep
@@ -5242,12 +5230,13 @@ async fn one_signer_at_its_share_does_not_lock_out_a_co_tenant() -> anyhow::Resu
 /// M`. The concurrent twin of the sequential test — here the bound is enforced by
 /// the LIVE reservation, not the durable dead charge.
 ///
-/// `remaining = 140`, `M = 0`, floor `40`: three lanes fit (`3 × 40 = 120 ≤ 140`),
-/// a fourth does not (`160 > 140`). Each lane is opened on its own bi-stream,
-/// reads one floor, and PARKS holding its live reservation; the streams stay open
+/// `remaining = 32`, `M = 0`, floor `HARNESS_FLOOR_COST` (`10`): three lanes fit
+/// (`3 × 10 = 30 ≤ 32`), a fourth does not (`40 > 32`). Each lane is opened on its
+/// own bi-stream, reads one floor, and PARKS holding its live reservation; the
+/// streams stay open
 /// (their send/recv halves are kept alive) so all three reservations are held
 /// concurrently. With three live floors held, a fourth distinct lane is refused
-/// `NotFound`. Non-vacuous: a fourth lane on its own would fit (`40 ≤ 140`); it is
+/// `NotFound`. Non-vacuous: a fourth lane on its own would fit (`10 ≤ 32`); it is
 /// refused only because the three concurrent reservations already committed the
 /// budget.
 #[tokio::test(flavor = "multi_thread")]
@@ -5288,8 +5277,8 @@ async fn concurrent_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
         held.push((i, send, recv));
     }
 
-    // Fourth concurrent distinct lane: refused — `Σ live floors (120) + floor (40) >
-    // remaining − M (140)`.
+    // Fourth concurrent distinct lane: refused — `Σ live floors (30) + floor (10) >
+    // remaining − M (32)`.
     let fourth = signers
         .get(affordable_floors)
         .ok_or_else(|| anyhow::anyhow!("missing the fourth lane signer"))?;
@@ -5485,6 +5474,32 @@ async fn rejected_first_voucher_still_records_dead_charge() -> anyhow::Result<()
 /// True if `encoded` (`OpenMetrics` text from `Metrics::encode`) contains `line`
 /// as a full line — mirrors the `has_metric_line` helper in `metrics.rs` so the
 /// reject counters are asserted on an exact `name value` match, not a substring.
+/// Assert exactly one per-signer sub-cap refusal was counted and no pool-ceiling
+/// refusal was.
+///
+/// Both caps sign as `NotFound`, so a client cannot tell them apart and these
+/// server-side counters are the only place the distinction exists — which matters
+/// because the remedies are opposite: a pool shortfall clears with a top-up, a
+/// signer at its share does not.
+fn ensure_only_the_sub_cap_refused(metrics: &Metrics) -> anyhow::Result<()> {
+    let encoded = metrics.encode()?;
+    for line in [
+        "decdn_serve_stream_rejected_signer_floor_at_cap_total 1",
+        "decdn_serve_stream_rejected_insufficient_deposit_total 0",
+    ] {
+        anyhow::ensure!(
+            metric_line_present(&encoded, line),
+            "expected metric line `{line}`; counters were:\n{}",
+            encoded
+                .lines()
+                .filter(|l| l.starts_with("decdn_serve_stream_rejected"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    Ok(())
+}
+
 fn metric_line_present(encoded: &str, line: &str) -> bool {
     encoded.lines().any(|l| l == line)
 }
@@ -9345,12 +9360,23 @@ async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<
 /// SAME store handle to back both the lane table and the floor-loss table, so
 /// `record_loss`/`load_losses` persist to the caller's own redb file rather
 /// than an ephemeral in-memory one.
+///
+/// `pool_floor_signer_share_bps` is explicit rather than defaulted: at `10_000`
+/// the sub-cap is at least the pool's whole headroom, so a restart test wired
+/// that way proves only that the POOL total rehydrated. A smaller share is what
+/// makes the per-signer half of hydration load-bearing.
 async fn spawn_pool_server_with_stores(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
     loss: Arc<dyn decdn_incentive::PoolFloorLossStore>,
     remaining: U256,
-) -> anyhow::Result<(EndpointAddr, Endpoint, tokio::task::JoinHandle<()>)> {
+    pool_floor_signer_share_bps: u64,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = operator_signer();
@@ -9370,12 +9396,13 @@ async fn spawn_pool_server_with_stores(
             deps.credit_max = decdn_common::config::DEFAULT_CREDIT_MAX;
             deps.credit_ramp_divisor = decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR;
             deps.floor_loss_store = Some(loss);
+            deps.pool_floor_signer_share_bps = pool_floor_signer_share_bps;
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, server_ep, server_task))
+    Ok((target, server_ep, server_task, metrics))
 }
 
 /// Poll a [`PersistentPoolStateStore`] directly (not the in-memory shortcut
@@ -9419,10 +9446,15 @@ async fn await_persistent_pool_dead_charge(
 /// in-memory zero, and this refusal would not happen — that is exactly the
 /// "withhold then restart" escape this test rules out.
 ///
-/// `remaining` covers one `HARNESS_FLOOR_COST` and no more, `M = 0`: lane A's withheld
-/// floor folds `dead_charge` to `40`. A second floor would need
-/// `40 + 40 = 80 > 60`, so lane B is refused after the restart, even though it
-/// never touched the pool before.
+/// `remaining` covers one `HARNESS_FLOOR_COST` (`10`) and no more (`10 + 2 = 12`),
+/// `M = 0`: lane A's withheld floor folds `dead_charge` to `10`. A second floor
+/// would need `10 + 10 = 20 > 12`, so lane B is refused after the restart, even
+/// though it never touched the pool before.
+///
+/// Deliberately at the `10_000` bps no-op share, so the POOL ceiling is what
+/// refuses B and this test covers the pool half of hydration on its own.
+/// `per_signer_dead_charge_gates_admission_across_restart` covers the per-signer
+/// half, where the pool keeps headroom throughout.
 #[tokio::test(flavor = "multi_thread")]
 async fn dead_charge_persists_across_restart() -> anyhow::Result<()> {
     use decdn_incentive::PoolFloorLossStore as _;
@@ -9449,8 +9481,8 @@ async fn dead_charge_persists_across_restart() -> anyhow::Result<()> {
         let store_dyn: Arc<dyn PoolStateStore> = redb_store.clone();
         let loss_dyn: Arc<dyn decdn_incentive::PoolFloorLossStore> = redb_store.clone();
 
-        let (target, server_ep, server_task) =
-            spawn_pool_server_with_stores(cache, store_dyn, loss_dyn, remaining).await?;
+        let (target, server_ep, server_task, _metrics) =
+            spawn_pool_server_with_stores(cache, store_dyn, loss_dyn, remaining, 10_000).await?;
 
         let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
         let client_node_id = B256::from(*client_ep.id().as_bytes());
@@ -9507,8 +9539,8 @@ async fn dead_charge_persists_across_restart() -> anyhow::Result<()> {
     let store_dyn: Arc<dyn PoolStateStore> = reopened.clone();
     let loss_dyn: Arc<dyn decdn_incentive::PoolFloorLossStore> = reopened.clone();
 
-    let (target_b, server_ep_b, server_task_b) =
-        spawn_pool_server_with_stores(cache_b, store_dyn, loss_dyn, remaining).await?;
+    let (target_b, server_ep_b, server_task_b, _metrics_b) =
+        spawn_pool_server_with_stores(cache_b, store_dyn, loss_dyn, remaining, 10_000).await?;
 
     let (client_ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let client_node_id_b = B256::from(*client_ep_b.id().as_bytes());
@@ -9541,6 +9573,142 @@ async fn dead_charge_persists_across_restart() -> anyhow::Result<()> {
     client_ep_b.close().await;
     server_ep_b.close().await;
     server_task_b.await?;
+    Ok(())
+}
+
+/// The per-SIGNER `dead_charge` gates admission across a restart, not merely the
+/// pool total: after a reboot the signer that withheld is still refused from its own
+/// share while the pool keeps headroom, and a co-tenant is served.
+///
+/// `dead_charge_persists_across_restart` cannot show this — it runs at the `10_000`
+/// bps no-op share on a pool with room for exactly one floor, so its post-restart
+/// refusal comes from the POOL ceiling and it passes even if hydration folds every
+/// signer's row into one undifferentiated total. That variant would hand each signer
+/// a fresh sub-cap on every reboot: withhold, restart, withhold again, forever.
+///
+/// `remaining = 4 floors + 2 = 42`, `M = 0`, share `2500` bps: each signer's sub-cap
+/// is one floor (`42 / 4 = 10`, equal to the one-credit-window clamp). Signer A
+/// withholds a floor before the restart, so its rehydrated `dead_charge` fills its
+/// whole share; three floors of POOL headroom survive, so nothing but the sub-cap
+/// can refuse it — pinned by the per-reason counters, which are the only place the
+/// two caps stay distinguishable behind their shared `NotFound` wire code.
+#[tokio::test(flavor = "multi_thread")]
+async fn per_signer_dead_charge_gates_admission_across_restart() -> anyhow::Result<()> {
+    use decdn_incentive::PoolFloorLossStore as _;
+
+    // > one interval so each lane parks after its floor rather than finishing.
+    let payload = vec![0x8Du8; 6 * 1024 * 1024];
+
+    let dir = tempfile::tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    // Four floors of headroom at a quarter share: one floor per signer, and three
+    // floors of pool budget still free once A has spent its share.
+    let remaining = U256::from(u128::from(HARNESS_FLOOR_COST) * 4 + 2);
+    let signer_a = Arc::new(PrivateKeySigner::random());
+    let signer_b = Arc::new(PrivateKeySigner::random());
+
+    // --- "Boot 1": signer A withholds, folding one floor into its OWN durable row.
+    {
+        let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+        let redb_store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+        redb_store.record(&fresh_lane(signer_a.address(), U256::from(10_000_000u64)))?;
+        let store_dyn: Arc<dyn PoolStateStore> = redb_store.clone();
+        let loss_dyn: Arc<dyn decdn_incentive::PoolFloorLossStore> = redb_store.clone();
+
+        let (target, server_ep, server_task, _metrics) =
+            spawn_pool_server_with_stores(cache, store_dyn, loss_dyn, remaining, 2_500).await?;
+
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let client_node_id = B256::from(*client_ep.id().as_bytes());
+        let conn = client_ep
+            .connect(target, ALPN_CLIENT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect lane A: {e}"))?;
+        let ext = binding_ext(&signer_a, client_node_id)?;
+        let (send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+        read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+        assert_parked_awaiting_voucher(&mut recv).await?;
+        drop(send);
+        drop(recv);
+        conn.close(0u32.into(), b"withhold");
+
+        await_persistent_pool_dead_charge(&redb_store, u128::from(HARNESS_FLOOR_COST)).await?;
+        shutdown([server_task], [&client_ep, &server_ep]).await?;
+        // `redb_store` drops here, releasing redb's process-exclusive lock before
+        // the reopen below.
+    }
+
+    // --- Simulated restart: reopen the SAME redb file, rebuild the handler. ---
+    let (cache_b, hash_b, _cache_tmp_b) = cache_with_blob(&payload).await?;
+    let reopened = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+    let rows = reopened.load_losses()?;
+    anyhow::ensure!(
+        rows == vec![(
+            pool_id(),
+            signer_a.address(),
+            u128::from(HARNESS_FLOOR_COST)
+        )],
+        "the durable row must name the signer that incurred the charge, got {rows:?}"
+    );
+
+    reopened.record(&fresh_lane(signer_a.address(), U256::from(10_000_000u64)))?;
+    reopened.record(&fresh_lane(signer_b.address(), U256::from(10_000_000u64)))?;
+    let store_dyn: Arc<dyn PoolStateStore> = reopened.clone();
+    let loss_dyn: Arc<dyn decdn_incentive::PoolFloorLossStore> = reopened.clone();
+
+    let (target_b, server_ep_b, server_task_b, metrics_b) =
+        spawn_pool_server_with_stores(cache_b, store_dyn, loss_dyn, remaining, 2_500).await?;
+
+    let (client_ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_node_id_b = B256::from(*client_ep_b.id().as_bytes());
+
+    // Signer A is still at its own cap after the reboot, while the pool holds three
+    // free floors — so hydration restored A's row, not just the pool total.
+    let conn_a = client_ep_b
+        .connect(target_b.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect A after restart: {e}"))?;
+    let ext_a = binding_ext(&signer_a, client_node_id_b)?;
+    let (refusal, refusal_ext) =
+        open_expecting_refusal(&conn_a, *hash_b.as_bytes(), Some(&ext_a)).await?;
+    anyhow::ensure!(
+        !refusal.body.ok,
+        "signer A's rehydrated dead charge must still fill its own share"
+    );
+    anyhow::ensure!(
+        matches!(
+            refusal_ext.error,
+            Some(decdn_protocol::client::StreamError::NotFound)
+        ),
+        "the sub-cap refusal collapses to NotFound on the wire, got {:?}",
+        refusal_ext.error
+    );
+    conn_a.close(0u32.into(), b"capped");
+
+    // Which cap refused is invisible on the wire, so the counters carry it: the
+    // sub-cap arm fired and the pool-ceiling arm did not. Without this pair the test
+    // would pass on a hydration that dumped A's charge into the pool total.
+    ensure_only_the_sub_cap_refused(&metrics_b)?;
+
+    // Signer B, untouched before the restart, is served from its own share.
+    let conn_b = client_ep_b
+        .connect(target_b, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect B after restart: {e}"))?;
+    let ext_b = binding_ext(&signer_b, client_node_id_b)?;
+    let (send_b, mut recv_b) = open_paid_stream(&conn_b, *hash_b.as_bytes(), Some(&ext_b)).await?;
+    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv_b).await?;
+    drop(send_b);
+    drop(recv_b);
+    conn_b.close(0u32.into(), b"done");
+
+    shutdown([server_task_b], [&client_ep_b, &server_ep_b]).await?;
     Ok(())
 }
 

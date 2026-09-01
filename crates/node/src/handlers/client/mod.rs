@@ -1118,7 +1118,10 @@ pub struct ClientHandlerDeps {
     /// floor sub-cap (ADR 003 §Pool solvency, per-signer floor isolation). The
     /// runtime sets it from `blockchain.pool_floor_signer_share_bps`; the default
     /// of `10_000` makes the sub-cap equal to the pool ceiling, i.e. a no-op, which
-    /// is what unit tests that only exercise the pool-wide bound want.
+    /// is what unit tests that only exercise the pool-wide bound want. It is
+    /// deliberately NOT the shipped default — `DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS`
+    /// is `2_500`, so a fixture that wants the production sub-cap must set this
+    /// field rather than rely on the deps default.
     pub pool_floor_signer_share_bps: u64,
     /// Absolute ceiling on that share, in ramp-start credit windows (ADR 003 §Pool
     /// solvency, per-signer floor isolation). The runtime sets it from
@@ -4066,8 +4069,6 @@ mod tests {
         );
     }
 
-    /// Lock the floor map for a test assertion, surfacing a poisoned lock as an
-    /// `anyhow` error rather than panicking (the anti-panic policy holds in tests).
     /// The capability signer every floor-accumulator unit test reserves under.
     /// A second signer (`TEST_SIGNER_B`) exercises the per-signer sub-cap.
     const TEST_SIGNER: Address = Address::new([0xa1u8; 20]);
@@ -4077,11 +4078,38 @@ mod tests {
     /// one-credit-window clamp in [`ClientHandler::signer_floor_cap`] reads it.
     const TEST_RATE: u64 = 1_000;
 
+    /// Lock the floor map for a test assertion, surfacing a poisoned lock as an
+    /// `anyhow` error rather than panicking (the anti-panic policy holds in tests).
     fn lock_floor(
         map: &Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
     ) -> anyhow::Result<std::sync::MutexGuard<'_, HashMap<B256, PoolFloorState>>> {
         map.lock()
             .map_err(|e| anyhow::anyhow!("floor map poisoned: {e}"))
+    }
+
+    /// Assert the accumulator's load-bearing invariant on one pool: the stored O(1)
+    /// pool counters are exactly the fold of its per-signer rows. A one-sided update
+    /// at any of the hand-maintained mutation sites would be silent, and — since
+    /// `dead_charge` only grows and clears only on pool reclaim — permanent.
+    fn ensure_floor_levels_agree(
+        handler: &ClientHandler,
+        pool: B256,
+        when: &str,
+    ) -> anyhow::Result<()> {
+        let st = lock_floor(&handler.pool_floor)?
+            .get(&pool)
+            .cloned()
+            .unwrap_or_default();
+        let folded = st
+            .signers
+            .values()
+            .fold(U256::ZERO, |acc, s| acc.saturating_add(s.committed()));
+        anyhow::ensure!(
+            st.committed() == folded,
+            "{when}: the pool total ({}) must stay the sum of its signer rows ({folded})",
+            st.committed()
+        );
+        Ok(())
     }
 
     /// A stream that never reaches a floor of payment leaves its unpaid tail (capped
@@ -4339,12 +4367,18 @@ mod tests {
         Ok(())
     }
 
-    /// The per-pool ceiling still bounds the AGGREGATE across signers: solvency
-    /// cannot be escaped by spraying identities. Four signers each take their own
-    /// full share, none of them ever exceeding its sub-cap, and the fifth is refused
-    /// `PoolExhausted` — the pool, not the signer, is what ran out.
+    /// The per-pool ceiling bounds the AGGREGATE however many signers draw on it:
+    /// solvency cannot be escaped by spraying identities. Four signers each take
+    /// their own full share, none of them ever exceeding its sub-cap, and the fifth
+    /// is refused `PoolExhausted` — the pool, not the signer, is what ran out.
+    ///
+    /// A roll-up guard on the POOL dimension only. It is deliberately blind to the
+    /// signer dimension — the arithmetic here holds with the sub-cap deleted
+    /// entirely — so it is not evidence that per-signer isolation works;
+    /// `signer_sub_cap_refuses_one_signer_and_admits_a_co_tenant` and
+    /// `one_signers_dead_charge_does_not_consume_a_co_tenants_share` carry that.
     #[tokio::test]
-    async fn pool_ceiling_still_bounds_the_aggregate_across_signers() -> anyhow::Result<()> {
+    async fn pool_ceiling_bounds_the_aggregate_however_many_signers_draw() -> anyhow::Result<()> {
         let metrics = Arc::new(Metrics::new());
         let (handler, _dir) =
             handler_for_tests_with_signer_share(&metrics, U256::ZERO, 2_500).await;
@@ -4565,38 +4599,285 @@ mod tests {
     }
 
     /// One signer's permanent `dead_charge` is charged to its own entry as well as to
-    /// the pool total, so it locks that signer out before it reaches any co-tenant's
-    /// share.
-    #[test]
-    fn one_signers_dead_charge_does_not_consume_a_co_tenants_share() -> anyhow::Result<()> {
-        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+    /// the pool total, so it locks that signer out of ADMISSION before it reaches any
+    /// co-tenant's share.
+    ///
+    /// Driven through [`ClientHandler::try_reserve_floor`] rather than by reading the
+    /// accumulator directly: the state assertions alone hold by construction — an
+    /// unseen signer reads as zero whether or not admission consults the sub-cap — so
+    /// they pass with the sub-cap deleted from `try_reserve_floor`. The admission
+    /// assertions are what fail when it is.
+    #[tokio::test]
+    async fn one_signers_dead_charge_does_not_consume_a_co_tenants_share() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        // Quarter shares, M = 0: four floors of headroom, one floor of share each.
+        let (handler, _dir) =
+            handler_for_tests_with_signer_share(&metrics, U256::ZERO, 2_500).await;
         let pool = B256::repeat_byte(0x33);
-        let floor = decdn_incentive::floor_micro(1000);
+        let floor = decdn_incentive::floor_micro(1_000_000);
+        let remaining = floor.saturating_mul(U256::from(4u64));
+        anyhow::ensure!(
+            handler.signer_floor_cap(remaining, TEST_RATE) == floor,
+            "a quarter of four floors of headroom is one floor, above the one-window clamp"
+        );
         {
             // Signer A abandons a stream: never settled, so the FULL reserved floor
-            // folds into its dead charge.
-            let _res = FloorReservation::reserve(
-                map.clone(),
-                None,
-                Arc::new(Metrics::new()),
-                pool,
-                TEST_SIGNER,
-                floor,
+            // folds into its dead charge, permanently.
+            let _res = handler
+                .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, floor)
+                .map_err(|e| anyhow::anyhow!("signer A's first floor refused: {e:?}"))?;
+        }
+        {
+            let st = lock_floor(&handler.pool_floor)?
+                .get(&pool)
+                .cloned()
+                .unwrap_or_default();
+            anyhow::ensure!(
+                st.dead_charge == floor && st.committed() == floor,
+                "the abandoned floor is charged to the pool total"
+            );
+            anyhow::ensure!(
+                st.signer_committed(TEST_SIGNER) == floor,
+                "and to the abandoning signer's own entry"
+            );
+            anyhow::ensure!(
+                st.signer_committed(TEST_SIGNER_B) == U256::ZERO,
+                "a co-tenant's entry is untouched by another signer's dead charge"
             );
         }
-        let st = lock_floor(&map)?.get(&pool).cloned().unwrap_or_default();
+        // The permanent charge fills A's whole share, so A is refused at ADMISSION
+        // while three floors of pool headroom remain untouched.
         anyhow::ensure!(
-            st.dead_charge == floor && st.committed() == floor,
-            "the abandoned floor is charged to the pool total"
+            handler
+                .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, floor)
+                .err()
+                .is_some_and(|e| matches!(e, FloorRefusal::SignerAtCap { .. })),
+            "a signer whose dead charge fills its share is refused by the SUB-cap, \
+             not the pool"
+        );
+        // ...and the co-tenant still draws on its own untouched share.
+        anyhow::ensure!(
+            handler
+                .try_reserve_floor(pool, TEST_SIGNER_B, remaining, TEST_RATE, floor)
+                .is_ok(),
+            "a co-tenant is admitted from its own share while the first signer is capped"
+        );
+        Ok(())
+    }
+
+    /// K threads race ONE admission through the pool ceiling: exactly one wins.
+    ///
+    /// [`ClientHandler::try_reserve_floor`] claims the budget read, both cap tests,
+    /// and the `live_reservation` increments happen under ONE lock hold, so two
+    /// concurrent admissions on a near-exhausted pool cannot both pass the check and
+    /// then both reserve. Every other floor test is sequential, so nothing else
+    /// exercises that claim: a check-then-reserve split would still pass them all and
+    /// over-commit only under contention.
+    ///
+    /// Each thread names a DISTINCT signer at a `10_000` bps share, so the sub-cap is
+    /// a no-op and the pool ceiling is unambiguously what refuses. The barrier makes
+    /// the threads collide inside the same lock acquisition rather than queueing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_admissions_cannot_over_commit_the_pool_ceiling() -> anyhow::Result<()> {
+        const RACERS: usize = 8;
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0, share 10_000 bps
+        let pool = B256::repeat_byte(0x3A);
+        let floor = decdn_incentive::floor_micro(1_000_000);
+        // Headroom for EXACTLY one floor: slack strictly under a second.
+        let remaining = floor.saturating_add(U256::from(1u64));
+        let barrier = std::sync::Barrier::new(RACERS);
+
+        let outcomes: Vec<Result<FloorReservation, FloorRefusal>> = std::thread::scope(|scope| {
+            let racers: Vec<_> = (0..RACERS)
+                .map(|i| {
+                    let handler = Arc::clone(&handler);
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        // A distinct signer per racer: at a 10_000 bps share every one
+                        // of them has the pool's whole headroom as its sub-cap, so the
+                        // only bound that can bite is the pool ceiling.
+                        let signer = Address::new([u8::try_from(i).unwrap_or(0xff); 20]);
+                        barrier.wait();
+                        handler.try_reserve_floor(pool, signer, remaining, TEST_RATE, floor)
+                    })
+                })
+                .collect();
+            racers
+                .into_iter()
+                .map(|h| h.join().map_err(|_| anyhow::anyhow!("racer panicked")))
+                .collect::<anyhow::Result<Vec<_>>>()
+        })?;
+
+        let admitted = outcomes.iter().filter(|o| o.is_ok()).count();
+        anyhow::ensure!(
+            admitted == 1,
+            "exactly one of {RACERS} concurrent admissions fits the one-floor ceiling, \
+             got {admitted}"
         );
         anyhow::ensure!(
-            st.signer_committed(TEST_SIGNER) == floor,
-            "and to the abandoning signer's own entry"
+            outcomes
+                .iter()
+                .filter_map(|o| o.as_ref().err())
+                .all(|e| matches!(e, FloorRefusal::PoolExhausted)),
+            "the losers are refused by the POOL ceiling, not the signer sub-cap"
+        );
+        ensure_floor_levels_agree(&handler, pool, "after the race")?;
+        drop(outcomes);
+        ensure_floor_levels_agree(&handler, pool, "after every guard drops")?;
+        Ok(())
+    }
+
+    /// The same race against ONE signer's share, with pool headroom the ceiling
+    /// cannot bind on: exactly one admission wins, and the losers name the SUB-cap.
+    ///
+    /// The pool-ceiling twin above cannot cover this: the two caps are separate tests
+    /// under the same lock hold, and a check-then-reserve split on the signer arm
+    /// alone would let two streams past one share while the pool stayed solvent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_admissions_cannot_over_commit_one_signers_share() -> anyhow::Result<()> {
+        const RACERS: usize = 8;
+        let metrics = Arc::new(Metrics::new());
+        // Quarter shares, M = 0.
+        let (handler, _dir) =
+            handler_for_tests_with_signer_share(&metrics, U256::ZERO, 2_500).await;
+        let pool = B256::repeat_byte(0x3B);
+        let floor = decdn_incentive::floor_micro(1_000_000);
+        // Four floors of headroom: a quarter share is exactly one floor, while the
+        // pool ceiling covers four — so only the sub-cap can refuse a second racer.
+        let remaining = floor.saturating_mul(U256::from(4u64));
+        anyhow::ensure!(
+            handler.signer_floor_cap(remaining, TEST_RATE) == floor,
+            "the share, not the one-window clamp, is the binding cap here"
+        );
+        let barrier = std::sync::Barrier::new(RACERS);
+
+        let outcomes: Vec<Result<FloorReservation, FloorRefusal>> = std::thread::scope(|scope| {
+            let racers: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let handler = Arc::clone(&handler);
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        handler.try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, floor)
+                    })
+                })
+                .collect();
+            racers
+                .into_iter()
+                .map(|h| h.join().map_err(|_| anyhow::anyhow!("racer panicked")))
+                .collect::<anyhow::Result<Vec<_>>>()
+        })?;
+
+        let admitted = outcomes.iter().filter(|o| o.is_ok()).count();
+        anyhow::ensure!(
+            admitted == 1,
+            "exactly one of {RACERS} concurrent admissions fits the one-floor share, \
+             got {admitted}"
         );
         anyhow::ensure!(
-            st.signer_committed(TEST_SIGNER_B) == U256::ZERO,
-            "a co-tenant's entry is untouched by another signer's dead charge"
+            outcomes
+                .iter()
+                .filter_map(|o| o.as_ref().err())
+                .all(|e| matches!(e, FloorRefusal::SignerAtCap { .. })),
+            "the losers are refused by the SUB-cap while the pool can still pay"
+        );
+        ensure_floor_levels_agree(&handler, pool, "after the race")?;
+        drop(outcomes);
+        ensure_floor_levels_agree(&handler, pool, "after every guard drops")?;
+        Ok(())
+    }
+
+    /// An admitted stream survives its signer's cap shrinking below the floor it
+    /// already committed, as long as the POOL stays solvent.
+    ///
+    /// The sub-cap is a share of `remaining − M`, so it shrinks as co-tenants draw the
+    /// pool down. [`ClientHandler::pool_budget_covers_reserve`] is deliberately the
+    /// pool level only for that reason: re-testing an already-admitted reservation
+    /// against the shrunken share would terminate a paying stream on a pool that can
+    /// still pay, and the mid-stream gate has nothing left to bound — the admitted
+    /// reservation is already counted at both levels. This pins that choice; adding
+    /// the sub-cap back to the re-check fails here.
+    #[tokio::test]
+    async fn an_admitted_stream_survives_its_signer_cap_shrinking() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) =
+            handler_for_tests_with_signer_share(&metrics, U256::ZERO, 2_500).await;
+        let pool = B256::repeat_byte(0x3C);
+        let floor = decdn_incentive::floor_micro(1_000_000);
+        // Eight floors of headroom: a quarter share is two floors, so one floor is
+        // comfortably inside the cap at admission time.
+        let wide = floor.saturating_mul(U256::from(8u64));
+        let _admitted = handler
+            .try_reserve_floor(pool, TEST_SIGNER, wide, TEST_RATE, floor)
+            .map_err(|e| anyhow::anyhow!("admission refused: {e:?}"))?;
+
+        // The owner's deposit drains to three floors — co-tenants spending, or the
+        // pool's own remaining falling as vouchers redeem. A quarter of three floors
+        // is under one floor, so this signer's cap is now BELOW what it committed.
+        let drained = floor.saturating_mul(U256::from(3u64));
+        anyhow::ensure!(
+            handler.signer_floor_cap(drained, TEST_RATE) < floor,
+            "the setup must actually shrink the cap below the committed floor"
+        );
+        anyhow::ensure!(
+            handler.pool_budget_covers_reserve(pool, drained, U256::ZERO),
+            "the mid-stream re-check reads the POOL level only, so a solvent pool \
+             keeps serving a stream whose signer share has shrunk under it"
+        );
+        // Non-vacuous in the other direction: once the POOL itself cannot cover the
+        // committed floor, the same re-check does refuse.
+        anyhow::ensure!(
+            !handler.pool_budget_covers_reserve(pool, U256::ZERO, U256::ZERO),
+            "an insolvent pool still fails the mid-stream re-check"
+        );
+        Ok(())
+    }
+
+    /// The SHIPPED default share is exercised, not just the `10_000` bps no-op every
+    /// other fixture pins.
+    ///
+    /// Every unit fixture defaults to `10_000` bps and the anvil e2e draws exactly one
+    /// floor per lane — inside the one-window clamp — so the share arithmetic itself
+    /// never runs at the value operators actually get. Read through the constant, so
+    /// a change to the default lands here rather than silently going uncovered.
+    #[tokio::test]
+    async fn the_shipped_default_share_bounds_a_signer_to_a_quarter() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests_with_signer_share(
+            &metrics,
+            U256::ZERO,
+            decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS,
+        )
+        .await;
+        let pool = B256::repeat_byte(0x3D);
+        let floor = decdn_incentive::floor_micro(1_000_000);
+        // Well above the one-window clamp, so the share is what binds.
+        let remaining = floor.saturating_mul(U256::from(40u64));
+        let cap = handler.signer_floor_cap(remaining, TEST_RATE);
+        anyhow::ensure!(
+            cap == remaining
+                .saturating_mul(U256::from(
+                    decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS
+                ))
+                .wrapping_div(U256::from(decdn_common::config::BPS_DENOMINATOR)),
+            "the default share is applied verbatim above the clamp"
+        );
+        anyhow::ensure!(
+            cap == floor.saturating_mul(U256::from(10u64)),
+            "a quarter of forty floors is ten"
+        );
+        // Exactly at the cap is admissible; one floor past it is not, while the pool
+        // still holds thirty floors of headroom.
+        let _held = handler
+            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, cap)
+            .map_err(|e| anyhow::anyhow!("a signer's exact share is refused: {e:?}"))?;
+        anyhow::ensure!(
+            handler
+                .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, floor)
+                .err()
+                .is_some_and(|e| matches!(e, FloorRefusal::SignerAtCap { .. })),
+            "one floor past the default share is refused by the sub-cap, not the pool"
         );
         Ok(())
     }
