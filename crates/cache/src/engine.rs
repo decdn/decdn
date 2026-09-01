@@ -2196,8 +2196,10 @@ impl CacheEngine {
     /// diffs a requested range — a block with any missing chunk is not
     /// covered.
     pub async fn coverage(&self, hash: Hash) -> CacheResult<decdn_protocol::Coverage> {
-        // One chunk is 1024 bytes; one discovery block is 65536 chunks (64 MiB).
-        const CHUNKS_PER_BLOCK: u64 = decdn_protocol::DISCOVERY_BLOCK_BYTES / 1024;
+        // One bao leaf chunk is 1024 bytes (`bao_tree::ChunkNum`'s unit); one
+        // discovery block is 65536 chunks (64 MiB).
+        const BAO_CHUNK_BYTES: u64 = 1024;
+        const CHUNKS_PER_BLOCK: u64 = decdn_protocol::DISCOVERY_BLOCK_BYTES / BAO_CHUNK_BYTES;
 
         if self.refuses(hash) {
             return Ok(decdn_protocol::Coverage::empty());
@@ -2218,7 +2220,7 @@ impl CacheEngine {
         };
         let present = self.present_ranges(hash).await?;
         let present = present.chunk_ranges();
-        let total_chunks = size.div_ceil(1024);
+        let total_chunks = size.div_ceil(BAO_CHUNK_BYTES);
         let total_blocks = decdn_protocol::num_blocks(size);
 
         let covered = (0..total_blocks).filter(|&i| {

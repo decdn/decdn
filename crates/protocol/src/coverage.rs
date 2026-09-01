@@ -40,10 +40,18 @@ pub const fn num_blocks(total_bytes: u64) -> u32 {
 /// length-prefixed byte vector — cheap on the wire and trivial to union/merge
 /// byte-wise if a future caller needs to.
 ///
-/// Carries no `num_blocks` field: the bitmap's own byte length only ever
-/// rounds a block count *up* to the next multiple of 8, so a trailing partial
-/// byte's unused high bits simply stay zero and never come back out of
-/// [`Self::covered_blocks`] or [`Self::covers`] for an out-of-range index.
+/// Carries no `num_blocks` field. A `Coverage` built locally (via
+/// [`Self::from_block_indices`] / [`Self::full`]) leaves the trailing partial
+/// byte's unused high bits zero. A `Coverage` **deserialized from untrusted
+/// wire** does not: the byte length only rounds the block count up to the next
+/// multiple of 8, and nothing on the wire pins the exact count, so a peer may
+/// set spurious high bits in that trailing byte. [`Self::covers`] and
+/// [`Self::covered_blocks`] report the raw bits as-is, so such a bit makes
+/// `covers(i)` true for an `i` past the blob's real block count. Consumers MUST
+/// clamp interpretation to the blob's own [`num_blocks`]`(total_bytes)` — query
+/// only `i < num_blocks`, and ignore any [`Self::covered_blocks`] index beyond
+/// it. The signed size, not the bitmap, is the authority on how many blocks
+/// exist.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Coverage {
     blocks: Vec<u8>,
@@ -98,7 +106,10 @@ impl Coverage {
         self.blocks.iter().all(|&b| b == 0)
     }
 
-    /// Iterates the covered block indices in ascending order.
+    /// Iterates the covered block indices in ascending order. Reports raw set
+    /// bits: a `Coverage` from untrusted wire may yield indices past the blob's
+    /// real block count (see the type doc), so a consumer bounds these against
+    /// its own [`num_blocks`]`(total_bytes)`.
     pub fn covered_blocks(&self) -> impl Iterator<Item = u32> + '_ {
         self.blocks.iter().enumerate().flat_map(|(byte_idx, &b)| {
             // `byte_idx` is bounded by the bitmap's own byte length, which never
