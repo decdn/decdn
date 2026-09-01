@@ -66,10 +66,17 @@ fn as_gauge(v: u64) -> i64 {
 /// DTO with a single production construction site.
 #[derive(Debug, Clone, Copy)]
 pub struct EvictionParams {
+    /// Configured cache size in MiB; the denominator for the two percentages.
     pub cache_size_mb: u64,
+    /// Crossing this percentage of the cache size starts a sweep.
     pub high_water_pct: u64,
+    /// A sweep runs until usage falls to this percentage. The gap to
+    /// `high_water_pct` is the hysteresis that stops it flapping.
     pub target_pct: u64,
+    /// Maximum blobs released in one sweep, so a sweep cannot monopolize the
+    /// store.
     pub per_sweep_budget: u64,
+    /// How often the driver re-reads usage.
     pub tick: Duration,
 }
 
@@ -440,7 +447,7 @@ mod tests {
         #[derive(Debug)]
         struct NewestFirst;
         impl decdn_cache::EvictionPolicy for NewestFirst {
-            fn plan(&self, ctx: &decdn_cache::EvictionContext) -> decdn_cache::EvictionPlan {
+            fn plan(&self, ctx: &decdn_cache::EvictionContext<'_>) -> decdn_cache::EvictionPlan {
                 let mut v: Vec<_> = ctx.candidates.iter().map(|(h, t)| (*h, *t)).collect();
                 v.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
                 let mut evict = Vec::new();

@@ -32,6 +32,7 @@ pub struct ResourcePressure {
 }
 
 impl ResourcePressure {
+    /// A policy with these thresholds, starting unpressured.
     #[must_use]
     pub const fn new(params: Params) -> Self {
         Self {

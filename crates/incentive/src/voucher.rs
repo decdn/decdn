@@ -172,7 +172,9 @@ impl Voucher {
 /// contract then matches against the registered capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedVoucher {
+    /// The cumulative payment claim.
     pub voucher: Voucher,
+    /// The capability signer's EIP-712 signature over it.
     pub signature: Signature,
 }
 
@@ -231,7 +233,9 @@ pub enum VoucherError {
     /// match the expected signer — e.g., the lane's pinned capability signer.
     #[error("voucher signed by {recovered}, expected {expected}")]
     WrongSigner {
+        /// The address the voucher had to be signed by.
         expected: Address,
+        /// The address the signature actually recovers to.
         recovered: Address,
     },
 }

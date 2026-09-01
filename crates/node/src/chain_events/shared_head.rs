@@ -52,6 +52,8 @@ use super::timed;
 /// `Err` is retryable: the caller's tick fails into backoff.
 #[async_trait]
 pub trait HeadSource: Send + Sync {
+    /// The current chain head, at or before the true head and never ahead
+    /// of it. `Err` is retryable.
     async fn head(&self) -> Result<u64>;
 }
 

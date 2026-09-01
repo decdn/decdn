@@ -53,6 +53,8 @@ pub struct MarginPolicy {
 }
 
 impl MarginPolicy {
+    /// `discount_bps` scales heat into the expected re-serve count `n_hat`,
+    /// which `n_max` caps.
     #[must_use]
     pub const fn new(discount_bps: u32, n_max: u32) -> Self {
         Self {

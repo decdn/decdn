@@ -34,7 +34,7 @@ use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets};
 
 /// Fresh random iroh identity.
-pub fn fresh_key() -> SecretKey {
+pub(crate) fn fresh_key() -> SecretKey {
     SecretKey::generate()
 }
 
@@ -46,7 +46,7 @@ pub fn fresh_key() -> SecretKey {
 /// the requested content length. Callers that used `payload.len()` for a
 /// bytes-delivered / receipt / region assertion now use this.
 #[must_use]
-pub fn bao_wire_len(total: u64, byte_offset: u64, byte_len: u64) -> u64 {
+pub(crate) fn bao_wire_len(total: u64, byte_offset: u64, byte_len: u64) -> u64 {
     match decdn_cache::range_pull::align_range(byte_offset, byte_len, total) {
         Ok(aligned) => decdn_cache::range_pull::bao_encoded_size(total, aligned.chunk_ranges()),
         // align_range only rejects an offset past the blob; tests pass valid
@@ -57,12 +57,12 @@ pub fn bao_wire_len(total: u64, byte_offset: u64, byte_len: u64) -> u64 {
 
 /// Whole-blob convenience for [`bao_wire_len`].
 #[must_use]
-pub fn bao_wire_len_whole(total: u64) -> u64 {
+pub(crate) fn bao_wire_len_whole(total: u64) -> u64 {
     bao_wire_len(total, 0, 0)
 }
 
 /// Open an empty cache (no origins) in a fresh temp dir.
-pub async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
+pub(crate) async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
     let cache = CacheEngine::open(tmp.path(), vec![], 16).await?;
     Ok((cache, tmp))
@@ -71,7 +71,7 @@ pub async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
 /// Open a cache pre-seeded with `payload` (pulled+verified via a filesystem
 /// origin, then the origin dir is dropped). Returns the cache, blob hash, and
 /// the cache temp dir to keep alive.
-pub async fn cache_with_blob(
+pub(crate) async fn cache_with_blob(
     payload: &[u8],
 ) -> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir)> {
     let hash = Hash::new(payload);
@@ -98,7 +98,7 @@ pub async fn cache_with_blob(
 }
 
 /// A connection limiter with all gates wide open (the common-case test setup).
-pub fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
+pub(crate) fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
     let cfg = ResolvedSecurity {
         max_concurrent_handlers: u32::MAX,
         per_source_rate_per_sec: 1_000_000.0,
@@ -110,7 +110,7 @@ pub fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
 
 /// Bind a loopback iroh endpoint with relays disabled, returning the endpoint
 /// and a dialable IPv4 socket address (loopback-rewritten if bound to 0.0.0.0).
-pub async fn local_endpoint(
+pub(crate) async fn local_endpoint(
     secret_key: SecretKey,
     alpns: Vec<Vec<u8>>,
 ) -> anyhow::Result<(Endpoint, SocketAddr)> {
@@ -169,7 +169,7 @@ const _: () = assert!(
 /// own — `1` is clean for one endpoint and a breach for two — so the totals ride
 /// along and [`ShutdownReport::is_clean`] is what callers assert on.
 #[derive(Debug, Clone, Copy)]
-pub struct ShutdownReport {
+pub(crate) struct ShutdownReport {
     /// Tasks joined before the deadline, whether they ended on their own,
     /// took the abort, or panicked.
     pub reaped: usize,
@@ -183,7 +183,7 @@ pub struct ShutdownReport {
 
 impl ShutdownReport {
     /// Every task reaped and every endpoint closed inside the deadline.
-    pub const fn is_clean(&self) -> bool {
+    pub(crate) const fn is_clean(&self) -> bool {
         self.reaped == self.of_tasks && self.closed == self.of_endpoints
     }
 }
@@ -249,7 +249,7 @@ impl ShutdownReport {
 /// # Errors
 ///
 /// A server task that panicked.
-pub async fn shutdown<const N: usize, const M: usize>(
+pub(crate) async fn shutdown<const N: usize, const M: usize>(
     tasks: [tokio::task::JoinHandle<()>; N],
     endpoints: [&Endpoint; M],
 ) -> anyhow::Result<ShutdownReport> {
@@ -266,7 +266,11 @@ pub async fn shutdown<const N: usize, const M: usize>(
 /// # Errors
 ///
 /// A server task that panicked.
-pub async fn shutdown_within<const N: usize, const M: usize>(
+#[expect(
+    clippy::print_stderr,
+    reason = "test harness diagnostic surfaced in the nextest log"
+)]
+pub(crate) async fn shutdown_within<const N: usize, const M: usize>(
     deadline: Duration,
     tasks: [tokio::task::JoinHandle<()>; N],
     endpoints: [&Endpoint; M],
@@ -333,7 +337,7 @@ pub async fn shutdown_within<const N: usize, const M: usize>(
 /// # Errors
 ///
 /// The task panicked, was cancelled, or outlived [`SHUTDOWN_TIMEOUT`].
-pub async fn reap<T>(label: &str, task: tokio::task::JoinHandle<T>) -> anyhow::Result<T> {
+pub(crate) async fn reap<T>(label: &str, task: tokio::task::JoinHandle<T>) -> anyhow::Result<T> {
     let handle = task.abort_handle();
     match tokio::time::timeout(SHUTDOWN_TIMEOUT, task).await {
         Ok(Ok(value)) => Ok(value),
@@ -355,7 +359,7 @@ pub async fn reap<T>(label: &str, task: tokio::task::JoinHandle<T>) -> anyhow::R
 /// EIP-712 domains a [`ClientHandler`] needs: slash-receipt, voucher, and
 /// client-binding. Grouped so callers thread one value through the builders.
 #[derive(Clone)]
-pub struct HandlerDomains {
+pub(crate) struct HandlerDomains {
     pub slash: Eip712Domain,
     pub voucher: Eip712Domain,
     pub binding: Eip712Domain,
@@ -364,7 +368,7 @@ pub struct HandlerDomains {
 /// In-memory [`ReceiptLog`] fake for tests: collects appended receipts so a
 /// suite can assert what was recorded on the voucher-accept path (issue #248).
 #[derive(Debug, Default)]
-pub struct VecReceiptLog {
+pub(crate) struct VecReceiptLog {
     inner: std::sync::Mutex<Vec<DownloadReceipt>>,
 }
 
@@ -378,7 +382,7 @@ impl VecReceiptLog {
     /// defaulting to empty (the prior `unwrap_or_default`) would mask the real
     /// failure cause in a test double.
     #[must_use]
-    pub fn snapshot(&self) -> Vec<DownloadReceipt> {
+    pub(crate) fn snapshot(&self) -> Vec<DownloadReceipt> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -401,7 +405,7 @@ impl ReceiptLog for VecReceiptLog {
 /// payment already committed to the channel store, so delivery must still
 /// succeed.
 #[derive(Debug, Default)]
-pub struct FailingReceiptLog;
+pub(crate) struct FailingReceiptLog;
 
 impl ReceiptLog for FailingReceiptLog {
     fn append(&self, _receipt: &DownloadReceipt) -> std::io::Result<()> {
@@ -415,7 +419,7 @@ impl ReceiptLog for FailingReceiptLog {
 /// the real background-writer sink, delivery must complete even while every
 /// `append` is stalled here (the buggy pre-#803 code awaited the append inline).
 #[derive(Default)]
-pub struct BlockingReceiptLog {
+pub(crate) struct BlockingReceiptLog {
     state: std::sync::Mutex<BlockingReceiptState>,
     released: std::sync::Condvar,
 }
@@ -428,7 +432,7 @@ struct BlockingReceiptState {
 
 impl BlockingReceiptLog {
     /// Unblock all current and future `append` calls.
-    pub fn release(&self) {
+    pub(crate) fn release(&self) {
         if let Ok(mut g) = self.state.lock() {
             g.released = true;
         }
@@ -437,7 +441,7 @@ impl BlockingReceiptLog {
 
     /// Snapshot the receipts appended so far.
     #[must_use]
-    pub fn snapshot(&self) -> Vec<DownloadReceipt> {
+    pub(crate) fn snapshot(&self) -> Vec<DownloadReceipt> {
         self.state
             .lock()
             .map(|g| g.seen.clone())
@@ -467,7 +471,7 @@ impl ReceiptLog for BlockingReceiptLog {
 /// Uses a throwaway in-memory receipt log; tests asserting receipt contents use
 /// [`build_handler_full_with_receipts`].
 #[allow(clippy::too_many_arguments)]
-pub fn build_handler_full(
+pub(crate) fn build_handler_full(
     server_id: iroh::PublicKey,
     server_eth: &Arc<PrivateKeySigner>,
     metrics: &Arc<Metrics>,
@@ -497,7 +501,7 @@ pub fn build_handler_full(
 /// Like [`build_handler_full`] but takes an explicit [`ReceiptLog`] so a test
 /// can hold a handle ([`VecReceiptLog`]) and assert the appended receipts.
 #[allow(clippy::too_many_arguments)]
-pub fn build_handler_full_with_receipts(
+pub(crate) fn build_handler_full_with_receipts(
     server_id: iroh::PublicKey,
     server_eth: &Arc<PrivateKeySigner>,
     metrics: &Arc<Metrics>,
@@ -533,7 +537,7 @@ pub fn build_handler_full_with_receipts(
 /// [`decdn_node::receipt_log::spawn_receipt_writer`] — so a test can exercise
 /// the production enqueue path instead of the synchronous [`DirectReceiptSink`].
 #[allow(clippy::too_many_arguments)]
-pub fn build_handler_full_with_sink(
+pub(crate) fn build_handler_full_with_sink(
     server_id: iroh::PublicKey,
     server_eth: &Arc<PrivateKeySigner>,
     metrics: &Arc<Metrics>,
@@ -616,7 +620,7 @@ fn client_handler_deps(
 /// …) by setting the matching `deps` fields. Uses the throwaway in-memory receipt
 /// log, like [`build_handler_full`].
 #[allow(clippy::too_many_arguments)]
-pub fn build_handler_full_configured(
+pub(crate) fn build_handler_full_configured(
     server_id: iroh::PublicKey,
     server_eth: &Arc<PrivateKeySigner>,
     metrics: &Arc<Metrics>,
@@ -649,7 +653,7 @@ pub fn build_handler_full_configured(
 /// Read one length-framed [`ClientMessage`] from `recv`. Mirrors the requester's
 /// private `client_requester::read_client_message`, exposed for the raw fake
 /// clients/servers the `cdn/client/v1` integration binaries hand-roll.
-pub async fn read_client_msg(recv: &mut RecvStream) -> anyhow::Result<ClientMessage> {
+pub(crate) async fn read_client_msg(recv: &mut RecvStream) -> anyhow::Result<ClientMessage> {
     let frame = read_frame(recv)
         .await
         .map_err(|e| anyhow::anyhow!("read frame: {e}"))?;
@@ -664,7 +668,7 @@ pub async fn read_client_msg(recv: &mut RecvStream) -> anyhow::Result<ClientMess
 /// The open-stage twin of [`read_client_msg`], which drops the remainder because
 /// every mid-stream variant is a single postcard value. Use this wherever a test
 /// needs the unsigned `error` code, which rides in the extension.
-pub async fn read_stream_response(
+pub(crate) async fn read_stream_response(
     recv: &mut RecvStream,
 ) -> anyhow::Result<(
     decdn_protocol::StreamResponse,
@@ -685,7 +689,10 @@ pub async fn read_stream_response(
 
 /// Write one length-framed [`ClientMessage`] to `send` (the write-side twin of
 /// [`read_client_msg`]).
-pub async fn write_client_msg(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Result<()> {
+pub(crate) async fn write_client_msg(
+    send: &mut SendStream,
+    msg: &ClientMessage,
+) -> anyhow::Result<()> {
     let payload = encode_message(msg).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
     write_frame(send, &payload)
         .await
@@ -695,7 +702,7 @@ pub async fn write_client_msg(send: &mut SendStream, msg: &ClientMessage) -> any
 /// Accept exactly one inbound connection on `ep` — the [`spawn_server`] accept
 /// plumbing (`incoming.accept()` then `connecting.await`) factored out for the
 /// one-shot raw servers that don't run a full accept loop.
-pub async fn accept_one(ep: &Endpoint) -> anyhow::Result<Connection> {
+pub(crate) async fn accept_one(ep: &Endpoint) -> anyhow::Result<Connection> {
     let incoming = ep
         .accept()
         .await
@@ -710,7 +717,7 @@ pub async fn accept_one(ep: &Endpoint) -> anyhow::Result<Connection> {
 
 /// Spawn a server endpoint running `handler`, accepting connections until the
 /// endpoint closes.
-pub fn spawn_server(
+pub(crate) fn spawn_server(
     server_ep: Endpoint,
     handler: Arc<ClientHandler>,
 ) -> tokio::task::JoinHandle<()> {

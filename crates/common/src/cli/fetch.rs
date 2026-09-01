@@ -497,6 +497,8 @@ pub struct FetchArgs {
     #[arg(long, value_name = "ID", value_parser = parse_fetch_namespace_id)]
     pub namespace: Option<u64>,
 
+    /// Retrieval flags shared with `decdn bundle pull`: peer discovery, chain
+    /// and payment-pool coordinates, multi-source and deadline tuning.
     #[command(flatten)]
     pub common: ClientFetchArgs,
 }

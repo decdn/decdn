@@ -1771,6 +1771,7 @@ macro_rules! watcher_downtime_recorders {
 }
 
 recorders! {
+    /// A `cdn/probe/v1` request was served.
     probe_request => probe_requests.inc();
 
     /// Publish the current count of active probe holds (ADR 005).
@@ -2131,7 +2132,9 @@ recorders! {
     /// cache (positive + negative entries), after an insert.
     origin_directory_cache_size(count: usize)
         => origin_directory_cache_size.set(sat(count));
+    /// A connection was accepted and handed to a handler.
     connection_opened => active_connections.inc();
+    /// A connection closed. Pairs with `connection_opened`.
     connection_closed => active_connections.dec();
 
     /// A `cdn/client/v1` connection was reaped by the application-layer idle

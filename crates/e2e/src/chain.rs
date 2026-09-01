@@ -190,12 +190,20 @@ pub struct EvidencePair<'a> {
 /// Deployed protocol contract addresses, read from the forge-script manifest.
 #[derive(Debug, Clone, Copy)]
 pub struct ContractAddrs {
+    /// `CapacityBond` — operator stake and slashing collateral.
     pub capacity_bond: Address,
+    /// `PaymentPool` — the shared USDC pools clients fund and sellers redeem.
     pub payment_pool: Address,
+    /// `FeeRouter` — splits redeemed revenue per ADR 026 § FeeRouter split.
     pub fee_router: Address,
+    /// `Token` — the TOKEN ERC-20 used for staking and governance.
     pub token: Address,
+    /// `SlashJudge` — adjudicates slash claims.
     pub slash_judge: Address,
+    /// `SlashAppeal` — the operator's appeal surface against a slash.
     pub slash_appeal: Address,
+    /// `DecdnGovernor` — the on-chain governor that proposes through the
+    /// timelock below.
     pub governor: Address,
     /// `TimelockController` — holds `GOVERNANCE_ROLE` + `DEFAULT_ADMIN_ROLE` on
     /// the governed contracts after the `DeployProtocol` handoff. The blacklist
@@ -203,11 +211,17 @@ pub struct ContractAddrs {
     /// deployer keeps no privileged roles; the G-NODE-05 grant executes through
     /// it via a real Governor proposal.
     pub timelock: Address,
+    /// `PublisherRegistry` — namespace ownership and its timelocked transfer
+    /// (ADR 002). Publisher identity is implicit on first `createNamespace`;
+    /// vetting lives in the policy at `manual_vetting_policy` below.
     pub publisher_registry: Address,
+    /// `OriginAssignment` — which bonded operators a publisher has seated as
+    /// authorized origins for each of its namespaces (ADR 011).
     pub origin_assignment: Address,
     /// `ManualVettingPolicy` — the genesis vetting policy `OriginAssignment`
     /// reads. The fixture vets publishers here (see [`ChainFixture::vet_publisher`]).
     pub manual_vetting_policy: Address,
+    /// `ContentBlacklist` — the on-chain takedown set the deny gate reads.
     pub content_blacklist: Address,
 }
 

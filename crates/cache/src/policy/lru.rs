@@ -5,11 +5,13 @@ use super::{
 };
 use crate::Hash;
 
+/// Evicts strictly by last access, oldest first, until the sweep reaches
+/// `target_bytes` or spends its budget. Promotes nothing.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LruEviction;
 
 impl EvictionPolicy for LruEviction {
-    fn plan(&self, ctx: &EvictionContext) -> EvictionPlan {
+    fn plan(&self, ctx: &EvictionContext<'_>) -> EvictionPlan {
         let mut ordered: Vec<(Hash, std::time::Instant)> =
             ctx.candidates.iter().map(|(h, t)| (*h, *t)).collect();
         ordered.sort_by_key(|(_, last)| *last); // oldest access first
@@ -32,6 +34,8 @@ impl EvictionPolicy for LruEviction {
     }
 }
 
+/// Stores every miss, straight into [`Segment::Main`]. The default admission
+/// policy, and the one that makes the segment map inert.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AlwaysAdmit;
 

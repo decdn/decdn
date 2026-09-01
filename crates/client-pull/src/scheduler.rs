@@ -2109,6 +2109,10 @@ mod tests {
     /// slow enough to reach `CEILING` is one this test is unreliable on
     /// whatever it is handed, so the ceiling says so on stderr rather than
     /// pretending the factor still holds.
+    #[expect(
+        clippy::print_stderr,
+        reason = "test-only calibration diagnostic surfaced in the nextest log"
+    )]
     async fn calibrated_wedge_budget() -> anyhow::Result<WedgeBudget> {
         const FLOOR: Duration = Duration::from_millis(600);
         const CEILING: Duration = Duration::from_secs(5);

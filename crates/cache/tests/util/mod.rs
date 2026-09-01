@@ -20,7 +20,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 /// Deterministic pseudo-random blob, identical generator to
 /// `pull_through.rs:4035` / `range_pull.rs`.
 #[allow(dead_code)]
-pub fn make_blob(len: usize) -> Vec<u8> {
+pub(crate) fn make_blob(len: usize) -> Vec<u8> {
     let mut v = vec![0u8; len];
     let mut x: u32 = 0x9e37_79b9;
     for b in &mut v {
@@ -33,7 +33,7 @@ pub fn make_blob(len: usize) -> Vec<u8> {
 }
 
 #[allow(dead_code)]
-pub fn sub(data: &[u8], start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn sub(data: &[u8], start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
     let s = usize::try_from(start)?;
     let e = usize::try_from(end)?;
     data.get(s..e)
@@ -58,12 +58,12 @@ async fn build(origins: Vec<Arc<dyn Origin>>) -> anyhow::Result<(CacheEngine, te
 }
 
 #[allow(dead_code)]
-pub async fn empty_engine() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
+pub(crate) async fn empty_engine() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     build(vec![]).await
 }
 
 #[allow(dead_code)]
-pub async fn engine_with_whole_blob(
+pub(crate) async fn engine_with_whole_blob(
     payload: &[u8],
 ) -> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir, MockServer)> {
     let hash = Hash::new(payload);
@@ -79,7 +79,7 @@ pub async fn engine_with_whole_blob(
 }
 
 #[allow(dead_code)]
-pub async fn engine_with_range_origin(
+pub(crate) async fn engine_with_range_origin(
     payload: &[u8],
 ) -> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir, MockServer)> {
     let ob = PreOrderMemOutboard::create(payload, IROH_BLOCK_SIZE);

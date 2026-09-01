@@ -80,7 +80,10 @@ pub const SLASH_SIG_LEN: usize = 65;
 pub enum MessageValidationError {
     /// `rate_per_mb` exceeds [`MAX_RATE_PER_MB`].
     #[error("rate_per_mb {rate} exceeds MAX_RATE_PER_MB ({max})", max = MAX_RATE_PER_MB)]
-    RateTooLarge { rate: u64 },
+    RateTooLarge {
+        /// The rate that was offered.
+        rate: u64,
+    },
     /// `rate_per_mb` is zero. A zero rate trivially wins client selection
     /// (score `rate × rtt × scale / reputation²` → 0, sorting to the top)
     /// while earning the node nothing — an obvious misconfiguration. Nodes
@@ -100,21 +103,30 @@ pub enum MessageValidationError {
          (ADR 014 §1: mandatory non-empty; EOA form is {expected} bytes)",
         expected = SLASH_SIG_LEN
     )]
-    InvalidSlashSigLen { len: usize },
+    InvalidSlashSigLen {
+        /// The signature length that was offered.
+        len: usize,
+    },
     /// A wire [`crate::client::Voucher`]'s `signature` is not
     /// [`crate::client::VOUCHER_SIG_LEN`] bytes. The EOA off-chain voucher
     /// signing form (ADR 024 §Off-Chain ERC-1271 Verification) is exactly that
     /// length; receivers reject deviations before reconstructing the EIP-712
     /// typed data.
     #[error("Voucher.signature has invalid length {len} (EOA form is 65 bytes)")]
-    InvalidVoucherSigLen { len: usize },
+    InvalidVoucherSigLen {
+        /// The signature length that was offered.
+        len: usize,
+    },
     /// A wire [`crate::client::ClientBinding`]'s `binding_signature` is not
     /// [`crate::client::BINDING_SIG_LEN`] bytes. The `BindNodeId` attestation
     /// is the same EOA off-chain signing form (ADR 024 §Off-Chain ERC-1271
     /// Verification); receivers reject deviations before `decdn_incentive`
     /// recovers the bound address.
     #[error("ClientBinding.binding_signature has invalid length {len} (EOA form is 65 bytes)")]
-    InvalidBindingSigLen { len: usize },
+    InvalidBindingSigLen {
+        /// The signature length that was offered.
+        len: usize,
+    },
     /// A [`crate::client::StreamResponse`] carries `body.ok == true` yet also an
     /// `error`. A node MUST NOT both promise to serve and report a failure
     /// (ADR 005 §`cdn/client/v1`). Enforced via

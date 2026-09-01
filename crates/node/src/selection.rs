@@ -197,7 +197,9 @@ pub struct Candidate {
 /// A candidate paired with its computed selection score. Lower score is better.
 #[derive(Debug, Clone)]
 pub struct RankedCandidate {
+    /// The peer that was scored.
     pub candidate: Candidate,
+    /// Its selection score. Lower is better.
     pub score: f64,
 }
 

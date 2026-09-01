@@ -23,6 +23,7 @@ use super::fetch::ClientFetchArgs;
 /// Top-level `decdn bundle` group.
 #[derive(Args, Debug)]
 pub struct BundleArgs {
+    /// The `decdn bundle` subcommand to run.
     #[command(subcommand)]
     pub cmd: BundleCommand,
 }
@@ -145,6 +146,8 @@ pub struct BundlePullArgs {
     #[arg(long, value_name = "ID", value_parser = super::fetch::parse_fetch_namespace_id)]
     pub namespace: Option<u64>,
 
+    /// Retrieval flags shared with `decdn fetch`: peer discovery, payment
+    /// pool, and output handling.
     #[command(flatten)]
     pub common: ClientFetchArgs,
 }

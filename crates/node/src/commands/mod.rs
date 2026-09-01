@@ -12,6 +12,10 @@ use decdn_common::{cli, config};
 use crate::runtime;
 
 /// Run the deCDN node with resolved configuration.
+#[expect(
+    clippy::print_stderr,
+    reason = "runs before the tracing subscriber is initialized"
+)]
 pub async fn run(
     config_path: Option<&std::path::Path>,
     run_args: &cli::RunArgs,
@@ -98,6 +102,12 @@ fn init_tracing(
 
     #[cfg(not(feature = "otlp"))]
     {
+        // `allow`, not `expect`: this `eprintln!` is itself cfg-gated, so an
+        // `--all-features` build would find the expectation unfulfilled. Scoped
+        // to this block rather than the function so the `LogLevelSetter` closure
+        // below — which runs on SIGHUP, long after `registry.init()` — stays
+        // covered by the workspace deny.
+        #[allow(clippy::print_stderr)]
         if resolved.observability.otlp_endpoint.is_some() {
             eprintln!("warning: --otlp-endpoint ignored (binary not built with 'otlp' feature)");
         }

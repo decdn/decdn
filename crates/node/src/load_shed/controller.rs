@@ -16,7 +16,7 @@ use super::{
 
 /// Bytes/sec for a megabit/sec budget: `Mbps * 1_000_000 / 8`.
 #[must_use]
-pub const fn egress_budget_bps(mbps: u64) -> u64 {
+const fn egress_budget_bps(mbps: u64) -> u64 {
     mbps.saturating_mul(125_000)
 }
 
@@ -49,6 +49,8 @@ pub struct LoadShedController {
 }
 
 impl LoadShedController {
+    /// Build a controller with the policy `cfg` selects, a fresh in-flight
+    /// counter, and an unseeded egress meter.
     #[must_use]
     pub fn from_config(cfg: &ResolvedLoadShed) -> Arc<Self> {
         Arc::new(Self {

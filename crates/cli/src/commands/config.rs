@@ -433,7 +433,11 @@ pub enum OriginSpec {
     Fs(std::path::PathBuf),
     /// S3-compatible origin. `bucket` is `None` for the bare `s3` spelling —
     /// the emitted block then carries a placeholder bucket to edit.
-    S3 { bucket: Option<String> },
+    S3 {
+        /// The bucket named in `s3://<bucket>`, or `None` for the bare `s3`
+        /// spelling.
+        bucket: Option<String>,
+    },
 }
 
 /// Map the `config init` role flags to a [`Role`]. `--origin` and `--client`

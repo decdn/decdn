@@ -24,7 +24,10 @@ pub use state::{ShedSlot, ShedState};
 /// is shed first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestClass {
+    /// The blob is already local: zero upstream cost, so it sheds last.
     CacheHit,
+    /// The blob must be pulled: origin egress plus upstream USDC, so it
+    /// sheds first.
     CacheMiss,
 }
 
@@ -53,9 +56,12 @@ pub enum ShedReason {
     ClientAtCapacity,
 }
 
+/// What a policy decided about one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShedDecision {
+    /// Serve it.
     Admit,
+    /// Refuse it, for this reason. The wire answer is `NotFound` regardless.
     Shed(ShedReason),
 }
 
@@ -63,6 +69,7 @@ pub enum ShedDecision {
 /// so it is unit-testable without a running node; the node wiring layer selects
 /// the implementation from config.
 pub trait LoadShedPolicy: Send + Sync {
+    /// Judge one request against a single pressure sample.
     fn decide(&self, class: RequestClass, snap: &PressureSnapshot) -> ShedDecision;
 
     /// Whether the policy currently considers the node pressured. Drives the
