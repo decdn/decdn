@@ -304,7 +304,7 @@ struct FloorGuardDeps {
 /// guard releases the live reservation if it was not already repaid and folds the
 /// last-noted unpaid amount (capped at the reserved amount) into the durable
 /// `dead_charge`,
-/// then persists the new dead total best-effort. Mirrors [`LaneSlot`]: the
+/// then persists the new dead total best-effort. Mirrors [`super::LaneSlot`]: the
 /// reservation is owned by the guard and never adjusted by hand, and every counter
 /// update saturates.
 #[must_use = "dropping the guard at once folds the FULL reservation into the pool's \
