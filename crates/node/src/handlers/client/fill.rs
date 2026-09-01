@@ -245,6 +245,46 @@ impl ClientHandler {
         }
     }
 
+    /// The partial-serve gate (#1506): whether `[byte_offset, byte_offset +
+    /// byte_len)` is already fully present in the LOCAL cache of a blob
+    /// `serve_audit` reports unserveable (not `Complete`) — the counterpart
+    /// to the will-serve coverage a partial holder now advertises (probe/DHT
+    /// tasks 2-3). Returns the blob's total size when so, letting the caller
+    /// skip straight to the size gate + delivery instead of running the
+    /// miss-path fill legs; `None` otherwise.
+    ///
+    /// `None` covers three cases the caller treats identically — this is a
+    /// best-effort optimization, never a decline path, so every one of them
+    /// falls through to the ordinary miss path unchanged: the requested span
+    /// is genuinely not fully cached, the local `inspect` failed, or the
+    /// blob's size is not yet knowable. That last case is a real limitation:
+    /// iroh-blobs only reports a `Partial` blob's size once its FINAL chunk
+    /// is present, so a non-origin front-prefix partial (holds the front, not
+    /// the tail) can't size its range here even though it may hold the
+    /// requested bytes. Closing that needs size persistence independent of
+    /// the store's own bookkeeping, which is out of scope.
+    ///
+    /// Reuses [`CacheEngine::missing_ranges`](super::CacheEngine::missing_ranges)'s
+    /// own size contract — the same `blob_size` source
+    /// [`Self::try_range_pull_through`] resolves via
+    /// [`CacheEngine::origin_size`](super::CacheEngine::origin_size) for the
+    /// ORIGIN-backed case; here the size comes from the LOCAL store's own
+    /// `inspect`, since a purely local partial has no origin to probe.
+    pub(super) async fn partial_hit_size(
+        &self,
+        hash: Hash,
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> Option<u64> {
+        let size = self.cache.inspect(hash).await.ok()?.size_bytes?;
+        let missing = self
+            .cache
+            .missing_ranges(hash, byte_offset, byte_len, size)
+            .await
+            .ok()?;
+        missing.is_empty().then_some(size)
+    }
+
     /// Handle a foreground pull-through deadline expiry (#859). Serves the blob if
     /// it landed in the store in the race; otherwise meters the abandoned pull and
     /// reports the miss.
