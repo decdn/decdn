@@ -402,6 +402,7 @@ pub(crate) async fn probe_and_order(
                 candidate: cand.clone(),
                 rtt_ms,
                 total_bytes: resp_ext.total_bytes,
+                coverage: resp_ext.coverage.clone(),
             });
         } else if warming.enabled {
             warming_pool.push(discovery::WarmingCandidate {
@@ -2346,6 +2347,7 @@ mod tests {
             },
             rtt_ms,
             total_bytes,
+            coverage: decdn_protocol::Coverage::empty(),
         }
     }
 
