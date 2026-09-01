@@ -2179,6 +2179,62 @@ impl CacheEngine {
         Ok(Box::pin(stream.map(|bf| bf.ranges)))
     }
 
+    /// Which [`decdn_protocol::DISCOVERY_BLOCK_BYTES`] discovery blocks of
+    /// `hash` this node can serve from its own cache right now.
+    ///
+    /// Cached blocks only — an origin-backed node that could re-pull the
+    /// whole blob on demand does NOT get all-ones here; that capability-aware
+    /// widening is the probe handler's job (it alone knows whether `hash` has
+    /// a configured origin), not this cache-only derivation's. Absent,
+    /// evicted, or otherwise refused hashes report [`decdn_protocol::Coverage::empty`],
+    /// mirroring [`Self::present_ranges`]'s guards.
+    ///
+    /// A block is covered iff every chunk in its byte span is present: this
+    /// reads `status()` for the blob's size (a `NotFound` or unknown-size
+    /// `Partial` reports no blocks), then diffs each block's chunk range
+    /// against [`Self::present_ranges`] the same way [`Self::missing_ranges`]
+    /// diffs a requested range — a block with any missing chunk is not
+    /// covered.
+    pub async fn coverage(&self, hash: Hash) -> CacheResult<decdn_protocol::Coverage> {
+        // One chunk is 1024 bytes; one discovery block is 65536 chunks (64 MiB).
+        const CHUNKS_PER_BLOCK: u64 = decdn_protocol::DISCOVERY_BLOCK_BYTES / 1024;
+
+        if self.refuses(hash) {
+            return Ok(decdn_protocol::Coverage::empty());
+        }
+        let status = self
+            .inner
+            .store
+            .blobs()
+            .status(hash)
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        let size = match status {
+            iroh_blobs::api::blobs::BlobStatus::NotFound => {
+                return Ok(decdn_protocol::Coverage::empty());
+            }
+            iroh_blobs::api::blobs::BlobStatus::Partial { size } => size.unwrap_or(0),
+            iroh_blobs::api::blobs::BlobStatus::Complete { size } => size,
+        };
+        let present = self.present_ranges(hash).await?;
+        let present = present.chunk_ranges();
+        let total_chunks = size.div_ceil(1024);
+        let total_blocks = decdn_protocol::num_blocks(size);
+
+        let covered = (0..total_blocks).filter(|&i| {
+            let start = u64::from(i) * CHUNKS_PER_BLOCK;
+            let end = (start + CHUNKS_PER_BLOCK).min(total_chunks);
+            let span = ChunkRanges::from(bao_tree::ChunkNum(start)..bao_tree::ChunkNum(end));
+            // `span - present` is empty iff `present` fully contains `span`,
+            // i.e. every chunk in this block is on disk.
+            (span - present).is_empty()
+        });
+        Ok(decdn_protocol::Coverage::from_block_indices(
+            total_blocks,
+            covered,
+        ))
+    }
+
     /// The chunk-aligned sub-ranges of `[byte_offset, byte_offset + byte_len)`
     /// (`byte_len == 0` = to `blob_size`) that are NOT present on disk.
     ///
@@ -9184,6 +9240,80 @@ mod tests {
             0,
             "a rejected import must not tag a partial"
         );
+    }
+
+    // -- coverage: cached-block derivation (#1506) --
+
+    #[tokio::test]
+    async fn coverage_of_absent_hash_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let cov = engine.coverage(Hash::from([7u8; 32])).await.unwrap();
+        assert!(cov.is_empty(), "an absent hash has no covered blocks");
+    }
+
+    #[tokio::test]
+    async fn coverage_of_complete_blob_is_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 3 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+        engine.admit_bao(hash, ranges, bao).await.unwrap();
+        assert!(
+            engine.present_ranges(hash).await.unwrap().is_complete(),
+            "whole blob admitted in one range"
+        );
+
+        let cov = engine.coverage(hash).await.unwrap();
+        assert_eq!(
+            cov,
+            decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total)),
+            "a complete blob covers every discovery block it spans"
+        );
+    }
+
+    #[tokio::test]
+    async fn coverage_of_partial_blob_covers_only_present_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        // Total spans two 64 MiB discovery blocks: block 0 is fully in range,
+        // block 1 covers the trailing 3 `group`s. iroh-blobs only reports a
+        // `Partial` blob's size once the FINAL chunk is present (that is what
+        // fixes the tree's total chunk count), so this admits block 0 in
+        // full, then separately admits the blob's last group (establishing
+        // the validated size) while leaving block 1's middle group missing —
+        // block 1 stays not-covered even though the size is now known.
+        let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        let (hash, block0_ranges, block0_bao) = bao_for(
+            root,
+            &plaintext,
+            outboard.clone(),
+            0,
+            decdn_protocol::DISCOVERY_BLOCK_BYTES,
+            total,
+        );
+        engine
+            .admit_bao(hash, block0_ranges, block0_bao)
+            .await
+            .unwrap();
+
+        let (_, tail_ranges, tail_bao) =
+            bao_for(root, &plaintext, outboard, total - group, group, total);
+        engine.admit_bao(hash, tail_ranges, tail_bao).await.unwrap();
+
+        assert!(
+            !engine.present_ranges(hash).await.unwrap().is_complete(),
+            "block 1's middle group was never admitted"
+        );
+
+        let cov = engine.coverage(hash).await.unwrap();
+        assert!(cov.covers(0), "block 0 was admitted in full");
+        assert!(!cov.covers(1), "block 1's middle group is missing");
     }
 
     /// An origin that admits the blob into the store itself (as the ported
