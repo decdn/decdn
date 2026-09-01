@@ -425,11 +425,25 @@ impl std::error::Error for HashMismatch {}
 /// buyer-side policy rejection — distinct from a hash mismatch or an unreachable
 /// peer — rather than mis-attributing it to the provider's reputation. `Display`
 /// carries `BlobTooLarge` so logs and the requester tests can match on it.
+///
+/// **Units.** `received` and `ceiling` are ALWAYS the same unit within one error —
+/// the comparison at each enforcement site is apples-to-apples — but that unit
+/// differs by site, so neither field is a raw `max_blob_size_bytes` config value
+/// across all call sites. The buffered receive loop (`receive_and_pay`) meters bao
+/// WIRE bytes (content plus interleaved proof, ADR 038) and compares against the
+/// wire size of a ceiling-sized blob. The gap-driven driver (`fill_gap`) meters
+/// CONTENT bytes (the store's delivered frontier) and the buffered resume-offset
+/// guard meters a CONTENT offset, both against the configured `max_blob_size_bytes`
+/// directly. Every one is a faithful "the byte position crossed the ceiling"
+/// report.
 #[derive(Debug)]
 pub struct BlobTooLarge {
-    /// Cumulative wire bytes received when the cap tripped (just over `ceiling`).
+    /// The byte position that crossed `ceiling` — wire bytes taken off the stream
+    /// (buffered receive loop), the store's content frontier (gap-driven driver),
+    /// or a content resume offset already past it. Same unit as `ceiling` (see the
+    /// type's **Units** note).
     pub received: u64,
-    /// The `max_blob_size_bytes` ceiling that was crossed.
+    /// The ceiling `received` crossed, in the same unit as `received`.
     pub ceiling: u64,
 }
 
@@ -470,7 +484,7 @@ impl std::fmt::Display for BlobTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "received {} bytes, crossing max_blob_size {} bytes (BlobTooLarge)",
+            "received {} bytes, crossing the {}-byte size ceiling (BlobTooLarge)",
             self.received, self.ceiling
         )
     }
