@@ -570,6 +570,33 @@ pub struct DecdnMetrics {
     /// persist failed" / "pool dead-charge forget failed"). Operator-visible
     /// name: `decdn_floor_loss_persist_failures_total`.
     pub floor_loss_persist_failures: Counter,
+    /// `serve_stream` requests served with the floor-credit gates SKIPPED, because
+    /// the cached `getPool` view answered `None` for the named pool.
+    ///
+    /// The skip is a deliberate fail-open: a transient blip in the chain watcher
+    /// must not refuse paying clients, and the open-time hash gates plus the first
+    /// voucher's on-chain `redeem` still carry compliance and revenue. It is also
+    /// contained — `intake_capability` fails closed on an unknown pool owner, so a
+    /// client cannot name a pool this node has never seen in order to escape the
+    /// caps. What it costs is accounting: neither the pool ceiling nor the
+    /// per-signer share is checked, and no `FloorReservation` opens, so a stream
+    /// abandoned inside that window folds NO `dead_charge` at all and consumes
+    /// budget that is never recorded against its signer. Without this counter that
+    /// window is invisible — the difference between a documented fail-open and one
+    /// nobody can see.
+    ///
+    /// Counted once per REQUEST at the single point the view is resolved, not once
+    /// per gate: one `None` skips four gates (the origin-funder gate, the
+    /// lane-concurrency gate, and both floor gates) and degrades two serve paths, so
+    /// this is an upper bound on floor gates actually skipped — a request refused
+    /// earlier for another reason still counts here.
+    ///
+    /// It conflates the three ways the view answers `None`: no pool view wired, a
+    /// pool the watcher has not seen yet, and a read fault. In production the view
+    /// is always wired, so a sustained rate means watcher lag or a read fault and
+    /// pairs with the watcher-liveness series. Operator-visible name:
+    /// `decdn_floor_gate_skipped_no_pool_view_total`.
+    pub floor_gate_skipped_no_pool_view: Counter,
     /// Slashes detected against this node's operator by the slash watcher
     /// (`SlashJudge.Slashed`), counting each distinct `slashId` once across the
     /// bring-up backfill and the live stream (#1032). A non-zero value means the
@@ -1872,6 +1899,11 @@ recorders! {
     /// Pairs with the `warn!`/`error!` lines in `handlers/client/mod.rs`
     /// ("floor dead-charge persist failed" / "pool dead-charge forget failed").
     floor_loss_persist_failure => floor_loss_persist_failures.inc();
+
+    /// Record a `serve_stream` request served with the floor-credit gates skipped
+    /// because the cached `getPool` view answered `None`. One bump per request, at
+    /// the single resolve site — see the field doc for what the fail-open costs.
+    floor_gate_skipped_no_pool_view => floor_gate_skipped_no_pool_view.inc();
 
     /// A distinct slash against this node's operator was detected by the slash
     /// watcher (#1032). Counts each `slashId` once (backfill + live dedup).
@@ -3234,6 +3266,32 @@ mod tests {
                 "reject counter {name} should read exactly 1 after one bump:\n{text}"
             );
         }
+    }
+
+    /// The floor fail-open counter is exported at zero on a fresh registry and
+    /// reads exactly one per bump.
+    ///
+    /// Deliberately its own test rather than a row in the `serve_stream_rejected_*`
+    /// array above: this counts requests that were SERVED with the floor gates
+    /// skipped, not requests refused, and folding it in with the reject family would
+    /// invite reading it as one. The zero-on-fresh assertion is what keeps a
+    /// dashboard from rendering `(no data)` on a node that has never hit the
+    /// fail-open — which is every healthy node.
+    #[test]
+    fn floor_gate_skipped_counter_starts_at_zero_and_increments() {
+        let metrics = Metrics::new();
+        let name = "decdn_floor_gate_skipped_no_pool_view_total";
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, name, 0),
+            "{name} should be exposed at zero on a fresh registry:\n{text}"
+        );
+        metrics.floor_gate_skipped_no_pool_view();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, name, 1),
+            "{name} should read exactly 1 after one bump:\n{text}"
+        );
     }
 
     #[test]

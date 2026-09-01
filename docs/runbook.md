@@ -432,6 +432,22 @@ alone cannot tell the first two apart — this is why the log line exists:
    value out of `1..=10_000` fails at the next start rather than at the reload.
    Rotating the session key is the remedy that takes effect immediately.
 
+The mirror image of all three is `decdn_floor_gate_skipped_no_pool_view_total`
+climbing: requests **served** with both floor gates skipped, because the cached
+`getPool` view answered `None` for the pool. That fail-open is deliberate — a
+watcher blip must not refuse paying clients, and the open-time hash gates plus the
+first voucher's on-chain `redeem` still carry compliance and revenue — and it is
+contained, since capability intake fails closed on an unknown pool owner. What it
+costs is accounting: a stream abandoned inside that window folds no `dead_charge`
+at all, so it spends floor budget charged to no signer. In production the pool view
+is always wired, so a sustained rate means the chain watcher is lagging or its
+reads are failing — check
+`decdn_settlement_watcher_last_tick_timestamp_seconds` as in remediation step (2)
+below, and treat it the same way as cause (2). A brief burst right after start-up,
+while the watcher backfills, is expected. The counter is one bump per request and a
+`None` view skips four gates, so read it as an upper bound rather than dividing it
+against a per-gate rate.
+
 A fourth, rarer cause: the operator's own
 `blockchain.buyer_working_deposit_micro_usdc` is too small for the *upstream*
 rate, in which case this node is the one being refused. (The node opens
