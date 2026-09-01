@@ -1110,6 +1110,33 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **The workspace moves to cargo's MSRV-aware resolver and denies stray output,
+  scaffolding macros, and lossy numeric casts.** `resolver = "3"` changes nothing
+  about feature unification — that was resolver 2, which the workspace already
+  had — but it defaults `resolver.incompatible-rust-versions` to `fallback`, so
+  cargo prefers dependency versions whose declared `rust-version` is at or below
+  the pinned 1.95. Nothing resolves differently today and `Cargo.lock` is
+  unchanged; the guard is against a future `cargo update` pulling a dependency
+  that raised its MSRV past the toolchain. Alongside it, `print_stdout`,
+  `print_stderr`, `dbg_macro`, `todo`, and `unimplemented` become `deny`, and
+  `cast_possible_truncation` / `cast_sign_loss` / `cast_precision_loss` move from
+  `warn` to `deny`. The cast promotion adds no new violations — CI clippy and the
+  pre-commit hook already pass `-D warnings`, so all 190 casts were fatal there;
+  it only makes a bare local `cargo clippy` agree. `dbg_macro`, `todo`, and
+  `unimplemented` had zero occurrences and are pure regression guards. The `decdn`
+  CLI allows both print lints at its crate roots because it is a terminal UI; the
+  handful of production `eprintln!` sites that run before the tracing subscriber
+  exists carry a per-site `#[expect]` naming that reason, which leaves every
+  library crate and every node handler with no way to print.
+- **Dev builds compile the keystore KDF at `opt-level = 3`.** `alloy`'s
+  `signer-keystore` runs scrypt on every keystore encrypt and decrypt, and an
+  unoptimized scrypt costs about 0.5s per operation. Raising `scrypt`, `salsa20`,
+  `pbkdf2`, `sha2`, and `hmac` to `opt-level = 3` under `[profile.dev.package]`
+  takes the `decdn-cli` suite from 3.79s to 3.20s (-16%), with the `key_gen_e2e`
+  tests themselves 16-22% faster; the `anvil-e2e` journeys pay the same cost once
+  per keygen. Nothing else about the dev profile changes, so debuginfo on
+  workspace crates is untouched.
+
 - **The node flushes lane writes to redb in table-key order, and the workspace
   floor moves to `redb = "4.2"`.** `flush` drains a `HashSet` of dirty lanes, so
   the batch reached redb in an arbitrary order. Sorting it by the

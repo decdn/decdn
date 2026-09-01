@@ -45,7 +45,11 @@ Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots
 
 **Code style:** `rustfmt.toml` sets `max_width = 100`.
 
-**Anti-panic policy:** Clippy denies `unwrap_used`, `expect_used`, `panic`, and `indexing_slicing` workspace-wide. Use `Result`/`Option` combinators or `.get()` for indexing. This is the most common CI failure for new code.
+**Anti-panic policy:** Clippy denies `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `todo`, and `unimplemented` workspace-wide. Use `Result`/`Option` combinators or `.get()` for indexing. This is the most common CI failure for new code.
+
+**Numeric safety:** `cast_possible_truncation`, `cast_sign_loss`, and `cast_precision_loss` are `deny`, not `warn`. A narrowing or sign-changing cast needs a per-site `#[allow]`/`#[expect]` with a comment saying why it cannot lose data.
+
+**No stray output:** `print_stdout`, `print_stderr`, and `dbg_macro` are `deny`. The `decdn` CLI is a terminal UI and allows both print lints at its crate roots; everywhere else, use `tracing`. The few production sites that run before the subscriber exists carry a per-site `#[expect]` with a reason.
 
 ### Crate Structure
 

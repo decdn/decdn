@@ -241,13 +241,19 @@ Dependabot auto-bumps the GitHub Actions refs only — it does **not** touch `ru
 
 MSRV (`rust-version.workspace = true` → 1.95) is the lower bound the workspace must compile under; it's checked separately by the `msrv` job in `.github/workflows/ci.yml` and is a distinct knob from the stable lint pin (currently set to the same value).
 
+The workspace is on `resolver = "3"`, which reads that `rust-version`: it defaults `resolver.incompatible-rust-versions` to `fallback`, so `cargo update` prefers dependency versions whose own declared MSRV is at or below ours instead of silently pulling one that raised it past the pinned toolchain. Resolver 3's feature-unification rules are identical to resolver 2's. If a dependency you need resolves to an older version than expected, that is this fallback at work — raise the workspace MSRV and the toolchain pin together rather than reaching for `--ignore-rust-version`.
+
 ## Code Style
 
 **Language:** Rust (edition 2024, MSRV 1.95).
 
 `rustfmt.toml` sets `max_width = 100`.
 
-**Anti-panic policy:** Clippy denies `unwrap_used`, `expect_used`, `panic`, and `indexing_slicing` workspace-wide. Use `Result`/`Option` combinators or `.get()` for indexing. This is the most common CI failure for new code.
+**Anti-panic policy:** Clippy denies `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `todo`, and `unimplemented` workspace-wide. Use `Result`/`Option` combinators or `.get()` for indexing. This is the most common CI failure for new code.
+
+**Numeric safety:** `cast_possible_truncation`, `cast_sign_loss`, and `cast_precision_loss` are `deny`, not `warn`. A narrowing or sign-changing cast needs a per-site `#[allow]`/`#[expect]` with a comment saying why it cannot lose data.
+
+**No stray output:** `print_stdout`, `print_stderr`, and `dbg_macro` are `deny`. The `decdn` CLI is a terminal UI and allows both print lints at its crate roots; everywhere else, use `tracing`. The few production sites that run before the subscriber exists carry a per-site `#[expect]` with a reason.
 
 ## Working with ADRs
 

@@ -5,6 +5,11 @@
 //! `node` subcommand group talks to a running daemon over the loopback
 //! admin RPC surface (ADR 025) and fails cleanly on a publisher's laptop
 //! where no daemon is running.
+//!
+//! Its one direct write is the top-level error boundary in `main`; everything
+//! else prints from [`decdn_cli::commands`]. A separate crate root from
+//! `lib.rs`, so it carries its own allow.
+#![allow(clippy::print_stderr)]
 
 use clap::Parser;
 

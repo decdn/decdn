@@ -12,6 +12,10 @@ use decdn_common::{cli, config};
 use crate::runtime;
 
 /// Run the deCDN node with resolved configuration.
+#[expect(
+    clippy::print_stderr,
+    reason = "runs before the tracing subscriber is initialized"
+)]
 pub async fn run(
     config_path: Option<&std::path::Path>,
     run_args: &cli::RunArgs,
@@ -65,7 +69,12 @@ pub async fn run(
 /// hot-reload path (#236). The closure captures a `reload::Handle` to the
 /// `EnvFilter` layer; calls to `modify` must respect any errors from the
 /// handle (e.g. the registry was dropped) by surfacing them.
-#[allow(clippy::unnecessary_wraps)] // Returns Result only when otlp feature is enabled.
+#[allow(clippy::unnecessary_wraps)]
+// Returns Result only when otlp feature is enabled.
+// `allow`, not `expect`: the only `eprintln!` in here sits under
+// `#[cfg(not(feature = "otlp"))]`, so an `--all-features` build would find
+// the expectation unfulfilled. It runs before `registry.init()` either way.
+#[allow(clippy::print_stderr)]
 fn init_tracing(
     filter: tracing_subscriber::EnvFilter,
     resolved: &config::ResolvedConfig,

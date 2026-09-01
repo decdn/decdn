@@ -266,6 +266,10 @@ pub async fn shutdown<const N: usize, const M: usize>(
 /// # Errors
 ///
 /// A server task that panicked.
+#[expect(
+    clippy::print_stderr,
+    reason = "test harness diagnostic surfaced in the nextest log"
+)]
 pub async fn shutdown_within<const N: usize, const M: usize>(
     deadline: Duration,
     tasks: [tokio::task::JoinHandle<()>; N],

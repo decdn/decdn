@@ -11245,6 +11245,10 @@ async fn serve_with_deposit_ceiling(
 ///
 /// Acceptance is implicit (continued delivery is the ack, ADR 005), so on accept no
 /// reply is written; only a rejection sends a message.
+#[expect(
+    clippy::print_stderr,
+    reason = "test harness diagnostic surfaced in the nextest log"
+)]
 async fn settle_voucher(
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,

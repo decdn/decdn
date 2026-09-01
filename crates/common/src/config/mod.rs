@@ -523,6 +523,10 @@ fn warn_retired_env_vars() -> Vec<&'static str> {
 /// so a test cannot set a variable to observe the behaviour. Injecting the
 /// predicate exercises the "var is set" branch directly — the branch that was
 /// silently broken before.
+#[expect(
+    clippy::print_stderr,
+    reason = "tracing is not initialized at config-resolve time"
+)]
 fn warn_retired_env_vars_with(is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
     let mut warned = Vec::new();
     for (name, why) in RETIRED_ENV_VARS {
@@ -698,6 +702,10 @@ fn validate_port_layout(
     one_section(|bag| validate_port_layout_into(network, observability, bag))
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "tracing is not initialized at config-resolve time"
+)]
 fn validate_port_layout_into(
     network: &ResolvedNetwork,
     observability: &ResolvedObservability,
@@ -859,6 +867,10 @@ fn normalize_region(raw: &str) -> anyhow::Result<String> {
 /// invariant bring-up enforces — a credential-bearing typo
 /// (`relay://user:pass@bad host`) is exactly the malformed shape that lands on
 /// the error path.
+#[expect(
+    clippy::print_stderr,
+    reason = "tracing is not initialized at config-resolve time"
+)]
 fn resolve_network_into(
     cli: &crate::cli::run::NetworkArgs,
     file: Option<&types::NetworkConfig>,
@@ -3031,6 +3043,10 @@ pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<
 /// sections during startup ([`resolve_config`]) and SIGHUP reload
 /// (`runtime::reload`); see [`resolve_payment_into`] for the rationale.
 #[allow(clippy::cognitive_complexity)]
+#[expect(
+    clippy::print_stderr,
+    reason = "tracing is not initialized at config-resolve time"
+)]
 pub fn resolve_security_into(
     file: Option<&types::SecurityConfig>,
     bag: &mut ConfigErrorBag,
@@ -3156,6 +3172,10 @@ pub fn resolve_load_shed_into(
 /// rejected as a deny-all corner case — the resolver treats it the same
 /// way [`resolve_security_into`] handles the `per_source` pairing.
 #[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
+#[expect(
+    clippy::print_stderr,
+    reason = "tracing is not initialized at config-resolve time"
+)]
 pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBag) -> ResolvedDht {
     // ADR 022 nests the rate-limit knobs under `dht.rate_limit.*`.
     // The file shape mirrors that; an absent `[dht.rate_limit]` collapses
@@ -3261,6 +3281,10 @@ pub fn resolve_dht(file: Option<&types::DhtConfig>) -> anyhow::Result<ResolvedDh
 /// Mirrors [`resolve_dht_into`]; only the
 /// defaults and the `probe.rate_limit.*` field keys differ.
 #[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
+#[expect(
+    clippy::print_stderr,
+    reason = "tracing is not initialized at config-resolve time"
+)]
 pub fn resolve_probe_into(
     file: Option<&types::ProbeConfig>,
     bag: &mut ConfigErrorBag,
