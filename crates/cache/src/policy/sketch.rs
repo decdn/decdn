@@ -2,8 +2,8 @@
 //!
 //! Keys are already uniform 32-byte hashes, so each row's column index is a
 //! disjoint 4-byte slice of the key reduced mod the sketch's width — no hash
-//! functions. Counters are 4-bit-style saturating `u8`; periodic halving ages
-//! them.
+//! functions. Counters are saturating `u8` — classic `TinyLFU` uses 4-bit
+//! counters, and the extra headroom is free at one byte each. Halving ages them.
 //!
 //! [`ShardedCountMinSketch`] is the form the estimator uses. It splits the
 //! counter array into [`SHARDS`] independently locked [`CountMinSketch`]es of
@@ -18,7 +18,7 @@
 //!   estimate against a node-wide `promotion_threshold`, and
 //!   [`super::tinylfu::TinyLfuEviction`] ranks candidates from *different*
 //!   shards least-frequent-first. Counters are only comparable if every counter
-//!   has been aged the same number of times. So the halving clock is one
+//!   is caught up to the same clock when it is read. So the halving clock is one
 //!   node-wide observation counter, and a shard halves lazily — on its next
 //!   touch — by however many windows have elapsed since it last caught up. The
 //!   *work* stays sharded (`1 / SHARDS` of the array under one shard's lock,
@@ -30,15 +30,17 @@
 //!   (`SHARDS / cols`) — the same `1 / cols` a single wide sketch gives, because
 //!   the shard slice and the row slices are disjoint bytes of a uniform hash.
 //!
-//! The per-row rate is what carries over exactly; the *whole-sketch* error rate
-//! does not. A count-min sketch over-reports only when two keys collide in all
-//! `ROWS` rows, and sharding correlates the rows — they collide all-or-nothing
-//! on the shard match. So the full-collision probability goes from `cols^-ROWS`
-//! to `SHARDS^(ROWS-1) / cols^ROWS`, a factor of `SHARDS^(ROWS-1)`. At the
-//! shipped sizing (`cols = 65536`, [`SHARDS`] `= 16`) that is `5e-20` against
-//! `2e-16`: both far below any rate that can move a decision. It matters only if
-//! `cache.tinylfu.sketch_bytes` is cut by orders of magnitude or [`SHARDS`] is
-//! raised a long way, so read it as the bound to check before either move.
+//! The over-report rate carries over as exactly as the per-row rate does. The
+//! sketch reads a key hotter than it is when every one of its `ROWS` counters
+//! also holds some other key's count. The polluting keys need not be the same
+//! one across rows, so "two keys collide in all `ROWS` rows" is a far rarer
+//! event that does not bound the error — do not size the sketch from it. For
+//! `N` live keys the rate is `(1 - e^(-N / cols))^ROWS`, and [`SHARDS`] cancels
+//! out: a shard divides the columns and the keys in the same proportion. So
+//! sharding costs nothing in accuracy and the width alone sets it. The rate
+//! turns on `N / cols`, which holds the shipped `cols = 65536` under one
+//! percent out to roughly 25000 live keys. See
+//! [`super::tinylfu::TinyLfuEstimator::new`] for the sizing and its floor.
 use crate::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -55,21 +57,37 @@ const ROWS: usize = 4;
 /// shipped sizing, and bounded in the module docs.
 pub const SHARDS: usize = 16;
 
-/// Byte offset of the 4-byte shard-routing slice. It sits past the
-/// `ROWS * 4 = 16` bytes the row indices consume, so shard choice and column
-/// choice are independent functions of the key.
-const SHARD_SLICE_START: usize = 16;
+/// Bytes of key each index consumes: one `u32` per row, and one for the shard.
+const SLICE_BYTES: usize = 4;
+
+/// Byte offset of the shard-routing slice. It is derived from the bytes the row
+/// indices consume, so shard choice and column choice stay independent functions
+/// of the key however many rows the sketch has. The module docs' collision-rate
+/// argument rests on that independence, and a stride or row count that put a row
+/// index on the shard slice would correlate the two while leaving every test in
+/// this file green — hence the derivation rather than a literal offset.
+const SHARD_SLICE_START: usize = ROWS * SLICE_BYTES;
+
+// The derivation keeps the slices disjoint; this bounds them to the key. Past
+// `ROWS = 7` the shard slice runs off the end of a hash, `word_at` reads zero
+// for every key, and the sharding collapses to one shard.
+const _: () = assert!(
+    SHARD_SLICE_START + SLICE_BYTES <= size_of::<Hash>(),
+    "the shard slice must fit inside the key"
+);
 
 /// Observations per node-wide aging window, per column of total width. A sketch
 /// `cols` wide halves every `cols * AGING_WINDOW_PER_COL` observations.
 const AGING_WINDOW_PER_COL: u64 = 10;
 
-/// Read the 4-byte little-endian word at `start` in `key`, or `0` if the key is
-/// shorter than the slice (unreachable for a 32-byte BLAKE3 hash, but expressed
+/// Read the little-endian word of [`SLICE_BYTES`] at `start` in `key`, or `0` if
+/// the key is shorter than the slice (unreachable for a 32-byte BLAKE3 hash, but expressed
 /// as a total function rather than an index that could panic).
 fn word_at(key: &Hash, start: usize) -> u32 {
     let bytes = key.as_bytes();
-    let slice = bytes.get(start..start.saturating_add(4)).unwrap_or(&[]);
+    let slice = bytes
+        .get(start..start.saturating_add(SLICE_BYTES))
+        .unwrap_or(&[]);
     u32::from_le_bytes([
         *slice.first().unwrap_or(&0),
         *slice.get(1).unwrap_or(&0),
@@ -99,7 +117,7 @@ impl CountMinSketch {
 
     pub fn increment(&mut self, key: &Hash) {
         for row in 0..ROWS {
-            let word = word_at(key, row.saturating_mul(4));
+            let word = word_at(key, row.saturating_mul(SLICE_BYTES));
             let col = (word as usize) % self.cols;
             if let Some(c) = self.counters.get_mut(row * self.cols + col) {
                 *c = c.saturating_add(1);
@@ -123,7 +141,7 @@ impl CountMinSketch {
     pub fn estimate(&self, key: &Hash) -> u8 {
         let mut min = u8::MAX;
         for row in 0..ROWS {
-            let word = word_at(key, row.saturating_mul(4));
+            let word = word_at(key, row.saturating_mul(SLICE_BYTES));
             let col = (word as usize) % self.cols;
             min = min.min(*self.counters.get(row * self.cols + col).unwrap_or(&0));
         }
@@ -147,8 +165,15 @@ struct Shard {
 /// `estimate` takes exactly one shard lock and reads or writes `ROWS` counters.
 /// Halving is per shard and lazy: the shard is aged on its next touch by the
 /// number of node-wide windows that have elapsed since it last caught up. So the
-/// work is `1 / SHARDS` of the array under one lock, while every counter in the
-/// sketch has still been halved the same number of times whenever it is read.
+/// work is `1 / SHARDS` of the array under one lock, while every counter is
+/// caught up to the node-wide clock at the moment it is read. A ranking pass
+/// reads each candidate separately, so it carries one halving of skew for every
+/// window boundary it crosses. A halving applied evenly across a pass cannot
+/// invert the ranking — it only creates ties — but candidates read on opposite
+/// sides of a boundary can misorder, and two whose estimates are within a
+/// factor of two can swap. The window is `cols * 10` observations, so a sweep
+/// crossing even one boundary is already the uncommon case, and the next sweep
+/// re-reads both on one side of it.
 ///
 /// The interior mutability is deliberate — the frequency estimator is shared by
 /// every serve completion and every fill-path admission read, so both take
@@ -207,9 +232,10 @@ impl ShardedCountMinSketch {
         self.shards.get(idx)
     }
 
-    /// Age `shard` up to `epoch` before it is read or written, so every counter
-    /// in the sketch has been halved the same number of times at the moment any
-    /// of them is observed.
+    /// Age `shard` up to `epoch` before it is read or written, so a counter is
+    /// caught up to the node-wide clock at the moment it is observed. `epoch`
+    /// never regresses a shard: a caller that computed a stale one finds
+    /// `elapsed` at zero and leaves the counters alone.
     fn catch_up(shard: &mut Shard, epoch: u64) {
         let elapsed = epoch.saturating_sub(shard.epoch);
         if elapsed == 0 {
@@ -227,9 +253,13 @@ impl ShardedCountMinSketch {
     /// popularity evidence, and refusing to count into a shard would silently
     /// freeze the frequency of every key routed to it.
     pub fn increment(&self, key: &Hash) {
-        // Claim this observation's slot on the node-wide clock first, so the
-        // epoch a concurrent estimator derives never trails a sighting already
-        // written into a shard.
+        // Claim this observation's slot on the node-wide clock before writing,
+        // so at any instant the clock already counts every sighting committed to
+        // a shard. An estimator loads the clock outside the shard lock, so the
+        // epoch it applies is stale by whatever lands between its load and its
+        // acquisition: it under-ages, never over-ages. Nothing bounds that gap
+        // in principle; a window is `cols * 10` observations, so in practice it
+        // is zero.
         let observed = self
             .observations
             .fetch_add(1, Ordering::Relaxed)
@@ -291,8 +321,8 @@ mod tests {
 
     /// Reference implementation: one wide sketch on a single global clock, i.e.
     /// the unsharded behaviour the sharded form must reproduce. Halving is
-    /// driven here rather than inside `CountMinSketch` because the clock now
-    /// belongs to the sharded wrapper.
+    /// driven here rather than inside `CountMinSketch` because the clock belongs
+    /// to the sharded wrapper.
     struct SingleSketch {
         inner: CountMinSketch,
         seen: u64,
@@ -418,7 +448,10 @@ mod tests {
             !others.is_empty(),
             "some key must route outside the hot shard"
         );
-        let window = 64 * usize::try_from(AGING_WINDOW_PER_COL).unwrap_or(usize::MAX);
+        // Read the realized window off the sketch, never a local copy: a change
+        // to SHARDS moves the realized width, and a stale copy would drive less
+        // than a full window and silently test nothing.
+        let window = usize::try_from(s.window)?;
         for n in 0..window {
             if let Some(k) = others.get(n % others.len()) {
                 s.increment(k);
@@ -430,6 +463,77 @@ mod tests {
             "a node-wide aging window must halve an untouched shard: {before} -> {}",
             s.estimate(&hot)
         );
+        Ok(())
+    }
+
+    /// A shard idle across many aging windows catches up by *every* window it
+    /// missed, not by one.
+    ///
+    /// Lazy catch-up is the mechanism that lets the halving work stay sharded
+    /// while the cadence stays node-wide, and it is the only place a shard's
+    /// elapsed-window count is read. A node with low key cardinality leaves most
+    /// shards untouched across many windows, so a blob routing into a
+    /// long-cold shard is exactly the case that must read back drained.
+    ///
+    /// Every value here is deterministic, so the assertions are exact. That is
+    /// what discriminates the two ways to get this wrong: halving once per touch
+    /// regardless of `elapsed` reads 20 at eight windows instead of 0, and
+    /// halving by `elapsed - 1` reads 40 at one window and 20 at two, where a
+    /// correct catch-up reads 20 and 10. A "did it shrink" check passes against
+    /// both.
+    #[test]
+    fn a_shard_cold_for_many_windows_catches_up_by_all_of_them() -> anyhow::Result<()> {
+        let hot = key(1);
+
+        // Sight the hot key, then drive `windows` full node-wide windows through
+        // keys that route to other shards, so the hot shard is only ever aged by
+        // the catch-up on the final read.
+        let drive = |windows: usize| -> anyhow::Result<u8> {
+            let s = ShardedCountMinSketch::new(64); // small → short node-wide window
+            // Read the window off the sketch rather than recomputing it: a
+            // change to SHARDS moves the realized width, and a stale local copy
+            // would leave the first arm driving less than a full window and
+            // silently testing nothing.
+            let window = usize::try_from(s.window)?;
+            for _ in 0..40 {
+                s.increment(&hot);
+            }
+            let Some(hot_shard) = s.shard_of(&hot) else {
+                anyhow::bail!("a non-empty sketch must route every key to a shard");
+            };
+            let others: Vec<Hash> = (2u32..4096)
+                .map(key)
+                .filter(|k| s.shard_of(k).is_some_and(|o| !std::ptr::eq(o, hot_shard)))
+                .take(64)
+                .collect();
+            anyhow::ensure!(
+                !others.is_empty(),
+                "some key must route outside the hot shard"
+            );
+            for n in 0..window.saturating_mul(windows) {
+                if let Some(k) = others.get(n % others.len()) {
+                    s.increment(k);
+                }
+            }
+            Ok(s.estimate(&hot))
+        };
+
+        let one = drive(1)?;
+        anyhow::ensure!(
+            one == 20,
+            "one window halves 40 once: expected 20, got {one}"
+        );
+
+        let two = drive(2)?;
+        anyhow::ensure!(
+            two == 10,
+            "two windows halve 40 twice: expected 10, got {two}"
+        );
+
+        // 40 needs six halvings to reach zero, so eight windows drains it with
+        // room to spare whatever the counter started at.
+        let many = drive(8)?;
+        anyhow::ensure!(many == 0, "eight windows drain 40 to zero, got {many}");
         Ok(())
     }
 
@@ -523,7 +627,7 @@ mod tests {
     ///
     /// This is the whole point of the split: `observe` runs at the end of every
     /// completed serve and `estimate` on every fill-path admission decision, and
-    /// under the single `Mutex<CountMinSketch>` those serialized node-wide.
+    /// a single sketch-wide mutex would serialize those node-wide.
     /// Holding one shard's lock and touching a key that routes elsewhere must
     /// still land; a routing regression that collapsed every key onto one shard
     /// would silently restore the contention and pass every other test here.

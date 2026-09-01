@@ -287,6 +287,31 @@ pub const DEFAULT_EVICTION_POLICY: &str = "lru";
 pub const DEFAULT_ADMISSION_POLICY: &str = "always";
 /// Default `cache.tinylfu.sketch_bytes` (ADR 040).
 pub const DEFAULT_TINYLFU_SKETCH_BYTES: usize = 262_144;
+/// Floor for `cache.tinylfu.sketch_bytes` (ADR 040 §Configuration surface).
+///
+/// One `u8` per counter over the sketch's four rows means `cols = bytes / 4`,
+/// so this floor buys 4096 columns.
+///
+/// It is set from an over-report target. A count-min sketch reads a key hotter
+/// than it is when every one of its four row counters also holds some other
+/// key's count — the polluting keys need not be the same one across rows, so
+/// the far rarer "one twin collides in all four rows" event does not bound the
+/// error. For `N` live hashes over `cols` columns the rate is
+/// `(1 - e^(-N / cols))^4`. Sharding cancels out of that expression: a shard
+/// divides the columns and the hashes in the same proportion, so the width
+/// alone sets the accuracy.
+///
+/// Because the rate turns only on `N / cols`, a target rate fixes a hash count
+/// proportional to the width — about `0.38 * cols` live hashes hold it under
+/// one percent. This floor is therefore good for roughly `1_500` hashes and
+/// [`DEFAULT_TINYLFU_SKETCH_BYTES`] for roughly `25_000`; a node holding more
+/// needs a proportionally wider sketch, not a fixed step up. Counts are an
+/// upper bound, since the sketch counts every hash it observes between
+/// halvings rather than only the resident ones.
+pub const MIN_TINYLFU_SKETCH_BYTES: usize = 16_384;
+// A default below its own floor would make every node that ships without a
+// `[cache.tinylfu]` block fail to start.
+const _: () = assert!(DEFAULT_TINYLFU_SKETCH_BYTES >= MIN_TINYLFU_SKETCH_BYTES);
 /// Default `cache.tinylfu.promotion_threshold` (ADR 040).
 pub const DEFAULT_TINYLFU_PROMOTION_THRESHOLD: u32 = 2;
 /// Default `cache.tinylfu.probation_target_pct` (ADR 040).
@@ -1960,6 +1985,30 @@ fn resolve_cache_into(
     let tinylfu_promotion_threshold = tinylfu_file
         .and_then(|t| t.promotion_threshold)
         .unwrap_or(DEFAULT_TINYLFU_PROMOTION_THRESHOLD);
+    // `sketch_bytes / 4` is the sketch's column count, and the over-report rate
+    // `(1 - e^(-N / cols))^4` climbs steeply as that count shrinks. Reject an
+    // undersized one at load, never clamp (ADR 040 §Configuration surface).
+    // The check does not consult the policy selectors, and for `sketch_bytes`
+    // that is not a precaution: the estimator is also built when
+    // `serve_economics.policy` is `margin`, which is the default, so this knob
+    // sizes a live sketch on a node whose selectors are `lru`/`always`. The two
+    // checks below gate genuinely selector-only knobs, and are unconditional so
+    // that a value which is wrong stays rejected when an operator switches.
+    bag.check_with(
+        tinylfu_sketch_bytes >= MIN_TINYLFU_SKETCH_BYTES,
+        "cache.tinylfu.sketch_bytes",
+        || {
+            format!(
+                "cache.tinylfu.sketch_bytes ({tinylfu_sketch_bytes}) must be >= \
+                 {MIN_TINYLFU_SKETCH_BYTES}: a narrower sketch reports cold blobs \
+                 as hot often enough to move admission, eviction and \
+                 serve-economics decisions. It applies whether or not a policy \
+                 selector names \"tinylfu\" — the default \
+                 cache.serve_economics.policy = \"margin\" builds the same \
+                 sketch."
+            )
+        },
+    );
     // `promotion_threshold` counts prior sightings before a probation member
     // admits to `Main`; zero is nonsensical — it would make admission
     // always-`Main` and promote everything, defeating probationary admission.
@@ -4576,6 +4625,54 @@ mod tests {
         assert!(
             resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
             "promotion_threshold = 0 must be rejected"
+        );
+    }
+
+    /// `sketch_bytes` below the floor buys too few columns per shard for the
+    /// estimates to separate distinct blobs, so the resolver rejects it rather
+    /// than clamping (ADR 040 §Configuration surface).
+    #[test]
+    fn resolve_cache_rejects_an_undersized_sketch() {
+        let sized = |bytes: usize, admission: &str| {
+            let cli = empty_cache_args();
+            let toml = types::CacheConfig {
+                admission_policy: Some(admission.to_string()),
+                tinylfu: Some(types::TinyLfuConfig {
+                    sketch_bytes: Some(bytes),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir"))
+                .err()
+                .map(|e| e.to_string())
+        };
+
+        // Name the knob in the assertion: the resolver bags every check into one
+        // error, so a bare `is_err()` would pass on any unrelated failure.
+        let err = sized(MIN_TINYLFU_SKETCH_BYTES - 1, "tinylfu")
+            .unwrap_or_else(|| "resolved without error".to_string());
+        assert!(
+            err.contains("cache.tinylfu.sketch_bytes"),
+            "the floor rejection must name the knob, got: {err}"
+        );
+
+        // The floor itself resolves — an off-by-one to `>` would reject the
+        // exact value the docs tell an operator is allowed.
+        assert!(
+            sized(MIN_TINYLFU_SKETCH_BYTES, "tinylfu").is_none(),
+            "the documented minimum must be accepted"
+        );
+
+        // Validation does not consult the policy selectors (ADR 040
+        // §Configuration surface). For `sketch_bytes` the selectors are not even
+        // the only gate: the default `serve_economics.policy = "margin"` builds
+        // the same estimator, so an `always` node runs this sketch for real.
+        let inert = sized(MIN_TINYLFU_SKETCH_BYTES - 1, "always")
+            .unwrap_or_else(|| "resolved without error".to_string());
+        assert!(
+            inert.contains("cache.tinylfu.sketch_bytes"),
+            "the floor applies whether or not a selector names tinylfu, got: {inert}"
         );
     }
 

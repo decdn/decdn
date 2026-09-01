@@ -6594,51 +6594,119 @@ mod tests {
 
     /// A concurrent record must not make the eviction sweep *lose* a candidate.
     ///
-    /// The sharded walk gave up point-in-time atomicity on purpose: a record
-    /// landing mid-walk may or may not appear. What it must never do is drop a
+    /// The sharded walk is not point-in-time, by design: a record landing
+    /// mid-walk may or may not appear. What it must never do is drop a
     /// hash that was already in the map when the walk started, because
     /// `eviction_candidates` is the only source of eviction candidates — a hash
     /// silently skipped by every sweep is a blob that is never reclaimed, which
     /// is unbounded disk growth. `DashMap::iter` holds each shard's read guard
     /// for that shard's traversal, so a concurrent insert can add to a shard the
     /// walk has not reached but cannot remove from one it has. This pins that.
+    ///
+    /// A round only counts once its result carries a hash the writer produced
+    /// *after the walk began* — the writer's counter is sampled either side of
+    /// the walk, and only that window's keys are accepted as witnesses. A key
+    /// written before the walk started proves nothing: the walk would find it in
+    /// a quiet map too. Scheduling decides whether a given round lands one, so
+    /// rounds repeat until one does; the no-candidate-lost invariant is checked
+    /// on every round either way.
+    ///
+    /// Each round writes into its own [`ROUND_STRIDE`]-wide key range, and the
+    /// range is asserted wide enough to hold that round's writes. Sharing one
+    /// range would make the witness vacuous from round two on: nothing evicts
+    /// the previous round's keys from `access_times`, so every later round would
+    /// "find" keys that were already there before its walk started, and a run
+    /// where the walk never overlapped the writer would report success.
     #[tokio::test]
     async fn a_scan_never_loses_a_candidate_to_a_concurrent_record() -> anyhow::Result<()> {
+        const WRITER_BASE: u32 = 1_000_000;
+        /// Keys per round. Rounds must not share keys (see the docstring), and
+        /// a round that outran this would start reusing the next round's range.
+        const ROUND_STRIDE: u32 = 10_000_000;
         let tmp = tempfile::tempdir()?;
         let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
 
-        // Seed enough hashes to spread across every shard.
-        let seeded: Vec<Hash> = (0..512u32).map(|i| Hash::new(i.to_le_bytes())).collect();
+        // Seed enough hashes to spread across every shard and to give the walk
+        // enough work that a concurrent writer can get inside it.
+        let seeded: Vec<Hash> = (0..4096u32).map(|i| Hash::new(i.to_le_bytes())).collect();
         for h in &seeded {
             engine.inner.access_times.insert(*h, Instant::now());
         }
 
-        // Hammer the map with fresh hashes for the duration of the walk.
-        let stop = Arc::new(AtomicBool::new(false));
-        let writer = {
-            let engine = engine.clone();
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                let mut i = 1_000_000u32;
-                while !stop.load(Ordering::Relaxed) {
-                    engine.observe_hit(Hash::new(i.to_le_bytes()));
-                    i = i.saturating_add(1);
-                }
-            })
-        };
+        let mut overlapped = false;
+        for round in 0..16u32 {
+            let base = WRITER_BASE.saturating_add(round.saturating_mul(ROUND_STRIDE));
+            // Hammer the map with fresh hashes for the duration of the walk.
+            let stop = Arc::new(AtomicBool::new(false));
+            let written = Arc::new(AtomicU64::new(0));
+            let writer = {
+                let engine = engine.clone();
+                let stop = Arc::clone(&stop);
+                let written = Arc::clone(&written);
+                std::thread::spawn(move || {
+                    let mut i = base;
+                    while !stop.load(Ordering::Relaxed) {
+                        engine.observe_hit(Hash::new(i.to_le_bytes()));
+                        written.fetch_add(1, Ordering::Relaxed);
+                        i = i.saturating_add(1);
+                    }
+                })
+            };
 
-        let candidates = engine.eviction_candidates();
-        stop.store(true, Ordering::Relaxed);
-        anyhow::ensure!(writer.join().is_ok(), "the recording thread panicked");
+            // Do not start the walk until the writer is provably running, or the
+            // scan can finish before the thread is even scheduled. Bounded, so a
+            // writer that dies before its first record fails the test instead of
+            // hanging it with the panic trapped in an unjoined thread.
+            let spin_deadline = Instant::now() + Duration::from_secs(10);
+            while written.load(Ordering::Relaxed) == 0 {
+                anyhow::ensure!(
+                    Instant::now() < spin_deadline,
+                    "the recording thread never recorded an access"
+                );
+                std::thread::yield_now();
+            }
 
-        let missing = seeded
-            .iter()
-            .filter(|h| !candidates.contains_key(h))
-            .count();
+            // The writer bumps its counter *after* the insert lands, so a key
+            // index below `before` is certainly already in the map and one at or
+            // above `after` is certainly not yet. Index `before` itself is the
+            // ambiguous one, which is why the witness range below skips it.
+            let before = written.load(Ordering::Relaxed);
+            let candidates = engine.eviction_candidates();
+            let after = written.load(Ordering::Relaxed);
+            stop.store(true, Ordering::Relaxed);
+            anyhow::ensure!(writer.join().is_ok(), "the recording thread panicked");
+
+            let missing = seeded
+                .iter()
+                .filter(|h| !candidates.contains_key(h))
+                .count();
+            anyhow::ensure!(
+                missing == 0,
+                "the sweep dropped {missing} of {} pre-existing candidates",
+                seeded.len()
+            );
+
+            anyhow::ensure!(
+                after < u64::from(ROUND_STRIDE),
+                "round wrote {after} keys, overrunning its {ROUND_STRIDE}-key range"
+            );
+
+            // Did this round's walk actually see a record that landed inside it?
+            // The writer bumps its counter *after* the insert lands, so at the
+            // instant `before` was read the key at index `before` may already be
+            // in the map — skip it and start at the first index that cannot be.
+            let during: HashSet<Hash> = (before.saturating_add(1)..after)
+                .filter_map(|n| u32::try_from(n).ok())
+                .map(|n| Hash::new(base.saturating_add(n).to_le_bytes()))
+                .collect();
+            overlapped |= candidates.iter().any(|(h, _)| during.contains(h));
+            if overlapped {
+                break;
+            }
+        }
         anyhow::ensure!(
-            missing == 0,
-            "the sweep dropped {missing} of {} pre-existing candidates",
-            seeded.len()
+            overlapped,
+            "no round overlapped the writer, so the walk was never concurrent"
         );
         Ok(())
     }

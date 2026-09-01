@@ -17,11 +17,13 @@ use std::sync::Arc;
 /// admission reads for different hashes therefore proceed in parallel, and the
 /// periodic aging pass touches a single shard rather than the whole array.
 ///
-/// Aging still runs on one node-wide clock across all shards. Both readers
-/// below compare estimates on a shared scale — [`ProbationAdmission`] against a
+/// Aging runs on one node-wide clock across all shards. Both readers below
+/// compare estimates on a shared scale — [`ProbationAdmission`] against a
 /// node-wide threshold, [`TinyLfuEviction`] by ranking candidates from
 /// different shards against each other — so counters are only meaningful if
-/// every one of them has been aged the same number of times.
+/// each is caught up to that one clock when it is read. A clock per shard would
+/// age at a rate set by key skew and put the two readers on scales that cannot
+/// be compared at all.
 #[derive(Debug)]
 pub struct TinyLfuEstimator {
     inner: ShardedCountMinSketch,
@@ -29,10 +31,16 @@ pub struct TinyLfuEstimator {
 
 impl TinyLfuEstimator {
     /// Size the sketch to roughly `sketch_bytes` of counters: one `u8` per
-    /// counter over `ROWS` rows, so `cols = bytes / 4`, floored at 64 columns.
-    /// The floor also keeps the width well above
-    /// [`super::sketch::SHARDS`], below which a sharded sketch degenerates to
-    /// one column per shard (see [`ShardedCountMinSketch::new`]).
+    /// counter over `ROWS` rows, so `cols = bytes / 4`.
+    ///
+    /// The floor of 64 columns is a backstop for callers outside config
+    /// resolution, which rejects a `cache.tinylfu.sketch_bytes` small enough to
+    /// reach it (`decdn_common::config::MIN_TINYLFU_SKETCH_BYTES`). It keeps the
+    /// width above [`super::sketch::SHARDS`], below which a sharded sketch
+    /// degenerates to one column per shard (see [`ShardedCountMinSketch::new`]).
+    /// It is not a width the estimates read usefully at: 64 columns over
+    /// [`super::sketch::SHARDS`] shards is four columns per shard, and the
+    /// collision rate that matters is the per-shard one.
     #[must_use]
     pub fn new(sketch_bytes: usize) -> Self {
         // one u8 per counter, ROWS(=4) rows: cols = bytes / 4.

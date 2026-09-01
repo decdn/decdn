@@ -28,6 +28,18 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **config: `cache.tinylfu.sketch_bytes` now carries a floor of 16384 bytes,
+  enforced whichever cache policy is selected.** A value below the floor is a
+  load-time error on both `decdn node` startup and `decdn config validate`; the
+  node never clamps it, because a clamp hides the mistake. The check does not
+  consult `cache.eviction_policy` / `cache.admission_policy`, and for this knob
+  that is not merely defensive: the default `cache.serve_economics.policy =
+  "margin"` builds the same frequency sketch, so `sketch_bytes` sizes a live
+  estimator on a node running the default `lru` / `always` selectors. Operators
+  with an explicit `[cache.tinylfu] sketch_bytes` below 16384 must raise it
+  before upgrading. See [ADR 040 § Configuration
+  surface](adr/040-cache-policy.md).
+
 - **`ProbeResponse` and `StreamResponse` unsigned fields moved into trailing
   extension structs; `cdn/dht/v1` gains the same seam.** `ProbeResponse` is now
   exactly `{body, slash_sig}` with `total_bytes` in a new `ProbeResponseExt`;

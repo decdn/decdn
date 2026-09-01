@@ -1660,9 +1660,12 @@ impl ClientHandler {
     /// buy-loop debit's units. A no-op for an untagged hash (own-namespace or
     /// non-speculative), so calling it unconditionally on every serve is correct.
     ///
-    /// The arithmetic runs here and the ledger update is enqueued, so this — the
-    /// stream task's last act on a clean completion — costs one bounded
-    /// `try_send` and never waits on the buy loop or the eviction driver.
+    /// The arithmetic runs here and the ledger update is handed to the wired
+    /// [`crate::warming_allowance::WarmingCreditSink`], so this — the stream
+    /// task's last act on a clean completion — costs whatever that sink costs.
+    /// The runtime's channel sink is one tag-map shard read and one bounded
+    /// `try_send`, and never waits on the bucket lock the buy loop takes, which
+    /// is what the sink contract requires of anything on this path.
     fn credit_warming_serve(&self, hash: Hash, served_bytes: u64) {
         let (sell_rate, _floor) = self.rate_bounds.raise_to_floor(self.rate_per_mb);
         let margin_per_mb = sell_rate
