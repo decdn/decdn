@@ -42,12 +42,19 @@ const _: () = assert!(
 /// application error codes lives in the node crate.
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
+    /// The underlying stream failed while reading or writing the frame.
     #[error("frame I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// The length prefix names more bytes than [`MAX_MESSAGE_SIZE`] allows.
+    /// Rejected before anything is buffered.
     #[error("frame length {0} exceeds MAX_MESSAGE_SIZE ({MAX_MESSAGE_SIZE})")]
     TooLarge(u32),
+    /// The length prefix is not a well-formed varint — empty, a
+    /// non-terminating continuation run, or an overflowing fifth byte.
     #[error("malformed varint length prefix")]
     Varint,
+    /// The frame's bytes are not a valid postcard encoding of the expected
+    /// message.
     #[error("postcard decode error: {0}")]
     Decode(#[from] postcard::Error),
 }

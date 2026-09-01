@@ -248,8 +248,13 @@ impl Pacer for WindowPacer {
 /// from the first byte, the same instant-ceiling behavior as the downstream window.
 #[derive(Debug, Clone, Copy)]
 pub struct RampPacer {
+    /// Ramp divisor: the window is `paid / divisor`. `0` opens the full
+    /// `credit_max` immediately.
     pub divisor: u64,
+    /// Smallest window the ramp may produce, so the pull can always make
+    /// progress. One chunk in practice.
     pub floor: u64,
+    /// Ceiling the ramp climbs toward.
     pub credit_max: u64,
 }
 

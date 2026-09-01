@@ -96,7 +96,9 @@ impl Capability {
 /// A capability together with its EIP-712 owner signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedCapability {
+    /// The delegation itself.
     pub capability: Capability,
+    /// The pool owner's EIP-712 signature over it.
     pub signature: Signature,
 }
 
@@ -155,7 +157,9 @@ pub enum CapabilityError {
     /// match the expected pool owner.
     #[error("capability signed by {recovered}, expected owner {expected}")]
     WrongOwner {
+        /// The pool owner the capability had to be signed by.
         expected: Address,
+        /// The address the signature actually recovers to.
         recovered: Address,
     },
 }

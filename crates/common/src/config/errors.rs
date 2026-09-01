@@ -61,6 +61,8 @@ impl Default for ConfigErrorBag {
 }
 
 impl ConfigErrorBag {
+    /// An empty bag. Resolution fills it and reports every problem at once,
+    /// rather than failing on the first.
     pub const fn new() -> Self {
         Self {
             problems: Vec::new(),

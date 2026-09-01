@@ -23,6 +23,8 @@ pub struct EgressMeter {
 }
 
 impl EgressMeter {
+    /// An unseeded meter. The first [`Self::sample`] seeds the EWMA rather
+    /// than reporting a rate against an unknown baseline.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

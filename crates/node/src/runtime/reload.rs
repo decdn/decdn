@@ -89,6 +89,8 @@ use decdn_common::config::{
 /// first reload commits one.
 #[derive(Debug, Clone, Copy)]
 pub struct ReloadSnapshot {
+    /// The live log level, or `None` while the startup `EnvFilter` came from
+    /// `RUST_LOG` and no reload has committed one.
     pub log_level: Option<decdn_common::cli::common::LogLevel>,
 }
 

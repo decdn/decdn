@@ -29,6 +29,7 @@ use positioned_io::ReadAt;
 
 #[cfg(feature = "test-util")]
 pub mod conformance;
+/// The `(hash, total_bytes)` blob view every range-aware backend implements.
 pub mod ranged_store;
 pub mod streaming;
 pub use ranged_store::{RangedFuture, RangedStore, RangedStoreError};

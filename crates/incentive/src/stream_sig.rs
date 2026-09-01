@@ -220,7 +220,9 @@ pub enum StreamSlashError {
     /// match the expected signer.
     #[error("stream slash_sig signed by {recovered}, expected {expected}")]
     WrongSigner {
+        /// The address the stream response had to be signed by.
         expected: Address,
+        /// The address the signature actually recovers to.
         recovered: Address,
     },
 }

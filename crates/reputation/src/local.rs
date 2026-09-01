@@ -59,18 +59,32 @@ pub const LOCAL_SCORE_MAX_DELTA_PER_REPORT: f64 = 0.05;
 /// Validation errors when constructing a [`LocalReputation`].
 #[derive(Debug, Error, PartialEq)]
 pub enum ConfigError {
+    /// A config field that must sit in `[0.0, 1.0]` is outside it, infinite,
+    /// or NaN.
     #[error("{field} must be a finite number in [0.0, 1.0], got {value}")]
-    OutOfUnitInterval { field: &'static str, value: f64 },
+    OutOfUnitInterval {
+        /// Name of the offending [`LocalReputationConfig`] field.
+        field: &'static str,
+        /// The value that was rejected.
+        value: f64,
+    },
+    /// `reference_bps` is `0`, which would make the log speed curve undefined.
     #[error("reference_bps must be > 0")]
     ZeroReferenceBps,
     #[error(
         "weights must sum to 1.0; got speed={speed} + correctness={correctness} \
          + reachability={reachability} = {sum}"
     )]
+    /// The three component weights do not add up to `1.0`, so the blended
+    /// score would not stay in `[0.0, 1.0]`.
     WeightsDoNotSumToOne {
+        /// The configured speed weight.
         speed: f64,
+        /// The configured correctness weight.
         correctness: f64,
+        /// The configured reachability weight.
         reachability: f64,
+        /// What the three actually add up to.
         sum: f64,
     },
 }
@@ -94,7 +108,13 @@ pub enum Outcome {
     /// Peer responded but BLAKE3 verification of the bytes failed.
     Corruption,
     /// Peer delivered correctly verified bytes over the wire.
-    Delivered { bytes: u64, elapsed: Duration },
+    Delivered {
+        /// Bytes that verified against the blob hash.
+        bytes: u64,
+        /// Wall-clock time the delivery took; with `bytes`, the throughput
+        /// the speed component scores.
+        elapsed: Duration,
+    },
     /// Peer self-attested *this node's own* region yet the observed probe
     /// latency exceeded the ADR 030 ceiling — the canonical region-spoofing
     /// signal
@@ -117,14 +137,23 @@ pub enum Outcome {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct LocalReputationConfig {
+    /// EWMA smoothing factor: the weight given to the newest sample. Larger
+    /// reacts faster and forgets faster.
     pub alpha: f64,
+    /// Score a peer starts at, before any interaction is recorded.
     pub initial_score: f64,
     /// Reference throughput scoring ~1.0 under the log speed curve (was the
     /// flat saturation baseline).
     pub reference_bps: u64,
+    /// Weight of the throughput component. The three weights must sum to
+    /// `1.0` or [`LocalReputation::new`] rejects the config.
     pub speed_weight: f64,
+    /// Weight of the hash-verification component.
     pub correctness_weight: f64,
+    /// Weight of the dial-success component.
     pub reachability_weight: f64,
+    /// Largest score movement one report may cause. `1.0` disables the clamp;
+    /// see [`LOCAL_SCORE_MAX_DELTA_PER_REPORT`].
     pub max_delta_per_update: f64,
     /// Half-life (seconds) of idle-score decay toward neutral (ADR 008 §Score
     /// Decay). Each half-life halves the distance to neutral. `0` disables decay.

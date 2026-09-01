@@ -577,11 +577,19 @@ pub struct ResolvedObservability {
 /// `decdn-common`'s integration tests cover.
 #[derive(Debug, Clone)]
 pub struct ResolvedDht {
+    /// Token refill rate for the per-peer (`NodeId`) limiter, in requests/second.
     pub per_peer_rate_per_sec: f64,
+    /// Bucket capacity for the per-peer limiter: how many requests one
+    /// peer may send back to back before the refill rate binds.
     pub per_peer_burst: u32,
+    /// Token refill rate for the per-source-IP limiter, in requests/second.
     pub per_ip_rate_per_sec: f64,
+    /// Bucket capacity for the per-IP limiter.
     pub per_ip_burst: u32,
+    /// Token refill rate for the handler-wide limiter, in requests/second. Applies
+    /// across all peers and all source IPs together.
     pub global_rate_per_sec: f64,
+    /// Bucket capacity for the handler-wide limiter.
     pub global_burst: u32,
     /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
     pub max_tracked_per_ip: usize,
@@ -614,11 +622,19 @@ impl Default for ResolvedDht {
 /// `resolve_probe_into` path threads the defaults through the resolver bag.
 #[derive(Debug, Clone)]
 pub struct ResolvedProbe {
+    /// Token refill rate for the per-peer (`NodeId`) limiter, in probes/second.
     pub per_peer_rate_per_sec: f64,
+    /// Bucket capacity for the per-peer limiter: how many probes one
+    /// peer may send back to back before the refill rate binds.
     pub per_peer_burst: u32,
+    /// Token refill rate for the per-source-IP limiter, in probes/second.
     pub per_ip_rate_per_sec: f64,
+    /// Bucket capacity for the per-IP limiter.
     pub per_ip_burst: u32,
+    /// Token refill rate for the handler-wide limiter, in probes/second. Applies
+    /// across all peers and all source IPs together.
     pub global_rate_per_sec: f64,
+    /// Bucket capacity for the handler-wide limiter.
     pub global_burst: u32,
     /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
     pub max_tracked_per_ip: usize,
@@ -660,17 +676,30 @@ pub struct ResolvedSecurity {
 /// Which load-shed policy the node runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadShedPolicyKind {
+    /// `resource-pressure` (the default): admit against the live egress,
+    /// concurrency, and per-client budgets below.
     ResourcePressure,
+    /// `always-admit`: never shed. The budgets are still resolved and
+    /// reported, but no request is refused on their account.
     AlwaysAdmit,
 }
 
 /// Resolved load-shedding thresholds.
 #[derive(Debug, Clone)]
 pub struct ResolvedLoadShed {
+    /// Which policy decides admission.
     pub policy: LoadShedPolicyKind,
+    /// Serving egress budget in Mbps. `0` disables the egress ceiling.
     pub egress_budget_mbps: u64,
+    /// Concurrency high-water mark: at or above it, the node starts shedding
+    /// misses. The resolver rejects a value below
+    /// [`Self::max_concurrent_serves_low`].
     pub max_concurrent_serves_high: u32,
+    /// Concurrency low-water mark: at or below it, the node resumes admitting.
+    /// The gap to the high mark is what stops the decision flapping.
     pub max_concurrent_serves_low: u32,
+    /// Per-client concurrent-serve cap, enforced only while under pressure.
+    /// `0` disables it.
     pub per_client_serve_cap: u32,
 }
 
@@ -724,17 +753,29 @@ impl Default for ResolvedReceipts {
 /// [`super::resolve_config`] to return an error if not provided.
 #[derive(Debug)]
 pub struct ResolvedConfig {
+    /// Node key and data directory.
     pub identity: ResolvedIdentity,
+    /// Listen addresses, relays, and NAT-traversal settings.
     pub network: ResolvedNetwork,
+    /// Chain RPC endpoint and the contract addresses the node talks to.
     pub blockchain: ResolvedBlockchain,
+    /// Blob store, origin backend, and admission/eviction policy.
     pub cache: ResolvedCache,
+    /// Pricing, voucher, and settlement settings.
     pub payment: ResolvedPayment,
+    /// Logging, metrics, and tracing endpoints.
     pub observability: ResolvedObservability,
+    /// Connection and dispatch limits for the serving path.
     pub security: ResolvedSecurity,
+    /// Overload-protection thresholds.
     pub load_shed: ResolvedLoadShed,
+    /// `cdn/dht/v1` settings (ADR 022).
     pub dht: ResolvedDht,
+    /// `cdn/probe/v1` settings (ADR 005).
     pub probe: ResolvedProbe,
+    /// Download-receipt log settings.
     pub receipts: ResolvedReceipts,
+    /// Local content denylist (ADR 011).
     pub content: ResolvedContent,
 }
 

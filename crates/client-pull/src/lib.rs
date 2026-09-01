@@ -635,6 +635,7 @@ pub const fn effective_rate_ceiling(probe_relative: u64, config_absolute: u64) -
 /// not in this crate.
 #[derive(Debug)]
 pub struct PullTimeout {
+    /// How long the pull ran before the budget elapsed.
     pub after: Duration,
 }
 
@@ -673,7 +674,11 @@ impl std::error::Error for PullTimeout {}
 /// the fix is a fresh capability or an owner top-up, not a resync.
 #[derive(Debug)]
 pub struct UpstreamVoucherRejected {
+    /// Why the seller refused the voucher.
     pub reason: VoucherRejectReason,
+    /// The seller's signer-verified watermark, when it sent one, so the buyer
+    /// can resync its cumulative state and retry. `None` means there is
+    /// nothing to resync from and the caller must surface the failure.
     pub bundle: Option<WatermarkBundle>,
 }
 
@@ -1054,8 +1059,11 @@ pub enum DeadlineError {
     /// throughput floor — the signal that a healthy stream is still making progress —
     /// can never fire.
     CapCannotOutlastItsStages {
+        /// The open-stage budget.
         open: Duration,
+        /// The throughput-floor window that follows it.
         window: Duration,
+        /// The whole-pull cap, which must exceed `open + window`.
         hard_cap: Duration,
     },
 }

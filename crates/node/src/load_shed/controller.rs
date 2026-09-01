@@ -49,6 +49,8 @@ pub struct LoadShedController {
 }
 
 impl LoadShedController {
+    /// Build a controller with the policy `cfg` selects, a fresh in-flight
+    /// counter, and an unseeded egress meter.
     #[must_use]
     pub fn from_config(cfg: &ResolvedLoadShed) -> Arc<Self> {
         Arc::new(Self {

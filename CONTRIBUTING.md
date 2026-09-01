@@ -257,6 +257,8 @@ The workspace is on `resolver = "3"`, which reads that `rust-version`: it defaul
 
 **Say what you mean:** `elided_lifetimes_in_paths` and `unreachable_pub` are `warn`. Write `Foo<'_>` when the type borrows, and give an item inside a private module the visibility it actually has (`pub(crate)` / `pub(super)`) rather than a bare `pub`. Both are machine-fixable — `cargo clippy --fix --workspace --all-targets` applies them.
 
+**`missing_docs` is `warn`:** every public item — including struct fields and enum variants — carries a doc comment. The `alloy::sol!` bindings are the one exception and already opt out at their `mod sol_types` wrappers. New docs are link-checked too: the `doc` gate runs `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items`, so a broken `[`Type`]` link fails the build.
+
 ## Working with ADRs
 
 ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview and index of all decisions; numbered files cover individual decisions.

@@ -70,7 +70,10 @@ impl FrequencyEstimator for TinyLfuEstimator {
 /// concurrent serve completion collide only when their hashes share a shard.
 #[derive(Debug)]
 pub struct ProbationAdmission {
+    /// The shared frequency estimator; read, never written, by this policy.
     pub freq: Arc<dyn FrequencyEstimator>,
+    /// Prior sightings a hash needs before a miss is admitted straight to
+    /// [`Segment::Main`] instead of `Probation`.
     pub promotion_threshold: u32,
 }
 
@@ -99,6 +102,9 @@ pub struct TinyLfuEviction {
 }
 
 impl TinyLfuEviction {
+    /// Rank against `freq`, promoting probation members at
+    /// `promotion_threshold` sightings and holding probation to
+    /// `probation_target_pct` of the cache.
     #[must_use]
     pub fn new(
         freq: Arc<dyn FrequencyEstimator>,

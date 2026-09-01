@@ -774,6 +774,8 @@ impl EvictionCandidates {
         self.0
     }
 
+    /// Wrap a hand-built map so policy tests can construct a candidate set
+    /// without running a real sweep.
     #[cfg(test)]
     #[must_use]
     pub const fn from_map_for_test(map: HashMap<Hash, Instant>) -> Self {
@@ -2607,6 +2609,8 @@ impl CacheEngine {
         }
     }
 
+    /// `admission_segment` under a test-visible name, so policy wiring can be
+    /// asserted without reaching through a fill.
     #[cfg(test)]
     pub fn admission_segment_for_test(
         &self,

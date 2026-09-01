@@ -550,6 +550,7 @@ fn resolve_bootstrap(
 pub enum Bootstrap {
     /// Read live from the on-chain registry.
     Live {
+        /// The peers the registry returned.
         peers: Vec<NodeCandidate>,
         /// Set when the read succeeded but could not be persisted, which leaves
         /// the next outage without a fallback.
@@ -557,6 +558,7 @@ pub enum Bootstrap {
     },
     /// The registry could not be read; these peers came from `peers.json`.
     Cached {
+        /// The peers `peers.json` held.
         peers: Vec<NodeCandidate>,
         /// How long ago the cache was written.
         age: Duration,

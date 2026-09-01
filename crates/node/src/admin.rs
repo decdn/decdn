@@ -304,7 +304,9 @@ impl DrainTrigger {
 /// the runtime's "no path → no reload" invariant.
 #[derive(Debug, Clone)]
 pub struct ReloadHook {
+    /// The runtime's reload state — the same `Arc` the SIGHUP arm holds.
     pub reload_state: Arc<RuntimeReloadState>,
+    /// Path to the config file the operator started with, re-read on reload.
     pub config_path: PathBuf,
 }
 
@@ -318,6 +320,9 @@ impl AdminState {
     // positional argument: `new` has several call sites (mostly unit
     // tests of the cache methods that don't need a DHT), and `with_dht`
     // lets the production runtime opt in without touching any of them.
+    /// Assemble the admin surface's view of the running node. `reload_hook`
+    /// is `None` when the daemon started with no config path, which is what
+    /// makes reload unavailable rather than merely inert.
     pub const fn new(
         node_id: [u8; 32],
         started_at: Instant,
@@ -485,6 +490,7 @@ pub struct AdminRpcImpl {
 }
 
 impl AdminRpcImpl {
+    /// Serve the admin RPC methods against `state`.
     pub const fn new(state: AdminState) -> Self {
         Self { state }
     }

@@ -31,9 +31,12 @@ pub struct Quote {
 /// A configured DEX venue.
 #[derive(Debug)]
 pub enum SwapVenue {
+    /// Test-only venue with hand-set quotes; see [`MockVenue`].
     #[cfg(test)]
     Mock(MockVenue),
+    /// Uniswap v3, quoted and swapped through a fee-tier pool.
     UniswapV3(UniswapV3Venue),
+    /// Balancer v3, quoted and swapped through a named pool.
     BalancerV3(BalancerV3Venue),
 }
 
@@ -171,16 +174,23 @@ pub fn from_config<P: Provider + Clone + 'static>(
     }
 }
 
+/// A venue whose quotes and swap hash are set by the test, so the swap
+/// balancer's decision logic can be exercised without a chain.
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct MockVenue {
+    /// Amount-in this venue quotes for any `amount_out`.
     pub expected_in: U256,
+    /// Amount-in at spot price, which the price-impact gate compares against.
     pub spot_in: U256,
+    /// Transaction hash the swap reports as sent.
     pub swap_tx: B256,
 }
 
 #[cfg(test)]
 impl MockVenue {
+    /// A venue that quotes 1 wei both ways and reports `swap_tx`, for tests
+    /// that care only about which branch ran.
     pub fn default_with_tx(swap_tx: B256) -> Self {
         Self {
             expected_in: U256::from(1u64),

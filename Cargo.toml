@@ -288,6 +288,9 @@ elided_lifetimes_in_paths = "warn"
 # it really is. Mostly this keeps the shared integration-test helper modules
 # honest, where `pub` is reflex rather than intent.
 unreachable_pub = "warn"
+# Every public item carries a doc comment. The `alloy::sol!` bindings are the
+# one exception and already opt out at their `mod sol_types` wrappers.
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

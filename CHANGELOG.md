@@ -1110,6 +1110,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **`missing_docs` is on, and the 230 public items that lacked a doc comment
+  have one.** 170 were struct fields and 24 enum variants — the shapes rustdoc
+  renders as a bare name with no explanation, which is where the gap actually
+  hurt: `ResolvedConfig`'s twelve sections, `ClientHandlerDeps`' required
+  wiring, the `expected`/`recovered` pairs on every signature-recovery error,
+  and the `PoolError` operands a node reads when it refuses a voucher. The
+  `alloy::sol!` bindings needed nothing: they already opt out at their twelve
+  `mod sol_types` wrappers. Every new comment is also link-checked, since the
+  `doc` gate denies rustdoc warnings.
+
 - **`elided_lifetimes_in_paths` and `unreachable_pub` are on.** A type path that
   borrows now says so — `TableDefinition<'_, …>` across `channel_store`'s eleven
   redb table definitions, `EvictionContext<'_>` in the cache's admission and
