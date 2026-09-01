@@ -26,14 +26,14 @@ use tokio::time::Instant;
 /// decode — is what makes progress observable inside a single large frame. Each
 /// `poll_read` adds the bytes it filled, so a frame that arrives in many transport
 /// reads advances the counter continuously rather than all at once on decode.
-pub struct ProgressReader<'a, R> {
+pub(crate) struct ProgressReader<'a, R> {
     inner: &'a mut R,
     counter: Arc<AtomicU64>,
 }
 
 impl<'a, R> ProgressReader<'a, R> {
     /// Wrap `inner`, adding each read's byte count to `counter`.
-    pub const fn new(inner: &'a mut R, counter: Arc<AtomicU64>) -> Self {
+    pub(crate) const fn new(inner: &'a mut R, counter: Arc<AtomicU64>) -> Self {
         Self { inner, counter }
     }
 }
@@ -59,7 +59,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<'_, R> {
 /// The streaming-stage stall policy: a minimum throughput `floor_bps` sustained over a
 /// trailing `window`.
 #[derive(Clone, Copy, Debug)]
-pub struct FloorConfig {
+pub(crate) struct FloorConfig {
     /// The trailing window over which throughput is measured.
     pub window: Duration,
     /// The minimum bytes-per-second the transfer must sustain over the window. `0`
@@ -70,7 +70,7 @@ pub struct FloorConfig {
 
 /// The outcome of one [`ThroughputFloor::evaluate`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FloorVerdict {
+pub(crate) enum FloorVerdict {
     /// Throughput is at or above the floor, or the window is not yet judgeable.
     Ok,
     /// Throughput has stayed below the floor across a full window.
@@ -85,7 +85,7 @@ pub enum FloorVerdict {
 /// budget: for the first window no byte is required to have arrived. [`Self::pause`] /
 /// [`Self::resume`] exclude a self-inflicted credit-window payment pause, so the payer's
 /// own unpaid balance is never read as a sender stall.
-pub struct ThroughputFloor {
+pub(crate) struct ThroughputFloor {
     cfg: FloorConfig,
     counter: Arc<AtomicU64>,
     samples: VecDeque<(Instant, u64)>,
@@ -95,7 +95,7 @@ pub struct ThroughputFloor {
 
 impl ThroughputFloor {
     /// Start watching `counter` from `started` (the moment streaming begins).
-    pub const fn new(cfg: FloorConfig, counter: Arc<AtomicU64>, started: Instant) -> Self {
+    pub(crate) const fn new(cfg: FloorConfig, counter: Arc<AtomicU64>, started: Instant) -> Self {
         Self {
             cfg,
             counter,
@@ -107,7 +107,7 @@ impl ThroughputFloor {
 
     /// Stop counting the interval that starts now: the receiver owes the covering proof,
     /// so a delivery pause here is self-inflicted, not the sender's stall.
-    pub const fn pause(&mut self, now: Instant) {
+    pub(crate) const fn pause(&mut self, now: Instant) {
         if self.paused_since.is_none() {
             self.paused_since = Some(now);
         }
@@ -116,7 +116,7 @@ impl ThroughputFloor {
     /// Resume counting. The paused span is folded out of the timeline: retained samples
     /// and the warmup origin shift forward by the span, so the pause reads as no elapsed
     /// time rather than as a stall.
-    pub fn resume(&mut self, now: Instant) {
+    pub(crate) fn resume(&mut self, now: Instant) {
         if let Some(since) = self.paused_since.take() {
             let span = now.saturating_duration_since(since);
             for sample in &mut self.samples {
@@ -133,7 +133,7 @@ impl ThroughputFloor {
     /// Sample the counter and judge the trailing window. Returns [`FloorVerdict::Stalled`]
     /// only once the window is warm and the bytes across it fall below `floor_bps · window`
     /// (or below one byte when `floor_bps == 0`).
-    pub fn evaluate(&mut self, now: Instant) -> FloorVerdict {
+    pub(crate) fn evaluate(&mut self, now: Instant) -> FloorVerdict {
         if self.paused_since.is_some() {
             return FloorVerdict::Ok;
         }

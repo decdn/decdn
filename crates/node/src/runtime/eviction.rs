@@ -440,7 +440,7 @@ mod tests {
         #[derive(Debug)]
         struct NewestFirst;
         impl decdn_cache::EvictionPolicy for NewestFirst {
-            fn plan(&self, ctx: &decdn_cache::EvictionContext) -> decdn_cache::EvictionPlan {
+            fn plan(&self, ctx: &decdn_cache::EvictionContext<'_>) -> decdn_cache::EvictionPlan {
                 let mut v: Vec<_> = ctx.candidates.iter().map(|(h, t)| (*h, *t)).collect();
                 v.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
                 let mut evict = Vec::new();

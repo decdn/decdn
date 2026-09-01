@@ -9,7 +9,7 @@ use crate::Hash;
 pub struct LruEviction;
 
 impl EvictionPolicy for LruEviction {
-    fn plan(&self, ctx: &EvictionContext) -> EvictionPlan {
+    fn plan(&self, ctx: &EvictionContext<'_>) -> EvictionPlan {
         let mut ordered: Vec<(Hash, std::time::Instant)> =
             ctx.candidates.iter().map(|(h, t)| (*h, *t)).collect();
         ordered.sort_by_key(|(_, last)| *last); // oldest access first

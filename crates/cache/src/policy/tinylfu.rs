@@ -114,7 +114,7 @@ impl TinyLfuEviction {
 }
 
 impl EvictionPolicy for TinyLfuEviction {
-    fn plan(&self, ctx: &EvictionContext) -> EvictionPlan {
+    fn plan(&self, ctx: &EvictionContext<'_>) -> EvictionPlan {
         // 1. Promote: probation members whose buffered frequency now clears
         // the threshold graduate to Main. They're excluded from the
         // probation-cap eviction below (and from the global loop, since a

@@ -255,6 +255,8 @@ The workspace is on `resolver = "3"`, which reads that `rust-version`: it defaul
 
 **No stray output:** `print_stdout`, `print_stderr`, and `dbg_macro` are `deny`. The `decdn` CLI is a terminal UI and allows both print lints at its crate roots; everywhere else, use `tracing`. The few production sites that run before the subscriber exists carry a per-site `#[expect]` with a reason.
 
+**Say what you mean:** `elided_lifetimes_in_paths` and `unreachable_pub` are `warn`. Write `Foo<'_>` when the type borrows, and give an item inside a private module the visibility it actually has (`pub(crate)` / `pub(super)`) rather than a bare `pub`. Both are machine-fixable — `cargo clippy --fix --workspace --all-targets` applies them.
+
 ## Working with ADRs
 
 ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview and index of all decisions; numbered files cover individual decisions.

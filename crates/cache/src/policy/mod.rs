@@ -80,7 +80,7 @@ pub trait EvictionPolicy: Send + Sync + std::fmt::Debug {
     /// ranks by frequency reads the shared [`FrequencyEstimator`] directly — the
     /// engine feeds that estimator on every serve. `candidates` is already
     /// stripped of pins/holds/deny by the engine.
-    fn plan(&self, ctx: &EvictionContext) -> EvictionPlan;
+    fn plan(&self, ctx: &EvictionContext<'_>) -> EvictionPlan;
 }
 
 /// Decayed frequency estimate shared by admission and eviction.

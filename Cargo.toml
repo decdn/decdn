@@ -280,6 +280,14 @@ redb = "4.2"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
+# Write `Foo<'_>`, not `Foo`, when the type has a lifetime: at a call site the
+# elided form hides that the value borrows, which is exactly what a reader
+# needs to see around the redb transaction and cache-eviction context types.
+elided_lifetimes_in_paths = "warn"
+# A `pub` item inside a private module is not part of any crate's API; say what
+# it really is. Mostly this keeps the shared integration-test helper modules
+# honest, where `pub` is reflex rather than intent.
+unreachable_pub = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

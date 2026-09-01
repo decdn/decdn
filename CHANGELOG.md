@@ -1110,6 +1110,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **`elided_lifetimes_in_paths` and `unreachable_pub` are on.** A type path that
+  borrows now says so — `TableDefinition<'_, …>` across `channel_store`'s eleven
+  redb table definitions, `EvictionContext<'_>` in the cache's admission and
+  eviction policy traits — so a reader sees the borrow at the call site instead of
+  having to look the type up. `unreachable_pub` narrows 46 items that were `pub`
+  inside a private module to the visibility they actually had: mostly the shared
+  integration-test helper modules (`node/tests/support`, `cache/tests/util`,
+  `cli/tests/common`), plus `client-pull`'s `progress` and `ledger` internals and
+  `load_shed`'s egress-budget helper. No item's real reachability changes.
+
 - **The workspace moves to cargo's MSRV-aware resolver and denies stray output,
   scaffolding macros, and lossy numeric casts.** `resolver = "3"` changes nothing
   about feature unification — that was resolver 2, which the workspace already

@@ -51,6 +51,8 @@ Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots
 
 **No stray output:** `print_stdout`, `print_stderr`, and `dbg_macro` are `deny`. The `decdn` CLI is a terminal UI and allows both print lints at its crate roots; everywhere else, use `tracing`. The few production sites that run before the subscriber exists carry a per-site `#[expect]` with a reason.
 
+**Say what you mean:** `elided_lifetimes_in_paths` and `unreachable_pub` are `warn`. Write `Foo<'_>` when the type borrows, and give an item inside a private module the visibility it actually has (`pub(crate)` / `pub(super)`) rather than a bare `pub`. Both are machine-fixable — `cargo clippy --fix --workspace --all-targets` applies them.
+
 ### Crate Structure
 
 ```

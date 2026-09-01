@@ -141,7 +141,7 @@ const SANE_TRAILER_MAX_BYTES: usize = 256;
 ///
 /// Key: the [`LaneKey`] encoding `pool_id ‖ signer ‖ provider` (`[u8; 72]`).
 /// Value: postcard-encoded [`StoredLaneState`] (variable length).
-const LANE_TABLE: TableDefinition<&[u8; LANE_KEY_LEN], &[u8]> =
+const LANE_TABLE: TableDefinition<'_, &[u8; LANE_KEY_LEN], &[u8]> =
     TableDefinition::new("lane_state_v1");
 
 /// redb table holding the pending-settle set (#327): pools this node closed
@@ -153,7 +153,7 @@ const LANE_TABLE: TableDefinition<&[u8; LANE_KEY_LEN], &[u8]> =
 /// Value: the grace-window deadline (Unix seconds). A fixed-width native `u64`
 /// value needs no postcard envelope (unlike [`LANE_TABLE`]), so there is no
 /// schema-version trailer to evolve here.
-const PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
+const PENDING_SETTLE_TABLE: TableDefinition<'_, &[u8; 32], u64> =
     TableDefinition::new("pending_settle_v1");
 
 /// redb table holding pools this node closed as the **buyer** (#988) — the
@@ -162,7 +162,7 @@ const PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
 /// value: deadline) but a SEPARATE table so the buyer settle sweep and the
 /// seller settle sweep never settle each other's closes. Lives in the same
 /// database file as [`LANE_TABLE`].
-const BUYER_PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
+const BUYER_PENDING_SETTLE_TABLE: TableDefinition<'_, &[u8; 32], u64> =
     TableDefinition::new("buyer_pending_settle_v1");
 
 /// redb table holding each on-chain watcher's scan checkpoint (#751, keyed in
@@ -171,7 +171,7 @@ const BUYER_PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
 /// down. Lives in the same database file as [`LANE_TABLE`]. One `&str` key per
 /// watcher (the [`CheckpointKey::as_str`] literals); a fixed-width native `u64`
 /// value needs no postcard envelope.
-const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
+const WATCHER_CHECKPOINT_TABLE: TableDefinition<'_, &str, u64> =
     TableDefinition::new("watcher_checkpoint_v1");
 
 /// redb table holding each `(pool_id, signer)` lane's cumulative unrecoverable
@@ -192,13 +192,13 @@ const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
 /// the accumulated `µUSDC` total as a native redb `u128` — no postcard envelope,
 /// matching the [`PENDING_SETTLE_TABLE`] convention of using redb's built-in
 /// scalar encoding for a single fixed-width number.
-const POOL_FLOOR_LOSS_TABLE: TableDefinition<&[u8; POOL_SIGNER_KEY_LEN], u128> =
+const POOL_FLOOR_LOSS_TABLE: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], u128> =
     TableDefinition::new("pool_floor_loss_v2");
 
 /// The superseded per-pool floor-loss table, keyed by `pool_id` alone. Nothing
 /// reads it; [`PersistentPoolStateStore::drop_superseded_floor_loss_table`] deletes
 /// it at open so a development store carrying one does not keep dead rows forever.
-const SUPERSEDED_POOL_FLOOR_LOSS_TABLE: TableDefinition<&[u8; 32], u128> =
+const SUPERSEDED_POOL_FLOOR_LOSS_TABLE: TableDefinition<'_, &[u8; 32], u128> =
     TableDefinition::new("pool_floor_loss_v1");
 
 /// redb table of tombstones for pools whose floor-loss rows were
@@ -216,7 +216,7 @@ const SUPERSEDED_POOL_FLOOR_LOSS_TABLE: TableDefinition<&[u8; 32], u128> =
 ///
 /// Key: raw `PoolId` bytes (`[u8; 32]`). Value: none (`()`), presence is the
 /// tombstone.
-const POOL_FLOOR_LOSS_FORGOTTEN_TABLE: TableDefinition<&[u8; 32], ()> =
+const POOL_FLOOR_LOSS_FORGOTTEN_TABLE: TableDefinition<'_, &[u8; 32], ()> =
     TableDefinition::new("pool_floor_loss_forgotten_v1");
 
 /// Byte width of a `(pool_id, signer)` key on disk: `32 + 20`. Two tables use
@@ -239,7 +239,7 @@ const POOL_SIGNER_KEY_LEN: usize = 52;
 ///
 /// Key: `pool_id ‖ signer` (`[u8; 52]`). Value: postcard-encoded
 /// [`StoredCapability`].
-const CAPABILITY_TABLE: TableDefinition<&[u8; POOL_SIGNER_KEY_LEN], &[u8]> =
+const CAPABILITY_TABLE: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], &[u8]> =
     TableDefinition::new("capability_v1");
 
 /// Encode a `(pool_id, signer)` pair into its `[u8; 52]` table key, shared by the
@@ -1470,7 +1470,7 @@ impl PersistentPoolStateStore {
     /// the seller and buyer pending sets stay byte-for-byte consistent.
     fn pending_record_in(
         &self,
-        table_def: TableDefinition<&[u8; 32], u64>,
+        table_def: TableDefinition<'_, &[u8; 32], u64>,
         entry: &PendingSettle,
     ) -> Result<(), StoreError> {
         let key: [u8; 32] = entry.pool_id.into();
@@ -1503,7 +1503,7 @@ impl PersistentPoolStateStore {
     /// empty set, not an error — first-boot tolerance).
     fn pending_load_from(
         &self,
-        table_def: TableDefinition<&[u8; 32], u64>,
+        table_def: TableDefinition<'_, &[u8; 32], u64>,
     ) -> Result<Vec<PendingSettle>, StoreError> {
         let read_txn = self
             .settle_db
@@ -1533,7 +1533,7 @@ impl PersistentPoolStateStore {
     /// never-written table, which must not be created as a side effect).
     fn pending_forget_in(
         &self,
-        table_def: TableDefinition<&[u8; 32], u64>,
+        table_def: TableDefinition<'_, &[u8; 32], u64>,
         pool_id: B256,
     ) -> Result<(), StoreError> {
         let key: [u8; 32] = pool_id.into();

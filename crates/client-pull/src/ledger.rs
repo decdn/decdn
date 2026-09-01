@@ -410,7 +410,7 @@ pub struct PoolLedger {
 /// takes this long means the upstream has stopped acknowledging at the
 /// transport level, not that it is merely slow. Generous enough never to fire on
 /// a healthy-but-loaded peer, short enough to bound the wedge into a failover.
-pub const VOUCHER_SEND_DEADLINE: Duration = Duration::from_secs(20);
+pub(crate) const VOUCHER_SEND_DEADLINE: Duration = Duration::from_secs(20);
 
 impl PoolLedger {
     /// Build a ledger seeded from the lane's persisted cumulative state (the
