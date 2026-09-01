@@ -223,21 +223,23 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "MICRO_USDC")]
     pub working_deposit_micro_usdc: Option<u64>,
 
-    /// Optional client-side size ceiling: refuse a delivery whose claimed total
-    /// size exceeds this many MiB before pulling any bytes. `0` (the default) =
-    /// no ceiling, so `decdn fetch` and `bundle pull` download a blob of any size
-    /// by its content hash. Set a nonzero value to stop before pulling something
-    /// larger than you expect. For `bundle pull` this is the per-entry ceiling.
+    /// Client-side size ceiling: refuse a delivery whose claimed total size
+    /// exceeds this many MiB before pulling any bytes. Defaults to 1 TiB
+    /// (1,048,576 MiB) — far above any real blob, so `decdn fetch` and
+    /// `bundle pull` download normal content by its hash without tuning, yet low
+    /// enough to bound what a provider's over-claimed `total_bytes` can cost
+    /// locally. Lower it as a tighter budget guard, or set `0` to disable the
+    /// ceiling entirely. For `bundle pull` this is the per-entry ceiling.
     ///
-    /// This is a user budget guard, not a memory safeguard: the streaming pull
-    /// writes to the on-disk ranged store and buffers only received bytes in
-    /// memory, so RAM stays bounded whatever the claim, and a provider that
-    /// over-claims `total_bytes` fails bao verification against the requested hash
-    /// regardless of this value. One on-disk cost does scale with the claim: the
-    /// store pre-sizes a sparse bao outboard sidecar (~0.4% of `total_bytes`) via
-    /// `set_len`, so an absurd claim can still surface a local disk or quota error
-    /// before verification rejects it. Set a nonzero ceiling to bound that.
-    #[arg(long, value_name = "MB", default_value_t = 0)]
+    /// The cost it bounds is on disk, not memory: the streaming pull buffers only
+    /// received bytes in RAM, so RAM stays bounded whatever the claim, and a
+    /// provider that over-claims `total_bytes` fails bao verification against the
+    /// requested hash regardless of this value. But the ranged store pre-sizes a
+    /// sparse bao outboard sidecar (~0.4% of `total_bytes`) via `set_len` at
+    /// creation, so without a ceiling an absurd claim could surface a local disk
+    /// or quota error before verification rejects it. This gate caps that pre-size
+    /// (1 TiB → ~4 GiB) by refusing the claim first.
+    #[arg(long, value_name = "MB", default_value_t = 1_048_576)]
     pub max_blob_mb: u64,
 
     /// Refuse a provider that quotes a per-MB rate above this many USDC base units
