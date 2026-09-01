@@ -927,6 +927,12 @@ pub struct ClientHandler {
     /// a [`FloorReservation`]'s `Drop` can reconcile under it (a tokio mutex cannot
     /// be locked in `Drop`). Hydrated from `floor_loss_store` at construction.
     pool_floor: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
+    /// Queue into the floor-loss persist worker (`floor::start_persist_worker`).
+    /// A [`FloorReservation`]'s `Drop` sends its new dead total here instead of
+    /// spawning: a `send` neither blocks nor panics, which is what makes it safe
+    /// from a `Drop` running during runtime shutdown. `None` when no floor-loss
+    /// store is configured, or outside any runtime, where drop writes inline.
+    floor_persist_tx: Option<tokio::sync::mpsc::UnboundedSender<floor::FloorLossWrite>>,
     /// Durable mirror of each pool's `dead_charge`; `None` in tests (in-memory
     /// only). A [`FloorReservation`]'s `Drop` writes the new dead total here
     /// best-effort.
@@ -1106,6 +1112,8 @@ impl ClientHandler {
         // Fails CLOSED, like the lane-state hydration above: starting empty would
         // silently re-grant every pool its full free-floor budget.
         let pool_floor = floor::hydrate(deps.floor_loss_store.as_ref())?;
+        let floor_persist_tx =
+            floor::start_persist_worker(deps.floor_loss_store.as_ref(), &deps.metrics);
         Ok(Self {
             node_id: deps.node_id,
             metrics: deps.metrics,
@@ -1126,6 +1134,7 @@ impl ClientHandler {
             lane_gauge_publish: std::sync::Mutex::new(()),
             capability_verify_cache: std::sync::Mutex::new(CapabilityVerifyCache::default()),
             pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
+            floor_persist_tx,
             floor_loss_store: deps.floor_loss_store,
             pool_floor_signer_share_bps: deps.pool_floor_signer_share_bps,
             pool_floor_signer_max_windows: deps.pool_floor_signer_max_windows,

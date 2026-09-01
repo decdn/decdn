@@ -2345,6 +2345,9 @@ pub async fn run(
     )
     .await?;
 
+    // Kept past the router so shutdown can drain the floor-loss persist worker,
+    // once every serve has returned and every `FloorReservation` has dropped.
+    let client_handler = Arc::clone(&ch.client_handler);
     let (router, signal) = serve_until_shutdown(
         &reload_state,
         config_path.as_deref(),
@@ -2380,6 +2383,7 @@ pub async fn run(
         warming_creditor: ch.warming_creditor,
         lane_flush_task: infra.lane_flush_task,
         channel_state_store: infra.channel_state_store,
+        client_handler,
         node_metrics: infra.node_metrics,
         tasks: bg.tasks,
     };
@@ -2426,6 +2430,9 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     /// flush of `channel_state_store`.
     lane_flush_task: tokio::task::JoinHandle<()>,
     channel_state_store: Arc<dyn PoolStateStore>,
+    /// Held only so the floor-loss persist worker can be drained below, once every
+    /// serve has returned and every `FloorReservation` has dropped.
+    client_handler: Arc<ClientHandler>,
     node_metrics: Arc<metrics::Metrics>,
     tasks: JoinSet<()>,
 }
@@ -2465,6 +2472,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
         warming_creditor,
         lane_flush_task,
         channel_state_store,
+        client_handler,
         node_metrics,
         mut tasks,
     } = handles;
@@ -2616,6 +2624,12 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // idempotent to re-scan. Bounded by the deadline
     // so a slow RPC cannot hang shutdown.
     payment_service.shutdown(SHUTDOWN_DEADLINE).await;
+
+    // Drain the floor-loss persist worker. The router has drained, so every
+    // `FloorReservation` has dropped and queued whatever dead charge it folded; this
+    // waits for that backlog to reach disk. A write lost here would hand its signer
+    // back a share of the pool's free-floor budget on the next boot.
+    client_handler.flush_floor_persists().await;
 
     // Final durable flush before stop, so the last interval of frontier lands.
     // The router has drained and the redeem sweep above already ran, so the
