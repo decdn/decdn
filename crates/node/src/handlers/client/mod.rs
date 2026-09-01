@@ -67,10 +67,9 @@ use crate::receipt_log::{RawReceipt, ReceiptSink};
 // (and the test module) can reach them via `use super::*` — Rust makes a
 // module's private items visible to its descendants (#1254).
 //
-// `floor` is the one exception: it OWNS its types rather than borrowing them
-// from here, so the floor accumulator's two-level counters are unreachable from
-// this module and can only be moved through the mutators that keep both levels
-// in step. See its module doc.
+// `floor` also owns the floor accumulator's types, so its two-level counters are
+// unreachable from here and can only be moved through the mutators that keep both
+// levels in step. See its module doc.
 mod delivery;
 mod dispatch;
 mod fill;

@@ -16,10 +16,9 @@
 //! in one call. A one-sided update would be silent, and since `dead_charge` only
 //! grows and clears only on pool reclaim, permanent.
 //!
-//! Unlike the other `handlers::client` submodules, which are bare `impl
-//! ClientHandler` blocks over types defined in `mod.rs`, this one owns its types.
-//! That is the point: `mod.rs` cannot reach the fields, so the mutators are the
-//! only way to move them.
+//! The counters live here rather than in `mod.rs` so that privacy is real: a
+//! sibling module cannot name a field, so the mutators are the only way to move
+//! one.
 
 use super::{
     Address, Arc, AtomicBool, AtomicU64, B256, CHUNK_BYTES, ClientHandler, Hash, HashMap, Metrics,
@@ -488,7 +487,7 @@ impl FloorReservation {
     /// own transient upstream unavailability, and a handful of such refusals strand
     /// a signer's whole floor share. That is the behavior `serve_stream` documents
     /// as "a refusal before the serve loop drops with `note_unpaid` at 0, so no
-    /// dead charge is folded"; this restores it. Mechanically a refused-unspent
+    /// dead charge is folded". Mechanically a refused-unspent
     /// serve and a fully-repaid one both owe nothing, so this delegates to
     /// [`Self::release_live_repaid`]; the distinct name states the intent at the
     /// refusal call sites.
@@ -546,11 +545,12 @@ impl Drop for FloorReservation {
         // `(pool, signer)` — it raises the stored total, never lowers it — so two
         // drops on the same lane arriving out of order cannot regress the row.
         //
-        // A `send` on an unbounded channel is the whole of this guard's work: it
-        // never blocks, and it never panics. Spawning here would do both wrong.
-        // `spawn_blocking` panics once the blocking pool is shutting down, which is
-        // exactly when guards drop en masse, and a panic inside a `Drop` is not
-        // something the serve path can absorb.
+        // A `send` on an unbounded channel is the whole of this guard's work, and a
+        // `Drop` cannot await. Spawning the write here instead would hand back a
+        // `JoinHandle` with nowhere to go: dropping it discards the outcome, so a
+        // write cancelled with the runtime — which is when guards drop en masse —
+        // would leave the durable total behind the in-memory one with nothing
+        // logged and nothing counted. The worker owns that outcome instead.
         let Some(store) = self.store.clone() else {
             return;
         };
@@ -2524,11 +2524,11 @@ mod tests {
     /// A persist cancelled or panicked in the blocking pool is COUNTED, not
     /// discarded.
     ///
-    /// The drop path used to spawn and drop the `JoinHandle`, so a write cancelled by
-    /// runtime shutdown — the case that happens when guards drop en masse — left no
-    /// trace at all. `floor_loss_persist_failures` is what an operator alerts on, and
-    /// the consequence of a cancelled write is identical to a failed one: the durable
-    /// total falls behind, and a restart re-grants the share.
+    /// A write cancelled with the runtime — the case that happens when guards drop
+    /// en masse — has the same consequence as one that failed outright: the durable
+    /// total falls behind the in-memory one, and a restart re-grants that signer its
+    /// share. `floor_loss_persist_failures` is what an operator alerts on, so both
+    /// reach it.
     #[test]
     fn a_cancelled_persist_is_counted_like_a_failed_one() -> anyhow::Result<()> {
         let metrics = Metrics::new();
