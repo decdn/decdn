@@ -1903,9 +1903,10 @@ recorders! {
     /// ("floor dead-charge persist failed" / "pool dead-charge forget failed").
     floor_loss_persist_failure => floor_loss_persist_failures.inc();
 
-    /// Record a `serve_stream` request served with the floor-credit gates skipped
-    /// because the cached `getPool` view answered `None`. One bump per request, at
-    /// the single resolve site — see the field doc for what the fail-open costs.
+    /// Record a `serve_stream` request that reached the pool-view resolve and found
+    /// no view answer, so the floor-credit gates are skipped. One bump per request at
+    /// that single site, which precedes every later gate — so a request refused
+    /// afterwards still counts. See the field doc for what the fail-open costs.
     floor_gate_skipped_no_pool_view => floor_gate_skipped_no_pool_view.inc();
 
     /// A distinct slash against this node's operator was detected by the slash

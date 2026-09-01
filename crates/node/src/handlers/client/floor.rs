@@ -405,9 +405,10 @@ impl FloorPersist {
 
     /// Make `micro` — the lane's new CUMULATIVE dead total — durable.
     ///
-    /// Called from a `Drop`, so it never blocks and never awaits. The worker path is
-    /// a `send`; everything else is a fallback that still gets the value to disk,
-    /// because losing it hands this signer its whole share back on the next boot.
+    /// Called from a `Drop`, so it never awaits. The worker path is a `send` and is
+    /// the only path a healthy serve takes; everything else is a fallback that writes
+    /// on this thread, because losing the value hands this signer its whole share
+    /// back on the next boot.
     fn write(&self, metrics: &Arc<Metrics>, pool_id: B256, signer: Address, micro: u128) {
         let store = match self {
             Self::Off => return,
@@ -435,26 +436,20 @@ impl FloorPersist {
                 store
             }
         };
-        // Keep the fsync off the reactor while a runtime remains: `record_loss`
-        // commits with `Durability::Immediate`, so writing here would block a tokio
-        // worker thread inside a `Drop` — precisely under the mass-drop conditions
-        // that kill workers. The handle is watched, so a cancelled write is counted
-        // like any other.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let store = Arc::clone(store);
-            let write_metrics = Arc::clone(metrics);
-            let write = handle.spawn_blocking(move || {
-                persist_loss(&store, &write_metrics, pool_id, signer, micro);
-            });
-            let watch_metrics = Arc::clone(metrics);
-            handle.spawn(async move {
-                if let Err(e) = write.await {
-                    note_join_failure(&watch_metrics, pool_id, signer, &e);
-                }
-            });
-            return;
-        }
-        // No runtime at all: a drop outside one, i.e. a sync unit test.
+        // Write on THIS thread, deliberately, even though `record_loss` commits with
+        // `Durability::Immediate` and this may be a runtime worker.
+        //
+        // Offloading looks better and is worse. `Handle::spawn_blocking` on a
+        // shutting-down blocking pool does not fail and does not panic — it returns a
+        // handle that never resolves (tokio `runtime::blocking::pool`), so the task
+        // never runs, the value never reaches disk, and the join is never observed
+        // either. The worker being gone is USUALLY the runtime tearing down, which is
+        // exactly that state: offloading would lose the write in the one case this
+        // fallback exists for.
+        //
+        // The cost is a stalled thread on a path that is already anomalous, already
+        // counted, and already warned. The alternative is an economic loss — that
+        // signer regains its whole floor share at the next boot.
         persist_loss(store, metrics, pool_id, signer, micro);
     }
 }
@@ -2964,8 +2959,6 @@ mod tests {
                 epoch,
             );
         }
-        // No runtime here, so the fallback writes on this thread and the assertion
-        // needs no wait.
         anyhow::ensure!(
             persisted_loss(&*store, pool)? == Some(floor.to()),
             "a drop whose worker is gone must still get the dead charge to disk"
@@ -2976,6 +2969,55 @@ mod tests {
                 .contains("decdn_floor_loss_persist_failures_total 1"),
             "and must count the degraded path, which is otherwise invisible until \
              the shutdown flush"
+        );
+        Ok(())
+    }
+
+    /// The dead-worker fallback writes on the DROPPING thread even inside a runtime,
+    /// rather than offloading to the blocking pool.
+    ///
+    /// The distinction is the whole point of the fallback. The worker is normally gone
+    /// because the runtime is tearing down, and `spawn_blocking` on a shutting-down
+    /// blocking pool neither fails nor panics — it hands back a handle that never
+    /// resolves, so an offloaded write would never run and never be observed. Losing
+    /// the value re-grants this signer its whole floor share at the next boot, which
+    /// is worse than stalling one thread on a path that is already counted and warned.
+    ///
+    /// Asserted with no `await` between the drop and the read: anything offloaded
+    /// could not have landed yet.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_dead_worker_fallback_writes_without_offloading() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(decdn_incentive::MemoryPoolFloorLossStore::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<FloorLossWrite>();
+        drop(rx);
+        let map: Arc<std::sync::Mutex<FloorAccumulator>> =
+            Arc::new(std::sync::Mutex::new(FloorAccumulator::default()));
+        let pool = B256::repeat_byte(0x75);
+        let floor = decdn_incentive::floor_micro(1000);
+        let epoch = {
+            let mut guard = lock_floor(&map)?;
+            guard.charge_live(pool, TEST_SIGNER, floor)
+        };
+        {
+            let _abandoned = FloorReservation::new_charged(
+                FloorGuardDeps {
+                    map: Arc::clone(&map),
+                    persist: FloorPersist::Worker {
+                        tx: tx.clone(),
+                        store: store.clone(),
+                    },
+                    metrics: Arc::clone(&metrics),
+                },
+                pool,
+                TEST_SIGNER,
+                floor,
+                epoch,
+            );
+        }
+        anyhow::ensure!(
+            persisted_loss(&*store, pool)? == Some(floor.to()),
+            "the fallback must have written before the drop returned, not queued it"
         );
         Ok(())
     }
