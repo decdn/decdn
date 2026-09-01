@@ -1344,6 +1344,7 @@ where
         progress,
         None, // pacing_wait: BudgetPacer never returns PaceDecision::Wait
         None, // served_paid: no downstream leg on the client path
+        None, // pool: single-source client fetch — one lane is the whole pool
     )
     .await;
 

@@ -36,7 +36,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -49,7 +49,7 @@ use decdn_client_pull::driver::DriveConfig;
 use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
     CoveredRun, HashMismatch as ClientPullHashMismatch, PacingWait, PeerSource, PoolExhausted,
-    RampPacer, RetryDisposition, drive, retry_disposition,
+    RampPacer, RetryDisposition, SharedPool, drive, retry_disposition,
 };
 use decdn_incentive::DepositOutcome;
 
@@ -558,6 +558,7 @@ pub(crate) async fn run_pull_leg(
         config: &config,
         pacing_wait: &pacing_wait,
         served_paid,
+        topups_used: AtomicU32::new(0),
         cancel: &cancel,
     };
 
@@ -601,6 +602,12 @@ struct PeerRunSink<'a> {
     /// The shared served-paid frontier; each run's `drive` reads it so the demand
     /// window is continuous.
     served_paid: Arc<AtomicU64>,
+    /// Reactive top-ups this assembly has escrowed, across EVERY run's lane
+    /// (#1506). One pool deposit backs the whole set, so [`Funder::max_topups`]
+    /// bounds the assembly, not each run — counting per-run would let a K-source
+    /// miss escrow K on-chain `topUp` txs for one serve. Built once here and
+    /// shared into every run's [`SharedPool`].
+    topups_used: AtomicU32,
     cancel: &'a CancellationToken,
 }
 
@@ -746,6 +753,36 @@ impl RunSink for PeerRunSink<'_> {
             move || served_paid.load(Ordering::Relaxed)
         };
 
+        // The shared-pool view this run's `drive` gates on (#1506). One deposit
+        // backs every run's lane, so the three pool facts are read across ALL of
+        // them, not this one lane:
+        // - `spent`: the whole-pool committed spend — the sum over every live
+        //   lane ledger for `pool_id`, INCLUDING this run's own (seeded above via
+        //   `lane_ledger`). Without it, a later run whose lane has spent nothing
+        //   sees `committed == 0` and believes the whole deposit is unspent, then
+        //   signs a voucher the pool cannot back → mid-stream `SpendingCapExhausted`.
+        // - `topups_used`: the assembly-wide reactive-top-up budget, shared so K
+        //   runs cannot each escrow `Funder::max_topups` on-chain `topUp` txs.
+        // - `credit`: a landed top-up's new deposit, written to THIS run's `ctx`
+        //   so its own gate stops reading the stale pre-top-up value; a later run
+        //   re-reads the deposit from the persisted pool row `open_or_reuse_pool`
+        //   already refreshed.
+        let ledgers = &self.deps.ledgers;
+        let spent = move || ledgers.pool_committed(pool_id);
+        let credit_ctx = Arc::clone(&ctx);
+        let credit = move |new_deposit: U256| -> anyhow::Result<()> {
+            credit_ctx
+                .lock()
+                .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+                .deposit = new_deposit;
+            Ok(())
+        };
+        let pool = SharedPool {
+            spent: &spent,
+            topups_used: &self.topups_used,
+            credit: &credit,
+        };
+
         let started = Instant::now();
         // Cooperative cancellation: the serve leg finishing cancels the token,
         // dropping the `drive` future; the `_settle` guard still persists the
@@ -768,6 +805,7 @@ impl RunSink for PeerRunSink<'_> {
                 None,
                 Some(self.pacing_wait),
                 Some(&served_paid_reader),
+                Some(&pool),
             ) => {
                 cancelled = false;
                 r
@@ -1056,6 +1094,8 @@ pub(crate) async fn run_local_pull_leg(
             None,
             Some(&pacing_wait),
             Some(&served_paid_reader),
+            // Single-source leg: one lane IS the pool, so no shared view.
+            None,
         ) => {
             cancelled = false;
             r

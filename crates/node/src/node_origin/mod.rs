@@ -1683,6 +1683,8 @@ async fn pull_from_candidate(
                     None,
                     None,
                     None,
+                    // Single-source candidate pull: one lane is the whole pool.
+                    None,
                 ) => {
                     cancelled = false;
                     r

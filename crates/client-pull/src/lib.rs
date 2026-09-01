@@ -80,7 +80,7 @@ pub use coverage_plan::{
     CoveredRun, SourceCoverage, covering_sources, plan_covered_runs, spread_segments,
 };
 pub use decdn_bao_range::RangedStore;
-pub use driver::{PacingWait, PoolExhausted, drive};
+pub use driver::{PacingWait, PoolExhausted, SharedPool, drive};
 pub use ledger::{
     ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Released, StreamProof,
 };
