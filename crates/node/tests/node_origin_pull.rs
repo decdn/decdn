@@ -888,6 +888,9 @@ async fn build_origin_seeded_ranking(
                 // Identical across candidates: the ranker's RTT term must not vary,
                 // or a loaded runner's live-probe jitter reappears through the cache.
                 rtt_ms: 1,
+                // Whole-blob coverage — these fixtures serve the whole blob, so a
+                // cache-hit candidate must range-plan as covering everything.
+                coverage: decdn_protocol::Coverage::full(1),
             })
             .collect(),
     );
