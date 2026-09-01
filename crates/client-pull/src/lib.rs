@@ -44,9 +44,9 @@ mod ledger;
 pub mod pacer;
 /// Reusable `cdn/probe/v1` client.
 pub mod probe;
-/// Client-only multi-source fetch scheduler (spec §5.3): fan a request across
-/// several paid sources over one shared store, with bao-aligned segmentation
-/// and tail-stealing. Drives [`driver::fill_gap`] per range.
+/// Sub-frame byte-progress observation (#1797): a `ProgressReader` that tallies bytes
+/// off the QUIC stream beneath the message decode, and the `ThroughputFloor` that judges
+/// those bytes against a minimum rate over a trailing window.
 mod progress;
 /// Wallet-filled HTTP provider builder for opening/settling payment channels.
 pub mod provider;
@@ -2074,8 +2074,9 @@ fn aligned_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow
 /// the decoder, not here). Enforces `ChunkData`'s non-empty FLOOR (#1088) — an
 /// oversized frame is refused earlier still, by the framing layer's
 /// `MAX_MESSAGE_SIZE`, before it allocates — plus the `cumulative <= expected_wire_bytes` overrun guard
-/// (ADR 005 §`cdn/client/v1`). The non-empty floor keeps every frame a unit of progress,
-/// so a run of empty frames cannot drive this loop without advancing the byte counter.
+/// (ADR 005 §`cdn/client/v1`). The non-empty floor ties every frame to payload, so a run of
+/// empty frames cannot drive this loop while `cumulative` and the voucher accounting stand
+/// still.
 ///
 /// `window` + `floor_bps` bound this loop by THROUGHPUT (#1797): bytes are counted off the
 /// QUIC stream sub-frame through a `ProgressReader`, and a `ThroughputFloor` aborts when
@@ -2131,7 +2132,12 @@ async fn receive_and_pay(
     loop {
         // Read the next frame while the sampler ticks. The floor is judged only when a read
         // is slow enough that the tick wins the `select!`; a healthy stream keeps the read
-        // arm ready and the floor rarely runs. The read future is pinned and polled across
+        // arm ready and the floor rarely runs. `biased` cannot starve the floor: the read arm
+        // is ready only once a whole frame has come off the wire, which is byte progress the
+        // counter has already recorded, and the very next poll finds the following frame
+        // incomplete unless the sender is outrunning this loop. Skipping the tick therefore
+        // means throughput above the floor, which is the case the floor would clear anyway.
+        // The read future is pinned and polled across
         // ticks rather than recreated each tick: `read_client_message` is not
         // cancellation-safe (`read_frame` fills a frame with `read_exact`), so dropping it
         // mid-frame would lose the bytes already read and desynchronise the stream. It is
@@ -2629,7 +2635,10 @@ impl UpstreamPull {
         // cancellation-safe — `read_frame` fills a frame with `read_exact`, so dropping the
         // future mid-frame loses the bytes already consumed and desynchronises the stream.
         // Recreating it per tick would corrupt every frame that spans a tick; the pinned
-        // future is dropped only when the floor actually aborts (#1797).
+        // future is dropped only when the floor actually aborts (#1797). `biased` cannot
+        // starve the floor: a ready read arm means a whole frame arrived, which is byte
+        // progress the counter already holds, so a skipped tick only ever coincides with
+        // throughput the floor would clear.
         let read = read_client_message(&mut reader);
         tokio::pin!(read);
         loop {
@@ -2684,11 +2693,11 @@ impl UpstreamPull {
             match msg {
                 ClientMessage::ChunkData(chunk) => {
                     // The payload is bounded on both sides by construction (#1088): the
-                    // ceiling caps per-frame allocation, and the non-empty floor keeps
-                    // every frame a unit of progress, so a peer cannot refresh the
-                    // inactivity deadline above with a run of empty frames. This path
-                    // has no belt-and-braces byte-progress check behind that floor, and
-                    // does not need one now the floor is structural.
+                    // ceiling caps per-frame allocation, and the non-empty floor ties every
+                    // frame to payload, so a peer cannot advance this loop with a run of
+                    // empty frames that move neither `cumulative` nor the voucher
+                    // accounting. This path has no belt-and-braces payload check behind
+                    // that floor, and does not need one now the floor is structural.
                     let chunk_len = chunk.bytes().len() as u64;
                     self.cumulative = self.cumulative.saturating_add(chunk_len);
                     if self.cumulative > self.expected_wire_bytes {
