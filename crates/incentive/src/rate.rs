@@ -144,9 +144,9 @@ pub enum RateError {
          with {tolerance_bps} bps tolerance"
     )]
     Underpayment {
-        /// Cumulative amount the buyer has actually paid.
+        /// The voucher's amount delta.
         paid: U256,
-        /// Cumulative bytes delivered against that amount.
+        /// The voucher's bytes delta, priced against that amount.
         bytes: U256,
         /// The advertised per-MB rate the payment is judged against.
         rate_per_mb: u64,

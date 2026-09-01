@@ -71,12 +71,12 @@ pub enum ConfigError {
     /// `reference_bps` is `0`, which would make the log speed curve undefined.
     #[error("reference_bps must be > 0")]
     ZeroReferenceBps,
+    /// The three component weights do not add up to `1.0`, so the blended
+    /// score would not stay in `[0.0, 1.0]`.
     #[error(
         "weights must sum to 1.0; got speed={speed} + correctness={correctness} \
          + reachability={reachability} = {sum}"
     )]
-    /// The three component weights do not add up to `1.0`, so the blended
-    /// score would not stay in `[0.0, 1.0]`.
     WeightsDoNotSumToOne {
         /// The configured speed weight.
         speed: f64,

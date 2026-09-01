@@ -106,9 +106,9 @@ pub struct CountMinSketch {
 }
 
 impl CountMinSketch {
-    #[must_use]
     /// A zeroed sketch `cols` counters wide per row. A `cols` of `0` is
     /// raised to `1` so the modulo is always defined.
+    #[must_use]
     pub fn new(cols: usize) -> Self {
         let cols = cols.max(1);
         Self {
@@ -141,9 +141,9 @@ impl CountMinSketch {
         }
     }
 
-    #[must_use]
     /// The count-min estimate for `key`: the smallest of its per-row
     /// counters, which bounds the collision overcount.
+    #[must_use]
     pub fn estimate(&self, key: &Hash) -> u8 {
         let mut min = u8::MAX;
         for row in 0..ROWS {

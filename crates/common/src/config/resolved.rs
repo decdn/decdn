@@ -580,7 +580,9 @@ pub struct ResolvedDht {
     /// Token refill rate for the per-peer (`NodeId`) limiter, in requests/second.
     pub per_peer_rate_per_sec: f64,
     /// Bucket capacity for the per-peer limiter: how many requests one
-    /// peer may send back to back before the refill rate binds.
+    /// peer may send back to back before the refill rate binds. `0` alongside
+    /// a `0.0` rate disables the layer; `0` against a nonzero rate is rejected
+    /// as a deny-all. The same pairing rule holds for the two below.
     pub per_peer_burst: u32,
     /// Token refill rate for the per-source-IP limiter, in requests/second.
     pub per_ip_rate_per_sec: f64,
@@ -625,7 +627,9 @@ pub struct ResolvedProbe {
     /// Token refill rate for the per-peer (`NodeId`) limiter, in probes/second.
     pub per_peer_rate_per_sec: f64,
     /// Bucket capacity for the per-peer limiter: how many probes one
-    /// peer may send back to back before the refill rate binds.
+    /// peer may send back to back before the refill rate binds. `0` alongside
+    /// a `0.0` rate disables the layer; `0` against a nonzero rate is rejected
+    /// as a deny-all. The same pairing rule holds for the two below.
     pub per_peer_burst: u32,
     /// Token refill rate for the per-source-IP limiter, in probes/second.
     pub per_ip_rate_per_sec: f64,
@@ -679,8 +683,8 @@ pub enum LoadShedPolicyKind {
     /// `resource-pressure` (the default): admit against the live egress,
     /// concurrency, and per-client budgets below.
     ResourcePressure,
-    /// `always-admit`: never shed. The budgets are still resolved and
-    /// reported, but no request is refused on their account.
+    /// `always-admit`: never shed. The budgets below are still resolved and
+    /// range-checked, but the policy discards them and refuses nothing.
     AlwaysAdmit,
 }
 

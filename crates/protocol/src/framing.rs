@@ -49,8 +49,9 @@ pub enum FrameError {
     /// Rejected before anything is buffered.
     #[error("frame length {0} exceeds MAX_MESSAGE_SIZE ({MAX_MESSAGE_SIZE})")]
     TooLarge(u32),
-    /// The length prefix is not a well-formed varint — empty, a
-    /// non-terminating continuation run, or an overflowing fifth byte.
+    /// The length prefix is not a well-formed varint — a non-terminating
+    /// continuation run through all five bytes, or a fifth byte overflowing
+    /// `u32`. A short or empty buffer reads as truncated, not malformed.
     #[error("malformed varint length prefix")]
     Varint,
     /// The frame's bytes are not a valid postcard encoding of the expected

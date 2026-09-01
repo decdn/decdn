@@ -69,12 +69,7 @@ pub async fn run(
 /// hot-reload path (#236). The closure captures a `reload::Handle` to the
 /// `EnvFilter` layer; calls to `modify` must respect any errors from the
 /// handle (e.g. the registry was dropped) by surfacing them.
-#[allow(clippy::unnecessary_wraps)]
-// Returns Result only when otlp feature is enabled.
-// `allow`, not `expect`: the only `eprintln!` in here sits under
-// `#[cfg(not(feature = "otlp"))]`, so an `--all-features` build would find
-// the expectation unfulfilled. It runs before `registry.init()` either way.
-#[allow(clippy::print_stderr)]
+#[allow(clippy::unnecessary_wraps)] // Returns Result only when otlp feature is enabled.
 fn init_tracing(
     filter: tracing_subscriber::EnvFilter,
     resolved: &config::ResolvedConfig,
@@ -107,6 +102,12 @@ fn init_tracing(
 
     #[cfg(not(feature = "otlp"))]
     {
+        // `allow`, not `expect`: this `eprintln!` is itself cfg-gated, so an
+        // `--all-features` build would find the expectation unfulfilled. Scoped
+        // to this block rather than the function so the `LogLevelSetter` closure
+        // below — which runs on SIGHUP, long after `registry.init()` — stays
+        // covered by the workspace deny.
+        #[allow(clippy::print_stderr)]
         if resolved.observability.otlp_endpoint.is_some() {
             eprintln!("warning: --otlp-endpoint ignored (binary not built with 'otlp' feature)");
         }

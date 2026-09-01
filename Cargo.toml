@@ -305,9 +305,9 @@ indexing_slicing = "deny"
 # Numeric safety (payment amounts, byte offsets). `deny`, not `warn`: CI clippy
 # and the pre-commit hook both pass `-D warnings`, so these were already fatal
 # there — `deny` makes a bare local `cargo clippy` agree, and stops a call site
-# relaxing one back to `warn`. Widening casts stay legal; `as_conversions`
-# (which fires on all 561 `as` casts in the workspace, safe ones included) is
-# deliberately NOT enabled — it counts casts, it does not judge them.
+# relaxing one back to `warn`. Widening casts stay legal; `as_conversions` is
+# deliberately NOT enabled — it fires on every `as` cast, safe ones included:
+# it counts casts, it does not judge them.
 cast_possible_truncation = "deny"
 cast_sign_loss = "deny"
 cast_precision_loss = "deny"

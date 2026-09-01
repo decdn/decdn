@@ -3043,9 +3043,13 @@ pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<
 /// sections during startup ([`resolve_config`]) and SIGHUP reload
 /// (`runtime::reload`); see [`resolve_payment_into`] for the rationale.
 #[allow(clippy::cognitive_complexity)]
+// Unlike the sibling resolvers, this one runs on the SIGHUP reload path too
+// (`runtime::reload::SecuritySection::resolve`), where a subscriber IS live.
+// The warnings below then reach boot stderr but not an operator's structured
+// log stream — routing them through `tracing` on that path is #1902.
 #[expect(
     clippy::print_stderr,
-    reason = "tracing is not initialized at config-resolve time"
+    reason = "no subscriber at startup resolve; on the reload path this under-reports (#1902)"
 )]
 pub fn resolve_security_into(
     file: Option<&types::SecurityConfig>,

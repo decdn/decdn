@@ -7,9 +7,7 @@
 //! where no daemon is running.
 //!
 //! Its one direct write is the top-level error boundary in `main`; everything
-//! else prints from [`decdn_cli::commands`]. A separate crate root from
-//! `lib.rs`, so it carries its own allow.
-#![allow(clippy::print_stderr)]
+//! else prints from [`decdn_cli::commands`].
 
 use clap::Parser;
 
@@ -22,6 +20,10 @@ use decdn_common::cli::{self, Cli, Command, ConfigCommand};
 /// path/query), and this is the single boundary every CLI command propagates
 /// to. See issue #954.
 #[tokio::main]
+#[expect(
+    clippy::print_stderr,
+    reason = "process exit boundary; the CLI installs no subscriber"
+)]
 async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,

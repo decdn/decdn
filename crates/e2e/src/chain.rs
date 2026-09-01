@@ -194,7 +194,7 @@ pub struct ContractAddrs {
     pub capacity_bond: Address,
     /// `PaymentPool` — the shared USDC pools clients fund and sellers redeem.
     pub payment_pool: Address,
-    /// `FeeRouter` — splits redeemed revenue per ADR 026 §2.
+    /// `FeeRouter` — splits redeemed revenue per ADR 026 § FeeRouter split.
     pub fee_router: Address,
     /// `Token` — the TOKEN ERC-20 used for staking and governance.
     pub token: Address,
@@ -211,9 +211,12 @@ pub struct ContractAddrs {
     /// deployer keeps no privileged roles; the G-NODE-05 grant executes through
     /// it via a real Governor proposal.
     pub timelock: Address,
-    /// `PublisherRegistry` — publisher identities and their vetting state.
+    /// `PublisherRegistry` — namespace ownership and its timelocked transfer
+    /// (ADR 002). Publisher identity is implicit on first `createNamespace`;
+    /// vetting lives in the policy at `manual_vetting_policy` below.
     pub publisher_registry: Address,
-    /// `OriginAssignment` — which nodes are assigned to which origin.
+    /// `OriginAssignment` — which bonded operators a publisher has seated as
+    /// authorized origins for each of its namespaces (ADR 011).
     pub origin_assignment: Address,
     /// `ManualVettingPolicy` — the genesis vetting policy `OriginAssignment`
     /// reads. The fixture vets publishers here (see [`ChainFixture::vet_publisher`]).

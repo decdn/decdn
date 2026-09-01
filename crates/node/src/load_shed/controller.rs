@@ -16,7 +16,7 @@ use super::{
 
 /// Bytes/sec for a megabit/sec budget: `Mbps * 1_000_000 / 8`.
 #[must_use]
-pub(super) const fn egress_budget_bps(mbps: u64) -> u64 {
+const fn egress_budget_bps(mbps: u64) -> u64 {
     mbps.saturating_mul(125_000)
 }
 

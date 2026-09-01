@@ -61,7 +61,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<'_, R> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FloorConfig {
     /// The trailing window over which throughput is measured.
-    pub window: Duration,
+    pub(crate) window: Duration,
     /// The minimum bytes-per-second the transfer must sustain over the window. `0`
     /// disables the throughput test and leaves pure idle detection: at least one byte
     /// per window.

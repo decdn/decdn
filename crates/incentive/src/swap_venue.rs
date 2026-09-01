@@ -189,8 +189,8 @@ pub struct MockVenue {
 
 #[cfg(test)]
 impl MockVenue {
-    /// A venue that quotes 1 wei both ways and reports `swap_tx`, for tests
-    /// that care only about which branch ran.
+    /// A venue that quotes one base unit of the input token both ways and
+    /// reports `swap_tx`, for tests that care only about which branch ran.
     pub fn default_with_tx(swap_tx: B256) -> Self {
         Self {
             expected_in: U256::from(1u64),

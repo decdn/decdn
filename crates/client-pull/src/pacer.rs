@@ -252,7 +252,8 @@ pub struct RampPacer {
     /// `credit_max` immediately.
     pub divisor: u64,
     /// Smallest window the ramp may produce, so the pull can always make
-    /// progress. One chunk in practice.
+    /// progress. In practice [`PULL_WINDOW_FLOOR`] — one chunk plus three
+    /// chunk groups; see that constant for why one chunk alone deadlocks.
     pub floor: u64,
     /// Ceiling the ramp climbs toward.
     pub credit_max: u64,

@@ -1116,9 +1116,9 @@ since project inception and will roll into the first tagged release.
   hurt: `ResolvedConfig`'s twelve sections, `ClientHandlerDeps`' required
   wiring, the `expected`/`recovered` pairs on every signature-recovery error,
   and the `PoolError` operands a node reads when it refuses a voucher. The
-  `alloy::sol!` bindings needed nothing: they already opt out at their twelve
-  `mod sol_types` wrappers. Every new comment is also link-checked, since the
-  `doc` gate denies rustdoc warnings.
+  `alloy::sol!` bindings needed nothing: each generated block already opts out
+  where it is declared. Every new comment is also link-checked, since the `doc`
+  gate denies rustdoc warnings.
 
 - **`elided_lifetimes_in_paths` and `unreachable_pub` are on.** A type path that
   borrows now says so — `TableDefinition<'_, …>` across `channel_store`'s eleven
@@ -1141,13 +1141,14 @@ since project inception and will roll into the first tagged release.
   `print_stderr`, `dbg_macro`, `todo`, and `unimplemented` become `deny`, and
   `cast_possible_truncation` / `cast_sign_loss` / `cast_precision_loss` move from
   `warn` to `deny`. The cast promotion adds no new violations — CI clippy and the
-  pre-commit hook already pass `-D warnings`, so all 190 casts were fatal there;
-  it only makes a bare local `cargo clippy` agree. `dbg_macro`, `todo`, and
+  pre-commit hook already pass `-D warnings`, so every cast was fatal there; it
+  only makes a bare local `cargo clippy` agree. `dbg_macro`, `todo`, and
   `unimplemented` had zero occurrences and are pure regression guards. The `decdn`
   CLI allows both print lints at its crate roots because it is a terminal UI; the
   handful of production `eprintln!` sites that run before the tracing subscriber
   exists carry a per-site `#[expect]` naming that reason, which leaves every
   library crate and every node handler with no way to print.
+
 - **Dev builds compile the keystore KDF at `opt-level = 3`.** `alloy`'s
   `signer-keystore` runs scrypt on every keystore encrypt and decrypt, and an
   unoptimized scrypt costs about 0.5s per operation. Raising `scrypt`, `salsa20`,

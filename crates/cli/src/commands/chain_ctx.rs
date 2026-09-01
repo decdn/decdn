@@ -262,8 +262,9 @@ pub struct ResolvedPublish {
     pub rpc_url: String,
     /// EVM chain id, checked against what the endpoint reports.
     pub chain_id: u64,
-    /// `PublisherRegistry` address. `None` until a subcommand that needs it
-    /// reports the specific flag or config key that is missing.
+    /// `PublisherRegistry` address. `None` when neither
+    /// `--publisher-registry-address` nor `blockchain.publisher_registry_address`
+    /// is set; a subcommand that needs it then errors naming the missing key.
     pub publisher_registry_address: Option<Address>,
     /// `OriginAssignment` address, optional on the same terms.
     pub origin_assignment_address: Option<Address>,
