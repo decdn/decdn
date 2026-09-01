@@ -204,6 +204,35 @@ impl NodeFixture {
         Ok(rate)
     }
 
+    /// Rewrite `blockchain.buyer_working_deposit_micro_usdc` in the daemon's
+    /// config and restart the daemon so the new deposit takes effect, returning
+    /// the newly-configured value.
+    ///
+    /// This is the amount the node's node-to-node cache-miss buyer leg escrows
+    /// when it opens its upstream pool, and the target every reactive mid-pull
+    /// top-up (#1530) refills that pool back toward. Shrinking it below a blob's
+    /// wire cost is what forces the buyer leg to exhaust its deposit mid-pull and
+    /// exercise the reactive top-up — the loopback suite drives this with a
+    /// `FundingOpener` double; this drives the real daemon against a real
+    /// on-chain `topUp`.
+    ///
+    /// Restart-required for the same reason as [`Self::set_rate_per_mb`]: the
+    /// buyer-leg config is read once at runtime bring-up, so a running node only
+    /// picks up a new deposit by rewriting the config and bouncing the process
+    /// ([`Self::restart`]). Must be `> 0` — the resolver rejects `0` at load
+    /// (`openPool` reverts `ZeroAmount`), so a caller passing `0` would fail the
+    /// restart's health wait rather than silently disabling the leg.
+    pub async fn set_buyer_working_deposit(&self, micro_usdc: u64) -> anyhow::Result<u64> {
+        let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
+        let rewritten = rewrite_buyer_working_deposit(&config, micro_usdc)?;
+        std::fs::write(&self.config_path, rewritten).context("write node config")?;
+
+        self.restart()
+            .await
+            .context("restart after buyer-deposit rewrite")?;
+        Ok(micro_usdc)
+    }
+
     /// The daemon's data dir (`0o700` on Unix). Doubles as the `HOME` a journey hands
     /// [`crate::cli::decdn_command`] when it drives the `decdn` CLI against
     /// this node's config + keystore (#1332).
@@ -769,6 +798,26 @@ fn rewrite_rate_per_mb(config: &str, rate: u64) -> anyhow::Result<String> {
     toml::to_string(&doc).context("render node config")
 }
 
+/// Rewrite `blockchain.buyer_working_deposit_micro_usdc` in a node TOML config,
+/// preserving every other key. Separate from
+/// [`NodeFixture::set_buyer_working_deposit`] so its parse → mutate →
+/// `toml::to_string` round-trip is testable without a live daemon, mirroring
+/// [`rewrite_rate_per_mb`]. The `[blockchain]` table holds only scalars, so it is
+/// free of the `ValueAfterTable` serializer hazard `[cache]` carries; the
+/// whole-doc round-trip is still guarded by `set_buyer_working_deposit_round_trips_through_toml`.
+fn rewrite_buyer_working_deposit(config: &str, micro_usdc: u64) -> anyhow::Result<String> {
+    let mut doc: toml::Table = config.parse().context("parse node config")?;
+    let blockchain = doc
+        .get_mut("blockchain")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| anyhow::anyhow!("node config has no [blockchain] table"))?;
+    blockchain.insert(
+        "buyer_working_deposit_micro_usdc".to_string(),
+        toml::Value::Integer(i64::try_from(micro_usdc).context("deposit overflows i64")?),
+    );
+    toml::to_string(&doc).context("render node config")
+}
+
 /// Write `blob` into a filesystem-origin shard layout (`{root}/{hex[..2]}/{hex}`).
 fn write_fs_origin_blob(root: &std::path::Path, hash: &Hash, blob: &[u8]) -> anyhow::Result<()> {
     let hex = hash.to_hex();
@@ -1024,5 +1073,30 @@ mod tests {
             Some(true)
         );
         assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
+    }
+
+    /// `set_buyer_working_deposit`'s parse → mutate → serialize step
+    /// (`rewrite_buyer_working_deposit`) must round-trip: the new deposit lands
+    /// under `[blockchain]` and every other section — notably the `[cache]`
+    /// scalar-after-subtable that trips the serializer hazard — survives.
+    #[test]
+    fn set_buyer_working_deposit_round_trips_through_toml() {
+        let rewritten = rewrite_buyer_working_deposit(&sample_rendered_config(), 4_000_000)
+            .expect("rewrite_buyer_working_deposit must succeed");
+        let doc: toml::Value =
+            toml::from_str(&rewritten).expect("rewritten config must be valid TOML");
+
+        assert_eq!(
+            doc["blockchain"]["buyer_working_deposit_micro_usdc"].as_integer(),
+            Some(4_000_000)
+        );
+        // Everything around the mutation is intact.
+        assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
+        assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
+        assert_eq!(
+            doc["cache"]["node_to_node_pull_through_enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(doc["payment"]["rate_per_mb"].as_integer(), Some(10));
     }
 }

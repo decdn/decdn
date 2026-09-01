@@ -572,6 +572,28 @@ impl FloorReservation {
             self.release_live_repaid();
         }
     }
+
+    /// Release the reservation for a serve that was REFUSED before the serve loop
+    /// ran — no upstream USDC fronted, no downstream byte delivered. Frees the
+    /// live reservation and suppresses the drop-time `dead_charge`.
+    ///
+    /// The un-settled drop folds the FULL `reserved` on purpose: it bounds
+    /// sequential abuse where a cache-miss fill is aborted AFTER the node fronted
+    /// upstream USDC (ADR 003 §Pool solvency). But a refusal BEFORE any spend —
+    /// the pre-flight floor-`M` gate, the size gate, or an upstream that refused
+    /// the free header handshake because its own `getPool` view has not yet caught
+    /// up to this pool — fronts nothing and delivers nothing, so folding a dead
+    /// charge there permanently penalizes an innocent pool for the serving node's
+    /// own transient upstream unavailability, and a handful of such refusals strand
+    /// a signer's whole floor share. That is the behavior `serve_stream` documents
+    /// as "a refusal before the serve loop drops with `note_unpaid` at 0, so no
+    /// dead charge is folded"; this restores it. Mechanically a refused-unspent
+    /// serve and a fully-repaid one both owe nothing, so this delegates to
+    /// [`Self::release_live_repaid`]; the distinct name states the intent at the
+    /// refusal call sites.
+    fn release_unspent(&self) {
+        self.release_live_repaid();
+    }
 }
 
 impl Drop for FloorReservation {
@@ -4147,6 +4169,49 @@ mod tests {
         anyhow::ensure!(
             st.dead_charge == floor,
             "an unsettled (abnormal) exit folds the full reserved floor, not the zero unpaid tail"
+        );
+        Ok(())
+    }
+
+    /// A serve REFUSED before the serve loop ran — [`FloorReservation::release_unspent`]
+    /// called on the pre-spend refusal paths (the floor-`M` gate, the size gate, an
+    /// upstream that refused the free header handshake) — frees the live reservation
+    /// and folds NO `dead_charge`, even though the guard was never marked settled.
+    /// This is the counterpart to `floor_reservation_abnormal_exit_folds_full_reserved`:
+    /// an abort AFTER fronting USDC folds the full floor, but a refusal BEFORE any
+    /// spend must not, or a transient upstream stumble permanently strands an
+    /// innocent pool's floor credit.
+    #[test]
+    fn floor_reservation_refused_unspent_folds_no_dead_charge() -> anyhow::Result<()> {
+        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pool = B256::repeat_byte(0x5C);
+        let floor = decdn_incentive::floor_micro(1000);
+        {
+            let res = FloorReservation::reserve(
+                map.clone(),
+                None,
+                Arc::new(Metrics::new()),
+                pool,
+                TEST_SIGNER,
+                floor,
+            );
+            let live = lock_floor(&map)?.get(&pool).map(|s| s.live_reservation);
+            anyhow::ensure!(
+                live == Some(floor),
+                "live reservation is held while the guard lives"
+            );
+            // Refused before any spend — release cleanly, never marked settled.
+            res.release_unspent();
+        } // drop → no-op: release_unspent already freed the live reservation
+        let st = lock_floor(&map)?.get(&pool).cloned().unwrap_or_default();
+        anyhow::ensure!(
+            st.live_reservation == U256::ZERO,
+            "the live reservation is released by release_unspent"
+        );
+        anyhow::ensure!(
+            st.dead_charge == U256::ZERO,
+            "a pre-spend refusal folds NO dead charge, unlike an abnormal exit after spending"
         );
         Ok(())
     }

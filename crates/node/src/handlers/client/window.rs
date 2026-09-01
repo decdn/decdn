@@ -12,6 +12,20 @@ use super::{
     StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 
+/// Release a miss leg's floor reservation on a refusal taken BEFORE the serve
+/// loop runs — the pre-flight floor-`M` gate, the size gate, or an upstream that
+/// refused the free header handshake. Nothing was fronted upstream and no byte
+/// was delivered, so [`FloorReservation::release_unspent`] frees the live
+/// reservation and folds no `dead_charge`; without it the guard's `Drop` would
+/// treat the un-settled reservation as an abnormal exit and permanently charge
+/// the pool for a serve it never performed (ADR 003 §Pool solvency). A no-op when
+/// no lane was known (no reservation was taken).
+fn release_reservation_unspent(reservation: Option<&FloorReservation>) {
+    if let Some(reservation) = reservation {
+        reservation.release_unspent();
+    }
+}
+
 impl ClientHandler {
     /// Serve a cache miss by running the two decoupled serve-miss legs (#856, ADR
     /// 037): the pull leg fills the cache from upstream for only the missing ranges
@@ -115,6 +129,7 @@ impl ClientHandler {
                 headroom,
                 decdn_incentive::min_payment(credit_floor, rate_per_mb),
             );
+            release_reservation_unspent(floor_reservation.as_ref());
             return self
                 .respond_error(
                     &mut send,
@@ -163,6 +178,7 @@ impl ClientHandler {
                         total
                     }
                     Err(reason) => {
+                        release_reservation_unspent(floor_reservation.as_ref());
                         return self
                             .respond_error(&mut send, req, reason, rate_per_mb)
                             .await;
@@ -175,6 +191,7 @@ impl ClientHandler {
         // (`open_pull_leg` already refuses an oversized header via its
         // `max_blob_size_bytes`; this is a belt-and-braces wire-reason check.)
         if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
+            release_reservation_unspent(floor_reservation.as_ref());
             return self
                 .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
                 .await;
@@ -238,6 +255,7 @@ impl ClientHandler {
             {
                 Ok(opened) => target = Some(opened),
                 Err(reason) => {
+                    release_reservation_unspent(floor_reservation.as_ref());
                     return self
                         .respond_error(&mut send, req, reason, rate_per_mb)
                         .await;
@@ -495,6 +513,7 @@ impl ClientHandler {
                 headroom,
                 decdn_incentive::min_payment(credit_floor, rate_per_mb),
             );
+            release_reservation_unspent(floor_reservation.as_ref());
             return self
                 .respond_error(
                     &mut send,
@@ -509,6 +528,7 @@ impl ClientHandler {
         // `origin_size` probe already produced `total_bytes`; refuse an oversized
         // blob with the wire-parity reason before signing anything).
         if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
+            release_reservation_unspent(floor_reservation.as_ref());
             return self
                 .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
                 .await;
