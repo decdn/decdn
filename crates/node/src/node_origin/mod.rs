@@ -732,7 +732,12 @@ async fn discover(
     namespace_id: U256,
 ) -> Vec<DhtNodeId> {
     let target = DhtHash::from_bytes(hash_bytes);
-    let providers = crate::dht::find_providers(
+    // `find_providers` now carries each holder's range-keyed `Coverage`
+    // alongside its `NodeId` (ADR 039-adjacent partial-holder discovery).
+    // This PR only wires the data layer through; the coverage is dropped
+    // here and picked back up by a later PR that ranks/selects candidates
+    // by which blocks they can serve.
+    let providers: Vec<DhtNodeId> = crate::dht::find_providers(
         &deps.endpoint,
         &deps.routing_table,
         &deps.staker_set,
@@ -742,7 +747,10 @@ async fn discover(
         deps.config.lookup,
         Some(&deps.metrics),
     )
-    .await;
+    .await
+    .into_iter()
+    .map(|(node, _coverage)| node)
+    .collect();
     if providers.is_empty() {
         deps.origin_directory.lookup_origins(namespace_id).await
     } else {

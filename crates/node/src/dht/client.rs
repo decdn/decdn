@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use decdn_protocol::{
-    ALPN_DHT, ContentHash, NodeId, decode_message, dht as wire, encode_message,
+    ALPN_DHT, ContentHash, Coverage, NodeId, decode_message, dht as wire, encode_message,
     encode_store_request, read_frame, write_frame,
 };
 use iroh::endpoint::{ConnectOptions, Connection};
@@ -73,8 +73,13 @@ pub async fn store(
     target: EndpointAddr,
     hash: ContentHash,
     holder: NodeId,
+    coverage: Coverage,
 ) -> anyhow::Result<wire::StoreAck> {
-    let request = wire::StoreRequest { hash, holder };
+    let request = wire::StoreRequest {
+        hash,
+        holder,
+        coverage,
+    };
     // Encode through the typed two-phase helper (ADR 013 §Tier 1) so the
     // client half mirrors the server's `parse_store_request_ext` seam: the
     // `StoreRequestExt` is appended here (empty today) and the payload is
@@ -97,18 +102,18 @@ pub async fn store(
 /// due hashes by receiver and sends each receiver its set via this. Every
 /// DHT node implements `BatchStore`, so there is no per-hash fallback.
 ///
-/// `hashes` MUST be ≤ [`decdn_protocol::dht::MAX_BATCH_STORE_HASHES`];
+/// `entries` MUST be ≤ [`decdn_protocol::dht::MAX_BATCH_STORE_HASHES`];
 /// an oversize batch is rejected by the receiver at wire decode with
 /// `MALFORMED_MESSAGE` and surfaces here as an error (the caller must
 /// split the set, not retry).
 pub async fn batch_store(
     endpoint: &Endpoint,
     target: EndpointAddr,
-    hashes: Vec<ContentHash>,
+    entries: Vec<(ContentHash, Coverage)>,
     holder: NodeId,
 ) -> anyhow::Result<wire::BatchStoreAck> {
-    let n = hashes.len();
-    let request = wire::DhtMessage::BatchStore(wire::BatchStoreRequest { hashes, holder });
+    let n = entries.len();
+    let request = wire::DhtMessage::BatchStore(wire::BatchStoreRequest { entries, holder });
     let response = exchange(endpoint, target, &request).await?;
     match response {
         // A conformant receiver returns exactly one `bool` per request hash

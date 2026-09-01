@@ -40,7 +40,7 @@ use decdn_node::dht::{
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::dht::DhtHandler;
 use decdn_node::metrics::Metrics;
-use decdn_protocol::{ALPN_DHT, ContentHash, NodeId};
+use decdn_protocol::{ALPN_DHT, ContentHash, Coverage, NodeId};
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
 
@@ -225,6 +225,7 @@ fn insert_record(records: &Mutex<RecordStore>, hash: [u8; 32], holder: [u8; 32])
     let outcome = guard.insert_at(
         NodeId::from_bytes(holder),
         ContentHash::from_bytes(hash),
+        Coverage::full(1),
         receive_us,
     );
     assert!(
@@ -278,7 +279,13 @@ async fn find_providers_returns_directly_reachable_provider() -> anyhow::Result<
     )
     .await;
 
-    assert_eq!(providers, vec![NodeId::from_bytes(*provider.id.as_bytes())]);
+    assert_eq!(
+        providers,
+        vec![(
+            NodeId::from_bytes(*provider.id.as_bytes()),
+            Coverage::full(1)
+        )]
+    );
 
     let (provider_task, provider_ep) = provider.into_teardown_parts();
     shutdown([provider_task], [&client_ep, &provider_ep]).await?;

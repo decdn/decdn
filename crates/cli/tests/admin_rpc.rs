@@ -40,7 +40,7 @@ use decdn_node::dht::{
     ConfigStakerSet, RecordStore, RecordStoreConfig, RepublishScheduler, StakerSet,
 };
 use decdn_node::metrics::Metrics;
-use decdn_protocol::ContentHash;
+use decdn_protocol::{ContentHash, Coverage};
 use jsonrpsee::RpcModule;
 use jsonrpsee::core::ClientError;
 use jsonrpsee::core::client::ClientT;
@@ -88,6 +88,7 @@ fn seeded_dht_handles() -> DhtStatusHandles {
     store.insert_at(
         NodeId::from_bytes([5u8; 32]),
         ContentHash::from_bytes([7u8; 32]),
+        Coverage::full(1),
         1_000,
     );
 

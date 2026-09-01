@@ -62,6 +62,7 @@ use crate::dht::chain_projection::with_lock;
 use crate::dht::client;
 use crate::dht::routing::{NodeId, RoutingTable};
 use decdn_protocol::ContentHash;
+use decdn_protocol::Coverage;
 use decdn_protocol::dht::MAX_BATCH_STORE_HASHES;
 
 /// Number of receivers per republish (ADR 022 §STORE Flow step 1:
@@ -823,7 +824,7 @@ pub async fn run_republish(
                         // discoverable for up to 50 minutes — the
                         // exact failure mode the eager publish
                         // closes.
-                        publish_hash(&endpoint, self_node_id, &routing, hash_bytes).await;
+                        publish_hash(&endpoint, self_node_id, &routing, &cache, hash_bytes).await;
                         scheduler.schedule_steady(hash_bytes);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -914,8 +915,9 @@ pub async fn run_republish(
                     // next cycle.
                     let ep = endpoint.clone();
                     let routing = Arc::clone(&routing);
+                    let cache_cloned = cache.clone();
                     tokio::spawn(async move {
-                        publish_batch(&ep, self_node_id, &routing, &held).await;
+                        publish_batch(&ep, self_node_id, &routing, &cache_cloned, &held).await;
                     });
                 }
             }
@@ -923,18 +925,21 @@ pub async fn run_republish(
     }
 }
 
-/// Whether this node would still answer `has_blob` for `hash` — `Some(true)`
-/// or `Some(false)` when the caches can answer, `None` when the store query
-/// faulted and the question has no answer. The due-time gate that stops the
-/// scheduler from re-publishing content LRU drift or an operator-evict already
-/// removed.
+/// Whether this node would still advertise `hash` — `Some(true)` when it
+/// holds at least one verified discovery block (ADR 039-adjacent partial-
+/// holder discovery; a partial holder is advertise-eligible, not just a
+/// `Complete` one), `Some(false)` when it holds none, `None` when the store
+/// query faulted and the question has no answer. The due-time gate that
+/// stops the scheduler from re-publishing content LRU drift or an
+/// operator-evict already removed.
 ///
-/// Origin-held counts, not just the local store. `CacheEngine::has` consults
-/// only the iroh-blobs store, but the probe path advertises origin-held content
-/// through `origin_held_size` — so a filesystem or pinned-origin hash that was
-/// never imported would be advertised at probe time and yet dropped here at its
-/// first due time, publishing no `Store` at all. Both bulk seeds feed exactly
-/// that content in, so a store-only check silently discards what they schedule.
+/// Origin-held counts, not just the local store. `CacheEngine::coverage`
+/// derives its bitmap from cached blocks only, but the probe path
+/// advertises origin-held content through `origin_held_size` — so a
+/// filesystem or pinned-origin hash that was never imported would be
+/// advertised at probe time and yet dropped here at its first due time,
+/// publishing no `Store` at all. Both bulk seeds feed exactly that content
+/// in, so a cache-only check silently discards what they schedule.
 ///
 /// A store error is `None`, never `Some(false)`: eviction is the only honest
 /// reason to stop republishing, and a fault is not eviction evidence. Folding
@@ -944,6 +949,11 @@ pub async fn run_republish(
 ///
 /// Both reads are in-memory or local; the live origin probe is deliberately not
 /// used, because this runs per hash per republish cycle.
+///
+/// Known limitation: a non-origin front-prefix partial with unknown size
+/// derives to an empty `Coverage` (see [`decdn_cache::CacheEngine::coverage`]),
+/// so it reports `Some(false)` here and never publishes a `Store` until a
+/// later size-persistence follow-up fixes the derivation.
 async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash) -> Option<bool> {
     let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
     if cache.refuses(h) {
@@ -955,8 +965,8 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash)
     if cache.origin_held_size(h).is_some() {
         return Some(true);
     }
-    match cache.has(h).await {
-        Ok(held) => Some(held),
+    match cache.coverage(h).await {
+        Ok(coverage) => Some(!coverage.is_empty()),
         Err(err) => {
             tracing::debug!(
                 hash = ?hash,
@@ -971,12 +981,18 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash)
 /// Send a `Store` to the K+3 closest peers for `hash` in parallel.
 /// Failures are logged at debug level — a missed receiver in this cycle
 /// will be retried on the next cycle (or on the next cold start).
+///
+/// `coverage` is derived once, up front — every receiver gets the same
+/// snapshot of what this node can currently serve for `hash` rather than a
+/// per-RPC re-derivation that could drift mid-fan-out.
 async fn publish_hash(
     endpoint: &Endpoint,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
+    cache: &decdn_cache::CacheEngine,
     hash: ContentHash,
 ) {
+    let coverage = fetch_coverage(cache, hash).await;
     let targets: Vec<NodeId> = with_lock(routing, "dht routing table", |table| {
         // ADR 022 §STORE Flow line 128 specifies K+3 (= 23) closest
         // nodes — the three positions beyond K are overflow targets
@@ -995,6 +1011,7 @@ async fn publish_hash(
     let mut handles = Vec::with_capacity(targets.len());
     for peer in targets {
         let endpoint_cloned = endpoint.clone();
+        let coverage_cloned = coverage.clone();
         handles.push(tokio::spawn(async move {
             let target_pk = match PublicKey::from_bytes(peer.as_bytes()) {
                 Ok(k) => k,
@@ -1008,7 +1025,7 @@ async fn publish_hash(
                 }
             };
             let addr = EndpointAddr::new(target_pk);
-            match client::store(&endpoint_cloned, addr, hash, self_node_id).await {
+            match client::store(&endpoint_cloned, addr, hash, self_node_id, coverage_cloned).await {
                 Ok(ack) if ack.accepted => {}
                 Ok(_) => {
                     tracing::debug!(
@@ -1030,6 +1047,26 @@ async fn publish_hash(
     }
     for h in handles {
         let _ = h.await;
+    }
+}
+
+/// Derive `hash`'s current [`Coverage`] from the cache, folding any store
+/// fault into [`Coverage::empty`] — a republish that can't answer the
+/// coverage question advertises nothing for this cycle rather than
+/// blocking on it; the hash stays scheduled and retries next cycle via the
+/// `cache_still_holds` due-time gate.
+async fn fetch_coverage(cache: &decdn_cache::CacheEngine, hash: ContentHash) -> Coverage {
+    let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
+    match cache.coverage(h).await {
+        Ok(coverage) => coverage,
+        Err(err) => {
+            tracing::debug!(
+                hash = ?hash,
+                error = %err,
+                "dht republish: coverage query faulted; publishing empty coverage this cycle"
+            );
+            Coverage::empty()
+        }
     }
 }
 
@@ -1063,6 +1100,7 @@ async fn publish_batch(
     endpoint: &Endpoint,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
+    cache: &decdn_cache::CacheEngine,
     hashes: &[ContentHash],
 ) {
     let groups = with_lock(routing, "dht routing table", |table| {
@@ -1073,9 +1111,19 @@ async fn publish_batch(
         // Nothing to do this cycle; the scheduler will retry.
         return;
     }
+    // Derive each hash's coverage once, up front, and share it across every
+    // receiver's batch — the same rationale as `publish_hash`'s single
+    // snapshot: every receiver of a given hash this cycle sees the same
+    // coverage rather than a per-batch re-derivation that could drift.
+    let mut coverage_by_hash = HashMap::with_capacity(hashes.len());
+    for &hash in hashes {
+        coverage_by_hash.insert(hash, fetch_coverage(cache, hash).await);
+    }
+    let coverage_by_hash = Arc::new(coverage_by_hash);
     let mut handles = Vec::with_capacity(groups.len());
     for (peer, peer_hashes) in groups {
         let endpoint_cloned = endpoint.clone();
+        let coverage_by_hash = Arc::clone(&coverage_by_hash);
         handles.push(tokio::spawn(async move {
             let target_pk = match PublicKey::from_bytes(peer.as_bytes()) {
                 Ok(k) => k,
@@ -1090,7 +1138,14 @@ async fn publish_batch(
             };
             let addr = EndpointAddr::new(target_pk);
             for chunk in peer_hashes.chunks(MAX_BATCH_STORE_HASHES) {
-                match client::batch_store(&endpoint_cloned, addr.clone(), chunk.to_vec(), self_node_id)
+                let entries: Vec<(ContentHash, Coverage)> = chunk
+                    .iter()
+                    .map(|h| {
+                        let coverage = coverage_by_hash.get(h).cloned().unwrap_or_else(Coverage::empty);
+                        (*h, coverage)
+                    })
+                    .collect();
+                match client::batch_store(&endpoint_cloned, addr.clone(), entries, self_node_id)
                     .await
                 {
                     Ok(ack) => {
