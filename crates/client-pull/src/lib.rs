@@ -27,6 +27,11 @@
 /// Buyer-side `PaymentPool` open kernel (#940), shared by the node service
 /// and the CLI.
 pub mod buyer_pool;
+/// Range-keyed discovery coverage-map primitive plus the two
+/// objective-specific planners over it (#1506): [`coverage_plan::plan_covered_runs`]
+/// (node — concentrate + sticky) and [`coverage_plan::spread_segments`] (client —
+/// spread for parallelism). Pure, no I/O.
+pub mod coverage_plan;
 /// Client-side node discovery (#936): read + select the active node set from
 /// `CapacityBond.getRegisteredNodes`, then rank probed blob-holders.
 pub mod discovery;
@@ -71,6 +76,9 @@ pub mod sink;
 /// seam), plus scripted test doubles.
 pub mod source;
 
+pub use coverage_plan::{
+    CoveredRun, SourceCoverage, covering_sources, plan_covered_runs, spread_segments,
+};
 pub use decdn_bao_range::RangedStore;
 pub use driver::{PacingWait, PoolExhausted, drive};
 pub use ledger::{
