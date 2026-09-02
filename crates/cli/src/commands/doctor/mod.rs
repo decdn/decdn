@@ -9,6 +9,7 @@ use serde::Serialize;
 mod chain;
 mod config;
 mod disk;
+mod live;
 mod origin;
 mod ports;
 mod report;
@@ -90,12 +91,21 @@ pub async fn run(
     let resolved = config::check_config(&mut report, args, global_config);
     // Config-dependent groups run only when resolve succeeded (Tasks 4-9).
     if let Some(resolved) = &resolved {
-        disk::check_disk(&mut report, resolved, None);
-        state::check_state(&mut report, resolved, false);
+        let live = if args.offline {
+            live::LiveInfo {
+                daemon_running: false,
+                cache_bytes: None,
+            }
+        } else {
+            live::probe_live(&mut report, resolved, args, global_config).await
+        };
+
+        disk::check_disk(&mut report, resolved, live.cache_bytes);
+        state::check_state(&mut report, resolved, live.daemon_running);
         if !args.offline {
-            ports::check_ports(&mut report, resolved, false);
             chain::check_chain(&mut report, resolved, args.timeout_ms).await;
             origin::check_origins(&mut report, resolved, args.timeout_ms).await;
+            ports::check_ports(&mut report, resolved, live.daemon_running);
         }
     }
 
