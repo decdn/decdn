@@ -28,6 +28,10 @@ const BAO_CHUNK_BYTES: u64 = 1024;
 /// Number of bao chunks spanned by one discovery block. Reads
 /// [`discovery_block_bytes`], which is the fixed `DISCOVERY_BLOCK_BYTES` in
 /// production and a test-overridable value under the `test-support` feature.
+// Not a `const fn`: under the `test-support` feature `discovery_block_bytes()`
+// reads a runtime override rather than the constant, so this cannot be const in
+// every feature configuration.
+#[allow(clippy::missing_const_for_fn)]
 fn chunks_per_block() -> u64 {
     discovery_block_bytes() / BAO_CHUNK_BYTES
 }
@@ -289,6 +293,14 @@ pub fn spread_segments(
     // fragment per block.
     let n_sources = sources.len().max(1);
     let target_share = candidates_by_block.len().div_ceil(n_sources).max(1);
+    // `rank` lists source indices best-first; invert it once so the tie-break in
+    // the assignment loop below reads a source's rank position in O(1) instead of
+    // scanning `rank` per candidate per block.
+    let rank_pos_by_source: HashMap<usize, usize> = rank
+        .iter()
+        .enumerate()
+        .map(|(pos, &src)| (src, pos))
+        .collect();
     let mut assigned_count: HashMap<usize, usize> = HashMap::new();
     let mut assignment: HashMap<u32, usize> = HashMap::new();
     let mut current: Option<usize> = None;
@@ -299,7 +311,7 @@ pub fn spread_segments(
         let chosen = stick.or_else(|| {
             candidates.iter().copied().min_by_key(|src| {
                 let load = assigned_count.get(src).copied().unwrap_or(0);
-                let rank_pos = rank.iter().position(|&r| r == *src).unwrap_or(usize::MAX);
+                let rank_pos = rank_pos_by_source.get(src).copied().unwrap_or(usize::MAX);
                 (load, rank_pos)
             })
         });
