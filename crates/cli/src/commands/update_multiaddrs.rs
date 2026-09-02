@@ -44,7 +44,13 @@ pub async fn run(
     let resolved = chain_ctx::resolve(&args.chain, &file)?;
     let cb_addr = resolved.capacity_bond_address;
 
-    // Pack first: an oversized single entry (past the `uint16` length prefix)
+    // Reject empty / whitespace-only entries before packing. `--multiaddr` is
+    // required, but clap accepts `--multiaddr ""`, and a blank string packs to a
+    // zero-length entry — an on-chain address no peer can dial, which recreates
+    // the exact relay-pinned footgun this command exists to fix.
+    reject_blank_multiaddrs(&args.multiaddrs)?;
+
+    // Pack next: an oversized single entry (past the `uint16` length prefix)
     // is a local encoding error, caught before any keystore decrypt or chain
     // read. The total-size ceiling is a separate, chain-read guardrail below.
     let packed = node_register::pack_multiaddrs(&args.multiaddrs)?;
@@ -190,6 +196,24 @@ async fn head_timestamp<P: Provider>(provider: &P) -> anyhow::Result<u64> {
     Ok(block.header.timestamp)
 }
 
+/// Reject empty or whitespace-only multiaddrs. clap enforces "at least one
+/// `--multiaddr`", but not that each is non-blank: `--multiaddr ""` (or `"  "`)
+/// packs to a zero-length on-chain entry no peer can dial — the relay-pinned
+/// footgun this command fixes, re-created. Pure so the guard is testable without
+/// a chain; runs before packing so nothing blank ever reaches the wire.
+pub(crate) fn reject_blank_multiaddrs(multiaddrs: &[String]) -> anyhow::Result<()> {
+    for (i, ma) in multiaddrs.iter().enumerate() {
+        anyhow::ensure!(
+            !ma.trim().is_empty(),
+            "--multiaddr #{} is empty or whitespace — publish a real QUIC address like \
+             `/ip4/203.0.113.10/udp/4433/quic-v1`, or omit it (at least one non-blank \
+             address is required).",
+            i + 1,
+        );
+    }
+    Ok(())
+}
+
 /// Refuse a run the contract would revert, naming the guardrail and its exact
 /// bound. Split from `run` so every branch is testable without a chain. The
 /// order matches the contract: `NodeNotActive`, then `MultiaddrsTooLarge`, then
@@ -198,8 +222,9 @@ pub(crate) fn ensure_submittable(plan: &Plan) -> anyhow::Result<()> {
     anyhow::ensure!(
         plan.active,
         "this operator is not in the active node set — `updateMultiaddrs` would revert \
-         NodeNotActive. Register first with `decdn node register` (or, if ejected, follow \
-         the exit in `decdn node deregister`)."
+         NodeNotActive. A registered node re-enters with `decdn node register`. An ejected \
+         operator cannot register (it would revert too) and instead exits the bond with \
+         `decdn node unbond --all`."
     );
     anyhow::ensure!(
         plan.packed_size <= plan.max_multiaddr_size,
@@ -307,6 +332,44 @@ mod tests {
     #[test]
     fn submittable_plan_passes() {
         ensure_submittable(&plan()).expect("an active, in-bounds, cooled-down plan is submittable");
+    }
+
+    #[test]
+    fn non_blank_multiaddrs_pass() {
+        reject_blank_multiaddrs(&["/ip4/203.0.113.10/udp/4433/quic-v1".to_string()])
+            .expect("a real address is accepted");
+    }
+
+    /// clap requires at least one `--multiaddr`, but `--multiaddr ""` slips
+    /// through and would pack to a zero-length entry — the relay-pinned footgun.
+    #[test]
+    fn empty_multiaddr_is_rejected() {
+        let err = reject_blank_multiaddrs(&["ok".to_string(), String::new()])
+            .expect_err("an empty entry must not proceed");
+        assert!(
+            format!("{err}").contains("#2"),
+            "names the offending index: {err}"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_multiaddr_is_rejected() {
+        reject_blank_multiaddrs(&["   ".to_string()])
+            .expect_err("a whitespace-only entry must not proceed");
+    }
+
+    /// An ejected operator cannot register — `deregister` sends them to
+    /// `unbond --all`, and so must this command, not to a `register` that reverts.
+    #[test]
+    fn inactive_message_routes_ejected_to_unbond_not_register_only() {
+        let mut p = plan();
+        p.active = false;
+        let err = ensure_submittable(&p).expect_err("inactive must not proceed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unbond --all"),
+            "names the ejected exit: {msg}"
+        );
     }
 
     #[test]
