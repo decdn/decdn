@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use decdn_common::config::ResolvedConfig;
+use decdn_common::config::{RECEIPT_LOG_FILE, ResolvedConfig};
 
 use super::{Finding, Report, Severity};
 
@@ -95,6 +95,7 @@ pub fn evaluate_secret(facts: &FileFacts) -> Finding {
 }
 
 /// Push all state-group findings.
+#[allow(clippy::too_many_lines)]
 pub fn check_state(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bool) {
     const REDB: &[&str] = &[
         "lanes.redb",
@@ -123,14 +124,18 @@ pub fn check_state(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bo
         } else {
             Severity::Warn
         },
-        title: if ks.exists {
+        title: if ks.exists && ks.is_file {
             "eth keystore present".into()
+        } else if ks.exists {
+            "keystore path exists but is not a regular file".into()
         } else {
             "eth keystore missing".into()
         },
         detail: Some(format!("path={}", keystore.display())),
-        remediation: if ks.exists {
+        remediation: if ks.exists && ks.is_file {
             None
+        } else if ks.exists {
+            Some("remove the non-file at the keystore path".into())
         } else {
             Some(
                 "create the keystore (decdn key-gen / your provisioning) before the node signs"
@@ -183,6 +188,39 @@ pub fn check_state(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bo
         };
         report.push(finding);
     }
+
+    // Receipt log: presence is optional before first receipt.
+    let receipt_path = data_dir.join(RECEIPT_LOG_FILE);
+    let receipts = FileFacts::read(&receipt_path);
+    let receipt_finding = if !receipts.exists {
+        Finding {
+            group: "State",
+            id: "state.receipts",
+            severity: Severity::Pass,
+            title: "receipt log absent (created on first receipt)".into(),
+            detail: None,
+            remediation: None,
+        }
+    } else if receipts.is_file {
+        Finding {
+            group: "State",
+            id: "state.receipts",
+            severity: Severity::Pass,
+            title: "receipt log present".into(),
+            detail: Some(format!("path={}", receipt_path.display())),
+            remediation: None,
+        }
+    } else {
+        Finding {
+            group: "State",
+            id: "state.receipts",
+            severity: Severity::Warn,
+            title: "receipt log path exists but is not a regular file".into(),
+            detail: Some(format!("path={}", receipt_path.display())),
+            remediation: Some("remove the non-file at the receipt log path".into()),
+        }
+    };
+    report.push(receipt_finding);
 
     if daemon_running {
         report.push(Finding {
@@ -245,5 +283,27 @@ mod tests {
             mode: Some(0o600),
         });
         assert_eq!(f.severity, Severity::Pass);
+    }
+
+    #[test]
+    fn absent_receipt_log_passes() {
+        let facts = FileFacts {
+            exists: false,
+            is_file: false,
+            len: 0,
+            mode: None,
+        };
+        assert!(!facts.exists);
+        assert!(!facts.is_file);
+    }
+
+    #[test]
+    fn present_receipt_log_passes() {
+        let tmp = std::env::temp_dir().join("decdn_receipt_test.jsonl");
+        let _ = std::fs::write(&tmp, "");
+        let facts = FileFacts::read(&tmp);
+        assert!(facts.exists);
+        assert!(facts.is_file);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
