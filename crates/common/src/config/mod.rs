@@ -5307,7 +5307,10 @@ swap_pool_address = \"0xPool\"
         let notices = bag.take_notices();
         assert_eq!(notices.len(), 1, "one notice per reported var");
         let notice = notices.first().expect("one notice");
-        assert_eq!(notice.field, "DECDN_DELIVERY_CEILING");
+        assert_eq!(
+            notice.field, "DECDN_DELIVERY_CEILING",
+            "the label names what the operator set — an env var here, not a dotted config key"
+        );
         assert_eq!(notice.level, ConfigNoticeLevel::Warn);
         assert!(
             notice.message.contains("no longer does anything"),

@@ -52,18 +52,25 @@ pub enum ConfigNoticeLevel {
     Warn,
 }
 
-/// One non-fatal resolve-time notice: a severity, a dotted field label
-/// (`security.max_tracked_sources`) and the operator-facing message text.
+/// One non-fatal resolve-time notice: a severity, the label of whatever the
+/// operator wrote, and the operator-facing message text.
 ///
-/// The label matches the problem-label convention so a notice and
-/// a problem about the same field read the same way, and so a consumer can
-/// render `field` as a structured log field rather than embedding it in prose.
-/// The message therefore does not repeat the field name.
+/// `field` names the **source**, not always a config key: usually a dotted
+/// config label (`security.max_tracked_sources`), matching the problem-label
+/// convention so a notice and a problem about the same field read the same
+/// way, but a notice about a retired environment variable carries the bare var
+/// name (`DECDN_DELIVERY_CEILING`) because that is the thing the operator set
+/// and must unset. A consumer that filters on `field` — the JSON log stream,
+/// a `doctor` finding — must not assume a dotted shape.
+///
+/// Either way `field` is rendered as a structured value rather than embedded
+/// in prose, so the message does not repeat the label.
 #[derive(Debug, Clone)]
 pub struct ConfigNotice {
     /// How loud this notice is.
     pub level: ConfigNoticeLevel,
-    /// Dotted field label the notice is about.
+    /// What the operator wrote: a dotted config label, or an environment
+    /// variable name for a notice about one.
     pub field: String,
     /// Operator-facing message text, without a severity prefix.
     pub message: String,
