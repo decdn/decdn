@@ -2237,6 +2237,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // operator (or the G-NODE-07 journey) detect the unslashable state
         // without scraping the daemon's log for a WARN line.
         .with_binding(ch.binding_report)
+        // Operator eth address for `admin_v1_status` (#1906). The loaded eth
+        // signer's address — the same value the binding check above derives —
+        // so an operator can read the wallet the node runs under without
+        // grepping the bring-up log.
+        .with_operator_address(infra.eth_signer.address())
         // ADR 041: the SAME warming allowance the buy loop debits, the serve
         // path credits, and the eviction driver forgets from, so
         // `admin_v1_evict` can also drop a hash's provenance tag on removal.
