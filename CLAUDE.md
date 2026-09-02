@@ -45,7 +45,15 @@ Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots
 
 **Code style:** `rustfmt.toml` sets `max_width = 100`.
 
-**Anti-panic policy:** Clippy denies `unwrap_used`, `expect_used`, `panic`, and `indexing_slicing` workspace-wide. Use `Result`/`Option` combinators or `.get()` for indexing. This is the most common CI failure for new code.
+**Anti-panic policy:** Clippy denies `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `todo`, and `unimplemented` workspace-wide. Use `Result`/`Option` combinators or `.get()` for indexing. This is the most common CI failure for new code.
+
+**Numeric safety:** `cast_possible_truncation`, `cast_sign_loss`, and `cast_precision_loss` are `deny`, not `warn`. A narrowing or sign-changing cast needs a per-site `#[allow]`/`#[expect]` with a comment saying why it cannot lose data.
+
+**No stray output:** `print_stdout`, `print_stderr`, and `dbg_macro` are `deny`. The `decdn` CLI is a terminal UI and allows both print lints at its library crate root; everywhere else, use `tracing`. The few production sites that run before the subscriber exists carry a per-site `#[expect]` with a reason — except where the `eprintln!` is itself `cfg`-gated, which takes an `#[allow]` scoped to that block, because an `#[expect]` would go unfulfilled in the build that turns the `cfg` on.
+
+**Say what you mean:** `elided_lifetimes_in_paths` and `unreachable_pub` are `warn`. Write `Foo<'_>` when the type borrows, and give an item inside a private module the visibility it actually has (`pub(crate)` / `pub(super)`) rather than a bare `pub`. Both are machine-fixable — `cargo clippy --fix --workspace --all-targets` applies them.
+
+**`missing_docs` is `warn`:** every public item — including struct fields and enum variants — carries a doc comment. The `alloy::sol!` bindings are the exception: each generated block opts out where it is declared, so a new binding needs the same `#[allow(missing_docs)]` on its wrapper. New docs are link-checked too: the `doc` gate runs `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items`, so a broken `[`Type`]` link fails the build.
 
 ### Crate Structure
 

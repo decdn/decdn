@@ -39,6 +39,7 @@ use decdn_incentive::capacity_bond::CapacityBond;
 /// Outcome of the bring-up binding check, as carried into `AdminState`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BindingReport {
+    /// Whether the operator address is bound, unbound, or could not be read.
     pub status: BindingStatus,
     /// The node id the operator is bound to, when it could be read and is
     /// non-zero. `None` for [`BindingStatus::Unbound`] and

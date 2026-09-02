@@ -9,6 +9,7 @@ use super::run::RunArgs;
 /// Manage `decdn` configuration files.
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
+    /// The `decdn config` subcommand to run.
     #[command(subcommand)]
     pub command: ConfigCommand,
 }
@@ -70,6 +71,8 @@ pub struct ConfigInitArgs {
 /// they would be during the daemon's startup.
 #[derive(Args, Debug)]
 pub struct ConfigValidateArgs {
+    /// The daemon's own `run` arguments, so validation honors the same
+    /// flags and `DECDN_*` variables startup would.
     #[command(flatten)]
     pub run: RunArgs,
 }

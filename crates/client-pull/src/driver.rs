@@ -74,7 +74,7 @@ use std::time::Duration;
 
 use alloy::primitives::U256;
 use bao_tree::ChunkRanges;
-use decdn_bao_range::align_range;
+use decdn_bao_range::{CHUNK_GROUP_BYTES, align_range};
 use decdn_incentive::DepositOutcome;
 
 use crate::pacer::{PaceDecision, PaceState};
@@ -543,6 +543,22 @@ where
         let missing_bytes = ranges_content_len(&still_missing, total_bytes);
         let delivered_frontier = gap_end.saturating_sub(missing_bytes);
 
+        // Received-byte ceiling (#1895): enforce the source's `max_blob_size_bytes`
+        // on the content that has ACTUALLY been received and BLAKE3-verified into the
+        // store, never on the peer's unverified signed `total_bytes`.
+        // `delivered_frontier` is the absolute content offset present from the blob
+        // start, so once it crosses the ceiling the blob is genuinely oversized —
+        // abort. The Draw arm clamps each leg so this fires within one chunk group of
+        // the ceiling rather than after a whole-gap `BudgetPacer` draw. `0` =
+        // unlimited (and own-origin, whose engine store applies its own cap).
+        let max_blob_size_bytes = source.max_blob_size_bytes();
+        if max_blob_size_bytes > 0 && delivered_frontier > max_blob_size_bytes {
+            return Err(anyhow::Error::new(crate::BlobTooLarge {
+                received: delivered_frontier,
+                ceiling: max_blob_size_bytes,
+            }));
+        }
+
         let committed = ledger.committed();
         let remaining_deposit = locked_deposit(ctx)?.saturating_sub(spent(committed.amount));
 
@@ -704,6 +720,21 @@ where
                 }
                 let resume_start = paid_frontier;
                 let draw_len = gap_end.saturating_sub(resume_start).min(up_to_bytes);
+                // Received-byte ceiling (#1895): cap this leg so the delivered
+                // frontier can exceed `max_blob_size_bytes` by at most one chunk
+                // group, at which point the loop-top check aborts. Without this a
+                // `BudgetPacer` (which draws the whole gap remainder) would pull an
+                // entire oversized blob before that check ever runs. `resume_start` is
+                // always at or below the ceiling here — a `resume_start` past it means
+                // the loop-top check already aborted — so `cap_end - resume_start` is
+                // at least one chunk group and never collapses `draw_len` to the `0`
+                // ("to end") sentinel. `0` = unlimited.
+                let draw_len = if max_blob_size_bytes > 0 {
+                    let cap_end = max_blob_size_bytes.saturating_add(CHUNK_GROUP_BYTES);
+                    draw_len.min(cap_end.saturating_sub(resume_start))
+                } else {
+                    draw_len
+                };
                 let aligned = align_range(resume_start, draw_len, total_bytes)?;
 
                 // Whole-blob content already present, so `ingest_stream`'s

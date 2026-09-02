@@ -168,8 +168,13 @@ impl std::fmt::Debug for ProbeHandler {
 }
 
 impl ProbeHandler {
+    /// The ALPN this handler answers on: `cdn/probe/v1`, the unauthenticated
+    /// latency and availability probe.
     pub const ALPN: &'static [u8] = ALPN_PROBE;
 
+    /// Build the probe handler from the runtime state it answers out of: the
+    /// node's identity and advertised rate, the rate limiters that gate an
+    /// unauthenticated caller, and the signer that attests each response.
     #[allow(clippy::missing_const_for_fn)] // Arc::new isn't const.
     #[allow(clippy::too_many_arguments)] // wiring struct; each arg is distinct runtime state.
     pub fn new(

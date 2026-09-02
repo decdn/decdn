@@ -69,6 +69,7 @@ pub struct SetupArgs {
     #[arg(long = "max-slippage-bps", value_name = "BPS", default_value_t = 300)]
     pub max_slippage_bps: u16,
 
+    /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
     #[command(flatten)]
     pub chain: ChainArgs,
 }

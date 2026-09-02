@@ -18,6 +18,8 @@ pub struct ShedState {
 }
 
 impl ShedState {
+    /// A counter with nothing in flight, already wrapped so [`ShedSlot`]s can
+    /// hold it.
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())

@@ -41,7 +41,10 @@ fn chunks_per_block() -> u64 {
 /// this module never dereferences `source_ix`, it only carries it through).
 #[derive(Debug, Clone)]
 pub struct SourceCoverage {
+    /// The caller's opaque handle for this source — a position in its own
+    /// candidate list. This module carries it through untouched.
     pub source_ix: usize,
+    /// The discovery-block bitmap this source advertises.
     pub coverage: Coverage,
 }
 
@@ -54,8 +57,13 @@ pub struct SourceCoverage {
 /// that block span; one covering a partial in-block slice is exactly that slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoveredRun {
+    /// First byte of the run, clamped to the gap∩request start.
     pub offset: u64,
+    /// Length of the run in bytes, clamped so `offset + len` never exceeds the
+    /// gap∩request end (nor `total_bytes` at the blob tail).
     pub len: u64,
+    /// The source assigned to serve this run — the `source_ix` of the
+    /// [`SourceCoverage`] whose coverage spans it.
     pub source_ix: usize,
 }
 

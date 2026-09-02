@@ -54,13 +54,21 @@ pub const KNOWN_CHAINS: &[KnownChain] = &[KnownChain {
 /// deploy script recorded it.
 #[derive(Debug)]
 pub struct ChainAddresses {
+    /// `blockchain.payment_pool_address`.
     pub payment_pool: String,
+    /// `blockchain.capacity_bond_address`.
     pub capacity_bond: String,
+    /// `blockchain.slash_judge_address`.
     pub slash_judge: String,
+    /// `blockchain.content_blacklist_address`.
     pub content_blacklist: String,
+    /// `blockchain.origin_assignment_address`.
     pub origin_assignment: String,
+    /// `blockchain.publisher_registry_address`.
     pub publisher_registry: String,
+    /// `blockchain.slash_appeal_address`.
     pub slash_appeal: String,
+    /// `blockchain.usdc_address` — the payment token on this chain.
     pub usdc: String,
 }
 

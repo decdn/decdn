@@ -94,6 +94,7 @@ pub struct PoolOpenArgs {
     /// Deposit to escrow, in micro-USDC (USDC base units).
     #[arg(long, value_name = "MICRO_USDC")]
     pub deposit_micro_usdc: u64,
+    /// Chain coordinates and the payment-pool address.
     #[command(flatten)]
     pub chain: PoolChainArgs,
 }

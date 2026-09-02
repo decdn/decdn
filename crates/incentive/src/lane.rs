@@ -895,11 +895,21 @@ pub enum PoolError {
     /// `voucher.pool_id` does not match the pool this lane draws from — also
     /// the "unknown pool" case surfaced by the caller.
     #[error("voucher pool_id {got} does not match expected {expected}")]
-    WrongPool { expected: B256, got: B256 },
+    WrongPool {
+        /// The pool this lane draws from.
+        expected: B256,
+        /// The pool the voucher named.
+        got: B256,
+    },
     /// `voucher.provider` names a node other than this one — a capability
     /// voucher scoped to one provider redeemed against another.
     #[error("voucher provider {got} does not match expected {expected}")]
-    WrongProvider { expected: Address, got: Address },
+    WrongProvider {
+        /// This node's provider address.
+        expected: Address,
+        /// The provider the voucher named.
+        got: Address,
+    },
     /// Cumulative amount did not cover what the lane already holds — a stale or
     /// replayed voucher, or a rollover that folded less than the frontier its
     /// retiring chain proved. `amount` is the sole ordering key (there is no
@@ -907,14 +917,29 @@ pub enum PoolError {
     /// on the ordering check, and the lane's full claim (anchor plus proved
     /// frontier) on the fold check.
     #[error("voucher amount {got} not greater than last accepted {last}")]
-    AmountRegression { last: U256, got: U256 },
+    AmountRegression {
+        /// What the voucher's cumulative amount had to beat.
+        last: U256,
+        /// The cumulative amount it carried.
+        got: U256,
+    },
     /// Cumulative bytes delivered went down.
     #[error("voucher bytes_delivered {got} less than last accepted {last}")]
-    BytesRegression { last: U256, got: U256 },
+    BytesRegression {
+        /// Last accepted cumulative bytes.
+        last: U256,
+        /// The lower figure the voucher carried.
+        got: U256,
+    },
     /// Voucher amount exceeds the capability's spending cap — the contract
     /// would revert at redemption.
     #[error("voucher amount {got} exceeds capability cap {cap}")]
-    CapExceeded { cap: U256, got: U256 },
+    CapExceeded {
+        /// The capability's spending cap.
+        cap: U256,
+        /// The voucher amount that exceeds it.
+        got: U256,
+    },
     /// A released hash-chain preimage does not reach the tracked tip in
     /// `index − verified` steps (ADR 003 §Concurrent Streams, Rule 2).
     ///
@@ -923,7 +948,12 @@ pub enum PoolError {
     /// repair a hash-chain mismatch. On-chain the same mismatch reverts
     /// `BadPreimage`, which is caller error rather than transient state.
     #[error("released preimage at index {index} does not reach the tip verified at {verified}")]
-    BadPreimage { index: u8, verified: u8 },
+    BadPreimage {
+        /// Chain index of the released preimage.
+        index: u8,
+        /// Index of the tip the lane has verified to.
+        verified: u8,
+    },
     /// Signature is malformed or signed by the wrong address.
     #[error(transparent)]
     Signature(#[from] VoucherError),

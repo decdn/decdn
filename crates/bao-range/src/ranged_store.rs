@@ -1,12 +1,25 @@
+//! The `(hash, total_bytes)` blob view every range-aware backend implements.
+//!
+//! [`RangedStore`] is what keeps this crate iroh-blobs-free: it speaks byte
+//! offsets and `ChunkRanges` only, so the node's iroh-blobs cache and the
+//! CLI's `.partial` sidecar can both satisfy it (#578).
+
+/// A boxed future returned by a [`RangedStore`] method, borrowing the store
+/// for `'a`.
 pub type RangedFuture<'a, T> =
     core::pin::Pin<Box<dyn core::future::Future<Output = Result<T, RangedStoreError>> + Send + 'a>>;
 
+/// What a [`RangedStore`] operation can fail with.
 #[derive(Debug, thiserror::Error)]
 pub enum RangedStoreError {
+    /// The requested range is not chunk-group aligned, or does not verify
+    /// against the outboard.
     #[error("range alignment: {0}")]
     Alignment(#[from] crate::RangeVerifyError),
+    /// Finalization was asked for while ranges are still missing.
     #[error("blob is incomplete: cannot finalize")]
     Incomplete,
+    /// The underlying store (file, blob store) failed.
     #[error("backend: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
 }

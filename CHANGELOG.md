@@ -1110,6 +1110,54 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **`missing_docs` is on, and the 230 public items that lacked a doc comment
+  have one.** 170 were struct fields and 24 enum variants — the shapes rustdoc
+  renders as a bare name with no explanation, which is where the gap actually
+  hurt: `ResolvedConfig`'s twelve sections, `ClientHandlerDeps`' required
+  wiring, the `expected`/`recovered` pairs on every signature-recovery error,
+  and the `PoolError` operands a node reads when it refuses a voucher. The
+  `alloy::sol!` bindings needed nothing: each generated block already opts out
+  where it is declared. Every new comment is also link-checked, since the `doc`
+  gate denies rustdoc warnings.
+
+- **`elided_lifetimes_in_paths` and `unreachable_pub` are on.** A type path that
+  borrows now says so — `TableDefinition<'_, …>` across `channel_store`'s eleven
+  redb table definitions, `EvictionContext<'_>` in the cache's admission and
+  eviction policy traits — so a reader sees the borrow at the call site instead of
+  having to look the type up. `unreachable_pub` narrows 46 items that were `pub`
+  inside a private module to the visibility they actually had: mostly the shared
+  integration-test helper modules (`node/tests/support`, `cache/tests/util`,
+  `cli/tests/common`), plus `client-pull`'s `progress` and `ledger` internals and
+  `load_shed`'s egress-budget helper. No item's real reachability changes.
+
+- **The workspace moves to cargo's MSRV-aware resolver and denies stray output,
+  scaffolding macros, and lossy numeric casts.** `resolver = "3"` changes nothing
+  about feature unification — that was resolver 2, which the workspace already
+  had — but it defaults `resolver.incompatible-rust-versions` to `fallback`, so
+  cargo prefers dependency versions whose declared `rust-version` is at or below
+  the pinned 1.95. Nothing resolves differently today and `Cargo.lock` is
+  unchanged; the guard is against a future `cargo update` pulling a dependency
+  that raised its MSRV past the toolchain. Alongside it, `print_stdout`,
+  `print_stderr`, `dbg_macro`, `todo`, and `unimplemented` become `deny`, and
+  `cast_possible_truncation` / `cast_sign_loss` / `cast_precision_loss` move from
+  `warn` to `deny`. The cast promotion adds no new violations — CI clippy and the
+  pre-commit hook already pass `-D warnings`, so every cast was fatal there; it
+  only makes a bare local `cargo clippy` agree. `dbg_macro`, `todo`, and
+  `unimplemented` had zero occurrences and are pure regression guards. The `decdn`
+  CLI allows both print lints at its crate roots because it is a terminal UI; the
+  handful of production `eprintln!` sites that run before the tracing subscriber
+  exists carry a per-site `#[expect]` naming that reason, which leaves every
+  library crate and every node handler with no way to print.
+
+- **Dev builds compile the keystore KDF at `opt-level = 3`.** `alloy`'s
+  `signer-keystore` runs scrypt on every keystore encrypt and decrypt, and an
+  unoptimized scrypt costs about 0.5s per operation. Raising `scrypt`, `salsa20`,
+  `pbkdf2`, `sha2`, and `hmac` to `opt-level = 3` under `[profile.dev.package]`
+  takes the `decdn-cli` suite from 3.79s to 3.20s (-16%), with the `key_gen_e2e`
+  tests themselves 16-22% faster; the `anvil-e2e` journeys pay the same cost once
+  per keygen. Nothing else about the dev profile changes, so debuginfo on
+  workspace crates is untouched.
+
 - **The node flushes lane writes to redb in table-key order, and the workspace
   floor moves to `redb = "4.2"`.** `flush` drains a `HashSet` of dirty lanes, so
   the batch reached redb in an arbitrary order. Sorting it by the

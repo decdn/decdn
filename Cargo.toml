@@ -1,5 +1,12 @@
 [workspace]
-resolver = "2"
+# Resolver 3 — the MSRV-aware resolver. Its feature-unification rules are
+# identical to resolver 2's; the only difference is that
+# `resolver.incompatible-rust-versions` defaults to `fallback` instead of
+# `allow`, so cargo prefers dependency versions whose declared `rust-version`
+# is <= ours. Paired with `rust-version = "1.95"` below, that stops a future
+# `cargo update` from silently pulling a dependency that raised its MSRV past
+# the pinned toolchain. Nothing is excluded at 1.95 today.
+resolver = "3"
 members = [
     "crates/node",
     "crates/protocol",
@@ -273,6 +280,17 @@ redb = "4.2"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
+# Write `Foo<'_>`, not `Foo`, when the type has a lifetime: at a call site the
+# elided form hides that the value borrows, which is exactly what a reader
+# needs to see around the redb transaction and cache-eviction context types.
+elided_lifetimes_in_paths = "warn"
+# A `pub` item inside a private module is not part of any crate's API; say what
+# it really is. Mostly this keeps the shared integration-test helper modules
+# honest, where `pub` is reflex rather than intent.
+unreachable_pub = "warn"
+# Every public item carries a doc comment. The `alloy::sol!` bindings are the
+# one exception and already opt out at their `mod sol_types` wrappers.
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -284,10 +302,26 @@ expect_used = "deny"
 panic = "deny"
 indexing_slicing = "deny"
 
-# Numeric safety (payment amounts, byte offsets)
-cast_possible_truncation = "warn"
-cast_sign_loss = "warn"
-cast_precision_loss = "warn"
+# Numeric safety (payment amounts, byte offsets). `deny`, not `warn`: CI clippy
+# and the pre-commit hook both pass `-D warnings`, so these were already fatal
+# there — `deny` makes a bare local `cargo clippy` agree, and stops a call site
+# relaxing one back to `warn`. Widening casts stay legal; `as_conversions` is
+# deliberately NOT enabled — it fires on every `as` cast, safe ones included:
+# it counts casts, it does not judge them.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_precision_loss = "deny"
+
+# No stray output or scaffolding. `dbg_macro` / `todo` / `unimplemented` have
+# zero occurrences and stay that way. The print lints keep stdio out of every
+# library crate and the daemon: the `decdn` CLI is a terminal UI and allows
+# both at its crate root, and the handful of production `eprintln!` sites that
+# run before `tracing` is initialized carry a per-site `#[expect]`.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
 
 # Code quality
 cognitive_complexity = "warn"
@@ -307,6 +341,27 @@ missing_panics_doc = "allow"
 [profile.dev]
 opt-level = 0
 debug = true
+
+# Keystore KDF at release speed in dev builds. `alloy`'s `signer-keystore`
+# runs scrypt on every keystore encrypt and decrypt, and unoptimized scrypt
+# costs ~0.5s per operation: measured on the `decdn-cli` suite, 3.79s -> 3.20s
+# (-16%), with the `key_gen_e2e` tests themselves 16-22% faster. The
+# `anvil-e2e` journeys pay it once per keygen. None of these crates is ever
+# stepped through in a debugger, so the lost debuginfo costs nothing.
+[profile.dev.package.scrypt]
+opt-level = 3
+
+[profile.dev.package.salsa20]
+opt-level = 3
+
+[profile.dev.package.pbkdf2]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.hmac]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

@@ -55,10 +55,16 @@ struct FileIdentity {
 /// Coordinates resolved from flags > config file > defaults.
 #[derive(Debug)]
 pub struct Resolved {
+    /// JSON-RPC endpoint the command talks to.
     pub rpc_url: String,
+    /// EVM chain id, checked against what the endpoint reports.
     pub chain_id: u64,
+    /// `CapacityBond` address the bond and unbond commands act on.
     pub capacity_bond_address: Address,
+    /// Path to the operator's Ethereum keystore file.
     pub keystore: PathBuf,
+    /// Node data directory; the keystore and node key default to paths
+    /// under it.
     pub data_dir: PathBuf,
 }
 
@@ -159,10 +165,16 @@ pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Reso
 /// `CapacityBond` directly).
 #[derive(Debug)]
 pub struct ResolvedAppeal {
+    /// JSON-RPC endpoint the command talks to.
     pub rpc_url: String,
+    /// EVM chain id, checked against what the endpoint reports.
     pub chain_id: u64,
+    /// `SlashAppeal` address the appeal is filed against.
     pub slash_appeal_address: Address,
+    /// Path to the operator's Ethereum keystore file.
     pub keystore: PathBuf,
+    /// Node data directory; the keystore and node key default to paths
+    /// under it.
     pub data_dir: PathBuf,
 }
 
@@ -246,11 +258,20 @@ pub async fn load_signer_with_password_file(
 /// only the one it targets and errors with a specific message if it is unset.
 #[derive(Debug)]
 pub struct ResolvedPublish {
+    /// JSON-RPC endpoint the command talks to.
     pub rpc_url: String,
+    /// EVM chain id, checked against what the endpoint reports.
     pub chain_id: u64,
+    /// `PublisherRegistry` address. `None` when neither
+    /// `--publisher-registry-address` nor `blockchain.publisher_registry_address`
+    /// is set; a subcommand that needs it then errors naming the missing key.
     pub publisher_registry_address: Option<Address>,
+    /// `OriginAssignment` address, optional on the same terms.
     pub origin_assignment_address: Option<Address>,
+    /// Path to the operator's Ethereum keystore file.
     pub keystore: PathBuf,
+    /// Node data directory; the keystore and node key default to paths
+    /// under it.
     pub data_dir: PathBuf,
 }
 

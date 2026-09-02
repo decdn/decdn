@@ -165,6 +165,10 @@ fn determinism_with_non_ascii_and_large_file() {
 // observed (#697). The contract this guards still runs on case-sensitive
 // Linux CI.
 #[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "test harness diagnostic surfaced in the nextest log"
+)]
 fn determinism_mixed_case_bytewise_sort() {
     let dir = TempDir::new().unwrap();
     let src = dir.path().join("src");

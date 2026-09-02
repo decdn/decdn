@@ -1030,17 +1030,33 @@ impl FillOutcome {
 /// pass it to [`ClientHandler::new`]. Each optional field's runtime semantics are
 /// documented on the matching [`ClientHandler`] field.
 pub struct ClientHandlerDeps {
+    /// This node's iroh identity. Carried for diagnostics — the handler does
+    /// not put it on the wire; `StreamResponseBody` has no node-id field.
     pub node_id: PublicKey,
+    /// Shared metrics registry the serve path records into.
     pub metrics: Arc<Metrics>,
+    /// Per-source connection-rate gate, applied before any work is done.
     pub limiter: Arc<ConnectionLimiter>,
     /// Overload-protection gate: sheds new serves under resource pressure.
     pub shed: Arc<crate::load_shed::LoadShedController>,
+    /// Blob store the serve path reads from, and the pull-through target on a
+    /// miss.
     pub cache: CacheEngine,
+    /// The operator's Ethereum key. Signs the `slash_sig` on each
+    /// `StreamResponse`; every other use reads it only for its address.
+    /// Client bindings are verified here, never signed.
     pub eth_signer: Arc<PrivateKeySigner>,
+    /// EIP-712 domain for slash attestations.
     pub slash_domain: Eip712Domain,
+    /// EIP-712 domain for payment vouchers.
     pub voucher_domain: Eip712Domain,
+    /// EIP-712 domain for lane bindings.
     pub bind_domain: Eip712Domain,
+    /// Durable per-lane cumulative state. Fences voucher replay across a
+    /// restart (ADR 003 §Off-chain voucher state persistence).
     pub channel_state_store: Arc<dyn PoolStateStore>,
+    /// Non-blocking sink for the served-and-paid audit log. One receipt per
+    /// accepted voucher, so a single delivery emits several.
     pub receipt_sink: Arc<dyn ReceiptSink>,
     /// Optional durable sink for owner-signed capability material (ADR 003
     /// §Capability delegation). `None` (tests) makes capability intake a no-op.
@@ -1062,7 +1078,11 @@ pub struct ClientHandlerDeps {
     /// `getRateBounds()` and updated by the `RateBoundsUpdated` watcher,
     /// replacing the by-value config stand-in.
     pub rate_bounds: crate::rate_bounds::RateBounds,
+    /// Largest blob the node will serve, in bytes, checked against the local
+    /// blob's inspected size. `0` disables the ceiling.
     pub max_blob_size_bytes: u64,
+    /// Cap on concurrently served streams within one connection — the
+    /// semaphore is built per accepted connection, not per node.
     pub max_concurrent_streams: usize,
     /// Live content deny-set (ADR 011): the operator's local denylist unioned
     /// with the on-chain origin blacklist. NOT an `Option`, unlike the wiring
@@ -1076,9 +1096,22 @@ pub struct ClientHandlerDeps {
     /// `ContentDenylist::empty()` explicitly.
     pub content_deny: Arc<crate::content_deny::ContentDenylist>,
     // Optional wiring — `None` unless the deployment enables the feature.
+    /// Best-effort nudge to the settlement service that a lane's accrued
+    /// claim advanced; sent on every accepted voucher, against no threshold.
+    /// `None` when no settlement service is wired.
     pub redeem_hint: Option<mpsc::Sender<LaneKey>>,
+    /// Deadline for the node-to-node cache-miss pull, so a slow upstream
+    /// cannot pin the delivery path. `None` disables the node-to-node leg
+    /// only; a miss can still fill from the local origin via
+    /// [`Self::local_populate`].
     pub pull_through: Option<Duration>,
+    /// Deadline for filling a miss from this node's OWN configured fs/http/s3
+    /// origin, tried ahead of any node-to-node path and independent of
+    /// [`Self::pull_through`]. `None` skips the local-origin tier.
     pub local_populate: Option<Duration>,
+    /// Selects the window-paced node-to-node pull leg, which bounds
+    /// speculative spend to the ramped credit window. `None` falls back to the
+    /// buffered `populate` path when [`Self::pull_through`] is set.
     pub pull_through_origin: Option<Arc<NodeOrigin>>,
     /// Downstream credit-window ceiling in bytes (ADR 003 §Credit window): the
     /// per-stream window ramps toward this cap as the stream pays. Defaults to
@@ -1102,6 +1135,9 @@ pub struct ClientHandlerDeps {
     /// clamps each request to the credit window's remaining room, so this is a
     /// ceiling on frame size rather than an exact size.
     pub frame_target_bytes: u64,
+    /// Application-layer idle-close ceiling for a whole connection (ADR 005
+    /// §Connection lifetime). `None` — the production path — reads as
+    /// `APP_IDLE_TIMEOUT` (30s); tests set a shorter one.
     pub idle_timeout: Option<Duration>,
     /// Wall-clock cadence for the mid-stream pool-solvency re-check (ADR 003
     /// §Pool solvency). `None` (the default and production path) reads as
@@ -1555,6 +1591,8 @@ impl std::fmt::Debug for ClientHandler {
 }
 
 impl ClientHandler {
+    /// The ALPN this handler answers on: `cdn/client/v1`, the single paid
+    /// delivery protocol for both client-to-node and node-to-node transfers.
     pub const ALPN: &'static [u8] = ALPN_CLIENT;
 
     /// Construct the handler from [`ClientHandlerDeps`], hydrating per-channel

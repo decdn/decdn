@@ -93,9 +93,9 @@ use crate::buyer_channel::{OpenReported, PoolOpenPending, PoolOpener};
 use crate::buyer_ledgers::BuyerLedgers;
 use crate::client_requester::probe::probe_once;
 use crate::client_requester::{
-    BlobTooLargeClaim, Cumulative, HashMismatch, LocalPullFault, PoolContext, PoolLedger,
-    PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd,
-    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
+    BlobTooLarge, Cumulative, HashMismatch, LocalPullFault, PoolContext, PoolLedger, PullDeadlines,
+    PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd, UpstreamRefused,
+    UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
     open_progressive_pull as open_progressive_upstream, sign_client_binding,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
@@ -284,8 +284,9 @@ pub struct NodeOriginConfig {
     /// disables the throughput test and leaves idle detection (#1797).
     pub min_throughput_bps: u64,
     /// Buyer-side blob-size ceiling (`cache.max_blob_size_mb` × MB), `0` = unlimited.
-    /// Mirrors the serving-side `BlobTooLarge` gate; rejects an oversized server
-    /// `total_bytes` claim before buffering (#840).
+    /// Enforced on the bytes that ACTUALLY arrive on the miss-pull leg, never on the
+    /// peer's unverified `total_bytes` claim: the pull aborts with `BlobTooLarge`
+    /// once cumulative received bytes cross it (#1895).
     pub max_blob_size_bytes: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling (`cache.max_rate_per_mb`), `0` =
     /// unlimited (#1375). Combined via [`effective_rate_ceiling`] with the
@@ -1221,12 +1222,12 @@ impl PullMiss {
             PullVerdict::OurLocalFault => Self::LocalFault,
             // Every other verdict is either about the peer (`Refused` of the first three
             // kinds, `Stalled`, `Corruption`, `Unreachable`), about OUR configuration of
-            // what we will accept from it (`OversizeClaim`, `RateCeiling`, `OurDeadline`),
+            // what we will accept from it (`Oversize`, `RateCeiling`, `OurDeadline`),
             // or about one lane to one provider (the two voucher arms). None of them
             // is evidence that THIS node is broken for every client and every blob, so
             // none earns an `InternalError`: a node with one wedged lane is still a
             // healthy node that simply cannot serve this blob right now.
-            PullVerdict::OversizeClaim
+            PullVerdict::Oversize
             | PullVerdict::RateCeiling
             | PullVerdict::OurDeadline
             | PullVerdict::Stalled
@@ -1600,7 +1601,6 @@ async fn pull_from_candidate(
         NO_NAMESPACE,
         0,
         now_micros(),
-        deps.config.max_blob_size_bytes,
         rate_ceiling,
         deadlines,
         0,
@@ -2059,8 +2059,10 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
 /// means "which arm does this error land in?" is a question a test can just ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullVerdict {
-    /// The blob is over OUR configured ceiling (#840) — it may be fine for other nodes.
-    OversizeClaim,
+    /// The bytes that actually arrived crossed OUR configured ceiling (#1895) — the
+    /// blob may be fine for other nodes with a wider cap. The peer's `total_bytes`
+    /// claim never triggers this; only received bytes do.
+    Oversize,
     /// The provider quoted a per-MB rate above the buyer's effective ceiling — the lower
     /// of its own probe rate and our configured absolute cap (#1375). We refused before
     /// paying; the signed over-quote is retained on the `RateAboveCeiling` error for a
@@ -2071,7 +2073,7 @@ enum PullVerdict {
     /// bound, not the config bound, was exceeded). Either way the rate is durable for this
     /// (peer, hash) — re-probing gets the same quote — so we suppress the pair (like
     /// [`Self::OurDeadline`]) rather than tar the peer, and count it (like
-    /// [`Self::OversizeClaim`], which meters but does not suppress).
+    /// [`Self::Oversize`], which meters but does not suppress).
     RateCeiling,
     /// OUR deadline fired: a possibly mis-sized local budget, not evidence about the peer.
     OurDeadline,
@@ -2256,8 +2258,8 @@ const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
 
 /// The ordered sentinel ladder. Pure: no metrics, no reputation, no I/O.
 fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
-    if err.downcast_ref::<BlobTooLargeClaim>().is_some() {
-        return PullVerdict::OversizeClaim;
+    if err.downcast_ref::<BlobTooLarge>().is_some() {
+        return PullVerdict::Oversize;
     }
     if err.downcast_ref::<RateAboveCeiling>().is_some() {
         return PullVerdict::RateCeiling;
@@ -2365,17 +2367,19 @@ fn classify_pull_failure(
     let verdict = pull_verdict(err);
     match verdict {
         // OUR ceiling, not the provider's fault — it may legitimately serve larger blobs to
-        // nodes configured with a higher `max_blob_size`. Metered, not scored (#840).
-        PullVerdict::OversizeClaim => {
+        // nodes configured with a higher `max_blob_size`. Metered, not scored (#1895). The
+        // abort fires once the RECEIVED bytes cross the ceiling, so we paid the upstream for
+        // the prefix we took (bounded to roughly one ceiling), never for the peer's claim.
+        PullVerdict::Oversize => {
             deps.metrics.node_pull_too_large();
-            debug!(%provider_addr, %err, "node-origin: upstream claimed an oversized blob; rejected before buffering");
+            debug!(%provider_addr, %err, "node-origin: upstream blob crossed our size ceiling on received bytes; pull aborted");
         }
         // The provider quoted above our effective rate ceiling (#1375). We refused before
         // paying; the signed over-quote is retained ON the `RateAboveCeiling` error for a
         // caller to act on, though this handler does not itself submit a challenge
-        // (auto-slashing is deferred). Metered like `OversizeClaim` so the refusal is
+        // (auto-slashing is deferred). Metered like `Oversize` so the refusal is
         // operator-visible, then suppressed for the full durable TTL (as `OurDeadline` does,
-        // NOT `OversizeClaim`, which only meters): the quote is a lasting fact about this
+        // NOT `Oversize`, which only meters): the quote is a lasting fact about this
         // (peer, hash) — re-probing gets the same rate. Reputation-neutral: whether it is a
         // bait-and-switch or just our tight config we do not adjudicate here, so we do not
         // tar the peer.
@@ -3007,7 +3011,7 @@ mod tests {
     fn only_our_own_fault_may_withhold_a_not_found() {
         let reason = VoucherRejectReason::SpendingCapExhausted;
         for verdict in [
-            PullVerdict::OversizeClaim,
+            PullVerdict::Oversize,
             PullVerdict::RateCeiling,
             PullVerdict::OurDeadline,
             PullVerdict::Stalled,

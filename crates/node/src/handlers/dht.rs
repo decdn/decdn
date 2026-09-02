@@ -116,6 +116,8 @@ impl std::fmt::Debug for DhtHandler {
 }
 
 impl DhtHandler {
+    /// The ALPN this handler answers on: `cdn/dht/v1`, the content-discovery
+    /// protocol (ADR 022).
     pub const ALPN: &'static [u8] = ALPN_DHT;
 
     /// Construct a handler. The routing table is empty at startup; PR 4

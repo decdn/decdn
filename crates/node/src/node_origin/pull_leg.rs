@@ -399,7 +399,6 @@ impl NodeOrigin {
             namespace_bytes,
             0,
             now_micros(),
-            deps.config.max_blob_size_bytes,
             rate_ceiling,
             deadlines,
             0,

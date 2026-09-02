@@ -43,6 +43,10 @@ enum DaemonCommand {
 /// chain errors are logged via `tracing` and sanitized at their own call sites.
 /// See issue #954.
 #[tokio::main]
+#[expect(
+    clippy::print_stderr,
+    reason = "process exit boundary; tracing may never have started"
+)]
 async fn main() -> std::process::ExitCode {
     let parsed = DaemonCli::parse();
     let config_path = parsed.config.map(|p| cli::common::expand_tilde(&p));
@@ -58,6 +62,9 @@ async fn main() -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
+            // `eprintln!` not `tracing::error!`: this is the process exit
+            // boundary, and the failure may be the one that stopped tracing
+            // from ever initializing.
             eprintln!("Error: {}", decdn_common::redact::sanitize_err_chain(&e));
             std::process::ExitCode::FAILURE
         }

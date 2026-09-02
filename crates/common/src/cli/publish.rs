@@ -69,6 +69,7 @@ pub enum NamespaceCommand {
 /// `decdn publish namespace create` flags.
 #[derive(Args, Debug)]
 pub struct NamespaceCreateArgs {
+    /// Chain coordinates and the publisher contract addresses.
     #[command(flatten)]
     pub chain: PublishChainArgs,
 }
@@ -86,6 +87,7 @@ pub struct AssignArgs {
     #[arg(value_name = "OPERATORS", required = true, num_args = 1..)]
     pub operators: Vec<String>,
 
+    /// Chain coordinates and the publisher contract addresses.
     #[command(flatten)]
     pub chain: PublishChainArgs,
 }
@@ -101,6 +103,7 @@ pub struct RevokeArgs {
     #[arg(value_name = "OPERATOR")]
     pub operator: String,
 
+    /// Chain coordinates and the publisher contract addresses.
     #[command(flatten)]
     pub chain: PublishChainArgs,
 }
@@ -112,6 +115,8 @@ pub struct RevokeArgs {
 /// flags.
 #[derive(Args, Debug)]
 pub struct PublishChainArgs {
+    /// RPC endpoint, chain id, keystore, and data-dir flags shared by every
+    /// chain-touching command.
     #[command(flatten)]
     pub common: CommonChainArgs,
 

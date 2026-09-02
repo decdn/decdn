@@ -221,7 +221,7 @@ pub(crate) mod test_support {
     /// Run `f` with `home` standing in for `dirs::home_dir()` on the
     /// current thread. Restores the previous override on return, even
     /// if `f` panics.
-    pub fn with_home_override<R>(home: Option<&Path>, f: impl FnOnce() -> R) -> R {
+    pub(crate) fn with_home_override<R>(home: Option<&Path>, f: impl FnOnce() -> R) -> R {
         struct Guard(Option<HomeOverride>);
         impl Drop for Guard {
             fn drop(&mut self) {

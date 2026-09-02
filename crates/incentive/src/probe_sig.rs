@@ -225,7 +225,9 @@ pub enum ProbeSlashError {
     /// match the expected signer.
     #[error("probe slash_sig signed by {recovered}, expected {expected}")]
     WrongSigner {
+        /// The address the probe attestation had to be signed by.
         expected: Address,
+        /// The address the signature actually recovers to.
         recovered: Address,
     },
 }
