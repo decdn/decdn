@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 use decdn_cache::{CacheEngine, CacheError};
 use decdn_common::admin::{
     AdminRpcServer, BucketStat, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE, DHT_POISONED_CODE,
@@ -131,6 +131,13 @@ pub struct AdminState {
     /// `None` (unit tests that don't wire it) reports `chain_denied_origins:
     /// 0` — an unwired `AdminState` has no chain-origin deny-set to count.
     denylist: Option<Arc<crate::content_deny::ContentDenylist>>,
+    /// The operator Ethereum address this node runs under, attached via
+    /// [`AdminState::with_operator_address`]. Sampled once at bring-up from the
+    /// loaded eth keystore — the same value the node-id binding check derives —
+    /// so `admin_v1_status` can report it without an extra chain round-trip.
+    /// `None` (unit tests, and any build with no chain wiring) reports
+    /// `operator_address: None`, the honest answer when nothing supplied one.
+    operator_address: Option<Address>,
 }
 
 /// Read-only lane handles the `admin_v1_lanes` handler snapshots (issue
@@ -345,6 +352,7 @@ impl AdminState {
             warming: None,
             staker_set: None,
             denylist: None,
+            operator_address: None,
         }
     }
 
@@ -442,6 +450,17 @@ impl AdminState {
     #[must_use]
     pub fn with_denylist(mut self, denylist: Arc<crate::content_deny::ContentDenylist>) -> Self {
         self.denylist = Some(denylist);
+        self
+    }
+
+    /// Attach the operator Ethereum address so `admin_v1_status` can report the
+    /// wallet this node runs under. The production runtime calls this once after
+    /// `new` with the loaded eth signer's address (the same value the bring-up
+    /// binding check derives); without it, `status` reports
+    /// `operator_address: None`.
+    #[must_use]
+    pub const fn with_operator_address(mut self, operator_address: Address) -> Self {
+        self.operator_address = Some(operator_address);
         self
     }
 }
@@ -712,6 +731,10 @@ impl AdminRpcServer for AdminRpcImpl {
             chain_denied_origins: self.state.denylist.as_ref().map_or(0, |d| {
                 u64::try_from(d.chain_origin_count()).unwrap_or(u64::MAX)
             }),
+            // `Address`'s `Display` is the EIP-55 mixed-case checksum, the same
+            // rendering the lane snapshots use. Sampled once at bring-up (no
+            // chain read here); `None` when no operator was wired in.
+            operator_address: self.state.operator_address.map(|a| a.to_string()),
         })
     }
 
@@ -1829,6 +1852,34 @@ mod tests {
         assert_eq!(resp.record_store.records, 1);
         assert_eq!(resp.record_store.capacity, 100_000);
         assert_eq!(resp.republish.scheduled_records, 1);
+    }
+
+    /// The operator address wired via `with_operator_address` is reported as an
+    /// EIP-55 checksummed string, and an `AdminState` with none reports `None`
+    /// (#1906).
+    #[tokio::test]
+    async fn status_reports_operator_address_when_wired() {
+        let operator: Address = "0x52908400098527886e0f7030069857d2e4169ee7"
+            .parse()
+            .expect("valid address");
+
+        let (state, _tmp) = state_with().await;
+        let rpc = AdminRpcImpl::new(
+            state
+                .with_dht(seeded_dht_handles())
+                .with_operator_address(operator),
+        );
+        let resp = rpc.status().await.expect("status ok");
+        // EIP-55 checksum, not the lowercase input.
+        assert_eq!(
+            resp.operator_address.as_deref(),
+            Some("0x52908400098527886E0F7030069857D2E4169EE7")
+        );
+
+        let (state, _tmp) = state_with().await;
+        let rpc = AdminRpcImpl::new(state.with_dht(seeded_dht_handles()));
+        let resp = rpc.status().await.expect("status ok");
+        assert_eq!(resp.operator_address, None);
     }
 
     /// A zero refresh clock (no bucket-refresh pass has completed yet)

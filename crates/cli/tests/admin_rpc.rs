@@ -918,13 +918,23 @@ async fn status_round_trips_dht_health() -> anyhow::Result<()> {
         Arc::new(DrainTrigger::new()),
         Arc::new(Metrics::new()),
     )
-    .with_dht(seeded_dht_handles());
+    .with_dht(seeded_dht_handles())
+    .with_operator_address(
+        "0x52908400098527886e0f7030069857d2e4169ee7"
+            .parse()
+            .expect("valid address"),
+    );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
     let resp = client.status().await?;
 
     assert_eq!(resp.node_id, "ab".repeat(32));
+    // The operator address survives the round-trip as an EIP-55 checksum.
+    assert_eq!(
+        resp.operator_address.as_deref(),
+        Some("0x52908400098527886E0F7030069857D2E4169EE7")
+    );
     assert_eq!(resp.routing.total_peers, 2);
     assert_eq!(resp.routing.non_empty_buckets, 2);
     let indices: Vec<u16> = resp.routing.buckets.iter().map(|b| b.index).collect();

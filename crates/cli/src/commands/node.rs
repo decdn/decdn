@@ -992,6 +992,14 @@ fn format_age(delta_us: u64) -> String {
 /// `--json`; the per-non-empty-bucket fill table follows.
 fn write_status(w: &mut impl io::Write, s: &StatusResponse, now_us: u64) -> io::Result<()> {
     writeln!(w, "node_id={}", s.node_id)?;
+    // The operator wallet this node runs under. `None` when the node reports no
+    // resolvable operator (no chain wiring); render an explicit sentinel rather
+    // than omitting the line, so the field is always present for scripts.
+    writeln!(
+        w,
+        "operator_address={}",
+        s.operator_address.as_deref().unwrap_or("(unknown)")
+    )?;
     writeln!(w, "known_stakers={}", s.known_stakers)?;
     let last_refresh = match s.routing.last_refresh_us {
         // No bucket-refresh pass has completed yet (node up < one interval).
@@ -1551,6 +1559,7 @@ mod tests {
         use decdn_common::admin::{BucketStat, RecordStoreHealth, RepublishHealth, RoutingHealth};
         StatusResponse {
             node_id: "ab".repeat(32),
+            operator_address: Some("0x52908400098527886E0F7030069857D2E4169EE7".to_string()),
             routing: RoutingHealth {
                 total_peers: 21,
                 non_empty_buckets: 2,
@@ -1585,6 +1594,10 @@ mod tests {
         write_status(&mut buf, &status, 2_000_000)?;
         let s = String::from_utf8(buf)?;
         assert!(s.contains(&format!("node_id={}", "ab".repeat(32))), "{s}");
+        assert!(
+            s.contains("operator_address=0x52908400098527886E0F7030069857D2E4169EE7"),
+            "{s}"
+        );
         assert!(s.contains("known_stakers=7"), "{s}");
         assert!(s.contains("total_peers=21"), "{s}");
         assert!(s.contains("non_empty_buckets=2"), "{s}");
@@ -1599,6 +1612,20 @@ mod tests {
         assert!(s.contains("FILL%"), "{s}");
         assert!(s.contains("20/20"), "{s}");
         assert!(s.contains("100%"), "{s}");
+        Ok(())
+    }
+
+    /// A node that reports no resolvable operator address (no chain wiring)
+    /// renders an explicit sentinel rather than dropping the line, so scripts
+    /// can always find the field.
+    #[test]
+    fn write_status_absent_operator_renders_unknown_sentinel() -> anyhow::Result<()> {
+        let mut status = mk_status(Some(1_000_000));
+        status.operator_address = None;
+        let mut buf = Vec::<u8>::new();
+        write_status(&mut buf, &status, 2_000_000)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("operator_address=(unknown)"), "{s}");
         Ok(())
     }
 
