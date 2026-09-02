@@ -54,7 +54,7 @@ mod tests {
     use super::*;
     use crate::commands::doctor::{Report, Severity};
 
-    fn args_for(_dir: &std::path::Path) -> decdn_common::cli::DoctorArgs {
+    fn args_for() -> decdn_common::cli::DoctorArgs {
         // Build DoctorArgs via clap from an argv so RunArgs defaults are populated.
         use clap::Parser;
         #[derive(clap::Parser)]
@@ -72,7 +72,7 @@ mod tests {
         // Missing required blockchain fields => resolve_config errors.
         std::fs::write(&cfg, "[cache]\ncache_size_mb = 1\n").unwrap();
         let mut report = Report::default();
-        let resolved = check_config(&mut report, &args_for(dir.path()), Some(&cfg));
+        let resolved = check_config(&mut report, &args_for(), Some(&cfg));
         assert!(resolved.is_none());
         let last = report.findings.last().unwrap();
         assert_eq!(last.id, "config.resolves");

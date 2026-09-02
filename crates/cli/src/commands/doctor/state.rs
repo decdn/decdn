@@ -94,8 +94,118 @@ pub fn evaluate_secret(facts: &FileFacts) -> Finding {
     )
 }
 
+/// Evaluate the eth keystore: only meaningful when blockchain is configured.
+/// The resolver already stat-checks `eth_keystore`; this surfaces
+/// readability in the report too. Absent is a `Warn` (not a `Fail`) because
+/// not every deployment signs on-chain from this node.
+pub fn evaluate_keystore(facts: &FileFacts, path: &Path) -> Finding {
+    Finding {
+        group: "State",
+        id: "state.keystore",
+        severity: if facts.exists && facts.is_file {
+            Severity::Pass
+        } else {
+            Severity::Warn
+        },
+        title: if facts.exists && facts.is_file {
+            "eth keystore present".into()
+        } else if facts.exists {
+            "keystore path exists but is not a regular file".into()
+        } else {
+            "eth keystore missing".into()
+        },
+        detail: Some(format!("path={}", path.display())),
+        remediation: if facts.exists && facts.is_file {
+            None
+        } else if facts.exists {
+            Some("remove the non-file at the keystore path".into())
+        } else {
+            Some(
+                "create the keystore (decdn key-gen / your provisioning) before the node signs"
+                    .into(),
+            )
+        },
+    }
+}
+
+/// Evaluate one redb store: presence + `0o600` + non-zero-length tripwire.
+/// Deeper open integrity is deferred to the daemon-side doctor (the store is
+/// locked while the daemon runs).
+pub fn evaluate_redb(name: &str, facts: &FileFacts, path: &Path) -> Finding {
+    if !facts.exists {
+        // Absent is normal before first run.
+        return Finding {
+            group: "State",
+            id: "state.redb",
+            severity: Severity::Pass,
+            title: format!("{name} absent (created on first use)"),
+            detail: None,
+            remediation: None,
+        };
+    }
+    if facts.len == 0 {
+        return Finding {
+            group: "State",
+            id: "state.redb",
+            severity: Severity::Fail,
+            title: format!("{name} is zero-length (corrupt)"),
+            detail: Some(format!("path={}", path.display())),
+            remediation: Some(format!("stop the node and restore or remove {name}")),
+        };
+    }
+    if facts.mode.is_some_and(|m| m & 0o077 != 0) {
+        return Finding {
+            group: "State",
+            id: "state.redb",
+            severity: Severity::Warn,
+            title: format!("{name} permissions are too open"),
+            detail: Some(format!("mode={:#o}", facts.mode.unwrap_or(0))),
+            remediation: Some(format!("run: chmod 600 <data_dir>/{name}")),
+        };
+    }
+    Finding {
+        group: "State",
+        id: "state.redb",
+        severity: Severity::Pass,
+        title: format!("{name} present"),
+        detail: None,
+        remediation: None,
+    }
+}
+
+/// Evaluate the receipt log: presence is optional before the first receipt.
+pub fn evaluate_receipts(facts: &FileFacts, path: &Path) -> Finding {
+    if !facts.exists {
+        return Finding {
+            group: "State",
+            id: "state.receipts",
+            severity: Severity::Pass,
+            title: "receipt log absent (created on first receipt)".into(),
+            detail: None,
+            remediation: None,
+        };
+    }
+    if facts.is_file {
+        return Finding {
+            group: "State",
+            id: "state.receipts",
+            severity: Severity::Pass,
+            title: "receipt log present".into(),
+            detail: Some(format!("path={}", path.display())),
+            remediation: None,
+        };
+    }
+    Finding {
+        group: "State",
+        id: "state.receipts",
+        severity: Severity::Warn,
+        title: "receipt log path exists but is not a regular file".into(),
+        detail: Some(format!("path={}", path.display())),
+        remediation: Some("remove the non-file at the receipt log path".into()),
+    }
+}
+
 /// Push all state-group findings.
-#[allow(clippy::too_many_lines)]
 pub fn check_state(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bool) {
     const REDB: &[&str] = &[
         "lanes.redb",
@@ -112,115 +222,20 @@ pub fn check_state(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bo
         &data_dir.join("node.secret"),
     )));
 
-    // Keystore: only meaningful when blockchain is configured. The resolver
-    // already stat-checks eth_keystore; surface readability here too.
     let keystore = &cfg.blockchain.eth_keystore;
-    let ks = FileFacts::read(keystore);
-    report.push(Finding {
-        group: "State",
-        id: "state.keystore",
-        severity: if ks.exists && ks.is_file {
-            Severity::Pass
-        } else {
-            Severity::Warn
-        },
-        title: if ks.exists && ks.is_file {
-            "eth keystore present".into()
-        } else if ks.exists {
-            "keystore path exists but is not a regular file".into()
-        } else {
-            "eth keystore missing".into()
-        },
-        detail: Some(format!("path={}", keystore.display())),
-        remediation: if ks.exists && ks.is_file {
-            None
-        } else if ks.exists {
-            Some("remove the non-file at the keystore path".into())
-        } else {
-            Some(
-                "create the keystore (decdn key-gen / your provisioning) before the node signs"
-                    .into(),
-            )
-        },
-    });
+    report.push(evaluate_keystore(&FileFacts::read(keystore), keystore));
 
-    // redb stores: presence + 0o600 + non-zero-length tripwire. Deeper open
-    // integrity is deferred to the daemon-side doctor (locked while running).
+    // redb stores.
     for name in REDB {
-        let facts = FileFacts::read(&data_dir.join(name));
-        let finding = if !facts.exists {
-            // Absent is normal before first run.
-            Finding {
-                group: "State",
-                id: "state.redb",
-                severity: Severity::Pass,
-                title: format!("{name} absent (created on first use)"),
-                detail: None,
-                remediation: None,
-            }
-        } else if facts.len == 0 {
-            Finding {
-                group: "State",
-                id: "state.redb",
-                severity: Severity::Fail,
-                title: format!("{name} is zero-length (corrupt)"),
-                detail: Some(format!("path={}", data_dir.join(name).display())),
-                remediation: Some(format!("stop the node and restore or remove {name}")),
-            }
-        } else if facts.mode.is_some_and(|m| m & 0o077 != 0) {
-            Finding {
-                group: "State",
-                id: "state.redb",
-                severity: Severity::Warn,
-                title: format!("{name} permissions are too open"),
-                detail: Some(format!("mode={:#o}", facts.mode.unwrap_or(0))),
-                remediation: Some(format!("run: chmod 600 <data_dir>/{name}")),
-            }
-        } else {
-            Finding {
-                group: "State",
-                id: "state.redb",
-                severity: Severity::Pass,
-                title: format!("{name} present"),
-                detail: None,
-                remediation: None,
-            }
-        };
-        report.push(finding);
+        let path = data_dir.join(name);
+        let facts = FileFacts::read(&path);
+        report.push(evaluate_redb(name, &facts, &path));
     }
 
-    // Receipt log: presence is optional before first receipt.
+    // Receipt log.
     let receipt_path = data_dir.join(RECEIPT_LOG_FILE);
     let receipts = FileFacts::read(&receipt_path);
-    let receipt_finding = if !receipts.exists {
-        Finding {
-            group: "State",
-            id: "state.receipts",
-            severity: Severity::Pass,
-            title: "receipt log absent (created on first receipt)".into(),
-            detail: None,
-            remediation: None,
-        }
-    } else if receipts.is_file {
-        Finding {
-            group: "State",
-            id: "state.receipts",
-            severity: Severity::Pass,
-            title: "receipt log present".into(),
-            detail: Some(format!("path={}", receipt_path.display())),
-            remediation: None,
-        }
-    } else {
-        Finding {
-            group: "State",
-            id: "state.receipts",
-            severity: Severity::Warn,
-            title: "receipt log path exists but is not a regular file".into(),
-            detail: Some(format!("path={}", receipt_path.display())),
-            remediation: Some("remove the non-file at the receipt log path".into()),
-        }
-    };
-    report.push(receipt_finding);
+    report.push(evaluate_receipts(&receipts, &receipt_path));
 
     if daemon_running {
         report.push(Finding {
@@ -285,6 +300,8 @@ mod tests {
         assert_eq!(f.severity, Severity::Pass);
     }
 
+    // --- evaluate_receipts ---------------------------------------------
+
     #[test]
     fn absent_receipt_log_passes() {
         let facts = FileFacts {
@@ -293,17 +310,130 @@ mod tests {
             len: 0,
             mode: None,
         };
-        assert!(!facts.exists);
-        assert!(!facts.is_file);
+        let f = evaluate_receipts(&facts, Path::new("/data/receipts.jsonl"));
+        assert_eq!(f.id, "state.receipts");
+        assert_eq!(f.severity, Severity::Pass);
+        assert!(f.title.to_lowercase().contains("absent"));
     }
 
     #[test]
-    fn present_receipt_log_passes() {
-        let tmp = std::env::temp_dir().join("decdn_receipt_test.jsonl");
-        let _ = std::fs::write(&tmp, "");
-        let facts = FileFacts::read(&tmp);
-        assert!(facts.exists);
-        assert!(facts.is_file);
-        let _ = std::fs::remove_file(&tmp);
+    fn present_regular_receipt_log_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let facts = FileFacts::read(&path);
+        let f = evaluate_receipts(&facts, &path);
+        assert_eq!(f.id, "state.receipts");
+        assert_eq!(f.severity, Severity::Pass);
+        assert!(f.title.to_lowercase().contains("present"));
+    }
+
+    #[test]
+    fn receipt_log_path_not_a_regular_file_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        std::fs::create_dir(&path).unwrap();
+        let facts = FileFacts::read(&path);
+        let f = evaluate_receipts(&facts, &path);
+        assert_eq!(f.id, "state.receipts");
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.remediation.is_some());
+    }
+
+    // --- evaluate_redb ----------------------------------------------------
+
+    #[test]
+    fn absent_redb_passes() {
+        let facts = FileFacts {
+            exists: false,
+            is_file: false,
+            len: 0,
+            mode: None,
+        };
+        let f = evaluate_redb("lanes.redb", &facts, Path::new("/data/lanes.redb"));
+        assert_eq!(f.id, "state.redb");
+        assert_eq!(f.severity, Severity::Pass);
+        assert!(f.title.contains("absent"));
+    }
+
+    #[test]
+    fn zero_length_redb_fails_as_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lanes.redb");
+        std::fs::write(&path, "").unwrap();
+        let facts = FileFacts::read(&path);
+        let f = evaluate_redb("lanes.redb", &facts, &path);
+        assert_eq!(f.id, "state.redb");
+        assert_eq!(f.severity, Severity::Fail);
+        assert!(f.title.to_lowercase().contains("corrupt"));
+    }
+
+    #[test]
+    fn present_redb_with_data_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lanes.redb");
+        std::fs::write(&path, b"some bytes").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let facts = FileFacts::read(&path);
+        let f = evaluate_redb("lanes.redb", &facts, &path);
+        assert_eq!(f.id, "state.redb");
+        assert_eq!(f.severity, Severity::Pass);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_perms_redb_warns() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lanes.redb");
+        std::fs::write(&path, b"some bytes").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let facts = FileFacts::read(&path);
+        let f = evaluate_redb("lanes.redb", &facts, &path);
+        assert_eq!(f.id, "state.redb");
+        assert_eq!(f.severity, Severity::Warn);
+    }
+
+    // --- evaluate_keystore --------------------------------------------
+
+    #[test]
+    fn present_regular_keystore_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keystore.json");
+        std::fs::write(&path, "{}").unwrap();
+        let facts = FileFacts::read(&path);
+        let f = evaluate_keystore(&facts, &path);
+        assert_eq!(f.id, "state.keystore");
+        assert_eq!(f.severity, Severity::Pass);
+    }
+
+    #[test]
+    fn keystore_path_is_a_directory_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keystore.json");
+        std::fs::create_dir(&path).unwrap();
+        let facts = FileFacts::read(&path);
+        let f = evaluate_keystore(&facts, &path);
+        assert_eq!(f.id, "state.keystore");
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.title.to_lowercase().contains("not a regular file"));
+    }
+
+    #[test]
+    fn missing_keystore_warns() {
+        let facts = FileFacts {
+            exists: false,
+            is_file: false,
+            len: 0,
+            mode: None,
+        };
+        let f = evaluate_keystore(&facts, Path::new("/data/keystore.json"));
+        assert_eq!(f.id, "state.keystore");
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.title.to_lowercase().contains("missing"));
     }
 }

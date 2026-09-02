@@ -53,6 +53,14 @@ pub async fn probe_live(
     let Ok(admin_url) =
         crate::commands::node::resolve_admin_url(args.admin_url.as_deref(), global_config)
     else {
+        report.push(Finding {
+            group: "Live",
+            id: "live.health",
+            severity: Severity::Pass,
+            title: "admin endpoint not resolvable — live checks skipped".into(),
+            detail: None,
+            remediation: None,
+        });
         return LiveInfo {
             daemon_running: false,
             cache_bytes: None,
@@ -63,6 +71,14 @@ pub async fn probe_live(
         .request_timeout(dur)
         .build(&admin_url)
     else {
+        report.push(Finding {
+            group: "Live",
+            id: "live.health",
+            severity: Severity::Pass,
+            title: "admin client could not be built — live checks skipped".into(),
+            detail: None,
+            remediation: None,
+        });
         return LiveInfo {
             daemon_running: false,
             cache_bytes: None,

@@ -61,6 +61,8 @@ fn render_json<W: std::io::Write>(w: &mut W, report: &Report) -> std::io::Result
     let doc = JsonReport {
         findings: &report.findings,
         summary: JsonSummary { pass, warn, fail },
+        // Fail-count only: under `--strict` a warn-only run exits nonzero
+        // while `ok` still reads true here.
         ok: fail == 0,
     };
     let text = serde_json::to_string_pretty(&doc).map_err(std::io::Error::other)?;
