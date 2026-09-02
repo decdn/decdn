@@ -15,10 +15,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_client_pull::buyer_pool::{ensure_allowance, open_pool, top_up};
+use decdn_client_pull::buyer_pool::{
+    ToppedUpPool, ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool, top_up,
+};
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
-use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome};
+use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_pool::PaymentPool;
@@ -172,13 +174,9 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
 
     // The deposit is escrowed on-chain; a failed local record leaves it
     // untracked (reconcile against the tx).
-    store.record(&opened.state).map_err(|e| {
-        anyhow::anyhow!(
-            "buyer pool opened on-chain (tx {}) but persisting it failed; the deposit is \
-             escrowed but untracked — reconcile manually: {e}",
-            opened.tx
-        )
-    })?;
+    store
+        .record(&opened.state)
+        .map_err(|e| escrowed_but_untracked("buyer pool opened", opened.tx, e))?;
 
     let out = PoolOpenJson {
         pool_id: format!("{:#x}", opened.state.pool_id),
@@ -224,24 +222,53 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
         .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
     ensure_allowance(&rpc, token, owner, chain.payment_pool, Some(additional)).await?;
 
-    let credited = top_up(&contract, pool_id, additional).await?;
+    let ToppedUpPool { credited, tx } = top_up(&contract, pool_id, additional).await?;
 
-    match store.add_deposit(owner, pool_id, credited) {
-        Ok(DepositOutcome::Added(new_deposit)) => {
-            println!(
-                "topped up pool {pool_id} by {credited} µUSDC; deposit now {new_deposit} µUSDC"
-            );
-        }
-        Ok(other) => eprintln!(
-            "topped up pool {pool_id} on-chain (+{credited} µUSDC), but the local record was \
-             not updated: {other:?}"
-        ),
-        Err(e) => eprintln!(
-            "topped up pool {pool_id} on-chain (+{credited} µUSDC), but persisting it locally \
-             failed: {e}"
-        ),
-    }
+    // `add_deposit` reports a backend fault as `Err` and a committed-row
+    // mismatch as a non-`Added` `Ok` (the row vanished or now tracks a
+    // different pool). Both mean the same thing here: the USDC is escrowed and
+    // the local deposit is short by `credited`. Exiting 0 on either would let a
+    // wrapper record the pool as funded — after which the low-water check
+    // re-fires on every later fetch, and re-running this command double-spends.
+    let effect = format!("pool {pool_id} topped up by {credited} µUSDC");
+    let new_deposit =
+        grade_deposit_credit(store.add_deposit(owner, pool_id, credited), &effect, tx)?;
+    println!("topped up pool {pool_id} by {credited} µUSDC; deposit now {new_deposit} µUSDC");
     Ok(())
+}
+
+/// Grade the local row-clear that follows a mined `closePool`.
+///
+/// `forget_if_pool` is compare-and-delete, so it reports "nothing was cleared"
+/// two different ways: an `Err` (backend fault) and `Ok(false)` (the row is
+/// absent, or the owner index already points at a newer pool). Both break the
+/// same invariant — `pool close` drops the local record *so that* a later
+/// `fetch` / `bundle pull` opens a fresh pool rather than reusing one that is
+/// winding down. A surviving row means later fetches sign vouchers the contract
+/// will not honour, and auto-refill may `topUp` a closing pool.
+///
+/// The close itself landed, so the error carries `reclaim_note` — the same
+/// reclaim instruction the success line would have printed. Losing that
+/// deadline is how a residual deposit goes unclaimed.
+///
+/// # Errors
+///
+/// Errors unless a matching row was actually deleted.
+fn grade_local_forget(
+    outcome: Result<bool, decdn_incentive::StoreError>,
+    pool_id: PoolId,
+    reclaim_note: &str,
+) -> anyhow::Result<()> {
+    let cause = match outcome {
+        Ok(true) => return Ok(()),
+        Ok(false) => "no matching local row was cleared".to_string(),
+        Err(e) => format!("clearing it from the local store failed: {e}"),
+    };
+    anyhow::bail!(
+        "pool {pool_id} closed on-chain but {cause}; a later fetch may reuse this closing pool \
+         and sign vouchers it cannot redeem — remove it from the buyer store manually. \
+         {reclaim_note}"
+    )
 }
 
 /// Terminal outcome of a single close/reclaim tx.
@@ -313,12 +340,10 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
                     format!("after the dispute window (couldn't read the exact deadline: {e})")
                 }
             };
-            if let Err(e) = store.forget_if_pool(owner, pool_id) {
-                eprintln!(
-                    "warning: pool {pool_id} closed on-chain but clearing it from the local \
-                     store failed: {e}"
-                );
-            }
+            let reclaim_note = format!(
+                "the close landed — run `decdn pool reclaim --pool {pool_id}` {deadline_note}"
+            );
+            grade_local_forget(store.forget_if_pool(owner, pool_id), pool_id, &reclaim_note)?;
             println!(
                 "closed pool {pool_id}; dispute window open — run `decdn pool reclaim --pool \
                  {pool_id}` {deadline_note}"
@@ -431,10 +456,12 @@ fn format_expiry(expiry: u64, now: u64) -> String {
 /// §Capability delegation).
 ///
 /// The capability is signed offline with the owner keystore against the pool's
-/// EIP-712 domain (`PaymentPool` address + chain id). The on-chain owner check
-/// is best-effort: a mismatch (or an unreachable RPC) only warns, because
-/// offline issuance is valid — the node is the one that enforces the owner
-/// signature against the pool's on-chain owner at redemption time.
+/// EIP-712 domain (`PaymentPool` address + chain id), so an unreachable RPC
+/// only warns — offline issuance is valid, and the node is the one that
+/// enforces the owner signature against the pool's on-chain owner at redemption
+/// time. An owner read that *succeeds* and disagrees is different evidence: it
+/// proves the token is already dead, so no token is printed and the command
+/// fails.
 async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
     let chain = resolve_chain(&args.chain, &file)?;
@@ -466,13 +493,15 @@ async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyho
         .owner(&domain)
         .map_err(|e| anyhow::anyhow!("re-recovering the owner from the fresh token failed: {e}"))?;
 
-    // Best-effort on-chain owner check. Offline issuance is valid, so an
-    // unreachable RPC or a mismatch only warns — the serving node enforces the
-    // owner signature against the pool's real owner at redemption.
+    // On-chain owner check. A read we could not perform only warns — offline
+    // issuance is valid, and the serving node enforces the owner signature
+    // against the pool's real owner at redemption. A read that *succeeded* and
+    // disagrees is different evidence entirely, and fails: see
+    // `ensure_on_chain_owner`.
     match provider::build_provider(&chain.rpc_url, &owner_signer) {
         Ok(rpc) => {
             let contract = PaymentPool::new(chain.payment_pool, rpc);
-            warn_if_not_on_chain_owner(&contract, pool_id, owner).await;
+            ensure_on_chain_owner(&contract, pool_id, owner).await?;
         }
         Err(e) => eprintln!(
             "warning: could not build an RPC provider to check the on-chain owner of pool \
@@ -494,28 +523,64 @@ async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyho
     Ok(())
 }
 
-/// Warn on stderr when the pool's on-chain `owner` is not `expected`, or when
-/// the read cannot be performed. Never fails the command — offline/degraded
-/// issuance stays valid.
-async fn warn_if_not_on_chain_owner<P>(
+/// Refuse to issue a capability the command has already proven dead, and warn
+/// when it could not find out either way.
+///
+/// The two outcomes are different evidence, and it matters that they do not
+/// share an exit code. A `getPool` that **succeeded** and returned a different
+/// owner proves the token will be rejected at redemption — printing it and
+/// exiting 0 means `decdn pool assign … > delegate.token` writes a file that
+/// looks valid and is not, and nothing downstream will find out until a
+/// delegate's first voucher bounces. A read that could not be performed proves
+/// nothing: offline issuance is valid by design (`Assign` is signed entirely
+/// from the owner keystore), and the serving node enforces the owner signature
+/// at redemption regardless — so that leg keeps degrading to a warning.
+///
+/// # Errors
+///
+/// Errors only when the read succeeded and the on-chain owner is not
+/// `expected`.
+async fn ensure_on_chain_owner<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     pool_id: PoolId,
     expected: Address,
-) where
+) -> anyhow::Result<()>
+where
     P: alloy::providers::Provider + Clone,
 {
     match contract.getPool(pool_id).call().await {
-        Ok(pool) if pool.owner == expected => {}
-        Ok(pool) => eprintln!(
-            "warning: pool {pool_id} on-chain owner {} is not this keystore's address {expected} \
-             — a capability signed by a non-owner is rejected at redemption; issuing anyway",
-            pool.owner
-        ),
-        Err(e) => eprintln!(
-            "warning: could not read pool {pool_id} on-chain to confirm ownership ({e}); issuing \
-             anyway — the node verifies the owner signature at redemption"
-        ),
+        Ok(pool) => ensure_owner_matches(pool_id, pool.owner, expected),
+        Err(e) => {
+            eprintln!(
+                "warning: could not read pool {pool_id} on-chain to confirm ownership ({e}); \
+                 issuing anyway — the node verifies the owner signature at redemption"
+            );
+            Ok(())
+        }
     }
+}
+
+/// The verdict [`ensure_on_chain_owner`] reaches on a read that succeeded.
+///
+/// Split from the RPC call so the decision is unit-testable without a provider,
+/// and so the two arms of that call — "the chain says no" and "the chain did
+/// not answer" — cannot drift back together.
+///
+/// # Errors
+///
+/// Errors when `on_chain` is not `expected`.
+fn ensure_owner_matches(
+    pool_id: PoolId,
+    on_chain: Address,
+    expected: Address,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        on_chain == expected,
+        "pool {pool_id} on-chain owner {on_chain} is not this keystore's address {expected}; a \
+         capability signed by a non-owner is rejected at redemption, so no token was issued — \
+         sign with the owner keystore, or check --pool",
+    );
+    Ok(())
 }
 
 /// `decdn pool list` / `status`: read-only dump of the tracked buyer pools and
@@ -665,7 +730,7 @@ fn short_hex(hex: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -841,5 +906,71 @@ mod tests {
         let long = "0x1111111111111111111111111111111111111111";
         assert!(short_hex(long).ends_with('…'));
         assert_eq!(short_hex("0x01"), "0x01");
+    }
+
+    // ---- landed-on-chain, not-recorded-locally ----------------------------
+
+    fn a_pool() -> PoolId {
+        PoolId::from([0x11; 32])
+    }
+
+    fn addr(byte: u8) -> Address {
+        Address::from([byte; 20])
+    }
+
+    /// `pool close` drops the local row *so that* a later `fetch` opens a fresh
+    /// pool rather than reusing one that is winding down. A row that survives
+    /// means later fetches sign vouchers the contract will not honour.
+    #[test]
+    fn a_cleared_row_is_the_only_clean_close() {
+        assert!(grade_local_forget(Ok(true), a_pool(), "reclaim note").is_ok());
+    }
+
+    /// `Ok(false)` is the quieter half of the same bug: compare-and-delete
+    /// matched nothing, so the invariant is broken exactly as it is on `Err` —
+    /// and before this it printed nothing at all.
+    #[test]
+    fn an_uncleared_row_fails_and_keeps_the_reclaim_instruction() {
+        for outcome in [
+            Ok(false),
+            Err(decdn_incentive::StoreError::Backend("no space".into())),
+        ] {
+            let err = grade_local_forget(
+                outcome,
+                a_pool(),
+                "the close landed — run `decdn pool reclaim --pool 0x11` after Unix 99",
+            )
+            .expect_err("a surviving row must not read as a clean close");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("closed on-chain"), "{msg}");
+            assert!(
+                msg.contains("decdn pool reclaim"),
+                "the close landed, so the reclaim deadline must survive the failure: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_owner_check_passes_when_the_chain_agrees() {
+        assert!(ensure_owner_matches(a_pool(), addr(0xaa), addr(0xaa)).is_ok());
+    }
+
+    /// A successful read that disagrees proves the token is dead at redemption.
+    /// Emitting it anyway is how `decdn pool assign … > delegate.token` writes a
+    /// file that looks valid and is not.
+    #[test]
+    fn a_disagreeing_owner_read_refuses_to_issue() {
+        let err = ensure_owner_matches(a_pool(), addr(0xbb), addr(0xaa))
+            .expect_err("a proven-dead capability must not be issued");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("rejected at redemption"), "{msg}");
+        assert!(
+            msg.contains("no token was issued"),
+            "the operator must know nothing usable reached stdout: {msg}"
+        );
+        assert!(
+            !msg.contains("dcap1:"),
+            "the error must not carry the token it refused to issue: {msg}"
+        );
     }
 }

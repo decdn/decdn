@@ -43,8 +43,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::chain_events::AbortOnDrop;
 use crate::client_requester::buyer_pool::{
-    LOW_WATER_DIVISOR, ensure_allowance, issue_self_capability, open_pool, refill_amount,
-    top_up as pool_top_up,
+    LOW_WATER_DIVISOR, ToppedUpPool, ensure_allowance, issue_self_capability, open_pool,
+    refill_amount, top_up as pool_top_up,
 };
 use crate::client_requester::{LocalPullFault, PoolContext};
 use crate::metrics::Metrics;
@@ -160,13 +160,13 @@ struct FundingHandles<P: Provider + Clone + 'static> {
 /// note in `swap_uniswap.rs`). On the happy path `attempt` runs once and
 /// `recover_allowance` never runs, so the node issues zero allowance reads
 /// per top-up.
-async fn top_up_recovering_allowance<A, AFut, R, RFut>(
+async fn top_up_recovering_allowance<T, A, AFut, R, RFut>(
     attempt: A,
     recover_allowance: R,
-) -> Result<U256>
+) -> Result<T>
 where
     A: Fn() -> AFut,
-    AFut: std::future::Future<Output = Result<U256>>,
+    AFut: std::future::Future<Output = Result<T>>,
     R: FnOnce() -> RFut,
     RFut: std::future::Future<Output = Result<()>>,
 {
@@ -201,7 +201,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
     // an allowance shortfall (the approval was revoked or never granted) do a
     // just-in-time `approve` and retry once — so the happy path issues zero
     // allowance reads per top-up.
-    let credited = match top_up_recovering_allowance(
+    let ToppedUpPool { credited, tx } = match top_up_recovering_allowance(
         || pool_top_up(&handles.contract, pool_id, additional),
         || {
             ensure_allowance(
@@ -215,7 +215,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
     )
     .await
     {
-        Ok(credited) => credited,
+        Ok(topped_up) => topped_up,
         Err(err) => {
             warn!(
                 %pool_id,
@@ -247,6 +247,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
             error!(
                 %pool_id,
                 %credited,
+                %tx,
                 ?outcome,
                 "buyer top-up: topUp landed on-chain but the local pool row could not be \
                  credited; the deposit is ESCROWED AND UNTRACKED — reconcile against the chain"
@@ -1213,7 +1214,7 @@ mod tests {
     async fn terminal_non_allowance_revert_is_not_retried() {
         let attempts = AtomicUsize::new(0);
         let recovers = AtomicUsize::new(0);
-        let out = top_up_recovering_allowance(
+        let out: Result<U256> = top_up_recovering_allowance(
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async { Err(anyhow::anyhow!("topUp reverted for pool: paused")) }
@@ -1240,7 +1241,7 @@ mod tests {
     #[tokio::test]
     async fn retry_still_shortfall_stops_after_one_retry() {
         let attempts = AtomicUsize::new(0);
-        let out = top_up_recovering_allowance(
+        let out: Result<U256> = top_up_recovering_allowance(
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async {

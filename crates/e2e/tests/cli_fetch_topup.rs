@@ -168,7 +168,10 @@ async fn run() -> anyhow::Result<()> {
     // measured on-chain amount into the local record via `add_deposit`.
     let remaining = deposit - prior_amount; // == 1
     let additional = deposit - remaining; // restore to a full `deposit`
-    let credited = top_up(&pool, pool_id, additional).await.context("top_up")?;
+    let credited = top_up(&pool, pool_id, additional)
+        .await
+        .context("top_up")?
+        .credited;
     let deposit_outcome = store
         .add_deposit(buyer_addr, pool_id, credited)
         .context("credit top-up into the local record")?;

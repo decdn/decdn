@@ -51,7 +51,9 @@ pub enum PoolCommand {
     /// a pool the caller owns to a delegate `--signer` key, and print the
     /// `dcap1:` token to hand to that delegated client (ADR 003 §Capability
     /// delegation). Offline-capable: only the owner keystore is required to
-    /// sign; the on-chain owner check is a best-effort warning.
+    /// sign, and an on-chain owner check that cannot be performed only warns.
+    /// A check that succeeds and finds a different owner fails the command —
+    /// that token would be rejected at redemption.
     Assign(PoolAssignArgs),
 }
 

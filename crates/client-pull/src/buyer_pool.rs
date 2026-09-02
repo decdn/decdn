@@ -21,7 +21,9 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
-use decdn_incentive::{BuyerPoolState, Capability, PoolOpenFailureReason, SignedCapability};
+use decdn_incentive::{
+    BuyerPoolState, Capability, DepositOutcome, PoolOpenFailureReason, SignedCapability, StoreError,
+};
 use tracing::{debug, error, info};
 
 use crate::PoolContext;
@@ -86,6 +88,76 @@ pub struct OpenedPool {
     pub capability: SignedCapability,
     /// The `openPool` transaction hash.
     pub tx: TxHash,
+}
+
+/// The outcome of a mined [`top_up`]: what the contract actually credited, and
+/// the transaction that credited it.
+///
+/// The tx hash rides along for the same reason [`OpenedPool::tx`] does. The
+/// funds are escrowed the moment this returns, so a caller whose local credit
+/// then fails has to name the transaction an operator reconciles against — see
+/// [`escrowed_but_untracked`].
+#[derive(Debug, Clone, Copy)]
+pub struct ToppedUpPool {
+    /// The amount the contract credited, read back from the receipt.
+    pub credited: U256,
+    /// The `topUp` transaction hash.
+    pub tx: TxHash,
+}
+
+/// Build the error for "the on-chain effect landed, the local record did not".
+///
+/// The funds have already moved when this is reached, so a non-zero exit is the
+/// only outcome that guarantees anyone reconciles: a caller that logs and
+/// returns success is indistinguishable from one that did the work, and a shell
+/// wrapper (`if decdn pool top-up …; then mark_funded; fi`) records the money as
+/// tracked when it is not.
+///
+/// `effect` names what landed on-chain in the operator's vocabulary
+/// (`buyer pool opened`, `pool 0x… topped up by 5 µUSDC`), `tx` is the handle to
+/// reconcile against, and `cause` is the local failure.
+pub fn escrowed_but_untracked(
+    effect: &str,
+    tx: TxHash,
+    cause: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{effect} on-chain (tx {tx}) but persisting it locally failed; the deposit is \
+         escrowed but untracked — reconcile manually: {cause}"
+    )
+}
+
+/// Grade the local credit that follows a mined [`top_up`], turning every
+/// not-credited outcome into an [`escrowed_but_untracked`] error.
+///
+/// [`decdn_incentive::BuyerPoolStore::add_deposit`] splits its failures across two channels by
+/// design: a backend or codec fault is the `Err`, while a committed-row
+/// mismatch (the row vanished, or now tracks a different pool) is a non-`Added`
+/// `Ok`. For a caller standing over freshly escrowed USDC the distinction does
+/// not change the disposition — either way the deposit moved on-chain and the
+/// local row is short by `credited` — so both collapse here. `DepositOutcome`
+/// is `#[must_use]` for exactly this reason: a dropped `PoolMismatch` looks
+/// identical to a successful credit.
+///
+/// Returns the new committed deposit on success.
+///
+/// # Errors
+///
+/// Errors on any outcome other than [`DepositOutcome::Added`].
+pub fn grade_deposit_credit(
+    outcome: Result<DepositOutcome, StoreError>,
+    effect: &str,
+    tx: TxHash,
+) -> Result<U256> {
+    match outcome {
+        Ok(DepositOutcome::Added(new_deposit)) => Ok(new_deposit),
+        Ok(other) => Err(escrowed_but_untracked(
+            effect,
+            tx,
+            format!("the local record was not updated: {other:?}"),
+        )),
+        Err(e) => Err(escrowed_but_untracked(effect, tx, e)),
+    }
 }
 
 /// Sign a self-owned [`SignedCapability`]: the pool owner delegates spend on
@@ -372,7 +444,7 @@ pub async fn top_up<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     pool_id: B256,
     additional: U256,
-) -> Result<U256> {
+) -> Result<ToppedUpPool> {
     let pending = match contract
         .topUp(pool_id, to_pool_u64(additional, "top-up")?)
         .send()
@@ -411,8 +483,9 @@ pub async fn top_up<P: Provider + Clone>(
         .map(|decoded| decoded.inner.data)
         .find(|ev| ev.poolId == pool_id)
         .map_or(additional, |ev| ev.additionalDeposit);
-    info!(%pool_id, %credited, "topped up buyer payment pool");
-    Ok(credited)
+    let tx = receipt.transaction_hash;
+    info!(%pool_id, %credited, %tx, "topped up buyer payment pool");
+    Ok(ToppedUpPool { credited, tx })
 }
 
 /// Refill a reused buyer pool to `target_deposit` once its remaining spendable
@@ -462,11 +535,13 @@ pub fn refill_amount(
 mod tests {
     use super::{
         AllowanceShortfall, LOW_WATER_DIVISOR, approval_floor, approve_decision,
-        issue_self_capability, open_pool, refill_amount, top_up,
+        escrowed_but_untracked, grade_deposit_credit, issue_self_capability, open_pool,
+        refill_amount, top_up,
     };
     use alloy::dyn_abi::Eip712Domain;
-    use alloy::primitives::{Address, B256, U256};
+    use alloy::primitives::{Address, B256, TxHash, U256};
     use alloy::signers::local::PrivateKeySigner;
+    use decdn_incentive::{DepositOutcome, StoreError};
     use decdn_incentive::{SignedCapability, voucher_domain};
 
     const CHAIN_ID: u64 = 421_614;
@@ -696,5 +771,60 @@ mod tests {
             "the daemon retry gate downcasts on this marker; it must survive the \
              `.context()` wrapping `top_up` applies"
         );
+    }
+
+    // ---- escrowed-but-untracked grading -----------------------------------
+    //
+    // The hazard these guard is asymmetric: the on-chain half already
+    // committed, so the only remaining lever is the exit code. A caller that
+    // logs and returns success is indistinguishable from one that did the
+    // work, and `if decdn pool top-up …; then mark_funded; fi` then records
+    // money as tracked that nobody will reconcile.
+
+    fn a_tx() -> TxHash {
+        TxHash::from([0xab; 32])
+    }
+
+    #[test]
+    fn escrowed_but_untracked_names_the_tx_and_the_action() {
+        let err = escrowed_but_untracked("pool 0x01 topped up by 5 µUSDC", a_tx(), "disk full");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("pool 0x01 topped up by 5 µUSDC"), "{msg}");
+        assert!(
+            msg.contains(&format!("{}", a_tx())),
+            "the tx is the handle an operator reconciles against: {msg}"
+        );
+        assert!(msg.contains("reconcile manually"), "{msg}");
+        assert!(msg.contains("disk full"), "the cause must survive: {msg}");
+    }
+
+    #[test]
+    fn a_credited_deposit_grades_to_the_new_total() {
+        let new_deposit = grade_deposit_credit(
+            Ok(DepositOutcome::Added(U256::from(140u64))),
+            "topped up",
+            a_tx(),
+        )
+        .expect("Added is the success path");
+        assert_eq!(new_deposit, U256::from(140u64));
+    }
+
+    /// `add_deposit` splits its failures across two channels — a backend fault
+    /// is the `Err`, a committed-row mismatch is a non-`Added` `Ok`. For a
+    /// caller standing over escrowed USDC they mean the same thing, and the
+    /// `Ok` half is the one that reads like success at a glance.
+    #[test]
+    fn every_uncredited_outcome_is_an_error_naming_the_tx() {
+        for outcome in [
+            Ok(DepositOutcome::UnknownPool),
+            Ok(DepositOutcome::PoolMismatch),
+            Err(StoreError::Backend("commit (fsync): no space".into())),
+        ] {
+            let err = grade_deposit_credit(outcome, "pool 0x01 topped up", a_tx())
+                .expect_err("an uncredited deposit must not read as success");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("escrowed but untracked"), "{msg}");
+            assert!(msg.contains(&format!("{}", a_tx())), "{msg}");
+        }
     }
 }

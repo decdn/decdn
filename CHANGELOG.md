@@ -601,6 +601,42 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: `pool top-up`, `pool close`, `pool assign` and `fetch`'s auto-refill now
+  exit non-zero when a landed on-chain effect cannot be recorded locally.**
+  Four sites printed the failure to stderr and returned `Ok(())`. All shared one
+  shape — the on-chain effect landed, the local write failed — and the money had
+  already moved, so exiting 0 was the one outcome that guaranteed nobody
+  reconciled it. A wrapper (`if decdn pool top-up …; then mark_funded; fi`)
+  recorded the pool as funded while the local `deposit` stayed short by
+  `credited`, which both re-triggered the low-water auto-top-up on every later
+  fetch and made a retry of the command double-spend. After a `pool close` whose
+  row-clear failed, `open_or_reuse_pool` reused a winding-down pool: later
+  fetches signed vouchers the contract will not honour, and auto-refill could
+  `topUp` it.
+  - This is a consistency fix, not a new policy. The reactive mid-fetch top-up
+    already bails terminally on the same hazard, and the daemon already meters it
+    as a top-up *failure* rather than a success. Only the proactive and manual
+    legs had not adopted it.
+  - `decdn pool assign` is in scope on different grounds: its middle arm had a
+    `getPool` read that **succeeded** and proved the on-chain owner is not this
+    keystore, yet still printed the `dcap1:` token, so
+    `decdn pool assign … > delegate.token` exited 0 with a capability already
+    proven dead at redemption. That arm now fails. The sibling arms — an
+    unreachable RPC, a provider that would not build — keep degrading to a
+    warning, because offline issuance is valid and a read that could not be
+    performed proves nothing.
+  - `pool close` also caught the quieter half: `forget_if_pool` is
+    compare-and-delete, and its `Ok(false)` ("nothing was cleared") was dropped
+    entirely, printing nothing at all. It now fails alongside the `Err`, and the
+    error carries the `pool reclaim` deadline the success line would have.
+  - Unchanged and deliberately so: `pool reclaim`'s row-clear (the row may
+    already be gone, so a failed clear costs nothing) and `fetch`'s
+    `persist_watermark` (it runs after delivery, and failing the fetch would
+    neither un-pay the bytes nor do anything but misreport a fetch that
+    succeeded).
+  - `client_pull::buyer_pool::top_up` now returns the `topUp` tx hash alongside
+    the credited amount, so every one of these errors names the transaction an
+    operator reconciles against — the handle the `open` path already had.
 - **config: resolve-time notices now reach the operator instead of raw stderr.**
   Every `*_into` resolver wrote its non-fatal warnings with `eprintln!`, on the
   documented grounds that no `tracing` subscriber exists at `resolve_config`
