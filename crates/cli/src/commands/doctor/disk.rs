@@ -23,11 +23,12 @@ pub struct DiskSpace {
 pub fn read_disk_space(path: &Path) -> anyhow::Result<DiskSpace> {
     let stat = nix::sys::statvfs::statvfs(path)
         .map_err(|e| anyhow::anyhow!("statvfs({}) failed: {e}", path.display()))?;
-    // statvfs block counts and fragment size fit u64 on supported Unix targets;
-    // the underlying C types are unsigned and no wider than u64 here, so a
-    // lossless `From` conversion covers every field.
     let frsize = stat.fragment_size();
+    // fsblkcnt_t is u32 on macOS (real widening) and u64 on 64-bit Linux glibc
+    // (identity); the value always fits u64 either way.
+    #[allow(clippy::useless_conversion)]
     let blocks = u64::from(stat.blocks());
+    #[allow(clippy::useless_conversion)]
     let blocks_available = u64::from(stat.blocks_available());
     Ok(DiskSpace {
         total: frsize.saturating_mul(blocks),
