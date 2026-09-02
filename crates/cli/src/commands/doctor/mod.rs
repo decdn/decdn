@@ -1,0 +1,171 @@
+//! `decdn node doctor` — read-only diagnosis of node config, on-disk state,
+//! disk-vs-budget, and network reachability. Runs pre-boot and against a live
+//! daemon; mutates nothing.
+
+use std::path::Path;
+
+use serde::Serialize;
+
+mod chain;
+mod config;
+mod disk;
+mod live;
+mod origin;
+mod ports;
+mod report;
+mod state;
+
+/// A single diagnostic outcome. Every `Warn`/`Fail` carries a one-line
+/// `remediation`; `detail` holds a grep-friendly `key=value` tail.
+#[derive(Debug, Serialize)]
+pub struct Finding {
+    /// Check group this finding belongs to.
+    pub group: &'static str,
+    /// Stable machine-readable id for this specific check.
+    pub id: &'static str,
+    /// Outcome severity of this check.
+    pub severity: Severity,
+    /// One-line human summary of the outcome.
+    pub title: String,
+    /// Optional grep-friendly `key=value` detail tail.
+    pub detail: Option<String>,
+    /// Optional one-line fix suggested when the check is not a clean pass.
+    pub remediation: Option<String>,
+}
+
+/// Diagnostic severity. Only `Fail` (and `Warn` under `--strict`) drives a
+/// nonzero exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// The check found nothing wrong.
+    Pass,
+    /// The check found a non-fatal issue worth the operator's attention.
+    Warn,
+    /// The check found a problem that blocks correct operation.
+    Fail,
+}
+
+/// The collected findings of one doctor run.
+#[derive(Debug, Default, Serialize)]
+pub struct Report {
+    /// Findings pushed so far, in the order each check ran.
+    pub findings: Vec<Finding>,
+}
+
+impl Report {
+    /// Append one finding to the report.
+    pub fn push(&mut self, finding: Finding) {
+        self.findings.push(finding);
+    }
+
+    /// Returns `(pass, warn, fail)` counts.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        self.findings
+            .iter()
+            .fold((0, 0, 0), |(p, w, f), finding| match finding.severity {
+                Severity::Pass => (p + 1, w, f),
+                Severity::Warn => (p, w + 1, f),
+                Severity::Fail => (p, w, f + 1),
+            })
+    }
+
+    /// True when any finding is a `Fail`.
+    pub fn has_fail(&self) -> bool {
+        self.findings.iter().any(|x| x.severity == Severity::Fail)
+    }
+
+    /// True when any finding is a `Warn`.
+    pub fn has_warn(&self) -> bool {
+        self.findings.iter().any(|x| x.severity == Severity::Warn)
+    }
+}
+
+/// Sentinel error returned by [`run`] when the report contains failing checks
+/// (or warnings under `--strict`). `main` recognizes it to set a nonzero exit
+/// **without** printing an `Error:` line — the report is already on stdout.
+#[derive(Debug)]
+pub struct DoctorFailed;
+
+impl std::fmt::Display for DoctorFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "doctor found failing checks")
+    }
+}
+
+impl std::error::Error for DoctorFailed {}
+
+/// Run every diagnostic group, render the report, and map severity to exit.
+pub async fn run(
+    args: &decdn_common::cli::DoctorArgs,
+    global_config: Option<&Path>,
+) -> anyhow::Result<()> {
+    let mut report = Report::default();
+    let resolved = config::check_config(&mut report, args, global_config);
+    // Config-dependent groups run only when resolve succeeded (Tasks 4-9).
+    if let Some(resolved) = &resolved {
+        let live = if args.offline {
+            live::LiveInfo {
+                daemon_running: false,
+                cache_bytes: None,
+            }
+        } else {
+            live::probe_live(&mut report, resolved, args, global_config).await
+        };
+
+        disk::check_disk(&mut report, resolved, live.cache_bytes);
+        state::check_state(&mut report, resolved, live.daemon_running);
+        if !args.offline {
+            chain::check_chain(&mut report, resolved, args.timeout_ms).await;
+            origin::check_origins(&mut report, resolved, args.timeout_ms).await;
+            ports::check_ports(&mut report, resolved, live.daemon_running);
+        }
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    report::render(&mut stdout, &report, args.json, args.strict)
+        .map_err(|e| anyhow::anyhow!("failed to write doctor report: {e}"))?;
+
+    let fail = report.has_fail() || (args.strict && report.has_warn());
+    if fail {
+        return Err(DoctorFailed.into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
+mod tests {
+    use super::*;
+
+    fn f(sev: Severity) -> Finding {
+        Finding {
+            group: "G",
+            id: "x",
+            severity: sev,
+            title: "t".into(),
+            detail: None,
+            remediation: None,
+        }
+    }
+
+    #[test]
+    fn counts_and_flags() {
+        let mut r = Report::default();
+        r.push(f(Severity::Pass));
+        r.push(f(Severity::Warn));
+        r.push(f(Severity::Fail));
+        assert_eq!(r.counts(), (1, 1, 1));
+        assert!(r.has_fail());
+        assert!(r.has_warn());
+    }
+
+    #[test]
+    fn clean_report_has_no_fail_or_warn() {
+        let mut r = Report::default();
+        r.push(f(Severity::Pass));
+        assert_eq!(r.counts(), (1, 0, 0));
+        assert!(!r.has_fail());
+        assert!(!r.has_warn());
+    }
+}
