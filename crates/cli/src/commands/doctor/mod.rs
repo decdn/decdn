@@ -10,6 +10,7 @@ mod chain;
 mod config;
 mod disk;
 mod origin;
+mod ports;
 mod report;
 mod state;
 
@@ -92,6 +93,7 @@ pub async fn run(
         disk::check_disk(&mut report, resolved, None);
         state::check_state(&mut report, resolved, false);
         if !args.offline {
+            ports::check_ports(&mut report, resolved, false);
             chain::check_chain(&mut report, resolved, args.timeout_ms).await;
             origin::check_origins(&mut report, resolved, args.timeout_ms).await;
         }
