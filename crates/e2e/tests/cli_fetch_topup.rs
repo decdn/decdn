@@ -689,19 +689,16 @@ const TWO_TOPUP_BLOB_BYTES: usize = 20 * 1024 * 1024 + 4113;
 
 /// IGNORED — a blob this far past the working deposit does not complete end to end.
 ///
-/// The buyer's stop recovery (`terminal_after_write_failure`) surfaces the node's
-/// typed exhaustion `StreamError`, so the fetch reaches the reactive top-up branch
-/// and runs the FIRST top-up. The resumed leg after it is then refused
-/// (`delivery refused: NotFound`): the exhausting first leg leaves a permanent
-/// per-signer dead charge on the pool that a top-up cannot clear, so the node
-/// declines the resumed request and the SECOND reactive top-up never runs. That
-/// two-top-up / dead-charge interaction (ADR 003 §Pool solvency) is separate work.
-///
-/// This is the deposit-dwarfing case the reactive top-up exists to serve, and the
-/// only test that would exercise a second top-up end to end; the sizing below
-/// already drives two top-ups once the resumed-leg refusal is fixed. Un-ignore
-/// then.
-#[ignore = "resumed leg after the first top-up is refused (dead charge -> NotFound); see the doc comment"]
+/// The per-signer floor does not block a reactive-top-up resume: it is a refilling
+/// abandonment bucket (ADR 003 §Pool solvency), so a single-signer resume admits at
+/// the floor gate rather than tripping a per-signer cap. What remains are separate,
+/// non-floor blockers this test still trips: the resumed
+/// leg can open before the first voucher materializes its lane in the node's store
+/// (`stream request on unknown lane; refusing pre-serve`), and the deposit/window
+/// sizing no longer reliably forces exactly two top-ups. Un-ignore once the
+/// lane-materialization race and the sizing are addressed; the driver below already
+/// asserts the two-top-up byte accounting.
+#[ignore = "resumed-leg lane-materialization race + top-up sizing; floor lockout resolved — see the doc comment"]
 #[tokio::test(flavor = "multi_thread")]
 async fn fetch_across_two_reactive_topups_pays_each_wire_byte_exactly_once() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_two_topup_fetch()))

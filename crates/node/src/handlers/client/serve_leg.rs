@@ -244,14 +244,14 @@ impl ClientHandler {
             }
 
             // Reconcile the pool floor reservation the SAME way the hit path does
-            // (`deliver`), so a cache-miss stream — which fronts upstream USDC — folds
-            // proportional `dead_charge` too. Capture this iteration's maximum in-flight
-            // unpaid balance NOW: after the deliver phase advanced `delivered` and
-            // before the recoup phase can advance `paid` or take the `VoucherStop::Rejected`
-            // early return / a `?` fault below. A stream that dies in its first
-            // iteration never reaches the end-of-iteration hook, so without this note its
-            // last-noted unpaid stays 0 and `Drop` would fold nothing — letting "connect,
-            // take one free interval, vanish" escape the `dead_charge` accounting.
+            // (`deliver`), so a cache-miss stream — which fronts upstream USDC — debits the
+            // abandonment bucket by its real un-recouped floor too. Capture this iteration's
+            // maximum in-flight unpaid balance NOW: after the deliver phase advanced
+            // `delivered` and before the recoup phase can advance `paid` or take the
+            // `VoucherStop::Rejected` early return / a `?` fault below. A stream that dies in
+            // its first iteration never reaches the end-of-iteration hook, so without this
+            // note its last-noted unpaid stays 0 and an abnormal `Drop` would debit nothing —
+            // letting "connect, take one free interval, vanish" escape the bucket accounting.
             // `delivered`/`paid` are WIRE BYTES (see their declaration); the reservation
             // accounts in µUSDC, so the byte quantity crosses over through `min_payment` —
             // the two units are never compared directly (ADR 003 §Pool solvency).
@@ -381,7 +381,7 @@ impl ClientHandler {
                 // full `credit_max`, so release waits for that much paid, not one chunk.
                 res.release_if_repaid(decdn_incentive::min_payment(paid, rate_per_mb));
                 // Keep the drop-time reconcile honest with the CURRENT unpaid balance: on
-                // an un-repaid stream `Drop` folds `min(reserved, this)` into `dead_charge`.
+                // an un-repaid stream's abnormal `Drop` debits `min(reserved, this)` into the bucket.
                 // A fully-settled stream ends `delivered == paid`, so the last note here is
                 // `min_payment(0, rate) == 0` and `Drop` charges nothing.
                 res.note_unpaid(decdn_incentive::min_payment(
@@ -400,7 +400,7 @@ impl ClientHandler {
             // symmetric with the takedown re-check below: re-read the cached pool
             // status and stop once `remaining − M` no longer covers the pool's
             // already-committed floor credit. A pool drains mid-flight — other
-            // lanes redeem `remaining` down, or `dead_charge` rises — so a long
+            // lanes redeem `remaining` down — so a long
             // stream must catch that; the credit window bounds delivery ahead of
             // the last COLLECTED voucher, not ahead of the last SOLVENCY-verified
             // point, so nothing else notices a shared pool going unredeemable.
@@ -435,10 +435,10 @@ impl ClientHandler {
                     self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
                         .await?;
                     // Observable stop (symmetric with the takedown re-check below): this
-                    // terminates a paying miss-leg delivery, and `dead_charge` only grows.
+                    // terminates a paying miss-leg delivery.
                     tracing::warn!(
                         pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
-                        "mid-stream PoolExhausted: pool can no longer fund the floor credit committed across its signers; owner should top up the deposit. This is the POOL level — stopped_signer names the terminated stream, not the cause; a per-signer sub-cap refusal never reaches here"
+                        "mid-stream PoolExhausted: pool can no longer fund the floor credit committed across its signers; owner should top up the deposit. This is the POOL level — stopped_signer names the terminated stream, not the cause; a per-signer gate refusal never reaches here"
                     );
                     return Ok(());
                 }
@@ -483,8 +483,8 @@ impl ClientHandler {
         // bao-verified into the cache by the pull leg's admit before this leg read
         // it, so the served bytes are sound. Only reached on clean completion — every
         // abnormal exit returns earlier — so mark the reservation settled, so its drop
-        // folds the proportional unpaid tail rather than the conservative full
-        // `reserved` (ADR 003 §Pool solvency).
+        // debits the abandonment bucket nothing rather than the real un-recouped floor
+        // an abnormal exit would (ADR 003 §Pool solvency).
         if let Some(res) = floor_reservation {
             res.mark_settled();
         }

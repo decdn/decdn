@@ -124,35 +124,25 @@ pub const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Precise sizing per ADR 003 is governance/ops policy, not a build-time
 /// constant.
 pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
-/// Default per-signer share of a pool's refundable headroom for the floor
-/// sub-cap: `2500` bps, a quarter of `remaining − M` each. ADR 003 § Pool
-/// solvency makes this node-local risk policy — the node's own bad-debt budget
-/// per counterparty — so the default targets a modest fan-out (four active
-/// signers per pool) rather than any protocol quantity. An operator serving
-/// wide-fan-out publishers lowers it; one serving single-signer pools raises it
-/// toward `10_000`, where the sub-cap becomes the pool ceiling.
-pub const DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS: u64 = 2_500;
-/// Default ceiling on the per-signer floor sub-cap: `0`, meaning no ceiling, so the
-/// share alone bounds a signer.
-///
-/// The ceiling is sound and available — set a window count to enable it — but it is
-/// off by default because it interacts badly with `dead_charge`, which is permanent
-/// until the pool is reclaimed on-chain. An admitted stream that fails without
-/// delivering folds a FULL window into that permanent total, and a client retrying a
-/// cold node accrues one such window per attempt. A ceiling of `k` windows therefore
-/// turns `k` transient warm-up failures into a permanent lockout for that signer,
-/// and the client's own retry loop is what spends the budget it then needs.
-///
-/// No constant escapes that: the burn is bounded only by the pool's headroom, not by
-/// anything the ceiling can be sized against. Enabling it by default would trade a
-/// fan-out bound for an availability failure on ordinary cold starts. Sizing the
-/// ceiling for its real job — bounding one signer's *concurrent* un-vouchered
-/// exposure — requires separating that from the cumulative abandonment budget the
-/// same number also serves.
-pub const DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS: u64 = 0;
-/// Basis-point denominator for [`DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS`] and the
-/// bound the resolver enforces on a configured share.
-pub const BPS_DENOMINATOR: u64 = 10_000;
+/// Default per-signer LIVE concurrency cap `k`, in ramp-start credit windows: `8`.
+/// The most live un-vouchered floor reservation any one capability signer may hold
+/// against a pool is `k · one credit window`, underneath the pool-wide `remaining − M`
+/// ceiling (ADR 003 § Pool solvency, per-signer floor isolation). The window is the
+/// unit rationed — honest need is `concurrent un-vouchered streams × one window`
+/// regardless of pool size — so an absolute count fits it directly. It carries no
+/// permanent memory: it recycles as each stream pays, and never penalizes a signer for
+/// quitting.
+pub const DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS: u64 = 8;
+/// Default per-signer abandonment-bucket capacity, in ramp-start credit windows: `8`.
+/// A signer may drain `8 · one credit window` of un-recouped floor from its node-local
+/// refilling allowance before this node soft-throttles it (ADR 003 § Pool solvency,
+/// per-signer abandonment allowance). Wide enough to absorb ordinary abandonment and
+/// reactive-top-up chains; a burst that out-runs the refill is what trips it.
+pub const DEFAULT_POOL_FLOOR_SIGNER_BUCKET_WINDOWS: u64 = 8;
+/// Default seconds to refill one window of the per-signer abandonment bucket: `60`.
+/// Fast enough that only a genuine burst of abandonment trips the throttle, and the
+/// throttle then clears on its own as the bucket refills (ADR 003 § Pool solvency).
+pub const DEFAULT_POOL_FLOOR_SIGNER_REFILL_SECS: u64 = 60;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
 /// Default per-source rate-limit refill (cells/second). A single source
@@ -1622,34 +1612,24 @@ fn resolve_blockchain_into(
         .and_then(|b| b.pool_min_remaining_deposit_micro_usdc)
         .unwrap_or(DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC);
 
-    // The per-signer share of `remaining − M` (ADR 003 § Pool solvency). Bounded
-    // on both sides. `0` is rejected as meaningless rather than dangerous: the
-    // node floors the resulting cap at one credit window, so `0` would clamp back
-    // to exactly one window and behave as `1` while reading as "off". A share
-    // above the whole headroom is not a share at all.
-    let pool_floor_signer_share_bps = file
-        .and_then(|b| b.pool_floor_signer_share_bps)
-        .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS);
-    // The absolute ceiling on that share, in credit windows. `0` is the documented
-    // disable sentinel, so there is no lower bound to enforce and no upper one that
-    // means anything — a ceiling above the pool's own headroom is simply never the
-    // binding constraint.
-    let pool_floor_signer_max_windows = file
-        .and_then(|b| b.pool_floor_signer_max_windows)
-        .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS);
-    bag.check_with(
-        (1..=BPS_DENOMINATOR).contains(&pool_floor_signer_share_bps),
-        "blockchain.pool_floor_signer_share_bps",
-        || {
-            let bound = format!("must be in 1..={BPS_DENOMINATOR}");
-            format!(
-                "blockchain.pool_floor_signer_share_bps {bound} (0 clamps to the same \
-                 one-credit-window floor as 1, so it cannot express \"no sub-cap\"; \
-                 {BPS_DENOMINATOR} lifts the share to the whole headroom, a no-op only \
-                 while pool_floor_signer_max_windows is 0)"
-            )
-        },
-    );
+    // Per-signer LIVE concurrency cap `k`, in credit windows (ADR 003 § Pool
+    // solvency, per-signer floor isolation). Any value is legal: the node
+    // lower-clamps the cap to one window at use, so `0` behaves as "admit a lone
+    // signer's first stream" rather than wedging it — no bound to enforce.
+    let pool_floor_signer_live_windows = file
+        .and_then(|b| b.pool_floor_signer_live_windows)
+        .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS);
+    // Per-signer abandonment-bucket capacity, in credit windows (ADR 003 § Pool
+    // solvency, per-signer abandonment allowance). Lower-clamped to one window at
+    // use, so no bound to enforce.
+    let pool_floor_signer_bucket_windows = file
+        .and_then(|b| b.pool_floor_signer_bucket_windows)
+        .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_BUCKET_WINDOWS);
+    // Seconds to refill one window of the abandonment bucket. Lower-clamped to one
+    // second at use, so `0` behaves as one second rather than dividing by zero.
+    let pool_floor_signer_refill_secs = file
+        .and_then(|b| b.pool_floor_signer_refill_secs)
+        .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_REFILL_SECS);
 
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
@@ -1683,8 +1663,9 @@ fn resolve_blockchain_into(
         buyer_working_deposit_micro_usdc,
         buyer_max_approve,
         pool_min_remaining_deposit_micro_usdc,
-        pool_floor_signer_share_bps,
-        pool_floor_signer_max_windows,
+        pool_floor_signer_live_windows,
+        pool_floor_signer_bucket_windows,
+        pool_floor_signer_refill_secs,
     }
 }
 
@@ -9658,13 +9639,12 @@ swap_pool_address = \"0xPool\"
         Ok(())
     }
 
-    /// The per-signer floor share (ADR 003 § Pool solvency) defaults to a quarter
-    /// of a pool's headroom, threads an explicit value through, and is rejected
-    /// outside `1..=10_000` on BOTH sides: `0` clamps back to the one-credit-window
-    /// floor and so cannot express "no sub-cap", and a share above the whole
-    /// headroom is not a share.
+    /// The per-signer floor knobs (ADR 003 § Pool solvency) default to `8` live
+    /// windows, an `8`-window abandonment bucket, and a `60`-second refill, and thread
+    /// explicit values through. No value is rejected: each is lower-clamped at use, so
+    /// there is nothing for the resolver to bound.
     #[test]
-    fn pool_floor_signer_share_defaults_threads_and_bounds() -> anyhow::Result<()> {
+    fn pool_floor_signer_knobs_default_and_thread() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,
@@ -9681,46 +9661,26 @@ swap_pool_address = \"0xPool\"
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
         // Literals, not the constants: asserting a value against the constant it
         // came from passes whatever the constant says, and the shipped defaults are
-        // documented in four places that have to agree with it.
-        assert_eq!(resolved.pool_floor_signer_share_bps, 2_500);
-        assert_eq!(DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS, 2_500);
-        assert_eq!(
-            resolved.pool_floor_signer_max_windows, 0,
-            "the window ceiling ships off — a cold-start retry loop burns one \
-             permanent window per attempt, so a ceiling of k locks a session key \
-             out after k warm-up failures"
-        );
-        assert_eq!(DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS, 0);
+        // documented in several places that have to agree with it.
+        assert_eq!(resolved.pool_floor_signer_live_windows, 8);
+        assert_eq!(DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS, 8);
+        assert_eq!(resolved.pool_floor_signer_bucket_windows, 8);
+        assert_eq!(DEFAULT_POOL_FLOOR_SIGNER_BUCKET_WINDOWS, 8);
+        assert_eq!(resolved.pool_floor_signer_refill_secs, 60);
+        assert_eq!(DEFAULT_POOL_FLOOR_SIGNER_REFILL_SECS, 60);
 
         let explicit = types::BlockchainConfig {
-            pool_floor_signer_share_bps: Some(10_000),
-            // `0` is the documented disable sentinel for the window ceiling, so it
-            // must survive resolution rather than being replaced by the default.
-            pool_floor_signer_max_windows: Some(0),
+            pool_floor_signer_live_windows: Some(16),
+            pool_floor_signer_bucket_windows: Some(32),
+            pool_floor_signer_refill_secs: Some(120),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
             ..Default::default()
         };
         let resolved = resolve_blockchain(&cli, Some(&explicit), dir.path())?;
-        assert_eq!(resolved.pool_floor_signer_share_bps, 10_000);
-        assert_eq!(resolved.pool_floor_signer_max_windows, 0);
-
-        for bad in [0u64, 10_001] {
-            let file = types::BlockchainConfig {
-                pool_floor_signer_share_bps: Some(bad),
-                slash_judge_address: Some(GOOD_ADDR.to_string()),
-                content_blacklist_address: Some(GOOD_ADDR.to_string()),
-                ..Default::default()
-            };
-            let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
-                anyhow::bail!("expected error for a signer share of {bad}");
-            };
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("blockchain.pool_floor_signer_share_bps"),
-                "error should name the field: {msg}"
-            );
-        }
+        assert_eq!(resolved.pool_floor_signer_live_windows, 16);
+        assert_eq!(resolved.pool_floor_signer_bucket_windows, 32);
+        assert_eq!(resolved.pool_floor_signer_refill_secs, 120);
         Ok(())
     }
 

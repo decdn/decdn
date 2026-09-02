@@ -794,7 +794,14 @@ impl ClientHandler {
                                 )
                                 .await;
                         }
-                        Ok(guard) => floor_reservation = Some(guard),
+                        Ok(guard) => {
+                            // This is the miss-fill admission: the fill below fronts
+                            // upstream USDC, so an abandon here strands that spend. Size
+                            // the abandonment debit to the reserved window, not the
+                            // downstream unpaid tail.
+                            guard.mark_fronted_upstream();
+                            floor_reservation = Some(guard);
+                        }
                     }
                 }
 

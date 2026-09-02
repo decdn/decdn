@@ -1343,11 +1343,13 @@ async fn build_chain_and_handlers(
         // restart reloads it rather than granting a fresh free-floor budget.
         floor_loss_store: Some(Arc::clone(&infra.concrete_channel_store)
             as Arc<dyn decdn_incentive::PoolFloorLossStore>),
-        // Per-signer floor sub-cap (ADR 003 §Pool solvency, per-signer floor
-        // isolation): the node's own bad-debt budget per capability-holder,
-        // underneath the per-pool `remaining − M` ceiling.
-        pool_floor_signer_share_bps: cfg.blockchain.pool_floor_signer_share_bps,
-        pool_floor_signer_max_windows: cfg.blockchain.pool_floor_signer_max_windows,
+        // Per-signer floor gates (ADR 003 §Pool solvency): the live concurrency cap
+        // `k` underneath the per-pool `remaining − M` ceiling, plus the node-local
+        // abandonment leaky-bucket (capacity + refill rate) that soft-throttles a
+        // burst-abandoner without ever touching the pool's money envelope.
+        pool_floor_signer_live_windows: cfg.blockchain.pool_floor_signer_live_windows,
+        pool_floor_signer_bucket_windows: cfg.blockchain.pool_floor_signer_bucket_windows,
+        pool_floor_signer_refill_secs: cfg.blockchain.pool_floor_signer_refill_secs,
         warming_credit,
         operator_shares: operator_shares.clone(),
         // Origin-only policy (#1759): backend-authoritative own/foreign decision.
@@ -3949,8 +3951,9 @@ mod tests {
                 buyer_working_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
                 pool_min_remaining_deposit_micro_usdc: 1_000_000,
-                pool_floor_signer_share_bps: 10_000,
-                pool_floor_signer_max_windows: 0,
+                pool_floor_signer_live_windows: 8,
+                pool_floor_signer_bucket_windows: 8,
+                pool_floor_signer_refill_secs: 60,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 content_blacklist_address: None,
                 content_blacklist_poll_interval_sec: 600,

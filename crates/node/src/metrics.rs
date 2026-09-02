@@ -555,20 +555,19 @@ pub struct DecdnMetrics {
     /// fsynced — the frontier-only replay surface is widening. Operator-visible
     /// name: `decdn_lane_flush_failures_total`.
     pub lane_flush_failures: Counter,
-    /// Floor dead-charge writes that failed: a drop-time persist (`record_loss`
-    /// on a `FloorReservation` drop) or a reclaimed pool's `forget_loss`. Both
-    /// are best-effort — the in-memory accumulator stays authoritative for the
-    /// running process — so a failed persist widens the restart-time re-grant
-    /// window instead of breaking delivery (a restart hydrates a stale total and
-    /// hands the affected pools back free-floor budget they already consumed),
-    /// and a failed forget leaves the closed pool's row with no tombstone, open
-    /// to permanent re-insertion by a late persist (#1781's error-path
-    /// residual). A sustained rate usually means the
-    /// `floor-loss.redb` file refuses writes (a prior failed commit latches redb
-    /// until the file is closed and reopened — restart the node) or is corrupt;
-    /// pairs with the per-failure `warn!`/`error!` lines ("floor dead-charge
-    /// persist failed" / "pool dead-charge forget failed"). Operator-visible
-    /// name: `decdn_floor_loss_persist_failures_total`.
+    /// Floor abandonment-bucket writes that failed: a drop-time persist
+    /// (`record_bucket` on an abnormal `FloorReservation` drop) or a reclaimed pool's
+    /// `forget_loss`. Both are best-effort — the in-memory bucket stays authoritative
+    /// for the running process — so a failed persist widens the restart-time re-grant
+    /// window instead of breaking delivery (a restart hydrates a stale snapshot and
+    /// grants the affected signers a fresh abandonment allowance), and a failed forget
+    /// leaves the closed pool's row with no tombstone, open to permanent re-insertion
+    /// by a late persist (#1781's error-path residual). A sustained rate usually means
+    /// the `floor-loss.redb` file refuses writes (a prior failed commit latches redb
+    /// until the file is closed and reopened — restart the node) or is corrupt; pairs
+    /// with the per-failure `warn!`/`error!` lines ("floor abandonment-bucket persist
+    /// failed" / "pool floor-bucket forget failed"). Operator-visible name:
+    /// `decdn_floor_loss_persist_failures_total`.
     pub floor_loss_persist_failures: Counter,
     /// Slashes detected against this node's operator by the slash watcher
     /// (`SlashJudge.Slashed`), counting each distinct `slashId` once across the
@@ -1866,12 +1865,12 @@ recorders! {
     /// and the shutdown flush in `runtime/mod.rs`.
     lane_flush_failure => lane_flush_failures.inc();
 
-    /// A floor dead-charge write failed: a drop-time persist (`record_loss` on a
-    /// `FloorReservation` drop, leaving the durable total behind the in-memory
-    /// accumulator until a later drop re-persists it) or a reclaimed pool's
+    /// A floor abandonment-bucket write failed: a drop-time persist (`record_bucket`
+    /// on an abnormal `FloorReservation` drop, leaving the durable snapshot behind the
+    /// in-memory bucket until a later drop re-persists it) or a reclaimed pool's
     /// `forget_loss` (leaving the row deletable by nothing and untombstoned).
     /// Pairs with the `warn!`/`error!` lines in `handlers/client/mod.rs`
-    /// ("floor dead-charge persist failed" / "pool dead-charge forget failed").
+    /// ("floor abandonment-bucket persist failed" / "pool floor-bucket forget failed").
     floor_loss_persist_failure => floor_loss_persist_failures.inc();
 
     /// A distinct slash against this node's operator was detected by the slash
