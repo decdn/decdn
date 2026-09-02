@@ -10,6 +10,7 @@ use decdn_common::redact::sanitize_err_chain;
 
 use super::{Finding, Report, Severity};
 
+/// Compare the configured chain id against the one the RPC reports.
 pub fn classify_chain_id(configured: u64, onchain: u64) -> Finding {
     let ok = configured == onchain;
     Finding {
@@ -33,6 +34,8 @@ pub fn classify_chain_id(configured: u64, onchain: u64) -> Finding {
     }
 }
 
+/// Classify a contract-code read: nonzero code length means the contract is
+/// deployed at `address`.
 pub fn classify_code(name: &str, address: &str, code_len: usize) -> Finding {
     let ok = code_len > 0;
     Finding {

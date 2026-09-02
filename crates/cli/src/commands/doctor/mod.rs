@@ -19,11 +19,17 @@ mod state;
 /// `remediation`; `detail` holds a grep-friendly `key=value` tail.
 #[derive(Debug, Serialize)]
 pub struct Finding {
+    /// Check group this finding belongs to.
     pub group: &'static str,
+    /// Stable machine-readable id for this specific check.
     pub id: &'static str,
+    /// Outcome severity of this check.
     pub severity: Severity,
+    /// One-line human summary of the outcome.
     pub title: String,
+    /// Optional grep-friendly `key=value` detail tail.
     pub detail: Option<String>,
+    /// Optional one-line fix suggested when the check is not a clean pass.
     pub remediation: Option<String>,
 }
 
@@ -32,18 +38,23 @@ pub struct Finding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
+    /// The check found nothing wrong.
     Pass,
+    /// The check found a non-fatal issue worth the operator's attention.
     Warn,
+    /// The check found a problem that blocks correct operation.
     Fail,
 }
 
 /// The collected findings of one doctor run.
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
+    /// Findings pushed so far, in the order each check ran.
     pub findings: Vec<Finding>,
 }
 
 impl Report {
+    /// Append one finding to the report.
     pub fn push(&mut self, finding: Finding) {
         self.findings.push(finding);
     }
@@ -59,10 +70,12 @@ impl Report {
             })
     }
 
+    /// True when any finding is a `Fail`.
     pub fn has_fail(&self) -> bool {
         self.findings.iter().any(|x| x.severity == Severity::Fail)
     }
 
+    /// True when any finding is a `Warn`.
     pub fn has_warn(&self) -> bool {
         self.findings.iter().any(|x| x.severity == Severity::Warn)
     }
@@ -110,7 +123,7 @@ pub async fn run(
     }
 
     let mut stdout = std::io::stdout().lock();
-    report::render(&mut stdout, &report, args.json)
+    report::render(&mut stdout, &report, args.json, args.strict)
         .map_err(|e| anyhow::anyhow!("failed to write doctor report: {e}"))?;
 
     let fail = report.has_fail() || (args.strict && report.has_warn());

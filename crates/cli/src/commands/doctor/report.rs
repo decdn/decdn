@@ -5,10 +5,17 @@ use serde::Serialize;
 use super::{Report, Severity};
 
 /// Render `report` to `w`. `json = true` emits a single machine-readable
-/// object; otherwise a grouped human checklist.
-pub fn render<W: std::io::Write>(w: &mut W, report: &Report, json: bool) -> std::io::Result<()> {
+/// object; otherwise a grouped human checklist. `strict` is the same flag
+/// `run()` uses to decide the process exit code — the JSON `ok` field
+/// mirrors that effective success condition; the human path ignores it.
+pub fn render<W: std::io::Write>(
+    w: &mut W,
+    report: &Report,
+    json: bool,
+    strict: bool,
+) -> std::io::Result<()> {
     if json {
-        render_json(w, report)
+        render_json(w, report, strict)
     } else {
         render_human(w, report)
     }
@@ -46,6 +53,9 @@ fn render_human<W: std::io::Write>(w: &mut W, report: &Report) -> std::io::Resul
 struct JsonReport<'a> {
     findings: &'a [super::Finding],
     summary: JsonSummary,
+    /// Effective success condition: `fail == 0 && !(strict && warn > 0)`.
+    /// Tracks the same condition that decides the process exit code,
+    /// including `--strict`.
     ok: bool,
 }
 
@@ -56,14 +66,12 @@ struct JsonSummary {
     fail: usize,
 }
 
-fn render_json<W: std::io::Write>(w: &mut W, report: &Report) -> std::io::Result<()> {
+fn render_json<W: std::io::Write>(w: &mut W, report: &Report, strict: bool) -> std::io::Result<()> {
     let (pass, warn, fail) = report.counts();
     let doc = JsonReport {
         findings: &report.findings,
         summary: JsonSummary { pass, warn, fail },
-        // Fail-count only: under `--strict` a warn-only run exits nonzero
-        // while `ok` still reads true here.
-        ok: fail == 0,
+        ok: fail == 0 && !(strict && warn > 0),
     };
     let text = serde_json::to_string_pretty(&doc).map_err(std::io::Error::other)?;
     writeln!(w, "{text}")
@@ -98,7 +106,7 @@ mod tests {
     #[test]
     fn human_groups_and_summary() {
         let mut buf = Vec::new();
-        render(&mut buf, &sample(), false).unwrap();
+        render(&mut buf, &sample(), false, false).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("Disk & cache"));
         assert!(out.contains("cache budget exceeds free disk"));
@@ -110,11 +118,39 @@ mod tests {
     #[test]
     fn json_is_machine_readable() {
         let mut buf = Vec::new();
-        render(&mut buf, &sample(), true).unwrap();
+        render(&mut buf, &sample(), true, false).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["summary"]["fail"], 1);
         assert_eq!(v["ok"], false);
         assert_eq!(v["findings"][0]["id"], "disk.budget_vs_free");
         assert_eq!(v["findings"][0]["severity"], "fail");
+    }
+
+    fn warn_only_report() -> Report {
+        let mut r = Report::default();
+        r.push(Finding {
+            group: "Disk & cache",
+            id: "disk.thin",
+            severity: Severity::Warn,
+            title: "free disk is low".into(),
+            detail: None,
+            remediation: None,
+        });
+        r
+    }
+
+    #[test]
+    fn json_ok_reflects_strict_on_warn_only_report() {
+        let report = warn_only_report();
+
+        let mut buf = Vec::new();
+        render(&mut buf, &report, true, false).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["ok"], true, "warn-only report is ok without --strict");
+
+        let mut buf = Vec::new();
+        render(&mut buf, &report, true, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["ok"], false, "warn-only report is not ok under --strict");
     }
 }

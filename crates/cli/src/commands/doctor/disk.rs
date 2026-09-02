@@ -14,7 +14,9 @@ const BYTES_PER_MB: u64 = 1024 * 1024;
 
 /// Total and unprivileged-available bytes at a path.
 pub struct DiskSpace {
+    /// Total filesystem capacity, in bytes.
     pub total: u64,
+    /// Bytes available to an unprivileged user, in bytes.
     pub avail: u64,
 }
 

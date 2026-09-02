@@ -9,11 +9,18 @@ use super::{Finding, Report, Severity};
 
 /// Metadata facts about a file, gathered by I/O and evaluated purely.
 pub struct FileFacts {
+    /// True when a filesystem entry exists at the path.
     pub exists: bool,
+    /// True when the entry exists and is a regular file.
     pub is_file: bool,
+    /// Entry length in bytes, or 0 when it does not exist.
     pub len: u64,
     /// Unix permission bits (`st_mode & 0o777`), or `None` on non-Unix.
     pub mode: Option<u32>,
+    /// `Some(kind)` when `symlink_metadata` failed for a reason other than
+    /// the entry being absent (e.g. a permission error); `None` when the
+    /// entry does not exist or was read cleanly.
+    pub stat_error: Option<std::io::ErrorKind>,
 }
 
 impl FileFacts {
@@ -32,21 +39,33 @@ impl FileFacts {
                     is_file: m.is_file(),
                     len: m.len(),
                     mode,
+                    stat_error: None,
                 }
             }
-            Err(_) => FileFacts {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileFacts {
                 exists: false,
                 is_file: false,
                 len: 0,
                 mode: None,
+                stat_error: None,
+            },
+            Err(e) => FileFacts {
+                exists: false,
+                is_file: false,
+                len: 0,
+                mode: None,
+                stat_error: Some(e.kind()),
             },
         }
     }
 }
 
 /// Evaluate `node.secret`: absent is fine (first boot generates it); present
-/// must be a 32-byte regular file with `0o600` (no group/other bits).
-pub fn evaluate_secret(facts: &FileFacts) -> Finding {
+/// must be a 32-byte regular file with `0o600` (no group/other bits). A
+/// non-`NotFound` stat error (e.g. permission denied) is reported as a
+/// `Warn` rather than treated as absent, since that would otherwise mask
+/// a real access problem behind a clean `Pass`.
+pub fn evaluate_secret(facts: &FileFacts, path: &Path) -> Finding {
     let base = |severity, title: String, remediation| Finding {
         group: "State",
         id: "state.node_secret",
@@ -55,6 +74,16 @@ pub fn evaluate_secret(facts: &FileFacts) -> Finding {
         detail: None,
         remediation,
     };
+    if let Some(kind) = facts.stat_error {
+        return Finding {
+            group: "State",
+            id: "state.node_secret",
+            severity: Severity::Warn,
+            title: format!("cannot stat {}: {kind}", path.display()),
+            detail: None,
+            remediation: Some("check permissions/ownership".into()),
+        };
+    }
     if !facts.exists {
         return base(
             Severity::Pass,
@@ -95,10 +124,24 @@ pub fn evaluate_secret(facts: &FileFacts) -> Finding {
 }
 
 /// Evaluate the eth keystore: only meaningful when blockchain is configured.
-/// The resolver already stat-checks `eth_keystore`; this surfaces
-/// readability in the report too. Absent is a `Warn` (not a `Fail`) because
-/// not every deployment signs on-chain from this node.
+/// Config resolution (`resolve_config`) already validated `eth_keystore`
+/// readability before doctor ran, so a healthy config implies this file
+/// exists and is readable at that point; this check re-stats it and
+/// surfaces that already-validated state in the report — it does not
+/// re-derive the invariant. Absent is a `Warn` (not a `Fail`) because not
+/// every deployment signs on-chain from this node, and the file could have
+/// been removed between config resolution and this check.
 pub fn evaluate_keystore(facts: &FileFacts, path: &Path) -> Finding {
+    if let Some(kind) = facts.stat_error {
+        return Finding {
+            group: "State",
+            id: "state.keystore",
+            severity: Severity::Warn,
+            title: format!("cannot stat {}: {kind}", path.display()),
+            detail: Some(format!("path={}", path.display())),
+            remediation: Some("check permissions/ownership".into()),
+        };
+    }
     Finding {
         group: "State",
         id: "state.keystore",
@@ -132,6 +175,16 @@ pub fn evaluate_keystore(facts: &FileFacts, path: &Path) -> Finding {
 /// Deeper open integrity is deferred to the daemon-side doctor (the store is
 /// locked while the daemon runs).
 pub fn evaluate_redb(name: &str, facts: &FileFacts, path: &Path) -> Finding {
+    if let Some(kind) = facts.stat_error {
+        return Finding {
+            group: "State",
+            id: "state.redb",
+            severity: Severity::Warn,
+            title: format!("cannot stat {}: {kind}", path.display()),
+            detail: Some(format!("path={}", path.display())),
+            remediation: Some("check permissions/ownership".into()),
+        };
+    }
     if !facts.exists {
         // Absent is normal before first run.
         return Finding {
@@ -175,6 +228,16 @@ pub fn evaluate_redb(name: &str, facts: &FileFacts, path: &Path) -> Finding {
 
 /// Evaluate the receipt log: presence is optional before the first receipt.
 pub fn evaluate_receipts(facts: &FileFacts, path: &Path) -> Finding {
+    if let Some(kind) = facts.stat_error {
+        return Finding {
+            group: "State",
+            id: "state.receipts",
+            severity: Severity::Warn,
+            title: format!("cannot stat {}: {kind}", path.display()),
+            detail: Some(format!("path={}", path.display())),
+            remediation: Some("check permissions/ownership".into()),
+        };
+    }
     if !facts.exists {
         return Finding {
             group: "State",
@@ -218,9 +281,11 @@ pub fn check_state(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bo
 
     let data_dir = &cfg.identity.data_dir;
 
-    report.push(evaluate_secret(&FileFacts::read(
-        &data_dir.join("node.secret"),
-    )));
+    let secret_path = data_dir.join("node.secret");
+    report.push(evaluate_secret(
+        &FileFacts::read(&secret_path),
+        &secret_path,
+    ));
 
     let keystore = &cfg.blockchain.eth_keystore;
     report.push(evaluate_keystore(&FileFacts::read(keystore), keystore));
@@ -257,47 +322,80 @@ mod tests {
 
     #[test]
     fn absent_secret_passes_with_first_boot_note() {
-        let f = evaluate_secret(&FileFacts {
-            exists: false,
-            is_file: false,
-            len: 0,
-            mode: None,
-        });
+        let f = evaluate_secret(
+            &FileFacts {
+                exists: false,
+                is_file: false,
+                len: 0,
+                mode: None,
+                stat_error: None,
+            },
+            Path::new("/data/node.secret"),
+        );
         assert_eq!(f.severity, Severity::Pass);
         assert!(f.title.to_lowercase().contains("generated") || f.detail.is_some());
     }
 
     #[test]
     fn wrong_size_secret_fails() {
-        let f = evaluate_secret(&FileFacts {
-            exists: true,
-            is_file: true,
-            len: 10,
-            mode: Some(0o600),
-        });
+        let f = evaluate_secret(
+            &FileFacts {
+                exists: true,
+                is_file: true,
+                len: 10,
+                mode: Some(0o600),
+                stat_error: None,
+            },
+            Path::new("/data/node.secret"),
+        );
         assert_eq!(f.severity, Severity::Fail);
     }
 
     #[test]
     fn loose_perms_secret_fails() {
-        let f = evaluate_secret(&FileFacts {
-            exists: true,
-            is_file: true,
-            len: 32,
-            mode: Some(0o644),
-        });
+        let f = evaluate_secret(
+            &FileFacts {
+                exists: true,
+                is_file: true,
+                len: 32,
+                mode: Some(0o644),
+                stat_error: None,
+            },
+            Path::new("/data/node.secret"),
+        );
         assert_eq!(f.severity, Severity::Fail);
     }
 
     #[test]
     fn good_secret_passes() {
-        let f = evaluate_secret(&FileFacts {
-            exists: true,
-            is_file: true,
-            len: 32,
-            mode: Some(0o600),
-        });
+        let f = evaluate_secret(
+            &FileFacts {
+                exists: true,
+                is_file: true,
+                len: 32,
+                mode: Some(0o600),
+                stat_error: None,
+            },
+            Path::new("/data/node.secret"),
+        );
         assert_eq!(f.severity, Severity::Pass);
+    }
+
+    #[test]
+    fn stat_error_on_secret_warns_instead_of_pass() {
+        let f = evaluate_secret(
+            &FileFacts {
+                exists: false,
+                is_file: false,
+                len: 0,
+                mode: None,
+                stat_error: Some(std::io::ErrorKind::PermissionDenied),
+            },
+            Path::new("/data/node.secret"),
+        );
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.title.to_lowercase().contains("cannot stat"));
+        assert!(f.remediation.is_some());
     }
 
     // --- evaluate_receipts ---------------------------------------------
@@ -309,6 +407,7 @@ mod tests {
             is_file: false,
             len: 0,
             mode: None,
+            stat_error: None,
         };
         let f = evaluate_receipts(&facts, Path::new("/data/receipts.jsonl"));
         assert_eq!(f.id, "state.receipts");
@@ -349,6 +448,7 @@ mod tests {
             is_file: false,
             len: 0,
             mode: None,
+            stat_error: None,
         };
         let f = evaluate_redb("lanes.redb", &facts, Path::new("/data/lanes.redb"));
         assert_eq!(f.id, "state.redb");
@@ -430,10 +530,56 @@ mod tests {
             is_file: false,
             len: 0,
             mode: None,
+            stat_error: None,
         };
         let f = evaluate_keystore(&facts, Path::new("/data/keystore.json"));
         assert_eq!(f.id, "state.keystore");
         assert_eq!(f.severity, Severity::Warn);
         assert!(f.title.to_lowercase().contains("missing"));
+    }
+
+    #[test]
+    fn stat_error_on_keystore_warns_with_cannot_stat() {
+        let facts = FileFacts {
+            exists: false,
+            is_file: false,
+            len: 0,
+            mode: None,
+            stat_error: Some(std::io::ErrorKind::PermissionDenied),
+        };
+        let f = evaluate_keystore(&facts, Path::new("/data/keystore.json"));
+        assert_eq!(f.id, "state.keystore");
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.title.to_lowercase().contains("cannot stat"));
+    }
+
+    #[test]
+    fn stat_error_on_redb_warns_with_cannot_stat() {
+        let facts = FileFacts {
+            exists: false,
+            is_file: false,
+            len: 0,
+            mode: None,
+            stat_error: Some(std::io::ErrorKind::PermissionDenied),
+        };
+        let f = evaluate_redb("lanes.redb", &facts, Path::new("/data/lanes.redb"));
+        assert_eq!(f.id, "state.redb");
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.title.to_lowercase().contains("cannot stat"));
+    }
+
+    #[test]
+    fn stat_error_on_receipts_warns_with_cannot_stat() {
+        let facts = FileFacts {
+            exists: false,
+            is_file: false,
+            len: 0,
+            mode: None,
+            stat_error: Some(std::io::ErrorKind::PermissionDenied),
+        };
+        let f = evaluate_receipts(&facts, Path::new("/data/receipts.jsonl"));
+        assert_eq!(f.id, "state.receipts");
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.title.to_lowercase().contains("cannot stat"));
     }
 }

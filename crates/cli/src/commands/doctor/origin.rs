@@ -11,6 +11,7 @@ use decdn_common::redact::{redact_userinfo, sanitize_rpc_display};
 
 use super::{Finding, Report, Severity};
 
+/// Evaluate one filesystem origin: it must exist and be a directory.
 pub fn evaluate_fs_origin(index: usize, path: &Path, exists: bool, is_dir: bool) -> Finding {
     let ok = exists && is_dir;
     Finding {

@@ -12,11 +12,17 @@ use super::{Finding, Report, Severity};
 
 /// What the live probe learned, threaded back into other groups.
 pub struct LiveInfo {
+    /// True when a running daemon answered the admin RPC health check.
     pub daemon_running: bool,
+    /// The daemon's reported `decdn_cache_bytes` gauge, when scraped.
     pub cache_bytes: Option<u64>,
 }
 
-/// Extract the `decdn_cache_bytes` gauge value from Prometheus text.
+/// Extract the `decdn_cache_bytes` gauge value from Prometheus text. Matches
+/// only the exact series name (so `decdn_cache_bytes_total` and
+/// `decdn_cache_bytes_returned_total` are skipped), tolerates a `{...}`
+/// label block, and takes the first whitespace-separated token after the
+/// name/labels as the value (so a trailing sample timestamp is ignored).
 pub fn parse_cache_bytes(metrics_body: &str) -> Option<u64> {
     metrics_body.lines().find_map(|line| {
         let line = line.trim_start();
@@ -24,10 +30,21 @@ pub fn parse_cache_bytes(metrics_body: &str) -> Option<u64> {
             return None;
         }
         let rest = line.strip_prefix("decdn_cache_bytes")?;
-        let value = rest.trim();
+        // The character right after the name must end the series name:
+        // whitespace (bare gauge) or `{` (labels). Otherwise this is a
+        // different series sharing the prefix (e.g. `_total`).
+        let after_name = match rest.chars().next() {
+            Some(c) if c.is_ascii_whitespace() => rest,
+            Some('{') => {
+                let close = rest.find('}')?;
+                rest.get(close + 1..)?
+            }
+            _ => return None,
+        };
+        let value = after_name.split_whitespace().next()?;
         // A Prometheus gauge value fits comfortably in u64; clamp negatives
-        // (never expected for a byte count) to 0 rather than propagating NaN
-        // via `as` truncation semantics.
+        // (never expected for a byte count) and NaN to 0 rather than
+        // propagating them via `as` truncation semantics.
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -36,7 +53,7 @@ pub fn parse_cache_bytes(metrics_body: &str) -> Option<u64> {
         value
             .parse::<f64>()
             .ok()
-            .map(|v| if v < 0.0 { 0 } else { v as u64 })
+            .map(|v| if v.is_nan() || v < 0.0 { 0 } else { v as u64 })
     })
 }
 
@@ -178,5 +195,29 @@ mod tests {
     #[test]
     fn handles_float_value() {
         assert_eq!(parse_cache_bytes("decdn_cache_bytes 2.0\n"), Some(2));
+    }
+
+    #[test]
+    fn handles_labelled_line() {
+        assert_eq!(
+            parse_cache_bytes("decdn_cache_bytes{node=\"a\"} 123\n"),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn handles_trailing_timestamp() {
+        assert_eq!(
+            parse_cache_bytes("decdn_cache_bytes 123 1712345\n"),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn ignores_prefix_collision_series() {
+        assert_eq!(
+            parse_cache_bytes("decdn_cache_bytes_total 999\ndecdn_cache_bytes_returned_total 5\n"),
+            None
+        );
     }
 }
