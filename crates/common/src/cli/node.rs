@@ -188,6 +188,22 @@ pub enum NodeCommand {
     /// iroh path, both signatures — without submitting or touching any key
     /// file.
     RotateKey(RotateKeyArgs),
+    /// (Re)publish this node's dialable QUIC addresses on-chain via
+    /// `CapacityBond.updateMultiaddrs` (#1908). The one-command fix for a node
+    /// that registered an empty multiaddr set (`decdn node register` with no
+    /// `--multiaddr`) and is therefore stranded on the iroh relay path: it
+    /// promotes direct addresses without a destructive deregister/re-register
+    /// cycle (which `register` alone cannot do — a second `register` reverts
+    /// `NodeAlreadyRegistered`).
+    ///
+    /// Like the other on-chain `node` subcommands this talks to the chain, not
+    /// a running node's admin RPC, and signs with the operator Ethereum key.
+    /// The node must be active; the contract's guardrails — the
+    /// `maxMultiaddrSize` byte ceiling and the `multiaddrUpdateCooldown`
+    /// between updates — are pre-checked and reported before the send. Pass
+    /// `--dry-run` to print the plan (packed size, ceiling, cooldown state)
+    /// without submitting.
+    UpdateMultiaddrs(UpdateMultiaddrsArgs),
     /// Unpaid client-side discovery of active nodes via
     /// `CapacityBond.getRegisteredNodes` (#1481). Maps node-ids/regions to
     /// operator Ethereum addresses — the input `decdn pool open
@@ -772,6 +788,26 @@ pub struct DeregisterArgs {
     /// the prompt, not the warning.
     #[arg(long = "yes", short = 'y')]
     pub yes: bool,
+
+    /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
+    #[command(flatten)]
+    pub chain: ChainArgs,
+}
+
+/// `decdn node update-multiaddrs` — (re)publish the operator's dialable QUIC
+/// addresses via `CapacityBond.updateMultiaddrs` (#1908). See
+/// [`NodeCommand::UpdateMultiaddrs`] for the full description. Performs an
+/// on-chain transaction rather than talking to a running node's admin RPC.
+#[derive(Args, Debug)]
+pub struct UpdateMultiaddrsArgs {
+    /// QUIC multiaddr to publish, e.g. `/ip4/203.0.113.10/udp/4433/quic-v1`.
+    /// Repeatable; at least one is required — the whole point of this command
+    /// is to advertise a non-empty set, so clearing addresses back to empty is
+    /// deliberately not offered here (it would re-create the relay-pinned
+    /// footgun). The set fully replaces whatever is on-chain (the contract
+    /// stores the field verbatim, it does not merge).
+    #[arg(long = "multiaddr", value_name = "MA", required = true)]
+    pub multiaddrs: Vec<String>,
 
     /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
     #[command(flatten)]

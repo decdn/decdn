@@ -73,6 +73,9 @@ pub async fn node_dispatch(
         cli::NodeCommand::Unbond(u) => crate::commands::unbond::run(u, global_config).await,
         cli::NodeCommand::Deregister(d) => crate::commands::deregister::run(d, global_config).await,
         cli::NodeCommand::RotateKey(r) => crate::commands::rotate_key::run(r, global_config).await,
+        cli::NodeCommand::UpdateMultiaddrs(u) => {
+            crate::commands::update_multiaddrs::run(u, global_config).await
+        }
         cli::NodeCommand::Lookup(l) => lookup(l, global_config).await,
     }
 }
