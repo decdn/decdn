@@ -10562,3 +10562,234 @@ async fn voucher_read_timeout_ends_a_parked_delivery() -> anyhow::Result<()> {
     shutdown([fx.server_task], [&client_ep, &fx.server_ep]).await?;
     Ok(())
 }
+
+/// The terminal signal [`serve_stop_send_then_signal`] sends once it has stopped
+/// the buyer's send half — a clean end or a mid-stream rejection.
+#[derive(Clone, Copy)]
+enum StopThenSignal {
+    /// A clean `StreamEnd` over the whole delivered blob — the completion race a
+    /// node hits when it finishes and drops `recv`.
+    End,
+    /// A `StreamError::VoucherRejected` in place of a clean end — the typed
+    /// rejection the node answers a spent pool with, whose reset otherwise masks
+    /// the reason as an opaque write failure.
+    Reject(VoucherRejectReason),
+}
+
+/// A raw `cdn/client/v1` upstream that signs a valid `StreamResponse`, then STOPS
+/// the buyer's send half *before* any covering voucher can be written, streams the
+/// whole blob, and finally sends a terminal signal.
+///
+/// The stop is issued causally before the chunk data the buyer must read to reach
+/// its closing-voucher write: on localhost, in-order delivery means the buyer's
+/// connection processes the `STOP_SENDING` before it has the bytes it needs, so the
+/// buyer's write deterministically fails with the peer-stop. This is the exact
+/// end-of-stream race a node produces when it writes `StreamEnd` and then drops its
+/// `recv` (an implicit `STOP_SENDING(0)`) while the buyer is still flushing its
+/// closing voucher.
+async fn serve_stop_send_then_signal(
+    conn: Connection,
+    eth: &Arc<PrivateKeySigner>,
+    slash: &Eip712Domain,
+    served_wire: &[u8],
+    total_bytes: u64,
+    signal: StopThenSignal,
+) -> anyhow::Result<()> {
+    let (mut send, mut recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
+    let req = match read_client_msg(&mut recv).await? {
+        ClientMessage::StreamRequest(req) => req,
+        other => anyhow::bail!("stop-send upstream: expected a StreamRequest, got {other:?}"),
+    };
+
+    let body = StreamResponseBody {
+        hash: req.hash,
+        ok: true,
+        rate_per_mb: RATE_PER_MB,
+        total_bytes,
+        pool_id: req.pool_id,
+        timestamp_us: req.timestamp_us,
+    };
+    let slash_sig = StreamSlashData::from_response_body(&body)
+        .sign(eth.as_ref(), slash)
+        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+        .as_bytes()
+        .to_vec();
+    let resp = StreamResponse { body, slash_sig };
+    write_frame(
+        &mut send,
+        &encode_stream_response(&resp, Some(&StreamResponseExt { error: None }))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+
+    // Stop the buyer's send half NOW — before the chunk data below, so the
+    // `STOP_SENDING(0)` is processed by the buyer before it can read the bytes it
+    // needs to reach its closing-voucher write. `0` is the no-error code a node's
+    // own teardown uses.
+    recv.stop(VarInt::from_u32(0))
+        .map_err(|e| anyhow::anyhow!("stop recv: {e}"))?;
+
+    for chunk in served_wire.chunks(LYING_FRAME) {
+        write_client_msg(
+            &mut send,
+            &ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?),
+        )
+        .await?;
+    }
+
+    match signal {
+        StopThenSignal::End => {
+            write_client_msg(&mut send, &ClientMessage::StreamEnd).await?;
+        }
+        StopThenSignal::Reject(reason) => {
+            write_client_msg(
+                &mut send,
+                &ClientMessage::StreamError(StreamError::VoucherRejected {
+                    reason,
+                    bundle: None,
+                }),
+            )
+            .await?;
+        }
+    }
+    let _ = send.finish();
+    conn.closed().await;
+    Ok(())
+}
+
+/// Spawn a one-connection [`serve_stop_send_then_signal`] server.
+fn spawn_stop_send_server(
+    ep: Endpoint,
+    eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    served_wire: Vec<u8>,
+    total_bytes: u64,
+    signal: StopThenSignal,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Ok(conn) = support::accept_one(&ep).await {
+            let _ =
+                serve_stop_send_then_signal(conn, &eth, &slash, &served_wire, total_bytes, signal)
+                    .await;
+        }
+    })
+}
+
+/// A buyer whose send half is stopped before its closing voucher still COMPLETES
+/// when the whole blob and a clean `StreamEnd` are on the wire: a voucher-write
+/// peer-stop is not fatal when the node has already delivered everything and signed
+/// off. This is the end-of-stream race — the node finishes, drops `recv`, and the
+/// buyer's trailing voucher write loses to the implicit `STOP_SENDING(0)`.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_completes_when_its_send_is_stopped_before_the_closing_voucher() -> anyhow::Result<()>
+{
+    // Under one chunk, so the buyer owes exactly one closing voucher — the single
+    // write the node's teardown races.
+    let payload = vec![0x5Au8; 256 * 1024];
+    let hash = Hash::new(&payload);
+    let wire = honest_bao_wire(&payload)?;
+    let total_bytes = payload.len() as u64;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_stop_send_server(
+        server_ep.clone(),
+        Arc::clone(&server_eth),
+        slash_domain(),
+        wire,
+        total_bytes,
+        StopThenSignal::End,
+    );
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(
+        &client_ep,
+        Arc::new(PrivateKeySigner::random()),
+        U256::from(10_000_000u64),
+    );
+    let blob = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        blob.as_ref() == payload.as_slice(),
+        "a fully delivered blob must survive a closing-voucher peer-stop"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// A buyer whose closing-voucher write is stopped surfaces the node's typed
+/// `StreamError` — not an opaque write failure. When a node rejects a payer (a
+/// spent pool) it writes `VoucherRejected` and resets; the reset otherwise masks
+/// the typed reason as "write failed", and the exhaustion / reactive-top-up path
+/// keys on [`UpstreamVoucherRejected`]. Under one chunk, so the only voucher is the
+/// closing one — the same end-of-stream write the sibling test covers, with a
+/// rejection terminal in place of a clean `StreamEnd`. (The recovery reads exactly
+/// one terminal message, so the failing write must be the one the terminal follows;
+/// a true mid-delivery reveal failure exercises the identical recovery path.)
+#[tokio::test(flavor = "multi_thread")]
+async fn client_surfaces_typed_rejection_when_its_send_is_stopped_before_the_closing_voucher()
+-> anyhow::Result<()> {
+    let payload = vec![0x5Bu8; 256 * 1024];
+    let hash = Hash::new(&payload);
+    let wire = honest_bao_wire(&payload)?;
+    let total_bytes = payload.len() as u64;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_stop_send_server(
+        server_ep.clone(),
+        Arc::clone(&server_eth),
+        slash_domain(),
+        wire,
+        total_bytes,
+        StopThenSignal::Reject(VoucherRejectReason::SpendingCapExhausted),
+    );
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(
+        &client_ep,
+        Arc::new(PrivateKeySigner::random()),
+        U256::from(10_000_000u64),
+    );
+    let err = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("a rejected fetch must fail"))?;
+    anyhow::ensure!(
+        err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
+        "the fetch must surface the typed UpstreamVoucherRejected, got: {err:#}"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}

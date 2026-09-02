@@ -2075,6 +2075,14 @@ async fn fetch_inner_once(
     )
     .await?;
 
+    // No more vouchers will be sent — the loop paid its last one above. Finish
+    // the send half now so the node sees our FIN promptly and can drain it to a
+    // clean close instead of stopping it (the `STOP_SENDING(0)` that the receive
+    // loop's `terminal_after_write_failure` recovery otherwise has to absorb). A
+    // stop that already landed makes this a no-op; either way the bytes are in and
+    // the decode below is what decides success.
+    let _ = send.finish();
+
     // A truncated stream (fewer wire bytes than the aligned range needs) cannot
     // decode; reject cleanly before the decoder hits an EOF mid-proof. There is no
     // whole-blob-hash fallback anymore, so this bound applies to every fetch
@@ -2145,6 +2153,58 @@ fn aligned_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow
 /// 100 ms so a tiny window cannot spin the sampler.
 fn stall_sample_period(window: Duration) -> Duration {
     (window / 8).max(Duration::from_millis(100))
+}
+
+/// How long the receive loop waits for a terminal message after a voucher write
+/// fails (below). The node writes `StreamEnd` (or a `StreamError`) *before* the
+/// teardown that stops our send, so the terminal signal is already in flight and
+/// arrives at once; the bound only stops a peer that stops our send and then goes
+/// silent from pinning this recovery read. It is an error-path bound, not a
+/// steady-state one.
+const TERMINAL_AFTER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The outcome of looking for a terminal message after a voucher write failed.
+enum TerminalAfterWrite {
+    /// A `StreamEnd` was waiting: the node delivered everything and considered the
+    /// stream fully paid, so the failed write was superfluous. The delivery
+    /// completes (the caller's byte-completeness check still guards a short one).
+    Complete,
+    /// No terminal message rescued the write — either a typed `StreamError` the
+    /// node sent (surfaced through [`voucher_rejection`]) or the original write
+    /// failure, when nothing terminal was waiting.
+    Fail(anyhow::Error),
+}
+
+/// Decide what a voucher write failure really means.
+///
+/// A node stops our send half only once it needs nothing more from us: a
+/// completed delivery leaves a `StreamEnd` on the wire, a mid-stream rejection a
+/// `StreamError`. The write half and the read half run in lock-step in the
+/// receive loop, so a raw voucher-write failure — the end-of-stream
+/// `STOP_SENDING(0)` a node emits when it finishes and drops `recv` — would
+/// otherwise mask that terminal signal and abort a complete, paid fetch (or
+/// swallow a typed rejection the reactive top-up path keys on). Read the terminal
+/// signal, briefly, and prefer it. A write we caused ourselves (a
+/// [`LocalPullFault`] encode fault) is never masked; nor is a stream that yields
+/// no terminal signal before the bound.
+async fn terminal_after_write_failure<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    ledger: &PoolLedger,
+    meter: &StreamMeter,
+    write_err: anyhow::Error,
+) -> TerminalAfterWrite {
+    if write_err.is::<LocalPullFault>() {
+        return TerminalAfterWrite::Fail(write_err);
+    }
+    match tokio::time::timeout(TERMINAL_AFTER_WRITE_TIMEOUT, read_client_message(reader)).await {
+        Ok(Ok(ClientMessage::StreamEnd)) => TerminalAfterWrite::Complete,
+        Ok(Ok(ClientMessage::StreamError(e))) => {
+            TerminalAfterWrite::Fail(voucher_rejection(ledger, meter, e))
+        }
+        // Any other message, a read error, or the timeout: nothing terminal is
+        // waiting, so the write failure stands as the honest outcome.
+        _ => TerminalAfterWrite::Fail(write_err),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2274,7 +2334,7 @@ async fn receive_and_pay(
                 // node legitimately pauses delivery (ADR 005 §Payment pacing), so that pause
                 // is self-inflicted, not a sender stall — exclude it from the window (#1797).
                 floor.pause(tokio::time::Instant::now());
-                unproved = meter
+                let paid = meter
                     .pay(
                         send,
                         ctx,
@@ -2283,8 +2343,30 @@ async fn receive_and_pay(
                         unproved,
                         cumulative >= expected_wire_bytes,
                     )
-                    .await?;
+                    .await;
                 floor.resume(tokio::time::Instant::now());
+                match paid {
+                    Ok(remaining) => unproved = remaining,
+                    // A voucher write that failed at end-of-stream may only mean the
+                    // node stopped our send after it finished (or is rejecting us):
+                    // prefer the terminal signal it left to the opaque write failure.
+                    // Boxed so this cold error-path future does not enlarge the steady
+                    // receive loop's future (`clippy::large_futures`); the allocation
+                    // only happens on the failure path.
+                    Err(write_err) => {
+                        let recovered = Box::pin(terminal_after_write_failure(
+                            &mut reader,
+                            ledger,
+                            &meter,
+                            write_err,
+                        ))
+                        .await;
+                        match recovered {
+                            TerminalAfterWrite::Complete => break,
+                            TerminalAfterWrite::Fail(err) => return Err(err),
+                        }
+                    }
+                }
             }
             // Acceptance is implicit — continued delivery IS acceptance (ADR 005),
             // so there is no positive ack to consume. Only a rejection is signalled,

@@ -538,6 +538,11 @@ impl ClientHandler {
         }
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
+        // Drain the client's send half to its FIN before `recv` drops, so its
+        // closing voucher — still in flight against our finish — is not stopped
+        // mid-write by the implicit `STOP_SENDING(0)` a dropped `RecvStream`
+        // issues (see `drain_recv_to_fin`).
+        super::drain_recv_to_fin(recv).await;
         // ADR 040: emit the ONE hit sighting for this served request, only after the
         // terminal StreamEnd frame is written — so a serve that fails to finish cleanly
         // is never counted. Fires exactly once per served blob (a multi-range or
