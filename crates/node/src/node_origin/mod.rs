@@ -1055,10 +1055,10 @@ async fn probe_candidate(
 /// three count as `probe_cache_miss` — a hit that saves no network work is not a
 /// hit in any sense a dashboard cares about.
 ///
-/// The cache stores only the ADR triple. `reputation` and `region` are rebuilt
-/// here, FRESH, and the result re-ranked. That is what ADR 001's "goes straight to
-/// selection" means: skip discovery and probing — not skip the selection
-/// algorithm. Caching a `Candidate` whole would have been less code and would have
+/// The cache stores the ADR triple plus the probe's unsigned `Coverage`. `reputation`
+/// and `region` are rebuilt here, FRESH, and the result re-ranked. That is what ADR
+/// 001's "goes straight to selection" means: skip discovery and probing — not skip
+/// the selection algorithm. Caching a `Candidate` whole would have been less code and would have
 /// frozen `reputation` for the TTL, letting a node that failed three pulls in
 /// the meantime keep the rank it earned before them; the fields we decline to
 /// cache are the ones that MOVE.

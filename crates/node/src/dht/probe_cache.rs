@@ -103,12 +103,12 @@ pub struct ProbedProvider {
 
 // The guard against retaining slashable evidence is the exhaustive struct
 // literal at the single write site (no `..`, so any new field must be populated
-// there — sending the author back to the module doc). `ProbedProvider` no
-// longer derives `Copy` — `Coverage` wraps a `Vec<u8>`, which cannot — so a
+// there — sending the author back to the module doc). `ProbedProvider` does not
+// derive `Copy`: `Coverage` wraps a `Vec<u8>`, which cannot be `Copy`. A
 // footprint-ceiling `size_of` assert would only ever bound the fixed head, not
-// the heap the coverage bitmap owns, and is dropped rather than kept as a
-// misleading half-measure. A `Signature`/`ProbeResponse` field would still be
-// caught at the write site, which is where the invariant actually lives.
+// the heap the coverage bitmap owns, so this struct carries none. A
+// `Signature`/`ProbeResponse` field is still caught at the write site, which is
+// where the invariant actually lives.
 
 #[derive(Debug)]
 struct Entry {

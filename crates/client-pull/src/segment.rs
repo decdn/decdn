@@ -98,8 +98,7 @@ fn canonicalize_ranges(
 /// of them, e.g. a blob no bigger than one discovery block, so several full
 /// holders tie on it), splitting the run further here — with NO
 /// [`MIN_SPLIT_SIZE`] floor, unlike [`steal_split`] — is what keeps every one
-/// of them fetching from the start, exactly as the old byte-count-only
-/// initial split always did before coverage existed. The caller is
+/// of them fetching from the start instead of sitting idle. The caller is
 /// responsible for choosing `k` no larger than the number of sources that
 /// actually cover the whole `[start, start + len)` span; splitting past that
 /// would hand a piece to a source the scheduler's own coverage filter

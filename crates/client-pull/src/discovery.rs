@@ -758,7 +758,7 @@ pub struct Probed {
     /// Which discovery blocks this holder answered `has_blob:true` for
     /// (`decdn_protocol::coverage`), taken from the probe's `ProbeResponseExt`
     /// (PR1). Unsigned, like `total_bytes` — a hint for the scheduler's segment
-    /// assignment (a later task), never a commitment. `has_blob:true` now means
+    /// assignment, never a commitment. `has_blob:true` means
     /// "will serve at least one block", so this may be a proper subset of the
     /// blob rather than the whole thing — a **partial holder** is admitted here
     /// exactly like a full one; nothing in this module treats the two

@@ -5,13 +5,15 @@
 //!
 //! One worker future per source drives [`fill_gap`]
 //! over the request's gap-set. The gap-set is spread across sources by
-//! discovery-block coverage ([`crate::coverage_plan::spread_segments`],
-//! #1506): each block goes to exactly one covering source, rarest-cover-first,
-//! so every source that covers anything starts with work it can actually
-//! serve. A freed source does not idle: it *steals* the aligned second half of
-//! the largest remaining range it also covers ([`steal_split`]), so a fast
-//! source keeps helping a slow one — but never a range outside its own
-//! coverage.
+//! discovery-block coverage ([`crate::coverage_plan::spread_segments`]): each
+//! block is assigned to one covering source, rarest-cover-first, into
+//! contiguous per-source runs, so every source that covers anything starts
+//! with work it can actually serve. A run every covering source holds WHOLE is
+//! then split evenly across those sources (`split_evenly`) so an
+//! otherwise-idle source still gets a share. A freed source does not idle
+//! either way: it *steals* the aligned second half of the largest remaining
+//! range it also covers ([`steal_split`]), so a fast source keeps helping a
+//! slow one — but never a range outside its own coverage.
 //!
 //! # Lane correctness — one unit per source
 //!
@@ -891,7 +893,7 @@ where
     // chunk-group aligned (never sub-group), which is the only floor the eager split
     // needs — it deliberately splits below `steal_split`'s `MIN_SPLIT_SIZE` so a
     // small blob no bigger than one block still engages every full holder from the
-    // start, exactly as the pre-#1506 byte-count fan-out did.
+    // start.
     let mut seeds: Vec<RunSeed> = runs
         .iter()
         .map(|run| {
@@ -1119,9 +1121,9 @@ mod tests {
     /// closure that turns a borrow of the source into a [`SourceLane`] — the
     /// source must outlive the lane, so the caller owns it.
     ///
-    /// Coverage defaults to the WHOLE blob: every pre-#1506 test assumed a
-    /// full holder, and this preserves that without touching each call site.
-    /// Tests exercising partial coverage use [`lane_with_coverage`] instead.
+    /// Coverage defaults to the WHOLE blob, so a test built with this helper gets a
+    /// full holder without spelling out coverage at each call site. Tests exercising
+    /// partial coverage use [`lane_with_coverage`] instead.
     fn lane(
         source: &ScriptedSource,
         ledger: Arc<PoolLedger>,

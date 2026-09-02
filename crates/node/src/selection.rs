@@ -726,8 +726,8 @@ mod tests {
 
     /// #1506: `rank_candidates` must carry each candidate's fresh
     /// probe-confirmed coverage through unchanged — ranking reorders on
-    /// score alone, but the caller downstream (the ranged-drive loop, a
-    /// later task) needs to read which blocks each ranked candidate holds.
+    /// score alone, but the caller downstream (the ranged-drive loop)
+    /// needs to read which blocks each ranked candidate holds.
     /// Two providers with disjoint single-block coverage ({block0} vs
     /// {block1}) pin that the field rides alongside the candidate rather
     /// than being dropped or averaged during ranking.

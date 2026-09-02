@@ -3248,14 +3248,13 @@ mod tests {
     /// The `LocalPullFault` marker must ride out on the errors the range helpers ACTUALLY
     /// raise — not on one a test hand-built (#1145 review).
     ///
-    /// This distinction is the whole point of the test, and the version it replaces got it
-    /// backwards. That one called the real `sign_client_binding`, asserted it was `Ok`,
-    /// threw the result away, and then hand-built `anyhow!("...").context(LocalPullFault)`
-    /// before asserting the ladder found `LocalPullFault` in it. Attaching the marker and
-    /// then finding it is true by construction: the test could not fail, and stripping every
-    /// `.context(LocalPullFault)` from the crate left the whole suite green. Its own doc
-    /// comment warned that "a synthetic `anyhow!(...)` would pass this test while production
-    /// scored the peer" — and then did exactly that.
+    /// This distinction is the whole point of the test: a test that calls the real
+    /// `sign_client_binding`, throws away its `Ok` result, and hand-builds
+    /// `anyhow!("...").context(LocalPullFault)` before asserting the ladder finds
+    /// `LocalPullFault` in it is true by construction. Attaching the marker and then
+    /// finding it proves nothing — such a test cannot fail even if every
+    /// `.context(LocalPullFault)` call site is stripped from the crate, so a synthetic
+    /// `anyhow!(...)` passes it while production silently fails to score the peer.
     ///
     /// So: real functions, real errors, marker never touched by the test. `align_range`
     /// rejects an offset at or past the end of the blob (never clamps — ADR 005), which is

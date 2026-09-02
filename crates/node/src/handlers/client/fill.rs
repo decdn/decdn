@@ -266,8 +266,9 @@ impl ClientHandler {
     /// soon as any chunk carries it, not only once the FINAL chunk validates
     /// — so a front-prefix partial (holds the front, not the tail) sizes its
     /// range here too, matching what it already advertises as covered.
-    /// Sizing serve and advertise from two different sources previously let
-    /// the node advertise a block it then refused to serve (#1506 C3).
+    /// Sizing serve and advertise from the same source matters: two different
+    /// sources here would let the node advertise a block it then refuses to
+    /// serve (#1506 C3).
     ///
     /// Reuses [`CacheEngine::missing_ranges`](super::CacheEngine::missing_ranges)'s
     /// own size contract — the same `blob_size` source

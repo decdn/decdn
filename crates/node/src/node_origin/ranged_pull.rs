@@ -1,6 +1,6 @@
 //! Ranged-drive assembly across partial holders (#1506, ADR 039).
 //!
-//! A whole-blob cache-miss pull no longer targets one provider that holds the
+//! A whole-blob cache-miss pull does not target one provider that holds the
 //! whole blob. A blob can live spread across partial holders — one node holds
 //! discovery block 0, another block 1 — so this walks the still-missing gap,
 //! plans it into contiguous [`CoveredRun`]s by each surviving candidate's

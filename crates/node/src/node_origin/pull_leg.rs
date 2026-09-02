@@ -573,7 +573,8 @@ pub(crate) async fn run_pull_leg(
     let outcome = assemble(&sink, &coverages, offset, len, total_bytes).await;
     // On cancel the serve leg has already finished and nobody reads this, but set a
     // terminal outcome regardless. A cancelled assembly is not a fault (Ok), matching
-    // the single-source leg it replaces; a range no holder covers is the existing miss.
+    // a single-source pull's own Cancelled outcome; a range no holder covers is the
+    // existing miss.
     let result = match outcome {
         AssembleOutcome::Complete | AssembleOutcome::Cancelled => Ok(()),
         AssembleOutcome::Unavailable => Err(FillError::new(
