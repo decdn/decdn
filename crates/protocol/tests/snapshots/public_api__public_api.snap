@@ -135,8 +135,13 @@ pub fn decdn_protocol::coverage::Coverage::empty() -> Self
 pub fn decdn_protocol::coverage::Coverage::from_block_indices(u32, impl core::iter::traits::iterator::Iterator<Item = u32>) -> Self
 pub fn decdn_protocol::coverage::Coverage::full(u32) -> Self
 pub fn decdn_protocol::coverage::Coverage::is_empty(&self) -> bool
+pub struct decdn_protocol::coverage::TestBlockSizeGuard
+impl core::ops::drop::Drop for decdn_protocol::coverage::TestBlockSizeGuard
+pub fn decdn_protocol::coverage::TestBlockSizeGuard::drop(&mut self)
 pub const decdn_protocol::coverage::DISCOVERY_BLOCK_BYTES: u64
-pub const fn decdn_protocol::coverage::num_blocks(u64) -> u32
+pub fn decdn_protocol::coverage::discovery_block_bytes() -> u64
+pub fn decdn_protocol::coverage::num_blocks(u64) -> u32
+pub fn decdn_protocol::coverage::override_discovery_block_bytes_for_test(u64) -> decdn_protocol::coverage::TestBlockSizeGuard
 pub mod decdn_protocol::dht
 pub enum decdn_protocol::dht::DhtMessage
 pub decdn_protocol::dht::DhtMessage::BatchStore(decdn_protocol::dht::BatchStoreRequest)
@@ -542,6 +547,9 @@ pub struct decdn_protocol::StreamResponseExt
 pub decdn_protocol::StreamResponseExt::error: core::option::Option<decdn_protocol::client::StreamError>
 impl decdn_protocol::client::StreamResponseExt
 pub const fn decdn_protocol::client::StreamResponseExt::validate(&self, bool) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
+pub struct decdn_protocol::TestBlockSizeGuard
+impl core::ops::drop::Drop for decdn_protocol::coverage::TestBlockSizeGuard
+pub fn decdn_protocol::coverage::TestBlockSizeGuard::drop(&mut self)
 pub struct decdn_protocol::Voucher
 pub decdn_protocol::Voucher::amount: u64
 pub decdn_protocol::Voucher::bytes_delivered: u64
@@ -576,6 +584,7 @@ pub const decdn_protocol::dht::DhtMessage::VARIANT_COUNT: u32
 impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::message::ProbeMessage
 pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
 pub fn decdn_protocol::decode_message<M: serde_core::de::DeserializeOwned>(&[u8]) -> core::result::Result<(M, &[u8]), decdn_protocol::framing::FrameError>
+pub fn decdn_protocol::discovery_block_bytes() -> u64
 pub fn decdn_protocol::encode_chunk_frame(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::message::MessageValidationError>
 pub fn decdn_protocol::encode_find_value_response(&decdn_protocol::dht::FindValueResponse, core::option::Option<&decdn_protocol::dht::FindValueResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::encode_message<M: serde_core::ser::Serialize>(&M) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
@@ -585,7 +594,8 @@ pub fn decdn_protocol::encode_stream_request(&decdn_protocol::client::StreamRequ
 pub fn decdn_protocol::encode_stream_response(&decdn_protocol::client::StreamResponse, core::option::Option<&decdn_protocol::client::StreamResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::is_unknown_variant<M: decdn_protocol::framing::TopLevelEnum>(&[u8]) -> bool
 pub fn decdn_protocol::is_valid_region(&str) -> bool
-pub const fn decdn_protocol::num_blocks(u64) -> u32
+pub fn decdn_protocol::num_blocks(u64) -> u32
+pub fn decdn_protocol::override_discovery_block_bytes_for_test(u64) -> decdn_protocol::coverage::TestBlockSizeGuard
 pub fn decdn_protocol::parse_find_value_response_ext(&[u8]) -> core::result::Result<decdn_protocol::dht::FindValueResponseExt, postcard::error::Error>
 pub fn decdn_protocol::parse_probe_response_ext(&[u8]) -> core::result::Result<decdn_protocol::message::ProbeResponseExt, postcard::error::Error>
 pub fn decdn_protocol::parse_store_request_ext(&[u8]) -> core::result::Result<decdn_protocol::dht::StoreRequestExt, postcard::error::Error>

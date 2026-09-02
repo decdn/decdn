@@ -1649,6 +1649,81 @@ mod tests {
         Ok(())
     }
 
+    /// Focused [`Work::retire`] fault coverage (#1506): the anti-hang prune, on
+    /// the state directly rather than through a whole fetch.
+    ///
+    /// The three integration fault tests
+    /// (`faulted_source_tail_is_reassigned_and_fetch_completes`,
+    /// `all_sources_failing_errors_without_hang`, …) all run every lane over the
+    /// SAME whole-blob coverage, so `retire`'s selective prune — drop only the
+    /// `pending` entries no *surviving* lane covers, keep the ones a survivor can
+    /// still serve — never actually decides anything there: every entry is
+    /// coverable by every other lane. This builds the work-state by hand with
+    /// DISJOINT coverage so the prune has a real choice, and asserts it makes the
+    /// right one. Without the keep half the fetch would refetch nothing but
+    /// needlessly, and without the drop half a survivor-uncoverable entry would
+    /// sit in `pending` forever and every idle worker would park on it — the hang
+    /// [`Work::retire`] exists to prevent.
+    ///
+    /// No blob is allocated (this pokes `Work` directly), so it stays tiny — the
+    /// block boundaries are the production 64 MiB `DISCOVERY_BLOCK_BYTES`, and the
+    /// `pending` entries are one-group slices inside two different blocks.
+    #[tokio::test]
+    async fn retire_drops_only_entries_no_surviving_lane_covers() -> anyhow::Result<()> {
+        use std::collections::VecDeque;
+
+        use decdn_bao_range::align_range;
+
+        use super::{CancelHandle, Work};
+
+        // A two-block blob; source 0 holds ONLY block 0, source 1 ONLY block 1.
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let coverage = vec![cov(2, &[0]), cov(2, &[1])];
+
+        // Two queued, un-started segments: one one-group slice inside block 0
+        // (only source 0 covers it) and one inside block 1 (only source 1).
+        let in_block0 = align_range(0, 1, total)?;
+        let in_block1 = align_range(DISCOVERY_BLOCK_BYTES, 1, total)?;
+        assert_eq!(in_block0.fetch_start(), 0);
+        assert_eq!(in_block1.fetch_start(), DISCOVERY_BLOCK_BYTES);
+
+        let mut work = Work {
+            pending: VecDeque::from(vec![in_block0, in_block1]),
+            in_flight: vec![None, None],
+            cancel: vec![Arc::new(CancelHandle::new()), Arc::new(CancelHandle::new())],
+            alive: vec![true, true],
+        };
+
+        // Source 0 faults out. Its block-0 entry has no surviving coverer and must
+        // be dropped; the block-1 entry is still served by the alive source 1 and
+        // must stay.
+        work.retire(0, &coverage, total);
+        assert!(!work.alive[0], "retired worker is marked gone");
+        assert!(work.alive[1], "the survivor stays alive");
+        let starts: Vec<u64> = work
+            .pending
+            .iter()
+            .map(decdn_bao_range::AlignedRange::fetch_start)
+            .collect();
+        assert_eq!(
+            starts,
+            vec![DISCOVERY_BLOCK_BYTES],
+            "the block-0 entry (orphaned by source 0's exit) is dropped; the block-1 \
+             entry a surviving lane still covers is kept"
+        );
+
+        // Now the last coverer of block 1 exits too: its entry is orphaned in turn,
+        // so the prune empties `pending` — nothing is left for a worker to park on,
+        // which is what lets the fetch converge to `all_idle` instead of hanging.
+        work.retire(1, &coverage, total);
+        assert!(
+            work.pending.is_empty(),
+            "with no lane left covering block 1, its entry is dropped too: {:?}",
+            work.pending
+        );
+        Ok(())
+    }
+
     /// THE double-pay test: a fast source and an artificially slow one over a
     /// 64 MiB blob, arranged so a steal DEFINITELY fires (the slow source stalls
     /// before its first byte, so the fast source finishes its own segment and

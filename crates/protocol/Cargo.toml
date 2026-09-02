@@ -37,6 +37,13 @@ insta = { workspace = true }
 # default `cargo nextest --workspace` (coverage) run. CI's dedicated
 # `public-api` job opts in with `--features public-api-test`.
 public-api-test = []
+# Makes the discovery-block size overridable via
+# `override_discovery_block_bytes_for_test`, so a downstream loopback test can
+# drive the block-spanning planner with tiny blocks (and thus tiny blobs)
+# instead of the 64 MiB a real two-block blob needs. Off by default, so a
+# production build reads the fixed `DISCOVERY_BLOCK_BYTES` constant and is
+# byte-identical; only enabled through dev-dependencies (see `decdn-node`).
+test-support = []
 
 # The public-API snapshot test shells out to a nightly rustdoc and is slow, so
 # it is compiled/run only when `public-api-test` is enabled (see CONTRIBUTING.md

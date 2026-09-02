@@ -19,15 +19,18 @@
 //! margin is enforced by the ADR 041 gate, not here.
 
 use bao_tree::{ChunkNum, ChunkRanges};
-use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
+use decdn_protocol::{Coverage, discovery_block_bytes, num_blocks};
 use std::collections::{HashMap, HashSet};
 
 /// Bao chunk size in bytes — the [`ChunkNum`] unit, fixed by `bao-tree`.
 const BAO_CHUNK_BYTES: u64 = 1024;
 
-/// Number of bao chunks spanned by one [`DISCOVERY_BLOCK_BYTES`] discovery
-/// block.
-const CHUNKS_PER_BLOCK: u64 = DISCOVERY_BLOCK_BYTES / BAO_CHUNK_BYTES;
+/// Number of bao chunks spanned by one discovery block. Reads
+/// [`discovery_block_bytes`], which is the fixed `DISCOVERY_BLOCK_BYTES` in
+/// production and a test-overridable value under the `test-support` feature.
+fn chunks_per_block() -> u64 {
+    discovery_block_bytes() / BAO_CHUNK_BYTES
+}
 
 /// One source's advertised discovery-block coverage, paired with the index
 /// the caller uses to identify it (a position in its own candidate list —
@@ -54,7 +57,7 @@ pub struct CoveredRun {
 
 /// The byte-offset start of discovery block `block`.
 fn block_offset(block: u32) -> u64 {
-    u64::from(block) * DISCOVERY_BLOCK_BYTES
+    u64::from(block) * discovery_block_bytes()
 }
 
 /// The tight byte extent of `gap` within `[lo, hi)`: the lowest missing byte at or
@@ -85,8 +88,9 @@ fn gap_extent(gap: &ChunkRanges, lo: u64, hi: u64) -> Option<(u64, u64)> {
 /// The chunk-range span of discovery block `block`: `block * 65536` through
 /// `(block + 1) * 65536`, exclusive, in [`ChunkNum`] units.
 fn block_chunks(block: u32) -> ChunkRanges {
-    let start = u64::from(block) * CHUNKS_PER_BLOCK;
-    let end = start + CHUNKS_PER_BLOCK;
+    let per = chunks_per_block();
+    let start = u64::from(block) * per;
+    let end = start + per;
     ChunkRanges::from(ChunkNum(start)..ChunkNum(end))
 }
 
@@ -106,7 +110,7 @@ fn run_from(
 ) -> CoveredRun {
     let block_lo = block_offset(start_block);
     let block_hi = block_offset(last_block)
-        .saturating_add(DISCOVERY_BLOCK_BYTES)
+        .saturating_add(discovery_block_bytes())
         .min(total_bytes);
     let (offset, end) = gap_extent(gap, block_lo, block_hi).unwrap_or((block_lo, block_hi));
     CoveredRun {
@@ -137,8 +141,9 @@ pub(crate) fn covers_byte_range(
     if end <= start {
         return true;
     }
-    let first_block = u32::try_from(start / DISCOVERY_BLOCK_BYTES).unwrap_or(u32::MAX);
-    let last_block = u32::try_from((end - 1) / DISCOVERY_BLOCK_BYTES).unwrap_or(u32::MAX);
+    let block_bytes = discovery_block_bytes();
+    let first_block = u32::try_from(start / block_bytes).unwrap_or(u32::MAX);
+    let last_block = u32::try_from((end - 1) / block_bytes).unwrap_or(u32::MAX);
     (first_block..=last_block).all(|b| coverage.covers(b))
 }
 
@@ -339,6 +344,7 @@ pub fn spread_segments(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use decdn_protocol::DISCOVERY_BLOCK_BYTES;
 
     fn cov(num_blocks: u32, blocks: &[u32]) -> Coverage {
         Coverage::from_block_indices(num_blocks, blocks.iter().copied())

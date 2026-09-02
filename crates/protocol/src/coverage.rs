@@ -21,14 +21,107 @@ use serde::{Deserialize, Serialize};
 /// bitmaps — see [`num_blocks`] and [`Coverage`].
 pub const DISCOVERY_BLOCK_BYTES: u64 = 64 << 20;
 
-/// Number of [`DISCOVERY_BLOCK_BYTES`] blocks a blob of `total_bytes` spans.
+/// The active discovery-block size in bytes.
+///
+/// Production reads the fixed [`DISCOVERY_BLOCK_BYTES`] constant — this
+/// accessor inlines to it, so the block geometry is byte-identical to naming
+/// the constant directly. Test builds that enable the `test-support` feature
+/// get an overridable value instead (see
+/// `override_discovery_block_bytes_for_test`), so a loopback test can drive
+/// the block-spanning planner with tiny blocks and tiny blobs rather than the
+/// 64 MiB a real two-block blob would need.
+#[cfg(not(feature = "test-support"))]
+#[inline]
+#[must_use]
+pub const fn discovery_block_bytes() -> u64 {
+    DISCOVERY_BLOCK_BYTES
+}
+
+/// Number of [`discovery_block_bytes`] blocks a blob of `total_bytes` spans.
 ///
 /// The empty blob spans zero blocks (`num_blocks(0) == 0`), not one — an
 /// empty [`Coverage`] over it is trivially complete.
+#[cfg(not(feature = "test-support"))]
 #[must_use]
 #[allow(clippy::cast_possible_truncation)] // a blob would need to be ~256 EiB to truncate here
 pub const fn num_blocks(total_bytes: u64) -> u32 {
     total_bytes.div_ceil(DISCOVERY_BLOCK_BYTES) as u32
+}
+
+/// The active discovery-block size in bytes — the `test-support` twin whose
+/// value a test can override. Defaults to [`DISCOVERY_BLOCK_BYTES`] until
+/// [`override_discovery_block_bytes_for_test`] sets it.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn discovery_block_bytes() -> u64 {
+    test_block_size::current()
+}
+
+/// Number of [`discovery_block_bytes`] blocks a blob of `total_bytes` spans —
+/// the `test-support` twin, which reads the overridable block size rather than
+/// the constant. Same arithmetic as the production `const fn`.
+#[cfg(feature = "test-support")]
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // a blob would need to be ~256 EiB to truncate here
+pub fn num_blocks(total_bytes: u64) -> u32 {
+    total_bytes.div_ceil(discovery_block_bytes()) as u32
+}
+
+/// The overridable discovery-block size, compiled only under `test-support`.
+#[cfg(feature = "test-support")]
+mod test_block_size {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::DISCOVERY_BLOCK_BYTES;
+
+    /// The active block size. Starts at [`DISCOVERY_BLOCK_BYTES`], so an
+    /// un-overridden `test-support` build behaves exactly like production.
+    static BLOCK_BYTES: AtomicU64 = AtomicU64::new(DISCOVERY_BLOCK_BYTES);
+
+    pub(super) fn current() -> u64 {
+        BLOCK_BYTES.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set(bytes: u64) {
+        BLOCK_BYTES.store(bytes, Ordering::Relaxed);
+    }
+
+    pub(super) fn reset() {
+        BLOCK_BYTES.store(DISCOVERY_BLOCK_BYTES, Ordering::Relaxed);
+    }
+}
+
+/// A live override of the discovery-block size for the duration of the returned
+/// guard (test-support only).
+///
+/// While the guard is held, [`discovery_block_bytes`] and [`num_blocks`] report
+/// `bytes` instead of [`DISCOVERY_BLOCK_BYTES`], so the block-spanning planner
+/// (`decdn_client_pull::plan_covered_runs`) and the node's coverage-union probe
+/// gather split a tiny blob into several blocks. Dropping the guard restores the
+/// production default.
+///
+/// The override is process-global, so it assumes the one-process-per-test
+/// isolation `cargo nextest run` gives; two tests that override it concurrently
+/// in one process (plain `cargo test`) would race.
+#[cfg(feature = "test-support")]
+#[must_use = "the override is reverted when the returned guard is dropped"]
+pub fn override_discovery_block_bytes_for_test(bytes: u64) -> TestBlockSizeGuard {
+    test_block_size::set(bytes);
+    TestBlockSizeGuard { _private: () }
+}
+
+/// Restores the production discovery-block size when dropped (test-support only).
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+pub struct TestBlockSizeGuard {
+    _private: (),
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for TestBlockSizeGuard {
+    fn drop(&mut self) {
+        test_block_size::reset();
+    }
 }
 
 /// A bitmap over discovery-block indices: bit `i` records whether block `i`

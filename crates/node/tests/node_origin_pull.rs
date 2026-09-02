@@ -31,9 +31,9 @@ use decdn_cache::{
     CacheEngine, CacheMetrics, CircuitBreakerPolicy, Hash, PinnedHashes, RetryPolicy,
 };
 use decdn_incentive::{
-    EPHEMERAL_BINDING_NONCE, LaneState, MemoryPoolStateStore, PoolStateStore, ProbeSlashData,
-    StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash, min_payment,
-    signed_to_wire_voucher, slash_judge_domain, voucher_domain,
+    EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
+    ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash,
+    min_payment, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::{PoolOpenPending, PoolOpener};
 use decdn_node::client_requester::PoolContext;
@@ -346,6 +346,22 @@ async fn answer_probe(
     rate: u64,
     total_bytes: u64,
 ) -> Result<()> {
+    // Whole-blob holder: advertises coverage over every discovery block.
+    let coverage = Coverage::full(decdn_protocol::num_blocks(total_bytes));
+    answer_probe_with_coverage(conn, eth, slash, rate, total_bytes, coverage).await
+}
+
+/// [`answer_probe`] with an explicit [`Coverage`], so a PARTIAL holder can
+/// advertise only the discovery blocks it serves (#1506 ranged assembly). The
+/// two-holder loopback drives one holder covering block 0 and another block 1.
+async fn answer_probe_with_coverage(
+    conn: Connection,
+    eth: &Arc<PrivateKeySigner>,
+    slash: &Eip712Domain,
+    rate: u64,
+    total_bytes: u64,
+    coverage: Coverage,
+) -> Result<()> {
     let (mut send, mut recv) = conn
         .accept_bi()
         .await
@@ -379,7 +395,7 @@ async fn answer_probe(
         &resp,
         Some(&ProbeResponseExt {
             total_bytes: Some(total_bytes),
-            coverage: Coverage::full(decdn_protocol::num_blocks(total_bytes)),
+            coverage,
         }),
     )
     .map_err(|e| anyhow::anyhow!("encode probe response: {e}"))?;
@@ -12763,5 +12779,422 @@ async fn attack_b_dud_flood_is_bounded_and_vindication_works() -> Result<()> {
         "a blob re-served >= 2x must refund the source's allowance and keep it warming"
     );
 
+    Ok(())
+}
+
+// ===========================================================================
+// #1506 — two-holder ranged assembly over the REAL paid path (`PeerRunSink`).
+//
+// Every other multi-holder test in the tree drives `node_origin::ranged_pull`'s
+// pure loop through the `FakeSink` (which scripts run outcomes and never opens a
+// lane). This one drives the PAID half: node S serve-misses a blob held only as
+// A:{block 0} + B:{block 1}, so `run_pull_leg`'s `PeerRunSink` opens a real
+// buyer lane to EACH holder in turn — voucher payment, settle/watermark
+// hand-off, and cross-run shared-pool solvency — the surface where #1506's
+// C1 (shared-pool accounting), C2 (run clamp), and cancel bugs live. The blob is
+// two DISCOVERY-block-sized slices; the block size is overridden to 16 KiB
+// (`override_discovery_block_bytes_for_test`) so "two blocks" is a 32 KiB blob,
+// not the 128 MiB a real two-block blob would need — the whole point of the
+// test-support seam. Both holders hold the whole (tiny) blob but ADVERTISE
+// partial coverage, so the planner concentrates each block onto its sole coverer
+// and the two lanes run sequentially on one shared pool.
+// ===========================================================================
+
+/// Two providers for `NodeOrigin`'s discovery: `(dht, operator)` for each of A
+/// and B. The ranged-assembly gather walks both because their coverage union is
+/// what spans the blob.
+fn two_providers(
+    a_dht: DhtNodeId,
+    a_eth: Address,
+    b_dht: DhtNodeId,
+    b_eth: Address,
+) -> (Vec<DhtNodeId>, HashMap<DhtNodeId, Address>) {
+    let mut addr_map = HashMap::new();
+    addr_map.insert(a_dht, a_eth);
+    addr_map.insert(b_dht, b_eth);
+    (vec![a_dht, b_dht], addr_map)
+}
+
+/// Spin up one PARTIAL holder: it holds the whole (tiny) blob in a real cache and
+/// serves any range over the real [`ClientHandler`], but its probe advertises
+/// only `coverage` — the discovery blocks the planner may route to it. Seeds its
+/// seller lane on the SHARED `ab_pool_id` keyed by the buyer's signer and this
+/// holder's own operator address, so a test can read back exactly what this
+/// holder was paid.
+async fn spawn_partial_holder(
+    payload: &[u8],
+    ab_pool_id: B256,
+    s_buyer_addr: Address,
+    coverage: Coverage,
+) -> Result<(
+    iroh::PublicKey,
+    std::net::SocketAddr,
+    Address,
+    iroh::Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<MemoryPoolStateStore>,
+)> {
+    let hash = Hash::new(payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let (cache, hash_h, tmp) = cache_with_blob(payload).await?;
+    anyhow::ensure!(hash_h == hash, "holder fixture hash mismatch");
+    std::mem::forget(tmp);
+
+    let sk = fresh_key();
+    let id = sk.public();
+    let eth = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        ab_pool_id,
+        s_buyer_addr,
+        eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler = build_handler_full(
+        id,
+        &eth,
+        &metrics,
+        limiter,
+        cache,
+        store.clone() as Arc<dyn PoolStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep, addr) = local_endpoint(sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    // Accept loop: real `ClientHandler` for the paid pull, a coverage-carrying
+    // probe responder for `cdn/probe/v1`.
+    let task = {
+        use iroh::protocol::ProtocolHandler;
+        let ep = ep.clone();
+        let eth = Arc::clone(&eth);
+        let slash = slash_domain();
+        tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let Ok(connecting) = incoming.accept() else {
+                    continue;
+                };
+                let Ok(conn) = connecting.await else { continue };
+                if conn.alpn() == ALPN_PROBE {
+                    let eth = Arc::clone(&eth);
+                    let dom = slash.clone();
+                    let coverage = coverage.clone();
+                    tokio::spawn(async move {
+                        let _ = answer_probe_with_coverage(
+                            conn,
+                            &eth,
+                            &dom,
+                            RATE,
+                            total_bytes,
+                            coverage,
+                        )
+                        .await;
+                    });
+                } else {
+                    let handler = Arc::clone(&handler);
+                    tokio::spawn(async move {
+                        let _ = decdn_node::handlers::client::ClientProtocol::new(handler)
+                            .accept(conn)
+                            .await;
+                    });
+                }
+            }
+        })
+    };
+    Ok((id, addr, eth.address(), ep, task, store))
+}
+
+/// Build serving node S: an empty-cache window-paced `ClientHandler` whose
+/// `NodeOrigin` discovers the two partial holders, plus the leaf's own lane in
+/// S's seller store. A focused twin of [`build_node_b_with_leaves`] for the
+/// two-holder ranged pull (that helper hardwires a single provider).
+#[allow(clippy::too_many_arguments)]
+async fn build_serving_node(
+    hash: Hash,
+    ab_pool_id: B256,
+    s_buyer: &Arc<PrivateKeySigner>,
+    providers: Vec<DhtNodeId>,
+    addr_map: HashMap<DhtNodeId, Address>,
+    holder_dials: &[(iroh::PublicKey, std::net::SocketAddr)],
+    leaf_channel_id: B256,
+    leaf_eth_addr: Address,
+    leaf_deposit: U256,
+) -> Result<(
+    Arc<decdn_node::handlers::client::ClientHandler>,
+    EndpointAddr,
+    iroh::Endpoint,
+    Arc<Mutex<Vec<ProgressEntry>>>,
+    decdn_cache::CacheEngine,
+    Address,
+)> {
+    let s_sk = fresh_key();
+    let s_id = s_sk.public();
+    let s_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_s, addr_s) = local_endpoint(s_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    // Prime S's iroh address cache for every holder so NodeId-only dialing in the
+    // pull resolves each one.
+    for (holder_id, holder_addr) in holder_dials {
+        let _ = probe_once(
+            &ep_s,
+            EndpointAddr::new(*holder_id).with_ip_addr(*holder_addr),
+            *hash.as_bytes(),
+            1,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let s_metrics = Arc::new(Metrics::new());
+    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin_with_deadlines(
+        &ep_s,
+        DhtNodeId::from_bytes(*s_id.as_bytes()),
+        hash,
+        ab_pool_id,
+        s_buyer,
+        &local_rep,
+        &s_metrics,
+        providers,
+        addr_map,
+        DEFAULT_TEST_PULL_DEADLINES,
+    )
+    .await;
+
+    let cache_tmp = tempfile::tempdir()?;
+    let cache_s = decdn_cache::CacheEngine::open(cache_tmp.path(), vec![], 64).await?;
+    let cache_handle = cache_s.clone();
+    std::mem::forget(cache_tmp);
+    let store_s = Arc::new(MemoryPoolStateStore::new());
+    store_s.record(&LaneState::hydrate(
+        leaf_channel_id,
+        leaf_eth_addr,
+        s_eth.address(),
+        leaf_deposit,
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let mut pool_status_map: HashMap<B256, decdn_node::pool_view::PoolStatus> = HashMap::new();
+    pool_status_map.insert(
+        leaf_channel_id,
+        decdn_node::pool_view::PoolStatus {
+            owner: leaf_eth_addr,
+            remaining: leaf_deposit,
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
+        },
+    );
+    let pool_view = Arc::new(StubPoolView {
+        status: pool_status_map,
+    }) as Arc<dyn decdn_node::pool_view::PoolView>;
+    let limiter = permissive_limiter(&s_metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_s = build_handler_full_configured(
+        s_id,
+        &s_eth,
+        &s_metrics,
+        limiter,
+        cache_s,
+        store_s as Arc<dyn PoolStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+        |deps| {
+            deps.pull_through = Some(Duration::from_secs(20));
+            deps.pull_through_origin = Some(Arc::new(origin));
+            deps.pool_view = Some(pool_view);
+        },
+    )?;
+    let target = EndpointAddr::new(s_id).with_ip_addr(addr_s);
+    Ok((
+        handler_s,
+        target,
+        ep_s,
+        recorded,
+        cache_handle,
+        s_eth.address(),
+    ))
+}
+
+/// #1506: node S assembles a blob held only as A:{block 0} + B:{block 1} across
+/// two sequential paid lanes on one shared pool, and each holder is paid only for
+/// ITS block.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
+    // Tiny discovery blocks so "two blocks" is a 32 KiB blob, not 128 MiB. The
+    // guard reverts the override when the test ends; `cargo nextest` runs each
+    // test in its own process, so no sibling test sees the override.
+    let block: u64 = 16 * 1024;
+    let _block_guard = decdn_protocol::override_discovery_block_bytes_for_test(block);
+    anyhow::ensure!(
+        decdn_protocol::discovery_block_bytes() == block,
+        "override did not take"
+    );
+
+    // A two-block, position-varying blob (a permuted chunk would still equal a
+    // uniform fill, so vary by index).
+    let payload_len = usize::try_from(2 * block).unwrap_or(usize::MAX);
+    let payload: Vec<u8> = (0..payload_len)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let hash = Hash::new(&payload);
+    let total_bytes = 2 * block;
+    anyhow::ensure!(
+        decdn_protocol::num_blocks(total_bytes) == 2,
+        "the blob must span exactly two discovery blocks under the override"
+    );
+
+    let ab_pool_id = B256::repeat_byte(0xA1);
+    let s_buyer = Arc::new(PrivateKeySigner::random());
+
+    // Holder A covers ONLY block 0; holder B ONLY block 1. Both hold the whole
+    // blob and can serve any range — only their ADVERTISED coverage is partial.
+    let (a_id, a_addr, a_eth, ep_a, task_a, store_a) = spawn_partial_holder(
+        &payload,
+        ab_pool_id,
+        s_buyer.address(),
+        Coverage::from_block_indices(2, [0].into_iter()),
+    )
+    .await?;
+    let (b_id, b_addr, b_eth, ep_b, task_b, store_b) = spawn_partial_holder(
+        &payload,
+        ab_pool_id,
+        s_buyer.address(),
+        Coverage::from_block_indices(2, [1].into_iter()),
+    )
+    .await?;
+
+    let (providers, addr_map) = two_providers(
+        DhtNodeId::from_bytes(*a_id.as_bytes()),
+        a_eth,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        b_eth,
+    );
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x1F);
+    let (handler_s, s_target, ep_s, recorded, cache_s, s_operator) = build_serving_node(
+        hash,
+        ab_pool_id,
+        &s_buyer,
+        providers,
+        addr_map,
+        &[(a_id, a_addr), (b_id, b_addr)],
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+    )
+    .await?;
+    let task_s = spawn_server(ep_s.clone(), handler_s);
+
+    // The leaf pulls the whole blob from S; S serve-misses and assembles it from
+    // both holders.
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        s_target,
+        leaf_node_id,
+        &leaf_eth,
+        s_operator,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await?;
+
+    anyhow::ensure!(outcome.completed, "leaf delivery did not complete");
+    anyhow::ensure!(outcome.hash_ok, "leaf received bytes failed the hash check");
+    anyhow::ensure!(
+        outcome.received == total_bytes,
+        "leaf received {} of {total_bytes} bytes",
+        outcome.received
+    );
+    // S cached the assembled, verified blob — it is now a holder for future pulls.
+    anyhow::ensure!(
+        cache_s.has(hash).await?,
+        "S must promote the assembled blob on a complete delivery"
+    );
+
+    // The headline: BOTH holders' seller lanes advanced, so the assembly opened a
+    // real paid lane to each — not one holder serving everything.
+    let lane_a = LaneKey {
+        pool_id: ab_pool_id,
+        signer: s_buyer.address(),
+        provider: a_eth,
+    };
+    let lane_b = LaneKey {
+        pool_id: ab_pool_id,
+        signer: s_buyer.address(),
+        provider: b_eth,
+    };
+    let a_delivered = store_a
+        .get(lane_a)?
+        .ok_or_else(|| anyhow::anyhow!("holder A lane vanished"))?
+        .last_bytes_delivered();
+    let b_delivered = store_b
+        .get(lane_b)?
+        .ok_or_else(|| anyhow::anyhow!("holder B lane vanished"))?
+        .last_bytes_delivered();
+
+    // Each holder is paid ONLY for its own block's wire: A the [0, block) range,
+    // B the [block, total) range — never the whole blob (#1506 C1/C2). Bao meters
+    // WIRE (content + interleaved proof), so compare against each range's own
+    // verified-stream encoding.
+    let a_wire =
+        u64::try_from(honest_bao_wire_range(&payload, 0, block)?.len()).unwrap_or(u64::MAX);
+    let b_wire =
+        u64::try_from(honest_bao_wire_range(&payload, block, 0)?.len()).unwrap_or(u64::MAX);
+    let whole_wire =
+        u64::try_from(honest_bao_wire_range(&payload, 0, 0)?.len()).unwrap_or(u64::MAX);
+    anyhow::ensure!(
+        a_delivered == U256::from(a_wire),
+        "holder A must be paid for exactly block 0's wire ({a_wire}), got {a_delivered}"
+    );
+    anyhow::ensure!(
+        b_delivered == U256::from(b_wire),
+        "holder B must be paid for exactly block 1's wire ({b_wire}), got {b_delivered}"
+    );
+    anyhow::ensure!(
+        a_delivered < U256::from(whole_wire) && b_delivered < U256::from(whole_wire),
+        "neither holder may be paid for the whole blob: A={a_delivered}, B={b_delivered}, \
+         whole={whole_wire}"
+    );
+
+    // S's buyer side persisted a watermark for BOTH providers on the one shared
+    // pool (#852 + #1506 C1): two distinct providers, each recorded.
+    let paid_providers: std::collections::HashSet<Address> = progress_log(&recorded)?
+        .into_iter()
+        .map(|(p, ..)| p)
+        .collect();
+    anyhow::ensure!(
+        paid_providers == std::collections::HashSet::from([a_eth, b_eth]),
+        "both holders' lanes must have persisted a watermark, got {paid_providers:?}"
+    );
+
+    shutdown([task_s, task_a, task_b], [&leaf_ep, &ep_s, &ep_a, &ep_b]).await?;
     Ok(())
 }
