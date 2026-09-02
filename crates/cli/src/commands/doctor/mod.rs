@@ -6,6 +6,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
+mod report;
+
 /// A single diagnostic outcome. Every `Warn`/`Fail` carries a one-line
 /// `remediation`; `detail` holds a grep-friendly `key=value` tail.
 #[derive(Debug, Serialize)]
@@ -87,7 +89,7 @@ pub async fn run(
     // Later tasks populate `report` here.
 
     let mut stdout = std::io::stdout().lock();
-    render(&mut stdout, &report, args.json)
+    report::render(&mut stdout, &report, args.json)
         .map_err(|e| anyhow::anyhow!("failed to write doctor report: {e}"))?;
 
     let fail = report.has_fail() || (args.strict && report.has_warn());
@@ -95,12 +97,6 @@ pub async fn run(
         return Err(DoctorFailed.into());
     }
     Ok(())
-}
-
-/// Placeholder renderer replaced in Task 2.
-fn render<W: std::io::Write>(w: &mut W, report: &Report, _json: bool) -> std::io::Result<()> {
-    let (p, warn, f) = report.counts();
-    writeln!(w, "Summary: {p} passed, {warn} warnings, {f} failed")
 }
 
 #[cfg(test)]
