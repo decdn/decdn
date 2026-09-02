@@ -9,6 +9,7 @@ use serde::Serialize;
 mod config;
 mod disk;
 mod report;
+mod state;
 
 /// A single diagnostic outcome. Every `Warn`/`Fail` carries a one-line
 /// `remediation`; `detail` holds a grep-friendly `key=value` tail.
@@ -92,6 +93,7 @@ pub async fn run(
     // Config-dependent groups run only when resolve succeeded (Tasks 4-9).
     if let Some(resolved) = &resolved {
         disk::check_disk(&mut report, resolved, None);
+        state::check_state(&mut report, resolved, false);
     }
 
     let mut stdout = std::io::stdout().lock();
