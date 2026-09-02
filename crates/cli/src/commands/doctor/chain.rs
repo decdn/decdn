@@ -6,6 +6,7 @@ use std::time::Duration;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use decdn_common::config::ResolvedConfig;
+use decdn_common::redact::sanitize_err_chain;
 
 use super::{Finding, Report, Severity};
 
@@ -71,7 +72,8 @@ pub async fn check_chain(report: &mut Report, cfg: &ResolvedConfig, timeout_ms: 
     let onchain = match tokio::time::timeout(dur, provider.get_chain_id()).await {
         Ok(Ok(id)) => id,
         Ok(Err(e)) => {
-            report.push(fail_rpc(&format!("RPC error: {e}")));
+            let redacted = sanitize_err_chain(&anyhow::Error::new(e));
+            report.push(fail_rpc(&format!("RPC error: {redacted}")));
             return;
         }
         Err(_) => {
@@ -127,14 +129,17 @@ pub async fn check_chain(report: &mut Report, cfg: &ResolvedConfig, timeout_ms: 
         };
         match tokio::time::timeout(dur, provider.get_code_at(addr)).await {
             Ok(Ok(code)) => report.push(classify_code(name, addr_str, code.len())),
-            Ok(Err(e)) => report.push(Finding {
-                group: "Chain",
-                id: "chain.code",
-                severity: Severity::Warn,
-                title: format!("could not read code for {name}"),
-                detail: Some(format!("address={addr_str} err={e}")),
-                remediation: Some("retry; check RPC provider limits".into()),
-            }),
+            Ok(Err(e)) => {
+                let redacted = sanitize_err_chain(&anyhow::Error::new(e));
+                report.push(Finding {
+                    group: "Chain",
+                    id: "chain.code",
+                    severity: Severity::Warn,
+                    title: format!("could not read code for {name}"),
+                    detail: Some(format!("address={addr_str} err={redacted}")),
+                    remediation: Some("retry; check RPC provider limits".into()),
+                });
+            }
             Err(_) => report.push(Finding {
                 group: "Chain",
                 id: "chain.code",
