@@ -197,6 +197,8 @@ pub enum NodeCommand {
     /// candidates by measured `cdn/probe/v1` round-trip time; without it,
     /// candidates are listed with no RTT.
     Lookup(LookupArgs),
+    /// Diagnose config, on-disk state, disk budget, and reachability.
+    Doctor(DoctorArgs),
 }
 
 /// `decdn node health` — report identity (hex `node_id`) and process
@@ -801,6 +803,34 @@ pub struct LookupArgs {
     // declaring it here too would collide (clap requires unique arg names).
     #[command(flatten)]
     pub chain: ChainArgs,
+}
+
+/// `decdn node doctor` arguments.
+#[derive(Args, Debug)]
+pub struct DoctorArgs {
+    /// Config overrides, resolved exactly as `decdn-node run` would.
+    #[command(flatten)]
+    pub run: crate::cli::run::RunArgs,
+
+    /// Emit the full report as JSON instead of the checklist.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Treat warnings as failures for the exit code.
+    #[arg(long)]
+    pub strict: bool,
+
+    /// Skip all network and live-daemon probes (config + disk + files only).
+    #[arg(long)]
+    pub offline: bool,
+
+    /// Per-probe timeout for network checks, in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5000)]
+    pub timeout_ms: u64,
+
+    /// Admin RPC URL for live enrichment [default: from config / `DECDN_ADMIN_PORT`].
+    #[arg(long, env = "DECDN_ADMIN_URL", value_name = "URL")]
+    pub admin_url: Option<String>,
 }
 
 /// `decdn node top` — live metrics view (issue #275).

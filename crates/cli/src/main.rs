@@ -21,6 +21,12 @@ async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
+            if e.downcast_ref::<decdn_cli::commands::doctor::DoctorFailed>()
+                .is_some()
+            {
+                // The report is already printed; exit nonzero without an Error: line.
+                return std::process::ExitCode::FAILURE;
+            }
             eprintln!("Error: {}", decdn_common::redact::sanitize_err_chain(&e));
             std::process::ExitCode::FAILURE
         }
