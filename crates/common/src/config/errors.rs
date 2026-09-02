@@ -1,6 +1,7 @@
-//! Structured config-validation error accumulator.
+//! Structured config-resolution diagnostics: fatal problems and non-fatal
+//! notices.
 //!
-//! [`ConfigErrorBag`] is threaded through every section resolver during a
+//! [`ConfigDiagnostics`] is threaded through every section resolver during a
 //! `resolve_config` pass — and through every reloadable section during a
 //! SIGHUP reload (`runtime::reload`) — so every problem an operator made
 //! surfaces in one bulleted `anyhow::Error`, not one per re-run.
@@ -9,7 +10,14 @@
 //! `cache.origins[2]`, ...) with the resolver's message text. Single-line
 //! messages are reproduced verbatim; multi-line messages have their
 //! continuation lines indented to stay under their bullet (see
-//! [`ConfigErrorBag::into_result`]).
+//! [`ConfigDiagnostics::into_result`]).
+//!
+//! [`ConfigNotice`] carries the other half: a value that resolves fine but
+//! that the operator should know about (a disabled cap, an unbounded map, a
+//! retired env var). A notice never fails resolution. It rides the same bag
+//! because the bag already reaches every resolver on both the startup and the
+//! SIGHUP path, so the caller — which is the only layer that knows whether a
+//! `tracing` subscriber exists yet — decides how to render it.
 
 /// Field labels that participate in a `has_field` cascade-suppression guard.
 ///
@@ -28,6 +36,39 @@
 pub(crate) const IDENTITY_REGION: &str = "identity.region";
 pub(crate) const IDENTITY_DATA_DIR: &str = "identity.data_dir";
 
+/// How loud a [`ConfigNotice`] is.
+///
+/// The split is the operator's, not the resolver's: `Warn` marks a value that
+/// weakens a safety property (an unbounded map, a collapsed failover list),
+/// `Info` marks a deliberate opt-out that is working as configured (a rate
+/// limit switched off). A consumer that gates an exit status or an alert on
+/// severity keys off this rather than parsing the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigNoticeLevel {
+    /// A deliberate, documented opt-out. Nothing is wrong.
+    Info,
+    /// The configured value weakens a safety property. Resolution still
+    /// succeeds — the operator asked for it — but it warrants attention.
+    Warn,
+}
+
+/// One non-fatal resolve-time notice: a severity, a dotted field label
+/// (`security.max_tracked_sources`) and the operator-facing message text.
+///
+/// The label matches the problem-label convention so a notice and
+/// a problem about the same field read the same way, and so a consumer can
+/// render `field` as a structured log field rather than embedding it in prose.
+/// The message therefore does not repeat the field name.
+#[derive(Debug, Clone)]
+pub struct ConfigNotice {
+    /// How loud this notice is.
+    pub level: ConfigNoticeLevel,
+    /// Dotted field label the notice is about.
+    pub field: String,
+    /// Operator-facing message text, without a severity prefix.
+    pub message: String,
+}
+
 /// One resolved-config problem: a dotted field label (`blockchain.rpc_url`)
 /// plus the resolver's message text.
 #[derive(Debug)]
@@ -36,36 +77,44 @@ struct ConfigProblem {
     message: String,
 }
 
-/// Accumulates every problem found during a single `resolve_config` pass.
+/// Accumulates every problem and every non-fatal notice found during a single
+/// `resolve_config` pass.
 ///
 /// Threaded by `&mut` through the `*_into` section workers. Callers record
 /// problems via `check` (the `anyhow::ensure!` replacement) and
 /// [`try_with`](Self::try_with) (the `?`/`.context()` replacement),
 /// substituting a placeholder for any value they could not resolve so
-/// later independent checks still run.
+/// later independent checks still run. They record notices via `warn` / `note`.
 ///
 /// Insertion order is preserved end-to-end: [`into_result`](Self::into_result)
 /// renders bullets in the same order they were `push`ed, so
 /// resolver authors can rely on operator-facing problem order matching the
 /// order of validation logic, and tests that pin specific output order keep
-/// working through future refactors.
+/// working through future refactors. [`take_notices`](Self::take_notices)
+/// preserves notice order for the same reason.
+///
+/// Notices and problems are independent: a bag carrying only notices still
+/// collapses to `Ok(())`, and a bag that fails resolution may still hold
+/// notices its caller chooses not to render.
 #[derive(Debug)]
-pub struct ConfigErrorBag {
+pub struct ConfigDiagnostics {
     problems: Vec<ConfigProblem>,
+    notices: Vec<ConfigNotice>,
 }
 
-impl Default for ConfigErrorBag {
+impl Default for ConfigDiagnostics {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ConfigErrorBag {
+impl ConfigDiagnostics {
     /// An empty bag. Resolution fills it and reports every problem at once,
     /// rather than failing on the first.
     pub const fn new() -> Self {
         Self {
             problems: Vec::new(),
+            notices: Vec::new(),
         }
     }
 
@@ -75,6 +124,39 @@ impl ConfigErrorBag {
             field: field.into(),
             message: message.into(),
         });
+    }
+
+    /// Record a [`ConfigNoticeLevel::Warn`] notice under `field`.
+    ///
+    /// Non-fatal by construction — the bag still collapses to `Ok(())`. Use it
+    /// where the operator asked for something legal that weakens a safety
+    /// property, and refusing to boot over it would be the worse failure.
+    pub(crate) fn warn(&mut self, field: impl Into<String>, message: impl Into<String>) {
+        self.notices.push(ConfigNotice {
+            level: ConfigNoticeLevel::Warn,
+            field: field.into(),
+            message: message.into(),
+        });
+    }
+
+    /// Record a [`ConfigNoticeLevel::Info`] notice under `field`. The `Info`
+    /// twin of [`warn`](Self::warn), for a deliberate opt-out that is working
+    /// exactly as configured.
+    pub(crate) fn note(&mut self, field: impl Into<String>, message: impl Into<String>) {
+        self.notices.push(ConfigNotice {
+            level: ConfigNoticeLevel::Info,
+            field: field.into(),
+            message: message.into(),
+        });
+    }
+
+    /// Take every notice recorded so far, leaving the bag's notice list empty.
+    ///
+    /// Separate from [`into_result`](Self::into_result) — which consumes the
+    /// bag — because the caller needs the notices whether resolution succeeded
+    /// or not, and must drain them before collapsing the problems.
+    pub fn take_notices(&mut self) -> Vec<ConfigNotice> {
+        std::mem::take(&mut self.notices)
     }
 
     /// `anyhow::ensure!` replacement for a static message: record `message`
@@ -182,8 +264,14 @@ impl ConfigErrorBag {
 /// `anyhow::Result<T>`.
 /// Cross-section aggregation lives in `resolve_config`, which runs the
 /// workers against one shared bag instead.
-pub(crate) fn one_section<T>(f: impl FnOnce(&mut ConfigErrorBag) -> T) -> anyhow::Result<T> {
-    let mut bag = ConfigErrorBag::new();
+///
+/// Notices are dropped: every caller of this wrapper is a `#[cfg(test)]` shim
+/// or an internal shape check, none of which is the operator-facing path a
+/// notice exists for. The two paths that do render notices —
+/// `resolve_config` and `runtime::reload` — drive the workers against their
+/// own bag and drain it with [`ConfigDiagnostics::take_notices`].
+pub(crate) fn one_section<T>(f: impl FnOnce(&mut ConfigDiagnostics) -> T) -> anyhow::Result<T> {
+    let mut bag = ConfigDiagnostics::new();
     let value = f(&mut bag);
     bag.into_result()?;
     Ok(value)
@@ -199,14 +287,67 @@ pub(crate) fn one_section<T>(f: impl FnOnce(&mut ConfigErrorBag) -> T) -> anyhow
 mod tests {
     use super::*;
 
+    /// Notices and problems are independent channels. A bag holding only
+    /// notices must still resolve — the whole point of the notice channel is
+    /// that it never fails a config an operator deliberately asked for.
+    #[test]
+    fn notices_alone_do_not_fail_resolution() {
+        let mut bag = ConfigDiagnostics::new();
+        bag.warn("security.max_tracked_sources", "0: unbounded");
+        bag.note("security.per_source_rate_per_sec", "0: disabled");
+        assert_eq!(bag.problem_count(), 0, "a notice is not a problem");
+        assert!(bag.into_result().is_ok());
+    }
+
+    /// Notice order is load-bearing for the same reason problem order is: an
+    /// operator reads them against the order of the validation logic.
+    #[test]
+    fn take_notices_drains_in_insertion_order() {
+        let mut bag = ConfigDiagnostics::new();
+        bag.warn("b.second", "second");
+        bag.note("a.first", "first");
+        bag.warn("c.third", "third");
+
+        let notices = bag.take_notices();
+        let fields: Vec<&str> = notices.iter().map(|n| n.field.as_str()).collect();
+        assert_eq!(fields, ["b.second", "a.first", "c.third"]);
+        assert_eq!(
+            notices.iter().map(|n| n.level).collect::<Vec<_>>(),
+            [
+                ConfigNoticeLevel::Warn,
+                ConfigNoticeLevel::Info,
+                ConfigNoticeLevel::Warn
+            ]
+        );
+        assert!(
+            bag.take_notices().is_empty(),
+            "take must drain, not clone — a second caller would double-report"
+        );
+    }
+
+    /// Draining notices must not disturb the problem channel: `resolve_config`
+    /// and `runtime::reload` both `take_notices()` immediately before
+    /// `into_result()`, so a bag that fails must still fail identically.
+    #[test]
+    fn taking_notices_leaves_problems_intact() {
+        let mut bag = ConfigDiagnostics::new();
+        bag.push("blockchain.rpc_url", "missing");
+        bag.warn("security.max_tracked_sources", "0: unbounded");
+
+        assert_eq!(bag.take_notices().len(), 1);
+        assert_eq!(bag.problem_count(), 1);
+        let err = bag.into_result().expect_err("the problem still fails");
+        assert!(format!("{err:#}").contains("blockchain.rpc_url"));
+    }
+
     #[test]
     fn empty_bag_is_ok() {
-        assert!(ConfigErrorBag::new().into_result().is_ok());
+        assert!(ConfigDiagnostics::new().into_result().is_ok());
     }
 
     #[test]
     fn check_records_only_on_false_and_returns_cond() {
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         assert!(bag.check(true, "a.b", "should not appear"));
         assert!(!bag.check(false, "a.b", "boom"));
         let msg = format!("{:#}", bag.into_result().unwrap_err());
@@ -218,7 +359,7 @@ mod tests {
 
     #[test]
     fn try_with_preserves_context_chain() {
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let r: anyhow::Result<u8> =
             Err(anyhow::anyhow!("root cause")).map_err(|e| e.context("outer context"));
         assert_eq!(bag.try_with("x.y", r), None);
@@ -229,7 +370,7 @@ mod tests {
 
     #[test]
     fn aggregates_all_problems_with_count_and_bullets() {
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         bag.push("one.a", "first problem");
         bag.push("two.b", "second problem");
         let msg = format!("{:#}", bag.into_result().unwrap_err());
@@ -240,7 +381,7 @@ mod tests {
 
     #[test]
     fn check_with_runs_closure_only_on_failure() {
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let mut calls = 0;
         assert!(bag.check_with(true, "a.b", || {
             calls += 1;
@@ -258,7 +399,7 @@ mod tests {
 
     #[test]
     fn into_result_indents_multiline_message_continuations() {
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         bag.push("x.y", "line one\nline two");
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         assert!(msg.contains("  - x.y: line one\n    line two"), "{msg}");
@@ -266,7 +407,7 @@ mod tests {
 
     #[test]
     fn has_field_matches_exact_label() {
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         bag.push("identity.region", "bad region");
         assert!(bag.has_field("identity.region"));
         assert!(!bag.has_field("identity"));

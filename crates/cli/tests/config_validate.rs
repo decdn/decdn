@@ -437,8 +437,16 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
 }
 
 fn render(source: Option<&Path>, cfg: &ResolvedConfig) -> anyhow::Result<String> {
+    render_with_notices(source, cfg, &[])
+}
+
+fn render_with_notices(
+    source: Option<&Path>,
+    cfg: &ResolvedConfig,
+    notices: &[decdn_common::config::ConfigNotice],
+) -> anyhow::Result<String> {
     let mut buf = Vec::new();
-    commands::write_validate_summary(&mut buf, source, cfg)?;
+    commands::write_validate_summary(&mut buf, source, cfg, notices)?;
     Ok(String::from_utf8(buf)?)
 }
 
@@ -738,5 +746,55 @@ fn summary_reports_defaults_only_when_no_source() -> anyhow::Result<()> {
         out.contains("source:                   (defaults + env only"),
         "{out}"
     );
+    Ok(())
+}
+
+/// `decdn` links no `tracing` subscriber, so a resolve-time notice the daemon
+/// logs would otherwise vanish here. `config validate` exists to tell an
+/// operator what the node sees, and a notice is part of that answer — so it
+/// renders to the same writer as the summary, under it.
+#[test]
+fn summary_renders_resolve_notices_under_the_field_list() -> anyhow::Result<()> {
+    use decdn_common::config::{ConfigNotice, ConfigNoticeLevel};
+
+    let cfg = sample_resolved(|_| {});
+    let notices = vec![
+        ConfigNotice {
+            level: ConfigNoticeLevel::Warn,
+            field: "security.max_tracked_sources".to_string(),
+            message: "0: rate-limit bookkeeping map is unbounded".to_string(),
+        },
+        ConfigNotice {
+            level: ConfigNoticeLevel::Info,
+            field: "security.per_source_rate_per_sec".to_string(),
+            message: "0: per-source rate-limit disabled".to_string(),
+        },
+    ];
+    let out = render_with_notices(None, &cfg, &notices)?;
+
+    anyhow::ensure!(out.contains("notices (2):"), "{out}");
+    anyhow::ensure!(
+        out.contains(
+            "- warning: security.max_tracked_sources: 0: rate-limit bookkeeping map is unbounded"
+        ),
+        "{out}"
+    );
+    anyhow::ensure!(
+        out.contains("- info: security.per_source_rate_per_sec: 0: per-source rate-limit disabled"),
+        "{out}"
+    );
+    // The config still resolved — a notice never fails validation — so the
+    // leading verdict must stand rather than being downgraded.
+    anyhow::ensure!(out.starts_with("config valid"), "{out}");
+    Ok(())
+}
+
+/// The common case prints nothing extra: a `notices (0):` header on every clean
+/// run is the kind of noise that trains an operator to stop reading.
+#[test]
+fn summary_omits_the_notices_block_when_there_are_none() -> anyhow::Result<()> {
+    let cfg = sample_resolved(|_| {});
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(!out.contains("notices"), "{out}");
     Ok(())
 }

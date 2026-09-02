@@ -18,7 +18,7 @@ use crate::cli::common::{self, expand_tilde};
 use crate::cli::run::RunArgs;
 use crate::redact::redact_userinfo;
 
-pub use errors::ConfigErrorBag;
+pub use errors::{ConfigDiagnostics, ConfigNotice, ConfigNoticeLevel};
 pub use resolved::{
     LoadShedPolicyKind, ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent,
     ResolvedDht, ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedLoadShed,
@@ -498,22 +498,21 @@ const RETIRED_ENV_VARS: &[(&str, &str)] = &[(
      only upper bound",
 )];
 
-/// Emit one warning per retired env var that is still set. Deliberately not a
+/// Record one notice per retired env var that is still set. Deliberately not a
 /// hard error: unlike a stale TOML key, an env var is often inherited from an
 /// orchestrator the operator does not directly control, and refusing to boot
 /// over one would be a worse failure than the silent ignore it replaces.
 ///
-/// Writes to stderr rather than `tracing`, and that is load-bearing rather than
-/// a style choice: `resolve_config` runs *before* `init_tracing` in the daemon
-/// (`decdn-node`'s `commands::run`), so a `tracing::warn!` here has no global
-/// subscriber and is discarded — and `decdn` (the CLI, which reaches this via
-/// `config validate`) does not depend on `tracing` at all. Either way the
-/// warning would never reach the operator it exists for. The adjacent
-/// malformed-`RUST_LOG` notice uses `eprintln!` for exactly this reason.
+/// Notices go on the bag rather than straight to a sink, because neither sink
+/// is available here: `resolve_config` runs *before* `init_tracing` in the
+/// daemon (`decdn-node`'s `commands::run`), so a `tracing::warn!` at this point
+/// has no global subscriber and is discarded, and `decdn` (the CLI, which
+/// reaches this via `config validate` and `node doctor`) does not depend on
+/// `tracing` at all. The caller renders them once it knows which sink it has.
 ///
-/// Returns the names it warned about so callers (and tests) can assert on them.
-fn warn_retired_env_vars() -> Vec<&'static str> {
-    warn_retired_env_vars_with(|name| std::env::var_os(name).is_some())
+/// Returns the names it recorded so callers (and tests) can assert on them.
+fn warn_retired_env_vars(bag: &mut ConfigDiagnostics) -> Vec<&'static str> {
+    warn_retired_env_vars_with(|name| std::env::var_os(name).is_some(), bag)
 }
 
 /// [`warn_retired_env_vars`] with the environment lookup injected.
@@ -523,17 +522,19 @@ fn warn_retired_env_vars() -> Vec<&'static str> {
 /// so a test cannot set a variable to observe the behaviour. Injecting the
 /// predicate exercises the "var is set" branch directly — the branch that was
 /// silently broken before.
-#[expect(
-    clippy::print_stderr,
-    reason = "tracing is not initialized at config-resolve time"
-)]
-fn warn_retired_env_vars_with(is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
+fn warn_retired_env_vars_with(
+    is_set: impl Fn(&str) -> bool,
+    bag: &mut ConfigDiagnostics,
+) -> Vec<&'static str> {
     let mut warned = Vec::new();
     for (name, why) in RETIRED_ENV_VARS {
         if is_set(name) {
-            eprintln!(
-                "warning: {name} is set but no longer does anything: {why}. Remove it from \
-                 the environment to silence this warning."
+            bag.warn(
+                *name,
+                format!(
+                    "set but no longer does anything: {why}. Remove it from the environment \
+                     to silence this notice."
+                ),
             );
             warned.push(*name);
         }
@@ -545,6 +546,13 @@ fn warn_retired_env_vars_with(is_set: impl Fn(&str) -> bool) -> Vec<&'static str
 ///
 /// CLI args take precedence over file values; defaults fill gaps.
 ///
+/// Returns the resolved config together with every [`ConfigNotice`] the
+/// resolvers recorded. Notices are non-fatal by construction, and the caller
+/// renders them: the daemon replays them through `tracing` once `init_tracing`
+/// has installed a subscriber, `decdn config validate` prints them in its
+/// summary, and `decdn node doctor` turns them into findings. Nothing here
+/// writes to a sink, because at this point neither sink exists.
+///
 /// # Errors
 ///
 /// Returns an error if:
@@ -552,16 +560,19 @@ fn warn_retired_env_vars_with(is_set: impl Fn(&str) -> bool) -> Vec<&'static str
 /// - A required field (`rpc_url`, `payment_pool_address`,
 ///   `capacity_bond_address`) is not provided by any source.
 /// - The home directory cannot be determined for default paths.
-pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Result<ResolvedConfig> {
+pub fn resolve_config(
+    config_path: Option<&Path>,
+    cli: &RunArgs,
+) -> anyhow::Result<(ResolvedConfig, Vec<ConfigNotice>)> {
     // `load_file_config` stays fail-fast: a file we could not read, parse,
     // or env-expand never produced a `FileConfig`, so there is nothing to
     // validate. Everything *after* this accumulates into one `bag` so an
     // operator sees every problem in a single pass.
     let file = load_file_config(config_path)?;
 
-    let _retired = warn_retired_env_vars();
+    let mut bag = ConfigDiagnostics::new();
 
-    let mut bag = ConfigErrorBag::new();
+    let _retired = warn_retired_env_vars(&mut bag);
 
     let identity = resolve_identity_into(&cli.identity, file.identity.as_ref(), &mut bag);
     // A region that was supplied but failed `normalize_region` is already
@@ -602,22 +613,29 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     validate_port_layout_into(&network, &observability, &mut bag);
     ensure_no_hash_pinned_and_denied_into(&cache, &content, &mut bag);
 
+    // Drain before `into_result` consumes the bag. Notices are dropped on the
+    // error path deliberately: a config that does not resolve is not the one
+    // the operator is running, so its notices would describe nothing live.
+    let notices = bag.take_notices();
     bag.into_result()?;
 
-    Ok(ResolvedConfig {
-        identity,
-        network,
-        blockchain,
-        cache,
-        payment,
-        observability,
-        security,
-        load_shed,
-        dht,
-        probe,
-        receipts,
-        content,
-    })
+    Ok((
+        ResolvedConfig {
+            identity,
+            network,
+            blockchain,
+            cache,
+            payment,
+            observability,
+            security,
+            load_shed,
+            dht,
+            probe,
+            receipts,
+            content,
+        },
+        notices,
+    ))
 }
 
 /// Reject a hash that is simultaneously **pinned** (`cache.pinned_hashes`) and
@@ -651,7 +669,7 @@ fn ensure_no_hash_pinned_and_denied(
 fn ensure_no_hash_pinned_and_denied_into(
     cache: &ResolvedCache,
     content: &ResolvedContent,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) {
     let mut both: Vec<String> = cache
         .pinned_hashes
@@ -691,9 +709,6 @@ fn ensure_no_hash_pinned_and_denied_into(
 /// with nothing (the OS picks distinct values) and needs no elevated
 /// privilege, so every check skips it. Admin disabled (`None`) means we
 /// skip the pair checks that involve it.
-///
-/// Uses `eprintln!` rather than `tracing::warn!` because `tracing` is not
-/// yet initialized at `resolve_config` time (see `commands::run`).
 #[cfg(test)]
 fn validate_port_layout(
     network: &ResolvedNetwork,
@@ -702,14 +717,10 @@ fn validate_port_layout(
     one_section(|bag| validate_port_layout_into(network, observability, bag))
 }
 
-#[expect(
-    clippy::print_stderr,
-    reason = "tracing is not initialized at config-resolve time"
-)]
 fn validate_port_layout_into(
     network: &ResolvedNetwork,
     observability: &ResolvedObservability,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) {
     let bind = network.bind_port;
     let metrics = observability.metrics_port;
@@ -772,10 +783,12 @@ fn validate_port_layout_into(
         if let Some(p) = port
             && (1..1024).contains(&p)
         {
-            eprintln!(
-                "warning: {name} = {p} is in the well-known range (<1024); \
-                 requires elevated privilege to bind on Unix and may collide with \
-                 a standardized service"
+            bag.warn(
+                name,
+                format!(
+                    "{p} is in the well-known range (<1024); requires elevated privilege to \
+                     bind on Unix and may collide with a standardized service"
+                ),
             );
         }
     }
@@ -793,7 +806,7 @@ fn resolve_identity(
 fn resolve_identity_into(
     cli: &crate::cli::run::IdentityArgs,
     file: Option<&types::IdentityConfig>,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> ResolvedIdentity {
     let data_dir = cli
         .data_dir
@@ -867,14 +880,10 @@ fn normalize_region(raw: &str) -> anyhow::Result<String> {
 /// invariant bring-up enforces — a credential-bearing typo
 /// (`relay://user:pass@bad host`) is exactly the malformed shape that lands on
 /// the error path.
-#[expect(
-    clippy::print_stderr,
-    reason = "tracing is not initialized at config-resolve time"
-)]
 fn resolve_network_into(
     cli: &crate::cli::run::NetworkArgs,
     file: Option<&types::NetworkConfig>,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> ResolvedNetwork {
     let bind_port = cli
         .bind_port
@@ -896,14 +905,14 @@ fn resolve_network_into(
     // takes precedence over the file list, so a stale exported env var silently
     // collapses a multi-entry `network.relay_urls` failover list (#795/#817) to
     // the single env value. Warn rather than defeat relay redundancy quietly.
-    // `eprintln!` not `tracing::warn!`: tracing is not initialized at resolve
-    // time (see `validate_security_into`).
     let file_relay_list_len = file.and_then(|n| n.relay_urls.as_ref()).map_or(0, Vec::len);
     if cli.relay_url.is_some() && file_relay_list_len > 0 {
-        eprintln!(
-            "warning: --relay-url (or DECDN_RELAY_URL) overrides the \
-             {file_relay_list_len}-entry network.relay_urls list; multi-relay \
-             failover is disabled"
+        bag.warn(
+            "network.relay_url",
+            format!(
+                "--relay-url (or DECDN_RELAY_URL) overrides the {file_relay_list_len}-entry \
+                 network.relay_urls list; multi-relay failover is disabled"
+            ),
         );
     }
 
@@ -976,7 +985,7 @@ pub fn resolve_discovery(file: &FileConfig) -> anyhow::Result<ResolvedDiscovery>
 /// reverse — `dns_origin` alone — is valid (a resolve-only node).
 fn resolve_discovery_into(
     file: Option<&types::NetworkConfig>,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> ResolvedDiscovery {
     let Some(disc) = file.and_then(|n| n.discovery.as_ref()) else {
         return ResolvedDiscovery::default();
@@ -1044,7 +1053,7 @@ fn resolve_discovery_into(
 fn resolve_discovery_peer(
     node_id: &str,
     peer: &types::DiscoveryPeer,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> Option<ResolvedDiscoveryPeer> {
     let mut ok = bag
         .try_with(
@@ -1095,7 +1104,7 @@ fn resolve_network(
     cli: &crate::cli::run::NetworkArgs,
     file: Option<&types::NetworkConfig>,
 ) -> ResolvedNetwork {
-    let mut bag = ConfigErrorBag::new();
+    let mut bag = ConfigDiagnostics::new();
     let resolved = resolve_network_into(cli, file, &mut bag);
     // This shim discards the bag, so it must only be fed well-formed relay
     // URLs. Trip loudly if a future caller passes a malformed entry whose
@@ -1157,7 +1166,7 @@ fn resolve_contract_address(
     flag_name: &str,
     missing_msg: &str,
     raw: Option<String>,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> String {
     match raw.filter(|s| !s.is_empty()) {
         None => {
@@ -1189,7 +1198,7 @@ fn resolve_blockchain_into(
     file: Option<&types::BlockchainConfig>,
     data_dir: &std::path::Path,
     data_dir_valid: bool,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> ResolvedBlockchain {
     let rpc_url = match cli
         .rpc_url
@@ -1708,7 +1717,7 @@ fn resolve_cache_into(
     cli: &crate::cli::run::CacheArgs,
     file: Option<&types::CacheConfig>,
     data_dir: &std::path::Path,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> ResolvedCache {
     let cache_dir = cli
         .cache_dir
@@ -2183,7 +2192,7 @@ fn resolve_cache_into(
 /// copy-paste mistake worth flagging in the startup log.
 fn resolve_origins_into(
     file: Option<&types::CacheConfig>,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> Vec<crate::config::ResolvedOrigin> {
     let Some(cache) = file else {
         return Vec::new();
@@ -2719,7 +2728,7 @@ pub fn parse_denied_origins(
 /// outcome an operator must never get silently.
 fn resolve_content_into(
     file: Option<&types::ContentConfig>,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> ResolvedContent {
     let denied_hashes = bag
         .try_with(
@@ -2773,7 +2782,7 @@ pub fn resolve_payment(
 pub fn resolve_payment_into(
     cli: &crate::cli::run::PaymentArgs,
     file: Option<&types::PaymentConfig>,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> ResolvedPayment {
     let rate_per_mb = cli
         .rate_per_mb
@@ -2903,7 +2912,7 @@ pub fn resolve_observability(
 pub fn resolve_observability_into(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> ResolvedObservability {
     let log_level = cli
         .log_level
@@ -2983,7 +2992,7 @@ fn resolve_receipts(file: Option<&types::ReceiptsConfig>) -> anyhow::Result<Reso
 /// `resolve_receipts` shim wraps this for direct unit tests.
 fn resolve_receipts_into(
     file: Option<&types::ReceiptsConfig>,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> ResolvedReceipts {
     let max_file_bytes = file
         .and_then(|r| r.max_file_bytes)
@@ -3043,17 +3052,9 @@ pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<
 /// sections during startup ([`resolve_config`]) and SIGHUP reload
 /// (`runtime::reload`); see [`resolve_payment_into`] for the rationale.
 #[allow(clippy::cognitive_complexity)]
-// Unlike the sibling resolvers, this one runs on the SIGHUP reload path too
-// (`runtime::reload::SecuritySection::resolve`), where a subscriber IS live.
-// The warnings below then reach boot stderr but not an operator's structured
-// log stream — routing them through `tracing` on that path is #1902.
-#[expect(
-    clippy::print_stderr,
-    reason = "no subscriber at startup resolve; on the reload path this under-reports (#1902)"
-)]
 pub fn resolve_security_into(
     file: Option<&types::SecurityConfig>,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> ResolvedSecurity {
     let max_concurrent_handlers = file
         .and_then(|s| s.max_concurrent_handlers)
@@ -3098,19 +3099,23 @@ pub fn resolve_security_into(
         .and_then(|s| s.max_tracked_sources)
         .unwrap_or(DEFAULT_MAX_TRACKED_SOURCES);
 
-    // `eprintln!` not `tracing::{info,warn}!`: tracing is not initialized
-    // at `resolve_config` time (see `commands::run` and the rationale on
-    // `validate_port_layout_into`).
     if max_concurrent_handlers == 0 {
-        eprintln!("info: security.max_concurrent_handlers = 0: global concurrency cap disabled");
+        bag.note(
+            "security.max_concurrent_handlers",
+            "0: global concurrency cap disabled",
+        );
     }
     if per_source_rate_per_sec == 0.0 {
-        eprintln!("info: security.per_source_rate_per_sec = 0: per-source rate-limit disabled");
+        bag.note(
+            "security.per_source_rate_per_sec",
+            "0: per-source rate-limit disabled",
+        );
     }
     if max_tracked_sources == 0 {
-        eprintln!(
-            "warning: security.max_tracked_sources = 0: rate-limit bookkeeping map is unbounded; \
-             an attacker churning sources can grow it without limit"
+        bag.warn(
+            "security.max_tracked_sources",
+            "0: rate-limit bookkeeping map is unbounded; an attacker churning sources can \
+             grow it without limit",
         );
     }
 
@@ -3132,7 +3137,7 @@ pub fn resolve_load_shed(file: Option<&types::LoadShedConfig>) -> anyhow::Result
 /// (`runtime::reload`); see [`resolve_payment_into`] for the rationale.
 pub fn resolve_load_shed_into(
     file: Option<&types::LoadShedConfig>,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> ResolvedLoadShed {
     let policy = match file.and_then(|c| c.policy.as_deref()) {
         None | Some("resource-pressure") => LoadShedPolicyKind::ResourcePressure,
@@ -3176,11 +3181,10 @@ pub fn resolve_load_shed_into(
 /// rejected as a deny-all corner case — the resolver treats it the same
 /// way [`resolve_security_into`] handles the `per_source` pairing.
 #[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
-#[expect(
-    clippy::print_stderr,
-    reason = "tracing is not initialized at config-resolve time"
-)]
-pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBag) -> ResolvedDht {
+pub fn resolve_dht_into(
+    file: Option<&types::DhtConfig>,
+    bag: &mut ConfigDiagnostics,
+) -> ResolvedDht {
     // ADR 022 nests the rate-limit knobs under `dht.rate_limit.*`.
     // The file shape mirrors that; an absent `[dht.rate_limit]` collapses
     // to "all defaults" through the same `.and_then` chain the other
@@ -3243,19 +3247,18 @@ pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBa
     let max_tracked_per_peer = rate_limit
         .and_then(|r| r.max_tracked_per_peer)
         .unwrap_or(DEFAULT_DHT_MAX_TRACKED_PER_PEER);
-    // `eprintln!` not `tracing::warn!`: tracing is not initialized at
-    // `resolve_config` time (see `commands::run` and the rationale on
-    // `validate_port_layout_into`).
     if max_tracked_per_ip == 0 {
-        eprintln!(
-            "warning: dht.rate_limit.max_tracked_per_ip = 0: per-IP bookkeeping map is unbounded; \
-             an attacker churning source IPs can grow it without limit"
+        bag.warn(
+            "dht.rate_limit.max_tracked_per_ip",
+            "0: per-IP bookkeeping map is unbounded; an attacker churning source IPs can \
+             grow it without limit",
         );
     }
     if max_tracked_per_peer == 0 {
-        eprintln!(
-            "warning: dht.rate_limit.max_tracked_per_peer = 0: per-peer bookkeeping map is unbounded; \
-             an attacker churning NodeIds can grow it without limit"
+        bag.warn(
+            "dht.rate_limit.max_tracked_per_peer",
+            "0: per-peer bookkeeping map is unbounded; an attacker churning NodeIds can \
+             grow it without limit",
         );
     }
 
@@ -3272,7 +3275,7 @@ pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBa
 }
 
 /// Convenience wrapper for [`resolve_dht_into`] that takes a fresh
-/// `ConfigErrorBag`. Test-only.
+/// `ConfigDiagnostics`. Test-only.
 #[cfg(test)]
 pub fn resolve_dht(file: Option<&types::DhtConfig>) -> anyhow::Result<ResolvedDht> {
     one_section(|bag| resolve_dht_into(file, bag))
@@ -3285,13 +3288,9 @@ pub fn resolve_dht(file: Option<&types::DhtConfig>) -> anyhow::Result<ResolvedDh
 /// Mirrors [`resolve_dht_into`]; only the
 /// defaults and the `probe.rate_limit.*` field keys differ.
 #[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
-#[expect(
-    clippy::print_stderr,
-    reason = "tracing is not initialized at config-resolve time"
-)]
 pub fn resolve_probe_into(
     file: Option<&types::ProbeConfig>,
-    bag: &mut ConfigErrorBag,
+    bag: &mut ConfigDiagnostics,
 ) -> ResolvedProbe {
     // ADR 005 nests the rate-limit knobs under `probe.rate_limit.*`.
     let rate_limit = file.and_then(|p| p.rate_limit.as_ref());
@@ -3352,18 +3351,18 @@ pub fn resolve_probe_into(
     let max_tracked_per_peer = rate_limit
         .and_then(|r| r.max_tracked_per_peer)
         .unwrap_or(DEFAULT_PROBE_MAX_TRACKED_PER_PEER);
-    // `eprintln!` not `tracing::warn!`: tracing is not initialized at
-    // `resolve_config` time (mirrors `resolve_dht_into`).
     if max_tracked_per_ip == 0 {
-        eprintln!(
-            "warning: probe.rate_limit.max_tracked_per_ip = 0: per-IP bookkeeping map is unbounded; \
-             an attacker churning source IPs can grow it without limit"
+        bag.warn(
+            "probe.rate_limit.max_tracked_per_ip",
+            "0: per-IP bookkeeping map is unbounded; an attacker churning source IPs can \
+             grow it without limit",
         );
     }
     if max_tracked_per_peer == 0 {
-        eprintln!(
-            "warning: probe.rate_limit.max_tracked_per_peer = 0: per-peer bookkeeping map is unbounded; \
-             an attacker churning NodeIds can grow it without limit"
+        bag.warn(
+            "probe.rate_limit.max_tracked_per_peer",
+            "0: per-peer bookkeeping map is unbounded; an attacker churning NodeIds can \
+             grow it without limit",
         );
     }
 
@@ -3380,7 +3379,7 @@ pub fn resolve_probe_into(
 }
 
 /// Convenience wrapper for [`resolve_probe_into`] that takes a fresh
-/// `ConfigErrorBag`. Test-only.
+/// `ConfigDiagnostics`. Test-only.
 #[cfg(test)]
 pub fn resolve_probe(file: Option<&types::ProbeConfig>) -> anyhow::Result<ResolvedProbe> {
     one_section(|bag| resolve_probe_into(file, bag))
@@ -5294,19 +5293,36 @@ swap_pool_address = \"0xPool\"
     /// `tracing::warn!`, which `resolve_config` reaches *before* `init_tracing`
     /// installs a subscriber — so it compiled, passed CI, and emitted nothing.
     /// Asserting the returned names is what makes "it actually fired" testable
-    /// without a subscriber; the stderr text is a side effect of the same call.
-    ///
+    /// without a subscriber; the recorded notice is a side effect of the same
+    /// call, and is asserted alongside it.
     #[test]
     fn retired_env_var_that_is_set_is_actually_reported() {
-        let warned = warn_retired_env_vars_with(|n| n == "DECDN_DELIVERY_CEILING");
+        let mut bag = ConfigDiagnostics::new();
+        let warned = warn_retired_env_vars_with(|n| n == "DECDN_DELIVERY_CEILING", &mut bag);
         assert_eq!(
             warned,
             vec!["DECDN_DELIVERY_CEILING"],
             "a set retired var must be reported"
         );
+        let notices = bag.take_notices();
+        assert_eq!(notices.len(), 1, "one notice per reported var");
+        let notice = notices.first().expect("one notice");
+        assert_eq!(notice.field, "DECDN_DELIVERY_CEILING");
+        assert_eq!(notice.level, ConfigNoticeLevel::Warn);
         assert!(
-            warn_retired_env_vars_with(|_| false).is_empty(),
+            notice.message.contains("no longer does anything"),
+            "notice must say the var is inert: {}",
+            notice.message
+        );
+
+        let mut clean = ConfigDiagnostics::new();
+        assert!(
+            warn_retired_env_vars_with(|_| false, &mut clean).is_empty(),
             "nothing set => nothing reported"
+        );
+        assert!(
+            clean.take_notices().is_empty(),
+            "nothing set => no notice recorded"
         );
     }
 
@@ -5818,7 +5834,7 @@ swap_pool_address = \"0xPool\"
             denied_hashes: Some(vec![shared.clone()]),
             ..types::ContentConfig::default()
         };
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let cache = resolve_cache_into(&cli, Some(&cache_file), Path::new("/tmp"), &mut bag);
         let content = resolve_content_into(Some(&content_file), &mut bag);
         bag.into_result()?; // each section parses fine on its own
@@ -5848,7 +5864,7 @@ swap_pool_address = \"0xPool\"
             denied_hashes: Some(vec!["cd".repeat(32)]),
             ..types::ContentConfig::default()
         };
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let cache = resolve_cache_into(&cli, Some(&cache_file), Path::new("/tmp"), &mut bag);
         let content = resolve_content_into(Some(&content_file), &mut bag);
         bag.into_result()?;
@@ -5862,7 +5878,7 @@ swap_pool_address = \"0xPool\"
             "[content]\ndenied_hashes = [\"{}\"]\ndenied_origins = [\"0x000000000000000000000000000000000000dEaD\"]\n",
             "cd".repeat(32)
         ))?;
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let resolved = resolve_content_into(file.content.as_ref(), &mut bag);
         bag.into_result()?;
         anyhow::ensure!(resolved.denied_hashes.len() == 1);
@@ -5872,7 +5888,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_content_absent_section_denies_nothing() {
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let resolved = resolve_content_into(None, &mut bag);
         assert!(bag.into_result().is_ok());
         assert!(resolved.denied_hashes.is_empty());
@@ -5936,7 +5952,7 @@ swap_pool_address = \"0xPool\"
             user_agent: Some("evil\r\nX-Inject: 1".to_string()),
             ..types::CacheConfig::default()
         };
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let resolved = resolve_cache_into(&cli, Some(&file), Path::new("/tmp"), &mut bag);
         assert!(
             bag.has_field("cache.user_agent"),
@@ -7028,7 +7044,7 @@ swap_pool_address = \"0xPool\"
         let dir = data_dir_with_keystore()?;
         let path = write_minimal_toml(&dir, &toml_body)?;
         let args = run_args_with_data_dir(dir.path());
-        let resolved = resolve_config(Some(&path), &args)?;
+        let (resolved, _notices) = resolve_config(Some(&path), &args)?;
         match resolved.cache.origins.into_iter().next() {
             Some(ResolvedOrigin::S3(s3)) => {
                 anyhow::ensure!(s3.bucket == "decdn-blobs");
@@ -7556,7 +7572,7 @@ swap_pool_address = \"0xPool\"
         // `validate_port_layout_into` that promises accumulation across
         // pairs, and verifies each pair carries a distinct field label so
         // the bag can hold all three without one overwriting another.
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         validate_port_layout_into(&net(7000), &obs_with_admin(7000, 7000), &mut bag);
         let err = bag
             .into_result()
@@ -8219,9 +8235,9 @@ swap_pool_address = \"0xPool\"
     fn resolve_network_cli_relay_url_overrides_file_list() {
         // The singular `--relay-url` CLI flag takes precedence over the file
         // list, preserving the existing single-relay override semantics. This
-        // is also the #843 warning trigger (CLI/env relay set while a non-empty
-        // `relay_urls` list exists); the warning is stderr-only, matching the
-        // other untested `eprintln!` resolve warnings.
+        // is also the #843 notice trigger (CLI/env relay set while a non-empty
+        // `relay_urls` list exists); the notice itself is asserted by
+        // `network_cli_relay_override_of_a_file_list_warns`.
         let mut cli = empty_network_args();
         cli.relay_url = Some("https://cli.example".to_string());
         let file = types::NetworkConfig {
@@ -8278,7 +8294,7 @@ swap_pool_address = \"0xPool\"
             ]),
             discovery: None,
         };
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
         assert_eq!(resolved.relay_urls.len(), 2);
         assert!(
@@ -8295,7 +8311,7 @@ swap_pool_address = \"0xPool\"
             relay_urls: Some(vec!["not a url".to_string()]),
             discovery: None,
         };
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         // Names the indexed field and echoes the offending entry so the
@@ -8318,7 +8334,7 @@ swap_pool_address = \"0xPool\"
             ]),
             discovery: None,
         };
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         assert!(msg.contains("configuration has 2 problem(s):"), "{msg}");
@@ -8339,7 +8355,7 @@ swap_pool_address = \"0xPool\"
             relay_urls: Some(vec!["https://user:s3cret@host:notaport".to_string()]),
             discovery: None,
         };
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         assert!(msg.contains("network.relay_urls[0]"), "{msg}");
@@ -8357,7 +8373,7 @@ swap_pool_address = \"0xPool\"
         // alias, reported under the singular `network.relay_url` label.
         let mut cli = empty_network_args();
         cli.relay_url = Some("not a url".to_string());
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let _ = resolve_network_into(&cli, None, &mut bag);
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         assert!(
@@ -8396,7 +8412,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: Some("discovery.example.".to_string()),
             peers: None,
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
         assert!(bag.into_result().is_ok());
         assert_eq!(
@@ -8419,7 +8435,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: Some("discovery.example.".to_string()),
             peers: None,
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
         assert!(bag.into_result().is_ok());
         assert!(resolved.discovery.pkarr_url.is_none());
@@ -8439,7 +8455,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: None,
             peers: None,
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         assert!(msg.contains("network.discovery.dns_origin"), "{msg}");
@@ -8455,7 +8471,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: Some("discovery.example.".to_string()),
             peers: None,
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         assert!(msg.contains("network.discovery.pkarr_url"), "{msg}");
@@ -8474,7 +8490,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: Some("   ".to_string()),
             peers: None,
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         assert!(msg.contains("network.discovery.dns_origin"), "{msg}");
@@ -8500,7 +8516,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: None,
             peers: Some(peers),
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
         assert!(bag.into_result().is_ok());
         assert_eq!(resolved.discovery.peers.len(), 1);
@@ -8525,7 +8541,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: None,
             peers: Some(peers),
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         assert!(
@@ -8550,7 +8566,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: None,
             peers: Some(peers),
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         assert!(
@@ -8578,7 +8594,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: Some("discovery.example.".to_string()),
             peers: Some(peers),
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
         assert!(bag.into_result().is_ok());
         assert!(resolved.discovery.pkarr_url.is_some());
@@ -8606,7 +8622,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: None,
             peers: Some(peers),
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         assert!(
@@ -8633,7 +8649,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: None,
             peers: Some(peers),
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         assert!(
@@ -8667,7 +8683,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: None,
             peers: Some(peers),
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
         assert_eq!(bag.problem_count(), 2, "both fields should be reported");
         let msg = format!("{:#}", bag.into_result().unwrap_err());
@@ -8707,7 +8723,7 @@ swap_pool_address = \"0xPool\"
             dns_origin: None,
             peers: Some(peers),
         });
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
         assert!(bag.into_result().is_ok());
         assert_eq!(resolved.discovery.peers.len(), 2);
@@ -10112,7 +10128,7 @@ capacity_bond_address = "{capacity_bond_address}"
         let mut args = run_args_with_data_dir(dir.path());
         args.network.bind_port = Some(31_337);
 
-        let resolved = resolve_config(Some(&path), &args)?;
+        let (resolved, _notices) = resolve_config(Some(&path), &args)?;
 
         // CLI value wins for bind_port.
         assert_eq!(resolved.network.bind_port, 31_337);
@@ -10153,7 +10169,7 @@ capacity_bond_address = "{capacity_bond_address}"
         args.blockchain.payment_pool_address = Some(GOOD_ADDR.to_string());
         args.blockchain.capacity_bond_address = Some(ALT_ADDR_3.to_string());
 
-        let resolved = resolve_config(Some(&path), &args)?;
+        let (resolved, _notices) = resolve_config(Some(&path), &args)?;
 
         assert!(
             resolved
@@ -10182,7 +10198,7 @@ capacity_bond_address = "{capacity_bond_address}"
         )?;
         let args = run_args_with_data_dir(dir.path());
 
-        let resolved = resolve_config(Some(&path), &args)?;
+        let (resolved, _notices) = resolve_config(Some(&path), &args)?;
 
         assert!(
             resolved
@@ -11098,5 +11114,197 @@ bind_port = 12345
         let resolved = resolve_probe(Some(&p)).expect("0 makes the maps unbounded");
         assert_eq!(resolved.max_tracked_per_ip, 0);
         assert_eq!(resolved.max_tracked_per_peer, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Resolve-time notices
+    //
+    // Every notice below was previously an `eprintln!` that nothing could
+    // observe: the resolvers ran before a subscriber existed, so the only
+    // assertion available was that the value resolved. Recording notices on
+    // the bag is what makes "the operator was actually told" testable, and
+    // these are the guards that keep a future refactor from dropping one
+    // silently the way `tracing::warn!` once did.
+    // -----------------------------------------------------------------
+
+    /// Run a bag-threading resolver and hand back only what it recorded.
+    fn notices_from<T>(f: impl FnOnce(&mut ConfigDiagnostics) -> T) -> Vec<ConfigNotice> {
+        let mut bag = ConfigDiagnostics::new();
+        f(&mut bag);
+        bag.take_notices()
+    }
+
+    /// Assert exactly one notice, and return it.
+    fn only_notice(notices: Vec<ConfigNotice>) -> ConfigNotice {
+        assert_eq!(notices.len(), 1, "expected exactly one notice: {notices:?}");
+        notices.into_iter().next().expect("one notice")
+    }
+
+    #[test]
+    fn security_zero_max_tracked_sources_warns_about_the_unbounded_map() {
+        let s = sec_with(|s| s.max_tracked_sources = Some(0));
+        let notice = only_notice(notices_from(|bag| resolve_security_into(Some(&s), bag)));
+        assert_eq!(notice.field, "security.max_tracked_sources");
+        assert_eq!(
+            notice.level,
+            ConfigNoticeLevel::Warn,
+            "an unbounded bookkeeping map weakens a safety property"
+        );
+        assert!(
+            notice.message.contains("unbounded"),
+            "the operator greps for this word: {}",
+            notice.message
+        );
+    }
+
+    /// The two disabled-layer notices are `Info`, not `Warn`: switching a rate
+    /// limit off is a documented opt-out working exactly as configured, and a
+    /// consumer that gates its exit status on severity must not trip on them.
+    #[test]
+    fn security_disabled_layers_are_informational_not_warnings() {
+        let s = sec_with(|s| {
+            s.max_concurrent_handlers = Some(0);
+            s.per_source_rate_per_sec = Some(0.0);
+            s.per_source_burst = Some(0);
+        });
+        let notices = notices_from(|bag| resolve_security_into(Some(&s), bag));
+        let fields: Vec<&str> = notices.iter().map(|n| n.field.as_str()).collect();
+        assert_eq!(
+            fields,
+            [
+                "security.max_concurrent_handlers",
+                "security.per_source_rate_per_sec"
+            ]
+        );
+        assert!(notices.iter().all(|n| n.level == ConfigNoticeLevel::Info));
+    }
+
+    #[test]
+    fn security_at_defaults_records_no_notice() {
+        assert!(notices_from(|bag| resolve_security_into(None, bag)).is_empty());
+    }
+
+    #[test]
+    fn dht_zero_max_tracked_warns_per_ip_and_per_peer() {
+        let d = dht_rl_with(|r| {
+            r.max_tracked_per_ip = Some(0);
+            r.max_tracked_per_peer = Some(0);
+        });
+        let notices = notices_from(|bag| resolve_dht_into(Some(&d), bag));
+        let fields: Vec<&str> = notices.iter().map(|n| n.field.as_str()).collect();
+        assert_eq!(
+            fields,
+            [
+                "dht.rate_limit.max_tracked_per_ip",
+                "dht.rate_limit.max_tracked_per_peer"
+            ]
+        );
+        assert!(notices.iter().all(|n| n.level == ConfigNoticeLevel::Warn));
+        assert!(notices.iter().all(|n| n.message.contains("unbounded")));
+    }
+
+    #[test]
+    fn probe_zero_max_tracked_warns_per_ip_and_per_peer() {
+        let p = probe_rl_with(|r| {
+            r.max_tracked_per_ip = Some(0);
+            r.max_tracked_per_peer = Some(0);
+        });
+        let notices = notices_from(|bag| resolve_probe_into(Some(&p), bag));
+        let fields: Vec<&str> = notices.iter().map(|n| n.field.as_str()).collect();
+        assert_eq!(
+            fields,
+            [
+                "probe.rate_limit.max_tracked_per_ip",
+                "probe.rate_limit.max_tracked_per_peer"
+            ]
+        );
+        assert!(notices.iter().all(|n| n.level == ConfigNoticeLevel::Warn));
+    }
+
+    /// #843: a stale exported `DECDN_RELAY_URL` collapses a multi-entry
+    /// failover list to one entry. Silent, and months later it reads as an
+    /// unexplained outage — which is exactly why the notice has to be
+    /// reachable rather than merely emitted.
+    #[test]
+    fn network_cli_relay_override_of_a_file_list_warns() {
+        let cli = crate::cli::run::NetworkArgs {
+            bind_port: None,
+            relay_url: Some("https://cli.example".to_string()),
+        };
+        let file = types::NetworkConfig {
+            bind_port: None,
+            relay_urls: Some(vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string(),
+            ]),
+            discovery: None,
+        };
+        let notice = only_notice(notices_from(|bag| {
+            resolve_network_into(&cli, Some(&file), bag)
+        }));
+        assert_eq!(notice.field, "network.relay_url");
+        assert_eq!(notice.level, ConfigNoticeLevel::Warn);
+        assert!(
+            notice.message.contains("2-entry") && notice.message.contains("failover is disabled"),
+            "the notice must name what was lost: {}",
+            notice.message
+        );
+    }
+
+    /// No override, no notice — the guard against a notice that fires on every
+    /// boot and trains the operator to ignore it.
+    #[test]
+    fn network_file_relay_list_alone_records_no_notice() {
+        let cli = empty_network_args();
+        let file = types::NetworkConfig {
+            bind_port: None,
+            relay_urls: Some(vec!["https://a.example".to_string()]),
+            discovery: None,
+        };
+        assert!(
+            notices_from(|bag| resolve_network_into(&cli, Some(&file), bag)).is_empty(),
+            "a file-only relay list is the normal configuration"
+        );
+    }
+
+    #[test]
+    fn well_known_port_warns_naming_the_field_the_operator_wrote() {
+        let network = ResolvedNetwork {
+            bind_port: 80,
+            ..resolve_network(&empty_network_args(), None)
+        };
+        let observability = resolve_observability(&empty_observability_args(), None)
+            .expect("observability defaults are valid");
+        let notice = only_notice(notices_from(|bag| {
+            validate_port_layout_into(&network, &observability, bag);
+        }));
+        assert_eq!(notice.field, "network.bind_port");
+        assert_eq!(notice.level, ConfigNoticeLevel::Warn);
+        assert!(notice.message.contains("well-known range"));
+    }
+
+    /// `resolve_config` hands notices back rather than printing them, and
+    /// drains them from the same bag the problems ride on — so a clean resolve
+    /// still carries whatever the section resolvers recorded.
+    #[test]
+    fn resolve_config_returns_the_notices_its_resolvers_recorded() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let body = format!(
+            "{}\n[security]\nmax_tracked_sources = 0\n",
+            complete_toml_body()
+        );
+        let path = write_minimal_toml(&dir, &body)?;
+        let args = run_args_with_data_dir(dir.path());
+
+        let (resolved, notices) = resolve_config(Some(&path), &args)?;
+        assert_eq!(resolved.security.max_tracked_sources, 0);
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.field == "security.max_tracked_sources"
+                    && n.level == ConfigNoticeLevel::Warn),
+            "the security notice must survive the trip out of resolve_config: {notices:?}"
+        );
+        Ok(())
     }
 }

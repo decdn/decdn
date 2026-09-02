@@ -605,3 +605,102 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         );
     }
 }
+
+/// A resolve-time notice must reach the operator's log stream on the SIGHUP
+/// path, not just boot stderr.
+///
+/// `resolve_security_into` runs in two places: once at startup, before
+/// `init_tracing` installs a subscriber, and again on every SIGHUP against a
+/// daemon whose subscriber has been live for hours. An operator running
+/// `log_format = "json"` and shipping only the structured stream sees nothing
+/// at all from a warning written straight to stderr — the reload's own
+/// "section applied" event carries the new value but neither the severity nor
+/// the word the operator greps for.
+///
+/// The same three constraints as the test above make the capture sound: a
+/// thread-local `set_default` guard, a `current_thread` runtime, and `reload`
+/// awaited inline rather than spawned.
+#[tokio::test(flavor = "current_thread")]
+async fn sighup_routes_a_resolve_notice_into_the_log_stream() {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let log_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = BufferWriter(Arc::clone(&log_buf));
+    let _log_guard = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .with_max_level(LevelFilter::INFO)
+        .finish()
+        .set_default();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+
+    let initial = seed_resolved(10, LogLevel::Info);
+    let (setter, _levels) = recording_setter();
+    let state = Arc::new(RuntimeReloadState::new(
+        ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port: None,
+            metrics_bind: None,
+            admin_port: None,
+            otlp_endpoint: None,
+        },
+        &initial,
+        setter,
+    ));
+
+    let mut hup = {
+        use tokio::signal::unix::{SignalKind, signal};
+        signal(SignalKind::hangup()).expect("install SIGHUP stream")
+    };
+
+    // `0` is a documented escape hatch, so the reload must *succeed* — the
+    // notice is the whole observable effect, which is what made it so easy to
+    // lose.
+    write_config(&path, "[security]\nmax_tracked_sources = 0\n");
+    raise_sighup_soon();
+    hup.recv().await.expect("first SIGHUP");
+    state.reload(&path).await.expect("0 is valid, not an error");
+
+    let logs = captured_logs(&log_buf);
+    let notice = logs
+        .lines()
+        .find(|l| l.contains("security.max_tracked_sources"))
+        .unwrap_or_else(|| panic!("no notice for the zeroed bookkeeping cap, got:\n{logs}"));
+    assert!(
+        notice.contains("WARN"),
+        "an unbounded bookkeeping map must be WARN, not INFO: {notice}"
+    );
+    assert!(
+        notice.contains("unbounded"),
+        "the notice must carry the word an operator alerts on: {notice}"
+    );
+
+    // An aborted reload applies nothing, so its notices would describe a
+    // config the node is not running. Clear the buffer, then SIGHUP a file
+    // whose `[security]` section carries both the notice trigger and a fatal
+    // problem.
+    log_buf.lock().unwrap().clear();
+    write_config(
+        &path,
+        "[security]\n\
+         max_tracked_sources = 0\n\
+         per_source_rate_per_sec = -1.0\n",
+    );
+    raise_sighup_soon();
+    hup.recv().await.expect("second SIGHUP");
+    state
+        .reload(&path)
+        .await
+        .expect_err("a negative rate must abort the reload");
+
+    let logs = captured_logs(&log_buf);
+    assert!(
+        !logs.contains("unbounded"),
+        "an aborted reload must not report notices about a config it did not \
+         apply, got:\n{logs}"
+    );
+}
