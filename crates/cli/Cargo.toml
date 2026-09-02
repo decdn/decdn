@@ -83,6 +83,11 @@ alloy = { workspace = true }
 # via `join_all`, which borrows one shared `&endpoint` instead of cloning it
 # per probe. Combinators only — no iroh-blobs, so the #578 invariant holds.
 futures-util = { workspace = true }
+# `decdn node doctor` (#1598) reads real free disk via `statvfs` to compare
+# against the configured cache budget — the eviction driver only bounds the
+# logical cache footprint, never real free disk. `fs` only; no `signal` (that
+# stays a `decdn-node` dev-only concern).
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 [dev-dependencies]
 decdn-incentive = { workspace = true, features = ["redb", "test-util"] }

@@ -7,6 +7,7 @@ use std::path::Path;
 use serde::Serialize;
 
 mod config;
+mod disk;
 mod report;
 
 /// A single diagnostic outcome. Every `Warn`/`Fail` carries a one-line
@@ -89,8 +90,8 @@ pub async fn run(
     let mut report = Report::default();
     let resolved = config::check_config(&mut report, args, global_config);
     // Config-dependent groups run only when resolve succeeded (Tasks 4-9).
-    if let Some(_resolved) = &resolved {
-        // filled in by later tasks
+    if let Some(resolved) = &resolved {
+        disk::check_disk(&mut report, resolved, None);
     }
 
     let mut stdout = std::io::stdout().lock();
