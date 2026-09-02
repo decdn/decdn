@@ -670,6 +670,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             self.signer,
             self.voucher_dom,
             admitted,
+            &order.coverage_by_node,
             self.relays,
             hash,
             staging,

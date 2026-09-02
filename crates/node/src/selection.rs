@@ -9,6 +9,8 @@ use rand::RngExt;
 use std::collections::HashSet;
 use std::time::Duration;
 
+use decdn_protocol::Coverage;
+
 use crate::dht::lookup::{DEFAULT_ROUND_TIMEOUT, MAX_LOOKUP_ROUNDS};
 
 /// Maximum providers to attempt before reporting a fetch failure to the
@@ -31,19 +33,28 @@ pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 /// then visible in one file, which is what stops the next one from being guessed.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// How many blob-holding candidates a probe round collects before it stops
-/// waiting on the rest. [`PROBE_TIMEOUT`] stays the ceiling — a sparse round that
-/// never reaches this count still waits it out — but when this many good
-/// providers have already answered, the round selects among them instead of
+/// How many blob-holding candidates a SINGLE-SOURCE probe round collects before
+/// it stops waiting on the rest. [`PROBE_TIMEOUT`] stays the ceiling — a sparse
+/// round that never reaches this count still waits it out — but when this many
+/// good providers have already answered, the round selects among them instead of
 /// waiting the full window for a straggler or a dead peer that will only time
 /// out. The count leaves at least one alternate in hand for per-blob failover
 /// while keeping cold-miss discovery latency at the speed of the fastest good
 /// answers rather than the ceiling. ADR 001 § Probe response collection.
 ///
-/// Equal to [`MAX_PROVIDER_ATTEMPTS`] on purpose: the pull loop tries at most
-/// that many providers, so collecting that many viable candidates already fills
-/// the failover budget — waiting for more only serves stragglers the loop would
-/// never reach.
+/// Equal to [`MAX_PROVIDER_ATTEMPTS`] on purpose: the single-source pull loop
+/// tries at most that many providers, so collecting that many viable candidates
+/// already fills the failover budget — waiting for more only serves stragglers
+/// the loop would never reach.
+///
+/// This fixed count is CORRECT only when one working provider is enough — the
+/// buffered single-source pull. The ranged-drive assembly path (#1506, ADR 039)
+/// needs a candidate set whose coverage UNION spans the requested range, not a
+/// fixed count: three responders that all hold discovery block 0 do not cover a
+/// three-block blob, yet stopping at this count would drop the block-1/block-2
+/// holders in the same fanout. That path gathers by coverage union instead (see
+/// `node_origin::probe_and_rank`'s `ProbeGather::CoverageUnion`), bounded only by
+/// the probe fanout.
 pub const PROBE_EARLY_EXIT_CANDIDATES: usize = MAX_PROVIDER_ATTEMPTS;
 
 /// One-time headroom added on top of the `MAX_PROVIDER_ATTEMPTS` sequential per-candidate
@@ -192,6 +203,13 @@ pub struct Candidate {
     /// integration is deferred; see ADR 019 for the capacity-bond interface
     /// that will.
     pub stake: u64,
+    /// Which discovery blocks (`decdn_protocol::coverage`) this candidate is
+    /// confirmed to hold, per its fresh `ProbeResponseExt.coverage` (#1506).
+    /// This is the PROBE-confirmed value, never the stale DHT-lookup hint —
+    /// discovery's ranking and selection consume only what a live probe just
+    /// verified. Ranking itself ignores this field; it rides alongside the
+    /// rank/RTT/rate fields for a range-aware caller to read after selection.
+    pub coverage: Coverage,
 }
 
 /// A candidate paired with its computed selection score. Lower score is better.
@@ -689,6 +707,7 @@ mod tests {
             reputation: rep,
             region: "US".to_string(),
             stake: 0,
+            coverage: Coverage::empty(),
         }
     }
 
@@ -700,6 +719,40 @@ mod tests {
     fn with_stake(mut c: Candidate, stake: u64) -> Candidate {
         c.stake = stake;
         c
+    }
+
+    fn with_coverage(mut c: Candidate, coverage: Coverage) -> Candidate {
+        c.coverage = coverage;
+        c
+    }
+
+    /// #1506: `rank_candidates` must carry each candidate's fresh
+    /// probe-confirmed coverage through unchanged — ranking reorders on
+    /// score alone, but the caller downstream (the ranged-drive loop)
+    /// needs to read which blocks each ranked candidate holds.
+    /// Two providers with disjoint single-block coverage ({block0} vs
+    /// {block1}) pin that the field rides alongside the candidate rather
+    /// than being dropped or averaged during ranking.
+    #[test]
+    fn rank_candidates_carries_each_candidates_fresh_probe_coverage() {
+        let block0 = Coverage::from_block_indices(2, [0].into_iter());
+        let block1 = Coverage::from_block_indices(2, [1].into_iter());
+        // Distinct scores so ordering is deterministic without the tie-breaker.
+        let holder0 = with_coverage(make_candidate(1, 100, 10, 1.0), block0.clone());
+        let holder1 = with_coverage(make_candidate(2, 200, 10, 1.0), block1.clone());
+        let out = rank_candidates(vec![holder0, holder1]);
+
+        assert_eq!(out.len(), 2);
+        let ranked0 = out
+            .iter()
+            .find(|r| r.candidate.node_id[0] == 1)
+            .expect("holder0 present in ranked output");
+        let ranked1 = out
+            .iter()
+            .find(|r| r.candidate.node_id[0] == 2)
+            .expect("holder1 present in ranked output");
+        assert_eq!(ranked0.candidate.coverage, block0);
+        assert_eq!(ranked1.candidate.coverage, block1);
     }
 
     #[test]

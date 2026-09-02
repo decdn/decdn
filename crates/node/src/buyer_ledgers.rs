@@ -83,6 +83,30 @@ impl BuyerLedgers {
         )
     }
 
+    /// The pool's total committed spend: the sum, across every live lane whose
+    /// [`LaneKey::pool_id`] matches `pool_id`, of that lane's committed voucher
+    /// amount.
+    ///
+    /// This is the whole-pool spend the node's ranged-drive loop gates on
+    /// (#1506). One buyer pool backs a voucher lane per provider, and the loop
+    /// assembles a blob across those providers as a sequence of lanes drawing on
+    /// the SAME deposit. Each lane's live ledger stays in the map for the whole
+    /// assembly (a new provider's lane never evicts another provider's), so
+    /// summing them here — including the run currently issuing vouchers, which
+    /// seeded its own live ledger via [`Self::get_or_seed`] — yields the exact
+    /// cumulative spend against the shared deposit. The live ledgers are the
+    /// authoritative in-memory watermarks (a persisted row lags, written on
+    /// redeem, not on issue), so a solvency gate reading this never under-counts
+    /// a still-in-flight voucher.
+    pub fn pool_committed(&self, pool_id: decdn_incentive::PoolId) -> alloy::primitives::U256 {
+        let live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        live.iter()
+            .filter(|(key, _)| key.pool_id == pool_id)
+            .fold(alloy::primitives::U256::ZERO, |acc, (_, ledger)| {
+                acc.saturating_add(ledger.committed().amount)
+            })
+    }
+
     /// Drop `key`'s ledger — the lane was retired, so no further voucher can be signed
     /// against it.
     ///
@@ -210,5 +234,42 @@ mod tests {
         let a = ledgers.get_or_seed(lane(9, 1), seed_at(0));
         let b = ledgers.get_or_seed(lane(9, 2), seed_at(0));
         assert!(!Arc::ptr_eq(&a, &b));
+    }
+
+    /// The C1 accounting the node's ranged-drive loop gates on (#1506): the spend
+    /// a later run subtracts from the shared deposit is the WHOLE pool's committed
+    /// amount, summed across every provider's lane — not this one lane's.
+    ///
+    /// Run 1 pays provider A (its lane committed 700). Run 2 opens a FRESH lane to
+    /// provider B, whose own committed is 0. If run 2 gated on B's ledger alone it
+    /// would read `committed == 0`, believe the whole deposit unspent, and sign a
+    /// voucher the pool cannot back. `pool_committed` returns 700 for that same
+    /// pool, so run 2 subtracts run 1's spend from the deposit exactly as it must.
+    #[test]
+    fn pool_committed_sums_every_providers_lane_in_the_pool() {
+        let ledgers = BuyerLedgers::default();
+        let pool_a = lane(1, 1); // pool 1, provider A — run 1
+        let pool_b = lane(1, 2); // pool 1, provider B — run 2 (fresh lane)
+        let other = lane(2, 1); // a different pool entirely
+
+        let _run1 = ledgers.get_or_seed(pool_a, seed_at(700));
+        let _run2 = ledgers.get_or_seed(pool_b, seed_at(0));
+        let _elsewhere = ledgers.get_or_seed(other, seed_at(999));
+
+        assert_eq!(
+            ledgers.pool_committed(pool_a.pool_id),
+            U256::from(700u64),
+            "run 2's gate must see run 1's 700 across the pool, not provider B's own 0",
+        );
+        assert_eq!(
+            ledgers.pool_committed(other.pool_id),
+            U256::from(999u64),
+            "a different pool's spend is isolated",
+        );
+        assert_eq!(
+            ledgers.pool_committed(B256::from([7u8; 32])),
+            U256::ZERO,
+            "a pool with no live lanes has spent nothing",
+        );
     }
 }

@@ -119,7 +119,7 @@ impl std::error::Error for PoolExhausted {}
 
 /// The state ONE pool deposit's concurrent lanes share, injected by the
 /// multi-source scheduler. Absent (`None`) on the single-source path, where the
-/// one lane IS the pool and its own [`DriveCounters`] and [`PoolContext`] already
+/// one lane IS the pool and its own `DriveCounters` and [`PoolContext`] already
 /// hold every fact below.
 ///
 /// Three facts are properties of the POOL, not of a lane, so a per-lane copy of
@@ -134,15 +134,24 @@ impl std::error::Error for PoolExhausted {}
 ///   only through this lane's `ctx`, it is invisible to the others, whose gate
 ///   still subtracts the aggregate spend from a stale deposit and walks to a
 ///   false exhaustion.
-pub(crate) struct SharedPool<'a> {
+pub struct SharedPool<'a> {
     /// Sum, across every lane, of the committed voucher amount — the pool's
     /// total spend so far.
-    pub(crate) spent: &'a (dyn Fn() -> U256 + Send + Sync),
+    pub spent: &'a (dyn Fn() -> U256 + Send + Sync),
     /// Reactive top-ups this FETCH has spent, across every lane.
-    pub(crate) topups_used: &'a AtomicU32,
+    pub topups_used: &'a AtomicU32,
     /// Credit a landed top-up's new deposit to EVERY lane's `PoolContext`, so no
     /// lane gates on a stale deposit.
-    pub(crate) credit: &'a (dyn Fn(U256) -> anyhow::Result<()> + Send + Sync),
+    pub credit: &'a (dyn Fn(U256) -> anyhow::Result<()> + Send + Sync),
+}
+
+impl std::fmt::Debug for SharedPool<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedPool")
+            .field("spent", &(self.spent)())
+            .field("topups_used", &self.topups_used.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 /// The injected wait signal for [`PaceDecision::Wait`] (ADR 037): the
@@ -332,6 +341,12 @@ fn ranges_content_len(ranges: &ChunkRanges, total_bytes: u64) -> u64 {
 /// The store is driven one write operation at a time (its documented concurrency
 /// contract): `drive` never issues overlapping `ingest_stream`/`finalize` calls.
 ///
+/// `pool` is `None` for a single-source fetch — the one lane is the whole pool.
+/// A caller that drives several per-provider lanes over one shared deposit (the
+/// node's ranged assembly) passes a [`SharedPool`] so every lane's solvency gate
+/// subtracts the aggregate spend and the reactive-top-up budget spans the whole
+/// set (#1506).
+///
 /// # What it does
 ///
 /// 1. Compute `store.missing_ranges(offset, len)` and split it into the ordered
@@ -368,6 +383,7 @@ pub async fn drive<St, S, P, F>(
     on_progress: Option<&ProgressCallback>,
     pacing_wait: Option<&dyn PacingWait>,
     served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
+    pool: Option<&SharedPool<'_>>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -406,11 +422,13 @@ where
                 on_progress,
                 pacing_wait,
                 served_paid,
-                // Single-source: this one lane IS the pool, so its own
-                // `counters` and `ctx` already hold the spend, the top-up
-                // budget, and the deposit. The multi-source scheduler injects
-                // the shared view of all three here instead.
-                None,
+                // `None` on the single-source path: this one lane IS the pool,
+                // so its own `counters` and `ctx` already hold the spend, the
+                // top-up budget, and the deposit. The node's ranged-drive loop
+                // injects a shared view of all three across its per-provider
+                // lanes here instead (#1506); the client's multi-source
+                // scheduler calls `fill_gap` directly with the same view.
+                pool,
             )
             .await?;
         }
@@ -1004,6 +1022,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("drive whole blob");
@@ -1086,6 +1105,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("drive fully-held blob");
@@ -1164,6 +1184,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("the mid-gap stall surfaces as a terminal error");
@@ -1188,6 +1209,7 @@ mod tests {
             0,
             0,
             &config(),
+            None,
             None,
             None,
             None,
@@ -1258,6 +1280,7 @@ mod tests {
             GROUP,
             GROUP,
             &config(),
+            None,
             None,
             None,
             None,
@@ -1427,6 +1450,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("drive completes after one reactive top-up");
@@ -1515,6 +1539,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("drive stops cleanly once the stub pacer says Done");
@@ -1595,6 +1620,7 @@ mod tests {
             &config(),
             None,
             Some(&wait_hook),
+            None,
             None,
         )
         .await
@@ -1678,6 +1704,7 @@ mod tests {
             None,
             Some(&wait_hook),
             Some(&served_paid_reader),
+            None,
         )
         .await
         .expect("drive completes as served_paid advances one window at a time");

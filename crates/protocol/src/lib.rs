@@ -18,7 +18,9 @@ pub use client::{
     encode_chunk_frame, encode_stream_request, encode_stream_response, parse_stream_request_ext,
     parse_stream_response_ext,
 };
-pub use coverage::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
+pub use coverage::{Coverage, DISCOVERY_BLOCK_BYTES, discovery_block_bytes, num_blocks};
+#[cfg(feature = "test-support")]
+pub use coverage::{TestBlockSizeGuard, override_discovery_block_bytes_for_test};
 pub use dht::{
     BatchStoreAck, BatchStoreRequest, CloserNodes, CloserNodesError, DhtMessage, FindNodeRequest,
     FindNodeResponse, FindValueRequest, FindValueResponse, FindValueResponseExt,

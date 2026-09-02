@@ -28,7 +28,7 @@ use alloy::providers::ProviderBuilder;
 use anyhow::Context;
 use decdn_common::redact::{sanitize_err_chain, sanitize_rpc_display};
 use decdn_incentive::capacity_bond::CapacityBond;
-use decdn_protocol::Region;
+use decdn_protocol::{Coverage, Region};
 use iroh::PublicKey;
 use serde::{Deserialize, Serialize};
 
@@ -757,6 +757,18 @@ pub struct Probed {
     /// spares the multi-source engagement gate a throwaway header open just to
     /// learn whether the blob clears the fan-out floor.
     pub total_bytes: Option<u64>,
+    /// Which discovery blocks this holder answered `has_blob:true` for
+    /// (`decdn_protocol::coverage`), taken from the probe's `ProbeResponseExt`
+    /// (PR1). Unsigned, like `total_bytes` — a hint for the scheduler's segment
+    /// assignment, never a commitment. `has_blob:true` means
+    /// "will serve at least one block", so this may be a proper subset of the
+    /// blob rather than the whole thing — a **partial holder** is admitted here
+    /// exactly like a full one; nothing in this module treats the two
+    /// differently. The requester-side `has_blob`/`coverage.is_empty()`
+    /// consistency check (ADR 013 §Tier 1, `ProbeResponseExt::consistent_with`)
+    /// runs before a `Probed` is ever constructed, so a malformed pairing never
+    /// reaches this field.
+    pub coverage: Coverage,
 }
 
 /// A bonded non-holder the client has a measured RTT for, and could route a
@@ -1068,6 +1080,60 @@ mod tests {
     fn admit_sources_zero_max_returns_empty() {
         let ranked = vec![cand(pk(1), addr(1), Some("US"))];
         assert_eq!(admit_sources(ranked, 0), Vec::new());
+    }
+
+    /// A [`Probed`] holder carries the coverage its probe reported, and a
+    /// **partial** holder (a proper subset of the blob's blocks) is admitted
+    /// exactly like a full one: `admit_sources` operates on `NodeCandidate`
+    /// rank order and operator identity only, so it has no way to see —
+    /// and must not need to see — that one holder's coverage is a strict
+    /// subset of another's. Two operators here each answered for a disjoint
+    /// half of the blob; both are admitted, and each one's `Probed` still
+    /// carries its own half, not the other's or the full blob's.
+    #[test]
+    fn partial_holders_carry_their_own_coverage_and_are_admitted_like_full_holders() {
+        let op1 = cand(pk(1), addr(1), Some("US"));
+        let op2 = cand(pk(2), addr(2), Some("US"));
+
+        // op1 holds only block 0; op2 holds only block 1 — both partial, of a
+        // 2-block blob, and disjoint.
+        let probed = [
+            Probed {
+                candidate: op1.clone(),
+                rtt_ms: 10.0,
+                total_bytes: Some(128 * 1024 * 1024),
+                coverage: Coverage::from_block_indices(2, [0].into_iter()),
+            },
+            Probed {
+                candidate: op2.clone(),
+                rtt_ms: 12.0,
+                total_bytes: Some(128 * 1024 * 1024),
+                coverage: Coverage::from_block_indices(2, [1].into_iter()),
+            },
+        ];
+
+        // Operator-dedup, unchanged: both are distinct operators, so both are
+        // admitted — coverage never enters the admission decision.
+        let admitted = admit_sources(vec![op1.clone(), op2.clone()], 2);
+        assert_eq!(
+            admitted.iter().map(|c| c.node_id).collect::<Vec<_>>(),
+            vec![pk(1), pk(2)],
+            "a partial holder is admitted exactly like a full holder"
+        );
+
+        // Each admitted candidate's own probed coverage is still its own —
+        // never full, never the other holder's block.
+        let cov = |node_id: PublicKey| {
+            probed
+                .iter()
+                .find(|p| p.candidate.node_id == node_id)
+                .map(|p| p.coverage.clone())
+        };
+        let cov1 = cov(pk(1)).expect("op1 was probed");
+        let cov2 = cov(pk(2)).expect("op2 was probed");
+        assert!(cov1.covers(0) && !cov1.covers(1), "op1 holds only block 0");
+        assert!(cov2.covers(1) && !cov2.covers(0), "op2 holds only block 1");
+        assert_ne!(cov1, Coverage::full(2), "op1 is a partial holder, not full");
     }
 
     #[test]

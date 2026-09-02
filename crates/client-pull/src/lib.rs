@@ -27,6 +27,11 @@
 /// Buyer-side `PaymentPool` open kernel (#940), shared by the node service
 /// and the CLI.
 pub mod buyer_pool;
+/// Range-keyed discovery coverage-map primitive plus the two
+/// objective-specific planners over it (#1506): [`coverage_plan::plan_covered_runs`]
+/// (node — concentrate + sticky) and [`coverage_plan::spread_segments`] (client —
+/// spread for parallelism). Pure, no I/O.
+pub mod coverage_plan;
 /// Client-side node discovery (#936): read + select the active node set from
 /// `CapacityBond.getRegisteredNodes`, then rank probed blob-holders.
 pub mod discovery;
@@ -71,8 +76,11 @@ pub mod sink;
 /// seam), plus scripted test doubles.
 pub mod source;
 
+pub use coverage_plan::{
+    CoveredRun, SourceCoverage, covering_sources, plan_covered_runs, spread_segments,
+};
 pub use decdn_bao_range::RangedStore;
-pub use driver::{PacingWait, PoolExhausted, drive};
+pub use driver::{PacingWait, PoolExhausted, SharedPool, drive};
 pub use ledger::{
     ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Released, StreamProof,
 };
@@ -3302,14 +3310,13 @@ mod tests {
     /// The `LocalPullFault` marker must ride out on the errors the range helpers ACTUALLY
     /// raise — not on one a test hand-built (#1145 review).
     ///
-    /// This distinction is the whole point of the test, and the version it replaces got it
-    /// backwards. That one called the real `sign_client_binding`, asserted it was `Ok`,
-    /// threw the result away, and then hand-built `anyhow!("...").context(LocalPullFault)`
-    /// before asserting the ladder found `LocalPullFault` in it. Attaching the marker and
-    /// then finding it is true by construction: the test could not fail, and stripping every
-    /// `.context(LocalPullFault)` from the crate left the whole suite green. Its own doc
-    /// comment warned that "a synthetic `anyhow!(...)` would pass this test while production
-    /// scored the peer" — and then did exactly that.
+    /// This distinction is the whole point of the test: a test that calls the real
+    /// `sign_client_binding`, throws away its `Ok` result, and hand-builds
+    /// `anyhow!("...").context(LocalPullFault)` before asserting the ladder finds
+    /// `LocalPullFault` in it is true by construction. Attaching the marker and then
+    /// finding it proves nothing — such a test cannot fail even if every
+    /// `.context(LocalPullFault)` call site is stripped from the crate, so a synthetic
+    /// `anyhow!(...)` passes it while production silently fails to score the peer.
     ///
     /// So: real functions, real errors, marker never touched by the test. `align_range`
     /// rejects an offset at or past the end of the blob (never clamps — ADR 005), which is

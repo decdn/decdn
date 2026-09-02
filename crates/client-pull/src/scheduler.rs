@@ -4,11 +4,16 @@
 //! byte-identical blob.
 //!
 //! One worker future per source drives [`fill_gap`]
-//! over the request's gap-set. The gap-set is split into large,
-//! bao-group-aligned contiguous segments (one per source), and a freed source
-//! does not idle: it *steals* the aligned second half of the largest range
-//! still in flight ([`steal_split`]), so a fast
-//! source keeps helping a slow one.
+//! over the request's gap-set. The gap-set is spread across sources by
+//! discovery-block coverage ([`crate::coverage_plan::spread_segments`]): each
+//! block is assigned to one covering source, rarest-cover-first, into
+//! contiguous per-source runs, so every source that covers anything starts
+//! with work it can actually serve. A run every covering source holds WHOLE is
+//! then split evenly across those sources (`split_evenly`) so an
+//! otherwise-idle source still gets a share. A freed source does not idle
+//! either way: it *steals* the aligned second half of the largest remaining
+//! range it also covers ([`steal_split`]), so a fast source keeps helping a
+//! slow one — but never a range outside its own coverage.
 //!
 //! # Lane correctness — one unit per source
 //!
@@ -79,14 +84,16 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
 use decdn_bao_range::{AlignedRange, align_range};
+use decdn_protocol::Coverage;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
+use crate::coverage_plan::{SourceCoverage, covers_byte_range, spread_segments};
 use crate::driver::{
     DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PoolExhausted, SharedPool,
     contiguous_byte_ranges, drive_with_interval_flush, fill_gap,
 };
 use crate::retry::{RetryDisposition, retry_disposition};
-use crate::segment::{initial_segments, steal_split};
+use crate::segment::{split_evenly, steal_split};
 use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{Pacer, PoolContext, PoolLedger, ProgressCallback};
 
@@ -114,6 +121,12 @@ pub struct SourceLane<'a, S> {
     /// This lane's voucher ledger, seeded from its persisted cumulative — the
     /// per-`(signer, provider)` watermark, never shared with another lane.
     pub ledger: Arc<PoolLedger>,
+    /// Which discovery blocks this source actually holds (#1506, B1's
+    /// `Probed::coverage`). Drives both the initial coverage-aware spread
+    /// ([`spread_segments`]) and the scheduler's internal coverage-filtered
+    /// steal — this lane is never assigned, and never steals, a range
+    /// outside what this says it can serve.
+    pub coverage: Coverage,
 }
 
 impl<S> std::fmt::Debug for SourceLane<'_, S> {
@@ -159,6 +172,19 @@ async fn cancelled(handle: &CancelHandle) {
             return;
         }
     }
+}
+
+/// One planned run staged for seeding into `pending`, with the piece count it
+/// will split into. `max_pieces` bounds the split to what is useful for THIS run —
+/// the number of lanes that hold it whole — while the seeding loop's global budget
+/// (`lanes.len()`) decides how much of that headroom each run actually uses.
+/// `pieces` starts at one contiguous span and only grows to reach otherwise-idle
+/// lanes.
+struct RunSeed {
+    offset: u64,
+    len: u64,
+    max_pieces: usize,
+    pieces: usize,
 }
 
 /// Bytes of `[start, start+len)` the store still misses — this worker's range is
@@ -263,8 +289,11 @@ impl LaneFault {
 /// this is what the scheduler itself consumes.
 #[derive(Debug, Clone, Copy)]
 pub struct MultiSourceConfig {
-    /// Cap on concurrently-used holders = the initial segment count. The
-    /// scheduler engages `min(max_sources, sources.len())` segments.
+    /// Cap on concurrently-used holders. Enforced by the caller's admission
+    /// (`discovery::admit_sources`) before it ever builds `lanes` — every
+    /// lane `multi_source_fetch` is handed here is engaged, since which
+    /// discovery blocks a lane serves is decided by its coverage (#1506), not
+    /// by an arbitrary segment-count split.
     pub max_sources: usize,
     /// No-verified-progress deadline before a source's remaining range is
     /// reassigned. Read by the stall watchdog, which each worker races its `fill_gap`
@@ -273,17 +302,26 @@ pub struct MultiSourceConfig {
 }
 
 /// Shared work-state, guarded by one [`AsyncMutex`]. `pending` seeds with the
-/// initial segments; `in_flight[i]` is source `i`'s currently-owned range as
-/// `(start, len)` (`None` = idle), which is both the tail-steal remaining-set
-/// and the "at most one source owns any range" ledger.
+/// coverage-planned initial segments; `in_flight[i]` is source `i`'s
+/// currently-owned range as `(start, len)` (`None` = idle), which is both the
+/// tail-steal remaining-set and the "at most one source owns any range"
+/// ledger.
 struct Work {
-    /// Segments not yet claimed by any worker (drains as workers pick).
+    /// Segments not yet claimed by any worker (drains as workers pick). A
+    /// worker only ever pops an entry its own [`Coverage`] includes (#1506):
+    /// [`Work::pick`] skips past any entry it cannot serve rather than
+    /// dequeuing it, so an item stays here until a covering worker is free to
+    /// take it.
     pending: VecDeque<AlignedRange>,
     /// Per-source current range, `None` when the source holds nothing.
     in_flight: Vec<Option<(u64, u64)>>,
     /// Per-source interrupt handles, indexed like `in_flight`. A steal signals
     /// `cancel[victim]`; the victim clears it on its next `pick`.
     cancel: Vec<Arc<CancelHandle>>,
+    /// `alive[i]` is `false` once worker `i` has permanently left the set (see
+    /// [`Work::retire`]) — never coming back to `pick` again, whether because
+    /// it ran out of coverable work or because it faulted.
+    alive: Vec<bool>,
 }
 
 impl Work {
@@ -304,20 +342,27 @@ impl Work {
         }
     }
 
-    /// Under the caller's lock, choose worker `i`'s next range. Pop a pending
-    /// segment first; when none remain, steal the aligned second half of the
-    /// largest range still in flight ([`steal_split`]), trimming the victim so
-    /// no other freed worker can re-steal the same tail. Records the choice in
-    /// `in_flight[i]`. `Ok(None)` means there is nothing to start right now —
-    /// the worker parks until a peer changes the work state, and exits only once
-    /// [`Work::all_idle`] holds.
+    /// Under the caller's lock, choose worker `i`'s next range. Pop the FIRST
+    /// pending segment `coverage` includes (a worker skips past, never
+    /// dequeues, an entry it cannot serve — #1506); when none remain, steal
+    /// the aligned second half of the largest COVERABLE range still in flight
+    /// ([`steal_split`]), trimming the victim so no other freed worker can
+    /// re-steal the same tail. Records the choice in `in_flight[i]`. `Ok(None)`
+    /// means there is nothing this worker can start right now — it parks until
+    /// a peer changes the work state, and exits only once [`Work::all_idle`]
+    /// holds.
     ///
     /// # Errors
     ///
     /// An out-of-range worker index; or the alignment error [`steal_split`]
     /// raises on an out-of-bounds range (never on the ranges this scheduler
     /// feeds it).
-    fn pick(&mut self, i: usize, total_bytes: u64) -> anyhow::Result<Option<AlignedRange>> {
+    fn pick(
+        &mut self,
+        i: usize,
+        total_bytes: u64,
+        coverage: &Coverage,
+    ) -> anyhow::Result<Option<AlignedRange>> {
         // This worker is starting a fresh unit: clear any cancel signal left from
         // a prior unit, under the lock, so a stale `notify_one` permit cannot
         // spuriously cancel the new unit (see `cancelled`).
@@ -325,15 +370,24 @@ impl Work {
             Some(handle) => handle.flag.store(false, Ordering::Release),
             None => anyhow::bail!("worker index {i} out of range for cancel handles"),
         }
-        if let Some(seg) = self.pending.pop_front() {
-            *self.slot_mut(i)? = Some((seg.fetch_start(), seg.fetch_len()));
-            return Ok(Some(seg));
+        let coverable = self.pending.iter().position(|seg| {
+            covers_byte_range(coverage, seg.fetch_start(), seg.fetch_len(), total_bytes)
+        });
+        if let Some(pos) = coverable {
+            // `pos` came from this same deque's `position`, so it is always
+            // in range; `VecDeque::remove` returns `Option`, never panics.
+            if let Some(seg) = self.pending.remove(pos) {
+                *self.slot_mut(i)? = Some((seg.fetch_start(), seg.fetch_len()));
+                return Ok(Some(seg));
+            }
         }
 
-        // Nothing pending: every remaining byte is in flight on a busy worker.
-        // Steal the aligned second half of the largest such range. `in_flight[i]`
-        // is `None` here (cleared before this pick), so this worker is excluded
-        // from the remaining set and never steals from itself.
+        // Nothing pending this worker can serve: every remaining byte is
+        // either in flight on a busy worker or outside this worker's own
+        // coverage. Steal the aligned second half of the largest COVERABLE
+        // such range. `in_flight[i]` is `None` here (cleared before this
+        // pick), so this worker is excluded from the remaining set and never
+        // steals from itself.
         let (owners, remaining): (Vec<usize>, Vec<(u64, u64)>) = self
             .in_flight
             .iter()
@@ -341,8 +395,15 @@ impl Work {
             .filter_map(|(idx, slot)| slot.map(|r| (idx, r)))
             .unzip();
         // `steal_split` returns WHICH remaining range it split, so the trim below
-        // lands on that exact victim — no second argmax to agree with.
-        let Some((v, half)) = steal_split(&remaining, total_bytes)? else {
+        // lands on that exact victim — no second argmax to agree with. The
+        // predicate excludes any range this worker's `coverage` does not fully
+        // include, so a narrow-coverage worker that finds nothing it can serve
+        // gets `None` here and parks rather than stealing a range it cannot
+        // deliver.
+        let Some((v, half)) = steal_split(&remaining, total_bytes, |s, l| {
+            covers_byte_range(coverage, s, l, total_bytes)
+        })?
+        else {
             *self.slot_mut(i)? = None;
             return Ok(None);
         };
@@ -396,6 +457,39 @@ impl Work {
     fn clear(&mut self, i: usize) -> anyhow::Result<()> {
         *self.slot_mut(i)? = None;
         Ok(())
+    }
+
+    /// Mark worker `i` as permanently gone — it will never call `pick` again,
+    /// whether it simply ran out of coverable work or it faulted on something
+    /// ELSE and dropped out mid-fetch — and drop any `pending` entry no other
+    /// still-alive worker's `coverage` includes.
+    ///
+    /// Coverage partitions the source set (#1506), so a `pending` entry can
+    /// have exactly one, a few, or NO covering worker left once one exits.
+    /// Without this cleanup an item whose sole remaining coverer just retired
+    /// would sit in `pending` forever: [`Work::all_idle`] never sees it
+    /// resolved (nothing left alive can ever pop it) or the set fall idle
+    /// (dropping it is the only way `pending` empties), so every other
+    /// worker — even ones with nothing to do with this item — parks on
+    /// [`Notify`] permanently. That breaks the "no worker hangs" contract
+    /// [`multi_source_fetch`] documents. Dropping the orphaned entry here
+    /// instead lets the fetch converge to `all_idle`; the bytes it covered
+    /// surface honestly through the ordinary residual-missing check at the
+    /// end of [`multi_source_fetch`], the same path an originally uncovered
+    /// block takes.
+    fn retire(&mut self, i: usize, coverage: &[Coverage], total_bytes: u64) {
+        if let Some(a) = self.alive.get_mut(i) {
+            *a = false;
+        }
+        let alive = self.alive.clone();
+        self.pending.retain(|seg| {
+            alive.iter().enumerate().any(|(j, &is_alive)| {
+                is_alive
+                    && coverage.get(j).is_some_and(|c| {
+                        covers_byte_range(c, seg.fetch_start(), seg.fetch_len(), total_bytes)
+                    })
+            })
+        });
     }
 }
 
@@ -463,6 +557,7 @@ async fn run_worker<St, S, P, F>(
     on_progress: Option<&ProgressCallback>,
     unit_deadline: Duration,
     pool: &SharedPool<'_>,
+    lane_coverage: &[Coverage],
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -470,6 +565,11 @@ where
     P: Pacer,
     F: Funder,
 {
+    // This worker's own coverage — the predicate `Work::pick` filters both its
+    // pending-pop and its steal candidates against (#1506).
+    let Some(my_coverage) = lane_coverage.get(i) else {
+        anyhow::bail!("worker index {i} out of range for lane coverage");
+    };
     // This worker's cancel handle, cloned once so `cancelled` can await it
     // OUTSIDE the `Work` lock while a peer's `pick` signals it under the lock.
     let handle = {
@@ -498,7 +598,7 @@ where
         // `fill_gap` await (the guard does not cross the await point).
         let picked = {
             let mut w = work.lock().await;
-            w.pick(i, total_bytes)?
+            w.pick(i, total_bytes, my_coverage)?
         };
         let Some(range) = picked else {
             // Nothing to start right now. Exit only when no peer holds anything
@@ -643,8 +743,12 @@ where
             Some(UnitOutcome::Completed) => {}
         }
     }
-    // This worker is leaving the set: a peer parked on "someone else still holds
-    // work" must re-evaluate against a set this worker is no longer part of.
+    // This worker is leaving the set: retire it BEFORE the final wake, so a
+    // peer that re-checks `pick`/`all_idle` on that wake sees both a set this
+    // worker is no longer part of AND any `pending` entry only this worker
+    // could have covered already dropped (`Work::retire`) — the coverage-aware
+    // counterpart of "someone else still holds work".
+    work.lock().await.retire(i, lane_coverage, total_bytes);
     wake();
     Ok(())
 }
@@ -714,6 +818,14 @@ where
     if lanes.is_empty() {
         anyhow::bail!("multi_source_fetch requires at least one source lane");
     }
+    // Defensively enforce `max_sources`. The caller's admission
+    // (`admit_sources`, ADR 001) already caps the set to `max_sources` before
+    // building lanes, and `lanes` arrives in rank order — so this is a no-op on
+    // the normal path, but it keeps the config knob authoritative if a caller
+    // ever passes an un-capped lane set, keeping the highest-ranked lanes.
+    let lanes = lanes
+        .get(..lanes.len().min(ms.max_sources.max(1)))
+        .unwrap_or(lanes);
     // The premise the whole payment model rests on, checked rather than trusted:
     // one lane per on-chain provider. Two lanes sharing a provider share a
     // `(signer, provider)` watermark, and their concurrent voucher streams
@@ -744,17 +856,87 @@ where
         return Ok(());
     }
 
-    // At least one segment; `min` honors `max_sources`, `max(1)` guards a
-    // degenerate `max_sources == 0` config from silently fetching nothing.
-    let k = ms.max_sources.min(lanes.len()).max(1);
-    let segs = initial_segments(&gaps, k, total_bytes)?;
+    // Coverage-aware spread (client planner, #1506): every admitted lane's
+    // `Probed` coverage (B1) becomes its `SourceCoverage`; `rank` is simply
+    // lane order, since `lanes` already arrives in the caller's admission /
+    // selection-score order (`admit_sources` — ADR 001) with no re-ranking
+    // done here. `spread_segments` assigns each `gap`-intersecting discovery
+    // block to exactly one covering lane, rarest-cover-first, so every lane
+    // that covers anything starts with coverable work.
+    let lane_coverage: Vec<Coverage> = lanes.iter().map(|l| l.coverage.clone()).collect();
+    let sources: Vec<SourceCoverage> = lane_coverage
+        .iter()
+        .enumerate()
+        .map(|(source_ix, coverage)| SourceCoverage {
+            source_ix,
+            coverage: coverage.clone(),
+        })
+        .collect();
+    let rank: Vec<usize> = (0..lanes.len()).collect();
+    let (runs, _uncovered) = spread_segments(&missing, total_bytes, &sources, &rank);
+    // `_uncovered` needs no bespoke handling here: a discovery block none of
+    // `lanes` covers is simply never queued into `pending`, so it stays in
+    // `missing_ranges` for the whole fetch and surfaces through the ordinary
+    // residual-missing "all sources failed" check below — the same "not
+    // available from this source set" outcome an orphaned mid-fetch range
+    // takes via `Work::retire`.
+    // Seed `pending` from the contiguous, gap-clamped runs, splitting further
+    // ONLY to reach otherwise-idle lanes (#1506). The eager fan-out is a GLOBAL
+    // budget — at most one contiguous span per lane — not a per-run multiplier: a
+    // large multi-block gap already plans ~one run per source, so it seeds ~N spans
+    // and never `blocks × N`. A gap that planned FEWER runs than lanes (a small
+    // gap, or a resume tail, where several full holders tied and the planner could
+    // pick only one per block) is split largest-first until every lane has a span,
+    // or no run can usefully split any further. A run is split at most as many ways
+    // as lanes hold it WHOLE, so every piece stays inside its holders' coverage and
+    // `Work::pick`'s filter never has to refuse it; `split_evenly` keeps each piece
+    // chunk-group aligned (never sub-group), which is the only floor the eager split
+    // needs — it deliberately splits below `steal_split`'s `MIN_SPLIT_SIZE` so a
+    // small blob no bigger than one block still engages every full holder from the
+    // start.
+    let mut seeds: Vec<RunSeed> = runs
+        .iter()
+        .map(|run| {
+            let holders = lane_coverage
+                .iter()
+                .filter(|c| covers_byte_range(c, run.offset, run.len, total_bytes))
+                .count()
+                .max(1);
+            RunSeed {
+                offset: run.offset,
+                len: run.len,
+                max_pieces: holders,
+                pieces: 1,
+            }
+        })
+        .collect();
+    let mut spare = lanes.len().saturating_sub(seeds.len());
+    while spare > 0 {
+        // The still-splittable run whose next split yields the largest piece.
+        let Some(seed) = seeds
+            .iter_mut()
+            .filter(|s| s.pieces < s.max_pieces)
+            .max_by_key(|s| s.len / u64::try_from(s.pieces + 1).unwrap_or(u64::MAX))
+        else {
+            break;
+        };
+        seed.pieces += 1;
+        spare -= 1;
+    }
+    let mut pending: VecDeque<AlignedRange> = VecDeque::with_capacity(seeds.len());
+    for seed in &seeds {
+        for seg in split_evenly(seed.offset, seed.len, seed.pieces, total_bytes)? {
+            pending.push_back(seg);
+        }
+    }
 
     let work = AsyncMutex::new(Work {
-        pending: segs.into_iter().collect(),
+        pending,
         in_flight: vec![None; lanes.len()],
         cancel: (0..lanes.len())
             .map(|_| Arc::new(CancelHandle::new()))
             .collect(),
+        alive: vec![true; lanes.len()],
     });
     // Wakes workers parked because nothing was pickable, whenever a peer frees,
     // re-queues, or leaves the set.
@@ -808,6 +990,7 @@ where
             on_progress,
             ms.unit_deadline,
             &pool,
+            &lane_coverage,
         )
     });
     // Drive every worker to completion while a single periodic tick flushes the
@@ -895,6 +1078,7 @@ mod tests {
     use alloy::primitives::{Address, B256, U256};
     use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::DepositOutcome;
+    use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
     use super::{MultiSourceConfig, SourceLane, multi_source_fetch};
     use crate::driver::DriveConfig;
@@ -936,15 +1120,32 @@ mod tests {
     /// with a context pinned to `provider`. Returns the source, its ledger, and a
     /// closure that turns a borrow of the source into a [`SourceLane`] — the
     /// source must outlive the lane, so the caller owns it.
+    ///
+    /// Coverage defaults to the WHOLE blob, so a test built with this helper gets a
+    /// full holder without spelling out coverage at each call site. Tests exercising
+    /// partial coverage use [`lane_with_coverage`] instead.
     fn lane(
         source: &ScriptedSource,
         ledger: Arc<PoolLedger>,
         provider: u8,
     ) -> SourceLane<'_, ScriptedSource> {
+        let full = Coverage::full(num_blocks(source.total_bytes()));
+        lane_with_coverage(source, ledger, provider, full)
+    }
+
+    /// Like [`lane`], but with an explicit [`Coverage`] rather than the
+    /// whole-blob default — for tests exercising partial holders (#1506).
+    fn lane_with_coverage(
+        source: &ScriptedSource,
+        ledger: Arc<PoolLedger>,
+        provider: u8,
+        coverage: Coverage,
+    ) -> SourceLane<'_, ScriptedSource> {
         SourceLane {
             source,
             ctx: ctx_for(provider),
             ledger,
+            coverage,
         }
     }
 
@@ -1016,6 +1217,305 @@ mod tests {
         assert!(
             src_a.opened_bytes() + src_b.opened_bytes() >= data.len() as u64,
             "the two sources together must cover the whole blob"
+        );
+        Ok(())
+    }
+
+    /// Fan-out geometry (#1506): a large multi-block gap across N full holders
+    /// seeds ~N contiguous spans — one per holder — never `blocks × N`. Before the
+    /// fix the client planner assigned one run per block and the scheduler split
+    /// each run by holder count, opening `blocks × N` streams (here 3 × 3 = 9) for a
+    /// blob that needs only N. Every holder still contributes.
+    #[tokio::test]
+    async fn large_multi_block_gap_seeds_about_one_span_per_holder() -> anyhow::Result<()> {
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let data = blob(total as usize);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_c = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let src_c = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_c));
+        let root = src_a.root();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+        let lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+            lane(&src_c, Arc::clone(&ledger_c), 0xC3),
+        ];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(
+            std::fs::read(dir.path().join("b"))?,
+            data,
+            "assembled byte-identical across the fan-out"
+        );
+        let opens =
+            src_a.opened_ranges().len() + src_b.opened_ranges().len() + src_c.opened_ranges().len();
+        // ~N = 3 spans, one per holder. The old `blocks × N` seeding opened 9. Allow
+        // a little slack for an opportunistic tail-steal, but stay well under 9.
+        assert!(
+            opens <= 6,
+            "fan-out seeds ~N contiguous spans, not blocks × N: {opens} opens across 3 holders"
+        );
+        assert!(
+            src_a.opened_bytes() > 0 && src_b.opened_bytes() > 0 && src_c.opened_bytes() > 0,
+            "every holder contributes: a={} b={} c={}",
+            src_a.opened_bytes(),
+            src_b.opened_bytes(),
+            src_c.opened_bytes()
+        );
+        Ok(())
+    }
+
+    /// Build a `Coverage` sized for `n` discovery blocks with exactly `blocks`
+    /// covered — the same shorthand `coverage_plan`'s own tests use.
+    fn cov(n: u32, blocks: &[u32]) -> Coverage {
+        Coverage::from_block_indices(n, blocks.iter().copied())
+    }
+
+    /// Disjoint coverage (#1506, task B2): source A holds only discovery block
+    /// 0, source B holds only block 1, over a whole-blob fetch spanning exactly
+    /// those two blocks. Every byte range A opens must fall inside block 0 and
+    /// every range B opens must fall inside block 1 — neither is EVER handed
+    /// the other's block, because `spread_segments`'s per-block assignment
+    /// (each block has exactly one covering candidate here) and `Work::pick`'s
+    /// coverage filter agree on the same routing.
+    #[tokio::test]
+    async fn disjoint_coverage_routes_each_block_to_its_only_coverer() -> anyhow::Result<()> {
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let data = blob(total as usize);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        let n = num_blocks(total);
+        let lanes = vec![
+            lane_with_coverage(&src_a, Arc::clone(&ledger_a), 0xA1, cov(n, &[0])),
+            lane_with_coverage(&src_b, Arc::clone(&ledger_b), 0xB2, cov(n, &[1])),
+        ];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+        )
+        .await?;
+
+        store.finalize().await?;
+        assert_eq!(
+            std::fs::read(dir.path().join("b"))?,
+            data,
+            "assembled byte-identical from two disjoint-coverage sources"
+        );
+
+        assert!(
+            src_a
+                .opened_ranges()
+                .iter()
+                .all(|&(s, l)| s + l <= DISCOVERY_BLOCK_BYTES),
+            "source A covers only block 0 and must never be opened past it: {:?}",
+            src_a.opened_ranges()
+        );
+        assert!(
+            src_b
+                .opened_ranges()
+                .iter()
+                .all(|&(s, _)| s >= DISCOVERY_BLOCK_BYTES),
+            "source B covers only block 1 and must never be opened before it: {:?}",
+            src_b.opened_ranges()
+        );
+        // Each source actually did its own block — this is not a degenerate
+        // single-source fetch.
+        assert!(src_a.opened_bytes() > 0, "A must have served block 0");
+        assert!(src_b.opened_bytes() > 0, "B must have served block 1");
+        Ok(())
+    }
+
+    /// A third, all-ones holder serves the one block neither of the two
+    /// partial holders covers (#1506, task B2). A holds only block 0, B holds
+    /// only block 1, and only O (full coverage) can serve block 2 — so O, and
+    /// only O, must open bytes in block 2.
+    #[tokio::test]
+    async fn a_block_only_the_all_ones_source_covers_is_served_by_it() -> anyhow::Result<()> {
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let data = blob(total as usize);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_o = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let src_o = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_o));
+        let root = src_a.root();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        let n = num_blocks(total);
+        let lanes = vec![
+            lane_with_coverage(&src_a, Arc::clone(&ledger_a), 0xA1, cov(n, &[0])),
+            lane_with_coverage(&src_b, Arc::clone(&ledger_b), 0xB2, cov(n, &[1])),
+            lane_with_coverage(&src_o, Arc::clone(&ledger_o), 0xC3, Coverage::full(n)),
+        ];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+        )
+        .await?;
+
+        store.finalize().await?;
+        assert_eq!(
+            std::fs::read(dir.path().join("b"))?,
+            data,
+            "assembled byte-identical with a partial-coverage trio"
+        );
+
+        let block2_start = 2 * DISCOVERY_BLOCK_BYTES;
+        assert!(
+            src_o
+                .opened_ranges()
+                .iter()
+                .any(|&(s, l)| s < total && s + l > block2_start),
+            "only O covers block 2, so O must be the one that opened it: {:?}",
+            src_o.opened_ranges()
+        );
+        assert!(
+            src_a.opened_ranges().iter().all(|&(s, _)| s < block2_start),
+            "A does not cover block 2 and must never open into it: {:?}",
+            src_a.opened_ranges()
+        );
+        assert!(
+            src_b.opened_ranges().iter().all(|&(s, _)| s < block2_start),
+            "B does not cover block 2 and must never open into it: {:?}",
+            src_b.opened_ranges()
+        );
+        Ok(())
+    }
+
+    /// Coverage-constrained steal (#1506, task B2): a fast source that covers
+    /// ONLY block 0 finishes its own segment quickly, while the block-1-only
+    /// holder is slow to start. With `pending` empty the fast source tries to
+    /// steal — but the only range left in flight (block 1) is outside its own
+    /// coverage, so `steal_split`'s predicate rejects it and the fast source
+    /// PARKS instead of stealing work it cannot serve. The slow source still
+    /// finishes block 1 on its own, and the fetch completes.
+    #[tokio::test]
+    async fn coverage_constrained_steal_parks_instead_of_taking_uncoverable_work()
+    -> anyhow::Result<()> {
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let data = blob(total as usize);
+        let ledger_fast = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_slow = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_fast = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_fast));
+        // Every leg the slow source opens stalls before its first byte, giving
+        // the fast source (block 0 only) time to finish and attempt a steal.
+        let src_slow = ScriptedSource::new(data.clone())?
+            .slow_to_start(Duration::from_millis(200))
+            .paying(Arc::clone(&ledger_slow));
+        let root = src_fast.root();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        let n = num_blocks(total);
+        let lanes = vec![
+            lane_with_coverage(&src_fast, Arc::clone(&ledger_fast), 0xA1, cov(n, &[0])),
+            lane_with_coverage(&src_slow, Arc::clone(&ledger_slow), 0xB2, cov(n, &[1])),
+        ];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 2,
+                unit_deadline: Duration::from_secs(30),
+            },
+            None,
+        )
+        .await?;
+
+        store.finalize().await?;
+        assert_eq!(
+            std::fs::read(dir.path().join("b"))?,
+            data,
+            "assembled byte-identical despite the fast source finding nothing to steal"
+        );
+
+        assert!(
+            src_fast
+                .opened_ranges()
+                .iter()
+                .all(|&(s, l)| s + l <= DISCOVERY_BLOCK_BYTES),
+            "the fast source covers only block 0 and must never open past it — it must \
+             have parked rather than stolen block 1: {:?}",
+            src_fast.opened_ranges()
+        );
+        assert!(
+            src_slow.opened_bytes() > 0,
+            "the slow source must still have served its own block 1"
         );
         Ok(())
     }
@@ -1147,6 +1647,81 @@ mod tests {
             total_delivered <= total + 8 * 1024 * 1024,
             "verified bytes must not be refetched: delivered {total_delivered} for a \
              {total}-byte blob"
+        );
+        Ok(())
+    }
+
+    /// Focused [`Work::retire`] fault coverage (#1506): the anti-hang prune, on
+    /// the state directly rather than through a whole fetch.
+    ///
+    /// The three integration fault tests
+    /// (`faulted_source_tail_is_reassigned_and_fetch_completes`,
+    /// `all_sources_failing_errors_without_hang`, …) all run every lane over the
+    /// SAME whole-blob coverage, so `retire`'s selective prune — drop only the
+    /// `pending` entries no *surviving* lane covers, keep the ones a survivor can
+    /// still serve — never actually decides anything there: every entry is
+    /// coverable by every other lane. This builds the work-state by hand with
+    /// DISJOINT coverage so the prune has a real choice, and asserts it makes the
+    /// right one. Without the keep half the fetch would refetch nothing but
+    /// needlessly, and without the drop half a survivor-uncoverable entry would
+    /// sit in `pending` forever and every idle worker would park on it — the hang
+    /// [`Work::retire`] exists to prevent.
+    ///
+    /// No blob is allocated (this pokes `Work` directly), so it stays tiny — the
+    /// block boundaries are the production 64 MiB `DISCOVERY_BLOCK_BYTES`, and the
+    /// `pending` entries are one-group slices inside two different blocks.
+    #[tokio::test]
+    async fn retire_drops_only_entries_no_surviving_lane_covers() -> anyhow::Result<()> {
+        use std::collections::VecDeque;
+
+        use decdn_bao_range::align_range;
+
+        use super::{CancelHandle, Work};
+
+        // A two-block blob; source 0 holds ONLY block 0, source 1 ONLY block 1.
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let coverage = vec![cov(2, &[0]), cov(2, &[1])];
+
+        // Two queued, un-started segments: one one-group slice inside block 0
+        // (only source 0 covers it) and one inside block 1 (only source 1).
+        let in_block0 = align_range(0, 1, total)?;
+        let in_block1 = align_range(DISCOVERY_BLOCK_BYTES, 1, total)?;
+        assert_eq!(in_block0.fetch_start(), 0);
+        assert_eq!(in_block1.fetch_start(), DISCOVERY_BLOCK_BYTES);
+
+        let mut work = Work {
+            pending: VecDeque::from(vec![in_block0, in_block1]),
+            in_flight: vec![None, None],
+            cancel: vec![Arc::new(CancelHandle::new()), Arc::new(CancelHandle::new())],
+            alive: vec![true, true],
+        };
+
+        // Source 0 faults out. Its block-0 entry has no surviving coverer and must
+        // be dropped; the block-1 entry is still served by the alive source 1 and
+        // must stay.
+        work.retire(0, &coverage, total);
+        assert!(!work.alive[0], "retired worker is marked gone");
+        assert!(work.alive[1], "the survivor stays alive");
+        let starts: Vec<u64> = work
+            .pending
+            .iter()
+            .map(decdn_bao_range::AlignedRange::fetch_start)
+            .collect();
+        assert_eq!(
+            starts,
+            vec![DISCOVERY_BLOCK_BYTES],
+            "the block-0 entry (orphaned by source 0's exit) is dropped; the block-1 \
+             entry a surviving lane still covers is kept"
+        );
+
+        // Now the last coverer of block 1 exits too: its entry is orphaned in turn,
+        // so the prune empties `pending` — nothing is left for a worker to park on,
+        // which is what lets the fetch converge to `all_idle` instead of hanging.
+        work.retire(1, &coverage, total);
+        assert!(
+            work.pending.is_empty(),
+            "with no lane left covering block 1, its entry is dropped too: {:?}",
+            work.pending
         );
         Ok(())
     }
@@ -1502,16 +2077,19 @@ mod tests {
         let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
         let pacer = BudgetPacer::new();
 
+        let full = Coverage::full(num_blocks(total));
         let lanes = vec![
             SourceLane {
                 source: &src_a,
                 ctx: Arc::new(Mutex::new(ctx_with(0xA1, deposit))),
                 ledger: Arc::clone(&ledger_a),
+                coverage: full.clone(),
             },
             SourceLane {
                 source: &src_b,
                 ctx: Arc::new(Mutex::new(ctx_with(0xB2, deposit))),
                 ledger: Arc::clone(&ledger_b),
+                coverage: full,
             },
         ];
         let result = tokio::time::timeout(
@@ -1696,16 +2274,19 @@ mod tests {
         };
 
         // Both lanes' ctxs carry the SAME shared pool deposit `D`.
+        let full = Coverage::full(num_blocks(total));
         let lanes = vec![
             SourceLane {
                 source: &src_a,
                 ctx: Arc::new(Mutex::new(ctx_with(0xA1, deposit))),
                 ledger: Arc::clone(&ledger_a),
+                coverage: full.clone(),
             },
             SourceLane {
                 source: &src_b,
                 ctx: Arc::new(Mutex::new(ctx_with(0xB2, deposit))),
                 ledger: Arc::clone(&ledger_b),
+                coverage: full,
             },
         ];
         multi_source_fetch(
@@ -1822,16 +2403,19 @@ mod tests {
         let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
         let pacer = BudgetPacer::new();
 
+        let full = Coverage::full(num_blocks(total));
         let lanes = vec![
             SourceLane {
                 source: &src_a,
                 ctx: Arc::new(Mutex::new(ctx_with(0xA1, deposit))),
                 ledger: Arc::clone(&ledger_a),
+                coverage: full.clone(),
             },
             SourceLane {
                 source: &src_b,
                 ctx: Arc::new(Mutex::new(ctx_with(0xB2, deposit))),
                 ledger: Arc::clone(&ledger_b),
+                coverage: full,
             },
         ];
         let result = tokio::time::timeout(

@@ -11,8 +11,8 @@
 //! - retains at most 10 providers per hash (top 10 by selection score);
 //! - retains entries for `PROBE_SLASH_WINDOW / 2` = 15s (ADR 005 §Derived
 //!   constants), anchored at insertion;
-//! - stores ONLY the ADR triple `(NodeId, rate_per_mb, rtt)` — never the
-//!   signed `ProbeResponse`.
+//! - stores the ADR triple `(NodeId, rate_per_mb, rtt)` plus the probe's
+//!   UNSIGNED range-keyed `Coverage` (#1506) — never the signed `ProbeResponse`.
 //!
 //! That last point is #1165's "no evidence retention" requirement, and it is
 //! not a memory optimisation. A `ProbeResponse` carries `slash_sig`: a peer's
@@ -25,6 +25,13 @@
 //! another node's slashable statements — retaining them turns an availability
 //! cache into an evidence locker.
 //!
+//! `Coverage` is exempt from that concern, not an exception to it: it is
+//! UNSIGNED (`ProbeResponseExt`, outside the `slash_sig` set), so it carries no
+//! author to slash and is not evidence of anything. It rides the entry so a
+//! cache-hit candidate can still be range-planned (`plan_covered_runs`) against
+//! its ≤15s-fresh coverage; without it a real partial holder would read as
+//! covering nothing on the hit path and be excluded from range assignment.
+//!
 //! `reputation` is likewise NOT stored, for a different reason: it is a local,
 //! live value that moves on every pull outcome. Freezing it for the TTL would let a
 //! node that just failed three pulls keep the rank it held before them.
@@ -36,6 +43,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use decdn_cache::PROBE_SLASH_WINDOW;
+use decdn_protocol::Coverage;
 use indexmap::IndexMap;
 use tracing::warn;
 
@@ -73,9 +81,10 @@ const DEFAULT_CAPACITY: usize = 1024;
 /// bound is an invariant of the TYPE: a cap a caller can forget is not a cap.
 const MAX_PROVIDERS_PER_HASH: usize = 10;
 
-/// One probed provider — exactly ADR 001 §Probe cache's entry triple
-/// (`hash → Vec<(NodeId, rate_per_mb, rtt)>`), nothing more.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One probed provider — ADR 001 §Probe cache's entry triple
+/// (`hash → Vec<(NodeId, rate_per_mb, rtt)>`) plus the probe's unsigned
+/// range-keyed [`Coverage`] (#1506), and nothing more.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbedProvider {
     /// The provider that answered `has_blob: true`.
     pub node_id: NodeId,
@@ -83,19 +92,23 @@ pub struct ProbedProvider {
     pub rate_per_mb: u64,
     /// The round-trip latency observed on that probe.
     pub rtt_ms: u32,
+    /// The discovery blocks the provider reported holding on that probe
+    /// (`ProbeResponseExt.coverage`, #1506). UNSIGNED — outside the `slash_sig`
+    /// set — so retaining it is not the evidence retention the module doc
+    /// forbids; it carries no slashable author. A cache-hit candidate is
+    /// range-planned against this ≤15s-fresh value rather than reading as
+    /// covering nothing.
+    pub coverage: Coverage,
 }
 
-// Review speed-bump for the "no evidence retention" invariant, NOT a hard
-// enforcement of it. 32 (node_id) + 8 (rate) + 4 (rtt) = 44, which the `u64`
-// pads to 48 — so this only trips for a field large enough to push past that
-// padding (another `NodeId`, a signature, an embedded `ProbeResponse`); a field
-// of ≤4 bytes fits in the existing tail padding and slips past silently. The
-// real guards against retaining slashable evidence are `#[derive(Copy)]` above
-// (a `Signature`/`Vec<u8>`/`ProbeResponse` is not `Copy`, so it fails to
-// compile) and the exhaustive struct literal at the single write site (no `..`,
-// so any new field must be populated there — sending the author back to the
-// module doc). This assert just adds a footprint ceiling on top of those.
-const _: () = assert!(size_of::<ProbedProvider>() <= 48);
+// The guard against retaining slashable evidence is the exhaustive struct
+// literal at the single write site (no `..`, so any new field must be populated
+// there — sending the author back to the module doc). `ProbedProvider` does not
+// derive `Copy`: `Coverage` wraps a `Vec<u8>`, which cannot be `Copy`. A
+// footprint-ceiling `size_of` assert would only ever bound the fixed head, not
+// the heap the coverage bitmap owns, so this struct carries none. A
+// `Signature`/`ProbeResponse` field is still caught at the write site, which is
+// where the invariant actually lives.
 
 #[derive(Debug)]
 struct Entry {
@@ -186,7 +199,8 @@ impl PositiveProbeCache {
     /// rebuilds `Candidate`s from this, which means an `await` on `region_of(..)`
     /// per provider, and holding a `std::sync::Mutex` guard across an await is
     /// exactly the hazard `clippy::await_holding_lock` exists for. At ≤10 small
-    /// `Copy` structs the copy is not worth arguing about.
+    /// providers — each a triple plus a coverage bitmap sized to the blob's
+    /// block count — the clone is not worth arguing about.
     #[must_use]
     pub fn get(&self, hash: &Hash) -> Option<Vec<ProbedProvider>> {
         let now = Instant::now();
@@ -300,6 +314,9 @@ mod tests {
             node_id: nid(byte),
             rate_per_mb: u64::from(byte),
             rtt_ms: u32::from(byte),
+            // A distinct one-block coverage per provider, so a round-trip that
+            // dropped or aliased the field fails the `PartialEq` assertions.
+            coverage: Coverage::from_block_indices(8, std::iter::once(u32::from(byte % 8))),
         }
     }
 
