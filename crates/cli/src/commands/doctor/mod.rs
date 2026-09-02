@@ -9,6 +9,7 @@ use serde::Serialize;
 mod chain;
 mod config;
 mod disk;
+mod origin;
 mod report;
 mod state;
 
@@ -92,6 +93,7 @@ pub async fn run(
         state::check_state(&mut report, resolved, false);
         if !args.offline {
             chain::check_chain(&mut report, resolved, args.timeout_ms).await;
+            origin::check_origins(&mut report, resolved, args.timeout_ms).await;
         }
     }
 
