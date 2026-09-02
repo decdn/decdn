@@ -6,6 +6,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+mod chain;
 mod config;
 mod disk;
 mod report;
@@ -79,11 +80,6 @@ impl std::fmt::Display for DoctorFailed {
 impl std::error::Error for DoctorFailed {}
 
 /// Run every diagnostic group, render the report, and map severity to exit.
-#[allow(clippy::unused_async)] // Future-shaped: later tasks add `.await`ed checks here.
-// `async` is preserved even though no body is currently `.await`ed: `node_dispatch`
-// awaits this future the same way it awaits every other subcommand handler, so the
-// signature is part of the dispatch contract. Task 2+ add real network/admin-RPC
-// awaits inside this body.
 pub async fn run(
     args: &decdn_common::cli::DoctorArgs,
     global_config: Option<&Path>,
@@ -94,6 +90,9 @@ pub async fn run(
     if let Some(resolved) = &resolved {
         disk::check_disk(&mut report, resolved, None);
         state::check_state(&mut report, resolved, false);
+        if !args.offline {
+            chain::check_chain(&mut report, resolved, args.timeout_ms).await;
+        }
     }
 
     let mut stdout = std::io::stdout().lock();
