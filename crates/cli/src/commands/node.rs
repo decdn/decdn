@@ -77,6 +77,7 @@ pub async fn node_dispatch(
             crate::commands::update_multiaddrs::run(u, global_config).await
         }
         cli::NodeCommand::Lookup(l) => lookup(l, global_config).await,
+        cli::NodeCommand::Doctor(d) => crate::commands::doctor::run(d, global_config).await,
     }
 }
 
@@ -836,7 +837,10 @@ fn io_error_kind_in_source_chain(
 ///    path falls through. `admin_port = 0` in the file is an operator
 ///    opt-out and errors here rather than silently probing the default.
 /// 4. Default `http://127.0.0.1:9191`.
-fn resolve_admin_url(flag: Option<&str>, config_path: Option<&Path>) -> anyhow::Result<String> {
+pub(crate) fn resolve_admin_url(
+    flag: Option<&str>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<String> {
     if let Some(url) = flag {
         return Ok(url.to_string());
     }

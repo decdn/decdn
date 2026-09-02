@@ -12,6 +12,7 @@ pub mod bundle_pull;
 pub mod chain_ctx;
 pub mod config;
 pub mod deregister;
+pub mod doctor;
 pub mod fetch;
 pub mod key_gen;
 pub mod manifest;
