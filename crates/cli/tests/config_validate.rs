@@ -437,8 +437,16 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
 }
 
 fn render(source: Option<&Path>, cfg: &ResolvedConfig) -> anyhow::Result<String> {
+    render_with_notices(source, cfg, &[])
+}
+
+fn render_with_notices(
+    source: Option<&Path>,
+    cfg: &ResolvedConfig,
+    notices: &[decdn_common::config::ConfigNotice],
+) -> anyhow::Result<String> {
     let mut buf = Vec::new();
-    commands::write_validate_summary(&mut buf, source, cfg)?;
+    commands::write_validate_summary(&mut buf, source, cfg, notices)?;
     Ok(String::from_utf8(buf)?)
 }
 
@@ -740,3 +748,105 @@ fn summary_reports_defaults_only_when_no_source() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// `decdn` links no `tracing` subscriber, so a resolve-time notice the daemon
+/// logs would otherwise vanish here. `config validate` exists to tell an
+/// operator what the node sees, and a notice is part of that answer — so it
+/// renders to the same writer as the summary, under it.
+#[test]
+fn summary_renders_resolve_notices_under_the_field_list() -> anyhow::Result<()> {
+    use decdn_common::config::{ConfigNotice, ConfigNoticeLevel};
+
+    let cfg = sample_resolved(|_| {});
+    let notices = vec![
+        ConfigNotice {
+            level: ConfigNoticeLevel::Warn,
+            field: "security.max_tracked_sources".to_string(),
+            message: "0: rate-limit bookkeeping map is unbounded".to_string(),
+        },
+        ConfigNotice {
+            level: ConfigNoticeLevel::Info,
+            field: "security.per_source_rate_per_sec".to_string(),
+            message: "0: per-source rate-limit disabled".to_string(),
+        },
+    ];
+    let out = render_with_notices(None, &cfg, &notices)?;
+
+    anyhow::ensure!(out.contains("notices (2):"), "{out}");
+    anyhow::ensure!(
+        out.contains(
+            "- warning: security.max_tracked_sources: 0: rate-limit bookkeeping map is unbounded"
+        ),
+        "{out}"
+    );
+    anyhow::ensure!(
+        out.contains("- info: security.per_source_rate_per_sec: 0: per-source rate-limit disabled"),
+        "{out}"
+    );
+    // The config still resolved — a notice never fails validation — so the
+    // leading verdict must stand rather than being downgraded.
+    anyhow::ensure!(out.starts_with("config valid"), "{out}");
+    Ok(())
+}
+
+/// The common case prints nothing extra: a `notices (0):` header on every clean
+/// run is the kind of noise that trains an operator to stop reading.
+#[test]
+fn summary_omits_the_notices_block_when_there_are_none() -> anyhow::Result<()> {
+    let cfg = sample_resolved(|_| {});
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(!out.contains("notices"), "{out}");
+    Ok(())
+}
+
+/// The wiring, through the real binary: `config_validate` resolves, takes the
+/// notices the resolvers recorded, and passes them to the summary writer. The
+/// tests above build `ConfigNotice` values by hand and prove the *formatter*;
+/// only a subprocess run proves the resolver's notices reach it at all.
+#[test]
+fn config_validate_renders_the_notices_the_resolver_recorded() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let cfg = dir.path().join("node.toml");
+    // `0` resolves fine and records a `Warn` notice — so the run must still
+    // report `config valid` and exit 0, with the notice underneath it.
+    fs::write(
+        &cfg,
+        format!("{MINIMAL_VALID_CONFIG}\n[security]\nmax_tracked_sources = 0\n"),
+    )?;
+    fs::write(dir.path().join("keystore.json"), "")?;
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_decdn"))
+        .args([
+            "--config",
+            cfg.to_str().unwrap_or_default(),
+            "config",
+            "validate",
+            "--data-dir",
+            dir.path().to_str().unwrap_or_default(),
+        ])
+        .output()?;
+
+    let stdout = String::from_utf8(out.stdout)?;
+    anyhow::ensure!(out.status.success(), "a notice must not fail validation");
+    anyhow::ensure!(stdout.starts_with("config valid"), "{stdout}");
+    anyhow::ensure!(stdout.contains("notices (1):"), "{stdout}");
+    anyhow::ensure!(
+        stdout.contains("- warning: security.max_tracked_sources: 0: rate-limit bookkeeping"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+/// Resolvable fixture for the subprocess run above. Mirrors the shape
+/// `doctor_cli.rs` uses against the same resolver.
+const MINIMAL_VALID_CONFIG: &str = r#"
+[blockchain]
+rpc_url = "http://127.0.0.1:8545"
+payment_pool_address = "0x0000000000000000000000000000000000000001"
+capacity_bond_address = "0x0000000000000000000000000000000000000002"
+slash_judge_address = "0x0000000000000000000000000000000000000003"
+content_blacklist_address = "0x0000000000000000000000000000000000000004"
+
+[cache]
+cache_size_mb = 1024
+"#;

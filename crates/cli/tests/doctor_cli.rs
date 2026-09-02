@@ -59,6 +59,70 @@ fn offline_json_report_is_wellformed() {
     }
 }
 
+/// The whole notice path, end to end through the real binary: a resolver
+/// records it, `resolve_config` hands it back, `check_config` turns it into a
+/// finding, and it lands in the JSON report. The unit tests either side of this
+/// cover the resolver and the renderer; nothing else covers the wiring, which
+/// is where #1902 went wrong in the first place.
+///
+/// `--strict` is what makes a notice change the exit status, so both codes are
+/// pinned here: an unbounded bookkeeping map is a warning, not a failure.
+#[test]
+fn a_resolve_notice_becomes_a_doctor_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("node.toml");
+    // `0` is the documented "unbounded" escape hatch — it resolves fine and
+    // records a `Warn` notice, which is exactly the shape doctor exists to
+    // surface: invisible in the resolved values themselves.
+    std::fs::write(
+        &cfg,
+        format!("{MINIMAL_CONFIG}\n[security]\nmax_tracked_sources = 0\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("keystore.json"), "").unwrap();
+
+    let run = |strict: bool| {
+        let mut cmd = decdn();
+        cmd.args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "node",
+            "doctor",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--offline",
+            "--json",
+        ]);
+        if strict {
+            cmd.arg("--strict");
+        }
+        cmd.output().unwrap()
+    };
+
+    let out = run(false);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let notice = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "config.notice")
+        .expect("the zeroed bookkeeping cap must reach the report");
+    assert_eq!(notice["severity"], "warn");
+    assert!(
+        notice["title"].as_str().unwrap().contains("unbounded"),
+        "{notice}"
+    );
+    assert_eq!(notice["detail"], "field=security.max_tracked_sources");
+    assert!(notice["remediation"].as_str().is_some(), "{notice}");
+
+    // A warning alone is not a failure.
+    assert!(out.status.success(), "a Warn must not fail a plain run");
+    assert!(
+        !run(true).status.success(),
+        "--strict is what turns a Warn into a nonzero exit"
+    );
+}
+
 const MINIMAL_CONFIG: &str = r#"
 [blockchain]
 rpc_url = "http://127.0.0.1:8545"
