@@ -283,9 +283,10 @@ async fn run_journey() -> anyhow::Result<()> {
     );
     // The operator wallet the node runs under is legible from `status` — the
     // first-party answer, without grepping the daemon log for it.
+    let expected_operator = node.operator_addr().to_string();
     assert_eq!(
         status.operator_address.as_deref(),
-        Some(node.operator_addr().to_string().as_str()),
+        Some(expected_operator.as_str()),
         "status must report the operator address the node bonded and registered under: {status:?}"
     );
 
