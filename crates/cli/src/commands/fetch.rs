@@ -25,6 +25,7 @@
 //! `temp_in_parent`) are `pub(crate)` so `decdn bundle pull` (#391) reuses the
 //! same gap-driven, reactive-top-up fetch core across a bundle's many entries.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -402,6 +403,7 @@ pub(crate) async fn probe_and_order(
                 candidate: cand.clone(),
                 rtt_ms,
                 total_bytes: resp_ext.total_bytes,
+                coverage: resp_ext.coverage.clone(),
             });
         } else if warming.enabled {
             warming_pool.push(discovery::WarmingCandidate {
@@ -440,6 +442,7 @@ pub(crate) async fn probe_and_order(
     Ok(ResolvedTargets {
         candidates: ordered.order,
         size_hint: ordered.size_hint,
+        coverage_by_node: ordered.coverage_by_node,
     })
 }
 
@@ -460,6 +463,13 @@ struct FailoverOrder {
     /// for the whole set. An overstated one costs nothing — the real header
     /// governs once the fan-out engages.
     size_hint: Option<u64>,
+    /// Each probed holder's measured [`decdn_protocol::Coverage`] (#1506's B1),
+    /// keyed by `node_id`. Proxy-warming candidates never appear here — they
+    /// are non-holders by definition, so a lookup miss on them (and on any
+    /// node this map otherwise has no entry for) means "no measured
+    /// coverage", which the multi-source lane builder treats as a full
+    /// holder rather than as a gap in the data.
+    coverage_by_node: HashMap<PublicKey, decdn_protocol::Coverage>,
 }
 
 /// Assemble the failover order (#1174, ADR 037 § Client selection policy) from
@@ -478,6 +488,12 @@ fn failover_order(
     warming: ProxyWarmingParams,
 ) -> FailoverOrder {
     holders.sort_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms));
+    // Captured before `holders` is consumed into `order` below — each probed
+    // holder's real coverage, for the multi-source lane builder (#1506's B3).
+    let coverage_by_node: HashMap<PublicKey, decdn_protocol::Coverage> = holders
+        .iter()
+        .map(|h| (h.candidate.node_id, h.coverage.clone()))
+        .collect();
     let best_holder_rtt = holders
         .iter()
         .map(|h| h.rtt_ms)
@@ -513,6 +529,7 @@ fn failover_order(
         order,
         warming_lead,
         size_hint,
+        coverage_by_node,
     }
 }
 
@@ -569,6 +586,13 @@ pub(crate) struct ResolvedTargets {
     /// pinned `--node-id` path and whenever no holder reported a size, where the
     /// gate falls back to the header open.
     pub(crate) size_hint: Option<u64>,
+    /// Each probed holder's measured [`decdn_protocol::Coverage`] (#1506's B1),
+    /// keyed by `node_id` — what the multi-source lane builder reads instead of
+    /// assuming every admitted candidate is a full holder. Empty on the pinned
+    /// `--node-id` path, where nothing was probed; a lookup miss there (as
+    /// everywhere else) reads as "no measured coverage" and the lane builder
+    /// falls back to [`decdn_protocol::Coverage::full`].
+    pub(crate) coverage_by_node: HashMap<PublicKey, decdn_protocol::Coverage>,
 }
 
 /// Resolve the ordered failover list of nodes to fetch from (#1174): the
@@ -606,6 +630,9 @@ pub(crate) async fn resolve_target_node(
             // A pinned node is one candidate, so multi-source never engages and
             // no size hint is needed.
             size_hint: None,
+            // Nothing was probed on this path, so no holder coverage was
+            // measured; irrelevant anyway since multi-source never engages here.
+            coverage_by_node: HashMap::new(),
         });
     }
 
@@ -798,6 +825,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // Resolve the ordered failover list: explicit `--node-id`, or auto-discover.
     let targets = resolve_target_node(common, &chain, &endpoint, &relays, hash).await?;
     let candidates = targets.candidates;
+    let coverage_by_node = targets.coverage_by_node;
 
     // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
@@ -877,6 +905,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             &signer,
             &voucher_dom,
             &candidates,
+            &coverage_by_node,
             &relays,
             hash,
             &args.output,
@@ -1246,7 +1275,6 @@ where
         deps.namespace_id,
         0,
         micros_now(),
-        deps.max_blob_bytes,
         deps.max_rate_per_mb,
         deps.deadlines,
         0,
@@ -1315,6 +1343,7 @@ where
         progress,
         None, // pacing_wait: BudgetPacer never returns PaceDecision::Wait
         None, // served_paid: no downstream leg on the client path
+        None, // pool: single-source client fetch — one lane is the whole pool
     )
     .await;
 
@@ -1353,6 +1382,10 @@ where
 /// the `PeerSource` so the borrowed [`SourceLane`] the scheduler consumes can
 /// point at it; the `ctx`/`ledger` `Arc`s are cloned into that `SourceLane`.
 struct MultiLane<'a> {
+    /// The candidate's `node_id` — the key the coverage map built in
+    /// [`failover_order`] is keyed on, so the scheduler lane this becomes can
+    /// look up its real measured coverage instead of assuming a full holder.
+    node_id: PublicKey,
     provider: Address,
     pool_id: PoolId,
     /// The lane's persisted prior amount — the baseline
@@ -1361,6 +1394,29 @@ struct MultiLane<'a> {
     ctx: Arc<Mutex<PoolContext>>,
     ledger: Arc<PoolLedger>,
     source: PeerSource<'a>,
+}
+
+/// The `SourceLane::coverage` for one multi-source lane: the REAL measured
+/// `Coverage` the `cdn/probe/v1` round trip reported for that holder (#1506's
+/// B1), looked up by `node_id` in the map [`failover_order`] built from the
+/// probed `holders`.
+///
+/// A lookup miss — a source with no entry in `coverage_by_node` — gets
+/// `Coverage::full`: every source reaching a multi-source lane already passed
+/// the `has_blob`/`coverage` probe consistency check EXCEPT a proxy-warming
+/// source (a non-holder promoted into the set to seed a regional copy via
+/// pull-through, and so will serve any range) and the pinned `--node-id` path
+/// (which probes nothing and passes an empty map). Both cases mean "will
+/// serve", matching the full-coverage semantic.
+fn lane_coverage(
+    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
+    node_id: PublicKey,
+    num_blocks: u32,
+) -> decdn_protocol::Coverage {
+    coverage_by_node
+        .get(&node_id)
+        .cloned()
+        .unwrap_or_else(|| decdn_protocol::Coverage::full(num_blocks))
 }
 
 /// Build the target address for a discovered candidate: its `node_id` plus the
@@ -1449,6 +1505,7 @@ where
         deps.deadlines,
     );
     Ok(MultiLane {
+        node_id: candidate.node_id,
         provider,
         pool_id,
         prior_amount,
@@ -1483,6 +1540,7 @@ pub(crate) async fn try_multi_source_fetch<P>(
     signer: &Arc<PrivateKeySigner>,
     voucher_dom: &Eip712Domain,
     candidates: &[NodeCandidate],
+    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
     relays: &[RelayUrl],
     hash: [u8; 32],
     output: &Path,
@@ -1508,6 +1566,7 @@ where
         signer,
         voucher_dom,
         admitted,
+        coverage_by_node,
         relays,
         hash,
         output,
@@ -1531,6 +1590,7 @@ pub(crate) async fn try_multi_source_fetch_from_admitted<P>(
     signer: &Arc<PrivateKeySigner>,
     voucher_dom: &Eip712Domain,
     admitted: Vec<NodeCandidate>,
+    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
     relays: &[RelayUrl],
     hash: [u8; 32],
     output: &Path,
@@ -1576,7 +1636,6 @@ where
             deps.namespace_id,
             0,
             micros_now(),
-            deps.max_blob_bytes,
             deps.max_rate_per_mb,
             deps.deadlines,
             0,
@@ -1653,12 +1712,14 @@ where
 
     // Borrow each lane's owned `PeerSource` into a scheduler `SourceLane`, cloning
     // its `ctx`/`ledger` handles. `lanes` outlives `source_lanes`.
+    let num_blocks = decdn_protocol::num_blocks(total_bytes);
     let source_lanes: Vec<SourceLane<'_, PeerSource<'_>>> = lanes
         .iter()
         .map(|l| SourceLane {
             source: &l.source,
             ctx: Arc::clone(&l.ctx),
             ledger: Arc::clone(&l.ledger),
+            coverage: lane_coverage(coverage_by_node, l.node_id, num_blocks),
         })
         .collect();
 
@@ -2346,6 +2407,7 @@ mod tests {
             },
             rtt_ms,
             total_bytes,
+            coverage: decdn_protocol::Coverage::empty(),
         }
     }
 
@@ -2430,6 +2492,48 @@ mod tests {
         assert!(out.warming_lead.is_none());
         let ids: Vec<_> = out.order.iter().map(|c| c.node_id).collect();
         assert_eq!(ids, vec![node_key(10)]);
+    }
+
+    /// `failover_order`'s `coverage_by_node` carries each holder's REAL measured
+    /// coverage (#1506's B1) — not `Coverage::full` for every lane, which was
+    /// the gap this task closes: disjoint per-holder coverage {block0}/{block1}
+    /// survives into the map keyed by `node_id`, and a node that was never
+    /// probed (e.g. a proxy) has no entry at all.
+    #[test]
+    fn failover_order_coverage_by_node_carries_each_holders_real_coverage() {
+        let mut h1 = holder(1, 100.0);
+        h1.coverage = decdn_protocol::Coverage::from_block_indices(2, [0].into_iter());
+        let mut h2 = holder(2, 200.0);
+        h2.coverage = decdn_protocol::Coverage::from_block_indices(2, [1].into_iter());
+
+        let out = super::failover_order(vec![h1.clone(), h2.clone()], &[], warming_params(false));
+
+        assert_eq!(out.coverage_by_node.get(&node_key(1)), Some(&h1.coverage));
+        assert_eq!(out.coverage_by_node.get(&node_key(2)), Some(&h2.coverage));
+        // Sanity: the two holders' coverage is genuinely different, not both
+        // collapsed to the same (e.g. full) value.
+        assert_ne!(h1.coverage, h2.coverage);
+        // A node that was never probed has no entry.
+        assert!(!out.coverage_by_node.contains_key(&node_key(99)));
+    }
+
+    /// [`lane_coverage`] is the read side of the same map: a holder with a
+    /// measured (possibly partial) coverage gets exactly that back, while a
+    /// node absent from the map — a proxy-warming source or the pinned
+    /// `--node-id` path's empty map — falls back to a full holder rather than
+    /// silently dropping out of the fan-out.
+    #[test]
+    fn lane_coverage_prefers_measured_coverage_and_falls_back_to_full() {
+        let measured = decdn_protocol::Coverage::from_block_indices(4, [0, 2].into_iter());
+        let mut map = HashMap::new();
+        map.insert(node_key(1), measured.clone());
+
+        assert_eq!(super::lane_coverage(&map, node_key(1), 4), measured);
+        assert_eq!(
+            super::lane_coverage(&map, node_key(2), 4),
+            decdn_protocol::Coverage::full(4),
+            "an unmeasured source (proxy / pinned --node-id) is treated as a full holder"
+        );
     }
 
     /// The delegated signer gate accepts the authorized key and rejects any

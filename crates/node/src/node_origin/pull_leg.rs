@@ -9,19 +9,24 @@
 //!
 //! # Two entry points
 //!
-//! - [`NodeOrigin::open_pull_leg`] — discovery + candidate walk + channel open + a
-//!   free header handshake. Returns the bound [`PullLegTarget`] (provider, channel
-//!   context, ledger) AND the upstream `total_bytes`, so the orchestration can sign
-//!   its `StreamResponse` before either leg streams a byte. Discovery happens ONCE
-//!   here; the pull leg does not re-discover. Open-time candidate fallback walks
-//!   the ranked candidates until one opens; mid-pull candidate switch is deferred,
-//!   consistent with the resumable-pull design (#1530).
-//! - [`run_pull_leg`] — builds the driver axes ([`NodeAdmitStore`] sink,
-//!   [`PeerSource`], [`RampPacer`], [`NodeFunder`]) and runs the drive, then scores
-//!   the provider and records its terminal outcome via the shared
-//!   [`decdn_cache::FillSession::mark_ended`]. A [`SettleOnDrop`] guard persists the buyer
-//!   watermark (#852) on EVERY exit — including a mid-drive cancellation when the
-//!   serve leg finishes first and drops this future (client disconnect / shutdown).
+//! - [`NodeOrigin::open_pull_leg`] — discovery + probe + rank + a free header
+//!   handshake. Returns the ranked [`PullLegTarget`] (the upstream `total_bytes`
+//!   plus the ranked candidates, each with its probe-fresh range-keyed coverage),
+//!   so the orchestration can sign its `StreamResponse` before either leg streams a
+//!   byte. Discovery happens ONCE here; the pull leg does not re-discover. Any
+//!   holder — partial or whole — reports the same `total_bytes`, so the handshake
+//!   walks candidates until one answers.
+//! - [`run_pull_leg`] — assembles the blob across the partial holders via the
+//!   ranged-drive loop (#1506): it plans the missing range into runs by coverage
+//!   ([`decdn_client_pull::plan_covered_runs`]) and drives them in offset order,
+//!   opening ONE payment lane ([`NodeAdmitStore`] sink, [`PeerSource`],
+//!   [`RampPacer`], [`NodeFunder`]) per run and re-planning a non-terminal run
+//!   fault onto the survivors. It scores each provider as its run ends and records
+//!   the assembly's terminal outcome via the shared
+//!   [`decdn_cache::FillSession::mark_ended`]. A per-lane [`SettleOnDrop`] guard
+//!   persists that lane's buyer watermark (#852) on EVERY exit — including a
+//!   mid-drive cancellation when the serve leg finishes first and drops this future
+//!   (client disconnect / shutdown).
 //!
 //! # Reputation, watermark
 //!
@@ -31,7 +36,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -43,7 +48,8 @@ use decdn_cache::{CacheEngine, CacheError, FillError, FillSession, Hash};
 use decdn_client_pull::driver::DriveConfig;
 use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
-    HashMismatch as ClientPullHashMismatch, PacingWait, PeerSource, RampPacer, drive,
+    CoveredRun, HashMismatch as ClientPullHashMismatch, PacingWait, PeerSource, PoolExhausted,
+    RampPacer, RetryDisposition, SharedPool, drive, retry_disposition,
 };
 use decdn_incentive::DepositOutcome;
 
@@ -58,13 +64,15 @@ use super::admit_store::NodeAdmitStore;
 use super::backend_source::BackendSource;
 use super::funder::NodeFunder;
 use super::funder::{SETTLE_POLL_STEP, settle_wait_budget};
+use super::ranged_pull::{AssembleOutcome, RunOutcome, RunSink, assemble};
 use super::{
-    EconGate, NodeOrigin, NodeOriginDeps, PullMiss, PullOutcome, SettleOnDrop, bind_upstream_ctx,
-    cached_candidates, classify_pull_failure, discover, economic_ceiling, heat_of, lane_ledger,
-    mb_of, now_micros, probe_and_rank, record_outcome, record_pool_open_failure,
+    EconGate, NodeOrigin, NodeOriginDeps, ProbeGather, PullMiss, PullOutcome, SettleOnDrop,
+    bind_upstream_ctx, cached_candidates, classify_pull_failure, discover, economic_ceiling,
+    heat_of, lane_ledger, mb_of, now_micros, probe_and_rank, record_outcome,
+    record_pool_open_failure,
 };
 use crate::client_requester::{
-    PoolContext, PoolLedger, PullDeadlines, open_progressive_pull as open_progressive_upstream,
+    PoolContext, PullDeadlines, open_progressive_pull as open_progressive_upstream,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::NodeId as DhtNodeId;
@@ -74,43 +82,24 @@ use crate::selection::{CHANNEL_OPEN_CALLER_BUDGET, Candidate, MAX_PROVIDER_ATTEM
 /// is its boundaries scaled by this (twin of the driver's private constant).
 const CHUNK_BYTES: u64 = 1024;
 
-/// A discovered, channel-open upstream ready to be pulled from by [`drive`], plus
-/// the `total_bytes` the caller needs to sign its `StreamResponse`. Everything a
-/// [`PeerSource`] and a [`NodeFunder`] need is bundled here so the orchestration can
-/// do discovery ONCE and hand the result to [`run_pull_leg`].
-#[allow(
-    dead_code,
-    reason = "wired by the orchestration in handlers::client::window"
-)]
+/// A discovered, ranked pull plan for one serve-miss: the `total_bytes` the caller
+/// needs to sign its `StreamResponse`, plus the RANKED candidate list (each
+/// carrying its probe-fresh range-keyed `coverage`, #1506) the ranged-drive loop
+/// assembles the blob from. Discovery + probe + rank happen ONCE, here, and the
+/// result is handed to [`run_pull_leg`], which opens a lane per planned run — a
+/// blob spread across partial holders is pulled from each in turn.
 pub(crate) struct PullLegTarget {
-    /// The provider's iroh identity — dialled by [`PeerSource`] and scored on
-    /// completion.
-    pk: PublicKey,
-    /// Its bonded operator address: the channel counterparty and the `PeerSource`
-    /// `expected_signer`.
-    provider_addr: alloy::primitives::Address,
-    /// The dial target (`EndpointAddr::new(pk)`).
-    target: EndpointAddr,
-    /// The buyer channel context, shared behind `Arc<Mutex<..>>` with the
-    /// [`NodeFunder`] so a mid-pull top-up's new deposit is visible to the next
-    /// [`PeerSource`].
-    ctx: Arc<std::sync::Mutex<PoolContext>>,
-    /// The channel's shared voucher ledger (`BuyerLedgers::get_or_seed`).
-    ledger: Arc<PoolLedger>,
-    /// The upstream-claimed content length, from the header handshake.
+    /// The upstream-claimed content length, from the header handshake against the
+    /// first openable candidate. Any holder — partial or whole — reports the same
+    /// blob geometry, so it is authoritative regardless of which candidate answered.
     pub(crate) total_bytes: u64,
-    /// The served client's namespace, threaded onto the pull (ADR 005), big-endian.
+    /// The served client's namespace, threaded onto every lane (ADR 005), big-endian.
     namespace_id: [u8; 32],
-    /// The effective per-MB rate ceiling (lower of the probe rate, the config
-    /// ceiling, and the ADR 041 buy cap), enforced by [`PeerSource`] before paying.
-    rate_ceiling: u64,
-    /// The open/stall stage bounds for each [`PeerSource`].
-    deadlines: PullDeadlines,
-    /// ADR 041: this buy was priced above the amortized profit-guaranteed floor, so a
-    /// clean completion debits the source's warming allowance by the full buy cost.
-    speculative: bool,
-    /// The candidate's per-MB buy rate, for the speculative warming debit.
-    buy_rate_per_mb: u64,
+    /// The ranked candidates (best-first), each with its probe-confirmed
+    /// `coverage`. The loop plans the missing range across these
+    /// ([`decdn_client_pull::plan_covered_runs`]) and opens one payment lane per
+    /// run.
+    candidates: Vec<Candidate>,
 }
 
 /// The injected wait for [`RampPacer`]'s `Wait`: resolve once the serve leg's paid
@@ -238,6 +227,7 @@ impl NodeOrigin {
         let deps = self.deps.get().ok_or(PullMiss::Clean)?;
         let hash_bytes = *hash.as_bytes();
         let target = DhtHash::from_bytes(hash_bytes);
+        let namespace_bytes = namespace_id.to_be_bytes::<32>();
         let mut budget = MAX_PROVIDER_ATTEMPTS;
         let mut attempt_metered = false;
         let mut miss = PullMiss::Clean;
@@ -247,10 +237,16 @@ impl NodeOrigin {
             deps.metrics.node_pull_attempt();
             attempt_metered = true;
             let outcome = self
-                .open_leg_from_candidates(deps, &cached, hash_bytes, namespace_id, budget)
+                .handshake_from_candidates(deps, &cached, hash_bytes, namespace_id, budget)
                 .await;
             match outcome.payload {
-                Ok(opened) => return Ok(opened),
+                Ok(total_bytes) => {
+                    return Ok(PullLegTarget {
+                        total_bytes,
+                        namespace_id: namespace_bytes,
+                        candidates: cached,
+                    });
+                }
                 Err(failed) => miss = miss.or(failed),
             }
             budget = budget.saturating_sub(outcome.attempts);
@@ -274,34 +270,47 @@ impl NodeOrigin {
         if !attempt_metered {
             deps.metrics.node_pull_attempt();
         }
-        let ranked = probe_and_rank(deps, providers, hash_bytes).await;
-        self.open_leg_from_candidates(deps, &ranked, hash_bytes, namespace_id, budget)
-            .await
-            .payload
-            .map_err(|failed| miss.or(failed))
+        // The ranged-drive assembly (#1506) plans over the coverage UNION of these
+        // candidates, so the probe round must gather holders until their union spans
+        // the blob — not stop at a fixed count that could miss the holders of the
+        // still-uncovered blocks.
+        let ranked = probe_and_rank(deps, providers, hash_bytes, ProbeGather::CoverageUnion).await;
+        let outcome = self
+            .handshake_from_candidates(deps, &ranked, hash_bytes, namespace_id, budget)
+            .await;
+        match outcome.payload {
+            Ok(total_bytes) => Ok(PullLegTarget {
+                total_bytes,
+                namespace_id: namespace_bytes,
+                candidates: ranked,
+            }),
+            Err(failed) => Err(miss.or(failed)),
+        }
     }
 
-    /// Walk `ranked` (bounded by `budget`), opening a pull-leg target from each until
-    /// one succeeds. The open-time-only fallback twin of `open_from_candidates`.
-    async fn open_leg_from_candidates(
+    /// Walk `ranked` (bounded by `budget`), running the free header handshake against
+    /// each until one reports `total_bytes`. Discovery already ranked the candidates;
+    /// this only learns the blob geometry the serve response commits to. The ranged
+    /// pull opens its own per-run lanes later — this handshake pays nothing.
+    async fn handshake_from_candidates(
         &self,
         deps: &NodeOriginDeps,
         ranked: &[Candidate],
         hash_bytes: [u8; 32],
         namespace_id: U256,
         budget: usize,
-    ) -> PullOutcome<PullLegTarget> {
+    ) -> PullOutcome<u64> {
         let mut attempts = 0;
         let mut miss = PullMiss::Clean;
         for candidate in ranked.iter().take(budget) {
             attempts += 1;
             match self
-                .open_leg_target_from_candidate(deps, candidate, hash_bytes, namespace_id)
+                .handshake_total_bytes(deps, candidate, hash_bytes, namespace_id)
                 .await
             {
-                Ok(target) => {
+                Ok(total_bytes) => {
                     return PullOutcome {
-                        payload: Ok(target),
+                        payload: Ok(total_bytes),
                         attempts,
                     };
                 }
@@ -314,16 +323,19 @@ impl NodeOrigin {
         }
     }
 
-    /// Resolve, open/reuse a channel, bind (#1117), and open a free header handshake
-    /// from one candidate; return the bound [`PullLegTarget`]. Classifies every
-    /// failure into the [`PullMiss`] it is, exactly like `open_from_candidate`.
-    async fn open_leg_target_from_candidate(
+    /// Resolve, open/reuse a channel, bind (#1117), and run a free header handshake
+    /// against one candidate; return the committed `total_bytes`. Any holder —
+    /// partial or whole — signs the same whole-blob geometry, so the caller can commit
+    /// its `StreamResponse` from whichever candidate answers first. Classifies every
+    /// failure into the [`PullMiss`] it is. The channel it opens is cached by
+    /// `open_or_reuse_pool`, so the ranged pull's first lane to this provider reuses it.
+    async fn handshake_total_bytes(
         &self,
         deps: &NodeOriginDeps,
         candidate: &Candidate,
         hash_bytes: [u8; 32],
         namespace_id: U256,
-    ) -> Result<PullLegTarget, PullMiss> {
+    ) -> Result<u64, PullMiss> {
         let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
             return Err(PullMiss::Clean);
         };
@@ -337,12 +349,9 @@ impl NodeOrigin {
         // ADR 041 buy-side gate: refuse a candidate quoting above this node's buy
         // ceiling BEFORE opening a channel. A skip folds into the walk as `BelowMargin`.
         let heat = heat_of(deps, hash_bytes);
-        let (econ_rate_ceiling, speculative) =
+        let rate_ceiling =
             match economic_ceiling(deps, candidate.node_id.into(), heat, candidate.rate_per_mb) {
-                EconGate::Allow {
-                    rate_ceiling,
-                    speculative,
-                } => (rate_ceiling, speculative),
+                EconGate::Allow { rate_ceiling, .. } => rate_ceiling,
                 EconGate::Skip => return Err(PullMiss::BelowMargin),
             };
         let ctx = match deps
@@ -371,15 +380,13 @@ impl NodeOrigin {
         let ctx = bind_upstream_ctx(deps, ctx).map_err(|err| local_miss(&err))?;
         let deadlines = deps.config.deadlines().map_err(|err| local_miss(&err))?;
         let ledger = lane_ledger(deps, provider_addr, &ctx);
-        // Folds the candidate probe rate, the static ceiling, and the ADR 041 buy cap.
-        let rate_ceiling = econ_rate_ceiling;
         let namespace_bytes = namespace_id.to_be_bytes::<32>();
 
         // The free header handshake: whole-tail open (`byte_offset == 0`,
         // `byte_len == 0`) to read the committed `total_bytes`, then abort — no
         // `next_chunk`, so no bytes are pulled and no voucher is paid, and the ledger
         // watermark is unchanged. The actual range-minimized pull re-opens per gap via
-        // `PeerSource` on this same channel.
+        // `PeerSource` on this same (now cached) channel.
         let stream_guard = deps.metrics.outbound_stream_guard();
         let (header, probe) = match open_progressive_upstream(
             &deps.endpoint,
@@ -392,7 +399,6 @@ impl NodeOrigin {
             namespace_bytes,
             0,
             now_micros(),
-            deps.config.max_blob_size_bytes,
             rate_ceiling,
             deadlines,
             0,
@@ -419,38 +425,51 @@ impl NodeOrigin {
         let total_bytes = header.total_bytes;
         let _ = probe.abort();
         drop(stream_guard);
-
-        Ok(PullLegTarget {
-            pk,
-            provider_addr,
-            target: EndpointAddr::new(pk),
-            ctx: Arc::new(std::sync::Mutex::new(ctx)),
-            ledger,
-            total_bytes,
-            namespace_id: namespace_bytes,
-            rate_ceiling,
-            deadlines,
-            speculative,
-            buy_rate_per_mb: candidate.rate_per_mb,
-        })
+        Ok(total_bytes)
     }
 }
 
-/// Run the range-minimized upstream pull for `[offset, offset + len)` of `hash`
-/// into `engine`'s cache via [`drive`], paying only for the missing ranges and
-/// pacing the pull with a [`RampPacer`] built from `credit_ramp_divisor`,
-/// `credit_floor`, and `credit_max` — the same ramped credit window the serve leg
-/// computes from its own paid frontier (ADR 003 §Credit window / ADR 037), so the
-/// pull never runs further ahead of the downstream serve leg's paid frontier than
-/// that window allows. Under coalescing that paid frontier is the shared, MAX-over-
-/// live-observers `served_paid` on `session` — each attached observer's serve leg
-/// advances it by `fetch_max`, so the pull is bounded by whichever observer has
-/// paid furthest (DECISION-B); a solo pull is the N=1 case. Records the terminal
-/// outcome via the shared [`FillSession::mark_ended`]
-/// on completion; a [`SettleOnDrop`] guard persists the buyer watermark (#852) on
-/// EVERY exit — clean completion, a terminal drive error, and a cooperative
-/// `cancel` (the serve leg finished, so the client no longer waits: stop the
-/// upstream spend, #1610).
+/// Assemble `[offset, offset + len)` of `hash` into `engine`'s cache across the
+/// ranked partial holders in `target` via the ranged-drive loop (#1506, ADR 039),
+/// paying only for the missing ranges and pacing each lane with a [`RampPacer`]
+/// built from `credit_ramp_divisor`, `credit_floor`, and `credit_max` — the same
+/// ramped credit window the serve leg computes from its own paid frontier (ADR 003
+/// §Credit window / ADR 037), so the pull never runs further ahead of the
+/// downstream serve leg's paid frontier than that window allows.
+///
+/// # Ranged assembly across partial holders
+///
+/// A blob can live spread across nodes — one holds discovery block 0, another
+/// block 1. The loop derives the still-missing gap from the shared
+/// [`NodeAdmitStore`], plans it into contiguous runs by each candidate's
+/// probe-fresh coverage ([`decdn_client_pull::plan_covered_runs`], concentrate +
+/// sticky), and drives the runs in offset order. Each run opens ONE buyer lane to
+/// its source — one `(signer, provider)` payment lane — and runs are SEQUENTIAL,
+/// so two lanes never pay at once. The [`NodeAdmitStore`], [`RampPacer`], the
+/// downstream `served_paid` reader, and the [`ServedPaidWait`] are SHARED across
+/// every run, so the demand window is continuous: it is keyed on the downstream
+/// paid frontier, not on the run, and a later run's lane still `Wait`s on the same
+/// frontier the earlier one did.
+///
+/// A run whose `drive` returns a NON-terminal fault ([`decdn_client_pull::retry_disposition`]
+/// `== RetryElsewhere`) drops that source and re-plans the still-missing remainder
+/// against the survivors — the loop-level reassign-only tail. The store keeps the
+/// verified bytes, so the replacement lane resumes at the gap and re-pays nothing
+/// (#1682). A TERMINAL fault (a shared-pool voucher rejection, an origin blacklist,
+/// an over-cap blob) ends the whole assembly. A still-missing range no surviving
+/// candidate covers ends it as an `Unavailable` outcome (origins advertise all-ones
+/// coverage, so an admitted origin candidate makes this unreachable). This function
+/// runs on the pull thread the serve leg spawns AFTER it has already signed and sent
+/// `ok: true`, so none of these failure outcomes reaches the client as a signed
+/// `NotFound` — they surface as a truncated stream (`session.mark_ended(Err(..))`
+/// stops the fill and the serve encoder ends short).
+///
+/// Records each provider's terminal outcome to reputation as its run ends, and the
+/// whole assembly's terminal outcome via the shared [`FillSession::mark_ended`]. A
+/// per-lane [`SettleOnDrop`] guard persists that lane's buyer watermark (#852) on
+/// EVERY exit — clean run, terminal drive error, or a cooperative `cancel` (the
+/// serve leg finished, so the client no longer waits: stop the upstream spend,
+/// #1610).
 ///
 /// # Off the accept task, on its own runtime
 ///
@@ -466,7 +485,7 @@ impl NodeOrigin {
 /// safely — atomics and `Notify` wakers are runtime-agnostic — and the
 /// [`CacheEngine`] store actor and iroh [`Endpoint`](iroh::Endpoint) are reached
 /// through their own channels, so a second runtime talking to them is fine.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_pull_leg(
     deps_lock: Arc<OnceLock<NodeOriginDeps>>,
     target: PullLegTarget,
@@ -482,29 +501,10 @@ pub(crate) async fn run_pull_leg(
 ) {
     let hash_bytes = *hash.as_bytes();
     let PullLegTarget {
-        pk,
-        provider_addr,
-        target: endpoint_target,
-        ctx,
-        ledger,
         total_bytes,
         namespace_id,
-        rate_ceiling,
-        deadlines,
-        speculative,
-        buy_rate_per_mb,
+        candidates,
     } = target;
-
-    // Read the pool id + lane seed once (quick std-lock, never held across
-    // await). `prior_amount` is the cumulative the lane started from, so the
-    // settle-on-drop can tell whether this stream advanced the watermark past
-    // its seed before persisting.
-    let (pool_id, prior_amount) = {
-        let guard = ctx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (guard.pool_id, guard.prior_amount)
-    };
 
     let Some(deps) = deps_lock.get() else {
         // Unprovisioned under us (cannot happen — we discovered via deps): still
@@ -514,182 +514,415 @@ pub(crate) async fn run_pull_leg(
         )));
         return;
     };
-
-    // #852: persist the buyer watermark on EVERY exit — clean completion, a terminal
-    // drive error, or a `cancel` (the serve leg finished first, e.g. client
-    // disconnect / done). Held as a local so its `Drop` runs on all three, on THIS
-    // pull-thread runtime.
-    let _settle = SettleOnDrop {
-        deps: Arc::clone(&deps_lock),
-        provider_addr,
-        pool_id,
-        prior_amount,
-        ledger: Arc::clone(&ledger),
+    // A zero/unusable deadline config is OUR fault (metered as such where it is
+    // raised); fail the serve rather than open a lane that cannot legally run.
+    let deadlines = match deps.config.deadlines() {
+        Ok(deadlines) => deadlines,
+        Err(err) => {
+            session.mark_ended(Err(FillError::new(format!(
+                "node-origin ranged pull has unusable deadlines: {err:#}"
+            ))));
+            return;
+        }
     };
 
     let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(Arc::clone(&session)));
-    // Content bytes this provider will actually serve (the gaps), for scoring —
-    // held ranges are not re-pulled, so this is below `total_bytes` on an interior
-    // hold.
-    let gap_bytes = match admit_store.missing_ranges(offset, len).await {
-        Ok(ranges) => content_len(&ranges, total_bytes),
-        Err(_) => total_bytes,
-    };
-
-    // Record every connection this leg dials, so an abandoned leg can wait for
-    // each to drain before this pull-thread runtime is dropped.
-    let abandoned = ConnDrain::default();
-    let observer = abandoned.observer();
-    let peer_source = PeerSource::new(
-        &deps.endpoint,
-        endpoint_target,
-        Arc::clone(&ctx),
-        Arc::clone(&ledger),
-        &deps.slash_domain,
-        provider_addr,
-        namespace_id,
-        deps.config.max_blob_size_bytes,
-        rate_ceiling,
-        deadlines,
-    )
-    .with_dial_observer(as_observer(&observer));
-    // The ramped credit-window pacer (ADR 003 §Credit window / ADR 037): the pull
-    // never runs further ahead of the downstream served-paid frontier than the
-    // ramped window allows, in lockstep with the serve leg's own ramp.
+    // The ramped credit-window pacer (ADR 003 §Credit window / ADR 037), SHARED
+    // across every run so the pull never runs further ahead of the downstream
+    // served-paid frontier than the window allows, in lockstep with the serve leg.
     let pacer = RampPacer {
         divisor: credit_ramp_divisor,
         floor: credit_floor,
         credit_max,
     };
-    let node_funder = NodeFunder::new(
-        Arc::clone(&deps.buyer),
-        Arc::clone(&ctx),
-        Arc::clone(&ledger),
-        Arc::clone(&deps.metrics),
-        // The window-paced serve-miss leg does not derive a refuse-metering signal
-        // from this flag; `NodeFunder` still records its own success/refusal metrics.
-        Arc::new(AtomicBool::new(false)),
-    );
     let config = DriveConfig {
         working_deposit: deps.config.working_deposit,
         max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
         settle_backoff: SETTLE_POLL_STEP,
     };
-    let served_paid_reader = {
-        let served_paid = Arc::clone(session.served_frontier());
-        move || served_paid.load(Ordering::Relaxed)
-    };
+    // The downstream demand window, SHARED across every run's lane so the window is
+    // continuous — keyed on the served-paid frontier, not on the run.
     let pacing_wait = ServedPaidWait {
         served_paid_advanced: Arc::clone(session.served_advanced()),
         served_paid: Arc::clone(session.served_frontier()),
         metrics: Arc::clone(&deps.metrics),
     };
+    let served_paid = Arc::clone(session.served_frontier());
+    // Index-aligned with `candidates`: `SourceCoverage.source_ix` is a position here.
+    let coverages: Vec<decdn_protocol::Coverage> =
+        candidates.iter().map(|c| c.coverage.clone()).collect();
 
-    let started = Instant::now();
-    // Cooperative cancellation: the serve leg finishing cancels the token. On cancel
-    // the `drive` future is dropped (aborting the in-flight upstream pull), and the
-    // `_settle` guard below still persists the buyer watermark (#852). No score on
-    // cancel — an abandoned pull is neither a clean delivery nor a provider fault.
-    let cancelled;
-    let result = tokio::select! {
-        biased;
-        r = drive(
-            &admit_store,
-            &peer_source,
-            &pacer,
-            &node_funder,
-            &ctx,
-            &ledger,
-            hash_bytes,
-            offset,
-            len,
-            &config,
-            None,
-            Some(&pacing_wait),
-            Some(&served_paid_reader),
-        ) => {
-            cancelled = false;
-            r
-        }
-        () = cancel.cancelled() => {
-            cancelled = true;
-            Ok(())
-        }
+    let sink = PeerRunSink {
+        deps,
+        deps_lock: &deps_lock,
+        candidates: &candidates,
+        hash_bytes,
+        namespace_id,
+        total_bytes,
+        deadlines,
+        admit_store: &admit_store,
+        pacer: &pacer,
+        config: &config,
+        pacing_wait: &pacing_wait,
+        served_paid,
+        topups_used: AtomicU32::new(0),
+        cancel: &cancel,
     };
-    let elapsed = started.elapsed();
 
-    // Abandon drain. On cancel the `drive` future above is dropped mid-transfer,
-    // which queues an upstream `Connection::close` (via `UpstreamPull::drop`) but
-    // does NOT drive it to completion. That connection's QUIC driver lives on THIS
-    // pull-thread current-thread runtime, which the caller (`window.rs`) drops the
-    // instant we return. Without a drain the connection is stranded with no driver,
-    // so it never reaches drained and the node's own `Endpoint::close()` waits
-    // forever. Wait for the transition itself rather than a fixed span — see
-    // [`super::abandon_drain`] for why no constant can be the right length. A drive
-    // that returns `Err` strands its upstream connection the SAME way a cancel does,
-    // so the wait covers it too. The clean `Ok` path skips the wait and stays on the
-    // hot path: `UpstreamPull::finish` closes the connection there, which is a state
-    // transition and not a drain, so that path carries the same residual as #1675 —
-    // accepted rather than proven clean, because waiting would add `3 * PTO` to every
-    // successful serve-miss teardown, which the last serve observer joins.
-    if cancelled || result.is_err() {
-        drain_abandoned(&abandoned, provider_addr, &deps.metrics).await;
+    let outcome = assemble(&sink, &coverages, offset, len, total_bytes).await;
+    // On cancel the serve leg has already finished and nobody reads this, but set a
+    // terminal outcome regardless. A cancelled assembly is not a fault (Ok), matching
+    // a single-source pull's own Cancelled outcome; a range no holder covers is the
+    // existing miss.
+    let result = match outcome {
+        AssembleOutcome::Complete | AssembleOutcome::Cancelled => Ok(()),
+        AssembleOutcome::Unavailable => Err(FillError::new(
+            "node-origin ranged pull: a still-missing range is held by no reachable provider",
+        )),
+        AssembleOutcome::Terminal(err) => Err(err),
+    };
+    session.mark_ended(result);
+    // Each run's per-lane `SettleOnDrop` already persisted its buyer watermark (#852)
+    // as that run ended.
+}
+
+/// The real [`RunSink`]: opens one buyer lane per planned run, drives it with
+/// [`drive`], scores the provider, and persists the lane watermark. All the
+/// per-run buyer state (channel context, voucher ledger, funder, source) is built
+/// INSIDE `drive_run` — one lane per run — while the store, pacer, and demand
+/// window it borrows from the fields are SHARED across every run.
+struct PeerRunSink<'a> {
+    deps: &'a NodeOriginDeps,
+    /// For the per-lane [`SettleOnDrop`], which holds the deps `Arc` so it can
+    /// persist the watermark after the run ends.
+    deps_lock: &'a Arc<OnceLock<NodeOriginDeps>>,
+    /// Ranked candidates, index-aligned with the coverage `assemble` plans over;
+    /// `CoveredRun.source_ix` indexes here.
+    candidates: &'a [Candidate],
+    hash_bytes: [u8; 32],
+    namespace_id: [u8; 32],
+    total_bytes: u64,
+    deadlines: PullDeadlines,
+    admit_store: &'a NodeAdmitStore,
+    pacer: &'a RampPacer,
+    config: &'a DriveConfig,
+    pacing_wait: &'a ServedPaidWait,
+    /// The shared served-paid frontier; each run's `drive` reads it so the demand
+    /// window is continuous.
+    served_paid: Arc<AtomicU64>,
+    /// Reactive top-ups this assembly has escrowed, across EVERY run's lane
+    /// (#1506). One pool deposit backs the whole set, so [`Funder::max_topups`]
+    /// bounds the assembly, not each run — counting per-run would let a K-source
+    /// miss escrow K on-chain `topUp` txs for one serve. Built once here and
+    /// shared into every run's [`SharedPool`].
+    topups_used: AtomicU32,
+    cancel: &'a CancellationToken,
+}
+
+impl RunSink for PeerRunSink<'_> {
+    async fn missing(&self, offset: u64, len: u64) -> ChunkRanges {
+        // A store read fault is OUR fault; surface it by reporting the whole range
+        // as still-missing so a run is attempted and `drive`'s own read raises and
+        // classifies it, rather than falsely reporting the range complete.
+        self.admit_store
+            .missing_ranges(offset, len)
+            .await
+            .unwrap_or_else(|_| whole_range_chunks(offset, len))
     }
 
-    // Reputation scoring, skipped on cancel — an abandoned pull is neither a
-    // clean delivery nor a provider fault. A ramp `Wait` never reaches here as a
-    // terminal state: `drive` only returns once the fetch completes, errors, or
-    // is cancelled, so a pacer pause is not a fault to skip scoring for.
-    if !cancelled {
-        match &result {
+    // Sequential resolve → econ-gate → open → bind → drive → classify pipeline; the
+    // tracing macros and the success/failure classification inflate the
+    // cognitive-complexity + line metrics past threshold, exactly as the buffered
+    // `pull_from_candidate` twin does. Splitting it would scatter one linear flow.
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    async fn drive_run(&self, run: CoveredRun) -> RunOutcome {
+        // Cancellation before the lane open (#1506). Each run now opens its OWN lane
+        // — `open_or_reuse_pool` can escrow a fresh `openChannel` or fire a proactive
+        // `topUp`, and `bind_upstream_ctx` / `missing_ranges` run before the `drive`
+        // `select!` that watches `cancel`. A serve leg that already finished (client
+        // gone, shutdown) must not land an on-chain tx for nobody, so stop the loop
+        // cleanly here rather than after opening.
+        if self.cancel.is_cancelled() {
+            return RunOutcome::Cancelled;
+        }
+        let Some(candidate) = self.candidates.get(run.source_ix) else {
+            // Cannot happen — `source_ix` is a live index into `candidates` — but
+            // drop the source rather than panic (anti-panic policy).
+            return RunOutcome::Reassign;
+        };
+        let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
+            return RunOutcome::Reassign;
+        };
+        let Some(provider_addr) = self
+            .deps
+            .addr_resolver
+            .address_of(&DhtNodeId::from_bytes(candidate.node_id))
+        else {
+            debug!("node-origin: ranged-pull run candidate has no resolvable operator address");
+            return RunOutcome::Reassign;
+        };
+        // ADR 041 buy-side gate: refuse a source quoting above this node's buy
+        // ceiling BEFORE opening a lane; drop it and re-plan onto another holder.
+        let heat = heat_of(self.deps, self.hash_bytes);
+        let (rate_ceiling, speculative) = match economic_ceiling(
+            self.deps,
+            candidate.node_id.into(),
+            heat,
+            candidate.rate_per_mb,
+        ) {
+            EconGate::Allow {
+                rate_ceiling,
+                speculative,
+            } => (rate_ceiling, speculative),
+            EconGate::Skip => return RunOutcome::Reassign,
+        };
+        let ctx = match self
+            .deps
+            .buyer
+            .open_or_reuse_pool(provider_addr, CHANNEL_OPEN_CALLER_BUDGET)
+            .await
+        {
+            Ok(ctx) => ctx,
+            // A channel-open failure is OUR payment-side problem, not the source's
+            // fault. If it is a node-wide LOCAL fault (a broken buyer key, an
+            // unreadable store), no other lane can fix it — terminal. Otherwise it
+            // is per-provider (a revert, an RPC blip): drop this source and re-plan.
+            Err(err) => {
+                return match record_pool_open_failure(self.deps, provider_addr, &err) {
+                    PullMiss::LocalFault => RunOutcome::Terminal(FillError::new(format!(
+                        "node-origin ranged pull: local buyer fault opening a lane: {err:#}"
+                    ))),
+                    _ => RunOutcome::Reassign,
+                };
+            }
+        };
+        // #1117: bind the request so the upstream can chain a reactive pull. A bind
+        // fault is our signer's — node-wide, so terminal.
+        let ctx = match bind_upstream_ctx(self.deps, ctx) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                let verdict = classify_pull_failure(
+                    self.deps,
+                    pk,
+                    provider_addr,
+                    self.hash_bytes,
+                    None,
+                    &err,
+                );
+                return match PullMiss::for_verdict(verdict) {
+                    PullMiss::LocalFault => RunOutcome::Terminal(FillError::new(format!(
+                        "node-origin ranged pull: local bind fault: {err:#}"
+                    ))),
+                    _ => RunOutcome::Reassign,
+                };
+            }
+        };
+        let pool_id = ctx.pool_id;
+        let prior_amount = ctx.prior_amount;
+        let ledger = lane_ledger(self.deps, provider_addr, &ctx);
+        let ctx = Arc::new(std::sync::Mutex::new(ctx));
+
+        // Content bytes this source will actually serve on THIS run (its gap,
+        // interior holds excluded), for scoring and the speculative warming debit.
+        let run_bytes = match self.admit_store.missing_ranges(run.offset, run.len).await {
+            Ok(ranges) => content_len(&ranges, self.total_bytes),
+            Err(_) => run.len,
+        };
+
+        // Per-lane #852 settle: persist THIS channel's watermark on every exit —
+        // clean run, terminal drive error, or a cooperative cancel — after `drive`
+        // below stops advancing the shared ledger.
+        let _settle = SettleOnDrop {
+            deps: Arc::clone(self.deps_lock),
+            provider_addr,
+            pool_id,
+            prior_amount,
+            ledger: Arc::clone(&ledger),
+        };
+        let abandoned = ConnDrain::default();
+        let observer = abandoned.observer();
+        let peer_source = PeerSource::new(
+            &self.deps.endpoint,
+            EndpointAddr::new(pk),
+            Arc::clone(&ctx),
+            Arc::clone(&ledger),
+            &self.deps.slash_domain,
+            provider_addr,
+            self.namespace_id,
+            self.deps.config.max_blob_size_bytes,
+            rate_ceiling,
+            self.deadlines,
+        )
+        .with_dial_observer(as_observer(&observer));
+        let node_funder = NodeFunder::new(
+            Arc::clone(&self.deps.buyer),
+            Arc::clone(&ctx),
+            Arc::clone(&ledger),
+            Arc::clone(&self.deps.metrics),
+            // The window-paced serve-miss leg does not derive a refuse-metering
+            // signal from this flag; `NodeFunder` records its own metrics.
+            Arc::new(AtomicBool::new(false)),
+        );
+        // The SAME shared served-paid frontier every run reads, so the demand
+        // window is continuous across the sequential lanes.
+        let served_paid_reader = {
+            let served_paid = Arc::clone(&self.served_paid);
+            move || served_paid.load(Ordering::Relaxed)
+        };
+
+        // The shared-pool view this run's `drive` gates on (#1506). One deposit
+        // backs every run's lane, so the three pool facts are read across ALL of
+        // them, not this one lane:
+        // - `spent`: the whole-pool committed spend — the sum over every live
+        //   lane ledger for `pool_id`, INCLUDING this run's own (seeded above via
+        //   `lane_ledger`). Without it, a later run whose lane has spent nothing
+        //   sees `committed == 0` and believes the whole deposit is unspent, then
+        //   signs a voucher the pool cannot back → mid-stream `SpendingCapExhausted`.
+        // - `topups_used`: the assembly-wide reactive-top-up budget, shared so K
+        //   runs cannot each escrow `Funder::max_topups` on-chain `topUp` txs.
+        // - `credit`: a landed top-up's new deposit, written to THIS run's `ctx`
+        //   so its own gate stops reading the stale pre-top-up value; a later run
+        //   re-reads the deposit from the persisted pool row `open_or_reuse_pool`
+        //   already refreshed.
+        let ledgers = &self.deps.ledgers;
+        let spent = move || ledgers.pool_committed(pool_id);
+        let credit_ctx = Arc::clone(&ctx);
+        let credit = move |new_deposit: U256| -> anyhow::Result<()> {
+            credit_ctx
+                .lock()
+                .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+                .deposit = new_deposit;
+            Ok(())
+        };
+        let pool = SharedPool {
+            spent: &spent,
+            topups_used: &self.topups_used,
+            credit: &credit,
+        };
+
+        let started = Instant::now();
+        // Cooperative cancellation: the serve leg finishing cancels the token,
+        // dropping the `drive` future; the `_settle` guard still persists the
+        // watermark. No score on cancel — an abandoned pull is neither a clean
+        // delivery nor a provider fault.
+        let cancelled;
+        let result = tokio::select! {
+            biased;
+            r = drive(
+                self.admit_store,
+                &peer_source,
+                self.pacer,
+                &node_funder,
+                &ctx,
+                &ledger,
+                self.hash_bytes,
+                run.offset,
+                run.len,
+                self.config,
+                None,
+                Some(self.pacing_wait),
+                Some(&served_paid_reader),
+                Some(&pool),
+            ) => {
+                cancelled = false;
+                r
+            }
+            () = self.cancel.cancelled() => {
+                cancelled = true;
+                Ok(())
+            }
+        };
+        let elapsed = started.elapsed();
+
+        // Abandon drain on the cancel/`Err` paths — a dropped or errored `drive`
+        // strands its upstream connection on this pull-thread runtime, which the
+        // caller drops the instant this leg returns (see the single-source leg and
+        // `abandon_drain` for why the wait is on the transition, not a fixed span).
+        if cancelled || result.is_err() {
+            drain_abandoned(&abandoned, provider_addr, &self.deps.metrics).await;
+        }
+        if cancelled {
+            return RunOutcome::Cancelled;
+        }
+
+        match result {
             Ok(()) => {
-                // ADR 041: a clean speculative pull debits the source's warming
-                // allowance by the full buy cost of the bytes this leg pulled (the
-                // gaps), accounted in whole MB at the candidate's buy rate.
+                // ADR 041: a clean speculative run debits the source's warming
+                // allowance by the full buy cost of the bytes it pulled (its gap),
+                // in whole MB at the candidate's buy rate.
                 if speculative {
-                    deps.config.warming.debit_speculative(
+                    self.deps.config.warming.debit_speculative(
                         (*pk.as_bytes()).into(),
-                        Hash::from_bytes(hash_bytes),
-                        buy_rate_per_mb.saturating_mul(mb_of(gap_bytes)),
+                        Hash::from_bytes(self.hash_bytes),
+                        candidate.rate_per_mb.saturating_mul(mb_of(run_bytes)),
                     );
                 }
                 record_outcome(
-                    deps,
+                    self.deps,
                     pk,
                     &Outcome::Delivered {
-                        bytes: gap_bytes,
+                        bytes: run_bytes,
                         elapsed,
                     },
                 );
+                RunOutcome::Filled
             }
             Err(err) => {
-                if is_bao_corruption(err) {
+                if is_bao_corruption(&err) {
                     tracing::warn!(
                         provider = %pk, %provider_addr,
-                        "node pull leg: upstream served bao-corrupt bytes; scoring Corruption"
+                        "node ranged pull: upstream served bao-corrupt bytes; scoring Corruption"
                     );
-                    record_outcome(deps, pk, &Outcome::Corruption);
-                    deps.metrics.node_pull_through_upstream_verify_failed();
+                    record_outcome(self.deps, pk, &Outcome::Corruption);
+                    self.deps.metrics.node_pull_through_upstream_verify_failed();
                 } else {
                     let _ = classify_pull_failure(
-                        deps,
+                        self.deps,
                         pk,
                         provider_addr,
-                        hash_bytes,
+                        self.hash_bytes,
                         Some(pool_id),
-                        err,
+                        &err,
                     );
+                }
+                // A terminal fault (shared-pool voucher rejection or exhaustion,
+                // origin blacklist, over-cap blob) cannot be fixed by another lane;
+                // anything else is a property of THIS source's delivery — drop it
+                // and re-plan.
+                if run_fault_is_terminal(&err) {
+                    RunOutcome::Terminal(FillError::new(format!("{err:#}")))
+                } else {
+                    RunOutcome::Reassign
                 }
             }
         }
     }
+}
 
-    // Record the terminal outcome so the serve leg can decide a gap it is waiting on
-    // (`mark_ended` sets the outcome then wakes waiters). On cancel the serve leg has
-    // already finished and nobody reads this, but set it regardless. `anyhow::Error`
-    // is not `Clone`, so flatten it into a `FillError` message.
-    session.mark_ended(result.map_err(|e| FillError::new(format!("{e:#}"))));
-    // `_settle` drops here, persisting the buyer watermark (#852).
+/// The chunk-range span of the byte range `[offset, offset + len)`, chunk-aligned
+/// outward — the whole-range gap a store-read fault reports so the range is
+/// re-attempted rather than falsely reported complete.
+fn whole_range_chunks(offset: u64, len: u64) -> ChunkRanges {
+    let start = offset / CHUNK_BYTES;
+    let end = offset.saturating_add(len).div_ceil(CHUNK_BYTES);
+    ChunkRanges::from(bao_tree::ChunkNum(start)..bao_tree::ChunkNum(end))
+}
+
+/// Whether a run's [`drive`] error ends the whole assembly rather than reassigning
+/// its range to another holder.
+///
+/// It is the shared [`retry_disposition`] verdict, PLUS one node-specific override:
+/// a [`PoolExhausted`] is terminal here even though `retry_disposition` calls it
+/// `RetryElsewhere`. The classifier keeps pool exhaustion retryable for the
+/// single-source failover, where a cheaper provider's next voucher may fit a
+/// deposit the current one's did not. The node's ranged loop is the opposite case:
+/// every lane draws the ONE shared buyer pool (ADR 003), so no surviving holder can
+/// pay from a dry pool — reassigning would only churn each remaining candidate
+/// (a fresh dial + a first-voucher attempt) before the same failure. This mirrors
+/// the multi-source scheduler, which special-cases exactly [`PoolExhausted`].
+fn run_fault_is_terminal(err: &anyhow::Error) -> bool {
+    retry_disposition(err) == RetryDisposition::Terminal
+        || err.downcast_ref::<PoolExhausted>().is_some()
 }
 
 // ===========================================================================
@@ -783,7 +1016,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// the ledger's committed `bytes` reach the gap end. An unpaid source that never
 /// advanced a ledger would leave that frontier at zero and the gap loop would
 /// re-draw forever. So the [`BackendSource`] carries a LOCAL bookkeeping
-/// [`PoolLedger`] and, on `finish`, advances its `bytes` by exactly the leg's
+/// [`PoolLedger`](decdn_client_pull::PoolLedger) and, on `finish`, advances its `bytes` by exactly the leg's
 /// drained wire (at amount 0). We hand `drive` that SAME ledger ([`BackendSource::ledger`])
 /// plus a benign [`local_bookkeeping_ctx`] and a [`NullFunder`], so the completion
 /// counter the source moves is the one the gap loop reads. This is NOT payment — no
@@ -878,6 +1111,8 @@ pub(crate) async fn run_local_pull_leg(
             None,
             Some(&pacing_wait),
             Some(&served_paid_reader),
+            // Single-source leg: one lane IS the pool, so no shared view.
+            None,
         ) => {
             cancelled = false;
             r
@@ -1285,6 +1520,57 @@ mod served_paid_wait_tests {
                     .expect("a later advance must wake the parked wait");
             },
             advance,
+        );
+    }
+}
+
+/// The ranged-drive loop's run-fault terminal classification (#1506): a
+/// shared-pool exhaustion must STOP the assembly, not reassign the range to
+/// another holder that draws the same dry pool.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
+mod run_fault_terminal_tests {
+    use decdn_client_pull::PoolExhausted;
+    use decdn_protocol::client::VoucherRejectReason;
+
+    use super::run_fault_is_terminal;
+    use crate::client_requester::UpstreamVoucherRejected;
+
+    /// A `PoolExhausted` is TERMINAL in the node loop even though the shared
+    /// `retry_disposition` classifier calls it `RetryElsewhere`: the node draws one
+    /// shared buyer pool, so no surviving holder can pay from a dry pool. Without
+    /// this override the loop churns every remaining candidate before giving up.
+    #[test]
+    fn pool_exhaustion_is_terminal_in_the_node_loop() {
+        let err = anyhow::Error::new(PoolExhausted {
+            gap_start: 0,
+            gap_len: 1 << 20,
+        });
+        assert!(
+            run_fault_is_terminal(&err),
+            "a dry shared pool must fail fast, not reassign onto another lane"
+        );
+    }
+
+    /// The classifier's own `Terminal` verdicts still flow through: a shared-pool
+    /// voucher rejection ends the assembly.
+    #[test]
+    fn voucher_rejection_stays_terminal() {
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::SpendingCapExhausted,
+            bundle: None,
+        });
+        assert!(run_fault_is_terminal(&err));
+    }
+
+    /// An ordinary delivery fault (a stall, a transport reset) is NOT terminal —
+    /// it faults one source and reassigns the range to another holder.
+    #[test]
+    fn a_transport_fault_reassigns() {
+        let err = anyhow::anyhow!("connect failed: timed out");
+        assert!(
+            !run_fault_is_terminal(&err),
+            "a per-source delivery fault must reassign, not stop the assembly"
         );
     }
 }

@@ -168,7 +168,10 @@ pub enum BindError {
     /// (variable length) are not supported off-chain; that path is deferred to
     /// Production (ADR 024 §Off-Chain ERC-1271 Verification).
     #[error("binding signature has invalid length {len} (EOA form is 65 bytes)")]
-    BadLength { len: usize },
+    BadLength {
+        /// The length that was offered.
+        len: usize,
+    },
     /// Signature is 65 bytes but malformed — non-canonical `s` or invalid
     /// recovery id; no address could be recovered.
     #[error("binding signature is malformed")]

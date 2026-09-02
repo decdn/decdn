@@ -90,7 +90,9 @@ const PAGE_SIZE: u64 = 100;
 /// absent needs a split group or a labelled family; see #1231.
 #[derive(Debug)]
 pub struct RegistryHandles {
+    /// The bonded-operator set the DHT admits records from.
     pub staker_set: Arc<dyn StakerSet>,
+    /// `NodeId` → dial address, present only where pull-through is on.
     pub node_addresses: Option<Arc<dyn NodeAddressResolver>>,
     /// `NodeId → regionHint` (non-empty only). Read by the ADR-030 region-latency
     /// penalty on the selection/pull path. Always present, unlike `node_addresses`.

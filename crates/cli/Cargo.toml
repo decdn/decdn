@@ -39,6 +39,13 @@ decdn-incentive = { workspace = true, features = ["redb"] }
 # content verification (NOT iroh-blobs), so the CLI's iroh-blobs-free invariant
 # (#578) holds — verify with `cargo tree -p decdn-cli -e normal -i iroh-blobs`.
 decdn-client-pull = { workspace = true }
+# `decdn origin import` (#1904) seeds a filesystem cache origin: it writes each
+# blob's sharded data object plus its `{hex}.obao4` pre-order bao outboard, which
+# must match the daemon's own encoding at `IROH_BLOCK_SIZE`. The `bao-range` leaf
+# crate owns that outboard encoder and the `.obao4` layout contract shared with
+# the cache reader; it depends only on `bao-tree`, so the iroh-blobs-free
+# invariant (#578) holds — already in this binary's tree via `client-pull`.
+decdn-bao-range = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

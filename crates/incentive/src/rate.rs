@@ -144,9 +144,13 @@ pub enum RateError {
          with {tolerance_bps} bps tolerance"
     )]
     Underpayment {
+        /// The voucher's amount delta.
         paid: U256,
+        /// The voucher's bytes delta, priced against that amount.
         bytes: U256,
+        /// The advertised per-MB rate the payment is judged against.
         rate_per_mb: u64,
+        /// Allowed shortfall, in basis points of the expected amount.
         tolerance_bps: u64,
     },
     /// Arithmetic would overflow U256. Will not occur for realistic values

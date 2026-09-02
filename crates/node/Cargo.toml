@@ -40,8 +40,11 @@ anvil-e2e = ["decdn-incentive/test-util"]
 # lib's own `#[cfg(test)]` build reaches them through the `any(test, …)` arm; the
 # cross-crate integration tests reach them through the self dev-dependency below,
 # which turns this feature on for the lib they link (a `cfg(test)` does not
-# cross the crate boundary).
-test-support = []
+# cross the crate boundary). It also flips `decdn-protocol` into its
+# `test-support` mode so the block-spanning planner's discovery-block size is
+# overridable (`override_discovery_block_bytes_for_test`) — the two-holder
+# ranged-assembly loopback drives tiny blocks that way rather than a 64 MiB blob.
+test-support = ["decdn-protocol/test-support"]
 
 [dependencies]
 decdn-protocol = { workspace = true }

@@ -55,8 +55,11 @@ pub const POOL_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// falls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Lifecycle {
+    /// Accepts top-ups and redemptions.
     #[default]
     Open,
+    /// Accepts redemptions only, and only until the deadline. A pool never
+    /// returns to `Open`.
     Closing {
         /// Unix seconds after which redemption reverts `PoolClosed`.
         deadline: u64,

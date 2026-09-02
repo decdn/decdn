@@ -2738,6 +2738,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "decdn-bao-range",
  "decdn-cache",
  "decdn-client-pull",
  "decdn-common",

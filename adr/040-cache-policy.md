@@ -370,4 +370,4 @@ retention.
 8. An unknown policy name is a config error at load, with no silent
    fallback.
 9. The workspace builds clean under the anti-panic clippy lints
-   (`unwrap_used`, `expect_used`, `panic`, `indexing_slicing` denied).
+   (`unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `todo`, `unimplemented` denied).

@@ -102,6 +102,16 @@ pub trait BlobSource: Send + Sync {
     /// a transport/protocol error while draining — the faults
     /// [`crate::UpstreamPull::finish`] raises.
     fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress>;
+
+    /// The buyer's received-byte ceiling (#1895): the driver aborts with
+    /// [`crate::BlobTooLarge`] once the content BLAKE3-verified into the store
+    /// crosses this, enforcing the size cap on the bytes that ACTUALLY arrive rather
+    /// than on the peer's unverified signed `total_bytes`. `0` = unlimited — the
+    /// default, and correct for an own-origin source whose engine store already caps
+    /// on stored bytes.
+    fn max_blob_size_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// The store/sink capability the gap-driven [`crate::drive`] needs beyond
@@ -255,9 +265,12 @@ impl std::fmt::Debug for PeerSource<'_> {
 
 impl<'a> PeerSource<'a> {
     /// Build a source for one gap-driven fetch against `target`, paid out of
-    /// `ledger` over `ctx`'s channel. `namespace_id`, `max_blob_size_bytes`,
-    /// `max_rate_per_mb`, and `deadlines` are the same buyer-side policy knobs
+    /// `ledger` over `ctx`'s channel. `namespace_id`, `max_rate_per_mb`, and
+    /// `deadlines` are the same buyer-side policy knobs
     /// [`crate::open_progressive_pull`] takes directly — see its docs.
+    /// `max_blob_size_bytes` is the received-byte ceiling (#1895) the driver reads
+    /// back via [`BlobSource::max_blob_size_bytes`] to abort a fill that crosses it;
+    /// `0` = unlimited.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
@@ -328,7 +341,6 @@ impl BlobSource for PeerSource<'_> {
                 self.namespace_id,
                 range.fetch_start(),
                 micros_now(),
-                self.max_blob_size_bytes,
                 self.max_rate_per_mb,
                 self.deadlines,
                 range.fetch_len(),
@@ -341,6 +353,10 @@ impl BlobSource for PeerSource<'_> {
 
     fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
         Box::pin(async move { reader.into_inner().finish().await })
+    }
+
+    fn max_blob_size_bytes(&self) -> u64 {
+        self.max_blob_size_bytes
     }
 }
 

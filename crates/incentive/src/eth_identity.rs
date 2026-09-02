@@ -332,6 +332,10 @@ fn read_password_file(path: &Path) -> anyhow::Result<Option<Zeroizing<String>>> 
     }
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "interactive terminal prompt; there is no subscriber to route this to"
+)]
 fn prompt_password(label: &str, confirm: bool) -> anyhow::Result<Zeroizing<String>> {
     const MAX_ATTEMPTS: u8 = 3;
     let mut attempts: u8 = 0;

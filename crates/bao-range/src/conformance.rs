@@ -25,8 +25,10 @@ use crate::ranged_store::RangedStore;
 /// empty store (no bytes admitted yet) so conformance cases stay isolated
 /// from one another.
 pub trait ConformanceFactory {
+    /// The backend under test.
     type Store: RangedStore;
 
+    /// Build one fresh, empty store for the blob `(root, total_bytes)`.
     fn make(
         &self,
         root: [u8; 32],

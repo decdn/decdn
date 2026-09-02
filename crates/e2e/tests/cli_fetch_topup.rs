@@ -687,39 +687,21 @@ const TWO_TOPUP_WORKING_MICRO_USDC: u64 = 16_000_000;
 /// SECOND top-up) and less than the deposit plus two top-ups (so two are enough).
 const TWO_TOPUP_BLOB_BYTES: usize = 20 * 1024 * 1024 + 4113;
 
-/// IGNORED — a live reproducer for a SEPARATE, pre-existing defect, not a
-/// regression in the per-leg baseline fix this test was written for.
+/// IGNORED — a blob this far past the working deposit does not complete end to end.
 ///
-/// As soon as the exhausting blob is large enough that the node still has bytes
-/// to send when the deposit runs out, `decdn fetch` dies with
+/// The buyer's stop recovery (`terminal_after_write_failure`) surfaces the node's
+/// typed exhaustion `StreamError`, so the fetch reaches the reactive top-up branch
+/// and runs the FIRST top-up. The resumed leg after it is then refused
+/// (`delivery refused: NotFound`): the exhausting first leg leaves a permanent
+/// per-signer dead charge on the pool that a top-up cannot clear, so the node
+/// declines the resumed request and the SECOND reactive top-up never runs. That
+/// two-top-up / dead-charge interaction (ADR 003 §Pool solvency) is separate work.
 ///
-/// ```text
-/// Error: write failed: frame I/O error: sending stopped by peer: error 0
-/// ```
-///
-/// and the reactive branch never runs at all — the CLI prints no `note: …topped
-/// up…` line, and no `topUp` reaches the chain. The mid-stream rejection reaches
-/// the client as an ambiguous WRITE failure instead of the typed
-/// `UpstreamVoucherRejected` that `genuine_exhaustion` keys on, so the whole
-/// reactive top-up path is bypassed.
-///
-/// Both existing reactive tests avoid this by construction: their blobs are small
-/// enough that the node has finished sending before the exhausting voucher is
-/// refused (2 MiB and 9 MiB, against a deposit that funds ~8 MiB plus the credit
-/// window). Empirically the boundary sits between the 9 MiB that passes and 14 MiB;
-/// at 14 MiB and 20 MiB this test fails on the FIRST leg.
-///
-/// Verified pre-existing: stashing every source change from the #1497 review pass
-/// and re-running reproduces the identical failure, so it is not caused by the
-/// per-leg re-anchor, the `reseed` monotonicity guard, or the proof-of-service
-/// refill gate.
-///
-/// This matters beyond the test: it is exactly the case the reactive top-up
-/// exists to serve — a single blob far larger than the working deposit — and it
-/// also means a SECOND reactive top-up has never been exercised end to end.
-/// Un-ignore once the mid-stream rejection surfaces as a typed rejection; the
-/// sizing below is already correct for driving two top-ups.
-#[ignore = "reproduces a pre-existing mid-stream rejection defect; see the doc comment"]
+/// This is the deposit-dwarfing case the reactive top-up exists to serve, and the
+/// only test that would exercise a second top-up end to end; the sizing below
+/// already drives two top-ups once the resumed-leg refusal is fixed. Un-ignore
+/// then.
+#[ignore = "resumed leg after the first top-up is refused (dead charge -> NotFound); see the doc comment"]
 #[tokio::test(flavor = "multi_thread")]
 async fn fetch_across_two_reactive_topups_pays_each_wire_byte_exactly_once() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_two_topup_fetch()))

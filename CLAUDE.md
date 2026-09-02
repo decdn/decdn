@@ -4,7 +4,7 @@
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC shared payment pools. Rust implementation; the initial network deployment targets tens of nodes on an Arbitrum Sepolia testnet. "PoC" in code and ADR comments refers to that network-scale milestone, not contract-surface scope — the on-chain surface ships at full production shape with governance-tunable economics from day one (see [ADR 016 § Contract Inventory](adr/016-contract-interactions.md) and [§ Tunable Economics](adr/016-contract-interactions.md#tunable-economics)).
 
-**Status: Early implementation.** Cargo workspace with 11 crates and two binaries (#421): the `node` crate builds the `decdn-node` daemon (runtime bring-up, admin RPC server, dispatch limiter, probe handler); the `cli` crate builds the user-facing `decdn` binary (`probe`, `node {health,region-stats,drain,evict,reload}`, `key-gen`, `config {…}`, `bundle {create}`). See the [Crate Structure](#crate-structure) section for what each crate owns. No crate is a stub.
+**Status: Early implementation.** Cargo workspace with 11 crates and two binaries (#421): the `node` crate builds the `decdn-node` daemon (runtime bring-up, admin RPC server, dispatch limiter, probe handler); the `cli` crate builds the user-facing `decdn` binary (`probe`, `node {health,region-stats,drain,evict,reload}`, `key-gen`, `config {…}`, `bundle {create}`, `origin {import}`). See the [Crate Structure](#crate-structure) section for what each crate owns. No crate is a stub.
 
 **Pre-launch: wire-breaking changes are fine.** Nothing is deployed and there are no live peers. Do not add backward-compatibility shims, version negotiation, dual-format readers, or migration paths for wire, postcard, ABI, config, or storage changes. Change the format, update every side in the same PR, and delete the old shape. Compatibility work only becomes real after the first public deployment.
 
@@ -45,18 +45,26 @@ Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots
 
 **Code style:** `rustfmt.toml` sets `max_width = 100`.
 
-**Anti-panic policy:** Clippy denies `unwrap_used`, `expect_used`, `panic`, and `indexing_slicing` workspace-wide. Use `Result`/`Option` combinators or `.get()` for indexing. This is the most common CI failure for new code.
+**Anti-panic policy:** Clippy denies `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `todo`, and `unimplemented` workspace-wide. Use `Result`/`Option` combinators or `.get()` for indexing. This is the most common CI failure for new code.
+
+**Numeric safety:** `cast_possible_truncation`, `cast_sign_loss`, and `cast_precision_loss` are `deny`, not `warn`. A narrowing or sign-changing cast needs a per-site `#[allow]`/`#[expect]` with a comment saying why it cannot lose data.
+
+**No stray output:** `print_stdout`, `print_stderr`, and `dbg_macro` are `deny`. The `decdn` CLI is a terminal UI and allows both print lints at its library crate root; everywhere else, use `tracing`. The few production sites that run before the subscriber exists carry a per-site `#[expect]` with a reason — except where the `eprintln!` is itself `cfg`-gated, which takes an `#[allow]` scoped to that block, because an `#[expect]` would go unfulfilled in the build that turns the `cfg` on.
+
+**Say what you mean:** `elided_lifetimes_in_paths` and `unreachable_pub` are `warn`. Write `Foo<'_>` when the type borrows, and give an item inside a private module the visibility it actually has (`pub(crate)` / `pub(super)`) rather than a bare `pub`. Both are machine-fixable — `cargo clippy --fix --workspace --all-targets` applies them.
+
+**`missing_docs` is `warn`:** every public item — including struct fields and enum variants — carries a doc comment. The `alloy::sol!` bindings are the exception: each generated block opts out where it is declared, so a new binding needs the same `#[allow(missing_docs)]` on its wrapper. New docs are link-checked too: the `doc` gate runs `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items`, so a broken `[`Type`]` link fails the build.
 
 ### Crate Structure
 
 ```
 crates/
   node/         — daemon binary `decdn-node`: runtime bring-up, handlers, admin RPC server, dispatch limiter
-  cli/          — user CLI binary `decdn`: probe, node admin, key-gen, config, bundle
+  cli/          — user CLI binary `decdn`: probe, node admin, key-gen, config, bundle, origin import
   common/       — shared types: config schema + resolver, identity loading, AdminRpc trait + DTOs
   protocol/     — shared types, wire format, ALPN message definitions (leaf crate, minimal deps)
   config-types/ — config-vocabulary value types (RetryPolicy, DecompressMode, OriginUrl, OriginKind, Hash, PinnedHashes) shared by cache + common (leaf crate: serde + url + anyhow, no iroh-blobs / no AWS — #578)
-  bao-range/    — iroh-blobs-free bao verified-range helpers (ADR 038): chunk-group alignment, range encode/verify against an untrusted `{H}.obao4` pre-order outboard. Builds on `bao-tree` rather than `iroh-blobs`, which is what keeps the CLI pull path iroh-blobs-free (#823, #915, #578)
+  bao-range/    — iroh-blobs-free bao verified-range helpers (ADR 038): chunk-group alignment, range encode/verify against an untrusted `{H}.obao4` pre-order outboard, plus the origin-store layout contract (`OBAO4_SUFFIX`, shard prefix) and the writer-side outboard encoder (`encode_outboard`) shared by the cache reader and `decdn origin import` (#1904). Builds on `bao-tree` rather than `iroh-blobs`, which is what keeps the CLI pull path iroh-blobs-free (#823, #915, #578, #1904)
   cache/        — cache engine wrapping iroh-blobs + origin pull-through
   client-pull/  — reusable `cdn/client/v1` paid-pull requester (`stream_fetch`) + buyer-side channel open: signs the request, verifies the signed `StreamResponse`, pays cumulative vouchers at each interval, assembles the blob. Shared by `node` (node-to-node miss pulls, #317) and `cli` (client fetch / bundle pull)
   incentive/    — shared payment pools, staking, vouchers (alloy for Ethereum)

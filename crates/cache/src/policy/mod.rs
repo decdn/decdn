@@ -23,7 +23,9 @@ pub enum Segment {
 /// A policy's admission verdict for a miss about to be served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionDecision {
+    /// Keep the blob, in this segment.
     Store {
+        /// Which segment the blob enters on admission.
         segment: Segment,
     },
     /// Reserved: serve without storing. No shipped impl returns it; the engine
@@ -34,12 +36,15 @@ pub enum AdmissionDecision {
 /// Inputs available to an admission decision.
 #[derive(Debug, Clone)]
 pub struct AdmissionContext {
+    /// The blob being admitted.
     pub hash: Hash,
     /// Total blob size when known ahead of the fill, else `None`.
     pub known_size: Option<u64>,
 }
 
+/// Decides whether a miss about to be served is worth keeping, and where.
 pub trait AdmissionPolicy: Send + Sync + std::fmt::Debug {
+    /// Judge one miss. Called on the serve path, so it must not block.
     fn admit(&self, ctx: &AdmissionContext) -> AdmissionDecision;
 }
 
@@ -75,17 +80,20 @@ pub struct EvictionPlan {
     pub promote: Vec<(Hash, Segment)>,
 }
 
+/// Decides what the engine releases when the store is over its target.
 pub trait EvictionPolicy: Send + Sync + std::fmt::Debug {
     /// The one sweep-time decision: what leaves, what graduates. A policy that
     /// ranks by frequency reads the shared [`FrequencyEstimator`] directly — the
     /// engine feeds that estimator on every serve. `candidates` is already
     /// stripped of pins/holds/deny by the engine.
-    fn plan(&self, ctx: &EvictionContext) -> EvictionPlan;
+    fn plan(&self, ctx: &EvictionContext<'_>) -> EvictionPlan;
 }
 
 /// Decayed frequency estimate shared by admission and eviction.
 pub trait FrequencyEstimator: Send + Sync + std::fmt::Debug {
+    /// Record one access to `hash`. The engine calls this on every serve.
     fn observe(&self, hash: Hash);
+    /// The current decayed access count for `hash`.
     fn estimate(&self, hash: Hash) -> u32;
 }
 

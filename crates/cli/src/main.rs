@@ -5,6 +5,9 @@
 //! `node` subcommand group talks to a running daemon over the loopback
 //! admin RPC surface (ADR 025) and fails cleanly on a publisher's laptop
 //! where no daemon is running.
+//!
+//! Its one direct write is the top-level error boundary in `main`; everything
+//! else prints from [`decdn_cli::commands`].
 
 use clap::Parser;
 
@@ -17,6 +20,10 @@ use decdn_common::cli::{self, Cli, Command, ConfigCommand};
 /// path/query), and this is the single boundary every CLI command propagates
 /// to. See issue #954.
 #[tokio::main]
+#[expect(
+    clippy::print_stderr,
+    reason = "process exit boundary; the CLI installs no subscriber"
+)]
 async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -53,6 +60,9 @@ async fn run() -> anyhow::Result<()> {
         Command::Bundle(args) => {
             commands::bundle::bundle_dispatch(&args, config_path.as_deref()).await
         }
+        // `origin` is offline, config-free local filesystem work — it never
+        // reads the node config, so `config_path` is intentionally not passed.
+        Command::Origin(args) => commands::origin::origin_dispatch(&args).await,
         Command::Pool(args) => commands::pool::pool_dispatch(&args, config_path.as_deref()).await,
         Command::Publish(args) => {
             commands::publish::publish_dispatch(&args, config_path.as_deref()).await

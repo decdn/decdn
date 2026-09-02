@@ -35,7 +35,7 @@ use std::process::Command;
 ///
 /// `home` must be absolute: `dirs` treats an empty `HOME` as *absent* and falls
 /// back to `getpwuid`, landing straight back on the real home directory.
-pub fn decdn_command(home: &Path) -> Command {
+pub(crate) fn decdn_command(home: &Path) -> Command {
     assert!(
         home.is_absolute(),
         "isolated HOME must be absolute, got {}: an empty or relative value \

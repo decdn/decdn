@@ -31,9 +31,9 @@ use decdn_cache::{
     CacheEngine, CacheMetrics, CircuitBreakerPolicy, Hash, PinnedHashes, RetryPolicy,
 };
 use decdn_incentive::{
-    EPHEMERAL_BINDING_NONCE, LaneState, MemoryPoolStateStore, PoolStateStore, ProbeSlashData,
-    StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash, min_payment,
-    signed_to_wire_voucher, slash_judge_domain, voucher_domain,
+    EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
+    ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash,
+    min_payment, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::{PoolOpenPending, PoolOpener};
 use decdn_node::client_requester::PoolContext;
@@ -346,6 +346,22 @@ async fn answer_probe(
     rate: u64,
     total_bytes: u64,
 ) -> Result<()> {
+    // Whole-blob holder: advertises coverage over every discovery block.
+    let coverage = Coverage::full(decdn_protocol::num_blocks(total_bytes));
+    answer_probe_with_coverage(conn, eth, slash, rate, total_bytes, coverage).await
+}
+
+/// [`answer_probe`] with an explicit [`Coverage`], so a PARTIAL holder can
+/// advertise only the discovery blocks it serves (#1506 ranged assembly). The
+/// two-holder loopback drives one holder covering block 0 and another block 1.
+async fn answer_probe_with_coverage(
+    conn: Connection,
+    eth: &Arc<PrivateKeySigner>,
+    slash: &Eip712Domain,
+    rate: u64,
+    total_bytes: u64,
+    coverage: Coverage,
+) -> Result<()> {
     let (mut send, mut recv) = conn
         .accept_bi()
         .await
@@ -379,7 +395,7 @@ async fn answer_probe(
         &resp,
         Some(&ProbeResponseExt {
             total_bytes: Some(total_bytes),
-            coverage: Coverage::full(decdn_protocol::num_blocks(total_bytes)),
+            coverage,
         }),
     )
     .map_err(|e| anyhow::anyhow!("encode probe response: {e}"))?;
@@ -506,6 +522,7 @@ async fn provisioned_origin(
         providers,
         addr_map,
         DEFAULT_TEST_PULL_DEADLINES,
+        0,
     )
     .await
 }
@@ -554,6 +571,7 @@ async fn provisioned_origin_with_deadlines(
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     (pull_timeout, stall_timeout): (Duration, Duration),
+    max_blob_size_bytes: u64,
 ) -> (
     NodeOrigin,
     CacheEngine,
@@ -580,7 +598,7 @@ async fn provisioned_origin_with_deadlines(
         addr_map,
         pull_timeout,
         stall_timeout,
-        0,
+        max_blob_size_bytes,
     )
     .await;
     (origin, engine, recorded, engine_tmp)
@@ -888,6 +906,9 @@ async fn build_origin_seeded_ranking(
                 // Identical across candidates: the ranker's RTT term must not vary,
                 // or a loaded runner's live-probe jitter reappears through the cache.
                 rtt_ms: 1,
+                // Whole-blob coverage — these fixtures serve the whole blob, so a
+                // cache-hit candidate must range-plan as covering everything.
+                coverage: decdn_protocol::Coverage::full(1),
             })
             .collect(),
     );
@@ -6045,22 +6066,25 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
     Ok(())
 }
 
-/// #840 over the real orchestration: an honest upstream holds and would serve a
-/// blob larger than B's `max_blob_size` ceiling. The buyer must reject the
-/// oversized `total_bytes` claim before buffering — the fetch is a clean
-/// `NotFound`, the `node_pull_too_large` counter moves, and (crucially) the
-/// provider is NOT scored: a buyer-side ceiling is OUR policy, not the provider's
-/// fault, so no observation is emitted and its local score stays neutral.
+/// #1895 over the real orchestration: an honest upstream holds and serves a blob
+/// larger than B's `max_blob_size` ceiling. B does NOT refuse on the signed
+/// `total_bytes` claim — it pulls, and the fill aborts once the RECEIVED bytes
+/// cross the ceiling. The fetch still surfaces a clean `NotFound`, the
+/// `node_pull_too_large` counter moves, and (crucially) the provider is NOT scored:
+/// a buyer-side ceiling is OUR policy, not the provider's fault, so no observation
+/// is emitted and its local score stays neutral. B pays the upstream for the bytes
+/// it actually received before aborting (bounded to roughly one ceiling), which
+/// this test does not assert on — only that the refusal is clean and unscored.
 ///
 /// This exercises `pull_from_candidate` passing `deps.config.max_blob_size_bytes`
 /// (the loopback test calls `stream_fetch_tracked` directly and bypasses it).
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
-async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()> {
+async fn node_origin_oversized_blob_aborts_on_received_bytes_without_scoring() -> Result<()> {
     let payload = vec![0xABu8; PAYLOAD_LEN];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
-    // Buyer ceiling well below the 1.5 MiB blob → the gate fires.
+    // Buyer ceiling well below the 1.5 MiB blob → the received bytes cross it.
     let ceiling: u64 = 1_048_576;
     anyhow::ensure!(total_bytes > ceiling, "fixture must exceed the ceiling");
 
@@ -6150,7 +6174,7 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
         .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
     anyhow::ensure!(
         matches!(got, OriginFetch::NotFound),
-        "an over-ceiling claim must not surface bytes (NotFound)"
+        "an over-ceiling blob must abort the fill and surface no bytes (NotFound)"
     );
     // The provider is NOT tarred: no observation, score stays at the neutral 0.5.
     anyhow::ensure!(
@@ -6925,6 +6949,7 @@ async fn build_node_b_with_leaves(
         providers,
         addr_map,
         node_pull_deadlines,
+        max_blob_size_bytes,
     )
     .await;
 
@@ -8838,17 +8863,23 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Result<()> {
-    // #856 step (4): the fused serve opens the upstream pull, reads `total_bytes`
-    // from the signed header, and — if it exceeds this node's `max_blob_size_bytes`
-    // — signs `BlobTooLarge` (wire `NotFound`), abandons BOTH the upstream pull and
-    // the cache tee, and forwards nothing. The regression this guards: a dropped
-    // size gate would fuse-serve an over-ceiling blob; a forgotten `tee.abandon()`
-    // on this arm would strand the in-flight tee claim for the hash. We assert the
-    // refusal, the `blob_too_large` metric, that no voucher was paid upstream
-    // (channel opened, zero bytes pulled), and that nothing was cached.
-    let payload = vec![0xB1u8; PAYLOAD_LEN];
+async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Result<()> {
+    // #1895: the fused serve no longer refuses on the upstream's signed `total_bytes`
+    // claim. B signs `ok: true`, opens the upstream pull, and forwards while filling —
+    // but the pull leg's receive loop enforces `max_blob_size_bytes` on the bytes that
+    // ACTUALLY arrive, so it ABORTS once cumulative received bytes cross the ceiling.
+    // The regression this guards: a claim-based refusal would let a holder inflate a
+    // small blob's size to make B (and every finite-ceiling relay) refuse to
+    // cache/serve while it monopolises the traffic; enforcing on received bytes makes
+    // the lie inert while still capping an honest giant. A forgotten tee release on
+    // the abort arm would strand the in-flight claim for the hash. We assert: the
+    // leaf's fetch fails (B aborted mid-serve), B's upstream spend stays bounded to
+    // roughly one ceiling (NOT the whole blob), nothing is promoted into B's cache,
+    // the too-large pull counter moves, and the aborted fill releases its tee claim so
+    // an identical retry is not wedged.
+    let payload = vec![0xB1u8; 4 * 1024 * 1024];
     let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let ab_channel_id = B256::repeat_byte(0xA6);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -8857,10 +8888,9 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x6F);
-    // 1 MiB ceiling, below the 1.5 MiB blob, so the SIZE gate trips — but the
-    // deposit guard (ceiling = min_payment(one chunk, RATE)) passes
-    // against the funded leaf, so we exercise step (4), not the step (1) deposit
-    // guard.
+    // 1 MiB ceiling, far below the 4 MiB blob, so the RECEIVED bytes cross it well
+    // before the whole blob is pulled. The deposit guard passes against the funded
+    // leaf, so we exercise the received-byte cap, not a deposit refusal.
     let max_blob_size_bytes = 1024 * 1024;
     let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
@@ -8896,21 +8926,47 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
     .is_err();
     anyhow::ensure!(
         refused,
-        "an upstream blob over the size ceiling must be refused (signed NotFound), not fused-served"
+        "an upstream blob over the size ceiling must abort the fused serve mid-stream, not complete"
     );
-    anyhow::ensure!(
-        progress_log(&recorded)?.is_empty(),
-        "the size gate must abort before any voucher is paid upstream, got {:?}",
-        progress_log(&recorded)?
-    );
+
+    // Wait for B's pull leg to SETTLE (it writes the upstream watermark this test
+    // reads); a sleep that returns first leaves the log empty, which reads as a spend
+    // of zero and passes the bound below while proving nothing.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let settled = loop {
+        if let Some(&(_, bytes, _)) = progress_log(&recorded)?.last() {
+            break bytes;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "B never recorded an upstream watermark: the pull leg did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
     anyhow::ensure!(
         !cache_b.has(hash).await?,
-        "an oversized-upstream refusal must not promote the blob into B's cache"
+        "an oversized-upstream abort must not promote the blob into B's cache"
     );
-    assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 1)?;
-    // The tee claim was released on the abort arm: a second request for the SAME
-    // hash is not wedged on a stranded in-flight entry — it reaches the size gate
-    // again and is refused identically (a leaked tee would instead hang/coalesce).
+    // B paid the upstream for the received prefix — bounded to roughly one ceiling plus
+    // the speculative pull window, never the whole 4 MiB blob.
+    let upstream_bytes: u64 = u64::try_from(settled).unwrap_or(u64::MAX);
+    let bound_content = max_blob_size_bytes.saturating_add(decdn_client_pull::PULL_WINDOW_FLOOR);
+    let bound_wire = support::bao_wire_len(total_bytes, 0, bound_content);
+    anyhow::ensure!(
+        upstream_bytes > 0,
+        "B must pay the upstream for the bytes it actually received before aborting"
+    );
+    anyhow::ensure!(
+        upstream_bytes <= bound_wire,
+        "B's upstream spend ({upstream_bytes} wire) must stay bounded to ~one ceiling \
+         ({bound_content} content = {bound_wire} wire), not the whole blob"
+    );
+    assert_counter(&b_metrics, "node_pull_too_large_total", 1)?;
+
+    // The tee claim was released on the abort arm: an identical retry is not wedged on
+    // a stranded in-flight entry — it reaches the received-byte cap again and aborts
+    // identically (a leaked tee would instead hang/coalesce).
     let retry_sk = fresh_key();
     let retry_node_id = B256::from(*retry_sk.public().as_bytes());
     let (retry_ep, _) = local_endpoint(retry_sk, vec![]).await?;
@@ -8929,9 +8985,9 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
     .is_err();
     anyhow::ensure!(
         refused_again,
-        "a repeat request for the same hash must be refused again, not wedged on a stranded tee claim"
+        "a repeat request for the same hash must abort again, not wedge on a stranded tee claim"
     );
-    assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 2)?;
+    assert_counter(&b_metrics, "node_pull_too_large_total", 2)?;
 
     shutdown([task_a, task_b], [&retry_ep, &leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
@@ -11208,6 +11264,10 @@ async fn serve_with_deposit_ceiling(
 ///
 /// Acceptance is implicit (continued delivery is the ack, ADR 005), so on accept no
 /// reply is written; only a rejection sends a message.
+#[expect(
+    clippy::print_stderr,
+    reason = "test harness diagnostic surfaced in the nextest log"
+)]
 async fn settle_voucher(
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
@@ -12760,5 +12820,423 @@ async fn attack_b_dud_flood_is_bounded_and_vindication_works() -> Result<()> {
         "a blob re-served >= 2x must refund the source's allowance and keep it warming"
     );
 
+    Ok(())
+}
+
+// ===========================================================================
+// #1506 — two-holder ranged assembly over the REAL paid path (`PeerRunSink`).
+//
+// Every other multi-holder test in the tree drives `node_origin::ranged_pull`'s
+// pure loop through the `FakeSink` (which scripts run outcomes and never opens a
+// lane). This one drives the PAID half: node S serve-misses a blob held only as
+// A:{block 0} + B:{block 1}, so `run_pull_leg`'s `PeerRunSink` opens a real
+// buyer lane to EACH holder in turn — voucher payment, settle/watermark
+// hand-off, and cross-run shared-pool solvency — the surface where #1506's
+// C1 (shared-pool accounting), C2 (run clamp), and cancel bugs live. The blob is
+// two DISCOVERY-block-sized slices; the block size is overridden to 16 KiB
+// (`override_discovery_block_bytes_for_test`) so "two blocks" is a 32 KiB blob,
+// not the 128 MiB a real two-block blob would need — the whole point of the
+// test-support seam. Both holders hold the whole (tiny) blob but ADVERTISE
+// partial coverage, so the planner concentrates each block onto its sole coverer
+// and the two lanes run sequentially on one shared pool.
+// ===========================================================================
+
+/// Two providers for `NodeOrigin`'s discovery: `(dht, operator)` for each of A
+/// and B. The ranged-assembly gather walks both because their coverage union is
+/// what spans the blob.
+fn two_providers(
+    a_dht: DhtNodeId,
+    a_eth: Address,
+    b_dht: DhtNodeId,
+    b_eth: Address,
+) -> (Vec<DhtNodeId>, HashMap<DhtNodeId, Address>) {
+    let mut addr_map = HashMap::new();
+    addr_map.insert(a_dht, a_eth);
+    addr_map.insert(b_dht, b_eth);
+    (vec![a_dht, b_dht], addr_map)
+}
+
+/// Spin up one PARTIAL holder: it holds the whole (tiny) blob in a real cache and
+/// serves any range over the real [`ClientHandler`], but its probe advertises
+/// only `coverage` — the discovery blocks the planner may route to it. Seeds its
+/// seller lane on the SHARED `ab_pool_id` keyed by the buyer's signer and this
+/// holder's own operator address, so a test can read back exactly what this
+/// holder was paid.
+async fn spawn_partial_holder(
+    payload: &[u8],
+    ab_pool_id: B256,
+    s_buyer_addr: Address,
+    coverage: Coverage,
+) -> Result<(
+    iroh::PublicKey,
+    std::net::SocketAddr,
+    Address,
+    iroh::Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<MemoryPoolStateStore>,
+)> {
+    let hash = Hash::new(payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let (cache, hash_h, tmp) = cache_with_blob(payload).await?;
+    anyhow::ensure!(hash_h == hash, "holder fixture hash mismatch");
+    std::mem::forget(tmp);
+
+    let sk = fresh_key();
+    let id = sk.public();
+    let eth = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        ab_pool_id,
+        s_buyer_addr,
+        eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler = build_handler_full(
+        id,
+        &eth,
+        &metrics,
+        limiter,
+        cache,
+        store.clone() as Arc<dyn PoolStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep, addr) = local_endpoint(sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    // Accept loop: real `ClientHandler` for the paid pull, a coverage-carrying
+    // probe responder for `cdn/probe/v1`.
+    let task = {
+        use iroh::protocol::ProtocolHandler;
+        let ep = ep.clone();
+        let eth = Arc::clone(&eth);
+        let slash = slash_domain();
+        tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let Ok(connecting) = incoming.accept() else {
+                    continue;
+                };
+                let Ok(conn) = connecting.await else { continue };
+                if conn.alpn() == ALPN_PROBE {
+                    let eth = Arc::clone(&eth);
+                    let dom = slash.clone();
+                    let coverage = coverage.clone();
+                    tokio::spawn(async move {
+                        let _ = answer_probe_with_coverage(
+                            conn,
+                            &eth,
+                            &dom,
+                            RATE,
+                            total_bytes,
+                            coverage,
+                        )
+                        .await;
+                    });
+                } else {
+                    let handler = Arc::clone(&handler);
+                    tokio::spawn(async move {
+                        let _ = decdn_node::handlers::client::ClientProtocol::new(handler)
+                            .accept(conn)
+                            .await;
+                    });
+                }
+            }
+        })
+    };
+    Ok((id, addr, eth.address(), ep, task, store))
+}
+
+/// Build serving node S: an empty-cache window-paced `ClientHandler` whose
+/// `NodeOrigin` discovers the two partial holders, plus the leaf's own lane in
+/// S's seller store. A focused twin of [`build_node_b_with_leaves`] for the
+/// two-holder ranged pull (that helper hardwires a single provider).
+#[allow(clippy::too_many_arguments)]
+async fn build_serving_node(
+    hash: Hash,
+    ab_pool_id: B256,
+    s_buyer: &Arc<PrivateKeySigner>,
+    providers: Vec<DhtNodeId>,
+    addr_map: HashMap<DhtNodeId, Address>,
+    holder_dials: &[(iroh::PublicKey, std::net::SocketAddr)],
+    leaf_channel_id: B256,
+    leaf_eth_addr: Address,
+    leaf_deposit: U256,
+) -> Result<(
+    Arc<decdn_node::handlers::client::ClientHandler>,
+    EndpointAddr,
+    iroh::Endpoint,
+    Arc<Mutex<Vec<ProgressEntry>>>,
+    decdn_cache::CacheEngine,
+    Address,
+)> {
+    let s_sk = fresh_key();
+    let s_id = s_sk.public();
+    let s_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_s, addr_s) = local_endpoint(s_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    // Prime S's iroh address cache for every holder so NodeId-only dialing in the
+    // pull resolves each one.
+    for (holder_id, holder_addr) in holder_dials {
+        let _ = probe_once(
+            &ep_s,
+            EndpointAddr::new(*holder_id).with_ip_addr(*holder_addr),
+            *hash.as_bytes(),
+            1,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let s_metrics = Arc::new(Metrics::new());
+    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin_with_deadlines(
+        &ep_s,
+        DhtNodeId::from_bytes(*s_id.as_bytes()),
+        hash,
+        ab_pool_id,
+        s_buyer,
+        &local_rep,
+        &s_metrics,
+        providers,
+        addr_map,
+        DEFAULT_TEST_PULL_DEADLINES,
+        0, // max_blob_size_bytes: 0 = unlimited; this test does not exercise the size ceiling
+    )
+    .await;
+
+    let cache_tmp = tempfile::tempdir()?;
+    let cache_s = decdn_cache::CacheEngine::open(cache_tmp.path(), vec![], 64).await?;
+    let cache_handle = cache_s.clone();
+    std::mem::forget(cache_tmp);
+    let store_s = Arc::new(MemoryPoolStateStore::new());
+    store_s.record(&LaneState::hydrate(
+        leaf_channel_id,
+        leaf_eth_addr,
+        s_eth.address(),
+        leaf_deposit,
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let mut pool_status_map: HashMap<B256, decdn_node::pool_view::PoolStatus> = HashMap::new();
+    pool_status_map.insert(
+        leaf_channel_id,
+        decdn_node::pool_view::PoolStatus {
+            owner: leaf_eth_addr,
+            remaining: leaf_deposit,
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
+        },
+    );
+    let pool_view = Arc::new(StubPoolView {
+        status: pool_status_map,
+    }) as Arc<dyn decdn_node::pool_view::PoolView>;
+    let limiter = permissive_limiter(&s_metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_s = build_handler_full_configured(
+        s_id,
+        &s_eth,
+        &s_metrics,
+        limiter,
+        cache_s,
+        store_s as Arc<dyn PoolStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+        |deps| {
+            deps.pull_through = Some(Duration::from_secs(20));
+            deps.pull_through_origin = Some(Arc::new(origin));
+            deps.pool_view = Some(pool_view);
+        },
+    )?;
+    let target = EndpointAddr::new(s_id).with_ip_addr(addr_s);
+    Ok((
+        handler_s,
+        target,
+        ep_s,
+        recorded,
+        cache_handle,
+        s_eth.address(),
+    ))
+}
+
+/// #1506: node S assembles a blob held only as A:{block 0} + B:{block 1} across
+/// two sequential paid lanes on one shared pool, and each holder is paid only for
+/// ITS block.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
+    // Tiny discovery blocks so "two blocks" is a 32 KiB blob, not 128 MiB. The
+    // guard reverts the override when the test ends; `cargo nextest` runs each
+    // test in its own process, so no sibling test sees the override.
+    let block: u64 = 16 * 1024;
+    let _block_guard = decdn_protocol::override_discovery_block_bytes_for_test(block);
+    anyhow::ensure!(
+        decdn_protocol::discovery_block_bytes() == block,
+        "override did not take"
+    );
+
+    // A two-block, position-varying blob (a permuted chunk would still equal a
+    // uniform fill, so vary by index).
+    let payload_len = usize::try_from(2 * block).unwrap_or(usize::MAX);
+    let payload: Vec<u8> = (0..payload_len)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let hash = Hash::new(&payload);
+    let total_bytes = 2 * block;
+    anyhow::ensure!(
+        decdn_protocol::num_blocks(total_bytes) == 2,
+        "the blob must span exactly two discovery blocks under the override"
+    );
+
+    let ab_pool_id = B256::repeat_byte(0xA1);
+    let s_buyer = Arc::new(PrivateKeySigner::random());
+
+    // Holder A covers ONLY block 0; holder B ONLY block 1. Both hold the whole
+    // blob and can serve any range — only their ADVERTISED coverage is partial.
+    let (a_id, a_addr, a_eth, ep_a, task_a, store_a) = spawn_partial_holder(
+        &payload,
+        ab_pool_id,
+        s_buyer.address(),
+        Coverage::from_block_indices(2, [0].into_iter()),
+    )
+    .await?;
+    let (b_id, b_addr, b_eth, ep_b, task_b, store_b) = spawn_partial_holder(
+        &payload,
+        ab_pool_id,
+        s_buyer.address(),
+        Coverage::from_block_indices(2, [1].into_iter()),
+    )
+    .await?;
+
+    let (providers, addr_map) = two_providers(
+        DhtNodeId::from_bytes(*a_id.as_bytes()),
+        a_eth,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        b_eth,
+    );
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x1F);
+    let (handler_s, s_target, ep_s, recorded, cache_s, s_operator) = build_serving_node(
+        hash,
+        ab_pool_id,
+        &s_buyer,
+        providers,
+        addr_map,
+        &[(a_id, a_addr), (b_id, b_addr)],
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+    )
+    .await?;
+    let task_s = spawn_server(ep_s.clone(), handler_s);
+
+    // The leaf pulls the whole blob from S; S serve-misses and assembles it from
+    // both holders.
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        s_target,
+        leaf_node_id,
+        &leaf_eth,
+        s_operator,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await?;
+
+    anyhow::ensure!(outcome.completed, "leaf delivery did not complete");
+    anyhow::ensure!(outcome.hash_ok, "leaf received bytes failed the hash check");
+    anyhow::ensure!(
+        outcome.received == total_bytes,
+        "leaf received {} of {total_bytes} bytes",
+        outcome.received
+    );
+    // S cached the assembled, verified blob — it is now a holder for future pulls.
+    anyhow::ensure!(
+        cache_s.has(hash).await?,
+        "S must promote the assembled blob on a complete delivery"
+    );
+
+    // The headline: BOTH holders' seller lanes advanced, so the assembly opened a
+    // real paid lane to each — not one holder serving everything.
+    let lane_a = LaneKey {
+        pool_id: ab_pool_id,
+        signer: s_buyer.address(),
+        provider: a_eth,
+    };
+    let lane_b = LaneKey {
+        pool_id: ab_pool_id,
+        signer: s_buyer.address(),
+        provider: b_eth,
+    };
+    let a_delivered = store_a
+        .get(lane_a)?
+        .ok_or_else(|| anyhow::anyhow!("holder A lane vanished"))?
+        .last_bytes_delivered();
+    let b_delivered = store_b
+        .get(lane_b)?
+        .ok_or_else(|| anyhow::anyhow!("holder B lane vanished"))?
+        .last_bytes_delivered();
+
+    // Each holder is paid ONLY for its own block's wire: A the [0, block) range,
+    // B the [block, total) range — never the whole blob (#1506 C1/C2). Bao meters
+    // WIRE (content + interleaved proof), so compare against each range's own
+    // verified-stream encoding.
+    let a_wire =
+        u64::try_from(honest_bao_wire_range(&payload, 0, block)?.len()).unwrap_or(u64::MAX);
+    let b_wire =
+        u64::try_from(honest_bao_wire_range(&payload, block, 0)?.len()).unwrap_or(u64::MAX);
+    let whole_wire =
+        u64::try_from(honest_bao_wire_range(&payload, 0, 0)?.len()).unwrap_or(u64::MAX);
+    anyhow::ensure!(
+        a_delivered == U256::from(a_wire),
+        "holder A must be paid for exactly block 0's wire ({a_wire}), got {a_delivered}"
+    );
+    anyhow::ensure!(
+        b_delivered == U256::from(b_wire),
+        "holder B must be paid for exactly block 1's wire ({b_wire}), got {b_delivered}"
+    );
+    anyhow::ensure!(
+        a_delivered < U256::from(whole_wire) && b_delivered < U256::from(whole_wire),
+        "neither holder may be paid for the whole blob: A={a_delivered}, B={b_delivered}, \
+         whole={whole_wire}"
+    );
+
+    // S's buyer side persisted a watermark for BOTH providers on the one shared
+    // pool (#852 + #1506 C1): two distinct providers, each recorded.
+    let paid_providers: std::collections::HashSet<Address> = progress_log(&recorded)?
+        .into_iter()
+        .map(|(p, ..)| p)
+        .collect();
+    anyhow::ensure!(
+        paid_providers == std::collections::HashSet::from([a_eth, b_eth]),
+        "both holders' lanes must have persisted a watermark, got {paid_providers:?}"
+    );
+
+    shutdown([task_s, task_a, task_b], [&leaf_ep, &ep_s, &ep_a, &ep_b]).await?;
     Ok(())
 }

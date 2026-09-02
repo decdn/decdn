@@ -27,6 +27,11 @@
 /// Buyer-side `PaymentPool` open kernel (#940), shared by the node service
 /// and the CLI.
 pub mod buyer_pool;
+/// Range-keyed discovery coverage-map primitive plus the two
+/// objective-specific planners over it (#1506): [`coverage_plan::plan_covered_runs`]
+/// (node — concentrate + sticky) and [`coverage_plan::spread_segments`] (client —
+/// spread for parallelism). Pure, no I/O.
+pub mod coverage_plan;
 /// Client-side node discovery (#936): read + select the active node set from
 /// `CapacityBond.getRegisteredNodes`, then rank probed blob-holders.
 pub mod discovery;
@@ -71,8 +76,11 @@ pub mod sink;
 /// seam), plus scripted test doubles.
 pub mod source;
 
+pub use coverage_plan::{
+    CoveredRun, SourceCoverage, covering_sources, plan_covered_runs, spread_segments,
+};
 pub use decdn_bao_range::RangedStore;
-pub use driver::{PacingWait, PoolExhausted, drive};
+pub use driver::{PacingWait, PoolExhausted, SharedPool, drive};
 pub use ledger::{
     ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Released, StreamProof,
 };
@@ -416,15 +424,34 @@ impl std::fmt::Display for HashMismatch {
 
 impl std::error::Error for HashMismatch {}
 
-/// Typed sentinel for a server that claimed a `total_bytes` above the buyer's
-/// `max_blob_size_bytes` ceiling (#840). Returned (not a bare string) so the
-/// pull orchestrator can `downcast_ref` and classify it as a buyer-side policy
-/// rejection — distinct from a hash mismatch or an unreachable peer — rather
-/// than mis-attributing it to the provider's reputation. `Display` carries
-/// `BlobTooLarge` so logs and the existing requester tests can match on it.
+/// Typed sentinel for a pull aborted because the bytes that ACTUALLY arrived
+/// crossed the buyer's `max_blob_size_bytes` ceiling (#1895). The peer's signed
+/// `total_bytes` claim never drives a refusal — it is peer-controlled and
+/// unverified (`StreamResponse::validate()` does not bound it) — so the ceiling
+/// binds on cumulative RECEIVED, BLAKE3-verified bytes instead. Returned (not a
+/// bare string) so the pull orchestrator can `downcast_ref` and classify it as a
+/// buyer-side policy rejection — distinct from a hash mismatch or an unreachable
+/// peer — rather than mis-attributing it to the provider's reputation. `Display`
+/// carries `BlobTooLarge` so logs and the requester tests can match on it.
+///
+/// **Units.** `received` and `ceiling` are ALWAYS the same unit within one error —
+/// the comparison at each enforcement site is apples-to-apples — but that unit
+/// differs by site, so neither field is a raw `max_blob_size_bytes` config value
+/// across all call sites. The buffered receive loop (`receive_and_pay`) meters bao
+/// WIRE bytes (content plus interleaved proof, ADR 038) and compares against the
+/// wire size of a ceiling-sized blob. The gap-driven driver (`fill_gap`) meters
+/// CONTENT bytes (the store's delivered frontier) and the buffered resume-offset
+/// guard meters a CONTENT offset, both against the configured `max_blob_size_bytes`
+/// directly. Every one is a faithful "the byte position crossed the ceiling"
+/// report.
 #[derive(Debug)]
-pub struct BlobTooLargeClaim {
-    pub claimed: u64,
+pub struct BlobTooLarge {
+    /// The byte position that crossed `ceiling` — wire bytes taken off the stream
+    /// (buffered receive loop), the store's content frontier (gap-driven driver),
+    /// or a content resume offset already past it. Same unit as `ceiling` (see the
+    /// type's **Units** note).
+    pub received: u64,
+    /// The ceiling `received` crossed, in the same unit as `received`.
     pub ceiling: u64,
 }
 
@@ -461,17 +488,17 @@ impl std::fmt::Display for ResumeOffsetPastEnd {
 
 impl std::error::Error for ResumeOffsetPastEnd {}
 
-impl std::fmt::Display for BlobTooLargeClaim {
+impl std::fmt::Display for BlobTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "server claimed {} bytes, exceeding max_blob_size {} bytes (BlobTooLarge)",
-            self.claimed, self.ceiling
+            "received {} bytes, crossing the {}-byte size ceiling (BlobTooLarge)",
+            self.received, self.ceiling
         )
     }
 }
 
-impl std::error::Error for BlobTooLargeClaim {}
+impl std::error::Error for BlobTooLarge {}
 
 /// Typed sentinel for a server that signed an open-stage `StreamResponse`
 /// (`ok == true`) quoting a per-MB `rate_per_mb` above the buyer's effective
@@ -616,6 +643,7 @@ pub const fn effective_rate_ceiling(probe_relative: u64, config_absolute: u64) -
 /// not in this crate.
 #[derive(Debug)]
 pub struct PullTimeout {
+    /// How long the pull ran before the budget elapsed.
     pub after: Duration,
 }
 
@@ -654,7 +682,11 @@ impl std::error::Error for PullTimeout {}
 /// the fix is a fresh capability or an owner top-up, not a resync.
 #[derive(Debug)]
 pub struct UpstreamVoucherRejected {
+    /// Why the seller refused the voucher.
     pub reason: VoucherRejectReason,
+    /// The seller's signer-verified watermark, when it sent one, so the buyer
+    /// can resync its cumulative state and retry. `None` means there is
+    /// nothing to resync from and the caller must surface the failure.
     pub bundle: Option<WatermarkBundle>,
 }
 
@@ -1035,8 +1067,11 @@ pub enum DeadlineError {
     /// throughput floor — the signal that a healthy stream is still making progress —
     /// can never fire.
     CapCannotOutlastItsStages {
+        /// The open-stage budget.
         open: Duration,
+        /// The throughput-floor window that follows it.
         window: Duration,
+        /// The whole-pull cap, which must exceed `open + window`.
         hard_cap: Duration,
     },
 }
@@ -1966,20 +2001,14 @@ async fn fetch_inner_once(
     if !resp.body.ok {
         return Err(UpstreamRefused::open(resp, &resp_ext));
     }
-    // Reject an oversized server-claimed `total_bytes` before allocating or
-    // entering the receive loop — `total_bytes` is server-controlled and
-    // `StreamResponse::validate()` does not bound it, so the in-loop
-    // `cumulative > expected` guard alone would let one inflated promise drive
-    // us toward OOM. Mirrors the serving-side `BlobTooLarge` gate
-    // (handlers/client.rs); `0` = unlimited (#840). Typed sentinel so the pull
-    // orchestrator classifies it as a buyer-side policy rejection, not provider
-    // misbehavior.
-    if max_blob_size_bytes > 0 && resp.body.total_bytes > max_blob_size_bytes {
-        return Err(anyhow::Error::new(BlobTooLargeClaim {
-            claimed: resp.body.total_bytes,
-            ceiling: max_blob_size_bytes,
-        }));
-    }
+    // The peer's signed `total_bytes` never drives a refusal here (#1895): it is
+    // peer-controlled and unverified (`StreamResponse::validate()` does not bound
+    // it), so an inflated claim on a small blob could otherwise make every
+    // finite-ceiling relay refuse to pull/cache/serve while the holder monopolises
+    // the traffic. The `max_blob_size_bytes` ceiling is enforced instead on the
+    // bytes that ACTUALLY arrive, inside `receive_and_pay`. A lie is inert — it
+    // cannot produce bytes that verify against the true root — while an honest
+    // giant is streamed and paid for only up to one ceiling before it aborts.
     // Reject an over-ceiling rate before paying a single voucher (#1375). `resp`
     // is `ok == true` and already verified against `expected_signer`, so it is
     // the operator's own signed quote — carry it into the error as replayable
@@ -2012,6 +2041,26 @@ async fn fetch_inner_once(
     let total_bytes = resp.body.total_bytes;
     let expected_wire = aligned_wire_len(byte_offset, 0, total_bytes)?;
 
+    // Received-byte ceiling (#1895), expressed as a WIRE bound so the buffered loop
+    // can enforce it without decoding: the wire size of a ceiling-sized blob's
+    // content from this offset. Enforced on the bytes that ACTUALLY arrive, never on
+    // the peer's unverified `total_bytes` claim. A resume offset already at/past the
+    // ceiling means the blob is genuinely oversized — abort before the loop. `0` =
+    // unlimited.
+    let max_received_wire = if max_blob_size_bytes == 0 {
+        0
+    } else {
+        match aligned_wire_len(byte_offset, 0, max_blob_size_bytes) {
+            Ok(wire) => wire,
+            Err(_) => {
+                return Err(anyhow::Error::new(BlobTooLarge {
+                    received: byte_offset,
+                    ceiling: max_blob_size_bytes,
+                }));
+            }
+        }
+    };
+
     let (buf, cumulative) = receive_and_pay(
         &mut send,
         &mut recv,
@@ -2019,11 +2068,20 @@ async fn fetch_inner_once(
         ledger,
         rate_per_mb,
         expected_wire,
+        max_received_wire,
         window,
         floor_bps,
         on_progress,
     )
     .await?;
+
+    // No more vouchers will be sent — the loop paid its last one above. Finish
+    // the send half now so the node sees our FIN promptly and can drain it to a
+    // clean close instead of stopping it (the `STOP_SENDING(0)` that the receive
+    // loop's `terminal_after_write_failure` recovery otherwise has to absorb). A
+    // stop that already landed makes this a no-op; either way the bytes are in and
+    // the decode below is what decides success.
+    let _ = send.finish();
 
     // A truncated stream (fewer wire bytes than the aligned range needs) cannot
     // decode; reject cleanly before the decoder hits an EOF mid-proof. There is no
@@ -2076,7 +2134,11 @@ fn aligned_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow
 /// `MAX_MESSAGE_SIZE`, before it allocates — plus the `cumulative <= expected_wire_bytes` overrun guard
 /// (ADR 005 §`cdn/client/v1`). The non-empty floor ties every frame to payload, so a run of
 /// empty frames cannot drive this loop while `cumulative` and the voucher accounting stand
-/// still.
+/// still. Separately, `max_received_wire` (`0` = unlimited) caps the bytes that
+/// ACTUALLY arrive against the buyer's received-byte ceiling (#1895): once
+/// `cumulative` crosses it the pull aborts with [`BlobTooLarge`], so an inflated
+/// `total_bytes` claim on a small blob cannot drive us toward OOM and a genuine
+/// giant is paid for only up to one ceiling.
 ///
 /// `window` + `floor_bps` bound this loop by THROUGHPUT (#1797): bytes are counted off the
 /// QUIC stream sub-frame through a `ProgressReader`, and a `ThroughputFloor` aborts when
@@ -2093,6 +2155,58 @@ fn stall_sample_period(window: Duration) -> Duration {
     (window / 8).max(Duration::from_millis(100))
 }
 
+/// How long the receive loop waits for a terminal message after a voucher write
+/// fails (below). The node writes `StreamEnd` (or a `StreamError`) *before* the
+/// teardown that stops our send, so the terminal signal is already in flight and
+/// arrives at once; the bound only stops a peer that stops our send and then goes
+/// silent from pinning this recovery read. It is an error-path bound, not a
+/// steady-state one.
+const TERMINAL_AFTER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The outcome of looking for a terminal message after a voucher write failed.
+enum TerminalAfterWrite {
+    /// A `StreamEnd` was waiting: the node delivered everything and considered the
+    /// stream fully paid, so the failed write was superfluous. The delivery
+    /// completes (the caller's byte-completeness check still guards a short one).
+    Complete,
+    /// No terminal message rescued the write — either a typed `StreamError` the
+    /// node sent (surfaced through [`voucher_rejection`]) or the original write
+    /// failure, when nothing terminal was waiting.
+    Fail(anyhow::Error),
+}
+
+/// Decide what a voucher write failure really means.
+///
+/// A node stops our send half only once it needs nothing more from us: a
+/// completed delivery leaves a `StreamEnd` on the wire, a mid-stream rejection a
+/// `StreamError`. The write half and the read half run in lock-step in the
+/// receive loop, so a raw voucher-write failure — the end-of-stream
+/// `STOP_SENDING(0)` a node emits when it finishes and drops `recv` — would
+/// otherwise mask that terminal signal and abort a complete, paid fetch (or
+/// swallow a typed rejection the reactive top-up path keys on). Read the terminal
+/// signal, briefly, and prefer it. A write we caused ourselves (a
+/// [`LocalPullFault`] encode fault) is never masked; nor is a stream that yields
+/// no terminal signal before the bound.
+async fn terminal_after_write_failure<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    ledger: &PoolLedger,
+    meter: &StreamMeter,
+    write_err: anyhow::Error,
+) -> TerminalAfterWrite {
+    if write_err.is::<LocalPullFault>() {
+        return TerminalAfterWrite::Fail(write_err);
+    }
+    match tokio::time::timeout(TERMINAL_AFTER_WRITE_TIMEOUT, read_client_message(reader)).await {
+        Ok(Ok(ClientMessage::StreamEnd)) => TerminalAfterWrite::Complete,
+        Ok(Ok(ClientMessage::StreamError(e))) => {
+            TerminalAfterWrite::Fail(voucher_rejection(ledger, meter, e))
+        }
+        // Any other message, a read error, or the timeout: nothing terminal is
+        // waiting, so the write failure stands as the honest outcome.
+        _ => TerminalAfterWrite::Fail(write_err),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_and_pay(
     send: &mut SendStream,
@@ -2101,6 +2215,7 @@ async fn receive_and_pay(
     ledger: &PoolLedger,
     rate_per_mb: u64,
     expected_wire_bytes: u64,
+    max_received_wire: u64,
     window: Duration,
     floor_bps: u64,
     on_progress: Option<&ProgressCallback>,
@@ -2185,6 +2300,20 @@ async fn receive_and_pay(
                         "server sent {cumulative} bytes, more than the {expected_wire_bytes} promised"
                     );
                 }
+                // Received-byte ceiling (#1895): enforce the size cap on the bytes
+                // that ACTUALLY arrive, never on the peer's unverified `total_bytes`
+                // claim. `max_received_wire` is the wire size of a ceiling-sized
+                // blob's content (computed by the caller), so this is the wire form of
+                // "received content > ceiling" — distinct from the claim-derived
+                // `expected_wire_bytes` overrun guard above. Abort BEFORE paying for
+                // the chunk that crosses it, so the spend stays bounded to roughly one
+                // ceiling. `0` = unlimited.
+                if max_received_wire > 0 && cumulative > max_received_wire {
+                    return Err(anyhow::Error::new(BlobTooLarge {
+                        received: cumulative,
+                        ceiling: max_received_wire,
+                    }));
+                }
                 buf.extend_from_slice(chunk.bytes());
                 // Surface delivery progress after each chunk. `cumulative` and
                 // `expected_wire_bytes` are both wire bytes, so the readout is
@@ -2205,7 +2334,7 @@ async fn receive_and_pay(
                 // node legitimately pauses delivery (ADR 005 §Payment pacing), so that pause
                 // is self-inflicted, not a sender stall — exclude it from the window (#1797).
                 floor.pause(tokio::time::Instant::now());
-                unproved = meter
+                let paid = meter
                     .pay(
                         send,
                         ctx,
@@ -2214,8 +2343,30 @@ async fn receive_and_pay(
                         unproved,
                         cumulative >= expected_wire_bytes,
                     )
-                    .await?;
+                    .await;
                 floor.resume(tokio::time::Instant::now());
+                match paid {
+                    Ok(remaining) => unproved = remaining,
+                    // A voucher write that failed at end-of-stream may only mean the
+                    // node stopped our send after it finished (or is rejecting us):
+                    // prefer the terminal signal it left to the opaque write failure.
+                    // Boxed so this cold error-path future does not enlarge the steady
+                    // receive loop's future (`clippy::large_futures`); the allocation
+                    // only happens on the failure path.
+                    Err(write_err) => {
+                        let recovered = Box::pin(terminal_after_write_failure(
+                            &mut reader,
+                            ledger,
+                            &meter,
+                            write_err,
+                        ))
+                        .await;
+                        match recovered {
+                            TerminalAfterWrite::Complete => break,
+                            TerminalAfterWrite::Fail(err) => return Err(err),
+                        }
+                    }
+                }
             }
             // Acceptance is implicit — continued delivery IS acceptance (ADR 005),
             // so there is no positive ack to consume. Only a rejection is signalled,
@@ -2435,14 +2586,18 @@ impl std::fmt::Debug for UpstreamPull {
 /// `total_bytes` is known up front), and return its header plus a live
 /// [`UpstreamPull`] to drive. The same response-validation rules as
 /// `stream_fetch` apply — zero-rate rejection, `slash_sig` recovery, echoed
-/// field checks, the [`BlobTooLargeClaim`] ceiling, and the
-/// `total_bytes >= byte_offset` floor — all enforced BEFORE the first chunk.
+/// field checks, and the `total_bytes >= byte_offset` floor — all enforced BEFORE
+/// the first chunk. The `max_blob_size_bytes` ceiling is NOT one of them (#1895):
+/// the peer's `total_bytes` claim is unverified, so the ceiling is enforced on the
+/// bytes that ACTUALLY arrive, inside [`UpstreamPull::next_chunk`], as
+/// [`BlobTooLarge`].
 ///
 /// # Errors
 ///
 /// Same set as `stream_fetch` for the handshake/response phase (connect /
 /// transport, refused or zero-rate response, bad `slash_sig`, mismatched echoed
-/// field, oversized `total_bytes`).
+/// field). The size ceiling surfaces later, as a [`BlobTooLarge`] abort once
+/// received bytes cross it.
 ///
 /// The open stage is bounded by `deadlines.open`, inside the shared `open_stream`
 /// helper — NOT left to the caller (#1134). `node_origin` additionally wraps this
@@ -2468,7 +2623,6 @@ pub async fn open_progressive_pull(
     namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
-    max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
     // Upper bound on the requested range: `[byte_offset, byte_offset + byte_len)`.
@@ -2510,15 +2664,13 @@ pub async fn open_progressive_pull(
     if !resp.body.ok {
         return Err(UpstreamRefused::open(resp, &resp_ext));
     }
-    // Same buyer-side ceiling as `fetch_inner`: reject an inflated `total_bytes`
-    // before forwarding/allocating anything (#840). Typed sentinel so the pull
-    // orchestrator classifies it as a buyer policy rejection, not provider fault.
-    if max_blob_size_bytes > 0 && resp.body.total_bytes > max_blob_size_bytes {
-        return Err(anyhow::Error::new(BlobTooLargeClaim {
-            claimed: resp.body.total_bytes,
-            ceiling: max_blob_size_bytes,
-        }));
-    }
+    // Same as `fetch_inner` (#1895): the peer's signed `total_bytes` never drives a
+    // refusal — it is unverified — so the `max_blob_size_bytes` ceiling is enforced
+    // on the bytes that ACTUALLY arrive, inside `UpstreamPull::next_chunk`, not on
+    // the claim. This is the fused serve leg, so refusing on an inflated claim here
+    // would let a holder centralise a small blob's traffic across every
+    // finite-ceiling relay; a lie cannot produce bytes that verify against the true
+    // root, and an honest giant is streamed and paid for only up to one ceiling.
     // Same buyer-side rate ceiling as `fetch_inner` (#1375): refuse an over-ceiling
     // quote before the first paid interval, carrying the signed quote out as
     // rate-manipulation evidence. `0` = unbounded.
@@ -3240,14 +3392,13 @@ mod tests {
     /// The `LocalPullFault` marker must ride out on the errors the range helpers ACTUALLY
     /// raise — not on one a test hand-built (#1145 review).
     ///
-    /// This distinction is the whole point of the test, and the version it replaces got it
-    /// backwards. That one called the real `sign_client_binding`, asserted it was `Ok`,
-    /// threw the result away, and then hand-built `anyhow!("...").context(LocalPullFault)`
-    /// before asserting the ladder found `LocalPullFault` in it. Attaching the marker and
-    /// then finding it is true by construction: the test could not fail, and stripping every
-    /// `.context(LocalPullFault)` from the crate left the whole suite green. Its own doc
-    /// comment warned that "a synthetic `anyhow!(...)` would pass this test while production
-    /// scored the peer" — and then did exactly that.
+    /// This distinction is the whole point of the test: a test that calls the real
+    /// `sign_client_binding`, throws away its `Ok` result, and hand-builds
+    /// `anyhow!("...").context(LocalPullFault)` before asserting the ladder finds
+    /// `LocalPullFault` in it is true by construction. Attaching the marker and then
+    /// finding it proves nothing — such a test cannot fail even if every
+    /// `.context(LocalPullFault)` call site is stripped from the crate, so a synthetic
+    /// `anyhow!(...)` passes it while production silently fails to score the peer.
     ///
     /// So: real functions, real errors, marker never touched by the test. `align_range`
     /// rejects an offset at or past the end of the blob (never clamps — ADR 005), which is

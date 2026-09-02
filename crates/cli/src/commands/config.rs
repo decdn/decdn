@@ -433,7 +433,11 @@ pub enum OriginSpec {
     Fs(std::path::PathBuf),
     /// S3-compatible origin. `bucket` is `None` for the bare `s3` spelling —
     /// the emitted block then carries a placeholder bucket to edit.
-    S3 { bucket: Option<String> },
+    S3 {
+        /// The bucket named in `s3://<bucket>`, or `None` for the bare `s3`
+        /// spelling.
+        bucket: Option<String>,
+    },
 }
 
 /// Map the `config init` role flags to a [`Role`]. `--origin` and `--client`
@@ -934,8 +938,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [cache]
 # cache_dir = "~/.decdn/cache"
-# cache_size_mb = 10240
-# max_blob_size_mb = 10240             # largest single blob admitted; unset => cache_size_mb (the disk budget). Must be <= cache_size_mb; 0 = unlimited
+# cache_size_mb = 102400
+# max_blob_size_mb = 51200             # largest single blob admitted; unset => 50 GB capped to cache_size_mb. Must be <= cache_size_mb; 0 = unlimited
 # max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the candidate's probe rate, before paying. Distinct from the seller-side [payment] delivery_floor clamp, which raises this node's own quote
 # pinned_hashes = []                       # blob hashes (hex) exempted from LRU eviction (#276)
 # user_agent = "decdn-node/<version>"      # User-Agent on HTTP origin pull-through (#435); default embeds the crate version

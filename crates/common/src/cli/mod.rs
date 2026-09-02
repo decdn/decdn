@@ -13,6 +13,7 @@ pub mod config_cmd;
 pub mod fetch;
 pub mod key_gen;
 pub mod node;
+pub mod origin;
 pub mod pool;
 pub mod probe;
 pub mod publish;
@@ -33,6 +34,7 @@ pub use node::{
     LookupArgs, NodeArgs, NodeCommand, RegisterArgs, ReloadArgs, RotateKeyArgs, RotateKeyTarget,
     SlashesArgs, StatusArgs, SwapVenueArg, TopArgs, UnbondArgs,
 };
+pub use origin::{OriginArgs, OriginCommand, OriginImportArgs};
 pub use pool::{
     PoolArgs, PoolAssignArgs, PoolChainArgs, PoolCloseArgs, PoolCommand, PoolListArgs,
     PoolOpenArgs, PoolReclaimArgs, PoolTopUpArgs,
@@ -103,6 +105,10 @@ pub enum Command {
     /// linking BLAKE3-content-addressed blobs by relative path. See
     /// `appendix-bundles.md` for the format and issue #391 for status.
     Bundle(BundleArgs),
+    /// Seed a cache origin store from local content (`import`) — offline,
+    /// config-free filesystem work that writes each blob's sharded data object
+    /// and its `{hex}.obao4` outboard in the layout the daemon reads (ADR 037).
+    Origin(OriginArgs),
     /// Client-side payment-pool lifecycle (`list`/`status`, `open`, `top-up`,
     /// `close`, `reclaim`).
     Pool(PoolArgs),

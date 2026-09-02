@@ -29,8 +29,10 @@ const DEFAULT_WAIT_POLL_MS: NonZeroU64 = match NonZeroU64::new(250) {
 /// `swap_venue` string is validated later when the venue is constructed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum SwapVenueArg {
+    /// Uniswap v3, quoted through a fee-tier pool.
     #[value(name = "uniswap-v3")]
     UniswapV3,
+    /// Balancer v3, quoted through a named pool.
     #[value(name = "balancer-v3")]
     BalancerV3,
 }
@@ -49,6 +51,7 @@ impl SwapVenueArg {
 /// Operator-local admin commands that query a running deCDN node.
 #[derive(Args, Debug)]
 pub struct NodeArgs {
+    /// The `decdn node` subcommand to run.
     #[command(subcommand)]
     pub cmd: NodeCommand,
 }
@@ -486,6 +489,8 @@ pub struct DrainArgs {
 /// `chain_id`, `keystore`, and `data_dir` fall back to built-in defaults.
 #[derive(Args, Debug)]
 pub struct ChainArgs {
+    /// RPC endpoint, chain id, keystore, and data-dir flags shared by every
+    /// chain-touching command.
     #[command(flatten)]
     pub common: CommonChainArgs,
 
@@ -551,6 +556,7 @@ pub struct RegisterArgs {
     #[arg(long = "accept-terms")]
     pub accept_terms: bool,
 
+    /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
     #[command(flatten)]
     pub chain: ChainArgs,
 }
@@ -659,6 +665,7 @@ pub struct RotateKeyArgs {
 
     // `--dry-run` and `--json` come from the flattened `ChainArgs`
     // (`CommonChainArgs`); declaring them here too would collide.
+    /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
     #[command(flatten)]
     pub chain: ChainArgs,
 }
@@ -677,6 +684,7 @@ pub struct BondArgs {
     #[arg(long, value_name = "MBPS")]
     pub mbps: u64,
 
+    /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
     #[command(flatten)]
     pub chain: ChainArgs,
 }
@@ -738,6 +746,7 @@ pub struct UnbondArgs {
     #[arg(long = "yes", short = 'y')]
     pub yes: bool,
 
+    /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
     #[command(flatten)]
     pub chain: ChainArgs,
 }
@@ -766,6 +775,7 @@ pub struct DeregisterArgs {
     #[arg(long = "yes", short = 'y')]
     pub yes: bool,
 
+    /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
     #[command(flatten)]
     pub chain: ChainArgs,
 }
@@ -801,6 +811,7 @@ pub struct LookupArgs {
 
     // `--json` is supplied by the flattened `ChainArgs` (`CommonChainArgs.json`);
     // declaring it here too would collide (clap requires unique arg names).
+    /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
     #[command(flatten)]
     pub chain: ChainArgs,
 }

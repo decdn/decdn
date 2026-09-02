@@ -56,7 +56,7 @@ type FetchTarget = (PublicKey, Address);
 /// file published at two paths) land in one group so it is fetched once (#1306).
 fn group_by_hash(entries: &[ManifestEntry]) -> Vec<HashGroup<'_>> {
     let mut index: HashMap<&str, usize> = HashMap::new();
-    let mut groups: Vec<HashGroup> = Vec::new();
+    let mut groups: Vec<HashGroup<'_>> = Vec::new();
     for entry in entries {
         let next = groups.len();
         let at = *index.entry(entry.hash.as_str()).or_insert(next);
@@ -670,6 +670,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             self.signer,
             self.voucher_dom,
             admitted,
+            &order.coverage_by_node,
             self.relays,
             hash,
             staging,

@@ -499,6 +499,8 @@ fn load_from(path: &Path) -> anyhow::Result<SecretKey> {
     Ok(SecretKey::from_bytes(&arr))
 }
 
+/// A newly generated node secret key, drawn from the OS RNG. The caller owns
+/// persisting it; nothing here touches disk.
 pub fn fresh_secret_key() -> SecretKey {
     SecretKey::generate()
 }

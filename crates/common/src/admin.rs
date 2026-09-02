@@ -364,6 +364,16 @@ pub struct StatusResponse {
     /// denylist the client handler and blacklist watcher share; `0` when no
     /// denylist is wired.
     pub chain_denied_origins: u64,
+    /// The operator Ethereum address this node runs under — the wallet it is
+    /// funded, bonded, registered, and paid under. Rendered as an EIP-55
+    /// mixed-case checksummed hex string (`0x`-prefixed), the same encoding
+    /// [`LaneSnapshot::counterparty`] uses. Sampled once at bring-up from the
+    /// loaded eth keystore (the same value the node-id binding check derives),
+    /// not re-read per call. `None` when the operator can't be resolved — an
+    /// `AdminState` with no chain wiring (unit tests, cache-only nodes) —
+    /// matching how [`HealthResponse::bound_node_id`] degrades. The address is
+    /// public; no key material is ever exposed here.
+    pub operator_address: Option<String>,
 }
 
 /// JSON view of one lane this node provides against a `PaymentPool`,
@@ -745,6 +755,7 @@ mod tests {
                 scheduled_records: 5,
             },
             chain_denied_origins: 3,
+            operator_address: Some("0x52908400098527886E0F7030069857D2E4169EE7".to_string()),
         };
         let json = serde_json::to_string(&resp).expect("serialize StatusResponse");
         let back: StatusResponse = serde_json::from_str(&json).expect("deserialize StatusResponse");
@@ -757,6 +768,10 @@ mod tests {
         assert_eq!(back.record_store.capacity, 100_000);
         assert_eq!(back.republish.scheduled_records, 5);
         assert_eq!(back.chain_denied_origins, 3);
+        assert_eq!(
+            back.operator_address.as_deref(),
+            Some("0x52908400098527886E0F7030069857D2E4169EE7")
+        );
     }
 
     /// `LanesResponse` round-trips through serde unchanged — guards the
