@@ -289,12 +289,17 @@ impl ProxyWarmingParams {
 }
 
 /// The terminal "nothing can serve this blob" error for [`probe_and_order`],
-/// naming the failure that actually happened (#1911). When every honest probe
-/// was unverifiable the cause is almost always local configuration, not missing
-/// content, so that case gets its own message; otherwise every candidate was
-/// simply unreachable. Reached only when there is neither a cache holder nor a
-/// reachable non-holder to pull through — a `has_blob:false` answer is a serve
-/// target, not a failure, so it never lands here.
+/// naming the failure that actually happened (#1911). A candidate leaves the
+/// selection loop three ways: it never answered (unreachable), it answered but
+/// its `slash_sig` did not recover (unverifiable), or it answered but was
+/// unusable — a `has_blob`/coverage mismatch that no honest responder produces.
+/// When any probe was unverifiable the cause is almost always local
+/// configuration rather than missing content, so that case gets its own message;
+/// otherwise the parenthetical accounts for the reachable-but-unanswered and the
+/// answered-but-unusable candidates separately. Reached only when there is
+/// neither a cache holder nor a reachable non-holder to pull through — a
+/// `has_blob:false` answer is a serve target, not a failure, so it never lands
+/// here.
 fn no_serve_target_error(
     probe_count: usize,
     unreachable: usize,
@@ -309,9 +314,13 @@ fn no_serve_target_error(
              the deployment these nodes registered against"
         );
     }
+    // With no unverifiable candidate, every non-unreachable one answered but was
+    // dropped as unusable (has_blob/coverage mismatch) — name both counts so the
+    // message never implies a silent, wholly-unreachable set when some replied.
+    let unusable = probe_count.saturating_sub(unreachable);
     anyhow::anyhow!(
-        "none of the {probe_count} probed node(s) were reachable to serve the blob \
-         ({unreachable} did not answer)"
+        "none of the {probe_count} probed node(s) could serve the blob \
+         ({unreachable} did not answer, {unusable} answered but were unusable)"
     )
 }
 
