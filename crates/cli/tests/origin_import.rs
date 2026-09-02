@@ -156,6 +156,95 @@ fn move_consumes_the_source_file() {
     assert!(data_object_path(origin.path(), &hex).is_file());
 }
 
+// Data-safety: with --move, a same-size but corrupt/foreign object already at
+// the target hash must NOT cause the source (the only correct copy) to be
+// deleted. The command re-verifies the present object's content and refuses.
+#[test]
+fn move_refuses_to_delete_source_when_present_object_is_corrupt() {
+    let src = TempDir::new().unwrap();
+    let origin = TempDir::new().unwrap();
+    let payload = vec![1u8; 20 * 1024];
+    let file = src.path().join("blob.bin");
+    fs::write(&file, &payload).unwrap();
+
+    // Plant a same-length but wrong-byte object at the content-addressed path.
+    let (_, hex) = hash_of(&payload);
+    let shard = origin.path().join(&hex[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    let mut corrupt = payload.clone();
+    corrupt[0] ^= 0xFF;
+    assert_eq!(corrupt.len(), payload.len());
+    fs::write(shard.join(&hex), &corrupt).unwrap();
+
+    let mut args = import_args(&file, origin.path());
+    args.move_source = true;
+    let err = rt().block_on(origin_import(&args)).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("do not match"),
+        "err was: {err:#}"
+    );
+    // The source is preserved and the corrupt object is untouched.
+    assert!(file.exists(), "source must not be deleted on a mismatch");
+    assert_eq!(fs::read(shard.join(&hex)).unwrap(), corrupt);
+}
+
+// With --move, a source whose content is already present AND verifies is safely
+// consumed (the store holds the correct bytes).
+#[test]
+fn move_consumes_source_when_present_object_verifies() {
+    let src = TempDir::new().unwrap();
+    let origin = TempDir::new().unwrap();
+    let payload = vec![2u8; 24 * 1024];
+
+    // Seed the origin by copy-importing one copy.
+    let first = src.path().join("first.bin");
+    fs::write(&first, &payload).unwrap();
+    rt().block_on(origin_import(&import_args(&first, origin.path())))
+        .unwrap();
+
+    // A second identical file, move-imported: the object is already present and
+    // verifies, so the redundant source is removed.
+    let second = src.path().join("second.bin");
+    fs::write(&second, &payload).unwrap();
+    let mut args = import_args(&second, origin.path());
+    args.move_source = true;
+    rt().block_on(origin_import(&args)).unwrap();
+    assert!(
+        !second.exists(),
+        "verified-present source should be consumed"
+    );
+}
+
+// A stale/foreign `.obao4` sibling left by a partial prior import is replaced on
+// re-import, not trusted — otherwise the node would reject range serving.
+#[test]
+fn stale_obao4_is_replaced() {
+    let origin = TempDir::new().unwrap();
+    let payload = vec![5u8; 48 * 1024];
+    let (_, hex) = hash_of(&payload);
+    let shard = origin.path().join(&hex[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    // Correct data object, but a garbage sibling outboard.
+    fs::write(shard.join(&hex), &payload).unwrap();
+    fs::write(shard.join(format!("{hex}.obao4")), b"stale-garbage").unwrap();
+
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("blob.bin");
+    fs::write(&file, &payload).unwrap();
+    rt().block_on(origin_import(&import_args(&file, origin.path())))
+        .unwrap();
+
+    let size = u64::try_from(payload.len()).unwrap();
+    let expected = decdn_bao_range::encode_outboard(payload.as_slice(), size)
+        .unwrap()
+        .outboard;
+    assert_eq!(
+        fs::read(shard.join(format!("{hex}.obao4"))).unwrap(),
+        expected,
+        "stale outboard must be replaced with the correct encoding"
+    );
+}
+
 #[test]
 fn directory_import_matches_bundle_create_and_imports_manifest() {
     let src = TempDir::new().unwrap();

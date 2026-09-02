@@ -22,7 +22,9 @@ use decdn_bao_range::{EncodedOutboard, encode_outboard};
 use decdn_common::cli::{OriginArgs, OriginCommand, OriginImportArgs};
 use serde::Serialize;
 
-use super::manifest::{build_excluder, serialize_canonical, walk_and_collect, write_bundle};
+use super::manifest::{
+    build_excluder, hash_file_at, serialize_canonical, walk_and_collect, write_bundle,
+};
 
 /// Dispatcher for `decdn origin ...`. Every subcommand is offline, config-free
 /// local work, so no `config_path` is threaded through.
@@ -251,7 +253,6 @@ fn import_one_file(
     std::fs::create_dir_all(&shard_dir)
         .map_err(|e| anyhow!("create shard dir {}: {e}", shard_dir.display()))?;
 
-    let mut source_consumed = false;
     if data_slot_needs_write(&data_path, size, force, &eo.hash_hex)? {
         if move_source {
             move_into_place(source, base, &data_path)?;
@@ -259,16 +260,27 @@ fn import_one_file(
             tmp.persist(&data_path)
                 .map_err(|e| anyhow!("persist data object {}: {}", data_path.display(), e.error))?;
         }
-        source_consumed = move_source;
-    }
-    // `--move` also consumes a source whose content was already present (the
-    // blob is in the store, so the redundant source is removed).
-    if move_source && !source_consumed {
+    } else if move_source {
+        // The object is already present (its size matched) and `--move` is about
+        // to delete the only other copy. A length match does NOT prove the store
+        // holds the right bytes — a same-size corrupt/foreign object at this hash
+        // would let us silently discard the source. Re-hash the present object
+        // and refuse to delete the source unless it verifies.
+        let (existing_hash, _) = hash_file_at(&data_path)
+            .map_err(|e| anyhow!("verify existing object {}: {e}", data_path.display()))?;
+        if existing_hash.to_hex().as_str() != eo.hash_hex.as_str() {
+            bail!(
+                "origin object {} already exists at {} but its bytes do not match \
+                 their hash; refusing to delete the moved source (pass --force to overwrite)",
+                eo.hash_hex,
+                data_path.display()
+            );
+        }
         std::fs::remove_file(source)
             .map_err(|e| anyhow!("remove moved source {}: {e}", source.display()))?;
     }
 
-    write_obao4_if_needed(&shard_dir, &obao4_path, &eo.outboard, force)?;
+    ensure_obao4(&shard_dir, &obao4_path, &eo.outboard)?;
 
     Ok(ImportedBlob {
         hash_hex: eo.hash_hex,
@@ -298,7 +310,7 @@ fn import_bytes(base: &Path, bytes: &[u8], force: bool) -> anyhow::Result<Import
             .map_err(|e| anyhow!("persist data object {}: {}", data_path.display(), e.error))?;
     }
 
-    write_obao4_if_needed(&shard_dir, &obao4_path, &eo.outboard, force)?;
+    ensure_obao4(&shard_dir, &obao4_path, &eo.outboard)?;
     Ok(ImportedBlob {
         hash_hex: eo.hash_hex,
         size,
@@ -343,19 +355,22 @@ fn data_slot_needs_write(
     }
 }
 
-/// Write the `{hex}.obao4` outboard sibling if it is missing (or `--force`).
-/// Completing an existing data object that lacks its sibling is intentional —
-/// the outboard is what lets the node serve verified ranges without the whole
-/// blob, so a data-only object gets its sibling filled in on re-import.
-fn write_obao4_if_needed(
-    shard_dir: &Path,
-    obao4_path: &Path,
-    outboard: &[u8],
-    force: bool,
-) -> anyhow::Result<()> {
-    let present = std::fs::metadata(obao4_path).is_ok();
-    if present && !force {
-        return Ok(());
+/// Ensure the `{hex}.obao4` outboard sibling holds exactly `outboard`. Writes it
+/// when missing, and replaces it when a present sibling's bytes differ — a stale
+/// or foreign outboard from a partial prior import must not be left in place,
+/// because the node rejects a mismatching `.obao4` and drops to whole-blob range
+/// serving. A byte-identical present sibling is left untouched, so a clean
+/// re-import stays a no-op. The outboard is small (~1/256 of the blob), so the
+/// read-and-compare is cheap.
+fn ensure_obao4(shard_dir: &Path, obao4_path: &Path, outboard: &[u8]) -> anyhow::Result<()> {
+    match std::fs::read(obao4_path) {
+        // Present and already correct — nothing to do.
+        Ok(existing) if existing == outboard => return Ok(()),
+        // Present but stale/foreign — fall through and replace atomically.
+        Ok(_) => {}
+        // Missing — fall through and write.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("read outboard {}: {e}", obao4_path.display())),
     }
     let mut tmp = tempfile::NamedTempFile::new_in(shard_dir)
         .map_err(|e| anyhow!("stage temp outboard in {}: {e}", shard_dir.display()))?;
