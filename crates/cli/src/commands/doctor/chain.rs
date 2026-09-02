@@ -11,7 +11,7 @@ use decdn_common::redact::sanitize_err_chain;
 use super::{Finding, Report, Severity};
 
 /// Compare the configured chain id against the one the RPC reports.
-pub fn classify_chain_id(configured: u64, onchain: u64) -> Finding {
+pub(crate) fn classify_chain_id(configured: u64, onchain: u64) -> Finding {
     let ok = configured == onchain;
     Finding {
         group: "Chain",
@@ -36,7 +36,7 @@ pub fn classify_chain_id(configured: u64, onchain: u64) -> Finding {
 
 /// Classify a contract-code read: nonzero code length means the contract is
 /// deployed at `address`.
-pub fn classify_code(name: &str, address: &str, code_len: usize) -> Finding {
+pub(crate) fn classify_code(name: &str, address: &str, code_len: usize) -> Finding {
     let ok = code_len > 0;
     Finding {
         group: "Chain",
@@ -61,7 +61,7 @@ pub fn classify_code(name: &str, address: &str, code_len: usize) -> Finding {
 /// Dial the RPC and push chain-group findings. All calls are wrapped in
 /// `timeout_ms`; an unreachable RPC is a single `Fail` and code checks are
 /// skipped.
-pub async fn check_chain(report: &mut Report, cfg: &ResolvedConfig, timeout_ms: u64) {
+pub(crate) async fn check_chain(report: &mut Report, cfg: &ResolvedConfig, timeout_ms: u64) {
     let dur = Duration::from_millis(timeout_ms);
     let url = match cfg.blockchain.rpc_url.parse() {
         Ok(u) => u,

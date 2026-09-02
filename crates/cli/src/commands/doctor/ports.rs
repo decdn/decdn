@@ -11,7 +11,7 @@ use super::{Finding, Report, Severity};
 
 /// Classify a bind attempt on `port`: `AddrInUse` while the daemon is
 /// running is expected, not a fault.
-pub fn classify_bind(
+pub(crate) fn classify_bind(
     label: &str,
     port: u16,
     result: Result<(), ErrorKind>,
@@ -67,7 +67,7 @@ fn try_udp(port: u16) -> Result<(), ErrorKind> {
 
 /// Push bindability findings for the QUIC, metrics, and (if configured)
 /// admin ports.
-pub fn check_ports(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bool) {
+pub(crate) fn check_ports(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bool) {
     report.push(classify_bind(
         "quic bind",
         cfg.network.bind_port,

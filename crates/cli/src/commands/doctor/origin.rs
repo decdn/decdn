@@ -12,7 +12,7 @@ use decdn_common::redact::{redact_userinfo, sanitize_rpc_display};
 use super::{Finding, Report, Severity};
 
 /// Evaluate one filesystem origin: it must exist and be a directory.
-pub fn evaluate_fs_origin(index: usize, path: &Path, exists: bool, is_dir: bool) -> Finding {
+pub(crate) fn evaluate_fs_origin(index: usize, path: &Path, exists: bool, is_dir: bool) -> Finding {
     let ok = exists && is_dir;
     Finding {
         group: "Origins",
@@ -35,7 +35,7 @@ pub fn evaluate_fs_origin(index: usize, path: &Path, exists: bool, is_dir: bool)
 /// Probe every configured origin backend and push one finding per origin.
 /// A node with no origin configured (a pure relay/edge node) is not an
 /// error — that gets a single `Pass`.
-pub async fn check_origins(report: &mut Report, cfg: &ResolvedConfig, timeout_ms: u64) {
+pub(crate) async fn check_origins(report: &mut Report, cfg: &ResolvedConfig, timeout_ms: u64) {
     if cfg.cache.origins.is_empty() {
         report.push(Finding {
             group: "Origins",

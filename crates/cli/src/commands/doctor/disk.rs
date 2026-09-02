@@ -13,16 +13,16 @@ use super::{Finding, Report, Severity};
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
 /// Total and unprivileged-available bytes at a path.
-pub struct DiskSpace {
+pub(crate) struct DiskSpace {
     /// Total filesystem capacity, in bytes.
-    pub total: u64,
+    pub(crate) total: u64,
     /// Bytes available to an unprivileged user, in bytes.
-    pub avail: u64,
+    pub(crate) avail: u64,
 }
 
 /// Read filesystem capacity at `path` via `statvfs`. Bytes = fragment size ×
 /// block counts (`f_frsize × f_blocks`, `f_frsize × f_bavail`).
-pub fn read_disk_space(path: &Path) -> anyhow::Result<DiskSpace> {
+pub(crate) fn read_disk_space(path: &Path) -> anyhow::Result<DiskSpace> {
     let stat = nix::sys::statvfs::statvfs(path)
         .map_err(|e| anyhow::anyhow!("statvfs({}) failed: {e}", path.display()))?;
     let frsize = stat.fragment_size();
@@ -48,7 +48,7 @@ fn gib(bytes: u64) -> f64 {
 /// Pure budget-vs-disk evaluation. `current_footprint` is the live
 /// `decdn_cache_bytes` when known, else 0. `reachable = fs_avail +
 /// current_footprint` is the space the cache could grow into.
-pub fn evaluate_disk(
+pub(crate) fn evaluate_disk(
     budget_bytes: u64,
     high_water_pct: u64,
     fs_total: u64,
@@ -119,7 +119,7 @@ pub fn evaluate_disk(
 }
 
 /// Push all disk-group findings.
-pub fn check_disk(report: &mut Report, cfg: &ResolvedConfig, live_footprint: Option<u64>) {
+pub(crate) fn check_disk(report: &mut Report, cfg: &ResolvedConfig, live_footprint: Option<u64>) {
     let cache_dir = &cfg.cache.cache_dir;
     let budget = cfg.cache.cache_size_mb.saturating_mul(BYTES_PER_MB);
 

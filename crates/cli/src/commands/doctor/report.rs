@@ -8,7 +8,7 @@ use super::{Report, Severity};
 /// object; otherwise a grouped human checklist. `strict` is the same flag
 /// `run()` uses to decide the process exit code — the JSON `ok` field
 /// mirrors that effective success condition; the human path ignores it.
-pub fn render<W: std::io::Write>(
+pub(crate) fn render<W: std::io::Write>(
     w: &mut W,
     report: &Report,
     json: bool,

@@ -8,19 +8,19 @@ use decdn_common::config::{RECEIPT_LOG_FILE, ResolvedConfig};
 use super::{Finding, Report, Severity};
 
 /// Metadata facts about a file, gathered by I/O and evaluated purely.
-pub struct FileFacts {
+pub(crate) struct FileFacts {
     /// True when a filesystem entry exists at the path.
-    pub exists: bool,
+    pub(crate) exists: bool,
     /// True when the entry exists and is a regular file.
-    pub is_file: bool,
+    pub(crate) is_file: bool,
     /// Entry length in bytes, or 0 when it does not exist.
-    pub len: u64,
+    pub(crate) len: u64,
     /// Unix permission bits (`st_mode & 0o777`), or `None` on non-Unix.
-    pub mode: Option<u32>,
+    pub(crate) mode: Option<u32>,
     /// `Some(kind)` when `symlink_metadata` failed for a reason other than
     /// the entry being absent (e.g. a permission error); `None` when the
     /// entry does not exist or was read cleanly.
-    pub stat_error: Option<std::io::ErrorKind>,
+    pub(crate) stat_error: Option<std::io::ErrorKind>,
 }
 
 impl FileFacts {
@@ -65,7 +65,7 @@ impl FileFacts {
 /// non-`NotFound` stat error (e.g. permission denied) is reported as a
 /// `Warn` rather than treated as absent, since that would otherwise mask
 /// a real access problem behind a clean `Pass`.
-pub fn evaluate_secret(facts: &FileFacts, path: &Path) -> Finding {
+pub(crate) fn evaluate_secret(facts: &FileFacts, path: &Path) -> Finding {
     let base = |severity, title: String, remediation| Finding {
         group: "State",
         id: "state.node_secret",
@@ -131,7 +131,7 @@ pub fn evaluate_secret(facts: &FileFacts, path: &Path) -> Finding {
 /// re-derive the invariant. Absent is a `Warn` (not a `Fail`) because not
 /// every deployment signs on-chain from this node, and the file could have
 /// been removed between config resolution and this check.
-pub fn evaluate_keystore(facts: &FileFacts, path: &Path) -> Finding {
+pub(crate) fn evaluate_keystore(facts: &FileFacts, path: &Path) -> Finding {
     if let Some(kind) = facts.stat_error {
         return Finding {
             group: "State",
@@ -174,7 +174,7 @@ pub fn evaluate_keystore(facts: &FileFacts, path: &Path) -> Finding {
 /// Evaluate one redb store: presence + `0o600` + non-zero-length tripwire.
 /// Deeper open integrity is deferred to the daemon-side doctor (the store is
 /// locked while the daemon runs).
-pub fn evaluate_redb(name: &str, facts: &FileFacts, path: &Path) -> Finding {
+pub(crate) fn evaluate_redb(name: &str, facts: &FileFacts, path: &Path) -> Finding {
     if let Some(kind) = facts.stat_error {
         return Finding {
             group: "State",
@@ -227,7 +227,7 @@ pub fn evaluate_redb(name: &str, facts: &FileFacts, path: &Path) -> Finding {
 }
 
 /// Evaluate the receipt log: presence is optional before the first receipt.
-pub fn evaluate_receipts(facts: &FileFacts, path: &Path) -> Finding {
+pub(crate) fn evaluate_receipts(facts: &FileFacts, path: &Path) -> Finding {
     if let Some(kind) = facts.stat_error {
         return Finding {
             group: "State",
@@ -269,7 +269,7 @@ pub fn evaluate_receipts(facts: &FileFacts, path: &Path) -> Finding {
 }
 
 /// Push all state-group findings.
-pub fn check_state(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bool) {
+pub(crate) fn check_state(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bool) {
     const REDB: &[&str] = &[
         "lanes.redb",
         "settle.redb",

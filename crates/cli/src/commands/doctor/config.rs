@@ -9,7 +9,7 @@ use super::{Finding, Report, Severity};
 /// Resolve config exactly as the daemon would. On success push a `Pass` and
 /// return the resolved config for the other groups; on failure push a `Fail`
 /// carrying the aggregated error text and return `None`.
-pub fn check_config(
+pub(crate) fn check_config(
     report: &mut Report,
     args: &decdn_common::cli::DoctorArgs,
     global_config: Option<&Path>,

@@ -11,11 +11,11 @@ use jsonrpsee::http_client::HttpClientBuilder;
 use super::{Finding, Report, Severity};
 
 /// What the live probe learned, threaded back into other groups.
-pub struct LiveInfo {
+pub(crate) struct LiveInfo {
     /// True when a running daemon answered the admin RPC health check.
-    pub daemon_running: bool,
+    pub(crate) daemon_running: bool,
     /// The daemon's reported `decdn_cache_bytes` gauge, when scraped.
-    pub cache_bytes: Option<u64>,
+    pub(crate) cache_bytes: Option<u64>,
 }
 
 /// Extract the `decdn_cache_bytes` gauge value from Prometheus text. Matches
@@ -23,7 +23,7 @@ pub struct LiveInfo {
 /// `decdn_cache_bytes_returned_total` are skipped), tolerates a `{...}`
 /// label block, and takes the first whitespace-separated token after the
 /// name/labels as the value (so a trailing sample timestamp is ignored).
-pub fn parse_cache_bytes(metrics_body: &str) -> Option<u64> {
+pub(crate) fn parse_cache_bytes(metrics_body: &str) -> Option<u64> {
     metrics_body.lines().find_map(|line| {
         let line = line.trim_start();
         if line.starts_with('#') {
@@ -60,7 +60,7 @@ pub fn parse_cache_bytes(metrics_body: &str) -> Option<u64> {
 /// Probe the admin RPC and metrics endpoints for a live daemon. Best-effort:
 /// an unreachable admin server is reported as a `Pass` ("offline diagnosis"),
 /// not a failure — the config/disk/state groups still stand on their own.
-pub async fn probe_live(
+pub(crate) async fn probe_live(
     report: &mut Report,
     cfg: &ResolvedConfig,
     args: &decdn_common::cli::DoctorArgs,
