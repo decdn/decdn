@@ -10570,8 +10570,9 @@ enum StopThenSignal {
     /// A clean `StreamEnd` over the whole delivered blob — the completion race a
     /// node hits when it finishes and drops `recv`.
     End,
-    /// A mid-stream `StreamError::VoucherRejected` — the exhaustion shape the node
-    /// answers a spent pool with, whose reset otherwise masks the typed reason.
+    /// A `StreamError::VoucherRejected` in place of a clean end — the typed
+    /// rejection the node answers a spent pool with, whose reset otherwise masks
+    /// the reason as an opaque write failure.
     Reject(VoucherRejectReason),
 }
 
@@ -10733,13 +10734,18 @@ async fn client_completes_when_its_send_is_stopped_before_the_closing_voucher() 
     Ok(())
 }
 
-/// A buyer whose send half is stopped mid-stream surfaces the node's typed
-/// `StreamError` — not an opaque write failure. The exhaustion path keys on
-/// [`UpstreamVoucherRejected`]; a raw reset that masks it as "write failed" bypasses
-/// the reactive top-up entirely.
+/// A buyer whose closing-voucher write is stopped surfaces the node's typed
+/// `StreamError` — not an opaque write failure. When a node rejects a payer (a
+/// spent pool) it writes `VoucherRejected` and resets; the reset otherwise masks
+/// the typed reason as "write failed", and the exhaustion / reactive-top-up path
+/// keys on [`UpstreamVoucherRejected`]. Under one chunk, so the only voucher is the
+/// closing one — the same end-of-stream write the sibling test covers, with a
+/// rejection terminal in place of a clean `StreamEnd`. (The recovery reads exactly
+/// one terminal message, so the failing write must be the one the terminal follows;
+/// a true mid-delivery reveal failure exercises the identical recovery path.)
 #[tokio::test(flavor = "multi_thread")]
-async fn client_surfaces_typed_rejection_when_its_send_is_stopped_mid_stream() -> anyhow::Result<()>
-{
+async fn client_surfaces_typed_rejection_when_its_send_is_stopped_before_the_closing_voucher()
+-> anyhow::Result<()> {
     let payload = vec![0x5Bu8; 256 * 1024];
     let hash = Hash::new(&payload);
     let wire = honest_bao_wire(&payload)?;
@@ -10778,7 +10784,7 @@ async fn client_surfaces_typed_rejection_when_its_send_is_stopped_mid_stream() -
     )
     .await
     .err()
-    .ok_or_else(|| anyhow::anyhow!("a mid-stream rejection must fail the fetch"))?;
+    .ok_or_else(|| anyhow::anyhow!("a rejected fetch must fail"))?;
     anyhow::ensure!(
         err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
         "the fetch must surface the typed UpstreamVoucherRejected, got: {err:#}"
