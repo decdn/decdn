@@ -29,8 +29,10 @@ use positioned_io::ReadAt;
 
 #[cfg(feature = "test-util")]
 pub mod conformance;
+pub mod origin_seed;
 pub mod ranged_store;
 pub mod streaming;
+pub use origin_seed::{EncodedOutboard, OBAO4_SUFFIX, encode_outboard, shard_prefix};
 pub use ranged_store::{RangedFuture, RangedStore, RangedStoreError};
 
 /// `iroh-blobs`' canonical on-disk block size (16 KiB chunk groups,

@@ -54,6 +54,9 @@ async fn run() -> anyhow::Result<()> {
         Command::Bundle(args) => {
             commands::bundle::bundle_dispatch(&args, config_path.as_deref()).await
         }
+        // `origin` is offline, config-free local filesystem work — it never
+        // reads the node config, so `config_path` is intentionally not passed.
+        Command::Origin(args) => commands::origin::origin_dispatch(&args).await,
         Command::Pool(args) => commands::pool::pool_dispatch(&args, config_path.as_deref()).await,
         Command::Publish(args) => {
             commands::publish::publish_dispatch(&args, config_path.as_deref()).await

@@ -23,11 +23,13 @@ use tokio_util::io::ReaderStream;
 use super::{Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
 use crate::error::OriginPullError;
 
-/// Sibling-key suffix for the published pre-order bao outboard
-/// (`{H}.obao4`), per [ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md).
-/// Shared spelling across the filesystem / HTTP / S3 adapters so an operator
-/// `aws s3 sync`-ing between backends keeps the same object names.
-pub(super) const OBAO4_SUFFIX: &str = ".obao4";
+/// Sibling-key suffix for the published pre-order bao outboard (`{H}.obao4`),
+/// per [ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md).
+/// Re-exported from [`decdn_bao_range`] — the shared layout contract every
+/// origin reader (filesystem / S3) and the `decdn origin import` writer derive
+/// the sibling key from, so an operator `aws s3 sync`-ing between backends keeps
+/// the same object names.
+pub(super) use decdn_bao_range::OBAO4_SUFFIX;
 
 /// Origin backed by a local filesystem directory. Blobs live at
 /// `{base}/{hex[0..2]}/{hex}`; the engine is responsible for BLAKE3
