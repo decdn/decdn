@@ -6,6 +6,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+mod config;
 mod report;
 
 /// A single diagnostic outcome. Every `Warn`/`Fail` carries a one-line
@@ -83,10 +84,14 @@ impl std::error::Error for DoctorFailed {}
 // awaits inside this body.
 pub async fn run(
     args: &decdn_common::cli::DoctorArgs,
-    _global_config: Option<&Path>,
+    global_config: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let report = Report::default();
-    // Later tasks populate `report` here.
+    let mut report = Report::default();
+    let resolved = config::check_config(&mut report, args, global_config);
+    // Config-dependent groups run only when resolve succeeded (Tasks 4-9).
+    if let Some(_resolved) = &resolved {
+        // filled in by later tasks
+    }
 
     let mut stdout = std::io::stdout().lock();
     report::render(&mut stdout, &report, args.json)
