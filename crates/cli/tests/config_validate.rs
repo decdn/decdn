@@ -798,3 +798,55 @@ fn summary_omits_the_notices_block_when_there_are_none() -> anyhow::Result<()> {
     anyhow::ensure!(!out.contains("notices"), "{out}");
     Ok(())
 }
+
+/// The wiring, through the real binary: `config_validate` resolves, takes the
+/// notices the resolvers recorded, and passes them to the summary writer. The
+/// tests above build `ConfigNotice` values by hand and prove the *formatter*;
+/// only a subprocess run proves the resolver's notices reach it at all.
+#[test]
+fn config_validate_renders_the_notices_the_resolver_recorded() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let cfg = dir.path().join("node.toml");
+    // `0` resolves fine and records a `Warn` notice — so the run must still
+    // report `config valid` and exit 0, with the notice underneath it.
+    fs::write(
+        &cfg,
+        format!("{MINIMAL_VALID_CONFIG}\n[security]\nmax_tracked_sources = 0\n"),
+    )?;
+    fs::write(dir.path().join("keystore.json"), "")?;
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_decdn"))
+        .args([
+            "--config",
+            cfg.to_str().unwrap_or_default(),
+            "config",
+            "validate",
+            "--data-dir",
+            dir.path().to_str().unwrap_or_default(),
+        ])
+        .output()?;
+
+    let stdout = String::from_utf8(out.stdout)?;
+    anyhow::ensure!(out.status.success(), "a notice must not fail validation");
+    anyhow::ensure!(stdout.starts_with("config valid"), "{stdout}");
+    anyhow::ensure!(stdout.contains("notices (1):"), "{stdout}");
+    anyhow::ensure!(
+        stdout.contains("- warning: security.max_tracked_sources: 0: rate-limit bookkeeping"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+/// Resolvable fixture for the subprocess run above. Mirrors the shape
+/// `doctor_cli.rs` uses against the same resolver.
+const MINIMAL_VALID_CONFIG: &str = r#"
+[blockchain]
+rpc_url = "http://127.0.0.1:8545"
+payment_pool_address = "0x0000000000000000000000000000000000000001"
+capacity_bond_address = "0x0000000000000000000000000000000000000002"
+slash_judge_address = "0x0000000000000000000000000000000000000003"
+content_blacklist_address = "0x0000000000000000000000000000000000000004"
+
+[cache]
+cache_size_mb = 1024
+"#;

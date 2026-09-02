@@ -38,17 +38,27 @@ pub(crate) const IDENTITY_DATA_DIR: &str = "identity.data_dir";
 
 /// How loud a [`ConfigNotice`] is.
 ///
-/// The split is the operator's, not the resolver's: `Warn` marks a value that
-/// weakens a safety property (an unbounded map, a collapsed failover list),
-/// `Info` marks a deliberate opt-out that is working as configured (a rate
-/// limit switched off). A consumer that gates an exit status or an alert on
-/// severity keys off this rather than parsing the message.
+/// The split is about what a consumer does with it, not about how the resolver
+/// feels: `Warn` is what an operator alerts on and what moves
+/// `decdn node doctor --strict` off zero, `Info` is visible but never changes
+/// an exit status. A consumer keys off this rather than parsing the message.
+///
+/// As a guide, `Warn` fits a value that weakens a safety property (an
+/// unbounded bookkeeping map, a collapsed failover list) or a setting that is
+/// inert and needs removing (a retired environment variable). `Info` fits a
+/// deliberate opt-out working exactly as configured, where paging someone
+/// would only teach them to ignore the channel.
+///
+/// Variants are declared in ascending severity. Deliberately no `Ord`: a
+/// consumer matches exhaustively, so a future variant inserted by topic cannot
+/// silently flip a comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigNoticeLevel {
     /// A deliberate, documented opt-out. Nothing is wrong.
     Info,
-    /// The configured value weakens a safety property. Resolution still
-    /// succeeds — the operator asked for it — but it warrants attention.
+    /// The value warrants attention: it weakens a safety property, or it is
+    /// inert and should be removed. Resolution still succeeds — the operator
+    /// asked for it.
     Warn,
 }
 
@@ -63,8 +73,8 @@ pub enum ConfigNoticeLevel {
 /// and must unset. A consumer that filters on `field` — the JSON log stream,
 /// a `doctor` finding — must not assume a dotted shape.
 ///
-/// Either way `field` is rendered as a structured value rather than embedded
-/// in prose, so the message does not repeat the label.
+/// Either way `field` is kept out of the message text, so a consumer can
+/// render or filter on it independently of what it says.
 #[derive(Debug, Clone)]
 pub struct ConfigNotice {
     /// How loud this notice is.
@@ -159,9 +169,11 @@ impl ConfigDiagnostics {
 
     /// Take every notice recorded so far, leaving the bag's notice list empty.
     ///
-    /// Separate from [`into_result`](Self::into_result) — which consumes the
-    /// bag — because the caller needs the notices whether resolution succeeded
-    /// or not, and must drain them before collapsing the problems.
+    /// Separate from [`into_result`](Self::into_result) because that method
+    /// consumes the bag: notices have to come out before the problems are
+    /// collapsed. Whether a caller then renders them is its own policy — both
+    /// callers today discard them on their failure path, since notices about a
+    /// config that was never applied describe nothing the node is running.
     pub fn take_notices(&mut self) -> Vec<ConfigNotice> {
         std::mem::take(&mut self.notices)
     }
@@ -266,17 +278,18 @@ impl ConfigDiagnostics {
     }
 }
 
-/// Wraps a section `*_into` worker so a single-section caller (a
-/// `runtime::reload` path or a `#[cfg(test)]` shim) gets back an
-/// `anyhow::Result<T>`.
-/// Cross-section aggregation lives in `resolve_config`, which runs the
-/// workers against one shared bag instead.
+/// Wraps a section `*_into` worker so a single-section caller gets back an
+/// `anyhow::Result<T>`. Cross-section aggregation lives in `resolve_config`,
+/// which runs the workers against one shared bag instead.
 ///
-/// Notices are dropped: every caller of this wrapper is a `#[cfg(test)]` shim
-/// or an internal shape check, none of which is the operator-facing path a
-/// notice exists for. The two paths that do render notices —
-/// `resolve_config` and `runtime::reload` — drive the workers against their
-/// own bag and drain it with [`ConfigDiagnostics::take_notices`].
+/// **Notices recorded by the wrapped worker are discarded**, so do not route
+/// an operator-facing resolve through this. The two paths that render notices
+/// — `resolve_config` and `RuntimeReloadState::reload` — drive the workers
+/// against their own bag and drain it with
+/// [`ConfigDiagnostics::take_notices`]. Every wrapper built on this is
+/// therefore `#[cfg(test)]`, except `resolve_discovery`, whose worker records
+/// no notices; a worker that grows one needs its caller moved off this
+/// wrapper, not a second sink here.
 pub(crate) fn one_section<T>(f: impl FnOnce(&mut ConfigDiagnostics) -> T) -> anyhow::Result<T> {
     let mut bag = ConfigDiagnostics::new();
     let value = f(&mut bag);

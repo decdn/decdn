@@ -503,14 +503,18 @@ const RETIRED_ENV_VARS: &[(&str, &str)] = &[(
 /// orchestrator the operator does not directly control, and refusing to boot
 /// over one would be a worse failure than the silent ignore it replaces.
 ///
-/// Notices go on the bag rather than straight to a sink, because neither sink
-/// is available here: `resolve_config` runs *before* `init_tracing` in the
-/// daemon (`decdn-node`'s `commands::run`), so a `tracing::warn!` at this point
-/// has no global subscriber and is discarded, and `decdn` (the CLI, which
-/// reaches this via `config validate` and `node doctor`) does not depend on
-/// `tracing` at all. The caller renders them once it knows which sink it has.
+/// Notices go on the bag rather than straight to a sink. stderr is reachable
+/// here but is not the operator's structured log stream, and `tracing` is not
+/// an option either: `resolve_config` runs *before* `init_tracing` in the
+/// daemon (`decdn-node`'s `commands::run`), so an event at this point has no
+/// global subscriber and is discarded, while `decdn` (the CLI, which reaches
+/// this via `config validate` and `node doctor`) does not depend on `tracing`
+/// at all. Only the caller knows which sink it owns, so only the caller can
+/// render.
 ///
-/// Returns the names it recorded so callers (and tests) can assert on them.
+/// Returns the names it recorded. The notice on the bag is what reaches an
+/// operator; the return value exists for the unit test, which needs to tell
+/// "the loop ran and matched nothing" from "the loop never ran".
 fn warn_retired_env_vars(bag: &mut ConfigDiagnostics) -> Vec<&'static str> {
     warn_retired_env_vars_with(|name| std::env::var_os(name).is_some(), bag)
 }
@@ -551,7 +555,8 @@ fn warn_retired_env_vars_with(
 /// renders them: the daemon replays them through `tracing` once `init_tracing`
 /// has installed a subscriber, `decdn config validate` prints them in its
 /// summary, and `decdn node doctor` turns them into findings. Nothing here
-/// writes to a sink, because at this point neither sink exists.
+/// writes to a sink: no subscriber exists yet in the daemon, the CLI links
+/// none at all, and stderr is not the stream an operator is reading.
 ///
 /// # Errors
 ///
@@ -964,7 +969,7 @@ fn resolve_network_into(
 /// Fails if any configured discovery field is malformed (same shape checks the
 /// full `resolve_config` pass applies to this section).
 pub fn resolve_discovery(file: &FileConfig) -> anyhow::Result<ResolvedDiscovery> {
-    errors::one_section(|bag| resolve_discovery_into(file.network.as_ref(), bag))
+    one_section(|bag| resolve_discovery_into(file.network.as_ref(), bag))
 }
 
 /// Resolve and shape-validate `[network.discovery]` (#818 scope 1), recording
@@ -2186,10 +2191,10 @@ fn resolve_cache_into(
 /// load surfaces the mistake before the first cache miss instead of
 /// silently degrading to `NoOrigin`.
 ///
-/// Duplicate entries (same kind + identity key) are permitted with a
-/// `tracing::warn!` log. Two HTTP origins pointing at the same URL is
-/// legitimate for connection-pool sharding, but is more often a
-/// copy-paste mistake worth flagging in the startup log.
+/// Duplicate entries (same kind + identity key) are permitted, with a
+/// [`ConfigNotice`] recorded per duplicate. Two HTTP origins pointing at the
+/// same URL is legitimate for connection-pool sharding, but is more often a
+/// copy-paste mistake worth putting in front of the operator.
 fn resolve_origins_into(
     file: Option<&types::CacheConfig>,
     bag: &mut ConfigDiagnostics,
@@ -2238,7 +2243,7 @@ fn resolve_origins_into(
                     resolved.push(o);
                 }
             }
-            warn_on_duplicate_origins(&resolved);
+            warn_on_duplicate_origins(&resolved, bag);
             resolved
         }
         (None, None) => Vec::new(),
@@ -2277,19 +2282,22 @@ fn origin_identity_key(origin: &crate::config::ResolvedOrigin) -> String {
 /// twice as often" puzzle. Not an error: ordering still determines
 /// fallback behaviour, and the engine handles duplicate backends
 /// without misbehaviour.
-fn warn_on_duplicate_origins(origins: &[crate::config::ResolvedOrigin]) {
+fn warn_on_duplicate_origins(
+    origins: &[crate::config::ResolvedOrigin],
+    bag: &mut ConfigDiagnostics,
+) {
     let mut seen: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(origins.len());
     for (idx, origin) in origins.iter().enumerate() {
         let key = origin_identity_key(origin);
         if !seen.insert(key.clone()) {
-            tracing::warn!(
-                origin_index = idx,
-                identity = %key,
-                "cache.origins[{idx}] duplicates an earlier entry — \
-                 the cache engine will dispatch the same backend twice \
-                 in the fallback chain (intentional for connection-pool \
-                 sharding, otherwise a likely copy-paste mistake)",
+            bag.warn(
+                format!("cache.origins[{idx}]"),
+                format!(
+                    "{key} duplicates an earlier entry — the cache engine will dispatch the \
+                     same backend twice in the fallback chain (intentional for connection-pool \
+                     sharding, otherwise a likely copy-paste mistake)"
+                ),
             );
         }
     }
@@ -2765,6 +2773,7 @@ fn resolve_content_into(
 /// honest client decoder rejects — fail at startup rather than silently
 /// emit unparseable wire traffic. The bound is also a defense-in-depth
 /// against the selection-score overflow path (issue #322).
+#[cfg(test)]
 pub fn resolve_payment(
     cli: &crate::cli::run::PaymentArgs,
     file: Option<&types::PaymentConfig>,
@@ -2772,7 +2781,7 @@ pub fn resolve_payment(
     one_section(|bag| resolve_payment_into(cli, file, bag))
 }
 
-/// Bag-threading variant of [`resolve_payment`]. Used by both
+/// Bag-threading variant of the test-only `resolve_payment` shim. Used by both
 /// [`resolve_config`] (single bag across every section at startup) and the
 /// SIGHUP hot-reload path in `runtime::reload` (single bag across every
 /// reloadable section), so an operator sees every problem in one error
@@ -2899,6 +2908,7 @@ pub fn resolve_payment_into(
 /// config. Cross-port collision checks (bind/metrics/admin) live in
 /// `validate_port_layout`, which sees all three sections at once — see
 /// there for the full ruleset.
+#[cfg(test)]
 pub fn resolve_observability(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
@@ -2906,7 +2916,7 @@ pub fn resolve_observability(
     one_section(|bag| resolve_observability_into(cli, file, bag))
 }
 
-/// Bag-threading variant of [`resolve_observability`]. Shares a bag with
+/// Bag-threading variant of the test-only `resolve_observability` shim. Shares a bag with
 /// other sections during startup ([`resolve_config`]) and SIGHUP reload
 /// (`runtime::reload`); see [`resolve_payment_into`] for the rationale.
 pub fn resolve_observability_into(
@@ -3044,11 +3054,12 @@ fn resolve_receipts_into(
 // triple; splitting them out would scatter the field-pair invariants
 // (rate/burst coupling) across helpers that have to take both arguments
 // anyway. Keep it linear.
+#[cfg(test)]
 pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<ResolvedSecurity> {
     one_section(|bag| resolve_security_into(file, bag))
 }
 
-/// Bag-threading variant of [`resolve_security`]. Shares a bag with other
+/// Bag-threading variant of the test-only `resolve_security` shim. Shares a bag with other
 /// sections during startup ([`resolve_config`]) and SIGHUP reload
 /// (`runtime::reload`); see [`resolve_payment_into`] for the rationale.
 #[allow(clippy::cognitive_complexity)]
@@ -3128,11 +3139,12 @@ pub fn resolve_security_into(
 }
 
 /// Resolve node-local load-shedding thresholds.
+#[cfg(test)]
 pub fn resolve_load_shed(file: Option<&types::LoadShedConfig>) -> anyhow::Result<ResolvedLoadShed> {
     one_section(|bag| resolve_load_shed_into(file, bag))
 }
 
-/// Bag-threading variant of [`resolve_load_shed`]. Shares a bag with other
+/// Bag-threading variant of the test-only `resolve_load_shed` shim. Shares a bag with other
 /// sections during startup ([`resolve_config`]) and SIGHUP reload
 /// (`runtime::reload`); see [`resolve_payment_into`] for the rationale.
 pub fn resolve_load_shed_into(
@@ -5128,14 +5140,11 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_accepts_duplicate_origins_without_erroring() -> anyhow::Result<()> {
-        // Duplicate entries are logged as `tracing::warn!` but must
-        // not fail config resolution — operators legitimately use
-        // duplicates for connection-pool sharding. Pinning the
-        // non-erroring contract here protects against a future PR
-        // promoting the warning to a hard error. (Tracing-event
-        // capture isn't asserted; that would require a new dev-dep
-        // for a single assertion. Code review of
-        // `warn_on_duplicate_origins` covers the log emission.)
+        // A duplicate records a notice but must not fail config
+        // resolution — operators legitimately use duplicates for
+        // connection-pool sharding. Pinning the non-erroring contract
+        // here protects against a future PR promoting the notice to a
+        // hard error.
         let cli = empty_cache_args();
         let toml = types::CacheConfig {
             origins: Some(vec![
@@ -5150,10 +5159,25 @@ swap_pool_address = \"0xPool\"
             ]),
             ..Default::default()
         };
-        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        let mut bag = ConfigDiagnostics::new();
+        let resolved = resolve_cache_into(&cli, Some(&toml), Path::new("/tmp"), &mut bag);
+        let notices = bag.take_notices();
+        bag.into_result()?;
         anyhow::ensure!(
             resolved.origins.len() == 2,
             "duplicate origins must both survive into the resolved vec"
+        );
+        let notice = notices.first().ok_or_else(|| {
+            anyhow::anyhow!("the duplicate must reach the operator, not just the resolved vec")
+        })?;
+        anyhow::ensure!(notices.len() == 1, "one notice per duplicate: {notices:?}");
+        // Indexed at the *second* entry: the operator needs to know which
+        // line to delete, and the first occurrence is the one to keep.
+        anyhow::ensure!(notice.field == "cache.origins[1]", "{notice:?}");
+        anyhow::ensure!(notice.level == ConfigNoticeLevel::Warn, "{notice:?}");
+        anyhow::ensure!(
+            notice.message.contains("duplicates an earlier entry"),
+            "{notice:?}"
         );
         Ok(())
     }
@@ -5292,9 +5316,9 @@ swap_pool_address = \"0xPool\"
     /// The regression this guard exists for: the first implementation used
     /// `tracing::warn!`, which `resolve_config` reaches *before* `init_tracing`
     /// installs a subscriber — so it compiled, passed CI, and emitted nothing.
-    /// Asserting the returned names is what makes "it actually fired" testable
-    /// without a subscriber; the recorded notice is a side effect of the same
-    /// call, and is asserted alongside it.
+    /// The recorded notice is what reaches an operator, so it carries the bulk
+    /// of the assertions; the returned names are what separate "the loop ran
+    /// and matched nothing" from "the loop never ran".
     #[test]
     fn retired_env_var_that_is_set_is_actually_reported() {
         let mut bag = ConfigDiagnostics::new();
@@ -7501,7 +7525,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn validate_port_layout_allows_well_known_port() -> anyhow::Result<()> {
-        // Well-known range only warns (via eprintln), never hard-fails —
+        // Well-known range only records a notice, never hard-fails —
         // operators have legitimate reasons to bind there (QUIC on 443,
         // privileged setup scripts, CAP_NET_BIND_SERVICE).
         validate_port_layout(&net(443), &obs(9090))?;
@@ -11122,19 +11146,29 @@ bind_port = 12345
     // -----------------------------------------------------------------
     // Resolve-time notices
     //
-    // Every notice below was previously an `eprintln!` that nothing could
-    // observe: the resolvers ran before a subscriber existed, so the only
-    // assertion available was that the value resolved. Recording notices on
-    // the bag is what makes "the operator was actually told" testable, and
-    // these are the guards that keep a future refactor from dropping one
-    // silently the way `tracing::warn!` once did.
+    // A resolver runs before any subscriber exists, so the bag is the only
+    // place a notice is observable — which is what makes "the operator was
+    // actually told" assertable at all rather than leaving the value itself
+    // as the only thing a test can check. These are the guards that keep a
+    // refactor from dropping one.
     // -----------------------------------------------------------------
 
     /// Run a bag-threading resolver and hand back only what it recorded.
+    /// Also asserts the resolver recorded no *problem*. Every value below is a
+    /// documented escape hatch, so a resolver that started rejecting one would
+    /// otherwise leave these tests green while the notice channel became
+    /// unreachable behind a hard error.
     fn notices_from<T>(f: impl FnOnce(&mut ConfigDiagnostics) -> T) -> Vec<ConfigNotice> {
         let mut bag = ConfigDiagnostics::new();
         f(&mut bag);
-        bag.take_notices()
+        let notices = bag.take_notices();
+        assert_eq!(
+            bag.problem_count(),
+            0,
+            "a notice-triggering value must stay non-fatal: {:#}",
+            bag.into_result().unwrap_err()
+        );
+        notices
     }
 
     /// Assert exactly one notice, and return it.
@@ -11171,6 +11205,9 @@ bind_port = 12345
             s.per_source_burst = Some(0);
         });
         let notices = notices_from(|bag| resolve_security_into(Some(&s), bag));
+        // The exact slice also pins that `per_source_burst = 0` adds nothing:
+        // `rate == 0` short-circuits the rate/burst pairing check, so the
+        // rate notice already covers the disabled layer.
         let fields: Vec<&str> = notices.iter().map(|n| n.field.as_str()).collect();
         assert_eq!(
             fields,
@@ -11180,6 +11217,13 @@ bind_port = 12345
             ]
         );
         assert!(notices.iter().all(|n| n.level == ConfigNoticeLevel::Info));
+        // Discriminating substrings, so swapping the two bodies fails here.
+        let messages: Vec<&str> = notices.iter().map(|n| n.message.as_str()).collect();
+        assert!(messages[0].contains("concurrency cap"), "{messages:?}");
+        assert!(
+            messages[1].contains("per-source rate-limit"),
+            "{messages:?}"
+        );
     }
 
     #[test]
@@ -11204,6 +11248,24 @@ bind_port = 12345
         );
         assert!(notices.iter().all(|n| n.level == ConfigNoticeLevel::Warn));
         assert!(notices.iter().all(|n| n.message.contains("unbounded")));
+        // Per-IP and per-peer are different attacks; a swapped pair must fail.
+        let messages: Vec<&str> = notices.iter().map(|n| n.message.as_str()).collect();
+        assert!(messages[0].contains("per-IP"), "{messages:?}");
+        assert!(messages[1].contains("per-peer"), "{messages:?}");
+    }
+
+    /// The counterpart guard: a default `[dht.rate_limit]` must stay silent.
+    /// An inverted condition would fire two `Warn`s on every clean config and
+    /// move `doctor --strict` off zero for every node on the network.
+    #[test]
+    fn dht_at_defaults_records_no_notice() {
+        assert!(notices_from(|bag| resolve_dht_into(None, bag)).is_empty());
+    }
+
+    /// Mirrors [`dht_at_defaults_records_no_notice`].
+    #[test]
+    fn probe_at_defaults_records_no_notice() {
+        assert!(notices_from(|bag| resolve_probe_into(None, bag)).is_empty());
     }
 
     #[test]
@@ -11222,6 +11284,10 @@ bind_port = 12345
             ]
         );
         assert!(notices.iter().all(|n| n.level == ConfigNoticeLevel::Warn));
+        assert!(notices.iter().all(|n| n.message.contains("unbounded")));
+        let messages: Vec<&str> = notices.iter().map(|n| n.message.as_str()).collect();
+        assert!(messages[0].contains("per-IP"), "{messages:?}");
+        assert!(messages[1].contains("per-peer"), "{messages:?}");
     }
 
     /// #843: a stale exported `DECDN_RELAY_URL` collapses a multi-entry
@@ -11284,6 +11350,30 @@ bind_port = 12345
         assert_eq!(notice.field, "network.bind_port");
         assert_eq!(notice.level, ConfigNoticeLevel::Warn);
         assert!(notice.message.contains("well-known range"));
+    }
+
+    /// The `(1..1024)` boundary. 1023 is the last privileged port and 1024 the
+    /// first unprivileged one, so an off-by-one either warns about a port that
+    /// binds fine or stays silent about one that needs `CAP_NET_BIND_SERVICE`.
+    /// Port 0 is excluded on purpose: it means "let the OS pick".
+    #[test]
+    fn well_known_port_notice_respects_the_range_edges() {
+        let observability = resolve_observability(&empty_observability_args(), None)
+            .expect("observability defaults are valid");
+        let notices_for = |port| {
+            let network = ResolvedNetwork {
+                bind_port: port,
+                ..resolve_network(&empty_network_args(), None)
+            };
+            notices_from(|bag| validate_port_layout_into(&network, &observability, bag))
+        };
+        assert_eq!(notices_for(1).len(), 1, "1 is the first privileged port");
+        assert_eq!(notices_for(1023).len(), 1, "1023 is still privileged");
+        assert!(notices_for(1024).is_empty(), "1024 is unprivileged");
+        assert!(
+            notices_for(0).is_empty(),
+            "0 means the OS picks; warning about it is noise"
+        );
     }
 
     /// `resolve_config` hands notices back rather than printing them, and

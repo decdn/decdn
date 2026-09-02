@@ -166,16 +166,22 @@ pub(crate) trait ReloadableSection: Send + Sync {
 /// Shared by the two paths that own a subscriber: `commands::run` replays what
 /// `resolve_config` handed back once `init_tracing` has installed one, and
 /// [`RuntimeReloadState::reload`] emits what the reloading sections recorded.
-/// The SIGHUP half is the one that could not work any other way — a reload
-/// re-runs the section resolvers against a daemon whose subscriber has been
-/// live for hours, so a notice written to stderr never enters the operator's
-/// structured log stream. Draining the shared bag rather than reaching into
-/// one section means a future reloadable section is covered for free.
+/// The SIGHUP half is the one only the caller can serve — a reload re-runs the
+/// section resolvers against a daemon whose subscriber has been live for hours,
+/// and only this layer holds it. Draining the shared bag rather than reaching
+/// into one section means a future reloadable section is covered for free.
 ///
 /// Severity comes from the notice: a `Warn` marks a value that weakens a
 /// safety property and an operator alerting on `WARN` should see it, while an
-/// `Info` marks a deliberate opt-out working as configured. `field` is a
-/// structured field so a JSON stream can be filtered on it.
+/// `Info` marks a deliberate opt-out working as configured. `field` rides as a
+/// `tracing` field rather than inside the message, so a JSON stream can be
+/// filtered on it.
+///
+/// Two properties an operator has to know about. Delivery is subject to the
+/// active filter: a node on `log_level = "error"`, or on a `RUST_LOG` that
+/// names other targets, receives none of these. And every reload re-resolves
+/// every section, so an unchanged notice repeats on each SIGHUP — the same
+/// best-effort shape [`warn_restart_required_sections`] has.
 pub(crate) fn emit_config_notices(notices: &[ConfigNotice]) {
     for notice in notices {
         match notice.level {
@@ -1081,10 +1087,10 @@ impl RuntimeReloadState {
         for section in &self.sections {
             section.resolve(&file, &mut bag);
         }
-        // Drain before `into_result` consumes the bag; emit only once the
-        // reload is known to be applying (below), since an aborted reload
-        // retains the previous values and its notices describe a config the
-        // node is not running.
+        // Drain before `into_result` consumes the bag. Emitting waits until
+        // every gate that can abort the reload has passed (below), because an
+        // aborted reload retains the previous values and its notices would
+        // describe a config the node is not running.
         let notices = bag.take_notices();
         let problem_count = bag.problem_count();
         if let Err(err) = bag.into_result() {
@@ -1101,7 +1107,6 @@ impl RuntimeReloadState {
         // Emit a "requires restart" notice for each non-reloadable field the
         // file carries. Read-only, so do it before the commit step.
         warn_restart_required_sections(&file);
-        emit_config_notices(&notices);
 
         // Phase 2: fallible commits. The log-level section is the only
         // one that can fail here today; future sections may add more.
@@ -1124,6 +1129,13 @@ impl RuntimeReloadState {
                 return Err(err);
             }
         }
+
+        // Past every gate that can abort: phase 1 collapsed clean, phase 2
+        // committed, and phase 3 below cannot fail. A notice emitted earlier
+        // would describe values a `fallible_commit` error left unapplied —
+        // that path returns before any `infallible_swap`, which is where the
+        // notice-bearing sections put their values.
+        emit_config_notices(&notices);
 
         // Phase 3: infallible swaps. None can fail.
         for section in &self.sections {

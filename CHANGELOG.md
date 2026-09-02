@@ -614,21 +614,28 @@ since project inception and will roll into the first tagged release.
   `ConfigDiagnostics` bag (formerly `ConfigErrorBag`, renamed because it carries
   both channels), and the caller renders them once it knows which sink it has:
   `decdn-node` replays them through `tracing` right after `init_tracing`,
-  the SIGHUP path emits them from `reload` on the success path only, `decdn
-  config validate` prints them under its field summary, and `decdn node doctor`
-  turns them into findings. Nothing became a hard error — `0 = unbounded` stays
-  a documented escape hatch and an inherited orchestrator env var must not
-  refuse boot. Notices carry a severity: an unbounded bookkeeping map or a
-  collapsed relay-failover list is `Warn` and moves `doctor`'s exit status, while
-  a deliberately disabled rate limit is `Info` and does not.
-  - Covers all ten former `eprintln!` sites — the retired-env-var notice, the
-    well-known-port notice, the #843 `--relay-url`-overrides-the-list notice, and
-    the unbounded-map notices across `security`, `dht.rate_limit` and
-    `probe.rate_limit`. Each is now asserted by a unit test; previously the only
-    thing a test could check was that the value resolved.
+  the SIGHUP path emits them from `reload` once every gate that can abort the
+  reload has passed, `decdn config validate` prints them under its field
+  summary, and `decdn node doctor` turns them into findings. Nothing became a
+  hard error — `0 = unbounded` stays a documented escape hatch and an inherited
+  orchestrator env var must not refuse boot. Notices carry a severity: an
+  unbounded bookkeeping map or a collapsed relay-failover list is `Warn`, which
+  is what an operator alerts on and what `decdn node doctor --strict` gates its
+  exit status on, while a deliberately disabled rate limit is `Info` and never
+  reaches an exit status.
+  - Covers all eleven former direct-emission sites — the retired-env-var
+    notice, the well-known-port notice, the #843 `--relay-url`-overrides-the-list
+    notice, the duplicate-`cache.origins` notice, and the unbounded-map notices
+    across `security`, `dht.rate_limit` and `probe.rate_limit`. Each is now
+    asserted by a test; previously the only thing a test could check was that
+    the value resolved.
   - `resolve_config` returns `(ResolvedConfig, Vec<ConfigNotice>)`. Notices are
     dropped on the error path: a config that does not resolve is not the one the
-    operator is running.
+    operator is running, so they do not surface until the config resolves.
+  - Delivery on the daemon follows the log filter, where raw stderr did not: a
+    node on `log_level = "error"`, or on a `RUST_LOG` naming other targets,
+    receives no notices. Reach them without a log stream via `decdn node doctor`
+    or `decdn config validate`, neither of which depends on a subscriber.
 
 - **cache: an origin size probe that faults no longer drops the hash from the
   announce set.** `rescan_origins` resolved each candidate through
