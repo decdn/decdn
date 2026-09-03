@@ -20,10 +20,10 @@ pub fn config_validate(
     config_path: Option<&std::path::Path>,
     args: &cli::ConfigValidateArgs,
 ) -> anyhow::Result<()> {
-    let resolved = config::resolve_config(config_path, &args.run)?;
+    let (resolved, notices) = config::resolve_config(config_path, &args.run)?;
     let source = effective_source(config_path, cli::common::default_config_path)?;
     let mut stdout = std::io::stdout().lock();
-    write_validate_summary(&mut stdout, source.as_deref(), &resolved)
+    write_validate_summary(&mut stdout, source.as_deref(), &resolved, &notices)
         .map_err(|e| anyhow::anyhow!("failed to write summary: {e}"))
 }
 
@@ -65,6 +65,7 @@ pub fn write_validate_summary<W: std::io::Write>(
     w: &mut W,
     source: Option<&std::path::Path>,
     resolved: &config::ResolvedConfig,
+    notices: &[config::ConfigNotice],
 ) -> std::io::Result<()> {
     writeln!(w, "config valid")?;
     match source {
@@ -402,6 +403,31 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  content.denied_origins:   {}",
         resolved.content.denied_origins.len()
     )?;
+    write_notices(w, notices)
+}
+
+/// Render the resolve-time notices under the field summary, one line each.
+///
+/// The config still resolved — a notice never fails validation — so these sit
+/// below the summary rather than replacing it, and the leading `config valid`
+/// line stands. They go to the same writer as the summary, not to stderr,
+/// because `config validate` exists to tell an operator what the node sees and
+/// a notice is part of that answer.
+fn write_notices<W: std::io::Write>(
+    w: &mut W,
+    notices: &[config::ConfigNotice],
+) -> std::io::Result<()> {
+    if notices.is_empty() {
+        return Ok(());
+    }
+    writeln!(w, "notices ({}):", notices.len())?;
+    for notice in notices {
+        let level = match notice.level {
+            config::ConfigNoticeLevel::Warn => "warning",
+            config::ConfigNoticeLevel::Info => "info",
+        };
+        writeln!(w, "  - {level}: {}: {}", notice.field, notice.message)?;
+    }
     Ok(())
 }
 

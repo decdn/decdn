@@ -38,7 +38,7 @@
 //! Each reloadable knob is a `ReloadableSection` impl. The trait
 //! drives a fixed three-phase iteration in [`RuntimeReloadState::reload`]:
 //!
-//! 1. **Resolve every section.** A single [`ConfigErrorBag`] is threaded
+//! 1. **Resolve every section.** A single [`ConfigDiagnostics`] is threaded
 //!    through every section's `resolve`, so an operator who broke
 //!    multiple fields sees them all in one error rather than fixing them
 //!    one SIGHUP at a time, and collapsed once at the end; any problem
@@ -73,9 +73,9 @@ use anyhow::Context;
 use decdn_common::cli::common::LogLevel;
 use decdn_common::cli::run::ObservabilityArgs;
 use decdn_common::config::{
-    ConfigErrorBag, FileConfig, ResolvedLoadShed, ResolvedObservability, ResolvedSecurity,
-    load_file_config, parse_pinned_hashes, resolve_load_shed_into, resolve_observability_into,
-    resolve_security_into,
+    ConfigDiagnostics, ConfigNotice, ConfigNoticeLevel, FileConfig, ResolvedLoadShed,
+    ResolvedObservability, ResolvedSecurity, load_file_config, parse_pinned_hashes,
+    resolve_load_shed_into, resolve_observability_into, resolve_security_into,
 };
 
 /// Read-only snapshot of the reloadable fields, returned by
@@ -142,7 +142,7 @@ pub(crate) trait ReloadableSection: Send + Sync {
     /// validation failed) — the buffer is only read downstream when the
     /// bag is empty, so a placeholder there is never observed by the
     /// commit/swap phases on the failure path.
-    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag);
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigDiagnostics);
 
     /// Phase 2: any commit step that can fail (e.g. swapping the live
     /// tracing filter). Default: no-op. The order of `fallible_commit`
@@ -159,6 +159,40 @@ pub(crate) trait ReloadableSection: Send + Sync {
     /// Must not fail — atomic stores, `Arc` swaps, and `ConnectionLimiter::reload`
     /// are the only operations allowed here.
     fn infallible_swap(&self);
+}
+
+/// Emit each resolve-time notice a config resolve recorded, one event apiece.
+///
+/// Shared by the two paths that own a subscriber: `commands::run` replays what
+/// `resolve_config` handed back once `init_tracing` has installed one, and
+/// [`RuntimeReloadState::reload`] emits what the reloading sections recorded.
+/// The SIGHUP half is the one only the caller can serve — a reload re-runs the
+/// section resolvers against a daemon whose subscriber has been live for hours,
+/// and only this layer holds it. Draining the shared bag rather than reaching
+/// into one section means a future reloadable section is covered for free.
+///
+/// Severity comes from the notice: a `Warn` marks a value that weakens a
+/// safety property and an operator alerting on `WARN` should see it, while an
+/// `Info` marks a deliberate opt-out working as configured. `field` rides as a
+/// `tracing` field rather than inside the message, so a JSON stream can be
+/// filtered on it.
+///
+/// Two properties an operator has to know about. Delivery is subject to the
+/// active filter: a node on `log_level = "error"`, or on a `RUST_LOG` that
+/// names other targets, receives none of these. And every reload re-resolves
+/// every section, so an unchanged notice repeats on each SIGHUP — the same
+/// best-effort shape [`warn_restart_required_sections`] has.
+pub(crate) fn emit_config_notices(notices: &[ConfigNotice]) {
+    for notice in notices {
+        match notice.level {
+            ConfigNoticeLevel::Warn => {
+                tracing::warn!(field = %notice.field, "{}", notice.message);
+            }
+            ConfigNoticeLevel::Info => {
+                tracing::info!(field = %notice.field, "{}", notice.message);
+            }
+        }
+    }
 }
 
 /// Set a cache-engine slot owned by a `ReloadableSection`, recovering
@@ -250,7 +284,7 @@ impl ReloadableSection for LogLevelSection {
             *g = false;
         }
     }
-    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigDiagnostics) {
         let resolved = resolve_observability_into(&self.cli, file.observability.as_ref(), bag);
         if let Ok(mut g) = self.buf.lock() {
             *g = Some(resolved);
@@ -336,7 +370,7 @@ impl ReloadableSection for PinnedHashesSection {
             *g = None;
         }
     }
-    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigDiagnostics) {
         // Same shape as `resolve_cache_into`: bag-push on parse failure,
         // empty placeholder so later sections still run. `reload()`'s
         // early return guarantees the placeholder never reaches swap.
@@ -434,7 +468,7 @@ impl ReloadableSection for ContentSection {
             *g = None;
         }
     }
-    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigDiagnostics) {
         // Same shape as the other sections: bag-push on parse failure, empty
         // placeholder so later sections still run. `reload()`'s early return
         // guarantees the placeholder never reaches swap — which matters more
@@ -520,7 +554,7 @@ impl ReloadableSection for SecuritySection {
             *g = None;
         }
     }
-    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigDiagnostics) {
         let resolved = resolve_security_into(file.security.as_ref(), bag);
         if let Ok(mut g) = self.buf.lock() {
             *g = Some(resolved);
@@ -577,7 +611,7 @@ impl ReloadableSection for LoadShedSection {
             *g = None;
         }
     }
-    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigDiagnostics) {
         let resolved = resolve_load_shed_into(file.load_shed.as_ref(), bag);
         if let Ok(mut g) = self.buf.lock() {
             *g = Some(resolved);
@@ -1050,10 +1084,15 @@ impl RuntimeReloadState {
         // Phase 1: resolve every section into one shared bag, then
         // collapse it once. Non-empty bag → return early, no side-effects
         // committed (the all-or-nothing contract).
-        let mut bag = ConfigErrorBag::new();
+        let mut bag = ConfigDiagnostics::new();
         for section in &self.sections {
             section.resolve(&file, &mut bag);
         }
+        // Drain before `into_result` consumes the bag. Emitting waits until
+        // every gate that can abort the reload has passed (below), because an
+        // aborted reload retains the previous values and its notices would
+        // describe a config the node is not running.
+        let notices = bag.take_notices();
         let problem_count = bag.problem_count();
         if let Err(err) = bag.into_result() {
             tracing::warn!(
@@ -1091,6 +1130,13 @@ impl RuntimeReloadState {
                 return Err(err);
             }
         }
+
+        // Past every gate that can abort: phase 1 collapsed clean, phase 2
+        // committed, and phase 3 below cannot fail. A notice emitted earlier
+        // would describe values a `fallible_commit` error left unapplied —
+        // that path returns before any `infallible_swap`, which is where the
+        // notice-bearing sections put their values.
+        emit_config_notices(&notices);
 
         // Phase 3: infallible swaps. None can fail.
         for section in &self.sections {
@@ -2324,7 +2370,7 @@ mod tests {
 
         let err = state.reload(&path).await.unwrap_err();
         let msg = format!("{err:#}");
-        // Aggregated envelope from `ConfigErrorBag::into_result`. `[payment]`
+        // Aggregated envelope from `ConfigDiagnostics::into_result`. `[payment]`
         // is restart-required and never resolved on reload, so it cannot
         // contribute a problem here — the two reloadable sections do.
         assert!(

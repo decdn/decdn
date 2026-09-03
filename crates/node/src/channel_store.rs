@@ -251,7 +251,21 @@ const POOL_SIGNER_KEY_LEN: usize = 52;
 ///
 /// Key: `pool_id ‖ signer` (`[u8; 52]`). Value: postcard-encoded
 /// [`StoredCapability`].
+///
+/// The name carries `_v2`: [`StoredCapability`] encodes `spending_cap` as a
+/// native `u64` rather than the earlier 32-byte word, so its postcard payload
+/// changed shape. A redb table's value BYTES are not typed-checked at open, so
+/// an old `capability_v1` row would silently misdecode; the version bump plus
+/// [`PersistentPoolStateStore::drop_superseded_capability_table`] retires the old
+/// table at open instead. Pre-launch there is nothing to migrate.
 const CAPABILITY_TABLE: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], &[u8]> =
+    TableDefinition::new("capability_v2");
+
+/// The superseded `capability_v1` table, whose [`StoredCapability`] rows encoded
+/// `spending_cap` as a 32-byte word. Nothing reads it;
+/// [`PersistentPoolStateStore::drop_superseded_capability_table`] deletes it at
+/// open so a development store carrying one does not keep undecodable rows.
+const SUPERSEDED_CAPABILITY_TABLE: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], &[u8]> =
     TableDefinition::new("capability_v1");
 
 /// Encode a `(pool_id, signer)` pair into its `[u8; 52]` table key, shared by the
@@ -286,15 +300,15 @@ fn pool_signer_key_range(pool_id: B256) -> ([u8; POOL_SIGNER_KEY_LEN], [u8; POOL
 
 /// On-disk owner-signed capability record. The `(pool_id, signer)` identity is
 /// the table key, so the value carries only the cap/expiry and the owner
-/// signature. `spending_cap` is a fixed-width big-endian array (identical to the
-/// on-chain representation); `owner_sig` is the raw EIP-712 signature (65-byte
-/// ECDSA, or an ERC-1271 payload) verbatim.
+/// signature. `spending_cap` is a native `u64`, identical to the on-chain
+/// `PaymentPool.spendingCap` width; `owner_sig` is the raw EIP-712 signature
+/// (65-byte ECDSA, or an ERC-1271 payload) verbatim.
 ///
 /// `PartialEq` lets [`PersistentPoolStateStore::put_capability`] dedup an
 /// identical repeat write (equal fields ⇒ equal record ⇒ nothing to mark dirty).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredCapability {
-    spending_cap: [u8; 32],
+    spending_cap: u64,
     expiry: u64,
     owner_sig: Vec<u8>,
 }
@@ -592,6 +606,7 @@ impl PersistentPoolStateStore {
         let buyer_db = Self::open_hardened_db(&data_dir.join(BUYER_DB_FILE), &chmod_fn)?;
 
         let lanes = Self::hydrate_lanes(&lanes_db)?;
+        Self::drop_superseded_capability_table(&lanes_db)?;
         let caps = Self::hydrate_capabilities(&lanes_db)?;
         Ok(Self {
             lanes_db,
@@ -746,6 +761,55 @@ impl PersistentPoolStateStore {
             out.insert(state.key(), LaneSlot::Live(state));
         }
         Ok(out)
+    }
+
+    /// Delete the superseded `capability_v1` table if the store still carries
+    /// one. Its [`StoredCapability`] rows encoded `spending_cap` as a 32-byte
+    /// word; the live [`CAPABILITY_TABLE`] (`capability_v2`) encodes it as a
+    /// native `u64`, so an old row's postcard bytes would misdecode under the new
+    /// shape. Pre-launch there is no migration to run, so the rows are dropped —
+    /// but loudly, because they are registration material a signer would then
+    /// re-send on its next request rather than silently lose.
+    ///
+    /// The table lives in the shared `lanes.redb` file, so the presence check
+    /// runs in a READ transaction first and a write transaction opens ONLY when
+    /// the old table is actually there. A blind `begin_write`/`commit` on every
+    /// boot would grow the lane file with an empty commit and break the #527
+    /// file-stability guarantee that `pre_existing_file_chmod_failure_preserves_file`
+    /// pins.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] when the presence check or delete transaction fails.
+    fn drop_superseded_capability_table(db: &Database) -> Result<(), StoreError> {
+        let read_txn = db.begin_read().map_err(|err| {
+            StoreError::Backend(format!("begin_read (capability_v1 probe): {err}"))
+        })?;
+        match read_txn.open_table(SUPERSEDED_CAPABILITY_TABLE) {
+            Ok(_) => {}
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(err) => {
+                return Err(StoreError::Backend(format!(
+                    "open_table (capability_v1 probe): {err}"
+                )));
+            }
+        }
+        drop(read_txn);
+        let txn = db.begin_write().map_err(|err| {
+            StoreError::Backend(format!("begin_write (capability_v1 drop): {err}"))
+        })?;
+        let dropped = txn
+            .delete_table(SUPERSEDED_CAPABILITY_TABLE)
+            .map_err(|err| StoreError::Backend(format!("delete_table (capability_v1): {err}")))?;
+        txn.commit()
+            .map_err(|err| StoreError::Backend(format!("commit (capability_v1 drop): {err}")))?;
+        if dropped {
+            tracing::warn!(
+                table = "capability_v1",
+                "dropped the superseded capability table; its owner-signed registration \
+                 material is re-sent by each client on its next request"
+            );
+        }
+        Ok(())
     }
 
     /// Read the whole capability table into the in-memory working set at open.
@@ -1274,12 +1338,12 @@ impl PersistentPoolStateStore {
         &self,
         pool_id: B256,
         signer: Address,
-        spending_cap: U256,
+        spending_cap: u64,
         expiry: u64,
         owner_sig: &[u8],
     ) {
         let record = StoredCapability {
-            spending_cap: spending_cap.to_be_bytes(),
+            spending_cap,
             expiry,
             owner_sig: owner_sig.to_vec(),
         };
@@ -1328,7 +1392,7 @@ pub trait CapabilitySink: Send + Sync + std::fmt::Debug {
         &self,
         pool_id: B256,
         signer: Address,
-        spending_cap: U256,
+        spending_cap: u64,
         expiry: u64,
         owner_sig: &[u8],
     );
@@ -1339,7 +1403,7 @@ impl CapabilitySink for PersistentPoolStateStore {
         &self,
         pool_id: B256,
         signer: Address,
-        spending_cap: U256,
+        spending_cap: u64,
         expiry: u64,
         owner_sig: &[u8],
     ) {
@@ -1374,7 +1438,7 @@ impl crate::payment_settlement::CapabilitySource for StoredCapabilitySource {
         self.inner
             .get_capability(key.pool_id, key.signer)
             .map(|record| crate::payment_settlement::CapabilityMaterial {
-                spending_cap: U256::from_be_bytes(record.spending_cap),
+                spending_cap: record.spending_cap,
                 expiry: record.expiry,
                 owner_sig: alloy::primitives::Bytes::from(record.owner_sig),
             })
@@ -2018,7 +2082,7 @@ mod tests {
         let signer = address!("00000000000000000000000000000000000000b5");
         let provider = address!("00000000000000000000000000000000000000c9");
         let owner_sig = vec![0x42u8; 65];
-        let spending_cap = U256::from(5_000_000u64);
+        let spending_cap = 5_000_000u64;
         let expiry = 1_950_000_000u64;
 
         // A signer with nothing persisted yields None.
@@ -2098,7 +2162,7 @@ mod tests {
             store.as_ref(),
             pool_id,
             signer,
-            U256::from(9u64),
+            9u64,
             2000,
             &[0x11u8; 65],
         );
@@ -2155,7 +2219,7 @@ mod tests {
                 store.as_ref(),
                 lane.pool_id,
                 lane.signer,
-                U256::from(7u64),
+                7u64,
                 3000,
                 &[0x33u8; 65],
             );
@@ -2170,7 +2234,7 @@ mod tests {
             store.as_ref(),
             kept_key.pool_id,
             kept_key.signer,
-            U256::from(8u64),
+            8u64,
             3001,
             &[0x44u8; 65],
         );
@@ -2186,7 +2250,7 @@ mod tests {
             .registration_material(&kept_key)
             .ok_or_else(|| anyhow::anyhow!("kept lane keeps its capability"))?;
         anyhow::ensure!(
-            material.spending_cap == U256::from(8u64) && material.expiry == 3001,
+            material.spending_cap == 8u64 && material.expiry == 3001,
             "the capability rewrite landed in the same flush as the lane work"
         );
         anyhow::ensure!(
@@ -2235,7 +2299,7 @@ mod tests {
                         store.as_ref(),
                         B256::repeat_byte(row),
                         Address::repeat_byte(row),
-                        U256::from(round),
+                        round,
                         round,
                         &[row; 65],
                     );
@@ -2287,40 +2351,19 @@ mod tests {
         let signer = address!("00000000000000000000000000000000000000ee");
         let owner_sig = vec![0x42u8; 65];
 
-        CapabilitySink::stage_capability(
-            store.as_ref(),
-            pool_id,
-            signer,
-            U256::from(5u64),
-            1000,
-            &owner_sig,
-        );
+        CapabilitySink::stage_capability(store.as_ref(), pool_id, signer, 5u64, 1000, &owner_sig);
         anyhow::ensure!(
             store.dirty_caps.len() == 1,
             "first write marks the row dirty"
         );
         // Identical repeat: nothing pushed.
-        CapabilitySink::stage_capability(
-            store.as_ref(),
-            pool_id,
-            signer,
-            U256::from(5u64),
-            1000,
-            &owner_sig,
-        );
+        CapabilitySink::stage_capability(store.as_ref(), pool_id, signer, 5u64, 1000, &owner_sig);
         anyhow::ensure!(
             store.dirty_caps.len() == 1,
             "identical repeat must not re-mark the row"
         );
         // A changed value pushes the key again; the flush dedups the two.
-        CapabilitySink::stage_capability(
-            store.as_ref(),
-            pool_id,
-            signer,
-            U256::from(6u64),
-            1000,
-            &owner_sig,
-        );
+        CapabilitySink::stage_capability(store.as_ref(), pool_id, signer, 6u64, 1000, &owner_sig);
         anyhow::ensure!(
             store.dirty_caps.len() == 2,
             "a changed value re-marks the row"
@@ -2339,20 +2382,10 @@ mod tests {
                 provider: address!("00000000000000000000000000000000000000de"),
             })
             .ok_or_else(|| anyhow::anyhow!("expected stored capability material"))?;
-        anyhow::ensure!(
-            material.spending_cap == U256::from(6u64),
-            "the updated cap landed"
-        );
+        anyhow::ensure!(material.spending_cap == 6u64, "the updated cap landed");
         // After a flush the buffer still holds the row, so re-writing the same
         // value is still a dedup no-op — only a changed value re-marks.
-        CapabilitySink::stage_capability(
-            store.as_ref(),
-            pool_id,
-            signer,
-            U256::from(6u64),
-            1000,
-            &owner_sig,
-        );
+        CapabilitySink::stage_capability(store.as_ref(), pool_id, signer, 6u64, 1000, &owner_sig);
         anyhow::ensure!(
             store.dirty_caps.is_empty(),
             "re-writing the just-flushed value is still a dedup no-op"
@@ -2377,14 +2410,7 @@ mod tests {
         // Write WITHOUT flushing, then drop the store (a crash).
         {
             let store = PersistentPoolStateStore::open(dir.path())?;
-            CapabilitySink::stage_capability(
-                &store,
-                pool_id,
-                signer,
-                U256::from(7u64),
-                2000,
-                &owner_sig,
-            );
+            CapabilitySink::stage_capability(&store, pool_id, signer, 7u64, 2000, &owner_sig);
         }
         // Reopen: the row is gone (frontier-loss-ok), so the redeemer would
         // find no material yet.
@@ -2403,14 +2429,7 @@ mod tests {
         // The client re-sends on its next request; intake re-persists, and a
         // later flush makes it durable. The pre-flush `source` clone must go
         // before reopen — it holds the database handle open.
-        CapabilitySink::stage_capability(
-            store.as_ref(),
-            pool_id,
-            signer,
-            U256::from(7u64),
-            2000,
-            &owner_sig,
-        );
+        CapabilitySink::stage_capability(store.as_ref(), pool_id, signer, 7u64, 2000, &owner_sig);
         store.flush()?;
         drop(source);
         drop(store);
@@ -2662,6 +2681,56 @@ mod tests {
         let only = all.first().ok_or_else(|| anyhow::anyhow!("missing"))?;
         anyhow::ensure!(only.key() == recorded_key);
         anyhow::ensure!(*only == recorded);
+        Ok(())
+    }
+
+    /// A store carrying the superseded `capability_v1` table drops it at open:
+    /// its rows encoded `spending_cap` as a 32-byte word, which the live
+    /// `capability_v2` codec would misdecode, so the migration deletes the old
+    /// table rather than read it. The lane frontier in the same file is
+    /// untouched.
+    #[test]
+    fn superseded_capability_v1_table_is_dropped_at_open() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let recorded = sample(9);
+        {
+            let store = PersistentPoolStateStore::open(dir.path())?;
+            store.record(&recorded)?;
+            store.flush()?;
+        }
+
+        // Inject a legacy `capability_v1` row directly, with arbitrary bytes —
+        // the migration never decodes them, it deletes the whole table.
+        let path = dir.path().join(LANES_DB_FILE);
+        let key = pool_signer_key_bytes(B256::repeat_byte(0x51), Address::repeat_byte(0x52));
+        {
+            let db =
+                Database::create(&path).map_err(|e| anyhow::anyhow!("open lanes.redb raw: {e}"))?;
+            let txn = db.begin_write()?;
+            {
+                let mut table = txn.open_table(SUPERSEDED_CAPABILITY_TABLE)?;
+                table.insert(&key, [0xAAu8; 40].as_slice())?;
+            }
+            txn.commit()?;
+        }
+
+        // Reopen through the store — the drop runs — then close it so the raw
+        // read below can take the file.
+        {
+            let store = PersistentPoolStateStore::open(dir.path())?;
+            let lanes = store.load_all()?;
+            anyhow::ensure!(lanes.len() == 1, "the lane frontier survives the migration");
+        }
+
+        let db = Database::create(&path).map_err(|e| anyhow::anyhow!("reopen raw: {e}"))?;
+        let read_txn = db.begin_read()?;
+        anyhow::ensure!(
+            matches!(
+                read_txn.open_table(SUPERSEDED_CAPABILITY_TABLE),
+                Err(redb::TableError::TableDoesNotExist(_))
+            ),
+            "the superseded capability_v1 table must be gone after open"
+        );
         Ok(())
     }
 

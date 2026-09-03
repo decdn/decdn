@@ -168,7 +168,15 @@ async fn run() -> anyhow::Result<()> {
     // measured on-chain amount into the local record via `add_deposit`.
     let remaining = deposit - prior_amount; // == 1
     let additional = deposit - remaining; // restore to a full `deposit`
-    let credited = top_up(&pool, pool_id, additional).await.context("top_up")?;
+    let topped_up = top_up(&pool, pool_id, additional).await.context("top_up")?;
+    // The tx is the only handle an operator has to reconcile an escrow whose
+    // local credit failed, so pin that a real mined hash comes back — every
+    // unit-level test of that path feeds it a synthetic one.
+    anyhow::ensure!(
+        !topped_up.tx.is_zero(),
+        "top_up must return the mining transaction, not a default hash"
+    );
+    let credited = topped_up.credited;
     let deposit_outcome = store
         .add_deposit(buyer_addr, pool_id, credited)
         .context("credit top-up into the local record")?;
@@ -358,7 +366,7 @@ const MULTI_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB
 
 // A single-invocation reactive MID-STREAM top-up extends a fetch past its
 // opening deposit: `cli/src/commands/fetch.rs::open_or_reuse_pool` signs the
-// self-capability with `spending_cap = U256::MAX`, so the on-chain cap
+// self-capability with `spending_cap = SELF_CAPABILITY_CAP` (`u64::MAX`), so the on-chain cap
 // `PaymentPool._registerCapability` fixes at first redemption never binds. The
 // pool deposit — not the capability cap — is the real spending bound, and
 // `redeem` pays `min(desired, cap-spent, remaining)` against whatever the

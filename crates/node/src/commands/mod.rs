@@ -20,7 +20,7 @@ pub async fn run(
     config_path: Option<&std::path::Path>,
     run_args: &cli::RunArgs,
 ) -> anyhow::Result<()> {
-    let resolved = config::resolve_config(config_path, run_args)?;
+    let (resolved, notices) = config::resolve_config(config_path, run_args)?;
 
     // Initialize tracing — RUST_LOG env var takes precedence over resolved log level.
     let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
@@ -35,6 +35,12 @@ pub async fn run(
     };
 
     let log_level_setter = init_tracing(filter, &resolved)?;
+
+    // Replay what `resolve_config` recorded. It runs before `init_tracing`
+    // (the fallback filter above is built from the resolved log level), so a
+    // resolver cannot emit these itself — it hands them back and this is the
+    // first point at which a subscriber exists to receive them.
+    runtime::emit_config_notices(&notices);
 
     tracing::info!("deCDN node starting");
     tracing::debug!(

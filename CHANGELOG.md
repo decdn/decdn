@@ -601,6 +601,96 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: `pool top-up`, `pool close`, `pool assign` and `fetch`'s auto-refill now
+  exit non-zero when a landed on-chain effect cannot be recorded locally.**
+  Four sites printed the failure to stderr and returned `Ok(())`. All shared one
+  shape — the on-chain effect landed, the local write failed — and the money had
+  already moved, so exiting 0 was the one outcome that guaranteed nobody
+  reconciled it. A wrapper (`if decdn pool top-up …; then mark_funded; fi`)
+  recorded the pool as funded while the local `deposit` stayed short by
+  `credited`, which both re-triggered the low-water auto-top-up on every later
+  fetch and made a retry of the command escrow again. After a `pool close` whose
+  row-clear failed, `open_or_reuse_pool` reused a winding-down pool: later
+  fetches signed vouchers that stop being redeemable at the dispute deadline,
+  against a deposit the owner is about to reclaim.
+  - This is a consistency fix, not a new policy. The reactive mid-fetch top-up
+    already bails terminally on the same hazard, and the daemon already meters it
+    as a top-up *failure* rather than a success. Only the proactive and manual
+    legs had not adopted it.
+  - `decdn pool assign` is in scope on different grounds: its middle arm had a
+    `getPool` read that **succeeded** and proved the on-chain owner is not this
+    keystore, yet still printed the `dcap1:` token, so
+    `decdn pool assign … > delegate.token` exited 0 with a capability already
+    proven dead at redemption. That arm now fails. The sibling arms — an
+    unreachable RPC, a provider that would not build — keep degrading to a
+    warning, because offline issuance is valid and a read that could not be
+    performed proves nothing.
+  - `pool close` fails on the `Err` only. `forget_if_pool` is compare-and-delete,
+    and its `Ok(false)` means it found nothing to delete — no row, or a row for a
+    newer pool — so nothing maps the owner to the closed pool and the close is
+    clean. Closing a pool the local store never tracked (a second machine, a
+    fresh `--data-dir`) lands there routinely. The `Err` error carries both the
+    close tx and the `pool reclaim` deadline, and the reclaim is what clears the
+    stale row.
+  - Unchanged and deliberately so: `pool reclaim`'s row-clear and `fetch`'s
+    `persist_watermark`. The reclaim stays a warning because the refund itself
+    landed and re-running the reclaim clears the row; its warning now names that
+    remedy. `persist_watermark` runs after delivery, so failing the fetch would
+    neither un-pay the bytes nor do anything but misreport a fetch that
+    succeeded; its warning now names the close-and-reopen remedy.
+  - `client_pull::buyer_pool::top_up` now returns the `topUp` tx hash alongside
+    the credited amount as a `ToppedUpPool`, so every one of these errors names
+    the transaction an operator reconciles against — the handle the `open` path
+    already had. The node's `fund_pool` returns the new deposit rather than a
+    `DepositOutcome` and grades both credit-failure channels through the same
+    helper, so its propagated error names the tx too and a store fault meters as
+    `buyer_topup_failure` rather than slipping past unmetered.
+  - The shared error now tells the operator not to re-run the command: an escrow
+    that already landed escrows a second time on retry.
+  - `pool assign` also distinguishes a pool that does not exist on the contract
+    (`getPool` zero-fills an unknown key rather than reverting) from an ownership
+    dispute, so a wrong `--pool` / `--payment-pool-address` / `--chain-id` is
+    diagnosed as such instead of "sign with the owner keystore".
+  - **Script impact:** these commands previously exited 0 in the degraded case.
+    Wrappers that treated exit 0 as "recorded" must now handle a non-zero exit
+    that means the on-chain effect landed and needs reconciling — not that it
+    failed to happen.
+- **config: resolve-time notices now reach the operator instead of raw stderr.**
+  Every `*_into` resolver wrote its non-fatal warnings with `eprintln!`, on the
+  documented grounds that no `tracing` subscriber exists at `resolve_config`
+  time. That held for startup, but `resolve_security_into` also runs on the
+  SIGHUP reload path, against a daemon whose subscriber has been live for hours.
+  An operator on `log_format = "json"` who set `security.max_tracked_sources = 0`
+  and reloaded got the "bookkeeping map is unbounded" warning on a stderr nobody
+  was reading, and nothing in their log pipeline — the reload's own "section
+  applied" event carried the new value but neither the severity nor the word to
+  alert on. The resolvers now record `ConfigNotice`s on the shared
+  `ConfigDiagnostics` bag (formerly `ConfigErrorBag`, renamed because it carries
+  both channels), and the caller renders them once it knows which sink it has:
+  `decdn-node` replays them through `tracing` right after `init_tracing`,
+  the SIGHUP path emits them from `reload` once every gate that can abort the
+  reload has passed, `decdn config validate` prints them under its field
+  summary, and `decdn node doctor` turns them into findings. Nothing became a
+  hard error — `0 = unbounded` stays a documented escape hatch and an inherited
+  orchestrator env var must not refuse boot. Notices carry a severity: an
+  unbounded bookkeeping map or a collapsed relay-failover list is `Warn`, which
+  is what an operator alerts on and what `decdn node doctor --strict` gates its
+  exit status on, while a deliberately disabled rate limit is `Info` and never
+  reaches an exit status.
+  - Covers all eleven former direct-emission sites — the retired-env-var
+    notice, the well-known-port notice, the #843 `--relay-url`-overrides-the-list
+    notice, the duplicate-`cache.origins` notice, and the unbounded-map notices
+    across `security`, `dht.rate_limit` and `probe.rate_limit`. Each is now
+    asserted by a test; previously the only thing a test could check was that
+    the value resolved.
+  - `resolve_config` returns `(ResolvedConfig, Vec<ConfigNotice>)`. Notices are
+    dropped on the error path: a config that does not resolve is not the one the
+    operator is running, so they do not surface until the config resolves.
+  - Delivery on the daemon follows the log filter, where raw stderr did not: a
+    node on `log_level = "error"`, or on a `RUST_LOG` naming other targets,
+    receives no notices. Reach them without a log stream via `decdn node doctor`
+    or `decdn config validate`, neither of which depends on a subscriber.
+
 - **cache: an origin size probe that faults no longer drops the hash from the
   announce set.** `rescan_origins` resolved each candidate through
   `origin_size`, whose per-origin error handling is swallow-and-advance, so a

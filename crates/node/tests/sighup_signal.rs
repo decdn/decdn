@@ -606,3 +606,214 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         );
     }
 }
+
+/// A resolve-time notice must reach the operator's structured log stream on
+/// the SIGHUP path, where the subscriber has been live for hours.
+///
+/// `resolve_security_into` runs in two places: once at startup, before
+/// `init_tracing` installs a subscriber, and again on every SIGHUP. An
+/// operator running `log_format = "json"` and shipping only the structured
+/// stream needs `field` to arrive as a real event field it can filter on — the
+/// reload's own "section applied" event carries the new value but neither the
+/// severity nor the word the operator greps for.
+///
+/// The capture is a JSON subscriber rather than the pretty formatter for that
+/// reason: rendered text cannot tell a structured `field` from one interpolated
+/// into the message, which is the whole property being claimed.
+///
+/// The same three constraints as `sighup_applies_mutable_but_rejects_restart_required_fields`
+/// make the capture sound: a thread-local `set_default` guard, a
+/// `current_thread` runtime, and `reload` awaited inline rather than spawned.
+#[tokio::test(flavor = "current_thread")]
+async fn sighup_routes_a_resolve_notice_into_the_log_stream() {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    /// Find the captured JSON event whose `field` value is `field`, and return
+    /// its level and message.
+    fn notice_event(logs: &str, field: &str) -> Option<(String, String)> {
+        logs.lines().find_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            let fields = v.get("fields")?;
+            // `field` must be its own event field, not text inside the message.
+            if fields.get("field")?.as_str()? != field {
+                return None;
+            }
+            Some((
+                v.get("level")?.as_str()?.to_string(),
+                fields.get("message")?.as_str()?.to_string(),
+            ))
+        })
+    }
+
+    let log_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = BufferWriter(Arc::clone(&log_buf));
+    let _log_guard = tracing_subscriber::fmt()
+        .json()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .with_max_level(LevelFilter::INFO)
+        .finish()
+        .set_default();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+
+    let initial = seed_resolved(10, LogLevel::Info);
+    let (setter, _levels) = recording_setter();
+    let state = Arc::new(RuntimeReloadState::new(
+        ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port: None,
+            metrics_bind: None,
+            admin_port: None,
+            otlp_endpoint: None,
+        },
+        &initial,
+        setter,
+    ));
+
+    let mut hup = {
+        use tokio::signal::unix::{SignalKind, signal};
+        signal(SignalKind::hangup()).expect("install SIGHUP stream")
+    };
+
+    // Both `0`s are documented escape hatches, so the reload must *succeed* —
+    // the notices are the whole observable effect, which is what made them so
+    // easy to lose. The two levels ride the same reload so the `Info` arm is
+    // exercised alongside the `Warn` one.
+    write_config(
+        &path,
+        "[security]\n\
+         max_tracked_sources = 0\n\
+         per_source_rate_per_sec = 0.0\n\
+         per_source_burst = 0\n",
+    );
+    raise_sighup_soon();
+    hup.recv().await.expect("first SIGHUP");
+    state.reload(&path).await.expect("0 is valid, not an error");
+
+    let logs = captured_logs(&log_buf);
+    let (level, message) =
+        notice_event(&logs, "security.max_tracked_sources").unwrap_or_else(|| {
+            panic!("no notice for the zeroed bookkeeping cap, got:\n{logs}");
+        });
+    assert_eq!(
+        level, "WARN",
+        "an unbounded bookkeeping map must be WARN, not INFO"
+    );
+    assert!(
+        message.contains("unbounded"),
+        "the notice must carry the word an operator alerts on: {message}"
+    );
+    assert!(
+        !message.contains("security.max_tracked_sources"),
+        "the label rides as a field, so the message must not repeat it: {message}"
+    );
+
+    let (level, message) = notice_event(&logs, "security.per_source_rate_per_sec")
+        .unwrap_or_else(|| panic!("no notice for the disabled rate limit, got:\n{logs}"));
+    assert_eq!(
+        level, "INFO",
+        "a deliberate opt-out must not page anyone alerting on WARN"
+    );
+    assert!(message.contains("disabled"), "{message}");
+
+    // An aborted reload applies nothing, so its notices would describe a
+    // config the node is not running. Clear the buffer, then SIGHUP a file
+    // whose `[security]` section carries both the notice trigger and a fatal
+    // problem.
+    log_buf.lock().unwrap().clear();
+    write_config(
+        &path,
+        "[security]\n\
+         max_tracked_sources = 0\n\
+         per_source_rate_per_sec = -1.0\n",
+    );
+    raise_sighup_soon();
+    hup.recv().await.expect("second SIGHUP");
+    state
+        .reload(&path)
+        .await
+        .expect_err("a negative rate must abort the reload");
+
+    let logs = captured_logs(&log_buf);
+    assert!(
+        !logs.contains("unbounded"),
+        "an aborted reload must not report notices about a config it did not \
+         apply, got:\n{logs}"
+    );
+}
+
+/// The other abort path: a reload that resolves clean but fails a phase-2
+/// `fallible_commit` must not report notices either.
+///
+/// This leg is easy to miss because the resolve gate looks like the only way
+/// out. It is not: a `fallible_commit` error returns *before* any
+/// `infallible_swap`, and `infallible_swap` is where the notice-bearing
+/// sections put their values — so a notice emitted before phase 2 describes a
+/// config the node is provably not running.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_commit_reports_no_notices() {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let log_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = BufferWriter(Arc::clone(&log_buf));
+    let _log_guard = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .with_max_level(LevelFilter::INFO)
+        .finish()
+        .set_default();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+
+    let initial = seed_resolved(10, LogLevel::Info);
+    let failing_setter: LogLevelSetter =
+        Box::new(|_| Err(anyhow::anyhow!("simulated tracing-reload failure")));
+    let state = Arc::new(RuntimeReloadState::new(
+        ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port: None,
+            metrics_bind: None,
+            admin_port: None,
+            otlp_endpoint: None,
+        },
+        &initial,
+        failing_setter,
+    ));
+
+    let mut hup = {
+        use tokio::signal::unix::{SignalKind, signal};
+        signal(SignalKind::hangup()).expect("install SIGHUP stream")
+    };
+
+    // Both sections resolve clean. `log_level` differs from the seeded value
+    // so the setter is actually called — and fails, taking the whole reload
+    // down with the security values still unapplied.
+    write_config(
+        &path,
+        "[observability]\n\
+         log_level = \"debug\"\n\
+         [security]\n\
+         max_tracked_sources = 0\n",
+    );
+    raise_sighup_soon();
+    hup.recv().await.expect("SIGHUP");
+    let err = state
+        .reload(&path)
+        .await
+        .expect_err("a failing setter must abort the reload");
+    assert!(format!("{err:#}").contains("simulated tracing-reload failure"));
+
+    let logs = captured_logs(&log_buf);
+    assert!(
+        !logs.contains("unbounded"),
+        "a reload that aborted in phase 2 applied no security values, so it \
+         must not report their notices, got:\n{logs}"
+    );
+}

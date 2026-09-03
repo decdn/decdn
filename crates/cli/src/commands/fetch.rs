@@ -35,7 +35,9 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_pool::{
-    LOW_WATER_DIVISOR, ensure_allowance, issue_self_capability, open_pool, refill_amount, top_up,
+    LOW_WATER_DIVISOR, SELF_CAPABILITY_CAP, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
+    grade_deposit_credit, issue_self_capability, open_pool, refill_amount, top_up,
+    topped_up_effect,
 };
 use decdn_client_pull::driver::{DriveConfig, drive};
 use decdn_client_pull::source::{Funder, SourceFuture};
@@ -288,10 +290,47 @@ impl ProxyWarmingParams {
     }
 }
 
+/// The terminal "nothing can serve this blob" error for [`probe_and_order`],
+/// naming the failure that actually happened (#1911). A candidate leaves the
+/// selection loop three ways: it never answered (unreachable), it answered but
+/// its `slash_sig` did not recover (unverifiable), or it answered but was
+/// unusable — a `has_blob`/coverage mismatch that no honest responder produces.
+/// When any probe was unverifiable the cause is almost always local
+/// configuration rather than missing content, so that case gets its own message;
+/// otherwise the parenthetical accounts for the reachable-but-unanswered and the
+/// answered-but-unusable candidates separately. Reached only when there is
+/// neither a cache holder nor a reachable non-holder to pull through — a
+/// `has_blob:false` answer is a serve target, not a failure, so it never lands
+/// here.
+fn no_serve_target_error(
+    probe_count: usize,
+    unreachable: usize,
+    unverifiable: usize,
+) -> anyhow::Error {
+    if unverifiable > 0 {
+        return anyhow::anyhow!(
+            "{unverifiable} of {probe_count} probed node(s) answered, but their probe \
+             signatures did not recover to the operator address each is registered \
+             under. That is usually local configuration rather than missing content: \
+             check that blockchain.slash_judge_address and blockchain.chain_id match \
+             the deployment these nodes registered against"
+        );
+    }
+    // With no unverifiable candidate, every non-unreachable one answered but was
+    // dropped as unusable (has_blob/coverage mismatch) — name both counts so the
+    // message never implies a silent, wholly-unreachable set when some replied.
+    let unusable = probe_count.saturating_sub(unreachable);
+    anyhow::anyhow!(
+        "none of the {probe_count} probed node(s) could serve the blob \
+         ({unreachable} did not answer, {unusable} answered but were unusable)"
+    )
+}
+
 /// Probe `candidates` for `hash` over `endpoint` and return the ordered
 /// provider-failover list (#1174, ADR 037 § Fallback): the sequence `fetch`
 /// tries in turn, each entry a fallback for the one before it, until one
-/// delivers the blob. Errors if none of the probed candidates hold it.
+/// delivers the blob. Errors only when no probed candidate is reachable to serve
+/// at all — a cache holder OR a bonded non-holder that can pull through (#1911).
 ///
 /// Every response is verified before it can influence the order: value
 /// invariants, echoed-field correlation, and `slash_sig` recovery to the
@@ -315,6 +354,10 @@ impl ProxyWarmingParams {
 /// exact fallback shape: the chosen proxy, then the next candidate, and finally
 /// the direct holder — routing around a proxy that declines or stalls without
 /// ever surfacing an error while a holder remains.
+///
+/// When no candidate holds the blob, the order is instead the reachable
+/// non-holders, nearest RTT first, as pull-through serve targets — see
+/// [`failover_order`] for why an empty holder set bootstraps rather than fails.
 pub(crate) async fn probe_and_order(
     endpoint: &Endpoint,
     candidates: &[NodeCandidate],
@@ -350,10 +393,15 @@ pub(crate) async fn probe_and_order(
 
     let probe_count = results.len();
     let mut holders = Vec::new();
-    // Probed bonded non-holders are the proxy-warming candidate pool (ADR 037 §
-    // Candidate pool): reachable nodes that don't hold the blob, with a measured
-    // RTT. Only collected when warming is enabled.
-    let mut warming_pool: Vec<discovery::WarmingCandidate> = Vec::new();
+    // Probed bonded nodes that answered `has_blob:false` — reachable, with a
+    // measured RTT, but not holding the blob in their cache store. They serve
+    // two roles: the proxy-warming candidate pool (ADR 037 § Candidate pool)
+    // when a holder exists but is distant, and — when NO holder answers — the
+    // pull-through serve targets a cold blob's first fetch bootstraps from
+    // (#1911), since `has_blob:false` from the cache store does not mean the
+    // node cannot serve via its own origin. Always collected, because the second
+    // role does not depend on warming being on.
+    let mut non_holders: Vec<discovery::WarmingCandidate> = Vec::new();
     // Three ways a candidate drops out, counted separately: the terminal error below
     // has to name the one that actually happened. A wrong `slash_judge_address` or
     // `chain_id` makes EVERY honest node fail verification, and reporting that as
@@ -405,8 +453,8 @@ pub(crate) async fn probe_and_order(
                 total_bytes: resp_ext.total_bytes,
                 coverage: resp_ext.coverage.clone(),
             });
-        } else if warming.enabled {
-            warming_pool.push(discovery::WarmingCandidate {
+        } else {
+            non_holders.push(discovery::WarmingCandidate {
                 node_id: cand.node_id,
                 eth_address: cand.eth_address,
                 rtt_ms,
@@ -414,24 +462,31 @@ pub(crate) async fn probe_and_order(
         }
     }
 
+    // Terminal only when NOTHING can serve — no holder AND no reachable
+    // non-holder to pull through. An empty holder set alone is not terminal: a
+    // cold blob is origin-only with zero cache holders, the normal first-fetch
+    // state (#1911), so as long as one bonded node answered it is a serve target.
+    if holders.is_empty() && non_holders.is_empty() {
+        return Err(no_serve_target_error(
+            probe_count,
+            unreachable,
+            unverifiable,
+        ));
+    }
+
     if holders.is_empty() {
-        if unverifiable > 0 {
-            anyhow::bail!(
-                "{unverifiable} of {probe_count} probed node(s) answered, but their probe \
-                 signatures did not recover to the operator address each is registered \
-                 under. That is usually local configuration rather than missing content: \
-                 check that blockchain.slash_judge_address and blockchain.chain_id match \
-                 the deployment these nodes registered against"
-            );
-        }
-        let answered = probe_count.saturating_sub(unreachable);
-        anyhow::bail!(
-            "none of the {probe_count} probed node(s) hold the requested blob \
-             ({unreachable} did not answer, {answered} answered without it)"
+        // No cache holder, but reachable non-holders can serve via pull-through.
+        // `decdn` installs no tracing subscriber, so the operator learns on
+        // stderr why the fetch is talking to nodes that answered `has_blob:false`.
+        eprintln!(
+            "no probed node holds the blob in cache; falling back to {} reachable bonded \
+             non-holder(s) as pull-through serve targets — a node serves an authorized miss \
+             from its own origin (#1911)",
+            non_holders.len()
         );
     }
 
-    let ordered = failover_order(holders, &warming_pool, warming);
+    let ordered = failover_order(holders, &non_holders, warming);
     if let Some((node_id, proxy_rtt, best_holder_rtt)) = ordered.warming_lead {
         eprintln!(
             "proxy-warming: routing through nearer non-holder {node_id} ({proxy_rtt:.1}ms) \
@@ -451,7 +506,9 @@ pub(crate) async fn probe_and_order(
 /// function so the ordering is unit-tested without live probing.
 struct FailoverOrder {
     /// The candidates to try in turn: proxy-warming non-holders first (nearest
-    /// RTT first) when warming engages, then the holders nearest RTT first.
+    /// RTT first) when warming engages, then the holders nearest RTT first — or,
+    /// when no holder answered, the reachable non-holders nearest RTT first as
+    /// pull-through serve targets (#1911).
     order: Vec<NodeCandidate>,
     /// `Some((proxy_node_id, proxy_rtt_ms, best_holder_rtt_ms))` when a warming
     /// proxy is prepended; `None` when the list is just the holders.
@@ -473,7 +530,8 @@ struct FailoverOrder {
 }
 
 /// Assemble the failover order (#1174, ADR 037 § Client selection policy) from
-/// the probed `holders` and the `warming_pool` of probed non-holders.
+/// the probed `holders` and the `non_holders` — probed bonded nodes that
+/// answered `has_blob:false`.
 ///
 /// The holders form the backbone, nearest RTT first — and, absent proxy warming,
 /// the whole list. When warming is enabled and the best holder is distant, the
@@ -482,11 +540,41 @@ struct FailoverOrder {
 /// pull-through and becomes the first regional copy) and falls over through the
 /// remaining proxies to the direct holder. RTT-only ranking; never a gamble (an
 /// empty proxy order leaves the list as just the holders).
+///
+/// When `holders` is empty the blob is cache-cold — its normal first-fetch state,
+/// since every object is born origin-only with zero cache holders (#1911). The
+/// order is then the `non_holders`, nearest RTT first, as real pull-through serve
+/// targets: a node serves an authorized miss from its own origin (or node-to-node)
+/// even when its cache store answers `has_blob:false`. This fallback is
+/// independent of proxy warming — it is how a caching network bootstraps cold
+/// content, not a latency optimization — so it applies whether warming is on or
+/// off. `warming_lead`, `size_hint`, and `coverage_by_node` are all empty here,
+/// since no holder answered.
 fn failover_order(
     mut holders: Vec<discovery::Probed>,
-    warming_pool: &[discovery::WarmingCandidate],
+    non_holders: &[discovery::WarmingCandidate],
     warming: ProxyWarmingParams,
 ) -> FailoverOrder {
+    if holders.is_empty() {
+        let mut cold = non_holders.iter().collect::<Vec<_>>();
+        cold.sort_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms));
+        let order = cold
+            .iter()
+            .map(|c| NodeCandidate {
+                node_id: c.node_id,
+                eth_address: c.eth_address,
+                // As for a proxy lead: `region_hint` never rides along on a
+                // candidate the client assembled from probe RTTs alone.
+                region_hint: None,
+            })
+            .collect();
+        return FailoverOrder {
+            order,
+            warming_lead: None,
+            size_hint: None,
+            coverage_by_node: HashMap::new(),
+        };
+    }
     holders.sort_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms));
     // Captured before `holders` is consumed into `order` below — each probed
     // holder's real coverage, for the multi-source lane builder (#1506's B3).
@@ -503,7 +591,7 @@ fn failover_order(
             best_holder_rtt,
             warming.rtt_threshold_ms,
             warming.margin_ms,
-            warming_pool,
+            non_holders,
         )
     } else {
         Vec::new()
@@ -770,11 +858,14 @@ fn persist_watermark(
         Ok(AdvanceOutcome::Advanced) => {}
         Ok(other) => eprintln!(
             "warning: voucher watermark not persisted for pool {pool_id} (provider {}): \
-             {other:?}; the next reuse may re-sign a stale watermark",
+             {other:?}; the next reuse may re-sign a stale watermark, which that provider \
+             rejects — close and reopen the pool if reuse starts failing",
             lane.provider
         ),
         Err(e) => eprintln!(
-            "warning: failed to persist voucher watermark for pool {pool_id} (provider {}): {e}",
+            "warning: failed to persist voucher watermark for pool {pool_id} (provider {}): {e}; \
+             the next reuse may re-sign a stale watermark, which that provider rejects — close \
+             and reopen the pool if reuse starts failing",
             lane.provider
         ),
     }
@@ -1879,13 +1970,20 @@ where
                 },
             )
             .await?;
-            let credited = top_up(self.contract, self.pool_id, additional).await?;
-            // The escrowed-but-untracked outcomes (`UnknownPool` / `PoolMismatch`)
-            // come straight back for the driver to treat as terminal — it will
-            // not credit a deposit it cannot track.
-            self.store
-                .add_deposit(self.owner, self.pool_id, credited)
-                .map_err(|e| anyhow::anyhow!("persist pool top-up: {e}"))
+            let ToppedUpPool { credited, tx } =
+                top_up(self.contract, self.pool_id, additional).await?;
+            // Grade here rather than handing the escrowed-but-untracked
+            // outcomes back for the driver to bail on. The driver treats them
+            // as terminal either way, but `DepositOutcome` has nowhere to carry
+            // the tx or the pool, so its bail names neither — and this is the
+            // one leg where the escrow has already moved.
+            let effect = topped_up_effect(self.pool_id, credited);
+            let new_deposit = grade_deposit_credit(
+                self.store.add_deposit(self.owner, self.pool_id, credited),
+                &effect,
+                tx,
+            )?;
+            Ok(DepositOutcome::Added(new_deposit))
         })
     }
 }
@@ -2219,32 +2317,46 @@ where
                 if max_approve { None } else { Some(additional) },
             )
             .await?;
-            let credited = top_up(contract, state.pool_id, additional).await?;
-            // The escrowed-but-untracked outcomes are logged inside `top_up`; the
-            // CLI re-reads the row below and reflects whatever landed.
-            match store.add_deposit(self_address, state.pool_id, credited) {
-                Ok(DepositOutcome::Added(_)) => {}
-                Ok(other) => eprintln!(
-                    "warning: pool {} topped up on-chain but the local record was not updated: \
-                     {other:?}",
-                    state.pool_id
-                ),
-                Err(e) => eprintln!(
-                    "warning: pool {} topped up on-chain but persisting it locally failed: {e}",
-                    state.pool_id
-                ),
-            }
-            store.get_by_pool_id(state.pool_id)?.unwrap_or(state)
+            let ToppedUpPool { credited, tx } = top_up(contract, state.pool_id, additional).await?;
+            // The USDC is escrowed the moment `topUp` mines. A local credit that
+            // does not land leaves the deposit untracked, and continuing would
+            // fetch on a `state.deposit` that understates the chain — so the
+            // low-water check re-fires on every later fetch while nobody
+            // reconciles the escrow. No bytes have been paid for on *this*
+            // entry yet — `bundle pull` calls this once per entry, so earlier
+            // entries may already be paid for and written — and only the escrow
+            // moved, so failing here strands nothing in flight. The reactive
+            // mid-fetch leg takes the same disposition (`CliFunder::top_up`).
+            let effect = topped_up_effect(state.pool_id, credited);
+            grade_deposit_credit(
+                store.add_deposit(self_address, state.pool_id, credited),
+                &effect,
+                tx,
+            )?;
+            // The credit committed, so the row must be there. A `None` here
+            // means it vanished between the write and this read — the local
+            // record did not survive, which is the same untracked-escrow
+            // condition, not something to paper over with the pre-top-up
+            // snapshot.
+            store
+                .get_by_pool_id(state.pool_id)?
+                .ok_or_else(|| escrowed_but_untracked(&effect, tx, "the credited row vanished"))?
         };
-        // Uncapped: a self-owned capability delegates spend to the owner's own
-        // key, so the pool deposit — not the capability cap — is the real
-        // spending bound. Capping at `state.deposit` here would freeze the
+        // Effectively uncapped: a self-owned capability delegates spend to the
+        // owner's own key, so the pool deposit — not the capability cap — is the
+        // real spending bound. Capping at `state.deposit` here would freeze the
         // on-chain cap at the pre-top-up deposit (`_registerCapability` is
-        // idempotent past first redemption) and reject spend past it.
+        // idempotent past first redemption) and reject spend past it. The cap is
+        // `SELF_CAPABILITY_CAP` (`u64::MAX` µUSDC, ~$18.4T), NOT `U256::MAX`: the
+        // `PaymentPool`'s `spendingCap` is a `uint64`, so a `U256::MAX` cap hashes
+        // to a word the contract can never reconstruct and every redemption of this
+        // lane's vouchers reverts, silently stranding the node's earnings (and,
+        // because the node's exhaustion gate keys on `deposit − totalRedeemed`,
+        // starving the reactive top-up path). Matches `open_pool`'s self-capability.
         let capability = issue_self_capability(
             signer.as_ref(),
             state.pool_id,
-            U256::MAX,
+            SELF_CAPABILITY_CAP,
             SELF_CAPABILITY_EXPIRY,
             voucher_domain,
         )?;
@@ -2281,13 +2393,9 @@ where
     .await?;
     // The deposit is escrowed on-chain; a failed local record leaves it
     // untracked (reconcile against the tx).
-    store.record(&opened.state).map_err(|e| {
-        anyhow::anyhow!(
-            "buyer pool opened on-chain (tx {}) but persisting it failed; the deposit is \
-             escrowed but untracked — reconcile manually: {e}",
-            opened.tx
-        )
-    })?;
+    store
+        .record(&opened.state)
+        .map_err(|e| escrowed_but_untracked("buyer pool opened", opened.tx, e))?;
     Ok(opened
         .ctx
         .with_provider(provider, U256::ZERO, U256::ZERO)
@@ -2492,6 +2600,56 @@ mod tests {
         assert!(out.warming_lead.is_none());
         let ids: Vec<_> = out.order.iter().map(|c| c.node_id).collect();
         assert_eq!(ids, vec![node_key(10)]);
+    }
+
+    /// With no holder, the failover order is the reachable bonded non-holders,
+    /// nearest RTT first, as pull-through serve targets (#1911): a cold blob is
+    /// origin-only with zero cache holders, so an empty holder set is the normal
+    /// first-fetch state, not a terminal error. The fallback is independent of
+    /// proxy warming — here warming is off — and reports no lead, size, or
+    /// holder coverage, since nothing answered `has_blob`.
+    #[test]
+    fn failover_order_empty_holders_falls_back_to_non_holders_by_rtt() {
+        let non_holders = vec![
+            discovery::WarmingCandidate {
+                node_id: node_key(31),
+                eth_address: Address::repeat_byte(31),
+                rtt_ms: 300.0,
+            },
+            discovery::WarmingCandidate {
+                node_id: node_key(32),
+                eth_address: Address::repeat_byte(32),
+                rtt_ms: 100.0,
+            },
+        ];
+        let out = super::failover_order(Vec::new(), &non_holders, warming_params(false));
+
+        assert!(out.warming_lead.is_none(), "no holder to warm toward");
+        assert!(out.size_hint.is_none(), "no holder reported a size");
+        assert!(
+            out.coverage_by_node.is_empty(),
+            "non-holders carry no measured coverage"
+        );
+        let ids: Vec<_> = out.order.iter().map(|c| c.node_id).collect();
+        assert_eq!(
+            ids,
+            vec![node_key(32), node_key(31)],
+            "nearest non-holder (100ms) leads the pull-through fallback"
+        );
+        assert!(
+            out.order.iter().all(|c| c.region_hint.is_none()),
+            "pull-through candidates carry no region hint (spoof-proofing, ADR 037)"
+        );
+    }
+
+    /// With neither a holder nor a reachable non-holder, the order is empty —
+    /// the genuinely terminal case `probe_and_order` turns into an error before
+    /// it ever calls this.
+    #[test]
+    fn failover_order_empty_when_no_holder_and_no_non_holder() {
+        let out = super::failover_order(Vec::new(), &[], warming_params(true));
+        assert!(out.order.is_empty());
+        assert!(out.warming_lead.is_none());
     }
 
     /// `failover_order`'s `coverage_by_node` carries each holder's REAL measured

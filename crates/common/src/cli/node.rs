@@ -188,6 +188,22 @@ pub enum NodeCommand {
     /// iroh path, both signatures — without submitting or touching any key
     /// file.
     RotateKey(RotateKeyArgs),
+    /// (Re)publish this node's dialable QUIC addresses on-chain via
+    /// `CapacityBond.updateMultiaddrs` (#1908). The one-command fix for a node
+    /// that registered an empty multiaddr set (`decdn node register` with no
+    /// `--multiaddr`) and is therefore stranded on the iroh relay path: it
+    /// promotes direct addresses without a destructive deregister/re-register
+    /// cycle (which `register` alone cannot do — a second `register` reverts
+    /// `NodeAlreadyRegistered`).
+    ///
+    /// Like the other on-chain `node` subcommands this talks to the chain, not
+    /// a running node's admin RPC, and signs with the operator Ethereum key.
+    /// The node must be active; the contract's guardrails — the
+    /// `maxMultiaddrSize` byte ceiling and the `multiaddrUpdateCooldown`
+    /// between updates — are pre-checked and reported before the send. Pass
+    /// `--dry-run` to print the plan (packed size, ceiling, cooldown state)
+    /// without submitting.
+    UpdateMultiaddrs(UpdateMultiaddrsArgs),
     /// Unpaid client-side discovery of active nodes via
     /// `CapacityBond.getRegisteredNodes` (#1481). Maps node-ids/regions to
     /// operator Ethereum addresses — the input `decdn pool open
@@ -200,6 +216,8 @@ pub enum NodeCommand {
     /// candidates by measured `cdn/probe/v1` round-trip time; without it,
     /// candidates are listed with no RTT.
     Lookup(LookupArgs),
+    /// Diagnose config, on-disk state, disk budget, and reachability.
+    Doctor(DoctorArgs),
 }
 
 /// `decdn node health` — report identity (hex `node_id`) and process
@@ -778,6 +796,26 @@ pub struct DeregisterArgs {
     pub chain: ChainArgs,
 }
 
+/// `decdn node update-multiaddrs` — (re)publish the operator's dialable QUIC
+/// addresses via `CapacityBond.updateMultiaddrs` (#1908). See
+/// [`NodeCommand::UpdateMultiaddrs`] for the full description. Performs an
+/// on-chain transaction rather than talking to a running node's admin RPC.
+#[derive(Args, Debug)]
+pub struct UpdateMultiaddrsArgs {
+    /// QUIC multiaddr to publish, e.g. `/ip4/203.0.113.10/udp/4433/quic-v1`.
+    /// Repeatable; at least one is required — the whole point of this command
+    /// is to advertise a non-empty set, so clearing addresses back to empty is
+    /// deliberately not offered here (it would re-create the relay-pinned
+    /// footgun). The set fully replaces whatever is on-chain (the contract
+    /// stores the field verbatim, it does not merge).
+    #[arg(long = "multiaddr", value_name = "MA", required = true)]
+    pub multiaddrs: Vec<String>,
+
+    /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
+    #[command(flatten)]
+    pub chain: ChainArgs,
+}
+
 /// `decdn node lookup` — unpaid client-side discovery of active nodes via
 /// `CapacityBond.getRegisteredNodes` (#1481). See [`NodeCommand::Lookup`] for the
 /// full description.
@@ -812,6 +850,34 @@ pub struct LookupArgs {
     /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
     #[command(flatten)]
     pub chain: ChainArgs,
+}
+
+/// `decdn node doctor` arguments.
+#[derive(Args, Debug)]
+pub struct DoctorArgs {
+    /// Config overrides, resolved exactly as `decdn-node run` would.
+    #[command(flatten)]
+    pub run: crate::cli::run::RunArgs,
+
+    /// Emit the full report as JSON instead of the checklist.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Treat warnings as failures for the exit code.
+    #[arg(long)]
+    pub strict: bool,
+
+    /// Skip all network and live-daemon probes (config + disk + files only).
+    #[arg(long)]
+    pub offline: bool,
+
+    /// Per-probe timeout for network checks, in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5000)]
+    pub timeout_ms: u64,
+
+    /// Admin RPC URL for live enrichment [default: from config / `DECDN_ADMIN_PORT`].
+    #[arg(long, env = "DECDN_ADMIN_URL", value_name = "URL")]
+    pub admin_url: Option<String>,
 }
 
 /// `decdn node top` — live metrics view (issue #275).

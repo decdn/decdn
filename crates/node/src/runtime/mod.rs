@@ -3,6 +3,7 @@
 pub mod eviction;
 pub mod reload;
 
+pub(crate) use reload::emit_config_notices;
 pub use reload::{LogLevelSetter, ReloadSnapshot, RuntimeReloadState};
 
 use crate::chain_events::shared_head::{HeadSource, SharedHead};

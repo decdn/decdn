@@ -110,7 +110,7 @@ pub const fn decdn_protocol::client::WatermarkBundle::validate(&self) -> core::r
 pub struct decdn_protocol::client::WireCapability
 pub decdn_protocol::client::WireCapability::expiry: u64
 pub decdn_protocol::client::WireCapability::owner_signature: alloc::vec::Vec<u8>
-pub decdn_protocol::client::WireCapability::spending_cap: [u8; 32]
+pub decdn_protocol::client::WireCapability::spending_cap: u64
 impl decdn_protocol::client::WireCapability
 pub const fn decdn_protocol::client::WireCapability::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub const decdn_protocol::client::BINDING_SIG_LEN: usize

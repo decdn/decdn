@@ -492,8 +492,11 @@ pub struct FetchArgs {
 
     /// Namespace the content is published under (ADR 002 § Retrieval by
     /// namespace). When set, the serving node routes a cache-miss origin pull to
-    /// that namespace's DAO-authorized origins. Absent => no namespace: served
-    /// best-effort from cache / DHT only, with no authorized origins.
+    /// that namespace's DAO-authorized origins. Absent => no namespace: no
+    /// routing to a namespace's authorized origin set — served from cache, from
+    /// peers, or from the serving node's OWN configured origin, which stays a
+    /// serve target either way (`namespace_id` is a routing hint, not a serve
+    /// gate — ADR 002).
     #[arg(long, value_name = "ID", value_parser = parse_fetch_namespace_id)]
     pub namespace: Option<u64>,
 

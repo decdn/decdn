@@ -534,8 +534,8 @@ pub struct DecdnMetrics {
     /// Background low-water top-ups (#1146) that did NOT cleanly land: the standing
     /// allowance re-approval failed, the `topUp` submission/receipt errored or
     /// reverted, OR the `topUp` landed on-chain but the local channel row vanished
-    /// or rotated during the RPC (escrowed-but-untracked — `top_up` logs the tx at
-    /// error!/warn! for reconcile). Folding the untracked case in here — rather than
+    /// or rotated during the RPC, or the credit itself faulted (escrowed-but-untracked
+    /// — `fund_pool` logs the tx at error! for reconcile). Folding the untracked case in here — rather than
     /// counting it as `buyer_topup_ok` — means an operator alerting on this metric
     /// sees stranded deposits. The refill is best-effort (the channel is simply left
     /// un-topped), but a sustained rate means reused channels
