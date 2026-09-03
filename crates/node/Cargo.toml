@@ -73,6 +73,9 @@ futures-util = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
 iroh-metrics = { workspace = true }
+# Direct dep on iroh's QUIC crate solely to select the BBR3 congestion
+# controller on the endpoint (`congestion::Bbr3Config`); see the root manifest.
+noq-proto = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 clap = { workspace = true }

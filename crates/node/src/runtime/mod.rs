@@ -23,6 +23,7 @@ use iroh::address_lookup::{DnsAddressLookup, MemoryLookup, PkarrPublisher};
 use iroh::endpoint::{IdleTimeout, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
+use noq_proto::congestion::Bbr3Config;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -237,6 +238,13 @@ fn quic_transport_config() -> anyhow::Result<QuicTransportConfig> {
         .max_idle_timeout(Some(idle_timeout))
         .keep_alive_interval(QUIC_KEEP_ALIVE_INTERVAL)
         .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS))
+        // BBR3 over the default Cubic. Congestion control lives at the sender, so
+        // this governs the bytes the node serves to a downstream client or node.
+        // BBR paces to the path's measured bandwidth and round trip instead of
+        // treating loss as the sole congestion signal, so a high-latency,
+        // lossy long-haul link — where a single Cubic flow backs off hard — keeps
+        // the pipe full without needing many parallel flows to compensate.
+        .congestion_controller_factory(Arc::new(Bbr3Config::default()))
         .build())
 }
 

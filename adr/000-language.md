@@ -27,7 +27,9 @@ Components:
 - `iroh::Endpoint` — QUIC peer-to-peer connectivity and ALPN protocol negotiation.
 - `iroh-blobs` with the `fs-store` backend — content-addressed blob storage and verified transfer.
 
-**iroh versioning policy.** Pin a caret requirement in `Cargo.toml` (e.g. `iroh = "1"`); the committed `Cargo.lock` is the true pin. Current baseline: **iroh 1.0**, iroh-blobs 0.103, iroh-metrics 1.0. Upgrade only on a deliberate `cargo update`: evaluate API compatibility, then record the new baseline here before merging.
+**iroh versioning policy.** Pin a caret requirement in `Cargo.toml` (e.g. `iroh = "1"`); the committed `Cargo.lock` is the true pin. Current baseline: **iroh 1.0**, iroh-blobs 0.103, iroh-metrics 1.0, noq-proto 1.0. Upgrade only on a deliberate `cargo update`: evaluate API compatibility, then record the new baseline here before merging.
+
+**Direct `noq-proto` dependency.** The `node` crate depends on `noq-proto` directly. `noq-proto` is iroh's QUIC protocol crate. The node names `congestion::Bbr3Config` from it to select the BBR3 congestion controller on its QUIC endpoint. iroh re-exports the `ControllerFactory` trait but not the concrete controller configs, so the concrete type comes from `noq-proto`. This dependency must resolve to the same version that iroh pulls. One lock entry gives one crate instance, so the `ControllerFactory` trait object the node builds matches the one iroh's endpoint builder expects. A future iroh major that raises the `noq-proto` major needs the same bump on the node's direct pin, in the same `cargo update`.
 
 ## Consequences
 

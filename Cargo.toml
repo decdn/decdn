@@ -63,6 +63,16 @@ decdn-node = { path = "crates/node", version = "0.1.1" }
 iroh = "1"
 iroh-blobs = { version = "0.103", features = ["fs-store"] }
 iroh-metrics = "1"
+# `noq-proto` is iroh 1.x's QUIC protocol crate (its quinn-proto fork). The node
+# depends on it directly for one reason: to name `congestion::Bbr3Config` and
+# select BBR3 over the default Cubic on its QUIC endpoint. iroh re-exports the
+# `ControllerFactory` trait but not the concrete controller configs, so the type
+# has to come from here. It MUST resolve to the same version iroh pulls (one lock
+# entry, one crate instance), or the `ControllerFactory` trait object built here
+# will not match the one iroh's builder expects. Pinned via Cargo.lock with the
+# rest of the iroh ecosystem (ADR 000); `default-features = false` mirrors iroh's
+# own dependency on it.
+noq-proto = { version = "1", default-features = false }
 # bao verified-range codec (#823). Pinned to the version `iroh-blobs` 0.103
 # carries transitively (0.16) so the on-disk outboard / interleaved-stream
 # encoding the cache produces is byte-identical to what `import_bao_bytes`
