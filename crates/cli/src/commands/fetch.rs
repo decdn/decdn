@@ -35,7 +35,9 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_pool::{
-    LOW_WATER_DIVISOR, ensure_allowance, issue_self_capability, open_pool, refill_amount, top_up,
+    LOW_WATER_DIVISOR, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
+    grade_deposit_credit, issue_self_capability, open_pool, refill_amount, top_up,
+    topped_up_effect,
 };
 use decdn_client_pull::driver::{DriveConfig, drive};
 use decdn_client_pull::source::{Funder, SourceFuture};
@@ -856,11 +858,14 @@ fn persist_watermark(
         Ok(AdvanceOutcome::Advanced) => {}
         Ok(other) => eprintln!(
             "warning: voucher watermark not persisted for pool {pool_id} (provider {}): \
-             {other:?}; the next reuse may re-sign a stale watermark",
+             {other:?}; the next reuse may re-sign a stale watermark, which that provider \
+             rejects — close and reopen the pool if reuse starts failing",
             lane.provider
         ),
         Err(e) => eprintln!(
-            "warning: failed to persist voucher watermark for pool {pool_id} (provider {}): {e}",
+            "warning: failed to persist voucher watermark for pool {pool_id} (provider {}): {e}; \
+             the next reuse may re-sign a stale watermark, which that provider rejects — close \
+             and reopen the pool if reuse starts failing",
             lane.provider
         ),
     }
@@ -1965,13 +1970,20 @@ where
                 },
             )
             .await?;
-            let credited = top_up(self.contract, self.pool_id, additional).await?;
-            // The escrowed-but-untracked outcomes (`UnknownPool` / `PoolMismatch`)
-            // come straight back for the driver to treat as terminal — it will
-            // not credit a deposit it cannot track.
-            self.store
-                .add_deposit(self.owner, self.pool_id, credited)
-                .map_err(|e| anyhow::anyhow!("persist pool top-up: {e}"))
+            let ToppedUpPool { credited, tx } =
+                top_up(self.contract, self.pool_id, additional).await?;
+            // Grade here rather than handing the escrowed-but-untracked
+            // outcomes back for the driver to bail on. The driver treats them
+            // as terminal either way, but `DepositOutcome` has nowhere to carry
+            // the tx or the pool, so its bail names neither — and this is the
+            // one leg where the escrow has already moved.
+            let effect = topped_up_effect(self.pool_id, credited);
+            let new_deposit = grade_deposit_credit(
+                self.store.add_deposit(self.owner, self.pool_id, credited),
+                &effect,
+                tx,
+            )?;
+            Ok(DepositOutcome::Added(new_deposit))
         })
     }
 }
@@ -2305,22 +2317,30 @@ where
                 if max_approve { None } else { Some(additional) },
             )
             .await?;
-            let credited = top_up(contract, state.pool_id, additional).await?;
-            // The escrowed-but-untracked outcomes are logged inside `top_up`; the
-            // CLI re-reads the row below and reflects whatever landed.
-            match store.add_deposit(self_address, state.pool_id, credited) {
-                Ok(DepositOutcome::Added(_)) => {}
-                Ok(other) => eprintln!(
-                    "warning: pool {} topped up on-chain but the local record was not updated: \
-                     {other:?}",
-                    state.pool_id
-                ),
-                Err(e) => eprintln!(
-                    "warning: pool {} topped up on-chain but persisting it locally failed: {e}",
-                    state.pool_id
-                ),
-            }
-            store.get_by_pool_id(state.pool_id)?.unwrap_or(state)
+            let ToppedUpPool { credited, tx } = top_up(contract, state.pool_id, additional).await?;
+            // The USDC is escrowed the moment `topUp` mines. A local credit that
+            // does not land leaves the deposit untracked, and continuing would
+            // fetch on a `state.deposit` that understates the chain — so the
+            // low-water check re-fires on every later fetch while nobody
+            // reconciles the escrow. No bytes have been paid for on *this*
+            // entry yet — `bundle pull` calls this once per entry, so earlier
+            // entries may already be paid for and written — and only the escrow
+            // moved, so failing here strands nothing in flight. The reactive
+            // mid-fetch leg takes the same disposition (`CliFunder::top_up`).
+            let effect = topped_up_effect(state.pool_id, credited);
+            grade_deposit_credit(
+                store.add_deposit(self_address, state.pool_id, credited),
+                &effect,
+                tx,
+            )?;
+            // The credit committed, so the row must be there. A `None` here
+            // means it vanished between the write and this read — the local
+            // record did not survive, which is the same untracked-escrow
+            // condition, not something to paper over with the pre-top-up
+            // snapshot.
+            store
+                .get_by_pool_id(state.pool_id)?
+                .ok_or_else(|| escrowed_but_untracked(&effect, tx, "the credited row vanished"))?
         };
         // Uncapped: a self-owned capability delegates spend to the owner's own
         // key, so the pool deposit — not the capability cap — is the real
@@ -2367,13 +2387,9 @@ where
     .await?;
     // The deposit is escrowed on-chain; a failed local record leaves it
     // untracked (reconcile against the tx).
-    store.record(&opened.state).map_err(|e| {
-        anyhow::anyhow!(
-            "buyer pool opened on-chain (tx {}) but persisting it failed; the deposit is \
-             escrowed but untracked — reconcile manually: {e}",
-            opened.tx
-        )
-    })?;
+    store
+        .record(&opened.state)
+        .map_err(|e| escrowed_but_untracked("buyer pool opened", opened.tx, e))?;
     Ok(opened
         .ctx
         .with_provider(provider, U256::ZERO, U256::ZERO)

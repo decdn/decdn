@@ -168,7 +168,15 @@ async fn run() -> anyhow::Result<()> {
     // measured on-chain amount into the local record via `add_deposit`.
     let remaining = deposit - prior_amount; // == 1
     let additional = deposit - remaining; // restore to a full `deposit`
-    let credited = top_up(&pool, pool_id, additional).await.context("top_up")?;
+    let topped_up = top_up(&pool, pool_id, additional).await.context("top_up")?;
+    // The tx is the only handle an operator has to reconcile an escrow whose
+    // local credit failed, so pin that a real mined hash comes back — every
+    // unit-level test of that path feeds it a synthetic one.
+    anyhow::ensure!(
+        !topped_up.tx.is_zero(),
+        "top_up must return the mining transaction, not a default hash"
+    );
+    let credited = topped_up.credited;
     let deposit_outcome = store
         .add_deposit(buyer_addr, pool_id, credited)
         .context("credit top-up into the local record")?;

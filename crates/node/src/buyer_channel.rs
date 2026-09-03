@@ -35,16 +35,14 @@ use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{
-    AdvanceOutcome, BuyerPoolState, BuyerPoolStore, DepositOutcome, LaneKey, PoolId,
-};
+use decdn_incentive::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore, LaneKey, PoolId};
 use futures_util::FutureExt;
 use tracing::{debug, error, info, warn};
 
 use crate::chain_events::AbortOnDrop;
 use crate::client_requester::buyer_pool::{
-    LOW_WATER_DIVISOR, ensure_allowance, issue_self_capability, open_pool, refill_amount,
-    top_up as pool_top_up,
+    LOW_WATER_DIVISOR, ToppedUpPool, ensure_allowance, grade_deposit_credit, issue_self_capability,
+    open_pool, refill_amount, top_up as pool_top_up, topped_up_effect,
 };
 use crate::client_requester::{LocalPullFault, PoolContext};
 use crate::metrics::Metrics;
@@ -98,7 +96,7 @@ impl std::error::Error for OpenReported {}
 
 type OpenOutcome = Result<(), Arc<anyhow::Error>>;
 type SharedOpen = futures_util::future::Shared<BoxFuture<'static, OpenOutcome>>;
-type TopUpOutcome = Result<DepositOutcome, Arc<anyhow::Error>>;
+type TopUpOutcome = Result<U256, Arc<anyhow::Error>>;
 type SharedTopUp = futures_util::future::Shared<BoxFuture<'static, TopUpOutcome>>;
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
@@ -160,18 +158,22 @@ struct FundingHandles<P: Provider + Clone + 'static> {
 /// note in `swap_uniswap.rs`). On the happy path `attempt` runs once and
 /// `recover_allowance` never runs, so the node issues zero allowance reads
 /// per top-up.
-async fn top_up_recovering_allowance<A, AFut, R, RFut>(
+///
+/// `T` is whatever the top-up returns, carried through untouched — from the
+/// retry on a recovered allowance, so it describes the second transaction.
+/// `attempt` may run twice, so producing a `T` must be safe to repeat.
+async fn top_up_recovering_allowance<T, A, AFut, R, RFut>(
     attempt: A,
     recover_allowance: R,
-) -> Result<U256>
+) -> Result<T>
 where
     A: Fn() -> AFut,
-    AFut: std::future::Future<Output = Result<U256>>,
+    AFut: std::future::Future<Output = Result<T>>,
     R: FnOnce() -> RFut,
     RFut: std::future::Future<Output = Result<()>>,
 {
     match attempt().await {
-        Ok(credited) => Ok(credited),
+        Ok(out) => Ok(out),
         Err(err)
             if err
                 .downcast_ref::<crate::client_requester::buyer_pool::AllowanceShortfall>()
@@ -187,21 +189,27 @@ where
 }
 
 /// Add `additional` USDC to the buyer pool `pool_id` on-chain, then credit the
-/// returned amount into the persisted [`BuyerPoolState`]. The shared funding
-/// kernel behind both the proactive low-water refill and the reactive mid-pull
-/// top-up (#1146/#1530), so the allowance posture, the [`DepositOutcome`]
-/// grading, and the metering cannot drift apart.
+/// returned amount into the persisted [`BuyerPoolState`] and return the new
+/// deposit. The shared funding kernel behind both the proactive low-water refill
+/// and the reactive mid-pull top-up (#1146/#1530), so the allowance posture, the
+/// deposit-credit grading, and the metering cannot drift apart.
+///
+/// # Errors
+///
+/// Errors if the allowance or `topUp` fails — the funds did not move — and if a
+/// mined `topUp` cannot be credited locally, in which case the deposit is
+/// escrowed and the error names the tx.
 async fn fund_pool<P: Provider + Clone + 'static>(
     handles: &FundingHandles<P>,
     pool_id: PoolId,
     additional: U256,
-) -> Result<DepositOutcome> {
+) -> Result<U256> {
     // Daemon posture: attempt the transfer directly against the standing
     // unlimited allowance granted at bootstrap. Only when `topUp` reverts with
     // an allowance shortfall (the approval was revoked or never granted) do a
     // just-in-time `approve` and retry once — so the happy path issues zero
     // allowance reads per top-up.
-    let credited = match top_up_recovering_allowance(
+    let ToppedUpPool { credited, tx } = match top_up_recovering_allowance(
         || pool_top_up(&handles.contract, pool_id, additional),
         || {
             ensure_allowance(
@@ -215,7 +223,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
     )
     .await
     {
-        Ok(credited) => credited,
+        Ok(topped_up) => topped_up,
         Err(err) => {
             warn!(
                 %pool_id,
@@ -230,29 +238,34 @@ async fn fund_pool<P: Provider + Clone + 'static>(
 
     // Credit the CHAIN-measured delta into the committed row inside one write txn,
     // so a concurrent settle cannot clobber the deposit or lose the top-up.
-    match handles
-        .store
-        .add_deposit(handles.owner, pool_id, credited)
-        .context("credit buyer pool top-up")?
-    {
-        outcome @ DepositOutcome::Added(_) => {
+    // `add_deposit` splits its failures across two channels — a backend fault is
+    // the `Err`, a committed-row mismatch (the row vanished or was replaced
+    // during the RPC) is a non-`Added` `Ok`. Both mean the topUp landed and the
+    // funds are escrowed-but-untracked, so both meter as a failure rather than
+    // `buyer_topup_ok`, or an operator watching the failure metric would miss
+    // stranded deposits (#1146 review). Grading both here is also what puts the
+    // tx in the propagated error: `DepositOutcome` has nowhere to carry it.
+    let effect = topped_up_effect(pool_id, credited);
+    match grade_deposit_credit(
+        handles.store.add_deposit(handles.owner, pool_id, credited),
+        &effect,
+        tx,
+    ) {
+        Ok(new_deposit) => {
             handles.metrics.buyer_topup_ok();
-            Ok(outcome)
+            Ok(new_deposit)
         }
-        // The topUp landed on-chain but the local row vanished or was replaced
-        // during the RPC. Funds are escrowed-but-untracked — NOT a clean success,
-        // so meter it as a failure rather than `buyer_topup_ok`, or an operator
-        // watching the failure metric would miss stranded deposits (#1146 review).
-        outcome => {
+        Err(err) => {
             error!(
                 %pool_id,
                 %credited,
-                ?outcome,
+                %tx,
+                error = %format!("{err:#}"),
                 "buyer top-up: topUp landed on-chain but the local pool row could not be \
                  credited; the deposit is ESCROWED AND UNTRACKED — reconcile against the chain"
             );
             handles.metrics.buyer_topup_failure();
-            Ok(outcome)
+            Err(err)
         }
     }
 }
@@ -509,9 +522,13 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// Best-effort background top-up of a reused pool that has run below its
     /// low-water mark (#1146). Spawns a detached task and returns immediately — it
     /// NEVER blocks the pull. Deduped via [`Self::topup_in_flight`], so many
-    /// concurrent reuse pulls fire at most one `topUp`. Every leg is advisory: an
-    /// in-flight refill, an allowance failure, or a reverted `topUp` all just skip
-    /// it (logged / metered), leaving the pool un-topped-up — strictly no worse.
+    /// concurrent reuse pulls fire at most one `topUp`. An in-flight refill, an
+    /// allowance failure, or a reverted `topUp` all just skip it (logged /
+    /// metered), leaving the pool un-topped-up — strictly no worse. The one leg
+    /// that IS worse is a `topUp` that mines and cannot be credited locally: the
+    /// deposit is then escrowed and untracked, and because this handle is
+    /// dropped, `fund_pool`'s `error!` and `buyer_topup_failure()` are all the
+    /// operator gets.
     fn spawn_refill_if_low(&self, state: &BuyerPoolState) {
         let additional =
             refill_decision(state.deposit, committed_amount(state), self.working_deposit);
@@ -743,7 +760,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             return Ok(state.deposit);
         }
         match self.join_or_spawn_topup(state.pool_id, additional).await {
-            Ok(DepositOutcome::Added(new_deposit)) => {
+            Ok(new_deposit) => {
                 info!(
                     pool_id = %state.pool_id,
                     %additional,
@@ -752,13 +769,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
                 );
                 Ok(new_deposit)
             }
-            Ok(outcome @ (DepositOutcome::UnknownPool | DepositOutcome::PoolMismatch)) => {
-                Err(anyhow::anyhow!(
-                    "reactive top-up of {additional} µUSDC landed on-chain but the local record \
-                     could not be credited ({outcome:?}): the deposit is ESCROWED AND UNTRACKED. \
-                     Reconcile against the chain"
-                ))
-            }
+            // `fund_pool` has already graded the escrowed-but-untracked case
+            // into this error, tx and all, so there is nothing to re-diagnose.
             Err(err) => Err(anyhow::anyhow!("reactive top-up failed: {err:#}")),
         }
     }
@@ -999,8 +1011,15 @@ async fn reclaim_once<P: Provider + Clone>(
     match contract.reclaim(state.pool_id).send().await {
         Ok(pending) => match pending.get_receipt().await {
             Ok(receipt) if receipt.status() => {
+                // Only the `Err` leaves the row's fate unknown — `Ok(false)`
+                // means the compare-and-delete found no row for this pool, so
+                // nothing maps the owner to it. A surviving row would send a
+                // later reuse back to a `Closed` pool whose `deposit` field
+                // still reads healthy, so meter it like the sibling arms
+                // instead of dropping out of the sweep silently.
                 if let Err(err) = store.forget_if_pool(owner, state.pool_id) {
                     warn!(pool_id = %state.pool_id, %err, "reclaim sweep: forget after reclaim failed");
+                    metrics.buyer_reclaim_failure();
                     return;
                 }
                 info!(pool_id = %state.pool_id, "reclaimed the buyer pool residual and dropped the row");
@@ -1213,7 +1232,7 @@ mod tests {
     async fn terminal_non_allowance_revert_is_not_retried() {
         let attempts = AtomicUsize::new(0);
         let recovers = AtomicUsize::new(0);
-        let out = top_up_recovering_allowance(
+        let out: Result<U256> = top_up_recovering_allowance(
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async { Err(anyhow::anyhow!("topUp reverted for pool: paused")) }
@@ -1240,7 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn retry_still_shortfall_stops_after_one_retry() {
         let attempts = AtomicUsize::new(0);
-        let out = top_up_recovering_allowance(
+        let out: Result<U256> = top_up_recovering_allowance(
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async {
