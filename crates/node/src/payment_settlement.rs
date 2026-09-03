@@ -97,6 +97,23 @@ pub const REDEEM_HINT_CAPACITY: usize = 256;
 /// re-send — so a bounded channel that drops on overflow is acceptable.
 pub const POOL_RESOLVE_HINT_CAPACITY: usize = 256;
 
+/// How long the pool-owner resolver suppresses a repeat `getPool` for a pool it
+/// just found not-servable (nonexistent / `Closed`) or that errored. A
+/// not-servable pool never folds into the projection, so its `snapshot` stays
+/// `None`; without this a client re-sending its capability on every request would
+/// drive one `getPool` per request against the same dead pool. On expiry the pool
+/// is re-checked once — the window is short enough that a pool opened after a
+/// negative result still becomes servable within it, long enough to collapse a
+/// request flood to ~one call per pool per window.
+const RESOLVE_NEGATIVE_TTL: Duration = Duration::from_mins(1);
+
+/// Cap on the resolver's negative cache, bounding its memory against a flood of
+/// distinct nonexistent pool ids. At the cap an insert first prunes expired
+/// entries; a flood of live distinct negatives past that simply falls back to the
+/// resolver's own serial rate bound (one in-flight `getPool` at a time) rather
+/// than growing the cache without limit.
+const RESOLVE_NEGATIVE_CACHE_MAX: usize = 4096;
+
 /// Bounded receipt wait for a redemption transaction. A stuck/dropped/replaced tx
 /// must not wedge a background tick; a lapse yields [`TxOutcome::Timeout`], a
 /// non-fatal failure (the tx may still mine later; the claim is at worst deferred,
@@ -761,16 +778,40 @@ impl PoolSettlementSink {
 /// A `getPool` fault, a nonexistent pool (`owner == 0`), or a `Closed` pool seeds
 /// nothing: the serve gate stays fail-open `None`, and the client re-hints on its
 /// next request. Seeding a `Closed` (reclaimed) pool would only register a lane
-/// against funds that can no longer be redeemed.
+/// against funds that can no longer be redeemed. Such an outcome is remembered in
+/// a short-TTL negative cache ([`RESOLVE_NEGATIVE_TTL`]) so a client re-requesting
+/// the same dead pool every request cannot drive a `getPool` per request.
 async fn pool_owner_resolver_loop<P: Provider + Clone>(
     contract: PaymentPool::PaymentPoolInstance<P>,
     pool_view: PoolProjection,
     mut resolve_rx: mpsc::Receiver<B256>,
 ) {
+    // Owned by this single task, so a plain map needs no synchronization. Holds a
+    // pool id → last-negative instant for pools recently found not-servable or
+    // that errored; a successful resolve removes the entry.
+    let mut negative: HashMap<B256, Instant> = HashMap::new();
     while let Some(pool_id) = resolve_rx.recv().await {
-        resolve_pool_owner(&contract, &pool_view, pool_id).await;
+        resolve_pool_owner(&contract, &pool_view, pool_id, &mut negative).await;
     }
     debug!("pool-owner resolver loop ended (all resolve-hint senders dropped)");
+}
+
+/// Whether `pool_id` is in the negative cache and still fresh — the resolver then
+/// skips the `getPool`. Pure, so the TTL gate is unit-testable without a provider.
+fn negative_cache_hit(cache: &HashMap<B256, Instant>, pool_id: B256) -> bool {
+    cache
+        .get(&pool_id)
+        .is_some_and(|at| at.elapsed() < RESOLVE_NEGATIVE_TTL)
+}
+
+/// Remember `pool_id` as recently not-servable / errored. At the cache cap, prune
+/// expired entries first so a flood of distinct nonexistent ids cannot grow the
+/// map without bound. Pure, so the cap-prune is unit-testable.
+fn remember_negative(cache: &mut HashMap<B256, Instant>, pool_id: B256) {
+    if cache.len() >= RESOLVE_NEGATIVE_CACHE_MAX {
+        cache.retain(|_, at| at.elapsed() < RESOLVE_NEGATIVE_TTL);
+    }
+    cache.insert(pool_id, Instant::now());
 }
 
 /// The serve-path serve status a resolved `getPool` snapshot maps to, or `None`
@@ -799,10 +840,16 @@ async fn resolve_pool_owner<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     pool_view: &PoolProjection,
     pool_id: B256,
+    negative: &mut HashMap<B256, Instant>,
 ) {
     // A concurrent event fold (or an earlier resolve of the same pool) may have
     // filled the entry between the hint and here — skip the round-trip.
     if pool_view.snapshot(pool_id).is_some() {
+        return;
+    }
+    // A pool recently found not-servable (or that errored) is suppressed for the
+    // negative-cache window, so a re-request flood cannot storm `getPool`.
+    if negative_cache_hit(negative, pool_id) {
         return;
     }
     let pool = match contract.getPool(pool_id).call().await {
@@ -813,14 +860,19 @@ async fn resolve_pool_owner<P: Provider + Clone>(
                 pool_id = %pool_id,
                 "pool-owner resolve: getPool failed; the client re-hints on its next request"
             );
+            remember_negative(negative, pool_id);
             return;
         }
     };
     let Some(lifecycle) = resolved_lifecycle(&pool) else {
         debug!(pool_id = %pool_id, "pool-owner resolve: pool absent or closed; not seeding");
+        remember_negative(negative, pool_id);
         return;
     };
     pool_view.record_resolved(pool_id, pool.owner, U256::from(pool.deposit), lifecycle);
+    // A later reopen at the same id (or a transient error that has since cleared)
+    // must not stay suppressed once the pool actually resolves.
+    negative.remove(&pool_id);
     debug!(
         pool_id = %pool_id,
         owner = %pool.owner,
@@ -1710,6 +1762,48 @@ mod tests {
             Some(Lifecycle::Closing {
                 deadline: 1_900_000_000
             })
+        );
+    }
+
+    fn stale_instant() -> Instant {
+        // An instant older than the negative-cache TTL, for the freshness gate.
+        Instant::now()
+            .checked_sub(RESOLVE_NEGATIVE_TTL + Duration::from_secs(1))
+            .unwrap_or_else(Instant::now)
+    }
+
+    #[test]
+    fn negative_cache_hit_only_for_a_fresh_entry() {
+        let mut cache: HashMap<B256, Instant> = HashMap::new();
+        let id = B256::repeat_byte(0x33);
+        assert!(!negative_cache_hit(&cache, id), "an absent id is not a hit");
+        remember_negative(&mut cache, id);
+        assert!(
+            negative_cache_hit(&cache, id),
+            "a just-recorded id is a hit"
+        );
+        cache.insert(id, stale_instant());
+        assert!(
+            !negative_cache_hit(&cache, id),
+            "an entry past the TTL is re-checked, not suppressed"
+        );
+    }
+
+    #[test]
+    fn remember_negative_prunes_expired_entries_at_the_cap() {
+        let mut cache: HashMap<B256, Instant> = HashMap::new();
+        // Fill to the cap with stale entries, then record one more: the insert
+        // prunes the expired ones instead of growing past the cap.
+        for i in 0..RESOLVE_NEGATIVE_CACHE_MAX {
+            let id = B256::from(U256::from(i).to_be_bytes::<32>());
+            cache.insert(id, stale_instant());
+        }
+        assert_eq!(cache.len(), RESOLVE_NEGATIVE_CACHE_MAX);
+        remember_negative(&mut cache, B256::repeat_byte(0xff));
+        assert_eq!(
+            cache.len(),
+            1,
+            "the cap-prune drops every expired entry, leaving only the fresh insert"
         );
     }
 
