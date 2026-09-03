@@ -1,8 +1,11 @@
-//! Disk & cache-budget group. The eviction driver bounds the *logical* cache
-//! footprint to `eviction_high_water_pct`% of `cache_size_mb` — a config
-//! number, never real free disk. This group compares that ceiling against the
-//! actual volume at `cache_dir`, so an over-budget cache on a small volume is
-//! caught before it fills the disk.
+//! Disk & cache-budget group. The eviction driver sizes the cache to real free
+//! disk: each tick it clamps the effective ceiling to
+//! `min(cache_size_mb, footprint + max(0, free - disk_headroom_mb))`, keeping
+//! `disk_headroom_mb` of the `cache_dir` volume free (ADR 040 §Free-disk-aware
+//! ceiling, #1930). So `cache_size_mb` is an upper bound and a large value is
+//! expected — free disk, not the budget, normally binds. This group is the
+//! pre-boot advisory: it checks the volume and `disk_headroom_mb` leave room for
+//! a useful cache before the node starts and the reactive clamp takes over.
 
 use std::path::Path;
 
@@ -20,18 +23,24 @@ fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
-/// Pure budget-vs-disk evaluation. `current_footprint` is the live
-/// `decdn_cache_bytes` when known, else 0. `reachable = fs_avail +
-/// current_footprint` is the space the cache could grow into.
+/// Pure headroom-vs-disk evaluation for the disk-aware ceiling (#1930).
+/// `current_footprint` is the live `decdn_cache_bytes` when known, else 0.
+/// `reachable = fs_avail + current_footprint` is the space the cache could
+/// occupy; the driver keeps `headroom_bytes` of it free, so the cache can grow
+/// into at most `reachable - headroom_bytes` before the `cache_size_mb` upper
+/// bound. A large `budget_bytes` is expected and never a failure on its own —
+/// the disk clamp handles it. The real misconfiguration is a `disk_headroom_mb`
+/// that leaves the cache little or no room on the `cache_dir` volume.
 pub(crate) fn evaluate_disk(
     budget_bytes: u64,
-    high_water_pct: u64,
+    headroom_bytes: u64,
     fs_total: u64,
     fs_avail: u64,
     current_footprint: u64,
 ) -> Finding {
-    let high_water = budget_bytes.saturating_mul(high_water_pct) / 100;
     let reachable = fs_avail.saturating_add(current_footprint);
+    let usable = reachable.saturating_sub(headroom_bytes);
+    let effective = usable.min(budget_bytes);
 
     let base = |severity, title: String, detail: String, remediation: Option<String>| Finding {
         group: "Disk & cache",
@@ -42,52 +51,43 @@ pub(crate) fn evaluate_disk(
         remediation,
     };
     let data = format!(
-        "cache_size_mib={} high_water_gib={:.1} free_gib={:.1} vol_total_gib={:.1}",
+        "cache_size_mib={} disk_headroom_gib={:.1} effective_ceiling_gib={:.1} free_gib={:.1} vol_total_gib={:.1}",
         budget_bytes / BYTES_PER_MB,
-        gib(high_water),
+        gib(headroom_bytes),
+        gib(effective),
         gib(fs_avail),
         gib(fs_total),
     );
 
-    if budget_bytes > fs_total {
+    // Headroom at or above the reachable space collapses the effective ceiling
+    // to (at most) the current footprint: the cache can never grow, and the
+    // driver evicts constantly. That is a misconfiguration, not disk pressure.
+    if headroom_bytes >= reachable {
         return base(
             Severity::Fail,
-            "cache budget exceeds the whole volume".into(),
+            "disk headroom leaves no room for the cache".into(),
             data,
             Some(format!(
-                "set cache.cache_size_mb below the volume size (~{:.0} MiB) or move cache.cache_dir",
-                gib(fs_total) * 1024.0
+                "cache.disk_headroom_mb ({} MiB) is at least the space on the cache_dir volume \
+                 (~{:.0} MiB reachable); lower it or move cache.cache_dir to a larger volume",
+                headroom_bytes / BYTES_PER_MB,
+                gib(reachable) * 1024.0
             )),
         );
     }
-    if high_water > reachable {
-        // Suggest a budget whose high-water fits in reachable space, with a
-        // safety margin: reserve max(10% of volume, 1 GiB).
-        let margin = (fs_total / 10).max(1024 * 1024 * 1024);
-        let usable = reachable.saturating_sub(margin);
-        let suggested_mb = (usable.saturating_mul(100) / high_water_pct.max(1)) / BYTES_PER_MB;
-        return base(
-            Severity::Fail,
-            "cache budget will fill the disk before eviction fires".into(),
-            data,
-            Some(format!(
-                "eviction only fires at {high_water_pct}% of the config budget, not real disk; \
-                 set cache.cache_size_mb <= {suggested_mb} or move cache.cache_dir to a larger volume"
-            )),
-        );
-    }
-    let thin = fs_avail < fs_total / 10;
-    if thin {
+    // Some room, but little: the cache above the headroom is under a tenth of the
+    // volume, so it will hold almost nothing.
+    if usable < fs_total / 10 {
         return base(
             Severity::Warn,
-            "free disk is low relative to the volume".into(),
+            "little room for the cache above the disk headroom".into(),
             data,
-            Some("monitor free space or move cache.cache_dir to a larger volume".into()),
+            Some("lower cache.disk_headroom_mb or move cache.cache_dir to a larger volume".into()),
         );
     }
     base(
         Severity::Pass,
-        "cache budget fits free disk".into(),
+        "cache is sized by free disk with headroom reserved".into(),
         data,
         None,
     )
@@ -97,14 +97,15 @@ pub(crate) fn evaluate_disk(
 pub(crate) fn check_disk(report: &mut Report, cfg: &ResolvedConfig, live_footprint: Option<u64>) {
     let cache_dir = &cfg.cache.cache_dir;
     let budget = cfg.cache.cache_size_mb.saturating_mul(BYTES_PER_MB);
+    let headroom = cfg.cache.disk_headroom_mb.saturating_mul(BYTES_PER_MB);
 
-    // budget vs free disk (needs statvfs on an existing dir; fall back to the
+    // headroom vs free disk (needs statvfs on an existing dir; fall back to the
     // nearest existing ancestor when cache_dir does not exist yet).
     match statvfs_target(cache_dir) {
         Ok(space) => {
             report.push(evaluate_disk(
                 budget,
-                cfg.cache.eviction_high_water_pct,
+                headroom,
                 space.total,
                 space.avail,
                 live_footprint.unwrap_or(0),
@@ -202,32 +203,36 @@ mod tests {
     const GIB: u64 = 1024 * 1024 * 1024;
 
     #[test]
-    fn budget_larger_than_volume_fails() {
-        // 100 GiB budget, 50 GiB volume.
-        let f = evaluate_disk(100 * GIB, 90, 50 * GIB, 40 * GIB, 0);
-        assert_eq!(f.severity, Severity::Fail);
+    fn budget_larger_than_volume_is_fine_now() {
+        // A large budget is the intended way to use the disk-aware ceiling: the
+        // clamp sizes the cache to free disk. 100 GiB budget on a 50 GiB volume
+        // with 40 GiB free and 8 GiB headroom leaves 32 GiB usable => Pass.
+        let f = evaluate_disk(100 * GIB, 8 * GIB, 50 * GIB, 40 * GIB, 0);
+        assert_eq!(f.severity, Severity::Pass);
         assert_eq!(f.id, "disk.budget_vs_free");
     }
 
     #[test]
-    fn high_water_above_reachable_fails() {
-        // 10 GiB budget (hw=9 GiB), only 3 GiB avail + 0 used => reachable 3 GiB < 9 GiB.
-        let f = evaluate_disk(10 * GIB, 90, 50 * GIB, 3 * GIB, 0);
+    fn headroom_at_or_above_reachable_fails() {
+        // 8 GiB headroom but only 3 GiB reachable => the cache can never grow.
+        let f = evaluate_disk(100 * GIB, 8 * GIB, 50 * GIB, 3 * GIB, 0);
         assert_eq!(f.severity, Severity::Fail);
         assert!(f.remediation.is_some());
     }
 
     #[test]
     fn healthy_headroom_passes() {
-        // 10 GiB budget (hw=9 GiB), 40 GiB avail => reachable 40 GiB >= 9 GiB, not thin.
-        let f = evaluate_disk(10 * GIB, 90, 50 * GIB, 40 * GIB, 0);
+        // 40 GiB free, 8 GiB headroom on a 50 GiB volume => 32 GiB usable, well
+        // above a tenth of the volume => Pass.
+        let f = evaluate_disk(10 * GIB, 8 * GIB, 50 * GIB, 40 * GIB, 0);
         assert_eq!(f.severity, Severity::Pass);
     }
 
     #[test]
-    fn thin_but_sufficient_warns() {
-        // hw=0.9 GiB, avail=1 GiB on a 50 GiB volume => reachable >= hw but avail < 10% of total.
-        let f = evaluate_disk(1 * GIB, 90, 50 * GIB, 1 * GIB, 0);
+    fn little_room_above_headroom_warns() {
+        // 9 GiB free, 8 GiB headroom on a 50 GiB volume => 1 GiB usable, under a
+        // tenth of the 50 GiB volume => Warn (some room, but almost none).
+        let f = evaluate_disk(100 * GIB, 8 * GIB, 50 * GIB, 9 * GIB, 0);
         assert_eq!(f.severity, Severity::Warn);
     }
 }

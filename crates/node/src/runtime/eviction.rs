@@ -465,7 +465,14 @@ pub async fn run(
             _ = ticker.tick() => {}
         }
 
-        let free_bytes = probe_free_bytes(&cache_dir, &mut state);
+        // `disk_headroom_mb = 0` opts out of the disk clamp (only `cache_size_mb`
+        // binds), so skip the syscall entirely and force the clamp-disabled
+        // sentinel — no probe, no probe-failure logging.
+        let free_bytes = if ceiling.headroom_bytes == 0 {
+            u64::MAX
+        } else {
+            probe_free_bytes(&cache_dir, &mut state)
+        };
 
         tick(
             &cache,
