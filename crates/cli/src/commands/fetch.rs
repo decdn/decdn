@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
@@ -109,12 +109,15 @@ pub(crate) fn micros_now() -> u64 {
 /// TTY-aware — `indicatif` hides it automatically when stderr is not a terminal,
 /// so a piped/redirected fetch emits no bar. A steady tick animates the spinner
 /// during the pre-byte connect/handshake so the command never looks hung. The
-/// bar counts **wire** bytes (content plus interleaved bao proof), so its total
-/// runs slightly above the final content-byte count printed on completion — it
-/// tracks the transfer, not the payload size.
+/// bar counts **delivered content bytes** against the blob's content size — the
+/// driver reports `base_present + received` (verified ranged-store leaf bytes),
+/// not the wire size, so its total matches the byte count printed on
+/// completion.
 fn new_progress_bar() -> indicatif::ProgressBar {
     let style = indicatif::ProgressStyle::with_template(
-        "{spinner:.green} {bytes}/{total_bytes} ({bytes_per_sec}, {eta}) [{wide_bar:.cyan/blue}]",
+        // Rate/ETA come from `{msg}` (see `delivery_progress`), not the built-in
+        // `{bytes_per_sec}`/`{eta}` — those swing wildly on bursty chunk arrival.
+        "{spinner:.green} {bytes}/{total_bytes} {msg}[{wide_bar:.cyan/blue}]",
     )
     // A bad template is a programming error, not a runtime one; fall back to the
     // built-in bar rather than panic (clippy forbids `unwrap`/`expect`).
@@ -988,7 +991,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // unchanged. Each lane pays its OWN provider on its OWN `(ctx, ledger)`; the
     // scheduler gates every lane on the shared pool's remaining balance.
     {
-        let (bar, on_progress) = delivery_progress();
+        let (bar, on_progress, meter) = delivery_progress();
         let multi = try_multi_source_fetch(
             &deps,
             &args.common,
@@ -1009,7 +1012,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         bar.finish_and_clear();
         match multi {
             Ok(Some(bytes)) => {
-                println!("fetched {bytes} bytes -> {}", args.output.display());
+                print_fetch_summary(bytes, &meter, &args.output);
                 return Ok(());
             }
             // Gate not met: run the single-source failover loop below. The gate
@@ -1093,7 +1096,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         // stderr and hides itself when stderr is not a terminal. On a resumed
         // fail-over it counts only the remaining transfer — the ranged store
         // re-pulls only the missing ranges.
-        let (bar, on_progress) = delivery_progress();
+        let (bar, on_progress, meter) = delivery_progress();
         let result = drive_fetch(
             &deps,
             ctx,
@@ -1118,7 +1121,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         // owner-side remedy rather than leaving a bare "voucher rejected: ...".
         let err = match result {
             Ok(bytes) => {
-                println!("fetched {bytes} bytes -> {}", args.output.display());
+                print_fetch_summary(bytes, &meter, &args.output);
                 return Ok(());
             }
             Err(err) if grant.is_some() => annotate_delegated_exhaustion(err),
@@ -2007,10 +2010,114 @@ fn ranged_store_location(output: &Path) -> anyhow::Result<(PathBuf, String)> {
     Ok((dir, stem))
 }
 
-/// The `decdn fetch` delivery progress bar plus the callback that drives it,
-/// returned as a pair so the caller can `finish_and_clear` the bar before its
-/// terminal message (#1118).
-fn delivery_progress() -> (indicatif::ProgressBar, impl Fn(u64, u64) + 'static) {
+/// Time constant for the smoothed delivery rate (seconds). Larger holds the
+/// readout steadier across bursty arrival; smaller tracks real speed changes
+/// faster. A few seconds keeps the number legible without lagging a genuine
+/// slowdown for long.
+const RATE_SMOOTHING_TAU_SECS: f64 = 3.0;
+
+/// Rolling delivery-rate estimate behind the progress bar's `{msg}`, and the
+/// running totals the end-of-fetch summary reads back.
+///
+/// The bar's positions are cumulative **delivered content bytes** — the driver
+/// reports `base_present + received` against the blob's content size, where
+/// `received` is the ranged store's verified-leaf count — not wire bytes.
+///
+/// Each `set_position` on the bar is bursty — many chunks land in one instant,
+/// then a gap — so a naive `delta / dt` per callback spikes and collapses. This
+/// holds a time-weighted exponential moving average instead: each sample folds
+/// in with weight `1 - exp(-dt / tau)`, so the estimate is stable regardless of
+/// how unevenly callbacks are spaced.
+#[derive(Default)]
+struct SpeedState {
+    /// Instant and cumulative-byte position at the first observed sample. The
+    /// summary measures elapsed and bytes-moved from here, so a resumed fetch
+    /// (which starts at a non-zero `base_present`) reports only what this run
+    /// actually transferred rather than dividing already-present bytes by this
+    /// run's short window.
+    started: Option<(Instant, u64)>,
+    /// Instant and cumulative delivered content bytes at the previous sample.
+    last: Option<(Instant, u64)>,
+    /// Smoothed rate in bytes/sec. `None` until the second sample gives a `dt`.
+    ewma_bps: Option<f64>,
+}
+
+/// Widen a byte count to `f64` for rate arithmetic. A single transfer never
+/// approaches 2^53 bytes, so the precision the cast lint guards against is not
+/// at risk here.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "byte counts stay far below f64's 2^53 exact-integer ceiling"
+)]
+const fn bytes_as_f64(n: u64) -> f64 {
+    n as f64
+}
+
+/// Format a non-negative bytes/sec rate as e.g. `12.3 MiB/s`. A rate at or
+/// below zero (no data yet, or a stall) renders as `--`.
+fn fmt_rate(bps: f64) -> String {
+    if bps.is_finite() && bps >= 1.0 {
+        // The rate is a small non-negative value; clamp before the cast so the
+        // `HumanBytes` argument can never wrap or lose sign.
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "bps is finite and >= 1.0 here; the cast cannot wrap or go negative"
+        )]
+        let whole = bps.min(bytes_as_f64(u64::MAX)) as u64;
+        format!("{}/s", indicatif::HumanBytes(whole))
+    } else {
+        "--".to_string()
+    }
+}
+
+/// Estimate remaining time from the smoothed rate, formatted like `ETA 8s`.
+/// Below a usable rate it reports `ETA --` rather than a divide-by-tiny blowup.
+fn fmt_eta(remaining_bytes: u64, bps: f64) -> String {
+    if bps >= 1.0 {
+        // Clamp the projection so `from_secs_f64` never overflows `Duration`.
+        let secs = (bytes_as_f64(remaining_bytes) / bps).clamp(0.0, 8.64e7);
+        format!(
+            "ETA {}",
+            indicatif::HumanDuration(Duration::from_secs_f64(secs))
+        )
+    } else {
+        "ETA --".to_string()
+    }
+}
+
+/// Reads the transfer duration and bytes moved this run back from a
+/// [`SpeedState`] after the bar finishes, for the end-of-fetch summary.
+#[derive(Clone)]
+struct DeliveryMeter {
+    state: Arc<Mutex<SpeedState>>,
+}
+
+impl DeliveryMeter {
+    /// `(elapsed across this run, content bytes this run transferred)`, or
+    /// `None` if no byte ever arrived (a failure before delivery) or the lock is
+    /// poisoned. Both are measured from the first observed sample, so a resumed
+    /// fetch excludes the already-present `base_present` bytes it did not move.
+    fn summary(&self) -> Option<(Duration, u64)> {
+        let state = self.state.lock().ok()?;
+        let (start_at, start_bytes) = state.started?;
+        let (last_at, last_bytes) = state.last?;
+        Some((
+            last_at.saturating_duration_since(start_at),
+            last_bytes.saturating_sub(start_bytes),
+        ))
+    }
+}
+
+/// The `decdn fetch` delivery progress bar, the callback that drives it, and a
+/// [`DeliveryMeter`] the caller reads after `finish_and_clear` for the terminal
+/// summary (#1118). The callback both advances the bar and folds each update
+/// into the shared [`SpeedState`] so `{msg}` shows a steady rate/ETA.
+fn delivery_progress() -> (
+    indicatif::ProgressBar,
+    impl Fn(u64, u64) + 'static,
+    DeliveryMeter,
+) {
     let bar = new_progress_bar();
     // `ProgressBar` is `Arc`-backed, so the clone the callback owns drives the
     // same bar the caller clears. The callback must be `'static`
@@ -2019,13 +2126,63 @@ fn delivery_progress() -> (indicatif::ProgressBar, impl Fn(u64, u64) + 'static) 
     // `expected` is constant across the pull, so set the bar length once (it
     // takes a write lock) rather than on every chunk in the hot receive loop.
     let length_set = std::sync::atomic::AtomicBool::new(false);
+    let state = Arc::new(Mutex::new(SpeedState::default()));
+    let cb_state = Arc::clone(&state);
     let on_progress = move |received: u64, expected: u64| {
         if !length_set.swap(true, std::sync::atomic::Ordering::Relaxed) {
             cb_bar.set_length(expected);
         }
         cb_bar.set_position(received);
+
+        let now = Instant::now();
+        // A poisoned lock only costs this one rate update; the bar still advances.
+        if let Ok(mut s) = cb_state.lock() {
+            s.started.get_or_insert((now, received));
+            if let Some((prev_at, prev_bytes)) = s.last {
+                let dt = now.saturating_duration_since(prev_at).as_secs_f64();
+                // Skip same-instant callbacks (a burst): they carry no usable
+                // `dt` and would divide by ~zero into a spike.
+                if dt > 0.0 {
+                    let inst = bytes_as_f64(received.saturating_sub(prev_bytes)) / dt;
+                    let alpha = 1.0 - (-dt / RATE_SMOOTHING_TAU_SECS).exp();
+                    // Seed from 0, not `inst`: on the first sample a tiny `dt`
+                    // makes `inst` huge, but `alpha * inst = (1 - exp(-dt/tau)) *
+                    // (delta/dt) -> delta/tau` as `dt -> 0`, so the estimate
+                    // stays bounded instead of spiking, then converges upward.
+                    let prev = s.ewma_bps.unwrap_or(0.0);
+                    s.ewma_bps = Some(prev + alpha * (inst - prev));
+                }
+            }
+            s.last = Some((now, received));
+            let bps = s.ewma_bps.unwrap_or(0.0);
+            cb_bar.set_message(format!(
+                "({}, {}) ",
+                fmt_rate(bps),
+                fmt_eta(expected.saturating_sub(received), bps)
+            ));
+        }
     };
-    (bar, on_progress)
+    (bar, on_progress, DeliveryMeter { state })
+}
+
+/// Print the terminal line after a successful fetch: content bytes, and — when
+/// the [`DeliveryMeter`] captured any delivery — the elapsed time and average
+/// transfer rate over the content bytes this run moved. Falls back to the bare
+/// byte/output line when nothing was delivered on this leg (e.g. a fully
+/// resumed transfer that re-pulled no bytes).
+fn print_fetch_summary(content_bytes: u64, meter: &DeliveryMeter, output: &Path) {
+    match meter.summary() {
+        Some((elapsed, moved_bytes)) if elapsed > Duration::ZERO && moved_bytes > 0 => {
+            let avg_bps = bytes_as_f64(moved_bytes) / elapsed.as_secs_f64();
+            println!(
+                "fetched {content_bytes} bytes in {} (avg {}) -> {}",
+                indicatif::HumanDuration(elapsed),
+                fmt_rate(avg_bps),
+                output.display()
+            );
+        }
+        _ => println!("fetched {content_bytes} bytes -> {}", output.display()),
+    }
 }
 
 /// Resolve the delegated `--capability`/`--capability-file` token into a
@@ -3011,5 +3168,65 @@ mod tests {
         let holders = vec![holder_sized(1, 10.0, None), holder_sized(2, 20.0, None)];
         let out = super::failover_order(holders, &[], warming_params(false));
         assert_eq!(out.size_hint, None);
+    }
+
+    /// A usable rate renders as a human `X/s`; a sub-1-byte/s rate (no data yet,
+    /// or a stall) and any non-finite value both render as `--`.
+    #[test]
+    fn fmt_rate_shows_human_units_and_placeholder_below_one() {
+        assert!(fmt_rate(2.0 * 1024.0 * 1024.0).ends_with("/s"));
+        assert!(fmt_rate(2.0 * 1024.0 * 1024.0).contains("MiB"));
+        assert_eq!(fmt_rate(0.0), "--");
+        assert_eq!(fmt_rate(0.4), "--");
+        assert_eq!(fmt_rate(f64::NAN), "--");
+        assert_eq!(fmt_rate(f64::INFINITY), "--");
+    }
+
+    /// ETA divides remaining bytes by the smoothed rate; below a usable rate it
+    /// reports `ETA --` rather than a divide-by-tiny blow-up, and a huge
+    /// projection is clamped so `Duration::from_secs_f64` cannot overflow.
+    #[test]
+    fn fmt_eta_projects_and_guards_low_rate() {
+        assert_eq!(fmt_eta(10 << 20, 0.0), "ETA --");
+        assert_eq!(fmt_eta(10 << 20, 0.9), "ETA --");
+        assert!(fmt_eta(10 << 20, 10.0 * 1024.0 * 1024.0).starts_with("ETA "));
+        // A near-zero rate with bytes left must not panic on the clamp path.
+        let _ = fmt_eta(u64::MAX, 1.0);
+    }
+
+    /// The summary measures elapsed and bytes-moved from the FIRST observed
+    /// sample, not the final position — so a resumed fetch that began at a
+    /// non-zero `base_present` reports only what this run actually transferred.
+    #[test]
+    fn summary_reports_delta_from_first_sample_not_absolute_position() {
+        let t0 = Instant::now();
+        let state = SpeedState {
+            // Resumed at 40 MiB already present, ran for 2s to 60 MiB.
+            started: Some((t0, 40 << 20)),
+            last: Some((t0 + Duration::from_secs(2), 60 << 20)),
+            ewma_bps: None,
+        };
+        let meter = DeliveryMeter {
+            state: Arc::new(Mutex::new(state)),
+        };
+        let (elapsed, moved) = meter
+            .summary()
+            .expect("a delivered sample yields a summary");
+        assert_eq!(elapsed, Duration::from_secs(2));
+        assert_eq!(
+            moved,
+            20 << 20,
+            "only this run's 20 MiB, not the 60 MiB total"
+        );
+    }
+
+    /// No delivery ever observed (a failure before the first byte) yields no
+    /// summary, so the caller falls back to the bare byte/output line.
+    #[test]
+    fn summary_is_none_before_any_delivery() {
+        let meter = DeliveryMeter {
+            state: Arc::new(Mutex::new(SpeedState::default())),
+        };
+        assert!(meter.summary().is_none());
     }
 }
