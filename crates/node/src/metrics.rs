@@ -569,6 +569,22 @@ pub struct DecdnMetrics {
     /// failed" / "pool floor-bucket forget failed"). Operator-visible name:
     /// `decdn_floor_loss_persist_failures_total`.
     pub floor_loss_persist_failures: Counter,
+    /// Drop-time floor-bucket persists that found the persist worker gone and wrote on
+    /// the dropping thread instead.
+    ///
+    /// A DEGRADED DISPATCH, not a lost write: the fallback normally lands, so this is
+    /// deliberately NOT `floor_loss_persist_failures` — folding the two together would
+    /// page an operator through every routine drain and inflate the µUSDC-lost estimate
+    /// on the one series that is supposed to carry it. A write that reaches the store on
+    /// this path bumps this counter and nothing else; a write that then FAILS bumps
+    /// `floor_loss_persist_failures` too, from `persist_bucket`, so the pair reads as
+    /// "degraded, and this many of those also lost".
+    ///
+    /// The worker is gone because its task was aborted or the runtime is past the point
+    /// where it can run one, so a sustained rate on a live node is an anomaly worth
+    /// chasing; a burst at shutdown is expected. Operator-visible name:
+    /// `decdn_floor_persist_worker_absent_total`.
+    pub floor_persist_worker_absent: Counter,
     /// `serve_stream` requests that reached the pool-view resolve and found no view
     /// answer for the named pool, so every floor gate is SKIPPED.
     ///
@@ -1897,6 +1913,16 @@ recorders! {
     /// Pairs with the `warn!`/`error!` lines in `handlers/client/mod.rs`
     /// ("floor abandonment-bucket persist failed" / "pool floor-bucket forget failed").
     floor_loss_persist_failure => floor_loss_persist_failures.inc();
+
+    /// Count `n` floor-bucket writes that did not reach disk at once. The shutdown
+    /// flush uses it: a worker that died took its whole queue with it, and one bump
+    /// would report a 400-write backlog the same as a single transient fault.
+    floor_loss_persist_failures_by(n: u64) => floor_loss_persist_failures.inc_by(n);
+
+    /// Record a drop-time floor-bucket persist that found the worker gone and wrote on
+    /// the dropping thread. Degraded dispatch, not a lost write — see the field doc for
+    /// why it is separate from `floor_loss_persist_failures`.
+    floor_persist_worker_absent => floor_persist_worker_absent.inc();
 
     /// Record a `serve_stream` request that reached the pool-view resolve and found no
     /// view answer, so the floor gates are skipped. One bump per request at that single

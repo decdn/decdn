@@ -392,8 +392,10 @@ impl PoolFloorState {
 /// One message for the floor-bucket persist worker ([`spawn_persist_worker`]).
 pub(super) enum FloorBucketWrite {
     /// Set this `(pool, signer)` lane's durable bucket snapshot. The value is the
-    /// lane's level at `refill_unix_ms`, and `record_bucket` raises monotonically, so
-    /// two writes for one lane arriving out of order cannot regress it.
+    /// lane's level at `refill_unix_ms`, and `record_bucket` keeps the greatest-
+    /// `refill_unix_ms` snapshot per lane (ties breaking to the larger level), so two
+    /// writes for one lane arriving out of order cannot regress it. The bucket refills,
+    /// so a lane is NOT monotonic in its level — only in its stamp.
     Record {
         pool_id: B256,
         signer: Address,
@@ -424,6 +426,16 @@ pub(super) enum FloorPersist {
     Worker {
         tx: tokio::sync::mpsc::UnboundedSender<FloorBucketWrite>,
         store: Arc<dyn decdn_incentive::PoolFloorLossStore>,
+        /// `Record`s accepted by the channel that the worker has not finished. Raised
+        /// at the send, lowered once the write has been attempted, so a reader sees
+        /// how many snapshots are in flight.
+        ///
+        /// Without it a lost queue is indistinguishable from a lost write: every
+        /// failure path here can only say "something did not land", and the shutdown
+        /// flush would report a whole abandoned backlog as a single bump. The count is
+        /// advisory — it is read outside any lock and races the worker by at most the
+        /// write in progress — which is the right precision for sizing an incident.
+        queued: Arc<AtomicU64>,
     },
 }
 
@@ -439,15 +451,20 @@ impl FloorPersist {
             return Self::Off;
         };
         match start_persist_worker(&store, metrics) {
-            Some(tx) => Self::Worker { tx, store },
+            Some((tx, queued)) => Self::Worker { tx, store, queued },
             None => Self::Inline(store),
         }
     }
 
-    /// The worker's mailbox, when one is running.
-    const fn sender(&self) -> Option<&tokio::sync::mpsc::UnboundedSender<FloorBucketWrite>> {
+    /// The worker's mailbox and its outstanding-write count, when one is running.
+    const fn worker(
+        &self,
+    ) -> Option<(
+        &tokio::sync::mpsc::UnboundedSender<FloorBucketWrite>,
+        &Arc<AtomicU64>,
+    )> {
         match self {
-            Self::Worker { tx, .. } => Some(tx),
+            Self::Worker { tx, queued, .. } => Some((tx, queued)),
             Self::Off | Self::Inline(_) => None,
         }
     }
@@ -470,8 +487,11 @@ impl FloorPersist {
         let store = match self {
             Self::Off => return,
             Self::Inline(store) => store,
-            Self::Worker { tx, store } => {
-                let queued = tx
+            Self::Worker { tx, store, queued } => {
+                // Raised BEFORE the send, so the worker can never lower a count that was
+                // not yet raised; a rejected send puts it straight back.
+                queued.fetch_add(1, Ordering::Relaxed);
+                let accepted = tx
                     .send(FloorBucketWrite::Record {
                         pool_id,
                         signer,
@@ -479,14 +499,18 @@ impl FloorPersist {
                         refill_ms,
                     })
                     .is_ok();
-                if queued {
+                if accepted {
                     return;
                 }
+                queued.fetch_sub(1, Ordering::Relaxed);
                 // The worker is gone — its task was aborted, or the runtime is past the
                 // point where it can run one. Counted and warned because a live handler
                 // whose worker has died is an anomaly, and this is the only place it
-                // shows before the shutdown flush notices.
-                metrics.floor_loss_persist_failure();
+                // shows before the shutdown flush notices. Its OWN counter: the write
+                // below normally lands, so charging this to `floor_loss_persist_failures`
+                // would report a loss that did not happen — and would report it twice
+                // when the fallback also fails, since `persist_bucket` bumps that one.
+                metrics.floor_persist_worker_absent();
                 tracing::warn!(
                     %pool_id, %signer, micro, refill_ms,
                     "floor persist worker is gone; writing the bucket snapshot off the worker"
@@ -496,12 +520,12 @@ impl FloorPersist {
         };
         // Write on THIS thread, deliberately, even though `record_bucket` commits with
         // `Durability::Immediate` and this may be a runtime worker. `spawn_blocking` on
-        // a shutting-down blocking pool does not fail and does not panic — it returns a
-        // handle that never resolves, so the task never runs and the snapshot never
-        // lands. The worker being gone is usually the runtime tearing down, which is
-        // exactly that state: offloading would lose the write in the one case this
-        // fallback exists for. A stalled thread on an already-counted path is the
-        // cheaper failure.
+        // a shutting-down blocking pool neither fails nor panics: the task is cancelled
+        // without ever running, so the snapshot never lands and the handle resolves
+        // `Err(JoinError::cancelled(..))`. The worker being gone is usually the runtime
+        // tearing down, which is exactly that state: offloading would lose the write in
+        // the one case this fallback exists for. A stalled thread on an already-counted
+        // path is the cheaper failure.
         persist_bucket(store, metrics, pool_id, signer, micro, refill_ms);
     }
 }
@@ -514,13 +538,22 @@ impl FloorPersist {
 fn start_persist_worker(
     store: &Arc<dyn decdn_incentive::PoolFloorLossStore>,
     metrics: &Arc<Metrics>,
-) -> Option<tokio::sync::mpsc::UnboundedSender<FloorBucketWrite>> {
+) -> Option<(
+    tokio::sync::mpsc::UnboundedSender<FloorBucketWrite>,
+    Arc<AtomicU64>,
+)> {
     if tokio::runtime::Handle::try_current().is_err() {
         return None;
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    spawn_persist_worker(Arc::clone(store), Arc::clone(metrics), rx);
-    Some(tx)
+    let queued = Arc::new(AtomicU64::new(0));
+    spawn_persist_worker(
+        Arc::clone(store),
+        Arc::clone(metrics),
+        rx,
+        Arc::clone(&queued),
+    );
+    Some((tx, queued))
 }
 
 /// Drain bucket writes onto a blocking thread, one at a time, until every sender is
@@ -540,6 +573,7 @@ fn spawn_persist_worker(
     store: Arc<dyn decdn_incentive::PoolFloorLossStore>,
     metrics: Arc<Metrics>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<FloorBucketWrite>,
+    queued: Arc<AtomicU64>,
 ) {
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -570,6 +604,10 @@ fn spawn_persist_worker(
                 );
             })
             .await;
+            // Lowered once the write has been ATTEMPTED, whatever came of it: the
+            // count answers "how many snapshots are still in flight", and a write that
+            // failed is already counted by `persist_bucket` or `note_join_failure`.
+            queued.fetch_sub(1, Ordering::Relaxed);
             if let Err(e) = joined {
                 note_join_failure(&metrics, pool_id, signer, &e);
             }
@@ -584,19 +622,45 @@ fn spawn_persist_worker(
 /// driven against a worker that is deliberately gone.
 async fn flush_queued_writes(
     tx: &tokio::sync::mpsc::UnboundedSender<FloorBucketWrite>,
+    queued: &AtomicU64,
     metrics: &Metrics,
 ) {
+    // `max(1)`: a worker that is gone took whatever it held, and the count can read
+    // zero if it died between lowering one and being asked for the next. Reporting no
+    // loss on a path that reached this branch would be worse than over-reporting by one.
+    let lost = || queued.load(Ordering::Relaxed).max(1);
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     if tx.send(FloorBucketWrite::Flush(ack_tx)).is_err() {
-        metrics.floor_loss_persist_failure();
-        tracing::warn!("floor persist worker is gone; queued bucket snapshots did not reach disk");
+        let lost = lost();
+        metrics.floor_loss_persist_failures_by(lost);
+        tracing::warn!(
+            lost,
+            "floor persist worker is gone; that many queued bucket snapshots did not reach \
+             disk, and their signers regain the allowance on the next boot"
+        );
         return;
     }
     if ack_rx.await.is_err() {
-        metrics.floor_loss_persist_failure();
+        let lost = lost();
+        metrics.floor_loss_persist_failures_by(lost);
         tracing::warn!(
-            "floor persist worker stopped before acknowledging the shutdown flush; queued \
-             bucket snapshots may not have reached disk"
+            lost,
+            "floor persist worker stopped before acknowledging the shutdown flush; that many \
+             queued bucket snapshots may not have reached disk"
+        );
+        return;
+    }
+    // The ack proves everything queued BEFORE the `Flush` landed. A guard that dropped
+    // after it — the serve tasks are aborted, not joined, so their reservations release
+    // asynchronously — queued behind the ack and is still the worker's to write. Not a
+    // loss yet, so not counted as one; named because at shutdown the process usually
+    // exits before the worker gets to it.
+    let residual = queued.load(Ordering::Relaxed);
+    if residual > 0 {
+        tracing::warn!(
+            residual,
+            "floor-bucket snapshots were queued after the shutdown flush acknowledged; they \
+             raced the process exit and may not have reached disk"
         );
     }
 }
@@ -909,12 +973,13 @@ impl Drop for FloorReservation {
         let pool_id = self.pool_id;
         let signer = self.signer;
         let micro = consumed.saturating_to::<u128>();
-        // One closure for both dispatch paths so the failure accounting cannot
-        // drift between them (#1782): bump `floor_loss_persist_failures`, log the
-        // µUSDC total that failed to reach disk, and surface a corrupt payment
-        // database at `error!` — after a mid-commit failure redb refuses further
-        // writes until the file is closed and reopened, so every later persist
-        // fails too and the fix is an operator restart, unlike a transient fault.
+        // Every dispatch arm funnels its store call through `persist_bucket`, so the
+        // failure accounting cannot drift between them (#1782): one bump of
+        // `floor_loss_persist_failures`, the µUSDC total that failed to reach disk in
+        // the log line, and a corrupt payment database surfaced at `error!` — after a
+        // mid-commit failure redb refuses further writes until the file is closed and
+        // reopened, so every later persist fails too and the fix is an operator
+        // restart, unlike a transient fault.
         self.persist
             .write(&self.metrics, pool_id, signer, micro, refill_ms);
     }
@@ -1205,9 +1270,20 @@ impl ClientHandler {
         signer: Address,
         reserved: U256,
     ) -> FloorReservation {
-        FloorReservation::reserve(
+        let epoch = {
+            let mut guard = self
+                .pool_floor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.charge_live(pool_id, signer, reserved)
+        };
+        FloorReservation::new_charged(
             Arc::clone(&self.pool_floor),
-            self.floor_loss_store.clone(),
+            // The handler's OWN dispatch, not a fresh one: `FloorPersist::new` starts a
+            // worker, so building one here would give this guard a private worker that
+            // [`Self::flush_floor_persists`] — which flushes the handler's — could never
+            // drain, and a test would assert against a topology production never runs.
+            self.floor_persist.clone(),
             Arc::clone(&self.metrics),
             pool_id,
             signer,
@@ -1217,6 +1293,7 @@ impl ClientHandler {
             // noted-unpaid amount, which is what the drop-accounting tests assert.
             reserved,
             self.pool_floor_signer_refill_secs,
+            epoch,
         )
     }
 
@@ -1269,13 +1346,21 @@ impl ClientHandler {
     /// floor reservation across every signer, plus `new_reserve`? Reads the floor
     /// accumulator; pure arithmetic otherwise. The per-signer abandonment buckets are
     /// node-local throttles and are NOT part of this money envelope. A poisoned
-    /// accumulator lock recovers the guard rather than panicking: every critical
-    /// section over this mutex is panic-free by construction — saturating `U256`
-    /// arithmetic and infallible map operations only, no indexing and no `unwrap` — so
-    /// a poison cannot originate from a holder of this lock, and a recovered guard
-    /// cannot observe a torn pool/signer split. Do NOT add a fallible or panicking
-    /// call under this lock; that argument is what the recovery rests on, because the
-    /// pool total and the signer entries must agree.
+    /// accumulator lock recovers the guard rather than panicking: in a release build
+    /// every critical section over this mutex is panic-free by construction —
+    /// saturating `U256` arithmetic and infallible map operations only, no indexing and
+    /// no `unwrap` — so a poison cannot originate from a holder of this lock, and a
+    /// recovered guard cannot observe a torn pool/signer split. Do NOT add a fallible
+    /// or panicking call under this lock in a form that survives `--release`; that
+    /// argument is what the recovery rests on, because the pool total and the signer
+    /// entries must agree.
+    ///
+    /// The `debug_assert!(levels_agree())` in each [`PoolFloorState`] mutator is the
+    /// deliberate exception, and only a debug build carries it. It trades this recovery
+    /// for a loud failure exactly when the invariant it guards is ALREADY broken: the
+    /// panic poisons the mutex, later sections recover a split they would otherwise
+    /// have caught, and the one inside `Drop` aborts a task that is already unwinding.
+    /// All three are the right outcome for a test run and unreachable in production.
     ///
     /// (The recovery is not justified by the accumulator being "best-effort": it
     /// gates whether the node fronts upstream USDC.)
@@ -1392,10 +1477,12 @@ impl ClientHandler {
 
     /// Wait until every bucket write queued so far has reached the store.
     ///
-    /// Called once at shutdown, after the router has drained: every
-    /// [`FloorReservation`] has dropped by then, so everything they debited is already
-    /// queued and this is the last write before the process exits. The worker processes
-    /// in order, so the ack proves the whole backlog landed.
+    /// Called once at shutdown, after the router has cancelled every in-flight serve:
+    /// no new reservation can open, and the guards that were live are being dropped as
+    /// their aborted tasks are torn down. The worker processes in order, so the ack
+    /// proves everything queued BEFORE the `Flush` landed — a guard that drops after it
+    /// is reported through the residual count rather than waited for, since there is no
+    /// point at which the queue is provably closed.
     ///
     /// Best-effort, like the writes themselves. No worker (a handler built outside any
     /// runtime, or without a floor-loss store) has nothing to wait for; a worker that is
@@ -1403,11 +1490,24 @@ impl ClientHandler {
     /// writes with it and is counted here — a `Record` the channel accepted is counted
     /// at neither `persist_bucket` nor `note_join_failure`, both of which only see
     /// writes the worker actually attempted.
+    /// Bucket snapshots the persist worker has accepted but not finished writing.
+    ///
+    /// Zero when no worker is running, which is also the honest answer: without one
+    /// every drop writes inline and nothing is ever outstanding. The shutdown drain
+    /// reads it when its own timeout fires, so an abandoned backlog is counted by depth
+    /// rather than as a single failure — see [`Self::flush_floor_persists`], which does
+    /// the same accounting for the paths it can observe itself.
+    pub(crate) fn queued_floor_persists(&self) -> u64 {
+        self.floor_persist
+            .worker()
+            .map_or(0, |(_, queued)| queued.load(Ordering::Relaxed))
+    }
+
     pub(crate) async fn flush_floor_persists(&self) {
-        let Some(tx) = self.floor_persist.sender() else {
+        let Some((tx, queued)) = self.floor_persist.worker() else {
             return;
         };
-        flush_queued_writes(tx, &self.metrics).await;
+        flush_queued_writes(tx, queued, &self.metrics).await;
     }
 
     /// Drop a reclaimed pool's floor accounting: remove its in-memory
@@ -2861,7 +2961,7 @@ mod tests {
     /// when guards drop en masse. Distinct from having no worker at all, which never
     /// reaches the send. Asserted with no `await` between the drop and the read, so
     /// anything offloaded could not have landed: `spawn_blocking` on a shutting-down
-    /// pool returns a handle that never resolves, which would lose the write in exactly
+    /// pool cancels the task without running it, which would lose the write in exactly
     /// the case this fallback exists for.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_drop_whose_worker_died_persists_without_offloading() -> anyhow::Result<()> {
@@ -2883,6 +2983,7 @@ mod tests {
                 FloorPersist::Worker {
                     tx: tx.clone(),
                     store: store.clone(),
+                    queued: Arc::new(AtomicU64::new(0)),
                 },
                 Arc::clone(&metrics),
                 pool,
@@ -2898,12 +2999,16 @@ mod tests {
             persisted_bucket(&*store, pool)? == Some(floor.to()),
             "the fallback must have written before the drop returned, not queued it"
         );
+        let text = metrics.encode()?;
         anyhow::ensure!(
-            metrics
-                .encode()?
-                .contains("decdn_floor_loss_persist_failures_total 1"),
+            text.contains("decdn_floor_persist_worker_absent_total 1"),
             "and must count the degraded path, which is otherwise invisible until the \
-             shutdown flush"
+             shutdown flush:\n{text}"
+        );
+        anyhow::ensure!(
+            text.contains("decdn_floor_loss_persist_failures_total 0"),
+            "but must NOT count a loss: the fallback write landed, and the loss series \
+             is what sizes the µUSDC that did not reach disk:\n{text}"
         );
         Ok(())
     }
@@ -2919,12 +3024,14 @@ mod tests {
         let metrics = Metrics::new();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<FloorBucketWrite>();
         drop(rx);
-        flush_queued_writes(&tx, &metrics).await;
+        // Three snapshots the dead worker took with it: the bump must be three, not one.
+        let queued = AtomicU64::new(3);
+        flush_queued_writes(&tx, &queued, &metrics).await;
+        let text = metrics.encode()?;
         anyhow::ensure!(
-            metrics
-                .encode()?
-                .contains("decdn_floor_loss_persist_failures_total 1"),
-            "a flush that cannot be acknowledged must bump the failure counter"
+            text.contains("decdn_floor_loss_persist_failures_total 3"),
+            "a flush that cannot be acknowledged must count every queued snapshot it \
+             abandoned, not one per flush:\n{text}"
         );
         Ok(())
     }
@@ -3002,6 +3109,178 @@ mod tests {
         anyhow::ensure!(
             encoded.contains("decdn_floor_loss_persist_failures_total 1"),
             "a failed bucket forget must bump the failure counter"
+        );
+        Ok(())
+    }
+    /// Admit a stream, abandon it, and drive the resulting snapshot to disk through the
+    /// WORKER — the only floor-persist topology production runs, and the only one whose
+    /// SUCCESS path nothing else covers.
+    ///
+    /// Every store-visible drop test elsewhere is a sync `#[test]`, which takes
+    /// `FloorPersist::Inline` because `start_persist_worker` finds no runtime; the two
+    /// worker tests drop the receiver first, so they exercise a worker that is GONE.
+    /// Without this, `continue`-ing the worker's `Record` arm — after which no node ever
+    /// persists a bucket again, and every signer regains a spent allowance on the next
+    /// boot — passes the entire suite, as does making `flush_floor_persists` a bare
+    /// `return`.
+    ///
+    /// Single-threaded deliberately. There is no `.await` between the drop and the first
+    /// read, so the worker task cannot have been polled: an EMPTY store at that point is
+    /// what proves the drop queued the write instead of writing it inline, and a
+    /// populated store after the flush is what proves the ack means the write landed.
+    #[tokio::test]
+    async fn a_queued_bucket_write_has_landed_by_the_time_the_flush_returns() -> anyhow::Result<()>
+    {
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(decdn_incentive::MemoryPoolFloorLossStore::new());
+        let (handler, _dir) = handler_for_tests_with_floor_store(
+            &metrics,
+            u64::MAX,
+            u64::MAX,
+            Arc::clone(&store) as Arc<dyn decdn_incentive::PoolFloorLossStore>,
+        )
+        .await;
+        let pool = B256::repeat_byte(0x7C);
+        let window = handler.one_window(TEST_RATE);
+        let remaining = window.saturating_mul(U256::from(8u64));
+
+        let res = handler
+            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            .map_err(|e| anyhow::anyhow!("admission refused: {e:?}"))?;
+        res.note_unpaid(window);
+        drop(res);
+
+        anyhow::ensure!(
+            persisted_bucket(&*store, pool)?.is_none(),
+            "the drop must QUEUE the write, not perform it: nothing can have reached the \
+             store with no await between the drop and this read"
+        );
+
+        handler.flush_floor_persists().await;
+
+        anyhow::ensure!(
+            persisted_bucket(&*store, pool)? == Some(window.to::<u128>()),
+            "and the flush must not return until the worker has written the exact \
+             snapshot the drop debited"
+        );
+        Ok(())
+    }
+
+    /// The flush ack is a proof about the queue, not a signal that the queue was read:
+    /// it does not arrive while a write the worker already picked up is still inside the
+    /// store.
+    ///
+    /// The worker awaits each blocking write before returning to `recv`, so a `Flush`
+    /// behind a `Record` cannot be answered first. That serialization is the whole basis
+    /// for calling the ack a proof about everything queued before it, and nothing
+    /// asserted it — a worker that answered the ack without awaiting the write in flight
+    /// would report a clean shutdown over a snapshot that never landed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_flush_ack_waits_for_a_write_the_worker_is_still_inside() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(GatedLossStore::new());
+        let (handler, _dir) = handler_for_tests_with_floor_store(
+            &metrics,
+            u64::MAX,
+            u64::MAX,
+            Arc::clone(&store) as Arc<dyn decdn_incentive::PoolFloorLossStore>,
+        )
+        .await;
+        let pool = B256::repeat_byte(0x7D);
+        let window = handler.one_window(TEST_RATE);
+        let remaining = window.saturating_mul(U256::from(8u64));
+
+        let res = handler
+            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            .map_err(|e| anyhow::anyhow!("admission refused: {e:?}"))?;
+        res.note_unpaid(window);
+        drop(res); // queues the snapshot; the worker picks it up and parks on the gate
+
+        let flushing = tokio::spawn({
+            let handler = Arc::clone(&handler);
+            async move { handler.flush_floor_persists().await }
+        });
+        // Long enough for the worker to dequeue the `Record` and enter the store, which
+        // is the state being asserted. Erring long only strengthens the check.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        anyhow::ensure!(
+            !flushing.is_finished(),
+            "the flush acknowledged while its queued write was still inside the store"
+        );
+
+        store.release();
+        flushing.await?;
+        anyhow::ensure!(
+            persisted_bucket(&*store, pool)? == Some(window.to::<u128>()),
+            "and once released, the acknowledged write is on disk"
+        );
+        Ok(())
+    }
+
+    /// A bucket write that PANICS in the blocking pool is counted as a lost write.
+    ///
+    /// `note_join_failure` is the only accounting for a write the worker attempted but
+    /// could not complete, and nothing reaches it: deleting the worker's
+    /// `if let Err(e) = joined` arm entirely leaves the suite green, so a panicking store
+    /// impl would silently stop persisting while `floor_loss_persist_failures` stayed
+    /// flat. The consequence is identical to a failed write — the durable snapshot stays
+    /// behind the in-memory one — which is why it counts on the same series.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bucket_write_that_panics_in_the_blocking_pool_is_counted() -> anyhow::Result<()> {
+        struct PanickingLossStore;
+        impl decdn_incentive::PoolFloorLossStore for PanickingLossStore {
+            #[expect(
+                clippy::panic,
+                reason = "the defect under test IS a panicking store impl; the worker \
+                          must convert it into a counted loss rather than losing it"
+            )]
+            fn record_bucket(
+                &self,
+                _: B256,
+                _: Address,
+                _: u128,
+                _: u64,
+            ) -> Result<(), decdn_incentive::StoreError> {
+                panic!("record_bucket is broken");
+            }
+            fn load_buckets(
+                &self,
+            ) -> Result<Vec<(B256, Address, u128, u64)>, decdn_incentive::StoreError> {
+                Ok(Vec::new())
+            }
+            fn forget_loss(&self, _: B256) -> Result<(), decdn_incentive::StoreError> {
+                Ok(())
+            }
+            fn sweep_forgotten(&self) -> Result<usize, decdn_incentive::StoreError> {
+                Ok(0)
+            }
+        }
+
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests_with_floor_store(
+            &metrics,
+            u64::MAX,
+            u64::MAX,
+            Arc::new(PanickingLossStore) as Arc<dyn decdn_incentive::PoolFloorLossStore>,
+        )
+        .await;
+        let pool = B256::repeat_byte(0x7E);
+        let window = handler.one_window(TEST_RATE);
+        let remaining = window.saturating_mul(U256::from(8u64));
+
+        let res = handler
+            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            .map_err(|e| anyhow::anyhow!("admission refused: {e:?}"))?;
+        res.note_unpaid(window);
+        drop(res);
+
+        handler.flush_floor_persists().await;
+
+        let text = metrics.encode()?;
+        anyhow::ensure!(
+            text.contains("decdn_floor_loss_persist_failures_total 1"),
+            "a write that panicked in the blocking pool must count as a lost \
+             write:\n{text}"
         );
         Ok(())
     }

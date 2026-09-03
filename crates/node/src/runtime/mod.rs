@@ -2656,26 +2656,37 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // so a slow RPC cannot hang shutdown.
     payment_service.shutdown(SHUTDOWN_DEADLINE).await;
 
-    // Drain the floor-bucket persist worker. The router has drained, so every
-    // `FloorReservation` has dropped and queued whatever it debited; this waits for
-    // that backlog to reach disk. A write lost here hands its signer back an
-    // abandonment allowance it has already spent, on the next boot.
+    // Drain the floor-bucket persist worker. The router has stopped accepting and has
+    // cancelled every in-flight serve, so no new reservation can open and the
+    // outstanding guards are being dropped; this waits for what they queued to reach
+    // disk. A write lost here hands its signer back an abandonment allowance it has
+    // already spent, on the next boot.
     //
-    // Bounded, unlike the cache flush below: the backlog is one `Durability::Immediate`
-    // commit per queued write processed serially, and a `spawn_blocking` issued once
-    // the blocking pool is shutting down yields a handle that never resolves — so an
-    // unbounded await here can hang shutdown outright rather than merely slow it. A
-    // timeout is counted as a persist failure because the consequence matches a failed
-    // write: the durable snapshot stays behind the in-memory one.
+    // Cancelled rather than joined: iroh aborts the `ProtocolHandler::accept` futures
+    // once `ProtocolHandler::shutdown` returns, and `ClientProtocol` takes the default
+    // no-op `shutdown`, so `ClientHandler::serve`'s own terminal drain does not run and
+    // the per-stream tasks are aborted. Their futures — and the `FloorReservation`s
+    // they hold — drop asynchronously. `flush_floor_persists` reports anything still
+    // queued once its ack returns, which is what covers a guard that dropped late.
+    //
+    // Bounded for the same reason: the backlog is one `Durability::Immediate` commit
+    // per queued write processed serially, and with no point at which the queue is
+    // provably closed an unbounded await could outlast the rest of shutdown. A timeout
+    // is counted as a persist failure because the consequence matches a failed write —
+    // the durable snapshot stays behind the in-memory one — and it is counted by the
+    // DEPTH of the abandoned backlog, since one bump would report a lost queue of four
+    // hundred exactly as it reports a single transient fault.
     if tokio::time::timeout(SHUTDOWN_DEADLINE, client_handler.flush_floor_persists())
         .await
         .is_err()
     {
-        node_metrics.floor_loss_persist_failure();
+        let lost = client_handler.queued_floor_persists().max(1);
+        node_metrics.floor_loss_persist_failures_by(lost);
         tracing::warn!(
+            lost,
             deadline = ?SHUTDOWN_DEADLINE,
-            "floor-bucket persist drain overran the shutdown deadline; queued snapshots \
-             may not have reached disk"
+            "floor-bucket persist drain overran the shutdown deadline; that many queued \
+             snapshots may not have reached disk"
         );
     }
 
