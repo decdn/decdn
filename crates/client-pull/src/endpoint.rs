@@ -14,8 +14,48 @@ use decdn_common::config::{ResolvedDiscovery, load_file_config, resolve_discover
 use decdn_common::identity::fresh_secret_key;
 use decdn_common::redact::redact_userinfo;
 use iroh::address_lookup::{DnsAddressLookup, MemoryLookup};
-use iroh::endpoint::presets;
+use iroh::endpoint::{QuicTransportConfig, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
+
+/// Per-stream QUIC receive window for a client pull.
+///
+/// QUIC flow control is receiver-advertised, and a download makes the client
+/// the receiver, so this window — not any node-side setting — bounds
+/// single-stream throughput at roughly `window / RTT`. It is sized to a
+/// default-configured node's paid-pull pacing envelope: a node serves at most
+/// one credit window of unpaid bytes ahead of the paid frontier, and that
+/// window ramps as `clamp(paid / credit_ramp_divisor, 1 MiB, credit_max)`
+/// toward `credit_max` (ADR 003 §Credit window), whose default is 64 MiB but is
+/// operator-configurable with no hard upper bound. Matching this window to that
+/// 64 MiB default keeps transport from being the bottleneck against a default
+/// node at any RTT. An operator who raises `payment.credit_max` past 64 MiB
+/// makes transport the binding cap again; the fixed default here needs no
+/// knowledge of the node's config and covers the common case.
+const CLIENT_STREAM_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+
+/// Whole-connection QUIC receive window for a client pull. A pull runs one bulk
+/// stream per connection (`per_source_inflight = 1`, one connection per
+/// provider), so this only needs to hold at least
+/// [`CLIENT_STREAM_RECEIVE_WINDOW`]; the 2x headroom leaves slack for the
+/// connection's control traffic without letting worst-case buffering grow
+/// larger than it must.
+const CLIENT_RECEIVE_WINDOW: u32 = 128 * 1024 * 1024;
+
+// A single stream must be able to fill its own window within the
+// whole-connection cap, or the per-stream window is unreachable.
+const _: () = assert!(CLIENT_STREAM_RECEIVE_WINDOW <= CLIENT_RECEIVE_WINDOW);
+
+/// QUIC transport config for a one-shot client [`Endpoint`]. It raises only the
+/// receive windows over the iroh defaults: on a download the client is the
+/// flow-control receiver, so these windows bound single-stream throughput on a
+/// high-latency path. Congestion control lives at the sender, so a node-side
+/// change is what would alter that half.
+fn client_transport_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .stream_receive_window(VarInt::from_u32(CLIENT_STREAM_RECEIVE_WINDOW))
+        .receive_window(VarInt::from_u32(CLIENT_RECEIVE_WINDOW))
+        .build()
+}
 
 /// Resolve the relay URLs for a client command. The `--relay-url` override
 /// (`flag`) wins; otherwise `network.relay_urls` from the config is used. An
@@ -106,7 +146,9 @@ pub async fn client_endpoint(
     } else {
         add_resolution_lookups(Endpoint::builder(presets::Minimal), discovery)?
     };
-    builder = builder.secret_key(fresh_secret_key());
+    builder = builder
+        .secret_key(fresh_secret_key())
+        .transport_config(client_transport_config());
     builder = if !relays.is_empty() {
         builder.relay_mode(relay_mode(relays))
     } else if discovery.is_empty() {
@@ -185,6 +227,17 @@ mod tests {
         f.write_all(body.as_bytes()).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn client_transport_windows_are_sized_and_ordered() {
+        // Pin the sizes this PR sets: the per-stream window matches a default
+        // node's `credit_max` ceiling, and the connection window sits above it.
+        assert_eq!(CLIENT_STREAM_RECEIVE_WINDOW, 64 * 1024 * 1024);
+        assert_eq!(CLIENT_RECEIVE_WINDOW, 128 * 1024 * 1024);
+        // The builder accepts these values and yields a config. (The
+        // stream-<=-connection invariant is a compile-time assertion above.)
+        let _config = client_transport_config();
     }
 
     #[test]
