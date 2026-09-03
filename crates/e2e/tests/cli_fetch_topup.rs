@@ -736,7 +736,8 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
         eth_identity::load_signer(&keystore, TOPUP_KEYSTORE_PASSWORD).context("load buyer")?;
     let buyer_addr = buyer.address();
     chain.fund_eth(buyer_addr, 100).await?;
-    // Enough for the open plus both top-ups, with headroom.
+    // Well above the opening deposit: covers the open and any reactive top-up a
+    // slower host might drive, with headroom. The test does not depend on a count.
     chain
         .mint_usdc(buyer_addr, U256::from(5 * DEPOSIT_SHORT_WORKING_MICRO_USDC))
         .await
@@ -819,14 +820,20 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
         if output.status.success() {
             break;
         }
-        // Anything already on disk means the run began delivering; a re-invocation
-        // would resume from that flushed prefix and corrupt the cost measurement,
-        // so surface the failure rather than retry.
+        // Retry ONLY the serve-path readiness race, and only before any byte lands.
+        // The race surfaces as a `NotFound` — the node's collapsed pre-serve refusal
+        // while its `getPool` view is still resolving the freshly-opened pool. Any
+        // other pre-delivery failure (a transport fault, a CLI error) is a real
+        // regression and must fail fast, never be masked by a later attempt's
+        // success. Anything already on disk means delivery began: re-invoking would
+        // resume from that flushed prefix and corrupt the cost measurement.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let readiness_race = stderr.contains("NotFound");
         let progressed = out.exists() || std::fs::metadata(&partial).is_ok_and(|m| m.len() > 0);
         anyhow::ensure!(
-            !progressed && tokio::time::Instant::now() < deadline,
-            "decdn fetch failed (delivered bytes on disk = {progressed}): {}",
-            String::from_utf8_lossy(&output.stderr)
+            readiness_race && !progressed && tokio::time::Instant::now() < deadline,
+            "decdn fetch failed (readiness race = {readiness_race}, delivered bytes on disk = \
+             {progressed}): {stderr}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
