@@ -47,7 +47,8 @@ pub struct Capability {
     /// Maximum cumulative amount (token base units) the `signer` may spend
     /// against `pool_id` under this grant. A `u64` to match the
     /// `PaymentPool.spendingCap` storage/calldata width exactly; the EIP-712
-    /// type-string still hashes it as a `uint256` word (see [`Self::to_sol`]).
+    /// type-string still hashes it as a `uint256` word (the signing hash widens
+    /// it with `U256::from`).
     pub spending_cap: u64,
     /// The pool this capability draws from — the on-chain `PaymentPool`
     /// deposit id.
