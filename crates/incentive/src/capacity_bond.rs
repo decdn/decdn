@@ -271,6 +271,25 @@ mod sol_types {
             /// the ready time rather than surface a bare revert.
             function multiaddrUpdateCooldown() external view returns (uint256);
 
+            /// Region self-attestation state for `operator` (ADR 030), as
+            /// `(regionHint, regionPrev, regionLastChanged, regionStabilityWindow)`:
+            /// the current on-chain region, the previous region retained for the
+            /// blacklist-scope ripening predicate, the unix-second stamp of the
+            /// last change (registration counts), and the governable cooldown
+            /// between `updateRegion` calls. `decdn node update-region` reads it to
+            /// report the current region and the cooldown state — `readyAt =
+            /// regionLastChanged + regionStabilityWindow`; a call before it reverts
+            /// `RegionCooldownActive(readyAt)` — before the send.
+            function regionScopeData(address operator)
+                external
+                view
+                returns (
+                    string memory regionHint,
+                    string memory regionPrev,
+                    uint64 regionLastChanged,
+                    uint256 regionStabilityWindow
+                );
+
             /// Per-operator EIP-712 `BindNodeId` nonce. Feeds the
             /// `bindingSignature` digest at registration time (ADR 019
             /// § Step 2.3). `0` for an operator that has never bound.
@@ -355,6 +374,18 @@ mod sol_types {
             /// pre-checked by the CLI.
             function updateMultiaddrs(bytes multiaddrs) external;
 
+            /// (Re)attest the caller's region (ADR 030), storing `newRegion` into
+            /// `_nodes[msg.sender].regionHint`, retaining the prior value in
+            /// `regionPrev`, and stamping `regionLastChanged`. Wrapped by `decdn
+            /// node update-region`, the non-destructive way for an active operator
+            /// to correct or move its region after registering. Reverts
+            /// `NodeNotActive` unless the caller is registered,
+            /// `RegionHintTooLong(size, ceiling)` above `MAX_REGION_HINT_BYTES`,
+            /// and `RegionCooldownActive(readyAt)` within `regionStabilityWindow`
+            /// of the last change — the active and cooldown gates pre-checked by the
+            /// CLI (a validated ISO 3166-1 alpha-2 code never nears the ceiling).
+            function updateRegion(string newRegion) external;
+
             // -----------------------------------------------------------------
             // Events that mutate active-set membership
             // -----------------------------------------------------------------
@@ -363,6 +394,10 @@ mod sol_types {
             /// `updateMultiaddrs`. `nodeId`-indexed; carries the new packed
             /// `multiaddrs` field.
             event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes multiaddrs);
+
+            /// Operator (re)attested its region via `updateRegion`.
+            /// `nodeId`-indexed; carries the prior and new region strings.
+            event RegionUpdated(bytes32 indexed nodeId, string oldRegion, string newRegion);
 
             /// Node activated via `registerNode`. `nodeId`-indexed.
             event NodeRegistered(
