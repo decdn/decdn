@@ -285,9 +285,12 @@ async fn run() -> anyhow::Result<()> {
     // pool-registration readiness window; the rest go straight through, the pool
     // now being known. Collected into `held` so the connections — and thus the
     // reservations — stay alive across the overflow assertion below.
+    // Convert the window count to `usize` once, with context, so the indexing
+    // below is infallible rather than papering over a bad conversion with a
+    // `usize::MAX` index that would panic out of bounds.
+    let held_count = usize::try_from(HELD_STREAMS).context("HELD_STREAMS does not fit in usize")?;
     let mut held: Vec<HeldStream> = Vec::new();
-    for round in 0..HELD_STREAMS {
-        let ctx = &contexts[usize::try_from(round).unwrap_or(usize::MAX)];
+    for (round, ctx) in contexts.iter().enumerate().take(held_count) {
         let outcome = if round == 0 {
             hold_open_until_ready(owner.endpoint(), target.clone(), ctx, hit_hash, floor_bytes)
                 .await?
@@ -313,7 +316,7 @@ async fn run() -> anyhow::Result<()> {
         }
     }
     anyhow::ensure!(
-        held.len() == usize::try_from(HELD_STREAMS).unwrap_or(usize::MAX),
+        held.len() == held_count,
         "expected {HELD_STREAMS} live held streams, have {}",
         held.len()
     );
@@ -324,7 +327,7 @@ async fn run() -> anyhow::Result<()> {
     // signer — pristine per-signer gates, zero live, empty bucket — can be refused
     // by NOTHING but the pool ceiling. It requests the SAME cached HIT, so
     // availability is not the reason either.
-    let overflow_ctx = &contexts[usize::try_from(HELD_STREAMS).unwrap_or(usize::MAX)];
+    let overflow_ctx = &contexts[held_count];
     let deposit_rejects_before = node.scrape_metric(INSUFFICIENT_DEPOSIT_METRIC).await?;
     let signer_rejects_before = node.scrape_metric(SIGNER_FLOOR_REJECT_METRIC).await?;
     let overflow = open_and_hold(
