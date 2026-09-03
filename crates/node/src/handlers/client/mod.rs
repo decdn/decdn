@@ -1180,9 +1180,6 @@ pub struct ClientHandlerDeps {
     /// Non-blocking sink for the served-and-paid audit log. One receipt per
     /// accepted voucher, so a single delivery emits several.
     pub receipt_sink: Arc<dyn ReceiptSink>,
-    /// Optional durable sink for owner-signed capability material (ADR 003
-    /// §Capability delegation). `None` (tests) makes capability intake a no-op.
-    pub capability_sink: Option<Arc<dyn crate::channel_store::CapabilitySink>>,
     /// Cached `getPool` view (owner + remaining), read by the floor-`M` solvency
     /// gate and the ADR 011 funder gate. `None` (tests) disables both gates —
     /// they fail open, exactly as before E4 wired the view.
@@ -1372,7 +1369,6 @@ impl ClientHandlerDeps {
             bind_domain,
             channel_state_store,
             receipt_sink,
-            capability_sink: None,
             pool_view: None,
             pool_min_remaining_deposit,
             rate_per_mb,
@@ -1546,14 +1542,6 @@ pub struct ClientHandler {
     /// A dropped receipt (queue full) is non-fatal — the payment already advanced
     /// the lane watermark.
     receipt_sink: Arc<dyn ReceiptSink>,
-    /// Durable sink for owner-signed capability material (ADR 003 §Capability
-    /// delegation), set at construction via [`ClientHandlerDeps`]. On a stream
-    /// whose [`StreamRequestExt`] carries a `capability`, the serve gate verifies
-    /// the owner signature and persists `{spending_cap, expiry, owner_sig}` for
-    /// `(pool_id, signer)` so the redeemer can register the signer on its first
-    /// on-chain redemption. `None` when no settlement surface is wired (tests) —
-    /// intake is then a no-op.
-    capability_sink: Option<Arc<dyn crate::channel_store::CapabilitySink>>,
     /// Cached `getPool` view for the floor-`M` and ADR 011 funder gates. `None`
     /// (tests) makes both gates fail open.
     pool_view: Option<Arc<dyn crate::pool_view::PoolView>>,
@@ -1828,7 +1816,6 @@ impl ClientHandler {
             channel_state_store: deps.channel_state_store,
             pool_min_remaining_deposit: deps.pool_min_remaining_deposit,
             receipt_sink: deps.receipt_sink,
-            capability_sink: deps.capability_sink,
             pool_view: deps.pool_view,
             lanes: Arc::new(map),
             lane_count,
@@ -2096,7 +2083,16 @@ impl ClientHandler {
         // vouchers for `(pool_id, signer, this operator)` — without this a
         // brand-new lane's first request is never served, since the serve gate
         // admits only known lanes. Idempotent for an already-tracked lane.
-        let lane = LaneState::hydrate(
+        //
+        // The verified owner signature rides the lane record itself, alongside
+        // the `cap`/`expiry` it authorizes: it is the `ownerSig` the redeemer
+        // submits as a `CapabilityReg` on the signer's first on-chain redemption.
+        // Kept ON the lane — not in a side table — so it is written in the same
+        // durable transaction as the voucher frontier and can never be lost while
+        // the frontier survives (#1906). A buffered in-memory insert like every
+        // lane `record`; the row lands on disk in the periodic lane flush's
+        // fsynced commit, not a per-request fsync on the intake path.
+        let mut lane = LaneState::hydrate(
             pool_id,
             signer,
             self.eth_signer.address(),
@@ -2109,21 +2105,10 @@ impl ClientHandler {
             None,
             decdn_incentive::LaneChain::NONE,
         );
+        lane.owner_sig = Some(sig_bytes);
         if let Err(e) = self.register_lane(lane) {
             tracing::warn!(%pool_id, %signer, error = %e, "lane registration failed; the request refuses as an unknown lane and the client retries");
         }
-
-        // Persist the owner-signed material for the redeemer (if a settlement
-        // sink is wired). `None` (tests) makes this a no-op. The sink is a
-        // buffered in-memory insert (#1789 item 1): repeated identical
-        // capability sends dedup against the buffered row, and the row lands
-        // on disk in the periodic lane flush's fsynced commit — not a
-        // per-request `spawn_blocking` fsync on the intake path.
-        let Some(sink) = self.capability_sink.as_ref() else {
-            return;
-        };
-        let owner_sig = capability.owner_signature.clone();
-        sink.stage_capability(pool_id, signer, spending_cap, expiry, &owner_sig);
     }
 
     /// Register a lane so the voucher path accepts vouchers for it — its
@@ -3953,28 +3938,13 @@ mod tests {
         );
     }
 
-    /// A [`crate::channel_store::CapabilitySink`] that records which
-    /// `(pool_id, signer)` grants were persisted, so a test can assert a
-    /// forged-owner capability is dropped before it reaches the redeemer.
-    #[derive(Debug)]
-    struct RecordingCapabilitySink {
-        recorded: Arc<std::sync::Mutex<Vec<(B256, Address)>>>,
-    }
-
-    impl crate::channel_store::CapabilitySink for RecordingCapabilitySink {
-        fn stage_capability(
-            &self,
-            pool_id: B256,
-            signer: Address,
-            _spending_cap: u64,
-            _expiry: u64,
-            _owner_sig: &[u8],
-        ) {
-            self.recorded
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((pool_id, signer));
-        }
+    /// Read a lane's own owner-signed capability material (`owner_sig`) from the
+    /// handler's live map — the field the redeemer builds its `CapabilityReg`
+    /// from. `None` when the lane is absent OR present without a captured grant.
+    async fn lane_owner_sig(handler: &ClientHandler, key: &LaneKey) -> Option<[u8; 65]> {
+        let lane = handler.lanes.get(key).map(|e| Arc::clone(e.value()))?;
+        // `owner_sig` is `Copy`, so it copies out as the guard's temporary drops.
+        lane.lock().await.state.owner_sig
     }
 
     /// A [`crate::pool_view::PoolView`] returning a fixed owner (and unbounded
@@ -3996,23 +3966,18 @@ mod tests {
         }
     }
 
-    /// Build a handler with a recording capability sink and a fixed-owner
-    /// pool-view wired, for the capability-intake owner check.
+    /// Build a handler with a real in-memory lane store and a fixed-owner
+    /// pool-view wired, for the capability-intake owner check. The captured
+    /// grant is read back off the lane record via [`lane_owner_sig`].
     async fn handler_with_capability_intake(
         metrics: &Arc<Metrics>,
         owner: Address,
-    ) -> (
-        Arc<ClientHandler>,
-        Arc<std::sync::Mutex<Vec<(B256, Address)>>>,
-        tempfile::TempDir,
-        mpsc::Receiver<B256>,
-    ) {
+    ) -> (Arc<ClientHandler>, tempfile::TempDir, mpsc::Receiver<B256>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
             .await
             .expect("cache");
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
-        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (resolve_tx, resolve_rx) = mpsc::channel(8);
         let mut deps = ClientHandlerDeps::new(
             iroh::SecretKey::generate().public(),
@@ -4044,25 +4009,22 @@ mod tests {
             U256::ZERO,
             always_admit_shed(),
         );
-        deps.capability_sink = Some(Arc::new(RecordingCapabilitySink {
-            recorded: Arc::clone(&recorded),
-        }));
         deps.pool_view = Some(Arc::new(FixedPoolView { owner }));
         deps.pool_resolve_hint = Some(resolve_tx);
         let handler = ClientHandler::new(deps).expect("handler");
-        (Arc::new(handler), recorded, dir, resolve_rx)
+        (Arc::new(handler), dir, resolve_rx)
     }
 
     /// Fix 1 (security): capability intake verifies the owner signature against
     /// the on-chain pool owner. A grant signed by a NON-owner key is dropped —
-    /// never persisted, never lane-registered — so it cannot revert the
-    /// redeemer's `redeemMany` batch. A correct-owner grant is persisted and
-    /// registers its lane.
+    /// never captured on a lane, never lane-registered — so it cannot revert the
+    /// redeemer's `redeemMany` batch. A correct-owner grant registers its lane
+    /// and rides the lane record as its `owner_sig`.
     #[tokio::test]
     async fn intake_rejects_wrong_owner_capability() {
         let metrics = Arc::new(Metrics::new());
         let owner = PrivateKeySigner::random();
-        let (handler, recorded, _dir, _resolve_rx) =
+        let (handler, _dir, _resolve_rx) =
             handler_with_capability_intake(&metrics, owner.address()).await;
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let pool_id = B256::repeat_byte(0x77);
@@ -4092,35 +4054,32 @@ mod tests {
             provider: handler.eth_signer.address(),
         };
 
-        // A capability signed by a NON-owner is dropped: not persisted, no lane.
+        // A capability signed by a NON-owner is dropped: no lane, no material.
         let bad = make_wire(&PrivateKeySigner::random());
         handler.intake_capability(pool_id, signer, Some(owner.address()), &bad);
-        assert!(
-            recorded
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "a forged-owner capability must not be persisted"
-        );
         assert!(
             !handler.lanes.contains_key(&lane_key),
             "a forged-owner capability must not register a lane"
         );
-
-        // The correct owner's capability is persisted and registers the lane.
-        let good = make_wire(&owner);
-        handler.intake_capability(pool_id, signer, Some(owner.address()), &good);
         assert_eq!(
-            recorded
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_slice(),
-            &[(pool_id, signer)],
-            "a correct-owner capability is persisted for the redeemer"
+            lane_owner_sig(&handler, &lane_key).await,
+            None,
+            "a forged-owner capability captures no material"
         );
+
+        // The correct owner's capability registers the lane and rides its record.
+        let good = make_wire(&owner);
+        let expected_sig =
+            <[u8; 65]>::try_from(good.owner_signature.as_slice()).expect("65-byte owner sig");
+        handler.intake_capability(pool_id, signer, Some(owner.address()), &good);
         assert!(
             handler.lanes.contains_key(&lane_key),
             "a correct-owner capability registers its lane so vouchers can be served"
+        );
+        assert_eq!(
+            lane_owner_sig(&handler, &lane_key).await,
+            Some(expected_sig),
+            "the verified owner signature is captured on the lane record for the redeemer"
         );
     }
 
@@ -4135,7 +4094,7 @@ mod tests {
     async fn intake_hints_resolver_for_an_unknown_pool_then_registers_on_retry() {
         let metrics = Arc::new(Metrics::new());
         let owner = PrivateKeySigner::random();
-        let (handler, recorded, _dir, mut resolve_rx) =
+        let (handler, _dir, mut resolve_rx) =
             handler_with_capability_intake(&metrics, owner.address()).await;
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let pool_id = B256::repeat_byte(0x5a);
@@ -4167,13 +4126,6 @@ mod tests {
         assert!(
             !handler.lanes.contains_key(&lane_key),
             "an unknown-owner capability must not register a lane"
-        );
-        assert!(
-            recorded
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "an unverifiable capability must not be persisted"
         );
         assert_eq!(
             resolve_rx.try_recv().ok(),
@@ -4266,11 +4218,16 @@ mod tests {
 
         let metrics = Arc::new(Metrics::new());
         let owner = PrivateKeySigner::random();
-        let (handler, recorded, _dir, _resolve_rx) =
+        let (handler, _dir, _resolve_rx) =
             handler_with_capability_intake(&metrics, owner.address()).await;
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let pool_id = B256::repeat_byte(0x12);
         let signer = Address::repeat_byte(0x34);
+        let lane_key = LaneKey {
+            pool_id,
+            signer,
+            provider: handler.eth_signer.address(),
+        };
         let signed = Capability {
             signer,
             spending_cap: 1_000_000u64,
@@ -4295,16 +4252,13 @@ mod tests {
         handler.intake_capability(pool_id, signer, Some(owner.address()), &wire);
 
         assert!(
-            recorded.lock().expect("recorded lock").is_empty(),
-            "a malformed capability is never persisted"
+            !handler.lanes.contains_key(&lane_key),
+            "a malformed capability never registers a lane (nor captures material)"
         );
-        assert!(
-            !handler.lanes.contains_key(&LaneKey {
-                pool_id,
-                signer,
-                provider: handler.eth_signer.address(),
-            }),
-            "a malformed capability never registers a lane"
+        assert_eq!(
+            lane_owner_sig(&handler, &lane_key).await,
+            None,
+            "a malformed capability captures no owner_sig"
         );
         let cached = handler
             .capability_verify_cache
@@ -4320,19 +4274,25 @@ mod tests {
 
     /// #1789 item 2: a client that re-sends the same capability (the
     /// documented recovery path) hits the verification cache instead of paying a
-    /// fresh `ecrecover`, and the repeated persist still dedups to one sink
-    /// write (item 1). A tampered re-send — same payload, different signature
-    /// — misses the cache, re-verifies, and is dropped.
+    /// fresh `ecrecover`, and the genuine grant lands on the lane record. A
+    /// tampered re-send — same payload, different signature — misses the cache,
+    /// re-verifies, recovers a different owner, and is dropped without disturbing
+    /// the genuine `owner_sig` already on the lane.
     #[allow(clippy::similar_names)] // signer/signed/signature pair up clearly here
     #[tokio::test]
-    async fn repeat_capability_send_hits_verify_cache_and_dedups_the_persist() {
+    async fn repeat_capability_send_hits_verify_cache_and_keeps_the_genuine_material() {
         let metrics = Arc::new(Metrics::new());
         let owner = PrivateKeySigner::random();
-        let (handler, recorded, _dir, _resolve_rx) =
+        let (handler, _dir, _resolve_rx) =
             handler_with_capability_intake(&metrics, owner.address()).await;
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let pool_id = B256::repeat_byte(0x12);
         let signer = Address::repeat_byte(0x34);
+        let lane_key = LaneKey {
+            pool_id,
+            signer,
+            provider: handler.eth_signer.address(),
+        };
         let signed = Capability {
             signer,
             spending_cap: 1_000_000u64,
@@ -4341,10 +4301,11 @@ mod tests {
         }
         .sign(&owner, &domain)
         .expect("sign capability");
+        let genuine_sig = signed.signature.as_bytes();
         let wire = decdn_protocol::client::WireCapability {
             spending_cap: signed.capability.spending_cap,
             expiry: signed.capability.expiry,
-            owner_signature: signed.signature.as_bytes().to_vec(),
+            owner_signature: genuine_sig.to_vec(),
         };
 
         handler.intake_capability(pool_id, signer, Some(owner.address()), &wire);
@@ -4358,23 +4319,11 @@ mod tests {
             cache_len, 1,
             "the identical repeat must hit the verification cache"
         );
-        // The fake sink records every call — the repeat-dedup itself sits in the
-        // real store's `put_capability` (covered by `channel_store` tests) — so
-        // what this pins is that repeated intake stays correct and cheap, with
-        // one cache entry for the grant.
         assert_eq!(
-            recorded
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            2,
-            "both intakes reach the sink; the store layer dedups the write"
+            lane_owner_sig(&handler, &lane_key).await,
+            Some(genuine_sig),
+            "the genuine owner_sig rides the lane record after the repeated intake"
         );
-        assert!(handler.lanes.contains_key(&LaneKey {
-            pool_id,
-            signer,
-            provider: handler.eth_signer.address(),
-        }));
 
         // A tampered re-send: the SAME capability payload signed by a
         // different key — a well-formed signature that is a distinct cache
@@ -4406,12 +4355,9 @@ mod tests {
             "the forged signature records its own (new) key"
         );
         assert_eq!(
-            recorded
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            2,
-            "the forged re-send is dropped before the sink; no extra write"
+            lane_owner_sig(&handler, &lane_key).await,
+            Some(genuine_sig),
+            "the forged re-send is dropped; the genuine owner_sig on the lane is untouched"
         );
     }
 
