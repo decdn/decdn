@@ -506,10 +506,11 @@ impl ClientHandler {
         // `serve_via_backend_origin` / `serve_via_window_pull_through` miss legs take it
         // by value and pass it by reference into their shared `serve_leg`. All three
         // note the live unpaid balance each iteration and release the reservation once
-        // the stream repays one floor, so `Drop` reconciles to the actual unpaid loss —
-        // the miss legs fold proportional `dead_charge` for the upstream USDC they front,
-        // exactly like the hit path. On a refusal before the serve loop the guard drops
-        // with `note_unpaid` at 0, so no dead charge is folded.
+        // the stream repays one floor, so `Drop` debits the signer's abandonment bucket
+        // by the real un-recouped floor an abnormal exit leaves — the reserved window
+        // for a miss leg (whose fronted upstream USDC the downstream tail under-measures)
+        // and `delivered − paid` for a direct-serve hit. On a refusal before the serve
+        // loop the guard drops unspent, debiting nothing.
         let mut floor_reservation: Option<FloorReservation> = None;
 
         // Set by the origin-tier range pull-through below (#823) when a
@@ -1162,13 +1163,13 @@ impl ClientHandler {
         // legs, which spend, open theirs pre-fill above). Open it HERE, span-capped
         // to `guard_bytes`, via [`ClientHandler::try_reserve_floor`] — its
         // two-level check — `remaining − M ≥ committed + reserved` pool-wide, and
-        // this signer's own share — both admits the stream and bounds the pool's
-        // cumulative cross-lane floor credit. A miss-fill stream
+        // this signer's own live cap — both admits the stream and bounds the pool's
+        // cumulative cross-lane LIVE floor credit. A miss-fill stream
         // already holds its reservation, so re-validate solvency against the pool's
-        // already-committed floor credit (`live_reservation + dead_charge`) via
+        // already-committed LIVE floor reservation via
         // [`ClientHandler::pool_budget_covers_reserve`] with `new_reserve = 0` — the
-        // same stateful check the mid-stream gate applies, so a pool-wide
-        // `dead_charge` that grew since the reservation refuses here rather than
+        // same stateful check the mid-stream gate applies, so a pool-wide live
+        // reservation that grew since this one was taken refuses here rather than
         // serving a free interval.
         //
         // `remaining` comes from the cached `getPool` view resolved above; a `None`
@@ -1201,13 +1202,13 @@ impl ClientHandler {
                 // A miss-fill stream already holds its reservation, counted at both
                 // levels, so this re-validates rather than reserves (`new_reserve =
                 // 0`) — and at the POOL level only, for the reason
-                // [`ClientHandler::pool_budget_covers_reserve`] gives: the signer's
-                // cap is a share of `remaining − M` and shrinks as co-tenants draw
-                // the pool down, so re-testing an already-admitted reservation
-                // against it refuses a stream the sub-cap let through. Here that is
-                // strictly worse than serving: the fill already fronted upstream
-                // USDC, so refusing loses that spend AND folds the full reservation
-                // into the signer's permanent dead charge. The sub-cap did its job
+                // [`ClientHandler::pool_budget_covers_reserve`] gives: the pool
+                // ceiling shrinks as co-tenants draw the pool down, so re-testing an
+                // already-admitted reservation against the per-signer gates could
+                // refuse a stream they let through pre-fill. Here that is strictly
+                // worse than serving: the fill already fronted upstream USDC, so
+                // refusing loses that spend AND debits the full reservation into the
+                // signer's abandonment bucket. The per-signer gates did their job
                 // pre-fill; this gate only asks whether the pool can still pay.
                 (!self.pool_budget_covers_reserve(
                     B256::from(req.pool_id),

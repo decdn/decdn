@@ -1337,10 +1337,11 @@ async fn build_chain_and_handlers(
         frame_target_bytes: cfg.payment.frame_target_bytes,
         idle_timeout: None,
         pool_recheck_interval: None,
-        // Durable floor dead-charge, keyed `(pool, signer)` (ADR 003 §Pool
-        // solvency): the same redb store that holds every lane record also
-        // mirrors each signer's unrecoverable floor loss against each pool, so a
-        // restart reloads it rather than granting a fresh free-floor budget.
+        // Durable per-signer abandonment-bucket snapshots, keyed `(pool, signer)`
+        // (ADR 003 §Pool solvency): the same redb store that holds every lane record
+        // also mirrors each signer's bucket level + refill timestamp against each
+        // pool, so a restart resumes a signer's throttle where it left off rather
+        // than granting a fresh allowance.
         floor_loss_store: Some(Arc::clone(&infra.concrete_channel_store)
             as Arc<dyn decdn_incentive::PoolFloorLossStore>),
         // Per-signer floor gates (ADR 003 §Pool solvency): the live concurrency cap

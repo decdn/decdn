@@ -1138,9 +1138,10 @@ pub struct DecdnMetrics {
     /// experiencing sustained concurrency pressure. Visible name:
     /// `decdn_serve_stream_rejected_lane_at_capacity_total`.
     pub serve_stream_rejected_lane_at_capacity: Counter,
-    /// Delivery refused because ONE capability signer's un-vouchered floor credit
-    /// — its live reservations plus its permanent `dead_charge` — already fills
-    /// its share of the pool budget, while the pool itself can still pay (ADR 003
+    /// Delivery refused because ONE capability signer hit a per-signer floor gate —
+    /// either its live concurrency cap of un-vouchered reservation, or its refilling
+    /// node-local abandonment bucket (drained by a burst of abandons) — while the
+    /// pool itself can still pay (ADR 003
     /// §Pool solvency, per-signer floor isolation). Wire-indistinguishable from
     /// `insufficient_deposit` (both signed as `NotFound`), so this counter is the
     /// only place the distinction lives — a rising value means one signer holds its
@@ -1982,9 +1983,9 @@ recorders! {
     /// refundable floor cannot cover the reserved cost of another.
     serve_stream_rejected_lane_at_capacity => serve_stream_rejected_lane_at_capacity.inc();
 
-    /// Record a `serve_stream` delivery refused because this capability signer's
-    /// un-vouchered floor credit already fills its share of the pool budget,
-    /// while the pool as a whole can still pay.
+    /// Record a `serve_stream` delivery refused because this capability signer hit a
+    /// per-signer floor gate — its live concurrency cap or its drained abandonment
+    /// bucket — while the pool as a whole can still pay.
     serve_stream_rejected_signer_floor_at_cap => serve_stream_rejected_signer_floor_at_cap.inc();
 
     /// Record a `serve_stream` delivery refused because the requested bounded

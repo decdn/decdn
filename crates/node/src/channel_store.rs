@@ -653,7 +653,7 @@ impl PersistentPoolStateStore {
     /// content but preserves the inode) would start with an empty store. For
     /// `lanes.redb` that silently reopens the issue #527 voucher-replay window;
     /// for the other families it silently re-grants budget the lost rows bounded
-    /// (a dropped floor-loss row re-grants free-floor budget, a dropped
+    /// (a dropped floor-loss row resets a signer's abandonment allowance, a dropped
     /// pending-settle entry forgets an in-flight redemption).
     ///
     /// On a chmod failure the cleanup depends on whether the file pre-existed

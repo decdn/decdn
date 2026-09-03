@@ -16,9 +16,9 @@ use super::{
 /// loop runs — the pre-flight floor-`M` gate, the size gate, or an upstream that
 /// refused the free header handshake. Nothing was fronted upstream and no byte
 /// was delivered, so [`FloorReservation::release_unspent`] frees the live
-/// reservation and folds no `dead_charge`; without it the guard's `Drop` would
-/// treat the un-settled reservation as an abnormal exit and permanently charge
-/// the pool for a serve it never performed (ADR 003 §Pool solvency). A no-op when
+/// reservation and debits no abandonment bucket; without it the guard's `Drop`
+/// would treat the un-settled reservation as an abnormal exit and debit the
+/// signer's bucket for a serve it never performed (ADR 003 §Pool solvency). A no-op when
 /// no lane was known (no reservation was taken).
 fn release_reservation_unspent(reservation: Option<&FloorReservation>) {
     if let Some(reservation) = reservation {
@@ -374,8 +374,8 @@ impl ClientHandler {
         // The pool floor reservation (opened at the dispatch pre-spend gate) is OWNED
         // here and passed by reference: the serve leg keeps its `note_unpaid` current
         // and releases it once the stream repays one floor, exactly like the hit path,
-        // so this MISS leg — which fronts upstream USDC — folds proportional
-        // `dead_charge` too. Holding ownership across the `await` keeps the guard alive
+        // so this MISS leg — which fronts upstream USDC — debits its abandonment
+        // bucket by the reserved window on an abnormal exit. Holding ownership across the `await` keeps the guard alive
         // for the whole serve; its `Drop` reconciles the residual unpaid loss AFTER
         // `serve_leg` returns, at this function's scope end.
         let serve_result = self
@@ -675,7 +675,7 @@ impl ClientHandler {
         // The pool floor reservation (opened at the dispatch pre-spend gate) is OWNED
         // here and passed by reference so the serve leg reconciles it exactly like the
         // hit path: delivery here is billed per voucher, so an un-repaid stream must
-        // fold proportional `dead_charge`. Holding ownership across the `await` keeps
+        // debit its abandonment bucket on an abnormal exit. Holding ownership across the `await` keeps
         // the guard alive for the whole serve; its `Drop` fires AFTER `serve_leg`
         // returns, at this function's scope end.
         let serve_result = self

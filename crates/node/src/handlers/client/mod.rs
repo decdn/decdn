@@ -1677,11 +1677,18 @@ pub struct ClientHandler {
     /// per-channel detail lives in the `debug!` beside it and in the counter.
     deposit_refusal_last_warn_ms: AtomicU64,
     deposit_refusal_suppressed: AtomicU64,
-    /// The same window for the per-signer arm, kept separate so neither cap can
-    /// starve the other's `warn!` or pollute its `suppressed` count
-    /// ([`ClientHandler::note_refusal`]).
+    /// The same window for the per-signer LIVE-cap arm, kept separate from the pool
+    /// arm so neither can starve the other's `warn!` or pollute its `suppressed`
+    /// count ([`ClientHandler::note_refusal`]).
     signer_cap_refusal_last_warn_ms: AtomicU64,
     signer_cap_refusal_suppressed: AtomicU64,
+    /// A THIRD, independent window for the per-signer abandonment-BUCKET arm. The
+    /// live-cap and bucket refusals have different remedies (rotate key / widen the
+    /// live cap vs. wait for refill / widen the bucket), so they must not share a
+    /// window: sharing one lets whichever fires first suppress the other's `warn!`
+    /// for the whole interval, sending the operator to the wrong knob.
+    signer_throttle_refusal_last_warn_ms: AtomicU64,
+    signer_throttle_refusal_suppressed: AtomicU64,
     /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime).
     /// `None` (the default and production path) reads as [`APP_IDLE_TIMEOUT`]
     /// (30s); a shorter value is set at construction via [`ClientHandlerDeps`]
@@ -1833,6 +1840,8 @@ impl ClientHandler {
             deposit_refusal_suppressed: AtomicU64::new(0),
             signer_cap_refusal_last_warn_ms: AtomicU64::new(0),
             signer_cap_refusal_suppressed: AtomicU64::new(0),
+            signer_throttle_refusal_last_warn_ms: AtomicU64::new(0),
+            signer_throttle_refusal_suppressed: AtomicU64::new(0),
             idle_timeout: deps.idle_timeout,
             pool_recheck_interval: deps.pool_recheck_interval,
             warming_credit: deps.warming_credit,
@@ -2216,12 +2225,25 @@ impl ClientHandler {
         )
     }
 
-    /// Throttle window for the per-signer arms: the pool is solvent and one signer
-    /// hit its live concurrency cap or drained its abandonment bucket.
+    /// Throttle window for the per-signer LIVE-cap arm: the pool is solvent and one
+    /// signer holds its whole live concurrency cap. Its remedy (rotate key / widen
+    /// `pool_floor_signer_live_windows`) differs from the bucket arm's, so it keeps a
+    /// window separate from [`Self::note_signer_throttle_refusal`].
     pub(super) fn note_signer_cap_refusal(&self) -> Option<u64> {
         Self::note_refusal(
             &self.signer_cap_refusal_last_warn_ms,
             &self.signer_cap_refusal_suppressed,
+        )
+    }
+
+    /// Throttle window for the per-signer abandonment-BUCKET arm: the pool is solvent
+    /// and one signer drained its refilling allowance. Separate from the live-cap
+    /// window so a burst of one refusal type never suppresses the other's `warn!` —
+    /// the two point the operator at different knobs.
+    pub(super) fn note_signer_throttle_refusal(&self) -> Option<u64> {
+        Self::note_refusal(
+            &self.signer_throttle_refusal_last_warn_ms,
+            &self.signer_throttle_refusal_suppressed,
         )
     }
 
@@ -2304,7 +2326,7 @@ impl ClientHandler {
             "refusing delivery: this capability signer's node-local abandonment bucket is drained \
              past capacity; the pool itself can still pay and the bucket refills over time"
         );
-        if let Some(suppressed) = self.note_signer_cap_refusal() {
+        if let Some(suppressed) = self.note_signer_throttle_refusal() {
             tracing::warn!(
                 %pool_id, %signer, %consumed, %capacity, %headroom, suppressed,
                 interval = ?Self::DEPOSIT_REFUSAL_WARN_INTERVAL,
@@ -4326,7 +4348,7 @@ mod tests {
     /// Lock the floor map for a test assertion, surfacing a poisoned lock as an
     /// `anyhow` error rather than panicking (the anti-panic policy holds in tests).
     /// The capability signer every floor-accumulator unit test reserves under.
-    /// A second signer (`TEST_SIGNER_B`) exercises the per-signer sub-cap.
+    /// A second signer (`TEST_SIGNER_B`) exercises per-signer isolation.
     const TEST_SIGNER: Address = Address::new([0xa1u8; 20]);
     /// A distinct co-tenant on the same pool.
     const TEST_SIGNER_B: Address = Address::new([0xb2u8; 20]);
