@@ -258,6 +258,19 @@ mod sol_types {
             /// unlock time it is about to commit the operator to.
             function unbondingPeriod() external view returns (uint256);
 
+            /// Governable ceiling (bytes) on the packed `multiaddrs` field an
+            /// operator may publish. `updateMultiaddrs` reverts
+            /// `MultiaddrsTooLarge` above it; `decdn node update-multiaddrs`
+            /// pre-checks against it so the cap surfaces before the send.
+            function maxMultiaddrSize() external view returns (uint256);
+
+            /// Governable minimum interval (seconds) between an operator's
+            /// `updateMultiaddrs` calls. `readyAt = lastMultiaddrUpdate +
+            /// multiaddrUpdateCooldown`; a call before it reverts
+            /// `MultiaddrCooldownActive(readyAt)`. Read so the CLI can report
+            /// the ready time rather than surface a bare revert.
+            function multiaddrUpdateCooldown() external view returns (uint256);
+
             /// Per-operator EIP-712 `BindNodeId` nonce. Feeds the
             /// `bindingSignature` digest at registration time (ADR 019
             /// § Step 2.3). `0` for an operator that has never bound.
@@ -328,9 +341,28 @@ mod sol_types {
             /// `InvalidEd25519Signature` on a mis-built digest.
             function bindNodeId(bytes32 nodeId, bytes bindingSignature, bytes ed25519Signature) external;
 
+            /// (Re)publish the caller's packed `multiaddrs` (ADR 019 §
+            /// Multiaddr encoding — a sequence of `(uint16 length, bytes
+            /// data)` entries, the same `node_register::pack_multiaddrs`
+            /// framing `registerNode` takes). Wrapped by `decdn node
+            /// update-multiaddrs`, the only non-destructive way for an active
+            /// operator to promote direct QUIC addresses after registering an
+            /// empty set. Stores the bytes into `_nodes[msg.sender].multiaddrs`
+            /// and stamps `lastMultiaddrUpdate`. Reverts `NodeNotActive` unless
+            /// the caller is registered, `MultiaddrsTooLarge(size, ceiling)`
+            /// above `maxMultiaddrSize`, and `MultiaddrCooldownActive(readyAt)`
+            /// within `multiaddrUpdateCooldown` of the last update — all three
+            /// pre-checked by the CLI.
+            function updateMultiaddrs(bytes multiaddrs) external;
+
             // -----------------------------------------------------------------
             // Events that mutate active-set membership
             // -----------------------------------------------------------------
+
+            /// Operator (re)published its dialable addresses via
+            /// `updateMultiaddrs`. `nodeId`-indexed; carries the new packed
+            /// `multiaddrs` field.
+            event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes multiaddrs);
 
             /// Node activated via `registerNode`. `nodeId`-indexed.
             event NodeRegistered(

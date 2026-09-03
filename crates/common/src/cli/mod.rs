@@ -32,7 +32,7 @@ pub use key_gen::KeyGenArgs;
 pub use node::{
     BondArgs, ChainArgs, DeregisterArgs, DoctorArgs, DrainArgs, EvictArgs, HealthArgs, LanesArgs,
     LookupArgs, NodeArgs, NodeCommand, RegisterArgs, ReloadArgs, RotateKeyArgs, RotateKeyTarget,
-    SlashesArgs, StatusArgs, SwapVenueArg, TopArgs, UnbondArgs,
+    SlashesArgs, StatusArgs, SwapVenueArg, TopArgs, UnbondArgs, UpdateMultiaddrsArgs,
 };
 pub use origin::{OriginArgs, OriginCommand, OriginImportArgs};
 pub use pool::{
