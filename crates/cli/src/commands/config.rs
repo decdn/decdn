@@ -970,7 +970,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [cache]
 # cache_dir = "~/.decdn/cache"
-# cache_size_mb = 102400
+# cache_size_mb = 102400                  # UPPER bound on the cache; the eviction driver clamps it down to keep disk_headroom_mb free on the volume (#1930). Set it large to let free disk size the cache.
+# disk_headroom_mb = 8192                  # free disk (MiB) the eviction driver keeps unused on the cache_dir volume, defended against ANY process (#1930); default 8 GiB. 0 opts out (only cache_size_mb binds)
 # max_blob_size_mb = 51200             # largest single blob admitted; unset => 50 GB capped to cache_size_mb. Must be <= cache_size_mb; 0 = unlimited
 # max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the candidate's probe rate, before paying. Distinct from the seller-side [payment] delivery_floor clamp, which raises this node's own quote
 # pinned_hashes = []                       # blob hashes (hex) exempted from LRU eviction (#276)
@@ -1318,6 +1319,7 @@ mod tests {
         let config::types::CacheConfig {
             cache_dir,
             cache_size_mb,
+            disk_headroom_mb,
             max_blob_size_mb,
             max_rate_per_mb,
             origin,
@@ -1353,6 +1355,7 @@ mod tests {
         let cache = [
             ("cache_dir =", cache_dir.is_none()),
             ("cache_size_mb =", cache_size_mb.is_none()),
+            ("disk_headroom_mb =", disk_headroom_mb.is_none()),
             ("max_blob_size_mb =", max_blob_size_mb.is_none()),
             ("max_rate_per_mb =", max_rate_per_mb.is_none()),
             ("[cache.origin]", origin.is_none()),

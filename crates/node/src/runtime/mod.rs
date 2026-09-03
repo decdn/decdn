@@ -1748,6 +1748,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         let (eviction_stop_tx, eviction_stop_rx) = oneshot::channel::<()>();
         let params = eviction::EvictionParams {
             cache_size_mb: cfg.cache.cache_size_mb,
+            disk_headroom_mb: cfg.cache.disk_headroom_mb,
             high_water_pct: cfg.cache.eviction_high_water_pct,
             target_pct: cfg.cache.eviction_target_pct,
             per_sweep_budget: cfg.cache.eviction_per_sweep_budget,
@@ -1757,6 +1758,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             infra.cache.clone(),
             infra.node_metrics.cache_metrics(),
             params,
+            cfg.cache.cache_dir.clone(),
             infra.eviction_policy.clone(),
             // ADR 041: the SAME warming allowance the buy loop debits and the serve
             // path credits — the driver forgets an evicted hash's tag.
@@ -3976,6 +3978,7 @@ mod tests {
             cache: decdn_common::config::ResolvedCache {
                 cache_dir,
                 cache_size_mb: 1024,
+                disk_headroom_mb: 8192,
                 max_blob_size_mb: 128,
                 max_rate_per_mb: 0,
                 origins,

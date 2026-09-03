@@ -33,6 +33,11 @@ const DEFAULT_BIND_PORT: u16 = 4433;
 /// Default maximum cache size in megabytes (100 GB) — sized for the large-file
 /// (AI model) wedge, where a node holds many multi-GB shards.
 const DEFAULT_CACHE_SIZE_MB: u64 = 102_400;
+/// Default free disk kept unused on the `cache_dir` volume (8 GiB), defended by
+/// the eviction driver against any process (#1930). Sized so a node dropped onto
+/// an arbitrary machine leaves comfortable room for the OS, logs, and other
+/// services below the cache's reactive (soft-evict + GC-lagged) ceiling.
+pub const DEFAULT_DISK_HEADROOM_MB: u64 = 8192;
 /// Default largest single blob admitted (50 GB), when `max_blob_size_mb` is unset.
 /// Comfortably holds the largest model shard the chunked-manifest wedge delivers
 /// while capping the RAM the buffered miss tier spends on one pull. Clamped down to
@@ -1720,6 +1725,15 @@ fn resolve_cache_into(
         .or_else(|| file.and_then(|c| c.cache_size_mb))
         .unwrap_or(DEFAULT_CACHE_SIZE_MB);
 
+    // Free-disk headroom the eviction driver defends on the cache volume (#1930).
+    // No range check: `0` is the valid opt-out (only `cache_size_mb` binds), and
+    // a headroom larger than the volume simply keeps the effective ceiling pinned
+    // to the footprint — degenerate but safe, and `decdn node doctor` flags a
+    // headroom that leaves the cache no room to grow.
+    let disk_headroom_mb = file
+        .and_then(|c| c.disk_headroom_mb)
+        .unwrap_or(DEFAULT_DISK_HEADROOM_MB);
+
     // Unset => `DEFAULT_MAX_BLOB_SIZE_MB` (50 GB), clamped to `cache_size_mb` so a
     // node with a smaller-than-default cache still resolves a valid ceiling rather
     // than tripping the `max_blob <= cache_size` invariant below. Operators who want
@@ -2113,6 +2127,7 @@ fn resolve_cache_into(
     ResolvedCache {
         cache_dir,
         cache_size_mb,
+        disk_headroom_mb,
         max_blob_size_mb,
         max_rate_per_mb,
         origins,

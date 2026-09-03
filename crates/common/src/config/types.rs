@@ -353,8 +353,22 @@ pub struct BlockchainConfig {
 pub struct CacheConfig {
     /// Blob cache directory.
     pub cache_dir: Option<PathBuf>,
-    /// Maximum cache size in megabytes.
+    /// Maximum cache size in megabytes. An *upper* bound on the cache ceiling,
+    /// not the ceiling itself: the eviction driver clamps it down each tick so
+    /// the cache never grows into the last [`Self::disk_headroom_mb`] of free
+    /// space on the `cache_dir` volume (#1930). Set it deliberately large to let
+    /// the disk-headroom clamp size the cache to whatever the volume offers.
     pub cache_size_mb: Option<u64>,
+    /// Free disk in megabytes the eviction driver keeps unused on the
+    /// `cache_dir` volume, defended against *any* process, not just this cache
+    /// (#1930). Absent => [`crate::config::DEFAULT_DISK_HEADROOM_MB`] (8192, 8
+    /// GiB). Each tick the effective ceiling is
+    /// `footprint + max(0, free_disk - disk_headroom_mb)`, capped by
+    /// [`Self::cache_size_mb`]; below the headroom the driver evicts to claw disk
+    /// back. `0` opts out of the disk clamp (only `cache_size_mb` binds). A slow
+    /// soft-evict/GC cycle means the margin is defended reactively, so keep it
+    /// comfortably above one GC interval's worth of writes.
+    pub disk_headroom_mb: Option<u64>,
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: Option<u64>,
     /// Buyer-side ABSOLUTE per-MB rate ceiling for paid pulls (#1375), in the same

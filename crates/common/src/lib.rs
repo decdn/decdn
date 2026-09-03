@@ -16,5 +16,6 @@ pub mod address;
 pub mod admin;
 pub mod cli;
 pub mod config;
+pub mod disk;
 pub mod identity;
 pub mod redact;

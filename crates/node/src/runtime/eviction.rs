@@ -2,13 +2,22 @@
 //! eviction is upstream-gated).
 //!
 //! A single async task, owned by the node wiring layer (per
-//! `appendix-poc-production-seams.md`), that enforces the `cache.cache_size_mb`
-//! ceiling the cache write path deliberately does not. It periodically measures
-//! on-disk footprint and, once over the high-water mark, releases the blobs the
-//! injected `EvictionPolicy` ranks for eviction (via
+//! `appendix-poc-production-seams.md`), that enforces the cache ceiling the
+//! write path deliberately does not. It periodically measures on-disk footprint
+//! and, once over the high-water mark, releases the blobs the injected
+//! `EvictionPolicy` ranks for eviction (via
 //! [`CacheEngine::release_for_eviction`], the soft-evict path that is *not* the
 //! durable operator-evict) down to the target mark, bounded by a per-sweep
 //! budget.
+//!
+//! ## The ceiling is disk-aware
+//!
+//! The ceiling is not the static `cache.cache_size_mb`. That is an upper bound;
+//! each tick the driver probes free disk on the `cache_dir` volume and clamps
+//! the ceiling down to keep `cache.disk_headroom_mb` free, defended against any
+//! process (#1930). See `effective_cap`. So a large `cache_size_mb` lets a node
+//! size its cache to whatever disk the machine offers, and the high-water and
+//! target marks track that dynamic ceiling.
 //!
 //! ## The driver's actuator is indirect — hence pending-reclaim accounting
 //!
@@ -66,9 +75,16 @@ fn as_gauge(v: u64) -> i64 {
 /// DTO with a single production construction site.
 #[derive(Debug, Clone, Copy)]
 pub struct EvictionParams {
-    /// Configured cache size in MiB; the denominator for the two percentages.
+    /// Configured cache size in MiB; the upper bound on the ceiling (the disk
+    /// clamp can only lower it, never raise it).
     pub cache_size_mb: u64,
-    /// Crossing this percentage of the cache size starts a sweep.
+    /// Free disk in MiB the driver keeps unused on the `cache_dir` volume by
+    /// *any* process (#1930). Each tick the effective ceiling is capped so the
+    /// cache cannot grow into the last `disk_headroom_mb` of free space; below
+    /// it, the driver evicts to claw disk back. `0` opts out of the disk clamp
+    /// (only `cache_size_mb` binds).
+    pub disk_headroom_mb: u64,
+    /// Crossing this percentage of the effective ceiling starts a sweep.
     pub high_water_pct: u64,
     /// A sweep runs until usage falls to this percentage. The gap to
     /// `high_water_pct` is the hysteresis that stops it flapping.
@@ -80,6 +96,22 @@ pub struct EvictionParams {
     pub tick: Duration,
 }
 
+/// Per-tick ceiling inputs, precomputed once in [`run`] from [`EvictionParams`].
+/// The effective ceiling itself is recomputed every tick from these plus the
+/// live footprint and free disk (#1930), so a shared volume's ceiling tracks
+/// real free space rather than a static config number.
+#[derive(Debug, Clone, Copy)]
+struct Ceiling {
+    /// `cache_size_mb × MiB` — the absolute upper bound on the ceiling.
+    config_limit_bytes: u64,
+    /// `disk_headroom_mb × MiB` — free space kept on the volume.
+    headroom_bytes: u64,
+    /// Percent of the effective ceiling above which a sweep starts.
+    high_water_pct: u64,
+    /// Percent of the effective ceiling a sweep evicts down to.
+    target_pct: u64,
+}
+
 /// Cross-tick driver state. Kept out of `run`'s body so `tick` can be unit-tested.
 #[derive(Debug, Default)]
 struct DriverState {
@@ -89,11 +121,44 @@ struct DriverState {
     pending_reclaim: u64,
     /// Previous raw measurement, used to detect a GC reclaim (a decrease).
     last_raw: Option<u64>,
+    /// Whether the disk-headroom clamp — not `cache_size_mb` — is the binding
+    /// ceiling. Tracked so the driver logs the transition once, not every tick.
+    disk_clamped: bool,
+    /// Whether the free-disk probe is currently failing. Tracked so a persistent
+    /// statvfs error logs once on the way in and once on recovery, not per tick.
+    disk_probe_failing: bool,
 }
 
 /// `base * pct / 100` in u128 space, saturated back to u64.
 fn pct_of(base: u64, pct: u64) -> u64 {
     u64::try_from(u128::from(base).saturating_mul(u128::from(pct)) / 100).unwrap_or(u64::MAX)
+}
+
+/// The effective cache ceiling for one tick: the smaller of the configured
+/// `cache_size_mb` budget and what free disk allows, recomputed every tick so a
+/// shared volume's ceiling tracks real free space (#1930).
+///
+/// Free-space tracking keeps `disk_headroom_mb` of the volume unused by *any*
+/// process. The cache may grow into whatever is free beyond that headroom, on
+/// top of the bytes it already holds:
+/// `disk_ceiling = footprint + max(0, free - headroom)`. At or below headroom
+/// the ceiling collapses to the current footprint, so the driver evicts to claw
+/// disk back toward the margin. A `free` of `u64::MAX` — the statvfs-failed
+/// sentinel the driver substitutes on a probe error — saturates the disk term
+/// so the configured budget binds, and a transient probe failure never shrinks
+/// the cache to its footprint.
+const fn effective_cap(
+    config_limit_bytes: u64,
+    footprint: u64,
+    free_bytes: u64,
+    headroom_bytes: u64,
+) -> u64 {
+    let disk_ceiling = footprint.saturating_add(free_bytes.saturating_sub(headroom_bytes));
+    if config_limit_bytes < disk_ceiling {
+        config_limit_bytes
+    } else {
+        disk_ceiling
+    }
 }
 
 /// Fold a fresh raw measurement into the driver's pending-reclaim bookkeeping
@@ -201,17 +266,69 @@ async fn sweep(
     freed
 }
 
-/// One driver tick: measure, refresh cache-health gauges, reconcile
+/// Recompute the effective ceiling for one tick, publish the ceiling gauge, and
+/// log the disk-clamp transition once (#1930).
+///
+/// `footprint` is the live raw on-disk footprint, paired with `free_bytes`
+/// (both real on-disk state) inside [`effective_cap`]. Returns
+/// `(cap, high_water_bytes, target_bytes)` for the latch and sweep. The clamp
+/// becoming — or ceasing to be — the binding ceiling is the operator-visible
+/// event, so it is logged on the transition, not every tick.
+fn resolve_ceiling(
+    ceiling: Ceiling,
+    footprint: u64,
+    free_bytes: u64,
+    state: &mut DriverState,
+    metrics: &CacheMetrics,
+) -> (u64, u64, u64) {
+    let cap = effective_cap(
+        ceiling.config_limit_bytes,
+        footprint,
+        free_bytes,
+        ceiling.headroom_bytes,
+    );
+    metrics.size_limit_bytes.set(as_gauge(cap));
+
+    let clamped = cap < ceiling.config_limit_bytes;
+    if clamped && !state.disk_clamped {
+        tracing::warn!(
+            effective_cap_bytes = cap,
+            config_limit_bytes = ceiling.config_limit_bytes,
+            free_bytes,
+            headroom_bytes = ceiling.headroom_bytes,
+            "eviction driver: free disk is the binding cache ceiling; cache.cache_size_mb \
+             is clamped down to keep cache.disk_headroom_mb free on the volume"
+        );
+    } else if !clamped && state.disk_clamped {
+        tracing::info!(
+            config_limit_bytes = ceiling.config_limit_bytes,
+            "eviction driver: free disk recovered; cache.cache_size_mb is the binding ceiling again"
+        );
+    }
+    state.disk_clamped = clamped;
+
+    (
+        cap,
+        pct_of(cap, ceiling.high_water_pct),
+        pct_of(cap, ceiling.target_pct),
+    )
+}
+
+/// One driver tick: measure, recompute the effective ceiling from the live
+/// footprint and free disk (#1930), refresh cache-health gauges, reconcile
 /// pending-reclaim against observed GC progress, apply the hysteresis latch, and
 /// (when latched over target) run one budget-bounded [`sweep`].
+///
+/// `free_bytes` is the volume's available bytes probed for this tick, or
+/// `u64::MAX` when the probe failed — the sentinel that disables the disk clamp
+/// so `config_limit_bytes` binds (see [`effective_cap`]).
 #[allow(clippy::too_many_arguments)]
 async fn tick(
     cache: &CacheEngine,
     metrics: &CacheMetrics,
-    high_water_bytes: u64,
-    target_bytes: u64,
+    ceiling: Ceiling,
+    free_bytes: u64,
     budget: u64,
-    cache_bytes: u64,
     state: &mut DriverState,
     policy: &Arc<dyn decdn_cache::EvictionPolicy>,
     warming: &Arc<crate::warming_allowance::WarmingAllowance>,
@@ -247,6 +364,12 @@ async fn tick(
         u64::try_from(cache.pinned_snapshot().len()).unwrap_or(u64::MAX),
     ));
 
+    // Effective ceiling for this tick: the configured budget, clamped down to
+    // real free disk (#1930). Publishes the ceiling gauge and logs the clamp
+    // transition.
+    let (cap, high_water_bytes, target_bytes) =
+        resolve_ceiling(ceiling, raw, free_bytes, state, metrics);
+
     // Hysteresis latch: only start evicting on a high-water crossing; once
     // latched, keep evicting until at/below target, then release.
     if state.evicting {
@@ -266,13 +389,45 @@ async fn tick(
         effective,
         target_bytes,
         budget,
-        cache_bytes,
+        cap,
         &sizes,
         policy,
         warming,
     )
     .await;
     state.pending_reclaim = state.pending_reclaim.saturating_add(freed);
+}
+
+/// Probe free disk for one tick, or return the `u64::MAX` clamp-disabled
+/// sentinel on a `statvfs` failure (#1930). One cheap syscall, dwarfed by the
+/// store walk `tick` already does. On failure the driver falls back to the
+/// config-only ceiling rather than evicting blind. The failure and recovery
+/// transitions are each logged once, not every tick.
+fn probe_free_bytes(cache_dir: &std::path::Path, state: &mut DriverState) -> u64 {
+    match decdn_common::disk::statvfs_target(cache_dir) {
+        Ok(space) => {
+            if state.disk_probe_failing {
+                tracing::info!(
+                    cache_dir = %cache_dir.display(),
+                    "eviction driver: free-disk probe recovered; disk-headroom clamp re-enabled"
+                );
+                state.disk_probe_failing = false;
+            }
+            space.avail
+        }
+        Err(err) => {
+            if !state.disk_probe_failing {
+                tracing::warn!(
+                    %err,
+                    cache_dir = %cache_dir.display(),
+                    "eviction driver: free-disk probe failed; disk-headroom clamp disabled \
+                     until it recovers (cache.cache_size_mb still enforced)"
+                );
+                state.disk_probe_failing = true;
+            }
+            u64::MAX
+        }
+    }
 }
 
 /// Run the eviction driver until `shutdown` fires. Intended to be
@@ -282,17 +437,17 @@ pub async fn run(
     cache: CacheEngine,
     metrics: Arc<CacheMetrics>,
     params: EvictionParams,
+    cache_dir: std::path::PathBuf,
     policy: Arc<dyn decdn_cache::EvictionPolicy>,
     warming: Arc<crate::warming_allowance::WarmingAllowance>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
-    let limit_bytes = params.cache_size_mb.saturating_mul(BYTES_PER_MB);
-    let high_water_bytes = pct_of(limit_bytes, params.high_water_pct);
-    let target_bytes = pct_of(limit_bytes, params.target_pct);
-
-    // Static gauge: the configured ceiling. Set once — `cache_size_mb` is
-    // restart-required.
-    metrics.size_limit_bytes.set(as_gauge(limit_bytes));
+    let ceiling = Ceiling {
+        config_limit_bytes: params.cache_size_mb.saturating_mul(BYTES_PER_MB),
+        headroom_bytes: params.disk_headroom_mb.saturating_mul(BYTES_PER_MB),
+        high_water_pct: params.high_water_pct,
+        target_pct: params.target_pct,
+    };
 
     let mut ticker = tokio::time::interval(params.tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -309,13 +464,22 @@ pub async fn run(
             }
             _ = ticker.tick() => {}
         }
+
+        // `disk_headroom_mb = 0` opts out of the disk clamp (only `cache_size_mb`
+        // binds), so skip the syscall entirely and force the clamp-disabled
+        // sentinel — no probe, no probe-failure logging.
+        let free_bytes = if ceiling.headroom_bytes == 0 {
+            u64::MAX
+        } else {
+            probe_free_bytes(&cache_dir, &mut state)
+        };
+
         tick(
             &cache,
             &metrics,
-            high_water_bytes,
-            target_bytes,
+            ceiling,
+            free_bytes,
             params.per_sweep_budget,
-            limit_bytes,
             &mut state,
             &policy,
             &warming,
@@ -362,6 +526,55 @@ mod tests {
         // base * pct done in u128 space, so a huge base can't wrap.
         assert_eq!(pct_of(u64::MAX, 100), u64::MAX);
         assert_eq!(pct_of(u64::MAX, 50), u64::MAX / 2);
+    }
+
+    /// The disk clamp binds below the configured budget when free space is
+    /// scarce: with only 2 GiB of growth room past headroom, the ceiling is the
+    /// footprint plus that room, far under the 100 GiB config.
+    #[test]
+    fn disk_ceiling_binds_below_configured_size_when_free_is_scarce() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // config 100 GiB, footprint 20 GiB, 10 GiB free, 8 GiB headroom:
+        // growth room = 10 - 8 = 2 GiB, so ceiling = 20 + 2 = 22 GiB.
+        assert_eq!(
+            effective_cap(100 * GIB, 20 * GIB, 10 * GIB, 8 * GIB),
+            22 * GIB
+        );
+    }
+
+    /// When the volume dwarfs the configured budget, the config number binds and
+    /// disk imposes no extra clamp.
+    #[test]
+    fn configured_size_binds_when_disk_is_abundant() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(effective_cap(10 * GIB, GIB, 500 * GIB, 8 * GIB), 10 * GIB);
+    }
+
+    /// At or below headroom there is no growth room, so the ceiling collapses to
+    /// the current footprint and the driver will evict to claw disk back toward
+    /// the headroom margin.
+    #[test]
+    fn ceiling_collapses_to_footprint_at_or_below_headroom() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // Below headroom: 4 GiB free, 8 GiB demanded.
+        assert_eq!(
+            effective_cap(100 * GIB, 20 * GIB, 4 * GIB, 8 * GIB),
+            20 * GIB
+        );
+        // Exactly at headroom: zero growth room, same boundary.
+        assert_eq!(
+            effective_cap(100 * GIB, 20 * GIB, 8 * GIB, 8 * GIB),
+            20 * GIB
+        );
+    }
+
+    /// `free = u64::MAX` is the statvfs-failed sentinel: the disk term saturates
+    /// and the configured budget binds, so a transient probe error never shrinks
+    /// the cache to its footprint.
+    #[test]
+    fn probe_failure_sentinel_disables_the_disk_clamp() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(effective_cap(10 * GIB, GIB, u64::MAX, 8 * GIB), 10 * GIB);
     }
 
     #[test]
@@ -528,6 +741,67 @@ mod tests {
         assert!(
             !remaining.contains_key(&newer_hash),
             "newer hash must be the one released under NewestFirst"
+        );
+        Ok(())
+    }
+
+    /// Free-space tracking (#1930): with a configured budget far larger than
+    /// the cache, a scarce volume (here: zero free against a large headroom)
+    /// collapses the effective ceiling to the current footprint, so a `tick`
+    /// evicts even though `cache_size_mb` alone would never trigger.
+    #[tokio::test]
+    async fn disk_clamp_drives_eviction_below_configured_size() -> anyhow::Result<()> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let origin_dir = tempfile::tempdir()?;
+        let cache_dir = tempfile::tempdir()?;
+
+        let mut hashes = Vec::new();
+        for i in 0..4u32 {
+            let payload = format!("disk clamp test: blob #{i}").into_bytes();
+            hashes.push(write_origin_blob(origin_dir.path(), &payload)?);
+        }
+
+        let origin =
+            std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+        let cache = CacheEngine::open(
+            cache_dir.path(),
+            vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+            16,
+        )
+        .await?;
+        for hash in &hashes {
+            let _ = cache.get(*hash).await?;
+        }
+
+        let metrics = CacheMetrics::default();
+        let policy: Arc<dyn decdn_cache::EvictionPolicy> = Arc::new(decdn_cache::LruEviction);
+        let warming = Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0));
+        let mut state = DriverState::default();
+
+        // config budget is effectively unbounded, so on its own it would never
+        // evict; the disk clamp is the only pressure. free_bytes = 0 against a
+        // 100 GiB headroom forces the ceiling down to the footprint.
+        let ceiling = Ceiling {
+            config_limit_bytes: u64::MAX,
+            headroom_bytes: 100 * GIB,
+            high_water_pct: 90,
+            target_pct: 80,
+        };
+        tick(
+            &cache, &metrics, ceiling, 0, 16, &mut state, &policy, &warming,
+        )
+        .await;
+
+        let remaining = cache.eviction_candidates();
+        assert!(
+            remaining.len() < hashes.len(),
+            "disk clamp must force at least one eviction (had {}, left {})",
+            hashes.len(),
+            remaining.len()
+        );
+        assert!(
+            state.disk_clamped,
+            "state must record that the disk clamp is the binding ceiling"
         );
         Ok(())
     }

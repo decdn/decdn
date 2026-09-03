@@ -251,10 +251,13 @@ pub struct CacheMetrics {
     /// for a saturation ratio; when it approaches `size_limit_bytes` the
     /// cache is at its high-water mark and the driver is actively evicting.
     pub bytes: Gauge,
-    /// Configured cache ceiling in bytes (`decdn_cache_size_limit_bytes`) —
-    /// `cache.cache_size_mb × 1 048 576`. Set once at driver start;
-    /// `cache_size_mb` is restart-required. The denominator of the saturation
-    /// ratio against `bytes`.
+    /// Effective cache ceiling in bytes (`decdn_cache_size_limit_bytes`) — the
+    /// denominator of the saturation ratio against `bytes`. The eviction driver
+    /// sets it every tick: `cache.cache_size_mb × 1 048 576`, clamped down so the
+    /// cache never grows into the last `cache.disk_headroom_mb` of free disk on
+    /// the volume (#1930). It therefore moves with real free space, and reads
+    /// below the configured budget whenever the disk clamp is the binding
+    /// ceiling.
     pub size_limit_bytes: Gauge,
     /// Size of the operator-pinned set (`decdn_cache_pinned_count`). Set by
     /// the eviction driver each sweep from
