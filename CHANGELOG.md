@@ -52,13 +52,18 @@ since project inception and will roll into the first tagged release.
     `--keystore-password-file` (env `DECDN_KEYSTORE_PASSWORD_FILE`), the flag
     the operator commands and `decdn-node run` already had. Without it those
     commands had only the env var and a prompt, so a headless client had no file
-    source to make empty. `decdn key-gen --password-file` also tilde-expands its
-    argument now, matching every other path flag — an unexpanded `~/pw.txt`
-    would otherwise fall through silently.
+    source to make empty. `decdn key-gen --keystore-password-file` also
+    tilde-expands its argument now, matching every other path flag — an
+    unexpanded `~/pw.txt` would otherwise fall through silently.
   - `decdn key-gen` warns on stderr when it CREATES a keystore under an empty
     password. The file stays encrypted and stays `0o600`, but a password anyone
     can guess leaves that mode and the `0o700` data dir as the only protection.
     Creation only — warning on every load would fire on every fetch.
+
+- **CLI: `decdn key-gen` renames its password-file flag from `--password-file`
+  to `--keystore-password-file`**, matching the spelling every other command
+  uses. The env var `DECDN_KEYSTORE_PASSWORD_FILE` is unchanged; scripts or
+  runbook steps that pass the old flag must be updated.
 
 - **config: `cache.tinylfu.sketch_bytes` now carries a floor of 16384 bytes,
   enforced whichever cache policy is selected.** A value below the floor is a

@@ -46,7 +46,7 @@ pub async fn pool_dispatch(args: &cli::PoolArgs, config_path: Option<&Path>) -> 
 /// Chain coordinates resolved flag > `[blockchain]`/`[identity]` config >
 /// default. Pure (parse-only) so the precedence is unit-testable.
 #[derive(Debug)]
-struct ResolvedChain {
+struct Resolved {
     rpc_url: String,
     payment_pool: Address,
     chain_id: u64,
@@ -71,7 +71,7 @@ fn resolve_data_dir(data_dir: Option<PathBuf>, file: &FileConfig) -> anyhow::Res
         })
 }
 
-fn resolve_chain(args: &cli::PoolChainArgs, file: &FileConfig) -> anyhow::Result<ResolvedChain> {
+fn resolve_chain(args: &cli::PoolChainArgs, file: &FileConfig) -> anyhow::Result<Resolved> {
     let bc = file.blockchain.as_ref();
     let rpc_url = args
         .rpc_url
@@ -103,7 +103,7 @@ fn resolve_chain(args: &cli::PoolChainArgs, file: &FileConfig) -> anyhow::Result
             || eth_identity::keystore_path(&data_dir),
             |p| expand_tilde(&p),
         );
-    Ok(ResolvedChain {
+    Ok(Resolved {
         rpc_url,
         payment_pool,
         chain_id,
@@ -116,7 +116,7 @@ fn resolve_chain(args: &cli::PoolChainArgs, file: &FileConfig) -> anyhow::Result
 /// Buyer signer for the on-chain `pool` commands (vouchers +
 /// open/top-up/close/reclaim txs). Password from `KEYSTORE_PASSWORD_ENV`, else
 /// `--keystore-password-file`, else TTY.
-fn load_buyer_signer(chain: &ResolvedChain) -> anyhow::Result<PrivateKeySigner> {
+fn load_buyer_signer(chain: &Resolved) -> anyhow::Result<PrivateKeySigner> {
     let password = read_password(
         &super::chain_ctx::password_sources(chain.keystore_password_file.as_deref(), false),
         "eth keystore password",

@@ -298,7 +298,7 @@ pub fn read_password(
     prompt_label: &str,
 ) -> anyhow::Result<Zeroizing<String>> {
     // Every skipped source is reported, not just the last: a mistyped
-    // `--password-file` falls through, and if only the final skip survived
+    // `--keystore-password-file` falls through, and if only the final skip survived
     // (`stdin is not a TTY`) the path the operator got wrong would never reach
     // them.
     let mut skipped: Vec<String> = Vec::new();

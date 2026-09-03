@@ -48,7 +48,7 @@ fn make_args(dir: &TempDir, force: bool, pw_file: PathBuf) -> KeyGenArgs {
     KeyGenArgs {
         output_dir: Some(dir.path().to_path_buf()),
         force,
-        password_file: Some(pw_file),
+        keystore_password_file: Some(pw_file),
     }
 }
 
