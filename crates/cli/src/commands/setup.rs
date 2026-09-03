@@ -394,15 +394,18 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         .call()
         .await
         .with_context(|| format!("failed to read nodeIdOf from CapacityBond at {cb_addr}"))?;
-    anyhow::ensure!(
-        bound.nodeId == B256::ZERO || bound.nodeId == local_node_id,
-        "operator {operator:#x} is already bound on-chain to node {:#x}, but the local node key is \
-         {local_node_id:#x}; setup will not register a different key. Restore the bound key under \
-         {}, or run `decdn node deregister` first",
-        bound.nodeId,
-        resolved.data_dir.display(),
-    );
-    let already_registered = bound.nodeId == local_node_id;
+    let already_registered =
+        match registration_status(bound.nodeId, bound.active, local_node_id) {
+            RegistrationStatus::Divergent => anyhow::bail!(
+                "operator {operator:#x} is already bound on-chain to node {:#x}, but the local \
+                 node key is {local_node_id:#x}; setup will not register a different key. Restore \
+                 the bound key under {}, or run `decdn node deregister` first",
+                bound.nodeId,
+                resolved.data_dir.display(),
+            ),
+            RegistrationStatus::AlreadyRegistered => true,
+            RegistrationStatus::Due => false,
+        };
 
     // ---- ADR 019 § Terms Acceptance — accept the current operator terms
     //      *before* any transaction, so a refusal / stale-client abort happens
@@ -522,8 +525,9 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             bond_reported = true;
         }
 
-        // ---- Register (skipped only when *this* key is already
-        //      bound; `terms_hash` is `Some` iff a fresh registration is due). ----
+        // ---- Register (skipped only when *this* key is already bound *and*
+        //      active; `terms_hash` is `Some` iff a fresh registration is due —
+        //      which includes a deregistered node whose binding still stands). ----
         if let Some(terms_hash) = terms_hash {
             if !json {
                 println!("register:");
@@ -648,6 +652,42 @@ fn precheck_keys(
         keystore.display(),
     );
     Ok(KeyAction::Generate)
+}
+
+/// Whether the operator's on-chain binding calls for a fresh registration,
+/// derived from `CapacityBond.nodeIdOf` (the bound node id and its `active`
+/// flag) against the local node key.
+enum RegistrationStatus {
+    /// The operator is bound to a *different*, non-zero node key. Setup refuses
+    /// rather than silently register over another operator's binding.
+    Divergent,
+    /// This node key is already bound and active; registration is skipped.
+    AlreadyRegistered,
+    /// A (re-)registration is due: the operator is unbound, or bound to this key
+    /// but currently inactive. `deregisterNode` clears `active` yet leaves the
+    /// address↔nodeId binding in place, so a deregistered node keeps its binding
+    /// and still needs to re-register to become active again.
+    Due,
+}
+
+/// Classify the operator's binding for the register-divergence guard. Pure over
+/// the on-chain read so the same-node inactive (deregistered) case is covered by
+/// unit tests. A binding to a different, non-zero node id is `Divergent`
+/// regardless of `active`; the same node id is `AlreadyRegistered` only while it
+/// is `active`, and `Due` once it is not.
+fn registration_status(
+    bound_node_id: B256,
+    bound_active: bool,
+    local_node_id: B256,
+) -> RegistrationStatus {
+    if bound_node_id != B256::ZERO && bound_node_id != local_node_id {
+        return RegistrationStatus::Divergent;
+    }
+    if bound_node_id == local_node_id && bound_active {
+        RegistrationStatus::AlreadyRegistered
+    } else {
+        RegistrationStatus::Due
+    }
 }
 
 /// ADR 019 § Terms Acceptance for `setup`: when a fresh registration is due,
@@ -1347,6 +1387,54 @@ mod tests {
             parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
             Some(784_111_777)
         );
+    }
+
+    #[test]
+    fn registration_status_unbound_is_due() {
+        let local = B256::repeat_byte(0xAA);
+        // No binding yet (`nodeId == 0`): a fresh registration is due.
+        assert!(matches!(
+            registration_status(B256::ZERO, false, local),
+            RegistrationStatus::Due
+        ));
+    }
+
+    #[test]
+    fn registration_status_same_node_active_is_already_registered() {
+        let local = B256::repeat_byte(0xAA);
+        // Bound to this key and active: registration is skipped.
+        assert!(matches!(
+            registration_status(local, true, local),
+            RegistrationStatus::AlreadyRegistered
+        ));
+    }
+
+    #[test]
+    fn registration_status_same_node_inactive_is_due() {
+        let local = B256::repeat_byte(0xAA);
+        // Deregistered: the binding to this key survives but `active` is false,
+        // so a re-registration is due rather than skipped. This is the case the
+        // guard previously mis-handled, stranding the node inactive.
+        assert!(matches!(
+            registration_status(local, false, local),
+            RegistrationStatus::Due
+        ));
+    }
+
+    #[test]
+    fn registration_status_different_node_is_divergent_regardless_of_active() {
+        let local = B256::repeat_byte(0xAA);
+        let other = B256::repeat_byte(0xBB);
+        // A different, non-zero binding is a divergence whether or not it is
+        // active — setup never registers over another operator's key.
+        assert!(matches!(
+            registration_status(other, true, local),
+            RegistrationStatus::Divergent
+        ));
+        assert!(matches!(
+            registration_status(other, false, local),
+            RegistrationStatus::Divergent
+        ));
     }
 
     #[test]
