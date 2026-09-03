@@ -1101,6 +1101,53 @@ fn note_forget_outcome(
     }
 }
 
+/// A callback run inside [`ClientHandler::try_reserve_floor`]'s lock hold, between the
+/// last admission gate and the charge.
+#[cfg(test)]
+type AdmissionSeam = Arc<dyn Fn() + Send + Sync>;
+
+/// The seam a concurrency test parks an admission on, so the check-and-reserve lock hold
+/// can be observed rather than raced for.
+///
+/// A barrier only synchronizes ARRIVAL: it releases its threads through a condvar, which
+/// schedules them microseconds apart, while the window a check-then-reserve split opens is
+/// tens of nanoseconds wide — and `std::sync::Mutex` barges, so a thread that unlocks and
+/// immediately re-locks beats the ones parked in the futex queue almost every time.
+/// Racing for that window therefore detects a split so rarely that the retries in
+/// `.config/nextest.toml` absorb it and CI stays green either way. Holding one admission
+/// open at the exact point a split would release the lock removes the race from the test:
+/// the second admission either blocks (correct) or completes (split), with nothing left to
+/// chance.
+///
+/// A process-wide `static` is sound because nextest runs each test in its own process, so
+/// no two tests share this. Compiled out entirely otherwise.
+#[cfg(test)]
+static ADMISSION_SEAM: std::sync::Mutex<Option<AdmissionSeam>> = std::sync::Mutex::new(None);
+
+/// Install the seam for the current test process.
+#[cfg(test)]
+fn set_admission_seam(hook: AdmissionSeam) {
+    *ADMISSION_SEAM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+}
+
+/// Run the installed seam, if any.
+///
+/// The `ADMISSION_SEAM` guard is dropped BEFORE the callback runs: the callback parks, and
+/// holding this lock across it would wedge every later admission on the seam's own mutex
+/// rather than on `pool_floor` — which is the lock the test is there to observe.
+#[cfg(test)]
+fn admission_seam() {
+    let hook = ADMISSION_SEAM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Which floor gate refused an admission
 /// ([`ClientHandler::try_reserve_floor`]). All collapse to one `NotFound` on the
 /// wire; they stay distinct here so the per-reason metric separates "this pool
@@ -1460,6 +1507,11 @@ impl ClientHandler {
                     capacity,
                 });
             }
+            // Every gate has passed and the charge has not happened yet — the one
+            // instant a check-then-reserve split would be holding no lock. Test-only,
+            // and a no-op unless a test installed a seam.
+            #[cfg(test)]
+            admission_seam();
             epoch = guard.charge_live(pool_id, signer, reserved);
         }
         Ok(FloorReservation::new_charged(
@@ -1883,10 +1935,15 @@ mod tests {
     /// split would still pass them all and over-commit only under contention.
     ///
     /// Each racer names a DISTINCT signer with a live cap wide enough never to bind,
-    /// so the pool ceiling is unambiguously what refuses. Detection is probabilistic
-    /// and the suite retries — the barrier makes the racers collide, it does not
-    /// guarantee they land in the same stale window — so read a FLAKY line here as the
-    /// defect signal `.config/nextest.toml` says it is.
+    /// so the pool ceiling is unambiguously what refuses.
+    ///
+    /// What this pins is that the real path SURVIVES contention — no deadlock, no
+    /// poisoned lock, and the invariant intact across the race and across every guard
+    /// drop. It does NOT reliably detect a check-then-reserve split: a barrier
+    /// synchronizes arrival, not residency in the critical section, so the racers land
+    /// in the same stale window only by luck.
+    /// [`an_admission_parked_between_gate_and_charge_blocks_its_racer`] is what catches
+    /// the split, by holding that window open instead of racing for it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_admissions_cannot_over_commit_the_pool_ceiling() -> anyhow::Result<()> {
         const RACERS: usize = 8;
@@ -1945,12 +2002,16 @@ mod tests {
     /// same lock hold, and a check-then-reserve split on the signer arm alone would let
     /// two streams past one `k`-window cap while the pool stayed solvent.
     ///
-    /// Only these two gates can race. The abandonment bucket is checked but never
-    /// charged at admission (`bucket_consumed >= capacity` is a read), so concurrent
-    /// admissions all observe the same level and there is no over-commit to expose —
-    /// the TOCTOU claim bites exactly on the gates that mutate.
+    /// Only these two gates can OVER-COMMIT. The abandonment bucket is compared against
+    /// its capacity and never charged at admission, so concurrent admissions decide
+    /// against the same level and there is no quantity to double-spend — the TOCTOU
+    /// claim bites exactly on the gates that add. (The bucket row is still MUTATED at
+    /// admission: [`FloorAccumulator::read_refilled`] refills it in place. That is safe
+    /// because the refill happens inside this same lock hold and is idempotent against a
+    /// monotone `now_ms`, not because the gate is read-only.)
     ///
-    /// Detection is probabilistic and the suite retries; see the twin above.
+    /// Like its twin, this pins survival under contention rather than detecting a split;
+    /// see [`an_admission_parked_between_gate_and_charge_blocks_its_racer`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_admissions_cannot_over_commit_one_signers_live_cap() -> anyhow::Result<()> {
         const RACERS: usize = 8;
@@ -3282,6 +3343,148 @@ mod tests {
             "a write that panicked in the blocking pool must count as a lost \
              write:\n{text}"
         );
+        Ok(())
+    }
+    /// One-shot park: the first admission to reach the seam announces itself and
+    /// waits, and every later one passes straight through.
+    struct Seam {
+        armed: AtomicBool,
+        reached: std::sync::Mutex<bool>,
+        reached_cv: std::sync::Condvar,
+        released: std::sync::Mutex<bool>,
+        released_cv: std::sync::Condvar,
+    }
+    impl Seam {
+        fn park_first(&self) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let mut at = self
+                    .reached
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *at = true;
+                self.reached_cv.notify_all();
+                drop(at);
+                let mut open = self
+                    .released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*open {
+                    open = self
+                        .released_cv
+                        .wait(open)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+        }
+        fn wait_reached(&self) {
+            let mut at = self
+                .reached
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*at {
+                at = self
+                    .reached_cv
+                    .wait(at)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        fn release(&self) {
+            let mut open = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *open = true;
+            self.released_cv.notify_all();
+        }
+    }
+
+    /// A second admission cannot pass the gates while the first is between its own last
+    /// gate and its charge. This is the check-and-reserve claim, tested deterministically.
+    ///
+    /// The two barrier races above run the real path under real contention, which is
+    /// worth having, but they cannot catch a check-then-reserve split: they have to WIN a
+    /// race whose window is tens of nanoseconds wide, against a barrier that only
+    /// synchronizes arrival and a `std::sync::Mutex` that barges. Measured against a
+    /// realistic split — the gate reads extracted into one lock hold and the charge into
+    /// another — that detects on the order of once in twenty thousand runs, which
+    /// `.config/nextest.toml`'s `retries = 2` then absorbs into a green run.
+    ///
+    /// So this one does not race. `ADMISSION_SEAM` parks the first admission at exactly
+    /// the point a split would be holding no lock, and the second admission is given a
+    /// clear window to run the whole path. Holding `pool_floor` across that window is the
+    /// entire property under test: the racer must BLOCK, and must then observe the charge.
+    /// Under a split it does not block, both admissions pass a ceiling with room for one,
+    /// and this fails every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_admission_parked_between_gate_and_charge_blocks_its_racer() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        // A live cap and bucket far too wide to bind, so only the pool ceiling can.
+        let (handler, _dir) =
+            handler_for_tests_with_signer_policy(&metrics, U256::ZERO, u64::MAX, u64::MAX, 60)
+                .await;
+        let pool = B256::repeat_byte(0x3E);
+        let window = handler.one_window(TEST_RATE);
+        // Headroom for EXACTLY one window, so a split admits two and the correct path one.
+        let remaining = window.saturating_add(U256::from(1u64));
+
+        let seam = Arc::new(Seam {
+            armed: AtomicBool::new(true),
+            reached: std::sync::Mutex::new(false),
+            reached_cv: std::sync::Condvar::new(),
+            released: std::sync::Mutex::new(false),
+            released_cv: std::sync::Condvar::new(),
+        });
+        set_admission_seam({
+            let seam = Arc::clone(&seam);
+            Arc::new(move || seam.park_first())
+        });
+
+        let (first, second, racer_ran_unblocked) = std::thread::scope(|scope| {
+            let parked = scope.spawn(|| {
+                handler.try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            });
+            // Only start the racer once the first admission is holding the window open,
+            // so the racer's whole attempt happens inside it.
+            seam.wait_reached();
+            let racer = scope.spawn(|| {
+                handler.try_reserve_floor(pool, TEST_SIGNER_B, remaining, TEST_RATE, window)
+            });
+            // A clear window for the racer to finish if it CAN. Under the single lock hold
+            // it is blocked on `pool_floor` throughout; under a split it completes here.
+            // Erring long only strengthens the check.
+            std::thread::sleep(Duration::from_millis(250));
+            // Sampled, not asserted: the seam MUST be released on every path out of this
+            // scope, or the parked thread never returns and the scope's join at the end
+            // turns a clean failure into a hang.
+            let racer_ran_unblocked = racer.is_finished();
+            seam.release();
+            let first = parked
+                .join()
+                .map_err(|_| anyhow::anyhow!("parked admission panicked"))?;
+            let second = racer
+                .join()
+                .map_err(|_| anyhow::anyhow!("racing admission panicked"))?;
+            Ok::<_, anyhow::Error>((first, second, racer_ran_unblocked))
+        })?;
+
+        anyhow::ensure!(
+            !racer_ran_unblocked,
+            "the racer completed while an admission sat between its last gate and its \
+             charge, so the gates and the charge are not one lock hold"
+        );
+        anyhow::ensure!(
+            first.is_ok(),
+            "the admission that got there first must win the one window of headroom"
+        );
+        anyhow::ensure!(
+            matches!(second, Err(FloorRefusal::PoolExhausted)),
+            "and the racer must see that charge and be refused by the POOL ceiling, not \
+             admitted alongside it: {:?}",
+            second.as_ref().err()
+        );
+        ensure_floor_levels_agree(&handler, pool, "after the parked race")?;
+        drop((first, second));
+        ensure_floor_levels_agree(&handler, pool, "after every guard drops")?;
         Ok(())
     }
 }
