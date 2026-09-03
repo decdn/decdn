@@ -28,6 +28,38 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **CLI/runtime: a keystore password source is chosen by PRESENCE, not by being
+  non-empty, so an empty password is a password.** `DECDN_KEYSTORE_PASSWORD` set
+  to the empty string, and a `--keystore-password-file` that is empty after the
+  one stripped trailing newline, each supply the empty string instead of falling
+  through to the next source. A password file that does not EXIST is now the
+  only file case that falls through; a path that exists but cannot be read — a
+  directory, a permission denial, non-UTF-8 contents — is a hard error, as is an
+  env var set to non-UTF-8. Precedence is unchanged: env var, then file, then an
+  interactive prompt on a TTY.
+  - Why: the old rule could not tell "the operator chose no password" from "the
+    source is absent", so a deliberately empty password — what tools that write
+    a keystore with no password produce — was unreachable from any
+    non-interactive source, and an empty file silently fell through to a prompt
+    a systemd unit can never answer.
+  - Two operator workflows change. `export DECDN_KEYSTORE_PASSWORD=` no longer
+    means "unset"; `unset DECDN_KEYSTORE_PASSWORD` does. And a mistyped
+    `--keystore-password-file` no longer fails at the read: on a terminal it
+    prompts, and headless it fails with `no keystore password source available
+    (...)`, which now lists every source that fell through — including the path
+    that was tried — rather than only the last one.
+  - `decdn fetch`, `decdn bundle pull`, and `decdn pool` gain
+    `--keystore-password-file` (env `DECDN_KEYSTORE_PASSWORD_FILE`), the flag
+    the operator commands and `decdn-node run` already had. Without it those
+    commands had only the env var and a prompt, so a headless client had no file
+    source to make empty. `decdn key-gen --password-file` also tilde-expands its
+    argument now, matching every other path flag — an unexpanded `~/pw.txt`
+    would otherwise fall through silently.
+  - `decdn key-gen` warns on stderr when it CREATES a keystore under an empty
+    password. The file stays encrypted and stays `0o600`, but a password anyone
+    can guess leaves that mode and the `0o700` data dir as the only protection.
+    Creation only — warning on every load would fire on every fetch.
+
 - **config: `cache.tinylfu.sketch_bytes` now carries a floor of 16384 bytes,
   enforced whichever cache policy is selected.** A value below the floor is a
   load-time error on both `decdn node` startup and `decdn config validate`; the

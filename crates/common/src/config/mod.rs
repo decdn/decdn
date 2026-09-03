@@ -1652,9 +1652,10 @@ fn resolve_blockchain_into(
 
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
-    // the runtime loader: if the operator passes a stale path the failure
-    // surfaces as "no keystore password source available", which is
-    // clearer than a config-resolution-time stat() error.
+    // the runtime loader: a stale path falls through there, so a headless run
+    // fails with "no keystore password source available" naming the path,
+    // which is clearer than a config-resolution-time stat() error. On a TTY it
+    // falls through to the prompt instead, and the stale path goes unreported.
     let keystore_password_file = cli.keystore_password_file.clone().map(|p| expand_tilde(&p));
 
     ResolvedBlockchain {

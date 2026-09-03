@@ -24,7 +24,7 @@ use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
-use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
+use decdn_incentive::eth_identity::{self, load_signer, read_password};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{Capability, CapabilityGrant, PoolId, voucher_domain};
 use serde::Serialize;
@@ -52,6 +52,10 @@ struct ResolvedChain {
     chain_id: u64,
     data_dir: PathBuf,
     keystore: PathBuf,
+    /// File holding the keystore password, consulted after the
+    /// `DECDN_KEYSTORE_PASSWORD` env var and before a prompt. CLI/env-only —
+    /// passwords do not belong in a config file even by reference.
+    keystore_password_file: Option<PathBuf>,
 }
 
 /// Resolve the buyer-store data dir: flag > `[identity]` config > client-scoped
@@ -105,21 +109,19 @@ fn resolve_chain(args: &cli::PoolChainArgs, file: &FileConfig) -> anyhow::Result
         chain_id,
         data_dir,
         keystore,
+        keystore_password_file: args.keystore_password_file.as_deref().map(expand_tilde),
     })
 }
 
 /// Buyer signer for the on-chain `pool` commands (vouchers +
 /// open/top-up/close/reclaim txs). Password from `KEYSTORE_PASSWORD_ENV`, else
-/// TTY.
-fn load_buyer_signer(keystore: &Path) -> anyhow::Result<PrivateKeySigner> {
+/// `--keystore-password-file`, else TTY.
+fn load_buyer_signer(chain: &ResolvedChain) -> anyhow::Result<PrivateKeySigner> {
     let password = read_password(
-        &[
-            PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
-            PasswordSource::Prompt { confirm: false },
-        ],
+        &super::chain_ctx::password_sources(chain.keystore_password_file.as_deref(), false),
         "eth keystore password",
     )?;
-    load_signer(keystore, &password)
+    load_signer(&chain.keystore, &password)
 }
 
 /// Parse a user-supplied `--pool`: 64 hex chars, optionally `0x`-prefixed (the
@@ -149,7 +151,7 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
     let chain = resolve_chain(&args.chain, &file)?;
 
     let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
-    let signer = Arc::new(load_buyer_signer(&chain.keystore)?);
+    let signer = Arc::new(load_buyer_signer(&chain)?);
     let owner = signer.address();
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentPool::new(chain.payment_pool, rpc.clone());
@@ -202,7 +204,7 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
     let pool_id = parse_pool_id(&args.pool)?;
 
     let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
-    let signer = Arc::new(load_buyer_signer(&chain.keystore)?);
+    let signer = Arc::new(load_buyer_signer(&chain)?);
     let owner = signer.address();
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentPool::new(chain.payment_pool, rpc.clone());
@@ -311,7 +313,7 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
     let pool_id = parse_pool_id(&args.pool)?;
 
     let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
-    let signer = Arc::new(load_buyer_signer(&chain.keystore)?);
+    let signer = Arc::new(load_buyer_signer(&chain)?);
     let owner = signer.address();
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentPool::new(chain.payment_pool, rpc);
@@ -383,7 +385,7 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
     let pool_id = parse_pool_id(&args.pool)?;
 
     let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
-    let signer = Arc::new(load_buyer_signer(&chain.keystore)?);
+    let signer = Arc::new(load_buyer_signer(&chain)?);
     let owner = signer.address();
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentPool::new(chain.payment_pool, rpc);
@@ -502,7 +504,7 @@ async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyho
     let now = unix_now()?;
     let expiry = resolve_expiry(now, args.expiry_secs, args.expiry_at)?;
 
-    let owner_signer = load_buyer_signer(&chain.keystore)?;
+    let owner_signer = load_buyer_signer(&chain)?;
     let owner = owner_signer.address();
     let domain = voucher_domain(chain.chain_id, chain.payment_pool);
     let spending_cap = args.cap_micro_usdc;
@@ -835,6 +837,7 @@ mod tests {
             payment_pool_address: None,
             chain_id: None,
             keystore: None,
+            keystore_password_file: None,
             data_dir: Some(PathBuf::from("/tmp/d")),
         }
     }
@@ -872,6 +875,30 @@ mod tests {
         assert_eq!(
             r.keystore,
             eth_identity::keystore_path(&PathBuf::from("/tmp/d"))
+        );
+    }
+
+    /// The password file is CLI/env-only — absent unless the operator passes
+    /// the flag, and carried through verbatim when they do. An absolute path
+    /// keeps the assertion off the ambient `$HOME` that `expand_tilde` reads.
+    #[test]
+    fn keystore_password_file_flows_through_and_defaults_to_none() {
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\n\
+             payment_pool_address = \"0x3333333333333333333333333333333333333333\"\n",
+        );
+        assert!(
+            resolve_chain(&args(), &file)
+                .unwrap()
+                .keystore_password_file
+                .is_none()
+        );
+
+        let mut a = args();
+        a.keystore_password_file = Some(PathBuf::from("/abs/pw.txt"));
+        assert_eq!(
+            resolve_chain(&a, &file).unwrap().keystore_password_file,
+            Some(PathBuf::from("/abs/pw.txt"))
         );
     }
 

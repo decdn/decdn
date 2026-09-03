@@ -77,10 +77,12 @@ pub struct BlockchainArgs {
     #[arg(long, value_name = "PATH", env = "DECDN_ETH_KEYSTORE")]
     pub eth_keystore: Option<PathBuf>,
 
-    /// Path to a file containing the keystore password. When unset, the
-    /// `DECDN_KEYSTORE_PASSWORD` env var is consulted; when that is also
-    /// unset and stdin is a TTY, an interactive prompt is used. A single
-    /// trailing newline is stripped from the file contents.
+    /// File whose contents are the keystore password. Consulted after the
+    /// `DECDN_KEYSTORE_PASSWORD` env var and before an interactive prompt on a
+    /// TTY. A single trailing newline is stripped; a file that is empty after
+    /// that strip is a deliberate empty password, not an absent source. A path
+    /// that does not exist falls through; one that exists but cannot be read is
+    /// an error.
     #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
     pub keystore_password_file: Option<PathBuf>,
 

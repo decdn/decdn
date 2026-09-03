@@ -51,7 +51,7 @@ use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore, DepositOutcome};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
-use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
+use decdn_incentive::eth_identity::{self, load_signer, read_password};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::rate::min_payment;
 use decdn_incentive::{
@@ -142,6 +142,11 @@ pub(crate) struct ResolvedChain {
     pub(crate) capacity_bond: Option<Address>,
     pub(crate) chain_id: u64,
     pub(crate) keystore: PathBuf,
+    /// File holding the keystore password, consulted after the
+    /// `DECDN_KEYSTORE_PASSWORD` env var and before a prompt. CLI/env-only, like
+    /// the daemon's `ResolvedBlockchain::keystore_password_file` — passwords do
+    /// not belong in a config file even by reference.
+    pub(crate) keystore_password_file: Option<PathBuf>,
     /// Directory holding the buyer-pool redb store and (by default) the
     /// keystore. Client-scoped (`~/.decdn/client`) unless an explicit
     /// `--data-dir`/`identity.data_dir` is given.
@@ -263,6 +268,7 @@ pub(crate) fn resolve_chain(
         capacity_bond,
         chain_id,
         keystore,
+        keystore_password_file: args.keystore_password_file.as_deref().map(expand_tilde),
         data_dir,
         region,
         working_deposit,
@@ -923,12 +929,9 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
 
     // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
-    // else TTY.
+    // else `--keystore-password-file`, else TTY.
     let password = read_password(
-        &[
-            PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
-            PasswordSource::Prompt { confirm: false },
-        ],
+        &super::chain_ctx::password_sources(chain.keystore_password_file.as_deref(), false),
         "eth keystore password",
     )?;
     let signer = Arc::new(load_signer(&chain.keystore, &password)?);
@@ -2600,6 +2603,7 @@ mod tests {
             unit_deadline_ms: 10_000,
             chain_id: None,
             keystore: None,
+            keystore_password_file: None,
             data_dir: Some(PathBuf::from("/tmp/d")),
             working_deposit_micro_usdc: None,
             max_blob_mb: 1024,
@@ -2614,6 +2618,31 @@ mod tests {
 
     fn config(body: &str) -> FileConfig {
         toml::from_str(body).expect("parse test config")
+    }
+
+    /// The password file is CLI/env-only — absent unless the operator passes
+    /// the flag, and carried through verbatim when they do. An absolute path
+    /// keeps the assertion off the ambient `$HOME` that `expand_tilde` reads.
+    #[test]
+    fn keystore_password_file_flows_through_and_defaults_to_none() {
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\n\
+             payment_pool_address = \"0x3333333333333333333333333333333333333333\"\n\
+             slash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+        );
+        assert!(
+            resolve_chain(&common(), &file)
+                .unwrap()
+                .keystore_password_file
+                .is_none()
+        );
+
+        let mut a = common();
+        a.keystore_password_file = Some(PathBuf::from("/abs/pw.txt"));
+        assert_eq!(
+            resolve_chain(&a, &file).unwrap().keystore_password_file,
+            Some(PathBuf::from("/abs/pw.txt"))
+        );
     }
 
     /// The pure multi-source engagement gate (#1760-series follow-on): engage

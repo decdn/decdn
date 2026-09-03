@@ -35,7 +35,7 @@ use decdn_common::cli::{BundlePullArgs, ClientFetchArgs};
 use decdn_common::config::load_file_config;
 use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
-use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
+use decdn_incentive::eth_identity::{load_signer, read_password};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{slash_judge_domain, voucher_domain};
 use futures_util::StreamExt as _;
@@ -284,15 +284,13 @@ async fn discover_candidates(
 
 /// Load the buyer's Ethereum signer (vouchers + any openPool/topUp tx) and its
 /// address, prompting for the keystore password once. Password from
-/// `$DECDN_KEYSTORE_PASSWORD`, else a TTY prompt.
+/// `$DECDN_KEYSTORE_PASSWORD`, else `--keystore-password-file`, else a TTY
+/// prompt.
 fn load_buyer_signer(
     chain: &fetch::ResolvedChain,
 ) -> anyhow::Result<(Arc<PrivateKeySigner>, Address)> {
     let password = read_password(
-        &[
-            PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
-            PasswordSource::Prompt { confirm: false },
-        ],
+        &super::chain_ctx::password_sources(chain.keystore_password_file.as_deref(), false),
         "eth keystore password",
     )?;
     let signer = Arc::new(load_signer(&chain.keystore, &password)?);
