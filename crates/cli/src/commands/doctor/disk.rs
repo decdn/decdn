@@ -6,6 +6,9 @@
 //! expected — free disk, not the budget, normally binds. This group is the
 //! pre-boot advisory: it checks the volume and `disk_headroom_mb` leave room for
 //! a useful cache before the node starts and the reactive clamp takes over.
+//! Headroom-vs-disk conditions are warnings, never failures — the node runs and
+//! the driver just evicts down until disk frees up — so doctor never hard-fails
+//! on a small-disk host. Only an unwritable `cache_dir` is a Fail here.
 
 use std::path::Path;
 
@@ -29,8 +32,16 @@ fn gib(bytes: u64) -> f64 {
 /// occupy; the driver keeps `headroom_bytes` of it free, so the cache can grow
 /// into at most `reachable - headroom_bytes` before the `cache_size_mb` upper
 /// bound. A large `budget_bytes` is expected and never a failure on its own —
-/// the disk clamp handles it. The real misconfiguration is a `disk_headroom_mb`
-/// that leaves the cache little or no room on the `cache_dir` volume.
+/// the disk clamp handles it.
+///
+/// This finding is Pass-or-Warn, never Fail. Disk pressure under the disk-aware
+/// ceiling is graceful and self-correcting — the node runs and the driver just
+/// evicts down / keeps the cache small — so it must not flip doctor's exit code
+/// (and any `--strict` gate) on a small-disk host: CI, a container, or a
+/// freshly-provisioned node whose volume is not sized yet. A headroom that
+/// exceeds the whole volume, and a headroom that leaves little room right now,
+/// are both warnings with distinct messages. Genuinely fatal disk problems (an
+/// unwritable `cache_dir`) are Fails, raised separately by `check_writable`.
 pub(crate) fn evaluate_disk(
     budget_bytes: u64,
     headroom_bytes: u64,
@@ -59,30 +70,36 @@ pub(crate) fn evaluate_disk(
         gib(fs_total),
     );
 
-    // Headroom at or above the reachable space collapses the effective ceiling
-    // to (at most) the current footprint: the cache can never grow, and the
-    // driver evicts constantly. That is a misconfiguration, not disk pressure.
-    if headroom_bytes >= reachable {
+    // Headroom at or above the entire volume can never be satisfied: the
+    // effective ceiling is pinned to the footprint forever, so the cache can
+    // never hold anything. A misconfiguration worth surfacing, but the node
+    // still runs — a warning, not a hard failure.
+    if headroom_bytes >= fs_total {
         return base(
-            Severity::Fail,
-            "disk headroom leaves no room for the cache".into(),
+            Severity::Warn,
+            "disk headroom exceeds the whole volume".into(),
             data,
             Some(format!(
-                "cache.disk_headroom_mb ({} MiB) is at least the space on the cache_dir volume \
-                 (~{:.0} MiB reachable); lower it or move cache.cache_dir to a larger volume",
+                "cache.disk_headroom_mb ({} MiB) is at least the cache_dir volume size \
+                 (~{:.0} MiB); lower it or move cache.cache_dir to a larger volume",
                 headroom_bytes / BYTES_PER_MB,
-                gib(reachable) * 1024.0
+                gib(fs_total) * 1024.0
             )),
         );
     }
-    // Some room, but little: the cache above the headroom is under a tenth of the
-    // volume, so it will hold almost nothing.
+    // Little or no room above the headroom right now (includes free disk at or
+    // below the headroom, where usable is 0). Advisory: the cache will hold
+    // almost nothing until disk frees up, but the node still runs.
     if usable < fs_total / 10 {
         return base(
             Severity::Warn,
             "little room for the cache above the disk headroom".into(),
             data,
-            Some("lower cache.disk_headroom_mb or move cache.cache_dir to a larger volume".into()),
+            Some(
+                "free disk space, lower cache.disk_headroom_mb, or move cache.cache_dir to a \
+                 larger volume"
+                    .into(),
+            ),
         );
     }
     base(
@@ -213,11 +230,36 @@ mod tests {
     }
 
     #[test]
-    fn headroom_at_or_above_reachable_fails() {
-        // 8 GiB headroom but only 3 GiB reachable => the cache can never grow.
-        let f = evaluate_disk(100 * GIB, 8 * GIB, 50 * GIB, 3 * GIB, 0);
-        assert_eq!(f.severity, Severity::Fail);
+    fn headroom_exceeds_whole_volume_warns_not_fails() {
+        // 60 GiB headroom on a 50 GiB volume can never be satisfied, but the node
+        // still runs => Warn, never Fail (doctor must not hard-fail on disk).
+        let f = evaluate_disk(100 * GIB, 60 * GIB, 50 * GIB, 40 * GIB, 0);
+        assert_eq!(f.severity, Severity::Warn);
         assert!(f.remediation.is_some());
+    }
+
+    #[test]
+    fn disk_findings_never_fail_even_when_headroom_dwarfs_the_volume() {
+        // The whole point of the Warn-only model: no combination of budget,
+        // headroom, and free disk yields a Fail, so doctor's exit code never
+        // flips on the runner's disk size.
+        for (budget, headroom, total, avail) in [
+            (1 * GIB, 8 * GIB, 4 * GIB, 3 * GIB), // headroom > small volume
+            (100 * GIB, 100 * GIB, 1 * GIB, 0),   // headroom == whole volume, no free
+            (1 * GIB, 0, 1 * GIB, 0),             // no free disk at all
+        ] {
+            let f = evaluate_disk(budget, headroom, total, avail, 0);
+            assert_ne!(f.severity, Severity::Fail, "{}", f.title);
+        }
+    }
+
+    #[test]
+    fn headroom_above_free_disk_only_warns() {
+        // 8 GiB headroom, only 3 GiB free, on a 50 GiB volume: no room right now
+        // but the volume is large enough in principle => Warn, never Fail. This
+        // is the case that must not hard-fail doctor on a small-disk host.
+        let f = evaluate_disk(100 * GIB, 8 * GIB, 50 * GIB, 3 * GIB, 0);
+        assert_eq!(f.severity, Severity::Warn);
     }
 
     #[test]
