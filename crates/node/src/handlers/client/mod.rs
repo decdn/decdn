@@ -4738,6 +4738,211 @@ mod tests {
         Ok(())
     }
 
+    /// Assert the accumulator's load-bearing invariant on one pool: the stored pool
+    /// `live_reservation` is exactly the fold of the per-signer `live_reservation`s.
+    ///
+    /// Deliberately the LIVE quantity only. The abandonment buckets are node-local and
+    /// signer-isolated — [`PoolFloorState::live_committed`] says so — so they are not
+    /// part of any pool total and folding them here would assert something false.
+    fn ensure_floor_levels_agree(
+        handler: &ClientHandler,
+        pool: B256,
+        when: &str,
+    ) -> anyhow::Result<()> {
+        let st = lock_floor(&handler.pool_floor)?
+            .get(&pool)
+            .cloned()
+            .ok_or_else(|| {
+                // Not `unwrap_or_default()`: an empty state folds `0 == 0` and would
+                // report success for a regression that REMOVED the entry.
+                anyhow::anyhow!("{when}: the pool entry is gone, so there is nothing to agree")
+            })?;
+        let folded = st.signers.values().fold(U256::ZERO, |acc, lane| {
+            acc.saturating_add(lane.live_reservation)
+        });
+        anyhow::ensure!(
+            st.live_reservation == folded,
+            "{when}: pool live_reservation ({}) must stay the sum of its signer rows ({folded})",
+            st.live_reservation
+        );
+        Ok(())
+    }
+
+    /// K threads race ONE admission through the pool ceiling: exactly one wins.
+    ///
+    /// [`ClientHandler::try_reserve_floor`] claims its gates and its
+    /// `live_reservation` increments happen under ONE lock hold, so concurrent
+    /// admissions cannot both pass a check and then both reserve. Every other floor
+    /// test is sequential, so nothing else exercises that claim: a check-then-reserve
+    /// split would still pass them all and over-commit only under contention.
+    ///
+    /// Each racer names a DISTINCT signer with a live cap wide enough never to bind,
+    /// so the pool ceiling is unambiguously what refuses. Detection is probabilistic
+    /// and the suite retries — the barrier makes the racers collide, it does not
+    /// guarantee they land in the same stale window — so read a FLAKY line here as the
+    /// defect signal `.config/nextest.toml` says it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_admissions_cannot_over_commit_the_pool_ceiling() -> anyhow::Result<()> {
+        const RACERS: usize = 8;
+        let metrics = Arc::new(Metrics::new());
+        // A live cap and bucket far too wide to bind, so only the pool ceiling can.
+        let (handler, _dir) =
+            handler_for_tests_with_signer_policy(&metrics, U256::ZERO, u64::MAX, u64::MAX, 60)
+                .await;
+        let pool = B256::repeat_byte(0x3A);
+        let window = handler.one_window(TEST_RATE);
+        // Headroom for EXACTLY one window: slack strictly under a second.
+        let remaining = window.saturating_add(U256::from(1u64));
+        let barrier = std::sync::Barrier::new(RACERS);
+
+        let outcomes: Vec<Result<FloorReservation, FloorRefusal>> = std::thread::scope(|scope| {
+            let racers: Vec<_> = (0..RACERS)
+                .map(|i| {
+                    let handler = Arc::clone(&handler);
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let signer = Address::new([u8::try_from(i).unwrap_or(0xff); 20]);
+                        barrier.wait();
+                        handler.try_reserve_floor(pool, signer, remaining, TEST_RATE, window)
+                    })
+                })
+                .collect();
+            racers
+                .into_iter()
+                .map(|h| h.join().map_err(|_| anyhow::anyhow!("racer panicked")))
+                .collect::<anyhow::Result<Vec<_>>>()
+        })?;
+
+        let admitted = outcomes.iter().filter(|o| o.is_ok()).count();
+        anyhow::ensure!(
+            admitted == 1,
+            "exactly one of {RACERS} concurrent admissions fits the one-window ceiling, \
+             got {admitted}"
+        );
+        anyhow::ensure!(
+            outcomes
+                .iter()
+                .filter_map(|o| o.as_ref().err())
+                .all(|e| matches!(e, FloorRefusal::PoolExhausted)),
+            "the losers are refused by the POOL ceiling, not a per-signer gate"
+        );
+        ensure_floor_levels_agree(&handler, pool, "after the race")?;
+        drop(outcomes);
+        ensure_floor_levels_agree(&handler, pool, "after every guard drops")?;
+        Ok(())
+    }
+
+    /// The same race against ONE signer's live cap, on a pool the ceiling cannot bind:
+    /// exactly one admission wins and the losers name the per-signer cap.
+    ///
+    /// The pool-ceiling twin cannot cover this. The two are separate tests under the
+    /// same lock hold, and a check-then-reserve split on the signer arm alone would let
+    /// two streams past one `k`-window cap while the pool stayed solvent.
+    ///
+    /// Only these two gates can race. The abandonment bucket is checked but never
+    /// charged at admission (`bucket_consumed >= capacity` is a read), so concurrent
+    /// admissions all observe the same level and there is no over-commit to expose —
+    /// the TOCTOU claim bites exactly on the gates that mutate.
+    ///
+    /// Detection is probabilistic and the suite retries; see the twin above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_admissions_cannot_over_commit_one_signers_live_cap() -> anyhow::Result<()> {
+        const RACERS: usize = 8;
+        let metrics = Arc::new(Metrics::new());
+        // k = 1 window per signer; the bucket cannot bind.
+        let (handler, _dir) =
+            handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 1, u64::MAX, 60).await;
+        let pool = B256::repeat_byte(0x3B);
+        let window = handler.one_window(TEST_RATE);
+        // Eight windows of pool headroom against a one-window signer cap, so the pool
+        // ceiling has room for every racer and only the signer cap can refuse.
+        let remaining = window.saturating_mul(U256::from(8u64));
+        anyhow::ensure!(
+            handler.signer_floor_cap(TEST_RATE) == window,
+            "the per-signer live cap, not the pool, is the binding bound here"
+        );
+        let barrier = std::sync::Barrier::new(RACERS);
+
+        let outcomes: Vec<Result<FloorReservation, FloorRefusal>> = std::thread::scope(|scope| {
+            let racers: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let handler = Arc::clone(&handler);
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        handler.try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+                    })
+                })
+                .collect();
+            racers
+                .into_iter()
+                .map(|h| h.join().map_err(|_| anyhow::anyhow!("racer panicked")))
+                .collect::<anyhow::Result<Vec<_>>>()
+        })?;
+
+        let admitted = outcomes.iter().filter(|o| o.is_ok()).count();
+        anyhow::ensure!(
+            admitted == 1,
+            "exactly one of {RACERS} concurrent admissions fits the one-window live cap, \
+             got {admitted}"
+        );
+        anyhow::ensure!(
+            outcomes
+                .iter()
+                .filter_map(|o| o.as_ref().err())
+                .all(|e| matches!(e, FloorRefusal::SignerAtCap { .. })),
+            "the losers are refused by the per-signer LIVE cap while the pool can still pay"
+        );
+        ensure_floor_levels_agree(&handler, pool, "after the race")?;
+        drop(outcomes);
+        ensure_floor_levels_agree(&handler, pool, "after every guard drops")?;
+        Ok(())
+    }
+
+    /// An admitted stream survives its pool draining below what its own signer could
+    /// now be admitted for, as long as the POOL itself stays solvent.
+    ///
+    /// [`ClientHandler::pool_budget_covers_reserve`] is deliberately the pool level
+    /// only: the per-signer gates are ADMISSION controls, and an admitted stream's
+    /// reservation is already counted in the pool total, so re-testing it against them
+    /// mid-stream would terminate a paying stream on a pool that can still pay while
+    /// bounding nothing extra. This pins that choice — adding a per-signer arm to the
+    /// re-check fails here.
+    #[tokio::test]
+    async fn an_admitted_stream_survives_a_mid_stream_recheck_on_a_solvent_pool()
+    -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) =
+            handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 1, u64::MAX, 60).await;
+        let pool = B256::repeat_byte(0x3C);
+        let window = handler.one_window(TEST_RATE);
+        let wide = window.saturating_mul(U256::from(8u64));
+        let _admitted = handler
+            .try_reserve_floor(pool, TEST_SIGNER, wide, TEST_RATE, window)
+            .map_err(|e| anyhow::anyhow!("admission refused: {e:?}"))?;
+
+        // This signer is now AT its live cap: a fresh admission would be refused.
+        anyhow::ensure!(
+            handler
+                .try_reserve_floor(pool, TEST_SIGNER, wide, TEST_RATE, window)
+                .err()
+                == Some(FloorRefusal::SignerAtCap { signer_cap: window }),
+            "the setup must actually leave the signer at its cap"
+        );
+        // The already-admitted stream keeps serving anyway, because the pool can pay.
+        anyhow::ensure!(
+            handler.pool_budget_covers_reserve(pool, wide, U256::ZERO),
+            "the mid-stream re-check reads the POOL level only, so a solvent pool keeps \
+             serving a stream whose signer could no longer be admitted"
+        );
+        // Non-vacuous in the other direction: an insolvent pool does refuse.
+        anyhow::ensure!(
+            !handler.pool_budget_covers_reserve(pool, U256::ZERO, U256::ZERO),
+            "an insolvent pool still fails the mid-stream re-check"
+        );
+        Ok(())
+    }
+
     /// Bring-up hydration restores each signer's OWN abandonment bucket. Two signers on
     /// one pool carry different persisted bucket levels across the restart: the one
     /// whose bucket is drained past capacity is refused `SignerThrottled`, while its
