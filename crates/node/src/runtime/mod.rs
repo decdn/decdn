@@ -1257,7 +1257,7 @@ async fn build_chain_and_handlers(
     // serve path sends a `pool_id` here when a presented capability names a pool
     // the projection has not observed; the settlement service's background
     // resolver folds its owner in. Created outside the service bootstrap so the
-    // sender clones into the handler deps below while the service takes `resolve_rx`.
+    // sender moves into the handler deps below while the service takes `resolve_rx`.
     let (pool_resolve_tx, pool_resolve_rx) =
         tokio::sync::mpsc::channel(crate::payment_settlement::POOL_RESOLVE_HINT_CAPACITY);
     // Overload-protection gate (load-shed): sheds new serves under resource

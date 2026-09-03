@@ -292,6 +292,13 @@ impl PoolProjection {
         deposit: U256,
         lifecycle: Lifecycle,
     ) {
+        // Fast path: a pool already known (a race where an event fold inserted
+        // between the resolve hint and here) needs no clone-and-publish, matching
+        // `record_topup`/`record_redeemed`. The `update` closure repeats the check
+        // because `rcu` may retry it against a map another writer changed.
+        if self.pools.load().contains_key(&pool_id) {
+            return;
+        }
         self.update(|pools| {
             if pools.contains_key(&pool_id) {
                 return;
