@@ -319,7 +319,7 @@ pub fn read_password(
                 Ok(Some(value)) => return Ok(value),
                 Ok(None) => {
                     skipped.push(format!(
-                        "password file {} could not be opened (no such file)",
+                        "password file {} not found (missing path or broken symlink)",
                         path.display()
                     ));
                 }
