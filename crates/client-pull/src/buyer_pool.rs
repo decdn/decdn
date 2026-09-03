@@ -24,7 +24,7 @@ use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::{
     BuyerPoolState, Capability, DepositOutcome, PoolOpenFailureReason, SignedCapability, StoreError,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::PoolContext;
 
@@ -71,11 +71,12 @@ const APPROVE_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// A freshly opened buyer pool: the persistable [`BuyerPoolState`], a
 /// ready-to-sign [`PoolContext`], the self-owned [`SignedCapability`] the buyer
-/// registers on its first redemption, and the open transaction hash (so a caller
-/// whose subsequent `store.record` fails can log the escrowed-but-untracked tx
-/// for manual reconciliation — the deposit is on-chain the moment `openPool`
-/// mines).
+/// registers on its first redemption, and the open transaction hash. The deposit
+/// is on-chain the moment `openPool` mines, so a caller whose subsequent
+/// `store.record` fails names that tx for manual reconciliation — an error in the
+/// CLI, an `error!` in the daemon.
 #[derive(Debug)]
+#[must_use = "the open tx is the only handle to an escrowed-but-untracked deposit"]
 pub struct OpenedPool {
     /// Persist this via `BuyerPoolStore::record`.
     pub state: BuyerPoolState,
@@ -98,6 +99,7 @@ pub struct OpenedPool {
 /// then fails has to name the transaction an operator reconciles against — see
 /// [`escrowed_but_untracked`].
 #[derive(Debug, Clone, Copy)]
+#[must_use = "the top-up tx is the only handle to an escrowed-but-untracked deposit"]
 pub struct ToppedUpPool {
     /// The amount the contract credited, read back from the receipt.
     pub credited: U256,
@@ -113,18 +115,35 @@ pub struct ToppedUpPool {
 /// wrapper (`if decdn pool top-up …; then mark_funded; fi`) records the money as
 /// tracked when it is not.
 ///
-/// `effect` names what landed on-chain in the operator's vocabulary
-/// (`buyer pool opened`, `pool 0x… topped up by 5 µUSDC`), `tx` is the handle to
+/// `effect` names what landed on-chain in the operator's vocabulary, as a
+/// past-tense clause that reads correctly with ` on-chain` appended
+/// (`buyer pool opened`, `pool 0x… topped up by 5 µUSDC`). `tx` is the handle to
 /// reconcile against, and `cause` is the local failure.
+///
+/// The message steers the operator away from the obvious response to a non-zero
+/// exit: re-running an escrow that already landed escrows a second time.
+#[must_use]
 pub fn escrowed_but_untracked(
     effect: &str,
     tx: TxHash,
     cause: impl std::fmt::Display,
 ) -> anyhow::Error {
     anyhow::anyhow!(
-        "{effect} on-chain (tx {tx}) but persisting it locally failed; the deposit is \
-         escrowed but untracked — reconcile manually: {cause}"
+        "{effect} on-chain (tx {tx}) but the local record did not survive; the deposit is \
+         escrowed but untracked — reconcile against the tx before retrying, because a retry \
+         escrows again: {cause}"
     )
+}
+
+/// The `effect` clause for a landed `topUp`, in the past-tense shape
+/// [`escrowed_but_untracked`] expects.
+///
+/// Every caller that grades a top-up credit names the same effect, and the
+/// amount and pool are what an operator reconciles the escrow against — so the
+/// wording lives here rather than being written out per call site.
+#[must_use]
+pub fn topped_up_effect(pool_id: B256, credited: U256) -> String {
+    format!("pool {pool_id} topped up by {credited} µUSDC")
 }
 
 /// Grade the local credit that follows a mined [`top_up`], turning every
@@ -426,16 +445,19 @@ impl std::fmt::Display for AllowanceShortfall {
 impl std::error::Error for AllowanceShortfall {}
 
 /// Add `additional` USDC to the buyer pool `pool_id` on-chain and return the
-/// credited amount read back from the `PoolToppedUp` event — the shared mechanism
-/// behind the node's cache-miss buyer (#744) and the CLI fetch buyer's auto-refill
-/// (#1103). `topUp` does not extend any lifecycle deadline; the caller credits the
-/// returned amount into its local [`BuyerPoolState`] via `add_deposit`.
+/// credited amount and the mining transaction as a [`ToppedUpPool`] — the shared
+/// mechanism behind the node's cache-miss buyer (#744) and the CLI fetch buyer's
+/// auto-refill (#1103). `topUp` does not extend any lifecycle deadline; the caller
+/// credits `credited` into its local [`BuyerPoolState`] via `add_deposit`, and
+/// names `tx` if that credit fails — see [`escrowed_but_untracked`].
 ///
 /// The amount credited is read back from `PoolToppedUp.additionalDeposit`, not
 /// assumed to equal `additional`: the contract credits a measured balance delta,
 /// so the two differ under a fee-on-transfer token and the local row must not
 /// over-state the on-chain deposit. If the event is absent (an ABI skew), the
-/// requested `additional` is returned as the best available estimate.
+/// requested `additional` is returned as the best available estimate and the
+/// fallback is logged — an over-stated local row is the mirror of the hazard
+/// [`escrowed_but_untracked`] guards, so it must not be reached silently.
 ///
 /// # Errors
 ///
@@ -482,7 +504,18 @@ pub async fn top_up<P: Provider + Clone>(
         .filter_map(|log| log.log_decode::<PaymentPool::PoolToppedUp>().ok())
         .map(|decoded| decoded.inner.data)
         .find(|ev| ev.poolId == pool_id)
-        .map_or(additional, |ev| ev.additionalDeposit);
+        .map_or_else(
+            || {
+                warn!(
+                    %pool_id,
+                    requested = %additional,
+                    "topUp mined without a PoolToppedUp event (ABI skew); crediting the \
+                     requested amount, which may over-state the on-chain deposit"
+                );
+                additional
+            },
+            |ev| ev.additionalDeposit,
+        );
     let tx = receipt.transaction_hash;
     info!(%pool_id, %credited, %tx, "topped up buyer payment pool");
     Ok(ToppedUpPool { credited, tx })
@@ -794,7 +827,12 @@ mod tests {
             msg.contains(&format!("{}", a_tx())),
             "the tx is the handle an operator reconciles against: {msg}"
         );
-        assert!(msg.contains("reconcile manually"), "{msg}");
+        assert!(msg.contains("reconcile against the tx"), "{msg}");
+        assert!(
+            msg.contains("a retry escrows again"),
+            "re-running is the obvious response to a non-zero exit and the one that \
+             double-spends: {msg}"
+        );
         assert!(msg.contains("disk full"), "the cause must survive: {msg}");
     }
 
@@ -815,16 +853,27 @@ mod tests {
     /// `Ok` half is the one that reads like success at a glance.
     #[test]
     fn every_uncredited_outcome_is_an_error_naming_the_tx() {
-        for outcome in [
-            Ok(DepositOutcome::UnknownPool),
-            Ok(DepositOutcome::PoolMismatch),
-            Err(StoreError::Backend("commit (fsync): no space".into())),
+        for (outcome, cause) in [
+            (Ok(DepositOutcome::UnknownPool), "UnknownPool"),
+            (Ok(DepositOutcome::PoolMismatch), "PoolMismatch"),
+            (
+                Err(StoreError::Backend("commit (fsync): no space".into())),
+                "no space",
+            ),
         ] {
-            let err = grade_deposit_credit(outcome, "pool 0x01 topped up", a_tx())
+            let err = grade_deposit_credit(outcome, "pool 0x01 topped up by 5 µUSDC", a_tx())
                 .expect_err("an uncredited deposit must not read as success");
             let msg = format!("{err:#}");
             assert!(msg.contains("escrowed but untracked"), "{msg}");
             assert!(msg.contains(&format!("{}", a_tx())), "{msg}");
+            assert!(
+                msg.contains("pool 0x01 topped up by 5 µUSDC"),
+                "the amount and pool are what an operator reconciles the escrow against: {msg}"
+            );
+            assert!(
+                msg.contains(cause),
+                "each channel must keep its own diagnosis, not collapse to one string: {msg}"
+            );
         }
     }
 }

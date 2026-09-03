@@ -1483,6 +1483,75 @@ mod tests {
         assert_eq!(got.as_ref(), plaintext.as_slice());
     }
 
+    /// A mid-fetch `topUp` that mines but cannot be credited locally is
+    /// terminal: the USDC is escrowed against a row that will not account for
+    /// it, so continuing would spend against a deposit the driver cannot track.
+    /// This is the disposition the proactive and manual legs are written to
+    /// match, so it has to be pinned rather than assumed.
+    #[tokio::test(start_paused = true)]
+    async fn an_uncreditable_reactive_top_up_is_terminal() {
+        for (outcome, expected) in [
+            (DepositOutcome::UnknownPool, "no local record remains"),
+            (DepositOutcome::PoolMismatch, "tracks a different pool"),
+        ] {
+            let total = 2 * GROUP;
+            let (root, plaintext, _outboard) = synth_blob(total as usize);
+            let store = fresh_store(root, total);
+
+            let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+            let inner = ScriptedSource::new(plaintext.clone())
+                .expect("source")
+                .paying(Arc::clone(&ledger));
+            let root = inner.root();
+            let source = FailFirstOpen {
+                inner,
+                opens: std::sync::atomic::AtomicUsize::new(0),
+            };
+
+            let pacer = BudgetPacer::new();
+            let funder = FakeFunder::new(3, outcome);
+
+            let mut ctx = healthy_ctx();
+            ctx.deposit = U256::ZERO; // under-deposited: the refusal is genuine
+            let ctx = Arc::new(Mutex::new(ctx));
+
+            let drive_config = DriveConfig {
+                working_deposit: U256::from(10_000u64),
+                max_settle_waits: 2,
+                settle_backoff: std::time::Duration::from_secs(2),
+            };
+
+            let err = drive(
+                &store,
+                &source,
+                &pacer,
+                &funder,
+                &ctx,
+                &ledger,
+                root,
+                0,
+                0,
+                &drive_config,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("an untrackable escrow must not read as a completed fetch");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(expected), "{outcome:?}: {msg}");
+            assert!(
+                msg.contains("escrowed"),
+                "the operator must learn the money moved: {msg}"
+            );
+            assert!(
+                !store.is_complete().await.expect("is_complete"),
+                "{outcome:?}: the fetch must not be reported complete"
+            );
+        }
+    }
+
     /// A [`Pacer`] stub for the `up_to_bytes` clamp test: `Draw { up_to_bytes }`
     /// on its first call, `Done` on every call after — so a driver that ignores
     /// the clamp and drains the whole gap in one open would still only see ONE
