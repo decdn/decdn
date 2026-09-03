@@ -3169,4 +3169,64 @@ mod tests {
         let out = super::failover_order(holders, &[], warming_params(false));
         assert_eq!(out.size_hint, None);
     }
+
+    /// A usable rate renders as a human `X/s`; a sub-1-byte/s rate (no data yet,
+    /// or a stall) and any non-finite value both render as `--`.
+    #[test]
+    fn fmt_rate_shows_human_units_and_placeholder_below_one() {
+        assert!(fmt_rate(2.0 * 1024.0 * 1024.0).ends_with("/s"));
+        assert!(fmt_rate(2.0 * 1024.0 * 1024.0).contains("MiB"));
+        assert_eq!(fmt_rate(0.0), "--");
+        assert_eq!(fmt_rate(0.4), "--");
+        assert_eq!(fmt_rate(f64::NAN), "--");
+        assert_eq!(fmt_rate(f64::INFINITY), "--");
+    }
+
+    /// ETA divides remaining bytes by the smoothed rate; below a usable rate it
+    /// reports `ETA --` rather than a divide-by-tiny blow-up, and a huge
+    /// projection is clamped so `Duration::from_secs_f64` cannot overflow.
+    #[test]
+    fn fmt_eta_projects_and_guards_low_rate() {
+        assert_eq!(fmt_eta(10 << 20, 0.0), "ETA --");
+        assert_eq!(fmt_eta(10 << 20, 0.9), "ETA --");
+        assert!(fmt_eta(10 << 20, 10.0 * 1024.0 * 1024.0).starts_with("ETA "));
+        // A near-zero rate with bytes left must not panic on the clamp path.
+        let _ = fmt_eta(u64::MAX, 1.0);
+    }
+
+    /// The summary measures elapsed and bytes-moved from the FIRST observed
+    /// sample, not the final position — so a resumed fetch that began at a
+    /// non-zero `base_present` reports only what this run actually transferred.
+    #[test]
+    fn summary_reports_delta_from_first_sample_not_absolute_position() {
+        let t0 = Instant::now();
+        let state = SpeedState {
+            // Resumed at 40 MiB already present, ran for 2s to 60 MiB.
+            started: Some((t0, 40 << 20)),
+            last: Some((t0 + Duration::from_secs(2), 60 << 20)),
+            ewma_bps: None,
+        };
+        let meter = DeliveryMeter {
+            state: Arc::new(Mutex::new(state)),
+        };
+        let (elapsed, moved) = meter
+            .summary()
+            .expect("a delivered sample yields a summary");
+        assert_eq!(elapsed, Duration::from_secs(2));
+        assert_eq!(
+            moved,
+            20 << 20,
+            "only this run's 20 MiB, not the 60 MiB total"
+        );
+    }
+
+    /// No delivery ever observed (a failure before the first byte) yields no
+    /// summary, so the caller falls back to the bare byte/output line.
+    #[test]
+    fn summary_is_none_before_any_delivery() {
+        let meter = DeliveryMeter {
+            state: Arc::new(Mutex::new(SpeedState::default())),
+        };
+        assert!(meter.summary().is_none());
+    }
 }
