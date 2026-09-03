@@ -394,18 +394,17 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         .call()
         .await
         .with_context(|| format!("failed to read nodeIdOf from CapacityBond at {cb_addr}"))?;
-    let already_registered =
-        match registration_status(bound.nodeId, bound.active, local_node_id) {
-            RegistrationStatus::Divergent => anyhow::bail!(
-                "operator {operator:#x} is already bound on-chain to node {:#x}, but the local \
+    let already_registered = match registration_status(bound.nodeId, bound.active, local_node_id) {
+        RegistrationStatus::Divergent => anyhow::bail!(
+            "operator {operator:#x} is already bound on-chain to node {:#x}, but the local \
                  node key is {local_node_id:#x}; setup will not register a different key. Restore \
                  the bound key under {}, or run `decdn node deregister` first",
-                bound.nodeId,
-                resolved.data_dir.display(),
-            ),
-            RegistrationStatus::AlreadyRegistered => true,
-            RegistrationStatus::Due => false,
-        };
+            bound.nodeId,
+            resolved.data_dir.display(),
+        ),
+        RegistrationStatus::AlreadyRegistered => true,
+        RegistrationStatus::Due => false,
+    };
 
     // ---- ADR 019 § Terms Acceptance — accept the current operator terms
     //      *before* any transaction, so a refusal / stale-client abort happens
@@ -658,8 +657,9 @@ fn precheck_keys(
 /// derived from `CapacityBond.nodeIdOf` (the bound node id and its `active`
 /// flag) against the local node key.
 enum RegistrationStatus {
-    /// The operator is bound to a *different*, non-zero node key. Setup refuses
-    /// rather than silently register over another operator's binding.
+    /// The operator is bound to a *different*, non-zero node key than the local
+    /// one. Setup refuses rather than silently overwrite that binding with a new
+    /// key (which would strand the previously bound key).
     Divergent,
     /// This node key is already bound and active; registration is skipped.
     AlreadyRegistered,
@@ -1425,8 +1425,8 @@ mod tests {
     fn registration_status_different_node_is_divergent_regardless_of_active() {
         let local = B256::repeat_byte(0xAA);
         let other = B256::repeat_byte(0xBB);
-        // A different, non-zero binding is a divergence whether or not it is
-        // active — setup never registers over another operator's key.
+        // A binding to a different, non-zero node key is a divergence whether or
+        // not it is active — setup never overwrites the operator's bound key.
         assert!(matches!(
             registration_status(other, true, local),
             RegistrationStatus::Divergent
