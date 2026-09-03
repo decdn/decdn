@@ -41,8 +41,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::chain_events::AbortOnDrop;
 use crate::client_requester::buyer_pool::{
-    LOW_WATER_DIVISOR, ToppedUpPool, ensure_allowance, grade_deposit_credit, issue_self_capability,
-    open_pool, refill_amount, top_up as pool_top_up, topped_up_effect,
+    LOW_WATER_DIVISOR, SELF_CAPABILITY_CAP, ToppedUpPool, ensure_allowance, grade_deposit_credit,
+    issue_self_capability, open_pool, refill_amount, top_up as pool_top_up, topped_up_effect,
 };
 use crate::client_requester::{LocalPullFault, PoolContext};
 use crate::metrics::Metrics;
@@ -328,7 +328,7 @@ fn pin_ctx(
     let capability = issue_self_capability(
         signer.as_ref(),
         state.pool_id,
-        U256::MAX,
+        SELF_CAPABILITY_CAP,
         SELF_CAPABILITY_EXPIRY,
         voucher_domain,
     )?;

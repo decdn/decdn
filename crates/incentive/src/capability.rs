@@ -45,8 +45,10 @@ pub struct Capability {
     /// The address the owner delegates spend to — the voucher-signing key.
     pub signer: Address,
     /// Maximum cumulative amount (token base units) the `signer` may spend
-    /// against `pool_id` under this grant.
-    pub spending_cap: U256,
+    /// against `pool_id` under this grant. A `u64` to match the
+    /// `PaymentPool.spendingCap` storage/calldata width exactly; the EIP-712
+    /// type-string still hashes it as a `uint256` word (see [`Self::to_sol`]).
+    pub spending_cap: u64,
     /// The pool this capability draws from — the on-chain `PaymentPool`
     /// deposit id.
     pub pool_id: B256,
@@ -56,10 +58,13 @@ pub struct Capability {
 }
 
 impl Capability {
-    const fn to_sol(&self) -> CapabilitySol {
+    fn to_sol(&self) -> CapabilitySol {
         CapabilitySol {
             signer: self.signer,
-            spendingCap: self.spending_cap,
+            // The contract hashes its `uint64 spendingCap` as a zero-padded
+            // `uint256` word (the type-string says `uint256`), so widening the
+            // `u64` here reproduces the contract's EIP-712 digest byte-for-byte.
+            spendingCap: U256::from(self.spending_cap),
             poolId: self.pool_id,
             expiry: self.expiry,
         }
@@ -174,7 +179,7 @@ mod tests {
     fn sample_capability() -> Capability {
         Capability {
             signer: address!("00000000000000000000000000000000000000a1"),
-            spending_cap: U256::from(10_000_000u64),
+            spending_cap: 10_000_000u64,
             pool_id: b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"),
             expiry: 1_900_000_000,
         }
@@ -233,7 +238,7 @@ mod tests {
         let owner = PrivateKeySigner::random();
         let domain = sample_domain();
         let mut signed = sample_capability().sign(&owner, &domain)?;
-        signed.capability.spending_cap += U256::from(1u64);
+        signed.capability.spending_cap += 1;
         let err = err_of(signed.verify_owner(owner.address(), &domain))?;
         anyhow::ensure!(matches!(err, CapabilityError::WrongOwner { .. }), "{err:?}");
         Ok(())
@@ -349,7 +354,7 @@ mod tests {
             pool_id: cap.pool_id,
             signer: cap.signer,
             provider: address!("00000000000000000000000000000000000000b2"),
-            amount: cap.spending_cap,
+            amount: U256::from(cap.spending_cap),
             bytes_delivered: U256::from(1u64),
             chain_root: B256::ZERO,
             chunk_price: U256::ZERO,

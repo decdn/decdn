@@ -16,7 +16,7 @@
 //! under it.
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, B256, Signature, U256};
+use alloy::primitives::{Address, B256, Signature};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -40,8 +40,10 @@ pub struct CapabilityGrant {
     pub pool_id: B256,
     /// The delegate voucher-signing key the owner authorizes.
     pub signer: Address,
-    /// Cumulative spend ceiling (token base units) for `signer` under this grant.
-    pub spending_cap: U256,
+    /// Cumulative spend ceiling (token base units) for `signer` under this
+    /// grant. A `u64`, matching [`Capability::spending_cap`] and the
+    /// `PaymentPool.spendingCap` on-chain width.
+    pub spending_cap: u64,
     /// Unix-seconds expiry after which vouchers under this grant stop being
     /// redeemable.
     pub expiry: u64,
@@ -183,7 +185,7 @@ mod tests {
     fn sample_capability() -> Capability {
         Capability {
             signer: address!("00000000000000000000000000000000000000a1"),
-            spending_cap: U256::from(10_000_000u64),
+            spending_cap: 10_000_000u64,
             pool_id: b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"),
             expiry: 1_900_000_000,
         }

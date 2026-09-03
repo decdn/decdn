@@ -370,7 +370,7 @@ fn delegate_lane(
     let delegate = PrivateKeySigner::random();
     let cap = Capability {
         signer: delegate.address(),
-        spending_cap: U256::from(DELEGATE_CAP_MICRO_USDC),
+        spending_cap: DELEGATE_CAP_MICRO_USDC,
         pool_id,
         expiry,
     }
@@ -474,7 +474,7 @@ async fn open_and_withhold(
     let ext = StreamRequestExt {
         binding: ctx.client_binding.clone(),
         capability: ctx.capability.as_ref().map(|signed| WireCapability {
-            spending_cap: signed.capability.spending_cap.to_be_bytes(),
+            spending_cap: signed.capability.spending_cap,
             expiry: signed.capability.expiry,
             owner_signature: signed.signature.as_bytes().to_vec(),
         }),
