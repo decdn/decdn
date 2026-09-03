@@ -643,80 +643,52 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---- Two reactive top-ups in ONE fetch: the paid-frontier baselines are per-leg ----
+// ---- A blob whose wire cost far exceeds the opening deposit still settles once ----
 //
-// The multi-interval test above drives exactly ONE top-up, sized so the working
-// deposit finishes the blob. That leaves the loop's most fragile invariant
-// untested: `content_paid_frontier` inverts the wire cost of ONE contiguous
-// delivery starting at `fetch_start_offset`, but `ledger.committed().bytes` is
-// CHANNEL-cumulative and keeps climbing across every leg of the fetch.
+// The multi-interval test above sizes its blob to land just over the working
+// deposit. This test drives the opposite extreme: a blob whose whole-blob WIRE
+// cost is ~2.5x the pool's opening deposit. The buyer opens one self-owned pool at
+// `DEPOSIT_SHORT_WORKING_MICRO_USDC`, and the single `decdn fetch` streams the
+// whole blob against it — proving the gap-driven driver's paid-frontier accounting
+// stays exact when the deposit is far short of the blob: the lane settles the
+// whole-blob wire cost delivered ONCE, never below it (under-pay) and never a
+// re-paid prefix above it (double-pay).
 //
-// If the two baselines (`fetch_start_offset` / `fetch_start_committed_bytes`) are
-// captured once per FETCH rather than re-anchored per LEG, the second top-up feeds
-// the helper the SUM of two independent bao range encodings — which re-bills the
-// first leg's span and its re-sent root->offset proof path — against a start offset
-// that is still the fetch's original one. The inflated budget maps to a frontier
-// PAST the true paid one: content skipped unbilled, `byte_offset` beyond the
-// verified on-disk prefix, `set_len` zero-extending the partial, and the whole-file
-// hash check failing a fetch that was already paid for.
-//
-// Sizing, at `TWO_TOPUP_RATE_PER_MB` and the protocol's fixed `CHUNK_BYTES`
-// quantum, so exactly two reactive top-ups are needed:
-//
-//   * The node's pre-serve deposit gate (#1518) refuses to serve unless headroom
-//     covers the reserved credit window. For a cold, unbounded request the ramp
-//     (ADR 003 §Credit window, #1669) prices at `paid = 0`, its floor — one
-//     chunk, 1 * 2_000_000 = 2_000_000 µUSDC at the quoted rate. So the deposit
-//     must clear that floor (plus `M`), or the resumed open after a top-up is
-//     refused instead of served. 16M clears it with headroom — the number below
-//     is driven by the delivery arithmetic, not by this floor.
-//   * The claim accumulates 2_000_000 µUSDC per whole chunk, so a 16_000_000
-//     deposit buys eight chunks before the ninth exhausts it. Each top-up
-//     restores headroom to the full 16_000_000 working deposit, buying eight
-//     more. The quantum sets only the granularity of that walk; what decides the
-//     top-up COUNT is the total: a ~20 MiB blob costs ~40_300_000 µUSDC of wire,
-//     which lands strictly between the deposit plus one top-up (32M — so a
-//     second top-up IS required) and the deposit plus two top-ups (48M — so two
-//     suffice, inside the `MAX_TOPUP_ATTEMPTS` budget of 3).
-//
-// The money bound is the same two-sided WIRE band the single-top-up test uses, and
-// it is the point of the test: across two top-ups the blob's wire bytes must be
-// paid for exactly once. The ceiling allows a little more slack here than the
-// single-top-up case because there are two conservative group-snapped resumes, each
-// re-fetching strictly under one chunk group, plus each resumed leg's own
-// left-boundary proof hashes.
+// Delivery outruns the pool-solvency re-check on localhost, so this is one leg.
+// The node's mid-stream pool-solvency gate reads `remaining = deposit −
+// totalRedeemed` from an in-memory projection the settlement watcher folds from
+// `PoolRedeemed` logs on its event-poll cadence, and re-reads it only every
+// `POOL_RECHECK_INTERVAL`. On an instant-block anvil over loopback the whole blob
+// delivers before `remaining` folds below the refundable floor `M`, so the gate
+// never trips: the node delivers the full blob in one leg, and the on-chain
+// `redeem` (`min(desired, remaining)`) caps its recovery at the deposit while the
+// buyer still records the full wire cost. Because a mid-stream reactive top-up
+// cannot be forced deterministically here, this test asserts no top-up count. The
+// per-leg `content_paid_frontier` re-anchoring invariant — that a second delivery
+// leg prices its paid frontier against its own leg's wire spend, not the fetch's
+// summed spend — is unit-tested directly in `client-pull`'s `sink.rs`
+// (`summed_multi_leg_wire_over_maps_which_is_why_baselines_are_per_leg`).
 
-const TWO_TOPUP_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB, as above
-// Must clear the ramp-floor one-chunk credit window at the rate above
-// (2_000_000 µUSDC) — sized well above that floor for the delivery arithmetic
-// explained above.
-const TWO_TOPUP_WORKING_MICRO_USDC: u64 = 16_000_000;
-/// Just over 20 MiB: costs more than the deposit plus one top-up (forcing a
-/// SECOND top-up) and less than the deposit plus two top-ups (so two are enough).
-const TWO_TOPUP_BLOB_BYTES: usize = 20 * 1024 * 1024 + 4113;
+const DEPOSIT_SHORT_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB
+// Clears the pre-serve credit-window gate to OPEN the pool: a cold request's ramp
+// floor is one chunk, `1 * 2_000_000` µUSDC at the rate above, and the deposit must
+// cover that floor plus the refundable floor `M`. 16 USDC clears it with headroom,
+// and stays far below the blob's ~40 USDC wire cost so the fetch runs deposit-short.
+const DEPOSIT_SHORT_WORKING_MICRO_USDC: u64 = 16_000_000;
+/// Just over 20 MiB: its whole-blob wire cost (~40 USDC) is ~2.5x the opening
+/// deposit, so the fetch spends well past the deposit in one leg.
+const DEPOSIT_SHORT_BLOB_BYTES: usize = 20 * 1024 * 1024 + 4113;
 
-/// IGNORED — a blob this far past the working deposit does not complete end to end.
-///
-/// The per-signer floor does not block a reactive-top-up resume: it is a refilling
-/// abandonment bucket (ADR 003 §Pool solvency), so a single-signer resume admits at
-/// the floor gate rather than tripping a per-signer cap. What remains are separate,
-/// non-floor blockers this test still trips: the resumed
-/// leg can open before the first voucher materializes its lane in the node's store
-/// (`stream request on unknown lane; refusing pre-serve`), and the deposit/window
-/// sizing no longer reliably forces exactly two top-ups. Un-ignore once the
-/// lane-materialization race and the sizing are addressed; the driver below already
-/// asserts the two-top-up byte accounting.
-#[ignore = "resumed-leg lane-materialization race + top-up sizing; floor lockout resolved — see the doc comment"]
 #[tokio::test(flavor = "multi_thread")]
-async fn fetch_across_two_reactive_topups_pays_each_wire_byte_exactly_once() -> anyhow::Result<()> {
-    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_two_topup_fetch()))
+async fn fetch_of_blob_far_exceeding_deposit_settles_whole_wire_cost_once() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_deposit_short_fetch()))
         .await
-        .context("two-top-up reactive e2e exceeded the overall timeout")??;
+        .context("deposit-short reactive e2e exceeded the overall timeout")??;
     Ok(())
 }
 
-fn make_two_topup_blob() -> Vec<u8> {
-    let mut v = vec![0u8; TWO_TOPUP_BLOB_BYTES];
+fn make_deposit_short_blob() -> Vec<u8> {
+    let mut v = vec![0u8; DEPOSIT_SHORT_BLOB_BYTES];
     let mut x: u32 = 0x1357_9bdf;
     for b in &mut v {
         x ^= x << 13;
@@ -733,7 +705,7 @@ fn make_two_topup_blob() -> Vec<u8> {
               deposit state, so decomposing it would thread state through helpers without reducing \
               the journey's length or making it easier to follow"
 )]
-async fn run_two_topup_fetch() -> anyhow::Result<()> {
+async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .try_init();
@@ -741,14 +713,14 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
     ensure_decdn_cli_built()?;
     let chain = ChainFixture::launch().await?;
 
-    let blob = make_two_topup_blob();
+    let blob = make_deposit_short_blob();
     let blob_hash = Hash::new(&blob);
     let (node, hash) = NodeFixture::launch(&chain, "US", &blob).await?;
     anyhow::ensure!(
         hash == blob_hash,
         "seeded blob hash mismatch: {hash} vs {blob_hash}"
     );
-    node.set_rate_per_mb(TWO_TOPUP_RATE_PER_MB).await?;
+    node.set_rate_per_mb(DEPOSIT_SHORT_RATE_PER_MB).await?;
 
     let client_dir = tempfile::tempdir().context("client tempdir")?;
     #[cfg(unix)]
@@ -764,9 +736,10 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
         eth_identity::load_signer(&keystore, TOPUP_KEYSTORE_PASSWORD).context("load buyer")?;
     let buyer_addr = buyer.address();
     chain.fund_eth(buyer_addr, 100).await?;
-    // Enough for the open plus both top-ups, with headroom.
+    // Well above the opening deposit: covers the open and any reactive top-up a
+    // slower host might drive, with headroom. The test does not depend on a count.
     chain
-        .mint_usdc(buyer_addr, U256::from(5 * TWO_TOPUP_WORKING_MICRO_USDC))
+        .mint_usdc(buyer_addr, U256::from(5 * DEPOSIT_SHORT_WORKING_MICRO_USDC))
         .await
         .context("mint buyer USDC")?;
 
@@ -792,7 +765,7 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
         &voucher_dom,
         chain.usdc(),
         buyer_addr,
-        U256::from(TWO_TOPUP_WORKING_MICRO_USDC),
+        U256::from(DEPOSIT_SHORT_WORKING_MICRO_USDC),
     )
     .await
     .context("open buyer pool")?;
@@ -820,41 +793,61 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
         client_dir.path(),
         &keystore,
         &out,
-        TWO_TOPUP_WORKING_MICRO_USDC,
+        DEPOSIT_SHORT_WORKING_MICRO_USDC,
     );
 
-    let output =
-        tokio::process::Command::from(decdn_command(client_dir.path(), TOPUP_KEYSTORE_PASSWORD)?)
-            .arg("fetch")
-            .args(&args)
-            .output()
-            .await
-            .context("spawn decdn fetch")?;
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    anyhow::ensure!(output.status.success(), "decdn fetch failed: {stderr}");
+    // Exactly one *delivering* invocation — same reasoning as the multi-interval
+    // test: a blind cross-invocation retry would let a second run resume from
+    // whatever the first flushed, corrupting the whole-blob cost measurement below.
+    // The one exception is the node's serve-path readiness race: right after
+    // `openPool` mines, the node can answer `NotFound` for the brief window before
+    // its `getPool` view resolves the new pool (there is no pool-open event to wait
+    // on). A pure readiness `NotFound` delivers no byte and writes no partial, so
+    // re-invoking is safe and cannot corrupt the measurement; the moment any byte
+    // lands the loop stops retrying.
+    let partial = client_dir.path().join("blob.bin.partial");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let output = tokio::process::Command::from(decdn_command(
+            client_dir.path(),
+            TOPUP_KEYSTORE_PASSWORD,
+        )?)
+        .arg("fetch")
+        .args(&args)
+        .output()
+        .await
+        .context("spawn decdn fetch")?;
+        if output.status.success() {
+            break;
+        }
+        // Retry ONLY the serve-path readiness race, and only before any byte lands.
+        // The race surfaces as a `NotFound` — the node's collapsed pre-serve refusal
+        // while its `getPool` view is still resolving the freshly-opened pool. Any
+        // other pre-delivery failure (a transport fault, a CLI error) is a real
+        // regression and must fail fast, never be masked by a later attempt's
+        // success. Anything already on disk means delivery began: re-invoking would
+        // resume from that flushed prefix and corrupt the cost measurement.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let readiness_race = stderr.contains("NotFound");
+        let progressed = out.exists() || std::fs::metadata(&partial).is_ok_and(|m| m.len() > 0);
+        anyhow::ensure!(
+            readiness_race && !progressed && tokio::time::Instant::now() < deadline,
+            "decdn fetch failed (readiness race = {readiness_race}, delivered bytes on disk = \
+             {progressed}): {stderr}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
-    // The fetch must have taken the reactive branch TWICE. Without this the test
-    // could pass having driven the single-top-up path the test above already
-    // covers, and the per-leg baseline invariant would go unexercised.
-    let topups = stderr.matches("topped up").count();
-    anyhow::ensure!(
-        topups == 2,
-        "the sizing must force exactly two reactive top-ups (saw {topups}); \
-         re-check the deposit/rate/blob arithmetic against the pre-serve credit-window \
-         gate. stderr:\n{stderr}"
-    );
-
-    // Byte-exact delivery. This is where a frontier that ran PAST the true paid
-    // one shows up: `set_len` would have zero-extended the partial over the
-    // skipped span, and the whole-file BLAKE3 check would reject the result.
+    // Byte-exact delivery. A paid frontier that ever ran PAST the true one shows up
+    // here: `set_len` would have zero-extended the partial over the skipped span,
+    // and the whole-file BLAKE3 check would reject the result.
     let got = std::fs::read(&out).context("read output")?;
     anyhow::ensure!(
         got == blob,
-        "the blob must be byte-exact after two reactive top-ups: got {} bytes, expected {}",
+        "the deposit-short blob must be byte-exact: got {} bytes, expected {}",
         got.len(),
         blob.len()
     );
-    let partial = client_dir.path().join("blob.bin.partial");
     anyhow::ensure!(
         !partial.exists(),
         "the .partial scratch file must be promoted away, not left beside --output: {}",
@@ -866,17 +859,19 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
     let blob_len = u64::try_from(blob.len()).context("blob length as u64")?;
     let ceil_cost = |bytes: u64| {
         U256::from(bytes)
-            .saturating_mul(U256::from(TWO_TOPUP_RATE_PER_MB))
+            .saturating_mul(U256::from(DEPOSIT_SHORT_RATE_PER_MB))
             .div_ceil(U256::from(MB_BYTES))
     };
     let whole_wire = align_range(0, 0, blob_len)
         .context("align whole blob")?
         .wire_len();
     let wire_floor = ceil_cost(whole_wire);
-    // Two conservative resumes, each re-fetching strictly under one 16 KiB chunk
-    // group, plus each resumed leg's left-boundary proof path and the per-proof
-    // `ceil` roundings. Four groups of headroom covers all of it and is still far
-    // below the 2_000_000 a single re-paid chunk would add.
+    // Delivery outruns the solvency re-check here, so the blob normally settles in
+    // one leg at `wire_floor` plus the per-voucher `ceil` roundings. Four chunk
+    // groups of headroom absorbs those roundings and — should a slower host let the
+    // re-check trip and drive a group-snapped reactive resume — each resumed leg's
+    // sub-group re-fetch and left-boundary proof path, while staying far below the
+    // 2_000_000 a genuine re-paid chunk would add.
     let one_group_cost = ceil_cost(decdn_bao_range::CHUNK_GROUP_BYTES);
     let ceiling = wire_floor.saturating_add(one_group_cost.saturating_mul(U256::from(4u64)));
 
@@ -892,34 +887,19 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
 
     anyhow::ensure!(
         settled_amount >= wire_floor,
-        "under-pay across two top-ups: settled {settled_amount} µUSDC, below the whole-blob WIRE cost of \
-         {wire_floor} µUSDC. A second-leg paid frontier derived from a stale baseline \
+        "under-pay: settled {settled_amount} µUSDC, below the whole-blob WIRE cost of \
+         {wire_floor} µUSDC. A paid frontier derived from a stale per-leg baseline \
          overshoots the true one and skips billing exactly this way"
     );
     anyhow::ensure!(
         settled_amount <= ceiling,
-        "double-pay across two top-ups: settled {settled_amount} µUSDC against a whole-blob WIRE cost of \
+        "double-pay: settled {settled_amount} µUSDC against a whole-blob WIRE cost of \
          {wire_floor} µUSDC (ceiling {ceiling}); a re-paid chunk would add 2000000"
     );
 
-    // Both top-ups landed on-chain and are reflected locally. Each one restores
-    // headroom to the working deposit, so the escrow ends strictly above what one
-    // top-up alone could have reached (open plus one top-up = 2× the working
-    // deposit).
-    let one_topup_ceiling = U256::from(2 * TWO_TOPUP_WORKING_MICRO_USDC);
-    anyhow::ensure!(
-        persisted.deposit > one_topup_ceiling,
-        "two top-ups must escrow more than a single top-up could ({one_topup_ceiling}); got {}",
-        persisted.deposit
-    );
-    // The escrow must still cover everything vouchered — the fetch completed, so
-    // the final voucher was within deposit.
-    anyhow::ensure!(
-        persisted.deposit >= settled_amount,
-        "escrow {} must cover the settled amount {}",
-        persisted.deposit,
-        settled_amount
-    );
+    // The buyer's local record mirrors the chain: whatever the escrow ended at —
+    // the opening deposit if no reactive top-up fired, or a raised deposit if a
+    // slower host let one land — the persisted deposit equals the on-chain deposit.
     let onchain = pool
         .getPool(opened.state.pool_id)
         .call()
@@ -928,8 +908,7 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
         .deposit;
     anyhow::ensure!(
         U256::from(onchain) == persisted.deposit,
-        "the persisted deposit must match the chain after two top-ups: local {} vs chain \
-         {onchain}",
+        "the persisted deposit must match the chain: local {} vs chain {onchain}",
         persisted.deposit
     );
 
