@@ -265,6 +265,57 @@ impl PoolProjection {
         });
     }
 
+    /// Seed a pool the projection has NOT observed through the event log, from a
+    /// direct `getPool` snapshot (the lazy cold-start backfill). The settlement
+    /// watcher anchors at head (`ColdStart::Head`), so a pool opened before this
+    /// node's first-ever boot never appears in the
+    /// forward-only `PoolOpened` scan. A node onboarding as a NEW provider to such
+    /// a pool would then have no owner to verify a presented capability against and
+    /// could never register the serve lane; the background pool-owner resolver
+    /// resolves the owner off the serve hot path and folds it here.
+    ///
+    /// Inserts ONLY IF the pool is still absent, so a concurrent event fold — the
+    /// projection's authoritative writer — always wins and this never clobbers a
+    /// live entry. `deposit` is the pool's FULL cumulative `getPool.deposit` (not
+    /// its remaining), seeded with `total_redeemed == 0`, exactly as
+    /// [`Self::record_opened`] seeds an event-observed open: the projection then
+    /// rebuilds `total_redeemed` from post-seed `PoolRedeemed` deltas off a zero
+    /// per-lane baseline, so no redemption is ever double-counted. Redemptions that
+    /// predate the snapshot are simply not folded, which only OVER-states
+    /// `remaining` — the fail-toward-serving direction this module commits to. An
+    /// out-of-range deposit (impossible by construction) saturates to `u64::MAX`,
+    /// the same fail-open direction as [`Self::record_opened`].
+    pub fn record_resolved(
+        &self,
+        pool_id: B256,
+        owner: Address,
+        deposit: U256,
+        lifecycle: Lifecycle,
+    ) {
+        // Fast path: a pool already known (a race where an event fold inserted
+        // between the resolve hint and here) needs no clone-and-publish, matching
+        // `record_topup`/`record_redeemed`. The `update` closure repeats the check
+        // because `rcu` may retry it against a map another writer changed.
+        if self.pools.load().contains_key(&pool_id) {
+            return;
+        }
+        self.update(|pools| {
+            if pools.contains_key(&pool_id) {
+                return;
+            }
+            pools.insert(
+                pool_id,
+                PoolEntry {
+                    owner,
+                    deposit: u64::try_from(deposit).unwrap_or(u64::MAX),
+                    total_redeemed: 0,
+                    lanes: HashMap::new(),
+                    lifecycle,
+                },
+            );
+        });
+    }
+
     /// A non-blocking snapshot read for callers outside an async trait object.
     #[must_use]
     pub fn snapshot(&self, pool_id: B256) -> Option<PoolStatus> {
@@ -454,6 +505,74 @@ mod tests {
         assert_eq!(s.remaining, U256::from(600u64));
         assert_eq!(
             s.lifecycle,
+            Lifecycle::Closing {
+                deadline: 1_900_000_000
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn record_resolved_seeds_an_absent_pool() {
+        let view = PoolProjection::new();
+        // A pool opened before the watcher's cold-start head is absent until the
+        // resolver folds a getPool snapshot.
+        assert!(view.status(pool(1)).await.is_none());
+        view.record_resolved(pool(1), addr(7), U256::from(1_000u64), Lifecycle::Open);
+        let s = view.status(pool(1)).await.expect("resolved pool is known");
+        assert_eq!(s.owner, addr(7));
+        assert_eq!(s.remaining, U256::from(1_000u64));
+        assert_eq!(s.lifecycle, Lifecycle::Open);
+    }
+
+    #[tokio::test]
+    async fn record_resolved_does_not_clobber_a_live_entry() {
+        let view = PoolProjection::new();
+        // An event fold (the authoritative writer) has already recorded the pool
+        // with a redemption drawn down; a late resolve for the same pool must not
+        // overwrite the folded remaining back up to the full deposit.
+        view.record_opened(pool(1), addr(7), U256::from(1_000u64));
+        view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 400)]);
+        view.record_resolved(pool(1), addr(8), U256::from(5_000u64), Lifecycle::Open);
+        let s = view.status(pool(1)).await.unwrap();
+        assert_eq!(
+            s.owner,
+            addr(7),
+            "resolve must not overwrite the folded owner"
+        );
+        assert_eq!(
+            s.remaining,
+            U256::from(600u64),
+            "resolve must not overwrite the folded remaining"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_resolved_rebuilds_remaining_without_double_count() {
+        let view = PoolProjection::new();
+        // Seed the FULL deposit with a zero redeemed baseline (as record_opened
+        // does), so a post-seed PoolRedeemed for a lane that already had on-chain
+        // history folds only its current cumulative — not double.
+        view.record_resolved(pool(1), addr(7), U256::from(1_000u64), Lifecycle::Open);
+        view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 150)]);
+        assert_eq!(
+            view.status(pool(1)).await.unwrap().remaining,
+            U256::from(850u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn record_resolved_carries_closing_lifecycle() {
+        let view = PoolProjection::new();
+        view.record_resolved(
+            pool(1),
+            addr(7),
+            U256::from(1_000u64),
+            Lifecycle::Closing {
+                deadline: 1_900_000_000,
+            },
+        );
+        assert_eq!(
+            view.status(pool(1)).await.unwrap().lifecycle,
             Lifecycle::Closing {
                 deadline: 1_900_000_000
             }

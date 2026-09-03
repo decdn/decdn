@@ -1253,6 +1253,13 @@ async fn build_chain_and_handlers(
     // drives the service's redeemer loop.
     let (redeem_tx, redeem_rx) =
         tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
+    // Pool-owner resolve-hint channel (cold-start `ColdStart::Head` gap): the
+    // serve path sends a `pool_id` here when a presented capability names a pool
+    // the projection has not observed; the settlement service's background
+    // resolver folds its owner in. Created outside the service bootstrap so the
+    // sender moves into the handler deps below while the service takes `resolve_rx`.
+    let (pool_resolve_tx, pool_resolve_rx) =
+        tokio::sync::mpsc::channel(crate::payment_settlement::POOL_RESOLVE_HINT_CAPACITY);
     // Overload-protection gate (load-shed): sheds new serves under resource
     // pressure so in-flight streams stay fast. Bound to a named local, not
     // inlined into the deps literal, so the reload section (`[load_shed]`,
@@ -1329,6 +1336,10 @@ async fn build_chain_and_handlers(
         // accrued claim is planned into a chunk promptly rather than waiting the
         // self-tick.
         redeem_hint: Some(redeem_tx.clone()),
+        // Cold-start pool-owner resolve nudge: capability intake meeting an
+        // unknown pool sends its `pool_id` here for the settlement service's
+        // background resolver to fold off the serve hot path.
+        pool_resolve_hint: Some(pool_resolve_tx),
         pull_through,
         local_populate,
         pull_through_origin,
@@ -1405,6 +1416,7 @@ async fn build_chain_and_handlers(
         pool_view,
         redeem_tx,
         redeem_rx,
+        pool_resolve_rx,
     )
     .await
     .context("PaymentPool settlement service bootstrap")?;

@@ -89,6 +89,31 @@ use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus};
 /// lanes without backpressuring the voucher-accept path.
 pub const REDEEM_HINT_CAPACITY: usize = 256;
 
+/// Capacity of the pool-owner resolve-hint channel. The serve path sends a
+/// `pool_id` here when a presented capability names a pool the projection has
+/// not observed (a pool opened before this node's cold-start head, so its
+/// `PoolOpened` predates the forward-only scan). Hints are advisory — a dropped
+/// hint only defers the pool's backfill until the client's next capability
+/// re-send — so a bounded channel that drops on overflow is acceptable.
+pub const POOL_RESOLVE_HINT_CAPACITY: usize = 256;
+
+/// How long the pool-owner resolver suppresses a repeat `getPool` for a pool it
+/// just found not-servable (nonexistent / `Closed`) or that errored. A
+/// not-servable pool never folds into the projection, so its `snapshot` stays
+/// `None`; without this a client re-sending its capability on every request would
+/// drive one `getPool` per request against the same dead pool. On expiry the pool
+/// is re-checked once — the window is short enough that a pool opened after a
+/// negative result still becomes servable within it, long enough to collapse a
+/// request flood to ~one call per pool per window.
+const RESOLVE_NEGATIVE_TTL: Duration = Duration::from_mins(1);
+
+/// Cap on the resolver's negative cache, bounding its memory against a flood of
+/// distinct nonexistent pool ids. At the cap an insert first prunes expired
+/// entries; a flood of live distinct negatives past that simply falls back to the
+/// resolver's own serial rate bound (one in-flight `getPool` at a time) rather
+/// than growing the cache without limit.
+const RESOLVE_NEGATIVE_CACHE_MAX: usize = 4096;
+
 /// Bounded receipt wait for a redemption transaction. A stuck/dropped/replaced tx
 /// must not wedge a background tick; a lapse yields [`TxOutcome::Timeout`], a
 /// non-fatal failure (the tx may still mine later; the claim is at worst deferred,
@@ -235,6 +260,12 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     /// impl aborts whatever remains. A `std::sync::Mutex` (not `tokio`): the guard
     /// is only ever held to `take()` the handle, never across an `.await`.
     redeemer: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The background pool-owner resolver task ([`pool_owner_resolver_loop`]).
+    /// Aborted when the service drops; it also ends on its own once every
+    /// resolve-hint sender is dropped. It has no final work to flush (unlike the
+    /// redeemer), so it needs no quiesce path — the [`crate::chain_events::AbortOnDrop`] guard is the
+    /// whole of its lifecycle management.
+    _resolver: crate::chain_events::AbortOnDrop,
 }
 
 impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
@@ -262,6 +293,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         pool_view: PoolProjection,
         redeem_tx: mpsc::Sender<LaneKey>,
         redeem_rx: mpsc::Receiver<LaneKey>,
+        resolve_rx: mpsc::Receiver<B256>,
     ) -> Result<(Self, Route)> {
         let contract = PaymentPool::new(payment_pool_addr, provider);
 
@@ -338,6 +370,19 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             pool_view.clone(),
         ));
 
+        // Lazy cold-start pool-owner resolver. A pool opened before this node's
+        // `ColdStart::Head` anchor never appears in the forward-only `PoolOpened`
+        // scan, so its owner is absent from the projection and the serve path
+        // cannot verify a presented capability against it. When the serve path
+        // meets such a pool it hints this task, which resolves the owner with one
+        // `getPool` off the serve hot path and folds it in for the client's next
+        // request.
+        let resolver = tokio::spawn(pool_owner_resolver_loop(
+            contract.clone(),
+            pool_view.clone(),
+            resolve_rx,
+        ));
+
         Ok((
             Self {
                 contract,
@@ -351,6 +396,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
                 metrics,
                 pool_view,
                 redeemer: std::sync::Mutex::new(Some(redeemer)),
+                _resolver: crate::chain_events::AbortOnDrop(resolver),
             },
             route,
         ))
@@ -709,6 +755,129 @@ impl PoolSettlementSink {
         }
         self.handler.forget_pool_floor(pool_id).await;
     }
+}
+
+/// Background pool-owner resolver: fold the owner of a cold-start pool the serve
+/// path could not verify a capability against.
+///
+/// The settlement watcher anchors at head
+/// ([`ColdStart::Head`]), so a pool opened
+/// before this node's first-ever boot never appears in the forward-only
+/// `PoolOpened` scan and has no `{owner, deposit}` in the projection. The serve
+/// path fails closed on that missing owner — it drops the presented capability
+/// and never registers the serve lane — which permanently blocks onboarding this
+/// node as a new provider to a pre-existing pool.
+///
+/// This task takes that off the serve hot path: the serve path only sends a
+/// `pool_id` hint, and this loop resolves it with ONE `getPool` and folds an
+/// owner + deposit snapshot into the projection ([`PoolProjection::record_resolved`]).
+/// The client re-sends the capability on its next request (the documented lane
+/// recovery path), and by then the lane registers. Ends cleanly once every
+/// resolve-hint sender is dropped.
+///
+/// A `getPool` fault, a nonexistent pool (`owner == 0`), or a `Closed` pool seeds
+/// nothing: the serve gate stays fail-open `None`, and the client re-hints on its
+/// next request. Seeding a `Closed` (reclaimed) pool would only register a lane
+/// against funds that can no longer be redeemed. Such an outcome is remembered in
+/// a short-TTL negative cache ([`RESOLVE_NEGATIVE_TTL`]) so a client re-requesting
+/// the same dead pool every request cannot drive a `getPool` per request.
+async fn pool_owner_resolver_loop<P: Provider + Clone>(
+    contract: PaymentPool::PaymentPoolInstance<P>,
+    pool_view: PoolProjection,
+    mut resolve_rx: mpsc::Receiver<B256>,
+) {
+    // Owned by this single task, so a plain map needs no synchronization. Holds a
+    // pool id → last-negative instant for pools recently found not-servable or
+    // that errored; a successful resolve removes the entry.
+    let mut negative: HashMap<B256, Instant> = HashMap::new();
+    while let Some(pool_id) = resolve_rx.recv().await {
+        resolve_pool_owner(&contract, &pool_view, pool_id, &mut negative).await;
+    }
+    debug!("pool-owner resolver loop ended (all resolve-hint senders dropped)");
+}
+
+/// Whether `pool_id` is in the negative cache and still fresh — the resolver then
+/// skips the `getPool`. Pure, so the TTL gate is unit-testable without a provider.
+fn negative_cache_hit(cache: &HashMap<B256, Instant>, pool_id: B256) -> bool {
+    cache
+        .get(&pool_id)
+        .is_some_and(|at| at.elapsed() < RESOLVE_NEGATIVE_TTL)
+}
+
+/// Remember `pool_id` as recently not-servable / errored. At the cache cap, prune
+/// expired entries first so a flood of distinct nonexistent ids cannot grow the
+/// map without bound. Pure, so the cap-prune is unit-testable.
+fn remember_negative(cache: &mut HashMap<B256, Instant>, pool_id: B256) {
+    if cache.len() >= RESOLVE_NEGATIVE_CACHE_MAX {
+        cache.retain(|_, at| at.elapsed() < RESOLVE_NEGATIVE_TTL);
+    }
+    cache.insert(pool_id, Instant::now());
+}
+
+/// The serve-path serve status a resolved `getPool` snapshot maps to, or `None`
+/// when the pool is not worth seeding: a zero owner (the pool does not exist, or
+/// a reorg unwound it) or a `Closed` (reclaimed / terminal) pool. Both leave the
+/// serve gate fail-open `None` rather than register a lane against a pool that
+/// can no longer be redeemed. Pure, so the mapping is unit-testable without a
+/// provider.
+fn resolved_lifecycle(pool: &PaymentPool::Pool) -> Option<Lifecycle> {
+    if pool.owner == Address::ZERO {
+        return None;
+    }
+    match pool.status {
+        PaymentPool::Status::Open => Some(Lifecycle::Open),
+        PaymentPool::Status::Closing => Some(Lifecycle::Closing {
+            deadline: pool.disputeDeadline,
+        }),
+        _ => None,
+    }
+}
+
+/// Resolve one cold-start pool: skip if the projection already knows it, else one
+/// `getPool` and fold the snapshot ([`PoolProjection::record_resolved`]) when
+/// [`resolved_lifecycle`] says it is servable.
+async fn resolve_pool_owner<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    pool_view: &PoolProjection,
+    pool_id: B256,
+    negative: &mut HashMap<B256, Instant>,
+) {
+    // A concurrent event fold (or an earlier resolve of the same pool) may have
+    // filled the entry between the hint and here — skip the round-trip.
+    if pool_view.snapshot(pool_id).is_some() {
+        return;
+    }
+    // A pool recently found not-servable (or that errored) is suppressed for the
+    // negative-cache window, so a re-request flood cannot storm `getPool`.
+    if negative_cache_hit(negative, pool_id) {
+        return;
+    }
+    let pool = match contract.getPool(pool_id).call().await {
+        Ok(pool) => pool,
+        Err(err) => {
+            warn!(
+                err = %sanitize_rpc_display(&err),
+                pool_id = %pool_id,
+                "pool-owner resolve: getPool failed; the client re-hints on its next request"
+            );
+            remember_negative(negative, pool_id);
+            return;
+        }
+    };
+    let Some(lifecycle) = resolved_lifecycle(&pool) else {
+        debug!(pool_id = %pool_id, "pool-owner resolve: pool absent or closed; not seeding");
+        remember_negative(negative, pool_id);
+        return;
+    };
+    pool_view.record_resolved(pool_id, pool.owner, U256::from(pool.deposit), lifecycle);
+    // A later reopen at the same id (or a transient error that has since cleared)
+    // must not stay suppressed once the pool actually resolves.
+    negative.remove(&pool_id);
+    debug!(
+        pool_id = %pool_id,
+        owner = %pool.owner,
+        "resolved cold-start pool owner via getPool"
+    );
 }
 
 /// Redemption task: chunk lanes' accrued claims and `redeemMany` a chunk once
@@ -1563,6 +1732,90 @@ mod tests {
     #[test]
     fn unknown_pool_fails_open() {
         assert!(pool_is_redeemable(None, 1_000));
+    }
+
+    fn pool(owner: Address, status: PaymentPool::Status, deadline: u64) -> PaymentPool::Pool {
+        PaymentPool::Pool {
+            owner,
+            status,
+            disputeDeadline: deadline,
+            deposit: 1_000,
+            totalRedeemed: 0,
+        }
+    }
+
+    #[test]
+    fn resolved_lifecycle_open_pool_is_servable() {
+        let p = pool(Address::from([7u8; 20]), PaymentPool::Status::Open, 0);
+        assert_eq!(resolved_lifecycle(&p), Some(Lifecycle::Open));
+    }
+
+    #[test]
+    fn resolved_lifecycle_closing_pool_carries_its_deadline() {
+        let p = pool(
+            Address::from([7u8; 20]),
+            PaymentPool::Status::Closing,
+            1_900_000_000,
+        );
+        assert_eq!(
+            resolved_lifecycle(&p),
+            Some(Lifecycle::Closing {
+                deadline: 1_900_000_000
+            })
+        );
+    }
+
+    fn stale_instant() -> Instant {
+        // An instant older than the negative-cache TTL, for the freshness gate.
+        Instant::now()
+            .checked_sub(RESOLVE_NEGATIVE_TTL + Duration::from_secs(1))
+            .unwrap_or_else(Instant::now)
+    }
+
+    #[test]
+    fn negative_cache_hit_only_for_a_fresh_entry() {
+        let mut cache: HashMap<B256, Instant> = HashMap::new();
+        let id = B256::repeat_byte(0x33);
+        assert!(!negative_cache_hit(&cache, id), "an absent id is not a hit");
+        remember_negative(&mut cache, id);
+        assert!(
+            negative_cache_hit(&cache, id),
+            "a just-recorded id is a hit"
+        );
+        cache.insert(id, stale_instant());
+        assert!(
+            !negative_cache_hit(&cache, id),
+            "an entry past the TTL is re-checked, not suppressed"
+        );
+    }
+
+    #[test]
+    fn remember_negative_prunes_expired_entries_at_the_cap() {
+        let mut cache: HashMap<B256, Instant> = HashMap::new();
+        // Fill to the cap with stale entries, then record one more: the insert
+        // prunes the expired ones instead of growing past the cap.
+        for i in 0..RESOLVE_NEGATIVE_CACHE_MAX {
+            let id = B256::from(U256::from(i).to_be_bytes::<32>());
+            cache.insert(id, stale_instant());
+        }
+        assert_eq!(cache.len(), RESOLVE_NEGATIVE_CACHE_MAX);
+        remember_negative(&mut cache, B256::repeat_byte(0xff));
+        assert_eq!(
+            cache.len(),
+            1,
+            "the cap-prune drops every expired entry, leaving only the fresh insert"
+        );
+    }
+
+    #[test]
+    fn resolved_lifecycle_skips_zero_owner_and_closed() {
+        // A nonexistent pool (zero owner) and a reclaimed (Closed) pool both seed
+        // nothing — the serve gate stays fail-open None rather than register a lane
+        // against funds that cannot be redeemed.
+        let no_owner = pool(Address::ZERO, PaymentPool::Status::Open, 0);
+        assert_eq!(resolved_lifecycle(&no_owner), None);
+        let closed = pool(Address::from([7u8; 20]), PaymentPool::Status::Closed, 0);
+        assert_eq!(resolved_lifecycle(&closed), None);
     }
 
     #[test]
