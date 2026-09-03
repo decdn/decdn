@@ -127,9 +127,9 @@ keystore consults the same three, and takes the first one that is **present**:
 1. The `DECDN_KEYSTORE_PASSWORD` environment variable.
 2. A password file: `--keystore-password-file` (env
    `DECDN_KEYSTORE_PASSWORD_FILE`) on `decdn-node run`, `decdn fetch`,
-   `decdn bundle pull`, `decdn pool`, and the operator commands; spelled
-   `--password-file` on `decdn key-gen`. One trailing newline is stripped;
-   other whitespace is part of the password.
+   `decdn bundle pull`, `decdn pool`, the operator commands, and
+   `decdn key-gen`. One trailing newline is stripped; other whitespace is
+   part of the password.
 3. An interactive prompt, when `stdin` is a TTY.
 
 **Presence decides, not content.** A variable that is set supplies its value

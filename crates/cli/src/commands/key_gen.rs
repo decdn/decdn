@@ -44,7 +44,7 @@ pub fn key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
     // alone — a password arriving from the env var or the file is used as
     // given, which is why the empty-password warning below is unconditional.
     let password = eth_identity::read_password(
-        &super::chain_ctx::password_sources(args.password_file.as_deref(), true),
+        &super::chain_ctx::password_sources(args.keystore_password_file.as_deref(), true),
         "eth keystore password",
     )?;
 

@@ -53,7 +53,7 @@ fn keystore(out: &TempDir) -> PathBuf {
 
 /// `DECDN_KEYSTORE_PASSWORD=""` is a deliberate empty password, not an unset
 /// variable, so it is used — and being first in precedence, it outranks the
-/// `--password-file` alongside it.
+/// `--keystore-password-file` alongside it.
 #[test]
 fn an_empty_env_password_is_used_and_outranks_the_password_file() {
     let (home, out) = dirs();
@@ -61,7 +61,7 @@ fn an_empty_env_password_is_used_and_outranks_the_password_file() {
     fs::write(&pw_file, b"not-this-one").unwrap();
 
     let output = run(key_gen(home.path(), out.path())
-        .arg("--password-file")
+        .arg("--keystore-password-file")
         .arg(&pw_file)
         .env(eth_identity::KEYSTORE_PASSWORD_ENV, ""));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -80,7 +80,7 @@ fn an_empty_env_password_is_used_and_outranks_the_password_file() {
 }
 
 /// The other half of the presence rule: an unset variable still falls through
-/// to `--password-file`, which is what every other `key-gen` test assumes.
+/// to `--keystore-password-file`, which is what every other `key-gen` test assumes.
 #[test]
 fn an_unset_env_password_falls_through_to_the_password_file() {
     let (home, out) = dirs();
@@ -88,7 +88,7 @@ fn an_unset_env_password_falls_through_to_the_password_file() {
     fs::write(&pw_file, b"hunter2\n").unwrap();
 
     let output = run(key_gen(home.path(), out.path())
-        .arg("--password-file")
+        .arg("--keystore-password-file")
         .arg(&pw_file));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "key-gen failed: {stderr}");
@@ -99,7 +99,7 @@ fn an_unset_env_password_falls_through_to_the_password_file() {
     );
 }
 
-/// An empty `--password-file` is a file that exists, so it supplies the empty
+/// An empty `--keystore-password-file` is a file that exists, so it supplies the empty
 /// password rather than falling through to a prompt no daemon can answer.
 #[test]
 fn an_empty_password_file_creates_an_empty_password_keystore() {
@@ -108,7 +108,7 @@ fn an_empty_password_file_creates_an_empty_password_keystore() {
     fs::write(&pw_file, b"").unwrap();
 
     let output = run(key_gen(home.path(), out.path())
-        .arg("--password-file")
+        .arg("--keystore-password-file")
         .arg(&pw_file));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "key-gen failed: {stderr}");
@@ -128,7 +128,7 @@ fn a_non_utf8_env_password_is_fatal_and_does_not_echo_the_value() {
     let bad = OsString::from_vec(vec![0x70, 0xff, 0x77]);
 
     let output = run(key_gen(home.path(), out.path())
-        .arg("--password-file")
+        .arg("--keystore-password-file")
         .arg(&pw_file)
         .env(eth_identity::KEYSTORE_PASSWORD_ENV, &bad));
     assert!(
@@ -150,7 +150,7 @@ fn a_non_utf8_env_password_is_fatal_and_does_not_echo_the_value() {
     );
 }
 
-/// `--password-file '~/pw.txt'` reaches the process literally when the shell
+/// `--keystore-password-file '~/pw.txt'` reaches the process literally when the shell
 /// quotes it, so the CLI expands it. Under the presence rule an unexpanded
 /// `~/pw.txt` would fall through as a missing file instead of erroring, so
 /// nothing else would notice the expansion being dropped.
@@ -160,7 +160,7 @@ fn a_tilde_password_file_is_expanded_against_home() {
     fs::write(home.path().join("pw.txt"), b"hunter2\n").unwrap();
 
     let output = run(key_gen(home.path(), out.path())
-        .arg("--password-file")
+        .arg("--keystore-password-file")
         .arg("~/pw.txt"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "key-gen failed: {stderr}");
@@ -168,7 +168,7 @@ fn a_tilde_password_file_is_expanded_against_home() {
         .expect("the tilde path must resolve to the file under HOME");
 }
 
-/// A `--password-file` that does not exist falls through rather than erroring
+/// A `--keystore-password-file` that does not exist falls through rather than erroring
 /// at the read. With no TTY and no env var every source is exhausted, and the
 /// resulting error names the path that was tried — which is what keeps a typo
 /// diagnosable.
@@ -178,7 +178,7 @@ fn a_missing_password_file_fails_naming_the_path() {
     let missing = out.path().join("nope.pw");
 
     let output = run(key_gen(home.path(), out.path())
-        .arg("--password-file")
+        .arg("--keystore-password-file")
         .arg(&missing));
     assert!(!output.status.success(), "a missing file must not succeed");
     let stderr = String::from_utf8_lossy(&output.stderr);

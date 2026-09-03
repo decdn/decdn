@@ -22,5 +22,5 @@ pub struct KeyGenArgs {
     /// that does not exist falls through; one that exists but cannot be read is
     /// an error.
     #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
-    pub password_file: Option<PathBuf>,
+    pub keystore_password_file: Option<PathBuf>,
 }

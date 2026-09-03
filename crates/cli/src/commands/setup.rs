@@ -207,7 +207,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             let kg = cli::KeyGenArgs {
                 output_dir: Some(resolved.data_dir.clone()),
                 force: false,
-                password_file: args.chain.common.keystore_password_file.clone(),
+                keystore_password_file: args.chain.common.keystore_password_file.clone(),
             };
             key_gen::key_gen(&kg).context("key generation failed")?;
             keys_generated = true;
