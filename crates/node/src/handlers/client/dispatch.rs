@@ -378,6 +378,14 @@ impl ClientHandler {
             Some(view) => view.status(B256::from(req.pool_id)).await,
             None => None,
         };
+        if pool_status.is_none() {
+            // One bump per request, HERE rather than at each gate: the skip is decided
+            // once and skips several, so a per-gate counter would multiply one cause.
+            // It makes the fail-open countable — without it a stream abandoned in this
+            // window spends floor credit that debits no signer's bucket and appears in
+            // no series.
+            self.metrics.floor_gate_skipped_no_pool_view();
+        }
 
         // Serve-path origin-blacklist gate (ADR 011 §On Blacklist Event): refuse a
         // pool whose FUNDER (`getPool.owner`) is on the operator's local

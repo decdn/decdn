@@ -2376,6 +2376,9 @@ pub async fn run(
     )
     .await?;
 
+    // Kept past the router so shutdown can drain the floor-bucket persist worker, once
+    // every serve has returned and every `FloorReservation` has dropped.
+    let client_handler = Arc::clone(&ch.client_handler);
     let (router, signal) = serve_until_shutdown(
         &reload_state,
         config_path.as_deref(),
@@ -2383,7 +2386,7 @@ pub async fn run(
         ServeInputs {
             ep: infra.ep,
             probe_handler: ch.probe_handler,
-            client_handler: ch.client_handler,
+            client_handler: Arc::clone(&client_handler),
             dht_handler: ch.dht_handler,
             blacklist_ready_rx: ch.blacklist_ready_rx,
         },
@@ -2411,6 +2414,7 @@ pub async fn run(
         warming_creditor: ch.warming_creditor,
         lane_flush_task: infra.lane_flush_task,
         channel_state_store: infra.channel_state_store,
+        client_handler,
         node_metrics: infra.node_metrics,
         tasks: bg.tasks,
     };
@@ -2457,6 +2461,9 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     /// flush of `channel_state_store`.
     lane_flush_task: tokio::task::JoinHandle<()>,
     channel_state_store: Arc<dyn PoolStateStore>,
+    /// Held only so the floor-bucket persist worker can be drained below, once every
+    /// serve has returned and every `FloorReservation` has dropped.
+    client_handler: Arc<ClientHandler>,
     node_metrics: Arc<metrics::Metrics>,
     tasks: JoinSet<()>,
 }
@@ -2496,6 +2503,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
         warming_creditor,
         lane_flush_task,
         channel_state_store,
+        client_handler,
         node_metrics,
         mut tasks,
     } = handles;
@@ -2647,6 +2655,29 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // idempotent to re-scan. Bounded by the deadline
     // so a slow RPC cannot hang shutdown.
     payment_service.shutdown(SHUTDOWN_DEADLINE).await;
+
+    // Drain the floor-bucket persist worker. The router has drained, so every
+    // `FloorReservation` has dropped and queued whatever it debited; this waits for
+    // that backlog to reach disk. A write lost here hands its signer back an
+    // abandonment allowance it has already spent, on the next boot.
+    //
+    // Bounded, unlike the cache flush below: the backlog is one `Durability::Immediate`
+    // commit per queued write processed serially, and a `spawn_blocking` issued once
+    // the blocking pool is shutting down yields a handle that never resolves — so an
+    // unbounded await here can hang shutdown outright rather than merely slow it. A
+    // timeout is counted as a persist failure because the consequence matches a failed
+    // write: the durable snapshot stays behind the in-memory one.
+    if tokio::time::timeout(SHUTDOWN_DEADLINE, client_handler.flush_floor_persists())
+        .await
+        .is_err()
+    {
+        node_metrics.floor_loss_persist_failure();
+        tracing::warn!(
+            deadline = ?SHUTDOWN_DEADLINE,
+            "floor-bucket persist drain overran the shutdown deadline; queued snapshots \
+             may not have reached disk"
+        );
+    }
 
     // Final durable flush before stop, so the last interval of frontier lands.
     // The router has drained and the redeem sweep above already ran, so the

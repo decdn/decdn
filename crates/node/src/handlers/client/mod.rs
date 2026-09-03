@@ -985,6 +985,10 @@ pub struct ClientHandler {
     /// only). A [`FloorReservation`]'s `Drop` writes the signer's new bucket snapshot
     /// here best-effort on an abnormal exit.
     floor_loss_store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
+    /// How a [`FloorReservation`]'s `Drop` makes its bucket snapshot durable —
+    /// normally a `send` to the persist worker, which neither blocks nor awaits and so
+    /// is safe from a `Drop`. Carries its own fallbacks; see `floor::FloorPersist`.
+    floor_persist: floor::FloorPersist,
     /// Per-signer LIVE concurrency cap `k`, in credit windows
     /// (see [`ClientHandlerDeps::pool_floor_signer_live_windows`]). Read by
     /// [`Self::signer_floor_cap`] on every admission
@@ -1179,6 +1183,7 @@ impl ClientHandler {
         // Fails CLOSED, like the lane-state hydration above: starting empty would
         // silently grant every signer a fresh abandonment allowance.
         let pool_floor = floor::hydrate(deps.floor_loss_store.as_ref())?;
+        let floor_persist = floor::FloorPersist::new(deps.floor_loss_store.clone(), &deps.metrics);
         Ok(Self {
             node_id: deps.node_id,
             metrics: deps.metrics,
@@ -1200,6 +1205,7 @@ impl ClientHandler {
             capability_verify_cache: std::sync::Mutex::new(CapabilityVerifyCache::default()),
             pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
             floor_loss_store: deps.floor_loss_store,
+            floor_persist,
             pool_floor_signer_live_windows: deps.pool_floor_signer_live_windows,
             pool_floor_signer_bucket_windows: deps.pool_floor_signer_bucket_windows,
             pool_floor_signer_refill_secs: deps.pool_floor_signer_refill_secs,

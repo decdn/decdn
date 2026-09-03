@@ -442,6 +442,23 @@ tops up — see
 `decdn_node_pull_refused_unattributable_total` climbing toward
 `decdn_node_pull_refused_total` instead.
 
+The mirror image of every cause above is
+`decdn_floor_gate_skipped_no_pool_view_total` climbing: requests that reached the
+pool-view resolve and found no answer for the pool, so the floor gates were skipped
+rather than refused. It counts the exposure, not requests served — the bump precedes
+every later refusal, and one `None` view skips more than one gate — so read it as an
+upper bound rather than dividing it against a per-gate rate.
+
+That fail-open is deliberate: a watcher blip must not refuse paying clients, and the
+open-time hash gates plus the first voucher's on-chain `redeem` still carry compliance
+and revenue. It is contained, since capability intake fails closed on an unknown pool
+owner. What it costs is accounting — a stream abandoned inside that window debits no
+abandonment bucket at all, so its signer keeps an allowance it has spent. In production
+the pool view is always wired, so a sustained rate means the chain watcher is lagging or
+its reads are failing; check `decdn_settlement_watcher_last_tick_timestamp_seconds` as
+in remediation step (2) below and treat it as cause (2). A brief burst right after
+start-up, while the watcher backfills, is expected.
+
 **Remediate:**
 
 1. Distinguish the two causes. Take a channel id from the `warn!` line and compare
