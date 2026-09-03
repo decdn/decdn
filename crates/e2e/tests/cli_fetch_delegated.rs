@@ -215,7 +215,7 @@ async fn run() -> anyhow::Result<()> {
         grant.signer
     );
     anyhow::ensure!(
-        grant.spending_cap == U256::from(DELEGATE_CAP_MICRO_USDC),
+        grant.spending_cap == DELEGATE_CAP_MICRO_USDC,
         "token cap {} does not match the assigned finite cap {DELEGATE_CAP_MICRO_USDC}",
         grant.spending_cap
     );
@@ -273,7 +273,7 @@ async fn run() -> anyhow::Result<()> {
     .await?
     .context("delegate signer was never registered on-chain (getAuthorization.cap stayed zero)")?;
     anyhow::ensure!(
-        U256::from(auth.cap) == grant.spending_cap,
+        auth.cap == grant.spending_cap,
         "registered cap {} must equal the delegated capability's FINITE cap {}",
         auth.cap,
         grant.spending_cap

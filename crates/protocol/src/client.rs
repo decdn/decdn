@@ -285,9 +285,11 @@ impl ClientBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireCapability {
     /// Maximum cumulative amount the signer may spend against the pool under
-    /// this grant, big-endian `uint256` (mirrors [`Voucher::amount`] — no
-    /// `U256` in the protocol crate).
-    pub spending_cap: [u8; 32],
+    /// this grant. A `u64`, matching the `PaymentPool.spendingCap` on-chain
+    /// storage/calldata width exactly — the node zero-extends it to a `uint256`
+    /// word when it reconstructs the EIP-712 capability digest (just as it does
+    /// [`Voucher::amount`]).
+    pub spending_cap: u64,
     /// Unix-seconds expiry. After it, vouchers under this capability are no
     /// longer redeemable.
     pub expiry: u64,
@@ -1315,7 +1317,7 @@ mod tests {
 
     fn sample_capability() -> WireCapability {
         WireCapability {
-            spending_cap: [0x22u8; 32],
+            spending_cap: 0x2222_2222_2222_2222,
             expiry: 1_800_000_000,
             owner_signature: vec![0x03u8; VOUCHER_SIG_LEN],
         }
@@ -1419,7 +1421,7 @@ mod tests {
     #[test]
     fn wire_capability_rejects_empty_signature() {
         let cap = WireCapability {
-            spending_cap: [0u8; 32],
+            spending_cap: 0,
             expiry: 0,
             owner_signature: Vec::new(),
         };
@@ -1434,7 +1436,7 @@ mod tests {
         let ext = StreamRequestExt {
             binding: None,
             capability: Some(WireCapability {
-                spending_cap: [0u8; 32],
+                spending_cap: 0,
                 expiry: 0,
                 owner_signature: Vec::new(),
             }),

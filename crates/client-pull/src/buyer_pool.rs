@@ -194,7 +194,7 @@ pub fn grade_deposit_credit(
 pub fn issue_self_capability(
     owner_signer: &PrivateKeySigner,
     pool_id: B256,
-    spending_cap: U256,
+    spending_cap: u64,
     expiry: u64,
     voucher_domain: &Eip712Domain,
 ) -> Result<SignedCapability> {
@@ -420,10 +420,9 @@ const SELF_CAPABILITY_EXPIRY: u64 = u64::MAX;
 /// `uint64 spendingCap` can hold, which is the effective "no
 /// delegated ceiling" for an owner spending against its own pool. The real
 /// bound is the deposit: redemption pays `min(desired, cap - spent, remaining)`.
-/// It is signed as a full EIP-712 word, so it must be a value the contract's
-/// narrower field can also carry — `U256::MAX` would hash to a word the
-/// contract can never reconstruct.
-pub const SELF_CAPABILITY_CAP: U256 = U256::from_limbs([u64::MAX, 0, 0, 0]);
+/// A `u64` by type, matching the contract field exactly, so it can never sign a
+/// cap the narrower on-chain field cannot reconstruct.
+pub const SELF_CAPABILITY_CAP: u64 = u64::MAX;
 
 /// Typed marker attached to a `top_up` submit error whose revert is an
 /// `ERC20InsufficientAllowance` shortfall: the `PaymentPool`'s standing USDC
@@ -612,13 +611,8 @@ mod tests {
     fn issue_self_capability_recovers_to_owner() -> anyhow::Result<()> {
         let owner = PrivateKeySigner::random();
         let pool_id = B256::repeat_byte(0x11);
-        let cap: SignedCapability = issue_self_capability(
-            &owner,
-            pool_id,
-            U256::from(1_000_000u64),
-            u64::MAX,
-            &domain(),
-        )?;
+        let cap: SignedCapability =
+            issue_self_capability(&owner, pool_id, 1_000_000u64, u64::MAX, &domain())?;
         assert_eq!(cap.recover_owner(&domain())?, owner.address());
         assert_eq!(
             cap.capability.signer,
@@ -636,20 +630,8 @@ mod tests {
     fn regenerated_capability_is_deterministic_for_same_params() -> anyhow::Result<()> {
         let owner = PrivateKeySigner::random();
         let pool_id = B256::repeat_byte(0x22);
-        let a = issue_self_capability(
-            &owner,
-            pool_id,
-            U256::from(5_000u64),
-            1_900_000_000,
-            &domain(),
-        )?;
-        let b = issue_self_capability(
-            &owner,
-            pool_id,
-            U256::from(5_000u64),
-            1_900_000_000,
-            &domain(),
-        )?;
+        let a = issue_self_capability(&owner, pool_id, 5_000u64, 1_900_000_000, &domain())?;
+        let b = issue_self_capability(&owner, pool_id, 5_000u64, 1_900_000_000, &domain())?;
         assert_eq!(
             a.signature, b.signature,
             "regenerated signatures must match"

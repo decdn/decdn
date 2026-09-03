@@ -35,7 +35,7 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_pool::{
-    LOW_WATER_DIVISOR, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
+    LOW_WATER_DIVISOR, SELF_CAPABILITY_CAP, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
     grade_deposit_credit, issue_self_capability, open_pool, refill_amount, top_up,
     topped_up_effect,
 };
@@ -2342,15 +2342,21 @@ where
                 .get_by_pool_id(state.pool_id)?
                 .ok_or_else(|| escrowed_but_untracked(&effect, tx, "the credited row vanished"))?
         };
-        // Uncapped: a self-owned capability delegates spend to the owner's own
-        // key, so the pool deposit — not the capability cap — is the real
-        // spending bound. Capping at `state.deposit` here would freeze the
+        // Effectively uncapped: a self-owned capability delegates spend to the
+        // owner's own key, so the pool deposit — not the capability cap — is the
+        // real spending bound. Capping at `state.deposit` here would freeze the
         // on-chain cap at the pre-top-up deposit (`_registerCapability` is
-        // idempotent past first redemption) and reject spend past it.
+        // idempotent past first redemption) and reject spend past it. The cap is
+        // `SELF_CAPABILITY_CAP` (`u64::MAX` µUSDC, ~$18.4T), NOT `U256::MAX`: the
+        // `PaymentPool`'s `spendingCap` is a `uint64`, so a `U256::MAX` cap hashes
+        // to a word the contract can never reconstruct and every redemption of this
+        // lane's vouchers reverts, silently stranding the node's earnings (and,
+        // because the node's exhaustion gate keys on `deposit − totalRedeemed`,
+        // starving the reactive top-up path). Matches `open_pool`'s self-capability.
         let capability = issue_self_capability(
             signer.as_ref(),
             state.pool_id,
-            U256::MAX,
+            SELF_CAPABILITY_CAP,
             SELF_CAPABILITY_EXPIRY,
             voucher_domain,
         )?;

@@ -321,7 +321,7 @@ fn client_binding_ext(ctx: &PoolContext) -> Option<StreamRequestExt> {
     Some(StreamRequestExt {
         binding: ctx.client_binding.clone(),
         capability: ctx.capability.as_ref().map(|signed| WireCapability {
-            spending_cap: signed.capability.spending_cap.to_be_bytes(),
+            spending_cap: signed.capability.spending_cap,
             expiry: signed.capability.expiry,
             owner_signature: signed.signature.as_bytes().to_vec(),
         }),
@@ -3605,7 +3605,7 @@ mod tests {
         let owner = PrivateKeySigner::random();
         let capability = decdn_incentive::Capability {
             signer: signer.address(),
-            spending_cap: U256::from(10_000_000u64),
+            spending_cap: 10_000_000u64,
             pool_id: B256::ZERO,
             expiry: 1_900_000_000,
         }
@@ -3617,7 +3617,7 @@ mod tests {
             .capability
             .ok_or_else(|| anyhow::anyhow!("ext must carry the capability"))?;
         anyhow::ensure!(
-            wire_cap.spending_cap == capability.capability.spending_cap.to_be_bytes(),
+            wire_cap.spending_cap == capability.capability.spending_cap,
             "spending_cap must round-trip to wire form"
         );
         anyhow::ensure!(

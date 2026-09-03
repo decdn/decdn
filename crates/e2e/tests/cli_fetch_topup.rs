@@ -366,7 +366,7 @@ const MULTI_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB
 
 // A single-invocation reactive MID-STREAM top-up extends a fetch past its
 // opening deposit: `cli/src/commands/fetch.rs::open_or_reuse_pool` signs the
-// self-capability with `spending_cap = U256::MAX`, so the on-chain cap
+// self-capability with `spending_cap = SELF_CAPABILITY_CAP` (`u64::MAX`), so the on-chain cap
 // `PaymentPool._registerCapability` fixes at first redemption never binds. The
 // pool deposit — not the capability cap — is the real spending bound, and
 // `redeem` pays `min(desired, cap-spent, remaining)` against whatever the

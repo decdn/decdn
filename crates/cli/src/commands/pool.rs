@@ -505,7 +505,7 @@ async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyho
     let owner_signer = load_buyer_signer(&chain.keystore)?;
     let owner = owner_signer.address();
     let domain = voucher_domain(chain.chain_id, chain.payment_pool);
-    let spending_cap = U256::from(args.cap_micro_usdc);
+    let spending_cap = args.cap_micro_usdc;
 
     let capability = Capability {
         signer: signer_addr,
@@ -545,7 +545,7 @@ async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyho
     println!("delegate:     {signer_addr} (the voucher-signing key this authorizes)");
     println!(
         "spending cap: {} USDC ({} µUSDC)",
-        format_usdc_u256(spending_cap),
+        format_usdc_u256(U256::from(spending_cap)),
         args.cap_micro_usdc
     );
     println!("expiry:       {}", format_expiry(expiry, now));

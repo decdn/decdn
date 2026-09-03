@@ -136,8 +136,10 @@ const CHECKPOINT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// capability and rides the stored registration.
 #[derive(Clone, Debug)]
 pub struct CapabilityMaterial {
-    /// The signer's cumulative spending cap (token base units).
-    pub spending_cap: U256,
+    /// The signer's cumulative spending cap (token base units). A `u64`,
+    /// matching the `PaymentPool.spendingCap` calldata width — it is placed
+    /// straight into [`PaymentPool::CapabilityReg`] with no narrowing.
+    pub spending_cap: u64,
     /// Capability expiry (Unix seconds).
     pub expiry: u64,
     /// The pool owner's signature over the EIP-712 `Capability`.
@@ -955,7 +957,7 @@ fn plan_lane(
             };
             Some(PaymentPool::CapabilityReg {
                 signer: key.signer,
-                spendingCap: to_pool_u64(material.spending_cap, "spending cap")?,
+                spendingCap: material.spending_cap,
                 expiry: material.expiry,
                 ownerSig: material.owner_sig,
             })
@@ -2000,7 +2002,7 @@ mod tests {
 
     fn material() -> CapabilityMaterial {
         CapabilityMaterial {
-            spending_cap: U256::from(1_000_000u64),
+            spending_cap: 1_000_000u64,
             expiry: 1_800_000_000,
             owner_sig: Bytes::from(vec![9u8; 65]),
         }

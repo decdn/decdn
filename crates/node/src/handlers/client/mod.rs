@@ -1878,7 +1878,7 @@ impl ClientHandler {
             tracing::debug!(%pool_id, %signer, "dropping capability: pool owner unavailable, cannot verify");
             return;
         };
-        let spending_cap = U256::from_be_bytes(capability.spending_cap);
+        let spending_cap = capability.spending_cap;
         let expiry = capability.expiry;
         // Only the common EOA (65-byte) owner signature is recoverable off-chain;
         // a contract-wallet signature is dropped rather than persisted unverified.
@@ -1939,7 +1939,9 @@ impl ClientHandler {
             pool_id,
             signer,
             self.eth_signer.address(),
-            spending_cap,
+            // `LaneState.cap` stays a `U256`; the capability's `u64` cap
+            // zero-extends into it losslessly.
+            U256::from(spending_cap),
             expiry,
             U256::ZERO,
             U256::ZERO,
@@ -3723,7 +3725,7 @@ mod tests {
             &self,
             pool_id: B256,
             signer: Address,
-            _spending_cap: U256,
+            _spending_cap: u64,
             _expiry: u64,
             _owner_sig: &[u8],
         ) {
@@ -3821,7 +3823,7 @@ mod tests {
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let pool_id = B256::repeat_byte(0x77);
         let signer = Address::repeat_byte(0x11);
-        let spending_cap = U256::from(1_000_000u64);
+        let spending_cap = 1_000_000u64;
         let expiry = 1_900_000_000u64;
 
         let make_wire = |key: &PrivateKeySigner| -> decdn_protocol::client::WireCapability {
@@ -3834,7 +3836,7 @@ mod tests {
             .sign(key, &domain)
             .expect("sign capability");
             decdn_protocol::client::WireCapability {
-                spending_cap: spending_cap.to_be_bytes(),
+                spending_cap,
                 expiry,
                 owner_signature: signed_cap.signature.as_bytes().to_vec(),
             }
@@ -3961,7 +3963,7 @@ mod tests {
         let signer = Address::repeat_byte(0x34);
         let signed = Capability {
             signer,
-            spending_cap: U256::from(1_000_000u64),
+            spending_cap: 1_000_000u64,
             pool_id,
             expiry: 1_900_000_000,
         }
@@ -3975,7 +3977,7 @@ mod tests {
         let bytes = twin.as_bytes();
 
         let wire = decdn_protocol::client::WireCapability {
-            spending_cap: signed.capability.spending_cap.to_be_bytes(),
+            spending_cap: signed.capability.spending_cap,
             expiry: signed.capability.expiry,
             owner_signature: bytes.to_vec(),
         };
@@ -4023,14 +4025,14 @@ mod tests {
         let signer = Address::repeat_byte(0x34);
         let signed = Capability {
             signer,
-            spending_cap: U256::from(1_000_000u64),
+            spending_cap: 1_000_000u64,
             pool_id,
             expiry: 1_900_000_000,
         }
         .sign(&owner, &domain)
         .expect("sign capability");
         let wire = decdn_protocol::client::WireCapability {
-            spending_cap: signed.capability.spending_cap.to_be_bytes(),
+            spending_cap: signed.capability.spending_cap,
             expiry: signed.capability.expiry,
             owner_signature: signed.signature.as_bytes().to_vec(),
         };
@@ -4079,7 +4081,7 @@ mod tests {
         .sign(&other, &domain)
         .expect("sign capability");
         let forged_wire = decdn_protocol::client::WireCapability {
-            spending_cap: forged.capability.spending_cap.to_be_bytes(),
+            spending_cap: forged.capability.spending_cap,
             expiry: forged.capability.expiry,
             owner_signature: forged.signature.as_bytes().to_vec(),
         };

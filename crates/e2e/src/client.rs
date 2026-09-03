@@ -834,7 +834,7 @@ impl ClientFixture {
         let capability = decdn_client_pull::buyer_pool::issue_self_capability(
             self.signer.as_ref(),
             pool_id,
-            U256::MAX,
+            decdn_client_pull::buyer_pool::SELF_CAPABILITY_CAP,
             u64::MAX,
             &voucher_dom,
         )
@@ -871,7 +871,7 @@ impl PoolSession {
 /// (`client-pull` does the same internally on the `stream_fetch` path).
 fn signed_to_wire_capability(signed: &SignedCapability) -> WireCapability {
     WireCapability {
-        spending_cap: signed.capability.spending_cap.to_be_bytes(),
+        spending_cap: signed.capability.spending_cap,
         expiry: signed.capability.expiry,
         owner_signature: signed.signature.as_bytes().to_vec(),
     }
