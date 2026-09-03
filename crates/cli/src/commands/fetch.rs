@@ -109,9 +109,10 @@ pub(crate) fn micros_now() -> u64 {
 /// TTY-aware — `indicatif` hides it automatically when stderr is not a terminal,
 /// so a piped/redirected fetch emits no bar. A steady tick animates the spinner
 /// during the pre-byte connect/handshake so the command never looks hung. The
-/// bar counts **wire** bytes (content plus interleaved bao proof), so its total
-/// runs slightly above the final content-byte count printed on completion — it
-/// tracks the transfer, not the payload size.
+/// bar counts **delivered content bytes** against the blob's content size — the
+/// driver reports `base_present + received` (verified ranged-store leaf bytes),
+/// not the wire size, so its total matches the byte count printed on
+/// completion.
 fn new_progress_bar() -> indicatif::ProgressBar {
     let style = indicatif::ProgressStyle::with_template(
         // Rate/ETA come from `{msg}` (see `delivery_progress`), not the built-in
@@ -2018,6 +2019,10 @@ const RATE_SMOOTHING_TAU_SECS: f64 = 3.0;
 /// Rolling delivery-rate estimate behind the progress bar's `{msg}`, and the
 /// running totals the end-of-fetch summary reads back.
 ///
+/// The bar's positions are cumulative **delivered content bytes** — the driver
+/// reports `base_present + received` against the blob's content size, where
+/// `received` is the ranged store's verified-leaf count — not wire bytes.
+///
 /// Each `set_position` on the bar is bursty — many chunks land in one instant,
 /// then a gap — so a naive `delta / dt` per callback spikes and collapses. This
 /// holds a time-weighted exponential moving average instead: each sample folds
@@ -2025,9 +2030,13 @@ const RATE_SMOOTHING_TAU_SECS: f64 = 3.0;
 /// how unevenly callbacks are spaced.
 #[derive(Default)]
 struct SpeedState {
-    /// Instant of the first byte, and total elapsed anchor for the summary.
-    started: Option<Instant>,
-    /// Instant and cumulative wire bytes at the previous sample.
+    /// Instant and cumulative-byte position at the first observed sample. The
+    /// summary measures elapsed and bytes-moved from here, so a resumed fetch
+    /// (which starts at a non-zero `base_present`) reports only what this run
+    /// actually transferred rather than dividing already-present bytes by this
+    /// run's short window.
+    started: Option<(Instant, u64)>,
+    /// Instant and cumulative delivered content bytes at the previous sample.
     last: Option<(Instant, u64)>,
     /// Smoothed rate in bytes/sec. `None` until the second sample gives a `dt`.
     ewma_bps: Option<f64>,
@@ -2077,7 +2086,7 @@ fn fmt_eta(remaining_bytes: u64, bps: f64) -> String {
     }
 }
 
-/// Reads the transfer duration and total wire bytes back from a
+/// Reads the transfer duration and bytes moved this run back from a
 /// [`SpeedState`] after the bar finishes, for the end-of-fetch summary.
 #[derive(Clone)]
 struct DeliveryMeter {
@@ -2085,13 +2094,18 @@ struct DeliveryMeter {
 }
 
 impl DeliveryMeter {
-    /// `(elapsed since first byte, total wire bytes delivered)`, or `None` if no
-    /// byte ever arrived (a failure before delivery) or the lock is poisoned.
+    /// `(elapsed across this run, content bytes this run transferred)`, or
+    /// `None` if no byte ever arrived (a failure before delivery) or the lock is
+    /// poisoned. Both are measured from the first observed sample, so a resumed
+    /// fetch excludes the already-present `base_present` bytes it did not move.
     fn summary(&self) -> Option<(Duration, u64)> {
         let state = self.state.lock().ok()?;
-        let started = state.started?;
+        let (start_at, start_bytes) = state.started?;
         let (last_at, last_bytes) = state.last?;
-        Some((last_at.saturating_duration_since(started), last_bytes))
+        Some((
+            last_at.saturating_duration_since(start_at),
+            last_bytes.saturating_sub(start_bytes),
+        ))
     }
 }
 
@@ -2123,7 +2137,7 @@ fn delivery_progress() -> (
         let now = Instant::now();
         // A poisoned lock only costs this one rate update; the bar still advances.
         if let Ok(mut s) = cb_state.lock() {
-            s.started.get_or_insert(now);
+            s.started.get_or_insert((now, received));
             if let Some((prev_at, prev_bytes)) = s.last {
                 let dt = now.saturating_duration_since(prev_at).as_secs_f64();
                 // Skip same-instant callbacks (a burst): they carry no usable
@@ -2131,7 +2145,12 @@ fn delivery_progress() -> (
                 if dt > 0.0 {
                     let inst = bytes_as_f64(received.saturating_sub(prev_bytes)) / dt;
                     let alpha = 1.0 - (-dt / RATE_SMOOTHING_TAU_SECS).exp();
-                    s.ewma_bps = Some(s.ewma_bps.map_or(inst, |prev| prev + alpha * (inst - prev)));
+                    // Seed from 0, not `inst`: on the first sample a tiny `dt`
+                    // makes `inst` huge, but `alpha * inst = (1 - exp(-dt/tau)) *
+                    // (delta/dt) -> delta/tau` as `dt -> 0`, so the estimate
+                    // stays bounded instead of spiking, then converges upward.
+                    let prev = s.ewma_bps.unwrap_or(0.0);
+                    s.ewma_bps = Some(prev + alpha * (inst - prev));
                 }
             }
             s.last = Some((now, received));
@@ -2148,12 +2167,13 @@ fn delivery_progress() -> (
 
 /// Print the terminal line after a successful fetch: content bytes, and — when
 /// the [`DeliveryMeter`] captured any delivery — the elapsed time and average
-/// transfer rate over the wire bytes moved. Falls back to the bare byte/output
-/// line when nothing was delivered on this leg (e.g. a fully resumed transfer).
+/// transfer rate over the content bytes this run moved. Falls back to the bare
+/// byte/output line when nothing was delivered on this leg (e.g. a fully
+/// resumed transfer that re-pulled no bytes).
 fn print_fetch_summary(content_bytes: u64, meter: &DeliveryMeter, output: &Path) {
     match meter.summary() {
-        Some((elapsed, wire_bytes)) if elapsed > Duration::ZERO && wire_bytes > 0 => {
-            let avg_bps = bytes_as_f64(wire_bytes) / elapsed.as_secs_f64();
+        Some((elapsed, moved_bytes)) if elapsed > Duration::ZERO && moved_bytes > 0 => {
+            let avg_bps = bytes_as_f64(moved_bytes) / elapsed.as_secs_f64();
             println!(
                 "fetched {content_bytes} bytes in {} (avg {}) -> {}",
                 indicatif::HumanDuration(elapsed),
