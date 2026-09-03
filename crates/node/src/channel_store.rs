@@ -222,7 +222,9 @@ const SUPERSEDED_POOL_FLOOR_LOSS_TABLE_V2: TableDefinition<'_, &[u8; POOL_SIGNER
 /// every signer of a tombstoned pool as a no-op. Swept at bring-up
 /// ([`PoolFloorLossStore::sweep_forgotten`]), when no persist can be in flight, so
 /// tombstones accumulate for at most one process lifetime. Lives in the same
-/// database file as [`LANE_TABLE`].
+/// database file as [`POOL_FLOOR_LOSS_TABLE`] (`floor-loss.redb`), so a
+/// `record_bucket` and its tombstone check share one exclusive writer slot — which
+/// is what makes the check atomic with the insert.
 ///
 /// Key: raw `PoolId` bytes (`[u8; 32]`). Value: none (`()`), presence is the
 /// tombstone.
