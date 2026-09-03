@@ -166,9 +166,19 @@ pub struct PoolChainArgs {
     pub chain_id: Option<u64>,
 
     /// Ethereum keystore path (else `blockchain.eth_keystore` > under the data
-    /// dir).
+    /// dir). Password from `$DECDN_KEYSTORE_PASSWORD`, else
+    /// `--keystore-password-file`, else a TTY prompt.
     #[arg(long, value_name = "PATH")]
     pub keystore: Option<PathBuf>,
+
+    /// File whose contents are the keystore password. Consulted after the
+    /// `DECDN_KEYSTORE_PASSWORD` env var and before an interactive prompt on a
+    /// TTY. A single trailing newline is stripped; a file that is empty after
+    /// that strip is a deliberate empty password, not an absent source. A path
+    /// that does not exist falls through; one that exists but cannot be read is
+    /// an error.
+    #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
+    pub keystore_password_file: Option<PathBuf>,
 
     /// Data dir holding the buyer-pool store (else `identity.data_dir` >
     /// default).

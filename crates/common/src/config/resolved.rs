@@ -84,7 +84,8 @@ pub struct ResolvedBlockchain {
     /// not surfaced via the TOML schema (passwords don't belong in config
     /// files even by reference). The runtime first consults the
     /// `DECDN_KEYSTORE_PASSWORD` env var, then this file, then prompts on
-    /// stdin if connected to a TTY.
+    /// stdin if connected to a TTY. Each source is chosen by presence, so a
+    /// set-but-empty env var and an empty file both mean an empty password.
     pub keystore_password_file: Option<PathBuf>,
     /// `PaymentPool` contract address — the shared payment pool this node
     /// registers against for buyer and seller flows alike.

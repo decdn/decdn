@@ -215,9 +215,8 @@ pub fn resolve_appeal(
 // call sites across the CLI keep resolving unchanged.
 pub use decdn_common::address::{parse_address, parse_nonzero_address};
 
-/// Load the operator's Ethereum keystore signer, sourcing the password from
-/// the `DECDN_KEYSTORE_PASSWORD` env var, then `--keystore-password-file`,
-/// then an interactive prompt — the same precedence the daemon uses.
+/// Load the operator's Ethereum keystore signer, sourcing the password per
+/// `password_sources` — the same precedence the daemon uses.
 ///
 /// `load_signer` runs the keystore's scrypt KDF, which is CPU-heavy
 /// (hundreds of ms); it is offloaded to `spawn_blocking` so it doesn't stall
@@ -229,9 +228,37 @@ pub async fn load_operator_signer(
     load_signer_with_password_file(chain.keystore_password_file.as_deref(), keystore).await
 }
 
-/// Load an Ethereum keystore signer, sourcing the password from the
-/// `DECDN_KEYSTORE_PASSWORD` env var, then `password_file`, then an interactive
-/// prompt. The scrypt KDF is offloaded to `spawn_blocking` so it doesn't stall
+/// The keystore password sources every `decdn` subcommand consults, in
+/// precedence order: the `DECDN_KEYSTORE_PASSWORD` env var, then
+/// `password_file` when the caller passed one, then an interactive prompt on a
+/// TTY. Presence decides at each step (see [`eth_identity::read_password`]), so
+/// an env var set to the empty string is the password rather than a skipped
+/// source. The `decdn-node` daemon builds the same list at
+/// `runtime::load_eth_signer`; it lives in a crate that cannot depend on this
+/// one, so the two are kept in step by hand.
+///
+/// `confirm` reaches the [`PasswordSource::Prompt`] entry, which prompts twice
+/// and requires the entries to match. True only where the command CREATES a
+/// keystore: an entry typed once has nothing to check it against. It constrains
+/// the prompt alone — a password arriving from the env var or the file is used
+/// as given.
+///
+/// `password_file` is tilde-expanded here so callers passing the raw clap value
+/// (`key-gen`, the operator commands) need not; `fetch` and `pool` expand at
+/// their own `resolve_chain` and pass an already-absolute path, and
+/// `expand_tilde` is a no-op on one.
+pub(crate) fn password_sources(password_file: Option<&Path>, confirm: bool) -> Vec<PasswordSource> {
+    let mut sources = vec![PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV)];
+    if let Some(path) = password_file.map(expand_tilde) {
+        sources.push(PasswordSource::File(path));
+    }
+    sources.push(PasswordSource::Prompt { confirm });
+    sources
+}
+
+/// Load an Ethereum keystore signer, sourcing the password per
+/// `password_sources`. The scrypt KDF is offloaded to `spawn_blocking` so it
+/// doesn't stall
 /// the async executor. The `node`, `appeal`, and `publish` commands all reach
 /// it through [`load_operator_signer`], which pulls the password-file path off
 /// the shared [`cli::CommonChainArgs`].
@@ -239,12 +266,10 @@ pub async fn load_signer_with_password_file(
     password_file: Option<&Path>,
     keystore: &Path,
 ) -> anyhow::Result<PrivateKeySigner> {
-    let mut sources = vec![PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV)];
-    if let Some(path) = password_file.map(expand_tilde) {
-        sources.push(PasswordSource::File(path));
-    }
-    sources.push(PasswordSource::Prompt { confirm: false });
-    let password = eth_identity::read_password(&sources, "eth keystore password")?;
+    let password = eth_identity::read_password(
+        &password_sources(password_file, false),
+        "eth keystore password",
+    )?;
     let keystore = keystore.to_path_buf();
     let display = keystore.display().to_string();
     tokio::task::spawn_blocking(move || eth_identity::load_signer(&keystore, &password))
@@ -406,6 +431,42 @@ mod tests {
     const FLAG_ADDR: Address = address!("0x00000000000000000000000000000000000000F1");
     const CONFIG_ADDR: Address = address!("0x00000000000000000000000000000000000000C0");
     const OA_ADDR: Address = address!("0x000000000000000000000000000000000000000A");
+
+    /// The builder every `decdn` subcommand routes through: `Env` first, the
+    /// `File` only when the caller passed a path, `Prompt` last carrying
+    /// `confirm`. Dropping the `Prompt` push would make every interactive
+    /// command headless-only, and pushing `File` ahead of `Env` would invert
+    /// the documented precedence — neither is visible from the resolver tests.
+    #[test]
+    fn password_sources_orders_env_then_file_then_prompt() {
+        let with_file = password_sources(Some(Path::new("/abs/pw.txt")), false);
+        assert!(
+            matches!(
+                with_file.as_slice(),
+                [
+                    PasswordSource::Env(name),
+                    PasswordSource::File(p),
+                    PasswordSource::Prompt { confirm: false },
+                ] if *name == eth_identity::KEYSTORE_PASSWORD_ENV
+                    && p == Path::new("/abs/pw.txt")
+            ),
+            "got: {with_file:?}"
+        );
+
+        // No path => no `File` entry at all, so an operator who passed no flag
+        // never sees a missing-file skip reason.
+        let without = password_sources(None, true);
+        assert!(
+            matches!(
+                without.as_slice(),
+                [
+                    PasswordSource::Env(_),
+                    PasswordSource::Prompt { confirm: true },
+                ]
+            ),
+            "got: {without:?}"
+        );
+    }
 
     fn empty_chain() -> cli::ChainArgs {
         cli::ChainArgs {

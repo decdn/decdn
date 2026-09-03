@@ -3081,8 +3081,19 @@ fn unbracket_host(host: &str) -> &str {
         .unwrap_or(host)
 }
 
-/// Resolve the keystore password from CLI/env/prompt, then decrypt the
-/// keystore JSON via alloy's KDF on a blocking thread. The Arbitrum Sepolia
+/// Resolve the keystore password, then decrypt the keystore JSON via alloy's
+/// KDF on a blocking thread.
+///
+/// Sources in precedence order: the `DECDN_KEYSTORE_PASSWORD` env var, then
+/// `blockchain.keystore_password_file`, then an interactive prompt on a TTY.
+/// Presence decides at each step (see [`eth_identity::read_password`]): a
+/// variable that is set and a file that exists each supply their value, the
+/// empty string included, so a headless host reaches one of the first two or
+/// the startup fails. The `decdn` CLI builds the same list in
+/// `commands::chain_ctx::password_sources`; `decdn-common` cannot depend on the
+/// `cli` crate, so the two are kept in step by hand.
+///
+/// The Arbitrum Sepolia
 /// chain id is bound on the signer so EIP-712 signers and any
 /// `eth_sendTransaction` paths inherit a deterministic value. To target a
 /// different chain, thread the value through `ResolvedBlockchain` next to

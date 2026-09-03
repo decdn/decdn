@@ -38,18 +38,28 @@ pub fn key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
 
     // Source the keystore password before any disk writes — interactive
     // prompts that abort (Ctrl-C, mismatch retries exhausted) shouldn't
-    // leave a half-written `node.secret` behind. Build the source list
-    // dynamically so `--password-file` only appears when the operator
-    // passed one (an absent `--password-file` should fall through to the
-    // env var or the prompt, not error on a missing file).
-    let mut sources = vec![eth_identity::PasswordSource::Env(
-        eth_identity::KEYSTORE_PASSWORD_ENV,
-    )];
-    if let Some(path) = args.password_file.as_deref() {
-        sources.push(eth_identity::PasswordSource::File(path.to_path_buf()));
+    // leave a half-written `node.secret` behind. `confirm: true` because this
+    // command CREATES the keystore: an entry typed once has nothing to check it
+    // against, so a typo would be sealed into the file. It guards the prompt
+    // alone — a password arriving from the env var or the file is used as
+    // given, which is why the empty-password warning below is unconditional.
+    let password = eth_identity::read_password(
+        &super::chain_ctx::password_sources(args.password_file.as_deref(), true),
+        "eth keystore password",
+    )?;
+
+    // An empty password is representable on purpose (#1931), but creating a
+    // keystore with one is unverifiable from the operator's side — a shell
+    // expanding an unset variable into `DECDN_KEYSTORE_PASSWORD` looks the same
+    // as a deliberate choice. Say so once, loudly. Loading needs no such
+    // warning: the wrong password fails to decrypt.
+    if password.is_empty() {
+        eprintln!(
+            "warning: creating {} with an EMPTY password; \
+             anyone who can read the file can use the key",
+            keystore_path.display()
+        );
     }
-    sources.push(eth_identity::PasswordSource::Prompt { confirm: true });
-    let password = eth_identity::read_password(&sources, "eth keystore password")?;
 
     // Two-phase rotation so a `--force` overwrite can't half-rotate the key
     // pair (#844). STAGE both secrets first — all the expensive, failure-prone

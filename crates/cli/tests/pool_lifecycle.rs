@@ -49,6 +49,7 @@ fn chain_args(dir: &Path) -> PoolChainArgs {
         payment_pool_address: Some("0x00000000000000000000000000000000000000ab".to_string()),
         chain_id: None,
         keystore: None,
+        keystore_password_file: None,
         data_dir: Some(dir.to_path_buf()),
     }
 }

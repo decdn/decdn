@@ -115,6 +115,53 @@ blacklist updates and stop being able to settle channels. Once
    track this is not emitted by the node yet — see
    [ContentBlacklist compliance](#contentblacklist-compliance).)
 
+## Keystore will not unlock
+
+**Symptoms:** a command or `decdn-node` startup exits with
+`no keystore password source available (...)`, or with
+`failed to decrypt eth keystore at <path>`.
+
+**Sources, in precedence order.** Every command that touches the Ethereum
+keystore consults the same three, and takes the first one that is **present**:
+
+1. The `DECDN_KEYSTORE_PASSWORD` environment variable.
+2. A password file: `--keystore-password-file` (env
+   `DECDN_KEYSTORE_PASSWORD_FILE`) on `decdn-node run`, `decdn fetch`,
+   `decdn bundle pull`, `decdn pool`, and the operator commands; spelled
+   `--password-file` on `decdn key-gen`. One trailing newline is stripped;
+   other whitespace is part of the password.
+3. An interactive prompt, when `stdin` is a TTY.
+
+**Presence decides, not content.** A variable that is set supplies its value
+even when that value is empty, and a file that exists supplies its contents even
+when they are empty — an empty password is a real password. Only an *unset*
+variable, a path that does *not exist*, and a non-TTY `stdin` fall through to
+the next source. A path that exists but cannot be read (a directory, a
+permission denial, non-UTF-8 contents) is an error rather than a skipped source.
+
+**Diagnose:**
+
+- `no keystore password source available (...)` lists every source that fell
+  through and why, including the password-file path that was tried. A path in
+  that list is a typo, an unexpanded `~`, or a file the unit cannot see.
+- `export DECDN_KEYSTORE_PASSWORD=` is *not* the same as
+  `unset DECDN_KEYSTORE_PASSWORD`. The first means "use an empty password" and
+  produces a decrypt failure against a keystore that has one; the second falls
+  through to the password file.
+- `failed to decrypt eth keystore at <path>` means a source *was* found and the
+  password was wrong. Check which source won before changing the password file.
+
+**Resolve:**
+
+- Headless hosts (systemd, containers) must reach source 1 or 2 — there is no
+  TTY, so the prompt always falls through. Point
+  `--keystore-password-file` at a `0o600` file the unit can read.
+- Recreate the keystore with `decdn key-gen --force` only as a last resort: it
+  archives the prior ciphertext to `keystore.json.bak.<ts>` but the node's
+  on-chain identity changes with the key. Follow
+  [the operator key-rotation appendix](../adr/appendix-operator-key-rotation.md)
+  instead.
+
 ## Slashing risk
 
 **Triggers** — the two, and only two, offenses `SlashJudge` adjudicates,

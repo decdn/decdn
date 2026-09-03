@@ -4,8 +4,7 @@
 //! Lives in `decdn-incentive` (per `appendix-poc-production-seams.md`
 //! §Seam 1) because the keystore surface is shared between nodes (slash
 //! signing, on-chain settlement) and clients (voucher signing per ADR 003
-//! §EIP-712 Voucher Signature). The surface is free functions `load_node_key`,
-//! `load_eth_key`, and `sign_voucher`.
+//! §EIP-712 Voucher Signature).
 //!
 //! Same security model as [`decdn_common::identity`] — the keystore file is
 //! encrypted at rest, but we still enforce `0o600` on the file and `0o700`
@@ -31,10 +30,10 @@ use anyhow::{Context, anyhow};
 use rand::Rng;
 use zeroize::Zeroizing;
 
-/// Process environment variable that supplies the keystore password when
-/// `--password-file` is unset and stdin isn't a TTY. Single source of truth
-/// for both the `decdn key-gen` CLI command and the `decdn run` runtime
-/// loader.
+/// Process environment variable that supplies the keystore password. Callers
+/// place it in their [`PasswordSource`] list; both the `decdn` CLI and the
+/// `decdn-node run` runtime loader put it first, ahead of a password file and
+/// an interactive prompt.
 pub const KEYSTORE_PASSWORD_ENV: &str = "DECDN_KEYSTORE_PASSWORD";
 
 const KEYSTORE_FILE_NAME: &str = "keystore.json";
@@ -47,15 +46,24 @@ const FORBIDDEN_BITS: u32 = 0o077;
 const KEYSTORE_FILE_MODE: u32 = 0o600;
 
 /// Source for the keystore password, in precedence order. The first source in
-/// the slice that yields a non-empty secret wins.
+/// the slice that is **present** wins, and it supplies its value as-is — the
+/// empty string included, because an empty password is a legitimate Web3 Secret
+/// Storage password. Presence, not emptiness, decides: a source that is not
+/// there falls through to the next entry.
 #[derive(Debug, Clone)]
 pub enum PasswordSource {
-    /// Process environment variable. Skipped if unset or empty.
+    /// Process environment variable. Present when the variable is set; its
+    /// value is the password, empty included. An unset variable falls through;
+    /// a value that is not valid UTF-8 is an error, because the variable is
+    /// there and the operator meant it to be read.
     Env(&'static str),
-    /// File whose contents are the password. A single trailing `\n` is
-    /// stripped (passwords may legitimately contain other whitespace).
+    /// File whose contents are the password. A single trailing `\n` (or
+    /// `\r\n`) is stripped; other whitespace is part of the password. Present
+    /// when the file exists — an empty file is an empty password. A path that
+    /// does not exist falls through; any other read failure is an error.
     File(PathBuf),
-    /// Interactive prompt via `rpassword`. Errors if `stdin` is not a TTY.
+    /// Interactive prompt via `rpassword`. Present when `stdin` is a TTY; a
+    /// non-TTY `stdin` falls through. An empty entry is an empty password.
     /// `confirm = true` re-prompts and verifies the entries match.
     Prompt {
         /// When true, prompt twice and require both entries to match.
@@ -267,8 +275,10 @@ pub fn load_signer(path: &Path, password: &str) -> anyhow::Result<PrivateKeySign
         .with_context(|| format!("failed to decrypt eth keystore at {}", path.display()))
 }
 
-/// Resolve a password from the first matching source. Empty `Env` values and
-/// missing `File` sources fall through to the next entry.
+/// Resolve a password from the first source that is present. An unset `Env`, a
+/// `File` path that does not exist, and a `Prompt` without a TTY fall through to
+/// the next entry; a source that is present supplies its value, the empty string
+/// included. When every source falls through, the error lists why each one did.
 ///
 /// Returns `Zeroizing<String>` so the password is overwritten in memory on
 /// drop — defense-in-depth against post-mortem heap inspection. The
@@ -277,59 +287,84 @@ pub fn load_signer(path: &Path, password: &str) -> anyhow::Result<PrivateKeySign
 ///
 /// # Errors
 ///
+/// - `Env` set to a value that is not valid UTF-8.
+/// - A `File` that exists but cannot be read: permissions, a directory, or
+///   contents that are not valid UTF-8.
+/// - `Prompt` when the terminal read itself fails.
 /// - `Prompt` with mismatched confirmations after 3 attempts.
-/// - `Prompt` when `stdin` is not a TTY.
-/// - All sources exhausted without producing a value.
+/// - All sources exhausted without a present one.
 pub fn read_password(
     sources: &[PasswordSource],
     prompt_label: &str,
 ) -> anyhow::Result<Zeroizing<String>> {
-    let mut last_skip_reason: Option<String> = None;
+    // Every skipped source is reported, not just the last: a mistyped
+    // `--password-file` falls through, and if only the final skip survived
+    // (`stdin is not a TTY`) the path the operator got wrong would never reach
+    // them.
+    let mut skipped: Vec<String> = Vec::new();
     for source in sources {
         match source {
             PasswordSource::Env(name) => match std::env::var(name) {
-                Ok(value) if !value.is_empty() => return Ok(Zeroizing::new(value)),
-                Ok(_) => last_skip_reason = Some(format!("env {name} is empty")),
-                Err(_) => last_skip_reason = Some(format!("env {name} unset")),
+                // A set variable is a deliberate value, so an empty one is an
+                // empty password rather than a reason to try the next source.
+                Ok(value) => return Ok(Zeroizing::new(value)),
+                Err(std::env::VarError::NotPresent) => skipped.push(format!("env {name} unset")),
+                // Set but unreadable is a misconfiguration, not an absent
+                // source. The message never echoes the value — it is a password.
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(anyhow!("env {name} is set but is not valid UTF-8"));
+                }
             },
             PasswordSource::File(path) => match read_password_file(path) {
                 Ok(Some(value)) => return Ok(value),
                 Ok(None) => {
-                    last_skip_reason = Some(format!("password file {} is empty", path.display()));
+                    skipped.push(format!(
+                        "password file {} not found (missing path or broken symlink)",
+                        path.display()
+                    ));
                 }
                 Err(e) => return Err(e),
             },
             PasswordSource::Prompt { confirm } => {
                 if !std::io::stdin().is_terminal() {
-                    last_skip_reason = Some("stdin is not a TTY".to_owned());
+                    skipped.push("stdin is not a TTY".to_owned());
                     continue;
                 }
                 return prompt_password(prompt_label, *confirm);
             }
         }
     }
-    Err(anyhow!(
-        "no keystore password source available ({})",
-        last_skip_reason.unwrap_or_else(|| "no sources configured".to_owned())
-    ))
+    let why = if skipped.is_empty() {
+        "no sources configured".to_owned()
+    } else {
+        skipped.join("; ")
+    };
+    Err(anyhow!("no keystore password source available ({why})"))
 }
 
+/// Read `path` as a password. `Ok(None)` means the file is not there, which is
+/// an absent source; `Ok(Some(_))` carries the file's contents with a single
+/// trailing `\n` or `\r\n` removed, the empty string included.
 fn read_password_file(path: &Path) -> anyhow::Result<Option<Zeroizing<String>>> {
-    let raw = Zeroizing::new(
-        fs::read_to_string(path)
-            .with_context(|| format!("failed to read password file {}", path.display()))?,
-    );
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => Zeroizing::new(raw),
+        // A path that is not there is an absent source and falls through. Every
+        // other read failure (unreadable, a directory) names a real mistake, so
+        // it stays fatal rather than silently selecting another source.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("failed to read password file {}", path.display()));
+        }
+    };
     // Strip a single trailing `\n` (or `\r\n`). `String::trim_end` would also
     // eat trailing spaces — passwords legitimately contain whitespace, so we
     // strip exactly the one newline that nearly every editor and `echo`
     // appends.
     let trimmed = raw.strip_suffix("\r\n").or_else(|| raw.strip_suffix('\n'));
-    let value = Zeroizing::new(trimmed.map_or(raw.as_str(), |s| s).to_owned());
-    if value.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(value))
-    }
+    Ok(Some(Zeroizing::new(
+        trimmed.map_or(raw.as_str(), |s| s).to_owned(),
+    )))
 }
 
 #[expect(
@@ -537,6 +572,30 @@ mod tests {
         );
     }
 
+    /// The empty-password twin of [`round_trip_address_recovery`]: a keystore
+    /// created with `""` opens with `""` and derives the same address (#1931).
+    #[test]
+    fn empty_password_round_trip() {
+        let tmp = make_data_dir();
+        let written = generate_and_persist(tmp.path(), "", false).unwrap();
+        let signer = load_signer(&keystore_path(tmp.path()), "").unwrap();
+        assert_eq!(
+            signer.address(),
+            written,
+            "an empty password must round-trip like any other"
+        );
+    }
+
+    /// Proves the empty password is really applied to the KDF rather than
+    /// treated as "no password set": a non-empty guess must not open it.
+    #[test]
+    fn wrong_password_rejected_for_empty_keystore() {
+        let tmp = make_data_dir();
+        generate_and_persist(tmp.path(), "", false).unwrap();
+        let err = load_signer(&keystore_path(tmp.path()), TEST_PASSWORD).unwrap_err();
+        assert!(format!("{err:#}").contains("decrypt"), "got: {err:#}");
+    }
+
     #[test]
     fn wrong_password_rejected() {
         let tmp = make_data_dir();
@@ -616,8 +675,8 @@ mod tests {
 
     #[test]
     fn first_matching_source_wins() {
-        // `read_password` honors source order. Using two `File` sources
-        // exercises the same precedence loop as `Env` would; the
+        // `read_password` stops at the first PRESENT source. Using two
+        // `File` sources exercises the same precedence loop as `Env` would; the
         // `unsafe_code = "forbid"` workspace lint blocks
         // `std::env::set_var` (edition 2024), so we drive the loop via
         // files instead. The "Env > File > Prompt" priority is a property
@@ -636,15 +695,15 @@ mod tests {
     }
 
     #[test]
-    fn skips_empty_source_and_continues() {
-        // First source is an empty file (skipped), second has content.
+    fn missing_file_source_falls_through() {
+        // First source is a path that does not exist (an absent source),
+        // second has content.
         let tmp = make_data_dir();
-        let empty = tmp.path().join("empty.txt");
+        let missing = tmp.path().join("not-there.txt");
         let real = tmp.path().join("real.txt");
-        fs::write(&empty, b"").unwrap();
         fs::write(&real, b"actual-pw").unwrap();
         let pw = read_password(
-            &[PasswordSource::File(empty), PasswordSource::File(real)],
+            &[PasswordSource::File(missing), PasswordSource::File(real)],
             "ignored",
         )
         .unwrap();
@@ -693,15 +752,117 @@ mod tests {
         );
     }
 
+    /// An empty file is a file that is there, so it supplies an empty password
+    /// rather than falling through. This is what lets an operator load a
+    /// keystore written with no password without a TTY (#1931).
     #[test]
-    fn empty_password_file_falls_through() {
+    fn empty_password_file_is_an_empty_password() {
         let tmp = make_data_dir();
         let empty = tmp.path().join("empty.txt");
         fs::write(&empty, b"").unwrap();
-        // Only an empty file source — should error with "empty" in the
-        // skip-reason chain.
-        let err = read_password(&[PasswordSource::File(empty)], "ignored").unwrap_err();
-        assert!(format!("{err:#}").contains("empty"), "got: {err:#}");
+        let pw = read_password(&[PasswordSource::File(empty)], "ignored").unwrap();
+        assert_eq!(pw.as_str(), "");
+    }
+
+    /// Presence, not content, decides precedence: an empty file earlier in the
+    /// slice beats a populated one later rather than falling through to it.
+    #[test]
+    fn empty_password_file_beats_a_later_populated_source() {
+        let tmp = make_data_dir();
+        let empty = tmp.path().join("empty.txt");
+        let real = tmp.path().join("real.txt");
+        fs::write(&empty, b"").unwrap();
+        fs::write(&real, b"never-reached").unwrap();
+        let pw = read_password(
+            &[PasswordSource::File(empty), PasswordSource::File(real)],
+            "ignored",
+        )
+        .unwrap();
+        assert_eq!(pw.as_str(), "");
+    }
+
+    /// A path that does not exist falls through, and the exhausted-sources
+    /// error names it — the only thing that keeps a typo'd
+    /// `--keystore-password-file` diagnosable, because a missing path falls
+    /// through rather than erroring at the read.
+    /// Every skipped source reaches the error, not just the last one. With a
+    /// single source this cannot be told apart from keeping only the last, so
+    /// the test drives all three fall-through legs at once.
+    #[test]
+    fn exhausted_sources_error_lists_every_skip_reason() {
+        // A name no environment sets, rather than `KEYSTORE_PASSWORD_ENV`: a
+        // developer who exports the real variable would otherwise fail this
+        // test for a reason that has nothing to do with accumulation.
+        const UNSET: &str = "DECDN_KEYSTORE_PASSWORD_ABSENT_IN_TESTS";
+        let tmp = make_data_dir();
+        let missing = tmp.path().join("nope.txt");
+        // Stdin is not a TTY under the test harness, so all three fall through.
+        let err = read_password(
+            &[
+                PasswordSource::Env(UNSET),
+                PasswordSource::File(missing.clone()),
+                PasswordSource::Prompt { confirm: false },
+            ],
+            "ignored",
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(UNSET), "got: {msg}");
+        assert!(msg.contains(&missing.display().to_string()), "got: {msg}");
+        assert!(msg.contains("TTY"), "got: {msg}");
+    }
+
+    #[test]
+    fn missing_password_file_falls_through_and_names_the_path() {
+        let tmp = make_data_dir();
+        let missing = tmp.path().join("nope.txt");
+        let err = read_password(&[PasswordSource::File(missing.clone())], "ignored").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no keystore password source"), "got: {msg}");
+        assert!(msg.contains(&missing.display().to_string()), "got: {msg}");
+    }
+
+    #[test]
+    fn password_file_with_only_a_newline_is_an_empty_password() {
+        let tmp = make_data_dir();
+        let pw_file = tmp.path().join("pw.txt");
+        fs::write(&pw_file, b"\n").unwrap();
+        let pw = read_password(&[PasswordSource::File(pw_file)], "ignored").unwrap();
+        assert_eq!(pw.as_str(), "");
+    }
+
+    /// A file that exists but cannot be read names a real misconfiguration, so
+    /// it is fatal — silently selecting the next source would hide it. A
+    /// directory is the portable way to provoke a non-`NotFound` read error: a
+    /// mode-000 file is still readable by root, and CI may run as root.
+    #[test]
+    fn unreadable_password_file_is_fatal() {
+        let tmp = make_data_dir();
+        let dir = tmp.path().join("a-directory");
+        fs::create_dir(&dir).unwrap();
+        let fallback = tmp.path().join("fallback.txt");
+        fs::write(&fallback, b"never-reached").unwrap();
+        let err = read_password(
+            &[
+                PasswordSource::File(dir.clone()),
+                PasswordSource::File(fallback),
+            ],
+            "ignored",
+        )
+        .unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("failed to read password file"),
+            "got: {chain}"
+        );
+        assert!(
+            chain.contains(&dir.display().to_string()),
+            "error must name the offending path, got: {chain}"
+        );
+        assert!(
+            !chain.contains("no keystore password source"),
+            "an unreadable file must not fall through to the next source: {chain}"
+        );
     }
 
     // Canonical EIP-712 schema from ADR 003 §EIP-712 NodeId-to-Ethereum
