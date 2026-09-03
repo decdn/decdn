@@ -204,6 +204,22 @@ pub enum NodeCommand {
     /// `--dry-run` to print the plan (packed size, ceiling, cooldown state)
     /// without submitting.
     UpdateMultiaddrs(UpdateMultiaddrsArgs),
+    /// (Re)attest this node's region on-chain via `CapacityBond.updateRegion`
+    /// (ADR 030). The one-command fix for a node that registered the wrong
+    /// `regionHint` (`decdn node register --region`) or whose operator has
+    /// physically relocated: it corrects the region without a destructive
+    /// deregister/re-register cycle (which `register` alone cannot do — a second
+    /// `register` reverts `NodeAlreadyRegistered`).
+    ///
+    /// Like the other on-chain `node` subcommands this talks to the chain, not
+    /// a running node's admin RPC, and signs with the operator Ethereum key. The
+    /// region is validated as an ISO 3166-1 alpha-2 code CLI-side — the contract
+    /// only length-checks and would otherwise store a garbage string. The node
+    /// must be active; the contract's `regionStabilityWindow` cooldown between
+    /// updates is pre-checked and reported before the send. Pass `--dry-run` to
+    /// print the plan (current region, new region, cooldown state) without
+    /// submitting.
+    UpdateRegion(UpdateRegionArgs),
     /// Unpaid client-side discovery of active nodes via
     /// `CapacityBond.getRegisteredNodes` (#1481). Maps node-ids/regions to
     /// operator Ethereum addresses — the input `decdn pool open
@@ -810,6 +826,25 @@ pub struct UpdateMultiaddrsArgs {
     /// stores the field verbatim, it does not merge).
     #[arg(long = "multiaddr", value_name = "MA", required = true)]
     pub multiaddrs: Vec<String>,
+
+    /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
+    #[command(flatten)]
+    pub chain: ChainArgs,
+}
+
+/// `decdn node update-region` — (re)attest the operator's region via
+/// `CapacityBond.updateRegion` (ADR 030). See [`NodeCommand::UpdateRegion`] for
+/// the full description. Performs an on-chain transaction rather than talking to
+/// a running node's admin RPC.
+#[derive(Args, Debug)]
+pub struct UpdateRegionArgs {
+    /// New region to attest, as an ISO 3166-1 alpha-2 country code (e.g. `DE`).
+    /// Validated CLI-side and normalized (trimmed, uppercased) before the send —
+    /// the contract only length-checks, so an unvalidated code would be stored
+    /// verbatim and read back as "no locality information" by every downstream
+    /// consumer. The value fully replaces the on-chain `regionHint`.
+    #[arg(long = "region", value_name = "CODE")]
+    pub region: String,
 
     /// Chain coordinates: RPC endpoint, contract addresses, and keystore.
     #[command(flatten)]

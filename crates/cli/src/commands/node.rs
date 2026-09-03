@@ -76,6 +76,9 @@ pub async fn node_dispatch(
         cli::NodeCommand::UpdateMultiaddrs(u) => {
             crate::commands::update_multiaddrs::run(u, global_config).await
         }
+        cli::NodeCommand::UpdateRegion(u) => {
+            crate::commands::update_region::run(u, global_config).await
+        }
         cli::NodeCommand::Lookup(l) => lookup(l, global_config).await,
         cli::NodeCommand::Doctor(d) => crate::commands::doctor::run(d, global_config).await,
     }
