@@ -14,8 +14,42 @@ use decdn_common::config::{ResolvedDiscovery, load_file_config, resolve_discover
 use decdn_common::identity::fresh_secret_key;
 use decdn_common::redact::redact_userinfo;
 use iroh::address_lookup::{DnsAddressLookup, MemoryLookup};
-use iroh::endpoint::presets;
+use iroh::endpoint::{QuicTransportConfig, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
+
+/// Per-stream QUIC receive window for a client pull.
+///
+/// QUIC flow control is receiver-advertised, and a download makes the client
+/// the receiver, so this window — not any node-side setting — bounds
+/// single-stream throughput at roughly `window / RTT`. It matches the paid
+/// path's own ceiling: a node serves at most one credit window of unpaid bytes
+/// ahead of the paid frontier (`clamp(paid/divisor, 4 MiB, 64 MiB)`, ADR 003),
+/// so unpaid in-flight never exceeds 64 MiB regardless of transport buffering.
+/// Sizing this to that same 64 MiB makes the transport window match the payment
+/// ceiling — below the credit cap the transport is never the bottleneck at any
+/// RTT, and above it a larger window would buy nothing because the credit
+/// window blocks first.
+const CLIENT_STREAM_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+
+/// Whole-connection QUIC receive window for a client pull. A pull runs one bulk
+/// stream per connection (`per_source_inflight = 1`, one connection per
+/// provider), so this only needs to hold at least
+/// [`CLIENT_STREAM_RECEIVE_WINDOW`]; the 2x headroom leaves slack for the
+/// connection's control traffic without letting worst-case buffering grow
+/// larger than it must.
+const CLIENT_RECEIVE_WINDOW: u32 = 128 * 1024 * 1024;
+
+/// QUIC transport config for a one-shot client [`Endpoint`]. It raises only the
+/// receive windows over the iroh defaults: on a download the client is the
+/// flow-control receiver, so these windows bound single-stream throughput on a
+/// high-latency path. Congestion control lives at the sender, so a node-side
+/// change is what would alter that half.
+fn client_transport_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .stream_receive_window(VarInt::from_u32(CLIENT_STREAM_RECEIVE_WINDOW))
+        .receive_window(VarInt::from_u32(CLIENT_RECEIVE_WINDOW))
+        .build()
+}
 
 /// Resolve the relay URLs for a client command. The `--relay-url` override
 /// (`flag`) wins; otherwise `network.relay_urls` from the config is used. An
@@ -106,7 +140,9 @@ pub async fn client_endpoint(
     } else {
         add_resolution_lookups(Endpoint::builder(presets::Minimal), discovery)?
     };
-    builder = builder.secret_key(fresh_secret_key());
+    builder = builder
+        .secret_key(fresh_secret_key())
+        .transport_config(client_transport_config());
     builder = if !relays.is_empty() {
         builder.relay_mode(relay_mode(relays))
     } else if discovery.is_empty() {
