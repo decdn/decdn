@@ -1078,7 +1078,9 @@ fn plan_lane(
                 warn!(
                     pool_id = %key.pool_id,
                     signer = %key.signer,
-                    "signer not registered on-chain and no capability held; skipping redemption"
+                    "signer not registered on-chain and the lane carries no owner-signed \
+                     capability (owner_sig); skipping redemption until the client re-sends \
+                     its capability"
                 );
                 return Ok(None);
             };
