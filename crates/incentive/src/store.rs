@@ -399,64 +399,68 @@ impl PoolStateStore for MemoryPoolStateStore {
     }
 }
 
-/// Durable accumulator of unrecoverable floor-credit loss (`µUSDC`), keyed by
-/// `(pool_id, signer)` (ADR 003 §Pool solvency — the `dead_charge`). Persisted so a node
-/// restart does not grant a pool a fresh free-floor budget: the un-vouchered floor
-/// is un-redeemable, so it appears in no on-chain quantity and must be stored here.
+/// Durable mirror of each `(pool_id, signer)` abandonment leaky-bucket (ADR 003
+/// §Pool solvency — the per-signer refilling allowance). Persisted so a node
+/// restart resumes a signer's throttle where it left off rather than granting a
+/// fresh allowance: the un-recouped floor a burst-abandoner drained is
+/// un-redeemable, so it appears in no on-chain quantity and lives only here.
 ///
-/// The signer dimension carries the per-signer sub-cap of ADR 003 §Pool solvency
-/// across a restart: a pool's floor exposure is bounded both in aggregate and per
-/// capability-holder, so the durable copy must remember which signer owes which
-/// share of the pool's dead charge. The pool-wide total is the sum of its signer
-/// rows, so a reader rebuilds it by folding [`PoolFloorLossStore::load_losses`].
+/// Each row is the bucket state as of a wall-clock instant: `consumed_micro` is
+/// the `µUSDC` of un-recouped floor drained from the allowance at `refill_unix_ms`,
+/// and a reader replays the time-refill from that instant to now on load. The
+/// signer dimension is the isolation boundary: one signer's drained bucket
+/// throttles only that signer on this node, never a co-tenant on the shared pool.
 ///
-/// Implementations MUST raise each `(pool_id, signer)` total monotonically: a
-/// total at or below the stored one leaves the row unchanged, and
-/// [`PoolFloorLossStore::forget_loss`] is the only downward transition. The store
-/// owns this rather than the caller because a caller that persists its total from
-/// an independent task cannot order its writes against another's.
+/// The bucket refills over time, so a row is NOT monotonic in `consumed_micro`.
+/// Implementations keep the row with the greatest `refill_unix_ms` (ties break to
+/// the larger `consumed_micro`): the most recent snapshot wins, so two
+/// reservation drops on one lane landing out of order cannot regress the bucket to
+/// a stale earlier level. [`PoolFloorLossStore::forget_loss`] is the only outright
+/// removal.
 ///
-/// For the same reason, `forget_loss` is TERMINAL for a pool id: it drops EVERY
-/// signer row of that pool and leaves one pool-level tombstone that makes every
-/// later `record_loss` for any signer of that pool a no-op. The caller that
-/// forgets a pool cannot order its delete against a `record_loss` already
-/// dispatched from another task, and a reclaimed pool id never recurs (monotonic
-/// open nonce) — so a write landing after the forget is always stale and must not
-/// resurrect the row. [`PoolFloorLossStore::sweep_forgotten`] reclaims the
-/// tombstones; it is safe only at bring-up, before any reservation exists, when no
-/// persist can be in flight.
+/// `forget_loss` is TERMINAL for a pool id: it drops EVERY signer row of that pool
+/// and leaves one pool-level tombstone that makes every later `record_bucket` for
+/// any signer of that pool a no-op. The caller that forgets a pool cannot order its
+/// delete against a `record_bucket` already dispatched from another task, and a
+/// reclaimed pool id never recurs (monotonic open nonce) — so a write landing after
+/// the forget is always stale and must not resurrect the row.
+/// [`PoolFloorLossStore::sweep_forgotten`] reclaims the tombstones; it is safe only
+/// at bring-up, before any reservation exists, when no persist can be in flight.
 ///
-/// Any write that raises a `(pool_id, signer)` total MUST commit durably (fsync, on
+/// Any write that changes a `(pool_id, signer)` row MUST commit durably (fsync, on
 /// disk-backed impls) before returning `Ok`, mirroring the [`PoolStateStore`]
-/// contract. A call that raises nothing may skip the commit: the durable value
+/// contract. A call that changes nothing may skip the commit: the durable value
 /// already satisfies it.
 pub trait PoolFloorLossStore: Send + Sync {
-    /// Raise this `(pool_id, signer)` lane's cumulative dead-charge total to
-    /// `micro_usdc`. A total at or below the stored one is a no-op, so a late,
-    /// smaller write cannot regress the row and re-grant already-consumed
-    /// free-floor budget. A pool that was [`PoolFloorLossStore::forget_loss`]-ed is
-    /// also a no-op for every one of its signers: the pool is closed, so the write
-    /// is a stale in-flight persist and must not resurrect the row.
+    /// Write this `(pool_id, signer)` lane's abandonment-bucket snapshot:
+    /// `consumed_micro` of un-recouped floor as of `refill_unix_ms`. The store keeps
+    /// whichever snapshot carries the greater `refill_unix_ms` (ties break to the
+    /// larger `consumed_micro`), so a late, stale write from an out-of-order drop
+    /// cannot regress the bucket. A pool that was [`PoolFloorLossStore::forget_loss`]-ed
+    /// is a no-op for every one of its signers: the pool is closed, so the write is a
+    /// stale in-flight persist and must not resurrect the row.
     ///
     /// # Errors
     /// Returns [`StoreError`] if the durable write fails.
-    fn record_loss(
+    fn record_bucket(
         &self,
         pool_id: B256,
         signer: Address,
-        micro_usdc: u128,
+        consumed_micro: u128,
+        refill_unix_ms: u64,
     ) -> Result<(), StoreError>;
 
-    /// Load every `(pool_id, signer)` lane's persisted dead charge. Called once at
-    /// bring-up to hydrate the in-memory accumulator, which folds the rows of one
-    /// pool back into that pool's total.
+    /// Load every `(pool_id, signer)` lane's persisted bucket snapshot as
+    /// `(pool_id, signer, consumed_micro, refill_unix_ms)`. Called once at bring-up
+    /// to hydrate the in-memory allowances, each of which replays its time-refill
+    /// from `refill_unix_ms` to boot.
     ///
     /// # Errors
     /// Returns [`StoreError`] if the backing store is unreadable.
-    fn load_losses(&self) -> Result<Vec<(B256, Address, u128)>, StoreError>;
+    fn load_buckets(&self) -> Result<Vec<(B256, Address, u128, u64)>, StoreError>;
 
     /// Drop EVERY signer row of a pool (on pool close/reclaim) and tombstone the
-    /// pool id, so an in-flight `record_loss` that lands after this call cannot
+    /// pool id, so an in-flight `record_bucket` that lands after this call cannot
     /// re-insert a row. Idempotent.
     ///
     /// # Errors
@@ -466,7 +470,7 @@ pub trait PoolFloorLossStore: Send + Sync {
     /// Reclaim every tombstone left by [`PoolFloorLossStore::forget_loss`],
     /// returning how many were swept. Bounds tombstone growth to one process
     /// lifetime. ONLY safe at bring-up, before any reservation exists: once a
-    /// tombstone is swept, a still-in-flight `record_loss` for its pool would
+    /// tombstone is swept, a still-in-flight `record_bucket` for its pool would
     /// insert again — at bring-up no such write can exist.
     ///
     /// # Errors
@@ -481,14 +485,14 @@ pub struct MemoryPoolFloorLossStore {
     inner: Mutex<MemoryFloorLoss>,
 }
 
-/// Totals and tombstones under ONE mutex, so `forget_loss`'s delete-and-tombstone
-/// is atomic against a concurrent `record_loss` — the same atomicity the redb impl
-/// gets from its exclusive write transaction. Totals key on `(pool_id, signer)`;
-/// tombstones stay pool-level, because a forget is a pool-lifecycle event that
-/// retires every signer on it at once.
+/// Buckets and tombstones under ONE mutex, so `forget_loss`'s delete-and-tombstone
+/// is atomic against a concurrent `record_bucket` — the same atomicity the redb impl
+/// gets from its exclusive write transaction. Buckets key on `(pool_id, signer)` and
+/// store `(consumed_micro, refill_unix_ms)`; tombstones stay pool-level, because a
+/// forget is a pool-lifecycle event that retires every signer on it at once.
 #[derive(Debug, Default)]
 struct MemoryFloorLoss {
-    totals: HashMap<(B256, Address), u128>,
+    buckets: HashMap<(B256, Address), (u128, u64)>,
     forgotten: HashSet<B256>,
 }
 
@@ -501,11 +505,12 @@ impl MemoryPoolFloorLossStore {
 }
 
 impl PoolFloorLossStore for MemoryPoolFloorLossStore {
-    fn record_loss(
+    fn record_bucket(
         &self,
         pool_id: B256,
         signer: Address,
-        micro_usdc: u128,
+        consumed_micro: u128,
+        refill_unix_ms: u64,
     ) -> Result<(), StoreError> {
         let mut guard = self
             .inner
@@ -518,30 +523,37 @@ impl PoolFloorLossStore for MemoryPoolFloorLossStore {
         if guard.forgotten.contains(&pool_id) {
             return Ok(());
         }
-        // Monotonic raise, matching the redb store step for step: out-of-order drops
-        // on one lane must not regress its total and re-grant consumed floor budget.
-        // An absent row reads as zero rather than being created, so a total that
-        // raises nothing — including a zero against an absent row — writes nothing.
-        let stored = guard
-            .totals
-            .get(&(pool_id, signer))
-            .copied()
-            .unwrap_or(0u128);
-        if micro_usdc > stored {
-            guard.totals.insert((pool_id, signer), micro_usdc);
+        // Timestamp-monotonic, matching the redb store step for step: the bucket
+        // refills, so a row is not monotonic in `consumed_micro`, but the snapshot
+        // with the greatest `refill_unix_ms` is the freshest view of the throttle.
+        // Two drops on one lane landing out of order therefore cannot regress the
+        // bucket to a stale earlier level. Ties break to the larger `consumed_micro`
+        // so a same-millisecond debit is never lost.
+        let keep =
+            guard
+                .buckets
+                .get(&(pool_id, signer))
+                .is_none_or(|&(stored_micro, stored_ms)| {
+                    refill_unix_ms > stored_ms
+                        || (refill_unix_ms == stored_ms && consumed_micro > stored_micro)
+                });
+        if keep {
+            guard
+                .buckets
+                .insert((pool_id, signer), (consumed_micro, refill_unix_ms));
         }
         Ok(())
     }
 
-    fn load_losses(&self) -> Result<Vec<(B256, Address, u128)>, StoreError> {
+    fn load_buckets(&self) -> Result<Vec<(B256, Address, u128, u64)>, StoreError> {
         let guard = self
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
         Ok(guard
-            .totals
+            .buckets
             .iter()
-            .map(|(&(pool_id, signer), &micro)| (pool_id, signer, micro))
+            .map(|(&(pool_id, signer), &(micro, ms))| (pool_id, signer, micro, ms))
             .collect())
     }
 
@@ -551,8 +563,8 @@ impl PoolFloorLossStore for MemoryPoolFloorLossStore {
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
         // Every signer row of the pool goes with the pool: the deposit they all
-        // drew on is reclaimed, so their dead charges are permanently moot.
-        guard.totals.retain(|&(pool, _signer), _| pool != pool_id);
+        // drew on is reclaimed, so their throttle buckets are permanently moot.
+        guard.buckets.retain(|&(pool, _signer), _| pool != pool_id);
         guard.forgotten.insert(pool_id);
         Ok(())
     }
@@ -706,83 +718,86 @@ mod tests {
     }
 
     #[test]
-    fn floor_loss_store_round_trip_and_forget() -> anyhow::Result<()> {
+    fn floor_bucket_store_round_trip_and_forget() -> anyhow::Result<()> {
         let store = MemoryPoolFloorLossStore::new();
         let (s1, s2) = signers();
         let a = b256!("0000000000000000000000000000000000000000000000000000000000000011");
         let b = b256!("0000000000000000000000000000000000000000000000000000000000000022");
-        store.record_loss(a, s1, 400)?;
-        store.record_loss(b, s1, 4_000_000)?;
-        // A higher total raises the stored value.
-        store.record_loss(a, s1, 800)?;
-        // A second signer on pool `a` is a SEPARATE row, not a raise of the first.
-        store.record_loss(a, s2, 90)?;
-        let mut all = store.load_losses()?;
-        all.sort_by_key(|&(pool, signer, _)| (pool, signer));
+        store.record_bucket(a, s1, 400, 100)?;
+        store.record_bucket(b, s1, 4_000_000, 100)?;
+        // A newer snapshot (greater timestamp) replaces the stored one.
+        store.record_bucket(a, s1, 800, 200)?;
+        // A second signer on pool `a` is a SEPARATE row, not an update of the first.
+        store.record_bucket(a, s2, 90, 100)?;
+        let mut all = store.load_buckets()?;
+        all.sort_by_key(|&(pool, signer, _, _)| (pool, signer));
         anyhow::ensure!(all.len() == 3);
-        anyhow::ensure!(all.first() == Some(&(a, s1, 800u128)));
-        anyhow::ensure!(all.get(1) == Some(&(a, s2, 90u128)));
+        anyhow::ensure!(all.first() == Some(&(a, s1, 800u128, 200u64)));
+        anyhow::ensure!(all.get(1) == Some(&(a, s2, 90u128, 100u64)));
         // Forgetting the pool drops EVERY signer row it holds, and only those.
         store.forget_loss(a)?;
-        anyhow::ensure!(store.load_losses()? == vec![(b, s1, 4_000_000u128)]);
+        anyhow::ensure!(store.load_buckets()? == vec![(b, s1, 4_000_000u128, 100u64)]);
         // Forgetting an already-forgotten pool is a no-op.
         store.forget_loss(a)?;
         Ok(())
     }
 
-    /// A late, smaller total — two floor-reservation drops on one lane landing out
-    /// of order — leaves the larger stored total in place, and `forget_loss` is the
-    /// only way back down. Monotonicity is per `(pool, signer)`: one signer's total
-    /// never gates another's.
+    /// A stale snapshot — two floor-reservation drops on one lane landing out of
+    /// order — leaves the fresher (greater-timestamp) row in place. The bucket
+    /// refills, so a newer snapshot may carry a LOWER consumed level and still wins:
+    /// timestamp is the freshness key, not the level. Rows are per `(pool, signer)`,
+    /// so one signer's bucket never gates another's.
     #[test]
-    fn floor_loss_store_never_regresses() -> anyhow::Result<()> {
+    fn floor_bucket_store_keeps_the_freshest_snapshot() -> anyhow::Result<()> {
         let store = MemoryPoolFloorLossStore::new();
         let (s1, s2) = signers();
         let pool = b256!("0000000000000000000000000000000000000000000000000000000000000077");
-        store.record_loss(pool, s1, 5_000)?;
-        store.record_loss(pool, s1, 10)?;
-        anyhow::ensure!(store.load_losses()? == vec![(pool, s1, 5_000u128)]);
-        store.record_loss(pool, s1, 5_001)?;
-        anyhow::ensure!(store.load_losses()? == vec![(pool, s1, 5_001u128)]);
-        // A smaller total for a DIFFERENT signer is its own row, not a regression.
-        store.record_loss(pool, s2, 10)?;
-        let mut all = store.load_losses()?;
-        all.sort_by_key(|&(_, signer, _)| signer);
-        anyhow::ensure!(all == vec![(pool, s1, 5_001u128), (pool, s2, 10u128)]);
+        store.record_bucket(pool, s1, 5_000, 200)?;
+        // An older-timestamp write (a reordered drop) does not clobber the fresher row.
+        store.record_bucket(pool, s1, 10, 100)?;
+        anyhow::ensure!(store.load_buckets()? == vec![(pool, s1, 5_000u128, 200u64)]);
+        // A newer timestamp wins even though its consumed level is lower (refill).
+        store.record_bucket(pool, s1, 1_000, 300)?;
+        anyhow::ensure!(store.load_buckets()? == vec![(pool, s1, 1_000u128, 300u64)]);
+        // A different signer is its own row.
+        store.record_bucket(pool, s2, 10, 100)?;
+        let mut all = store.load_buckets()?;
+        all.sort_by_key(|&(_, signer, _, _)| signer);
+        anyhow::ensure!(all == vec![(pool, s1, 1_000u128, 300u64), (pool, s2, 10u128, 100u64)]);
         Ok(())
     }
 
-    /// `forget_loss` is terminal for a pool id: a `record_loss` landing after it —
+    /// `forget_loss` is terminal for a pool id: a `record_bucket` landing after it —
     /// the in-flight persist a reservation drop dispatched before the pool was
     /// reclaimed — is a no-op for EVERY signer of that pool and does not resurrect
     /// the row. `sweep_forgotten` (bring-up only) reclaims the tombstones.
     #[test]
-    fn floor_loss_record_after_forget_does_not_resurrect() -> anyhow::Result<()> {
+    fn floor_bucket_record_after_forget_does_not_resurrect() -> anyhow::Result<()> {
         let store = MemoryPoolFloorLossStore::new();
         let (s1, s2) = signers();
         let pool = b256!("0000000000000000000000000000000000000000000000000000000000000077");
-        store.record_loss(pool, s1, 5_000)?;
+        store.record_bucket(pool, s1, 5_000, 100)?;
         store.forget_loss(pool)?;
-        store.record_loss(pool, s1, 5_000)?;
+        store.record_bucket(pool, s1, 5_000, 200)?;
         // The tombstone is pool-level, so a signer that never had a row is blocked
         // too — its first persist may simply have lost the race.
-        store.record_loss(pool, s2, 7)?;
+        store.record_bucket(pool, s2, 7, 200)?;
         anyhow::ensure!(
-            store.load_losses()?.is_empty(),
-            "a record_loss landing after forget_loss must not resurrect the row"
+            store.load_buckets()?.is_empty(),
+            "a record_bucket landing after forget_loss must not resurrect the row"
         );
         // A pool never recorded but forgotten (the drop's FIRST persist lost the
         // race) is tombstoned the same way.
         let unseen = b256!("0000000000000000000000000000000000000000000000000000000000000088");
         store.forget_loss(unseen)?;
-        store.record_loss(unseen, s1, 40)?;
-        anyhow::ensure!(store.load_losses()?.is_empty());
+        store.record_bucket(unseen, s1, 40, 100)?;
+        anyhow::ensure!(store.load_buckets()?.is_empty());
         anyhow::ensure!(store.sweep_forgotten()? == 2, "both tombstones are swept");
         anyhow::ensure!(store.sweep_forgotten()? == 0, "sweep is idempotent");
         // After the bring-up sweep the pool id accepts writes again; at bring-up no
         // stale persist can exist, and a reclaimed pool id never recurs.
-        store.record_loss(pool, s1, 10)?;
-        anyhow::ensure!(store.load_losses()? == vec![(pool, s1, 10u128)]);
+        store.record_bucket(pool, s1, 10, 300)?;
+        anyhow::ensure!(store.load_buckets()? == vec![(pool, s1, 10u128, 300u64)]);
         Ok(())
     }
 }

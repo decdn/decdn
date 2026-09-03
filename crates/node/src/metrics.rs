@@ -555,20 +555,19 @@ pub struct DecdnMetrics {
     /// fsynced — the frontier-only replay surface is widening. Operator-visible
     /// name: `decdn_lane_flush_failures_total`.
     pub lane_flush_failures: Counter,
-    /// Floor dead-charge writes that failed: a drop-time persist (`record_loss`
-    /// on a `FloorReservation` drop) or a reclaimed pool's `forget_loss`. Both
-    /// are best-effort — the in-memory accumulator stays authoritative for the
-    /// running process — so a failed persist widens the restart-time re-grant
-    /// window instead of breaking delivery (a restart hydrates a stale total and
-    /// hands the affected pools back free-floor budget they already consumed),
-    /// and a failed forget leaves the closed pool's row with no tombstone, open
-    /// to permanent re-insertion by a late persist (#1781's error-path
-    /// residual). A sustained rate usually means the
-    /// `floor-loss.redb` file refuses writes (a prior failed commit latches redb
-    /// until the file is closed and reopened — restart the node) or is corrupt;
-    /// pairs with the per-failure `warn!`/`error!` lines ("floor dead-charge
-    /// persist failed" / "pool dead-charge forget failed"). Operator-visible
-    /// name: `decdn_floor_loss_persist_failures_total`.
+    /// Floor abandonment-bucket writes that failed: a drop-time persist
+    /// (`record_bucket` on an abnormal `FloorReservation` drop) or a reclaimed pool's
+    /// `forget_loss`. Both are best-effort — the in-memory bucket stays authoritative
+    /// for the running process — so a failed persist widens the restart-time re-grant
+    /// window instead of breaking delivery (a restart hydrates a stale snapshot and
+    /// grants the affected signers a fresh abandonment allowance), and a failed forget
+    /// leaves the closed pool's row with no tombstone, open to permanent re-insertion
+    /// by a late persist (#1781's error-path residual). A sustained rate usually means
+    /// the `floor-loss.redb` file refuses writes (a prior failed commit latches redb
+    /// until the file is closed and reopened — restart the node) or is corrupt; pairs
+    /// with the per-failure `warn!`/`error!` lines ("floor abandonment-bucket persist
+    /// failed" / "pool floor-bucket forget failed"). Operator-visible name:
+    /// `decdn_floor_loss_persist_failures_total`.
     pub floor_loss_persist_failures: Counter,
     /// Slashes detected against this node's operator by the slash watcher
     /// (`SlashJudge.Slashed`), counting each distinct `slashId` once across the
@@ -1139,9 +1138,10 @@ pub struct DecdnMetrics {
     /// experiencing sustained concurrency pressure. Visible name:
     /// `decdn_serve_stream_rejected_lane_at_capacity_total`.
     pub serve_stream_rejected_lane_at_capacity: Counter,
-    /// Delivery refused because ONE capability signer's un-vouchered floor credit
-    /// — its live reservations plus its permanent `dead_charge` — already fills
-    /// its share of the pool budget, while the pool itself can still pay (ADR 003
+    /// Delivery refused because ONE capability signer hit a per-signer floor gate —
+    /// either its live concurrency cap of un-vouchered reservation, or its refilling
+    /// node-local abandonment bucket (drained by a burst of abandons) — while the
+    /// pool itself can still pay (ADR 003
     /// §Pool solvency, per-signer floor isolation). Wire-indistinguishable from
     /// `insufficient_deposit` (both signed as `NotFound`), so this counter is the
     /// only place the distinction lives — a rising value means one signer holds its
@@ -1866,12 +1866,12 @@ recorders! {
     /// and the shutdown flush in `runtime/mod.rs`.
     lane_flush_failure => lane_flush_failures.inc();
 
-    /// A floor dead-charge write failed: a drop-time persist (`record_loss` on a
-    /// `FloorReservation` drop, leaving the durable total behind the in-memory
-    /// accumulator until a later drop re-persists it) or a reclaimed pool's
+    /// A floor abandonment-bucket write failed: a drop-time persist (`record_bucket`
+    /// on an abnormal `FloorReservation` drop, leaving the durable snapshot behind the
+    /// in-memory bucket until a later drop re-persists it) or a reclaimed pool's
     /// `forget_loss` (leaving the row deletable by nothing and untombstoned).
     /// Pairs with the `warn!`/`error!` lines in `handlers/client/mod.rs`
-    /// ("floor dead-charge persist failed" / "pool dead-charge forget failed").
+    /// ("floor abandonment-bucket persist failed" / "pool floor-bucket forget failed").
     floor_loss_persist_failure => floor_loss_persist_failures.inc();
 
     /// A distinct slash against this node's operator was detected by the slash
@@ -1983,9 +1983,9 @@ recorders! {
     /// refundable floor cannot cover the reserved cost of another.
     serve_stream_rejected_lane_at_capacity => serve_stream_rejected_lane_at_capacity.inc();
 
-    /// Record a `serve_stream` delivery refused because this capability signer's
-    /// un-vouchered floor credit already fills its share of the pool budget,
-    /// while the pool as a whole can still pay.
+    /// Record a `serve_stream` delivery refused because this capability signer hit a
+    /// per-signer floor gate — its live concurrency cap or its drained abandonment
+    /// bucket — while the pool as a whole can still pay.
     serve_stream_rejected_signer_floor_at_cap => serve_stream_rejected_signer_floor_at_cap.inc();
 
     /// Record a `serve_stream` delivery refused because the requested bounded

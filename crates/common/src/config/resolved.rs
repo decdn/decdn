@@ -183,18 +183,22 @@ pub struct ResolvedBlockchain {
     /// remaining on-chain balance minus `M` can no longer cover the next
     /// credit window. Defaults to 1 USDC (`1_000_000` `µUSDC`).
     pub pool_min_remaining_deposit_micro_usdc: u64,
-    /// Share of a pool's refundable headroom (`remaining − M`), in basis points,
-    /// that any one capability signer may hold as un-vouchered floor credit
-    /// (ADR 003 § Pool solvency, per-signer floor isolation). Guaranteed in
-    /// `1..=10_000` (the resolver rejects anything else); the guarantee holds only
-    /// for a value the resolver produced. Defaults to `2500`.
-    pub pool_floor_signer_share_bps: u64,
-    /// Absolute ceiling on the per-signer floor sub-cap, in ramp-start credit
-    /// windows (ADR 003 § Pool solvency, per-signer floor isolation). `0` disables
-    /// the ceiling, which is the default — see
-    /// `decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS` for why it is
-    /// opt-in.
-    pub pool_floor_signer_max_windows: u64,
+    /// Per-signer LIVE concurrency cap `k`, in ramp-start credit windows (ADR 003
+    /// § Pool solvency, per-signer floor isolation): the most live un-vouchered floor
+    /// reservation any one capability signer may hold against a pool, `k · one credit
+    /// window`. Lower-clamped to one window at use. Defaults to `8` — see
+    /// `decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS`.
+    pub pool_floor_signer_live_windows: u64,
+    /// Per-signer abandonment-bucket capacity, in ramp-start credit windows (ADR 003
+    /// § Pool solvency, per-signer abandonment allowance): the un-recouped floor a
+    /// signer may drain before this node soft-throttles it. Lower-clamped to one window
+    /// at use. Defaults to `8` — see
+    /// `decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_BUCKET_WINDOWS`.
+    pub pool_floor_signer_bucket_windows: u64,
+    /// Seconds to refill one window of the per-signer abandonment bucket (ADR 003
+    /// § Pool solvency). Lower-clamped to one second at use. Defaults to `60` — see
+    /// `decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_REFILL_SECS`.
+    pub pool_floor_signer_refill_secs: u64,
 }
 
 /// Resolved cache fields.
