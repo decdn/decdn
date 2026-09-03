@@ -41,6 +41,10 @@ const CLIENT_STREAM_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
 /// larger than it must.
 const CLIENT_RECEIVE_WINDOW: u32 = 128 * 1024 * 1024;
 
+// A single stream must be able to fill its own window within the
+// whole-connection cap, or the per-stream window is unreachable.
+const _: () = assert!(CLIENT_STREAM_RECEIVE_WINDOW <= CLIENT_RECEIVE_WINDOW);
+
 /// QUIC transport config for a one-shot client [`Endpoint`]. It raises only the
 /// receive windows over the iroh defaults: on a download the client is the
 /// flow-control receiver, so these windows bound single-stream throughput on a
@@ -223,6 +227,17 @@ mod tests {
         f.write_all(body.as_bytes()).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn client_transport_windows_are_sized_and_ordered() {
+        // Pin the sizes this PR sets: the per-stream window matches a default
+        // node's `credit_max` ceiling, and the connection window sits above it.
+        assert_eq!(CLIENT_STREAM_RECEIVE_WINDOW, 64 * 1024 * 1024);
+        assert_eq!(CLIENT_RECEIVE_WINDOW, 128 * 1024 * 1024);
+        // The builder accepts these values and yields a config. (The
+        // stream-<=-connection invariant is a compile-time assertion above.)
+        let _config = client_transport_config();
     }
 
     #[test]
