@@ -89,6 +89,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         cache: ResolvedCache {
             cache_dir: PathBuf::from("/tmp/cache"),
             cache_size_mb: 1024,
+            disk_headroom_mb: 8192,
             max_blob_size_mb: 128,
             max_rate_per_mb: 0,
             origins: Vec::new(),

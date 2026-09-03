@@ -206,8 +206,16 @@ pub struct ResolvedBlockchain {
 pub struct ResolvedCache {
     /// Blob cache directory.
     pub cache_dir: PathBuf,
-    /// Maximum cache size in megabytes.
+    /// Upper bound on the cache ceiling in megabytes. The eviction driver clamps
+    /// it down each tick so the cache never grows into the last
+    /// [`Self::disk_headroom_mb`] of free space on the `cache_dir` volume
+    /// (#1930).
     pub cache_size_mb: u64,
+    /// Free disk in megabytes the eviction driver keeps unused on the
+    /// `cache_dir` volume, defended against any process (#1930). Default
+    /// [`crate::config::DEFAULT_DISK_HEADROOM_MB`]; `0` opts out of the disk
+    /// clamp so only [`Self::cache_size_mb`] binds.
+    pub disk_headroom_mb: u64,
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling for paid pulls (#1375), in the same

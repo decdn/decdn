@@ -219,6 +219,8 @@ exists, range reclaim is future work, external to this ADR.
 
 ```toml
 [cache]
+cache_size_mb    = 102400       # UPPER bound on the ceiling; free disk clamps it down (see § Free-disk-aware ceiling)
+disk_headroom_mb = 8192         # free disk kept on the cache_dir volume (default 8 GiB); 0 opts out
 admission_policy = "always"     # "always" | "tinylfu"   (default "always")
 eviction_policy  = "lru"        # "lru"    | "tinylfu"   (default "lru")
 
@@ -276,6 +278,40 @@ economic weight and has no cross-node interoperability requirement.
 The defaults, `always` admission and `lru` eviction, reproduce today's
 recency-only behavior exactly. Adopting `tinylfu` is an explicit operator
 opt-in.
+
+### Free-disk-aware ceiling
+
+`cache_size_mb` is an upper bound, not the ceiling. The eviction driver clamps
+it down each tick to keep `disk_headroom_mb` of the `cache_dir` volume free. It
+defends that margin against every process on the volume, not only this cache.
+
+The driver probes free disk once per tick with one `statvfs` call, beside the
+store walk it already runs. It then recomputes the effective ceiling:
+
+```
+effective_cap = min(cache_size_mb, footprint + max(0, free_disk - disk_headroom_mb))
+```
+
+The cache may grow into whatever is free beyond the headroom. Below the
+headroom the ceiling collapses to the current footprint, so the driver evicts to
+claw disk back. The high-water and target percentages apply to this dynamic
+ceiling, so the sweep tracks real free space rather than a static number.
+
+The clamp is continuous, so a node with a large `cache_size_mb` sizes itself to
+its volume. An operator drops the same config onto any machine and the cache
+fills the disk down to the headroom, whatever the disk holds.
+
+A `statvfs` failure disables the clamp for that tick. The configured
+`cache_size_mb` binds, and the driver never evicts blind on a probe error. The
+driver logs the clamp transition and the probe-failure transition once each, not
+every tick.
+
+`disk_headroom_mb` defaults to 8192 (8 GiB). `0` opts out, leaving only
+`cache_size_mb`. Because reclaim is soft (tag-drop then GC), the driver defends
+the margin reactively, so a headroom smaller than one GC interval's writes can
+be crossed briefly under a heavy write burst. `decdn node doctor` reads the same
+free-disk helper to flag a budget or headroom that does not fit the volume
+before boot.
 
 ### Pinning, durable operator-evict, and the probe-hold stay engine-enforced
 
@@ -341,7 +377,9 @@ retention.
   unenforceable and the boot path only warns.
 - The write path applies no disk-full backpressure. Footprint overshoot is
   bounded only by the reactive eviction driver and the per-blob
-  `max_blob_size` limit.
+  `max_blob_size` limit. The free-disk-aware ceiling defends `disk_headroom_mb`
+  of the volume, but reactively: soft-evict plus GC lag means a heavy write
+  burst can cross the margin briefly before the driver claws it back.
 - Segment membership lives in memory only. A restart loses it, so every
   cached blob returns to an uncapped state until traffic re-observes it and
   the estimator rebuilds its signal.

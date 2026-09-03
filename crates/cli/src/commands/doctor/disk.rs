@@ -7,36 +7,11 @@
 use std::path::Path;
 
 use decdn_common::config::ResolvedConfig;
+use decdn_common::disk::statvfs_target;
 
 use super::{Finding, Report, Severity};
 
 const BYTES_PER_MB: u64 = 1024 * 1024;
-
-/// Total and unprivileged-available bytes at a path.
-pub(crate) struct DiskSpace {
-    /// Total filesystem capacity, in bytes.
-    pub(crate) total: u64,
-    /// Bytes available to an unprivileged user, in bytes.
-    pub(crate) avail: u64,
-}
-
-/// Read filesystem capacity at `path` via `statvfs`. Bytes = fragment size ×
-/// block counts (`f_frsize × f_blocks`, `f_frsize × f_bavail`).
-pub(crate) fn read_disk_space(path: &Path) -> anyhow::Result<DiskSpace> {
-    let stat = nix::sys::statvfs::statvfs(path)
-        .map_err(|e| anyhow::anyhow!("statvfs({}) failed: {e}", path.display()))?;
-    let frsize = stat.fragment_size();
-    // fsblkcnt_t is u32 on macOS (real widening) and u64 on 64-bit Linux glibc
-    // (identity); the value always fits u64 either way.
-    #[allow(clippy::useless_conversion)]
-    let blocks = u64::from(stat.blocks());
-    #[allow(clippy::useless_conversion)]
-    let blocks_available = u64::from(stat.blocks_available());
-    Ok(DiskSpace {
-        total: frsize.saturating_mul(blocks),
-        avail: frsize.saturating_mul(blocks_available),
-    })
-}
 
 // Precision loss above 2^52 bytes (~4 PiB) is immaterial: this only feeds a
 // human-readable GiB figure in report text, never a comparison or decision.
@@ -179,20 +154,6 @@ pub(crate) fn check_disk(report: &mut Report, cfg: &ResolvedConfig, live_footpri
     check_writable(report, "disk.data_dir", "data_dir", &cfg.identity.data_dir);
 }
 
-/// statvfs the path, or the nearest existing ancestor if it does not exist yet.
-fn statvfs_target(path: &Path) -> anyhow::Result<DiskSpace> {
-    let mut cur = path;
-    loop {
-        if cur.exists() {
-            return read_disk_space(cur);
-        }
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => return read_disk_space(path), // let statvfs surface the error
-        }
-    }
-}
-
 /// Probe writability by creating and removing a temp file in `dir` (or its
 /// parent when `dir` does not exist yet). Read-only w.r.t. real node state.
 fn check_writable(report: &mut Report, id: &'static str, label: &'static str, dir: &Path) {
@@ -268,12 +229,5 @@ mod tests {
         // hw=0.9 GiB, avail=1 GiB on a 50 GiB volume => reachable >= hw but avail < 10% of total.
         let f = evaluate_disk(1 * GIB, 90, 50 * GIB, 1 * GIB, 0);
         assert_eq!(f.severity, Severity::Warn);
-    }
-
-    #[test]
-    fn read_disk_space_of_tempdir_is_nonzero() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = read_disk_space(dir.path()).unwrap();
-        assert!(s.total > 0);
     }
 }
