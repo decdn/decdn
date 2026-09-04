@@ -4894,33 +4894,20 @@ mod tests {
     }
 
     #[test]
-    fn blockchain_swap_fields_parse_under_deny_unknown_fields() -> anyhow::Result<()> {
-        // #991: `decdn setup --pay-bond-with usdc` reads the swap knobs from
-        // `[blockchain]`. `BlockchainConfig` has `deny_unknown_fields`, so a
-        // config that drives `setup` must also parse here (and via
-        // `decdn config validate`) — otherwise the schema forks. Assert all
-        // seven swap fields deserialize without an "unknown field" error.
+    fn blockchain_usdc_address_parses_under_deny_unknown_fields() -> anyhow::Result<()> {
+        // `usdc_address` is the settlement token a client config names, and
+        // `BlockchainConfig` has `deny_unknown_fields`, so a client config must
+        // parse here (and via `decdn config validate`) — otherwise the schema
+        // forks. Assert it deserializes without an "unknown field" error.
         let toml = "\
 [blockchain]
-swap_venue = \"uniswap-v3\"
-swap_router_address = \"0xRouter\"
-swap_quoter_address = \"0xQuoter\"
 usdc_address = \"0xUsdc\"
-swap_fee_tier = 3000
-swap_balancer_pool = \"0xBalPool\"
-swap_pool_address = \"0xPool\"
 ";
         let file: crate::config::FileConfig = ::toml::from_str(toml)?;
         let bc = file
             .blockchain
             .ok_or_else(|| anyhow::anyhow!("missing [blockchain] section"))?;
-        anyhow::ensure!(bc.swap_venue.as_deref() == Some("uniswap-v3"));
-        anyhow::ensure!(bc.swap_router_address.as_deref() == Some("0xRouter"));
-        anyhow::ensure!(bc.swap_quoter_address.as_deref() == Some("0xQuoter"));
         anyhow::ensure!(bc.usdc_address.as_deref() == Some("0xUsdc"));
-        anyhow::ensure!(bc.swap_fee_tier == Some(3000));
-        anyhow::ensure!(bc.swap_balancer_pool.as_deref() == Some("0xBalPool"));
-        anyhow::ensure!(bc.swap_pool_address.as_deref() == Some("0xPool"));
         Ok(())
     }
 

@@ -1252,13 +1252,6 @@ mod tests {
                     json: false,
                 },
                 capacity_bond_address: None,
-                swap_venue: None,
-                swap_router_address: None,
-                swap_quoter_address: None,
-                usdc_address: None,
-                swap_fee_tier: None,
-                swap_balancer_pool: None,
-                swap_pool_address: None,
             },
         }
     }

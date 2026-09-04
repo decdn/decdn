@@ -154,8 +154,8 @@ struct FundingHandles<P: Provider + Clone + 'static> {
 /// exactly once. Any other error — and any error from the recovery or the
 /// retry — returns as-is. Generic over the two async effects so the retry
 /// control flow is unit-testable with plain closures and counters, no RPC
-/// (matches the repo's extracted-control-flow posture; see the `Asserter`
-/// note in `swap_uniswap.rs`). On the happy path `attempt` runs once and
+/// (matches the repo's extracted-control-flow posture). On the happy path
+/// `attempt` runs once and
 /// `recover_allowance` never runs, so the node issues zero allowance reads
 /// per top-up.
 ///
