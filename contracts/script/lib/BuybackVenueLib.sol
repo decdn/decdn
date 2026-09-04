@@ -98,8 +98,6 @@ library BuybackVenueLib {
         address pool;
         address vault;
         address permit2;
-        uint256 subSwapCount;
-        uint256 subSwapMinBlockGap;
     }
 
     /// @notice Resolve a `BUYBACK_VENUE` string to the enum. Case-sensitive and
@@ -128,9 +126,7 @@ library BuybackVenueLib {
     ///         constructor skips validation and the burner reverts `PoolNotWired` on
     ///         every swap forever. A zero `swapRouter` or `permit2` would hit
     ///         `ZeroAddress` in that constructor anyway; naming them here only makes
-    ///         the failure legible. `subSwapCount` is keeper-schedule metadata, an
-    ///         immutable that ADR 018 § Parameter Table defines for `= 1` and `> 1`
-    ///         and never `0`, so a zero is a permanently-wrong, redeploy-only config.
+    ///         the failure legible.
     function requireBalancerWiring(BalancerWiring memory wiring, GuardedBuybackBurner.GuardParams memory guard)
         internal
         pure
@@ -139,7 +135,6 @@ library BuybackVenueLib {
         if (wiring.pool == address(0)) revert WiringIncomplete("balancer.pool");
         if (wiring.vault == address(0)) revert WiringIncomplete("balancer.vault");
         if (wiring.permit2 == address(0)) revert WiringIncomplete("balancer.permit2");
-        if (wiring.subSwapCount == 0) revert WiringIncomplete("balancer.subSwapCount");
         _requireLiveGuardBand(guard);
     }
 
@@ -217,8 +212,6 @@ library BuybackVenueLib {
                 pool_: wiring.pool,
                 vault_: wiring.vault,
                 permit2_: wiring.permit2,
-                subSwapCount_: wiring.subSwapCount,
-                subSwapMinBlockGap_: wiring.subSwapMinBlockGap,
                 twapMinWindow_: guard.twapMinWindow_,
                 maxBuybackAmount_: guard.maxBuybackAmount_,
                 minBuybackAmount_: guard.minBuybackAmount_,

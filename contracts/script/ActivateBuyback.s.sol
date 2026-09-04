@@ -52,8 +52,6 @@ import { BuybackVenueLib } from "./lib/BuybackVenueLib.sol";
 ///           - `BALANCER_VAULT`       — Balancer V3 Vault (pool reads + registration)
 ///           - `BALANCER_POOL`        — 80/20 TOKEN/USDC weighted pool
 ///           - `PERMIT2_ADDRESS`          (optional; default canonical Permit2)
-///           - `SUB_SWAP_COUNT`           (optional; default 4)
-///           - `SUB_SWAP_MIN_BLOCK_GAP`   (optional; default 10)
 ///
 ///         Uniswap venue env vars:
 ///           - `UNISWAP_SWAP_ROUTER`  — Uniswap V3 SwapRouter02 (swap call target)
@@ -128,9 +126,7 @@ contract ActivateBuyback is Script {
                 swapRouter: vm.envAddress("BALANCER_ROUTER"),
                 pool: vm.envAddress("BALANCER_POOL"),
                 vault: vm.envAddress("BALANCER_VAULT"),
-                permit2: vm.envOr("PERMIT2_ADDRESS", BuybackVenueLib.CANONICAL_PERMIT2),
-                subSwapCount: vm.envOr("SUB_SWAP_COUNT", uint256(4)),
-                subSwapMinBlockGap: vm.envOr("SUB_SWAP_MIN_BLOCK_GAP", uint256(10))
+                permit2: vm.envOr("PERMIT2_ADDRESS", BuybackVenueLib.CANONICAL_PERMIT2)
             }),
             _readGuardParams()
         );
