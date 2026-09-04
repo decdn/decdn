@@ -598,14 +598,24 @@ pub struct DecdnMetrics {
     /// no abandonment bucket at all and its signer keeps an allowance it has spent.
     /// Without this counter that window is invisible.
     ///
-    /// Counted once per REQUEST at the single point the view is resolved, not once per
-    /// gate: one `None` skips several gates and degrades two serve paths, and the bump
-    /// precedes every later refusal, so a request refused afterwards still counts. Read
-    /// it as an upper bound rather than dividing it against a per-gate rate.
+    /// Counted once per REQUEST at the single point the ADMISSION path resolves the
+    /// view, not once per gate: one `None` skips several gates and degrades two serve
+    /// paths, and the bump precedes every later refusal, so a request refused afterwards
+    /// still counts. Read it as an upper bound rather than dividing it against a
+    /// per-gate rate.
+    ///
+    /// The admission path is the whole of its scope. A serve resolves the view again at
+    /// each voucher boundary — for the mid-stream solvency re-check and the ADR 011
+    /// takedown re-check — and those skips are NOT in this series. That gap has a shape
+    /// worth knowing: a pool reclaimed mid-stream answers `None` from then on, so every
+    /// later re-check on an already-admitted stream fails open while this counter stays
+    /// flat, because admission resolved `Some`.
     ///
     /// It conflates the three ways the view answers `None`: no pool view wired, a pool
-    /// the watcher has not seen yet, and a read fault. In production the view is always
-    /// wired, so a sustained rate means watcher lag or a read fault and pairs with the
+    /// the watcher has not seen yet, and a pool the projection has dropped on
+    /// `PoolReclaimed`. There is no fault case to look for — the wired projection reads
+    /// an in-memory map and answers `None` only for an absent key. In production the
+    /// view is always wired, so a sustained rate means watcher lag and pairs with the
     /// watcher-liveness series. Operator-visible name:
     /// `decdn_floor_gate_skipped_no_pool_view_total`.
     pub floor_gate_skipped_no_pool_view: Counter,

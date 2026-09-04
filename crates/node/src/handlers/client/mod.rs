@@ -978,13 +978,9 @@ pub struct ClientHandler {
     /// signer within each pool, that signer's live slice plus its node-local
     /// abandonment bucket. Guards an O(1) map only and is never held across `.await` —
     /// a plain `std::sync::Mutex`, so a [`FloorReservation`]'s `Drop` can reconcile
-    /// under it (a tokio mutex cannot be locked in `Drop`). Hydrated from
-    /// `floor_loss_store` at construction.
+    /// under it (a tokio mutex cannot be locked in `Drop`). Hydrated at construction
+    /// from the floor-loss store named in [`ClientHandlerDeps::floor_loss_store`].
     pool_floor: Arc<std::sync::Mutex<FloorAccumulator>>,
-    /// Durable mirror of each signer's abandonment bucket; `None` in tests (in-memory
-    /// only). A [`FloorReservation`]'s `Drop` writes the signer's new bucket snapshot
-    /// here best-effort on an abnormal exit.
-    floor_loss_store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
     /// How a [`FloorReservation`]'s `Drop` makes its bucket snapshot durable —
     /// normally a `send` to the persist worker, which neither blocks nor awaits and so
     /// is safe from a `Drop`. Carries its own fallbacks; see `floor::FloorPersist`.
@@ -1204,7 +1200,6 @@ impl ClientHandler {
             lane_gauge_publish: std::sync::Mutex::new(()),
             capability_verify_cache: std::sync::Mutex::new(CapabilityVerifyCache::default()),
             pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
-            floor_loss_store: deps.floor_loss_store,
             floor_persist,
             pool_floor_signer_live_windows: deps.pool_floor_signer_live_windows,
             pool_floor_signer_bucket_windows: deps.pool_floor_signer_bucket_windows,

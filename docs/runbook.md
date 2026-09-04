@@ -451,13 +451,24 @@ upper bound rather than dividing it against a per-gate rate.
 
 That fail-open is deliberate: a watcher blip must not refuse paying clients, and the
 open-time hash gates plus the first voucher's on-chain `redeem` still carry compliance
-and revenue. It is contained, since capability intake fails closed on an unknown pool
-owner. What it costs is accounting — a stream abandoned inside that window debits no
-abandonment bucket at all, so its signer keeps an allowance it has spent. In production
-the pool view is always wired, so a sustained rate means the chain watcher is lagging or
-its reads are failing; check `decdn_settlement_watcher_last_tick_timestamp_seconds` as
-in remediation step (2) below and treat it as cause (2). A brief burst right after
-start-up, while the watcher backfills, is expected.
+and revenue. What it costs is accounting — a stream abandoned inside that window debits
+no abandonment bucket at all, so its signer keeps an allowance it has spent.
+
+It is contained against a pool this node has **never seen**: capability intake fails
+closed on an unknown pool owner, so no lane is registered and the request is refused
+before it can serve. It is not contained for lanes the node already knows. Lanes hydrate
+from the durable store at start-up independently of the pool projection, which stays
+empty until the settlement watcher backfills — so for that window, established and
+genuinely paying lanes serve with every admission floor gate skipped. That is the
+start-up burst below, and it is expected.
+
+In production the pool view is always wired, so a sustained rate outside start-up means
+the chain watcher is lagging: check `decdn_settlement_watcher_last_tick_timestamp_seconds`
+as in remediation step (2) below. Go straight to step (2) — step (1) does not apply here.
+Unlike every other symptom in this section this one emits **no log line at all**, so
+there is no channel id to take from a `warn!`, and it is about POOL views rather than
+the per-channel deposits step (1) reconciles. This counter and the watcher gauge are the
+whole signal.
 
 **Remediate:**
 

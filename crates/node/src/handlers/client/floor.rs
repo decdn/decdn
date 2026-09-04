@@ -8,10 +8,16 @@
 //! [`FloorReservation`] is the RAII hold one stream takes against them.
 //!
 //! The invariant every mutation must preserve is that the pool's `live_reservation`
-//! equals the fold of the per-signer ones. That is why the counters are PRIVATE to
-//! this module and moved only through [`PoolFloorState`]'s inherent mutators, each
+//! equals the fold of the per-signer ones. That is why the LIVE counters are PRIVATE
+//! to this module and moved only through [`PoolFloorState`]'s inherent mutators, each
 //! of which touches both levels in one call. A one-sided update would be silent, and
 //! nothing downstream would notice until the pool over- or under-admitted.
+//!
+//! The abandonment buckets are outside that rule and are refilled in place through the
+//! signer row ([`FloorAccumulator::read_refilled`]) rather than through a pool-level
+//! mutator. They roll into no pool total, so there is no second level for them to fall
+//! out of step with — which is also why [`PoolFloorState::levels_agree`] does not fold
+//! them.
 //!
 //! The counters live here rather than in `mod.rs` so that privacy is real: a sibling
 //! module cannot name a field, so the mutators are the only way to move one.
@@ -60,12 +66,15 @@ pub(super) fn hydrate(
 
 /// Every pool's floor accounting, keyed by `pool_id`.
 ///
-/// A newtype rather than a bare `HashMap` because the map is the last way to break
-/// the invariant the entries themselves protect: `PoolFloorState::default()` mints a
-/// fresh epoch, so a stray `entry(pool).or_default()` would wipe a pool's persisted
-/// abandonment buckets and orphan every guard holding the old epoch — their
-/// reservations would then never be released. Wrapping the map keeps `Default`
-/// reachable only from here, and the operations below are the whole surface.
+/// A newtype rather than a bare `HashMap` because the map is the last way to break the
+/// invariant the entries themselves protect. `PoolFloorState::default()` mints a fresh
+/// epoch, so a stray `entry(pool).or_default()` on a pool [`Self::forget`] has already
+/// removed re-enters it under a NEW generation, orphaning every guard still holding the
+/// old one: their reservations reconcile against nothing and are never released, and the
+/// pool carries a live total no guard can retire. (`or_default()` inserts only when the
+/// key is absent, so it overwrites nothing — the hazard is the resurrection, not a
+/// clobber.) Wrapping the map keeps `Default` reachable only from here, and the
+/// operations below are the whole surface.
 #[derive(Debug, Default)]
 pub(super) struct FloorAccumulator(HashMap<B256, PoolFloorState>);
 
@@ -116,9 +125,11 @@ impl FloorAccumulator {
     }
 
     /// The entry a reservation guard may reconcile against — see
-    /// [`PoolFloorState::entry_for_epoch`].
+    /// [`PoolFloorState::has_epoch`] for which entries qualify and why.
     fn entry_for_epoch(&mut self, pool_id: B256, epoch: u64) -> Option<&mut PoolFloorState> {
-        PoolFloorState::entry_for_epoch(&mut self.0, pool_id, epoch)
+        self.0
+            .get_mut(&pool_id)
+            .filter(|entry| entry.has_epoch(epoch))
     }
 
     /// Load one persisted bucket row at bring-up.
@@ -256,12 +267,17 @@ impl PoolFloorState {
     /// refilled to zero) would leave an empty row alive until the pool is reclaimed
     /// on-chain — inside a map locked on every admission.
     ///
-    /// Safe against a live guard: a repaid guard's `Drop` returns before touching
-    /// the map at all, and an unrepaid guard holds `live_reservation > 0` — every
-    /// admission reserves a non-zero span at a rate the chain floors above zero, so a
-    /// reservation is never zero — and neither can have its row pruned out from
-    /// under it. A row whose bucket still holds a debit is not empty, so a drained
-    /// signer's throttle is not pruned away either.
+    /// Safe against a live guard. A repaid guard's `Drop` returns before touching the
+    /// map at all. An unrepaid guard normally holds `live_reservation > 0`, so its row
+    /// is not empty and cannot be pruned from under it. The exception is a zero-length
+    /// request — a genuinely empty blob audits as serveable at size 0, and
+    /// `min_payment` is zero exactly when the byte span is — whose row CAN be pruned
+    /// while its guard is alive; nothing is lost, because that guard's debit is zero
+    /// too and [`Self::release_and_debit`] re-creates the row with `entry()` rather
+    /// than requiring one. That `entry()` is what makes this unconditionally safe; the
+    /// non-zero reservation is the common case, not the guarantee. A row whose bucket
+    /// still holds a debit is not empty, so a drained signer's throttle is not pruned
+    /// away either.
     fn prune_spent(&mut self, signer: Address) {
         if self
             .signers
@@ -380,12 +396,13 @@ impl PoolFloorState {
     /// remove: subtracting from it would report a reservation this guard never charged
     /// to it, and debiting into it would put this stream's abandonment against a signer
     /// row that outlives the pool it served. Both cases reconcile against nothing.
-    fn entry_for_epoch(
-        map: &mut HashMap<B256, PoolFloorState>,
-        pool_id: B256,
-        epoch: u64,
-    ) -> Option<&mut Self> {
-        map.get_mut(&pool_id).filter(|entry| entry.epoch == epoch)
+    ///
+    /// A predicate rather than a lookup, so the `HashMap` stays inside
+    /// [`FloorAccumulator`]: handing `&mut self.0` out to an associated function here
+    /// would put the map back in reach of the code the newtype exists to keep away from
+    /// it. The absent-entry half of the rule is the caller's `get_mut` returning `None`.
+    const fn has_epoch(&self, epoch: u64) -> bool {
+        self.epoch == epoch
     }
 }
 
@@ -453,6 +470,21 @@ impl FloorPersist {
         match start_persist_worker(&store, metrics) {
             Some((tx, queued)) => Self::Worker { tx, store, queued },
             None => Self::Inline(store),
+        }
+    }
+
+    /// The floor-loss store behind this dispatch, when one is configured.
+    ///
+    /// [`FloorPersist::Off`] is exactly the "no store" case, so this is the whole
+    /// answer to whether durable floor state exists — which is why `ClientHandler` does
+    /// not keep a second `Option<Arc<dyn PoolFloorLossStore>>` beside it. As two fields
+    /// the pair could disagree, and the reclaim path and the drop path read different
+    /// ones: a divergence would forget durable rows while persists went nowhere, or the
+    /// reverse.
+    const fn store(&self) -> Option<&Arc<dyn decdn_incentive::PoolFloorLossStore>> {
+        match self {
+            Self::Off => None,
+            Self::Inline(store) | Self::Worker { store, .. } => Some(store),
         }
     }
 
@@ -609,7 +641,7 @@ fn spawn_persist_worker(
             // failed is already counted by `persist_bucket` or `note_join_failure`.
             queued.fetch_sub(1, Ordering::Relaxed);
             if let Err(e) = joined {
-                note_join_failure(&metrics, pool_id, signer, &e);
+                note_join_failure(&metrics, pool_id, signer, micro_usdc, refill_ms, &e);
             }
         }
     });
@@ -1045,10 +1077,17 @@ fn persist_bucket(
 /// panicked in the blocking pool. Counted like a failed write because the consequence
 /// is identical: the durable snapshot stays behind the in-memory one, so a restart
 /// hands that signer back the allowance this write was recording.
+///
+/// Carries the snapshot it lost, matching [`persist_bucket`]'s failure lines. Naming
+/// only the lane would say that something was lost without saying how much, on one of
+/// the two paths that can lose it — and the amount is the whole reason this subsystem
+/// exists.
 fn note_join_failure(
     metrics: &Metrics,
     pool_id: B256,
     signer: Address,
+    micro: u128,
+    refill_ms: u64,
     err: &tokio::task::JoinError,
 ) {
     metrics.floor_loss_persist_failure();
@@ -1056,12 +1095,12 @@ fn note_join_failure(
         // A panic means `record_bucket` or a store impl is broken — a defect to chase,
         // not the shutdown artifact a cancellation is.
         tracing::error!(
-            %pool_id, %signer, error = %err,
+            %pool_id, %signer, micro, refill_ms, error = %err,
             "floor abandonment-bucket persist panicked in the blocking pool"
         );
     } else {
         tracing::warn!(
-            %pool_id, %signer, error = %err,
+            %pool_id, %signer, micro, refill_ms, error = %err,
             "floor abandonment-bucket persist cancelled"
         );
     }
@@ -1307,7 +1346,7 @@ impl ClientHandler {
     /// it notes the stream's unpaid balance as it delivers and releases the
     /// reservation once a floor is repaid; on an abnormal drop the guard releases the
     /// live reservation and debits the signer's node-local abandonment bucket, in
-    /// memory and (best-effort) in the durable [`Self::floor_loss_store`].
+    /// memory and (best-effort) in the store behind [`FloorPersist`].
     // Test-only: the serve path admits through `try_reserve_floor`, which checks
     // every floor gate and reserves under one lock hold.
     #[cfg(test)]
@@ -1582,7 +1621,7 @@ impl ClientHandler {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.forget(pool_id);
         }
-        let Some(store) = self.floor_loss_store.clone() else {
+        let Some(store) = self.floor_persist.store().map(Arc::clone) else {
             return;
         };
         let result = tokio::task::spawn_blocking(move || store.forget_loss(pool_id)).await;
@@ -2161,7 +2200,13 @@ mod tests {
             admitted.is_ok(),
             "its co-tenant's own hydrated bucket has room, so the pool still serves it"
         );
+        // The only check on `hydrate_bucket` that survives `--release`. Its
+        // `debug_assert!` is compiled out there, so without this a mutation that moved
+        // `live_reservation` during hydration — granting every restarted pool a phantom
+        // committed floor — would pass a release run of the whole suite.
+        ensure_floor_levels_agree(&handler, pool, "after bring-up hydration")?;
         drop(admitted);
+        ensure_floor_levels_agree(&handler, pool, "after the hydrated guard drops")?;
         Ok(())
     }
 
@@ -2649,6 +2694,10 @@ mod tests {
                 .is_ok(),
             "once the bucket has refilled the same signer is admitted again"
         );
+        // Bucket traffic moves `charge_live` and `release_and_debit` many times over;
+        // assert the two levels still agree without relying on their `debug_assert!`s,
+        // which a `--release` run compiles out.
+        ensure_floor_levels_agree(&handler, pool, "after a burst, a throttle and a refill")?;
         Ok(())
     }
 
