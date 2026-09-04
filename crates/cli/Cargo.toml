@@ -101,8 +101,9 @@ decdn-node = { workspace = true }
 decdn-cache = { workspace = true }
 # `tests/key_gen_prompt_pty.rs` drives the real `decdn` binary through the
 # interactive keystore-password prompt, which `rpassword` reads from
-# `/dev/tty`. `rexpect` forks the child onto a pty and makes it the controlling
-# terminal — see the workspace-manifest note for why that cannot be done here.
+# `/dev/tty`. `rexpect` forks the child onto a pty and makes that pty its
+# controlling terminal — see the workspace-manifest note for why we do not do
+# the fork ourselves.
 rexpect = { workspace = true }
 
 [lints]

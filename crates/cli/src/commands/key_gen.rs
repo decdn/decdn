@@ -38,10 +38,7 @@ pub fn key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
 
     // Source the keystore password before any disk writes — interactive
     // prompts that abort (Ctrl-C, mismatch retries exhausted) shouldn't
-    // leave a half-written `node.secret` behind. `PasswordUse::Create` reaches
-    // the prompt alone, which is why the empty-password warning below is
-    // unconditional: an env var or a password file supplies its value under
-    // either use.
+    // leave a half-written `node.secret` behind.
     let password = eth_identity::read_password(
         &super::chain_ctx::password_sources(
             args.keystore_password_file.as_deref(),

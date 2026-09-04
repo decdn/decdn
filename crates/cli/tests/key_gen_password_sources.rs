@@ -8,7 +8,9 @@
 //! deterministic on a developer machine that exports the variable.
 //!
 //! `crates/cli/tests/key_gen_e2e.rs` drives the handler in-process by design
-//! and stays that way; the process boundary lives only here.
+//! and stays that way. These tests close stdin, so the `Prompt` source always
+//! falls through; the prompt itself needs a controlling terminal and is driven
+//! in `key_gen_prompt_pty.rs`.
 
 #![cfg(unix)] // Permission assertions are POSIX-specific.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

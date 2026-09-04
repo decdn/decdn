@@ -47,11 +47,8 @@ const KEYSTORE_FILE_MODE: u32 = 0o600;
 /// What the caller is about to do with the keystore password, which is what
 /// decides whether the interactive prompt asks once or twice.
 ///
-/// The two states have richer semantics than "confirm on / off": `Create` is
-/// not merely "prompt twice", it is "there is no ciphertext yet to check this
-/// entry against, so the operator must supply it twice". Naming them keeps that
-/// reason visible at the call site, where a bare boolean carried it only in a
-/// comment.
+/// Each call site names which one it means, so the reason for the double entry
+/// travels with the argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordUse {
     /// The command CREATES the keystore. The prompt asks twice and requires the
@@ -85,8 +82,9 @@ pub enum PasswordSource {
     /// non-TTY `stdin` falls through. An empty entry is an empty password.
     /// [`PasswordUse::Create`] re-prompts and verifies the entries match.
     Prompt {
-        /// What the password is for. `Create` prompts twice and requires both
-        /// entries to match; `Unlock` takes the first entry as given.
+        /// What the password is for; see [`PasswordUse`]. `Create` prompts
+        /// twice and requires both entries to match, `Unlock` takes the single
+        /// entry as given.
         usage: PasswordUse,
     },
 }
@@ -424,8 +422,11 @@ fn prompt_password(label: &str, usage: PasswordUse) -> anyhow::Result<Zeroizing<
             rpassword::prompt_password(format!("{label}: "))
                 .with_context(|| "failed to read password from terminal")?,
         );
-        if usage == PasswordUse::Unlock {
-            return Ok(pw);
+        // Matched, not compared, so a variant added later fails the build here
+        // rather than inheriting `Create`'s double entry by default.
+        match usage {
+            PasswordUse::Unlock => return Ok(pw),
+            PasswordUse::Create => {}
         }
         let again = Zeroizing::new(
             rpassword::prompt_password(format!("{label} (confirm): "))
