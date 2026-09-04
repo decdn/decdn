@@ -47,6 +47,9 @@ mod ledger;
 /// The pure pacing axis (#1608): [`pacer::Pacer`] / [`pacer::BudgetPacer`] decide
 /// draw / top-up / wait / done / refuse for the gap-driven driver, with no I/O.
 pub mod pacer;
+/// Persisted per-peer knowledge base: registry-fed identity plus interaction-fed
+/// latency and price, keyed by iroh [`PublicKey`], one JSON file per peer.
+pub mod peer_store;
 /// Reusable `cdn/probe/v1` client.
 pub mod probe;
 /// Sub-frame byte-progress observation (#1797): a `ProgressReader` that tallies bytes
@@ -87,6 +90,7 @@ pub use ledger::{
 pub use pacer::{
     BudgetPacer, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer,
 };
+pub use peer_store::{PeerRecord, StoreConfig};
 pub use ranged_store::ClientRangedStore;
 pub use retry::{RetryDisposition, retry_disposition};
 pub use scheduler::{MultiSourceConfig, SourceLane, multi_source_fetch};
