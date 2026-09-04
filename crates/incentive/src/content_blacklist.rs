@@ -141,8 +141,7 @@ mod sol_types {
 
             /// A page of the UNION of the origin and operator deny lists — the
             /// same disjunction `OriginAssignment` evaluates per address, and the
-            /// only readable source for a set that sits outside the
-            /// `getBlacklistVersion()` mechanism entirely. Same raw-membership and
+            /// only readable source for that set. Same raw-membership and
             /// pinned-block caveats as `blacklistedHashes`.
             function blacklistedAddresses(uint256 offset, uint256 limit)
                 external
@@ -193,21 +192,18 @@ mod sol_types {
             /// as an empty deny-set, which reads exactly like "nothing is blacklisted"
             /// while the node serves content it is slashable for serving.
             ///
-            /// `version` (the post-change `getBlacklistVersion()`, ADR 011 § Polling) and
-            /// `reason` (the audit-trail note) are both unused here for that reason alone:
-            /// they are part of the signature, so they are part of this declaration.
-            event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash, uint256 version, string reason);
+            /// `reason` (the audit-trail note) is unused here for that reason alone:
+            /// it is part of the signature, so it is part of this declaration.
+            event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash, string reason);
 
-            /// A `(region, hash)` entry was removed. `version` as above.
-            event HashRemoved(bytes32 indexed region, bytes32 indexed hash, uint256 version);
+            /// A `(region, hash)` entry was removed.
+            event HashRemoved(bytes32 indexed region, bytes32 indexed hash);
 
             /// An origin/operator address entered or left the origin blacklist
             /// (ADR 011 § Hash Evasion and Origin Blacklisting).
             ///
-            /// Deliberately carries NO `version` and is deliberately OUTSIDE the
-            /// `getBlacklistVersion()` poll cycle (ADR 011 § Polling), so a
-            /// consumer cannot use the version counter to detect that it missed
-            /// one.
+            /// Like the hash events, it carries no version counter: a consumer
+            /// detects a missed one by re-enumerating, not from the event.
             ///
             /// The set is enumerable via [`blacklistedAddresses`], so a consumer holds
             /// the deny-set by enumeration and treats this event as a low-latency signal

@@ -138,45 +138,14 @@ contract ContentBlacklistTest is Test {
         assertFalse(blacklist.isHashBlacklisted(SAMPLE_HASH));
     }
 
-    /// @notice ADR 011 § Blacklist version — `getBlacklistVersion()` starts at
-    ///         zero and advances by exactly one on every hash add and every hash
-    ///         removal, on both the global and the regional path. Nodes poll this
-    ///         instead of replaying the full event history.
-    function test_getBlacklistVersion_bumpsOnEveryAddAndRemove() public {
-        assertEq(blacklist.getBlacklistVersion(), 0);
-
-        vm.prank(admin);
-        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-TEST");
-        assertEq(blacklist.getBlacklistVersion(), 1);
-
-        vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
-        assertEq(blacklist.getBlacklistVersion(), 2);
-
-        vm.prank(admin);
-        blacklist.removeHashGlobal(SAMPLE_HASH);
-        assertEq(blacklist.getBlacklistVersion(), 3);
-
-        vm.prank(regionalBody);
-        blacklist.removeHashRegional(REGION_US, SAMPLE_HASH);
-        assertEq(blacklist.getBlacklistVersion(), 4);
-
-        // Re-adding an already-removed hash is a fresh add, so it bumps again —
-        // the counter tracks operations, not the live entry count.
-        vm.prank(admin);
-        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-TEST-2");
-        assertEq(blacklist.getBlacklistVersion(), 5);
-    }
-
-    /// @notice ADR 011 § Polling — `HashRemoved` carries the post-change version
-    ///         so a delta consumer can key the removal to the counter it polled.
-    function test_HashRemoved_carriesVersion() public {
+    /// @notice A removal emits `HashRemoved(region, hash)` — the low-latency
+    ///         re-read signal for a node tracking the deny-set by enumeration.
+    function test_HashRemoved_emitted() public {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
 
-        uint256 expectedVersion = blacklist.getBlacklistVersion() + 1;
         vm.expectEmit(true, true, false, true, address(blacklist));
-        emit ContentBlacklist.HashRemoved(REGION_US, SAMPLE_HASH, expectedVersion);
+        emit ContentBlacklist.HashRemoved(REGION_US, SAMPLE_HASH);
         vm.prank(regionalBody);
         blacklist.removeHashRegional(REGION_US, SAMPLE_HASH);
     }
@@ -317,9 +286,8 @@ contract ContentBlacklistTest is Test {
 
     /// @notice `addHashGlobal` persists the reason and emits it on the event.
     function test_addHashGlobal_persistsReason() public {
-        uint256 expectedVersion = blacklist.getBlacklistVersion() + 1;
         vm.expectEmit(true, true, false, true, address(blacklist));
-        emit ContentBlacklist.HashBlacklisted(GLOBAL_REGION, SAMPLE_HASH, expectedVersion, "DMCA-2026-001");
+        emit ContentBlacklist.HashBlacklisted(GLOBAL_REGION, SAMPLE_HASH, "DMCA-2026-001");
         vm.prank(admin);
         blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-2026-001");
         assertEq(blacklist.hashReason(GLOBAL_REGION, SAMPLE_HASH), "DMCA-2026-001");
@@ -327,9 +295,8 @@ contract ContentBlacklistTest is Test {
 
     /// @notice `addHashRegional` persists the reason under the entry's region.
     function test_addHashRegional_persistsReason() public {
-        uint256 expectedVersion = blacklist.getBlacklistVersion() + 1;
         vm.expectEmit(true, true, false, true, address(blacklist));
-        emit ContentBlacklist.HashBlacklisted(REGION_US, SAMPLE_HASH, expectedVersion, "DSA-DE-001");
+        emit ContentBlacklist.HashBlacklisted(REGION_US, SAMPLE_HASH, "DSA-DE-001");
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DSA-DE-001");
         assertEq(blacklist.hashReason(REGION_US, SAMPLE_HASH), "DSA-DE-001");
@@ -363,34 +330,6 @@ contract ContentBlacklistTest is Test {
     function test_complianceWindow_defaults() public view {
         assertEq(blacklist.complianceWindow(), 24 hours);
         assertEq(blacklist.emergencyComplianceWindow(), 2 hours);
-    }
-
-    /// @notice The counter tracks the ENFORCED hash set and nothing else. Admin
-    ///         actions that change no hash entry — operator blacklisting, origin
-    ///         blacklisting, compliance-window retunes — must not bump it, and
-    ///         neither must any read. A spurious bump is not cosmetic:
-    ///         `blacklist_watcher.rs` uses the counter as its missed-log
-    ///         detector, so every phantom advance costs every node on the
-    ///         network a full delta re-fetch.
-    function test_getBlacklistVersion_unaffectedByNonEntryOperations() public {
-        vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
-        uint256 versionAfterAdd = blacklist.getBlacklistVersion();
-        assertEq(versionAfterAdd, 1);
-
-        vm.startPrank(admin);
-        blacklist.addOperator(operator);
-        blacklist.removeOperator(operator);
-        blacklist.setOriginBlacklist(address(0xBEEF), true);
-        blacklist.setComplianceWindow(12 hours);
-        blacklist.setEmergencyComplianceWindow(1 hours);
-        vm.stopPrank();
-        assertEq(blacklist.getBlacklistVersion(), versionAfterAdd, "non-entry writes must not bump");
-
-        // Reads never bump.
-        blacklist.isHashBlacklistedInRegion(SAMPLE_HASH, REGION_US);
-        blacklist.getHashEntry(REGION_US, SAMPLE_HASH);
-        assertEq(blacklist.getBlacklistVersion(), versionAfterAdd, "reads must not bump");
     }
 
     function test_addHashGlobal_stampsEffectiveAt() public {
@@ -504,23 +443,22 @@ contract ContentBlacklistTest is Test {
         assertTrue(blacklist.isHashBlacklisted(SAMPLE_HASH));
     }
 
-    /// @notice Expiry alone changes the enforced set with the version counter
-    ///         frozen, which a delta-polling node cannot observe (ADR 011
-    ///         § Polling). `expireEmergencyEntry` materializes it as a real
-    ///         `HashRemoved` + version bump.
-    function test_expireEmergencyEntry_bumpsVersionAndEmitsHashRemoved() public {
+    /// @notice Expiry alone changes the enforced set with no write and no log,
+    ///         which a node tracking membership by enumeration cannot observe
+    ///         until it re-enumerates. `expireEmergencyEntry` materializes it as
+    ///         a real `HashRemoved` and drops the entry from the enumerable
+    ///         membership.
+    function test_expireEmergencyEntry_emitsHashRemoved() public {
         vm.prank(multisig);
         blacklist.emergencyAdd(SAMPLE_HASH, uint8(ContentBlacklist.Category.GENERAL), "DMCA");
-        uint256 versionBefore = blacklist.getBlacklistVersion();
         vm.warp(block.timestamp + 14 days + 1);
 
         vm.expectEmit(true, true, false, true, address(blacklist));
-        emit ContentBlacklist.HashRemoved(GLOBAL_REGION, SAMPLE_HASH, versionBefore + 1);
+        emit ContentBlacklist.HashRemoved(GLOBAL_REGION, SAMPLE_HASH);
         // Permissionless — no prank, and `stranger` holds no role.
         vm.prank(stranger);
         blacklist.expireEmergencyEntry(GLOBAL_REGION, SAMPLE_HASH);
 
-        assertEq(blacklist.getBlacklistVersion(), versionBefore + 1);
         assertEq(blacklist.getHashEntry(GLOBAL_REGION, SAMPLE_HASH).addedAt, 0);
     }
 
@@ -560,9 +498,9 @@ contract ContentBlacklistTest is Test {
         assertFalse(blacklist.isOriginBlacklisted(origin));
     }
 
-    /// @notice Origin blacklisting sits outside the version poll entirely, so
-    ///         the `OriginBlacklistUpdated(origin, false)` here is the ONLY
-    ///         signal a node ever gets that the entry lapsed.
+    /// @notice A node tracks the origin deny-set by enumeration and event tail,
+    ///         so the `OriginBlacklistUpdated(origin, false)` here is the
+    ///         low-latency signal that the entry lapsed.
     function test_expireEmergencyOrigin_emitsClearingEvent() public {
         address origin = address(0x0121B);
         vm.prank(multisig);
