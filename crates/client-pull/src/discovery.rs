@@ -528,6 +528,35 @@ pub fn select_candidates(
     candidates
 }
 
+/// Pre-filter `candidates` by an optional region allowlist, then order via
+/// [`select_candidates`].
+///
+/// A candidate whose `region_hint` is `Some(r)` with `r` not in `allow` is
+/// dropped; a candidate with `region_hint == None` is kept. An empty `allow`
+/// is a no-op. Ranking is unchanged (region is a self-attested hint, never a
+/// ranking key) — this only narrows which candidates are eligible to be
+/// probed/discovered at all (Task 9), independent of the peer store.
+#[must_use]
+pub fn select_candidates_filtered(
+    candidates: Vec<NodeCandidate>,
+    client_region: Option<&str>,
+    k: usize,
+    allow: &[Region],
+) -> Vec<NodeCandidate> {
+    let filtered = if allow.is_empty() {
+        candidates
+    } else {
+        candidates
+            .into_iter()
+            .filter(|c| match c.region_hint {
+                Some(r) => allow.contains(&r),
+                None => true,
+            })
+            .collect()
+    };
+    select_candidates(filtered, client_region, k)
+}
+
 /// Pick up to `max_sources` candidates from an already-ranked `ordered` list,
 /// admitting at most ONE per `eth_address` (operator), without disturbing rank
 /// order. Used by the multi-source scheduler's engagement gate to pick the
@@ -808,6 +837,40 @@ mod tests {
         let out = select_candidates(cands, Some("US"), 5);
         assert_eq!(out[0].eth_address, Address::repeat_byte(2));
         assert_eq!(out[1].eth_address, Address::repeat_byte(1));
+    }
+
+    /// With allowlist `["US"]`, a `Some(DE)` candidate is dropped, a
+    /// `Some(US)` candidate is kept, and a `None`-region candidate is kept
+    /// (absent-region-include, per the brief).
+    #[test]
+    fn region_allowlist_filters_present_regions_only() {
+        let us = candidate(1, "US");
+        let de = candidate(2, "DE");
+        let none = candidate(3, "nonsense");
+        let allow = [Region::parse("US").expect("valid")];
+        let out = select_candidates_filtered(
+            vec![us.clone(), de.clone(), none.clone()],
+            None,
+            10,
+            &allow,
+        );
+        let addrs: Vec<_> = out.iter().map(|c| c.eth_address).collect();
+        assert!(addrs.contains(&us.eth_address));
+        assert!(addrs.contains(&none.eth_address));
+        assert!(!addrs.contains(&de.eth_address));
+    }
+
+    /// An empty allowlist is a no-op: every candidate survives, regardless of
+    /// region.
+    #[test]
+    fn empty_region_allowlist_keeps_everything() {
+        let cands = vec![
+            candidate(1, "US"),
+            candidate(2, "DE"),
+            candidate(3, "nonsense"),
+        ];
+        let out = select_candidates_filtered(cands.clone(), None, 10, &[]);
+        assert_eq!(out.len(), cands.len());
     }
 
     /// An iroh node id derived from a small seed, for [`cand`] fixtures — mirrors

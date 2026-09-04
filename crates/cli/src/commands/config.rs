@@ -1116,6 +1116,13 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # a typo in a takedown must not silently leave content served.
 # denied_hashes = ["0000000000000000000000000000000000000000000000000000000000000000"]
 # denied_origins = ["0x000000000000000000000000000000000000dEaD"]   # operator addresses whose channels are refused (the zero address is rejected)
+
+[client]
+# `decdn fetch`/`decdn bundle pull` discovery pre-filter (independent of the
+# node-scoped [network.discovery] address discovery above). Narrows which
+# registered nodes are probed/discovered; never ranks them. Absent/empty =>
+# no filter, every registered node is eligible.
+# region_allowlist = ["US", "DE"]
 "#;
 
 #[cfg(test)]
@@ -1150,6 +1157,7 @@ mod tests {
             probe,
             receipts,
             content,
+            client,
         } = &parsed;
         // Every uncommented line is a section header with no field values —
         // some nested (`[dht.rate_limit]`, `[probe.rate_limit]`) but each
@@ -1168,6 +1176,7 @@ mod tests {
             ("probe", probe.is_some()),
             ("receipts", receipts.is_some()),
             ("content", content.is_some()),
+            ("client", client.is_some()),
         ] {
             assert!(
                 present,

@@ -154,10 +154,46 @@ pub(crate) struct ResolvedChain {
     /// Client region for region-first discovery ordering (`--region` >
     /// `identity.region`). `None` skips the ordering.
     pub(crate) region: Option<String>,
+    /// Client region allowlist (Task 9, `[client] region_allowlist`):
+    /// narrows which peers `discover_provider` probes/discovers, never ranks
+    /// them. Empty when the config omits `[client]` or the list, which is a
+    /// no-op in [`discovery::select_candidates_filtered`]. Invalid entries
+    /// (fail `Region::parse`) are dropped with an `eprintln!` warning in
+    /// [`resolve_chain`] rather than failing config resolution — a typo'd
+    /// region code shrinks the filter, it does not break the fetch.
+    /// `eprintln!`, not `tracing::warn!`: `decdn` installs no tracing
+    /// subscriber (see [`discovery::bootstrap_nodes`]'s doc comment), so a
+    /// `warn!` here would reach nobody.
+    pub(crate) region_allowlist: Vec<decdn_protocol::Region>,
     /// Deposit to escrow when OPENING a pool, and the target a reused pool's
     /// proactive refill restores toward once it has served verified bytes.
     pub(crate) working_deposit: U256,
     pub(crate) max_approve: bool,
+}
+
+/// Parse `[client] region_allowlist` (Task 9) into [`decdn_protocol::Region`]s.
+/// Parsed here — not carried as raw strings — so an invalid code is reported
+/// once at config-resolution time rather than on every fetch's discovery
+/// path. An entry that fails `Region::parse` is dropped, not fatal: it costs
+/// the filter one entry, not the whole fetch. Absent `[client]` or an absent
+/// `region_allowlist` both yield an empty `Vec`, which is a no-op filter.
+fn parse_region_allowlist(file: &FileConfig) -> Vec<decdn_protocol::Region> {
+    file.client
+        .as_ref()
+        .and_then(|c| c.region_allowlist.as_ref())
+        .into_iter()
+        .flatten()
+        .filter_map(|code| {
+            let parsed = decdn_protocol::Region::parse(code);
+            if parsed.is_none() {
+                eprintln!(
+                    "warning: client.region_allowlist entry {code:?} is not a recognized \
+                     region code; dropping it from the filter"
+                );
+            }
+            parsed
+        })
+        .collect()
 }
 
 pub(crate) fn resolve_chain(
@@ -208,6 +244,9 @@ pub(crate) fn resolve_chain(
         .region
         .clone()
         .or_else(|| file.identity.as_ref().and_then(|i| i.region.clone()));
+
+    // Task 9: `[client] region_allowlist` pre-filters discovery/probing.
+    let region_allowlist = parse_region_allowlist(file);
 
     let chain_id = args
         .chain_id
@@ -271,6 +310,7 @@ pub(crate) fn resolve_chain(
         keystore_password_file: args.keystore_password_file.as_deref().map(expand_tilde),
         data_dir,
         region,
+        region_allowlist,
         working_deposit,
         max_approve,
     })
@@ -675,6 +715,13 @@ async fn discover_provider(
         args.discovery_cap(),
     )
     .await?;
+    // Captured before `bootstrap` is consumed: the registry-outage fallback
+    // (`Bootstrap::Cached`, the peer store's surviving identities) must
+    // IGNORE `chain.region_allowlist` (Task 9) — the client is already
+    // degraded to whatever the store still has, and narrowing that further
+    // by region risks starving the fetch entirely over data that is already
+    // possibly stale.
+    let is_live_registry = matches!(bootstrap, discovery::Bootstrap::Live { .. });
     // `client-pull` cannot log this itself — `decdn` installs no tracing
     // subscriber — and a silently stale peer list is exactly what the user
     // needs told, so the provenance comes back in the return value.
@@ -685,11 +732,32 @@ async fn discover_provider(
     if all.is_empty() {
         anyhow::bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }
-    // Captured BEFORE `select_candidates` truncates to `SELECT_K`: the harvest
-    // persists identity for the whole registry read, not just the shortlist
-    // that got probed (#1911-series peer store, Task 5).
+    // Captured BEFORE `select_candidates_filtered` truncates to `SELECT_K`:
+    // the harvest persists identity for the whole registry read, not just
+    // the shortlist that got probed (#1911-series peer store, Task 5).
     let registry_candidates = all.clone();
-    let selected = discovery::select_candidates(all, chain.region.as_deref(), discovery::SELECT_K);
+    let allow: &[decdn_protocol::Region] = if is_live_registry {
+        chain.region_allowlist.as_slice()
+    } else {
+        &[]
+    };
+    let mut selected = discovery::select_candidates_filtered(
+        all,
+        chain.region.as_deref(),
+        discovery::SELECT_K,
+        allow,
+    );
+    // Progressive widening (Task 9): a too-thin region filter must never
+    // starve the fetch. Re-run unfiltered over the same registry read when
+    // the filtered pool falls below the store's own freshness floor.
+    if !allow.is_empty() && selected.len() < store_cfg.min_fresh_candidates {
+        selected = discovery::select_candidates_filtered(
+            registry_candidates.clone(),
+            chain.region.as_deref(),
+            discovery::SELECT_K,
+            &[],
+        );
+    }
     let warming = ProxyWarmingParams::from_args(args);
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
     let targets =
