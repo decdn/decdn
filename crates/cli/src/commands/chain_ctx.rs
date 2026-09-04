@@ -228,16 +228,15 @@ pub async fn load_operator_signer(
     load_signer_with_password_file(chain.keystore_password_file.as_deref(), keystore).await
 }
 
-/// The keystore password sources every `decdn` subcommand consults, in
-/// precedence order: the `DECDN_KEYSTORE_PASSWORD` env var, then
-/// `password_file` when the caller passed one, then an interactive prompt on a
-/// TTY. Presence decides at each step (see [`eth_identity::read_password`]), so
-/// an env var set to the empty string is the password rather than a skipped
-/// source. The `decdn-node` daemon builds the same list at
-/// `runtime::load_eth_signer`; it lives in a crate that cannot depend on this
-/// one, so the two are kept in step by hand.
+/// CLI-boundary wrapper over [`decdn_incentive::eth_identity::standard_sources`],
+/// the shared keystore password source list in precedence order (env var, then
+/// `password_file`, then an interactive prompt on a TTY). Presence decides at
+/// each step (see [`decdn_incentive::eth_identity::read_password`]), so an env
+/// var set to the empty string is the password rather than a skipped source.
+/// The `decdn-node` daemon reaches the same list through `standard_sources`
+/// directly.
 ///
-/// `confirm` reaches the [`PasswordSource::Prompt`] entry, which prompts twice
+/// `confirm` reaches the `PasswordSource::Prompt` entry, which prompts twice
 /// and requires the entries to match. True only where the command CREATES a
 /// keystore: an entry typed once has nothing to check it against. It constrains
 /// the prompt alone — a password arriving from the env var or the file is used
@@ -248,12 +247,7 @@ pub async fn load_operator_signer(
 /// their own `resolve_chain` and pass an already-absolute path, and
 /// `expand_tilde` is a no-op on one.
 pub(crate) fn password_sources(password_file: Option<&Path>, confirm: bool) -> Vec<PasswordSource> {
-    let mut sources = vec![PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV)];
-    if let Some(path) = password_file.map(expand_tilde) {
-        sources.push(PasswordSource::File(path));
-    }
-    sources.push(PasswordSource::Prompt { confirm });
-    sources
+    eth_identity::standard_sources(password_file.map(expand_tilde), confirm)
 }
 
 /// Load an Ethereum keystore signer, sourcing the password per
@@ -432,29 +426,33 @@ mod tests {
     const CONFIG_ADDR: Address = address!("0x00000000000000000000000000000000000000C0");
     const OA_ADDR: Address = address!("0x000000000000000000000000000000000000000A");
 
-    /// The builder every `decdn` subcommand routes through: `Env` first, the
-    /// `File` only when the caller passed a path, `Prompt` last carrying
-    /// `confirm`. Dropping the `Prompt` push would make every interactive
-    /// command headless-only, and pushing `File` ahead of `Env` would invert
-    /// the documented precedence — neither is visible from the resolver tests.
+    /// The wrapper is the CLI boundary for the shared source list: it tilde-
+    /// expands `password_file` before delegating to
+    /// `eth_identity::standard_sources`, so the raw clap value (`key-gen`, the
+    /// operator commands) reaches the File entry already-absolute. Ordering the
+    /// File entry after Env and before Prompt is inherited from
+    /// `standard_sources`; this test pins the boundary contracts: delegation
+    /// happens, and expansion happens here (compare the File path against
+    /// `expand_tilde` itself, so the assertion holds whether or not a home
+    /// directory is available).
     #[test]
-    fn password_sources_orders_env_then_file_then_prompt() {
-        let with_file = password_sources(Some(Path::new("/abs/pw.txt")), false);
+    fn password_sources_expands_tilde_and_delegates() {
+        let raw = Path::new("~/pw.txt");
+        let expanded = expand_tilde(raw);
+        let sources = password_sources(Some(raw), false);
         assert!(
             matches!(
-                with_file.as_slice(),
+                sources.as_slice(),
                 [
                     PasswordSource::Env(name),
                     PasswordSource::File(p),
                     PasswordSource::Prompt { confirm: false },
                 ] if *name == eth_identity::KEYSTORE_PASSWORD_ENV
-                    && p == Path::new("/abs/pw.txt")
+                    && p == &expanded
             ),
-            "got: {with_file:?}"
+            "got: {sources:?}"
         );
 
-        // No path => no `File` entry at all, so an operator who passed no flag
-        // never sees a missing-file skip reason.
         let without = password_sources(None, true);
         assert!(
             matches!(
