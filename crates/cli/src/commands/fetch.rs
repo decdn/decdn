@@ -418,6 +418,10 @@ pub(crate) async fn probe_and_order(
     // of a local misconfiguration.
     let mut unreachable = 0usize;
     let mut unverifiable = 0usize;
+    // (node_id, rtt_ms, rate_per_mb) for each holder that answered a probe
+    // this fetch, harvested into the peer store off the critical path
+    // (spawn_harvest, called from discover_provider).
+    let mut probed_samples: Vec<(PublicKey, f64, u64)> = Vec::new();
     for (cand, res) in results {
         let Some((resp, resp_ext, rtt_ms)) = res else {
             unreachable += 1;
@@ -456,6 +460,7 @@ pub(crate) async fn probe_and_order(
             continue;
         }
         if resp.body.has_blob {
+            probed_samples.push((cand.node_id, rtt_ms, resp.body.rate_per_mb));
             holders.push(discovery::Probed {
                 candidate: cand.clone(),
                 rtt_ms,
@@ -507,6 +512,7 @@ pub(crate) async fn probe_and_order(
         candidates: ordered.order,
         size_hint: ordered.size_hint,
         coverage_by_node: ordered.coverage_by_node,
+        probed_samples,
     })
 }
 
@@ -665,10 +671,56 @@ async fn discover_provider(
     if all.is_empty() {
         anyhow::bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }
+    // Captured BEFORE `select_candidates` truncates to `SELECT_K`: the harvest
+    // persists identity for the whole registry read, not just the shortlist
+    // that got probed (#1911-series peer store, Task 5).
+    let registry_candidates = all.clone();
     let selected = discovery::select_candidates(all, chain.region.as_deref(), discovery::SELECT_K);
     let warming = ProxyWarmingParams::from_args(args);
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
-    probe_and_order(endpoint, &selected, relay_hint, hash, warming, &slash_dom).await
+    let targets =
+        probe_and_order(endpoint, &selected, relay_hint, hash, warming, &slash_dom).await?;
+    // Off the fetch's critical path: the handle is intentionally dropped,
+    // never awaited here (tests await it directly for determinism).
+    drop(spawn_harvest(
+        &chain.data_dir,
+        registry_candidates,
+        targets.probed_samples.clone(),
+    ));
+    Ok(targets)
+}
+
+/// Persist a discovery session's identity + probe stats off the fetch's
+/// critical path: `upsert_identity` for every registry candidate (whether or
+/// not it was probed), `record_sample` for each probed triple, then
+/// `prune_and_cap` to bound store growth. Never awaited on the fetch path —
+/// the returned handle exists so tests can await it for determinism.
+pub(crate) fn spawn_harvest(
+    data_dir: &Path,
+    registry: Vec<NodeCandidate>,
+    probed: Vec<(PublicKey, f64, u64)>,
+) -> tokio::task::JoinHandle<()> {
+    let dir = data_dir.to_path_buf();
+    tokio::spawn(async move {
+        let store = decdn_client_pull::PeerStore::open(&dir);
+        let cfg = decdn_client_pull::StoreConfig::default();
+        let now = now_secs_cli();
+        for cand in &registry {
+            let _ = store.upsert_identity(cand, now);
+        }
+        for (id, rtt_ms, rate) in probed {
+            let _ = store.record_sample(&id, rtt_ms, rate, now, &cfg);
+        }
+        let _ = store.prune_and_cap(now, &cfg);
+    })
+}
+
+/// Seconds since the Unix epoch, saturating to 0 on a clock before the epoch
+/// (never on this platform in practice) rather than panicking.
+fn now_secs_cli() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// The ordered failover list plus what discovery already learned about the
@@ -690,6 +742,9 @@ pub(crate) struct ResolvedTargets {
     /// everywhere else) reads as "no measured coverage" and the lane builder
     /// falls back to [`decdn_protocol::Coverage::full`].
     pub(crate) coverage_by_node: HashMap<PublicKey, decdn_protocol::Coverage>,
+    /// `(node_id, rtt_ms, rate_per_mb)` for each holder that answered a probe
+    /// this fetch — harvested into the peer store.
+    pub(crate) probed_samples: Vec<(PublicKey, f64, u64)>,
 }
 
 /// Resolve the ordered failover list of nodes to fetch from (#1174): the
@@ -730,6 +785,8 @@ pub(crate) async fn resolve_target_node(
             // Nothing was probed on this path, so no holder coverage was
             // measured; irrelevant anyway since multi-source never engages here.
             coverage_by_node: HashMap::new(),
+            // Nothing was probed on this path, so there is nothing to harvest.
+            probed_samples: Vec::new(),
         });
     }
 
@@ -2657,6 +2714,38 @@ mod tests {
         assert!(!should_multi_source(false, 100 << 20, 64 << 20, 4)); // kill switch
         assert!(!should_multi_source(true, 10 << 20, 64 << 20, 4)); // below size gate
         assert!(!should_multi_source(true, 100 << 20, 64 << 20, 1)); // one holder
+    }
+
+    /// `spawn_harvest`/`NodeCandidate` are `pub(crate)`, unreachable from an
+    /// integration test in `crates/cli/tests/` — so this lives in-crate
+    /// instead of `crates/cli/tests/peer_store_harvest.rs`. The test awaits
+    /// the returned `JoinHandle` (never done on the real fetch path) purely
+    /// for determinism.
+    fn harvest_key(b: u8) -> PublicKey {
+        iroh::SecretKey::from_bytes(&[b; 32]).public()
+    }
+
+    fn harvest_candidate(b: u8) -> NodeCandidate {
+        NodeCandidate {
+            node_id: harvest_key(b),
+            eth_address: Address::from([b; 20]),
+            region_hint: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn harvest_persists_identity_and_stats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let regs = vec![harvest_candidate(1), harvest_candidate(2)];
+        let probed = vec![(harvest_key(1), 42.0_f64, 9_u64)];
+        let handle = spawn_harvest(dir.path(), regs, probed);
+        handle.await.expect("harvest task join");
+
+        let store = decdn_client_pull::PeerStore::open(dir.path());
+        assert!(store.get(&harvest_key(2)).is_some());
+        let r = store.get(&harvest_key(1)).expect("probed peer persisted");
+        assert_eq!(r.latency_ms, Some(42.0));
+        assert_eq!(r.rate_per_mb, Some(9));
     }
 
     fn ctx_with(binding: Option<decdn_protocol::client::ClientBinding>) -> PoolContext {
