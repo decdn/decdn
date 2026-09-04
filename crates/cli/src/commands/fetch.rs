@@ -745,9 +745,9 @@ pub(crate) async fn resolve_target_node(
     //
     // The bound is applied INSIDE `bootstrap_nodes` (around the read alone)
     // rather than wrapped around discovery from out here. Wrapping from out
-    // here also cancels the ADR 012 § Bootstrap step 4 cache fallback, so a
-    // client holding a usable `peers.json` would be handed a hard failure
-    // instead of the degraded-but-working fetch the cache exists to provide.
+    // here also cancels the ADR 012 § Bootstrap step 4 peer-store fallback,
+    // so a client with a usable peer store would be handed a hard failure
+    // instead of the degraded-but-working fetch the store exists to provide.
     let order =
         discover_provider(endpoint, chain, capacity_bond, relays.first(), hash, args).await?;
     if let Some(primary) = order.candidates.first() {
