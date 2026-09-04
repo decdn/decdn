@@ -645,10 +645,12 @@ pub struct WarmingCandidate {
     /// Measured round-trip time in milliseconds, from the **live `cdn/probe/v1`
     /// probe issued for this request**.
     ///
-    /// Note this diverges from ADR 037 § RTT source, which specifies a
-    /// longitudinal per-peer RTT map; no such map exists, so the candidate pool
-    /// is limited to the ≤`SELECT_K` nodes this request happened to probe rather
-    /// than the full peer table minus holders.
+    /// The persisted peer knowledge base (ADR 037 § RTT source,
+    /// `decdn_client_pull::peer_store`) does not track which peers hold which
+    /// blobs, only identity, latency, and price — it cannot tell a non-holder
+    /// from a holder for this hash. So this warming candidate pool still comes
+    /// only from nodes this request actually probed (`has_blob: false`
+    /// responses), not from the full peer store minus holders.
     pub rtt_ms: f64,
 }
 
