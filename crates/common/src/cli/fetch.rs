@@ -55,6 +55,14 @@ fn parse_region_flag(raw: &str) -> Result<String, String> {
 /// see. `--node-id` requires `--provider-address` at the clap layer; the reverse
 /// pairing (`--provider-address` needs `--node-id`) is enforced in `validate()`.
 /// `--addr` requires `--node-id` at the clap layer.
+// The bool fields (`proxy_warming`, `multi_source`, `no_multi_source`,
+// `rediscover`) are independent operator toggles on one flattened CLI arg
+// set, not a state machine — a bitflags or two-variant-enum refactor would
+// only obscure the clap surface.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent CLI flags, not modelled state"
+)]
 #[derive(Debug, Clone, Args)]
 pub struct ClientFetchArgs {
     /// Target node id (iroh `EndpointId`, z-base32). Omit it to auto-discover:
@@ -63,6 +71,11 @@ pub struct ClientFetchArgs {
     /// `--provider-address` is required (they pair).
     #[arg(long, value_name = "ID", requires = "provider_address")]
     pub node_id: Option<String>,
+
+    /// Ignore the persisted peer store for selection this run and re-probe/discover
+    /// afresh; the store is still updated from what this fetch learns.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub rediscover: bool,
 
     /// Direct socket address of the target node (e.g. `127.0.0.1:4433`). Only
     /// meaningful with an explicit `--node-id`; auto-discovery resolves the
@@ -786,6 +799,15 @@ mod tests {
             .resolve_capability_token()
             .unwrap();
         assert_eq!(token.as_deref(), Some("dcap1:abc"));
+    }
+
+    /// `--rediscover` bypasses the store fast path (Task 8): absent it defaults
+    /// to `false` (the fast path is eligible), and the flag itself carries no
+    /// value — presence alone flips it to `true`.
+    #[test]
+    fn rediscover_defaults_false_and_flag_sets_true() {
+        assert!(!parse(&[]).rediscover, "defaults to false");
+        assert!(parse(&["--rediscover"]).rediscover, "flag sets it true");
     }
 
     /// `--multi-source` defaults on; `--no-multi-source` is the off-switch.

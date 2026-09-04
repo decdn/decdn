@@ -662,8 +662,9 @@ async fn discover_provider(
     // new failure mode, only a possible extra probe round.
     let peer_store = decdn_client_pull::PeerStore::open(&chain.data_dir);
     let store_cfg = decdn_client_pull::StoreConfig::default();
-    if let Some(targets) =
-        store_fast_path(&peer_store, &store_cfg, args.max_sources, now_secs_cli())
+    if !args.rediscover
+        && let Some(targets) =
+            store_fast_path(&peer_store, &store_cfg, args.max_sources, now_secs_cli())
     {
         return Ok(targets);
     }
@@ -2755,6 +2756,7 @@ mod tests {
     fn common() -> cli::ClientFetchArgs {
         cli::ClientFetchArgs {
             node_id: Some("n".into()),
+            rediscover: false,
             addr: None,
             relay_url: None,
             provider_address: Some("0x0000000000000000000000000000000000000001".into()),
