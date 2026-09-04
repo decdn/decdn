@@ -43,7 +43,7 @@ pub struct FileConfig {
     /// Local content denylist (ADR 011 §Local Denylist). Absent => both lists
     /// empty; nothing is denied locally.
     pub content: Option<ContentConfig>,
-    /// Client-scoped discovery settings (Task 9). Absent => no region filter;
+    /// Client-scoped discovery settings. Absent => no region filter;
     /// discovery/probing considers every registered node.
     pub client: Option<ClientConfig>,
 }
@@ -58,13 +58,18 @@ pub struct IdentityConfig {
     pub region: Option<String>,
 }
 
-/// Client-scoped section of the config file (Task 9). Independent of the
+/// Client-scoped section of the config file. Independent of the
 /// node-scoped `[network.discovery]` (address discovery) — this narrows which
 /// peers a client discovers/probes, never ranks them.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     /// Regions to restrict discovery/probing to; empty/absent = no filter.
+    ///
+    /// This is a DISCOVERY-TIME filter only: it narrows the pool the client
+    /// probes/rediscovers. It does NOT apply to the probe-less peer-store fast
+    /// path, where measured latency ranking already governs which peers are
+    /// near, so a warm store selects by latency without consulting this list.
     pub region_allowlist: Option<Vec<String>>,
 }
 
@@ -1261,8 +1266,8 @@ mod tests {
     }
 
     /// An absent `[client]` table resolves to `None` — no filter, not an
-    /// empty one — so a config file written before Task 9 keeps behaving
-    /// exactly as it did.
+    /// empty one — so a config file that omits `[client]` keeps behaving
+    /// exactly as one that never had a region filter.
     #[test]
     fn client_section_absent_by_default() {
         let file: FileConfig = toml::from_str("").expect("empty config parses");

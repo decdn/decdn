@@ -801,7 +801,7 @@ mod tests {
         assert_eq!(token.as_deref(), Some("dcap1:abc"));
     }
 
-    /// `--rediscover` bypasses the store fast path (Task 8): absent it defaults
+    /// `--rediscover` bypasses the store fast path: absent it defaults
     /// to `false` (the fast path is eligible), and the flag itself carries no
     /// value — presence alone flips it to `true`.
     #[test]

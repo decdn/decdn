@@ -133,14 +133,6 @@ impl PeerRecord {
     }
 }
 
-#[allow(dead_code)]
-fn now_secs() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 use std::path::{Path, PathBuf};
 
 /// Directory-backed peer knowledge base: one JSON file per peer under `<data_dir>/peers`.
@@ -191,10 +183,13 @@ impl PeerStore {
     }
 
     fn write(&self, rec: &PeerRecord) -> anyhow::Result<()> {
+        use std::io::Write as _;
         std::fs::create_dir_all(&self.dir)?;
         let bytes = serde_json::to_vec_pretty(rec)?;
         let tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
-        std::fs::write(tmp.path(), &bytes)?;
+        // Write through the same handle that is synced below, so the durable
+        // bytes are the ones this write produced.
+        tmp.as_file().write_all(&bytes)?;
         tmp.as_file().sync_all()?;
         tmp.persist(self.path_for(&rec.node_id))
             .map_err(|e| anyhow::anyhow!("persist peer record: {e}"))?;

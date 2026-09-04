@@ -154,7 +154,7 @@ pub(crate) struct ResolvedChain {
     /// Client region for region-first discovery ordering (`--region` >
     /// `identity.region`). `None` skips the ordering.
     pub(crate) region: Option<String>,
-    /// Client region allowlist (Task 9, `[client] region_allowlist`):
+    /// Client region allowlist (`[client] region_allowlist`):
     /// narrows which peers `discover_provider` probes/discovers, never ranks
     /// them. Empty when the config omits `[client]` or the list, which is a
     /// no-op in [`discovery::select_candidates_filtered`]. Invalid entries
@@ -171,7 +171,7 @@ pub(crate) struct ResolvedChain {
     pub(crate) max_approve: bool,
 }
 
-/// Parse `[client] region_allowlist` (Task 9) into [`decdn_protocol::Region`]s.
+/// Parse `[client] region_allowlist` into [`decdn_protocol::Region`]s.
 /// Parsed here — not carried as raw strings — so an invalid code is reported
 /// once at config-resolution time rather than on every fetch's discovery
 /// path. An entry that fails `Region::parse` is dropped, not fatal: it costs
@@ -245,7 +245,7 @@ pub(crate) fn resolve_chain(
         .clone()
         .or_else(|| file.identity.as_ref().and_then(|i| i.region.clone()));
 
-    // Task 9: `[client] region_allowlist` pre-filters discovery/probing.
+    // The `[client] region_allowlist` pre-filters discovery/probing.
     let region_allowlist = parse_region_allowlist(file);
 
     let chain_id = args
@@ -499,8 +499,9 @@ pub(crate) async fn probe_and_order(
             );
             continue;
         }
+        // Every verified responder contributes a probe sample, holder or not.
+        probed_samples.push((cand.node_id, rtt_ms, resp.body.rate_per_mb));
         if resp.body.has_blob {
-            probed_samples.push((cand.node_id, rtt_ms, resp.body.rate_per_mb));
             holders.push(discovery::Probed {
                 candidate: cand.clone(),
                 rtt_ms,
@@ -508,7 +509,6 @@ pub(crate) async fn probe_and_order(
                 coverage: resp_ext.coverage.clone(),
             });
         } else {
-            probed_samples.push((cand.node_id, rtt_ms, resp.body.rate_per_mb));
             non_holders.push(discovery::WarmingCandidate {
                 node_id: cand.node_id,
                 eth_address: cand.eth_address,
@@ -554,6 +554,7 @@ pub(crate) async fn probe_and_order(
         size_hint: ordered.size_hint,
         coverage_by_node: ordered.coverage_by_node,
         probed_samples,
+        from_store_fast_path: false, // just probed: reachability-checked
     })
 }
 
@@ -695,7 +696,7 @@ async fn discover_provider(
     // parameters (clippy caps this function at 7).
     args: &cli::ClientFetchArgs,
 ) -> anyhow::Result<ResolvedTargets> {
-    // Probe-less fast path (Task 7): when the store already holds enough fresh,
+    // Probe-less fast path: when the store already holds enough fresh,
     // unsuppressed candidates, skip the network probe round entirely and rank
     // by the store's own EWMA latency. Falls through to today's bootstrap +
     // probe path whenever the store can't back a full candidate set — never a
@@ -717,7 +718,7 @@ async fn discover_provider(
     .await?;
     // Captured before `bootstrap` is consumed: the registry-outage fallback
     // (`Bootstrap::Cached`, the peer store's surviving identities) must
-    // IGNORE `chain.region_allowlist` (Task 9) — the client is already
+    // IGNORE `chain.region_allowlist` — the client is already
     // degraded to whatever the store still has, and narrowing that further
     // by region risks starving the fetch entirely over data that is already
     // possibly stale.
@@ -734,7 +735,7 @@ async fn discover_provider(
     }
     // Captured BEFORE `select_candidates_filtered` truncates to `SELECT_K`:
     // the harvest persists identity for the whole registry read, not just
-    // the shortlist that got probed (#1911-series peer store, Task 5).
+    // the shortlist that got probed (#1911-series peer store).
     let registry_candidates = all.clone();
     let allow: &[decdn_protocol::Region] = if is_live_registry {
         chain.region_allowlist.as_slice()
@@ -747,7 +748,7 @@ async fn discover_provider(
         discovery::SELECT_K,
         allow,
     );
-    // Progressive widening (Task 9): a too-thin region filter must never
+    // Progressive widening: a too-thin region filter must never
     // starve the fetch. Re-run unfiltered over the same registry read when
     // the filtered pool falls below the store's own freshness floor.
     if !allow.is_empty() && selected.len() < store_cfg.min_fresh_candidates {
@@ -762,18 +763,32 @@ async fn discover_provider(
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
     let targets =
         probe_and_order(endpoint, &selected, relay_hint, hash, warming, &slash_dom).await?;
+    // Identity is harvested ONLY against a live registry read, and
+    // `resolve_bootstrap` already does that: on a `Bootstrap::Live` read it
+    // upserts+prunes identity for every returned node. So the harvest here
+    // writes stats only and never identity. Two reasons:
+    //   - On the `Bootstrap::Cached` outage path `registry_candidates` IS the
+    //     store's own surviving identities; re-`upsert_identity`-ing them would
+    //     "confirm" identity against the store itself and reset
+    //     `identity_seen_at_secs` — contradicting its meaning ("last confirmed
+    //     against the registry") and keeping a departed node from ever becoming
+    //     `identity_prunable` while outages recur.
+    //   - On the live path it would be a redundant second identity write over
+    //     what `resolve_bootstrap` already wrote.
+    // The probed stats are harvested on both paths.
+    //
     // Off the fetch's critical path: the handle is intentionally dropped,
     // never awaited here (tests await it directly for determinism).
     drop(spawn_harvest(
         &chain.data_dir,
-        registry_candidates,
+        Vec::new(),
         targets.probed_samples.clone(),
     ));
     Ok(targets)
 }
 
-/// Build a probe-less [`ResolvedTargets`] straight from the peer store (Task
-/// 7): rank every [`decdn_client_pull::PeerRecord::selectable`] record by its
+/// Build a probe-less [`ResolvedTargets`] straight from the peer store: rank
+/// every [`decdn_client_pull::PeerRecord::selectable`] record by its
 /// EWMA `latency_ms` (ascending, `None` sorts last), project each back to a
 /// [`NodeCandidate`], and admit per-operator via
 /// [`discovery::admit_sources`]. Returns `None` when fewer than
@@ -787,10 +802,16 @@ fn store_fast_path(
     max_sources: usize,
     now_secs: u64,
 ) -> Option<ResolvedTargets> {
+    // Require BOTH a fresh, unsuppressed latency sample AND a non-prunable
+    // identity — symmetric with `resolve_bootstrap`'s outage-fallback filter. A
+    // stats-only placeholder that `record_sample` created for an unknown peer
+    // carries `eth_address: Address::ZERO` and `identity_seen_at_secs == 0`, so
+    // it is always `identity_prunable` and can never project a `0x0` payment
+    // lane into a fetch here.
     let mut fresh: Vec<_> = store
         .load_all()
         .into_iter()
-        .filter(|r| r.selectable(now_secs, cfg))
+        .filter(|r| r.selectable(now_secs, cfg) && !r.identity_prunable(now_secs, cfg))
         .collect();
     if fresh.len() < cfg.min_fresh_candidates {
         return None;
@@ -813,6 +834,9 @@ fn store_fast_path(
         size_hint: None,
         coverage_by_node: HashMap::new(),
         probed_samples: Vec::new(),
+        // The one site that sets this: these candidates are projected from the
+        // store without a probe, so the driver must keep discovery in reserve.
+        from_store_fast_path: true,
     })
 }
 
@@ -871,6 +895,14 @@ pub(crate) struct ResolvedTargets {
     /// `(node_id, rtt_ms, rate_per_mb)` for each holder that answered a probe
     /// this fetch — harvested into the peer store.
     pub(crate) probed_samples: Vec<(PublicKey, f64, u64)>,
+    /// `true` only when this set came from the probe-less [`store_fast_path`],
+    /// which projects candidates from the store without probing them. The
+    /// driver reads it to enforce the store's approved invariant: a fresh but
+    /// unreachable fast-path set must never make a fetch fail that discovery
+    /// would have served, so exhausting one with a retryable error triggers a
+    /// single in-fetch rediscovery. `false` on every probed / pinned path,
+    /// where the candidates were already reachability-checked.
+    pub(crate) from_store_fast_path: bool,
 }
 
 /// Resolve the ordered failover list of nodes to fetch from (#1174): the
@@ -913,6 +945,9 @@ pub(crate) async fn resolve_target_node(
             coverage_by_node: HashMap::new(),
             // Nothing was probed on this path, so there is nothing to harvest.
             probed_samples: Vec::new(),
+            // A pinned `--node-id` is not a store projection; there is nothing
+            // to rediscover if it fails.
+            from_store_fast_path: false,
         });
     }
 
@@ -1106,9 +1141,13 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
 
     // Resolve the ordered failover list: explicit `--node-id`, or auto-discover.
+    // These are `mut` so the store-fast-path rediscovery fallback below can
+    // replace them with a freshly discovered set within this same fetch.
     let targets = resolve_target_node(common, &chain, &endpoint, &relays, hash).await?;
-    let candidates = targets.candidates;
-    let coverage_by_node = targets.coverage_by_node;
+    let mut candidates = targets.candidates;
+    let mut coverage_by_node = targets.coverage_by_node;
+    let mut size_hint = targets.size_hint;
+    let mut from_store_fast_path = targets.from_store_fast_path;
 
     // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
@@ -1173,171 +1212,227 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         deadlines,
     };
 
-    // Multi-source fan-out (ADR 039): when enabled, the blob clears the size
-    // floor, and at least two operator-distinct holders are admissible, fetch it
-    // in parallel across a per-provider lane set. A `None` gate (kill switch off,
-    // too small, too few holders) falls through to the single-source loop below
-    // unchanged. Each lane pays its OWN provider on its OWN `(ctx, ledger)`; the
-    // scheduler gates every lane on the shared pool's remaining balance.
-    {
-        let (bar, on_progress, meter) = delivery_progress();
-        let multi = try_multi_source_fetch(
-            &deps,
-            &args.common,
-            grant.as_ref(),
-            &signer,
-            &voucher_dom,
-            &candidates,
-            &coverage_by_node,
-            &relays,
-            hash,
-            &args.output,
-            targets.size_hint,
-            Some(&on_progress),
-            // One fetch at a time: no cross-fetch pool opens to serialize.
-            None,
-        )
-        .await;
-        bar.finish_and_clear();
-        match multi {
-            Ok(Some(bytes)) => {
-                print_fetch_summary(bytes, &meter, &args.output);
-                return Ok(());
-            }
-            // Gate not met: run the single-source failover loop below. The gate
-            // itself reports which condition it was.
-            Ok(None) => {}
-            // The fan-out engaged and failed. Only a TERMINAL failure ends the
-            // fetch: a pool exhaustion (no lane and no provider can fund it) or
-            // what the shared classifier rules terminal. Anything else is
-            // precisely the class the failover loop below was built to survive —
-            // returning it here would fail a recoverable fetch that the
-            // pre-fan-out path completed by trying the next candidate. The loop
-            // resumes the same `.partial`, so nothing already paid for is
-            // re-bought.
-            Err(err)
-                if retry_disposition(&err) == RetryDisposition::Terminal
-                    || err.downcast_ref::<PoolExhausted>().is_some() =>
-            {
-                // On the delegated path reconnect a terminal exhaustion to the
-                // owner remedy, same as the single-source path does.
-                return Err(if grant.is_some() {
-                    annotate_delegated_exhaustion(err)
-                } else {
-                    err
-                });
-            }
-            Err(err) => {
-                eprintln!(
-                    "multi-source fetch failed ({err:#}); falling back to single-source \
-                     failover over the same candidates"
-                );
+    // The fetch runs at most twice: once over the resolved candidate set, and —
+    // if that set came from the probe-less store fast path and its failover
+    // exhausts with a RETRYABLE error — once more over a freshly DISCOVERED set.
+    // The store must never make a fetch fail that probing would have served
+    // (ADR 037 § in-fetch discovery fallback), so a fresh-but-unreachable
+    // fast-path set falls through to real discovery within this same fetch. The
+    // second pass forces discovery (fast path off), so it cannot loop back into
+    // the fast path; `rediscovered` caps it at one retry regardless.
+    let mut rediscovered = false;
+    loop {
+        // Multi-source fan-out (ADR 039): when enabled, the blob clears the size
+        // floor, and at least two operator-distinct holders are admissible, fetch
+        // it in parallel across a per-provider lane set. A `None` gate (kill switch
+        // off, too small, too few holders) falls through to the single-source loop
+        // below unchanged. Each lane pays its OWN provider on its OWN `(ctx,
+        // ledger)`; the scheduler gates every lane on the shared pool's remaining
+        // balance.
+        {
+            let (bar, on_progress, meter) = delivery_progress();
+            let multi = try_multi_source_fetch(
+                &deps,
+                &args.common,
+                grant.as_ref(),
+                &signer,
+                &voucher_dom,
+                &candidates,
+                &coverage_by_node,
+                &relays,
+                hash,
+                &args.output,
+                size_hint,
+                Some(&on_progress),
+                // One fetch at a time: no cross-fetch pool opens to serialize.
+                None,
+            )
+            .await;
+            bar.finish_and_clear();
+            match multi {
+                Ok(Some(bytes)) => {
+                    print_fetch_summary(bytes, &meter, &args.output);
+                    return Ok(());
+                }
+                // Gate not met: run the single-source failover loop below. The gate
+                // itself reports which condition it was.
+                Ok(None) => {}
+                // The fan-out engaged and failed. Only a TERMINAL failure ends the
+                // fetch: a pool exhaustion (no lane and no provider can fund it) or
+                // what the shared classifier rules terminal. Anything else is
+                // precisely the class the failover loop below was built to survive —
+                // returning it here would fail a recoverable fetch that the
+                // pre-fan-out path completed by trying the next candidate. The loop
+                // resumes the same `.partial`, so nothing already paid for is
+                // re-bought.
+                Err(err)
+                    if retry_disposition(&err) == RetryDisposition::Terminal
+                        || err.downcast_ref::<PoolExhausted>().is_some() =>
+                {
+                    // On the delegated path reconnect a terminal exhaustion to the
+                    // owner remedy, same as the single-source path does.
+                    return Err(if grant.is_some() {
+                        annotate_delegated_exhaustion(err)
+                    } else {
+                        err
+                    });
+                }
+                Err(err) => {
+                    eprintln!(
+                        "multi-source fetch failed ({err:#}); falling back to single-source \
+                         failover over the same candidates"
+                    );
+                }
             }
         }
+
+        // Provider failover (#1174, ADR 037 § Fallback): try each resolved
+        // candidate in turn until one delivers the blob. All candidates draw on the
+        // ONE shared pool (ADR 003) — each provider is a distinct lane, and a lane
+        // for a not-yet-paid provider opens nothing on-chain — and the
+        // `ClientRangedStore` beside `--output` is keyed on `(hash, total_bytes)`,
+        // so a fail-over resumes the partial and re-pays nothing already delivered.
+        // A retryable failure (a cache-miss `NotFound`, a stall, a transport fault)
+        // advances to the next candidate; a terminal one (pool/funder exhausted,
+        // blob over the cap) stops immediately; the last error is carried out when
+        // the list is exhausted.
+        let mut last_err: Option<anyhow::Error> = None;
+        for (attempt, candidate) in candidates.iter().enumerate() {
+            let provider = candidate.eth_address;
+
+            // Delegated (`--capability`): adopt the named pool + owner capability,
+            // no open. Self-owned: reuse the caller's live pool (resuming this
+            // provider's lane watermark) or open and persist a new one. Both attach
+            // the ADR 005 client binding. Rebuilt per candidate because the lane is
+            // per-provider.
+            let ctx = build_ctx_for_fetch(
+                grant.as_ref(),
+                &store,
+                &contract,
+                &rpc,
+                &signer,
+                &voucher_dom,
+                provider,
+                self_address,
+                &chain,
+                &endpoint,
+            )
+            .await?;
+
+            let mut target = EndpointAddr::new(candidate.node_id);
+            // `--addr` requires `--node-id` (clap), so it only pins the single
+            // explicit-node candidate; a discovered node is reached via its
+            // resolved address + relay hint.
+            if let Some(addr) = common.addr {
+                target = target.with_ip_addr(addr);
+            }
+            if let Some(url) = relays.first() {
+                target = target.with_relay_url(url.clone());
+            }
+
+            // Immutable pool fact captured before `ctx` moves into `drive_fetch`.
+            let pool_id = ctx.pool_id;
+
+            // A fresh delivery progress bar per attempt (#1118). `indicatif` draws
+            // to stderr and hides itself when stderr is not a terminal. On a resumed
+            // fail-over it counts only the remaining transfer — the ranged store
+            // re-pulls only the missing ranges.
+            let (bar, on_progress, meter) = delivery_progress();
+            let result = drive_fetch(
+                &deps,
+                ctx,
+                target,
+                provider,
+                pool_id,
+                hash,
+                &args.output,
+                Some(&on_progress),
+                || bar.finish_and_clear(),
+            )
+            .await;
+            // Safety net for the header-probe-failure early-return path inside
+            // `drive_fetch` (before `drive()` ever runs). `finish_and_clear` is
+            // idempotent, so this is a harmless no-op on paths where the hook
+            // already cleared the bar.
+            bar.finish_and_clear();
+
+            // On the delegated path `SpendingCapExhausted`, `CapabilityExpired`, and
+            // `PoolExhausted` are all terminal — the delegate cannot top up an
+            // owner's pool or raise/re-mint its own capability — so reconnect them
+            // to the owner-side remedy rather than leaving a bare "voucher
+            // rejected: ...".
+            let err = match result {
+                Ok(bytes) => {
+                    print_fetch_summary(bytes, &meter, &args.output);
+                    return Ok(());
+                }
+                Err(err) if grant.is_some() => annotate_delegated_exhaustion(err),
+                Err(err) => err,
+            };
+
+            // Stop on a terminal failure immediately. On a retryable one, route to
+            // the next candidate, or — when this was the last — break out with it so
+            // the store-fast-path rediscovery fallback below can consider it.
+            if retry_disposition(&err) == RetryDisposition::Terminal {
+                return Err(err);
+            }
+            let more_candidates = attempt + 1 < candidates.len();
+            if !more_candidates {
+                last_err = Some(err);
+                break;
+            }
+            eprintln!(
+                "fetch: provider {provider} could not deliver ({err:#}); failing over to the \
+                 next of {} candidate(s)",
+                candidates.len(),
+            );
+            last_err = Some(err);
+        }
+
+        // The candidate list exhausted with a retryable error (or, in the
+        // never-reached empty-list case, none at all). `last_err` is set whenever
+        // the loop ran a candidate; keep a defensive error for the unreachable
+        // empty case.
+        let exhausted_err = last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("no candidate node could deliver the requested blob")
+        });
+
+        // In-fetch discovery fallback (ADR 037 § in-fetch discovery fallback,
+        // acceptance criterion 5): when the exhausted set came from the probe-less
+        // store fast path and the failure is retryable, re-resolve ONCE via full
+        // discovery and run the failover again over the probed candidates. The
+        // `.partial` ranged store and the shared payment pool's lane watermarks are
+        // persisted on disk and keyed by content, so the second pass resumes the
+        // partial and re-pays nothing already delivered (ADR 003) — it is a
+        // continuation, not a fresh from-zero fetch. A terminal failure is never
+        // retried this way; it returns exactly as before.
+        if from_store_fast_path
+            && !rediscovered
+            && retry_disposition(&exhausted_err) != RetryDisposition::Terminal
+        {
+            rediscovered = true;
+            eprintln!(
+                "fetch: every probe-less store candidate was unreachable ({exhausted_err:#}); \
+                 re-resolving via full discovery within this fetch and resuming the partial \
+                 already held (ADR 037)"
+            );
+            // Force discovery for this second resolve by cloning the args and
+            // setting `rediscover` — a clone, so the user's own args are untouched
+            // and identity/stats harvest still runs on the discovery path.
+            let mut disc_args = common.clone();
+            disc_args.rediscover = true;
+            let fresh = resolve_target_node(&disc_args, &chain, &endpoint, &relays, hash).await?;
+            candidates = fresh.candidates;
+            coverage_by_node = fresh.coverage_by_node;
+            size_hint = fresh.size_hint;
+            // False by construction (discovery forced), which — together with
+            // `rediscovered` — guarantees the loop cannot rediscover again.
+            from_store_fast_path = fresh.from_store_fast_path;
+            continue;
+        }
+
+        return Err(exhausted_err);
     }
-
-    // Provider failover (#1174, ADR 037 § Fallback): try each resolved candidate
-    // in turn until one delivers the blob. All candidates draw on the ONE shared
-    // pool (ADR 003) — each provider is a distinct lane, and a lane for a
-    // not-yet-paid provider opens nothing on-chain — and the `ClientRangedStore`
-    // beside `--output` is keyed on `(hash, total_bytes)`, so a fail-over resumes
-    // the partial and re-pays nothing already delivered. A retryable failure
-    // (a cache-miss `NotFound`, a stall, a transport fault) advances to the next
-    // candidate; a terminal one (pool/funder exhausted, blob over the cap) stops
-    // immediately; the last error is returned when the list is exhausted.
-    let mut last_err: Option<anyhow::Error> = None;
-    for (attempt, candidate) in candidates.iter().enumerate() {
-        let provider = candidate.eth_address;
-
-        // Delegated (`--capability`): adopt the named pool + owner capability, no
-        // open. Self-owned: reuse the caller's live pool (resuming this provider's
-        // lane watermark) or open and persist a new one. Both attach the ADR 005
-        // client binding. Rebuilt per candidate because the lane is per-provider.
-        let ctx = build_ctx_for_fetch(
-            grant.as_ref(),
-            &store,
-            &contract,
-            &rpc,
-            &signer,
-            &voucher_dom,
-            provider,
-            self_address,
-            &chain,
-            &endpoint,
-        )
-        .await?;
-
-        let mut target = EndpointAddr::new(candidate.node_id);
-        // `--addr` requires `--node-id` (clap), so it only pins the single
-        // explicit-node candidate; a discovered node is reached via its resolved
-        // address + relay hint.
-        if let Some(addr) = common.addr {
-            target = target.with_ip_addr(addr);
-        }
-        if let Some(url) = relays.first() {
-            target = target.with_relay_url(url.clone());
-        }
-
-        // Immutable pool fact captured before `ctx` moves into `drive_fetch`.
-        let pool_id = ctx.pool_id;
-
-        // A fresh delivery progress bar per attempt (#1118). `indicatif` draws to
-        // stderr and hides itself when stderr is not a terminal. On a resumed
-        // fail-over it counts only the remaining transfer — the ranged store
-        // re-pulls only the missing ranges.
-        let (bar, on_progress, meter) = delivery_progress();
-        let result = drive_fetch(
-            &deps,
-            ctx,
-            target,
-            provider,
-            pool_id,
-            hash,
-            &args.output,
-            Some(&on_progress),
-            || bar.finish_and_clear(),
-        )
-        .await;
-        // Safety net for the header-probe-failure early-return path inside
-        // `drive_fetch` (before `drive()` ever runs). `finish_and_clear` is
-        // idempotent, so this is a harmless no-op on paths where the hook already
-        // cleared the bar.
-        bar.finish_and_clear();
-
-        // On the delegated path `SpendingCapExhausted`, `CapabilityExpired`, and
-        // `PoolExhausted` are all terminal — the delegate cannot top up an owner's
-        // pool or raise/re-mint its own capability — so reconnect them to the
-        // owner-side remedy rather than leaving a bare "voucher rejected: ...".
-        let err = match result {
-            Ok(bytes) => {
-                print_fetch_summary(bytes, &meter, &args.output);
-                return Ok(());
-            }
-            Err(err) if grant.is_some() => annotate_delegated_exhaustion(err),
-            Err(err) => err,
-        };
-
-        // Stop on a terminal failure, or on a retryable one with nothing left to
-        // fail over to (the last error is what the caller sees). Otherwise route
-        // to the next candidate.
-        let more_candidates = attempt + 1 < candidates.len();
-        if retry_disposition(&err) == RetryDisposition::Terminal || !more_candidates {
-            return Err(err);
-        }
-        eprintln!(
-            "fetch: provider {provider} could not deliver ({err:#}); failing over to the next of \
-             {} candidate(s)",
-            candidates.len(),
-        );
-        last_err = Some(err);
-    }
-
-    // The list is empty only if `resolve_target_node` returned no candidates,
-    // which it never does (discovery errors on an empty holder set, and the
-    // explicit path yields one). `last_err` is therefore set whenever the loop
-    // falls through; keep a defensive error for the unreachable empty case.
-    Err(last_err
-        .unwrap_or_else(|| anyhow::anyhow!("no candidate node could deliver the requested blob")))
 }
 
 /// Reconnect a delegated fetch's terminal owner-remedy voucher rejection
@@ -2958,6 +3053,11 @@ mod tests {
         assert!(targets.coverage_by_node.is_empty());
         assert!(targets.probed_samples.is_empty());
         assert!(targets.size_hint.is_none());
+        // The fast path is the one construction site that marks its result, so
+        // the driver can fall through to discovery if every one of these
+        // never-probed candidates turns out to be unreachable (ADR 037 § in-fetch
+        // discovery fallback).
+        assert!(targets.from_store_fast_path);
 
         // Only two selectable records -> below min_fresh_candidates -> None.
         let dir2 = tempfile::tempdir()?;

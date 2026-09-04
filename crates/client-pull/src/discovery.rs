@@ -535,7 +535,7 @@ pub fn select_candidates(
 /// dropped; a candidate with `region_hint == None` is kept. An empty `allow`
 /// is a no-op. Ranking is unchanged (region is a self-attested hint, never a
 /// ranking key) — this only narrows which candidates are eligible to be
-/// probed/discovered at all (Task 9), independent of the peer store.
+/// probed/discovered at all, independent of the peer store.
 #[must_use]
 pub fn select_candidates_filtered(
     candidates: Vec<NodeCandidate>,
