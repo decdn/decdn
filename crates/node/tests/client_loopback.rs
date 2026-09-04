@@ -10801,3 +10801,131 @@ async fn client_surfaces_typed_rejection_when_its_send_is_stopped_before_the_clo
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
+
+/// A [`decdn_node::pool_view::PoolView`] that knows only the pools it was given, and
+/// answers `None` for every other — the production shape of the floor fail-open.
+///
+/// [`FixedRemainingPoolView`] cannot express it: it answers `Some` for every id, so the
+/// only `None` it can produce is the degenerate "no view wired at all". What an operator
+/// actually meets is a view that IS wired and has simply not seen this pool yet, because
+/// the settlement watcher is still backfilling or has dropped it on `PoolReclaimed`.
+#[derive(Debug)]
+struct SparsePoolView {
+    known: std::collections::HashMap<B256, decdn_node::pool_view::PoolStatus>,
+}
+
+#[async_trait]
+impl decdn_node::pool_view::PoolView for SparsePoolView {
+    async fn status(&self, pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        self.known.get(&pool_id).copied()
+    }
+}
+
+/// `spawn_handler_server_with_metrics` with a pool view wired that does NOT know the
+/// lane's pool, so every floor gate is skipped while the lane itself stays known.
+async fn spawn_handler_server_with_sparse_pool(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Arc<PrivateKeySigner>,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let owner = operator_addr();
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        move |deps| {
+            // One entry, for a pool nothing in the test names — so the view is genuinely
+            // wired and genuinely answering, just not about this pool.
+            let mut known = std::collections::HashMap::new();
+            known.insert(
+                B256::repeat_byte(0xEE),
+                decdn_node::pool_view::PoolStatus {
+                    owner,
+                    remaining: U256::from(u64::MAX),
+                    lifecycle: decdn_node::pool_view::Lifecycle::Open,
+                },
+            );
+            deps.pool_view = Some(Arc::new(SparsePoolView { known }));
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_eth, server_ep, server_task, metrics))
+}
+
+/// A request whose pool the view cannot answer for bumps the floor fail-open counter
+/// exactly once, at the call site.
+///
+/// The counter's only other coverage calls the recorder directly, so deleting the whole
+/// `if pool_status.is_none()` block in `serve_stream` leaves every test green — and the
+/// fail-open it exists to make visible goes back to being invisible. A stream abandoned
+/// in that window debits no abandonment bucket at all, so its signer keeps an allowance
+/// it has spent, and no series says so.
+///
+/// Exactly one, not merely non-zero: one `None` view skips several gates, and the whole
+/// point of bumping at the single admission-path resolve rather than at each gate is that
+/// one cause reads as one event.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_whose_pool_the_view_cannot_answer_for_counts_the_floor_fail_open()
+-> anyhow::Result<()> {
+    let payload = vec![0x71u8; 512 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        signer.address(),
+        operator_addr(),
+        U256::from(10_000_000u64),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_sparse_pool(cache, store_dyn).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    let wire = support::bao_wire_len_whole(payload.len() as u64);
+    let only = stall_delivery_at_closing_voucher(&conn, *hash.as_bytes(), wire, Some(&ext)).await?;
+    let _ = only
+        .pay_and_finish(&signer, VoucherTotals::default())
+        .await?;
+
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&encoded, "decdn_floor_gate_skipped_no_pool_view_total 1"),
+        "one request against a pool the view does not know must bump the fail-open \
+         counter exactly once:\n{encoded}"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}

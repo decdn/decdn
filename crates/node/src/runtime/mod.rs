@@ -2461,11 +2461,64 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     /// flush of `channel_state_store`.
     lane_flush_task: tokio::task::JoinHandle<()>,
     channel_state_store: Arc<dyn PoolStateStore>,
-    /// Held only so the floor-bucket persist worker can be drained below, once every
-    /// serve has returned and every `FloorReservation` has dropped.
+    /// Held only so the floor-bucket persist worker can be drained below, once the
+    /// router has cancelled every in-flight serve and the `FloorReservation`s those
+    /// tasks held are being dropped. See [`drain_floor_persists`] for why that is a
+    /// cancellation rather than a join, and what the drain can and cannot prove.
     client_handler: Arc<ClientHandler>,
     node_metrics: Arc<metrics::Metrics>,
     tasks: JoinSet<()>,
+}
+
+/// Wait for the floor-bucket persist worker to write what the dropped reservations
+/// queued, bounded by `deadline`.
+///
+/// Called once at shutdown, after the router has stopped accepting and cancelled every
+/// in-flight serve, so no new reservation can open and the outstanding guards are being
+/// dropped. A write lost here hands its signer back an abandonment allowance it has
+/// already spent, on the next boot.
+///
+/// Cancelled rather than joined: iroh aborts the `ProtocolHandler::accept` futures once
+/// `ProtocolHandler::shutdown` returns, and `ClientProtocol` takes the default no-op
+/// `shutdown`, so `ClientHandler::serve`'s own terminal drain does not run and the
+/// per-stream tasks are aborted. Their futures — and the `FloorReservation`s they hold —
+/// drop asynchronously. [`ClientHandler::flush_floor_persists`] reports anything still
+/// queued once its ack returns, which is what covers a guard that dropped late.
+///
+/// Bounded for the same reason: the backlog is one `Durability::Immediate` commit per
+/// queued write processed serially, and with no point at which the queue is provably
+/// closed an unbounded await could outlast the rest of shutdown. A timeout counts as a
+/// persist failure because the consequence matches a failed write — the durable snapshot
+/// stays behind the in-memory one — and it counts by the DEPTH of the abandoned backlog,
+/// since one bump would report a lost queue of four hundred exactly as it reports a
+/// single transient fault.
+///
+/// A free function taking what it needs rather than a block inside [`shutdown`], which is
+/// private, takes a private `ShutdownHandles`, and is reachable only from [`run`] — so a
+/// block there is testable only under `--features anvil-e2e` against a live chain. Here
+/// the deadline is a parameter and a test can wedge the worker.
+///
+/// `pub(crate)` for that test alone: the floor-loss fixtures it needs (a gated store, a
+/// handler wired to one) live in `handlers::client::floor`'s test module and cannot be
+/// reached from this one. [`shutdown`] remains the only production caller.
+pub(crate) async fn drain_floor_persists(
+    handler: &ClientHandler,
+    node_metrics: &metrics::Metrics,
+    deadline: Duration,
+) {
+    if tokio::time::timeout(deadline, handler.flush_floor_persists())
+        .await
+        .is_err()
+    {
+        let lost = handler.queued_floor_persists().max(1);
+        node_metrics.floor_loss_persist_failures_by(lost);
+        tracing::warn!(
+            lost,
+            ?deadline,
+            "floor-bucket persist drain overran the shutdown deadline; that many queued \
+             snapshots may not have reached disk"
+        );
+    }
 }
 
 /// Graceful teardown extracted verbatim from the tail of [`run`] (issue #1253
@@ -2656,39 +2709,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // so a slow RPC cannot hang shutdown.
     payment_service.shutdown(SHUTDOWN_DEADLINE).await;
 
-    // Drain the floor-bucket persist worker. The router has stopped accepting and has
-    // cancelled every in-flight serve, so no new reservation can open and the
-    // outstanding guards are being dropped; this waits for what they queued to reach
-    // disk. A write lost here hands its signer back an abandonment allowance it has
-    // already spent, on the next boot.
-    //
-    // Cancelled rather than joined: iroh aborts the `ProtocolHandler::accept` futures
-    // once `ProtocolHandler::shutdown` returns, and `ClientProtocol` takes the default
-    // no-op `shutdown`, so `ClientHandler::serve`'s own terminal drain does not run and
-    // the per-stream tasks are aborted. Their futures — and the `FloorReservation`s
-    // they hold — drop asynchronously. `flush_floor_persists` reports anything still
-    // queued once its ack returns, which is what covers a guard that dropped late.
-    //
-    // Bounded for the same reason: the backlog is one `Durability::Immediate` commit
-    // per queued write processed serially, and with no point at which the queue is
-    // provably closed an unbounded await could outlast the rest of shutdown. A timeout
-    // is counted as a persist failure because the consequence matches a failed write —
-    // the durable snapshot stays behind the in-memory one — and it is counted by the
-    // DEPTH of the abandoned backlog, since one bump would report a lost queue of four
-    // hundred exactly as it reports a single transient fault.
-    if tokio::time::timeout(SHUTDOWN_DEADLINE, client_handler.flush_floor_persists())
-        .await
-        .is_err()
-    {
-        let lost = client_handler.queued_floor_persists().max(1);
-        node_metrics.floor_loss_persist_failures_by(lost);
-        tracing::warn!(
-            lost,
-            deadline = ?SHUTDOWN_DEADLINE,
-            "floor-bucket persist drain overran the shutdown deadline; that many queued \
-             snapshots may not have reached disk"
-        );
-    }
+    drain_floor_persists(&client_handler, &node_metrics, SHUTDOWN_DEADLINE).await;
 
     // Final durable flush before stop, so the last interval of frontier lands.
     // The router has drained and the redeem sweep above already ran, so the

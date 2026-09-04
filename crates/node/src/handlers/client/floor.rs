@@ -1163,12 +1163,23 @@ type AdmissionSeam = Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
 static ADMISSION_SEAM: std::sync::Mutex<Option<AdmissionSeam>> = std::sync::Mutex::new(None);
 
+/// Whether any test has installed a seam in this process.
+///
+/// Checked before the mutex so an uninstalled seam costs one relaxed load on a path
+/// taken by every admission. Locking a process-wide mutex and cloning an `Arc` inside
+/// `try_reserve_floor`'s own lock hold would tax every test that admits — including the
+/// live-endpoint fixtures that assert against wall-clock budgets — to serve two tests
+/// that install one.
+#[cfg(test)]
+static ADMISSION_SEAM_SET: AtomicBool = AtomicBool::new(false);
+
 /// Install the seam for the current test process.
 #[cfg(test)]
 fn set_admission_seam(hook: AdmissionSeam) {
     *ADMISSION_SEAM
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    ADMISSION_SEAM_SET.store(true, Ordering::SeqCst);
 }
 
 /// Run the installed seam, if any.
@@ -1178,6 +1189,9 @@ fn set_admission_seam(hook: AdmissionSeam) {
 /// rather than on `pool_floor` — which is the lock the test is there to observe.
 #[cfg(test)]
 fn admission_seam() {
+    if !ADMISSION_SEAM_SET.load(Ordering::SeqCst) {
+        return;
+    }
     let hook = ADMISSION_SEAM
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3534,6 +3548,167 @@ mod tests {
         ensure_floor_levels_agree(&handler, pool, "after the parked race")?;
         drop((first, second));
         ensure_floor_levels_agree(&handler, pool, "after every guard drops")?;
+        Ok(())
+    }
+    /// The shutdown drain gives up on a wedged persist worker inside its deadline, and
+    /// counts the backlog it abandoned by DEPTH rather than as a single failure.
+    ///
+    /// `runtime::shutdown` is private, takes a private `ShutdownHandles`, and is called
+    /// only from `runtime::run`, so the drain is reachable in place only under
+    /// `--features anvil-e2e` against a live chain — which is why it is a free function.
+    /// Deleting its timeout arm, or reverting the bump to a flat `+1`, otherwise fails
+    /// nothing at all: an operator would read a lost queue of four hundred snapshots
+    /// exactly as they read one transient fault, and every one of those signers regains
+    /// a spent allowance on the next boot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shutdown_drain_gives_up_on_a_wedged_worker_and_counts_the_backlog()
+    -> anyhow::Result<()> {
+        const QUEUED: usize = 3;
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(GatedLossStore::new());
+        let (handler, _dir) = handler_for_tests_with_floor_store(
+            &metrics,
+            u64::MAX,
+            u64::MAX,
+            Arc::clone(&store) as Arc<dyn decdn_incentive::PoolFloorLossStore>,
+        )
+        .await;
+        let pool = B256::repeat_byte(0x8A);
+        let window = handler.one_window(TEST_RATE);
+        let remaining = window.saturating_mul(U256::from(64u64));
+
+        // Three abandoned streams: the worker parks in the store on the first and the
+        // other two sit behind it, so nothing is ever lowered and the depth stays 3.
+        for _ in 0..QUEUED {
+            let res = handler
+                .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+                .map_err(|e| anyhow::anyhow!("admission refused: {e:?}"))?;
+            res.note_unpaid(window);
+            drop(res);
+        }
+        anyhow::ensure!(
+            handler.queued_floor_persists() == QUEUED as u64,
+            "the drops must have queued {QUEUED} snapshots, not {}",
+            handler.queued_floor_persists()
+        );
+
+        let deadline = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        crate::runtime::drain_floor_persists(&handler, &metrics, deadline).await;
+        let elapsed = started.elapsed();
+        let text = metrics.encode()?;
+
+        // Release BEFORE asserting. An early return from a failed `ensure!` would leave
+        // the blocking thread parked on the gate, which keeps the test process alive
+        // until nextest's backstop — turning a two-second failure into a nine-minute
+        // timeout that says nothing about what broke.
+        store.release();
+
+        anyhow::ensure!(
+            elapsed < Duration::from_secs(5),
+            "the drain must return on its own deadline rather than waiting on a worker \
+             that cannot finish; took {elapsed:?}"
+        );
+        anyhow::ensure!(
+            text.contains(&format!("decdn_floor_loss_persist_failures_total {QUEUED}")),
+            "and must count every abandoned snapshot, not one per drain:\n{text}"
+        );
+        Ok(())
+    }
+    /// A guard's `Drop` cannot reconcile while an admission is mid-decision on the same
+    /// signer — and once both have run, the admission's charge and the drop's bucket
+    /// debit are each present exactly once.
+    ///
+    /// This is the third gate's real interleaving, and the one nothing covered. The two
+    /// gates that can over-commit race admission against admission; the abandonment
+    /// bucket instead races admission against RECONCILIATION.
+    /// [`FloorAccumulator::read_refilled`] refills the signer's bucket IN PLACE while
+    /// deciding, and a concurrent [`PoolFloorState::release_and_debit`] writes that same
+    /// row. They are safe only because both run under one `pool_floor` hold — not
+    /// because the gate is a read, which it is not.
+    ///
+    /// Parked on [`ADMISSION_SEAM`] rather than raced for, same as its sibling above: a
+    /// split `try_reserve_floor` lets the drop reconcile inside the admission's decision
+    /// window, and this fails on the spot instead of once in twenty thousand runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_guard_drop_cannot_reconcile_inside_an_admissions_decision() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        // Nothing may bind but the lock itself: a live cap and bucket wide enough to
+        // admit freely, and a refill slow enough that none intrudes on the measurement.
+        let (handler, _dir) = handler_for_tests_with_signer_policy(
+            &metrics,
+            U256::ZERO,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+        )
+        .await;
+        let pool = B256::repeat_byte(0x3F);
+        let window = handler.one_window(TEST_RATE);
+        let remaining = window.saturating_mul(U256::from(64u64));
+
+        // The guard whose drop will contend. Opened BEFORE the seam is installed, so its
+        // own admission does not trip it.
+        let abandoning = handler
+            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            .map_err(|e| anyhow::anyhow!("setup admission refused: {e:?}"))?;
+        abandoning.note_unpaid(window);
+
+        let seam = Arc::new(Seam {
+            armed: AtomicBool::new(true),
+            reached: std::sync::Mutex::new(false),
+            reached_cv: std::sync::Condvar::new(),
+            released: std::sync::Mutex::new(false),
+            released_cv: std::sync::Condvar::new(),
+        });
+        set_admission_seam({
+            let seam = Arc::clone(&seam);
+            Arc::new(move || seam.park_first())
+        });
+
+        let drop_ran_unblocked = std::thread::scope(|scope| {
+            let admitting = scope.spawn(|| {
+                handler.try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            });
+            // Only drop once the admission is holding its decision open.
+            seam.wait_reached();
+            let dropping = scope.spawn(move || drop(abandoning));
+            // A clear window for the drop to reconcile if it CAN. Under one lock hold it
+            // is blocked on `pool_floor`; under a split it finishes here.
+            std::thread::sleep(Duration::from_millis(250));
+            // Sampled, not asserted: the seam must be released on every path out of this
+            // scope or the parked thread never returns and the join below hangs.
+            let ran = dropping.is_finished();
+            seam.release();
+            let admitted = admitting
+                .join()
+                .map_err(|_| anyhow::anyhow!("admission panicked"))?;
+            dropping
+                .join()
+                .map_err(|_| anyhow::anyhow!("drop panicked"))?;
+            drop(admitted);
+            Ok::<_, anyhow::Error>(ran)
+        })?;
+
+        anyhow::ensure!(
+            !drop_ran_unblocked,
+            "a guard reconciled while an admission held the accumulator mid-decision, so \
+             the in-place bucket refill and the drop's debit are not serialized"
+        );
+        let consumed = {
+            let guard = lock_floor(&handler.pool_floor)?;
+            guard
+                .0
+                .get(&pool)
+                .and_then(|entry| entry.signers.get(&TEST_SIGNER))
+                .map(|lane| lane.bucket_consumed)
+        };
+        anyhow::ensure!(
+            consumed == Some(window),
+            "the abandoned guard's debit must survive the concurrent admission exactly \
+             once: expected {window}, got {consumed:?}"
+        );
+        ensure_floor_levels_agree(&handler, pool, "after the admission and the drop")?;
         Ok(())
     }
 }
