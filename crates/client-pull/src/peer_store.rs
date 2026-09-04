@@ -141,6 +141,122 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+use std::path::{Path, PathBuf};
+
+/// Directory-backed peer knowledge base: one JSON file per peer under `<data_dir>/peers`.
+#[derive(Debug, Clone)]
+pub struct PeerStore {
+    dir: PathBuf,
+}
+
+impl PeerStore {
+    /// Open (do not create) the store rooted at `<data_dir>/peers`.
+    #[must_use]
+    pub fn open(data_dir: &Path) -> Self {
+        Self {
+            dir: data_dir.join("peers"),
+        }
+    }
+
+    fn path_for(&self, node_id: &PublicKey) -> PathBuf {
+        self.dir.join(format!("{node_id}.json"))
+    }
+
+    /// Read every valid record, skipping files that do not parse.
+    #[must_use]
+    pub fn load_all(&self) -> Vec<PeerRecord> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Ok(rec) = serde_json::from_slice::<PeerRecord>(&bytes)
+            {
+                out.push(rec);
+            }
+        }
+        out
+    }
+
+    /// Read one record by id.
+    #[must_use]
+    pub fn get(&self, node_id: &PublicKey) -> Option<PeerRecord> {
+        let bytes = std::fs::read(self.path_for(node_id)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn write(&self, rec: &PeerRecord) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let bytes = serde_json::to_vec_pretty(rec)?;
+        let tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
+        std::fs::write(tmp.path(), &bytes)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(self.path_for(&rec.node_id))
+            .map_err(|e| anyhow::anyhow!("persist peer record: {e}"))?;
+        Ok(())
+    }
+
+    /// Refresh identity, preserving existing stats.
+    pub fn upsert_identity(&self, cand: &NodeCandidate, now_secs: u64) -> anyhow::Result<()> {
+        let mut rec = self.get(&cand.node_id).unwrap_or(PeerRecord {
+            node_id: cand.node_id,
+            eth_address: cand.eth_address,
+            region_hint: cand.region_hint,
+            identity_seen_at_secs: now_secs,
+            latency_ms: None,
+            last_sampled_at_secs: None,
+            rate_per_mb: None,
+            sample_count: 0,
+            last_failure_at_secs: None,
+        });
+        rec.eth_address = cand.eth_address;
+        rec.region_hint = cand.region_hint;
+        rec.identity_seen_at_secs = now_secs;
+        self.write(&rec)
+    }
+
+    /// Fold a latency sample, set price, stamp freshness, and clear any failure.
+    pub fn record_sample(
+        &self,
+        node_id: &PublicKey,
+        latency_ms: f64,
+        rate_per_mb: u64,
+        now_secs: u64,
+        cfg: &StoreConfig,
+    ) -> anyhow::Result<()> {
+        let mut rec = self.get(node_id).unwrap_or(PeerRecord {
+            node_id: *node_id,
+            eth_address: Address::ZERO,
+            region_hint: None,
+            identity_seen_at_secs: 0,
+            latency_ms: None,
+            last_sampled_at_secs: None,
+            rate_per_mb: None,
+            sample_count: 0,
+            last_failure_at_secs: None,
+        });
+        rec.fold_latency(latency_ms, cfg.ewma_alpha);
+        rec.rate_per_mb = Some(rate_per_mb);
+        rec.last_sampled_at_secs = Some(now_secs);
+        rec.last_failure_at_secs = None;
+        self.write(&rec)
+    }
+
+    /// Stamp a failure so the peer is suppressed from selection.
+    pub fn record_failure(&self, node_id: &PublicKey, now_secs: u64) -> anyhow::Result<()> {
+        let Some(mut rec) = self.get(node_id) else {
+            return Ok(());
+        };
+        rec.last_failure_at_secs = Some(now_secs);
+        self.write(&rec)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +320,85 @@ mod tests {
         let r = sample_record();
         assert!(!r.identity_prunable(1_000 + cfg.identity_prune_secs, &cfg));
         assert!(r.identity_prunable(1_000 + cfg.identity_prune_secs + 1, &cfg));
+    }
+
+    use tempfile::tempdir;
+
+    fn key(b: u8) -> PublicKey {
+        iroh::SecretKey::from_bytes(&[b; 32]).public()
+    }
+
+    fn candidate(b: u8) -> NodeCandidate {
+        NodeCandidate {
+            node_id: key(b),
+            eth_address: Address::repeat_byte(b),
+            region_hint: Region::parse("US"),
+        }
+    }
+
+    #[test]
+    fn upsert_then_get_roundtrips_identity() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        store.upsert_identity(&candidate(1), 5_000)?;
+        let got = store
+            .get(&key(1))
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        assert_eq!(got.eth_address, Address::repeat_byte(1));
+        assert_eq!(got.identity_seen_at_secs, 5_000);
+        assert_eq!(got.latency_ms, None);
+        Ok(())
+    }
+
+    #[test]
+    fn sample_preserves_identity_and_folds_latency() -> anyhow::Result<()> {
+        let cfg = StoreConfig::default();
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        store.upsert_identity(&candidate(2), 5_000)?;
+        store.record_sample(&key(2), 30.0, 7, 5_100, &cfg)?;
+        let got = store
+            .get(&key(2))
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        assert_eq!(got.latency_ms, Some(30.0));
+        assert_eq!(got.rate_per_mb, Some(7));
+        assert_eq!(got.last_sampled_at_secs, Some(5_100));
+        assert_eq!(got.eth_address, Address::repeat_byte(2)); // identity intact
+        Ok(())
+    }
+
+    #[test]
+    fn failure_then_success_clears_stamp() -> anyhow::Result<()> {
+        let cfg = StoreConfig::default();
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        store.upsert_identity(&candidate(3), 5_000)?;
+        store.record_failure(&key(3), 6_000)?;
+        assert!(
+            store
+                .get(&key(3))
+                .and_then(|r| r.last_failure_at_secs)
+                .is_some()
+        );
+        store.record_sample(&key(3), 25.0, 3, 6_100, &cfg)?;
+        assert!(
+            store
+                .get(&key(3))
+                .and_then(|r| r.last_failure_at_secs)
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_all_skips_corrupt_files() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        store.upsert_identity(&candidate(4), 5_000)?;
+        std::fs::create_dir_all(dir.path().join("peers"))?;
+        std::fs::write(dir.path().join("peers").join("garbage.json"), b"{not json")?;
+        let all = store.load_all();
+        assert_eq!(all.len(), 1);
+        Ok(())
     }
 }
