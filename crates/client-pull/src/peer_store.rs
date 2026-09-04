@@ -255,6 +255,42 @@ impl PeerStore {
         rec.last_failure_at_secs = Some(now_secs);
         self.write(&rec)
     }
+
+    fn delete(&self, node_id: &PublicKey) -> anyhow::Result<()> {
+        match std::fs::remove_file(self.path_for(node_id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Prune very-stale identities, then LRU-evict down to `lru_cap`.
+    pub fn prune_and_cap(&self, now_secs: u64, cfg: &StoreConfig) -> anyhow::Result<()> {
+        let mut records = self.load_all();
+        records.retain(|r| {
+            if r.identity_prunable(now_secs, cfg) {
+                let _ = self.delete(&r.node_id);
+                false
+            } else {
+                true
+            }
+        });
+        if records.len() <= cfg.lru_cap {
+            return Ok(());
+        }
+        // Least-recently-useful first: oldest last sample, then oldest identity.
+        records.sort_by(|a, b| {
+            a.last_sampled_at_secs
+                .unwrap_or(0)
+                .cmp(&b.last_sampled_at_secs.unwrap_or(0))
+                .then(a.identity_seen_at_secs.cmp(&b.identity_seen_at_secs))
+        });
+        let evict = records.len().saturating_sub(cfg.lru_cap);
+        for r in records.into_iter().take(evict) {
+            self.delete(&r.node_id)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +435,38 @@ mod tests {
         std::fs::write(dir.path().join("peers").join("garbage.json"), b"{not json")?;
         let all = store.load_all();
         assert_eq!(all.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_drops_very_stale_identity_keeps_fresh() -> anyhow::Result<()> {
+        let cfg = StoreConfig::default();
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        store.upsert_identity(&candidate(1), 0)?; // ancient identity
+        store.upsert_identity(&candidate(2), 1_000_000)?; // fresh identity
+        let now = 1_000_000 + cfg.identity_prune_secs; // key(1) is prunable, key(2) is not
+        store.prune_and_cap(now, &cfg)?;
+        assert!(store.get(&key(1)).is_none());
+        assert!(store.get(&key(2)).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn cap_evicts_least_recently_sampled() -> anyhow::Result<()> {
+        let cfg = StoreConfig {
+            lru_cap: 2,
+            ..Default::default()
+        };
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        for b in 1u8..=3 {
+            store.upsert_identity(&candidate(b), 1_000_000)?;
+            store.record_sample(&key(b), 10.0, 1, 1_000_000 + u64::from(b), &cfg)?;
+        }
+        store.prune_and_cap(1_000_100, &cfg)?;
+        assert_eq!(store.load_all().len(), 2);
+        assert!(store.get(&key(1)).is_none()); // oldest sample evicted
         Ok(())
     }
 }
