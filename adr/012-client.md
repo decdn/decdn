@@ -75,7 +75,7 @@ Startup sequence from first launch to ready state:
 
 The peer store is a directory of per-node JSON files under the resolved client data dir — `--data-dir`, else `[identity] data_dir`, defaulting to `~/.decdn/client` — so it moves with the rest of the client's state rather than living at a fixed path.
 
-The on-chain registry is the sole discovery source. Nodes and clients both build their node list from it. The peer store's identity half — the last registry snapshot — covers a transient RPC outage. The store's stats half — round-trip latency and quoted price, sampled from probes and completed streams — lets a client route a fetch without probing when it holds enough fresh candidates, going straight to a `StreamRequest` and taking price from the node's `StreamResponse`. A client stays online only long enough to fetch, so it holds no long-lived network role. The store persists across invocations, so a later run can skip both the registry read and the probe.
+The on-chain registry is the sole discovery source. Nodes and clients both build their node list from it. The peer store's identity half — the last registry snapshot — covers a transient RPC outage. The store's stats half — round-trip latency and quoted price, sampled from probes and completed streams — lets a client route a fetch without probing when it holds enough fresh candidates, going straight to a `StreamRequest` and taking price from the node's `StreamResponse`. The two halves of a record age on independent clocks: identity refreshes and prunes on the registry's own horizon (the periodic registry refresh of step 8), while stats age against the RTT map's own staleness TTL ([ADR 037 § Client RTT map and latency discovery](037-regional-proxy-warming.md#client-rtt-map-and-latency-discovery), `rtt_map.staleness_secs`) — a record can carry fresh identity with stale stats, or the reverse. A client stays online only long enough to fetch, so it holds no long-lived network role. The store persists across invocations, so a later run can skip both the registry read and the probe.
 
 Node-side registry interaction and bootstrap is in [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-node-view-from-on-chain-registry).
 
@@ -186,6 +186,8 @@ in current schema terms:
 - `[blockchain]` — `rpc_url`, `eth_keystore`, `chain_id`, plus the `payment_channel_address` /
   `slash_judge_address` (and `capacity_bond_address` for auto-discovery) a client needs to pay for
   and verify delivery. The RPC URL and keystore live here, **not** under `[network]`/`[keys]`.
+- `[client]` — an optional `region_allowlist` list of regions. When set, it restricts discovery and
+  probing to nodes whose `region_hint` matches; empty or absent means no filter.
 
 The voucher byte-accounting granularity is a fixed protocol constant that every client and node
 reads directly ([ADR 003 § Key parameters](003-payments.md#adr-003-payment-model)), so a client has
