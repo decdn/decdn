@@ -750,16 +750,40 @@ pub(crate) async fn resolve_target_node(
     // instead of the degraded-but-working fetch the cache exists to provide.
     let order =
         discover_provider(endpoint, chain, capacity_bond, relays.first(), hash, args).await?;
-    if let Some(primary) = order.candidates.first() {
-        eprintln!(
-            "discovered {} candidate node(s); primary {} (provider {}, region {:?})",
-            order.candidates.len(),
-            primary.node_id,
-            primary.eth_address,
-            primary.region_hint
-        );
+    if !order.candidates.is_empty() {
+        eprintln!("Discovered {} node(s):", order.candidates.len());
+        for c in &order.candidates {
+            eprintln!(
+                "  * {} / {} / {}",
+                c.region_hint.as_ref().map_or("??", |r| r.as_str()),
+                node_id_tail(&c.node_id),
+                short_address(&c.eth_address),
+            );
+        }
     }
     Ok(order)
+}
+
+/// Last 4 hex characters of a node id, for a compact operator-facing listing.
+///
+/// The full 64-hex id is unwieldy in a per-line summary; the tail is enough to
+/// tell candidates apart at a glance. Falls back to the full string only if it
+/// is somehow shorter than 4 characters (it never is for a `PublicKey`).
+fn node_id_tail(node_id: &PublicKey) -> String {
+    let s = node_id.to_string();
+    s.get(s.len().saturating_sub(4)..).unwrap_or(&s).to_owned()
+}
+
+/// Shorten an Ethereum address to `0x` + first 4 + `...` + last 4 hex
+/// characters (e.g. `0xa43d...fdCe`), preserving the checksummed casing.
+///
+/// Returns the full string unchanged if it is unexpectedly short.
+fn short_address(addr: &Address) -> String {
+    let s = addr.to_string();
+    match (s.get(..6), s.get(s.len().saturating_sub(4)..)) {
+        (Some(head), Some(tail)) if s.len() > 10 => format!("{head}...{tail}"),
+        _ => s,
+    }
 }
 
 /// Reconnect an opaque `delivery refused: NotFound` to its likely cause(s).
