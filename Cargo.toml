@@ -226,6 +226,15 @@ aws-smithy-types = "1"
 tempfile = "3"
 wiremock = "0.6"
 proptest = "1"
+# `decdn key-gen`'s double-entry password prompt is only reachable through a
+# controlling terminal: `rpassword` reads `/dev/tty`, not stdin, so redirecting
+# a child's stdin cannot drive it. Giving a spawned process a pty as its
+# controlling terminal needs `forkpty` (or `setsid` + `TIOCSCTTY`), which is
+# `unsafe` — forbidden workspace-wide — so the fork lives in this dependency
+# instead. `default-features = false` drops the `which` feature, needed only by
+# `rexpect::spawn`'s command-string form; the tests spawn a `Command` built from
+# `CARGO_BIN_EXE_decdn`, an absolute path.
+rexpect = { version = "0.7", default-features = false }
 # `decdn-node`'s chain-watcher tests need a provider whose RPCs never resolve, to
 # prove each sink-internal read is bounded by `chain_events::timed`. alloy's own
 # `Asserter` cannot express that (it pops a queued response or errors — never

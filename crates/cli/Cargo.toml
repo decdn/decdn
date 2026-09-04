@@ -99,6 +99,11 @@ decdn-incentive = { workspace = true, features = ["redb", "test-util"] }
 # None of this leaks into the `decdn` binary's release dep tree.
 decdn-node = { workspace = true }
 decdn-cache = { workspace = true }
+# `tests/key_gen_prompt_pty.rs` drives the real `decdn` binary through the
+# interactive keystore-password prompt, which `rpassword` reads from
+# `/dev/tty`. `rexpect` forks the child onto a pty and makes it the controlling
+# terminal — see the workspace-manifest note for why that cannot be done here.
+rexpect = { workspace = true }
 
 [lints]
 workspace = true

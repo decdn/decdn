@@ -15,7 +15,7 @@ use anyhow::Context;
 use decdn_common::cli;
 use decdn_common::cli::common::expand_tilde;
 use decdn_common::config::DEFAULT_CHAIN_ID;
-use decdn_incentive::eth_identity::{self, PasswordSource};
+use decdn_incentive::eth_identity::{self, PasswordSource, PasswordUse};
 use decdn_incentive::swap_venue::ResolvedSwap;
 use serde::Deserialize;
 
@@ -230,7 +230,7 @@ pub async fn load_operator_signer(
 
 /// CLI-boundary wrapper over [`decdn_incentive::eth_identity::standard_sources`],
 /// the shared keystore password source list. Precedence, presence semantics,
-/// and `confirm` are documented there; the `decdn-node` daemon reaches the same
+/// and `usage` are documented there; the `decdn-node` daemon reaches the same
 /// builder directly.
 ///
 /// The delta this wrapper adds is tilde expansion, so callers passing the raw
@@ -239,8 +239,11 @@ pub async fn load_operator_signer(
 /// leaves an already-expanded path alone, so the second pass costs them
 /// nothing. Expansion rewrites a leading `~` and nothing else: a relative path
 /// stays relative and resolves against the working directory when read.
-pub(crate) fn password_sources(password_file: Option<&Path>, confirm: bool) -> Vec<PasswordSource> {
-    eth_identity::standard_sources(password_file.map(expand_tilde), confirm)
+pub(crate) fn password_sources(
+    password_file: Option<&Path>,
+    usage: PasswordUse,
+) -> Vec<PasswordSource> {
+    eth_identity::standard_sources(password_file.map(expand_tilde), usage)
 }
 
 /// Load an Ethereum keystore signer, sourcing the password per
@@ -256,7 +259,7 @@ pub async fn load_signer_with_password_file(
     keystore: &Path,
 ) -> anyhow::Result<PrivateKeySigner> {
     let password = eth_identity::read_password(
-        &password_sources(password_file, false),
+        &password_sources(password_file, PasswordUse::Unlock),
         "eth keystore password",
     )?;
     let keystore = keystore.to_path_buf();
@@ -435,7 +438,7 @@ mod tests {
     /// delegating and rebuilds the list by hand.
     #[test]
     fn password_sources_expands_tilde_and_delegates() {
-        let sources = password_sources(Some(Path::new("~/pw.txt")), false);
+        let sources = password_sources(Some(Path::new("~/pw.txt")), PasswordUse::Unlock);
         let want = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("pw.txt"));
         assert!(
             matches!(
@@ -443,7 +446,9 @@ mod tests {
                 [
                     PasswordSource::Env(name),
                     PasswordSource::File(p),
-                    PasswordSource::Prompt { confirm: false },
+                    PasswordSource::Prompt {
+                        usage: PasswordUse::Unlock
+                    },
                 ] if *name == eth_identity::KEYSTORE_PASSWORD_ENV
                     && want.as_ref().is_none_or(|want| p == want)
             ),
@@ -453,7 +458,7 @@ mod tests {
         // An already-expanded path arrives untouched: `fetch` and `pool` hand
         // the wrapper a path their own `resolve_chain` expanded, and a second
         // pass must not rewrite it.
-        let absolute = password_sources(Some(Path::new("/abs/pw.txt")), false);
+        let absolute = password_sources(Some(Path::new("/abs/pw.txt")), PasswordUse::Unlock);
         assert!(
             matches!(
                 absolute.as_slice(),
@@ -462,13 +467,15 @@ mod tests {
             "got: {absolute:?}"
         );
 
-        let without = password_sources(None, true);
+        let without = password_sources(None, PasswordUse::Create);
         assert!(
             matches!(
                 without.as_slice(),
                 [
                     PasswordSource::Env(_),
-                    PasswordSource::Prompt { confirm: true },
+                    PasswordSource::Prompt {
+                        usage: PasswordUse::Create
+                    },
                 ]
             ),
             "got: {without:?}"

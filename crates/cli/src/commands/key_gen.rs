@@ -3,7 +3,7 @@
 
 use anyhow::Context;
 use decdn_common::{cli, identity};
-use decdn_incentive::eth_identity;
+use decdn_incentive::eth_identity::{self, PasswordUse};
 
 /// Generate (or reuse) the persistent Ed25519 node key, and a fresh
 /// Ethereum keystore alongside it.
@@ -38,13 +38,15 @@ pub fn key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
 
     // Source the keystore password before any disk writes — interactive
     // prompts that abort (Ctrl-C, mismatch retries exhausted) shouldn't
-    // leave a half-written `node.secret` behind. `confirm: true` because this
-    // command CREATES the keystore: an entry typed once has nothing to check it
-    // against, so a typo would be sealed into the file. `confirm` reaches the
-    // prompt alone, which is why the empty-password warning below is
-    // unconditional.
+    // leave a half-written `node.secret` behind. `PasswordUse::Create` reaches
+    // the prompt alone, which is why the empty-password warning below is
+    // unconditional: an env var or a password file supplies its value under
+    // either use.
     let password = eth_identity::read_password(
-        &super::chain_ctx::password_sources(args.keystore_password_file.as_deref(), true),
+        &super::chain_ctx::password_sources(
+            args.keystore_password_file.as_deref(),
+            PasswordUse::Create,
+        ),
         "eth keystore password",
     )?;
 
