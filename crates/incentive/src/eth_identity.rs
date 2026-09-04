@@ -30,10 +30,9 @@ use anyhow::{Context, anyhow};
 use rand::Rng;
 use zeroize::Zeroizing;
 
-/// Process environment variable that supplies the keystore password. Callers
-/// place it in their [`PasswordSource`] list; both the `decdn` CLI and the
-/// `decdn-node run` runtime loader put it first, ahead of a password file and
-/// an interactive prompt.
+/// Process environment variable that supplies the keystore password.
+/// [`standard_sources`] places it first in the [`PasswordSource`] list, ahead
+/// of a password file and an interactive prompt.
 pub const KEYSTORE_PASSWORD_ENV: &str = "DECDN_KEYSTORE_PASSWORD";
 
 const KEYSTORE_FILE_NAME: &str = "keystore.json";
@@ -69,6 +68,31 @@ pub enum PasswordSource {
         /// When true, prompt twice and require both entries to match.
         confirm: bool,
     },
+}
+
+/// The keystore password sources every binary consults, in precedence order:
+/// the `DECDN_KEYSTORE_PASSWORD` env var, then `password_file` when the
+/// caller passed one, then an interactive prompt on a TTY. Presence decides
+/// at each step (see [`read_password`]), so an env var set to the empty
+/// string is the password rather than a skipped source.
+///
+/// `confirm` reaches the [`PasswordSource::Prompt`] entry, which prompts twice
+/// and requires the entries to match. True only where the command CREATES a
+/// keystore: an entry typed once has nothing to check it against. It constrains
+/// the prompt alone — a password arriving from the env var or the file is used
+/// as given.
+///
+/// `password_file` is used as given; no expansion happens here. Tilde
+/// expansion is the caller's concern. The CLI expands at its boundary
+/// (`chain_ctx::password_sources`), the daemon resolves it in `decdn-common`
+/// config resolution.
+pub fn standard_sources(password_file: Option<PathBuf>, confirm: bool) -> Vec<PasswordSource> {
+    let mut sources = vec![PasswordSource::Env(KEYSTORE_PASSWORD_ENV)];
+    if let Some(path) = password_file {
+        sources.push(PasswordSource::File(path));
+    }
+    sources.push(PasswordSource::Prompt { confirm });
+    sources
 }
 
 /// Path of the persistent Ethereum keystore within `data_dir`.
@@ -495,6 +519,44 @@ mod tests {
         // umask 002 — force the mode explicitly so the validation passes.
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         tmp
+    }
+
+    /// The builder every binary routes through: `Env` first, the `File` only
+    /// when the caller passed a path, `Prompt` last carrying `confirm`.
+    /// Dropping the `Prompt` push would make every interactive command
+    /// headless-only, and pushing `File` ahead of `Env` would invert the
+    /// documented precedence. Neither shows up in the [`read_password`] tests
+    /// below: those drive a list handed to them, so they pin how a list is
+    /// consumed, never how this one is built.
+    #[test]
+    fn password_sources_orders_env_then_file_then_prompt() {
+        let with_file = standard_sources(Some(PathBuf::from("/abs/pw.txt")), false);
+        assert!(
+            matches!(
+                with_file.as_slice(),
+                [
+                    PasswordSource::Env(name),
+                    PasswordSource::File(p),
+                    PasswordSource::Prompt { confirm: false },
+                ] if *name == KEYSTORE_PASSWORD_ENV
+                    && p == Path::new("/abs/pw.txt")
+            ),
+            "got: {with_file:?}"
+        );
+
+        // No path => no `File` entry at all, so an operator who passed no flag
+        // never sees a missing-file skip reason.
+        let without = standard_sources(None, true);
+        assert!(
+            matches!(
+                without.as_slice(),
+                [
+                    PasswordSource::Env(_),
+                    PasswordSource::Prompt { confirm: true },
+                ]
+            ),
+            "got: {without:?}"
+        );
     }
 
     #[test]

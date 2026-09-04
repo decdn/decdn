@@ -48,7 +48,7 @@ use decdn_common::config::ResolvedConfig;
 use decdn_common::identity;
 use decdn_common::redact::{redact_userinfo, sanitize_rpc_display};
 use decdn_incentive::PoolStateStore;
-use decdn_incentive::eth_identity::{self, PasswordSource};
+use decdn_incentive::eth_identity;
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
 /// and metrics server have been signalled to stop. Sized comfortably larger
@@ -3089,9 +3089,8 @@ fn unbracket_host(host: &str) -> &str {
 /// Presence decides at each step (see [`eth_identity::read_password`]): a
 /// variable that is set and a file that exists each supply their value, the
 /// empty string included, so a headless host reaches one of the first two or
-/// the startup fails. The `decdn` CLI builds the same list in
-/// `commands::chain_ctx::password_sources`; `decdn-common` cannot depend on the
-/// `cli` crate, so the two are kept in step by hand.
+/// the startup fails. The list comes from
+/// [`eth_identity::standard_sources`], the single builder every binary shares.
 ///
 /// The Arbitrum Sepolia
 /// chain id is bound on the signer so EIP-712 signers and any
@@ -3102,11 +3101,8 @@ fn unbracket_host(host: &str) -> &str {
 async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigner> {
     use alloy::signers::Signer;
 
-    let mut sources = vec![PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV)];
-    if let Some(path) = cfg.blockchain.keystore_password_file.clone() {
-        sources.push(PasswordSource::File(path));
-    }
-    sources.push(PasswordSource::Prompt { confirm: false });
+    let sources =
+        eth_identity::standard_sources(cfg.blockchain.keystore_password_file.clone(), false);
     let password = eth_identity::read_password(&sources, "eth keystore password")?;
 
     let path = cfg.blockchain.eth_keystore.clone();
