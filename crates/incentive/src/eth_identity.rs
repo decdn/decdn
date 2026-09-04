@@ -30,10 +30,9 @@ use anyhow::{Context, anyhow};
 use rand::Rng;
 use zeroize::Zeroizing;
 
-/// Process environment variable that supplies the keystore password. Callers
-/// place it in their [`PasswordSource`] list; both the `decdn` CLI and the
-/// `decdn-node run` runtime loader put it first, ahead of a password file and
-/// an interactive prompt.
+/// Process environment variable that supplies the keystore password.
+/// [`standard_sources`] places it first in the [`PasswordSource`] list, ahead
+/// of a password file and an interactive prompt.
 pub const KEYSTORE_PASSWORD_ENV: &str = "DECDN_KEYSTORE_PASSWORD";
 
 const KEYSTORE_FILE_NAME: &str = "keystore.json";
@@ -526,7 +525,9 @@ mod tests {
     /// when the caller passed a path, `Prompt` last carrying `confirm`.
     /// Dropping the `Prompt` push would make every interactive command
     /// headless-only, and pushing `File` ahead of `Env` would invert the
-    /// documented precedence — neither is visible from the resolver tests.
+    /// documented precedence. Neither shows up in the [`read_password`] tests
+    /// below: those drive a list handed to them, so they pin how a list is
+    /// consumed, never how this one is built.
     #[test]
     fn password_sources_orders_env_then_file_then_prompt() {
         let with_file = standard_sources(Some(PathBuf::from("/abs/pw.txt")), false);

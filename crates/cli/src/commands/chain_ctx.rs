@@ -229,33 +229,28 @@ pub async fn load_operator_signer(
 }
 
 /// CLI-boundary wrapper over [`decdn_incentive::eth_identity::standard_sources`],
-/// the shared keystore password source list in precedence order (env var, then
-/// `password_file`, then an interactive prompt on a TTY). Presence decides at
-/// each step (see [`decdn_incentive::eth_identity::read_password`]), so an env
-/// var set to the empty string is the password rather than a skipped source.
-/// The `decdn-node` daemon reaches the same list through `standard_sources`
-/// directly.
+/// the shared keystore password source list. Precedence, presence semantics,
+/// and `confirm` are documented there; the `decdn-node` daemon reaches the same
+/// builder directly.
 ///
-/// `confirm` reaches the `PasswordSource::Prompt` entry, which prompts twice
-/// and requires the entries to match. True only where the command CREATES a
-/// keystore: an entry typed once has nothing to check it against. It constrains
-/// the prompt alone — a password arriving from the env var or the file is used
-/// as given.
-///
-/// `password_file` is tilde-expanded here so callers passing the raw clap value
-/// (`key-gen`, the operator commands) need not; `fetch` and `pool` expand at
-/// their own `resolve_chain` and pass an already-absolute path, and
-/// `expand_tilde` is a no-op on one.
+/// The delta this wrapper adds is tilde expansion, so callers passing the raw
+/// clap value (`key-gen`, the operator commands) need not do it themselves.
+/// `fetch` and `pool` expand at their own `resolve_chain`, and `expand_tilde`
+/// leaves an already-expanded path alone, so the second pass costs them
+/// nothing. Expansion rewrites a leading `~` and nothing else: a relative path
+/// stays relative and resolves against the working directory when read.
 pub(crate) fn password_sources(password_file: Option<&Path>, confirm: bool) -> Vec<PasswordSource> {
     eth_identity::standard_sources(password_file.map(expand_tilde), confirm)
 }
 
 /// Load an Ethereum keystore signer, sourcing the password per
 /// `password_sources`. The scrypt KDF is offloaded to `spawn_blocking` so it
-/// doesn't stall
-/// the async executor. The `node`, `appeal`, and `publish` commands all reach
-/// it through [`load_operator_signer`], which pulls the password-file path off
-/// the shared [`cli::CommonChainArgs`].
+/// doesn't stall the async executor.
+///
+/// `password_file` is the raw `--keystore-password-file` value; expansion is
+/// `password_sources`' job. Most callers arrive through
+/// [`load_operator_signer`], which pulls that path off the shared
+/// [`cli::CommonChainArgs`].
 pub async fn load_signer_with_password_file(
     password_file: Option<&Path>,
     keystore: &Path,
@@ -426,20 +421,22 @@ mod tests {
     const CONFIG_ADDR: Address = address!("0x00000000000000000000000000000000000000C0");
     const OA_ADDR: Address = address!("0x000000000000000000000000000000000000000A");
 
-    /// The wrapper is the CLI boundary for the shared source list: it tilde-
-    /// expands `password_file` before delegating to
-    /// `eth_identity::standard_sources`, so the raw clap value (`key-gen`, the
-    /// operator commands) reaches the File entry already-absolute. Ordering the
-    /// File entry after Env and before Prompt is inherited from
-    /// `standard_sources`; this test pins the boundary contracts: delegation
-    /// happens, and expansion happens here (compare the File path against
-    /// `expand_tilde` itself, so the assertion holds whether or not a home
-    /// directory is available).
+    /// The wrapper's own contract: it tilde-expands `password_file`, and hands
+    /// back what `eth_identity::standard_sources` builds from it. Expansion is
+    /// checked against a path assembled independently of `expand_tilde`, so
+    /// dropping the `map(expand_tilde)` fails here rather than comparing the
+    /// raw path with itself. `HOME` gates that half — `expand_tilde` returns
+    /// `~/pw.txt` unchanged where no home directory is available — and CI
+    /// always has one.
+    ///
+    /// Matching the whole `[Env, File, Prompt]` shape is deliberate
+    /// redundancy. `standard_sources` owns the ordering and pins it in its own
+    /// crate; re-checking it at the boundary catches a wrapper that stops
+    /// delegating and rebuilds the list by hand.
     #[test]
     fn password_sources_expands_tilde_and_delegates() {
-        let raw = Path::new("~/pw.txt");
-        let expanded = expand_tilde(raw);
-        let sources = password_sources(Some(raw), false);
+        let sources = password_sources(Some(Path::new("~/pw.txt")), false);
+        let want = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("pw.txt"));
         assert!(
             matches!(
                 sources.as_slice(),
@@ -448,9 +445,21 @@ mod tests {
                     PasswordSource::File(p),
                     PasswordSource::Prompt { confirm: false },
                 ] if *name == eth_identity::KEYSTORE_PASSWORD_ENV
-                    && p == &expanded
+                    && want.as_ref().is_none_or(|want| p == want)
             ),
-            "got: {sources:?}"
+            "got: {sources:?}, wanted file {want:?}"
+        );
+
+        // An already-expanded path arrives untouched: `fetch` and `pool` hand
+        // the wrapper a path their own `resolve_chain` expanded, and a second
+        // pass must not rewrite it.
+        let absolute = password_sources(Some(Path::new("/abs/pw.txt")), false);
+        assert!(
+            matches!(
+                absolute.as_slice(),
+                [_, PasswordSource::File(p), _] if p == Path::new("/abs/pw.txt")
+            ),
+            "got: {absolute:?}"
         );
 
         let without = password_sources(None, true);

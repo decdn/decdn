@@ -967,12 +967,33 @@ fn decdn_node_bin() -> anyhow::Result<PathBuf> {
 /// here covers the `DECDN_*` env namespace (which outranks the config) and any
 /// path the config leaves to a `$HOME`-derived default (#1332).
 fn spawn_daemon(config_path: &std::path::Path, home: &std::path::Path) -> anyhow::Result<Child> {
+    let decoy = write_password_decoy(home)?;
     crate::cli::hermetic_command(decdn_node_bin()?, home, KEYSTORE_PASSWORD)?
+        // Set after `hermetic_command`, which strips the whole `DECDN_*`
+        // namespace before seeding its own entries.
+        .env("DECDN_KEYSTORE_PASSWORD_FILE", &decoy)
         .arg("--config")
         .arg(config_path)
         .arg("run")
         .spawn()
         .context("spawn decdn-node")
+}
+
+/// Write a password file holding the WRONG password, for the daemon to reach
+/// through `DECDN_KEYSTORE_PASSWORD_FILE`.
+///
+/// Both password sources are then present with different values, so the
+/// keystore decrypts only if the env var outranks the file. That makes every
+/// launch in this fixture a precedence assertion at the real
+/// `runtime::load_eth_signer` call site: swap the two entries and bring-up
+/// fails on a decrypt error instead of booting on the wrong source. Unit tests
+/// pin the order inside `eth_identity::standard_sources`; nothing else pins
+/// that the daemon consumes that list rather than one of its own.
+fn write_password_decoy(home: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let path = home.join("wrong-keystore.pass");
+    std::fs::write(&path, "not-the-keystore-password")
+        .with_context(|| format!("write decoy password file {}", path.display()))?;
+    Ok(path)
 }
 
 /// Put the operator in the on-chain state a launch asks for: fully onboarded, or

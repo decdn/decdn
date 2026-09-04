@@ -40,9 +40,9 @@ pub fn key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
     // prompts that abort (Ctrl-C, mismatch retries exhausted) shouldn't
     // leave a half-written `node.secret` behind. `confirm: true` because this
     // command CREATES the keystore: an entry typed once has nothing to check it
-    // against, so a typo would be sealed into the file. It guards the prompt
-    // alone — a password arriving from the env var or the file is used as
-    // given, which is why the empty-password warning below is unconditional.
+    // against, so a typo would be sealed into the file. `confirm` reaches the
+    // prompt alone, which is why the empty-password warning below is
+    // unconditional.
     let password = eth_identity::read_password(
         &super::chain_ctx::password_sources(args.keystore_password_file.as_deref(), true),
         "eth keystore password",

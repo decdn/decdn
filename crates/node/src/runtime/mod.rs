@@ -3090,8 +3090,7 @@ fn unbracket_host(host: &str) -> &str {
 /// variable that is set and a file that exists each supply their value, the
 /// empty string included, so a headless host reaches one of the first two or
 /// the startup fails. The list comes from
-/// [`eth_identity::standard_sources`], the same builder the `decdn` CLI's
-/// `chain_ctx::password_sources` wraps.
+/// [`eth_identity::standard_sources`], the single builder every binary shares.
 ///
 /// The Arbitrum Sepolia
 /// chain id is bound on the signer so EIP-712 signers and any
