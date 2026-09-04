@@ -83,9 +83,10 @@ pub enum PasswordSource {
 /// the prompt alone — a password arriving from the env var or the file is used
 /// as given.
 ///
-/// `password_file` arrives already-absolute; tilde expansion is the caller's
-/// concern. The CLI expands at its boundary (`chain_ctx::password_sources`),
-/// the daemon resolves it in `decdn-common` config resolution.
+/// `password_file` is used as given; no expansion happens here. Tilde
+/// expansion is the caller's concern. The CLI expands at its boundary
+/// (`chain_ctx::password_sources`), the daemon resolves it in `decdn-common`
+/// config resolution.
 pub fn standard_sources(password_file: Option<PathBuf>, confirm: bool) -> Vec<PasswordSource> {
     let mut sources = vec![PasswordSource::Env(KEYSTORE_PASSWORD_ENV)];
     if let Some(path) = password_file {
