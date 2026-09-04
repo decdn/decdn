@@ -349,8 +349,8 @@ pub const DEFAULT_SERVE_ECONOMICS_WARMING_REFILL: u64 = 58;
 /// `appendix-poc-production-seams.md` §Seam 8).
 pub const DEFAULT_CHAIN_ID: u64 = 421_614;
 
-/// Default seconds between the blacklist watcher's periodic replay + re-scope
-/// pass (ADR 011 §Polling's 10-minute `getBlacklistVersion` cadence).
+/// Default seconds between the blacklist watcher's periodic re-enumeration +
+/// re-scope pass (ADR 011 § Node Behavior's 10-minute cadence).
 pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 600;
 
 /// Default seconds between authoritative `PaymentPool.getRateBounds()`

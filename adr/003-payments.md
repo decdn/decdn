@@ -798,7 +798,7 @@ If the event subscription is lost and RPC polling fails, the node SHOULD continu
 
 #### No version-based delta pattern
 
-Unlike the content blacklist (which uses `getBlacklistVersion()` for cheap change detection and incremental delta fetching), the rate floor is a single `uint256`. A version counter adds no value — the full state is readable in a single `eth_call` with negligible overhead. This is an intentional divergence from the [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) pattern.
+The rate floor is a single `uint256`, readable in one `eth_call` with negligible overhead, so it carries no version counter and no delta-fetch path. This matches the content blacklist, which likewise keeps no version cursor and reads full current state by enumeration ([ADR 011 § Node Behavior](011-content-takedown.md#node-behavior)).
 
 For how nodes validate `rate_per_mb` against the cached floor before signing protocol messages, see [ADR 005 — Rate Bounds Validation](005-protocol.md#rate-bounds-validation).
 

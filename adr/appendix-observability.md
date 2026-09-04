@@ -16,7 +16,7 @@ Without this document, operators cannot build dashboards, detect slashable condi
 
 ### Note on existing ADR names
 
-Several ADRs reference informal metric names (e.g., `probe_hold_violations`, `blacklist_sync_lag_seconds` — from ADRs 005, 011). This appendix is the authoritative canonical registry. The names below are the canonical forms of those informal references, with identical semantic intent.
+Several ADRs reference informal metric names (e.g., `probe_hold_violations` — from [ADR 005](005-protocol.md#adr-005-wire-protocol)). This appendix is the authoritative canonical registry. The names below are the canonical forms of those informal references, with identical semantic intent.
 
 ## Decision
 
@@ -70,15 +70,13 @@ Adding a metric therefore means editing this table in the same change, not after
 
 #### Slash-Safety Metrics (all Mandatory)
 
-These give early warning for the two slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. A sustained non-zero value for the blacklist-lag **gauges** would require immediate operator attention, but both are `planned` — nothing emits them, so the blacklist rows in the threshold table below are specification, not deployable coverage (`DecdnBlacklistWatcherStalled` in `monitoring/` is the live substitute, reading the watcher's last-tick gauge). The probe-hold gauges (`decdn_probe_hold_slots_used`/`_max`) are live and normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_unavailable_total` is an availability signal, not a slash risk — see its row, and alert only on `reason="exhausted"`, the budget-pressure value.
+These give early warning for the two slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. Blacklist-watcher liveness is monitored through `decdn_blacklist_watcher_last_tick_timestamp_seconds` (the `DecdnBlacklistWatcherStalled` rule in `monitoring/` reads it); the watcher rebuilds the deny-set by full enumeration and keeps no version cursor, so there is no sync-lag gauge to alert on. The probe-hold gauges (`decdn_probe_hold_slots_used`/`_max`) are live and normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_unavailable_total` is an availability signal, not a slash risk — see its row, and alert only on `reason="exhausted"`, the budget-pressure value.
 
 | Metric | Type | Tier | Status | Description |
 |--------|------|------|--------|-------------|
 | `decdn_probe_hold_unavailable_total{reason}` | Counter | M | live | A probe for a present blob that got **no** eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). Holds are best-effort, so this is not the same as answering `has_blob: false` — see the per-reason split. Never a safety fault: no offense pairs a probe with a later miss ([ADR 014](014-on-chain-verification.md#rate-manipulation)), and an unheld advertisement that loses the eviction race costs one wasted round trip. The `reason` label carries the cause, because each has a different operator remedy: **`exhausted`** — blob present but **all** hold slots were live (`max_probe_holds` reached); the node still advertises `has_blob: true` and forgoes only the hold, so the blob may be LRU-evicted before the pull. Genuine budget pressure and the only value the "raise `max_probe_holds`" alert fires on. **`disabled`** — blob present but the hold path is **off by config** (`max_probe_holds == 0`); the one reason that also suppresses the advertisement (`has_blob: false` for store-backed content; origin-held content takes no hold and is unaffected). An intentional operator choice, so alerting on it would be nonsensical. **`stake_lane_reserved`** — an end-client probe hit the stake-lane-reserved end-client ceiling (`max_probe_holds − cache.stake_lane_reserved_holds`), keeping hold headroom for registered node-to-node cache-miss probes ([ADR 003 § Admission and Priority](003-payments.md#admission-and-priority)). The reservation is a content-independent admission decision taken before any hold attempt, but the handler still consults the cache to answer honestly and advertises a present blob. Stays zero unless `cache.stake_lane_reserved_holds > 0`. All three children are exported at zero from startup, so a missing series means a broken exporter, not an idle node. |
 | `decdn_probe_hold_slots_used` | Gauge | M | live | Eviction-hold slots in use out of `max_probe_holds`. Saturation means new probes are advertised without a hold, not answered `has_blob: false`. |
 | `decdn_probe_hold_slots_max` | Gauge | M | live | Configured `max_probe_holds`. Paired with `decdn_probe_hold_slots_used` for a saturation ratio. |
-| `decdn_blacklist_sync_lag_seconds` | Gauge | M | planned | Seconds since the last successful `getBlacklistVersion()` poll. Exceeding the compliance window makes serving any recently-blacklisted hash slashable ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). |
-| `decdn_blacklist_version_behind` | Gauge | M | planned | `on_chain_version − local_version`. Positive means new blacklist entries not yet fetched. |
 | `decdn_rate_bounds_clamp_events_total` | Counter | M | live | Times `rate_per_mb` was raised to the governance `deliveryFloor` before signing a `ProbeResponse` / `StreamResponse` — the configured rate sits below the current floor ([ADR 003](003-payments.md#adr-003-payment-model), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
 
 **Recommended alert thresholds:**
@@ -86,8 +84,6 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | Metric | Warning | Critical | Action |
 |--------|---------|----------|--------|
 | `decdn_probe_hold_unavailable_total{reason="exhausted"}` (rate) | > 0 | > 0 sustained | Reduce load or increase `max_probe_holds`; check for OOM. Filter on `reason="exhausted"` — the `disabled` and `stake_lane_reserved` values are deliberate operator decisions and must not trip this alert. |
-| `decdn_blacklist_sync_lag_seconds` | > 600s (1 poll interval) | > 1800s | **`planned` — do not deploy this rule; nothing emits the gauge and it can never fire.** The watcher ships; what is missing is this version-poll gauge, since the watcher enumerates current chain state instead of keying on a version checkpoint ([ADR 011 § Node Behavior](011-content-takedown.md#node-behavior)). Live blacklist coverage is `decdn_blacklist_watcher_last_tick_timestamp_seconds` below. Thresholds recorded for whoever adds the gauge. |
-| `decdn_blacklist_version_behind` | > 0 | > 1 | **`planned` — do not deploy this rule** (see above). Investigate RPC / poll failure. |
 | `decdn_rate_bounds_clamp_events_total` (rate) | > 0 | — | Raise the `rate_per_mb` config to at least the governance `deliveryFloor`. |
 
 #### Delivery Metrics (`cdn/client/v1`)
@@ -255,7 +251,6 @@ The origin directory is not a watcher — it is a lazy, on-demand TTL cache with
   "status": "ready" | "degraded" | "not_ready",
   "node_id": "<hex iroh NodeId>",
   "registry_active": true,
-  "blacklist_version": 42,
   "blacklist_synced": true,
   "rate_bounds_loaded": true,
   "staker_set_active_count": 27,
@@ -273,7 +268,6 @@ The origin directory is not a watcher — it is a lazy, on-demand TTL cache with
 | `lanes_open` | `decdn_lanes_open` | Direct gauge value |
 | `pool_deposit_usdc` | `decdn_pool_deposit_usdc` | Formatted as decimal string for readability; metric stores raw value |
 | `node_uptime_seconds` | `decdn_node_uptime_seconds` | Direct gauge value |
-| `blacklist_version` | `decdn_blacklist_version_behind` (derived) | Absolute version number from RPC, not the lag gauge |
 
 **Status semantics:**
 
@@ -315,8 +309,6 @@ Each metric series has one canonical `decdn_`-prefixed name; informal short name
 | `probe_stake_lane_reserved` | `decdn_probe_hold_unavailable_total{reason="stake_lane_reserved"}` | [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority) |
 | `probe_hold_slots_used` | `decdn_probe_hold_slots_used` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
 | `rate_bounds_clamp_events` | `decdn_rate_bounds_clamp_events_total` | architecture.md |
-| `blacklist_sync_lag_seconds` | `decdn_blacklist_sync_lag_seconds` | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
-| `blacklist_version_behind` | `decdn_blacklist_version_behind` | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
 | `probe_collection_latency_seconds` | `decdn_probe_collection_latency_seconds` | [ADR 001 § Probe response collection](001-network.md#probe-response-collection) |
 | `streams_active` | `decdn_streams_active` | architecture.md |
 | `streams_completed` | `decdn_streams_completed_total` | architecture.md |

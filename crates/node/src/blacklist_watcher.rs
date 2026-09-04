@@ -534,9 +534,9 @@ impl WatcherState {
 /// Applies the five live event families to the deny-set, enforces compliance, and
 /// re-enumerates + re-scopes on the operator's cadence. `apply` records each entry
 /// and, for a `HashBlacklisted`, immediately re-checks scope + evicts (prompt live
-/// enforcement); an undecodable ORIGIN log aborts the tick (there is no
-/// version/enumeration backstop to reveal a skipped one until the next
-/// re-enumeration), while an undecodable HASH log is logged and skipped (re-scoped
+/// enforcement); an undecodable ORIGIN log aborts the tick (there is no per-tick
+/// backstop to reveal a skipped one until the next re-enumeration), while an
+/// undecodable HASH log is logged and skipped (re-scoped
 /// every pass, sticky eviction). [`Self::on_tick_complete`] runs the batched
 /// re-enumeration + re-scope.
 struct BlacklistSink<P: Provider + Clone> {
@@ -710,8 +710,8 @@ where
 /// stays sticky, and same-hash entries in other regions survive). `Ok(true)` iff a
 /// re-check failed and needs a prompt retry.
 ///
-/// `Err` is reserved for an undecodable ORIGIN-class log: there is no version
-/// counter and (until the next re-enumeration) nothing to sweep against, so
+/// `Err` is reserved for an undecodable ORIGIN-class log: until the next
+/// re-enumeration there is nothing to sweep against, so
 /// skipping one is a silent deny-set gap — aborting the tick holds the scan cursor
 /// so the readiness gate keeps the router closed rather than opening on a set we
 /// know is incomplete. An undecodable HASH log is skipped (re-scoped every pass,
@@ -782,8 +782,8 @@ fn on_operator_log(state: &mut WatcherState, log: &Log, blacklisted: bool) -> Re
 /// curiosity, so it aborts the tick and holds the scan cursor.
 ///
 /// The hash events can afford to skip-and-continue: they are re-scoped every pass
-/// and eviction is sticky. The origin events have no such per-tick backstop — no
-/// version counter to reveal a gap — so a skipped log is gone until the next
+/// and eviction is sticky. The origin events have no such per-tick backstop, so a
+/// skipped log is gone until the next
 /// re-enumeration and the deny-set is silently short an entry meanwhile. Holding
 /// the cursor lets the readiness gate keep the router closed rather than opening on
 /// a set we know is incomplete.
@@ -1147,9 +1147,8 @@ where
 /// paths. Split out from [`bootstrap`] so the exact topic0 set is
 /// unit-testable without a provider.
 ///
-/// Origin blacklisting rides the same scan (ADR 011 § Hash Evasion). It is
-/// deliberately outside the `getBlacklistVersion()` mechanism, so unlike the
-/// hash events there is no counter to detect a missed one — the
+/// Origin blacklisting rides the same scan (ADR 011 § Hash Evasion). Like the
+/// hash events, it has no version counter to detect a missed one — the
 /// re-enumeration is the backstop. `addOperator` is the PRIMARY governance
 /// origin-blacklist path — it writes a SEPARATE mapping and emits
 /// `OperatorBlacklisted`/`OperatorBlacklistCleared`, never
@@ -1991,7 +1990,6 @@ mod tests {
         let event = HashRemoved {
             region,
             hash: B256::from(hash_bytes),
-            version: alloy::primitives::U256::from(1u64),
         };
         Log {
             inner: alloy::primitives::Log {

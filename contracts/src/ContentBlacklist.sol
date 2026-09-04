@@ -36,12 +36,12 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     // ADR 011 § Compliance Window — an entry does NOT become slashable at
     // `addedAt`; it becomes slashable at `effectiveAt = addedAt + window`. The
-    // grace exists because nodes learn of an entry by polling
-    // `getBlacklistVersion()` on an interval (10 minutes by default, ADR 011
-    // § Polling): without it, a node serving a request microseconds before the
-    // add lands is slashable for a delivery it could not have known was
-    // prohibited. Both windows are governance-tunable inside the hardcoded
-    // [1 hour, 7 days] bounds the ADR fixes.
+    // grace exists because nodes learn of an entry by re-enumerating the
+    // deny-set on an interval (10 minutes by default, ADR 011 § Node Behavior):
+    // without it, a node serving a request microseconds before the add lands is
+    // slashable for a delivery it could not have known was prohibited. Both
+    // windows are governance-tunable inside the hardcoded [1 hour, 7 days]
+    // bounds the ADR fixes.
     uint64 internal constant COMPLIANCE_WINDOW_DEFAULT = 24 hours;
     uint64 internal constant EMERGENCY_COMPLIANCE_WINDOW_DEFAULT = 2 hours;
     uint64 internal constant COMPLIANCE_WINDOW_FLOOR = 1 hours;
@@ -198,25 +198,13 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         Public auto-getter `regionOfBody(address)`.
     mapping(address body => bytes32 region) public regionOfBody;
 
-    /// @notice Monotonic blacklist revision (ADR 011 § Blacklist version), read
-    ///         via `getBlacklistVersion`. Bumped once per change to the enforced
-    ///         blacklist: every hash add and every hash removal. Nodes cache
-    ///         the last-seen value and re-fetch entry deltas only when it
-    ///         advances, replacing a full event replay from
-    ///         the deploy block with an O(1) version check.
-    /// @dev    Bumped in the two internal choke points `_addHash` and
-    ///         `_removeHashRegional`, which every add/remove funnels through, so
-    ///         no call site has to remember to increment it. Deliberately not a `public` auto-getter:
-    ///         ADR 011 names the accessor `getBlacklistVersion()`, and an
-    ///         auto-getter would be `_blacklistVersion()`.
-    uint256 internal _blacklistVersion;
-
     /// @notice Membership index for `_hashEntries[region]`, so the entry set of a
     ///         region can be READ rather than reconstructed from the event log.
-    /// @dev    Maintained in the same two choke points as `_blacklistVersion`
-    ///         (`_addHash` / `_removeHashRegional`), so no call site can add an
-    ///         entry without indexing it. Holds RAW membership — see
-    ///         `blacklistedHashes` for why it is not expiry-filtered.
+    /// @dev    Maintained in the two internal choke points `_addHash` and
+    ///         `_removeHashRegional`, which every add/remove funnels through, so
+    ///         no call site can add an entry without indexing it. Holds RAW
+    ///         membership — see `blacklistedHashes` for why it is not
+    ///         expiry-filtered.
     mapping(bytes32 region => EnumerableSet.Bytes32Set) internal _regionHashes;
 
     /// @notice Membership index for the union of the two address-level deny
@@ -233,17 +221,15 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // Events
     // -----------------------------------------------------------------
 
-    /// @notice A hash entered the enforced deny-set. `version` is the
-    ///         `getBlacklistVersion()` value *after* this change, so a delta
-    ///         consumer can order events and detect gaps against the counter
-    ///         (ADR 011 § Polling). Non-indexed: EVM topic filters are
-    ///         set-membership, not range, so indexing it buys no range query —
-    ///         the node reads the counter to decide *whether* to fetch, then a
-    ///         block-range `eth_getLogs` for *what* changed.
-    event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash, uint256 version, string reason);
-    /// @notice A hash left the enforced deny-set. `version` as in
+    /// @notice A hash entered the enforced deny-set. A node treats this as a
+    ///         low-latency signal to re-read the in-scope predicate for the
+    ///         hashes it holds; the authoritative deny-set is the full
+    ///         enumeration (ADR 011 § Node Behavior), so a missed event is
+    ///         recovered by the next re-enumeration rather than by any counter.
+    event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash, string reason);
+    /// @notice A hash left the enforced deny-set. Signal semantics as in
     ///         `HashBlacklisted`.
-    event HashRemoved(bytes32 indexed region, bytes32 indexed hash, uint256 version);
+    event HashRemoved(bytes32 indexed region, bytes32 indexed hash);
     event OperatorBlacklisted(address indexed operator);
     event OperatorBlacklistCleared(address indexed operator);
     event OriginBlacklistUpdated(address indexed origin, bool blacklisted);
@@ -438,13 +424,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     /// @notice Permissionlessly retire an emergency hash entry that has passed
     ///         its category deadline.
     /// @dev    `_isLive` already reports an expired entry as unenforceable, so
-    ///         this changes no view answer. It exists for observability, and it
-    ///         is required rather than nice-to-have: expiry silently shrinks the
-    ///         enforced set while `getBlacklistVersion()` stays frozen, and ADR
-    ///         011 § Polling has nodes fetch deltas ONLY when that counter
-    ///         advances. Without a materializing call, a delta-polling node
-    ///         would keep enforcing an expired entry forever. Mirrors the
-    ///         permissionless-cleanup model of
+    ///         this changes no view answer. It exists to materialize the expiry:
+    ///         it removes the entry from the enumerable `_regionHashes` index and
+    ///         emits `HashRemoved`, so the raw `blacklistedHashes` membership a
+    ///         node enumerates (ADR 011 § Node Behavior) no longer carries the
+    ///         lapsed entry. Mirrors the permissionless-cleanup model of
     ///         `OriginAssignment.pruneBlacklistedOrigin`.
     function expireEmergencyEntry(bytes32 region, bytes32 hash) external {
         HashEntry storage e = _hashEntries[region][hash];
@@ -454,11 +438,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     }
 
     /// @notice Permissionless counterpart of `expireEmergencyEntry` for origins.
-    /// @dev    Origin blacklisting sits outside the version-poll mechanism
-    ///         entirely (ADR 011 § Polling — `OriginBlacklistUpdated` carries no
-    ///         version), so nodes track it purely off the event tail. That makes
-    ///         the `OriginBlacklistUpdated(origin, false)` emitted here the ONLY
-    ///         signal an expiry ever happened.
+    /// @dev    Nodes track the origin deny-set by enumerating
+    ///         `blacklistedAddresses` and following the event tail (ADR 011
+    ///         § Node Behavior). `OriginBlacklistUpdated(origin, false)` emitted
+    ///         here is the low-latency signal an expiry happened; the entry also
+    ///         leaves the enumerated membership on removal.
     function expireEmergencyOrigin(address origin) external {
         EmergencyOrigin storage eo = _emergencyOrigins[origin];
         if (!_emergencyExpired(eo.addedAt != 0, eo.addedAt, eo.category)) revert NotExpired();
@@ -641,12 +625,10 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         returned, and the order is unstable across mutations. The live
     ///         per-address predicates remain `isOriginBlacklisted` and
     ///         `isOperatorBlacklisted`.
-    /// @dev    This is the only readable source for the origin deny-set. Unlike
-    ///         the hash set, it is outside the `getBlacklistVersion()` mechanism
-    ///         (ADR 011 § Polling — `OriginBlacklistUpdated` carries no version),
-    ///         so a consumer has no counter to detect a missed update against, and
-    ///         reconciles a dropped `OriginBlacklistUpdated` event against this full
-    ///         enumeration.
+    /// @dev    This is the only readable source for the origin deny-set. Like
+    ///         the hash set, it carries no version counter: a consumer reconciles
+    ///         a dropped `OriginBlacklistUpdated` event against this full
+    ///         enumeration (ADR 011 § Node Behavior).
     function blacklistedAddresses(uint256 offset, uint256 limit) external view returns (address[] memory page) {
         uint256 len = _blacklistedAddrs.length();
         if (offset >= len) return new address[](0);
@@ -656,16 +638,6 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         for (uint256 i = 0; i < n; ++i) {
             page[i] = _blacklistedAddrs.at(offset + i);
         }
-    }
-
-    /// @notice Current blacklist revision (ADR 011 § Blacklist version) —
-    ///         monotonically increasing, bumped once per change to the enforced
-    ///         blacklist: every hash add and every hash removal. An O(1) poll
-    ///         target: a caller whose cached value still matches knows the set
-    ///         of hashes it must enforce is unchanged and can skip fetching
-    ///         deltas entirely.
-    function getBlacklistVersion() external view returns (uint256) {
-        return _blacklistVersion;
     }
 
     // -----------------------------------------------------------------
@@ -812,10 +784,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         // Idempotent: a re-add restamps the entry and leaves the index alone.
         // slither-disable-next-line unused-return
         _regionHashes[region].add(hash);
-        unchecked {
-            ++_blacklistVersion;
-        }
-        emit HashBlacklisted(region, hash, _blacklistVersion, reason);
+        emit HashBlacklisted(region, hash, reason);
     }
 
     function _removeHashRegional(bytes32 region, bytes32 hash) internal {
@@ -825,10 +794,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         delete hashReason[region][hash];
         // slither-disable-next-line unused-return
         _regionHashes[region].remove(hash);
-        unchecked {
-            ++_blacklistVersion;
-        }
-        emit HashRemoved(region, hash, _blacklistVersion);
+        emit HashRemoved(region, hash);
     }
 
     /// @dev Re-derive `a`'s membership in the union index from BOTH source

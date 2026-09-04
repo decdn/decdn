@@ -49,16 +49,11 @@ groups:
             and changes nothing. See
             adr/005-protocol.md#probe-triggered-eviction-hold.
 
-      # Removed in #1513: DecdnBlacklistSyncLagWarning / …Critical (on
-      # decdn_blacklist_sync_lag_seconds) and DecdnBlacklistVersionBehind /
-      # …FarBehind (on decdn_blacklist_version_behind). Neither series has ever
-      # been exported — ADR 011 designs them, no field implements them — so all
-      # four rules were permanently silent while reading, on a dashboard, as
-      # blacklist-lag coverage. DecdnBlacklistWatcherStalled below is the real
-      # coverage: it fires on staleness of the watcher's last successful tick,
-      # which IS exported. If the version-delta gauges land later, restore the
-      # threshold rules then; adr/appendix-observability.md carries them as
-      # `planned` rows in the meantime.
+      # There is no blacklist sync-lag or version-delta alert: the watcher
+      # rebuilds the deny-set by full enumeration and keeps no version cursor
+      # (adr/011-content-takedown.md § Node Behavior), so no such gauge exists to
+      # alert on. DecdnBlacklistWatcherStalled below is the coverage: it fires on
+      # staleness of the watcher's last successful tick, which IS exported.
       - alert: DecdnBlacklistWatcherStalled
         # Positive liveness: the gauge is stamped every successful poll tick, so
         # staleness catches a panicked, wedged, or exited watcher that the

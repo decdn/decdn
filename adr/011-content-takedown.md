@@ -73,11 +73,11 @@ interface IContentBlacklist {
     // `emergency` flag, which is what makes the entry permanent.
     //
     // Permissionless materialization of that expiry. Reverts unless the entry is
-    // an emergency entry past its deadline. Deleting the entry is what advances
-    // getBlacklistVersion() and emits HashRemoved — without it the enforced set
-    // would shrink with the counter frozen, and a delta-polling node would never
-    // learn (see § Blacklist version). The origin variant is the only signal at
-    // all on its side, since OriginBlacklistUpdated carries no version.
+    // an emergency entry past its deadline. Deleting the entry removes it from
+    // the enumerable membership and emits HashRemoved — without it the lapsed
+    // entry stays in the raw blacklistedHashes set a node enumerates (see
+    // § Node Behavior). The origin variant is the low-latency signal on its
+    // side, since a node tracks origins by enumeration and event tail.
     function expireEmergencyEntry(bytes32 region, bytes32 blake3Hash) external;
     function expireEmergencyOrigin(address operatorAddress) external;
 
@@ -112,18 +112,15 @@ interface IContentBlacklist {
     function isHashBlacklistedForOperator(bytes32 blake3Hash, address operator) external view returns (bool);
     function isOriginBlacklisted(address operatorAddress) external view returns (bool);
     function getHashEntry(bytes32 region, bytes32 blake3Hash) external view returns (BlacklistEntry memory);
-    function getBlacklistVersion() external view returns (uint256);
 
-    // Events. `version` is the getBlacklistVersion() value AFTER the change, so a
-    // delta consumer can order events and confirm no gap. Non-indexed: EVM topic
-    // filters are set-membership, not range, so indexing it buys no range query
-    // (see § Polling). Every hash-set change emits exactly one of the two below,
-    // so the counter never advances with no matching log.
-    event HashBlacklisted(bytes32 indexed region, bytes32 indexed blake3Hash, uint256 version, string reason);
-    event HashRemoved(bytes32 indexed region, bytes32 indexed blake3Hash, uint256 version);
-    // Origin blacklisting is a single toggle, deliberately OUTSIDE the version
-    // mechanism: it carries no version and is enforced via OriginAssignment
-    // cross-reference (§ Permissionless property), not the hash version poll.
+    // Events. Each is a low-latency signal to re-read the in-scope predicate for
+    // the hashes a node holds; the authoritative deny-set is the full
+    // enumeration (see § Node Behavior), so a missed event is recovered by the
+    // next re-enumeration, not by any counter.
+    event HashBlacklisted(bytes32 indexed region, bytes32 indexed blake3Hash, string reason);
+    event HashRemoved(bytes32 indexed region, bytes32 indexed blake3Hash);
+    // Origin blacklisting is a single toggle, enforced via OriginAssignment
+    // cross-reference (§ Permissionless property).
     event OriginBlacklistUpdated(address indexed operatorAddress, bool blacklisted);
 }
 
@@ -149,11 +146,9 @@ struct BlacklistEntry {
 >
 > `bytes32` rather than a narrower `bytes2` — the key must be comparable against the value scope matching reads, which is the operator's **on-chain `regionHint`**, and `CapacityBond` caps that field at 16 bytes, not 2 (`MAX_REGION_HINT_BYTES`; [ADR 014 § Blacklist violation](014-on-chain-verification.md#blacklist-violation) is where the slash path performs the comparison). The on-chain `regionHint` is the only region the scope check reads, and it can hold values wider than a two-byte ISO 3166-1 alpha-2 code, so a two-byte entry key could not represent every region the registry admits. A `bytes32` key is also topic-native, which is what lets `HashBlacklisted` / `HashRemoved` index `region` directly. The `BlacklistEntry` layout is the struct above.
 
-### Blacklist version
+### Emergency auto-expiry
 
-`getBlacklistVersion()` returns a monotonically increasing counter incremented on every change to the enforced hash set, across all paths: every hash add, every hash removal, and every `expireEmergencyEntry`.
-
-Emergency auto-expiry is the one set change that is not caused by a transaction: the entry simply stops being enforceable when its deadline passes, with no write and no log. The liveness views honour that deadline immediately — an expired entry is unenforceable whether or not anyone cleans it up — and a node applies exactly those views (`isHashBlacklistedForOperator`, `isOriginBlacklisted` / `isOperatorBlacklisted`) when it filters its enumerated snapshot, so a lapsed emergency entry is dropped even while it still sits in the raw `blacklistedHashes` / `blacklistedAddresses` membership. `expireEmergencyEntry` (and `expireEmergencyOrigin` on the origin side) then removes it from that membership: permissionless, callable by anyone once the deadline passes, it deletes the entry through the ordinary removal path so the counter advances and a `HashRemoved` lands in the log like any other removal. The counter is not a delta-fetch cursor — nodes rebuild the full deny-set by enumeration ([§ Enumerating the deny-set](#enumerating-the-deny-set)) — but it remains a cheap monotonic liveness signal for sync-lag monitoring.
+Emergency auto-expiry is the one set change that is not caused by a transaction: the entry simply stops being enforceable when its deadline passes, with no write and no log. The liveness views honour that deadline immediately — an expired entry is unenforceable whether or not anyone cleans it up — and a node applies exactly those views (`isHashBlacklistedForOperator`, `isOriginBlacklisted` / `isOperatorBlacklisted`) when it filters its enumerated snapshot, so a lapsed emergency entry is dropped even while it still sits in the raw `blacklistedHashes` / `blacklistedAddresses` membership. `expireEmergencyEntry` (and `expireEmergencyOrigin` on the origin side) then removes it from that membership: permissionless, callable by anyone once the deadline passes, it deletes the entry through the ordinary removal path so a `HashRemoved` lands in the log like any other removal. Nodes rebuild the full deny-set by enumeration ([§ Enumerating the deny-set](#enumerating-the-deny-set)), with no version cursor.
 
 ### Reason field
 
@@ -187,7 +182,7 @@ Regional bodies operate independently within their scope. A hash blacklisted by 
 
 Regional bodies acting in good faith can still issue entries that are later contested — a wrongly served takedown notice, a body that drifts outside its declared jurisdiction, or a notice that misidentifies content. Two tools answer that, at two different scopes.
 
-For a **single disputed entry**, the removal functions are the recourse, and the two scopes are not interchangeable. `removeHashGlobal` (global entries) is restricted to `GOVERNANCE_ROLE`, which DecdnGovernor proposals reach via the standard timelock; it routes to `_removeHashRegional(GLOBAL_REGION, …)` and so cannot touch a regional entry. `removeHashRegional` is restricted to `REGIONAL_BODY_ROLE`, reverts on the `GLOBAL_REGION` sentinel, and additionally requires the caller to be that region's currently-registered, unsuspended body — so it is a *regional body's* unilateral power, and governance reaches a regional entry only by replacing the body (`deregisterRegionalBody` then `registerRegionalBody`). Both bump `getBlacklistVersion()` so nodes pick the removal up on their next poll.
+For a **single disputed entry**, the removal functions are the recourse, and the two scopes are not interchangeable. `removeHashGlobal` (global entries) is restricted to `GOVERNANCE_ROLE`, which DecdnGovernor proposals reach via the standard timelock; it routes to `_removeHashRegional(GLOBAL_REGION, …)` and so cannot touch a regional entry. `removeHashRegional` is restricted to `REGIONAL_BODY_ROLE`, reverts on the `GLOBAL_REGION` sentinel, and additionally requires the caller to be that region's currently-registered, unsuspended body — so it is a *regional body's* unilateral power, and governance reaches a regional entry only by replacing the body (`deregisterRegionalBody` then `registerRegionalBody`). Both emit `HashRemoved` and drop the entry from the enumerable membership, so nodes pick the removal up on their next re-enumeration.
 
 For a **systemically misbehaving body**, `suspendRegionalBody` bars that body from writing, subject to governance ratification within 14 days. Two properties matter operationally and pull in opposite directions: it retracts nothing — every entry already issued stays live, enforceable and slashable — and because `_requireActiveBodyFor` gates removals as well as additions, it also *blocks* the body from taking its own entries down. Suspension is therefore the right tool against a body issuing bad entries and the wrong one against a body refusing to remove them; for the latter, replace the body (see [§ Regional Governance Bodies](#regional-governance-bodies)).
 
@@ -437,7 +432,7 @@ Each node maintains a local deny-set mirroring `ContentBlacklist` — the blackl
 - **While running**, the node follows the contract's events from the boot snapshot head: `HashBlacklisted` / `HashRemoved` for hash entries, and both `OriginBlacklistUpdated` and `OperatorBlacklisted` / `OperatorBlacklistCleared` for the address union. Both address event families feed the one deny-set, because the operator leg is separate on-chain — `addOperator` sets `isOperatorBlacklisted` and never emits `OriginBlacklistUpdated`, so a node that watched only the origin event would keep serving a blacklisted operator.
 - **Periodically**, the node re-enumerates the deny-set at a fresh pinned block as a backstop and re-scopes its hash set. This repairs any event lost to a reorg or an RPC-backoff gap, and catches [ADR 030 § Region-stability window](030-node-region-self-attestation.md#region-stability-window) region/ripening transitions, which change a hash's scope while emitting no event.
 
-`getBlacklistVersion()` remains a cheap liveness signal for the `blacklist_sync_lag_seconds` metric, but the node does not key a block-range log query on a last-seen version checkpoint: enumeration reads the full current state on every boot, so there is no delta cursor to persist and no offline version gap to recover — a node returning after any downtime rebuilds the complete deny-set from one snapshot. Origin blacklisting is not a separate poll from hash entries; the address union folds both into the same enumeration and tail (see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist) and [§ Permissionless property](#permissionless-property)). Nodes SHOULD expose the `blacklist_sync_lag_seconds` metric for operational monitoring — see [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics).
+The node keeps no version cursor: enumeration reads the full current state on every boot, so there is no delta cursor to persist and no offline gap to recover — a node returning after any downtime rebuilds the complete deny-set from one snapshot. Origin blacklisting is not a separate poll from hash entries; the address union folds both into the same enumeration and tail (see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist) and [§ Permissionless property](#permissionless-property)). Nodes SHOULD expose the `decdn_blacklist_watcher_last_tick_timestamp_seconds` gauge for operational monitoring — see [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics).
 
 The node MUST NOT accept connections until its initial enumeration completes.
 

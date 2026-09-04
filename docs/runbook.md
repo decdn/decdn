@@ -111,8 +111,8 @@ blacklist updates and stop being able to settle channels. Once
    (`https://sepolia-rollup.arbitrum.io/rpc`) — rate-limited; for production,
    use a paid provider.
 3. After recovery, confirm RPC reachability is restored before considering the
-   incident closed. (The `decdn_blacklist_sync_lag_seconds` gauge that would
-   track this is not emitted by the node yet — see
+   incident closed. (Blacklist-watcher liveness is tracked by
+   `decdn_blacklist_watcher_last_tick_timestamp_seconds` — see
    [ContentBlacklist compliance](#contentblacklist-compliance).)
 
 ## Keystore will not unlock
@@ -335,12 +335,10 @@ action is required.
     answer different questions: deny-set enforced vs chain readable.
 - Grafana: the "Blacklist watcher tick age" panel in
   `monitoring/grafana-dashboard.json`.
-- There is no sync-lag or version-delta coverage: `decdn_blacklist_sync_lag_seconds`
-  and `decdn_blacklist_version_behind` have never been emitted, so #1513 deleted
-  the four alerts that queried them and repointed the one panel onto the tick
-  gauge above, rather than leave permanently silent rules reading as coverage.
-  Both names survive in `adr/appendix-observability.md` as `planned` rows;
-  restore the rules if the gauges land.
+- There is no sync-lag or version-delta coverage: the watcher rebuilds the
+  deny-set by full enumeration and keeps no version cursor
+  (`adr/011-content-takedown.md` § Node Behavior), so no such gauge exists. The
+  tick-age gauge above is the liveness coverage.
 - Manual on-chain check: query `ContentBlacklist` directly with
   the hash from the takedown notice — `isHashBlacklisted(hash)` for global
   entries, `isHashBlacklistedInRegion(hash, region)` for a regional entry. The
