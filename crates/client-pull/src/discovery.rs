@@ -369,11 +369,15 @@ fn resolve_bootstrap(
         Ok(peers) => {
             // Best-effort identity refresh; a write failure must not fail a
             // fetch that already succeeded — the store is a fallback, not the
-            // source of truth for a live read.
-            for cand in &peers {
-                let _ = store.upsert_identity(cand, now);
+            // source of truth for a live read. An empty read touches nothing:
+            // an emptied registry is not a reason to prune or discard the
+            // last known-good identities.
+            if !peers.is_empty() {
+                for cand in &peers {
+                    let _ = store.upsert_identity(cand, now);
+                }
+                let _ = store.prune_and_cap(now, &cfg);
             }
-            let _ = store.prune_and_cap(now, &cfg);
             return Ok(Bootstrap::Live { peers });
         }
         Err(e) => e,
@@ -1383,6 +1387,34 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(store_candidates(dir.path()), peers);
+    }
+
+    #[test]
+    fn an_empty_registry_read_does_not_prune_a_stale_identity() {
+        // Seed an identity old enough to clear `IDENTITY_PRUNE_SECS` relative
+        // to "now", so it would be pruned if `resolve_bootstrap` ran
+        // `prune_and_cap` on this empty-but-successful read. It must not: an
+        // emptied registry is not a reason to discard the last known-good
+        // identities, so the stale entry must survive untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let peers = vec![candidate(7, "DE")];
+        let stale_seen_at = now_secs()
+            .saturating_sub(crate::peer_store::IDENTITY_PRUNE_SECS)
+            .saturating_sub(1);
+        seed_store(dir.path(), &peers, stale_seen_at);
+
+        assert!(
+            resolve_bootstrap(Ok(Vec::new()), dir.path())
+                .unwrap()
+                .into_peers()
+                .is_empty()
+        );
+        assert_eq!(
+            store_candidates(dir.path()),
+            peers,
+            "the stale identity must still be in the store: an empty successful \
+             read must not prune"
+        );
     }
 
     fn warming(seed: u8, rtt_ms: f64) -> WarmingCandidate {
