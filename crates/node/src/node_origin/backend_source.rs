@@ -143,6 +143,8 @@ impl BlobSource for BackendSource {
                 total_bytes: self.total_bytes,
                 rate_per_mb: 0,
                 interval_bytes: 0,
+                // A local origin re-encode, not a network round trip.
+                ttfb_ms: 0.0,
             };
             Ok((
                 header,

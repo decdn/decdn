@@ -453,6 +453,22 @@ mod tests {
     }
 
     #[test]
+    fn stream_sample_supersedes_probe_sample() -> anyhow::Result<()> {
+        let cfg = StoreConfig::default();
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        store.upsert_identity(&candidate(1), 1_000)?;
+        store.record_sample(&key(1), 200.0, 5, 1_000, &cfg)?; // probe-derived
+        store.record_sample(&key(1), 20.0, 5, 1_100, &cfg)?; // stream-derived TTFB
+        let r = store
+            .get(&key(1))
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        // EWMA: 0.7*200 + 0.3*20 = 146; the fresh stream pulls latency down toward TTFB.
+        assert!(r.latency_ms.unwrap_or_default() < 200.0);
+        Ok(())
+    }
+
+    #[test]
     fn cap_evicts_least_recently_sampled() -> anyhow::Result<()> {
         let cfg = StoreConfig {
             lru_cap: 2,

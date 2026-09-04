@@ -620,6 +620,8 @@ mod doubles {
                     total_bytes: self.total_bytes(),
                     rate_per_mb: SCRIPTED_RATE_PER_MB,
                     interval_bytes: SCRIPTED_INTERVAL_BYTES,
+                    // No real network round trip in this scripted double.
+                    ttfb_ms: 0.0,
                 };
                 // Wire bytes this leg will drain (post-fault-truncation). `finish`
                 // is reached only on a CLEAN drain (the driver skips it on an

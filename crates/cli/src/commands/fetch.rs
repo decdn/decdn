@@ -1385,7 +1385,7 @@ fn select_watermark(
     VoucherProgress::from_cumulative(cum, prior_amount)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn drive_fetch<P>(
     deps: &DriveFetchDeps<'_, P>,
     ctx: PoolContext,
@@ -1415,6 +1415,12 @@ where
     // the watermark to persist afterwards is read straight back off it.
     let ledger = Arc::new(ctx.new_ledger());
 
+    // Captured before `target` moves into `PeerSource::new` below — the key the
+    // peer store's stream-derived sample/failure is filed under (#1906-series).
+    let node_id = target.id;
+    let peer_store = decdn_client_pull::PeerStore::open(&deps.chain.data_dir);
+    let peer_store_cfg = decdn_client_pull::StoreConfig::default();
+
     // Learn the whole-blob size before constructing the ranged store: the store is
     // keyed on `(root, total_bytes)`, and the signed `StreamResponse` header is the
     // authoritative source of `total_bytes`. This throwaway open is a handshake
@@ -1422,7 +1428,12 @@ where
     // — and its pull is dropped immediately; `drive` re-opens exactly the gaps it
     // needs. The cache-miss annotation is applied here too, so an unbound or
     // underfunded refusal is still explained at this first contact.
-    let (header, first_pull) = open_progressive_pull(
+    //
+    // This handshake is also the observed-TTFB boundary the peer store wants
+    // (#1906-series): a source that cannot even complete it is stamped as a
+    // failure, and one that does hands back a real stream-derived latency —
+    // best-effort in both directions (`let _ =`), never failing the fetch.
+    let (header, first_pull) = match open_progressive_pull(
         deps.endpoint,
         target.clone(),
         &ctx,
@@ -1440,7 +1451,22 @@ where
         None,
     )
     .await
-    .map_err(|err| annotate_unbound_cache_miss(err, &ctx))?;
+    {
+        Ok(opened) => opened,
+        Err(err) => {
+            let _ = peer_store.record_failure(&node_id, now_secs_cli());
+            return Err(annotate_unbound_cache_miss(err, &ctx));
+        }
+    };
+    // The stream's own quoted rate supersedes any remembered probe rate — it is
+    // the authoritative figure this fetch is actually paying.
+    let _ = peer_store.record_sample(
+        &node_id,
+        header.ttfb_ms,
+        header.rate_per_mb,
+        now_secs_cli(),
+        &peer_store_cfg,
+    );
     let total_bytes = header.total_bytes;
     drop(first_pull);
 
@@ -1504,6 +1530,13 @@ where
         None, // pool: single-source client fetch — one lane is the whole pool
     )
     .await;
+    // The handshake succeeded (the sample above is real) but delivery itself
+    // failed — still a failure of this source for selection purposes, so stamp
+    // it. This runs AFTER `record_sample` above, so a failing body transfer
+    // always wins the suppression: `record_failure` is the last write.
+    if drive_result.is_err() {
+        let _ = peer_store.record_failure(&node_id, now_secs_cli());
+    }
 
     // Clear the progress bar (or run the caller's no-op, for `bundle pull`) now —
     // BEFORE `persist_watermark`, which can `eprintln!` a rare non-advance
@@ -1777,13 +1810,20 @@ where
     )
     .await?;
     let probe_target = multi_source_target(first_candidate, relays);
+    // Peer-store bookkeeping for this header probe (#1906-series): the only
+    // network round trip `try_multi_source_fetch_from_admitted` itself makes —
+    // every other admitted lane's opens happen inside `multi_source_fetch`'s
+    // scheduler, out of this function's view, so only the first candidate gets a
+    // stream-derived sample/failure here. Best-effort throughout (`let _ =`).
+    let peer_store = decdn_client_pull::PeerStore::open(&deps.chain.data_dir);
+    let peer_store_cfg = decdn_client_pull::StoreConfig::default();
     let (header, first_pull) = {
         let ctx = first
             .ctx
             .lock()
             .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
             .clone();
-        open_progressive_pull(
+        match open_progressive_pull(
             deps.endpoint,
             probe_target,
             &ctx,
@@ -1800,11 +1840,24 @@ where
             None,
         )
         .await
-        .map_err(|err| match first.ctx.lock() {
-            Ok(guard) => annotate_unbound_cache_miss(err, &guard),
-            Err(_) => err,
-        })?
+        {
+            Ok(opened) => opened,
+            Err(err) => {
+                let _ = peer_store.record_failure(&first.node_id, now_secs_cli());
+                return Err(match first.ctx.lock() {
+                    Ok(guard) => annotate_unbound_cache_miss(err, &guard),
+                    Err(_) => err,
+                });
+            }
+        }
     };
+    let _ = peer_store.record_sample(
+        &first.node_id,
+        header.ttfb_ms,
+        header.rate_per_mb,
+        now_secs_cli(),
+        &peer_store_cfg,
+    );
     let total_bytes = header.total_bytes;
     drop(first_pull);
 

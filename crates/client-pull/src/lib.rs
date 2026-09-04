@@ -2495,6 +2495,13 @@ pub struct UpstreamPullHeader {
     /// upstream — it is a protocol constant, not a negotiated value — and `0`
     /// on an unpaid source, which is the only reason it is carried at all.
     pub interval_bytes: u64,
+    /// Observed time-to-first-byte in milliseconds: wall-clock elapsed between
+    /// dialling `target` and this signed [`StreamResponse`] verifying. `0.0` for
+    /// a source with no real network round trip (a local origin re-encode, or a
+    /// test double). Fed into [`crate::PeerStore::record_sample`] by callers that
+    /// track peer knowledge (`decdn fetch`), superseding a probe-only latency
+    /// with the real per-fetch figure.
+    pub ttfb_ms: f64,
 }
 
 /// A live, progressive `cdn/client/v1` pull (#856), the streaming counterpart of
@@ -2643,6 +2650,12 @@ pub async fn open_progressive_pull(
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     let window = deadlines.window;
     let floor_bps = deadlines.floor_bps;
+    // TTFB boundary (#1906-series peer store): measured from immediately before
+    // dial to the moment the signed `StreamResponse` verifies inside
+    // `open_stream`, so it captures the real send-to-first-byte round trip a
+    // probe cannot — a probe measures only its own tiny response, not the
+    // paid-stream handshake this fetch actually pays for.
+    let started = std::time::Instant::now();
     let (conn, send, recv, resp, resp_ext) = open_stream(
         endpoint,
         target,
@@ -2699,10 +2712,12 @@ pub async fn open_progressive_pull(
     // bytes (ADR 038 §Payment metering). Same derivation as `fetch_inner`.
     let total_bytes = resp.body.total_bytes;
     let expected_wire_bytes = aligned_wire_len(byte_offset, byte_len, total_bytes)?;
+    let ttfb_ms = started.elapsed().as_secs_f64() * 1000.0;
     let header = UpstreamPullHeader {
         total_bytes,
         rate_per_mb,
         interval_bytes: CHUNK_BYTES,
+        ttfb_ms,
     };
     let progress_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let floor = progress::ThroughputFloor::new(
