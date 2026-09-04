@@ -3101,8 +3101,10 @@ fn unbracket_host(host: &str) -> &str {
 async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigner> {
     use alloy::signers::Signer;
 
-    let sources =
-        eth_identity::standard_sources(cfg.blockchain.keystore_password_file.clone(), false);
+    let sources = eth_identity::standard_sources(
+        cfg.blockchain.keystore_password_file.clone(),
+        eth_identity::PasswordUse::Unlock,
+    );
     let password = eth_identity::read_password(&sources, "eth keystore password")?;
 
     let path = cfg.blockchain.eth_keystore.clone();

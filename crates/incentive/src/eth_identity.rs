@@ -44,6 +44,23 @@ const FORBIDDEN_BITS: u32 = 0o077;
 #[cfg(unix)]
 const KEYSTORE_FILE_MODE: u32 = 0o600;
 
+/// What the caller is about to do with the keystore password, which is what
+/// decides whether the interactive prompt asks once or twice.
+///
+/// Each call site names which one it means, so the reason for the double entry
+/// travels with the argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordUse {
+    /// The command CREATES the keystore. The prompt asks twice and requires the
+    /// entries to match: a password typed once has nothing to check it against,
+    /// so a typo would be encrypted into the file and stay undiscovered until
+    /// the next unlock fails, by which point the key is unrecoverable.
+    Create,
+    /// The command opens a keystore that already exists. One entry is enough —
+    /// a wrong password simply fails to decrypt, and says so immediately.
+    Unlock,
+}
+
 /// Source for the keystore password, in precedence order. The first source in
 /// the slice that is **present** wins, and it supplies its value as-is — the
 /// empty string included, because an empty password is a legitimate Web3 Secret
@@ -63,10 +80,12 @@ pub enum PasswordSource {
     File(PathBuf),
     /// Interactive prompt via `rpassword`. Present when `stdin` is a TTY; a
     /// non-TTY `stdin` falls through. An empty entry is an empty password.
-    /// `confirm = true` re-prompts and verifies the entries match.
+    /// [`PasswordUse::Create`] re-prompts and verifies the entries match.
     Prompt {
-        /// When true, prompt twice and require both entries to match.
-        confirm: bool,
+        /// What the password is for; see [`PasswordUse`]. `Create` prompts
+        /// twice and requires both entries to match, `Unlock` takes the single
+        /// entry as given.
+        usage: PasswordUse,
     },
 }
 
@@ -76,22 +95,21 @@ pub enum PasswordSource {
 /// at each step (see [`read_password`]), so an env var set to the empty
 /// string is the password rather than a skipped source.
 ///
-/// `confirm` reaches the [`PasswordSource::Prompt`] entry, which prompts twice
-/// and requires the entries to match. True only where the command CREATES a
-/// keystore: an entry typed once has nothing to check it against. It constrains
-/// the prompt alone — a password arriving from the env var or the file is used
-/// as given.
+/// `usage` reaches the [`PasswordSource::Prompt`] entry and nothing else:
+/// [`PasswordUse::Create`] makes that prompt ask twice and require a match,
+/// [`PasswordUse::Unlock`] makes it ask once. A password arriving from the env
+/// var or the file is used as given under either.
 ///
 /// `password_file` is used as given; no expansion happens here. Tilde
 /// expansion is the caller's concern. The CLI expands at its boundary
 /// (`chain_ctx::password_sources`), the daemon resolves it in `decdn-common`
 /// config resolution.
-pub fn standard_sources(password_file: Option<PathBuf>, confirm: bool) -> Vec<PasswordSource> {
+pub fn standard_sources(password_file: Option<PathBuf>, usage: PasswordUse) -> Vec<PasswordSource> {
     let mut sources = vec![PasswordSource::Env(KEYSTORE_PASSWORD_ENV)];
     if let Some(path) = password_file {
         sources.push(PasswordSource::File(path));
     }
-    sources.push(PasswordSource::Prompt { confirm });
+    sources.push(PasswordSource::Prompt { usage });
     sources
 }
 
@@ -349,12 +367,12 @@ pub fn read_password(
                 }
                 Err(e) => return Err(e),
             },
-            PasswordSource::Prompt { confirm } => {
+            PasswordSource::Prompt { usage } => {
                 if !std::io::stdin().is_terminal() {
                     skipped.push("stdin is not a TTY".to_owned());
                     continue;
                 }
-                return prompt_password(prompt_label, *confirm);
+                return prompt_password(prompt_label, *usage);
             }
         }
     }
@@ -395,7 +413,7 @@ fn read_password_file(path: &Path) -> anyhow::Result<Option<Zeroizing<String>>> 
     clippy::print_stderr,
     reason = "interactive terminal prompt; there is no subscriber to route this to"
 )]
-fn prompt_password(label: &str, confirm: bool) -> anyhow::Result<Zeroizing<String>> {
+fn prompt_password(label: &str, usage: PasswordUse) -> anyhow::Result<Zeroizing<String>> {
     const MAX_ATTEMPTS: u8 = 3;
     let mut attempts: u8 = 0;
     loop {
@@ -404,8 +422,11 @@ fn prompt_password(label: &str, confirm: bool) -> anyhow::Result<Zeroizing<Strin
             rpassword::prompt_password(format!("{label}: "))
                 .with_context(|| "failed to read password from terminal")?,
         );
-        if !confirm {
-            return Ok(pw);
+        // Matched, not compared, so a variant added later fails the build here
+        // rather than inheriting `Create`'s double entry by default.
+        match usage {
+            PasswordUse::Unlock => return Ok(pw),
+            PasswordUse::Create => {}
         }
         let again = Zeroizing::new(
             rpassword::prompt_password(format!("{label} (confirm): "))
@@ -522,7 +543,7 @@ mod tests {
     }
 
     /// The builder every binary routes through: `Env` first, the `File` only
-    /// when the caller passed a path, `Prompt` last carrying `confirm`.
+    /// when the caller passed a path, `Prompt` last carrying `usage`.
     /// Dropping the `Prompt` push would make every interactive command
     /// headless-only, and pushing `File` ahead of `Env` would invert the
     /// documented precedence. Neither shows up in the [`read_password`] tests
@@ -530,14 +551,16 @@ mod tests {
     /// consumed, never how this one is built.
     #[test]
     fn password_sources_orders_env_then_file_then_prompt() {
-        let with_file = standard_sources(Some(PathBuf::from("/abs/pw.txt")), false);
+        let with_file = standard_sources(Some(PathBuf::from("/abs/pw.txt")), PasswordUse::Unlock);
         assert!(
             matches!(
                 with_file.as_slice(),
                 [
                     PasswordSource::Env(name),
                     PasswordSource::File(p),
-                    PasswordSource::Prompt { confirm: false },
+                    PasswordSource::Prompt {
+                        usage: PasswordUse::Unlock
+                    },
                 ] if *name == KEYSTORE_PASSWORD_ENV
                     && p == Path::new("/abs/pw.txt")
             ),
@@ -546,13 +569,15 @@ mod tests {
 
         // No path => no `File` entry at all, so an operator who passed no flag
         // never sees a missing-file skip reason.
-        let without = standard_sources(None, true);
+        let without = standard_sources(None, PasswordUse::Create);
         assert!(
             matches!(
                 without.as_slice(),
                 [
                     PasswordSource::Env(_),
-                    PasswordSource::Prompt { confirm: true },
+                    PasswordSource::Prompt {
+                        usage: PasswordUse::Create
+                    },
                 ]
             ),
             "got: {without:?}"
@@ -805,8 +830,13 @@ mod tests {
         // Under `cargo test` / `cargo nextest` stdin is not a TTY, so
         // `Prompt` should fall through and the empty source list path
         // surfaces the standard error.
-        let err =
-            read_password(&[PasswordSource::Prompt { confirm: false }], "ignored").unwrap_err();
+        let err = read_password(
+            &[PasswordSource::Prompt {
+                usage: PasswordUse::Unlock,
+            }],
+            "ignored",
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("no keystore password source") && msg.contains("TTY"),
@@ -863,7 +893,9 @@ mod tests {
             &[
                 PasswordSource::Env(UNSET),
                 PasswordSource::File(missing.clone()),
-                PasswordSource::Prompt { confirm: false },
+                PasswordSource::Prompt {
+                    usage: PasswordUse::Unlock,
+                },
             ],
             "ignored",
         )

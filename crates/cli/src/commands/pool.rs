@@ -24,7 +24,7 @@ use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
-use decdn_incentive::eth_identity::{self, load_signer, read_password};
+use decdn_incentive::eth_identity::{self, PasswordUse, load_signer, read_password};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{Capability, CapabilityGrant, PoolId, voucher_domain};
 use serde::Serialize;
@@ -118,7 +118,10 @@ fn resolve_chain(args: &cli::PoolChainArgs, file: &FileConfig) -> anyhow::Result
 /// `--keystore-password-file`, else TTY.
 fn load_buyer_signer(chain: &Resolved) -> anyhow::Result<PrivateKeySigner> {
     let password = read_password(
-        &super::chain_ctx::password_sources(chain.keystore_password_file.as_deref(), false),
+        &super::chain_ctx::password_sources(
+            chain.keystore_password_file.as_deref(),
+            PasswordUse::Unlock,
+        ),
         "eth keystore password",
     )?;
     load_signer(&chain.keystore, &password)
