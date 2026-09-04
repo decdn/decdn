@@ -3,9 +3,10 @@
 //! Implements [`PoolStateStore`] against a set of `redb` database files under
 //! `<data_dir>`, one file per durable write family:
 //!
-//! - `lanes.redb` — seller lane frontier (`lane_state_v1`) and the owner-signed
-//!   capability rows (`capability_v1`), which the flush commits in one
-//!   transaction.
+//! - `lanes.redb` — seller lane frontier (`lane_state_v1`). Each record also
+//!   carries its lane's owner-signed capability material (`owner_sig`), so the
+//!   redeemer's registration payload lands in the same durable write as the
+//!   frontier it backs.
 //! - `settle.redb` — the seller and buyer pending-settle sets.
 //! - `floor-loss.redb` — per-signer abandonment-bucket snapshots and their forget
 //!   tombstones, committed in one transaction so a `record_bucket` orders against
@@ -31,23 +32,16 @@
 //! between two flushes loses the unflushed lane advances; the caller decides
 //! the flush cadence.
 //!
-//! The owner-signed **capability** table is buffered in the same shape:
-//! `put_capability` mutates the in-memory set only (deduping an identical
-//! repeat write), and the same `flush()` that lands the dirty lanes writes the
-//! dirty capability rows in the same fsynced transaction. A capability present
-//! only in the buffer is still served from `get_capability` (it reads the
-//! buffer), so the redeemer needs the material only by its first redemption,
-//! which the pre-redeem `flush_store_durable` floors on the strict path. The
-//! forced close/shutdown path redeems even when that flush fails, so a
-//! capability that only ever lived in the buffer can be missing from disk at
-//! its first redemption; the residual is that a crash in that window leaves an
-//! on-chain registration whose local material is gone.
-//!
-//! Losing an unflushed capability row on a crash is otherwise recoverable the
-//! way the ADR 003 voucher frontier is, but by a different mechanism and so on
-//! its own terms: a lost frontier is superseded by the signer's next, higher
-//! voucher, while a lost capability row is restored only because the client
-//! re-sends the capability on its next request and intake re-persists it.
+//! The **owner-signed capability material** (`owner_sig`) is a field of the lane
+//! record, not a side table. It is written by the same `record`/`flush` path as
+//! the frontier, in the same fsynced transaction, so it can never be durable-out-
+//! of-step with the frontier it backs: whenever a lane's frontier is on disk, its
+//! `owner_sig` is too, and a `forget` deletes both in one row removal. A crash
+//! between two flushes loses the lane's unflushed advances AND its `owner_sig`
+//! together — never one without the other — and both recover the same way: the
+//! frontier is superseded by the signer's next, higher voucher, and the material
+//! is re-supplied because the client re-sends its capability on the next request
+//! and intake re-writes it onto the lane (#1906).
 //!
 //! See [`decdn_incentive::store`] for the trait contract and
 //! [ADR 003 §Off-chain voucher state persistence] for the protocol rule
@@ -59,10 +53,12 @@
 //!
 //! The record persists the latest voucher's signature (so the seller
 //! redemption path can submit it to the on-chain `PaymentPool.redeem` after a
-//! restart without forfeiting the claim), the capability's spending cap, and
-//! the capability's expiry (so the node stops serving once the grant lapses).
-//! All of these are plain fields of the one `StoredLaneState` record — there is
-//! a single on-disk format and no older shape to decode.
+//! restart without forfeiting the claim), the capability's spending cap, its
+//! expiry (so the node stops serving once the grant lapses), and the owner's
+//! signature over the capability (`owner_sig`, the `ownerSig` the redeemer
+//! submits to register the signer on-chain). All of these are plain fields of
+//! the one `StoredLaneState` record — there is a single on-disk format and no
+//! older shape to decode.
 //!
 //! The seller table above is defined here. The **buyer** pool table (#744) is
 //! not: its record codec and every one of its operations live in
@@ -94,7 +90,7 @@ use decdn_incentive::{
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-/// File name of the seller lane + capability redb database within `data_dir`.
+/// File name of the seller lane redb database within `data_dir`.
 const LANES_DB_FILE: &str = "lanes.redb";
 
 /// File name of the pending-settle redb database (seller and buyer sets).
@@ -231,45 +227,27 @@ const SUPERSEDED_POOL_FLOOR_LOSS_TABLE_V2: TableDefinition<'_, &[u8; POOL_SIGNER
 const POOL_FLOOR_LOSS_FORGOTTEN_TABLE: TableDefinition<'_, &[u8; 32], ()> =
     TableDefinition::new("pool_floor_loss_forgotten_v1");
 
-/// Byte width of a `(pool_id, signer)` key on disk: `32 + 20`. Two tables use
-/// this shape — the capability table (a capability authorizes one signer under
-/// one pool for every provider, so it is keyed by the pair, not the full lane
-/// triple) and the floor-loss table (ADR 003 §Pool solvency bounds un-vouchered
-/// floor per signer under the per-pool ceiling). The pool id leads, so every row
-/// of one pool shares a 32-byte prefix and a range scan selects exactly that
-/// pool's rows.
+/// Byte width of a `(pool_id, signer)` key on disk: `32 + 20`. The floor-loss
+/// table uses this shape (ADR 003 §Pool solvency bounds un-vouchered floor per
+/// signer under the per-pool ceiling). The pool id leads, so every row of one
+/// pool shares a 32-byte prefix and a range scan selects exactly that pool's
+/// rows.
 const POOL_SIGNER_KEY_LEN: usize = 52;
 
-/// redb table holding the owner-signed capability material the seller
-/// voucher-intake path persists so the redeemer can register a signer on its
-/// first on-chain redemption (ADR 003 §Capability delegation). The lane's
-/// [`LaneState`] carries the signer's `cap` and `expiry`, but not the owner's
-/// signature over the EIP-712 `Capability`; this table holds that signature
-/// alongside a copy of the cap/expiry so the redeemer builds the registration
-/// payload without a chain read. Lives in the same `lanes.redb` file as
-/// [`LANE_TABLE`].
-///
-/// Key: `pool_id ‖ signer` (`[u8; 52]`). Value: postcard-encoded
-/// [`StoredCapability`].
-///
-/// The name carries `_v2`: [`StoredCapability`] encodes `spending_cap` as a
-/// native `u64` rather than the earlier 32-byte word, so its postcard payload
-/// changed shape. A redb table's value BYTES are not typed-checked at open, so
-/// an old `capability_v1` row would silently misdecode; the version bump plus
-/// [`PersistentPoolStateStore::drop_superseded_capability_table`] retires the old
-/// table at open instead. Pre-launch there is nothing to migrate.
-const CAPABILITY_TABLE: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], &[u8]> =
+/// The two superseded owner-signed capability tables, keyed by `pool_id ‖ signer`
+/// (`[u8; 52]`). Both are retired: the owner signature now rides the lane record
+/// itself (`StoredLaneState::owner_sig`), so it commits in the same transaction
+/// as the frontier it backs and can never be durable-out-of-step with it (#1906).
+/// Nothing reads these; [`PersistentPoolStateStore::drop_superseded_capability_tables`]
+/// deletes both at open so a development store carrying them does not keep dead
+/// rows. Pre-launch there is nothing to migrate.
+const SUPERSEDED_CAPABILITY_TABLE_V2: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], &[u8]> =
     TableDefinition::new("capability_v2");
-
-/// The superseded `capability_v1` table, whose [`StoredCapability`] rows encoded
-/// `spending_cap` as a 32-byte word. Nothing reads it;
-/// [`PersistentPoolStateStore::drop_superseded_capability_table`] deletes it at
-/// open so a development store carrying one does not keep undecodable rows.
-const SUPERSEDED_CAPABILITY_TABLE: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], &[u8]> =
+const SUPERSEDED_CAPABILITY_TABLE_V1: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], &[u8]> =
     TableDefinition::new("capability_v1");
 
-/// Encode a `(pool_id, signer)` pair into its `[u8; 52]` table key, shared by the
-/// capability and floor-loss tables.
+/// Encode a `(pool_id, signer)` pair into its `[u8; 52]` table key, used by the
+/// floor-loss table.
 fn pool_signer_key_bytes(pool_id: B256, signer: Address) -> [u8; POOL_SIGNER_KEY_LEN] {
     let mut out = [0u8; POOL_SIGNER_KEY_LEN];
     out[..32].copy_from_slice(pool_id.as_slice());
@@ -296,21 +274,6 @@ fn pool_signer_key_range(pool_id: B256) -> ([u8; POOL_SIGNER_KEY_LEN], [u8; POOL
         pool_signer_key_bytes(pool_id, Address::from([0x00u8; 20])),
         pool_signer_key_bytes(pool_id, Address::from([0xffu8; 20])),
     )
-}
-
-/// On-disk owner-signed capability record. The `(pool_id, signer)` identity is
-/// the table key, so the value carries only the cap/expiry and the owner
-/// signature. `spending_cap` is a native `u64`, identical to the on-chain
-/// `PaymentPool.spendingCap` width; `owner_sig` is the raw EIP-712 signature
-/// (65-byte ECDSA, or an ERC-1271 payload) verbatim.
-///
-/// `PartialEq` lets [`PersistentPoolStateStore::put_capability`] dedup an
-/// identical repeat write (equal fields ⇒ equal record ⇒ nothing to mark dirty).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StoredCapability {
-    spending_cap: u64,
-    expiry: u64,
-    owner_sig: Vec<u8>,
 }
 
 /// Encode a [`LaneKey`] into its `[u8; 72]` table key: `pool_id ‖ signer ‖
@@ -348,17 +311,22 @@ fn lane_key_parts(bytes: &[u8; LANE_KEY_LEN]) -> (B256, Address, Address) {
 ///
 /// The lane's identity (`pool_id`, `signer`, `provider`) is NOT stored in the
 /// value — it is the table key ([`lane_key_bytes`]) — so a value carries only
-/// the mutable watermark plus the capability's `cap`/`expiry`.
+/// the mutable watermark plus the capability's `cap`/`expiry` and the owner's
+/// signature over that capability (`owner_sig`).
 ///
 /// `schema_version` is a forward tripwire only (see [`SUPPORTED_SCHEMA_VERSION`]):
 /// `decode_record` uses [`postcard::take_from_bytes`], which tolerates trailing
 /// bytes, so a record a newer binary wrote with an appended field still decodes
 /// its known prefix here rather than erroring on the extra bytes.
 ///
-/// `signature` is a length-prefixed `Vec<u8>` on disk; the in-memory
-/// [`LaneState`] carries the stronger `Option<[u8; 65]>`, and the narrowing
-/// (empty → `None`, 65 → `Some`, anything else → corrupt) lives in
-/// [`StoredLaneState::into_state`].
+/// `signature` and `owner_sig` are each a length-prefixed `Vec<u8>` on disk; the
+/// in-memory [`LaneState`] carries the stronger `Option<[u8; 65]>`, and the
+/// narrowing (empty → `None`, 65 → `Some`, anything else → corrupt) lives in
+/// [`StoredLaneState::into_state`]. `owner_sig` is the owner's EIP-712 signature
+/// over the lane's `Capability` — the `ownerSig` the redeemer submits as a
+/// `PaymentPool.redeemMany` `CapabilityReg`. It is a field of the lane record,
+/// not a side table, so it is committed in the same fsynced transaction as the
+/// voucher frontier it backs and can never be durable-out-of-step with it.
 ///
 /// `registered_until` is a required field after `expiry`: the observed on-chain
 /// capability expiry for this lane's signer. Adding it is a breaking on-disk
@@ -390,6 +358,18 @@ struct StoredLaneState {
     chunk_price: [u8; 32],
     verified_index: u8,
     tip: [u8; 32],
+    /// The owner's EIP-712 signature over the lane's `Capability` (`r‖s‖v`),
+    /// length-prefixed on disk and narrowed to the in-memory `Option<[u8; 65]>`
+    /// (empty → `None`, 65 → `Some`, anything else → corrupt) in
+    /// [`StoredLaneState::into_state`]. The seller redeemer submits it as a
+    /// `PaymentPool.redeemMany` `CapabilityReg` `ownerSig` to register the signer
+    /// on-chain (ADR 003 §Capability delegation). A required field like
+    /// `registered_until`: adding it is a breaking on-disk change — a record
+    /// written before it fails to decode (the trailing length-prefix is absent,
+    /// so `take_from_bytes` hits `DeserializeUnexpectedEnd`), it is not silently
+    /// defaulted. That break is deliberate and unversioned: deCDN is pre-launch
+    /// with no deployed store to stay compatible with.
+    owner_sig: Vec<u8>,
 }
 
 impl From<&LaneState> for StoredLaneState {
@@ -402,6 +382,7 @@ impl From<&LaneState> for StoredLaneState {
             cap: state.cap.to_be_bytes(),
             expiry: state.expiry,
             registered_until: state.registered_until,
+            owner_sig: state.owner_sig.map_or_else(Vec::new, |s| s.to_vec()),
             chain_root: state.chain().chain_root.into(),
             chunk_price: state.chain().chunk_price.to_be_bytes(),
             verified_index: state.chain().verified_index,
@@ -452,6 +433,7 @@ impl StoredLaneState {
             });
         }
         let last_signature = decode_signature(&self.signature, pool_id, "voucher")?;
+        let owner_sig = decode_signature(&self.owner_sig, pool_id, "owner capability")?;
         let mut state = LaneState::hydrate(
             pool_id,
             signer,
@@ -469,6 +451,7 @@ impl StoredLaneState {
             },
         );
         state.registered_until = self.registered_until;
+        state.owner_sig = owner_sig;
         Ok(state)
     }
 }
@@ -513,8 +496,9 @@ enum LaneSlot {
 /// single buffer mutex played for the whole map.
 #[derive(Debug)]
 pub struct PersistentPoolStateStore {
-    /// Seller lane frontier + capability rows (`lanes.redb`). The periodic
-    /// flush commits both tables here in one transaction.
+    /// Seller lane frontier (`lanes.redb`). The owner-signed capability material
+    /// each lane's redeemer needs rides the lane record itself (`owner_sig`), so
+    /// the periodic flush commits it in the same transaction as the frontier.
     lanes_db: Database,
     /// Seller + buyer pending-settle sets (`settle.redb`).
     settle_db: Database,
@@ -537,16 +521,6 @@ pub struct PersistentPoolStateStore {
     /// `record` (ADR 003 §Off-chain voucher state persistence): a `record` that
     /// lands after a key is drained pushes it afresh and is captured next flush.
     dirty: SegQueue<LaneKey>,
-    /// Buffered capability rows keyed by `pool_id ‖ signer` (`[u8; 52]` —
-    /// [`pool_signer_key_bytes`]). Sharded like `lanes`, and for the same
-    /// reason: a `put_capability` on the intake path locks only its own row's
-    /// shard. The map needs no slot enum: a row is removed outright by
-    /// [`Self::forget`], and the drained key with no row IS the tombstone the
-    /// next flush turns into a table delete.
-    caps: DashMap<[u8; POOL_SIGNER_KEY_LEN], StoredCapability>,
-    /// Lock-free work-list of capability rows changed or removed since the last
-    /// flush, drained by `flush` exactly like `dirty`.
-    dirty_caps: SegQueue<[u8; POOL_SIGNER_KEY_LEN]>,
 }
 
 impl PersistentPoolStateStore {
@@ -606,8 +580,7 @@ impl PersistentPoolStateStore {
         let buyer_db = Self::open_hardened_db(&data_dir.join(BUYER_DB_FILE), &chmod_fn)?;
 
         let lanes = Self::hydrate_lanes(&lanes_db)?;
-        Self::drop_superseded_capability_table(&lanes_db)?;
-        let caps = Self::hydrate_capabilities(&lanes_db)?;
+        Self::drop_superseded_capability_tables(&lanes_db)?;
         Ok(Self {
             lanes_db,
             settle_db,
@@ -617,8 +590,6 @@ impl PersistentPoolStateStore {
             path,
             lanes,
             dirty: SegQueue::new(),
-            caps,
-            dirty_caps: SegQueue::new(),
         })
     }
 
@@ -763,87 +734,68 @@ impl PersistentPoolStateStore {
         Ok(out)
     }
 
-    /// Delete the superseded `capability_v1` table if the store still carries
-    /// one. Its [`StoredCapability`] rows encoded `spending_cap` as a 32-byte
-    /// word; the live [`CAPABILITY_TABLE`] (`capability_v2`) encodes it as a
-    /// native `u64`, so an old row's postcard bytes would misdecode under the new
-    /// shape. Pre-launch there is no migration to run, so the rows are dropped —
-    /// but loudly, because they are registration material a signer would then
-    /// re-send on its next request rather than silently lose.
+    /// Delete the superseded `capability_v1` / `capability_v2` tables if the
+    /// store still carries them. The owner-signed material each row held now rides
+    /// the lane record itself ([`StoredLaneState::owner_sig`]), so it commits in
+    /// the same transaction as the frontier it backs (#1906) and there is no
+    /// side table to keep. Pre-launch there is no migration to run, so the rows
+    /// are dropped — but loudly, because they are registration material a signer
+    /// would then re-send on its next request rather than silently lose.
     ///
-    /// The table lives in the shared `lanes.redb` file, so the presence check
-    /// runs in a READ transaction first and a write transaction opens ONLY when
-    /// the old table is actually there. A blind `begin_write`/`commit` on every
-    /// boot would grow the lane file with an empty commit and break the #527
-    /// file-stability guarantee that `pre_existing_file_chmod_failure_preserves_file`
-    /// pins.
+    /// Each table lives in the shared `lanes.redb` file, so a presence check runs
+    /// in a READ transaction first and a write transaction opens ONLY when a table
+    /// is actually there. A blind `begin_write`/`commit` on every boot would grow
+    /// the lane file with an empty commit and break the #527 file-stability
+    /// guarantee that `pre_existing_file_chmod_failure_preserves_file` pins.
     ///
     /// # Errors
-    /// [`StoreError::Backend`] when the presence check or delete transaction fails.
-    fn drop_superseded_capability_table(db: &Database) -> Result<(), StoreError> {
-        let read_txn = db.begin_read().map_err(|err| {
-            StoreError::Backend(format!("begin_read (capability_v1 probe): {err}"))
-        })?;
-        match read_txn.open_table(SUPERSEDED_CAPABILITY_TABLE) {
+    /// [`StoreError::Backend`] when a presence check or delete transaction fails.
+    fn drop_superseded_capability_tables(db: &Database) -> Result<(), StoreError> {
+        Self::drop_superseded_capability_table(
+            db,
+            SUPERSEDED_CAPABILITY_TABLE_V2,
+            "capability_v2",
+        )?;
+        Self::drop_superseded_capability_table(db, SUPERSEDED_CAPABILITY_TABLE_V1, "capability_v1")
+    }
+
+    /// Delete one superseded capability table by definition + name, presence-
+    /// checked in a read transaction so a store without it takes no write.
+    fn drop_superseded_capability_table(
+        db: &Database,
+        table: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], &[u8]>,
+        name: &str,
+    ) -> Result<(), StoreError> {
+        let read_txn = db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read ({name} probe): {err}")))?;
+        match read_txn.open_table(table) {
             Ok(_) => {}
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
             Err(err) => {
                 return Err(StoreError::Backend(format!(
-                    "open_table (capability_v1 probe): {err}"
+                    "open_table ({name} probe): {err}"
                 )));
             }
         }
         drop(read_txn);
-        let txn = db.begin_write().map_err(|err| {
-            StoreError::Backend(format!("begin_write (capability_v1 drop): {err}"))
-        })?;
+        let txn = db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write ({name} drop): {err}")))?;
         let dropped = txn
-            .delete_table(SUPERSEDED_CAPABILITY_TABLE)
-            .map_err(|err| StoreError::Backend(format!("delete_table (capability_v1): {err}")))?;
+            .delete_table(table)
+            .map_err(|err| StoreError::Backend(format!("delete_table ({name}): {err}")))?;
         txn.commit()
-            .map_err(|err| StoreError::Backend(format!("commit (capability_v1 drop): {err}")))?;
+            .map_err(|err| StoreError::Backend(format!("commit ({name} drop): {err}")))?;
         if dropped {
             tracing::warn!(
-                table = "capability_v1",
+                table = name,
                 "dropped the superseded capability table; its owner-signed registration \
-                 material is re-sent by each client on its next request"
+                 material now rides the lane record and is re-sent by each client on its \
+                 next request"
             );
         }
         Ok(())
-    }
-
-    /// Read the whole capability table into the in-memory working set at open.
-    /// A corrupt record aborts startup like a corrupt lane row would — the
-    /// redeemer must not silently miss registration material for a signer it is
-    /// about to register on-chain.
-    fn hydrate_capabilities(
-        db: &Database,
-    ) -> Result<DashMap<[u8; POOL_SIGNER_KEY_LEN], StoredCapability>, StoreError> {
-        let read_txn = db
-            .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        let table = match read_txn.open_table(CAPABILITY_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(DashMap::new()),
-            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
-        };
-        let out = DashMap::new();
-        let iter = table
-            .iter()
-            .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
-        for entry in iter {
-            let (key_guard, value_guard) =
-                entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
-            let key_bytes: [u8; POOL_SIGNER_KEY_LEN] = *key_guard.value();
-            let (pool_id, signer) = pool_signer_key_parts(&key_bytes);
-            let record: StoredCapability =
-                postcard::from_bytes(value_guard.value()).map_err(|err| StoreError::Corrupt {
-                    pool_id: Some(pool_id),
-                    detail: format!("capability postcard decode failed for signer {signer}: {err}"),
-                })?;
-            out.insert(key_bytes, record);
-        }
-        Ok(out)
     }
 
     /// Operator-facing logging for the chmod-failure cleanup branch. Extracted
@@ -1003,6 +955,14 @@ impl PoolStateStore for PersistentPoolStateStore {
             Entry::Occupied(mut occ) => {
                 if let LaneSlot::Live(existing) = occ.get() {
                     next.registered_until = next.registered_until.max(existing.registered_until);
+                    // Never let a record that omits the owner-signed material drop
+                    // a grant the lane already holds: like `registered_until`,
+                    // `owner_sig` is trusted-writer state set once and kept, and
+                    // losing it would strand the redeemer for a lane whose frontier
+                    // still advances (#1906).
+                    if next.owner_sig.is_none() {
+                        next.owner_sig = existing.owner_sig;
+                    }
                 }
                 occ.insert(LaneSlot::Live(next));
             }
@@ -1036,29 +996,19 @@ impl PoolStateStore for PersistentPoolStateStore {
     /// Tombstone the lane so reads treat it as absent and the next flush deletes
     /// its on-disk row. Idempotent. The slot stays in the map (as a tombstone)
     /// so a concurrent `record` resurrecting the lane is decided under the same
-    /// shard lock rather than racing a separate set.
-    ///
-    /// The lane's capability row goes with it. Registration material is only
-    /// ever asked for by [`LaneKey`], so a capability whose lane is gone is
-    /// unreachable — keeping it would grow both the resident map and the table
-    /// with the count of distinct `(pool_id, signer)` pairs the node has ever
-    /// seen, and the signer half of that pair is chosen by whoever funds the
-    /// pool. Removal and re-insertion race under the row's own shard lock, and
-    /// the drained-but-absent key is what makes the next flush delete the row
-    /// rather than leave it to be re-hydrated at the next open.
+    /// shard lock rather than racing a separate set. The lane's owner-signed
+    /// capability material (`owner_sig`) is part of the record, so it goes with
+    /// the lane in the same delete.
     fn forget(&self, key: LaneKey) -> Result<(), StoreError> {
         self.lanes.insert(key, LaneSlot::Tombstoned);
         self.dirty.push(key);
-        let cap_key = pool_signer_key_bytes(key.pool_id, key.signer);
-        if self.caps.remove(&cap_key).is_some() {
-            self.dirty_caps.push(cap_key);
-        }
         Ok(())
     }
 
-    /// Write every dirty lane, apply every tombstone, and write every dirty
-    /// capability row in ONE fsynced redb transaction. Idempotent — a no-op
-    /// when clean.
+    /// Write every dirty lane and apply every tombstone in ONE fsynced redb
+    /// transaction. Each lane record carries its own owner-signed capability
+    /// material, so nothing is written separately. Idempotent — a no-op when
+    /// clean.
     ///
     /// Double-buffered: the dirty work-list is drained and each lane's slot is
     /// cloned out (a cheap memcpy — [`LaneState`] holds no heap fields), then
@@ -1078,11 +1028,7 @@ impl PoolStateStore for PersistentPoolStateStore {
         while let Some(key) = self.dirty.pop() {
             drained.insert(key);
         }
-        let mut drained_caps: HashSet<[u8; POOL_SIGNER_KEY_LEN]> = HashSet::new();
-        while let Some(key) = self.dirty_caps.pop() {
-            drained_caps.insert(key);
-        }
-        if drained.is_empty() && drained_caps.is_empty() {
+        if drained.is_empty() {
             return Ok(());
         }
 
@@ -1103,14 +1049,9 @@ impl PoolStateStore for PersistentPoolStateStore {
                             // Re-push every drained key so the next flush retries
                             // them — an early return here without the re-push
                             // would leave the un-encoded lanes permanently
-                            // "clean" and never reach disk. The capability
-                            // work-list is already drained too, so it re-pushes
-                            // on the same path.
+                            // "clean" and never reach disk.
                             for key in &drained {
                                 self.dirty.push(*key);
-                            }
-                            for key in &drained_caps {
-                                self.dirty_caps.push(*key);
                             }
                             return Err(StoreError::Codec(format!(
                                 "postcard encode failed: {err}"
@@ -1125,39 +1066,7 @@ impl PoolStateStore for PersistentPoolStateStore {
                 None => {}
             }
         }
-        let mut cap_writes: Vec<([u8; POOL_SIGNER_KEY_LEN], Vec<u8>)> =
-            Vec::with_capacity(drained_caps.len());
-        let mut cap_deletes: Vec<[u8; POOL_SIGNER_KEY_LEN]> = Vec::new();
-        for key in &drained_caps {
-            // Same shape as the lane loop: clone the row out under its shard
-            // lock, release, then encode. A drained key with no row is a
-            // `forget` tombstone — the row left the map, so the table row goes
-            // with it.
-            let Some(record) = self.caps.get(key).map(|entry| entry.value().clone()) else {
-                cap_deletes.push(*key);
-                continue;
-            };
-            match postcard::to_allocvec(&record) {
-                Ok(encoded) => cap_writes.push((*key, encoded)),
-                Err(err) => {
-                    for key in &drained {
-                        self.dirty.push(*key);
-                    }
-                    for key in &drained_caps {
-                        self.dirty_caps.push(*key);
-                    }
-                    return Err(StoreError::Codec(format!(
-                        "capability postcard encode failed: {err}"
-                    )));
-                }
-            }
-        }
-        let mut snapshot = FlushSnapshot {
-            writes,
-            tombstones,
-            cap_writes,
-            cap_deletes,
-        };
+        let mut snapshot = FlushSnapshot { writes, tombstones };
         // Every batch reaches redb in ascending key order; see
         // [`FlushSnapshot::sort_by_table_key`].
         snapshot.sort_by_table_key();
@@ -1175,20 +1084,8 @@ impl PoolStateStore for PersistentPoolStateStore {
             for key in &snapshot.tombstones {
                 self.dirty.push(*key);
             }
-            for (key, _) in &snapshot.cap_writes {
-                self.dirty_caps.push(*key);
-            }
-            for key in &snapshot.cap_deletes {
-                self.dirty_caps.push(*key);
-            }
-            // The operator-facing flush warning upstream reports only that a
-            // flush failed. Name the un-durable volume here, where the counts
-            // exist: post-#1789 a failed flush leaves capability material
-            // buffered as well as lane frontier, and the two are separately
-            // consequential.
             tracing::warn!(
                 dirty_lanes = snapshot.writes.len() + snapshot.tombstones.len(),
-                dirty_capabilities = snapshot.cap_writes.len() + snapshot.cap_deletes.len(),
                 error = %err,
                 "lane store commit failed; every drained key is re-queued for the next flush"
             );
@@ -1206,14 +1103,13 @@ impl PoolStateStore for PersistentPoolStateStore {
     }
 }
 
-/// Encoded dirty writes, tombstone keys, and dirty capability rows resolved from
-/// the drained work-lists, so [`PersistentPoolStateStore::flush`] can run its
-/// fsynced commit with no shard lock held.
+/// Encoded dirty writes and tombstone keys resolved from the drained work-list,
+/// so [`PersistentPoolStateStore::flush`] can run its fsynced commit with no
+/// shard lock held. Each lane record already carries its own owner-signed
+/// capability material, so there is no separate capability batch.
 struct FlushSnapshot {
     writes: Vec<(LaneKey, Vec<u8>)>,
     tombstones: Vec<LaneKey>,
-    cap_writes: Vec<([u8; POOL_SIGNER_KEY_LEN], Vec<u8>)>,
-    cap_deletes: Vec<[u8; POOL_SIGNER_KEY_LEN]>,
 }
 
 impl FlushSnapshot {
@@ -1236,21 +1132,11 @@ impl FlushSnapshot {
     /// each drained key resolves to exactly one of a live slot or a tombstone —
     /// so the insert run and the remove run never meet on one key, and sorting
     /// both leaves the whole flush deterministic even though the work-list drains
-    /// through a `HashSet` whose iteration order carries no meaning. The
-    /// capability keys are already their own table keys, so sorting them by the
-    /// raw `[u8; POOL_SIGNER_KEY_LEN]` (lexicographic) gives the same ascending
-    /// append pattern on `CAPABILITY_TABLE`.
+    /// through a `HashSet` whose iteration order carries no meaning.
     fn sort_by_table_key(&mut self) {
         self.writes
             .sort_by_cached_key(|(lane, _)| lane_key_bytes(lane));
         self.tombstones.sort_by_cached_key(lane_key_bytes);
-        self.cap_writes.sort_by_key(|(key, _)| *key);
-        self.cap_deletes.sort_unstable();
-    }
-
-    /// Whether this snapshot touches `CAPABILITY_TABLE` at all.
-    const fn touches_capabilities(&self) -> bool {
-        !self.cap_writes.is_empty() || !self.cap_deletes.is_empty()
     }
 }
 
@@ -1283,165 +1169,11 @@ impl PersistentPoolStateStore {
                     .remove(&key_bytes)
                     .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
             }
-            // Only opened when the snapshot has capability work. A lane-only
-            // flush must not be able to fail on the capability table: the lane
-            // frontier and the capability rows share one transaction, so a
-            // capability-side backend error would otherwise abort a commit that
-            // carries only voucher watermarks — the loss ADR 003's flush design
-            // exists to bound.
-            if snapshot.touches_capabilities() {
-                let mut cap_table = write_txn
-                    .open_table(CAPABILITY_TABLE)
-                    .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-                for (key, encoded) in &snapshot.cap_writes {
-                    cap_table
-                        .insert(key, encoded.as_slice())
-                        .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
-                }
-                for key in &snapshot.cap_deletes {
-                    cap_table
-                        .remove(key)
-                        .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
-                }
-            }
         }
         write_txn
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
         Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Capability store (seller first-redemption registration material)
-// ---------------------------------------------------------------------------
-
-impl PersistentPoolStateStore {
-    /// Stage the owner-signed capability material for `(pool_id, signer)` in
-    /// the working set, so the redeemer can register the signer on its first
-    /// on-chain redemption. NOT durable on return — [`Self::flush`] is what
-    /// writes it.
-    ///
-    /// Buffered like [`PoolStateStore::record`]: inserts into the in-memory
-    /// working set and pushes the row onto the dirty work-list, landing on disk
-    /// in the SAME fsynced transaction as the lanes at the next flush. Locks
-    /// only this row's [`DashMap`] shard. Deduped: a repeat intake whose
-    /// `(spending_cap, expiry, owner_sig)` already equals the buffered row marks
-    /// nothing dirty, so repeated capability sends are free (the intake path
-    /// calls this on every request carrying a capability).
-    ///
-    /// A crash between two flushes loses unflushed capability rows. The client
-    /// re-sends the capability on its next request and intake re-stages it, and
-    /// the pre-redeem `flush_store_durable` floors the material on the strict
-    /// redeem paths — see the module docs for the shutdown-path residual.
-    pub fn put_capability(
-        &self,
-        pool_id: B256,
-        signer: Address,
-        spending_cap: u64,
-        expiry: u64,
-        owner_sig: &[u8],
-    ) {
-        let record = StoredCapability {
-            spending_cap,
-            expiry,
-            owner_sig: owner_sig.to_vec(),
-        };
-        let key_bytes = pool_signer_key_bytes(pool_id, signer);
-        // Decide the dedup under the entry's shard lock, so two concurrent
-        // intakes of different material for one row cannot both conclude
-        // "unchanged" against the value the other is about to replace.
-        match self.caps.entry(key_bytes) {
-            Entry::Occupied(mut occ) => {
-                if occ.get() == &record {
-                    return;
-                }
-                occ.insert(record);
-            }
-            Entry::Vacant(vac) => {
-                vac.insert(record);
-            }
-        }
-        self.dirty_caps.push(key_bytes);
-    }
-
-    /// Read the stored capability material for `(pool_id, signer)`, or `None`
-    /// if this node holds no capability for it. Reads the in-memory working
-    /// set, so a row written by [`Self::put_capability`] but not yet flushed is
-    /// still visible — the buffer is the authoritative copy after `open()`
-    /// hydrates it, which is also why the read cannot fault.
-    fn get_capability(&self, pool_id: B256, signer: Address) -> Option<StoredCapability> {
-        let key_bytes = pool_signer_key_bytes(pool_id, signer);
-        self.caps.get(&key_bytes).map(|entry| entry.value().clone())
-    }
-}
-
-/// Write side of the capability table used by the seller voucher-intake path.
-/// Kept as a trait so the [`ClientHandler`](crate::handlers::client::ClientHandler)
-/// holds it behind an `Arc<dyn CapabilitySink>` and tests can pass `None` (an
-/// in-memory store has no capability table).
-///
-/// Staging is infallible by contract, so the intake path has no persist error
-/// to handle: the only way capability material fails to reach disk is a failed
-/// [`PoolStateStore::flush`], which is metered and logged where the flush runs.
-pub trait CapabilitySink: Send + Sync + std::fmt::Debug {
-    /// Stage the owner-signed capability material for `(pool_id, signer)` in
-    /// the implementation's working set. NOT durable on return: a
-    /// [`PoolStateStore::flush`] on the same store is what commits it.
-    fn stage_capability(
-        &self,
-        pool_id: B256,
-        signer: Address,
-        spending_cap: u64,
-        expiry: u64,
-        owner_sig: &[u8],
-    );
-}
-
-impl CapabilitySink for PersistentPoolStateStore {
-    fn stage_capability(
-        &self,
-        pool_id: B256,
-        signer: Address,
-        spending_cap: u64,
-        expiry: u64,
-        owner_sig: &[u8],
-    ) {
-        self.put_capability(pool_id, signer, spending_cap, expiry, owner_sig);
-    }
-}
-
-/// [`CapabilitySource`](crate::payment_settlement::CapabilitySource) backed by
-/// the persisted `CAPABILITY_TABLE`. The seller voucher-intake path persists a
-/// signer's owner-signed capability on first sight; the redeemer reads it here
-/// to register the signer on its first on-chain redemption. A signer with no
-/// persisted capability yields `None` and is safely skipped by the redeemer.
-#[derive(Debug)]
-pub struct StoredCapabilitySource {
-    inner: std::sync::Arc<PersistentPoolStateStore>,
-}
-
-impl StoredCapabilitySource {
-    /// Wrap the concrete store. The same `lanes.redb` file backs both the lane
-    /// records and the capability table.
-    #[must_use]
-    pub const fn new(inner: std::sync::Arc<PersistentPoolStateStore>) -> Self {
-        Self { inner }
-    }
-}
-
-impl crate::payment_settlement::CapabilitySource for StoredCapabilitySource {
-    fn registration_material(
-        &self,
-        key: &LaneKey,
-    ) -> Option<crate::payment_settlement::CapabilityMaterial> {
-        self.inner
-            .get_capability(key.pool_id, key.signer)
-            .map(|record| crate::payment_settlement::CapabilityMaterial {
-                spending_cap: record.spending_cap,
-                expiry: record.expiry,
-                owner_sig: alloy::primitives::Bytes::from(record.owner_sig),
-            })
     }
 }
 
@@ -2068,381 +1800,31 @@ mod tests {
         )
     }
 
-    /// The capability store round-trips: what the seller intake persists via
-    /// [`CapabilitySink::stage_capability`] is exactly what the redeemer reads
-    /// through [`StoredCapabilitySource`], and a `(pool_id, signer)` with no
-    /// stored capability yields `None` (so the redeemer safely skips it).
+    /// The owner-signed capability material rides the lane record: a lane
+    /// recorded with an `owner_sig` and flushed reads back with the same
+    /// `owner_sig` after a reopen. The material and the voucher frontier are one
+    /// row committed in one transaction, so the redeemer's registration material
+    /// can never be durable-out-of-step with the frontier it backs (the #1906
+    /// stranding gap).
     #[test]
-    fn capability_store_round_trips_and_missing_is_none() -> anyhow::Result<()> {
-        use crate::payment_settlement::CapabilitySource;
-
+    fn owner_sig_rides_the_lane_record_through_flush_and_reopen() -> anyhow::Result<()> {
         let dir = data_dir()?;
         let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
-        let pool_id = b256!("00000000000000000000000000000000000000000000000000000000000000a7");
-        let signer = address!("00000000000000000000000000000000000000b5");
-        let provider = address!("00000000000000000000000000000000000000c9");
-        let owner_sig = vec![0x42u8; 65];
-        let spending_cap = 5_000_000u64;
-        let expiry = 1_950_000_000u64;
-
-        // A signer with nothing persisted yields None.
-        let source = StoredCapabilitySource::new(Arc::clone(&store));
-        let empty_key = LaneKey {
-            pool_id,
-            signer,
-            provider,
-        };
-        anyhow::ensure!(source.registration_material(&empty_key).is_none());
-
-        // Persist through the write trait, read back through the source.
-        CapabilitySink::stage_capability(
-            store.as_ref(),
-            pool_id,
-            signer,
-            spending_cap,
-            expiry,
-            &owner_sig,
-        );
-        let material = source
-            .registration_material(&empty_key)
-            .ok_or_else(|| anyhow::anyhow!("expected stored capability material"))?;
-        anyhow::ensure!(material.spending_cap == spending_cap);
-        anyhow::ensure!(material.expiry == expiry);
-        anyhow::ensure!(material.owner_sig.as_ref() == owner_sig.as_slice());
-
-        // The provider segment of the lane key is ignored (capability is keyed by
-        // (pool_id, signer)): a different provider under the same signer still
-        // resolves the same material.
-        let other_provider_key = LaneKey {
-            pool_id,
-            signer,
-            provider: address!("00000000000000000000000000000000000000ff"),
-        };
-        anyhow::ensure!(source.registration_material(&other_provider_key).is_some());
-
-        // Reads above are served from the working set, so they prove nothing
-        // about the table. Flush, reopen, and check every field survives the
-        // postcard round-trip — a field-order regression in `StoredCapability`
-        // is invisible to an in-memory read.
-        store.flush()?;
-        drop(source);
-        drop(store);
-        let reopened = Arc::new(PersistentPoolStateStore::open(dir.path())?);
-        let material = StoredCapabilitySource::new(reopened)
-            .registration_material(&empty_key)
-            .ok_or_else(|| anyhow::anyhow!("expected capability material after reopen"))?;
-        anyhow::ensure!(material.spending_cap == spending_cap, "cap survives reopen");
-        anyhow::ensure!(material.expiry == expiry, "expiry survives reopen");
-        anyhow::ensure!(
-            material.owner_sig.as_ref() == owner_sig.as_slice(),
-            "owner signature survives reopen"
-        );
-        Ok(())
-    }
-
-    /// Forgetting a lane drops its capability row from the working set AND from
-    /// the table: registration material is only ever asked for by [`LaneKey`],
-    /// so a row whose lane is gone is unreachable, and keeping it would grow
-    /// both with the count of distinct `(pool_id, signer)` pairs ever seen.
-    #[test]
-    fn forgetting_a_lane_drops_its_capability_row() -> anyhow::Result<()> {
-        use crate::payment_settlement::CapabilitySource;
-
-        let dir = data_dir()?;
-        let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
-        let pool_id = b256!("00000000000000000000000000000000000000000000000000000000000000d1");
-        let signer = address!("00000000000000000000000000000000000000d2");
-        let provider = address!("00000000000000000000000000000000000000d3");
-        let key = LaneKey {
-            pool_id,
-            signer,
-            provider,
-        };
-        CapabilitySink::stage_capability(
-            store.as_ref(),
-            pool_id,
-            signer,
-            9u64,
-            2000,
-            &[0x11u8; 65],
-        );
-        store.flush()?;
-        anyhow::ensure!(
-            StoredCapabilitySource::new(Arc::clone(&store))
-                .registration_material(&key)
-                .is_some(),
-            "the flushed capability is readable before the forget"
-        );
-
-        PoolStateStore::forget(store.as_ref(), key)?;
-        anyhow::ensure!(
-            store.caps.is_empty(),
-            "forget drops the row from the working set immediately"
-        );
+        let mut lane = sample(0x5a);
+        lane.owner_sig = Some([0x42u8; 65]);
+        PoolStateStore::record(store.as_ref(), &lane)?;
         store.flush()?;
         drop(store);
 
-        let reopened = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+        // Reopen from disk: an in-memory read would prove nothing about the
+        // postcard round-trip.
+        let reopened = PersistentPoolStateStore::open(dir.path())?;
+        let got = PoolStateStore::get(&reopened, lane.key())?
+            .ok_or_else(|| anyhow::anyhow!("lane gone after reopen"))?;
         anyhow::ensure!(
-            reopened.caps.is_empty(),
-            "the flushed delete keeps the row from being re-hydrated"
+            got.owner_sig == Some([0x42u8; 65]),
+            "owner_sig survives the reopen with the frontier it backs"
         );
-        anyhow::ensure!(
-            StoredCapabilitySource::new(reopened)
-                .registration_material(&key)
-                .is_none(),
-            "a forgotten lane's capability is gone after a reopen"
-        );
-        Ok(())
-    }
-
-    /// One flush carrying lane writes, a lane tombstone, a capability write and
-    /// a capability delete lands all four in the same transaction. The two
-    /// tables share one commit, so this is the shape that would expose a
-    /// capability-side error taking the lane frontier down with it.
-    #[test]
-    fn flush_persists_mixed_lane_and_capability_work() -> anyhow::Result<()> {
-        use crate::payment_settlement::CapabilitySource;
-
-        let dir = data_dir()?;
-        let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
-        let kept = mk_lane(0x01, 0xE0, 40);
-        let dropped = mk_lane(0x02, 0xE0, 41);
-        let kept_key = kept.key();
-        let dropped_key = dropped.key();
-
-        // Seed both lanes and both capability rows, and get them on disk.
-        PoolStateStore::record(store.as_ref(), &kept)?;
-        PoolStateStore::record(store.as_ref(), &dropped)?;
-        for lane in [&kept_key, &dropped_key] {
-            CapabilitySink::stage_capability(
-                store.as_ref(),
-                lane.pool_id,
-                lane.signer,
-                7u64,
-                3000,
-                &[0x33u8; 65],
-            );
-        }
-        store.flush()?;
-
-        // Now one flush that writes a lane, tombstones a lane, rewrites one
-        // capability and deletes the other.
-        let advanced = mk_lane(0x01, 0xE0, 99);
-        PoolStateStore::record(store.as_ref(), &advanced)?;
-        CapabilitySink::stage_capability(
-            store.as_ref(),
-            kept_key.pool_id,
-            kept_key.signer,
-            8u64,
-            3001,
-            &[0x44u8; 65],
-        );
-        PoolStateStore::forget(store.as_ref(), dropped_key)?;
-        store.flush()?;
-        drop(store);
-
-        let reopened = Arc::new(PersistentPoolStateStore::open(dir.path())?);
-        let lanes = reopened.load_all()?;
-        anyhow::ensure!(lanes.len() == 1, "only the kept lane survives");
-        let source = StoredCapabilitySource::new(Arc::clone(&reopened));
-        let material = source
-            .registration_material(&kept_key)
-            .ok_or_else(|| anyhow::anyhow!("kept lane keeps its capability"))?;
-        anyhow::ensure!(
-            material.spending_cap == 8u64 && material.expiry == 3001,
-            "the capability rewrite landed in the same flush as the lane work"
-        );
-        anyhow::ensure!(
-            source.registration_material(&dropped_key).is_none(),
-            "the forgotten lane's capability delete landed in the same flush"
-        );
-        Ok(())
-    }
-
-    /// A `stage_capability` that lands after its key was drained is captured by
-    /// the NEXT flush, never dropped — the same guarantee `record` has. The
-    /// dedup decides under the row's shard lock, so a changed value always
-    /// re-marks the row even while a flush is draining concurrently.
-    #[test]
-    fn concurrent_capability_writes_during_flush_are_not_lost() -> anyhow::Result<()> {
-        use crate::payment_settlement::CapabilitySource;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        const ROWS: u8 = 8;
-        const ROUNDS: u64 = 60;
-
-        let dir = data_dir()?;
-        let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
-        let stop = Arc::new(AtomicBool::new(false));
-
-        let flusher = {
-            let store = Arc::clone(&store);
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || -> anyhow::Result<()> {
-                while !stop.load(Ordering::Relaxed) {
-                    store.flush()?;
-                    std::thread::yield_now();
-                }
-                Ok(())
-            })
-        };
-
-        let mut writers = Vec::new();
-        for row in 0..ROWS {
-            let store = Arc::clone(&store);
-            writers.push(std::thread::spawn(move || {
-                for round in 1..=ROUNDS {
-                    // `expiry` strictly increases with the round, so the last
-                    // staged value for each row is the highest.
-                    CapabilitySink::stage_capability(
-                        store.as_ref(),
-                        B256::repeat_byte(row),
-                        Address::repeat_byte(row),
-                        round,
-                        round,
-                        &[row; 65],
-                    );
-                }
-            }));
-        }
-        for w in writers {
-            w.join()
-                .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
-        }
-        stop.store(true, Ordering::Relaxed);
-        flusher
-            .join()
-            .map_err(|_| anyhow::anyhow!("flusher thread panicked"))??;
-
-        store.flush()?;
-        drop(store);
-
-        let reopened = Arc::new(PersistentPoolStateStore::open(dir.path())?);
-        let source = StoredCapabilitySource::new(reopened);
-        for row in 0..ROWS {
-            let material = source
-                .registration_material(&LaneKey {
-                    pool_id: B256::repeat_byte(row),
-                    signer: Address::repeat_byte(row),
-                    provider: Address::repeat_byte(0xAA),
-                })
-                .ok_or_else(|| anyhow::anyhow!("row {row} lost every write"))?;
-            anyhow::ensure!(
-                material.expiry == ROUNDS,
-                "row {row} must reach its final staged value on disk, got {}",
-                material.expiry
-            );
-        }
-        Ok(())
-    }
-
-    /// A repeated intake of an IDENTICAL capability pushes nothing onto the
-    /// dirty work-list: the buffered row already equals
-    /// `{spending_cap, expiry, owner_sig}`, so the dedup makes repeated sends
-    /// free instead of re-queuing an fsync. Only a genuinely changed row pushes.
-    #[test]
-    fn repeated_identical_capability_write_marks_nothing_dirty() -> anyhow::Result<()> {
-        use crate::payment_settlement::CapabilitySource;
-
-        let dir = data_dir()?;
-        let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
-        let pool_id = b256!("9000000000000000000000000000000000000000000000000000000000000001");
-        let signer = address!("00000000000000000000000000000000000000ee");
-        let owner_sig = vec![0x42u8; 65];
-
-        CapabilitySink::stage_capability(store.as_ref(), pool_id, signer, 5u64, 1000, &owner_sig);
-        anyhow::ensure!(
-            store.dirty_caps.len() == 1,
-            "first write marks the row dirty"
-        );
-        // Identical repeat: nothing pushed.
-        CapabilitySink::stage_capability(store.as_ref(), pool_id, signer, 5u64, 1000, &owner_sig);
-        anyhow::ensure!(
-            store.dirty_caps.len() == 1,
-            "identical repeat must not re-mark the row"
-        );
-        // A changed value pushes the key again; the flush dedups the two.
-        CapabilitySink::stage_capability(store.as_ref(), pool_id, signer, 6u64, 1000, &owner_sig);
-        anyhow::ensure!(
-            store.dirty_caps.len() == 2,
-            "a changed value re-marks the row"
-        );
-        // Flush drains the work-list; the changed value is what lands.
-        store.flush()?;
-        anyhow::ensure!(
-            store.dirty_caps.is_empty(),
-            "flush drains the dirty capability work-list"
-        );
-        let source = StoredCapabilitySource::new(Arc::clone(&store));
-        let material = source
-            .registration_material(&LaneKey {
-                pool_id,
-                signer,
-                provider: address!("00000000000000000000000000000000000000de"),
-            })
-            .ok_or_else(|| anyhow::anyhow!("expected stored capability material"))?;
-        anyhow::ensure!(material.spending_cap == 6u64, "the updated cap landed");
-        // After a flush the buffer still holds the row, so re-writing the same
-        // value is still a dedup no-op — only a changed value re-marks.
-        CapabilitySink::stage_capability(store.as_ref(), pool_id, signer, 6u64, 1000, &owner_sig);
-        anyhow::ensure!(
-            store.dirty_caps.is_empty(),
-            "re-writing the just-flushed value is still a dedup no-op"
-        );
-        Ok(())
-    }
-
-    /// Crash-between-flush replay semantics: an unflushed capability row is
-    /// lost on reopen (frontier loss) — but the client re-sends the capability
-    /// on its next request, so a second intake restores it, and once flushed
-    /// the row survives.
-    #[test]
-    fn unflushed_capability_is_lost_but_resend_restores_it() -> anyhow::Result<()> {
-        use crate::payment_settlement::CapabilitySource;
-
-        let dir = data_dir()?;
-        let pool_id = b256!("9100000000000000000000000000000000000000000000000000000000000001");
-        let signer = address!("00000000000000000000000000000000000000dd");
-        let provider = address!("00000000000000000000000000000000000000de");
-        let owner_sig = vec![0x99u8; 65];
-
-        // Write WITHOUT flushing, then drop the store (a crash).
-        {
-            let store = PersistentPoolStateStore::open(dir.path())?;
-            CapabilitySink::stage_capability(&store, pool_id, signer, 7u64, 2000, &owner_sig);
-        }
-        // Reopen: the row is gone (frontier-loss-ok), so the redeemer would
-        // find no material yet.
-        let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
-        let source = StoredCapabilitySource::new(Arc::clone(&store));
-        anyhow::ensure!(
-            source
-                .registration_material(&LaneKey {
-                    pool_id,
-                    signer,
-                    provider
-                })
-                .is_none(),
-            "an unflushed capability row is lost on a crash"
-        );
-        // The client re-sends on its next request; intake re-persists, and a
-        // later flush makes it durable. The pre-flush `source` clone must go
-        // before reopen — it holds the database handle open.
-        CapabilitySink::stage_capability(store.as_ref(), pool_id, signer, 7u64, 2000, &owner_sig);
-        store.flush()?;
-        drop(source);
-        drop(store);
-        let store = PersistentPoolStateStore::open(dir.path())?;
-        let source = StoredCapabilitySource::new(Arc::new(store));
-        let material = source
-            .registration_material(&LaneKey {
-                pool_id,
-                signer,
-                provider,
-            })
-            .ok_or_else(|| anyhow::anyhow!("a flushed capability row must survive a re-open"))?;
-        anyhow::ensure!(material.expiry == 2000);
         Ok(())
     }
 
@@ -2684,13 +2066,12 @@ mod tests {
         Ok(())
     }
 
-    /// A store carrying the superseded `capability_v1` table drops it at open:
-    /// its rows encoded `spending_cap` as a 32-byte word, which the live
-    /// `capability_v2` codec would misdecode, so the migration deletes the old
-    /// table rather than read it. The lane frontier in the same file is
-    /// untouched.
+    /// A store carrying either superseded capability table drops both at open:
+    /// the owner-signed material now rides the lane record itself, so the side
+    /// tables are dead. The migration deletes them without reading a row. The
+    /// lane frontier in the same file is untouched.
     #[test]
-    fn superseded_capability_v1_table_is_dropped_at_open() -> anyhow::Result<()> {
+    fn superseded_capability_tables_are_dropped_at_open() -> anyhow::Result<()> {
         let dir = data_dir()?;
         let recorded = sample(9);
         {
@@ -2699,8 +2080,9 @@ mod tests {
             store.flush()?;
         }
 
-        // Inject a legacy `capability_v1` row directly, with arbitrary bytes —
-        // the migration never decodes them, it deletes the whole table.
+        // Inject legacy `capability_v1` AND `capability_v2` rows directly, with
+        // arbitrary bytes — the migration never decodes them, it deletes both
+        // whole tables.
         let path = dir.path().join(LANES_DB_FILE);
         let key = pool_signer_key_bytes(B256::repeat_byte(0x51), Address::repeat_byte(0x52));
         {
@@ -2708,8 +2090,10 @@ mod tests {
                 Database::create(&path).map_err(|e| anyhow::anyhow!("open lanes.redb raw: {e}"))?;
             let txn = db.begin_write()?;
             {
-                let mut table = txn.open_table(SUPERSEDED_CAPABILITY_TABLE)?;
-                table.insert(&key, [0xAAu8; 40].as_slice())?;
+                let mut v1 = txn.open_table(SUPERSEDED_CAPABILITY_TABLE_V1)?;
+                v1.insert(&key, [0xAAu8; 40].as_slice())?;
+                let mut v2 = txn.open_table(SUPERSEDED_CAPABILITY_TABLE_V2)?;
+                v2.insert(&key, [0xBBu8; 17].as_slice())?;
             }
             txn.commit()?;
         }
@@ -2726,10 +2110,17 @@ mod tests {
         let read_txn = db.begin_read()?;
         anyhow::ensure!(
             matches!(
-                read_txn.open_table(SUPERSEDED_CAPABILITY_TABLE),
+                read_txn.open_table(SUPERSEDED_CAPABILITY_TABLE_V1),
                 Err(redb::TableError::TableDoesNotExist(_))
             ),
             "the superseded capability_v1 table must be gone after open"
+        );
+        anyhow::ensure!(
+            matches!(
+                read_txn.open_table(SUPERSEDED_CAPABILITY_TABLE_V2),
+                Err(redb::TableError::TableDoesNotExist(_))
+            ),
+            "the superseded capability_v2 table must be gone after open"
         );
         Ok(())
     }
@@ -2834,37 +2225,38 @@ mod tests {
         Ok(())
     }
 
-    /// A corrupt capability row refuses the open, deliberately: the redeemer
-    /// must not silently miss registration material for a signer it is about to
-    /// register on-chain, and a skipped row would surface only as a reverted
-    /// `redeemMany` batch. The diagnostic names BOTH halves of the table key —
-    /// the pool alone does not identify the row an operator has to repair.
+    /// A lane record with a bad-length `owner_sig` refuses the open: the redeemer
+    /// must not submit malformed registration material to `PaymentPool.redeemMany`.
+    /// The diagnostic names the pool the operator has to repair.
     #[test]
-    fn corrupt_capability_row_refuses_the_open_and_names_the_row() -> anyhow::Result<()> {
+    fn corrupt_owner_sig_on_a_lane_refuses_the_open() -> anyhow::Result<()> {
         let dir = data_dir()?;
-        let pool_id = b256!("00000000000000000000000000000000000000000000000000000000000000c1");
-        let signer = address!("00000000000000000000000000000000000000c2");
-        let key_bytes = pool_signer_key_bytes(pool_id, signer);
+        let mut lane = sample(0xc1);
+        // A well-formed lane, then corrupt only its stored owner_sig to a length
+        // that is neither empty (None) nor 65 (Some).
+        lane.owner_sig = Some([0x11u8; 65]);
+        let key_bytes = lane_key_bytes(&lane.key());
         {
             let store = PersistentPoolStateStore::open(dir.path())?;
+            let mut stored = StoredLaneState::from(&lane);
+            stored.owner_sig = vec![0xFFu8; 3];
+            let encoded = postcard::to_allocvec(&stored)?;
             let mut tx = store.lanes_db.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
             {
-                let mut table = tx.open_table(CAPABILITY_TABLE)?;
-                // Not a `StoredCapability` postcard encoding.
-                table.insert(&key_bytes, [0xFFu8; 3].as_slice())?;
+                let mut table = tx.open_table(LANE_TABLE)?;
+                table.insert(&key_bytes, encoded.as_slice())?;
             }
             tx.commit()?;
         }
         let err = PersistentPoolStateStore::open(dir.path())
             .err()
-            .ok_or_else(|| anyhow::anyhow!("a corrupt capability row must refuse the open"))?;
+            .ok_or_else(|| anyhow::anyhow!("a corrupt owner_sig must refuse the open"))?;
         anyhow::ensure!(
             matches!(&err, StoreError::Corrupt { pool_id: Some(id), detail }
-                if *id == pool_id
-                    && detail.contains("capability postcard decode failed")
-                    && detail.contains(&signer.to_string())),
-            "expected a Corrupt naming the pool and the signer, got {err:?}",
+                if *id == lane.pool_id
+                    && detail.contains("owner capability signature is 3 bytes")),
+            "expected a Corrupt naming the pool and the owner-signature length, got {err:?}",
         );
         Ok(())
     }
@@ -3294,19 +2686,6 @@ mod tests {
                 .map(|lane| (*lane, vec![pool_tag(lane)]))
                 .collect(),
             tombstones: forgotten.iter().rev().copied().collect(),
-            // Also reversed: the capability batches sort by their own raw table
-            // key, which is what keeps `CAPABILITY_TABLE` appending rightward.
-            cap_writes: (0u8..6)
-                .rev()
-                .map(|i| {
-                    let key = pool_signer_key_bytes(B256::repeat_byte(i), Address::repeat_byte(i));
-                    (key, vec![i])
-                })
-                .collect(),
-            cap_deletes: (6u8..10)
-                .rev()
-                .map(|i| pool_signer_key_bytes(B256::repeat_byte(i), Address::repeat_byte(i)))
-                .collect(),
         };
         snapshot.sort_by_table_key();
 
@@ -3332,25 +2711,6 @@ mod tests {
                 .iter()
                 .all(|(lane, encoded)| *encoded == vec![pool_tag(lane)]),
             "every value still travels with its own key"
-        );
-        anyhow::ensure!(
-            snapshot.cap_writes.iter().map(|(key, _)| *key).is_sorted(),
-            "capability writes ascend by table key"
-        );
-        anyhow::ensure!(
-            snapshot.cap_deletes.is_sorted(),
-            "capability deletes ascend by table key"
-        );
-        anyhow::ensure!(
-            snapshot.cap_writes.len() == 6 && snapshot.cap_deletes.len() == 4,
-            "sorting the capability batches drops and duplicates nothing"
-        );
-        anyhow::ensure!(
-            snapshot
-                .cap_writes
-                .iter()
-                .all(|(key, encoded)| *encoded == vec![key.first().copied().unwrap_or_default()]),
-            "every capability value still travels with its own key"
         );
         Ok(())
     }

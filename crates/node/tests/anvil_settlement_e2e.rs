@@ -34,7 +34,8 @@
 //!    checks; the eth key signs the EIP-712 binding).
 //! 3. Bring up the seller settlement service in-process
 //!    ([`PoolSettlementService::bootstrap`] + a [`PersistentPoolStateStore`] + a
-//!    [`ClientHandler`] wired with a `capability_sink` and a chain `pool_view`)
+//!    [`ClientHandler`] wired with a chain `pool_view`; the owner-signed
+//!    capability material the redeemer needs rides each lane record)
 //!    pointed at the anvil RPC.
 //! 4. Seller path — a buyer opens a pool on-chain, runs a real iroh paid-delivery
 //!    roundtrip carrying its self-capability so a genuine voucher is produced, and
@@ -83,7 +84,7 @@ use decdn_incentive::{
 };
 use decdn_node::buyer_channel::BuyerPoolService;
 use decdn_node::chain_events::shared_head::{HeadSource, SharedHead};
-use decdn_node::channel_store::{PersistentPoolStateStore, StoredCapabilitySource};
+use decdn_node::channel_store::PersistentPoolStateStore;
 use decdn_node::client_requester::{PoolContext, stream_fetch};
 use decdn_node::metrics::Metrics;
 use decdn_node::payment_settlement::PoolSettlementService;
@@ -626,7 +627,6 @@ async fn run_e2e() -> anyhow::Result<()> {
     let pool_view = decdn_node::pool_view::PoolProjection::new();
     let handler = {
         let hint = redeem_tx.clone();
-        let cap_store = Arc::clone(&concrete_store);
         let pool_view = pool_view.clone();
         build_handler_full_configured(
             node_pub,
@@ -641,19 +641,12 @@ async fn run_e2e() -> anyhow::Result<()> {
             16,
             move |deps| {
                 deps.redeem_hint = Some(hint);
-                // Owner-signed capability intake: the serve gate persists a
-                // presented capability so the redeemer registers the signer on
-                // its first redemption.
-                deps.capability_sink =
-                    Some(cap_store as Arc<dyn decdn_node::channel_store::CapabilitySink>);
                 deps.pool_view =
                     Some(Arc::new(pool_view) as Arc<dyn decdn_node::pool_view::PoolView>);
             },
         )?
     };
 
-    let capability_source: Arc<dyn decdn_node::payment_settlement::CapabilitySource> =
-        Arc::new(StoredCapabilitySource::new(Arc::clone(&concrete_store)));
     let (service, settlement_route) = PoolSettlementService::bootstrap(
         node_provider.clone(),
         payment_pool,
@@ -661,7 +654,6 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&store),
         Arc::clone(&checkpoint_store),
         Arc::clone(&handler),
-        capability_source,
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         300,
         Duration::from_secs(300),

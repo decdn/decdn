@@ -88,6 +88,17 @@ pub struct LaneState {
     /// still live. Not replay-critical (it gates no amount/bytes monotonicity),
     /// so it is `pub` like `cap`/`expiry` rather than a private `last_*` field.
     pub registered_until: u64,
+    /// The owner's EIP-712 signature over this lane's `Capability` (`r‖s‖v`,
+    /// exactly 65 bytes), which the seller redeemer submits as the `ownerSig` of
+    /// a `PaymentPool.redeemMany` `CapabilityReg` to register the signer on its
+    /// first on-chain redemption (ADR 003 §Capability delegation). `None` until
+    /// the seller intake path verifies a grant against the pool owner and sets
+    /// it. Kept ON the lane record — not a side table — so it is written in the
+    /// same durable transaction as the voucher frontier it backs and can never
+    /// be durable-out-of-step with it. Set by trusted node-side writers (the
+    /// intake path and the on-disk decoder) like `cap`/`expiry`/`registered_until`,
+    /// not replay-critical, so it is `pub` rather than a private `last_*` field.
+    pub owner_sig: Option<[u8; 65]>,
     /// Cumulative amount of the most-recently-accepted voucher (token base
     /// units). `U256::ZERO` until the first voucher is applied. Private
     /// (#527/#751) — read via [`Self::last_amount`].
@@ -236,10 +247,11 @@ impl LaneState {
     /// not add callers without round-trip coverage that pins a signer distinct
     /// from the provider.
     ///
-    /// Hydration seeds `registered_until` to `0` (unknown) regardless of
-    /// caller-supplied `expiry`; the trusted on-disk decoder
-    /// (`StoredLaneState::into_state`) assigns the persisted value on the
-    /// returned `Self` after construction.
+    /// Hydration seeds `registered_until` to `0` (unknown) and `owner_sig` to
+    /// `None` regardless of caller-supplied `expiry`; the trusted on-disk decoder
+    /// (`StoredLaneState::into_state`) assigns the persisted values on the
+    /// returned `Self` after construction, and the seller intake path sets
+    /// `owner_sig` on the lane it registers.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn hydrate(
@@ -260,6 +272,7 @@ impl LaneState {
             cap,
             expiry,
             registered_until: 0,
+            owner_sig: None,
             last_amount,
             last_bytes_delivered,
             last_signature,

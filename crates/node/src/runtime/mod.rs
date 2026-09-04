@@ -1322,12 +1322,6 @@ async fn build_chain_and_handlers(
         bind_domain: bind_domain.clone(),
         channel_state_store: Arc::clone(&infra.channel_state_store),
         receipt_sink: Arc::clone(&infra.receipt_sink),
-        // Owner-signed capability intake (ADR 003 §Capability delegation): the
-        // serve gate persists a presented capability so the redeemer registers
-        // the signer on first redemption. Same redb file every lane record
-        // lives in.
-        capability_sink: Some(Arc::clone(&infra.concrete_channel_store)
-            as Arc<dyn crate::channel_store::CapabilitySink>),
         pool_view: Some(Arc::new(pool_view.clone()) as Arc<dyn crate::pool_view::PoolView>),
         pool_min_remaining_deposit: U256::from(
             cfg.blockchain.pool_min_remaining_deposit_micro_usdc,
@@ -1400,15 +1394,6 @@ async fn build_chain_and_handlers(
         (*infra.eth_signer).clone(),
         event_poll_interval,
     );
-    // First-redemption capability material (owner signature over the EIP-712
-    // `Capability`) for each signer, persisted by the seller voucher-intake path
-    // and read here so the redeemer can register a signer on its first redemption
-    // (ADR 003 §Capability delegation). Backed by the same redb file every other
-    // lane record lives in.
-    let capability_source: Arc<dyn crate::payment_settlement::CapabilitySource> =
-        Arc::new(crate::channel_store::StoredCapabilitySource::new(
-            Arc::clone(&infra.concrete_channel_store),
-        ));
     let (payment_service, settlement_route) = PoolSettlementService::bootstrap(
         wallet_provider,
         payment_pool_addr,
@@ -1416,7 +1401,6 @@ async fn build_chain_and_handlers(
         Arc::clone(&infra.channel_state_store),
         Arc::clone(&infra.watcher_checkpoint_store),
         Arc::clone(&client_handler),
-        capability_source,
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
         usize::try_from(cfg.blockchain.redeem_max_vouchers_per_tx).unwrap_or(usize::MAX),
         Duration::from_secs(cfg.blockchain.redeem_interval_secs),

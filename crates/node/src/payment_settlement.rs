@@ -152,42 +152,6 @@ const CHECKPOINT_FLUSH_BLOCKS: u64 = 512;
 /// re-scans when block-cadence alone would defer the write indefinitely.
 const CHECKPOINT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The owner-signed capability material a node attaches on a signer's FIRST
-/// redemption to register `authorized[poolId][signer]` on-chain. `spending_cap`
-/// and `expiry` also live on the lane's `decdn_incentive::LaneState`; `owner_sig` is the pool
-/// owner's EIP-712 signature over the capability (`r‖s‖v`, or a longer
-/// ERC-1271 payload), which the seller intake path persists when it accepts a
-/// lane's first voucher. Every later redemption for that signer omits the
-/// capability and rides the stored registration.
-#[derive(Clone, Debug)]
-pub struct CapabilityMaterial {
-    /// The signer's cumulative spending cap (token base units). A `u64`,
-    /// matching the `PaymentPool.spendingCap` calldata width — it is placed
-    /// straight into [`PaymentPool::CapabilityReg`] with no narrowing.
-    pub spending_cap: u64,
-    /// Capability expiry (Unix seconds).
-    pub expiry: u64,
-    /// The pool owner's signature over the EIP-712 `Capability`.
-    pub owner_sig: Bytes,
-}
-
-/// Source of the first-redemption registration material for a lane's signer.
-///
-/// `redeem`/`redeemMany` register a signer once, on its first redemption, from an
-/// owner-signed capability. The lane's `decdn_incentive::LaneState` carries the signer's `cap`
-/// and `expiry`, but not the owner's signature over the capability — that is
-/// persisted by the seller voucher-intake path and surfaced here so the redeemer
-/// can build the on-chain registration payload only when a signer's batched
-/// `getAuthorizations` read comes back with `cap == 0` (a lane whose persisted
-/// `registered_until` is still live skips this read, and hence never needs
-/// this material).
-pub trait CapabilitySource: Send + Sync {
-    /// The registration material for `key`'s signer, or `None` if this node holds
-    /// no capability for it (in which case an unregistered signer cannot be
-    /// redeemed and the lane is skipped until the material is available).
-    fn registration_material(&self, key: &LaneKey) -> Option<CapabilityMaterial>;
-}
-
 /// The paid-cumulative watermark of every lane, keyed by [`LaneKey`]. Written
 /// solely by the `PoolRedeemed` watcher (the single write path for the paid
 /// side, ADR 003 § Tracking owed vs. paid) and read by the redeemer to compute
@@ -248,7 +212,6 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     contract: PaymentPool::PaymentPoolInstance<P>,
     redeem_tx: mpsc::Sender<LaneKey>,
     store: Arc<dyn PoolStateStore>,
-    capabilities: Arc<dyn CapabilitySource>,
     paid: PaidWatermarks,
     self_address: Address,
     redeem_threshold: U256,
@@ -285,7 +248,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         store: Arc<dyn PoolStateStore>,
         checkpoint_store: Arc<dyn KeyedCheckpointStore>,
         handler: Arc<ClientHandler>,
-        capabilities: Arc<dyn CapabilitySource>,
         redeem_threshold: U256,
         redeem_max_vouchers_per_tx: usize,
         redeem_interval: Duration,
@@ -359,7 +321,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         let redeemer = tokio::spawn(redeemer_loop(
             contract.clone(),
             Arc::clone(&store),
-            Arc::clone(&capabilities),
             paid.clone(),
             self_address,
             redeem_threshold,
@@ -388,7 +349,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
                 contract,
                 redeem_tx,
                 store,
-                capabilities,
                 paid,
                 self_address,
                 redeem_threshold,
@@ -447,7 +407,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         redeem_sweep(
             &self.contract,
             &self.store,
-            &self.capabilities,
             &self.paid,
             self.self_address,
             self.redeem_threshold,
@@ -890,7 +849,6 @@ async fn resolve_pool_owner<P: Provider + Clone>(
 async fn redeemer_loop<P: Provider + Clone>(
     contract: PaymentPool::PaymentPoolInstance<P>,
     store: Arc<dyn PoolStateStore>,
-    capabilities: Arc<dyn CapabilitySource>,
     paid: PaidWatermarks,
     self_address: Address,
     redeem_threshold: U256,
@@ -909,7 +867,7 @@ async fn redeemer_loop<P: Provider + Clone>(
             hint = redeem_rx.recv() => match hint {
                 Some(key) => {
                     redeem_one(
-                        &contract, &store, &capabilities, &paid, self_address,
+                        &contract, &store, &paid, self_address,
                         redeem_threshold, max_vouchers, key, &metrics, &pool_view,
                     )
                     .await;
@@ -919,7 +877,7 @@ async fn redeemer_loop<P: Provider + Clone>(
             },
             _ = ticker.tick() => {
                 redeem_sweep(
-                    &contract, &store, &capabilities, &paid, self_address,
+                    &contract, &store, &paid, self_address,
                     redeem_threshold, max_vouchers, true, &metrics, &pool_view,
                 )
                 .await;
@@ -1073,10 +1031,10 @@ enum RegistrationStatus {
 /// resolves the registration status first (batched chain read or the
 /// persisted `registered_until` watermark). Returns `Ok(None)` when the lane
 /// is not this node's, has no signed voucher, has nothing unredeemed, or is
-/// an unregistered signer for which this node holds no capability material.
+/// an unregistered signer whose lane carries no owner-signed capability material
+/// (`owner_sig`).
 fn plan_lane(
     st: &LaneState,
-    capabilities: &Arc<dyn CapabilitySource>,
     paid: &PaidWatermarks,
     self_address: Address,
     status: &RegistrationStatus,
@@ -1116,19 +1074,26 @@ fn plan_lane(
 
     let register = match status {
         RegistrationStatus::Fetched(auth) if auth.cap == 0 => {
-            let Some(material) = capabilities.registration_material(&key) else {
+            let Some(owner_sig) = st.owner_sig else {
                 warn!(
                     pool_id = %key.pool_id,
                     signer = %key.signer,
-                    "signer not registered on-chain and no capability held; skipping redemption"
+                    "signer not registered on-chain and the lane carries no owner-signed \
+                     capability (owner_sig); skipping redemption until the client re-sends \
+                     its capability"
                 );
                 return Ok(None);
             };
+            // Every field of the registration payload comes off the lane record
+            // itself — the same durable row as the frontier being redeemed — so a
+            // lane the redeemer can weigh always carries the material to register
+            // its signer (#1906). `cap` recovers the `u64` spending cap the intake
+            // path zero-extended into the lane's `U256`.
             Some(PaymentPool::CapabilityReg {
                 signer: key.signer,
-                spendingCap: material.spending_cap,
-                expiry: material.expiry,
-                ownerSig: material.owner_sig,
+                spendingCap: to_pool_u64(st.cap, "capability spending cap")?,
+                expiry: st.expiry,
+                ownerSig: Bytes::from(owner_sig.to_vec()),
             })
         }
         RegistrationStatus::Registered | RegistrationStatus::Fetched(_) => None,
@@ -1207,7 +1172,6 @@ async fn batched_authorizations<P: Provider + Clone>(
 async fn plan_lanes<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
-    capabilities: &Arc<dyn CapabilitySource>,
     paid: &PaidWatermarks,
     self_address: Address,
     states: Vec<LaneState>,
@@ -1266,7 +1230,7 @@ async fn plan_lanes<P: Provider + Clone>(
                 None => continue, // read failed/omitted; defer to the next sweep
             }
         };
-        match plan_lane(st, capabilities, paid, self_address, &reg_status) {
+        match plan_lane(st, paid, self_address, &reg_status) {
             Ok(Some(lane)) => plans.push(lane),
             Ok(None) => {}
             Err(err) => {
@@ -1285,7 +1249,6 @@ async fn plan_lanes<P: Provider + Clone>(
 async fn redeem_one<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
-    capabilities: &Arc<dyn CapabilitySource>,
     paid: &PaidWatermarks,
     self_address: Address,
     floor: U256,
@@ -1306,7 +1269,6 @@ async fn redeem_one<P: Provider + Clone>(
     let plans = plan_lanes(
         contract,
         store,
-        capabilities,
         paid,
         self_address,
         vec![st],
@@ -1328,7 +1290,6 @@ async fn redeem_one<P: Provider + Clone>(
 async fn redeem_sweep<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
-    capabilities: &Arc<dyn CapabilitySource>,
     paid: &PaidWatermarks,
     self_address: Address,
     floor: U256,
@@ -1347,7 +1308,6 @@ async fn redeem_sweep<P: Provider + Clone>(
     let plans = plan_lanes(
         contract,
         store,
-        capabilities,
         paid,
         self_address,
         states,
@@ -1862,9 +1822,9 @@ mod tests {
     #[test]
     fn partition_keeps_redeemable_and_counts_skips() {
         // pool 1: open+funded (keep), pool 2: open+drained (skip), pool 3: unknown (keep, fail open)
-        let s1 = signed_lane_state(1, 10, 20);
-        let s2 = signed_lane_state(2, 11, 20);
-        let s3 = signed_lane_state(3, 12, 20);
+        let s1 = signed_lane_state(1, 10, 20, None);
+        let s2 = signed_lane_state(2, 11, 20, None);
+        let s3 = signed_lane_state(3, 12, 20, None);
         let mut snap: HashMap<PoolId, Option<PoolStatus>> = HashMap::new();
         snap.insert(s1.pool_id, Some(status(500, Lifecycle::Open)));
         snap.insert(s2.pool_id, Some(status(0, Lifecycle::Open)));
@@ -2225,40 +2185,29 @@ mod tests {
         assert!(super::is_registered(1001, 1000), "live");
     }
 
-    /// A [`CapabilitySource`] test double: returns fixed material for a set of
-    /// keys, `None` for everything else.
-    struct FixedCapabilitySource {
-        material: Option<CapabilityMaterial>,
-    }
-
-    impl CapabilitySource for FixedCapabilitySource {
-        fn registration_material(&self, _key: &LaneKey) -> Option<CapabilityMaterial> {
-            self.material.clone()
-        }
-    }
-
     /// A lane with a signed voucher and non-zero owed amount, ready for
-    /// `plan_lane` tests.
-    fn signed_lane_state(pool: u8, signer: u8, provider: u8) -> LaneState {
-        LaneState::hydrate(
+    /// `plan_lane` tests. `owner_sig` is the lane's own registration material —
+    /// `Some` for a lane whose intake verified an owner grant, `None` for one
+    /// that never captured one.
+    fn signed_lane_state(
+        pool: u8,
+        signer: u8,
+        provider: u8,
+        owner_sig: Option<[u8; 65]>,
+    ) -> LaneState {
+        let mut st = LaneState::hydrate(
             PoolId::from([pool; 32]),
             Address::from([signer; 20]),
             Address::from([provider; 20]),
             U256::from(10_000_000u64),
-            0,
+            1_800_000_000,
             U256::from(1_000u64),
             U256::from(1_048_576u64),
             Some(sig_with_v(0)),
             decdn_incentive::LaneChain::NONE,
-        )
-    }
-
-    fn material() -> CapabilityMaterial {
-        CapabilityMaterial {
-            spending_cap: 1_000_000u64,
-            expiry: 1_800_000_000,
-            owner_sig: Bytes::from(vec![9u8; 65]),
-        }
+        );
+        st.owner_sig = owner_sig;
+        st
     }
 
     fn auth(cap: u64, expiry: u64) -> PaymentPool::Authorization {
@@ -2271,13 +2220,10 @@ mod tests {
 
     #[test]
     fn plan_lane_registered_status_skips_read_and_omits_capability_reg() -> Result<()> {
-        let st = signed_lane_state(1, 10, 20);
-        let capabilities: Arc<dyn CapabilitySource> =
-            Arc::new(FixedCapabilitySource { material: None });
+        let st = signed_lane_state(1, 10, 20, None);
         let paid = PaidWatermarks::default();
         let plan = plan_lane(
             &st,
-            &capabilities,
             &paid,
             Address::from([20u8; 20]),
             &RegistrationStatus::Registered,
@@ -2293,23 +2239,20 @@ mod tests {
 
     #[test]
     fn plan_lane_fetched_unregistered_with_material_attaches_registration() -> Result<()> {
-        let st = signed_lane_state(1, 11, 21);
-        let capabilities: Arc<dyn CapabilitySource> = Arc::new(FixedCapabilitySource {
-            material: Some(material()),
-        });
+        let st = signed_lane_state(1, 11, 21, Some(sig_with_v(1)));
         let paid = PaidWatermarks::default();
         let status = RegistrationStatus::Fetched(auth(0, 0));
-        let plan = plan_lane(
-            &st,
-            &capabilities,
-            &paid,
-            Address::from([21u8; 20]),
-            &status,
-        )?
-        .ok_or_else(|| anyhow::anyhow!("unregistered lane with held material should plan"))?;
-        assert!(
-            plan.register.is_some(),
-            "cap==0 + material attaches a CapabilityReg"
+        let plan = plan_lane(&st, &paid, Address::from([21u8; 20]), &status)?
+            .ok_or_else(|| anyhow::anyhow!("unregistered lane with held material should plan"))?;
+        let reg = plan
+            .register
+            .ok_or_else(|| anyhow::anyhow!("cap==0 + owner_sig attaches a CapabilityReg"))?;
+        assert_eq!(reg.signer, st.signer, "reg names the lane's signer");
+        assert_eq!(reg.expiry, st.expiry, "reg carries the lane's expiry");
+        assert_eq!(
+            reg.ownerSig.as_ref(),
+            sig_with_v(1).as_slice(),
+            "reg carries the lane's own owner signature"
         );
         assert_eq!(plan.key, st.key());
         Ok(())
@@ -2317,37 +2260,25 @@ mod tests {
 
     #[test]
     fn plan_lane_fetched_unregistered_without_material_is_skipped() -> Result<()> {
-        let st = signed_lane_state(1, 12, 22);
-        let capabilities: Arc<dyn CapabilitySource> =
-            Arc::new(FixedCapabilitySource { material: None });
+        let st = signed_lane_state(1, 12, 22, None);
         let paid = PaidWatermarks::default();
         let status = RegistrationStatus::Fetched(auth(0, 0));
-        let plan = plan_lane(
-            &st,
-            &capabilities,
-            &paid,
-            Address::from([22u8; 20]),
-            &status,
-        )?;
-        assert!(plan.is_none(), "no material and cap==0 skips the lane");
+        let plan = plan_lane(&st, &paid, Address::from([22u8; 20]), &status)?;
+        assert!(
+            plan.is_none(),
+            "no owner_sig on the lane and cap==0 skips the lane"
+        );
         Ok(())
     }
 
     #[test]
     fn plan_lane_fetched_already_registered_omits_registration() -> Result<()> {
-        let st = signed_lane_state(1, 13, 23);
-        let capabilities: Arc<dyn CapabilitySource> =
-            Arc::new(FixedCapabilitySource { material: None });
+        let st = signed_lane_state(1, 13, 23, None);
         let paid = PaidWatermarks::default();
         let status = RegistrationStatus::Fetched(auth(5_000_000, 1_800_000_000));
-        let plan = plan_lane(
-            &st,
-            &capabilities,
-            &paid,
-            Address::from([23u8; 20]),
-            &status,
-        )?
-        .ok_or_else(|| anyhow::anyhow!("already-registered lane with owed balance should plan"))?;
+        let plan = plan_lane(&st, &paid, Address::from([23u8; 20]), &status)?.ok_or_else(|| {
+            anyhow::anyhow!("already-registered lane with owed balance should plan")
+        })?;
         assert!(
             plan.register.is_none(),
             "cap!=0 rides the existing registration; no CapabilityReg attached"
