@@ -393,9 +393,7 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
                 swapRouter: address(0x8081),
                 pool: address(0), // created by `_activateBalancer`; prefilling is rejected
                 vault: address(0xA017),
-                permit2: BuybackVenueLib.CANONICAL_PERMIT2,
-                subSwapCount: 4,
-                subSwapMinBlockGap: 10
+                permit2: BuybackVenueLib.CANONICAL_PERMIT2
             })
         });
         act.seed = _derivePoolSeed(BuybackVenueLib.Venue.BALANCER, USDC_SEED, TARGET_PRICE);

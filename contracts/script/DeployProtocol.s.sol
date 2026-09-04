@@ -257,8 +257,6 @@ contract DeployProtocol is BaseProtocolDeploy {
     //     - `BALANCER_ROUTER`, `BALANCER_VAULT` (required)
     //     - `PERMIT2_ADDRESS`            (default canonical Permit2)
     //     - `BALANCER_SWAP_FEE`          (default 1e16 = 1%)
-    //     - `SUB_SWAP_COUNT`             (default 4)
-    //     - `SUB_SWAP_MIN_BLOCK_GAP`     (default 10)
     error PoolFeeOutOfRange(uint256 fee);
 
     function _readBuybackActivation() internal view returns (BuybackActivation memory act) {
@@ -305,9 +303,7 @@ contract DeployProtocol is BaseProtocolDeploy {
                 swapRouter: vm.envAddress("BALANCER_ROUTER"),
                 pool: address(0),
                 vault: vm.envAddress("BALANCER_VAULT"),
-                permit2: vm.envOr("PERMIT2_ADDRESS", BuybackVenueLib.CANONICAL_PERMIT2),
-                subSwapCount: vm.envOr("SUB_SWAP_COUNT", uint256(4)),
-                subSwapMinBlockGap: vm.envOr("SUB_SWAP_MIN_BLOCK_GAP", uint256(10))
+                permit2: vm.envOr("PERMIT2_ADDRESS", BuybackVenueLib.CANONICAL_PERMIT2)
             });
         }
     }

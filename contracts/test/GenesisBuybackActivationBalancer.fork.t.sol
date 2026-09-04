@@ -125,12 +125,7 @@ contract GenesisBuybackActivationBalancerForkTest is Test, BaseProtocolDeploy {
             swapFee: 1e16, // 1%
             // `pool` is filled by `_activateBalancer` once the factory creates it.
             wiring: BuybackVenueLib.BalancerWiring({
-                swapRouter: ROUTER,
-                pool: address(0),
-                vault: VAULT,
-                permit2: PERMIT2,
-                subSwapCount: 4,
-                subSwapMinBlockGap: 10
+                swapRouter: ROUTER, pool: address(0), vault: VAULT, permit2: PERMIT2
             })
         });
         act.seed = _derivePoolSeed(BuybackVenueLib.Venue.BALANCER, USDC_SEED, TARGET_PRICE);

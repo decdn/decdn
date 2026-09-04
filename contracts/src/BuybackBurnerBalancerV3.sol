@@ -36,16 +36,6 @@ contract BuybackBurnerBalancerV3 is GuardedBuybackBurner {
     // Immutables
     // -----------------------------------------------------------------
 
-    /// @notice TWAP sub-swap calibration for the off-chain keeper (ADR 018
-    ///         § TWAP policy). The contract performs exactly one Router swap per
-    ///         `executeBuyback` call — the sub-swap cadence (spacing, count) is
-    ///         a keeper concern across multiple calls; these are stored only for
-    ///         keeper introspection / event-log correlation.
-    // forge-lint: disable-next-line(screaming-snake-case-immutable)
-    uint256 public immutable subSwapCount;
-    // forge-lint: disable-next-line(screaming-snake-case-immutable)
-    uint256 public immutable subSwapMinBlockGap;
-
     /// @notice Uniswap Permit2 — the Balancer V3 Router's token-pull authority.
     ///         A V3 Router pulls `tokenIn` via `permit2.transferFrom`, so the
     ///         swap authorizes it through Permit2 (ERC20-approve Permit2 + a
@@ -100,8 +90,6 @@ contract BuybackBurnerBalancerV3 is GuardedBuybackBurner {
         address pool_;
         address vault_;
         address permit2_;
-        uint256 subSwapCount_;
-        uint256 subSwapMinBlockGap_;
         uint256 twapMinWindow_;
         uint256 maxBuybackAmount_;
         uint256 minBuybackAmount_;
@@ -130,8 +118,6 @@ contract BuybackBurnerBalancerV3 is GuardedBuybackBurner {
         permit2 = IPermit2(cfg.permit2_);
         balancerPool = cfg.pool_;
         balancerVault = cfg.vault_;
-        subSwapCount = cfg.subSwapCount_;
-        subSwapMinBlockGap = cfg.subSwapMinBlockGap_;
 
         // Fail-fast on a pool/vault supplied at deploy (issue #968): a `Config`
         // that wires both must reference a Vault-registered pool containing at

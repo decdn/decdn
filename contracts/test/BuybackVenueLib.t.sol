@@ -72,8 +72,7 @@ contract BuybackVenueLibTest is Test {
     ///         factory, vault or pool — and because the library is the seam that gives
     ///         `ActivateBuyback` the same protection the genesis path gets.
     function test_balancerBurner_rejectsIncompleteWiring() public {
-        string[5] memory fields =
-            ["balancer.swapRouter", "balancer.pool", "balancer.vault", "balancer.permit2", "balancer.subSwapCount"];
+        string[4] memory fields = ["balancer.swapRouter", "balancer.pool", "balancer.vault", "balancer.permit2"];
         for (uint256 i = 0; i < fields.length; i++) {
             vm.expectRevert(abi.encodeWithSelector(BuybackVenueLib.WiringIncomplete.selector, fields[i]));
             harness.requireBalancer(_wiringWithFieldCleared(i), _liveGuard());
@@ -123,9 +122,7 @@ contract BuybackVenueLibTest is Test {
             swapRouter: address(0x8081),
             pool: address(0xB001),
             vault: address(0xA017),
-            permit2: BuybackVenueLib.CANONICAL_PERMIT2,
-            subSwapCount: 4,
-            subSwapMinBlockGap: 10
+            permit2: BuybackVenueLib.CANONICAL_PERMIT2
         });
     }
 
@@ -135,8 +132,7 @@ contract BuybackVenueLibTest is Test {
         if (i == 0) w.swapRouter = address(0);
         else if (i == 1) w.pool = address(0);
         else if (i == 2) w.vault = address(0);
-        else if (i == 3) w.permit2 = address(0);
-        else w.subSwapCount = 0;
+        else w.permit2 = address(0);
     }
 
     /// @notice The Permit2 default every Balancer seed approves through when

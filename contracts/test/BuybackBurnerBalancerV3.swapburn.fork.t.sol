@@ -119,8 +119,6 @@ contract BuybackBurnerBalancerV3SwapBurnForkTest is Test {
             pool_: pool,
             vault_: VAULT,
             permit2_: PERMIT2,
-            subSwapCount_: 4,
-            subSwapMinBlockGap_: 1,
             twapMinWindow_: 30 minutes,
             maxBuybackAmount_: 1_000_000e6,
             minBuybackAmount_: 1e6,
