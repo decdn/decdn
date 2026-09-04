@@ -468,6 +468,7 @@ pub(crate) async fn probe_and_order(
                 coverage: resp_ext.coverage.clone(),
             });
         } else {
+            probed_samples.push((cand.node_id, rtt_ms, resp.body.rate_per_mb));
             non_holders.push(discovery::WarmingCandidate {
                 node_id: cand.node_id,
                 eth_address: cand.eth_address,
