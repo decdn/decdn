@@ -655,6 +655,18 @@ async fn discover_provider(
     // parameters (clippy caps this function at 7).
     args: &cli::ClientFetchArgs,
 ) -> anyhow::Result<ResolvedTargets> {
+    // Probe-less fast path (Task 7): when the store already holds enough fresh,
+    // unsuppressed candidates, skip the network probe round entirely and rank
+    // by the store's own EWMA latency. Falls through to today's bootstrap +
+    // probe path whenever the store can't back a full candidate set — never a
+    // new failure mode, only a possible extra probe round.
+    let peer_store = decdn_client_pull::PeerStore::open(&chain.data_dir);
+    let store_cfg = decdn_client_pull::StoreConfig::default();
+    if let Some(targets) =
+        store_fast_path(&peer_store, &store_cfg, args.max_sources, now_secs_cli())
+    {
+        return Ok(targets);
+    }
     let bootstrap = discovery::bootstrap_nodes(
         &chain.rpc_url,
         capacity_bond,
@@ -689,6 +701,50 @@ async fn discover_provider(
         targets.probed_samples.clone(),
     ));
     Ok(targets)
+}
+
+/// Build a probe-less [`ResolvedTargets`] straight from the peer store (Task
+/// 7): rank every [`decdn_client_pull::PeerRecord::selectable`] record by its
+/// EWMA `latency_ms` (ascending, `None` sorts last), project each back to a
+/// [`NodeCandidate`], and admit per-operator via
+/// [`discovery::admit_sources`]. Returns `None` when fewer than
+/// `cfg.min_fresh_candidates` records are selectable, or when admission still
+/// leaves the set below that floor — either way the caller falls back to the
+/// probe path unchanged. Takes no [`Endpoint`], so it structurally issues no
+/// network probe.
+fn store_fast_path(
+    store: &decdn_client_pull::PeerStore,
+    cfg: &decdn_client_pull::StoreConfig,
+    max_sources: usize,
+    now_secs: u64,
+) -> Option<ResolvedTargets> {
+    let mut fresh: Vec<_> = store
+        .load_all()
+        .into_iter()
+        .filter(|r| r.selectable(now_secs, cfg))
+        .collect();
+    if fresh.len() < cfg.min_fresh_candidates {
+        return None;
+    }
+    fresh.sort_by(|a, b| {
+        a.latency_ms
+            .unwrap_or(f64::MAX)
+            .total_cmp(&b.latency_ms.unwrap_or(f64::MAX))
+    });
+    let ordered: Vec<NodeCandidate> = fresh
+        .iter()
+        .map(decdn_client_pull::PeerRecord::as_candidate)
+        .collect();
+    let candidates = discovery::admit_sources(ordered, max_sources);
+    if candidates.len() < cfg.min_fresh_candidates {
+        return None;
+    }
+    Some(ResolvedTargets {
+        candidates,
+        size_hint: None,
+        coverage_by_node: HashMap::new(),
+        probed_samples: Vec::new(),
+    })
 }
 
 /// Persist a discovery session's identity + probe stats off the fetch's
@@ -2800,6 +2856,48 @@ mod tests {
         let r = store.get(&harvest_key(1)).expect("probed peer persisted");
         assert_eq!(r.latency_ms, Some(42.0));
         assert_eq!(r.rate_per_mb, Some(9));
+    }
+
+    /// `store_fast_path` ranks selectable records by latency and excludes a
+    /// suppressed one, and refuses to engage below `min_fresh_candidates`.
+    /// It takes no [`Endpoint`], so it structurally cannot issue a network
+    /// probe — this is the probe-less fast path itself, not merely tested
+    /// without one.
+    #[test]
+    fn fast_path_needs_min_fresh_and_ranks_by_latency() -> anyhow::Result<()> {
+        let cfg = decdn_client_pull::StoreConfig::default();
+        let dir = tempfile::tempdir()?;
+        let store = decdn_client_pull::PeerStore::open(dir.path());
+        let now = 10_000;
+        for (b, lat) in [(1u8, 80.0), (2, 20.0), (3, 50.0)] {
+            store.upsert_identity(&harvest_candidate(b), now)?;
+            store.record_sample(&harvest_key(b), lat, 1, now, &cfg)?;
+        }
+        // A fourth, freshly-failed record: selectable would otherwise admit it,
+        // but the failure suppression must exclude it.
+        store.upsert_identity(&harvest_candidate(9), now)?;
+        store.record_sample(&harvest_key(9), 5.0, 1, now, &cfg)?;
+        store.record_failure(&harvest_key(9), now)?;
+
+        let targets = store_fast_path(&store, &cfg, 4, now)
+            .ok_or_else(|| anyhow::anyhow!("expected Some"))?;
+        assert_eq!(targets.candidates.len(), 3);
+        assert_eq!(targets.candidates[0].node_id, harvest_key(2)); // lowest latency first
+        assert_eq!(targets.candidates[1].node_id, harvest_key(3));
+        assert_eq!(targets.candidates[2].node_id, harvest_key(1));
+        assert!(targets.coverage_by_node.is_empty());
+        assert!(targets.probed_samples.is_empty());
+        assert!(targets.size_hint.is_none());
+
+        // Only two selectable records -> below min_fresh_candidates -> None.
+        let dir2 = tempfile::tempdir()?;
+        let s2 = decdn_client_pull::PeerStore::open(dir2.path());
+        for b in [1u8, 2] {
+            s2.upsert_identity(&harvest_candidate(b), now)?;
+            s2.record_sample(&harvest_key(b), 30.0, 1, now, &cfg)?;
+        }
+        assert!(store_fast_path(&s2, &cfg, 4, now).is_none());
+        Ok(())
     }
 
     fn ctx_with(binding: Option<decdn_protocol::client::ClientBinding>) -> PoolContext {
