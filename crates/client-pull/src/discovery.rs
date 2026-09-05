@@ -371,32 +371,51 @@ fn resolve_bootstrap(
             // fetch that already succeeded — the store is a fallback, not the
             // source of truth for a live read. An empty read touches nothing:
             // an emptied registry is not a reason to prune or discard the
-            // last known-good identities.
+            // last known-good identities. The first write failure is still
+            // carried on the return value so a degraded store is visible to
+            // the caller instead of failing silently.
+            let mut store_warning = None;
             if !peers.is_empty() {
                 for cand in &peers {
-                    let _ = store.upsert_identity(cand, now);
+                    if let Err(e) = store.upsert_identity(cand, now) {
+                        store_warning.get_or_insert_with(|| e.to_string());
+                    }
                 }
-                let _ = store.prune_and_cap(now, &cfg);
+                if let Err(e) = store.prune_and_cap(now, &cfg) {
+                    store_warning.get_or_insert_with(|| e.to_string());
+                }
             }
-            return Ok(Bootstrap::Live { peers });
+            return Ok(Bootstrap::Live {
+                peers,
+                store_warning,
+            });
         }
         Err(e) => e,
     };
-    let cached: Vec<NodeCandidate> = store
-        .load_all()
+    let records = store.load_all();
+    // The staleness of the fallback identities, computed from the store
+    // records before they are projected down to `NodeCandidate`s below —
+    // `as_candidate` drops `identity_seen_at_secs`.
+    let oldest_identity_secs = records
+        .iter()
+        .filter(|r| !r.identity_prunable(now, &cfg))
+        .map(|r| r.identity_seen_at_secs)
+        .min();
+    let cached: Vec<NodeCandidate> = records
         .into_iter()
         .filter(|r| !r.identity_prunable(now, &cfg))
         .map(|r| r.as_candidate())
         .collect();
-    if cached.is_empty() {
+    let Some(oldest_identity_secs) = oldest_identity_secs else {
         return Err(err.context(BOOTSTRAP_UNREACHABLE));
-    }
+    };
     Ok(Bootstrap::Cached {
         peers: cached,
         // Sanitized `{err:#}`, not `%err`: plain Display on an
         // `anyhow::Error` renders only the outermost context and drops the
         // reason the registry read actually failed.
         registry_error: sanitize_err_chain(&err),
+        oldest_identity_secs,
     })
 }
 
@@ -413,6 +432,12 @@ pub enum Bootstrap {
     Live {
         /// The peers the registry returned.
         peers: Vec<NodeCandidate>,
+        /// The first peer-store write error hit while refreshing identities
+        /// or pruning, if any. The fetch itself never fails on this — the
+        /// store is best-effort — but a persistent write failure degrades
+        /// the next run's fallback and selection, so it is surfaced here
+        /// rather than swallowed.
+        store_warning: Option<String>,
     },
     /// The registry could not be read; these peers came from the peer store.
     Cached {
@@ -420,7 +445,26 @@ pub enum Bootstrap {
         peers: Vec<NodeCandidate>,
         /// Why the registry read failed, sanitized for display.
         registry_error: String,
+        /// Seconds since the Unix epoch when the stalest identity among
+        /// `peers` was last confirmed against the registry — the minimum
+        /// `identity_seen_at_secs` across the fallback set, so it bounds how
+        /// old the least-fresh record in the set may be.
+        oldest_identity_secs: u64,
     },
+}
+
+/// Render a duration in seconds as a coarse, human-readable age: seconds
+/// under a minute, minutes under an hour, hours under a day, else days.
+fn format_age_secs(age_secs: u64) -> String {
+    if age_secs < 60 {
+        format!("{age_secs}s")
+    } else if age_secs < 3_600 {
+        format!("{}m", age_secs / 60)
+    } else if age_secs < 86_400 {
+        format!("{}h", age_secs / 3_600)
+    } else {
+        format!("{}d", age_secs / 86_400)
+    }
 }
 
 impl Bootstrap {
@@ -429,16 +473,24 @@ impl Bootstrap {
     #[must_use]
     pub fn warning(&self) -> Option<String> {
         match self {
-            Self::Live { .. } => None,
+            Self::Live { store_warning, .. } => store_warning.as_ref().map(|e| {
+                format!(
+                    "warning: peer store write failed: {e} (selection may be degraded next run)"
+                )
+            }),
             Self::Cached {
                 peers,
                 registry_error,
-            } => Some(format!(
-                "warning: could not reach the node registry ({registry_error}); using {} \
-                 previously known node(s) from the local peer store. These nodes may have been \
-                 deactivated or slashed since.",
-                peers.len()
-            )),
+                oldest_identity_secs,
+            } => {
+                let age = format_age_secs(now_secs().saturating_sub(*oldest_identity_secs));
+                Some(format!(
+                    "warning: could not reach the node registry ({registry_error}); using {} \
+                     previously known node(s) from the local peer store, identity up to {age} \
+                     old. These nodes may have been deactivated or slashed since.",
+                    peers.len()
+                ))
+            }
         }
     }
 
@@ -446,7 +498,7 @@ impl Bootstrap {
     #[must_use]
     pub fn into_peers(self) -> Vec<NodeCandidate> {
         match self {
-            Self::Live { peers } | Self::Cached { peers, .. } => peers,
+            Self::Live { peers, .. } | Self::Cached { peers, .. } => peers,
         }
     }
 }
@@ -1340,12 +1392,39 @@ mod tests {
             "the warning names the cause, not just the symptom: {warning}"
         );
         assert!(warning.contains("deactivated or slashed"));
+        assert!(
+            warning.contains("identity up to"),
+            "the warning names the staleness of the fallback identities: {warning}"
+        );
         assert!(matches!(&out, Bootstrap::Cached { .. }));
         let mut got = out.into_peers();
         let mut want = peers;
         got.sort_by_key(|c| c.node_id);
         want.sort_by_key(|c| c.node_id);
         assert_eq!(got, want);
+    }
+
+    /// ADR 012 requires the cached-fallback warning to say how old the
+    /// identities it serves are (§ Bootstrap, step 7). Seed a record whose
+    /// identity was last confirmed hours ago and check the warning reports
+    /// that age, not just that the fallback happened.
+    #[test]
+    fn registry_failure_warning_reports_identity_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_secs();
+        let stale_secs = 3 * 3_600; // 3 hours old
+        seed_store(
+            dir.path(),
+            &[candidate(9, "JP")],
+            now.saturating_sub(stale_secs),
+        );
+
+        let out = resolve_bootstrap(Err(anyhow::anyhow!("rpc down")), dir.path()).unwrap();
+        let warning = out.warning().unwrap();
+        assert!(
+            warning.contains("identity up to 3h old") || warning.contains("identity up to 2h old"),
+            "the warning reports a coarse age around the seeded staleness: {warning}"
+        );
     }
 
     /// Identity past the prune horizon is dropped from the fallback set — a

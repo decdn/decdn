@@ -155,6 +155,11 @@ impl PeerStore {
     }
 
     /// Read every valid record, skipping files that do not parse.
+    ///
+    /// A per-file read or decode error is logged via `tracing::warn!` and the
+    /// file is skipped — one torn record must not take down the whole store,
+    /// but a wholesale-unreadable store still shows up in logs instead of
+    /// silently returning an empty peer set.
     #[must_use]
     pub fn load_all(&self) -> Vec<PeerRecord> {
         let mut out = Vec::new();
@@ -166,10 +171,26 @@ impl PeerStore {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(bytes) = std::fs::read(&path)
-                && let Ok(rec) = serde_json::from_slice::<PeerRecord>(&bytes)
-            {
-                out.push(rec);
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "peer store: ignoring unreadable record"
+                    );
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<PeerRecord>(&bytes) {
+                Ok(rec) => out.push(rec),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "peer store: ignoring unreadable record"
+                    );
+                }
             }
         }
         out
