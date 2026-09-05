@@ -32,8 +32,7 @@ pub use key_gen::KeyGenArgs;
 pub use node::{
     BondArgs, ChainArgs, DeregisterArgs, DoctorArgs, DrainArgs, EvictArgs, HealthArgs, LanesArgs,
     LookupArgs, NodeArgs, NodeCommand, RegisterArgs, ReloadArgs, RotateKeyArgs, RotateKeyTarget,
-    SlashesArgs, StatusArgs, SwapVenueArg, TopArgs, UnbondArgs, UpdateMultiaddrsArgs,
-    UpdateRegionArgs,
+    SlashesArgs, StatusArgs, TopArgs, UnbondArgs, UpdateMultiaddrsArgs, UpdateRegionArgs,
 };
 pub use origin::{OriginArgs, OriginCommand, OriginImportArgs};
 pub use pool::{
@@ -46,7 +45,7 @@ pub use publish::{
     PublishChainArgs, PublishCommand, RevokeArgs,
 };
 pub use run::RunArgs;
-pub use setup::{PayBondWith, SetupArgs};
+pub use setup::SetupArgs;
 
 use std::path::PathBuf;
 

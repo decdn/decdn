@@ -654,10 +654,8 @@ fn render_blockchain_section(chain: &known_chains::KnownChain) -> anyhow::Result
          publisher_registry_address = \"{publisher_registry}\"\n\
          slash_appeal_address       = \"{slash_appeal}\"\n\
          usdc_address               = \"{usdc}\"\n\
-         # Optional tuning knobs (economics, poll intervals) and the DEX swap_*\n\
-         # keys for `decdn setup --pay-bond-with usdc` are commented in the blank\n\
-         # template — see `decdn config init --chain none`. Swap addresses are\n\
-         # venue-specific and are not baked in.\n\
+         # Optional tuning knobs (economics, poll intervals) are commented in the\n\
+         # blank template — see `decdn config init --chain none`.\n\
          \n",
         label = chain.label,
         chain_id = chain.chain_id,
@@ -883,7 +881,7 @@ const CLIENT_CONFIG: &str = r#"# deCDN client configuration — fetch-only consu
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # eth_keystore = "~/.decdn/keystore.json"   # defaults to <data_dir>/keystore.json; create with `decdn key-gen`
 # payment_pool_address = ""          # REQUIRED: 0x-prefixed hex; pool the client opens payment channels through
-# usdc_address = ""                  # USDC token deposits spend; also required for `decdn setup` swaps
+# usdc_address = ""                  # USDC settlement token deposits spend
 # buyer_working_deposit_micro_usdc = 10000000  # deposit when OPENING a pool and refill target; must be > 0; default 10 USDC
 # buyer_max_approve = false          # exact deposit-sized USDC approvals (client default); true opts into an unlimited standing approval
 "#;
@@ -956,17 +954,11 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # pool_floor_signer_live_windows = 8              # per-signer LIVE concurrency cap k, in ramp-start credit windows: the most live un-vouchered floor reservation one capability signer may hold against a pool, k × one window (ADR 003 § Pool solvency); recycles as streams pay; lower-clamped to one window; default 8
 # pool_floor_signer_bucket_windows = 8            # per-signer abandonment-bucket capacity, in ramp-start credit windows: the un-recouped floor a signer may drain from its node-local refilling allowance before this node soft-throttles it (ADR 003 § Pool solvency); a burst of abandons trips it, a paid stream costs nothing; lower-clamped to one window; default 8
 # pool_floor_signer_refill_secs = 60              # seconds to refill one window of the per-signer abandonment bucket (ADR 003 § Pool solvency); faster refill forgives bursts sooner; lower-clamped to one second; default 60
-# CLI-only [blockchain] keys — consumed by `decdn setup` / `decdn appeal`, NOT the daemon.
+# CLI-only [blockchain] keys — consumed by `decdn appeal` / the client, NOT the daemon.
 # They live here because [blockchain] denies unknown fields and a node's node.toml is
 # shared with those CLIs, so a config that drives them must still pass `config validate`.
 # slash_appeal_address = ""          # `decdn appeal slash` target (ADR 028)
-# swap_venue = "uniswap-v3"          # `decdn setup --pay-bond-with usdc` venue: uniswap-v3 | balancer-v3
-# swap_router_address = ""           # router for swap_venue (Uniswap SwapRouter02 / Balancer V3 Router); required when swap_venue is set
-# swap_quoter_address = ""           # Uniswap QuoterV2 (Uniswap venue only)
-# usdc_address = ""                  # USDC token the swap spends; required when swap_venue is set
-# swap_fee_tier = 3000               # Uniswap V3 pool fee tier, e.g. 500/3000/10000 (Uniswap venue only)
-# swap_balancer_pool = ""            # Balancer V3 pool address (Balancer venue only)
-# swap_pool_address = ""             # Uniswap V3 TOKEN/USDC pool for the advisory price-impact check (optional)
+# usdc_address = ""                  # USDC settlement token clients spend on pool deposits (client resolves it from PaymentPool.usdc() at runtime)
 
 [cache]
 # cache_dir = "~/.decdn/cache"
@@ -1220,13 +1212,7 @@ mod tests {
             pool_floor_signer_live_windows,
             pool_floor_signer_bucket_windows,
             pool_floor_signer_refill_secs,
-            swap_venue,
-            swap_router_address,
-            swap_quoter_address,
             usdc_address,
-            swap_fee_tier,
-            swap_balancer_pool,
-            swap_pool_address,
         } = &config::types::BlockchainConfig::default();
         let blockchain = [
             ("rpc_url =", rpc_url.is_none()),
@@ -1307,13 +1293,7 @@ mod tests {
                 "pool_floor_signer_refill_secs =",
                 pool_floor_signer_refill_secs.is_none(),
             ),
-            ("swap_venue =", swap_venue.is_none()),
-            ("swap_router_address =", swap_router_address.is_none()),
-            ("swap_quoter_address =", swap_quoter_address.is_none()),
             ("usdc_address =", usdc_address.is_none()),
-            ("swap_fee_tier =", swap_fee_tier.is_none()),
-            ("swap_balancer_pool =", swap_balancer_pool.is_none()),
-            ("swap_pool_address =", swap_pool_address.is_none()),
         ];
 
         let config::types::CacheConfig {

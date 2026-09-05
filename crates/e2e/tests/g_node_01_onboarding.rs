@@ -182,13 +182,7 @@ async fn run_journey() -> anyhow::Result<()> {
         Some(false),
         "a clean run must not be flagged partial: {summary}"
     );
-    for gate in [
-        "chain_id_ok",
-        "clock_ok",
-        "funding_ok",
-        "native_ok",
-        "token_ok",
-    ] {
+    for gate in ["chain_id_ok", "clock_ok", "native_ok", "token_ok"] {
         assert_eq!(
             summary["preflight"]
                 .get(gate)

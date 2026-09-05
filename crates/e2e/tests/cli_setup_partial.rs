@@ -3,8 +3,8 @@
 //!
 //! # Why this exists
 //!
-//! `setup` submits an irreversible sequence — USDC swap, then `approve`, then
-//! `bond`, then `declareMbps`, then `registerNode`. Under `--json` its aggregated
+//! `setup` submits an irreversible sequence — `approve`, then `bond`, then
+//! `declareMbps`, then `registerNode`. Under `--json` its aggregated
 //! summary is the *only* machine-readable carrier of those transaction hashes:
 //! the human-mode progress lines are suppressed. Before #1355 a mid-sequence
 //! failure propagated straight out, so an operator whose TOKEN had already moved
@@ -134,14 +134,7 @@ async fn run() -> anyhow::Result<()> {
     );
     // Same shape as a successful run — a consumer parses one schema and branches
     // on `partial`, rather than having to recognise an error object.
-    for key in [
-        "dry_run",
-        "preflight",
-        "bond",
-        "register",
-        "swap",
-        "readiness",
-    ] {
+    for key in ["dry_run", "preflight", "bond", "register", "readiness"] {
         assert!(
             summary.get(key).is_some(),
             "partial summary must keep the success shape, missing `{key}`: {summary}"
