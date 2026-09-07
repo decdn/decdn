@@ -73,6 +73,14 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
+    /// Enable client-side logging at this level. Off by default (the CLI is a
+    /// terminal UI); `RUST_LOG` overrides this when set. Useful for diagnosing
+    /// a stalled `decdn fetch` from the client side. Deliberately not bound to
+    /// an environment variable: the CLI stays silent unless logging is asked
+    /// for on this invocation, even when the daemon's log-level env is exported.
+    #[arg(long, global = true, value_name = "LEVEL")]
+    pub log_level: Option<common::LogLevel>,
+
     /// Subcommand to execute.
     #[command(subcommand)]
     pub command: Command,

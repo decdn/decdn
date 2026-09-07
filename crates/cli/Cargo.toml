@@ -75,6 +75,11 @@ tempfile = { workspace = true }
 # a piped/redirected fetch stays silent. Small dep tree (console, unicode-width),
 # unrelated to the iroh-blobs/AWS-free invariant above.
 indicatif = { workspace = true }
+# Opt-in client-side logging (`--log-level` / `RUST_LOG`): the CLI installs no
+# subscriber by default, so verbose fetch/incentive/iroh spans are diagnosable
+# on demand without disturbing the terminal UI. Already in this binary's tree
+# via `decdn-node`'s daemon path; env-filter + fmt only.
+tracing-subscriber = { workspace = true }
 # `node top` (issue #275) scrapes the daemon's loopback /metrics HTTP
 # endpoint. Workspace-pinned with rustls + no default features — same
 # settings `decdn-node` uses, so the dep tree stays unified.
