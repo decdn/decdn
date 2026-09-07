@@ -47,13 +47,15 @@ anyhow = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 iroh = { workspace = true }
-# Peer-cache (`peers.json`) persistence for the ADR 012 bootstrap fallback.
+# Peer store (one JSON file per peer under `<data_dir>/peers`) persistence for
+# the ADR 012 bootstrap fallback.
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Unique temp names for the peer cache's write-and-rename: two `decdn` processes
-# can share a client data dir, and a fixed `peers.json.tmp` would let them
-# interleave into one file and rename the tear into place. Also used by
-# `endpoint`'s relay-resolution tests for throwaway TOML config files.
+# Unique temp names for the peer store's per-record write-and-rename: two
+# `decdn` processes can share a client data dir, and a fixed temp name would
+# let them interleave into one record file and rename the tear into place.
+# Also used by `endpoint`'s relay-resolution tests for throwaway TOML config
+# files.
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

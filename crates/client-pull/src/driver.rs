@@ -1371,6 +1371,7 @@ mod tests {
                         total_bytes: self.inner.total_bytes(),
                         rate_per_mb: 1,
                         interval_bytes: 1024 * 1024,
+                        ttfb_ms: 0.0,
                     };
                     let fault = UpstreamVoucherRejected {
                         reason: VoucherRejectReason::SpendingCapExhausted,

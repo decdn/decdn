@@ -43,6 +43,9 @@ pub struct FileConfig {
     /// Local content denylist (ADR 011 §Local Denylist). Absent => both lists
     /// empty; nothing is denied locally.
     pub content: Option<ContentConfig>,
+    /// Client-scoped discovery settings. Absent => no region filter;
+    /// discovery/probing considers every registered node.
+    pub client: Option<ClientConfig>,
 }
 
 /// Identity section of the config file.
@@ -53,6 +56,21 @@ pub struct IdentityConfig {
     pub data_dir: Option<PathBuf>,
     /// ISO 3166-1 alpha-2 region code.
     pub region: Option<String>,
+}
+
+/// Client-scoped section of the config file. Independent of the
+/// node-scoped `[network.discovery]` (address discovery) — this narrows which
+/// peers a client discovers/probes, never ranks them.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientConfig {
+    /// Regions to restrict discovery/probing to; empty/absent = no filter.
+    ///
+    /// This is a DISCOVERY-TIME filter only: it narrows the pool the client
+    /// probes/rediscovers. It does NOT apply to the probe-less peer-store fast
+    /// path, where measured latency ranking already governs which peers are
+    /// near, so a warm store selects by latency without consulting this list.
+    pub region_allowlist: Option<Vec<String>>,
 }
 
 /// Network section of the config file.
@@ -1193,4 +1211,41 @@ pub struct ContentConfig {
     /// `0x`-prefixed hex, checksum-agnostic (any case accepted); the zero
     /// address is rejected.
     pub denied_origins: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
+mod tests {
+    use super::*;
+
+    /// `[client] region_allowlist = [...]` round-trips through TOML into
+    /// `Some`, carrying the raw (unvalidated) strings — parsing into
+    /// [`decdn_protocol::Region`] happens at the client's discovery boundary,
+    /// not here.
+    #[test]
+    fn client_region_allowlist_parses_when_present() {
+        let file: FileConfig = toml::from_str(
+            r#"
+            [client]
+            region_allowlist = ["US", "DE"]
+            "#,
+        )
+        .expect("valid [client] table parses");
+        assert_eq!(
+            file.client
+                .expect("[client] present")
+                .region_allowlist
+                .expect("region_allowlist present"),
+            vec!["US".to_string(), "DE".to_string()]
+        );
+    }
+
+    /// An absent `[client]` table resolves to `None` — no filter, not an
+    /// empty one — so a config file that omits `[client]` keeps behaving
+    /// exactly as one that never had a region filter.
+    #[test]
+    fn client_section_absent_by_default() {
+        let file: FileConfig = toml::from_str("").expect("empty config parses");
+        assert!(file.client.is_none());
+    }
 }

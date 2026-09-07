@@ -325,7 +325,7 @@ async fn resolve_selection(
     let candidates = match explicit {
         Some(_) => None,
         // The registry read is bounded by `--timeout-ms` (#1349), inside
-        // `bootstrap_nodes` so a timeout still falls through to the peer cache.
+        // `bootstrap_nodes` so a timeout still falls through to the peer store.
         // No probing happens here — `discover_candidates` is the registry read
         // plus `select_candidates`; probing is per entry, in `pick_excluding`
         // below.

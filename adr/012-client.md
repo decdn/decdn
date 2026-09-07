@@ -57,25 +57,25 @@ Startup sequence from first launch to ready state:
      `--timeout-ms`, so the retry schedule can never be the reason a fetch
      appears to hang past the deadline the user set.
 4. If the registry read fails (retries exhausted, or a deterministic failure):
-     On cached peers present: fall back to the peer cache, and tell the user
-       the list is cached and how old it is — those nodes may have been
-       deactivated or slashed since it was written
-     On no cache: exit with error —
+     On stored peer identity present: fall back to the peer store, and tell
+       the user the identity is cached and how old it is — those nodes may
+       have been deactivated or slashed since it was last seen
+     On no stored identity: exit with error —
        "Cannot reach bootstrap sources. Check network connectivity
         and RPC endpoint configuration."
 5. Connect to iroh relay (for NAT traversal)
 6. Build node list from the resolved bootstrap peers
-     (registry results, or the cached peers.json on fallback)
-7. Persist peer list to the peer cache
-     A successful but *empty* read is the exception: it does not overwrite the
-     cache, since an emptied registry is no reason to discard the last
-     known-good peer list.
+     (registry results, or the store's identity records on fallback)
+7. Upsert identity for every returned node into the peer store
+     A successful but *empty* read is the exception: it does not touch the
+     store, since an emptied registry is no reason to discard the last
+     known-good peer identities.
 8. Begin periodic registry refresh (every 10 minutes)
 ```
 
-The peer cache is `peers.json` under the resolved client data dir — `--data-dir`, else `[identity] data_dir`, defaulting to `~/.decdn/client` — so it moves with the rest of the client's state rather than living at a fixed path.
+The peer store is a directory of per-node JSON files under the resolved client data dir — `--data-dir`, else `[identity] data_dir`, defaulting to `~/.decdn/client` — so it moves with the rest of the client's state rather than living at a fixed path.
 
-The on-chain registry is the sole discovery source. Nodes and clients both build their node list from it. A cached peer list from the last successful query covers a transient RPC outage. A client stays online only long enough to fetch, so it holds no long-lived network role.
+The on-chain registry is the sole discovery source. Nodes and clients both build their node list from it. The peer store's identity half — the last registry snapshot — covers a transient RPC outage. The store's stats half — round-trip latency and quoted price, sampled from probes and completed streams — lets a client route a fetch without probing when it holds enough fresh candidates, going straight to a `StreamRequest` and taking price from the node's `StreamResponse`. The two halves of a record age on independent clocks: identity refreshes and prunes on the registry's own horizon (the periodic registry refresh of step 8), while stats age against the RTT map's own staleness TTL ([ADR 037 § Client RTT map and latency discovery](037-regional-proxy-warming.md#client-rtt-map-and-latency-discovery), `rtt_map.staleness_secs`) — a record can carry fresh identity with stale stats, or the reverse. A client stays online only long enough to fetch, so it holds no long-lived network role. The store persists across invocations, so a later run can skip both the registry read and the probe.
 
 Node-side registry interaction and bootstrap is in [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-node-view-from-on-chain-registry).
 
@@ -168,7 +168,7 @@ All client state resides under `~/.decdn/`, with the per-client data dir (`--dat
 └── client/                   # the resolved client data dir
     ├── keystore.json         # Encrypted Ethereum keystore (Web3 Secret Storage)
     ├── buyer-pools.redb   # Buyer-side payment-pool store
-    └── peers.json            # Cached peer list from last registry query
+    └── peers/                 # Per-node peer knowledge base (identity + stats), one JSON file per node
 ```
 
 Default configuration:
@@ -186,12 +186,14 @@ in current schema terms:
 - `[blockchain]` — `rpc_url`, `eth_keystore`, `chain_id`, plus the `payment_channel_address` /
   `slash_judge_address` (and `capacity_bond_address` for auto-discovery) a client needs to pay for
   and verify delivery. The RPC URL and keystore live here, **not** under `[network]`/`[keys]`.
+- `[client]` — an optional `region_allowlist` list of regions. When set, it restricts discovery and
+  probing to nodes whose `region_hint` matches; empty or absent means no filter.
 
 The voucher byte-accounting granularity is a fixed protocol constant that every client and node
 reads directly ([ADR 003 § Key parameters](003-payments.md#adr-003-payment-model)), so a client has
 nothing to configure for it — which is why a client leaves the `[payment]` section unset.
 
-The Ed25519 node key and the `peers.json` cache have no config keys of their own: both live inside
+The Ed25519 node key and the peer store have no config keys of their own: both live inside
 the resolved data dir (see the tree above), so they move with `--data-dir` / `[identity] data_dir`.
 
 **Registry refresh (not yet implemented).** The bootstrap step-8 periodic registry refresh has no

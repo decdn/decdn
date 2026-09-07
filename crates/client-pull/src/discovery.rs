@@ -6,7 +6,7 @@
 //! `fetch::probe_and_rank`. `decdn probe` deliberately still requires an
 //! explicit target.
 //!
-//! This is the **read + select** half, plus the peer cache that backs it up.
+//! This is the **read + select** half, plus the peer store that backs it up.
 //! Dialing the chosen node uses its iroh `NodeId` via a discovery-enabled
 //! endpoint (`presets::N0` / configured `[network.discovery]`) — the same
 //! mechanism the node uses — so the registry `multiaddrs` field is not decoded
@@ -14,13 +14,15 @@
 //! decentralized fallback (#936 § fallback).
 //!
 //! `bootstrap_nodes` is the entry point: it wraps the registry read in ADR
-//! 012's retry schedule and persists the result to `peers.json` under the
-//! client data dir, falling back to that file when the registry cannot be read.
-//! That cache is the only filesystem state this module owns.
+//! 012's retry schedule and refreshes the [`crate::PeerStore`] identity
+//! records under the client data dir on success, falling back to the store's
+//! surviving identities when the registry cannot be read. The store — one
+//! JSON file per peer under `<data_dir>/peers` — is the only filesystem state
+//! this module owns.
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, U256};
@@ -66,20 +68,6 @@ const REGISTRY_RETRY_BACKOFF: [Duration; 3] = [
     Duration::from_secs(30),
 ];
 
-/// Filename of the peer cache inside the resolved client data dir.
-const PEER_CACHE_FILE: &str = "peers.json";
-
-/// Version tag written into (and required of) the peer cache file, so a future
-/// shape change is a cache miss rather than a decode error. For that to hold,
-/// [`read_peer_cache`] decodes the tag through [`CacheVersion`] *before* the
-/// body — a whole-`PeerCache` decode would fail on the changed `peers` shape
-/// and never reach the check.
-///
-/// `2` since #1348 retyped `region_hint` from `String` to `Option<Region>`: a
-/// v1 file can hold a region string the validating `Region` deserializer now
-/// rejects, which would fail the whole-file decode rather than the one field.
-const PEER_CACHE_VERSION: u32 = 2;
-
 /// The outermost context on a failed bootstrap — the wording pinned by ADR 012
 /// § Bootstrap step 4. `decdn`'s error boundary renders `{err:#}`
 /// (`sanitize_err_chain`), so the user sees this sentence followed by the
@@ -95,15 +83,14 @@ pub const BOOTSTRAP_UNREACHABLE: &str =
 /// `multiaddrs` is intentionally dropped — dialing is by `node_id` via iroh
 /// discovery (see module docs).
 ///
-/// Serializable so the resolved set can be persisted to the peer cache and
-/// reloaded when the registry is unreachable (ADR 012 § Bootstrap step 4).
+/// Serializable so the resolved set can be projected into [`crate::PeerStore`]
+/// identity records and reloaded from the store when the registry is
+/// unreachable (ADR 012 § Bootstrap step 4).
 ///
-/// That encoding is a private implementation detail of `peers.json`, **not** a
-/// stable format: the JSON keys are the field names, and the bytes are
+/// That encoding is a private implementation detail of the peer store, **not**
+/// a stable format: the JSON keys are the field names, and the bytes are
 /// codec-dependent (iroh renders `PublicKey` as z-base-32 under a
-/// human-readable codec and as raw bytes otherwise). The version tag that makes
-/// a format change safe lives on the private `PeerCache` wrapper, so nothing
-/// outside this module should persist or transmit a `NodeCandidate`.
+/// human-readable codec and as raw bytes otherwise).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCandidate {
     /// iroh endpoint id — dialed via discovery, never needs an explicit addr.
@@ -123,7 +110,7 @@ pub struct NodeCandidate {
     /// stricter than the source of truth and would silently shrink the
     /// fetchable set. Parsing at this boundary is what makes the derived `Eq`
     /// above correct and keeps an unbounded operator-submitted string off the
-    /// peer-cache read path (#1348).
+    /// peer-store read path (#1348).
     pub region_hint: Option<Region>,
 }
 
@@ -352,38 +339,6 @@ pub async fn active_nodes(
     .await
 }
 
-/// On-disk shape of the peer cache. The version tag lets a later shape change
-/// be read as "no usable cache" instead of a hard decode failure — see
-/// [`PEER_CACHE_VERSION`] for why the tag is decoded separately to make that
-/// true.
-#[derive(Debug, Serialize, Deserialize)]
-struct PeerCache {
-    version: u32,
-    /// Seconds since the Unix epoch at which this cache was written, so the
-    /// fallback can tell the user how old the peer list it is serving is.
-    /// Present from version 1 — adding it later would have cost a version bump
-    /// that invalidates every deployed cache.
-    written_at: u64,
-    peers: Vec<NodeCandidate>,
-}
-
-/// Just the version tag. Decoded first (serde ignores the rest) so that a
-/// future change to the `peers` shape is reported as a version mismatch rather
-/// than as an opaque decode failure — a whole-[`PeerCache`] decode would choke
-/// on the new shape before the tag was ever read.
-#[derive(Deserialize)]
-struct CacheVersion {
-    version: u32,
-}
-
-impl PeerCache {
-    /// How long ago this cache was written, saturating at zero so a clock that
-    /// moved backwards reads as "just now" rather than underflowing.
-    fn age(&self) -> Duration {
-        Duration::from_secs(now_secs().saturating_sub(self.written_at))
-    }
-}
-
 /// Wall-clock seconds since the Unix epoch, or 0 if the clock predates it.
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -392,151 +347,76 @@ fn now_secs() -> u64 {
         .unwrap_or_default()
 }
 
-/// Path of the cached peer list inside the resolved client data dir
-/// (`--data-dir` / `identity.data_dir`, defaulting to `~/.decdn/client`).
-fn peer_cache_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(PEER_CACHE_FILE)
-}
-
-/// Outcome of a peer-cache read.
-///
-/// [`Unusable`](Self::Unusable) is kept distinct from [`Absent`](Self::Absent)
-/// because the two mean opposite things to whoever has to fix the problem: no
-/// file is the ordinary first-run state, while a file that exists and cannot be
-/// used is a misconfiguration the user can act on — and it is at its most
-/// confusing precisely when the registry is *also* down, which is the only time
-/// this is read. The reason travels back to the caller rather than into a log,
-/// for the same reason [`Bootstrap`] carries its provenance: `decdn` has no log
-/// sink.
-enum CacheRead {
-    Ok(Box<PeerCache>),
-    Absent,
-    /// Why the existing cache could not be used, phrased for the error chain.
-    Unusable(String),
-}
-
-/// Read the cached peer list.
-fn read_peer_cache(data_dir: &Path) -> CacheRead {
-    let path = peer_cache_path(data_dir);
-    let at = path.display();
-    let raw = match std::fs::read(&path) {
-        Ok(raw) => raw,
-        // The ordinary first-run case.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CacheRead::Absent,
-        // Anything else is a cache that is *there* and being ignored — most
-        // often a root-owned `peers.json` left by an earlier `sudo` run, or a
-        // data dir that is really a file.
-        Err(e) => return CacheRead::Unusable(format!("the peer cache at {at} is unreadable: {e}")),
-    };
-    // Version before body — see `PEER_CACHE_VERSION`.
-    let version = match serde_json::from_slice::<CacheVersion>(&raw) {
-        Ok(v) => v.version,
-        Err(e) => {
-            return CacheRead::Unusable(format!("the peer cache at {at} is undecodable: {e}"));
-        }
-    };
-    if version != PEER_CACHE_VERSION {
-        return CacheRead::Unusable(format!(
-            "the peer cache at {at} is version {version}, but this build reads version \
-             {PEER_CACHE_VERSION}"
-        ));
-    }
-    let cache: PeerCache = match serde_json::from_slice(&raw) {
-        Ok(cache) => cache,
-        Err(e) => {
-            return CacheRead::Unusable(format!("the peer cache at {at} has a bad body: {e}"));
-        }
-    };
-    if cache.peers.is_empty() {
-        return CacheRead::Unusable(format!("the peer cache at {at} lists no peers"));
-    }
-    CacheRead::Ok(Box::new(cache))
-}
-
-/// Persist `peers` to the peer cache, creating `data_dir` if needed. Written to
-/// a uniquely-named sibling temp file, fsynced, and atomically renamed, so a
-/// crash can only lose the *new* cache, never truncate the old one, and a
-/// second `decdn` process sharing the data dir cannot interleave into the same
-/// temp file (last writer wins, with a whole file).
-///
-/// Two limits worth knowing: only the file's data is fsynced, not the directory
-/// entry, so the rename itself is not crash-durable — `Ok` does not guarantee
-/// the new cache survives a power loss. And a crash between temp-create and
-/// rename strands a `.tmpXXXXXX` file that nothing reaps.
-///
-/// # Errors
-///
-/// Fails if the data dir cannot be created or the write/sync/rename fails.
-fn write_peer_cache(data_dir: &Path, peers: &[NodeCandidate]) -> anyhow::Result<()> {
-    use std::io::Write as _;
-
-    let path = peer_cache_path(data_dir);
-    let body = serde_json::to_vec_pretty(&PeerCache {
-        version: PEER_CACHE_VERSION,
-        written_at: now_secs(),
-        peers: peers.to_vec(),
-    })?;
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("creating client data dir {}", data_dir.display()))?;
-    // Same dir as the target so `persist` is a rename, not a cross-device copy.
-    let mut tmp = tempfile::NamedTempFile::new_in(data_dir)
-        .with_context(|| format!("creating a temp file in {}", data_dir.display()))?;
-    tmp.write_all(&body)
-        .with_context(|| format!("writing {}", tmp.path().display()))?;
-    tmp.as_file()
-        .sync_all()
-        .with_context(|| format!("syncing {}", tmp.path().display()))?;
-    tmp.persist(&path)
-        .map_err(|e| e.error)
-        .with_context(|| format!("renaming into {}", path.display()))?;
-    Ok(())
-}
-
 /// Turn a registry read outcome into the bootstrap peer set (ADR 012
 /// § Bootstrap steps 4 and 7 — step 6, building the peer table, is
-/// `select_candidates` in the callers): persist a successful read to the peer
-/// cache, or on failure fall back to the cache, or — with no cache — surface
+/// `select_candidates` in the callers): on a live read, refresh every
+/// candidate's identity into the [`crate::PeerStore`] under `data_dir` and
+/// prune/cap the store, or on failure fall back to the store's
+/// non-prunable identities, or — with the store empty too — surface
 /// [`BOOTSTRAP_UNREACHABLE`] with the registry failure as its cause.
 ///
-/// An empty successful read is returned as-is but does **not** overwrite the
-/// cache: an emptied registry is not a reason to discard the last known-good
-/// peer list.
+/// An empty successful read is returned as-is but does **not** touch the
+/// store: an emptied registry is not a reason to discard the last known-good
+/// identities.
 fn resolve_bootstrap(
     registry: anyhow::Result<Vec<NodeCandidate>>,
     data_dir: &Path,
 ) -> anyhow::Result<Bootstrap> {
+    let store = crate::PeerStore::open(data_dir);
+    let cfg = crate::StoreConfig::default();
+    let now = now_secs();
     let err = match registry {
         Ok(peers) => {
-            // A cache we could not persist must not fail a fetch that already
-            // succeeded — but it is not free either: it silently disarms the
-            // fallback, and a data dir that is read-only or full fails this way
-            // on *every* invocation, so the user believes they have outage
-            // protection they have never actually had. Hence it travels back to
-            // the caller rather than only into a log.
-            let cache_error = (!peers.is_empty())
-                .then(|| write_peer_cache(data_dir, &peers).err())
-                .flatten()
-                .map(|e| sanitize_err_chain(&e));
-            return Ok(Bootstrap::Live { peers, cache_error });
+            // Best-effort identity refresh; a write failure must not fail a
+            // fetch that already succeeded — the store is a fallback, not the
+            // source of truth for a live read. An empty read touches nothing:
+            // an emptied registry is not a reason to prune or discard the
+            // last known-good identities. The first write failure is still
+            // carried on the return value so a degraded store is visible to
+            // the caller instead of failing silently.
+            let mut store_warning = None;
+            if !peers.is_empty() {
+                for cand in &peers {
+                    if let Err(e) = store.upsert_identity(cand, now) {
+                        store_warning.get_or_insert_with(|| e.to_string());
+                    }
+                }
+                if let Err(e) = store.prune_and_cap(now, &cfg) {
+                    store_warning.get_or_insert_with(|| e.to_string());
+                }
+            }
+            return Ok(Bootstrap::Live {
+                peers,
+                store_warning,
+            });
         }
         Err(e) => e,
     };
-    match read_peer_cache(data_dir) {
-        CacheRead::Ok(cache) => Ok(Bootstrap::Cached {
-            age: cache.age(),
-            peers: cache.peers,
-            // Sanitized `{err:#}`, not `%err`: plain Display on an
-            // `anyhow::Error` renders only the outermost context and drops the
-            // reason the registry read actually failed.
-            registry_error: sanitize_err_chain(&err),
-        }),
-        CacheRead::Absent => Err(err.context(BOOTSTRAP_UNREACHABLE)),
-        // Layered *under* `BOOTSTRAP_UNREACHABLE` so `{err}` still renders the
-        // ADR-pinned sentence verbatim, while `{err:#}` — what `main()` prints —
-        // names the cache that was ignored and why. Otherwise the one moment
-        // the cache matters is the one moment its failure is invisible.
-        CacheRead::Unusable(why) => Err(err.context(why).context(BOOTSTRAP_UNREACHABLE)),
-    }
+    let records = store.load_all();
+    // The staleness of the fallback identities, computed from the store
+    // records before they are projected down to `NodeCandidate`s below —
+    // `as_candidate` drops `identity_seen_at_secs`.
+    let oldest_identity_secs = records
+        .iter()
+        .filter(|r| !r.identity_prunable(now, &cfg))
+        .map(|r| r.identity_seen_at_secs)
+        .min();
+    let cached: Vec<NodeCandidate> = records
+        .into_iter()
+        .filter(|r| !r.identity_prunable(now, &cfg))
+        .map(|r| r.as_candidate())
+        .collect();
+    let Some(oldest_identity_secs) = oldest_identity_secs else {
+        return Err(err.context(BOOTSTRAP_UNREACHABLE));
+    };
+    Ok(Bootstrap::Cached {
+        peers: cached,
+        // Sanitized `{err:#}`, not `%err`: plain Display on an
+        // `anyhow::Error` renders only the outermost context and drops the
+        // reason the registry read actually failed.
+        registry_error: sanitize_err_chain(&err),
+        oldest_identity_secs,
+    })
 }
 
 /// Where a bootstrap peer set came from.
@@ -552,19 +432,39 @@ pub enum Bootstrap {
     Live {
         /// The peers the registry returned.
         peers: Vec<NodeCandidate>,
-        /// Set when the read succeeded but could not be persisted, which leaves
-        /// the next outage without a fallback.
-        cache_error: Option<String>,
+        /// The first peer-store write error hit while refreshing identities
+        /// or pruning, if any. The fetch itself never fails on this — the
+        /// store is best-effort — but a persistent write failure degrades
+        /// the next run's fallback and selection, so it is surfaced here
+        /// rather than swallowed.
+        store_warning: Option<String>,
     },
-    /// The registry could not be read; these peers came from `peers.json`.
+    /// The registry could not be read; these peers came from the peer store.
     Cached {
-        /// The peers `peers.json` held.
+        /// The peers the peer store held.
         peers: Vec<NodeCandidate>,
-        /// How long ago the cache was written.
-        age: Duration,
         /// Why the registry read failed, sanitized for display.
         registry_error: String,
+        /// Seconds since the Unix epoch when the stalest identity among
+        /// `peers` was last confirmed against the registry — the minimum
+        /// `identity_seen_at_secs` across the fallback set, so it bounds how
+        /// old the least-fresh record in the set may be.
+        oldest_identity_secs: u64,
     },
+}
+
+/// Render a duration in seconds as a coarse, human-readable age: seconds
+/// under a minute, minutes under an hour, hours under a day, else days.
+fn format_age_secs(age_secs: u64) -> String {
+    if age_secs < 60 {
+        format!("{age_secs}s")
+    } else if age_secs < 3_600 {
+        format!("{}m", age_secs / 60)
+    } else if age_secs < 86_400 {
+        format!("{}h", age_secs / 3_600)
+    } else {
+        format!("{}d", age_secs / 86_400)
+    }
 }
 
 impl Bootstrap {
@@ -573,23 +473,24 @@ impl Bootstrap {
     #[must_use]
     pub fn warning(&self) -> Option<String> {
         match self {
-            Self::Live { cache_error, .. } => cache_error.as_ref().map(|e| {
+            Self::Live { store_warning, .. } => store_warning.as_ref().map(|e| {
                 format!(
-                    "warning: could not save the peer cache ({e}); a registry outage will not \
-                     be survivable until this is fixed"
+                    "warning: peer store write failed: {e} (selection may be degraded next run)"
                 )
             }),
             Self::Cached {
                 peers,
-                age,
                 registry_error,
-            } => Some(format!(
-                "warning: could not reach the node registry ({registry_error}); using the peer \
-                 list cached {} ago ({} node(s)). These nodes may have been deactivated or \
-                 slashed since.",
-                humanize(*age),
-                peers.len()
-            )),
+                oldest_identity_secs,
+            } => {
+                let age = format_age_secs(now_secs().saturating_sub(*oldest_identity_secs));
+                Some(format!(
+                    "warning: could not reach the node registry ({registry_error}); using {} \
+                     previously known node(s) from the local peer store, identity up to {age} \
+                     old. These nodes may have been deactivated or slashed since.",
+                    peers.len()
+                ))
+            }
         }
     }
 
@@ -602,38 +503,21 @@ impl Bootstrap {
     }
 }
 
-/// Coarse human-readable duration for the staleness warning — the difference
-/// between "2 minutes" and "6 months" is what the user acts on; minutes of
-/// precision inside a month are not.
-fn humanize(d: Duration) -> String {
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 60 * MINUTE;
-    const DAY: u64 = 24 * HOUR;
-    let secs = d.as_secs();
-    let (n, unit) = match secs {
-        s if s < MINUTE => (s, "second"),
-        s if s < HOUR => (s / MINUTE, "minute"),
-        s if s < DAY => (s / HOUR, "hour"),
-        s => (s / DAY, "day"),
-    };
-    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
-}
-
 /// Bootstrap the client's peer set (ADR 012 § Bootstrap): read the active node
-/// set from `CapacityBond` with the ADR's retry schedule, persisting it to the
-/// peer cache under `data_dir` on success and falling back to that cache when
-/// the registry cannot be read.
+/// set from `CapacityBond` with the ADR's retry schedule, refreshing the
+/// [`crate::PeerStore`] under `data_dir` on success and falling back to the
+/// store's surviving identities when the registry cannot be read.
 ///
 /// `data_dir` is the resolved client data dir, so an explicit `--data-dir`
-/// moves the cache with the rest of the client's state.
+/// moves the peer store with the rest of the client's state.
 ///
 /// Callers must print [`Bootstrap::warning`] — the degraded paths are invisible
 /// otherwise.
 ///
 /// # Errors
 ///
-/// Fails with [`BOOTSTRAP_UNREACHABLE`] when the registry read fails and no
-/// cached peer list exists.
+/// Fails with [`BOOTSTRAP_UNREACHABLE`] when the registry read fails and the
+/// peer store holds no usable identity.
 pub async fn bootstrap_nodes(
     rpc_url: &str,
     capacity_bond_addr: Address,
@@ -643,10 +527,10 @@ pub async fn bootstrap_nodes(
     // The deadline bounds the REGISTRY READ ONLY, not the whole bootstrap
     // (#1349). Wrapping `bootstrap_nodes` from outside would cancel
     // `resolve_bootstrap` along with it, and that is where the ADR 012
-    // § Bootstrap step 4 cache fallback lives — so a client with a perfectly
-    // good `peers.json` and a flaky RPC would get a hard failure instead of a
-    // degraded-but-working fetch. Timing out is just another way for the
-    // registry read to fail, so it is fed in as one and the existing
+    // § Bootstrap step 4 peer-store fallback lives — so a client with a
+    // perfectly good peer store and a flaky RPC would get a hard failure
+    // instead of a degraded-but-working fetch. Timing out is just another way
+    // for the registry read to fail, so it is fed in as one and the existing
     // `Bootstrap::Cached` arm handles it, warning and all.
     let registry =
         match tokio::time::timeout(registry_cap, active_nodes(rpc_url, capacity_bond_addr)).await {
@@ -694,6 +578,35 @@ pub fn select_candidates(
     }
     candidates.truncate(k);
     candidates
+}
+
+/// Pre-filter `candidates` by an optional region allowlist, then order via
+/// [`select_candidates`].
+///
+/// A candidate whose `region_hint` is `Some(r)` with `r` not in `allow` is
+/// dropped; a candidate with `region_hint == None` is kept. An empty `allow`
+/// is a no-op. Ranking is unchanged (region is a self-attested hint, never a
+/// ranking key) — this only narrows which candidates are eligible to be
+/// probed/discovered at all, independent of the peer store.
+#[must_use]
+pub fn select_candidates_filtered(
+    candidates: Vec<NodeCandidate>,
+    client_region: Option<&str>,
+    k: usize,
+    allow: &[Region],
+) -> Vec<NodeCandidate> {
+    let filtered = if allow.is_empty() {
+        candidates
+    } else {
+        candidates
+            .into_iter()
+            .filter(|c| match c.region_hint {
+                Some(r) => allow.contains(&r),
+                None => true,
+            })
+            .collect()
+    };
+    select_candidates(filtered, client_region, k)
 }
 
 /// Pick up to `max_sources` candidates from an already-ranked `ordered` list,
@@ -784,10 +697,12 @@ pub struct WarmingCandidate {
     /// Measured round-trip time in milliseconds, from the **live `cdn/probe/v1`
     /// probe issued for this request**.
     ///
-    /// Note this diverges from ADR 037 § RTT source, which specifies a
-    /// longitudinal per-peer RTT map; no such map exists, so the candidate pool
-    /// is limited to the ≤`SELECT_K` nodes this request happened to probe rather
-    /// than the full peer table minus holders.
+    /// The persisted peer knowledge base (ADR 037 § RTT source,
+    /// `decdn_client_pull::peer_store`) does not track which peers hold which
+    /// blobs, only identity, latency, and price — it cannot tell a non-holder
+    /// from a holder for this hash. So this warming candidate pool still comes
+    /// only from nodes this request actually probed (`has_blob: false`
+    /// responses), not from the full peer store minus holders.
     pub rtt_ms: f64,
 }
 
@@ -976,6 +891,40 @@ mod tests {
         let out = select_candidates(cands, Some("US"), 5);
         assert_eq!(out[0].eth_address, Address::repeat_byte(2));
         assert_eq!(out[1].eth_address, Address::repeat_byte(1));
+    }
+
+    /// With allowlist `["US"]`, a `Some(DE)` candidate is dropped, a
+    /// `Some(US)` candidate is kept, and a `None`-region candidate is kept
+    /// (absent-region-include, per the brief).
+    #[test]
+    fn region_allowlist_filters_present_regions_only() {
+        let us = candidate(1, "US");
+        let de = candidate(2, "DE");
+        let none = candidate(3, "nonsense");
+        let allow = [Region::parse("US").expect("valid")];
+        let out = select_candidates_filtered(
+            vec![us.clone(), de.clone(), none.clone()],
+            None,
+            10,
+            &allow,
+        );
+        let addrs: Vec<_> = out.iter().map(|c| c.eth_address).collect();
+        assert!(addrs.contains(&us.eth_address));
+        assert!(addrs.contains(&none.eth_address));
+        assert!(!addrs.contains(&de.eth_address));
+    }
+
+    /// An empty allowlist is a no-op: every candidate survives, regardless of
+    /// region.
+    #[test]
+    fn empty_region_allowlist_keeps_everything() {
+        let cands = vec![
+            candidate(1, "US"),
+            candidate(2, "DE"),
+            candidate(3, "nonsense"),
+        ];
+        let out = select_candidates_filtered(cands.clone(), None, 10, &[]);
+        assert_eq!(out.len(), cands.len());
     }
 
     /// An iroh node id derived from a small seed, for [`cand`] fixtures — mirrors
@@ -1400,185 +1349,40 @@ mod tests {
         assert_eq!(out.len(), usize::try_from(PAGE_SIZE).unwrap() + 1);
     }
 
-    /// The cached peers alone, for the many assertions that do not care about
-    /// the surrounding [`PeerCache`] metadata.
-    fn cached_peers(data_dir: &Path) -> Option<Vec<NodeCandidate>> {
-        match read_peer_cache(data_dir) {
-            CacheRead::Ok(c) => Some(c.peers),
-            _ => None,
+    /// Seed the peer store at `data_dir` with `peers`' identities, as
+    /// `resolve_bootstrap` itself does on a live read.
+    fn seed_store(data_dir: &Path, peers: &[NodeCandidate], now: u64) {
+        let store = crate::PeerStore::open(data_dir);
+        for cand in peers {
+            store.upsert_identity(cand, now).unwrap();
         }
     }
 
-    /// The reason an existing cache was rejected, or `None` if it was usable or
-    /// absent.
-    fn cache_rejection(data_dir: &Path) -> Option<String> {
-        match read_peer_cache(data_dir) {
-            CacheRead::Unusable(why) => Some(why),
-            _ => None,
-        }
+    /// The identities the store at `data_dir` currently holds, projected back
+    /// to [`NodeCandidate`]s (order-independent — callers compare as sets).
+    fn store_candidates(data_dir: &Path) -> Vec<NodeCandidate> {
+        crate::PeerStore::open(data_dir)
+            .load_all()
+            .into_iter()
+            .map(|r| r.as_candidate())
+            .collect()
     }
 
     #[test]
-    fn peer_cache_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let peers = vec![candidate(1, "DE"), candidate(2, "US")];
-        write_peer_cache(dir.path(), &peers).unwrap();
-        assert_eq!(cached_peers(dir.path()), Some(peers));
-    }
-
-    #[test]
-    fn the_cache_json_shape_is_pinned() {
-        // `peer_cache_round_trips` structurally cannot catch a format change,
-        // because the writer and reader move together. If iroh alters how
-        // `PublicKey` serializes, every deployed `peers.json` silently becomes
-        // undecodable at version 1 while the suite stays green. Pin the shape so
-        // that change has to be a deliberate `PEER_CACHE_VERSION` bump.
-        let dir = tempfile::tempdir().unwrap();
-        let peer = candidate(1, "DE");
-        write_peer_cache(dir.path(), std::slice::from_ref(&peer)).unwrap();
-
-        let raw = std::fs::read(peer_cache_path(dir.path())).unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(v["version"], PEER_CACHE_VERSION);
-        assert!(v["written_at"].is_u64());
-        assert_eq!(
-            v["peers"][0]["node_id"],
-            serde_json::Value::String(peer.node_id.to_string()),
-            "node_id is the z-base-32 string form"
-        );
-        assert_eq!(v["peers"][0]["region_hint"], "DE");
-        assert_eq!(
-            v["peers"][0]["eth_address"],
-            serde_json::Value::String(peer.eth_address.to_string())
-        );
-    }
-
-    #[test]
-    fn a_cache_of_an_unknown_version_reads_as_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = serde_json::json!({
-            "version": PEER_CACHE_VERSION + 1,
-            "written_at": 0,
-            "peers": [candidate(1, "DE")],
-        });
-        std::fs::write(peer_cache_path(dir.path()), body.to_string()).unwrap();
-        let why = cache_rejection(dir.path()).unwrap();
-        // Derived from the constant, not hardcoded: the point of the assertion
-        // is that both numbers reach the operator, and a bump must not silently
-        // turn it into a comparison of two stale literals.
-        assert!(
-            why.contains(&format!("is version {}", PEER_CACHE_VERSION + 1)),
-            "{why}"
-        );
-        assert!(
-            why.contains(&format!("reads version {PEER_CACHE_VERSION}")),
-            "{why}"
-        );
-    }
-
-    #[test]
-    fn the_version_tag_survives_a_future_peers_shape() {
-        // This is what the separate `CacheVersion` decode buys: a later version
-        // that changes the `peers` shape is still reportable as a version
-        // mismatch. Decoding the whole `PeerCache` first would fail on the body
-        // and never reach the tag.
-        let body = serde_json::json!({
-            "version": PEER_CACHE_VERSION + 1,
-            "peers": { "shape": "changed" },
-        })
-        .to_string();
-
-        assert_eq!(
-            serde_json::from_str::<CacheVersion>(&body).unwrap().version,
-            PEER_CACHE_VERSION + 1
-        );
-        assert!(
-            serde_json::from_str::<PeerCache>(&body).is_err(),
-            "the body is undecodable — only the narrow decode can recover the tag"
-        );
-
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(peer_cache_path(dir.path()), &body).unwrap();
-        assert!(
-            cache_rejection(dir.path())
-                .unwrap()
-                .contains(&format!("is version {}", PEER_CACHE_VERSION + 1))
-        );
-    }
-
-    #[test]
-    fn a_malformed_cache_reads_as_none() {
-        // A truncated `peers.json` from a pre-atomic-write crash is exactly the
-        // scenario `write_peer_cache` was hardened against; reading one must
-        // degrade to "no cache", not propagate.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(peer_cache_path(dir.path()), b"{\"version\": 1, \"pee").unwrap();
-        assert!(cache_rejection(dir.path()).unwrap().contains("undecodable"));
-    }
-
-    #[test]
-    fn writing_the_cache_leaves_no_temp_file_behind() {
-        let dir = tempfile::tempdir().unwrap();
-        write_peer_cache(dir.path(), &[candidate(6, "US")]).unwrap();
-        let names: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names, vec![std::ffi::OsString::from(PEER_CACHE_FILE)]);
-    }
-
-    #[test]
-    fn absent_cache_reads_as_absent() {
-        // Distinct from `Unusable`: no file is the ordinary first-run state and
-        // must not be reported to the user as a problem.
-        let dir = tempfile::tempdir().unwrap();
-        assert!(matches!(read_peer_cache(dir.path()), CacheRead::Absent));
-    }
-
-    #[test]
-    fn successful_read_persists_the_cache_and_warns_about_nothing() {
+    fn successful_read_persists_identities_and_warns_about_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let peers = vec![candidate(5, "FR")];
         let out = resolve_bootstrap(Ok(peers.clone()), dir.path()).unwrap();
         assert!(out.warning().is_none(), "a healthy bootstrap is quiet");
         assert_eq!(out.into_peers(), peers);
-        assert_eq!(cached_peers(dir.path()), Some(peers));
+        assert_eq!(store_candidates(dir.path()), peers);
     }
 
     #[test]
-    fn a_cache_write_failure_does_not_fail_a_successful_read() {
-        // A data dir that is really a regular file makes `create_dir_all` fail
-        // deterministically everywhere — unlike a chmod-based test, which no-ops
-        // when CI runs as root.
-        let dir = tempfile::tempdir().unwrap();
-        let not_a_dir = dir.path().join("occupied");
-        std::fs::write(&not_a_dir, b"").unwrap();
-
-        let peers = vec![candidate(7, "US")];
-        let out = resolve_bootstrap(Ok(peers.clone()), &not_a_dir).unwrap();
-        assert!(
-            matches!(
-                &out,
-                Bootstrap::Live {
-                    cache_error: Some(_),
-                    ..
-                }
-            ),
-            "an unpersistable cache is reported, not swallowed"
-        );
-        assert!(
-            out.warning()
-                .unwrap()
-                .contains("could not save the peer cache")
-        );
-        assert_eq!(out.into_peers(), peers, "but the fetch still proceeds");
-    }
-
-    #[test]
-    fn registry_failure_falls_back_to_the_cache() {
+    fn registry_failure_falls_back_to_the_store() {
         let dir = tempfile::tempdir().unwrap();
         let peers = vec![candidate(3, "US"), candidate(4, "DE")];
-        write_peer_cache(dir.path(), &peers).unwrap();
+        seed_store(dir.path(), &peers, now_secs());
 
         let out = resolve_bootstrap(Err(anyhow::anyhow!("rpc down")), dir.path()).unwrap();
         let warning = out.warning().unwrap();
@@ -1588,28 +1392,79 @@ mod tests {
             "the warning names the cause, not just the symptom: {warning}"
         );
         assert!(warning.contains("deactivated or slashed"));
-        let Bootstrap::Cached { age, .. } = &out else {
-            panic!("expected a cached bootstrap, got {out:?}");
-        };
-        assert!(*age < Duration::from_mins(1), "a just-written cache is new");
-        assert_eq!(out.into_peers(), peers);
+        assert!(
+            warning.contains("identity up to"),
+            "the warning names the staleness of the fallback identities: {warning}"
+        );
+        assert!(matches!(&out, Bootstrap::Cached { .. }));
+        let mut got = out.into_peers();
+        let mut want = peers;
+        got.sort_by_key(|c| c.node_id);
+        want.sort_by_key(|c| c.node_id);
+        assert_eq!(got, want);
+    }
+
+    /// ADR 012 requires the cached-fallback warning to say how old the
+    /// identities it serves are (§ Bootstrap, step 7). Seed a record whose
+    /// identity was last confirmed hours ago and check the warning reports
+    /// that age, not just that the fallback happened.
+    #[test]
+    fn registry_failure_warning_reports_identity_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_secs();
+        let stale_secs = 3 * 3_600; // 3 hours old
+        seed_store(
+            dir.path(),
+            &[candidate(9, "JP")],
+            now.saturating_sub(stale_secs),
+        );
+
+        let out = resolve_bootstrap(Err(anyhow::anyhow!("rpc down")), dir.path()).unwrap();
+        let warning = out.warning().unwrap();
+        assert!(
+            warning.contains("identity up to 3h old") || warning.contains("identity up to 2h old"),
+            "the warning reports a coarse age around the seeded staleness: {warning}"
+        );
+    }
+
+    /// Identity past the prune horizon is dropped from the fallback set — a
+    /// node absent from the registry this long has likely left the bond set.
+    #[test]
+    fn registry_failure_excludes_prunable_identities_from_the_fallback() {
+        let cfg = crate::StoreConfig::default();
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::PeerStore::open(dir.path());
+        let now = now_secs();
+        // `resolve_bootstrap` stamps its own `now_secs()`, so both fixtures are
+        // anchored to it: one seen long enough ago to be prunable, one seen
+        // "just now" and not.
+        store
+            .upsert_identity(
+                &candidate(1, "DE"),
+                now.saturating_sub(cfg.identity_prune_secs + 1),
+            )
+            .unwrap();
+        store.upsert_identity(&candidate(2, "DE"), now).unwrap();
+
+        let out = resolve_bootstrap(Err(anyhow::anyhow!("rpc down")), dir.path()).unwrap();
+        assert_eq!(out.into_peers(), vec![candidate(2, "DE")]);
     }
 
     /// The `--timeout-ms` bound must not cost a client its outage protection
     /// (#1349). Timing out is one more way for the registry read to fail, so it
-    /// has to land on the cache-fallback path like any other failure.
+    /// has to land on the store-fallback path like any other failure.
     ///
     /// This is the regression a naive fix reintroduces: wrapping
     /// `bootstrap_nodes` in `tokio::time::timeout` from the CALL SITE cancels
-    /// `resolve_bootstrap` along with the read, so a client holding a perfectly
-    /// good `peers.json` gets a hard error instead of a working fetch. Any
-    /// `--timeout-ms` below the schedule's own 36 s hits this, which is exactly
-    /// the range the flag was widened for.
+    /// `resolve_bootstrap` along with the read, so a client holding a
+    /// perfectly good peer store gets a hard error instead of a working
+    /// fetch. Any `--timeout-ms` below the schedule's own 36 s hits this,
+    /// which is exactly the range the flag was widened for.
     #[tokio::test(start_paused = true)]
-    async fn a_timed_out_registry_read_still_falls_back_to_the_cache() {
+    async fn a_timed_out_registry_read_still_falls_back_to_the_store() {
         let dir = tempfile::tempdir().unwrap();
         let peers = vec![candidate(7, "US")];
-        write_peer_cache(dir.path(), &peers).unwrap();
+        seed_store(dir.path(), &peers, now_secs());
 
         // An unroutable address, so the read cannot finish inside the budget.
         // Paused time makes the 5 s deadline instant.
@@ -1620,7 +1475,7 @@ mod tests {
             Duration::from_secs(5),
         )
         .await
-        .expect("a timeout with a usable cache must not fail the fetch");
+        .expect("a timeout with a usable store must not fail the fetch");
 
         let warning = out.warning().unwrap();
         assert!(
@@ -1634,12 +1489,12 @@ mod tests {
         assert_eq!(
             out.into_peers(),
             peers,
-            "the cached peers are what the fetch proceeds with"
+            "the stored peers are what the fetch proceeds with"
         );
     }
 
     #[test]
-    fn registry_failure_without_a_cache_reports_the_adr_error() {
+    fn registry_failure_without_a_store_reports_the_adr_error() {
         let dir = tempfile::tempdir().unwrap();
         let err = resolve_bootstrap(Err(anyhow::anyhow!("rpc down")), dir.path()).unwrap_err();
         assert_eq!(
@@ -1655,37 +1510,9 @@ mod tests {
     }
 
     #[test]
-    fn an_ignored_cache_is_named_in_the_rendered_error() {
-        // The worst case for silence: the registry is down *and* the cache that
-        // would have covered it is unusable. `main()` prints `{err:#}`, so that
-        // is the rendering asserted here — the user must be told a cache
-        // existed and why it was skipped, not just that the RPC failed.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(peer_cache_path(dir.path()), b"not json at all").unwrap();
-
-        let err = resolve_bootstrap(Err(anyhow::anyhow!("rpc down")), dir.path()).unwrap_err();
-        assert_eq!(
-            format!("{err}"),
-            BOOTSTRAP_UNREACHABLE,
-            "the ADR-pinned sentence stays the outermost context"
-        );
-        let rendered = sanitize_err_chain(&err);
-        assert!(rendered.contains(BOOTSTRAP_UNREACHABLE));
-        assert!(
-            rendered.contains("undecodable"),
-            "the cache-read reason survives into the chain: {rendered}"
-        );
-        assert!(
-            rendered.contains(PEER_CACHE_FILE),
-            "and names the file to fix: {rendered}"
-        );
-        assert!(rendered.contains("rpc down"), "as does the registry cause");
-    }
-
-    #[test]
-    fn an_absent_cache_adds_nothing_to_the_error() {
-        // The mirror of the above: with no cache there is nothing to report, so
-        // the chain must not gain a spurious "cache" layer on a fresh install.
+    fn an_empty_store_adds_nothing_to_the_error() {
+        // With no peer store entries there is nothing to report, so the chain
+        // must not gain a spurious layer on a fresh install.
         let dir = tempfile::tempdir().unwrap();
         let err = resolve_bootstrap(Err(anyhow::anyhow!("rpc down")), dir.path()).unwrap_err();
         let rendered = sanitize_err_chain(&err);
@@ -1693,27 +1520,45 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_registry_read_leaves_a_populated_cache_intact() {
+    fn an_empty_registry_read_leaves_a_populated_store_intact() {
         let dir = tempfile::tempdir().unwrap();
         let peers = vec![candidate(6, "US")];
-        write_peer_cache(dir.path(), &peers).unwrap();
+        seed_store(dir.path(), &peers, now_secs());
         assert!(
             resolve_bootstrap(Ok(Vec::new()), dir.path())
                 .unwrap()
                 .into_peers()
                 .is_empty()
         );
-        assert_eq!(cached_peers(dir.path()), Some(peers));
+        assert_eq!(store_candidates(dir.path()), peers);
     }
 
     #[test]
-    fn humanize_picks_a_coarse_unit() {
-        assert_eq!(humanize(Duration::from_secs(1)), "1 second");
-        assert_eq!(humanize(Duration::from_secs(42)), "42 seconds");
-        assert_eq!(humanize(Duration::from_secs(90)), "1 minute");
-        assert_eq!(humanize(Duration::from_hours(3)), "3 hours");
-        assert_eq!(humanize(Duration::from_hours(25)), "1 day");
-        assert_eq!(humanize(Duration::from_hours(24 * 60)), "60 days");
+    fn an_empty_registry_read_does_not_prune_a_stale_identity() {
+        // Seed an identity old enough to clear `IDENTITY_PRUNE_SECS` relative
+        // to "now", so it would be pruned if `resolve_bootstrap` ran
+        // `prune_and_cap` on this empty-but-successful read. It must not: an
+        // emptied registry is not a reason to discard the last known-good
+        // identities, so the stale entry must survive untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let peers = vec![candidate(7, "DE")];
+        let stale_seen_at = now_secs()
+            .saturating_sub(crate::peer_store::IDENTITY_PRUNE_SECS)
+            .saturating_sub(1);
+        seed_store(dir.path(), &peers, stale_seen_at);
+
+        assert!(
+            resolve_bootstrap(Ok(Vec::new()), dir.path())
+                .unwrap()
+                .into_peers()
+                .is_empty()
+        );
+        assert_eq!(
+            store_candidates(dir.path()),
+            peers,
+            "the stale identity must still be in the store: an empty successful \
+             read must not prune"
+        );
     }
 
     fn warming(seed: u8, rtt_ms: f64) -> WarmingCandidate {
