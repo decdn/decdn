@@ -42,6 +42,61 @@ pub fn key_path(data_dir: &Path) -> PathBuf {
     data_dir.join(KEY_FILE_NAME)
 }
 
+/// Load the node's `SecretKey` from disk **without** generating one when it is
+/// absent — the read-only counterpart of [`load_or_generate`], used by
+/// `decdn whoami` to report the existing identity without minting a new key.
+///
+/// Applies the same validation as [`load_or_generate`]'s load path: `data_dir`
+/// must be a secure directory and `node.secret` a secure 32-byte regular file.
+///
+/// # Errors
+///
+/// Returns an error if `node.secret` does not exist; if it is a symlink or
+/// other non-regular file, has the wrong size, or has insecure permissions;
+/// if `data_dir` is missing, not a directory, or has insecure permissions; if
+/// the key path can't be stat'd for reasons other than non-existence; or if
+/// reading fails.
+pub fn load(data_dir: &Path) -> anyhow::Result<SecretKey> {
+    let path = key_path(data_dir);
+
+    // Check `data_dir` first so a clear "invalid data_dir" error beats a
+    // confusing "failed to stat key path" when `data_dir` is e.g. a regular
+    // file (the `join` would make the key path unstat'able with ENOTDIR).
+    match fs::symlink_metadata(data_dir) {
+        Ok(_) => validate_data_dir(data_dir)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "no node identity: data_dir {} does not exist (key path {})",
+                data_dir.display(),
+                path.display()
+            ));
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context(format!("failed to stat data_dir {}", data_dir.display())));
+        }
+    }
+
+    // `symlink_metadata` rather than `path.exists()`: it returns `Ok` for a
+    // dangling symlink (so `validate_key_file` rejects it), and it distinguishes
+    // `NotFound` from other errors so a storage EIO is not mistaken for an
+    // absent key.
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            validate_key_file(&path)?;
+            load_from(&path)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
+            "no node identity at {}; run `decdn key-gen` to create one",
+            path.display()
+        )),
+        Err(e) => {
+            Err(anyhow::Error::new(e)
+                .context(format!("failed to stat key path {}", path.display())))
+        }
+    }
+}
+
 /// Load the node's `SecretKey` from disk, generating and persisting one if absent.
 ///
 /// # Errors
@@ -744,6 +799,51 @@ mod tests {
         let k1 = load_or_generate(dir.path())?;
         let k2 = load_or_generate(dir.path())?;
         assert_eq!(k1.to_bytes(), k2.to_bytes());
+        Ok(())
+    }
+
+    // `load` reads the same key `load_or_generate` persisted, without a second
+    // generate path that could diverge.
+    #[test]
+    fn load_reads_the_persisted_key() -> anyhow::Result<()> {
+        let dir = secure_tempdir()?;
+        let generated = load_or_generate(dir.path())?;
+        let loaded = load(dir.path())?;
+        assert_eq!(generated.to_bytes(), loaded.to_bytes());
+        Ok(())
+    }
+
+    // The whole point of `load` over `load_or_generate`: an absent key is an
+    // error, and the call writes nothing — `whoami` must never mint an identity.
+    #[test]
+    fn load_errors_on_absent_key_and_writes_nothing() -> anyhow::Result<()> {
+        let dir = secure_tempdir()?;
+        let err = load(dir.path()).expect_err("absent key must error, not generate");
+        assert!(
+            format!("{err:#}").contains(&key_path(dir.path()).display().to_string()),
+            "error must name the missing key path: {err:#}"
+        );
+        assert!(
+            !key_path(dir.path()).exists(),
+            "load must not create node.secret"
+        );
+        Ok(())
+    }
+
+    // `load` keeps `load_or_generate`'s permission validation: a world-readable
+    // key is rejected rather than loaded.
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_insecure_key_file() -> anyhow::Result<()> {
+        let dir = secure_tempdir()?;
+        let path = key_path(dir.path());
+        fs::write(&path, [0u8; KEY_LEN])?;
+        chmod(&path, 0o644)?;
+        let err = load(dir.path()).expect_err("world-readable key must be rejected");
+        assert!(
+            format!("{err:#}").contains("invalid node.secret"),
+            "{err:#}"
+        );
         Ok(())
     }
 

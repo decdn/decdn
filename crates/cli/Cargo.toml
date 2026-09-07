@@ -90,6 +90,9 @@ alloy = { workspace = true }
 # via `join_all`, which borrows one shared `&endpoint` instead of cloning it
 # per probe. Combinators only — no iroh-blobs, so the #578 invariant holds.
 futures-util = { workspace = true }
+# `decdn whoami` holds the resolved keystore password in a `Zeroizing<String>`
+# (the type `eth_identity::read_password` returns) so it is scrubbed on drop.
+zeroize = { workspace = true }
 [dev-dependencies]
 decdn-incentive = { workspace = true, features = ["redb", "test-util"] }
 # Integration tests in `tests/admin_rpc.rs` exercise the loopback admin
