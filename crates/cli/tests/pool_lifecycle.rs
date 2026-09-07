@@ -77,7 +77,8 @@ async fn close_with_unparseable_pool_id_errors_before_touching_chain() {
     let cfg = empty_config(dir.path());
     let args = PoolArgs {
         command: PoolCommand::Close(PoolCloseArgs {
-            pool: "not-a-pool-id".to_string(),
+            pool: Some("not-a-pool-id".to_string()),
+            all: false,
             chain: chain_args(dir.path()),
         }),
     };
@@ -93,7 +94,8 @@ async fn reclaim_with_unparseable_pool_id_errors_before_touching_chain() {
     let cfg = empty_config(dir.path());
     let args = PoolArgs {
         command: PoolCommand::Reclaim(PoolReclaimArgs {
-            pool: "not-a-pool-id".to_string(),
+            pool: Some("not-a-pool-id".to_string()),
+            all: false,
             chain: chain_args(dir.path()),
         }),
     };

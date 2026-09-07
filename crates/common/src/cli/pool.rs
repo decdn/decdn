@@ -9,10 +9,11 @@
 //! refunds the residual once that window has elapsed (`reclaim`, callable by
 //! anyone); `assign` issues an owner-signed spending capability delegating a
 //! bounded spend on the pool to a delegate signer key, printing the `dcap1:`
-//! token to hand off. Each of `top-up`/`close`/`reclaim`/`assign` takes the
-//! target pool
-//! explicitly via `--pool` — there is no implicit per-provider lookup, because
-//! one pool fans out to every provider the owner pays (ADR 003).
+//! token to hand off. Each of `top-up`/`close`/`reclaim`/`assign` names its
+//! target pool explicitly via `--pool` — there is no implicit per-provider
+//! lookup, because one pool fans out to every provider the owner pays
+//! (ADR 003). `close` and `reclaim` also accept `--all`, which enumerates every
+//! pool this keystore owns on-chain (`getPools`) and acts on each eligible one.
 
 use std::path::PathBuf;
 
@@ -120,11 +121,24 @@ pub struct PoolTopUpArgs {
 }
 
 /// `decdn pool close` flags.
+///
+/// Targets exactly one of a single `--pool` or `--all`. `--all` enumerates every
+/// pool this keystore owns from chain (`getPools`) and closes the ones that are
+/// still `Open`.
 #[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("close_target").required(true).args(["pool", "all"])))]
 pub struct PoolCloseArgs {
-    /// The pool to close (0x-prefixed 32-byte `poolId`).
+    /// The pool to close (0x-prefixed 32-byte `poolId`). Mutually exclusive
+    /// with `--all`.
     #[arg(long, value_name = "0xHASH")]
-    pub pool: String,
+    pub pool: Option<String>,
+
+    /// Close every pool this keystore owns that is currently `Open`, discovered
+    /// on-chain via `getPools`. Pools already closing or closed are skipped;
+    /// one pool's failure does not abort the rest. Mutually exclusive with
+    /// `--pool`.
+    #[arg(long)]
+    pub all: bool,
 
     /// Shared chain + store coordinates.
     #[command(flatten)]
@@ -132,11 +146,24 @@ pub struct PoolCloseArgs {
 }
 
 /// `decdn pool reclaim` flags.
+///
+/// Targets exactly one of a single `--pool` or `--all`. `--all` enumerates every
+/// pool this keystore owns from chain (`getPools`) and reclaims the ones whose
+/// dispute window has elapsed.
 #[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("reclaim_target").required(true).args(["pool", "all"])))]
 pub struct PoolReclaimArgs {
-    /// The pool to reclaim (0x-prefixed 32-byte `poolId`).
+    /// The pool to reclaim (0x-prefixed 32-byte `poolId`). Mutually exclusive
+    /// with `--all`.
     #[arg(long, value_name = "0xHASH")]
-    pub pool: String,
+    pub pool: Option<String>,
+
+    /// Reclaim every pool this keystore owns whose grace window has elapsed,
+    /// discovered on-chain via `getPools`. Pools still `Open`, still inside
+    /// their dispute window, or already reclaimed are skipped; one pool's
+    /// failure does not abort the rest. Mutually exclusive with `--pool`.
+    #[arg(long)]
+    pub all: bool,
 
     /// Shared chain + store coordinates.
     #[command(flatten)]

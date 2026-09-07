@@ -307,31 +307,136 @@ const fn receipt_outcome(landed: bool) -> TxOutcome {
     }
 }
 
-/// `decdn pool close`: start the grace-window close on a pool the caller owns
-/// (`closePool`). Redemptions stay valid until the dispute deadline; `pool
-/// reclaim` refunds the residual after it elapses.
-async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
-    let file = load_file_config(config_path)?;
-    let chain = resolve_chain(&args.chain, &file)?;
-    let pool_id = parse_pool_id(&args.pool)?;
+/// What `close --all` does with one enumerated pool, decided from its on-chain
+/// status alone. Only `Open` pools have anything to close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosePlan {
+    /// `Open` — send `closePool`.
+    Close,
+    /// Not `Open` — nothing to do; the string is the human-readable reason.
+    Skip(&'static str),
+}
 
-    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
-    let signer = Arc::new(load_buyer_signer(&chain)?);
-    let owner = signer.address();
-    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
-    let contract = PaymentPool::new(chain.payment_pool, rpc);
+/// What `reclaim --all` does with one enumerated pool, decided from its status
+/// and dispute deadline against the current time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimPlan {
+    /// `Closing` and its dispute window has elapsed — send `reclaim`.
+    Reclaim,
+    /// `Open` — it must be closed first, so there is nothing to reclaim yet.
+    SkipOpen,
+    /// `Closing` but still inside the dispute window; carries the absolute
+    /// Unix deadline so the operator learns when it becomes reclaimable.
+    SkipInWindow(u64),
+    /// `Closed` — already reclaimed (or it never held a residual).
+    SkipClosed,
+}
 
-    let pool = contract
-        .getPool(pool_id)
-        .call()
-        .await
-        .map_err(|e| anyhow::anyhow!("getPool failed: {e}"))?;
-    ensure_owned(pool.owner, owner, pool_id)?;
+/// Running counts for a `--all` sweep. The exit code keys off `failed`; the
+/// other two are reported for the operator.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BatchTally {
+    /// Pools closed or reclaimed successfully.
+    acted: usize,
+    /// Pools intentionally left untouched (wrong status / window not elapsed).
+    skipped: usize,
+    /// Pools whose read or transaction errored.
+    failed: usize,
+}
+
+/// Classify one enumerated pool for `close --all`.
+const fn plan_close(status: PaymentPool::Status) -> ClosePlan {
+    match status {
+        PaymentPool::Status::Open => ClosePlan::Close,
+        PaymentPool::Status::Closing => ClosePlan::Skip("already closing"),
+        PaymentPool::Status::Closed => ClosePlan::Skip("already closed"),
+        // `sol!` enums carry a hidden invalid variant, so a wildcard is
+        // required; an unrecognized status has nothing safe to close.
+        _ => ClosePlan::Skip("unknown on-chain status"),
+    }
+}
+
+/// Classify one enumerated pool for `reclaim --all`. `reclaim` reverts unless
+/// the pool is `Closing` past its deadline, so the plan pre-filters to exactly
+/// that case and names why each other pool is skipped. `now == deadline` counts
+/// as elapsed, matching the on-chain `block.timestamp >= disputeDeadline` gate.
+const fn plan_reclaim(status: PaymentPool::Status, dispute_deadline: u64, now: u64) -> ReclaimPlan {
+    match status {
+        PaymentPool::Status::Open => ReclaimPlan::SkipOpen,
+        PaymentPool::Status::Closing if now >= dispute_deadline => ReclaimPlan::Reclaim,
+        PaymentPool::Status::Closing => ReclaimPlan::SkipInWindow(dispute_deadline),
+        // `Closed` and the hidden invalid variant: nothing to reclaim.
+        _ => ReclaimPlan::SkipClosed,
+    }
+}
+
+/// Turn a finished `--all` sweep into a process result. Any failed pool is a
+/// nonzero exit; "nothing eligible" is success — the summary line already says
+/// so.
+///
+/// # Errors
+///
+/// Errors when at least one pool failed to `verb`.
+fn batch_result(tally: &BatchTally, verb: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
-        matches!(pool.status, PaymentPool::Status::Open),
-        "pool {pool_id} is not Open — nothing to close (already closing or closed)"
+        tally.failed == 0,
+        "{} pool(s) failed to {verb}; see the summary above",
+        tally.failed
     );
+    Ok(())
+}
 
+/// Every pool id this `owner` has opened, read from chain oldest-first by paging
+/// `getPools`. Chain-authoritative: unlike the local buyer store (which drops a
+/// row at close), this enumerates pools in every lifecycle state, which is what
+/// `--all` needs to reach historical `Closing` pools awaiting reclaim.
+async fn enumerate_owned_pools<P>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: Address,
+) -> anyhow::Result<Vec<PoolId>>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    // `getPools` clamps `limit` to the remaining count and returns an empty page
+    // once `offset` passes the owner's nonce, so a short page ends the walk
+    // without a separate `ownerPoolNonce` read.
+    const PAGE: usize = 256;
+    let mut ids = Vec::new();
+    let mut offset: u64 = 0;
+    loop {
+        let page = contract
+            .getPools(owner, U256::from(offset), U256::from(PAGE))
+            .call()
+            .await
+            .map_err(|e| anyhow::anyhow!("getPools(offset={offset}) failed: {e}"))?;
+        let n = page.len();
+        ids.extend(page);
+        if n < PAGE {
+            break;
+        }
+        offset = offset.saturating_add(u64::try_from(n)?);
+    }
+    Ok(ids)
+}
+
+/// Send `closePool(pool_id)`, wait for the receipt, and on success clear the
+/// local buyer row so a later fetch opens a fresh pool. Ownership and `Open`
+/// status are the caller's responsibility. Returns the reclaim note shared by
+/// the success line and the row-clear warning.
+///
+/// # Errors
+///
+/// Errors when the send is rejected, the receipt cannot be read, the tx
+/// reverted, or the local row-clear faulted after a landed close.
+async fn close_and_forget<P>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    store: &RedbBuyerPoolStore,
+    owner: Address,
+    pool_id: PoolId,
+) -> anyhow::Result<String>
+where
+    P: alloy::providers::Provider + Clone,
+{
     let pending = match contract.closePool(pool_id).send().await {
         Ok(pending) => pending,
         Err(e) if e.as_revert_data().is_some() => {
@@ -349,10 +454,9 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
             // The dispute deadline is only known post-close; read it best-effort
             // and never print the pre-close `0` if that read fails. The local
             // record is dropped so a later `fetch`/`bundle pull` opens a fresh
-            // pool rather than reusing one that is winding down — `--pool`
-            // still names this one explicitly for `pool reclaim`. The transport
-            // error reaches stdout, so it goes through the same URL redaction
-            // `main` applies at the error boundary.
+            // pool rather than reusing one that is winding down. Any transport
+            // error is redacted here, since the caller may print it directly
+            // rather than through `main`'s error boundary.
             let deadline_note = match contract.getPool(pool_id).call().await {
                 Ok(p) => format!("after Unix {}", p.disputeDeadline),
                 Err(e) => format!(
@@ -369,8 +473,7 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
                 receipt.transaction_hash,
                 &reclaim_note,
             )?;
-            println!("closed pool {pool_id}; dispute window open — {reclaim_note}");
-            Ok(())
+            Ok(reclaim_note)
         }
         TxOutcome::Reverted => anyhow::bail!(
             "closePool reverted on-chain for pool {pool_id} (it may have raced a concurrent \
@@ -379,20 +482,24 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
     }
 }
 
-/// `decdn pool reclaim`: refund the residual deposit of a pool once its grace
-/// window has elapsed (`reclaim`; permissionless — callable by anyone, but only
-/// the owner receives funds).
-async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
-    let file = load_file_config(config_path)?;
-    let chain = resolve_chain(&args.chain, &file)?;
-    let pool_id = parse_pool_id(&args.pool)?;
-
-    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
-    let signer = Arc::new(load_buyer_signer(&chain)?);
-    let owner = signer.address();
-    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
-    let contract = PaymentPool::new(chain.payment_pool, rpc);
-
+/// Send `reclaim(pool_id)`, wait for the receipt, and on success best-effort
+/// clear the local row. `reclaim` is permissionless, so no ownership check is
+/// needed. Returns `Ok(())` once the refund lands.
+///
+/// # Errors
+///
+/// Errors when the send is rejected, the receipt cannot be read, or the tx
+/// reverted (not closed, or the dispute window has not elapsed). A failed local
+/// row-clear only warns — the refund itself landed.
+async fn reclaim_and_forget<P>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    store: &RedbBuyerPoolStore,
+    owner: Address,
+    pool_id: PoolId,
+) -> anyhow::Result<()>
+where
+    P: alloy::providers::Provider + Clone,
+{
     let pending = match contract.reclaim(pool_id).send().await {
         Ok(pending) => pending,
         Err(e) if e.as_revert_data().is_some() => {
@@ -425,7 +532,6 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
                      {pool_id}` to clear it"
                 );
             }
-            println!("reclaimed pool {pool_id}; residual deposit refunded to its owner");
             Ok(())
         }
         TxOutcome::Reverted => anyhow::bail!(
@@ -433,6 +539,203 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
              has not elapsed yet)"
         ),
     }
+}
+
+/// `decdn pool close`: start the grace-window close on a pool the caller owns
+/// (`closePool`). Redemptions stay valid until the dispute deadline; `pool
+/// reclaim` refunds the residual after it elapses. `--all` closes every `Open`
+/// pool this keystore owns; `--pool` closes exactly one.
+async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let file = load_file_config(config_path)?;
+    let chain = resolve_chain(&args.chain, &file)?;
+    // Parse the target id before any store/keystore/provider work, so a
+    // malformed `--pool` fails fast without touching the chain. `None` is the
+    // `--all` sweep (clap's arg group guarantees exactly one of the two).
+    let target = args.pool.as_deref().map(parse_pool_id).transpose()?;
+
+    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
+    let signer = Arc::new(load_buyer_signer(&chain)?);
+    let owner = signer.address();
+    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+    let contract = PaymentPool::new(chain.payment_pool, rpc);
+
+    let Some(pool_id) = target else {
+        return close_all(&contract, &store, owner).await;
+    };
+
+    let pool = contract
+        .getPool(pool_id)
+        .call()
+        .await
+        .map_err(|e| anyhow::anyhow!("getPool failed: {e}"))?;
+    ensure_owned(pool.owner, owner, pool_id)?;
+    anyhow::ensure!(
+        matches!(pool.status, PaymentPool::Status::Open),
+        "pool {pool_id} is not Open — nothing to close (already closing or closed)"
+    );
+
+    let reclaim_note = close_and_forget(&contract, &store, owner, pool_id).await?;
+    println!("closed pool {pool_id}; dispute window open — {reclaim_note}");
+    Ok(())
+}
+
+/// `close --all`: enumerate every pool this keystore owns and close the `Open`
+/// ones. One pool's read or close failure is recorded and the sweep continues;
+/// the exit code is nonzero only if any pool failed.
+async fn close_all<P>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    store: &RedbBuyerPoolStore,
+    owner: Address,
+) -> anyhow::Result<()>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let ids = enumerate_owned_pools(contract, owner).await?;
+    if ids.is_empty() {
+        println!("no pools found for this keystore — nothing to close");
+        return Ok(());
+    }
+
+    let mut tally = BatchTally::default();
+    for pool_id in ids {
+        let status = match contract.getPool(pool_id).call().await {
+            Ok(pool) => pool.status,
+            Err(e) => {
+                eprintln!(
+                    "failed to read pool {pool_id}: {}",
+                    decdn_common::redact::sanitize_err_chain(&anyhow::anyhow!("{e}"))
+                );
+                tally.failed += 1;
+                continue;
+            }
+        };
+        match plan_close(status) {
+            ClosePlan::Close => match close_and_forget(contract, store, owner, pool_id).await {
+                Ok(note) => {
+                    println!("closed pool {pool_id}; dispute window open — {note}");
+                    tally.acted += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "failed to close pool {pool_id}: {}",
+                        decdn_common::redact::sanitize_err_chain(&e)
+                    );
+                    tally.failed += 1;
+                }
+            },
+            ClosePlan::Skip(reason) => {
+                println!("skipped pool {pool_id}: {reason}");
+                tally.skipped += 1;
+            }
+        }
+    }
+    println!(
+        "close --all: closed {}, skipped {}, failed {}",
+        tally.acted, tally.skipped, tally.failed
+    );
+    batch_result(&tally, "close")
+}
+
+/// `decdn pool reclaim`: refund the residual deposit of a pool once its grace
+/// window has elapsed (`reclaim`; permissionless — callable by anyone, but only
+/// the owner receives funds). `--all` reclaims every pool this keystore owns
+/// whose window has elapsed; `--pool` reclaims exactly one.
+async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let file = load_file_config(config_path)?;
+    let chain = resolve_chain(&args.chain, &file)?;
+    // Parse the target id before any store/keystore/provider work, so a
+    // malformed `--pool` fails fast without touching the chain. `None` is the
+    // `--all` sweep (clap's arg group guarantees exactly one of the two).
+    let target = args.pool.as_deref().map(parse_pool_id).transpose()?;
+
+    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
+    let signer = Arc::new(load_buyer_signer(&chain)?);
+    let owner = signer.address();
+    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+    let contract = PaymentPool::new(chain.payment_pool, rpc);
+
+    let Some(pool_id) = target else {
+        return reclaim_all(&contract, &store, owner).await;
+    };
+
+    reclaim_and_forget(&contract, &store, owner, pool_id).await?;
+    println!("reclaimed pool {pool_id}; residual deposit refunded to its owner");
+    Ok(())
+}
+
+/// `reclaim --all`: enumerate every pool this keystore owns and reclaim the ones
+/// whose dispute window has elapsed. Pools still `Open`, still inside the
+/// window, or already reclaimed are skipped (in-window pools report when they
+/// become reclaimable). One pool's failure is recorded and the sweep continues;
+/// the exit code is nonzero only if any pool failed.
+async fn reclaim_all<P>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    store: &RedbBuyerPoolStore,
+    owner: Address,
+) -> anyhow::Result<()>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let now = unix_now()?;
+    let ids = enumerate_owned_pools(contract, owner).await?;
+    if ids.is_empty() {
+        println!("no pools found for this keystore — nothing to reclaim");
+        return Ok(());
+    }
+
+    let mut tally = BatchTally::default();
+    for pool_id in ids {
+        let pool = match contract.getPool(pool_id).call().await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!(
+                    "failed to read pool {pool_id}: {}",
+                    decdn_common::redact::sanitize_err_chain(&anyhow::anyhow!("{e}"))
+                );
+                tally.failed += 1;
+                continue;
+            }
+        };
+        match plan_reclaim(pool.status, pool.disputeDeadline, now) {
+            ReclaimPlan::Reclaim => {
+                match reclaim_and_forget(contract, store, owner, pool_id).await {
+                    Ok(()) => {
+                        println!(
+                            "reclaimed pool {pool_id}; residual deposit refunded to its owner"
+                        );
+                        tally.acted += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "failed to reclaim pool {pool_id}: {}",
+                            decdn_common::redact::sanitize_err_chain(&e)
+                        );
+                        tally.failed += 1;
+                    }
+                }
+            }
+            ReclaimPlan::SkipOpen => {
+                println!("skipped pool {pool_id}: still Open — run `pool close` first");
+                tally.skipped += 1;
+            }
+            ReclaimPlan::SkipInWindow(deadline) => {
+                println!(
+                    "skipped pool {pool_id}: dispute window open — reclaimable after Unix \
+                     {deadline}"
+                );
+                tally.skipped += 1;
+            }
+            ReclaimPlan::SkipClosed => {
+                println!("skipped pool {pool_id}: already reclaimed");
+                tally.skipped += 1;
+            }
+        }
+    }
+    println!(
+        "reclaim --all: reclaimed {}, skipped {}, failed {}",
+        tally.acted, tally.skipped, tally.failed
+    );
+    batch_result(&tally, "reclaim")
 }
 
 /// Resolve the capability's absolute Unix-seconds expiry from the mutually
@@ -1060,6 +1363,72 @@ mod tests {
             msg.contains("decdn pool reclaim"),
             "the close landed, so the reclaim deadline must survive the failure: {msg}"
         );
+    }
+
+    // ---- `--all` classification + summary --------------------------------
+
+    #[test]
+    fn close_plan_acts_only_on_open() {
+        assert_eq!(plan_close(PaymentPool::Status::Open), ClosePlan::Close);
+        assert!(matches!(
+            plan_close(PaymentPool::Status::Closing),
+            ClosePlan::Skip(_)
+        ));
+        assert!(matches!(
+            plan_close(PaymentPool::Status::Closed),
+            ClosePlan::Skip(_)
+        ));
+    }
+
+    #[test]
+    fn reclaim_plan_respects_status_and_deadline() {
+        // Open must be closed first.
+        assert_eq!(
+            plan_reclaim(PaymentPool::Status::Open, 100, 200),
+            ReclaimPlan::SkipOpen
+        );
+        // Closing, still inside the window: not yet, and it carries the deadline.
+        assert_eq!(
+            plan_reclaim(PaymentPool::Status::Closing, 200, 100),
+            ReclaimPlan::SkipInWindow(200)
+        );
+        // Closing, window elapsed (now == deadline is elapsed): reclaim.
+        assert_eq!(
+            plan_reclaim(PaymentPool::Status::Closing, 200, 200),
+            ReclaimPlan::Reclaim
+        );
+        assert_eq!(
+            plan_reclaim(PaymentPool::Status::Closing, 200, 300),
+            ReclaimPlan::Reclaim
+        );
+        // Already reclaimed.
+        assert_eq!(
+            plan_reclaim(PaymentPool::Status::Closed, 0, 300),
+            ReclaimPlan::SkipClosed
+        );
+    }
+
+    #[test]
+    fn batch_result_is_ok_unless_something_failed() {
+        // Nothing eligible is success (exit 0) — the summary line said so.
+        assert!(batch_result(&BatchTally::default(), "close").is_ok());
+        // Acted + skipped, none failed: still success.
+        let clean = BatchTally {
+            acted: 3,
+            skipped: 2,
+            failed: 0,
+        };
+        assert!(batch_result(&clean, "reclaim").is_ok());
+        // Any failure is a nonzero exit, and the verb reaches the message.
+        let broke = BatchTally {
+            acted: 1,
+            skipped: 0,
+            failed: 2,
+        };
+        let err = batch_result(&broke, "close").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains('2'), "the failure count must show: {msg}");
+        assert!(msg.contains("close"), "the verb must show: {msg}");
     }
 
     #[test]
