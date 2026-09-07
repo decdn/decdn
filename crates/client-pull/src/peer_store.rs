@@ -2,7 +2,7 @@
 //! latency and price, keyed by iroh [`iroh::PublicKey`], one JSON file per peer.
 
 use crate::discovery::NodeCandidate;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, Bytes};
 use decdn_protocol::Region;
 use iroh::PublicKey;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,15 @@ pub struct PeerRecord {
     pub eth_address: Address,
     /// The node's self-attested region (ADR 030), or `None` when unset/invalid.
     pub region_hint: Option<Region>,
+    /// The node's registry-published, packed `multiaddrs` field, refreshed on
+    /// every identity upsert. Persisting it lets a returning client dial a
+    /// known-good peer directly when it can reach neither the chain (RPC outage)
+    /// nor iroh discovery — the fully-decentralized fallback (ADR 001 § Node
+    /// Discovery, ADR 012 § Bootstrap step 4). Additive and self-attested: a
+    /// stale cached address loses the iroh path race but never fails a dial that
+    /// live infrastructure would have served, since on the outage path there is
+    /// no discovery to fall back to anyway.
+    pub multiaddrs: Bytes,
     /// Seconds since the Unix epoch when identity was last confirmed against the registry.
     pub identity_seen_at_secs: u64,
     /// EWMA-smoothed observed latency in milliseconds; `None` until the first sample.
@@ -113,13 +122,17 @@ impl PeerRecord {
             && !self.failure_suppressed(now_secs, cfg)
     }
 
-    /// Project the identity half back into a [`NodeCandidate`] for selection/fallback.
+    /// Project the identity half back into a [`NodeCandidate`] for
+    /// selection/fallback, carrying the cached `multiaddrs` so a registry-outage
+    /// fallback dial can reach a reachable peer directly, without iroh discovery
+    /// (ADR 012 § Bootstrap step 4).
     #[must_use]
-    pub const fn as_candidate(&self) -> NodeCandidate {
+    pub fn as_candidate(&self) -> NodeCandidate {
         NodeCandidate {
             node_id: self.node_id,
             eth_address: self.eth_address,
             region_hint: self.region_hint,
+            multiaddrs: self.multiaddrs.clone(),
         }
     }
 
@@ -223,6 +236,7 @@ impl PeerStore {
             node_id: cand.node_id,
             eth_address: cand.eth_address,
             region_hint: cand.region_hint,
+            multiaddrs: cand.multiaddrs.clone(),
             identity_seen_at_secs: now_secs,
             latency_ms: None,
             last_sampled_at_secs: None,
@@ -232,6 +246,9 @@ impl PeerStore {
         });
         rec.eth_address = cand.eth_address;
         rec.region_hint = cand.region_hint;
+        // Addresses ride the identity clock: refreshed on every registry read so
+        // the cache tracks the latest published `multiaddrs`.
+        rec.multiaddrs = cand.multiaddrs.clone();
         rec.identity_seen_at_secs = now_secs;
         self.write(&rec)
     }
@@ -249,6 +266,7 @@ impl PeerStore {
             node_id: *node_id,
             eth_address: Address::ZERO,
             region_hint: None,
+            multiaddrs: Bytes::new(),
             identity_seen_at_secs: 0,
             latency_ms: None,
             last_sampled_at_secs: None,
@@ -321,6 +339,7 @@ mod tests {
             node_id,
             eth_address: Address::repeat_byte(0xAB),
             region_hint: Region::parse("US"),
+            multiaddrs: Bytes::new(),
             identity_seen_at_secs: 1_000,
             latency_ms: None,
             last_sampled_at_secs: None,
@@ -385,6 +404,7 @@ mod tests {
             node_id: key(b),
             eth_address: Address::repeat_byte(b),
             region_hint: Region::parse("US"),
+            multiaddrs: Bytes::new(),
         }
     }
 
@@ -399,6 +419,48 @@ mod tests {
         assert_eq!(got.eth_address, Address::repeat_byte(1));
         assert_eq!(got.identity_seen_at_secs, 5_000);
         assert_eq!(got.latency_ms, None);
+        Ok(())
+    }
+
+    fn candidate_with_addr(b: u8, multiaddr: &str) -> anyhow::Result<NodeCandidate> {
+        let mut cand = candidate(b);
+        cand.multiaddrs = Bytes::from(decdn_incentive::node_register::pack_multiaddrs(&[
+            multiaddr.to_string(),
+        ])?);
+        Ok(cand)
+    }
+
+    #[test]
+    fn upsert_persists_multiaddrs_and_as_candidate_carries_them() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        let cand = candidate_with_addr(5, "/ip4/203.0.113.10/udp/4433/quic-v1")?;
+        store.upsert_identity(&cand, 5_000)?;
+        let got = store
+            .get(&key(5))
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        assert_eq!(got.multiaddrs, cand.multiaddrs);
+        // Projected back for a registry-outage dial, the cached address decodes.
+        assert_eq!(
+            got.as_candidate().dial_addrs(),
+            vec!["203.0.113.10:4433".parse()?]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn record_sample_preserves_cached_multiaddrs() -> anyhow::Result<()> {
+        let cfg = StoreConfig::default();
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        let cand = candidate_with_addr(6, "/ip4/198.51.100.7/udp/5000/quic-v1")?;
+        store.upsert_identity(&cand, 5_000)?;
+        // A later stats-only update must not clear the cached addresses.
+        store.record_sample(&key(6), 30.0, 7, 5_100, &cfg)?;
+        let got = store
+            .get(&key(6))
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        assert_eq!(got.multiaddrs, cand.multiaddrs);
         Ok(())
     }
 

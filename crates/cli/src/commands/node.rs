@@ -2295,6 +2295,7 @@ mod tests {
             node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
             eth_address: alloy::primitives::Address::repeat_byte(seed),
             region_hint: decdn_protocol::Region::parse(region),
+            multiaddrs: alloy::primitives::Bytes::new(),
         }
     }
 

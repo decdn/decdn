@@ -126,6 +126,52 @@ pub fn unpack_multiaddrs(packed: &[u8]) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
+/// Decode the on-chain `multiaddrs` field into dialable UDP socket addresses,
+/// for use as iroh direct-address hints (ADR 001 § Node Discovery). Leniency is
+/// the contract: a record whose framing does not decode, or an entry that is not
+/// a `/ip4|ip6/<addr>/udp/<port>/quic-v1` QUIC multiaddr, is skipped rather than
+/// raised. A self-attested address is only ever one dial path among several, so
+/// a malformed or partial record must never remove a peer from the candidate
+/// set — it can only fail to add a direct path, leaving iroh discovery and the
+/// relay fallback intact.
+#[must_use]
+pub fn decode_dial_addrs(packed: &[u8]) -> Vec<std::net::SocketAddr> {
+    unpack_multiaddrs(packed)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| parse_quic_multiaddr(s))
+        .collect()
+}
+
+/// Parse one `/ip4/<addr>/udp/<port>/quic-v1` (or `/ip6/…`) QUIC multiaddr into
+/// a [`std::net::SocketAddr`]. Returns `None` for any string that is not that
+/// shape; the caller reads `None` as "no direct hint from this entry", never an
+/// error. Trailing segments (e.g. `/p2p/<id>`) are ignored — the socket address
+/// is fully determined by the ip and udp segments.
+fn parse_quic_multiaddr(s: &str) -> Option<std::net::SocketAddr> {
+    // Split on '/', dropping the empty element the leading slash produces:
+    // ["ip4", "<addr>", "udp", "<port>", "quic-v1", ..].
+    let mut segs = s.strip_prefix('/')?.split('/');
+    let proto = segs.next()?;
+    if proto != "ip4" && proto != "ip6" {
+        return None;
+    }
+    let ip: std::net::IpAddr = segs.next()?.parse().ok()?;
+    // Reject a family mismatch (`/ip4/::1/…`): the declared proto must match the
+    // parsed address family, or the record is malformed and dropped.
+    if proto == "ip4" && !ip.is_ipv4() || proto == "ip6" && !ip.is_ipv6() {
+        return None;
+    }
+    if segs.next()? != "udp" {
+        return None;
+    }
+    let port: u16 = segs.next()?.parse().ok()?;
+    if segs.next()? != "quic-v1" {
+        return None;
+    }
+    Some(std::net::SocketAddr::new(ip, port))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
@@ -233,5 +279,58 @@ mod tests {
         let huge = "x".repeat(usize::from(u16::MAX) + 1);
         let err = pack_multiaddrs(&[huge]).unwrap_err();
         assert!(err.to_string().contains("exceeds the uint16"), "{err}");
+    }
+
+    #[test]
+    fn decode_dial_addrs_parses_ip4_and_ip6() {
+        let packed = pack_multiaddrs(&[
+            "/ip4/203.0.113.10/udp/4433/quic-v1".to_string(),
+            "/ip6/2001:db8::1/udp/4434/quic-v1".to_string(),
+        ])
+        .unwrap();
+        let addrs = decode_dial_addrs(&packed);
+        assert_eq!(
+            addrs,
+            vec![
+                "203.0.113.10:4433".parse().unwrap(),
+                "[2001:db8::1]:4434".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_dial_addrs_ignores_trailing_segments() {
+        let packed =
+            pack_multiaddrs(&["/ip4/203.0.113.10/udp/4433/quic-v1/p2p/abc".to_string()]).unwrap();
+        assert_eq!(
+            decode_dial_addrs(&packed),
+            vec!["203.0.113.10:4433".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn decode_dial_addrs_skips_malformed_entries_keeps_valid() {
+        // A TCP multiaddr, a family mismatch, and a garbage string are each
+        // dropped; the one well-formed QUIC entry survives.
+        let packed = pack_multiaddrs(&[
+            "/ip4/203.0.113.10/tcp/4433".to_string(),
+            "/ip4/::1/udp/4433/quic-v1".to_string(),
+            "not-a-multiaddr".to_string(),
+            "/ip4/198.51.100.7/udp/5000/quic-v1".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            decode_dial_addrs(&packed),
+            vec!["198.51.100.7:5000".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn decode_dial_addrs_empty_and_malformed_framing_yield_empty() {
+        // Empty field → no hints.
+        assert!(decode_dial_addrs(&[]).is_empty());
+        // Truncated framing (unpack would error) → lenient empty, never a panic
+        // or error: a torn record must not remove a peer from the dial set.
+        assert!(decode_dial_addrs(&[0x00]).is_empty());
     }
 }

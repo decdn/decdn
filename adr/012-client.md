@@ -63,7 +63,9 @@ Startup sequence from first launch to ready state:
      On no stored identity: exit with error —
        "Cannot reach bootstrap sources. Check network connectivity
         and RPC endpoint configuration."
-5. Connect to iroh relay (for NAT traversal)
+5. Feed each peer's registry multiaddrs to iroh as direct-address hints;
+     connect directly to a reachable peer, using an iroh relay only as the
+     NAT-traversal fallback
 6. Build node list from the resolved bootstrap peers
      (registry results, or the store's identity records on fallback)
 7. Upsert identity for every returned node into the peer store
@@ -75,7 +77,7 @@ Startup sequence from first launch to ready state:
 
 The peer store is a directory of per-node JSON files under the resolved client data dir — `--data-dir`, else `[identity] data_dir`, defaulting to `~/.decdn/client` — so it moves with the rest of the client's state rather than living at a fixed path.
 
-The on-chain registry is the sole discovery source. Nodes and clients both build their node list from it. The peer store's identity half — the last registry snapshot — covers a transient RPC outage. The store's stats half — round-trip latency and quoted price, sampled from probes and completed streams — lets a client route a fetch without probing when it holds enough fresh candidates, going straight to a `StreamRequest` and taking price from the node's `StreamResponse`. The two halves of a record age on independent clocks: identity refreshes and prunes on the registry's own horizon (the periodic registry refresh of step 8), while stats age against the RTT map's own staleness TTL ([ADR 037 § Client RTT map and latency discovery](037-regional-proxy-warming.md#client-rtt-map-and-latency-discovery), `rtt_map.staleness_secs`) — a record can carry fresh identity with stale stats, or the reverse. A client stays online only long enough to fetch, so it holds no long-lived network role. The store persists across invocations, so a later run can skip both the registry read and the probe.
+The on-chain registry is the sole discovery source. Nodes and clients both build their node list from it. The peer store's identity half — the last registry snapshot — covers a transient RPC outage. That snapshot includes each peer's last-seen `multiaddrs`, so an outage-fallback dial reaches a reachable peer directly, without iroh discovery ([ADR 001 § Node Discovery](001-network.md#node-discovery-registry)); a stale cached address loses the iroh path race but never fails a dial, so the store only ever speeds a fetch. The store's stats half — round-trip latency and quoted price, sampled from probes and completed streams — lets a client route a fetch without probing when it holds enough fresh candidates, going straight to a `StreamRequest` and taking price from the node's `StreamResponse`. The two halves of a record age on independent clocks: identity refreshes and prunes on the registry's own horizon (the periodic registry refresh of step 8), while stats age against the RTT map's own staleness TTL ([ADR 037 § Client RTT map and latency discovery](037-regional-proxy-warming.md#client-rtt-map-and-latency-discovery), `rtt_map.staleness_secs`) — a record can carry fresh identity with stale stats, or the reverse. A client stays online only long enough to fetch, so it holds no long-lived network role. The store persists across invocations, so a later run can skip both the registry read and the probe.
 
 Node-side registry interaction and bootstrap is in [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-node-view-from-on-chain-registry).
 
