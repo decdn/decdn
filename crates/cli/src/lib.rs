@@ -12,3 +12,4 @@
 
 pub mod commands;
 pub mod known_chains;
+pub mod logging;

@@ -22,7 +22,7 @@ use decdn_common::cli::{self, Cli, Command, ConfigCommand};
 #[tokio::main]
 #[expect(
     clippy::print_stderr,
-    reason = "process exit boundary; the CLI installs no subscriber"
+    reason = "process exit boundary; the final user-facing error line, not a log event"
 )]
 async fn main() -> std::process::ExitCode {
     match run().await {
@@ -42,6 +42,11 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Opt-in only: with neither `--log-level` nor `RUST_LOG` this is a no-op and
+    // the CLI stays a clean terminal UI. Installed before dispatch so it covers
+    // every subcommand.
+    decdn_cli::logging::init(cli.log_level);
 
     let config_path = cli.config.map(|p| cli::common::expand_tilde(&p));
 

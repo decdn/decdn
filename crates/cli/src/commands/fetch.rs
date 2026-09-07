@@ -126,7 +126,10 @@ fn new_progress_bar() -> indicatif::ProgressBar {
     let bar = indicatif::ProgressBar::new(0);
     bar.set_style(style);
     bar.enable_steady_tick(Duration::from_millis(120));
-    bar
+    // When client logging is enabled, share stderr with the tracing subscriber
+    // through its `MultiProgress` so log lines do not corrupt the bar; a no-op
+    // (returns the bar unchanged) on the default no-subscriber path.
+    crate::logging::attach_progress_bar(bar)
 }
 
 /// Chain coordinates resolved flag > `[blockchain]`/`[identity]` config >
