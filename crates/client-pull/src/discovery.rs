@@ -7,11 +7,15 @@
 //! explicit target.
 //!
 //! This is the **read + select** half, plus the peer store that backs it up.
-//! Dialing the chosen node uses its iroh `NodeId` via a discovery-enabled
-//! endpoint (`presets::N0` / configured `[network.discovery]`) — the same
-//! mechanism the node uses — so the registry `multiaddrs` field is not decoded
-//! here; a self-contained `multiaddrs` decoder is the deferred, more-
-//! decentralized fallback (#936 § fallback).
+//! Dialing the chosen node uses its iroh `NodeId` on a discovery-enabled
+//! endpoint (`presets::N0` / configured `[network.discovery]`), and the
+//! registry's `NodeInfo.multiaddrs` ride along as iroh direct-address hints
+//! ([`NodeCandidate::dial_addrs`](crate::discovery::NodeCandidate::dial_addrs),
+//! [`with_dial_addrs`](crate::discovery::with_dial_addrs)): a reachable node then
+//! connects without a relay, while discovery and the relay path stay as the
+//! fallback for a node behind NAT (ADR 001 § Node Discovery). The hints are
+//! additive — a stale or malformed address loses the path race but never fails
+//! a dial.
 //!
 //! `bootstrap_nodes` is the entry point: it wraps the registry read in ADR
 //! 012's retry schedule and refreshes the [`crate::PeerStore`] identity
@@ -25,7 +29,7 @@ use std::future::Future;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::ProviderBuilder;
 use anyhow::Context;
 use decdn_common::redact::{sanitize_err_chain, sanitize_rpc_display};
@@ -80,8 +84,9 @@ pub const BOOTSTRAP_UNREACHABLE: &str =
     "Cannot reach bootstrap sources. Check network connectivity and RPC endpoint configuration.";
 
 /// A node the client may fetch from, distilled from a registry `NodeInfo`.
-/// `multiaddrs` is intentionally dropped — dialing is by `node_id` via iroh
-/// discovery (see module docs).
+/// Dialing is by `node_id`; the registry-published `multiaddrs` ride along as
+/// iroh direct-address hints so a reachable peer connects without a relay (see
+/// module docs and [`NodeCandidate::dial_addrs`]).
 ///
 /// Serializable so the resolved set can be projected into [`crate::PeerStore`]
 /// identity records and reloaded from the store when the registry is
@@ -112,6 +117,40 @@ pub struct NodeCandidate {
     /// above correct and keeps an unbounded operator-submitted string off the
     /// peer-store read path (#1348).
     pub region_hint: Option<Region>,
+    /// The node's registry-published, packed `multiaddrs` field
+    /// (`pack_multiaddrs` framing), decoded on demand by [`Self::dial_addrs`]
+    /// into iroh direct-address hints. Self-attested and additive: it can only
+    /// add a direct dial path, never gate one. Carried through the peer store,
+    /// so a candidate rebuilt on a registry outage keeps the last-seen addresses
+    /// and can dial a reachable peer directly, without iroh discovery.
+    pub multiaddrs: Bytes,
+}
+
+impl NodeCandidate {
+    /// Registry-published direct dial addresses, decoded leniently from the
+    /// packed on-chain `multiaddrs` field for use as iroh direct-address hints
+    /// (ADR 001 § Node Discovery). Empty when the node published none, the field
+    /// is malformed, or the candidate came from the peer store rather than a
+    /// live registry read. A returned address is only ever one dial path among
+    /// discovery and the relay fallback, so a stale entry loses the path race
+    /// but never fails the connection.
+    #[must_use]
+    pub fn dial_addrs(&self) -> Vec<std::net::SocketAddr> {
+        decdn_incentive::node_register::decode_dial_addrs(&self.multiaddrs)
+    }
+}
+
+/// Attach a candidate's registry-published direct addresses to `target` as iroh
+/// direct-address hints (ADR 001 § Node Discovery), so a reachable peer connects
+/// without a relay. Additive: an empty or malformed `multiaddrs` field adds
+/// nothing and leaves iroh discovery and the relay fallback untouched, so this
+/// can only speed or enable a dial, never fail one.
+#[must_use]
+pub fn with_dial_addrs(mut target: iroh::EndpointAddr, cand: &NodeCandidate) -> iroh::EndpointAddr {
+    for sock in cand.dial_addrs() {
+        target = target.with_ip_addr(sock);
+    }
+    target
 }
 
 /// Distill a registry `NodeInfo` into a [`NodeCandidate`], or `None` if it is
@@ -136,6 +175,9 @@ fn candidate_from(info: &CapacityBond::NodeInfo, is_active: bool) -> Option<Node
         // unparseable hint costs the node its locality bonus, not its place in
         // the candidate set.
         region_hint: Region::parse(&info.regionHint),
+        // Carried raw and decoded only at dial time (`dial_addrs`); malformed
+        // bytes cost a direct-dial hint, never the candidate.
+        multiaddrs: info.multiaddrs.clone(),
     })
 }
 
@@ -785,6 +827,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn candidate_carries_registry_multiaddrs_for_dialing() {
+        let key = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let mut info = node_info(*key.as_bytes(), true);
+        info.multiaddrs = Bytes::from(
+            decdn_incentive::node_register::pack_multiaddrs(&[
+                "/ip4/203.0.113.10/udp/4433/quic-v1".to_string(),
+            ])
+            .unwrap(),
+        );
+        let cand = candidate_from(&info, true).expect("active candidate");
+        assert_eq!(
+            cand.dial_addrs(),
+            vec!["203.0.113.10:4433".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn with_dial_addrs_attaches_registry_address_to_target() {
+        let key = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let mut info = node_info(*key.as_bytes(), true);
+        info.multiaddrs = Bytes::from(
+            decdn_incentive::node_register::pack_multiaddrs(&[
+                "/ip4/198.51.100.7/udp/5000/quic-v1".to_string(),
+            ])
+            .unwrap(),
+        );
+        let cand = candidate_from(&info, true).expect("active candidate");
+        let target = with_dial_addrs(iroh::EndpointAddr::new(cand.node_id), &cand);
+        let want: std::net::SocketAddr = "198.51.100.7:5000".parse().unwrap();
+        assert!(
+            target.ip_addrs().any(|a| *a == want),
+            "direct addr attached"
+        );
+    }
+
+    #[test]
+    fn with_dial_addrs_is_noop_without_registry_addresses() {
+        // Empty `multiaddrs` (or store-projected candidate): no direct hint is
+        // added, so the dial falls back to discovery exactly as before.
+        let cand = candidate(1, "US");
+        let target = with_dial_addrs(iroh::EndpointAddr::new(cand.node_id), &cand);
+        assert_eq!(target.ip_addrs().count(), 0);
+    }
+
     /// The filter keys on the on-chain `isActive` (the `active[]` column of
     /// `getRegisteredNodes`), NOT the raw `NodeInfo.active` registration flag. A
     /// node mid-unbonding is still `NodeInfo.active == true` but `isActive ==
@@ -832,6 +919,7 @@ mod tests {
             node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
             eth_address: Address::repeat_byte(seed),
             region_hint: Region::parse(region),
+            multiaddrs: Bytes::new(),
         }
     }
 
@@ -950,6 +1038,7 @@ mod tests {
             node_id,
             eth_address,
             region_hint: region.and_then(Region::parse),
+            multiaddrs: Bytes::new(),
         }
     }
 
