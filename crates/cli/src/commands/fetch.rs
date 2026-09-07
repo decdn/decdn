@@ -553,7 +553,7 @@ pub(crate) async fn probe_and_order(
         size_hint: ordered.size_hint,
         coverage_by_node: ordered.coverage_by_node,
         probed_samples,
-        from_store_fast_path: false, // just probed: reachability-checked
+        skipped_registry_read: false, // just probed: reachability-checked
     })
 }
 
@@ -716,6 +716,45 @@ async fn discover_provider(
     {
         return Ok(targets);
     }
+    // Registry read-skip (identity-fresh, latency-stale): when the store still
+    // holds enough recently-confirmed identities, build the candidate set from
+    // them and re-probe for fresh RTT, issuing NO `getRegisteredNodes`. This
+    // decouples "skip the registry read" (bounded by the 24h identity horizon)
+    // from "skip the probe" (bounded by the 10-min latency TTL, the fast path
+    // above). Falls through to the registry read when too few identities are
+    // fresh. `--rediscover` forces the read (checked above alongside the fast
+    // path).
+    if !args.rediscover {
+        let cached = identity_fresh_candidates(&peer_store, &store_cfg, now_secs_cli());
+        let selected = select_with_widening(
+            cached,
+            chain.region.as_deref(),
+            chain.region_allowlist.as_slice(),
+            &store_cfg,
+        );
+        if selected.len() >= store_cfg.min_fresh_candidates {
+            let warming = ProxyWarmingParams::from_args(args);
+            let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+            let mut targets =
+                probe_and_order(endpoint, &selected, relay_hint, hash, warming, &slash_dom).await?;
+            // Resolved without a registry read, so keep the in-fetch rediscovery
+            // entitlement: an all-unreachable cached set must still fall back to
+            // a real `getRegisteredNodes` (ADR 037), never fail a fetch the
+            // registry would have served.
+            targets.skipped_registry_read = true;
+            // Stats-only harvest, never identity — identity refreshes ONLY on a
+            // real registry read (same reasoning as the `Bootstrap::Cached`
+            // path): re-`upsert_identity` here would "confirm" identity against
+            // the store itself, reset `identity_seen_at_secs`, and keep the 24h
+            // refresh horizon from ever expiring.
+            drop(spawn_harvest(
+                &chain.data_dir,
+                Vec::new(),
+                targets.probed_samples.clone(),
+            ));
+            return Ok(targets);
+        }
+    }
     let bootstrap = discovery::bootstrap_nodes(
         &chain.rpc_url,
         capacity_bond,
@@ -740,32 +779,12 @@ async fn discover_provider(
     if all.is_empty() {
         anyhow::bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }
-    // Captured BEFORE `select_candidates_filtered` truncates to `SELECT_K`:
-    // the harvest persists identity for the whole registry read, not just
-    // the shortlist that got probed (#1911-series peer store).
-    let registry_candidates = all.clone();
     let allow: &[decdn_protocol::Region] = if is_live_registry {
         chain.region_allowlist.as_slice()
     } else {
         &[]
     };
-    let mut selected = discovery::select_candidates_filtered(
-        all,
-        chain.region.as_deref(),
-        discovery::SELECT_K,
-        allow,
-    );
-    // Progressive widening: a too-thin region filter must never
-    // starve the fetch. Re-run unfiltered over the same registry read when
-    // the filtered pool falls below the store's own freshness floor.
-    if !allow.is_empty() && selected.len() < store_cfg.min_fresh_candidates {
-        selected = discovery::select_candidates_filtered(
-            registry_candidates.clone(),
-            chain.region.as_deref(),
-            discovery::SELECT_K,
-            &[],
-        );
-    }
+    let selected = select_with_widening(all, chain.region.as_deref(), allow, &store_cfg);
     let warming = ProxyWarmingParams::from_args(args);
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
     let targets =
@@ -774,8 +793,8 @@ async fn discover_provider(
     // `resolve_bootstrap` already does that: on a `Bootstrap::Live` read it
     // upserts+prunes identity for every returned node. So the harvest here
     // writes stats only and never identity. Two reasons:
-    //   - On the `Bootstrap::Cached` outage path `registry_candidates` IS the
-    //     store's own surviving identities; re-`upsert_identity`-ing them would
+    //   - On the `Bootstrap::Cached` outage path the returned peer set (`all`) IS
+    //     the store's own surviving identities; re-`upsert_identity`-ing them would
     //     "confirm" identity against the store itself and reset
     //     `identity_seen_at_secs` — contradicting its meaning ("last confirmed
     //     against the registry") and keeping a departed node from ever becoming
@@ -843,8 +862,71 @@ fn store_fast_path(
         probed_samples: Vec::new(),
         // The one site that sets this: these candidates are projected from the
         // store without a probe, so the driver must keep discovery in reserve.
-        from_store_fast_path: true,
+        skipped_registry_read: true,
     })
+}
+
+/// Gather the cached peers whose identity is fresh enough to build a candidate
+/// set from without re-reading the registry: identity confirmed within
+/// [`decdn_client_pull::StoreConfig::identity_refresh_secs`], not
+/// failure-suppressed, and not past the prune horizon. Latency freshness is NOT
+/// required — this is exactly the identity-fresh/latency-stale case that
+/// [`store_fast_path`] rejects; the caller re-probes these records for a fresh
+/// RTT. Returns them projected to [`NodeCandidate`], unranked (the probe orders
+/// them); empty when none qualify, letting the caller fall through to the
+/// registry read.
+fn identity_fresh_candidates(
+    store: &decdn_client_pull::PeerStore,
+    cfg: &decdn_client_pull::StoreConfig,
+    now_secs: u64,
+) -> Vec<NodeCandidate> {
+    store
+        .load_all()
+        .into_iter()
+        .filter(|r| {
+            r.identity_fresh(now_secs, cfg)
+                && !r.identity_prunable(now_secs, cfg)
+                && !r.failure_suppressed(now_secs, cfg)
+        })
+        .map(|r| r.as_candidate())
+        .collect()
+}
+
+/// The persisted pool's settlement token, or `None` when the owner has no pool
+/// row yet. The token is `PaymentPool.usdc()`, immutable per contract, so a
+/// persisted [`BuyerPoolState::token`] equals a fresh on-chain read — letting a
+/// repeat fetch skip the `usdc()` `eth_call`. Only a first-ever pool falls
+/// through to the on-chain read.
+fn cached_pool_token(
+    store: &RedbBuyerPoolStore,
+    self_address: Address,
+) -> anyhow::Result<Option<Address>> {
+    Ok(store.get_by_owner(self_address)?.map(|state| state.token))
+}
+
+/// Region-filter a candidate set to at most [`discovery::SELECT_K`], then
+/// progressively widen: a too-thin region allowlist must never starve the fetch,
+/// so re-run unfiltered over the same set when the filtered pool falls below the
+/// store's freshness floor. Shared by the live registry path and the
+/// registry-read-skip path so both rank identically.
+fn select_with_widening(
+    candidates: Vec<NodeCandidate>,
+    region: Option<&str>,
+    allow: &[decdn_protocol::Region],
+    cfg: &decdn_client_pull::StoreConfig,
+) -> Vec<NodeCandidate> {
+    // Only a non-empty allowlist can trigger the widening re-run, so keep the
+    // unfiltered copy only in that case — the common empty-allowlist path (no
+    // filtering, no widening possible) does no extra allocation.
+    let widen_fallback = (!allow.is_empty()).then(|| candidates.clone());
+    let selected =
+        discovery::select_candidates_filtered(candidates, region, discovery::SELECT_K, allow);
+    if let Some(widened) = widen_fallback
+        && selected.len() < cfg.min_fresh_candidates
+    {
+        return discovery::select_candidates_filtered(widened, region, discovery::SELECT_K, &[]);
+    }
+    selected
 }
 
 /// Persist a discovery session's identity + probe stats off the fetch's
@@ -902,14 +984,16 @@ pub(crate) struct ResolvedTargets {
     /// `(node_id, rtt_ms, rate_per_mb)` for each holder that answered a probe
     /// this fetch — harvested into the peer store.
     pub(crate) probed_samples: Vec<(PublicKey, f64, u64)>,
-    /// `true` only when this set came from the probe-less [`store_fast_path`],
-    /// which projects candidates from the store without probing them. The
-    /// driver reads it to enforce the store's approved invariant: a fresh but
-    /// unreachable fast-path set must never make a fetch fail that discovery
-    /// would have served, so exhausting one with a retryable error triggers a
-    /// single in-fetch rediscovery. `false` on every probed / pinned path,
-    /// where the candidates were already reachability-checked.
-    pub(crate) from_store_fast_path: bool,
+    /// `true` when this set was resolved WITHOUT reading the registry — the
+    /// probe-less [`store_fast_path`], or the identity-fresh candidate set that
+    /// [`identity_fresh_candidates`] projects and re-probes. The driver reads it
+    /// to enforce the store's approved invariant: a set built from cached
+    /// membership must never make a fetch fail that a registry read would have
+    /// served, so exhausting one with a retryable error triggers a single
+    /// in-fetch rediscovery (a real `getRegisteredNodes`). `false` on every path
+    /// that already read the registry, and on the pinned `--node-id` path (which
+    /// has nothing to rediscover).
+    pub(crate) skipped_registry_read: bool,
 }
 
 /// Resolve the ordered failover list of nodes to fetch from (#1174): the
@@ -957,7 +1041,7 @@ pub(crate) async fn resolve_target_node(
             probed_samples: Vec::new(),
             // A pinned `--node-id` is not a store projection; there is nothing
             // to rediscover if it fails.
-            from_store_fast_path: false,
+            skipped_registry_read: false,
         });
     }
 
@@ -1181,7 +1265,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let mut candidates = targets.candidates;
     let mut coverage_by_node = targets.coverage_by_node;
     let mut size_hint = targets.size_hint;
-    let mut from_store_fast_path = targets.from_store_fast_path;
+    let mut skipped_registry_read = targets.skipped_registry_read;
 
     // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
@@ -1200,11 +1284,19 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let contract = PaymentPool::new(chain.payment_pool, rpc.clone());
     let voucher_dom = voucher_domain(chain.chain_id, chain.payment_pool);
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
-    let token = contract
-        .usdc()
-        .call()
-        .await
-        .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
+    // The pool's token is `PaymentPool.usdc()`, immutable per contract. A repeat
+    // fetch already holds it in the persisted pool row, so read it there and skip
+    // the eth_call; only a first-ever pool (no row) pays the `usdc()` round-trip.
+    // The reuse branch of `open_or_reuse_pool` already trusts this same
+    // `state.token`, so this only makes the top-level value consistent with it.
+    let token = match cached_pool_token(&store, self_address)? {
+        Some(token) => token,
+        None => contract
+            .usdc()
+            .call()
+            .await
+            .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?,
+    };
 
     let max_blob_bytes = common.max_blob_mb.saturating_mul(1024 * 1024);
     // The namespace routing hint (ADR 005 § Namespace routing): `--namespace <id>`
@@ -1437,21 +1529,22 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         });
 
         // In-fetch discovery fallback (ADR 037 § in-fetch discovery fallback,
-        // acceptance criterion 5): when the exhausted set came from the probe-less
-        // store fast path and the failure is retryable, re-resolve ONCE via full
+        // acceptance criterion 5): when the exhausted set was resolved without a
+        // registry read (the probe-less store fast path, or the identity-fresh
+        // candidate set) and the failure is retryable, re-resolve ONCE via full
         // discovery and run the failover again over the probed candidates. The
         // `.partial` ranged store and the shared payment pool's lane watermarks are
         // persisted on disk and keyed by content, so the second pass resumes the
         // partial and re-pays nothing already delivered (ADR 003) — it is a
         // continuation, not a fresh from-zero fetch. A terminal failure is never
         // retried this way; it returns exactly as before.
-        if from_store_fast_path
+        if skipped_registry_read
             && !rediscovered
             && retry_disposition(&exhausted_err) != RetryDisposition::Terminal
         {
             rediscovered = true;
             eprintln!(
-                "fetch: every probe-less store candidate was unreachable ({exhausted_err:#}); \
+                "fetch: every cached-membership candidate was unreachable ({exhausted_err:#}); \
                  re-resolving via full discovery within this fetch and resuming the partial \
                  already held (ADR 037)"
             );
@@ -1466,7 +1559,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             size_hint = fresh.size_hint;
             // False by construction (discovery forced), which — together with
             // `rediscovered` — guarantees the loop cannot rediscover again.
-            from_store_fast_path = fresh.from_store_fast_path;
+            skipped_registry_read = fresh.skipped_registry_read;
             continue;
         }
 
@@ -3077,6 +3170,94 @@ mod tests {
         assert_eq!(r.rate_per_mb, Some(9));
     }
 
+    /// `select_with_widening` re-runs unfiltered when a region allowlist filters
+    /// the pool below the freshness floor, so a too-thin allowlist never starves
+    /// the fetch; an empty allowlist filters nothing.
+    #[test]
+    fn select_with_widening_widens_when_allowlist_starves() {
+        let cfg = decdn_client_pull::StoreConfig::default();
+        let de = decdn_protocol::Region::parse("DE");
+        let cands: Vec<NodeCandidate> = (1u8..=4)
+            .map(|b| NodeCandidate {
+                node_id: harvest_key(b),
+                eth_address: Address::from([b; 20]),
+                region_hint: de,
+                multiaddrs: alloy::primitives::Bytes::new(),
+            })
+            .collect();
+        let us = decdn_protocol::Region::parse("US").expect("US is a valid region");
+
+        // Allowlist excludes every candidate's region -> filtered to zero ->
+        // below the floor -> widening re-runs unfiltered and keeps all four.
+        let widened = select_with_widening(cands.clone(), None, &[us], &cfg);
+        assert_eq!(widened.len(), 4);
+
+        // No allowlist -> nothing filtered, nothing to widen.
+        let all = select_with_widening(cands, None, &[], &cfg);
+        assert_eq!(all.len(), 4);
+    }
+
+    /// `cached_pool_token` returns the persisted pool's immutable token without
+    /// any contract read, and `None` (so the caller reads `usdc()` on-chain) when
+    /// no pool row exists for the owner yet.
+    #[test]
+    fn cached_pool_token_uses_persisted_row_and_skips_rpc() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // A fresh subpath so the store's `ensure_data_dir` creates it at 0o700;
+        // the tempdir root itself is 0o755, which the store rejects.
+        let store = RedbBuyerPoolStore::open(&dir.path().join("data"))?;
+        let owner = Address::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+
+        // No row yet -> None -> caller must read usdc() on the open path.
+        assert_eq!(cached_pool_token(&store, owner)?, None);
+
+        // Persist a pool row for this owner.
+        let state =
+            BuyerPoolState::new(B256::repeat_byte(0xAB), owner, token, U256::from(1_000u64));
+        store.record(&state)?;
+
+        // Row present -> the immutable token comes back with no contract read.
+        assert_eq!(cached_pool_token(&store, owner)?, Some(token));
+        // A different owner has no row -> still None.
+        assert_eq!(cached_pool_token(&store, Address::repeat_byte(0x33))?, None);
+        Ok(())
+    }
+
+    /// `identity_fresh_candidates` gathers cached peers whose identity is fresh
+    /// (within the refresh horizon) and not suppressed/prunable, regardless of
+    /// latency freshness — the set the registry-read-skip path re-probes.
+    #[test]
+    fn identity_fresh_candidates_gathers_latency_stale_peers() -> anyhow::Result<()> {
+        let cfg = decdn_client_pull::StoreConfig::default();
+        let dir = tempfile::tempdir()?;
+        let store = decdn_client_pull::PeerStore::open(dir.path());
+        let now = 1_000_000;
+
+        // Three identity-fresh peers whose latency is STALE (sampled long ago):
+        // store_fast_path would reject them, but the registry-skip path keeps them.
+        for b in [1u8, 2, 3] {
+            store.upsert_identity(&harvest_candidate(b), now)?;
+            let stale = now - cfg.latency_ttl_secs - 1;
+            store.record_sample(&harvest_key(b), 30.0, 1, stale, &cfg)?;
+        }
+        // Identity-stale peer (>24h since confirmed) -> excluded.
+        store.upsert_identity(&harvest_candidate(4), now - cfg.identity_refresh_secs - 1)?;
+        // Freshly-failed peer -> suppressed -> excluded.
+        store.upsert_identity(&harvest_candidate(5), now)?;
+        store.record_failure(&harvest_key(5), now)?;
+
+        let cands = identity_fresh_candidates(&store, &cfg, now);
+        let ids: std::collections::HashSet<_> = cands.iter().map(|c| c.node_id).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&harvest_key(1)));
+        assert!(ids.contains(&harvest_key(2)));
+        assert!(ids.contains(&harvest_key(3)));
+        assert!(!ids.contains(&harvest_key(4)));
+        assert!(!ids.contains(&harvest_key(5)));
+        Ok(())
+    }
+
     /// `store_fast_path` ranks selectable records by latency and excludes a
     /// suppressed one, and refuses to engage below `min_fresh_candidates`.
     /// It takes no [`Endpoint`], so it structurally cannot issue a network
@@ -3111,7 +3292,7 @@ mod tests {
         // the driver can fall through to discovery if every one of these
         // never-probed candidates turns out to be unreachable (ADR 037 § in-fetch
         // discovery fallback).
-        assert!(targets.from_store_fast_path);
+        assert!(targets.skipped_registry_read);
 
         // Only two selectable records -> below min_fresh_candidates -> None.
         let dir2 = tempfile::tempdir()?;
