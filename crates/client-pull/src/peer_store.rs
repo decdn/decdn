@@ -70,10 +70,16 @@ pub struct PeerRecord {
     /// every identity upsert. Persisting it lets a returning client dial a
     /// known-good peer directly when it can reach neither the chain (RPC outage)
     /// nor iroh discovery — the fully-decentralized fallback (ADR 001 § Node
-    /// Discovery, ADR 012 § Bootstrap step 4). Additive and self-attested: a
+    /// Discovery, ADR 012 § Bootstrap step 5). Additive and self-attested: a
     /// stale cached address loses the iroh path race but never fails a dial that
     /// live infrastructure would have served, since on the outage path there is
     /// no discovery to fall back to anyway.
+    ///
+    /// `#[serde(default)]` so a record written before this field existed still
+    /// loads — with empty addresses — instead of failing to deserialize and
+    /// taking its latency and identity stats down with it. The field then
+    /// repopulates on the next registry read.
+    #[serde(default)]
     pub multiaddrs: Bytes,
     /// Seconds since the Unix epoch when identity was last confirmed against the registry.
     pub identity_seen_at_secs: u64,
@@ -125,7 +131,7 @@ impl PeerRecord {
     /// Project the identity half back into a [`NodeCandidate`] for
     /// selection/fallback, carrying the cached `multiaddrs` so a registry-outage
     /// fallback dial can reach a reachable peer directly, without iroh discovery
-    /// (ADR 012 § Bootstrap step 4).
+    /// (ADR 012 § Bootstrap step 5).
     #[must_use]
     pub fn as_candidate(&self) -> NodeCandidate {
         NodeCandidate {
@@ -445,6 +451,29 @@ mod tests {
             got.as_candidate().dial_addrs(),
             vec!["203.0.113.10:4433".parse()?]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn record_without_multiaddrs_field_still_deserializes() -> anyhow::Result<()> {
+        // A record written before `multiaddrs` existed must still load (with
+        // empty addresses) rather than fail and drop its latency/identity stats.
+        // Build a real record, strip the field an older writer never wrote, and
+        // reload — no hand-guessing of the PublicKey/Address JSON encodings.
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        store.upsert_identity(&candidate(9), 5_000)?;
+        let rec = store
+            .get(&key(9))
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        let mut value = serde_json::to_value(&rec)?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("record is not a JSON object"))?
+            .remove("multiaddrs");
+        let reloaded: PeerRecord = serde_json::from_value(value)?;
+        assert!(reloaded.multiaddrs.is_empty());
+        assert_eq!(reloaded.identity_seen_at_secs, 5_000); // unrelated fields survive
         Ok(())
     }
 

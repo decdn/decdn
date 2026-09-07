@@ -128,19 +128,42 @@ pub fn unpack_multiaddrs(packed: &[u8]) -> anyhow::Result<Vec<String>> {
 
 /// Decode the on-chain `multiaddrs` field into dialable UDP socket addresses,
 /// for use as iroh direct-address hints (ADR 001 § Node Discovery). Leniency is
-/// the contract: a record whose framing does not decode, or an entry that is not
-/// a `/ip4|ip6/<addr>/udp/<port>/quic-v1` QUIC multiaddr, is skipped rather than
-/// raised. A self-attested address is only ever one dial path among several, so
-/// a malformed or partial record must never remove a peer from the candidate
-/// set — it can only fail to add a direct path, leaving iroh discovery and the
-/// relay fallback intact.
+/// per entry: a non-UTF8 entry, or one that is not a
+/// `/ip4|ip6/<addr>/udp/<port>/quic-v1` QUIC multiaddr, is skipped on its own
+/// while the valid entries around it survive. This walks the `pack_multiaddrs`
+/// framing directly rather than through [`unpack_multiaddrs`], whose all-or-
+/// nothing contract would drop every entry on the first bad one. Only a length
+/// prefix that overruns the buffer stops the walk — past that point the next
+/// entry's position is unknowable — so the entries decoded before it still
+/// count. A self-attested address is only ever one dial path among several, so
+/// a malformed or partial record can only fail to add a direct path, never
+/// remove a peer from the candidate set, leaving iroh discovery and the relay
+/// fallback intact.
 #[must_use]
 pub fn decode_dial_addrs(packed: &[u8]) -> Vec<std::net::SocketAddr> {
-    unpack_multiaddrs(packed)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|s| parse_quic_multiaddr(s))
-        .collect()
+    let mut out = Vec::new();
+    let mut rest = packed;
+    while let Some((prefix, body)) = rest.split_at_checked(2) {
+        // `split_at_checked(2)` guarantees exactly two bytes, so the array
+        // conversion cannot fail; keeping it fallible stays out of the indexing
+        // lint without a panic path.
+        let Ok(len_bytes) = <[u8; 2]>::try_from(prefix) else {
+            break;
+        };
+        let len = usize::from(u16::from_be_bytes(len_bytes));
+        let Some((entry, tail)) = body.split_at_checked(len) else {
+            // Length prefix overruns the buffer: the next entry's offset is
+            // unknowable, so stop — but keep whatever decoded before here.
+            break;
+        };
+        if let Ok(s) = std::str::from_utf8(entry)
+            && let Some(sock) = parse_quic_multiaddr(s)
+        {
+            out.push(sock);
+        }
+        rest = tail;
+    }
+    out
 }
 
 /// Parse one `/ip4/<addr>/udp/<port>/quic-v1` (or `/ip6/…`) QUIC multiaddr into
@@ -329,8 +352,33 @@ mod tests {
     fn decode_dial_addrs_empty_and_malformed_framing_yield_empty() {
         // Empty field → no hints.
         assert!(decode_dial_addrs(&[]).is_empty());
-        // Truncated framing (unpack would error) → lenient empty, never a panic
-        // or error: a torn record must not remove a peer from the dial set.
+        // A lone byte cannot even hold a 2-byte length prefix → no hints, never
+        // a panic: a torn record must not remove a peer from the dial set.
         assert!(decode_dial_addrs(&[0x00]).is_empty());
+        // A length prefix (0x0004 = 4) that overruns the 2-byte body stops the
+        // walk with nothing decoded before it.
+        assert!(decode_dial_addrs(&[0x00, 0x04, b'a', b'b']).is_empty());
+    }
+
+    #[test]
+    fn decode_dial_addrs_recovers_per_entry_around_a_non_utf8_entry() {
+        // A valid QUIC entry, a framing-intact but non-UTF8 entry, then another
+        // valid QUIC entry. `unpack_multiaddrs` would error on the non-UTF8
+        // entry and drop everything; the per-entry walk keeps both valid ones.
+        let mut packed = pack_multiaddrs(&["/ip4/203.0.113.10/udp/4433/quic-v1".to_string()])
+            .expect("pack first");
+        // A hand-framed non-UTF8 entry: 2-byte big-endian length 1, then 0xFF.
+        packed.extend_from_slice(&[0x00, 0x01, 0xFF]);
+        packed.extend_from_slice(
+            &pack_multiaddrs(&["/ip4/198.51.100.7/udp/5000/quic-v1".to_string()])
+                .expect("pack third"),
+        );
+        assert_eq!(
+            decode_dial_addrs(&packed),
+            vec![
+                "203.0.113.10:4433".parse().expect("addr 1"),
+                "198.51.100.7:5000".parse().expect("addr 2"),
+            ]
+        );
     }
 }
