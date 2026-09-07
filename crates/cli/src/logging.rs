@@ -44,6 +44,14 @@ fn filter_directive(rust_log: Option<&str>, log_level: Option<LogLevel>) -> Opti
     }
 }
 
+/// Level to use when the chosen directive is `RUST_LOG` but it fails to parse:
+/// the operator's `--log-level` if they passed one, otherwise `info`. Mirrors
+/// the daemon, so a broken `RUST_LOG` exported in the shell does not defeat an
+/// explicit `--log-level` on the invocation.
+fn malformed_rust_log_fallback(log_level: Option<LogLevel>) -> LogLevel {
+    log_level.unwrap_or(LogLevel::Info)
+}
+
 /// Install the CLI tracing subscriber when the operator opts in.
 ///
 /// Reads `RUST_LOG` and the parsed `--log-level`; if neither requests logging
@@ -60,14 +68,20 @@ pub fn init(log_level: Option<LogLevel>) {
         return;
     };
 
-    // `EnvFilter::try_new` reports a malformed directive instead of panicking;
-    // fall back to a plain `info` filter (which never fails) so a typo in
-    // `RUST_LOG` still yields useful logs rather than silence.
+    // `EnvFilter::try_new` reports a malformed directive instead of panicking.
+    // Only a `RUST_LOG` value can be malformed here — a `--log-level` directive
+    // is always a valid level name — so fall back to the operator's
+    // `--log-level` (or `info`), like the daemon, rather than dropping to a
+    // fixed level or going silent.
     let filter = match tracing_subscriber::EnvFilter::try_new(&directive) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("warning: ignoring malformed log filter '{directive}': {e}");
-            tracing_subscriber::EnvFilter::new(LogLevel::Info.to_string())
+            let fallback = malformed_rust_log_fallback(log_level);
+            eprintln!(
+                "warning: ignoring malformed RUST_LOG '{directive}'; \
+                 falling back to log level '{fallback}': {e}"
+            );
+            tracing_subscriber::EnvFilter::new(fallback.to_string())
         }
     };
 
@@ -169,5 +183,18 @@ mod tests {
     #[test]
     fn blank_rust_log_with_no_level_stays_silent() {
         assert_eq!(filter_directive(Some(""), None), None);
+    }
+
+    #[test]
+    fn malformed_rust_log_prefers_explicit_log_level() {
+        assert_eq!(
+            malformed_rust_log_fallback(Some(LogLevel::Debug)),
+            LogLevel::Debug
+        );
+    }
+
+    #[test]
+    fn malformed_rust_log_without_level_falls_back_to_info() {
+        assert_eq!(malformed_rust_log_fallback(None), LogLevel::Info);
     }
 }
