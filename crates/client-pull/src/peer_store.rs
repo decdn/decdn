@@ -105,6 +105,16 @@ impl PeerRecord {
         now_secs.saturating_sub(self.identity_seen_at_secs) > cfg.identity_prune_secs
     }
 
+    /// Identity was confirmed against the registry within the refresh horizon, so
+    /// the cached membership is fresh enough to build a candidate set from without
+    /// re-reading the registry. Distinct from [`Self::latency_fresh`]: identity and
+    /// latency age on separate clocks, so a peer can be identity-fresh yet
+    /// latency-stale — the case the registry-read-skip path serves by re-probing.
+    #[must_use]
+    pub const fn identity_fresh(&self, now_secs: u64, cfg: &StoreConfig) -> bool {
+        now_secs.saturating_sub(self.identity_seen_at_secs) <= cfg.identity_refresh_secs
+    }
+
     /// Eligible for the probe-less fast path: has a fresh latency sample and is not suppressed.
     #[must_use]
     pub const fn selectable(&self, now_secs: u64, cfg: &StoreConfig) -> bool {
@@ -372,6 +382,14 @@ mod tests {
         let r = sample_record();
         assert!(!r.identity_prunable(1_000 + cfg.identity_prune_secs, &cfg));
         assert!(r.identity_prunable(1_000 + cfg.identity_prune_secs + 1, &cfg));
+    }
+
+    #[test]
+    fn identity_freshness_respects_refresh_horizon() {
+        let cfg = StoreConfig::default();
+        let r = sample_record();
+        assert!(r.identity_fresh(1_000 + cfg.identity_refresh_secs, &cfg));
+        assert!(!r.identity_fresh(1_000 + cfg.identity_refresh_secs + 1, &cfg));
     }
 
     use tempfile::tempdir;
