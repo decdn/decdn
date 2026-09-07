@@ -19,6 +19,7 @@ pub mod probe;
 pub mod publish;
 pub mod run;
 pub mod setup;
+pub mod whoami;
 
 pub use appeal::{AppealArgs, AppealCommand, AppealSlashArgs};
 pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs, BundlePullArgs};
@@ -46,6 +47,7 @@ pub use publish::{
 };
 pub use run::RunArgs;
 pub use setup::SetupArgs;
+pub use whoami::WhoamiArgs;
 
 use std::path::PathBuf;
 
@@ -85,6 +87,9 @@ pub struct Cli {
 pub enum Command {
     /// Generate a new Ed25519 node key and Ethereum keystore.
     KeyGen(KeyGenArgs),
+    /// Print the local identity read-only: iroh node id, eth address, and the
+    /// resolved key paths. Generates and rotates nothing.
+    Whoami(WhoamiArgs),
     /// Manage configuration files (`init`, `validate`).
     Config(ConfigArgs),
     /// Probe a running node over the `cdn/probe/v1` ALPN.

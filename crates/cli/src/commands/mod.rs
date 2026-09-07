@@ -29,3 +29,4 @@ pub mod terms;
 pub mod unbond;
 pub mod update_multiaddrs;
 pub mod update_region;
+pub mod whoami;
