@@ -3177,6 +3177,7 @@ mod tests {
                 node_id: harvest_key(b),
                 eth_address: Address::from([b; 20]),
                 region_hint: de,
+                multiaddrs: alloy::primitives::Bytes::new(),
             })
             .collect();
         let us = decdn_protocol::Region::parse("US").expect("US is a valid region");
