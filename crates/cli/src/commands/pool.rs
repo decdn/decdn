@@ -328,8 +328,11 @@ enum ReclaimPlan {
     /// `Closing` but still inside the dispute window; carries the absolute
     /// Unix deadline so the operator learns when it becomes reclaimable.
     SkipInWindow(u64),
-    /// `Closed` — already reclaimed (or it never held a residual).
+    /// `Closed` — the reclaim already happened (that is what sets `Closed`).
     SkipClosed,
+    /// An unrecognized on-chain status (the hidden invalid `sol!` variant) —
+    /// nothing safe to reclaim, and not asserted to have been reclaimed.
+    SkipUnknown,
 }
 
 /// Running counts for a `--all` sweep. The exit code keys off `failed`; the
@@ -365,8 +368,10 @@ const fn plan_reclaim(status: PaymentPool::Status, dispute_deadline: u64, now: u
         PaymentPool::Status::Open => ReclaimPlan::SkipOpen,
         PaymentPool::Status::Closing if now >= dispute_deadline => ReclaimPlan::Reclaim,
         PaymentPool::Status::Closing => ReclaimPlan::SkipInWindow(dispute_deadline),
-        // `Closed` and the hidden invalid variant: nothing to reclaim.
-        _ => ReclaimPlan::SkipClosed,
+        PaymentPool::Status::Closed => ReclaimPlan::SkipClosed,
+        // `sol!` enums carry a hidden invalid variant, so a wildcard is
+        // required; an unrecognized status is not asserted to be reclaimed.
+        _ => ReclaimPlan::SkipUnknown,
     }
 }
 
@@ -727,6 +732,10 @@ where
             }
             ReclaimPlan::SkipClosed => {
                 println!("skipped pool {pool_id}: already reclaimed");
+                tally.skipped += 1;
+            }
+            ReclaimPlan::SkipUnknown => {
+                println!("skipped pool {pool_id}: unrecognized on-chain status");
                 tally.skipped += 1;
             }
         }
