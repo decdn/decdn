@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_pool::{
     LOW_WATER_DIVISOR, SELF_CAPABILITY_CAP, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
@@ -424,12 +424,8 @@ pub(crate) async fn probe_and_order(
     // kept because it needs no per-probe clone. `probe_once`'s internal
     // timeout bounds each leg.
     let probes = candidates.iter().map(|cand| {
-        let relay = relay_hint.cloned();
+        let target = probe_target(cand, relay_hint.cloned());
         async move {
-            let mut target = EndpointAddr::new(cand.node_id);
-            if let Some(url) = relay {
-                target = target.with_relay_url(url);
-            }
             let res = probe_once(
                 endpoint,
                 target,
@@ -626,6 +622,10 @@ fn failover_order(
                 // As for a proxy lead: `region_hint` never rides along on a
                 // candidate the client assembled from probe RTTs alone.
                 region_hint: None,
+                // A warming candidate carries no registry addresses (the probe
+                // RTT path does not thread them), so it dials via iroh
+                // discovery — the pre-multiaddr behavior, unchanged.
+                multiaddrs: Bytes::new(),
             })
             .collect();
         return FailoverOrder {
@@ -668,6 +668,10 @@ fn failover_order(
         // pre-probe shortlist and operator logging. Leaving it unset keeps a
         // spoofed region from riding along.
         region_hint: None,
+        // Warming proxies dial via iroh discovery: `WarmingCandidate` carries no
+        // registry addresses, so no direct-dial hint is available here. A
+        // follow-up could thread them through for relay-free warming.
+        multiaddrs: Bytes::new(),
     });
     let order = proxies
         .chain(holders.iter().map(|h| h.candidate.clone()))
@@ -1018,6 +1022,9 @@ pub(crate) async fn resolve_target_node(
                 node_id,
                 eth_address: provider,
                 region_hint: None,
+                // A `--node-id`-pinned target takes its direct address from
+                // `--addr` at the dial site, not from the registry.
+                multiaddrs: Bytes::new(),
             }],
             // A pinned node is one candidate, so multi-source never engages and
             // no size hint is needed.
@@ -1443,6 +1450,11 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             if let Some(url) = relays.first() {
                 target = target.with_relay_url(url.clone());
             }
+            // A discovered node also carries its registry multiaddrs as
+            // direct-address hints, so a reachable node connects relay-free
+            // (ADR 001 § Node Discovery). On the explicit `--addr` path this
+            // adds nothing — a pinned candidate has empty `multiaddrs`.
+            target = discovery::with_dial_addrs(target, candidate);
 
             // Immutable pool fact captured before `ctx` moves into `drive_fetch`.
             let pool_id = ctx.pool_id;
@@ -1945,15 +1957,29 @@ fn lane_coverage(
         .unwrap_or_else(|| decdn_protocol::Coverage::full(num_blocks))
 }
 
-/// Build the target address for a discovered candidate: its `node_id` plus the
-/// first configured relay hint. Multi-source only runs on the auto-discovered
+/// Build a probe target for a discovered candidate: its `node_id`, an optional
+/// relay hint, and its registry multiaddrs as direct-address hints so a
+/// reachable node is probed relay-free (ADR 001 § Node Discovery).
+fn probe_target(cand: &NodeCandidate, relay: Option<RelayUrl>) -> EndpointAddr {
+    let mut target = EndpointAddr::new(cand.node_id);
+    if let Some(url) = relay {
+        target = target.with_relay_url(url);
+    }
+    discovery::with_dial_addrs(target, cand)
+}
+
+/// Build the target address for a discovered candidate: its `node_id`, the
+/// first configured relay hint, and its registry multiaddrs as direct-address
+/// hints (ADR 001 § Node Discovery). Multi-source only runs on the auto-discovered
 /// set (never the single explicit `--node-id`/`--addr`), so no pinned IP applies.
 fn multi_source_target(candidate: &NodeCandidate, relays: &[RelayUrl]) -> EndpointAddr {
     let mut target = EndpointAddr::new(candidate.node_id);
     if let Some(url) = relays.first() {
         target = target.with_relay_url(url.clone());
     }
-    target
+    // Registry multiaddrs as direct-address hints: a reachable lane provider
+    // connects without a relay (ADR 001 § Node Discovery).
+    discovery::with_dial_addrs(target, candidate)
 }
 
 /// Build one [`MultiLane`] for `candidate`: open/reuse its per-provider pool,
@@ -3120,6 +3146,7 @@ mod tests {
             node_id: harvest_key(b),
             eth_address: Address::from([b; 20]),
             region_hint: None,
+            multiaddrs: Bytes::new(),
         }
     }
 
@@ -3314,6 +3341,7 @@ mod tests {
                 node_id: node_key(seed),
                 eth_address: Address::repeat_byte(seed),
                 region_hint: None,
+                multiaddrs: Bytes::new(),
             },
             rtt_ms,
             total_bytes,

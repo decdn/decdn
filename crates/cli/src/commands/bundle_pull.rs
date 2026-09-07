@@ -696,7 +696,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// entry's `.partial` beside `staging`, so a fail-over re-pays nothing.
     async fn fetch_to_staging(&self, hash: [u8; 32], staging: &Path) -> anyhow::Result<()> {
         if let Some(pinned) = self.explicit {
-            return self.fetch_to_staging_from(hash, pinned, staging).await;
+            // A `--node-id`-pinned target takes its direct address from `--addr`,
+            // not the registry, so no on-chain dial hints apply.
+            return self.fetch_to_staging_from(hash, pinned, &[], staging).await;
         }
         let candidates = self
             .candidates
@@ -760,7 +762,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let mut last_err: Option<anyhow::Error> = None;
         for (attempt, cand) in order.iter().enumerate() {
             let target = (cand.node_id, cand.eth_address);
-            let err = match self.fetch_to_staging_from(hash, target, staging).await {
+            // Registry multiaddrs as direct-address hints for a relay-free dial
+            // to a reachable node (ADR 001 § Node Discovery).
+            let dial_addrs = cand.dial_addrs();
+            let err = match self
+                .fetch_to_staging_from(hash, target, &dial_addrs, staging)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(err) => err,
             };
@@ -785,6 +793,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         &self,
         hash: [u8; 32],
         (node_id, provider): FetchTarget,
+        dial_addrs: &[std::net::SocketAddr],
         staging: &Path,
     ) -> anyhow::Result<()> {
         // Serialize all access to this provider's lane: the voucher-signing
@@ -854,6 +863,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         }
         if let Some(url) = self.relays.first() {
             target = target.with_relay_url(url.clone());
+        }
+        // Registry-published direct addresses (empty on the pinned `--addr`
+        // path): a reachable node connects without a relay (ADR 001 § Node
+        // Discovery). Additive — a stale hint loses the path race, never fails it.
+        for sock in dial_addrs {
+            target = target.with_ip_addr(*sock);
         }
 
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
