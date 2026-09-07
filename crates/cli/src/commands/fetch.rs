@@ -915,10 +915,15 @@ fn select_with_widening(
     allow: &[decdn_protocol::Region],
     cfg: &decdn_client_pull::StoreConfig,
 ) -> Vec<NodeCandidate> {
-    let widened = candidates.clone();
+    // Only a non-empty allowlist can trigger the widening re-run, so keep the
+    // unfiltered copy only in that case — the common empty-allowlist path (no
+    // filtering, no widening possible) does no extra allocation.
+    let widen_fallback = (!allow.is_empty()).then(|| candidates.clone());
     let selected =
         discovery::select_candidates_filtered(candidates, region, discovery::SELECT_K, allow);
-    if !allow.is_empty() && selected.len() < cfg.min_fresh_candidates {
+    if let Some(widened) = widen_fallback
+        && selected.len() < cfg.min_fresh_candidates
+    {
         return discovery::select_candidates_filtered(widened, region, discovery::SELECT_K, &[]);
     }
     selected
