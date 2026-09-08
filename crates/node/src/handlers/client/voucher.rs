@@ -292,6 +292,23 @@ impl ClientHandler {
             drop(guard);
             return Err(anyhow::anyhow!("lane store record failed: {e}"));
         }
+
+        // Wallet-less resume (#1946): decide the heal BEFORE stamping this as an
+        // accepted voucher — a rejected voucher must not advance the last-voucher
+        // liveness diagnostic. Built under the guard; the reject is sent without it.
+        let resume_bundle = Self::stale_resume_bundle(
+            &guard.state,
+            &guard.active_streams,
+            wire.amount,
+            prior_last_amount,
+        );
+        if let Some(bundle) = resume_bundle {
+            drop(guard);
+            self.write_reject(send, VoucherRejectReason::AmountRegression, Some(bundle))
+                .await?;
+            return Ok(VoucherStop::Rejected);
+        }
+
         // Stamp the lane's last-voucher liveness clock (issue #1733) while the
         // per-lane guard is STILL held — a plain field write on the lane state,
         // no separate global lock. Best-effort diagnostic (drives the admin
@@ -300,22 +317,7 @@ impl ClientHandler {
         guard
             .last_voucher_at
             .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
-
-        // Wallet-less resume (#1946): build the heal watermark for a payer that fell
-        // behind while the guard is held; send the reject (below) without it.
-        let resume_bundle = Self::stale_resume_bundle(
-            &guard.state,
-            &guard.active_streams,
-            wire.amount,
-            prior_last_amount,
-        );
         drop(guard);
-
-        if let Some(bundle) = resume_bundle {
-            self.write_reject(send, VoucherRejectReason::AmountRegression, Some(bundle))
-                .await?;
-            return Ok(VoucherStop::Rejected);
-        }
 
         // (3) Post-acceptance bookkeeping (best-effort, off the durability path).
         //
@@ -662,9 +664,10 @@ impl ClientHandler {
     /// the `VOUCHER_READ_TIMEOUT` backstop. The count is maintained off-chain too
     /// (see the admission gate), so this holds without pool-status data.
     ///
-    /// `state` is read while the caller still holds the per-lane guard, before it
-    /// swaps in the newly verified state; for a benign sub-watermark voucher that
-    /// swap leaves the watermark unchanged, so the bundle reports our true frontier.
+    /// `state` is read while the caller still holds the per-lane guard, AFTER it has
+    /// swapped in the newly verified state; for a benign sub-watermark voucher that
+    /// swap leaves the watermark (amount / bytes / signature) unchanged, so the
+    /// bundle still reports our true frontier.
     fn stale_resume_bundle(
         state: &LaneState,
         active_streams: &std::sync::atomic::AtomicU32,
