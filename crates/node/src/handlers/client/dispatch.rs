@@ -437,6 +437,12 @@ impl ClientHandler {
         // applies NO surcharge, so a lone stream is admitted exactly as before the cap;
         // its own per-path floor gate is the only solvency check it faces.
         //
+        // The active-stream COUNT is maintained whenever the lane is known, but the
+        // solvency SURCHARGE runs only with a live `pool_status` (without one there is
+        // no on-chain `remaining` to check against). Keeping the count off-chain too is
+        // what lets the wallet-less-resume heal (`commit_one_proof`) tell a lone stream
+        // from a concurrent-sibling lane without depending on chain data.
+        //
         // Checked-and-incremented under the lane lock so two simultaneous opens
         // serialize and neither admits into the same last slot (TOCTOU → N+1). Only
         // capability-bearing streams reach here with `known_lane` set — intake registers
@@ -444,33 +450,35 @@ impl ClientHandler {
         // on a fresh lane share one counter. `LaneSlot`'s drop releases the slot on every
         // exit (success, `?`, disconnect, panic).
         let mut lane_slot: Option<LaneSlot> = None;
-        if let (Some(lane), Some(status)) = (known_lane.as_ref(), pool_status) {
-            let floor = self.credit_window(CHUNK_BYTES, 0);
+        if let Some(lane) = known_lane.as_ref() {
             let guard = lane.lock().await;
             let active = guard.active_streams.clone();
             let n_active = active.load(Ordering::Relaxed);
-            let reserved = floor.saturating_mul(u64::from(n_active).saturating_add(1));
-            if n_active > 0
-                && !self.pool_remaining_covers_window(status.remaining, reserved, rate_per_mb)
-            {
-                drop(guard);
-                let headroom = status
-                    .remaining
-                    .saturating_sub(self.pool_min_remaining_deposit);
-                self.log_deposit_refusal(
-                    B256::from(req.pool_id),
-                    hash,
-                    headroom,
-                    decdn_incentive::min_payment(reserved, rate_per_mb),
-                );
-                return self
-                    .respond_error(
-                        &mut send,
-                        &req,
-                        ServeRejectReason::LaneAtCapacity,
-                        rate_per_mb,
-                    )
-                    .await;
+            if let Some(status) = pool_status {
+                let floor = self.credit_window(CHUNK_BYTES, 0);
+                let reserved = floor.saturating_mul(u64::from(n_active).saturating_add(1));
+                if n_active > 0
+                    && !self.pool_remaining_covers_window(status.remaining, reserved, rate_per_mb)
+                {
+                    drop(guard);
+                    let headroom = status
+                        .remaining
+                        .saturating_sub(self.pool_min_remaining_deposit);
+                    self.log_deposit_refusal(
+                        B256::from(req.pool_id),
+                        hash,
+                        headroom,
+                        decdn_incentive::min_payment(reserved, rate_per_mb),
+                    );
+                    return self
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::LaneAtCapacity,
+                            rate_per_mb,
+                        )
+                        .await;
+                }
             }
             active.fetch_add(1, Ordering::Relaxed);
             drop(guard);
