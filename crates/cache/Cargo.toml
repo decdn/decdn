@@ -78,7 +78,7 @@ wiremock = { workspace = true }
 # `async-compression` in #271 PR3 — these crates remain only on the
 # encoder side for tests.
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 # Operation-level S3 mocks (#437 PR2). The `mock_client!` macro builds an
 # `aws_sdk_s3::Client` whose dispatcher returns canned responses, so
 # `S3Origin` can be exercised end-to-end without standing up MinIO.
