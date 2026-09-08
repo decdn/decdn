@@ -133,7 +133,10 @@ impl ClientHandler {
     /// store (buffered; the background flush makes it durable, ADR 003
     /// §Off-chain voucher state persistence). Acceptance is implicit: no positive
     /// message is written; the caller keeps delivering.
-    #[allow(clippy::too_many_arguments)]
+    // One coherent hot-path unit under the per-lane guard: read, verify, advance,
+    // credit, heal a fallen-behind payer, then record. Splitting it would scatter
+    // state that must stay atomic under the lock.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) async fn commit_one_proof(
         &self,
         send: &mut SendStream,
@@ -226,6 +229,11 @@ impl ClientHandler {
         // streams reading the same watermark and both advancing would lose one.
         let mut guard = lane.lock().await;
 
+        // The lane's authoritative cumulative BEFORE this voucher, captured for the
+        // wallet-less-resume check below: a voucher strictly under it is a payer
+        // whose watermark fell behind ours, not a normal advance.
+        let prior_last_amount = guard.state.last_amount();
+
         // Capability-expiry gate (ADR 003 §Capability delegation). `expiry == 0`
         // means "not tracked" and never expires. An expired grant surfaces as
         // `CapabilityExpired` — distinct from a cap-exhausted `SpendingCapExhausted`,
@@ -292,7 +300,22 @@ impl ClientHandler {
         guard
             .last_voucher_at
             .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
+
+        // Wallet-less resume (#1946): build the heal watermark for a payer that fell
+        // behind while the guard is held; send the reject (below) without it.
+        let resume_bundle = Self::stale_resume_bundle(
+            &guard.state,
+            &guard.active_streams,
+            wire.amount,
+            prior_last_amount,
+        );
         drop(guard);
+
+        if let Some(bundle) = resume_bundle {
+            self.write_reject(send, VoucherRejectReason::AmountRegression, Some(bundle))
+                .await?;
+            return Ok(VoucherStop::Rejected);
+        }
 
         // (3) Post-acceptance bookkeeping (best-effort, off the durability path).
         //
@@ -618,6 +641,42 @@ impl ClientHandler {
                 Err(VerifyStop::Reject(reason, bundle))
             }
         }
+    }
+
+    /// The wallet-less-resume watermark to hand a payer whose voucher fell BEHIND
+    /// our watermark (#1946), or `None` to keep serving under the benign-swallow.
+    ///
+    /// A voucher STRICTLY below our last-accepted `amount` is a payer re-signing
+    /// from a stale anchor — typically a client that crashed before it persisted
+    /// vouchers we already accepted (its watermark persists once, at end of fetch).
+    /// Every such voucher credits nothing, so delivery wedges at the one-chunk
+    /// credit floor. Returning the node's authoritative watermark lets the payer
+    /// reseed and resume; it re-verifies the bundle against its own key first, and
+    /// its reseed is a no-op unless the bundle actually advances it.
+    ///
+    /// Gated on `active_streams <= 1`: a concurrent same-lane sibling (#1697)
+    /// legitimately sends out-of-order sub-watermark vouchers whose bytes another
+    /// stream's advance already covers, and the terminal reject the caller builds
+    /// from this would tear down that honest stream. For the multi-stream lane the
+    /// caller keeps the benign-swallow; a genuinely wedged one still recovers via
+    /// the `VOUCHER_READ_TIMEOUT` backstop. The count is maintained off-chain too
+    /// (see the admission gate), so this holds without pool-status data.
+    ///
+    /// `state` is read while the caller still holds the per-lane guard, before it
+    /// swaps in the newly verified state; for a benign sub-watermark voucher that
+    /// swap leaves the watermark unchanged, so the bundle reports our true frontier.
+    fn stale_resume_bundle(
+        state: &LaneState,
+        active_streams: &std::sync::atomic::AtomicU32,
+        wire_amount: u64,
+        prior_last_amount: U256,
+    ) -> Option<WatermarkBundle> {
+        if U256::from(wire_amount) >= prior_last_amount
+            || active_streams.load(Ordering::Relaxed) > 1
+        {
+            return None;
+        }
+        Self::watermark_bundle_for_reject(VoucherRejectReason::AmountRegression, state)
     }
 
     /// Build the wallet-less-resume [`WatermarkBundle`] for a rejected voucher

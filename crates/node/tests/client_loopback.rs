@@ -3274,6 +3274,125 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Crash-restart desync (#1946): the client's persisted voucher watermark falls
+/// BEHIND the node's after a mid-stream crash — the ledger commits in memory as
+/// each voucher is sent and persists to disk only once, at end of fetch, so a
+/// kill before that write loses every voucher the node already accepted. On
+/// restart the client re-seeds its ledger from the stale persisted watermark
+/// (`prior_* = 0` here) and re-signs from there, so its first voucher lands
+/// STRICTLY BELOW the node's `last_amount`.
+///
+/// The node must hand back its authoritative watermark (a `WatermarkBundle` on a
+/// gated rejection) so the client can reseed and resume; otherwise every voucher
+/// is a sub-watermark `AmountRegression` that credits zero, the credit window
+/// stays pinned at its one-chunk floor, and the stream wedges after ~1 chunk.
+///
+/// The blob is 3 MiB — above the 1 MiB (`CHUNK_BYTES`) credit floor — so delivery
+/// must cross the window and demand a payment-advancing voucher the stale client
+/// cannot produce until it reseeds. A sub-1 MiB blob fits inside the opening
+/// floor window and never exercises the wedge.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_restart_with_stale_watermark_heals_and_resumes() -> anyhow::Result<()> {
+    let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(1_000_000_000u64);
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        client_signer.address(),
+        operator_addr(),
+        deposit,
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Stream 1: a healthy fetch that advances the node's lane watermark to the
+    // full blob. This is the state the node holds when the client crashes.
+    let ctx1 = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let got1 = stream_fetch(
+        &client_ep,
+        target.clone(),
+        &ctx1,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x1111,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(got1.as_ref() == payload.as_slice());
+
+    let after1 = store.load_all()?;
+    let s1 = after1
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
+    let wire = support::bao_wire_len_whole(payload.len() as u64);
+    anyhow::ensure!(
+        s1.last_bytes_delivered() == U256::from(wire),
+        "stream-1 advanced the node lane to {wire}, got {}",
+        s1.last_bytes_delivered()
+    );
+
+    // Stream 2: the RESTARTED client. `prior_* = 0` models a crash before the
+    // end-of-fetch watermark persist — the node's lane is at `wire`, the client
+    // believes it is at zero. It must still complete: the node hands back its
+    // watermark and the client reseeds forward.
+    //
+    // The 8s budget is deliberately BELOW the node's 10s `VOUCHER_READ_TIMEOUT`
+    // backstop: recovery must fire on the first sub-watermark voucher, not wait
+    // for the read to time out. An unhealed stream wedges at the ~1 MiB floor
+    // and blows this budget.
+    let ctx2 = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let got2 = stream_fetch(
+        &client_ep,
+        target,
+        &ctx2,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x2222,
+        Duration::from_secs(8),
+    )
+    .await?;
+    anyhow::ensure!(
+        got2.as_ref() == payload.as_slice(),
+        "restarted client must recover the full blob, got {} of {} bytes",
+        got2.len(),
+        payload.len()
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// Resume with a NON-EMPTY proof spine (#1060): a ~200 KiB blob spans many 16 KiB
 /// chunk groups, so the offset resume exercises the production
 /// `export_bao_range` ↔ `decode_verified_range` pair over real proof PARENT
