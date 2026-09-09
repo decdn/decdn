@@ -312,7 +312,6 @@ async fn partial_serve_within_cached_range_serves_without_any_fill() -> anyhow::
         store_dyn,
         RATE_PER_MB,
         &domains(),
-        0,
         16,
     )?;
 
@@ -433,7 +432,6 @@ async fn partial_serve_mixed_range_falls_through_to_fill() -> anyhow::Result<()>
         store_dyn,
         RATE_PER_MB,
         &domains(),
-        0,
         16,
     )?;
 

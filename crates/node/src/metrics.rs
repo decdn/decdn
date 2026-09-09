@@ -1076,10 +1076,6 @@ pub struct DecdnMetrics {
     /// `InternalError`, not a signed absence. Visible name:
     /// `decdn_serve_stream_rejected_internal_error_total`.
     pub serve_stream_rejected_internal_error: Counter,
-    /// `serve_stream` requests refused because the blob exceeds the configured
-    /// `max_blob_size_bytes`. Visible name:
-    /// `decdn_serve_stream_rejected_blob_too_large_total`.
-    pub serve_stream_rejected_blob_too_large: Counter,
     /// `serve_stream` requests refused on an unknown / never-opened lane
     /// (#848). Wire-indistinguishable from `cache_miss`/`owner_mismatch` (all
     /// signed as `NotFound` to avoid leaking lane existence), so this
@@ -1942,10 +1938,6 @@ recorders! {
     /// Record a `serve_stream` request refused by a local store fault,
     /// surfaced as `InternalError` (#876).
     serve_stream_rejected_internal_error => serve_stream_rejected_internal_error.inc();
-
-    /// Record a `serve_stream` request refused because the blob exceeds
-    /// `max_blob_size_bytes` (#876).
-    serve_stream_rejected_blob_too_large => serve_stream_rejected_blob_too_large.inc();
 
     /// Record a `serve_stream` request refused on an unknown lane (#876).
     serve_stream_rejected_unknown_lane => serve_stream_rejected_unknown_lane.inc();
@@ -3178,7 +3170,6 @@ mod tests {
             "decdn_serve_stream_rejected_evicted_since_probe_total",
             "decdn_serve_stream_rejected_cache_miss_total",
             "decdn_serve_stream_rejected_internal_error_total",
-            "decdn_serve_stream_rejected_blob_too_large_total",
             "decdn_serve_stream_rejected_unknown_lane_total",
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
@@ -3206,7 +3197,6 @@ mod tests {
         metrics.serve_stream_rejected_evicted_since_probe();
         metrics.serve_stream_rejected_cache_miss();
         metrics.serve_stream_rejected_internal_error();
-        metrics.serve_stream_rejected_blob_too_large();
         metrics.serve_stream_rejected_unknown_lane();
         metrics.serve_stream_rejected_owner_mismatch();
         metrics.serve_stream_rejected_insufficient_deposit();

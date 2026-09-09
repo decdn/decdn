@@ -137,7 +137,6 @@ impl ClientHandler {
             }
             ServeRejectReason::CacheMiss => self.metrics.serve_stream_rejected_cache_miss(),
             ServeRejectReason::InternalError => self.metrics.serve_stream_rejected_internal_error(),
-            ServeRejectReason::BlobTooLarge => self.metrics.serve_stream_rejected_blob_too_large(),
             ServeRejectReason::UnknownChannel => {
                 self.metrics.serve_stream_rejected_unknown_lane();
             }

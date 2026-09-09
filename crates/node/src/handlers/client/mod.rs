@@ -619,7 +619,6 @@ enum ServeRejectReason {
     EvictedSinceProbe,
     CacheMiss,
     InternalError,
-    BlobTooLarge,
     UnknownChannel,
     OwnerMismatch,
     InsufficientDeposit,
@@ -718,7 +717,6 @@ impl ServeRejectReason {
             | Self::ForeignNamespaceDeclined => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
-            Self::BlobTooLarge => StreamError::BlobTooLarge,
             // The two takedown refusals do NOT collapse to `NotFound`. ADR 011
             // §`StreamRequest` Response names distinct codes because the retry
             // advice differs and a miss-shaped answer would be actively
@@ -889,9 +887,6 @@ pub struct ClientHandlerDeps {
     /// `getRateBounds()` and updated by the `RateBoundsUpdated` watcher,
     /// replacing the by-value config stand-in.
     pub rate_bounds: crate::rate_bounds::RateBounds,
-    /// Largest blob the node will serve, in bytes, checked against the local
-    /// blob's inspected size. `0` disables the ceiling.
-    pub max_blob_size_bytes: u64,
     /// Cap on concurrently served streams within one connection — the
     /// semaphore is built per accepted connection, not per node.
     pub max_concurrent_streams: usize,
@@ -997,7 +992,6 @@ impl std::fmt::Debug for ClientHandlerDeps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientHandlerDeps")
             .field("node_id", &self.node_id)
-            .field("max_blob_size_bytes", &self.max_blob_size_bytes)
             .field("max_concurrent_streams", &self.max_concurrent_streams)
             .finish_non_exhaustive()
     }
@@ -1019,7 +1013,6 @@ impl ClientHandlerDeps {
         receipt_sink: Arc<dyn ReceiptSink>,
         rate_per_mb: u64,
         rate_bounds: crate::rate_bounds::RateBounds,
-        max_blob_size_bytes: u64,
         max_concurrent_streams: usize,
         content_deny: Arc<crate::content_deny::ContentDenylist>,
         pool_min_remaining_deposit: U256,
@@ -1041,7 +1034,6 @@ impl ClientHandlerDeps {
             pool_min_remaining_deposit,
             rate_per_mb,
             rate_bounds,
-            max_blob_size_bytes,
             max_concurrent_streams,
             content_deny,
             redeem_hint: None,
@@ -1310,7 +1302,6 @@ pub struct ClientHandler {
     /// [`ClientHandlerDeps::rate_per_mb`]).
     rate_per_mb: u64,
     rate_bounds: crate::rate_bounds::RateBounds,
-    max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
     /// Throttle state for the insufficient-deposit refusal log (#1520): the
     /// millisecond timestamp of the last emitted `warn!`, and how many refusals
@@ -1365,7 +1356,6 @@ impl std::fmt::Debug for ClientHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientHandler")
             .field("node_id", &self.node_id)
-            .field("max_blob_size_bytes", &self.max_blob_size_bytes)
             .field("max_concurrent_streams", &self.max_concurrent_streams)
             .finish_non_exhaustive()
     }
@@ -1445,7 +1435,6 @@ impl ClientHandler {
             content_deny: deps.content_deny,
             rate_per_mb: deps.rate_per_mb,
             rate_bounds: deps.rate_bounds,
-            max_blob_size_bytes: deps.max_blob_size_bytes,
             max_concurrent_streams: deps.max_concurrent_streams,
             deposit_refusal_last_warn_ms: AtomicU64::new(0),
             deposit_refusal_suppressed: AtomicU64::new(0),
@@ -2640,7 +2629,6 @@ pub(super) async fn handler_over_store(
         ))) as Arc<dyn ReceiptSink>,
         1,
         crate::rate_bounds::RateBounds::new(0),
-        0,
         16,
         Arc::new(crate::content_deny::ContentDenylist::empty()),
         U256::ZERO,
@@ -2865,7 +2853,6 @@ mod tests {
             ))) as Arc<dyn ReceiptSink>,
             1,
             crate::rate_bounds::RateBounds::new(0),
-            0,
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
             pool_min_remaining_deposit,
@@ -3408,7 +3395,6 @@ mod tests {
             ))) as Arc<dyn ReceiptSink>,
             1,
             crate::rate_bounds::RateBounds::new(0),
-            0,
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
             U256::ZERO,
