@@ -343,6 +343,13 @@ pub const DEFAULT_CHAIN_ID: u64 = 421_614;
 /// re-scope pass (ADR 011 § Node Behavior's 10-minute cadence).
 pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 600;
 
+/// Default seconds the node may go without a successful chain read before the
+/// serve and probe paths refuse (ADR 011 § Serving while chain-stale). Thirty
+/// minutes: comfortably inside the one-hour compliance-window floor, so a node
+/// stops serving well before an outage-hidden takedown could cross into
+/// slashable territory, while short RPC blips never take the node dark.
+pub const DEFAULT_CHAIN_STALENESS_GRACE_SEC: u64 = 1800;
+
 /// Default seconds between authoritative `PaymentPool.getRateBounds()`
 /// re-reads by the rate-bounds watcher (#1172, ADR 019 §3.1) — the safety-net
 /// cadence alongside the `RateBoundsUpdated` event subscription. One hour.
@@ -1440,6 +1447,20 @@ fn resolve_blockchain_into(
          reconcile interval must be non-zero; omit it for the default (600s)",
     );
 
+    let chain_staleness_grace_sec = file
+        .and_then(|b| b.chain_staleness_grace_sec)
+        .unwrap_or(DEFAULT_CHAIN_STALENESS_GRACE_SEC);
+    // `0` is not a "disable" sentinel — a zero grace makes every chain read
+    // instantly stale, so the node would refuse every serve. Opting out is done
+    // by setting a large window, not `0`. Reject it up front.
+    bag.check(
+        chain_staleness_grace_sec != 0,
+        "blockchain.chain_staleness_grace_sec",
+        "blockchain.chain_staleness_grace_sec must not be 0 — a zero grace \
+         refuses every serve; set a large value to opt out, or omit it for the \
+         default (1800s)",
+    );
+
     let rate_bounds_poll_interval_sec = file
         .and_then(|b| b.rate_bounds_poll_interval_sec)
         .unwrap_or(DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC);
@@ -1651,6 +1672,7 @@ fn resolve_blockchain_into(
         slash_judge_address,
         content_blacklist_address,
         content_blacklist_poll_interval_sec,
+        chain_staleness_grace_sec,
         chain_id,
         rpc_watchdog_interval_sec,
         event_poll_interval_ms,
@@ -7974,6 +7996,68 @@ usdc_address = \"0xUsdc\"
         assert_eq!(resolved.origin_directory_positive_ttl_sec, 600);
         assert_eq!(resolved.origin_directory_negative_ttl_sec, 5);
         assert_eq!(resolved.origin_directory_cache_capacity, 128);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_chain_staleness_grace_defaults_when_unset() -> anyhow::Result<()> {
+        // An absent grace resolves to the 30-minute default.
+        let dir = data_dir_with_keystore()?;
+        let cli = empty_blockchain_args();
+        let file = types::BlockchainConfig {
+            rpc_url: Some("https://example/rpc".to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            chain_staleness_grace_sec: None,
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(
+            resolved.chain_staleness_grace_sec,
+            DEFAULT_CHAIN_STALENESS_GRACE_SEC
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_chain_staleness_grace_passes_through() -> anyhow::Result<()> {
+        // A large explicit value survives — this is how an operator opts out of
+        // the stop-serving-while-stale behavior.
+        let dir = data_dir_with_keystore()?;
+        let cli = empty_blockchain_args();
+        let file = types::BlockchainConfig {
+            rpc_url: Some("https://example/rpc".to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            chain_staleness_grace_sec: Some(31_536_000),
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(resolved.chain_staleness_grace_sec, 31_536_000);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_chain_staleness_grace() -> anyhow::Result<()> {
+        // `0` is not a disable sentinel — a zero grace refuses every serve — so
+        // it is rejected, and the error names the field.
+        let dir = data_dir_with_keystore()?;
+        let cli = empty_blockchain_args();
+        let file = types::BlockchainConfig {
+            rpc_url: Some("https://example/rpc".to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            chain_staleness_grace_sec: Some(0),
+            ..Default::default()
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected resolve_blockchain to reject a zero grace");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("blockchain.chain_staleness_grace_sec"),
+            "error should name the field: {msg}"
+        );
         Ok(())
     }
 

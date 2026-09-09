@@ -195,6 +195,18 @@ pub struct BlockchainConfig {
     /// [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`] (600s). Only
     /// consulted when `content_blacklist_address` is set.
     pub content_blacklist_poll_interval_sec: Option<u64>,
+    /// Seconds the node may go without a successful chain read before it stops
+    /// serving (ADR 011 § Serving while chain-stale). While the blacklist
+    /// watcher cannot reach the RPC, every chain-derived serve guard — the
+    /// deny-set, pool solvency, per-signer caps — answers from stale state, so a
+    /// takedown that lands during the outage would go unenforced and serving it
+    /// past the compliance window is slashable. Past this window the serve and
+    /// probe paths refuse rather than sign evidence the node can no longer
+    /// vouch for. Always evaluated (there is no on/off flag); set it large to
+    /// opt out. Absent => [`super::DEFAULT_CHAIN_STALENESS_GRACE_SEC`] (1800s /
+    /// 30 min). Must not be `0` (that would refuse every serve). Only consulted
+    /// when `content_blacklist_address` is set.
+    pub chain_staleness_grace_sec: Option<u64>,
     /// EIP-712 `chainId` bound into every `slash_sig` domain separator.
     /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial
     /// network target — matches the chain id bound on the runtime signer).

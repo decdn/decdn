@@ -265,6 +265,28 @@ impl ClientHandler {
         // had a price.
         let rate_per_mb = self.clamped_rate();
 
+        // Chain-staleness gate (ADR 011 §Serving while chain-stale). Every gate
+        // below this point — the local/governance deny-set, the funder
+        // blacklist, the pool-solvency and signer-cap checks — answers from a
+        // projection that only advances while the chain watchers reach the RPC.
+        // Once the node has been unable to read the chain for longer than
+        // `chain_staleness_grace_sec`, all of them silently pass on stale state,
+        // so a takedown that landed during the blind window would go unenforced
+        // and serving it is slashable. Refuse here, ABOVE those gates, rather
+        // than sign a `StreamResponse` the node can no longer vouch for. It
+        // collapses to `NotFound`, so the client re-routes to a peer whose reads
+        // are live. `None` (no blacklist watcher wired — dev/test) disables the
+        // gate, the same fail-open shape the pool-view gates use with no chain.
+        if self
+            .chain_freshness
+            .as_ref()
+            .is_some_and(crate::chain_freshness::ChainFreshness::is_stale)
+        {
+            return self
+                .respond_error(&mut send, &req, ServeRejectReason::ChainStale, rate_per_mb)
+                .await;
+        }
+
         // Local-denylist gate (ADR 011 §Local Denylist, §On Blacklist Event
         // step 2: "reject any new StreamRequest for the hash immediately").
         //

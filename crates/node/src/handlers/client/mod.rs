@@ -675,6 +675,15 @@ enum ServeRejectReason {
     /// miss must look the same to a client, which re-routes either way), see
     /// [`Self::wire_error`].
     ForeignNamespaceDeclined,
+    /// The node has been unable to reach the chain for longer than
+    /// `blockchain.chain_staleness_grace_sec` (ADR 011 § Serving while
+    /// chain-stale), so its deny-set, pool-solvency, and signer-cap guards are
+    /// all reading stale state. It refuses rather than sign a serve it can no
+    /// longer vouch for. Collapses to `NotFound` on the wire (see
+    /// [`Self::wire_error`]): the refusal is reputation-benign and the client
+    /// should re-route to a peer whose chain reads are live, exactly as for a
+    /// miss.
+    ChainStale,
 }
 
 impl ServeRejectReason {
@@ -714,7 +723,8 @@ impl ServeRejectReason {
             | Self::LoadShedHit
             | Self::LoadShedMiss
             | Self::RangeNotSatisfiable
-            | Self::ForeignNamespaceDeclined => StreamError::NotFound,
+            | Self::ForeignNamespaceDeclined
+            | Self::ChainStale => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
             // The two takedown refusals do NOT collapse to `NotFound`. ADR 011
@@ -901,6 +911,11 @@ pub struct ClientHandlerDeps {
     /// operator who denies nothing. Callers with no deny-set (tests) pass
     /// `ContentDenylist::empty()` explicitly.
     pub content_deny: Arc<crate::content_deny::ContentDenylist>,
+    /// Liveness of the node's chain reads (ADR 011 § Serving while chain-stale).
+    /// `Some` only when the blacklist watcher is wired; the admit path refuses a
+    /// serve once this reads stale. `None` (dev/test, no chain) disables the
+    /// gate — the same fail-open shape as an unwired [`Self::pool_view`].
+    pub chain_freshness: Option<crate::chain_freshness::ChainFreshness>,
     // Optional wiring — `None` unless the deployment enables the feature.
     /// Best-effort nudge to the settlement service that a lane's accrued
     /// claim advanced; sent on every accepted voucher, against no threshold.
@@ -1036,6 +1051,7 @@ impl ClientHandlerDeps {
             rate_bounds,
             max_concurrent_streams,
             content_deny,
+            chain_freshness: None,
             redeem_hint: None,
             pull_through: None,
             local_populate: None,
@@ -1201,6 +1217,10 @@ pub struct ClientHandler {
     /// Cached `getPool` view for the floor-`M` and ADR 011 funder gates. `None`
     /// (tests) makes both gates fail open.
     pool_view: Option<Arc<dyn crate::pool_view::PoolView>>,
+    /// Liveness of the node's chain reads (ADR 011 § Serving while chain-stale).
+    /// `Some` only when the blacklist watcher is wired; the admit path refuses
+    /// once it reads stale. `None` (tests) disables the gate.
+    chain_freshness: Option<crate::chain_freshness::ChainFreshness>,
     /// Per-lane state, hydrated from the store at construction. The sharded map
     /// resolves independent lanes concurrently — a lookup keyed by [`LaneKey`]
     /// is a point read that only locks that key's shard; each inner mutex
@@ -1419,6 +1439,7 @@ impl ClientHandler {
             pool_min_remaining_deposit: deps.pool_min_remaining_deposit,
             receipt_sink: deps.receipt_sink,
             pool_view: deps.pool_view,
+            chain_freshness: deps.chain_freshness,
             lanes: Arc::new(map),
             lane_count,
             lane_gauge_publish: std::sync::Mutex::new(()),

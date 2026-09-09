@@ -983,6 +983,18 @@ async fn build_chain_and_handlers(
     // watcher.
     let rate_bounds = crate::rate_bounds::RateBounds::new(cfg.payment.delivery_floor);
 
+    // Chain-read liveness (ADR 011 §Serving while chain-stale). One handle,
+    // stamped by the blacklist watcher (boot enumeration + every successful poll
+    // tick) and read by the probe and serve paths, which refuse once the node
+    // has been unable to reach the chain for longer than the grace window. This
+    // runtime path always wires the blacklist watcher — `content_blacklist_address`
+    // is mandatory at node config resolution — so the gate is always live here;
+    // the `Option` the handlers hold exists for the test paths that build a
+    // handler with no chain.
+    let chain_freshness = crate::chain_freshness::ChainFreshness::new(Duration::from_secs(
+        cfg.blockchain.chain_staleness_grace_sec,
+    ));
+
     let probe_handler = Arc::new(ProbeHandler::new(
         infra.secret_key.public(),
         cfg.payment.rate_per_mb,
@@ -995,6 +1007,7 @@ async fn build_chain_and_handlers(
         rate_bounds.clone(),
         stake_lane_policy,
         cfg.cache.relay_foreign_namespaces,
+        Some(chain_freshness.clone()),
     ));
 
     // `cdn/dht/v1` handler (ADR 022 / #320). FindNode + FindValue +
@@ -1342,6 +1355,7 @@ async fn build_chain_and_handlers(
         rate_bounds: rate_bounds.clone(),
         max_concurrent_streams: MAX_CLIENT_STREAMS,
         content_deny: Arc::clone(&content_denylist),
+        chain_freshness: Some(chain_freshness.clone()),
         // Hint the settlement service on each accepted voucher so a lane's
         // accrued claim is planned into a chunk promptly rather than waiting the
         // self-tick.
@@ -1428,6 +1442,7 @@ async fn build_chain_and_handlers(
         blacklist_ready_tx,
         &infra.node_metrics,
         Arc::clone(&content_denylist),
+        chain_freshness,
     )
     .await
     .context("blacklist compliance watcher boot enumeration")?;
@@ -3962,6 +3977,7 @@ mod tests {
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 content_blacklist_address: None,
                 content_blacklist_poll_interval_sec: 600,
+                chain_staleness_grace_sec: 1800,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
             cache: decdn_common::config::ResolvedCache {

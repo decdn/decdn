@@ -155,6 +155,12 @@ pub struct ProbeHandler {
     /// store-present blob it will now decline to relay is never advertised —
     /// so a foreign decline never reads as "advertised but didn't serve".
     relay_foreign_namespaces: bool,
+    /// Liveness of the node's chain reads (ADR 011 § Serving while chain-stale).
+    /// `Some` only when the blacklist watcher is wired; while it reads stale the
+    /// handler answers `has_blob: false` for every hash rather than sign a
+    /// `ProbeResponse` advertising content whose takedown status it can no longer
+    /// confirm. `None` (dev/test, no chain) leaves the presence answer unchanged.
+    chain_freshness: Option<crate::chain_freshness::ChainFreshness>,
 }
 
 impl std::fmt::Debug for ProbeHandler {
@@ -189,6 +195,7 @@ impl ProbeHandler {
         rate_bounds: crate::rate_bounds::RateBounds,
         stake_lane: Option<StakeLanePolicy>,
         relay_foreign_namespaces: bool,
+        chain_freshness: Option<crate::chain_freshness::ChainFreshness>,
     ) -> Self {
         Self {
             node_id,
@@ -202,6 +209,7 @@ impl ProbeHandler {
             rate_bounds,
             stake_lane,
             relay_foreign_namespaces,
+            chain_freshness,
         }
     }
 
@@ -370,7 +378,26 @@ impl ProbeHandler {
         let mut store_present = false;
         let mut holds_disabled = false;
 
-        let (has_blob, total_bytes) = if self.relay_foreign_namespaces {
+        // Chain-staleness gate (ADR 011 §Serving while chain-stale). A
+        // `has_blob: true` is signed slash evidence (ADR 011 §Slash evidence), and
+        // while the node cannot reach the chain it cannot confirm this hash was not
+        // taken down during the blind window. When stale the node advertises
+        // nothing: `has_blob: false` is a reputation-benign true negative, so a
+        // client routes to a peer whose reads are live — the same posture the
+        // serve-admit gate in `dispatch.rs` takes. `None` (no chain wired —
+        // dev/test) leaves the answer unchanged. Read once and applied in two
+        // places: it short-circuits the presence computation below (no store read,
+        // no origin fold, no live HEAD), AND forces the final coverage empty, since
+        // `has_blob` is re-derived from `coverage` — gating only the presence
+        // computation would let the coverage read re-affirm the held blob.
+        let chain_stale = self
+            .chain_freshness
+            .as_ref()
+            .is_some_and(crate::chain_freshness::ChainFreshness::is_stale);
+
+        let (has_blob, total_bytes) = if chain_stale {
+            (false, None)
+        } else if self.relay_foreign_namespaces {
             // Probe-triggered eviction hold (ADR 005 §Probe-triggered eviction
             // hold). The hold is **best-effort**: a node answers `has_blob: true`
             // whenever it holds the blob and has not refused it, then keeps a 35s
@@ -546,7 +573,12 @@ impl ProbeHandler {
         //   unaffected — it never reaches this arm because it is already
         //   `is_origin_sourced`).
         let is_origin_sourced = has_blob && !store_present;
-        let coverage = if is_origin_sourced {
+        let coverage = if chain_stale {
+            // Chain-stale (above): advertise no coverage, so the re-derived
+            // `has_blob` below stays false. This is the arm that actually binds the
+            // stale answer — `has_blob` is the coverage biconditional.
+            Coverage::empty()
+        } else if is_origin_sourced {
             total_bytes.map_or_else(Coverage::empty, |size| Coverage::full(num_blocks(size)))
         } else if holds_disabled || !self.relay_foreign_namespaces {
             // `holds_disabled`: the operator's explicit store opt-out (above).

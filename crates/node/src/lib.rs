@@ -12,6 +12,7 @@ pub mod blacklist_watcher;
 pub mod buyer_channel;
 pub mod buyer_ledgers;
 pub mod chain_events;
+pub mod chain_freshness;
 pub mod channel_store;
 /// The `cdn/client/v1` paid-pull requester lives in the shared
 /// `decdn-client-pull` crate (reused by the CLI's client fetch / bundle pull),
