@@ -105,9 +105,10 @@ pub enum PasswordOrigin {
 }
 
 impl PasswordOrigin {
-    /// A human phrase naming the source, for operator-facing messages, e.g.
-    /// "the environment variable `DECDN_KEYSTORE_PASSWORD`" or "an interactive
-    /// prompt". Never includes the password itself.
+    /// A human phrase naming the source, for operator-facing messages — "the
+    /// environment variable" followed by the variable name, "the password file"
+    /// followed by the path, or "an interactive prompt". Plain text with no
+    /// backticks, and never the password itself.
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
