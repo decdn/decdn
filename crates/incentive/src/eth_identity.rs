@@ -89,6 +89,88 @@ pub enum PasswordSource {
     },
 }
 
+/// Which [`PasswordSource`] supplied the password that [`read_password`]
+/// returned. Lets a caller name the winning source in its own messages —
+/// `key-gen` uses it to refuse an empty password that came from the
+/// environment (a shell expanding an unset variable), and operator commands
+/// use it to say which source won.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordOrigin {
+    /// The environment variable named here supplied the password.
+    Env(&'static str),
+    /// This file supplied the password.
+    File(PathBuf),
+    /// An interactive terminal prompt supplied the password.
+    Prompt,
+}
+
+impl PasswordOrigin {
+    /// A human phrase naming the source, for operator-facing messages, e.g.
+    /// "the environment variable `DECDN_KEYSTORE_PASSWORD`" or "an interactive
+    /// prompt". Never includes the password itself.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            PasswordOrigin::Env(name) => format!("the environment variable {name}"),
+            PasswordOrigin::File(path) => format!("the password file {}", path.display()),
+            PasswordOrigin::Prompt => "an interactive prompt".to_owned(),
+        }
+    }
+}
+
+/// The outcome of [`read_password`]: the password, the source that won, and any
+/// operator-facing warnings about sources that were configured but not used.
+///
+/// The warnings exist because a mistyped `--keystore-password-file` on a TTY
+/// silently falls through to an interactive prompt — correct at the terminal,
+/// but a different mode than the headless unit the operator ultimately deploys.
+/// The caller decides where the warnings go: the CLI prints them to stderr
+/// (`decdn-incentive` cannot, it denies `print_stderr`), the daemon logs them
+/// through `tracing`.
+#[derive(Debug)]
+pub struct ResolvedPassword {
+    secret: Zeroizing<String>,
+    origin: PasswordOrigin,
+    warnings: Vec<String>,
+}
+
+impl ResolvedPassword {
+    /// The resolved password. Borrowed as `&str` for the common case of
+    /// passing it straight to [`load_signer`] or [`stage_keystore`].
+    #[must_use]
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+
+    /// Whether the resolved password is the empty string.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.secret.is_empty()
+    }
+
+    /// Which source supplied the password.
+    #[must_use]
+    pub const fn origin(&self) -> &PasswordOrigin {
+        &self.origin
+    }
+
+    /// Operator-facing warnings about configured-but-unused sources, in source
+    /// order. Empty in the common case. Each is a complete sentence with no
+    /// `warning:` prefix and never contains the password.
+    #[must_use]
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// Consume the outcome and yield the password, still zeroized on drop. Use
+    /// when the secret must be moved (e.g. into a `spawn_blocking` closure)
+    /// after the warnings and origin have been inspected.
+    #[must_use]
+    pub fn into_secret(self) -> Zeroizing<String> {
+        self.secret
+    }
+}
+
 /// The keystore password sources every binary consults, in precedence order:
 /// the `DECDN_KEYSTORE_PASSWORD` env var, then `password_file` when the
 /// caller passed one, then an interactive prompt on a TTY. Presence decides
@@ -322,10 +404,12 @@ pub fn load_signer(path: &Path, password: &str) -> anyhow::Result<PrivateKeySign
 /// the next entry; a source that is present supplies its value, the empty string
 /// included. When every source falls through, the error lists why each one did.
 ///
-/// Returns `Zeroizing<String>` so the password is overwritten in memory on
-/// drop — defense-in-depth against post-mortem heap inspection. The
-/// `String` itself is still subject to allocator reuse, but the wrapper
-/// guarantees the bytes are scrubbed before that reuse becomes possible.
+/// Returns a [`ResolvedPassword`]: the secret, which source won, and any
+/// warnings about configured-but-unused sources for the caller to surface. The
+/// secret is held in a `Zeroizing<String>` so it is overwritten in memory on
+/// drop — defense-in-depth against post-mortem heap inspection. The `String`
+/// itself is still subject to allocator reuse, but the wrapper guarantees the
+/// bytes are scrubbed before that reuse becomes possible.
 ///
 /// # Errors
 ///
@@ -338,19 +422,22 @@ pub fn load_signer(path: &Path, password: &str) -> anyhow::Result<PrivateKeySign
 pub fn read_password(
     sources: &[PasswordSource],
     prompt_label: &str,
-) -> anyhow::Result<Zeroizing<String>> {
+) -> anyhow::Result<ResolvedPassword> {
     // Every skipped source is reported, not just the last: a mistyped
     // `--keystore-password-file` falls through, and if only the final skip survived
     // (`stdin is not a TTY`) the path the operator got wrong would never reach
     // them.
     let mut skipped: Vec<String> = Vec::new();
-    for source in sources {
-        match source {
+    for (idx, source) in sources.iter().enumerate() {
+        let won: Option<(Zeroizing<String>, PasswordOrigin)> = match source {
             PasswordSource::Env(name) => match std::env::var(name) {
                 // A set variable is a deliberate value, so an empty one is an
                 // empty password rather than a reason to try the next source.
-                Ok(value) => return Ok(Zeroizing::new(value)),
-                Err(std::env::VarError::NotPresent) => skipped.push(format!("env {name} unset")),
+                Ok(value) => Some((Zeroizing::new(value), PasswordOrigin::Env(name))),
+                Err(std::env::VarError::NotPresent) => {
+                    skipped.push(format!("env {name} unset"));
+                    None
+                }
                 // Set but unreadable is a misconfiguration, not an absent
                 // source. The message never echoes the value — it is a password.
                 Err(std::env::VarError::NotUnicode(_)) => {
@@ -358,22 +445,35 @@ pub fn read_password(
                 }
             },
             PasswordSource::File(path) => match read_password_file(path) {
-                Ok(Some(value)) => return Ok(value),
+                Ok(Some(value)) => Some((value, PasswordOrigin::File(path.clone()))),
                 Ok(None) => {
                     skipped.push(format!(
                         "password file {} not found (missing path or broken symlink)",
                         path.display()
                     ));
+                    None
                 }
                 Err(e) => return Err(e),
             },
             PasswordSource::Prompt { usage } => {
-                if !std::io::stdin().is_terminal() {
+                if std::io::stdin().is_terminal() {
+                    Some((
+                        prompt_password(prompt_label, *usage)?,
+                        PasswordOrigin::Prompt,
+                    ))
+                } else {
                     skipped.push("stdin is not a TTY".to_owned());
-                    continue;
+                    None
                 }
-                return prompt_password(prompt_label, *usage);
             }
+        };
+        if let Some((secret, origin)) = won {
+            let warnings = unused_file_warnings(sources, idx, &origin);
+            return Ok(ResolvedPassword {
+                secret,
+                origin,
+                warnings,
+            });
         }
     }
     let why = if skipped.is_empty() {
@@ -382,6 +482,45 @@ pub fn read_password(
         skipped.join("; ")
     };
     Err(anyhow!("no keystore password source available ({why})"))
+}
+
+/// Build the operator warnings for a successful resolve: a `File` source the
+/// caller configured but that did not win is worth a word, because the usual
+/// reason is a typo.
+///
+/// Two shapes, told apart by position relative to the winner at `win_idx`:
+/// a file *before* the winner was reached and fell through as not-found (so a
+/// later source quietly won — the 3am-under-systemd trap); a file *after* the
+/// winner was never consulted because a higher-precedence source was present
+/// (so the flag is inert). A file read fatally (permissions, a directory)
+/// never reaches here — that path returns an error instead.
+fn unused_file_warnings(
+    sources: &[PasswordSource],
+    win_idx: usize,
+    origin: &PasswordOrigin,
+) -> Vec<String> {
+    let winner = origin.describe();
+    let mut warnings = Vec::new();
+    for (idx, source) in sources.iter().enumerate() {
+        let PasswordSource::File(path) = source else {
+            continue;
+        };
+        match idx.cmp(&win_idx) {
+            // The file itself won; nothing to warn about.
+            std::cmp::Ordering::Equal => {}
+            // Reached and fell through as not-found; a later source won.
+            std::cmp::Ordering::Less => warnings.push(format!(
+                "password file {} not found; used {winner} instead",
+                path.display()
+            )),
+            // Never consulted because a higher-precedence source was present.
+            std::cmp::Ordering::Greater => warnings.push(format!(
+                "password file {} was not used; {winner} took precedence",
+                path.display()
+            )),
+        }
+    }
+    warnings
 }
 
 /// Read `path` as a password. `Ok(None)` means the file is not there, which is
@@ -778,7 +917,7 @@ mod tests {
             "ignored",
         )
         .unwrap();
-        assert_eq!(pw.as_str(), "first-wins");
+        assert_eq!(pw.secret(), "first-wins");
     }
 
     #[test]
@@ -794,7 +933,76 @@ mod tests {
             "ignored",
         )
         .unwrap();
-        assert_eq!(pw.as_str(), "actual-pw");
+        assert_eq!(pw.secret(), "actual-pw");
+    }
+
+    /// A file that fell through as not-found before a later source won is worth
+    /// a warning naming the path (#1934): the usual cause is a typo that looks
+    /// fine at the terminal and fails headless. The warning names the skipped
+    /// path and the source that actually supplied the password.
+    #[test]
+    fn a_skipped_file_before_the_winner_warns_naming_the_path() {
+        let tmp = make_data_dir();
+        let missing = tmp.path().join("typo.txt");
+        let real = tmp.path().join("real.txt");
+        fs::write(&real, b"actual-pw").unwrap();
+        let resolved = read_password(
+            &[
+                PasswordSource::File(missing.clone()),
+                PasswordSource::File(real.clone()),
+            ],
+            "ignored",
+        )
+        .unwrap();
+        assert_eq!(resolved.warnings().len(), 1, "{:?}", resolved.warnings());
+        let warning = resolved.warnings().first().unwrap();
+        assert!(
+            warning.contains(&missing.display().to_string()),
+            "{warning}"
+        );
+        assert!(warning.contains(&real.display().to_string()), "{warning}");
+        assert!(warning.contains("not found"), "{warning}");
+        assert!(
+            !warning.contains("actual-pw"),
+            "must not echo the password: {warning}"
+        );
+    }
+
+    /// A file configured after the source that won was never consulted, so its
+    /// flag is inert — warn that it was not used (#1934, the shadowed case).
+    #[test]
+    fn a_file_after_the_winner_warns_it_was_unused() {
+        let tmp = make_data_dir();
+        let winner = tmp.path().join("winner.txt");
+        let shadowed = tmp.path().join("shadowed.txt");
+        fs::write(&winner, b"winning-pw").unwrap();
+        fs::write(&shadowed, b"never-read").unwrap();
+        let resolved = read_password(
+            &[
+                PasswordSource::File(winner),
+                PasswordSource::File(shadowed.clone()),
+            ],
+            "ignored",
+        )
+        .unwrap();
+        let warning = resolved.warnings().first().expect("one warning");
+        assert!(
+            warning.contains(&shadowed.display().to_string()),
+            "{warning}"
+        );
+        assert!(warning.contains("was not used"), "{warning}");
+    }
+
+    /// The common case: the single source that wins produces no warning and
+    /// reports itself as the origin.
+    #[test]
+    fn a_clean_single_source_resolve_has_no_warnings() {
+        let tmp = make_data_dir();
+        let pw_file = tmp.path().join("pw.txt");
+        fs::write(&pw_file, b"hunter2").unwrap();
+        let resolved = read_password(&[PasswordSource::File(pw_file.clone())], "ignored").unwrap();
+        assert!(resolved.warnings().is_empty(), "{:?}", resolved.warnings());
+        assert_eq!(resolved.origin(), &PasswordOrigin::File(pw_file));
     }
 
     #[test]
@@ -803,7 +1011,7 @@ mod tests {
         let pw_file = tmp.path().join("pw.txt");
         fs::write(&pw_file, b"hunter2\n").unwrap();
         let pw = read_password(&[PasswordSource::File(pw_file)], "ignored").unwrap();
-        assert_eq!(pw.as_str(), "hunter2");
+        assert_eq!(pw.secret(), "hunter2");
     }
 
     #[test]
@@ -813,7 +1021,7 @@ mod tests {
         fs::write(&pw_file, b"line1\nline2").unwrap();
         let pw = read_password(&[PasswordSource::File(pw_file)], "ignored").unwrap();
         // No trailing newline to strip; internal newline preserved.
-        assert_eq!(pw.as_str(), "line1\nline2");
+        assert_eq!(pw.secret(), "line1\nline2");
     }
 
     #[test]
@@ -822,7 +1030,7 @@ mod tests {
         let pw_file = tmp.path().join("pw.txt");
         fs::write(&pw_file, b"hunter2\r\n").unwrap();
         let pw = read_password(&[PasswordSource::File(pw_file)], "ignored").unwrap();
-        assert_eq!(pw.as_str(), "hunter2");
+        assert_eq!(pw.secret(), "hunter2");
     }
 
     #[test]
@@ -853,7 +1061,7 @@ mod tests {
         let empty = tmp.path().join("empty.txt");
         fs::write(&empty, b"").unwrap();
         let pw = read_password(&[PasswordSource::File(empty)], "ignored").unwrap();
-        assert_eq!(pw.as_str(), "");
+        assert_eq!(pw.secret(), "");
     }
 
     /// Presence, not content, decides precedence: an empty file earlier in the
@@ -870,7 +1078,7 @@ mod tests {
             "ignored",
         )
         .unwrap();
-        assert_eq!(pw.as_str(), "");
+        assert_eq!(pw.secret(), "");
     }
 
     /// A path that does not exist falls through, and the exhausted-sources
@@ -922,7 +1130,7 @@ mod tests {
         let pw_file = tmp.path().join("pw.txt");
         fs::write(&pw_file, b"\n").unwrap();
         let pw = read_password(&[PasswordSource::File(pw_file)], "ignored").unwrap();
-        assert_eq!(pw.as_str(), "");
+        assert_eq!(pw.secret(), "");
     }
 
     /// A file that exists but cannot be read names a real misconfiguration, so

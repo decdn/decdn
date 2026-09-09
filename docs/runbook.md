@@ -139,6 +139,14 @@ variable, a path that does *not exist*, and a non-TTY `stdin` fall through to
 the next source. A path that exists but cannot be read (a directory, a
 permission denial, non-UTF-8 contents) is an error rather than a skipped source.
 
+**`decdn key-gen` refuses an empty password from `DECDN_KEYSTORE_PASSWORD`.**
+Creating a keystore is unverifiable — a wrong password is only caught at the
+next unlock — and a set-but-empty env var is almost always a shell expanding an
+unset variable. To create an empty-password keystore on purpose, point
+`--keystore-password-file` at an empty file. Loading (everything except
+`key-gen`) still accepts an empty env password: a wrong one simply fails to
+decrypt.
+
 **Diagnose:**
 
 - `no keystore password source available (...)` lists every source that fell
@@ -149,7 +157,10 @@ permission denial, non-UTF-8 contents) is an error rather than a skipped source.
   produces a decrypt failure against a keystore that has one; the second falls
   through to the password file.
 - `failed to decrypt eth keystore at <path>` means a source *was* found and the
-  password was wrong. Check which source won before changing the password file.
+  password was wrong. A `warning: password file <path> ...` line says when a
+  password file was not found and another source won, or when a set
+  `DECDN_KEYSTORE_PASSWORD` shadowed the file — check it before changing the
+  password file. The daemon logs the same warning through `tracing`.
 
 **Resolve:**
 

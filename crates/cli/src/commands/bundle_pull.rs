@@ -35,7 +35,7 @@ use decdn_common::cli::{BundlePullArgs, ClientFetchArgs};
 use decdn_common::config::load_file_config;
 use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
-use decdn_incentive::eth_identity::{PasswordUse, load_signer, read_password};
+use decdn_incentive::eth_identity::{PasswordUse, load_signer};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{slash_judge_domain, voucher_domain};
 use futures_util::StreamExt as _;
@@ -289,13 +289,14 @@ async fn discover_candidates(
 fn load_buyer_signer(
     chain: &fetch::ResolvedChain,
 ) -> anyhow::Result<(Arc<PrivateKeySigner>, Address)> {
-    let password = read_password(
+    let password = super::chain_ctx::read_keystore_password(
         &super::chain_ctx::password_sources(
             chain.keystore_password_file.as_deref(),
             PasswordUse::Unlock,
         ),
         "eth keystore password",
-    )?;
+    )?
+    .into_secret();
     let signer = Arc::new(load_signer(&chain.keystore, &password)?);
     let self_address = signer.address();
     Ok((signer, self_address))

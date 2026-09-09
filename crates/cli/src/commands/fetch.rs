@@ -51,7 +51,7 @@ use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore, DepositOutcome};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
-use decdn_incentive::eth_identity::{self, PasswordUse, load_signer, read_password};
+use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::rate::min_payment;
 use decdn_incentive::{
@@ -1272,13 +1272,14 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
     // else `--keystore-password-file`, else TTY.
-    let password = read_password(
+    let password = super::chain_ctx::read_keystore_password(
         &super::chain_ctx::password_sources(
             chain.keystore_password_file.as_deref(),
             PasswordUse::Unlock,
         ),
         "eth keystore password",
-    )?;
+    )?
+    .into_secret();
     let signer = Arc::new(load_signer(&chain.keystore, &password)?);
     let self_address = signer.address();
 

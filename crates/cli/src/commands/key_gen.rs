@@ -39,7 +39,7 @@ pub fn key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
     // Source the keystore password before any disk writes — interactive
     // prompts that abort (Ctrl-C, mismatch retries exhausted) shouldn't
     // leave a half-written `node.secret` behind.
-    let password = eth_identity::read_password(
+    let resolved = super::chain_ctx::read_keystore_password(
         &super::chain_ctx::password_sources(
             args.keystore_password_file.as_deref(),
             PasswordUse::Create,
@@ -47,18 +47,36 @@ pub fn key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
         "eth keystore password",
     )?;
 
-    // An empty password is representable on purpose (#1931), but creating a
-    // keystore with one is unverifiable from the operator's side — a shell
-    // expanding an unset variable into `DECDN_KEYSTORE_PASSWORD` looks the same
-    // as a deliberate choice. Say so once, loudly. Loading needs no such
-    // warning: the wrong password fails to decrypt.
-    if password.is_empty() {
+    // An empty password is representable on purpose (#1931), but CREATING a
+    // keystore with one is unverifiable from the operator's side: the wrong
+    // password is only caught at the next unlock, by which point the key is
+    // sealed. Loading needs no such care — a wrong password fails to decrypt at
+    // once.
+    //
+    // An empty password from the environment variable is refused (#1935): the
+    // usual cause is a shell expanding an unset variable (`$SOME_UNSET_VAR` ->
+    // "") into `DECDN_KEYSTORE_PASSWORD`, which then silently outranks a correct
+    // password file sitting right beside it. A deliberate empty password stays
+    // reachable by pointing `--keystore-password-file` at an empty file, an
+    // unambiguous act no shell produces by accident.
+    if resolved.is_empty() {
+        if let eth_identity::PasswordOrigin::Env(name) = resolved.origin() {
+            anyhow::bail!(
+                "refusing to create {} with an empty password from {}; an empty \
+                 ${name} is usually an unset shell variable. To create an \
+                 empty-password keystore on purpose, point --keystore-password-file \
+                 at an empty file.",
+                keystore_path.display(),
+                resolved.origin().describe(),
+            );
+        }
         eprintln!(
             "warning: creating {} with an EMPTY password; \
              anyone who can read the file can use the key",
             keystore_path.display()
         );
     }
+    let password = resolved.into_secret();
 
     // Two-phase rotation so a `--force` overwrite can't half-rotate the key
     // pair (#844). STAGE both secrets first — all the expensive, failure-prone

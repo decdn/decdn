@@ -3079,7 +3079,14 @@ async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigne
         cfg.blockchain.keystore_password_file.clone(),
         eth_identity::PasswordUse::Unlock,
     );
-    let password = eth_identity::read_password(&sources, "eth keystore password")?;
+    let resolved = eth_identity::read_password(&sources, "eth keystore password")?;
+    // Surface a configured-but-unused password source (a typo'd or shadowed
+    // password file). The daemon has a `tracing` subscriber, so unlike the CLI
+    // it logs rather than printing.
+    for warning in resolved.warnings() {
+        tracing::warn!("keystore password: {warning}");
+    }
+    let password = resolved.into_secret();
 
     let path = cfg.blockchain.eth_keystore.clone();
     // `spawn_blocking` because alloy's `decrypt_keystore` runs scrypt /
