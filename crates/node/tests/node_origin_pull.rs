@@ -1198,7 +1198,6 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
         |deps| deps.local_populate = Some(Duration::from_secs(20)),
     )?;
@@ -1313,7 +1312,6 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -1463,7 +1461,6 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -2311,7 +2308,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -2507,7 +2503,6 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -3371,7 +3366,6 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -5266,7 +5260,6 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -5563,7 +5556,6 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         store_n as Arc<dyn PoolStateStore>,
         STALL_RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_n, addr_n) =
@@ -5605,7 +5597,6 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -6124,7 +6115,6 @@ async fn node_origin_oversized_blob_aborts_on_received_bytes_without_scoring() -
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0, // server ceiling unlimited — it would happily serve the full blob.
         16,
     )?;
     let (ep_a, addr_a) =
@@ -6252,7 +6242,6 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0, // server blob ceiling unlimited — isolate the RATE gate.
         16,
     )?;
     let (ep_a, addr_a) =
@@ -6383,7 +6372,6 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -6548,7 +6536,6 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -7008,7 +6995,6 @@ async fn build_node_b_with_leaves(
         store_b as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        max_blob_size_bytes,
         16,
         |deps| {
             // Window-paced pull-through: the deadline accommodates the full
@@ -7084,7 +7070,6 @@ async fn spawn_node_a(
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -9066,7 +9051,6 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -9322,7 +9306,6 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -9451,7 +9434,6 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -9925,7 +9907,6 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         store_h as Arc<dyn PoolStateStore>,
         h_rate,
         &domains,
-        0,
         16,
     )?;
     let (ep_h, addr_h) =
@@ -10067,7 +10048,6 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -10426,7 +10406,6 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         store_h as Arc<dyn PoolStateStore>,
         h_rate,
         &domains,
-        0,
         16,
     )?;
     let (ep_h, addr_h) =
@@ -10770,7 +10749,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -12273,7 +12251,6 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         QUOTE_A,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -12386,7 +12363,6 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         store_b.clone() as Arc<dyn PoolStateStore>,
         SELL,
         &domains,
-        0,
         16,
         |deps| {
             deps.warming_credit = Arc::new(
@@ -12536,7 +12512,6 @@ async fn attack_b_attempt(
         store_a as Arc<dyn PoolStateStore>,
         quote,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -12641,7 +12616,6 @@ async fn attack_b_attempt(
             store_b as Arc<dyn PoolStateStore>,
             sell,
             &domains,
-            0,
             16,
             |deps| {
                 deps.warming_credit =
@@ -12913,7 +12887,6 @@ async fn spawn_partial_holder(
         store.clone() as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep, addr) = local_endpoint(sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
@@ -13059,7 +13032,6 @@ async fn build_serving_node(
         store_s as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
         |deps| {
             deps.pull_through = Some(Duration::from_secs(20));

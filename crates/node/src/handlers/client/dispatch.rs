@@ -1106,17 +1106,6 @@ impl ClientHandler {
             };
             total_bytes
         };
-        if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
-            return self
-                .respond_error(
-                    &mut send,
-                    &req,
-                    ServeRejectReason::BlobTooLarge,
-                    rate_per_mb,
-                )
-                .await;
-        }
-
         // Bounded-range bounds check (ADR 005 §Bounded byte ranges). Reject an
         // out-of-bounds range with a `StreamError` *before* signing the success
         // response below — otherwise the client accepts a signed `ok: true` that

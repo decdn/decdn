@@ -126,7 +126,6 @@ async fn handler_over_http_origin(
         store_dyn,
         RATE_PER_MB,
         &domains(),
-        0,
         16,
         |deps| deps.pull_through = pull_through,
     )?;
@@ -1377,7 +1376,6 @@ async fn handler_two_channels_over_http_origin(
         store_dyn,
         RATE_PER_MB,
         &domains(),
-        0,
         16,
         |deps| deps.pull_through = pull_through,
     )?;

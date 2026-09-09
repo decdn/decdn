@@ -94,11 +94,9 @@ impl ClientHandler {
             // `EvictionLimitExceeded`) is DETERMINISTIC: it will recur on every
             // request for this hash, so it is not evidence the node is degraded.
             // Reporting it as `InternalError` ("do not retry this node") would
-            // steer clients off a healthy node permanently over one bad blob — and
-            // for `BlobTooLarge` it would also contradict the size gate, which
-            // refuses the very same condition with the dedicated `BlobTooLarge`
-            // code when the blob happens to be in the store. Meter it (the operator
-            // still needs to see it) but let it fall through as a plain miss.
+            // steer clients off a healthy node permanently over one bad blob.
+            // Meter it (the operator still needs to see it) but let it fall
+            // through as a plain miss.
             Ok(Err(e)) => {
                 self.metrics.node_pull_through_error();
                 tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a permanent cache-engine error");

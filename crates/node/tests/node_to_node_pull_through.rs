@@ -225,8 +225,7 @@ fn build_server(
         store,
         rate,
         &hop_domains(),
-        0,  // max_blob_size_bytes (0 == unlimited)
-        16, // max_concurrent_streams
+        16,
     )
 }
 

@@ -635,7 +635,6 @@ async fn run_e2e() -> anyhow::Result<()> {
             Arc::clone(&store),
             RATE_PER_MB,
             &domains,
-            0,
             16,
             move |deps| {
                 deps.redeem_hint = Some(hint);

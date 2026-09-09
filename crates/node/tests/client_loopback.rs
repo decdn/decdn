@@ -10,7 +10,8 @@
 //! reject reason, just a clean finish — so the client resends the same voucher
 //! on a fresh stream.
 //!
-//! Delivery/authorization gates also covered: `BlobTooLarge` (size gate),
+//! Delivery/authorization gates also covered: the buyer-side received-byte
+//! ceiling (#1895, `BlobTooLarge` on bytes that actually arrive),
 //! `EvictedSinceProbe` (evicted between probe and stream), the client-binding
 //! mismatch reset and the binding-does-not-own-channel `NotFound` (both driven
 //! by a small [`raw_request`] client, since the honest requester never sends a
@@ -167,8 +168,8 @@ fn fresh_lane(signer: Address, cap: U256) -> LaneState {
     )
 }
 
-/// Build a `ClientHandler` with the given rate and channel store, an unlimited
-/// blob-size gate, and a 16-stream per-connection cap (the common-case setup).
+/// Build a `ClientHandler` with the given rate and channel store and a 16-stream
+/// per-connection cap (the common-case setup).
 fn build_handler(
     server_id: iroh::PublicKey,
     server_eth: &Arc<PrivateKeySigner>,
@@ -179,12 +180,11 @@ fn build_handler(
     rate: u64,
 ) -> anyhow::Result<Arc<ClientHandler>> {
     build_handler_limited(
-        server_id, server_eth, metrics, limiter, cache, store, rate, 0, 16,
+        server_id, server_eth, metrics, limiter, cache, store, rate, 16,
     )
 }
 
-/// Build a `ClientHandler` exposing the `max_blob_size_bytes` and
-/// `max_concurrent_streams` knobs (`0` blob size == unlimited).
+/// Build a `ClientHandler` exposing the `max_concurrent_streams` knob.
 #[allow(clippy::too_many_arguments)]
 fn build_handler_limited(
     server_id: iroh::PublicKey,
@@ -194,7 +194,6 @@ fn build_handler_limited(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
     rate: u64,
-    max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
 ) -> anyhow::Result<Arc<ClientHandler>> {
     build_handler_full(
@@ -206,7 +205,6 @@ fn build_handler_limited(
         store,
         rate,
         &loopback_domains(),
-        max_blob_size_bytes,
         max_concurrent_streams,
     )
 }
@@ -225,7 +223,7 @@ fn build_handler_configured(
     configure: impl FnOnce(&mut ClientHandlerDeps),
 ) -> anyhow::Result<Arc<ClientHandler>> {
     build_handler_limited_configured(
-        server_id, server_eth, metrics, limiter, cache, store, rate, 0, 16, configure,
+        server_id, server_eth, metrics, limiter, cache, store, rate, 16, configure,
     )
 }
 
@@ -239,7 +237,6 @@ fn build_handler_limited_configured(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
     rate: u64,
-    max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
     configure: impl FnOnce(&mut ClientHandlerDeps),
 ) -> anyhow::Result<Arc<ClientHandler>> {
@@ -252,7 +249,6 @@ fn build_handler_limited_configured(
         store,
         rate,
         &loopback_domains(),
-        max_blob_size_bytes,
         max_concurrent_streams,
         configure,
     )
@@ -420,7 +416,6 @@ async fn spawn_pipelined_server(
         store,
         RATE_PER_MB,
         &loopback_domains(),
-        0,
         16,
         |deps| {
             deps.credit_max = credit_max;
@@ -2875,7 +2870,6 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
         Arc::clone(&receipts) as Arc<dyn decdn_node::receipt_log::ReceiptLog>,
         RATE_PER_MB,
         &loopback_domains(),
-        0,
         16,
     )?;
 
@@ -3025,7 +3019,6 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
         receipt_sink,
         RATE_PER_MB,
         &loopback_domains(),
-        0,
         16,
     )?;
 
@@ -3119,7 +3112,6 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
         Arc::new(FailingReceiptLog) as Arc<dyn decdn_node::receipt_log::ReceiptLog>,
         RATE_PER_MB,
         &loopback_domains(),
-        0,
         16,
     )?;
 
@@ -3659,7 +3651,7 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
     // Empty store: the channel is unknown to the node.
     let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
     let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
 
     // A bound client whose lane is not in the (empty) store: the binding
     // resolves a lane key, but no lane exists for it, so the serve is refused as
@@ -3836,7 +3828,7 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     let (target, server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
@@ -4421,13 +4413,11 @@ fn seeded_store() -> anyhow::Result<(Arc<dyn PoolStateStore>, Arc<PrivateKeySign
 
 /// Spin up a server endpoint running a `ClientHandler` over `cache`/`store`,
 /// returning the dialable target, the node's Ethereum signer (for `slash_sig`
-/// verification), the server endpoint, and its accept-loop handle. `max_blob`
-/// of `0` disables the size gate.
+/// verification), the server endpoint, and its accept-loop handle.
 async fn spawn_handler_server(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
     rate: u64,
-    max_blob: u64,
     max_streams: usize,
 ) -> anyhow::Result<(
     EndpointAddr,
@@ -4436,7 +4426,7 @@ async fn spawn_handler_server(
     tokio::task::JoinHandle<()>,
 )> {
     let (target, server_eth, server_ep, server_task, _metrics) =
-        spawn_handler_server_with_metrics(cache, store, rate, max_blob, max_streams).await?;
+        spawn_handler_server_with_metrics(cache, store, rate, max_streams).await?;
     Ok((target, server_eth, server_ep, server_task))
 }
 
@@ -4448,7 +4438,6 @@ async fn spawn_handler_server_with_metrics(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
     rate: u64,
-    max_blob: u64,
     max_streams: usize,
 ) -> anyhow::Result<(
     EndpointAddr,
@@ -4470,7 +4459,6 @@ async fn spawn_handler_server_with_metrics(
         cache,
         store,
         rate,
-        max_blob,
         max_streams,
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -5654,49 +5642,6 @@ fn sign_binding_for(signer: &PrivateKeySigner, client_node_id: B256) -> anyhow::
     Ok(signer.sign_hash_sync(&hash)?.as_bytes().to_vec())
 }
 
-/// Size gate: a blob larger than `max_blob_size_bytes` is refused with
-/// `ok: false` / `BlobTooLarge` before any bytes (or payment) flow.
-#[tokio::test(flavor = "multi_thread")]
-async fn client_blob_too_large_is_refused() -> anyhow::Result<()> {
-    let payload = vec![0x7Eu8; 8192];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let (store, signer, deposit) = seeded_store()?;
-    // max_blob_size 4096 < 8192-byte payload → the size gate refuses delivery.
-    let (target, server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 4096, 16).await?;
-
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
-    let err = stream_fetch(
-        &client_ep,
-        target,
-        &ctx,
-        &slash_domain(),
-        server_eth.address(),
-        *hash.as_bytes(),
-        0,
-        0x00b1,
-        Duration::from_secs(10),
-    )
-    .await
-    .err()
-    .ok_or_else(|| anyhow::anyhow!("oversized blob must be refused"))?;
-    anyhow::ensure!(
-        err.to_string().contains("BlobTooLarge") || err.to_string().contains("refused"),
-        "error should surface BlobTooLarge: {err}"
-    );
-    anyhow::ensure!(
-        metric_line_present(
-            &metrics.encode()?,
-            "decdn_serve_stream_rejected_blob_too_large_total 1"
-        ),
-        "oversized-blob refusal must bump its reason counter (#876)"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
 /// Buyer-side received-byte cap (#1895): the buyer never refuses on the server's
 /// *claimed* `total_bytes` — the claim is peer-controlled and unverified
 /// (`StreamResponse::validate()` does not bound it). Instead it enters the receive
@@ -5712,7 +5657,7 @@ async fn buyer_aborts_oversized_small_blob_without_paying() -> anyhow::Result<()
     let (store, signer, deposit) = seeded_store()?;
     // Server ceiling 0 (unlimited) — it honestly serves all 8192 bytes.
     let (target, server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
@@ -5766,7 +5711,7 @@ async fn buyer_pays_for_received_bytes_then_aborts_over_ceiling() -> anyhow::Res
     let (store, signer, deposit) = seeded_store()?;
     // Server ceiling 0 (unlimited) — it honestly serves the whole 4 MiB blob.
     let (target, server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
@@ -5826,7 +5771,7 @@ async fn buyer_rejects_over_ceiling_rate() -> anyhow::Result<()> {
     let (store, signer, deposit) = seeded_store()?;
     // Server quotes RATE_PER_MB (10); no size ceiling.
     let (target, server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
@@ -5900,7 +5845,7 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
@@ -5943,7 +5888,7 @@ async fn buyer_accepts_rate_at_exact_ceiling() -> anyhow::Result<()> {
     let (store, signer, deposit) = seeded_store()?;
     // Server quotes RATE_PER_MB; buyer ceiling set to EXACTLY RATE_PER_MB.
     let (target, server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
@@ -5986,7 +5931,7 @@ async fn progress_callback_reports_monotonic_delivery() -> anyhow::Result<()> {
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
@@ -6105,7 +6050,6 @@ async fn spawn_handler_server_with_deny(
         cache,
         store,
         RATE_PER_MB,
-        0,
         16,
         |deps| {
             deps.content_deny = deny;
@@ -6149,7 +6093,7 @@ async fn denylisted_hash_is_refused_even_when_held() -> anyhow::Result<()> {
 
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
@@ -6208,7 +6152,7 @@ async fn governance_denied_hash_is_refused_as_hash_blacklisted() -> anyhow::Resu
 
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
@@ -6275,7 +6219,7 @@ async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
     let (store, signer, deposit) = seeded_store()?;
     let deny_cache = cache.clone();
     let (target, server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
@@ -6397,7 +6341,7 @@ async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
     cache.evict(hash).await?; // logically gone: has() now false, is_evicted() true.
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
@@ -6441,7 +6385,7 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, _owner, _deposit) = seeded_store()?;
     let (target, _server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -6487,7 +6431,7 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
     // different address (`intruder`), so it must not authorize this channel.
     let (store, _owner, _deposit) = seeded_store()?;
     let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -6602,7 +6546,7 @@ async fn binding_matching_the_delegate_signer_is_authorized() -> anyhow::Result<
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, _funder, delegate) = delegate_signer_store()?;
     let (target, _server_eth, server_ep, server_task, _metrics) =
-        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -6642,7 +6586,7 @@ async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, funder, _delegate) = delegate_signer_store()?;
     let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -6765,7 +6709,7 @@ async fn delegate_signed_vouchers_carry_a_delivery_to_completion() -> anyhow::Re
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, _funder, delegate) = delegate_signer_store()?;
     let (target, server_eth, server_ep, server_task, _metrics) =
-        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     // The requester signs with the DELEGATE — the funder's key never appears.
@@ -6946,7 +6890,7 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
     let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, Arc::clone(&store), RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     // ONE channel context, ONE shared ledger seeded fresh (all `prior_* == ZERO`),
@@ -7238,7 +7182,6 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
         store,
         RATE_PER_MB,
         &loopback_domains(),
-        0,
         16,
         |deps| deps.pull_through = Some(std::time::Duration::from_secs(10)),
     )?;
@@ -7342,7 +7285,6 @@ async fn pull_through_authorizes_the_delegate_not_the_funder() -> anyhow::Result
         store,
         RATE_PER_MB,
         &loopback_domains(),
-        0,
         16,
         |deps| deps.pull_through = Some(std::time::Duration::from_secs(10)),
     )?;
@@ -7433,7 +7375,6 @@ async fn spawn_counting_pull_server_with_deny(
         store,
         RATE_PER_MB,
         &loopback_domains(),
-        0,
         16,
         |deps| {
             deps.pull_through = Some(std::time::Duration::from_secs(10));
@@ -7998,7 +7939,6 @@ async fn pull_through_fills_under_deadline(
         store,
         RATE_PER_MB,
         &loopback_domains(),
-        0,
         16,
         |deps| deps.pull_through = Some(outer_deadline),
     )?;
@@ -8133,7 +8073,6 @@ async fn spawn_pull_through_server(
         cache,
         store,
         RATE_PER_MB,
-        0,
         16,
         |deps| deps.pull_through = Some(Duration::from_secs(20)),
     )?;
@@ -8165,7 +8104,6 @@ async fn spawn_origin_only_server(
         cache,
         store,
         RATE_PER_MB,
-        0,
         16,
         |deps| {
             deps.pull_through = Some(Duration::from_secs(20));
@@ -8205,7 +8143,6 @@ async fn spawn_origin_only_server_with_metrics(
         cache,
         store,
         RATE_PER_MB,
-        0,
         16,
         |deps| {
             deps.pull_through = Some(Duration::from_secs(20));
@@ -8594,7 +8531,6 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
         cache,
         store.clone(),
         RATE_PER_MB,
-        0,
         16,
         |deps| {
             deps.pull_through = Some(Duration::from_secs(20));
@@ -8705,7 +8641,6 @@ async fn a_completed_serve_credits_the_source_through_the_background_aggregator(
         cache,
         store.clone(),
         RATE_PER_MB,
-        0,
         16,
         |deps| {
             deps.pull_through = Some(Duration::from_secs(20));
@@ -8909,7 +8844,6 @@ async fn spawn_local_populate_server(
         cache,
         store,
         RATE_PER_MB,
-        0,
         16,
         |deps| deps.local_populate = Some(Duration::from_secs(20)),
     )?;
@@ -8941,7 +8875,6 @@ async fn spawn_local_and_window_server(
         cache,
         store,
         RATE_PER_MB,
-        0,
         16,
         |deps| {
             deps.local_populate = Some(Duration::from_secs(20));
@@ -9219,7 +9152,6 @@ async fn spawn_fault_server(
         cache,
         store,
         RATE_PER_MB,
-        0,
         16,
         |deps| match tiers {
             FaultTiers::LocalOnly => deps.local_populate = Some(Duration::from_secs(20)),
@@ -10274,7 +10206,6 @@ async fn over_cap_stream_is_reset_without_signing_a_response() -> anyhow::Result
         cache,
         store_dyn,
         RATE_PER_MB,
-        0,
         1,
         |_deps| {},
     )?;
@@ -10586,7 +10517,7 @@ async fn request_read_timeout_resets_a_silent_opener() -> anyhow::Result<()> {
     let (store, _signer, _deposit) = seeded_store()?;
 
     let (target, _server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let conn = client_ep

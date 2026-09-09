@@ -1340,10 +1340,6 @@ async fn build_chain_and_handlers(
         ),
         rate_per_mb: cfg.payment.rate_per_mb,
         rate_bounds: rate_bounds.clone(),
-        max_blob_size_bytes: cfg
-            .cache
-            .max_blob_size_mb
-            .saturating_mul(decdn_protocol::MB_BYTES),
         max_concurrent_streams: MAX_CLIENT_STREAMS,
         content_deny: Arc::clone(&content_denylist),
         // Hint the settlement service on each accepted voucher so a lane's
