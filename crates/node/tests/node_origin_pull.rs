@@ -7750,28 +7750,31 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
     Ok(())
 }
 
-/// The hoisted per-lane admission cap (#1697) covers the window pull-through MISS
-/// path, not only the cache-hit path: a same-lane stream already in flight makes a
-/// concurrent same-lane MISS refuse with the collapsed `NotFound` wire code before
-/// it ever opens a second upstream pull.
+/// The per-pool floor ceiling covers the window pull-through MISS path, not only
+/// the cache-hit path: a same-lane stream already in flight makes a concurrent
+/// same-lane MISS refuse with the collapsed `NotFound` wire code before it ever
+/// opens a second upstream pull.
 ///
 /// Both leaves share ONE lane — same `pool_id` (the gated upstream's channel id
 /// reused as the leaf channel) and same signer, dialed over two independent
 /// connections, mirroring two concurrent client streams on one payment lane.
+/// A whole-blob miss reserves a full floor before it spends upstream, so
 /// `remaining` covers `min_payment(floor, RATE)` with a little slack (`floor` =
-/// one `CHUNK_BYTES`) — enough for the first stream's own pre-flight floor-M
-/// guard inside `serve_via_window_pull_through` — but not
-/// `min_payment(2 * floor, RATE)`, the reserve the hoisted gate charges once a
-/// second same-lane stream sees `n_active == 1`. This is the same one-floor
-/// headroom tuning as `second_same_lane_stream_refused_when_budget_covers_one` in
-/// `client_loopback.rs`, extended to a request that MISSES locally and fills via
-/// the window-paced pull-through provider instead of a cache hit.
+/// one `CHUNK_BYTES`) — enough for the first stream's pre-spend floor reservation
+/// inside `serve_via_window_pull_through` — but not `min_payment(2 * floor, RATE)`,
+/// the two reservations two same-lane streams commit to the pool's floor
+/// accumulator. The pool ceiling (`remaining − M`) refuses the second. This is the
+/// same one-floor headroom tuning as
+/// `second_same_lane_stream_refused_when_budget_covers_one` in `client_loopback.rs`,
+/// extended to a request that MISSES locally and fills via the window-paced
+/// pull-through provider instead of a cache hit.
 ///
-/// Determinism: leaf 1 is admitted and its lane slot incremented by the hoisted
-/// gate — which runs before B ever dials upstream — strictly before A's gated
-/// server observes the upstream `StreamRequest`. Waiting on `received` therefore
-/// guarantees leaf 1's slot is held before leaf 2 opens, so leaf 2 deterministically
-/// sees `n_active == 1` and is refused pre-serve (it never reaches A at all).
+/// Determinism: leaf 1 is admitted and its floor reservation committed at the
+/// pre-spend gate — which runs before B ever dials upstream — strictly before A's
+/// gated server observes the upstream `StreamRequest`. Waiting on `received`
+/// therefore guarantees leaf 1's reservation is held before leaf 2 opens, so leaf 2
+/// deterministically finds the pool ceiling full and is refused pre-serve (it never
+/// reaches A at all).
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
@@ -7898,7 +7901,7 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
     );
     anyhow::ensure!(
         matches!(resp2_ext.error, Some(StreamError::NotFound)),
-        "expected the collapsed NotFound wire code for LaneAtCapacity, got {:?}",
+        "expected the collapsed NotFound wire code for the pool-ceiling refusal, got {:?}",
         resp2_ext.error
     );
     conn2.close(0u32.into(), b"refused");

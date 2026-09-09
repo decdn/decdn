@@ -111,6 +111,29 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
     async fn cached_status(&self, pool_id: B256) -> Option<PoolStatus> {
         self.status(pool_id).await
     }
+
+    /// The admit-path signer confirm: the request's voucher `signer` on-chain
+    /// `cap − spent` headroom, in micro-USDC. A signer's `cap` is shared across
+    /// every provider (ADR 003 §Deposit Economics), so a signer that has drawn its
+    /// full `cap` at other nodes is uncashable here and must be refused before a
+    /// serve is admitted.
+    ///
+    /// - `Some(u64::MAX)` — no on-chain constraint. An unregistered signer (it has
+    ///   spent nothing on-chain, so it admits on its off-chain capability budget)
+    ///   or no chain wired. Never refuse.
+    /// - `Some(h)` — a registered signer's remaining headroom `cap − spent`.
+    /// - `None` — the on-chain read could not confirm the signer (a
+    ///   `getAuthorization` fault). The caller refuses rather than fail open.
+    ///
+    /// The default never refuses: the bare [`PoolProjection`] and test doubles hold
+    /// no chain, so the admit path treats every signer as unconstrained. The
+    /// production wrapper
+    /// ([`crate::payment_settlement::ResolvingPoolView`]) overrides it with one
+    /// briefly-cached `getAuthorization`.
+    async fn signer_cap_headroom_micro(&self, pool_id: B256, signer: Address) -> Option<u64> {
+        let _ = (pool_id, signer);
+        Some(u64::MAX)
+    }
 }
 
 /// Per-pool state the projection folds from the `PaymentPool` event log.

@@ -400,6 +400,31 @@ impl ClientHandler {
                 .await;
         }
 
+        // Signer cap-headroom confirm (ADR 003 §Pool solvency): a capability whose
+        // signer has already drawn its shared `cap` at other nodes is uncashable here.
+        // Confirm the signer's on-chain `cap - spent` covers a floor before admitting,
+        // so a "spent" capability sprayed to a fresh node is refused, not served for
+        // vouchers this node can never redeem. Unregistered signer or no chain wired ->
+        // u64::MAX (never refuse); a getAuthorization fault -> None -> refuse.
+        if let (Some(view), Some(signer)) = (self.pool_view.as_ref(), verified_client) {
+            let floor_micro =
+                decdn_incentive::min_payment(self.credit_window(CHUNK_BYTES, 0), rate_per_mb);
+            let headroom_ok = view
+                .signer_cap_headroom_micro(B256::from(req.pool_id), signer)
+                .await
+                .is_some_and(|h| U256::from(h) >= floor_micro);
+            if !headroom_ok {
+                return self
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::SignerCapExhausted,
+                        rate_per_mb,
+                    )
+                    .await;
+            }
+        }
+
         // Serve-path origin-blacklist gate (ADR 011 §On Blacklist Event): refuse a
         // pool whose FUNDER (`getPool.owner`) is on the operator's local
         // `denied_origins` or the on-chain origin blacklist. The funding address is
@@ -448,61 +473,23 @@ impl ClientHandler {
             None => None,
         };
 
-        // Per-lane concurrent-stream admission cap (#1697). Runs ONCE here, before
-        // any serve-path branch, so every delivered stream — cache hit, backend-origin
-        // miss, window pull-through miss, or buffered miss — is counted. Each same-lane
-        // stream ALREADY in flight reserves one credit-window floor of pool headroom on
-        // top of this stream's own per-path floor gate, so a lane cannot put more unpaid
-        // downstream egress in flight than its refundable-floor headroom covers.
+        // Per-lane active-stream counter. Runs ONCE here, before any serve-path branch,
+        // so every delivered stream — cache hit, backend-origin miss, window
+        // pull-through miss, or buffered miss — is counted. The count is not a solvency
+        // gate: the per-pool ceiling and the per-signer live cap (both in
+        // `try_reserve_floor`, ADR 003 §Pool solvency) bound un-vouchered floor across
+        // and within lanes. The count exists for the wallet-less-resume heal
+        // (`commit_one_proof`), which reads `active_streams` to tell a lone wedged
+        // stream from a concurrent-sibling out-of-order voucher without depending on
+        // chain data.
         //
-        // A stream's window is FIXED at admission; this never re-divides a live stream's
-        // share — it gates NEW admissions only. `n_active == 0` (the single-stream case)
-        // applies NO surcharge, so a lone stream is admitted exactly as before the cap;
-        // its own per-path floor gate is the only solvency check it faces.
-        //
-        // The active-stream COUNT is maintained whenever the lane is known, but the
-        // solvency SURCHARGE runs only with a live `pool_status` (without one there is
-        // no on-chain `remaining` to check against). Keeping the count off-chain too is
-        // what lets the wallet-less-resume heal (`commit_one_proof`) tell a lone stream
-        // from a concurrent-sibling lane without depending on chain data.
-        //
-        // Checked-and-incremented under the lane lock so two simultaneous opens
-        // serialize and neither admits into the same last slot (TOCTOU → N+1). Only
-        // capability-bearing streams reach here with `known_lane` set — intake registers
-        // the lane from this request's own capability above, so concurrent first-streams
-        // on a fresh lane share one counter. `LaneSlot`'s drop releases the slot on every
-        // exit (success, `?`, disconnect, panic).
+        // Incremented under the lane lock so concurrent first-streams on a fresh lane
+        // share one counter. `LaneSlot`'s drop releases the slot on every exit (success,
+        // `?`, disconnect, panic).
         let mut lane_slot: Option<LaneSlot> = None;
         if let Some(lane) = known_lane.as_ref() {
             let guard = lane.lock().await;
             let active = guard.active_streams.clone();
-            let n_active = active.load(Ordering::Relaxed);
-            if let Some(status) = pool_status {
-                let floor = self.credit_window(CHUNK_BYTES, 0);
-                let reserved = floor.saturating_mul(u64::from(n_active).saturating_add(1));
-                if n_active > 0
-                    && !self.pool_remaining_covers_window(status.remaining, reserved, rate_per_mb)
-                {
-                    drop(guard);
-                    let headroom = status
-                        .remaining
-                        .saturating_sub(self.pool_min_remaining_deposit);
-                    self.log_deposit_refusal(
-                        B256::from(req.pool_id),
-                        hash,
-                        headroom,
-                        decdn_incentive::min_payment(reserved, rate_per_mb),
-                    );
-                    return self
-                        .respond_error(
-                            &mut send,
-                            &req,
-                            ServeRejectReason::LaneAtCapacity,
-                            rate_per_mb,
-                        )
-                        .await;
-                }
-            }
             active.fetch_add(1, Ordering::Relaxed);
             drop(guard);
             lane_slot = Some(LaneSlot::new(active));
@@ -510,14 +497,15 @@ impl ClientHandler {
         let _lane_slot = lane_slot;
 
         // Per-pool cumulative floor-credit admission reservation (ADR 003 §Pool
-        // solvency, stateful-B). Unlike the per-lane #1697 cap above, it sums floor
-        // credit across ALL distinct lanes on the pool and bounds it to
-        // `remaining − M`, closing the fan-out hole where many distinct signers each
-        // draw one un-vouchered floor on the same pool. The reservation is span-capped
+        // solvency, stateful-B). It sums floor credit across ALL distinct lanes on
+        // the pool and bounds it to `remaining − M`, closing the fan-out hole where
+        // many distinct signers each draw one un-vouchered floor on the same pool; a
+        // per-signer live cap `k · one window` bounds any one signer's share
+        // underneath it. The reservation is span-capped
         // to what THIS request can draw — at most one voucher-interval floor, less for
         // a bounded range or tail resume — and held for the stream's lifetime; the
-        // `FloorReservation` guard reconciles it to the actual unpaid loss at stream
-        // end.
+        // `FloorReservation` guard releases it once the stream repays that floor, and
+        // frees the pool's floor headroom on any exit via `Drop`.
         //
         // The guard is opened at the point the billed span is knowable, NOT here: an
         // open-ended tail (`byte_len == 0`, `byte_offset > 0`) only knows its span
@@ -531,17 +519,16 @@ impl ClientHandler {
         // refusal collapses to `InsufficientDeposit` → wire `NotFound`,
         // indistinguishable from any other miss (no balance leak).
         //
-        // Held at fn scope so the reservation reconciles on EVERY exit via `Drop`.
+        // Held at fn scope so the reservation is released on EVERY exit via `Drop`.
         // Every serve path that reaches a serve loop MOVES it in and threads it through:
         // the direct-serve path hands it to `deliver`, and the
         // `serve_via_backend_origin` / `serve_via_window_pull_through` miss legs take it
         // by value and pass it by reference into their shared `serve_leg`. All three
-        // note the live unpaid balance each iteration and release the reservation once
-        // the stream repays one floor, so `Drop` debits the signer's abandonment bucket
-        // by the real un-recouped floor an abnormal exit leaves — the reserved window
-        // for a miss leg (whose fronted upstream USDC the downstream tail under-measures)
-        // and `delivered − paid` for a direct-serve hit. On a refusal before the serve
-        // loop the guard drops unspent, debiting nothing.
+        // release the reservation once the stream repays one floor; any other exit
+        // (disconnect, `?`, panic) drops the guard, whose `Drop` frees the pool's live
+        // floor headroom so an abandoned stream never holds it past its own lifetime.
+        // No abandonment charge survives the drop — bounding un-vouchered floor is the
+        // admission-time job of the pool ceiling and the per-signer live cap.
         let mut floor_reservation: Option<FloorReservation> = None;
 
         // Set by the origin-tier range pull-through below (#823) when a
@@ -827,11 +814,6 @@ impl ClientHandler {
                                 .await;
                         }
                         Ok(guard) => {
-                            // This is the miss-fill admission: the fill below fronts
-                            // upstream USDC, so an abandon here strands that spend. Size
-                            // the abandonment debit to the reserved window, not the
-                            // downstream unpaid tail.
-                            guard.mark_fronted_upstream();
                             floor_reservation = Some(guard);
                         }
                     }
@@ -1224,12 +1206,11 @@ impl ClientHandler {
                 // 0`) — and at the POOL level only, for the reason
                 // [`ClientHandler::pool_budget_covers_reserve`] gives: the pool
                 // ceiling shrinks as co-tenants draw the pool down, so re-testing an
-                // already-admitted reservation against the per-signer gates could
-                // refuse a stream they let through pre-fill. Here that is strictly
+                // already-admitted reservation against the per-signer cap could
+                // refuse a stream it let through pre-fill. Here that is strictly
                 // worse than serving: the fill already fronted upstream USDC, so
-                // refusing loses that spend AND debits the full reservation into the
-                // signer's abandonment bucket. The per-signer gates did their job
-                // pre-fill; this gate only asks whether the pool can still pay.
+                // refusing loses that spend for nothing. The per-signer cap did its
+                // job pre-fill; this gate only asks whether the pool can still pay.
                 (!self.pool_budget_covers_reserve(
                     B256::from(req.pool_id),
                     status.remaining,

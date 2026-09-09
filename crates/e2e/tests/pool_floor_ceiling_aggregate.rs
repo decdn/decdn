@@ -1,11 +1,10 @@
 //! Live anvil-backed e2e for the per-pool floor-credit ceiling: the pool's
 //! `remaining − M` bounds the AGGREGATE live, un-vouchered floor reservation
 //! across DISTINCT signers, so the hard money envelope cannot be beaten by
-//! spraying signer identities (ADR 003 § Pool solvency, stateful-B). This is the
-//! pool-level twin of the per-signer abandonment bucket exercised in
-//! `abandonment_bucket_throttle.rs`: that bucket is a node-local, signer-keyed
-//! throttle; THIS ceiling is the on-chain-solvency bound that no fan-out of fresh
-//! signer keys can escape.
+//! spraying signer identities (ADR 003 § Pool solvency, stateful-B). THIS ceiling
+//! is the on-chain-solvency bound that no fan-out of fresh signer keys can escape,
+//! the complement to the per-signer live cap (which bounds one signer's concurrent
+//! un-vouchered reservation).
 //!
 //! `crates/node/src/handlers/client/mod.rs` proves the invariant against fakes
 //! (`pool_ceiling_still_bounds_the_aggregate_across_signers`: four signers each
@@ -31,8 +30,8 @@
 //!
 //! 2. **Refuse the overflow across a fresh identity.** With all [`HELD_STREAMS`]
 //!    reservations still live, one MORE stream on YET ANOTHER distinct signer is
-//!    refused. Its own per-signer gates are pristine (a fresh key, zero live, an
-//!    empty bucket), so the ONLY thing that can refuse it is the pool ceiling: the
+//!    refused. Its own per-signer live cap is pristine (a fresh key, zero live), so
+//!    the ONLY thing that can refuse it is the pool ceiling: the
 //!    aggregate would exceed `remaining − M`. The refusal is `PoolExhausted`,
 //!    which `FloorRefusal`→`ServeRejectReason` maps to `InsufficientDeposit` and
 //!    `ServeRejectReason::wire_error` collapses onto the wire `NotFound` every
@@ -55,8 +54,7 @@
 //! property needs. The lower-level pieces used here
 //! (`decdn_client_pull::buyer_pool::open_pool`, `PoolContext`,
 //! `decdn_incentive::Capability::sign`, and the raw `write_frame`/`read_frame`
-//! wire helpers) are the same ones the fixture itself is built from, and match
-//! `abandonment_bucket_throttle.rs`.
+//! wire helpers) are the same ones the fixture itself is built from.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` on
 //! `PATH` and a built `decdn-node`:
@@ -144,25 +142,20 @@ const READY_RETRY_BUDGET: Duration = Duration::from_secs(45);
 /// (a parked stream's reservation is released once that elapses), leaving the
 /// whole set live at the instant the overflow stream is refused.
 const HELD_STREAMS: u64 = 2;
-/// Per-signer LIVE concurrency cap and abandonment-bucket capacity, in windows,
-/// both frozen far above anything this journey draws. Each held stream is on its
-/// OWN signer and holds exactly one window, so the per-signer gates are made
-/// deliberately non-binding: the ONLY gate that can refuse the overflow stream is
-/// the pool ceiling, which is the whole point.
+/// Per-signer LIVE concurrency cap, in windows, frozen far above anything this
+/// journey draws. Each held stream is on its OWN signer and holds exactly one
+/// window, so the per-signer cap is made deliberately non-binding: the ONLY gate
+/// that can refuse the overflow stream is the pool ceiling, which is the whole
+/// point.
 const SIGNER_WINDOWS: u64 = 64;
-/// Seconds to refill one abandonment-bucket window. Frozen far above the journey's
-/// wall-clock duration so no refill occurs mid-run; it is irrelevant to the
-/// outcome (the streams are held open, not abandoned, until after the assertions)
-/// but pinned for determinism.
-const REFILL_SECS: u64 = 3_600;
 /// The node-local reject counter behind the collapsed wire `NotFound` for a pool
 /// ceiling refusal: `FloorRefusal::PoolExhausted` →
 /// `ServeRejectReason::InsufficientDeposit`. A `0→1` delta across the overflow
 /// request pins the refusal to the pool ceiling.
 const INSUFFICIENT_DEPOSIT_METRIC: &str = "decdn_serve_stream_rejected_insufficient_deposit_total";
-/// The per-signer reject counter (live cap OR abandonment throttle). It must stay
-/// FLAT across the overflow request: the refusal is the pool ceiling, not a
-/// per-signer gate, so spraying a fresh identity cannot be what refused it.
+/// The per-signer live-cap reject counter. It must stay FLAT across the overflow
+/// request: the refusal is the pool ceiling, not the per-signer cap, so spraying a
+/// fresh identity cannot be what refused it.
 const SIGNER_FLOOR_REJECT_METRIC: &str = "decdn_serve_stream_rejected_signer_floor_at_cap_total";
 const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
@@ -213,15 +206,13 @@ async fn run() -> anyhow::Result<()> {
     let hit_blob = deterministic_blob(BLOB_BYTES, 0x5eed_0003);
     let (node, hit_hash) = NodeFixture::launch(&chain, "US", &hit_blob).await?;
 
-    // Make the per-signer gates deliberately non-binding: a large live cap (each
-    // held stream is on its own signer and holds exactly one window) and a large,
-    // frozen bucket (streams are held open, not abandoned, until after the
-    // assertions). The ONLY gate left able to refuse the overflow stream is the
-    // pool ceiling. Applied before any pool activity; the restart reopens the same
-    // warm cache.
-    node.set_pool_floor_signer(SIGNER_WINDOWS, SIGNER_WINDOWS, REFILL_SECS)
+    // Make the per-signer live cap deliberately non-binding: a large cap, and each
+    // held stream on its own signer holding exactly one window. The ONLY gate left
+    // able to refuse the overflow stream is the pool ceiling. Applied before any
+    // pool activity; the restart reopens the same warm cache.
+    node.set_pool_floor_signer(SIGNER_WINDOWS)
         .await
-        .context("relax per-signer floor gates so only the pool ceiling binds")?;
+        .context("relax the per-signer live cap so only the pool ceiling binds")?;
 
     // The pool OWNER: funded via `ClientFixture` for its ETH/USDC/allowance
     // plumbing and its loopback iroh endpoint, reused directly (not through

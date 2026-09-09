@@ -229,16 +229,6 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
-        "  pool_floor_signer_bucket_windows: {}",
-        resolved.blockchain.pool_floor_signer_bucket_windows
-    )?;
-    writeln!(
-        w,
-        "  pool_floor_signer_refill_secs: {}",
-        resolved.blockchain.pool_floor_signer_refill_secs
-    )?;
-    writeln!(
-        w,
         "  cache_dir:                {}",
         resolved.cache.cache_dir.display()
     )?;
@@ -952,8 +942,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentPool (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # pool_min_remaining_deposit_micro_usdc = 1000000 # refundable floor M the node keeps in reserve on a pool it serves (ADR 003 § Sizing); default 1 USDC
 # pool_floor_signer_live_windows = 8              # per-signer LIVE concurrency cap k, in ramp-start credit windows: the most live un-vouchered floor reservation one capability signer may hold against a pool, k × one window (ADR 003 § Pool solvency); recycles as streams pay; lower-clamped to one window; default 8
-# pool_floor_signer_bucket_windows = 8            # per-signer abandonment-bucket capacity, in ramp-start credit windows: the un-recouped floor a signer may drain from its node-local refilling allowance before this node soft-throttles it (ADR 003 § Pool solvency); a burst of abandons trips it, a paid stream costs nothing; lower-clamped to one window; default 8
-# pool_floor_signer_refill_secs = 60              # seconds to refill one window of the per-signer abandonment bucket (ADR 003 § Pool solvency); faster refill forgives bursts sooner; lower-clamped to one second; default 60
 # CLI-only [blockchain] keys — consumed by `decdn appeal` / the client, NOT the daemon.
 # They live here because [blockchain] denies unknown fields and a node's node.toml is
 # shared with those CLIs, so a config that drives them must still pass `config validate`.
@@ -1219,8 +1207,6 @@ mod tests {
             buyer_max_approve,
             pool_min_remaining_deposit_micro_usdc,
             pool_floor_signer_live_windows,
-            pool_floor_signer_bucket_windows,
-            pool_floor_signer_refill_secs,
             usdc_address,
         } = &config::types::BlockchainConfig::default();
         let blockchain = [
@@ -1293,14 +1279,6 @@ mod tests {
             (
                 "pool_floor_signer_live_windows =",
                 pool_floor_signer_live_windows.is_none(),
-            ),
-            (
-                "pool_floor_signer_bucket_windows =",
-                pool_floor_signer_bucket_windows.is_none(),
-            ),
-            (
-                "pool_floor_signer_refill_secs =",
-                pool_floor_signer_refill_secs.is_none(),
             ),
             ("usdc_address =", usdc_address.is_none()),
         ];

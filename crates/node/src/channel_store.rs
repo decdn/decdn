@@ -8,16 +8,13 @@
 //!   redeemer's registration payload lands in the same durable write as the
 //!   frontier it backs.
 //! - `settle.redb` — the seller and buyer pending-settle sets.
-//! - `floor-loss.redb` — per-signer abandonment-bucket snapshots and their forget
-//!   tombstones, committed in one transaction so a `record_bucket` orders against
-//!   a `forget_loss` on this file's writer slot.
 //! - `checkpoint.redb` — the settlement watcher's scan checkpoints.
 //! - `buyer.redb` — the buyer pool state and its owner index.
 //!
 //! Each file has its own `redb` write-transaction slot, so a commit in one
 //! family never waits on an unrelated commit in another: the periodic lane
-//! flush, a settlement checkpoint, a floor-loss write on abnormal stream end,
-//! and a buyer top-up all proceed on independent writer slots. Families are
+//! flush, a settlement checkpoint, and a buyer top-up all proceed on
+//! independent writer slots. Families are
 //! never written in one transaction — `redb` forbids a transaction spanning two
 //! `Database` handles — so a crash between two family commits can leave them at
 //! different watermarks, which every family already tolerates (each records and
@@ -80,8 +77,8 @@ use alloy::primitives::{Address, B256, U256};
 use decdn_common::identity;
 use decdn_incentive::buyer_pool_table::BuyerPoolTable;
 use decdn_incentive::store::{
-    CheckpointKey, KeyedCheckpointStore, PendingSettle, PendingSettleStore, PoolFloorLossStore,
-    PoolStateStore, StoreError,
+    CheckpointKey, KeyedCheckpointStore, PendingSettle, PendingSettleStore, PoolStateStore,
+    StoreError,
 };
 use decdn_incentive::{
     AdvanceOutcome, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome, LaneChain, LaneKey,
@@ -95,10 +92,6 @@ const LANES_DB_FILE: &str = "lanes.redb";
 
 /// File name of the pending-settle redb database (seller and buyer sets).
 const SETTLE_DB_FILE: &str = "settle.redb";
-
-/// File name of the floor-loss redb database (abandonment-bucket snapshots +
-/// tombstones).
-const FLOOR_LOSS_DB_FILE: &str = "floor-loss.redb";
 
 /// File name of the settlement-watcher checkpoint redb database.
 const CHECKPOINT_DB_FILE: &str = "checkpoint.redb";
@@ -171,67 +164,10 @@ const BUYER_PENDING_SETTLE_TABLE: TableDefinition<'_, &[u8; 32], u64> =
 const WATCHER_CHECKPOINT_TABLE: TableDefinition<'_, &str, u64> =
     TableDefinition::new("watcher_checkpoint_v1");
 
-/// redb table holding each `(pool_id, signer)` lane's abandonment leaky-bucket
-/// snapshot (ADR 003 §Pool solvency — the per-signer refilling allowance):
-/// `consumed_micro` of un-recouped floor as of the wall-clock `refill_unix_ms`.
-/// This exposure appears in no on-chain quantity, so it is persisted here to let a
-/// restart resume a signer's throttle where it left off rather than granting a
-/// fresh allowance. The signer dimension is the isolation boundary; the bucket
-/// refills, so a reader replays the time-refill from `refill_unix_ms` on load.
-///
-/// The name carries a version because a redb table's key AND value types are part
-/// of its identity: reopening a table under a different value shape fails
-/// `TableTypeMismatch` at bring-up. Pre-launch there is nothing to migrate, so a
-/// superseded `pool_floor_loss_v1`/`_v2` table left in a development store is deleted
-/// at open by [`PersistentPoolStateStore::drop_superseded_floor_loss_table`] rather
-/// than read — the reset is then a deliberate, logged act instead of a silent empty
-/// load that reads exactly like a first boot.
-///
-/// Key: `pool_id ‖ signer` (`[u8; 52]`, see [`pool_signer_key_bytes`]). Value: the
-/// abandonment leaky-bucket snapshot `(consumed_micro, refill_unix_ms)` as a native
-/// redb `(u128, u64)` tuple — no postcard envelope, matching the
-/// [`PENDING_SETTLE_TABLE`] convention of using redb's built-in scalar encoding for
-/// fixed-width numbers.
-const POOL_FLOOR_LOSS_TABLE: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], (u128, u64)> =
-    TableDefinition::new("pool_floor_loss_v3");
-
-/// The superseded per-pool floor-loss table, keyed by `pool_id` alone. Nothing
-/// reads it; [`PersistentPoolStateStore::drop_superseded_floor_loss_table`] deletes
-/// it at open so a development store carrying one does not keep dead rows forever.
-const SUPERSEDED_POOL_FLOOR_LOSS_TABLE: TableDefinition<'_, &[u8; 32], u128> =
-    TableDefinition::new("pool_floor_loss_v1");
-
-/// The superseded `(pool_id, signer)`-keyed floor-loss table that stored a single
-/// monotonic `µUSDC` dead-charge total. Its value shape differs from the live
-/// bucket-snapshot table, so it is dropped at open the same way as v1.
-const SUPERSEDED_POOL_FLOOR_LOSS_TABLE_V2: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], u128> =
-    TableDefinition::new("pool_floor_loss_v2");
-
-/// redb table of tombstones for pools whose floor-loss rows were
-/// [`PoolFloorLossStore::forget_loss`]-ed. A reservation drop reads its bucket
-/// snapshot under the in-memory floor lock but persists it from an independent
-/// blocking task, so a `record_bucket` can land AFTER the pool's `forget_loss`
-/// committed; without the tombstone that late write re-inserts a row for a closed
-/// pool, and — the pool id never recurring — nothing would ever delete it again
-/// (#1781). `record_bucket` checks this table inside its own write transaction
-/// (redb's exclusive writer slot makes the check atomic with the insert) and treats
-/// every signer of a tombstoned pool as a no-op. Swept at bring-up
-/// ([`PoolFloorLossStore::sweep_forgotten`]), when no persist can be in flight, so
-/// tombstones accumulate for at most one process lifetime. Lives in the same
-/// database file as [`POOL_FLOOR_LOSS_TABLE`] (`floor-loss.redb`), so a
-/// `record_bucket` and its tombstone check share one exclusive writer slot — which
-/// is what makes the check atomic with the insert.
-///
-/// Key: raw `PoolId` bytes (`[u8; 32]`). Value: none (`()`), presence is the
-/// tombstone.
-const POOL_FLOOR_LOSS_FORGOTTEN_TABLE: TableDefinition<'_, &[u8; 32], ()> =
-    TableDefinition::new("pool_floor_loss_forgotten_v1");
-
-/// Byte width of a `(pool_id, signer)` key on disk: `32 + 20`. The floor-loss
-/// table uses this shape (ADR 003 §Pool solvency bounds un-vouchered floor per
-/// signer under the per-pool ceiling). The pool id leads, so every row of one
-/// pool shares a 32-byte prefix and a range scan selects exactly that pool's
-/// rows.
+/// Byte width of a `(pool_id, signer)` key on disk: `32 + 20`. The superseded
+/// owner-signed capability tables use this shape. The pool id leads, so every row
+/// of one pool shares a 32-byte prefix and a range scan selects exactly that
+/// pool's rows.
 const POOL_SIGNER_KEY_LEN: usize = 52;
 
 /// The two superseded owner-signed capability tables, keyed by `pool_id ‖ signer`
@@ -246,34 +182,15 @@ const SUPERSEDED_CAPABILITY_TABLE_V2: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_
 const SUPERSEDED_CAPABILITY_TABLE_V1: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], &[u8]> =
     TableDefinition::new("capability_v1");
 
-/// Encode a `(pool_id, signer)` pair into its `[u8; 52]` table key, used by the
-/// floor-loss table.
+/// Encode a `(pool_id, signer)` pair into its `[u8; 52]` table key. The live
+/// tables no longer use this shape; the superseded-capability drop test builds
+/// keys with it to inject legacy rows.
+#[cfg(test)]
 fn pool_signer_key_bytes(pool_id: B256, signer: Address) -> [u8; POOL_SIGNER_KEY_LEN] {
     let mut out = [0u8; POOL_SIGNER_KEY_LEN];
     out[..32].copy_from_slice(pool_id.as_slice());
     out[32..].copy_from_slice(signer.as_slice());
     out
-}
-
-/// Split a `[u8; 52]` `(pool_id, signer)` table key back into its parts. The input
-/// is fixed-width and both ranges are constants inside it, so neither the slicing
-/// nor the `copy_from_slice` can fail.
-fn pool_signer_key_parts(bytes: &[u8; POOL_SIGNER_KEY_LEN]) -> (B256, Address) {
-    let mut pool = [0u8; 32];
-    pool.copy_from_slice(&bytes[..32]);
-    let mut signer = [0u8; 20];
-    signer.copy_from_slice(&bytes[32..]);
-    (B256::from(pool), Address::from(signer))
-}
-
-/// The inclusive `[u8; 52]` key bounds covering EVERY signer row of one pool.
-/// redb orders `&[u8; N]` keys lexicographically, so the pool's 32-byte prefix
-/// followed by the all-zero and all-`0xff` signers brackets exactly its rows.
-fn pool_signer_key_range(pool_id: B256) -> ([u8; POOL_SIGNER_KEY_LEN], [u8; POOL_SIGNER_KEY_LEN]) {
-    (
-        pool_signer_key_bytes(pool_id, Address::from([0x00u8; 20])),
-        pool_signer_key_bytes(pool_id, Address::from([0xffu8; 20])),
-    )
 }
 
 /// Encode a [`LaneKey`] into its `[u8; 72]` table key: `pool_id ‖ signer ‖
@@ -502,8 +419,6 @@ pub struct PersistentPoolStateStore {
     lanes_db: Database,
     /// Seller + buyer pending-settle sets (`settle.redb`).
     settle_db: Database,
-    /// Per-pool floor-loss totals + forget tombstones (`floor-loss.redb`).
-    floor_loss_db: Database,
     /// Settlement-watcher scan checkpoints (`checkpoint.redb`).
     checkpoint_db: Database,
     /// Buyer pool state + owner index (`buyer.redb`).
@@ -574,8 +489,6 @@ impl PersistentPoolStateStore {
         let path = data_dir.join(LANES_DB_FILE);
         let lanes_db = Self::open_hardened_db(&path, &chmod_fn)?;
         let settle_db = Self::open_hardened_db(&data_dir.join(SETTLE_DB_FILE), &chmod_fn)?;
-        let floor_loss_db = Self::open_hardened_db(&data_dir.join(FLOOR_LOSS_DB_FILE), &chmod_fn)?;
-        Self::drop_superseded_floor_loss_table(&floor_loss_db)?;
         let checkpoint_db = Self::open_hardened_db(&data_dir.join(CHECKPOINT_DB_FILE), &chmod_fn)?;
         let buyer_db = Self::open_hardened_db(&data_dir.join(BUYER_DB_FILE), &chmod_fn)?;
 
@@ -584,7 +497,6 @@ impl PersistentPoolStateStore {
         Ok(Self {
             lanes_db,
             settle_db,
-            floor_loss_db,
             checkpoint_db,
             buyer_db,
             path,
@@ -598,49 +510,13 @@ impl PersistentPoolStateStore {
     /// file gets. Each family lives in its own file so its commits take an
     /// independent `redb` writer slot.
     ///
-    /// Delete the superseded floor-loss tables (`pool_floor_loss_v1`, keyed by
-    /// `pool_id` alone, and `pool_floor_loss_v2`, the `(pool_id, signer)`-keyed
-    /// monotonic dead-charge total) if the store still carries one. The live table
-    /// keeps a per-signer leaky-bucket snapshot `(consumed_micro, refill_unix_ms)`,
-    /// and a redb table's key AND value types are part of its identity, so the new
-    /// shape needs a new name; leaving an old table in place would keep its rows
-    /// readable by nothing and make the reset indistinguishable from a first boot.
-    /// Pre-launch there is no migration to run, so the rows are dropped — but loudly,
-    /// because they will not be re-accrued.
-    ///
-    /// # Errors
-    /// [`StoreError::Backend`] when the delete transaction fails.
-    fn drop_superseded_floor_loss_table(db: &Database) -> Result<(), StoreError> {
-        let txn = db
-            .begin_write()
-            .map_err(|e| floor_loss_backend_err("begin_write (superseded drop)", None, e))?;
-        let dropped_v1 = txn
-            .delete_table(SUPERSEDED_POOL_FLOOR_LOSS_TABLE)
-            .map_err(|e| floor_loss_backend_err("delete_table (v1)", None, e))?;
-        let dropped_v2 = txn
-            .delete_table(SUPERSEDED_POOL_FLOOR_LOSS_TABLE_V2)
-            .map_err(|e| floor_loss_backend_err("delete_table (v2)", None, e))?;
-        txn.commit()
-            .map_err(|e| floor_loss_backend_err("commit (superseded drop)", None, e))?;
-        if dropped_v1 || dropped_v2 {
-            tracing::warn!(
-                dropped_v1,
-                dropped_v2,
-                "dropped a superseded floor-loss table; its rows do not carry into the \
-                 per-signer bucket table and those signers start with a fresh allowance"
-            );
-        }
-        Ok(())
-    }
-
     /// Rejects a zero-length file: `redb::Database::create` treats both "file
     /// does not exist" and "file exists but is empty" as "create a fresh
     /// database" — so a `truncate -s 0` (or a filesystem rollback that nukes
     /// content but preserves the inode) would start with an empty store. For
     /// `lanes.redb` that silently reopens the issue #527 voucher-replay window;
     /// for the other families it silently re-grants budget the lost rows bounded
-    /// (a dropped floor-loss row resets a signer's abandonment allowance, a dropped
-    /// pending-settle entry forgets an in-flight redemption).
+    /// (a dropped pending-settle entry forgets an in-flight redemption).
     ///
     /// On a chmod failure the cleanup depends on whether the file pre-existed
     /// this call: a freshly-created file is removed so the next start sees a
@@ -1399,271 +1275,6 @@ impl PendingSettleStore for PersistentPoolStateStore {
     }
 }
 
-/// Map a redb error from the floor-loss surface into a [`StoreError`],
-/// surfacing database corruption distinctly (#1782): `redb::Error::Corrupted`
-/// becomes [`StoreError::Corrupt`], so the reservation-drop logging can tell
-/// "the payment database is corrupt" (operator intervention: close and reopen —
-/// redb refuses further writes after a mid-commit failure) from a transient
-/// backend fault. Everything else stays [`StoreError::Backend`].
-fn floor_loss_backend_err(
-    op: &str,
-    pool_id: Option<B256>,
-    err: impl Into<redb::Error>,
-) -> StoreError {
-    match err.into() {
-        redb::Error::Corrupted(detail) => StoreError::Corrupt {
-            pool_id,
-            detail: format!("{op}: {detail}"),
-        },
-        other => StoreError::Backend(format!("{op}: {other}")),
-    }
-}
-
-/// Delete every signer row of one pool from an OPEN floor-loss table, inside the
-/// caller's write transaction. redb cannot remove while a range iterator borrows
-/// the table, so the keys are collected first — the same collect-then-remove shape
-/// [`PoolFloorLossStore::sweep_forgotten`] uses. Every row implies at least one
-/// admitted floor charge against the pool, so the count is bounded by
-/// `remaining − M` divided by one credit window. That is small for an honest pool,
-/// whose signers pay and prune. It is NOT small for one that sprays signer
-/// identities: a large deposit admits a row per window of headroom, so the bound is
-/// the pool's budget rather than any modest constant. Minting a signer needs an
-/// owner signature, which is what keeps this off the anonymous-abuse path.
-fn remove_pool_floor_rows(
-    table: &mut redb::Table<'_, &'static [u8; POOL_SIGNER_KEY_LEN], (u128, u64)>,
-    pool_id: B256,
-) -> Result<(), StoreError> {
-    let (lo, hi) = pool_signer_key_range(pool_id);
-    let keys: Vec<[u8; POOL_SIGNER_KEY_LEN]> = {
-        let iter = table
-            .range::<&[u8; POOL_SIGNER_KEY_LEN]>(&lo..=&hi)
-            .map_err(|e| floor_loss_backend_err("range (pool prefix)", Some(pool_id), e))?;
-        let mut keys = Vec::new();
-        for entry in iter {
-            let (key_guard, _) =
-                entry.map_err(|e| floor_loss_backend_err("range entry", Some(pool_id), e))?;
-            keys.push(*key_guard.value());
-        }
-        keys
-    };
-    for key in &keys {
-        table
-            .remove(key)
-            .map_err(|e| floor_loss_backend_err("remove", Some(pool_id), e))?;
-    }
-    Ok(())
-}
-
-impl PoolFloorLossStore for PersistentPoolStateStore {
-    fn record_bucket(
-        &self,
-        pool_id: B256,
-        signer: Address,
-        consumed_micro: u128,
-        refill_unix_ms: u64,
-    ) -> Result<(), StoreError> {
-        let pool_key: [u8; 32] = pool_id.into();
-        let key = pool_signer_key_bytes(pool_id, signer);
-        let mut write_txn = self
-            .floor_loss_db
-            .begin_write()
-            .map_err(|e| floor_loss_backend_err("begin_write", Some(pool_id), e))?;
-        // Force fsync-on-commit, same durability discipline as the other tables: a
-        // lost bucket snapshot after a restart would silently grant a burst-abandoner
-        // a fresh allowance on this signer.
-        write_txn
-            .set_durability(Durability::Immediate)
-            .map_err(|e| floor_loss_backend_err("set_durability", Some(pool_id), e))?;
-        // A tombstoned pool is closed: this write is a stale in-flight persist that
-        // lost the race with `forget_loss`, and honoring it would resurrect a row
-        // no later forget will ever delete (#1781). The check sits inside the write
-        // transaction — redb's exclusive writer slot orders it against the
-        // tombstone insert — so there is no window between check and write. The
-        // `open_table` creates the tombstone table on a fresh store; the abort
-        // below rolls that back on the no-op paths, and the advancing path commits
-        // a real write anyway.
-        let advanced = {
-            let forgotten = write_txn
-                .open_table(POOL_FLOOR_LOSS_FORGOTTEN_TABLE)
-                .map_err(|e| floor_loss_backend_err("open_table (tombstones)", Some(pool_id), e))?;
-            let tombstoned = forgotten
-                .get(&pool_key)
-                .map_err(|e| floor_loss_backend_err("get (tombstone)", Some(pool_id), e))?
-                .is_some();
-            if tombstoned {
-                false
-            } else {
-                // Timestamp-monotonic write: the bucket refills, so a row is not
-                // monotonic in `consumed_micro`, but the snapshot with the greatest
-                // `refill_unix_ms` is the freshest view. The caller persists from an
-                // independent blocking task, so two writes for one lane can land out
-                // of order; keeping the greater-timestamp snapshot (ties break to the
-                // larger `consumed_micro`) means a reordered stale write never
-                // regresses the throttle. `begin_write` holds redb's exclusive writer
-                // slot, so the compare and the write are atomic together.
-                let mut table = write_txn
-                    .open_table(POOL_FLOOR_LOSS_TABLE)
-                    .map_err(|e| floor_loss_backend_err("open_table", Some(pool_id), e))?;
-                let existing = table
-                    .get(&key)
-                    .map_err(|e| floor_loss_backend_err("get", Some(pool_id), e))?
-                    .map(|v| v.value());
-                let keep = existing.is_none_or(|(stored_micro, stored_ms)| {
-                    refill_unix_ms > stored_ms
-                        || (refill_unix_ms == stored_ms && consumed_micro > stored_micro)
-                });
-                if keep {
-                    table
-                        .insert(&key, (consumed_micro, refill_unix_ms))
-                        .map_err(|e| floor_loss_backend_err("insert", Some(pool_id), e))?;
-                    true
-                } else {
-                    false
-                }
-            }
-        };
-        // Nothing changed, so abort rather than fsync a transaction that holds no
-        // change. This is sound only because every writer of `floor-loss.redb`
-        // commits with `Durability::Immediate`: `existing` is therefore already
-        // durable and at least as fresh as what this call carries (or the pool is
-        // tombstoned and the write is stale), so the postcondition holds without a
-        // write. A `Durability::None` writer on this file breaks that. Aborting does
-        // not free redb's writer slot any earlier than a commit would — the slot was
-        // taken at `begin_write` — it saves the fsync, which is what serializes this
-        // call against the other floor-loss writers on `floor-loss.redb`'s slot.
-        if !advanced {
-            return write_txn
-                .abort()
-                .map_err(|e| floor_loss_backend_err("abort (no-op write)", Some(pool_id), e));
-        }
-        write_txn
-            .commit()
-            .map_err(|e| floor_loss_backend_err("commit (fsync)", Some(pool_id), e))?;
-        Ok(())
-    }
-
-    fn load_buckets(&self) -> Result<Vec<(B256, Address, u128, u64)>, StoreError> {
-        let read_txn = self
-            .floor_loss_db
-            .begin_read()
-            .map_err(|e| floor_loss_backend_err("begin_read", None, e))?;
-        // A never-written table means no signer has drained a bucket yet —
-        // first-boot tolerance, matching every family table in the store.
-        let table = match read_txn.open_table(POOL_FLOOR_LOSS_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(err) => return Err(floor_loss_backend_err("open_table", None, err)),
-        };
-        let mut out = Vec::new();
-        let iter = table
-            .iter()
-            .map_err(|e| floor_loss_backend_err("table iter", None, e))?;
-        for entry in iter {
-            let (key_guard, value_guard) =
-                entry.map_err(|e| floor_loss_backend_err("iter entry", None, e))?;
-            let (pool_id, signer) = pool_signer_key_parts(key_guard.value());
-            let (micro, ms) = value_guard.value();
-            out.push((pool_id, signer, micro, ms));
-        }
-        Ok(out)
-    }
-
-    fn forget_loss(&self, pool_id: B256) -> Result<(), StoreError> {
-        let pool_key: [u8; 32] = pool_id.into();
-        let mut write_txn = self
-            .floor_loss_db
-            .begin_write()
-            .map_err(|e| floor_loss_backend_err("begin_write", Some(pool_id), e))?;
-        write_txn
-            .set_durability(Durability::Immediate)
-            .map_err(|e| floor_loss_backend_err("set_durability", Some(pool_id), e))?;
-        // Row deletes and tombstone insert in ONE transaction: a `record_bucket`
-        // serialized after this commit sees the tombstone, so the deletes cannot be
-        // undone by an in-flight persist (#1781). EVERY signer row of the pool goes
-        // — the deposit they all drew on is reclaimed. The tombstone goes in even
-        // when the pool never recorded a row — the racing `record_bucket` may be the
-        // pool's FIRST — so forget takes no "never-written store" early-return:
-        // it must always leave the marker.
-        {
-            let mut table = write_txn
-                .open_table(POOL_FLOOR_LOSS_TABLE)
-                .map_err(|e| floor_loss_backend_err("open_table", Some(pool_id), e))?;
-            remove_pool_floor_rows(&mut table, pool_id)?;
-            let mut forgotten = write_txn
-                .open_table(POOL_FLOOR_LOSS_FORGOTTEN_TABLE)
-                .map_err(|e| floor_loss_backend_err("open_table (tombstones)", Some(pool_id), e))?;
-            forgotten
-                .insert(&pool_key, ())
-                .map_err(|e| floor_loss_backend_err("insert (tombstone)", Some(pool_id), e))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| floor_loss_backend_err("commit (fsync)", Some(pool_id), e))?;
-        Ok(())
-    }
-
-    fn sweep_forgotten(&self) -> Result<usize, StoreError> {
-        // No separate existence probe: `open_table` creates a missing table
-        // inside this transaction, and the no-op abort below rolls that
-        // creation back — the same abort-rolls-back property `record_bucket`'s
-        // in-transaction tombstone check relies on. A fresh store therefore
-        // ends the sweep exactly as it began. The table existing does NOT
-        // imply a tombstone — any committed `record_bucket` creates it empty as
-        // a side effect of its check — that case also takes the no-op abort.
-        let mut write_txn = self
-            .floor_loss_db
-            .begin_write()
-            .map_err(|e| floor_loss_backend_err("begin_write", None, e))?;
-        write_txn
-            .set_durability(Durability::Immediate)
-            .map_err(|e| floor_loss_backend_err("set_durability", None, e))?;
-        let swept = {
-            let mut forgotten = write_txn
-                .open_table(POOL_FLOOR_LOSS_FORGOTTEN_TABLE)
-                .map_err(|e| floor_loss_backend_err("open_table (tombstones)", None, e))?;
-            let keys: Vec<[u8; 32]> = {
-                let iter = forgotten
-                    .iter()
-                    .map_err(|e| floor_loss_backend_err("table iter (tombstones)", None, e))?;
-                let mut keys = Vec::new();
-                for entry in iter {
-                    let (key_guard, _) = entry
-                        .map_err(|e| floor_loss_backend_err("iter entry (tombstones)", None, e))?;
-                    keys.push(*key_guard.value());
-                }
-                keys
-            };
-            // Belt-and-braces: `record_bucket`'s in-transaction tombstone check
-            // means a tombstoned pool can hold no loss row, so each prefix delete
-            // is expected to remove nothing. It keeps the sweep's postcondition —
-            // neither row nor tombstone for a forgotten pool — independent of that
-            // invariant.
-            let mut table = write_txn
-                .open_table(POOL_FLOOR_LOSS_TABLE)
-                .map_err(|e| floor_loss_backend_err("open_table", None, e))?;
-            for key in &keys {
-                remove_pool_floor_rows(&mut table, B256::from(*key))?;
-                forgotten
-                    .remove(key)
-                    .map_err(|e| floor_loss_backend_err("remove (tombstone)", None, e))?;
-            }
-            keys.len()
-        };
-        // An empty sweep holds no change: skip the fsync, same rationale as
-        // `record_bucket`'s no-op abort.
-        if swept == 0 {
-            return write_txn
-                .abort()
-                .map_err(|e| floor_loss_backend_err("abort (no-op sweep)", None, e))
-                .map(|()| 0);
-        }
-        write_txn
-            .commit()
-            .map_err(|e| floor_loss_backend_err("commit (fsync)", None, e))?;
-        Ok(swept)
-    }
-}
-
 /// [`PendingSettleStore`] over the buyer's `buyer_pending_settle_v1` table,
 /// isolated from the seller's `pending_settle_v1` table so the two settle
 /// sweeps never finalize each other's closes (#988). Wraps the same shared
@@ -1962,7 +1573,6 @@ mod tests {
         for file in [
             LANES_DB_FILE,
             SETTLE_DB_FILE,
-            FLOOR_LOSS_DB_FILE,
             CHECKPOINT_DB_FILE,
             BUYER_DB_FILE,
         ] {
@@ -2315,285 +1925,6 @@ mod tests {
         store.forget_pending(a.pool_id)?;
         store.forget_pending(b.pool_id)?;
         anyhow::ensure!(store.load_pending()?.is_empty());
-        Ok(())
-    }
-
-    /// Two distinct signers on one pool, so every floor-loss test exercises the
-    /// `(pool_id, signer)` key rather than a pool-wide row.
-    fn loss_signers() -> (Address, Address) {
-        (
-            address!("00000000000000000000000000000000000000a1"),
-            address!("00000000000000000000000000000000000000b2"),
-        )
-    }
-
-    /// Every [`PoolFloorLossStore`] keeps a `(pool, signer)` lane's freshest bucket
-    /// snapshot: a stale, older-timestamp write — two floor-reservation drops on one
-    /// lane landing out of order — leaves the greater-timestamp one in place, and a
-    /// newer snapshot wins even when its consumed level is lower (the bucket refilled).
-    /// It also keeps signers independent (one lane's bucket never gates another's) and
-    /// drops EVERY signer row of a forgotten pool. Run over both impls so the memory
-    /// store used in tests speaks for the redb store that ships.
-    fn assert_floor_bucket_keeps_freshest<S: PoolFloorLossStore>(store: &S) -> anyhow::Result<()> {
-        let pool = b256!("7700000000000000000000000000000000000000000000000000000000000000");
-        let (s1, s2) = loss_signers();
-        store.record_bucket(pool, s1, 5_000, 200)?;
-        // An older-timestamp write (a reordered drop) does not clobber the fresher row.
-        store.record_bucket(pool, s1, 10, 100)?;
-        anyhow::ensure!(store.load_buckets()? == vec![(pool, s1, 5_000u128, 200u64)]);
-        // A newer timestamp wins even though its consumed level is lower (refill).
-        store.record_bucket(pool, s1, 1_000, 300)?;
-        anyhow::ensure!(store.load_buckets()? == vec![(pool, s1, 1_000u128, 300u64)]);
-        // A SECOND signer on the same pool is its own row, independent of the first.
-        store.record_bucket(pool, s2, 7, 100)?;
-        let mut both = store.load_buckets()?;
-        both.sort_by_key(|&(_, signer, _, _)| signer);
-        anyhow::ensure!(
-            both == vec![(pool, s1, 1_000u128, 300u64), (pool, s2, 7u128, 100u64)],
-            "per-signer rows are independent, not one pool-wide bucket"
-        );
-        // Forget is terminal AND pool-wide: the delete drops every signer row and
-        // tombstones the pool, so an in-flight persist landing after it — the #1781
-        // interleaving — cannot resurrect a row for any signer. Only the bring-up
-        // sweep clears the tombstone, and at bring-up no persist can be in flight.
-        store.forget_loss(pool)?;
-        store.record_bucket(pool, s1, 10, 400)?;
-        store.record_bucket(pool, s2, 10, 400)?;
-        anyhow::ensure!(
-            store.load_buckets()?.is_empty(),
-            "a record_bucket landing after forget_loss must not resurrect the row"
-        );
-        anyhow::ensure!(store.sweep_forgotten()? == 1, "one tombstone swept");
-        store.record_bucket(pool, s1, 10, 500)?;
-        anyhow::ensure!(
-            store.load_buckets()? == vec![(pool, s1, 10u128, 500u64)],
-            "after the bring-up sweep the pool id accepts writes again"
-        );
-        store.forget_loss(pool)?;
-        Ok(())
-    }
-
-    #[test]
-    fn floor_bucket_stores_agree_on_freshness() -> anyhow::Result<()> {
-        assert_floor_bucket_keeps_freshest(&decdn_incentive::MemoryPoolFloorLossStore::new())?;
-        let dir = data_dir()?;
-        assert_floor_bucket_keeps_freshest(&PersistentPoolStateStore::open(dir.path())?)
-    }
-
-    /// The freshest snapshot is what reaches disk. The older-timestamp write lands
-    /// LAST, so a store that wrote unconditionally would leave it behind for the
-    /// reopen to find; this pins the durable outcome, not the mechanism.
-    #[test]
-    fn redb_pool_floor_bucket_freshest_survives_reopen() -> anyhow::Result<()> {
-        let dir = data_dir()?;
-        let pool = sample(7).pool_id;
-        let (s1, _) = loss_signers();
-        {
-            let store = PersistentPoolStateStore::open(dir.path())?;
-            store.record_bucket(pool, s1, 5_000, 200)?;
-            // A stale, older-timestamp snapshot lands LAST — a store that wrote
-            // unconditionally would leave it behind for the reopen to find.
-            store.record_bucket(pool, s1, 5_000, 200)?;
-            store.record_bucket(pool, s1, 10, 100)?;
-        }
-        let store = PersistentPoolStateStore::open(dir.path())?;
-        anyhow::ensure!(store.load_buckets()? == vec![(pool, s1, 5_000u128, 200u64)]);
-        Ok(())
-    }
-
-    /// A forget tombstone is durable: a `record_bucket` landing after a restart —
-    /// there is none in the real system, but the property it pins is that the
-    /// tombstone rides the same fsync discipline as the rows — still cannot
-    /// resurrect the row, and the bring-up sweep then reclaims the tombstone
-    /// without disturbing other pools' rows (#1781).
-    #[test]
-    fn redb_forget_tombstone_survives_reopen_and_boot_sweep_reclaims_it() -> anyhow::Result<()> {
-        let dir = data_dir()?;
-        let closed = sample(21).pool_id;
-        let live = sample(22).pool_id;
-        let (s1, s2) = loss_signers();
-        {
-            let store = PersistentPoolStateStore::open(dir.path())?;
-            // TWO signers on the closed pool, so the forget must clear a whole
-            // key prefix rather than a single row.
-            store.record_bucket(closed, s1, 700, 100)?;
-            store.record_bucket(closed, s2, 800, 100)?;
-            store.record_bucket(live, s1, 900, 100)?;
-            store.forget_loss(closed)?;
-        }
-        let store = PersistentPoolStateStore::open(dir.path())?;
-        store.record_bucket(closed, s1, 700, 200)?;
-        store.record_bucket(closed, s2, 800, 200)?;
-        anyhow::ensure!(
-            store.load_buckets()? == vec![(live, s1, 900u128, 100u64)],
-            "the tombstone survives the reopen and blocks the late write for every signer"
-        );
-        anyhow::ensure!(store.sweep_forgotten()? == 1, "the boot sweep reclaims it");
-        anyhow::ensure!(store.sweep_forgotten()? == 0, "sweep is idempotent");
-        anyhow::ensure!(
-            store.load_buckets()? == vec![(live, s1, 900u128, 100u64)],
-            "the sweep does not disturb live rows"
-        );
-        Ok(())
-    }
-
-    /// `forget_loss` clears a pool's rows at BOTH inclusive bounds of the key range.
-    /// Every other test uses interior signer addresses, so nothing else would catch
-    /// `..` in place of `..=` in `pool_signer_key_range` — and the all-`0xff` row it
-    /// would strand belongs to a pool that is now tombstoned, so `record_bucket` can
-    /// never overwrite it and no later `forget_loss` ever deletes it again. That is
-    /// the #1781 leak, reintroduced for exactly one address.
-    #[test]
-    fn forget_loss_clears_both_inclusive_bounds_of_the_key_range() -> anyhow::Result<()> {
-        let dir = data_dir()?;
-        let store = PersistentPoolStateStore::open(dir.path())?;
-        let pool = sample(9).pool_id;
-        let neighbour = sample(10).pool_id;
-        let lowest = Address::from([0x00u8; 20]);
-        let highest = Address::from([0xffu8; 20]);
-        store.record_bucket(pool, lowest, 11, 100)?;
-        store.record_bucket(pool, highest, 22, 100)?;
-        // A neighbouring pool at both bounds too, so the range cannot simply be
-        // deleting everything.
-        store.record_bucket(neighbour, lowest, 33, 100)?;
-        store.record_bucket(neighbour, highest, 44, 100)?;
-        anyhow::ensure!(store.load_buckets()?.len() == 4);
-
-        store.forget_loss(pool)?;
-        let mut left = store.load_buckets()?;
-        left.sort_by_key(|&(_, signer, _, _)| signer);
-        anyhow::ensure!(
-            left == vec![
-                (neighbour, lowest, 33u128, 100u64),
-                (neighbour, highest, 44u128, 100u64)
-            ],
-            "forget must clear the pool's rows at both bounds and neither neighbour's, got {left:?}"
-        );
-        Ok(())
-    }
-
-    /// The #1781 interleaving, raced for real: one thread forgets the pool while
-    /// another lands the `record_bucket` a reservation drop dispatched before the
-    /// pool closed. Whichever order redb's exclusive writer slot serializes them
-    /// in, the terminal state is "no row": record-then-forget deletes it,
-    /// forget-then-record hits the tombstone. Without the tombstone, the second
-    /// ordering re-inserts a row nothing ever deletes again.
-    #[test]
-    fn record_bucket_racing_forget_loss_never_leaves_a_row() -> anyhow::Result<()> {
-        let dir = data_dir()?;
-        let store = std::sync::Arc::new(PersistentPoolStateStore::open(dir.path())?);
-        for round in 0u8..8 {
-            let pool = B256::repeat_byte(round.saturating_add(0x30));
-            let (s1, _) = loss_signers();
-            store.record_bucket(pool, s1, 1_000, 100)?;
-            let recorder = {
-                let store = std::sync::Arc::clone(&store);
-                std::thread::spawn(move || store.record_bucket(pool, s1, 2_000, 200))
-            };
-            let forgetter = {
-                let store = std::sync::Arc::clone(&store);
-                std::thread::spawn(move || store.forget_loss(pool))
-            };
-            recorder
-                .join()
-                .map_err(|_| anyhow::anyhow!("recorder thread panicked"))??;
-            forgetter
-                .join()
-                .map_err(|_| anyhow::anyhow!("forgetter thread panicked"))??;
-            anyhow::ensure!(
-                store.load_buckets()?.is_empty(),
-                "round {round}: a late record_bucket resurrected a forgotten pool's row"
-            );
-        }
-        Ok(())
-    }
-
-    /// Out-of-order snapshots for one pool settle on the greatest timestamp. This is
-    /// the shape the freshness contract exists for: the caller reads its bucket under
-    /// a lock, then persists it from an independent blocking task, so the writes
-    /// arrive interleaved. Reading and writing inside one `begin_write` is what makes
-    /// the compare-and-keep atomic — splitting the compare into its own read
-    /// transaction would reintroduce a lost update, and this test is what would catch
-    /// that. Each write stamps `consumed == ts`, so the row settles on the max ts.
-    #[test]
-    fn concurrent_out_of_order_snapshots_settle_on_the_freshest() -> anyhow::Result<()> {
-        let dir = data_dir()?;
-        let store = std::sync::Arc::new(PersistentPoolStateStore::open(dir.path())?);
-        let pool = sample(11).pool_id;
-        let (s1, _) = loss_signers();
-        // Jumbled per thread so no thread walks its own timestamps in order, and the
-        // global maximum is not written by the last thread to finish.
-        let threads: Vec<_> = (0u64..8)
-            .map(|t| {
-                let store = std::sync::Arc::clone(&store);
-                std::thread::spawn(move || -> Result<(), StoreError> {
-                    for i in 0u64..64 {
-                        let ts = (i.wrapping_mul(37).wrapping_add(t.wrapping_mul(11))) % 500;
-                        store.record_bucket(pool, s1, u128::from(ts), ts)?;
-                    }
-                    Ok(())
-                })
-            })
-            .collect();
-        for handle in threads {
-            handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
-        }
-        let want = (0u64..8)
-            .flat_map(|t| {
-                (0u64..64).map(move |i| (i.wrapping_mul(37).wrapping_add(t.wrapping_mul(11))) % 500)
-            })
-            .max()
-            .ok_or_else(|| anyhow::anyhow!("empty value set"))?;
-        anyhow::ensure!(
-            store.load_buckets()? == vec![(pool, s1, u128::from(want), want)],
-            "interleaved writers settle on the greatest timestamp, not the last write"
-        );
-        Ok(())
-    }
-
-    /// The floor-loss bucket store round-trips, survives a reopen (durable commit),
-    /// and forgets cleanly. Keyed by `(pool_id, signer)`, so two signers on one pool
-    /// hold two independent rows and a forget clears both.
-    #[test]
-    fn redb_pool_floor_bucket_round_trip_and_persist() -> anyhow::Result<()> {
-        let dir = data_dir()?;
-        let a_pool = sample(1).pool_id;
-        let b_pool = sample(2).pool_id;
-        let (s1, s2) = loss_signers();
-        {
-            let store = PersistentPoolStateStore::open(dir.path())?;
-            store.record_bucket(a_pool, s1, 1_234_567_890_123u128, 100)?;
-            store.record_bucket(a_pool, s2, 7u128, 100)?;
-            store.record_bucket(b_pool, s1, 42u128, 100)?;
-            // A newer snapshot updates the row in place, not a second row.
-            store.record_bucket(a_pool, s1, 999_999_999_999_999u128, 200)?;
-        }
-        // Reopen over the SAME path — the value must survive the durable commit.
-        let store = PersistentPoolStateStore::open(dir.path())?;
-        let mut all = store.load_buckets()?;
-        all.sort_by_key(|&(id, signer, _, _)| (id, signer));
-        anyhow::ensure!(all.len() == 3, "an update must not add a row");
-        let first = all.first().ok_or_else(|| anyhow::anyhow!("missing [0]"))?;
-        let second = all.get(1).ok_or_else(|| anyhow::anyhow!("missing [1]"))?;
-        let third = all.get(2).ok_or_else(|| anyhow::anyhow!("missing [2]"))?;
-        anyhow::ensure!(*first == (a_pool, s1, 999_999_999_999_999u128, 200u64));
-        anyhow::ensure!(*second == (a_pool, s2, 7u128, 100u64));
-        anyhow::ensure!(*third == (b_pool, s1, 42u128, 100u64));
-
-        // forget clears EVERY signer row of the pool, and forget on a
-        // never-recorded pool is a no-op.
-        store.forget_loss(a_pool)?;
-        anyhow::ensure!(
-            store.load_buckets()? == vec![(b_pool, s1, 42u128, 100u64)],
-            "forget clears both of pool a's signer rows and neither of pool b's"
-        );
-        store.forget_loss(b_pool)?;
-        anyhow::ensure!(store.load_buckets()?.is_empty());
-        store.forget_loss(b256!(
-            "3333333333333333333333333333333333333333333333333333333333333333"
-        ))?;
         Ok(())
     }
 

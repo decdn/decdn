@@ -105,6 +105,23 @@ const RESOLVE_NEGATIVE_TTL: Duration = Duration::from_mins(1);
 /// `getPool` per admit rather than growing the cache without limit.
 const RESOLVE_NEGATIVE_CACHE_MAX: usize = 4096;
 
+/// How long an admit-path `getAuthorization` headroom read stays fresh in the
+/// signer-auth cache. A cached headroom may go stale as the signer spends its
+/// shared `cap` at other nodes, so within the window a stale-OK entry admits
+/// however many streams that signer opens against a cap it has since drained — a
+/// TTL-bounded over-admission, not a per-stream one. The exposure is bounded anyway
+/// by the on-chain `redeemMany`, which pays `min(desired, cap − spent)` and never
+/// over-cashes; a short TTL keeps the window small while a repeat fetch within it
+/// does no on-chain read.
+const SIGNER_AUTH_TTL: Duration = Duration::from_mins(1);
+
+/// Cap on the admit-path signer-auth cache, bounding its memory against a flood of
+/// distinct `(pool, signer)` pairs. At the cap an insert first prunes expired
+/// entries; if the cache is still full it skips caching that entry and pays one
+/// extra `getAuthorization` next time, so the map never grows without bound.
+/// Mirrors [`RESOLVE_NEGATIVE_CACHE_MAX`].
+const AUTH_CACHE_MAX: usize = 4096;
+
 /// Bounded receipt wait for a redemption transaction. A stuck/dropped/replaced tx
 /// must not wedge a background tick; a lapse yields [`TxOutcome::Timeout`], a
 /// non-fatal failure (the tx may still mine later; the claim is at worst deferred,
@@ -682,7 +699,7 @@ impl PoolSettlementSink {
                 info!(pool_id = %pool_id, signer = %key.signer, "pool reclaimed; dropped tracked lane");
             }
         }
-        self.handler.forget_pool_floor(pool_id).await;
+        self.handler.forget_pool_floor(pool_id);
     }
 }
 
@@ -718,6 +735,12 @@ pub struct ResolvingPoolView<P: Provider + Clone> {
     /// that errored. The guard is held only to read/insert one entry, never across
     /// the `getPool` await.
     negative: Mutex<HashMap<B256, Instant>>,
+    /// `(pool_id, signer)` → (last-observed `cap − spent` headroom in micro-USDC,
+    /// observed-at instant), for the admit-path signer confirm. An entry younger
+    /// than [`SIGNER_AUTH_TTL`] is served without a `getAuthorization`. The guard is
+    /// held only to read/insert one entry, never across the `getAuthorization`
+    /// await.
+    auth_cache: Mutex<HashMap<(B256, Address), (u64, Instant)>>,
 }
 
 impl<P: Provider + Clone> std::fmt::Debug for ResolvingPoolView<P> {
@@ -738,6 +761,7 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
             contract,
             projection,
             negative: Mutex::new(HashMap::new()),
+            auth_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -802,6 +826,62 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
     async fn cached_status(&self, pool_id: B256) -> Option<PoolStatus> {
         // MUST NOT block: read the projection only, never a `getPool`.
         self.projection.snapshot(pool_id)
+    }
+
+    async fn signer_cap_headroom_micro(&self, pool_id: B256, signer: Address) -> Option<u64> {
+        // Fast path: a fresh cached headroom needs no `getAuthorization`.
+        {
+            let guard = self
+                .auth_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((headroom, at)) = guard.get(&(pool_id, signer))
+                && at.elapsed() < SIGNER_AUTH_TTL
+            {
+                return Some(*headroom);
+            }
+        }
+        let auth = match self.contract.getAuthorization(pool_id, signer).call().await {
+            Ok(auth) => auth,
+            Err(err) => {
+                warn!(
+                    err = %sanitize_rpc_display(&err),
+                    %pool_id,
+                    %signer,
+                    "admit getAuthorization failed; refusing this signer"
+                );
+                return None;
+            }
+        };
+        // An UNREGISTERED signer reads as the all-zero authorization
+        // (`cap == 0 && expiry == 0`): it has spent nothing on-chain and holds its
+        // full off-chain capability budget, so it is unconstrained here. A
+        // REGISTERED signer has real headroom `cap − spent` — including one whose
+        // owner registered it with a zero `spendingCap` (`cap == 0` but
+        // `expiry != 0`), whose headroom is `0`, so it is refused rather than
+        // misread as unconstrained.
+        let headroom = if auth.cap == 0 && auth.expiry == 0 {
+            u64::MAX
+        } else {
+            auth.cap.saturating_sub(auth.spent)
+        };
+        {
+            let mut guard = self
+                .auth_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Bound the cache: at the cap, prune expired entries; if it is still
+            // full, skip caching this one and pay one extra `getAuthorization` next
+            // time rather than let a flood of distinct signers grow the map without
+            // bound.
+            if guard.len() >= AUTH_CACHE_MAX {
+                guard.retain(|_, (_, at)| at.elapsed() < SIGNER_AUTH_TTL);
+            }
+            if guard.len() < AUTH_CACHE_MAX {
+                guard.insert((pool_id, signer), (headroom, Instant::now()));
+            }
+        }
+        Some(headroom)
     }
 }
 
@@ -1925,6 +2005,181 @@ mod tests {
             asserter.read_q().len(),
             1,
             "the queued getPool response is untouched by cached_status"
+        );
+        Ok(())
+    }
+
+    fn authz(cap: u64, spent: u64) -> PaymentPool::Authorization {
+        PaymentPool::Authorization {
+            cap,
+            expiry: 0,
+            spent,
+        }
+    }
+
+    /// A mocked provider whose `eth_call` queue returns one ABI-encoded
+    /// `getAuthorization` result per entry. `Authorization` is an all-static
+    /// uint64 tuple, so its `SolValue` encoding equals the single-struct return
+    /// `getAuthorization` decodes.
+    fn mocked_getauth_view(
+        responses: &[PaymentPool::Authorization],
+    ) -> (
+        ResolvingPoolView<impl Provider + Clone + 'static>,
+        alloy::providers::mock::Asserter,
+    ) {
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+        use alloy::sol_types::SolValue;
+
+        let asserter = Asserter::new();
+        for auth in responses {
+            asserter.push_success(&Bytes::from(auth.abi_encode()));
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let contract = PaymentPool::new(Address::ZERO, provider);
+        let view = ResolvingPoolView::new(contract, PoolProjection::new());
+        (view, asserter)
+    }
+
+    /// A registered signer with headroom reports `cap − spent` in micro-USDC.
+    #[tokio::test]
+    async fn signer_headroom_reports_cap_minus_spent() -> Result<()> {
+        use crate::pool_view::PoolView;
+
+        let (view, _asserter) = mocked_getauth_view(&[authz(1_000, 300)]);
+        let headroom = view
+            .signer_cap_headroom_micro(B256::repeat_byte(0x11), Address::from([2u8; 20]))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("a registered signer reports headroom"))?;
+        assert_eq!(headroom, 700, "cap 1000 − spent 300");
+        Ok(())
+    }
+
+    /// A signer that has spent its full `cap` reports zero headroom — the floor
+    /// gate in the dispatch path then refuses it, but the view reports the truth.
+    #[tokio::test]
+    async fn exhausted_signer_reports_zero_headroom() -> Result<()> {
+        use crate::pool_view::PoolView;
+
+        let (view, _asserter) = mocked_getauth_view(&[authz(1_000, 1_000)]);
+        let headroom = view
+            .signer_cap_headroom_micro(B256::repeat_byte(0x22), Address::from([3u8; 20]))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("an exhausted signer still reports a value"))?;
+        assert_eq!(headroom, 0, "spent == cap");
+        Ok(())
+    }
+
+    /// An unregistered signer (`cap == 0`) reports `u64::MAX` — it has spent
+    /// nothing on-chain and admits on its off-chain capability — and a second call
+    /// within the TTL is served from cache with no further `getAuthorization`.
+    #[tokio::test]
+    async fn unregistered_signer_is_unconstrained_and_cached() -> Result<()> {
+        use crate::pool_view::PoolView;
+
+        // Only ONE response queued: a second on-chain read would error → None.
+        let (view, asserter) = mocked_getauth_view(&[authz(0, 0)]);
+        let pool_id = B256::repeat_byte(0x33);
+        let signer = Address::from([4u8; 20]);
+
+        let first = view
+            .signer_cap_headroom_micro(pool_id, signer)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("an unregistered signer is unconstrained"))?;
+        assert_eq!(first, u64::MAX, "cap == 0 → no on-chain constraint");
+        assert_eq!(
+            asserter.read_q().len(),
+            0,
+            "exactly one getAuthorization was consumed"
+        );
+
+        let second = view
+            .signer_cap_headroom_micro(pool_id, signer)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("a fresh cache entry serves the second call"))?;
+        assert_eq!(
+            second,
+            u64::MAX,
+            "the cached headroom is returned unchanged"
+        );
+        assert_eq!(
+            asserter.read_q().len(),
+            0,
+            "no second getAuthorization was issued within the TTL"
+        );
+        Ok(())
+    }
+
+    /// A REGISTERED signer with a zero `spendingCap` (`cap == 0` but `expiry != 0`)
+    /// is NOT the all-zero unregistered struct: its headroom is `0`, so it reports
+    /// `Some(0)` and the dispatch gate refuses it — it is not misread as
+    /// unconstrained (`u64::MAX`), which would fail open and admit an uncashable
+    /// signer.
+    #[tokio::test]
+    async fn registered_zero_cap_signer_is_refused_not_unconstrained() -> Result<()> {
+        use crate::pool_view::PoolView;
+
+        let auth = PaymentPool::Authorization {
+            cap: 0,
+            expiry: 1_900_000_000,
+            spent: 0,
+        };
+        let (view, _asserter) = mocked_getauth_view(&[auth]);
+        let headroom = view
+            .signer_cap_headroom_micro(B256::repeat_byte(0x44), Address::from([5u8; 20]))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("a registered zero-cap signer reports a value"))?;
+        assert_eq!(
+            headroom, 0,
+            "cap == 0 with expiry != 0 is a registered zero-cap signer, not unregistered"
+        );
+        Ok(())
+    }
+
+    /// A `getAuthorization` RPC fault refuses the signer (`None`) so the caller
+    /// does not fail open.
+    #[tokio::test]
+    async fn getauthorization_fault_refuses_signer() -> Result<()> {
+        use crate::pool_view::PoolView;
+
+        // No response queued: the mocked eth_call errors.
+        let (view, _asserter) = mocked_getauth_view(&[]);
+        assert!(
+            view.signer_cap_headroom_micro(B256::repeat_byte(0x44), Address::from([5u8; 20]))
+                .await
+                .is_none(),
+            "a getAuthorization fault refuses the signer"
+        );
+        Ok(())
+    }
+
+    /// A second call within `SIGNER_AUTH_TTL` is served from cache, consuming no
+    /// further `getAuthorization` (proven by the single queued response and a
+    /// `Some` result on the second call).
+    #[tokio::test]
+    async fn signer_headroom_second_call_hits_cache() -> Result<()> {
+        use crate::pool_view::PoolView;
+
+        let (view, asserter) = mocked_getauth_view(&[authz(1_000, 200)]);
+        let pool_id = B256::repeat_byte(0x55);
+        let signer = Address::from([6u8; 20]);
+
+        let first = view
+            .signer_cap_headroom_micro(pool_id, signer)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the first call resolves on-chain"))?;
+        assert_eq!(first, 800);
+        assert_eq!(asserter.read_q().len(), 0, "one getAuthorization consumed");
+
+        let second = view
+            .signer_cap_headroom_micro(pool_id, signer)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the second call is served from cache"))?;
+        assert_eq!(second, 800, "the cached headroom is returned");
+        assert_eq!(
+            asserter.read_q().len(),
+            0,
+            "no second getAuthorization within the TTL"
         );
         Ok(())
     }
