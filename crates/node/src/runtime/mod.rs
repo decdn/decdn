@@ -1261,13 +1261,6 @@ async fn build_chain_and_handlers(
     // drives the service's redeemer loop.
     let (redeem_tx, redeem_rx) =
         tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
-    // Pool-owner resolve-hint channel (cold-start `ColdStart::Head` gap): the
-    // serve path sends a `pool_id` here when a presented capability names a pool
-    // the projection has not observed; the settlement service's background
-    // resolver folds its owner in. Created outside the service bootstrap so the
-    // sender moves into the handler deps below while the service takes `resolve_rx`.
-    let (pool_resolve_tx, pool_resolve_rx) =
-        tokio::sync::mpsc::channel(crate::payment_settlement::POOL_RESOLVE_HINT_CAPACITY);
     // Overload-protection gate (load-shed): sheds new serves under resource
     // pressure so in-flight streams stay fast. Bound to a named local, not
     // inlined into the deps literal, so the reload section (`[load_shed]`,
@@ -1294,6 +1287,25 @@ async fn build_chain_and_handlers(
     // `{owner, remaining}` in-memory — no per-serve `getPool` `eth_call`. The same
     // instance is handed to the settlement service (its watcher is the writer).
     let pool_view = crate::pool_view::PoolProjection::new();
+    // Wallet-filled provider + `PaymentPool` binding, created here so the handler's
+    // pool-view (below) can confirm a projection-miss pool with a `getPool` at
+    // admission. The same provider is moved into the settlement service, which
+    // builds its own binding from the same address; the buyer path builds its own
+    // provider separately.
+    let wallet_provider = ProviderFactory::seller_wallet(
+        rpc_url.clone(),
+        (*infra.eth_signer).clone(),
+        event_poll_interval,
+    );
+    // Admit-path pool-view: reads the event-fed projection first and, on a miss
+    // (a pool opened before the watcher's `ColdStart::Head` anchor), does ONE
+    // `getPool` to confirm the pool is live and solvent before a serve is admitted
+    // — folding a servable pool into the projection and refusing an absent/closed/
+    // errored one. The mid-stream re-check reads the projection only.
+    let resolving_pool_view = crate::payment_settlement::ResolvingPoolView::new(
+        decdn_incentive::payment_pool::PaymentPool::new(payment_pool_addr, wallet_provider.clone()),
+        pool_view.clone(),
+    );
     // ADR 041 serve-credit inputs: a non-blocking sink in front of the SAME warming
     // allowance the buy loop debits and the eviction path forgets, plus the live
     // operator fee-share cell. The background aggregator behind the sink is what
@@ -1322,7 +1334,7 @@ async fn build_chain_and_handlers(
         bind_domain: bind_domain.clone(),
         channel_state_store: Arc::clone(&infra.channel_state_store),
         receipt_sink: Arc::clone(&infra.receipt_sink),
-        pool_view: Some(Arc::new(pool_view.clone()) as Arc<dyn crate::pool_view::PoolView>),
+        pool_view: Some(Arc::new(resolving_pool_view) as Arc<dyn crate::pool_view::PoolView>),
         pool_min_remaining_deposit: U256::from(
             cfg.blockchain.pool_min_remaining_deposit_micro_usdc,
         ),
@@ -1338,10 +1350,6 @@ async fn build_chain_and_handlers(
         // accrued claim is planned into a chunk promptly rather than waiting the
         // self-tick.
         redeem_hint: Some(redeem_tx.clone()),
-        // Cold-start pool-owner resolve nudge: capability intake meeting an
-        // unknown pool sends its `pool_id` here for the settlement service's
-        // background resolver to fold off the serve hot path.
-        pool_resolve_hint: Some(pool_resolve_tx),
         pull_through,
         local_populate,
         pull_through_origin,
@@ -1389,11 +1397,8 @@ async fn build_chain_and_handlers(
     // until restart. `SimpleNonceManager` stores nothing — each send re-reads
     // the pending nonce — so a failed send can't gap the lane. The buyer
     // provider below relies on this same property for the retried `reclaimExpired`.
-    let wallet_provider = ProviderFactory::seller_wallet(
-        rpc_url.clone(),
-        (*infra.eth_signer).clone(),
-        event_poll_interval,
-    );
+    // `wallet_provider` was built above (the handler's admit-path pool-view shares
+    // it); it moves into the service here.
     let (payment_service, settlement_route) = PoolSettlementService::bootstrap(
         wallet_provider,
         payment_pool_addr,
@@ -1408,7 +1413,6 @@ async fn build_chain_and_handlers(
         pool_view,
         redeem_tx,
         redeem_rx,
-        pool_resolve_rx,
     )
     .await
     .context("PaymentPool settlement service bootstrap")?;

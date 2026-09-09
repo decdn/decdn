@@ -363,21 +363,42 @@ impl ClientHandler {
             }
         }
 
-        // Cached `getPool` view (owner + remaining), read ONCE and reused by the
+        // Pool `getPool` view (owner + remaining), read ONCE and reused by the
         // funder gate here, the capability owner check, and the floor-`M` solvency
-        // gates below. Read AFTER the origin-only gate, not beside it: the only
-        // wired `PoolView` answers from an in-memory projection with no round-trip
-        // (`PoolProjection::status`), so there is no latency to overlap and a
-        // declined request must not pay for a read it never uses. `None` — no
-        // pool-view wired, an unknown pool (which includes the window before the
-        // watcher has seen it), or a read fault — makes the fail-open gates fail
-        // open: a transient blip must not refuse paying clients, and the open-time
-        // hash gates plus the first voucher's on-chain `redeem` still carry
-        // compliance and revenue.
+        // gates below. Read AFTER the origin-only gate, not beside it: a declined
+        // request must not pay for a read it never uses. The wired `PoolView`
+        // answers from the in-memory projection on a hit and, on a miss (a pool
+        // opened before the watcher's cold-start head), does ONE `getPool` to
+        // confirm the pool before this serve is admitted. A `None` here therefore
+        // means the pool does not exist on-chain, is closed/reclaimed, or the read
+        // faulted — the refuse-on-`None` gate just below turns that into a
+        // rejection rather than a fail-open serve. With NO pool-view wired
+        // (dev/test, no chain) the read is `None` and the downstream gates keep
+        // their prior fail-open behavior.
         let pool_status = match self.pool_view.as_ref() {
             Some(view) => view.status(B256::from(req.pool_id)).await,
             None => None,
         };
+
+        // Confirm-before-serve (ADR 003 §Pool solvency): when a pool-view is wired,
+        // the admit-path `status()` above did a `getPool` on a projection miss, so a
+        // `None` here means the pool does not exist on-chain, is closed/reclaimed, or
+        // the read faulted. Refuse rather than fail open — a node must not admit a
+        // serve against a pool it cannot confirm is live and solvent. `pool_status`
+        // is therefore guaranteed `Some` past this point whenever `pool_view` is
+        // wired, which lets the capability-owner and floor gates below rely on it.
+        // With NO pool-view (dev/test, no chain wired) `pool_status` stays `None` and
+        // the pre-#-gates keep their prior fail-open behavior.
+        if self.pool_view.is_some() && pool_status.is_none() {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::InsufficientDeposit,
+                    rate_per_mb,
+                )
+                .await;
+        }
 
         // Serve-path origin-blacklist gate (ADR 011 §On Blacklist Event): refuse a
         // pool whose FUNDER (`getPool.owner`) is on the operator's local
@@ -406,13 +427,15 @@ impl ClientHandler {
         // the owner-signed grant for the redeemer. A forged-owner grant is dropped
         // — never registered, never persisted — so it cannot revert the redeemer's
         // `redeemMany` batch. Best-effort otherwise.
-        if let (Some(signer), Some(capability)) = (verified_client, ext.capability.as_ref()) {
-            self.intake_capability(
-                B256::from(req.pool_id),
-                signer,
-                pool_status.map(|s| s.owner),
-                capability,
-            );
+        // Intake runs only with a confirmed pool: `pool_status` is `Some` whenever a
+        // pool-view is wired (the refuse-on-`None` gate above returned otherwise), so
+        // the owner is known here. With no pool-view wired (dev/test) `pool_status` is
+        // `None` and intake is skipped — the no-chain path registers no lane from a
+        // capability owner it cannot confirm.
+        if let (Some(signer), Some(capability), Some(status)) =
+            (verified_client, ext.capability.as_ref(), pool_status)
+        {
+            self.intake_capability(B256::from(req.pool_id), signer, status.owner, capability);
         }
 
         // Resolve the live lane AFTER intake, so a lane just registered from this

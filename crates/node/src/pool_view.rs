@@ -12,12 +12,23 @@
 //!
 //! Both quantities are fully determined by the `PaymentPool` event log, so the
 //! serve path reads them from an in-memory projection the settlement watcher folds
-//! from that log ([`crate::payment_settlement`]) — no serve request costs a
-//! `getPool` `eth_call`. An unknown pool (never opened in the projection's scan
-//! window, or already reclaimed) yields `None`, and the callers fail **open**
-//! (serve): a pool the projection has not caught up to must not refuse a paying
-//! client, and the first voucher's on-chain `redeem` plus the open-time hash gates
-//! still protect revenue and compliance.
+//! from that log ([`crate::payment_settlement`]) — the common case costs no
+//! `getPool` `eth_call`. The two reads split by whether the caller can block:
+//!
+//! - **Admission** ([`PoolView::status`]) MAY block. The production wrapper
+//!   ([`crate::payment_settlement::ResolvingPoolView`]) reads the projection first
+//!   and, on a miss (a pool opened before the watcher's cold-start head), does ONE
+//!   `getPool` to confirm the pool exists and is solvent BEFORE a serve is
+//!   admitted. An absent, closed, or errored pool yields `None` and the admit gate
+//!   refuses — it does not fail open.
+//! - **Mid-stream** ([`PoolView::cached_status`]) MUST NOT block: it reads the
+//!   projection only. A `None` there (a stream whose admission read has aged out
+//!   of the projection) fails open, since the on-chain `redeem` is the backstop
+//!   and a chain read at a voucher boundary would stall delivery.
+//!
+//! The bare [`PoolProjection`] is the projection itself: its `status` returns
+//! `None` for a pool it has not folded and never touches the network. Tests wire
+//! it (or a fake) directly; production wraps it in the `getPool`-on-miss view.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -81,10 +92,13 @@ pub struct PoolStatus {
 /// `Arc<dyn PoolView>` and tests pass a fake (or `None`) without a chain.
 #[async_trait::async_trait]
 pub trait PoolView: Send + Sync + std::fmt::Debug {
-    /// The pool's status, or `None` if the pool is unknown (callers fail open).
-    /// The stream-admission read: a caller here may tolerate a blocking source,
-    /// so an implementation MAY do slow work. The production implementation
-    /// ([`PoolProjection`]) reads from memory and never blocks.
+    /// The pool's status, or `None` if the pool cannot be confirmed. The
+    /// stream-admission read: a caller here may tolerate a blocking source, so an
+    /// implementation MAY do slow work. The bare [`PoolProjection`] reads from
+    /// memory and returns `None` for a pool it has not folded; the production
+    /// wrapper ([`crate::payment_settlement::ResolvingPoolView`]) confirms such a
+    /// pool with one `getPool` before returning, so the admit gate refuses a
+    /// pool it still cannot confirm rather than failing open.
     async fn status(&self, pool_id: B256) -> Option<PoolStatus>;
 
     /// A read that MUST NOT block: it returns `None` rather than doing any slow or

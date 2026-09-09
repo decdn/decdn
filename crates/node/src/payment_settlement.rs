@@ -89,15 +89,7 @@ use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus};
 /// lanes without backpressuring the voucher-accept path.
 pub const REDEEM_HINT_CAPACITY: usize = 256;
 
-/// Capacity of the pool-owner resolve-hint channel. The serve path sends a
-/// `pool_id` here when a presented capability names a pool the projection has
-/// not observed (a pool opened before this node's cold-start head, so its
-/// `PoolOpened` predates the forward-only scan). Hints are advisory — a dropped
-/// hint only defers the pool's backfill until the client's next capability
-/// re-send — so a bounded channel that drops on overflow is acceptable.
-pub const POOL_RESOLVE_HINT_CAPACITY: usize = 256;
-
-/// How long the pool-owner resolver suppresses a repeat `getPool` for a pool it
+/// How long the admit-path `getPool` suppresses a repeat call for a pool it
 /// just found not-servable (nonexistent / `Closed`) or that errored. A
 /// not-servable pool never folds into the projection, so its `snapshot` stays
 /// `None`; without this a client re-sending its capability on every request would
@@ -107,11 +99,10 @@ pub const POOL_RESOLVE_HINT_CAPACITY: usize = 256;
 /// request flood to ~one call per pool per window.
 const RESOLVE_NEGATIVE_TTL: Duration = Duration::from_mins(1);
 
-/// Cap on the resolver's negative cache, bounding its memory against a flood of
+/// Cap on the admit-path negative cache, bounding its memory against a flood of
 /// distinct nonexistent pool ids. At the cap an insert first prunes expired
-/// entries; a flood of live distinct negatives past that simply falls back to the
-/// resolver's own serial rate bound (one in-flight `getPool` at a time) rather
-/// than growing the cache without limit.
+/// entries; a flood of live distinct negatives past that simply pays one
+/// `getPool` per admit rather than growing the cache without limit.
 const RESOLVE_NEGATIVE_CACHE_MAX: usize = 4096;
 
 /// Bounded receipt wait for a redemption transaction. A stuck/dropped/replaced tx
@@ -223,12 +214,6 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     /// impl aborts whatever remains. A `std::sync::Mutex` (not `tokio`): the guard
     /// is only ever held to `take()` the handle, never across an `.await`.
     redeemer: std::sync::Mutex<Option<JoinHandle<()>>>,
-    /// The background pool-owner resolver task ([`pool_owner_resolver_loop`]).
-    /// Aborted when the service drops; it also ends on its own once every
-    /// resolve-hint sender is dropped. It has no final work to flush (unlike the
-    /// redeemer), so it needs no quiesce path — the [`crate::chain_events::AbortOnDrop`] guard is the
-    /// whole of its lifecycle management.
-    _resolver: crate::chain_events::AbortOnDrop,
 }
 
 impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
@@ -255,7 +240,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         pool_view: PoolProjection,
         redeem_tx: mpsc::Sender<LaneKey>,
         redeem_rx: mpsc::Receiver<LaneKey>,
-        resolve_rx: mpsc::Receiver<B256>,
     ) -> Result<(Self, Route)> {
         let contract = PaymentPool::new(payment_pool_addr, provider);
 
@@ -331,19 +315,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             pool_view.clone(),
         ));
 
-        // Lazy cold-start pool-owner resolver. A pool opened before this node's
-        // `ColdStart::Head` anchor never appears in the forward-only `PoolOpened`
-        // scan, so its owner is absent from the projection and the serve path
-        // cannot verify a presented capability against it. When the serve path
-        // meets such a pool it hints this task, which resolves the owner with one
-        // `getPool` off the serve hot path and folds it in for the client's next
-        // request.
-        let resolver = tokio::spawn(pool_owner_resolver_loop(
-            contract.clone(),
-            pool_view.clone(),
-            resolve_rx,
-        ));
-
         Ok((
             Self {
                 contract,
@@ -356,7 +327,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
                 metrics,
                 pool_view,
                 redeemer: std::sync::Mutex::new(Some(redeemer)),
-                _resolver: crate::chain_events::AbortOnDrop(resolver),
             },
             route,
         ))
@@ -716,47 +686,128 @@ impl PoolSettlementSink {
     }
 }
 
-/// Background pool-owner resolver: fold the owner of a cold-start pool the serve
-/// path could not verify a capability against.
+/// A [`PoolView`](crate::pool_view::PoolView) that confirms a pool on-chain
+/// before a serve is admitted.
 ///
-/// The settlement watcher anchors at head
-/// ([`ColdStart::Head`]), so a pool opened
-/// before this node's first-ever boot never appears in the forward-only
-/// `PoolOpened` scan and has no `{owner, deposit}` in the projection. The serve
-/// path fails closed on that missing owner — it drops the presented capability
-/// and never registers the serve lane — which permanently blocks onboarding this
-/// node as a new provider to a pre-existing pool.
+/// The serve gates read `{owner, remaining}` from the event-fed [`PoolProjection`]
+/// the settlement watcher folds, so the common case costs no `eth_call`. A pool
+/// the projection has not observed is the hard case: a pool opened before this
+/// node's `ColdStart::Head` anchor never appears in the forward-only `PoolOpened`
+/// scan, so its owner is absent from the projection even though the pool is live.
+/// Rather than fail open on that gap, [`status`](crate::pool_view::PoolView::status) does ONE `getPool` at
+/// admission — a read the admission path tolerates (it may block) — folds a
+/// servable pool into the projection, and refuses an absent, closed, or errored
+/// pool. The client re-sends its capability on its next request (the documented
+/// lane recovery path), and by then the folded owner registers the lane.
 ///
-/// This task takes that off the serve hot path: the serve path only sends a
-/// `pool_id` hint, and this loop resolves it with ONE `getPool` and folds an
-/// owner + deposit snapshot into the projection ([`PoolProjection::record_resolved`]).
-/// The client re-sends the capability on its next request (the documented lane
-/// recovery path), and by then the lane registers. Ends cleanly once every
-/// resolve-hint sender is dropped.
+/// The mid-stream re-check calls [`cached_status`](crate::pool_view::PoolView::cached_status), which reads the
+/// projection ONLY and never blocks on a `getPool` — a chain read at a voucher
+/// boundary would stall delivery.
 ///
-/// A `getPool` fault, a nonexistent pool (`owner == 0`), or a `Closed` pool seeds
-/// nothing: the serve gate stays fail-open `None`, and the client re-hints on its
-/// next request. Seeding a `Closed` (reclaimed) pool would only register a lane
-/// against funds that can no longer be redeemed. Such an outcome is remembered in
-/// a short-TTL negative cache ([`RESOLVE_NEGATIVE_TTL`]) so a client re-requesting
-/// the same dead pool every request cannot drive a `getPool` per request.
-async fn pool_owner_resolver_loop<P: Provider + Clone>(
+/// A short-TTL negative cache suppresses a repeat
+/// `getPool` for a pool just found not-servable or that errored, so a client
+/// re-requesting the same dead pool every request cannot drive one `getPool` per
+/// request.
+pub struct ResolvingPoolView<P: Provider + Clone> {
+    /// The wallet/RPC-backed `PaymentPool` binding the admit-path `getPool` reads.
     contract: PaymentPool::PaymentPoolInstance<P>,
-    pool_view: PoolProjection,
-    mut resolve_rx: mpsc::Receiver<B256>,
-) {
-    // Owned by this single task, so a plain map needs no synchronization. Holds a
-    // pool id → last-negative instant for pools recently found not-servable or
-    // that errored; a successful resolve removes the entry.
-    let mut negative: HashMap<B256, Instant> = HashMap::new();
-    while let Some(pool_id) = resolve_rx.recv().await {
-        resolve_pool_owner(&contract, &pool_view, pool_id, &mut negative).await;
-    }
-    debug!("pool-owner resolver loop ended (all resolve-hint senders dropped)");
+    /// The event-fed projection this view reads first and folds a resolved pool
+    /// into. Shared with the settlement watcher's sink (the authoritative writer).
+    projection: PoolProjection,
+    /// Pool id → last-negative instant for pools recently found not-servable or
+    /// that errored. The guard is held only to read/insert one entry, never across
+    /// the `getPool` await.
+    negative: Mutex<HashMap<B256, Instant>>,
 }
 
-/// Whether `pool_id` is in the negative cache and still fresh — the resolver then
-/// skips the `getPool`. Pure, so the TTL gate is unit-testable without a provider.
+impl<P: Provider + Clone> std::fmt::Debug for ResolvingPoolView<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvingPoolView")
+            .field("address", self.contract.address())
+            .field("projection", &self.projection)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P: Provider + Clone> ResolvingPoolView<P> {
+    /// Wrap the event-fed `projection` with an admit-path `getPool` fallback
+    /// against `contract`.
+    #[must_use]
+    pub fn new(contract: PaymentPool::PaymentPoolInstance<P>, projection: PoolProjection) -> Self {
+        Self {
+            contract,
+            projection,
+            negative: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPoolView<P> {
+    async fn status(&self, pool_id: B256) -> Option<PoolStatus> {
+        // Fast path: the event fold already knows this pool — no chain call.
+        if let Some(status) = self.projection.snapshot(pool_id) {
+            return Some(status);
+        }
+        // A pool recently found not-servable (or that errored) is suppressed for
+        // the negative-cache window, so a re-request flood cannot storm `getPool`.
+        {
+            let guard = self
+                .negative
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if negative_cache_hit(&guard, pool_id) {
+                return None;
+            }
+        }
+        let pool = match self.contract.getPool(pool_id).call().await {
+            Ok(pool) => pool,
+            Err(err) => {
+                warn!(
+                    err = %sanitize_rpc_display(&err),
+                    %pool_id,
+                    "admit getPool failed; refusing this pool"
+                );
+                let mut guard = self
+                    .negative
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                remember_negative(&mut guard, pool_id);
+                return None;
+            }
+        };
+        let Some(lifecycle) = resolved_lifecycle(&pool) else {
+            debug!(%pool_id, "admit getPool: pool absent or closed; refusing");
+            let mut guard = self
+                .negative
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            remember_negative(&mut guard, pool_id);
+            return None;
+        };
+        self.projection
+            .record_resolved(pool_id, pool.owner, U256::from(pool.deposit), lifecycle);
+        // A later reopen at the same id (or a transient error that has since
+        // cleared) must not stay suppressed once the pool actually resolves.
+        {
+            let mut guard = self
+                .negative
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(&pool_id);
+        }
+        self.projection.snapshot(pool_id)
+    }
+
+    async fn cached_status(&self, pool_id: B256) -> Option<PoolStatus> {
+        // MUST NOT block: read the projection only, never a `getPool`.
+        self.projection.snapshot(pool_id)
+    }
+}
+
+/// Whether `pool_id` is in the negative cache and still fresh — the admit path
+/// then skips the `getPool`. Pure, so the TTL gate is unit-testable without a
+/// provider.
 fn negative_cache_hit(cache: &HashMap<B256, Instant>, pool_id: B256) -> bool {
     cache
         .get(&pool_id)
@@ -790,53 +841,6 @@ fn resolved_lifecycle(pool: &PaymentPool::Pool) -> Option<Lifecycle> {
         }),
         _ => None,
     }
-}
-
-/// Resolve one cold-start pool: skip if the projection already knows it, else one
-/// `getPool` and fold the snapshot ([`PoolProjection::record_resolved`]) when
-/// [`resolved_lifecycle`] says it is servable.
-async fn resolve_pool_owner<P: Provider + Clone>(
-    contract: &PaymentPool::PaymentPoolInstance<P>,
-    pool_view: &PoolProjection,
-    pool_id: B256,
-    negative: &mut HashMap<B256, Instant>,
-) {
-    // A concurrent event fold (or an earlier resolve of the same pool) may have
-    // filled the entry between the hint and here — skip the round-trip.
-    if pool_view.snapshot(pool_id).is_some() {
-        return;
-    }
-    // A pool recently found not-servable (or that errored) is suppressed for the
-    // negative-cache window, so a re-request flood cannot storm `getPool`.
-    if negative_cache_hit(negative, pool_id) {
-        return;
-    }
-    let pool = match contract.getPool(pool_id).call().await {
-        Ok(pool) => pool,
-        Err(err) => {
-            warn!(
-                err = %sanitize_rpc_display(&err),
-                pool_id = %pool_id,
-                "pool-owner resolve: getPool failed; the client re-hints on its next request"
-            );
-            remember_negative(negative, pool_id);
-            return;
-        }
-    };
-    let Some(lifecycle) = resolved_lifecycle(&pool) else {
-        debug!(pool_id = %pool_id, "pool-owner resolve: pool absent or closed; not seeding");
-        remember_negative(negative, pool_id);
-        return;
-    };
-    pool_view.record_resolved(pool_id, pool.owner, U256::from(pool.deposit), lifecycle);
-    // A later reopen at the same id (or a transient error that has since cleared)
-    // must not stay suppressed once the pool actually resolves.
-    negative.remove(&pool_id);
-    debug!(
-        pool_id = %pool_id,
-        owner = %pool.owner,
-        "resolved cold-start pool owner via getPool"
-    );
 }
 
 /// Redemption task: chunk lanes' accrued claims and `redeemMany` a chunk once
@@ -1776,6 +1780,153 @@ mod tests {
         assert_eq!(resolved_lifecycle(&no_owner), None);
         let closed = pool(Address::from([7u8; 20]), PaymentPool::Status::Closed, 0);
         assert_eq!(resolved_lifecycle(&closed), None);
+    }
+
+    /// A mocked provider whose `eth_call` queue returns one ABI-encoded `getPool`
+    /// result. `Pool` is a static tuple, so its `SolValue` encoding equals the
+    /// single-struct return `getPool` decodes.
+    fn mocked_getpool_view(
+        response: Option<PaymentPool::Pool>,
+    ) -> (
+        ResolvingPoolView<impl Provider + Clone + 'static>,
+        PoolProjection,
+        alloy::providers::mock::Asserter,
+    ) {
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+        use alloy::sol_types::SolValue;
+
+        let asserter = Asserter::new();
+        if let Some(pool) = response {
+            asserter.push_success(&Bytes::from(pool.abi_encode()));
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let contract = PaymentPool::new(Address::ZERO, provider);
+        let projection = PoolProjection::new();
+        let view = ResolvingPoolView::new(contract, projection.clone());
+        (view, projection, asserter)
+    }
+
+    /// Admit path (i): a pool the projection has not observed triggers ONE
+    /// `getPool`; a solvent pool is folded into the projection and admitted. A
+    /// second request is a projection hit and issues no further `getPool`.
+    #[tokio::test]
+    async fn resolving_status_does_getpool_on_miss_and_admits_solvent_pool() -> Result<()> {
+        use crate::pool_view::PoolView;
+
+        let owner = Address::from([7u8; 20]);
+        let (view, projection, asserter) =
+            mocked_getpool_view(Some(pool(owner, PaymentPool::Status::Open, 0)));
+        let pool_id = B256::repeat_byte(0x44);
+
+        let status = view
+            .status(pool_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("a solvent unknown pool must admit via getPool"))?;
+        assert_eq!(status.owner, owner);
+        // `pool()` seeds deposit 1000, totalRedeemed 0.
+        assert_eq!(status.remaining, U256::from(1_000u64));
+        assert!(
+            projection.snapshot(pool_id).is_some(),
+            "the resolved pool is folded into the projection"
+        );
+        assert_eq!(
+            asserter.read_q().len(),
+            0,
+            "exactly one getPool was consumed"
+        );
+
+        // Admit path (iii): the second request hits the projection — no getPool.
+        // The queue is empty, so any second eth_call would error and yield None;
+        // a Some result therefore proves the projection served it.
+        let again = view.status(pool_id).await.ok_or_else(|| {
+            anyhow::anyhow!("a confirmed pool stays admitted from the projection")
+        })?;
+        assert_eq!(again.owner, owner);
+        Ok(())
+    }
+
+    /// Admit path (ii): an absent (`owner == 0`) or `Closed` pool the `getPool`
+    /// returns is refused (`None`) and never folded, and the negative cache then
+    /// suppresses a repeat `getPool`.
+    #[tokio::test]
+    async fn resolving_status_refuses_absent_pool_and_caches_negative() -> Result<()> {
+        use crate::pool_view::PoolView;
+
+        let (view, projection, asserter) =
+            mocked_getpool_view(Some(pool(Address::ZERO, PaymentPool::Status::Open, 0)));
+        let pool_id = B256::repeat_byte(0x55);
+
+        assert!(
+            view.status(pool_id).await.is_none(),
+            "an absent (zero-owner) pool is refused"
+        );
+        assert!(
+            projection.snapshot(pool_id).is_none(),
+            "an absent pool is never folded into the projection"
+        );
+        assert!(
+            view.negative
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&pool_id),
+            "the refusal is remembered in the negative cache"
+        );
+        // The negative cache short-circuits before any getPool — the queue stays
+        // empty (only the first response was consumed), so no second call is made.
+        assert!(view.status(pool_id).await.is_none());
+        assert_eq!(asserter.read_q().len(), 0, "no second getPool was issued");
+        Ok(())
+    }
+
+    /// Admit path (ii, errored): a `getPool` RPC fault refuses the pool (`None`)
+    /// and remembers it in the negative cache, so a re-request flood cannot storm
+    /// `getPool`.
+    #[tokio::test]
+    async fn resolving_status_refuses_on_getpool_error_and_caches_negative() -> Result<()> {
+        use crate::pool_view::PoolView;
+
+        // No response queued: the mocked eth_call errors.
+        let (view, projection, _asserter) = mocked_getpool_view(None);
+        let pool_id = B256::repeat_byte(0x66);
+
+        assert!(
+            view.status(pool_id).await.is_none(),
+            "a getPool fault refuses the pool"
+        );
+        assert!(projection.snapshot(pool_id).is_none());
+        assert!(
+            view.negative
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&pool_id),
+            "an errored getPool is remembered in the negative cache"
+        );
+        Ok(())
+    }
+
+    /// `cached_status` never issues a `getPool`: it reads the projection only, so
+    /// an unknown pool returns `None` even though `status` would resolve it, and
+    /// the mock's response queue is left untouched.
+    #[tokio::test]
+    async fn resolving_cached_status_never_calls_getpool() -> Result<()> {
+        use crate::pool_view::PoolView;
+
+        let owner = Address::from([7u8; 20]);
+        let (view, _projection, asserter) =
+            mocked_getpool_view(Some(pool(owner, PaymentPool::Status::Open, 0)));
+        let pool_id = B256::repeat_byte(0x77);
+
+        assert!(
+            view.cached_status(pool_id).await.is_none(),
+            "cached_status does not resolve an unknown pool on-chain"
+        );
+        assert_eq!(
+            asserter.read_q().len(),
+            1,
+            "the queued getPool response is untouched by cached_status"
+        );
+        Ok(())
     }
 
     #[test]
