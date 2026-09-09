@@ -3759,8 +3759,7 @@ mod tests {
     /// The pool-budget guard counts a pool's committed LIVE floor reservation against
     /// `remaining − M`. This is the re-check both the mid-stream gate and the
     /// direct-serve gate apply to a stream that already holds its reservation, so it is
-    /// deliberately pool-level only, carries no signer dimension, and never counts a
-    /// signer's node-local abandonment bucket.
+    /// deliberately pool-level only and carries no signer dimension.
     #[tokio::test]
     async fn pool_budget_covers_reserve_accounts_committed_floor() -> anyhow::Result<()> {
         let metrics = Arc::new(Metrics::new());

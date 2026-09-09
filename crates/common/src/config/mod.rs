@@ -9662,10 +9662,9 @@ usdc_address = \"0xUsdc\"
         Ok(())
     }
 
-    /// The per-signer floor knobs (ADR 003 § Pool solvency) default to `8` live
-    /// windows, an `8`-window abandonment bucket, and a `60`-second refill, and thread
-    /// explicit values through. No value is rejected: each is lower-clamped at use, so
-    /// there is nothing for the resolver to bound.
+    /// The per-signer floor knob (ADR 003 § Pool solvency) defaults to `8` live
+    /// windows and threads an explicit value through. No value is rejected: it is
+    /// lower-clamped at use, so there is nothing for the resolver to bound.
     #[test]
     fn pool_floor_signer_knobs_default_and_thread() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;

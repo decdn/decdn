@@ -479,8 +479,8 @@ impl ClientHandler {
         // underneath it. The reservation is span-capped
         // to what THIS request can draw — at most one voucher-interval floor, less for
         // a bounded range or tail resume — and held for the stream's lifetime; the
-        // `FloorReservation` guard reconciles it to the actual unpaid loss at stream
-        // end.
+        // `FloorReservation` guard releases it once the stream repays that floor, and
+        // frees the pool's floor headroom on any exit via `Drop`.
         //
         // The guard is opened at the point the billed span is knowable, NOT here: an
         // open-ended tail (`byte_len == 0`, `byte_offset > 0`) only knows its span
@@ -494,17 +494,16 @@ impl ClientHandler {
         // refusal collapses to `InsufficientDeposit` → wire `NotFound`,
         // indistinguishable from any other miss (no balance leak).
         //
-        // Held at fn scope so the reservation reconciles on EVERY exit via `Drop`.
+        // Held at fn scope so the reservation is released on EVERY exit via `Drop`.
         // Every serve path that reaches a serve loop MOVES it in and threads it through:
         // the direct-serve path hands it to `deliver`, and the
         // `serve_via_backend_origin` / `serve_via_window_pull_through` miss legs take it
         // by value and pass it by reference into their shared `serve_leg`. All three
-        // note the live unpaid balance each iteration and release the reservation once
-        // the stream repays one floor, so `Drop` debits the signer's abandonment bucket
-        // by the real un-recouped floor an abnormal exit leaves — the reserved window
-        // for a miss leg (whose fronted upstream USDC the downstream tail under-measures)
-        // and `delivered − paid` for a direct-serve hit. On a refusal before the serve
-        // loop the guard drops unspent, debiting nothing.
+        // release the reservation once the stream repays one floor; any other exit
+        // (disconnect, `?`, panic) drops the guard, whose `Drop` frees the pool's live
+        // floor headroom so an abandoned stream never holds it past its own lifetime.
+        // No abandonment charge survives the drop — bounding un-vouchered floor is the
+        // admission-time job of the pool ceiling and the per-signer live cap.
         let mut floor_reservation: Option<FloorReservation> = None;
 
         // Set by the origin-tier range pull-through below (#823) when a
@@ -1193,12 +1192,11 @@ impl ClientHandler {
                 // 0`) — and at the POOL level only, for the reason
                 // [`ClientHandler::pool_budget_covers_reserve`] gives: the pool
                 // ceiling shrinks as co-tenants draw the pool down, so re-testing an
-                // already-admitted reservation against the per-signer gates could
-                // refuse a stream they let through pre-fill. Here that is strictly
+                // already-admitted reservation against the per-signer cap could
+                // refuse a stream it let through pre-fill. Here that is strictly
                 // worse than serving: the fill already fronted upstream USDC, so
-                // refusing loses that spend AND debits the full reservation into the
-                // signer's abandonment bucket. The per-signer gates did their job
-                // pre-fill; this gate only asks whether the pool can still pay.
+                // refusing loses that spend for nothing. The per-signer cap did its
+                // job pre-fill; this gate only asks whether the pool can still pay.
                 (!self.pool_budget_covers_reserve(
                     B256::from(req.pool_id),
                     status.remaining,

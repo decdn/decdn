@@ -5023,8 +5023,8 @@ fn store_with_distinct_lanes(
 
 /// CORE security property (concurrent): with many DISTINCT-signer streams held open
 /// at once, admissions stop as soon as `Σ live floors` would exceed `remaining −
-/// M`. The concurrent twin of the sequential test — here the bound is enforced by
-/// the LIVE reservation, not the durable dead charge.
+/// M`. The bound is the per-pool live floor reservation — the hard money envelope
+/// no fan-out of fresh signer keys can escape.
 ///
 /// `remaining = 140`, `M = 0`, floor `40`: three lanes fit (`3 × 40 = 120 ≤ 140`),
 /// a fourth does not (`160 > 140`). Each lane is opened on its own bi-stream,

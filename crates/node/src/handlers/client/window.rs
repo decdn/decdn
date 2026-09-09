@@ -16,10 +16,9 @@ use super::{
 /// loop runs — the pre-flight floor-`M` gate, the size gate, or an upstream that
 /// refused the free header handshake. Nothing was fronted upstream and no byte
 /// was delivered, so [`FloorReservation::release_unspent`] frees the live
-/// reservation and debits no abandonment bucket; without it the guard's `Drop`
-/// would treat the un-settled reservation as an abnormal exit and debit the
-/// signer's bucket for a serve it never performed (ADR 003 §Pool solvency). A no-op when
-/// no lane was known (no reservation was taken).
+/// reservation promptly and marks the guard so its `Drop` is a clean no-op
+/// (ADR 003 §Pool solvency). A no-op when no lane was known (no reservation was
+/// taken).
 fn release_reservation_unspent(reservation: Option<&FloorReservation>) {
     if let Some(reservation) = reservation {
         reservation.release_unspent();
@@ -672,11 +671,11 @@ impl ClientHandler {
         // paces every pull it draws from (its own plus any attached sibling).
         //
         // The pool floor reservation (opened at the dispatch pre-spend gate) is OWNED
-        // here and passed by reference so the serve leg reconciles it exactly like the
-        // hit path: delivery here is billed per voucher, so an un-repaid stream must
-        // debit its abandonment bucket on an abnormal exit. Holding ownership across the `await` keeps
-        // the guard alive for the whole serve; its `Drop` fires AFTER `serve_leg`
-        // returns, at this function's scope end.
+        // here and passed by reference so the serve leg releases it exactly like the
+        // hit path once the stream repays its floor. Holding ownership across the
+        // `await` keeps the guard alive for the whole serve; its `Drop` frees the
+        // pool's live floor headroom AFTER `serve_leg` returns, at this function's
+        // scope end.
         let serve_result = self
             .serve_leg(
                 &mut send,
