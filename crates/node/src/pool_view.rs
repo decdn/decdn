@@ -22,9 +22,11 @@
 //!   admitted. An absent, closed, or errored pool yields `None` and the admit gate
 //!   refuses — it does not fail open.
 //! - **Mid-stream** ([`PoolView::cached_status`]) MUST NOT block: it reads the
-//!   projection only. A `None` there (a stream whose admission read has aged out
-//!   of the projection) fails open, since the on-chain `redeem` is the backstop
-//!   and a chain read at a voucher boundary would stall delivery.
+//!   projection only. An admitted stream's pool was seeded at admission and a
+//!   projection entry persists until the pool is forgotten (a `PoolReclaimed`
+//!   removes it), so a `None` here is not expected for a live stream; if it does
+//!   occur it fails open, since the on-chain `redeem` is the backstop and a chain
+//!   read at a voucher boundary would stall delivery.
 //!
 //! The bare [`PoolProjection`] is the projection itself: its `status` returns
 //! `None` for a pool it has not folded and never touches the network. Tests wire

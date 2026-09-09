@@ -394,7 +394,7 @@ impl ClientHandler {
                 .respond_error(
                     &mut send,
                     &req,
-                    ServeRejectReason::InsufficientDeposit,
+                    ServeRejectReason::PoolUnconfirmed,
                     rate_per_mb,
                 )
                 .await;

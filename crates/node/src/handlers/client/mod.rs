@@ -941,6 +941,15 @@ enum ServeRejectReason {
     UnknownChannel,
     OwnerMismatch,
     InsufficientDeposit,
+    /// A wired `PoolView` could not confirm the request's pool on-chain: the pool
+    /// has no on-chain record, is closed/reclaimed, or the admit-path `getPool`
+    /// faulted. The node refuses rather than serve a pool it cannot confirm is live
+    /// and solvent (ADR 003 §Pool solvency). Distinct from [`Self::InsufficientDeposit`]
+    /// for the per-reason metric ONLY — both collapse to `NotFound` on the wire (see
+    /// [`Self::wire_error`]), so a client cannot tell an unconfirmed pool from a
+    /// drained one, and an operator can tell a chain/RPC problem from real
+    /// deposit exhaustion.
+    PoolUnconfirmed,
     /// The lane already has enough concurrent same-lane streams in flight that
     /// admitting one more would put more unpaid egress in flight than the pool's
     /// refundable-floor headroom covers. Distinct from [`Self::InsufficientDeposit`]
@@ -1018,6 +1027,7 @@ impl ServeRejectReason {
             | Self::UnknownChannel
             | Self::OwnerMismatch
             | Self::InsufficientDeposit
+            | Self::PoolUnconfirmed
             | Self::LaneAtCapacity
             | Self::SignerFloorAtCap
             | Self::LoadShedHit
