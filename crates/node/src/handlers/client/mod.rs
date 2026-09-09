@@ -1511,6 +1511,61 @@ impl ClientHandler {
         self.pool_view.as_ref()?.cached_status(pool_id).await
     }
 
+    /// The signer's total on-chain `spent` across every provider in `pool_id`, read
+    /// from the event-fed projection ONLY (never a `getAuthorization`), for the
+    /// mid-stream signer cap-headroom re-check. `None` when no pool-view is wired
+    /// (dev/test, no chain) or the view holds no projection — the re-check then skips
+    /// and delivery continues, matching how [`Self::pool_view_status_cached`] fails
+    /// open. See [`crate::pool_view::PoolView::signer_spent_cached`].
+    pub(super) async fn signer_spent_cached(&self, pool_id: B256, signer: Address) -> Option<u64> {
+        self.pool_view
+            .as_ref()?
+            .signer_spent_cached(pool_id, signer)
+            .await
+    }
+
+    /// Whether a live stream must stop because its voucher `signer` has drained its
+    /// shared on-chain `cap` at other nodes since admission (ADR 003 §Pool solvency,
+    /// mid-stream re-check). A signer's `cap` is shared across every provider, so a
+    /// signer that spends it elsewhere leaves `held_cap − spent` unable to cover a
+    /// serve floor here, and further vouchers redeem `min(desired, cap − spent) ≈ 0`
+    /// — the node would eat the delivered bytes, unbounded for a large blob.
+    ///
+    /// `held_cap` is the `cap` the node already holds on the lane (the admit-time
+    /// capability), and `spent` is read from the event-fed projection. The floor is
+    /// one ramp-start credit window, the SAME quantity the admit-time gate confirms
+    /// (`ClientHandler::serve_stream`), so the mid-stream threshold matches admission.
+    ///
+    /// Fails toward SERVING: `signer_spent_cached` returning `None` (no projection)
+    /// skips the stop, and a projection that has not yet folded the signer's
+    /// pre-admission spend only UNDER-counts `spent`, over-stating headroom. That is
+    /// acceptable — the admit-time `getAuthorization` (#1958) already caught an
+    /// already-exhausted signer authoritatively, so this only catches drain SINCE
+    /// admit, and the on-chain `redeemMany` `min(desired, cap − spent)` is the
+    /// backstop; this re-check only BOUNDS over-delivery, it is not a correctness
+    /// gate. Bumps the mid-stream metric when it returns `true`.
+    pub(super) async fn signer_cap_drained_midstream(
+        &self,
+        pool_id: B256,
+        signer: Address,
+        held_cap: U256,
+        rate_per_mb: u64,
+    ) -> bool {
+        let Some(spent) = self.signer_spent_cached(pool_id, signer).await else {
+            return false;
+        };
+        let headroom = held_cap.saturating_sub(U256::from(spent));
+        let floor_micro = U256::from(decdn_incentive::min_payment(
+            self.credit_window(CHUNK_BYTES, 0),
+            rate_per_mb,
+        ));
+        if headroom < floor_micro {
+            self.metrics.serve_stream_midstream_signer_cap_exhausted();
+            return true;
+        }
+        false
+    }
+
     /// The pool's funder (`getPool.owner`) for the ADR 011 mid-stream takedown
     /// re-check, or `None` when no pool-view is wired or the read faulted (the
     /// re-check then falls back to the open-time gates and the hash-denylist
@@ -3405,6 +3460,56 @@ mod tests {
         (Arc::new(handler), dir)
     }
 
+    /// Build a handler whose pool-view is a real [`crate::pool_view::PoolProjection`],
+    /// returned alongside so a test can fold `PoolRedeemed` deltas into it and drive
+    /// the mid-stream signer cap-headroom re-check against a live projection.
+    async fn handler_with_projection_view(
+        metrics: &Arc<Metrics>,
+    ) -> (
+        Arc<ClientHandler>,
+        crate::pool_view::PoolProjection,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
+            .await
+            .expect("cache");
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let projection = crate::pool_view::PoolProjection::new();
+        let mut deps = ClientHandlerDeps::new(
+            iroh::SecretKey::generate().public(),
+            Arc::clone(metrics),
+            Arc::new(ConnectionLimiter::new(
+                &decdn_common::config::ResolvedSecurity {
+                    max_concurrent_handlers: u32::MAX,
+                    per_source_rate_per_sec: 1e9,
+                    per_source_burst: u32::MAX,
+                    max_tracked_sources: 16,
+                },
+                Arc::clone(metrics),
+            )),
+            cache,
+            Arc::new(alloy::signers::local::PrivateKeySigner::random()),
+            domain.clone(),
+            domain.clone(),
+            domain,
+            Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+                as Arc<dyn PoolStateStore>,
+            Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
+                crate::receipt_log::NoopReceiptLog,
+            ))) as Arc<dyn ReceiptSink>,
+            1,
+            crate::rate_bounds::RateBounds::new(0),
+            16,
+            Arc::new(crate::content_deny::ContentDenylist::empty()),
+            U256::ZERO,
+            always_admit_shed(),
+        );
+        deps.pool_view = Some(Arc::new(projection.clone()));
+        let handler = ClientHandler::new(deps).expect("handler");
+        (Arc::new(handler), projection, dir)
+    }
+
     /// Fix 1 (security): capability intake verifies the owner signature against
     /// the on-chain pool owner. A grant signed by a NON-owner key is dropped —
     /// never captured on a lane, never lane-registered — so it cannot revert the
@@ -4138,6 +4243,101 @@ mod tests {
         anyhow::ensure!(
             clamped.signer_floor_cap(TEST_RATE) == one_window,
             "k = 0 clamps up to one window regardless of the deposit"
+        );
+        Ok(())
+    }
+
+    /// A `PoolRedeemed` lane entry for the projection, at `cumulative` `µUSDC`.
+    fn lane_settled(
+        signer: Address,
+        cumulative: u64,
+    ) -> decdn_incentive::payment_pool::PaymentPool::LaneSettled {
+        decdn_incentive::payment_pool::PaymentPool::LaneSettled {
+            signer,
+            newPaidCumulative: cumulative,
+            bytesPaid: 0,
+        }
+    }
+
+    /// The mid-stream signer cap-headroom re-check stops a live stream once the
+    /// signer drains its shared `cap` at OTHER providers since admission — the drain
+    /// the pool-solvency re-check cannot see, because the pool's `remaining` stays
+    /// healthy on other signers' budgets.
+    #[tokio::test]
+    async fn midstream_signer_recheck_trips_when_signer_drains_at_other_nodes() -> anyhow::Result<()>
+    {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, projection, _dir) = handler_with_projection_view(&metrics).await;
+        let pool = B256::repeat_byte(0x51);
+        let signer = Address::new([0xa1; 20]);
+        let one_window =
+            decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
+        let ow = u64::try_from(one_window).expect("one window fits u64");
+        // The signer holds a cap of ten windows on this lane; the pool is richly
+        // funded, so only per-signer cap headroom can bind here.
+        let held_cap = U256::from(ow.saturating_mul(10));
+        projection.record_opened(pool, Address::new([0x07; 20]), U256::MAX);
+
+        // At admit the signer has spent one window across providers — nine windows of
+        // headroom remain, above the one-window floor, so the stream keeps serving.
+        projection.record_redeemed(pool, Address::new([0xc0; 20]), &[lane_settled(signer, ow)]);
+        anyhow::ensure!(
+            !handler
+                .signer_cap_drained_midstream(pool, signer, held_cap, TEST_RATE)
+                .await,
+            "nine windows of headroom must keep the stream serving"
+        );
+
+        // Mid-stream the signer drains the rest of its cap at a DIFFERENT provider,
+        // taking the cross-provider total to the full cap — headroom falls below one
+        // floor, so the re-check stops the stream.
+        projection.record_redeemed(
+            pool,
+            Address::new([0xc1; 20]),
+            &[lane_settled(signer, ow.saturating_mul(9))],
+        );
+        anyhow::ensure!(
+            handler
+                .signer_cap_drained_midstream(pool, signer, held_cap, TEST_RATE)
+                .await,
+            "a signer drained to its full cap across providers must stop the stream"
+        );
+        Ok(())
+    }
+
+    /// The re-check fails toward SERVING on the cold-start undercount: a pool the
+    /// projection has not folded reports zero spent, over-stating headroom, and a
+    /// handler with no pool-view skips the check entirely. Both mirror the pool
+    /// re-check's fail-open, and the admit-time `getAuthorization` (#1958) already
+    /// caught an already-exhausted signer authoritatively.
+    #[tokio::test]
+    async fn midstream_signer_recheck_fails_toward_serving_on_projection_gap() -> anyhow::Result<()>
+    {
+        let metrics = Arc::new(Metrics::new());
+        let pool = B256::repeat_byte(0x52);
+        let signer = Address::new([0xa2; 20]);
+
+        // Pool-view wired, but the pool is ABSENT from the projection (opened before
+        // the watcher's cold-start head): `signer_spent` under-counts to zero, so even
+        // a cap of exactly one floor reads as full headroom and the stream serves.
+        let (handler, _projection, _dir) = handler_with_projection_view(&metrics).await;
+        let one_window =
+            decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
+        anyhow::ensure!(
+            !handler
+                .signer_cap_drained_midstream(pool, signer, one_window, TEST_RATE)
+                .await,
+            "an unfolded pool under-counts spent to zero and must fail toward serving"
+        );
+
+        // No pool-view wired at all (dev/test): the re-check is skipped, whatever the
+        // held cap.
+        let (bare, _d) = handler_for_tests(&metrics).await;
+        anyhow::ensure!(
+            !bare
+                .signer_cap_drained_midstream(pool, signer, U256::ZERO, TEST_RATE)
+                .await,
+            "no pool-view wired must skip the re-check and keep serving"
         );
         Ok(())
     }

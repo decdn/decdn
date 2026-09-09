@@ -2240,7 +2240,9 @@ const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
             PullVerdict::OurVoucherRetryable(reason)
         }
         // Terminal for THIS lane while the pool row is still worth keeping. The signer's
-        // cap is spent (`SpendingCapExhausted`) or its capability expired
+        // cap is spent — either the upstream's voucher-amount check
+        // (`SpendingCapExhausted`) or its mid-stream cross-provider cap-headroom
+        // re-check (`SignerCapExhausted`) — or its capability expired
         // (`CapabilityExpired`), our accounting drifted
         // (`AmountRegression`/`BytesRegression`), or the voucher named the wrong pool or a
         // different provider (`WrongPool`/`WrongProvider`). None of these has surrendered
@@ -2252,6 +2254,7 @@ const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
         | VoucherRejectReason::AmountRegression
         | VoucherRejectReason::BytesRegression
         | VoucherRejectReason::SpendingCapExhausted
+        | VoucherRejectReason::SignerCapExhausted
         | VoucherRejectReason::CapabilityExpired => PullVerdict::OurDeadLane(reason),
     }
 }

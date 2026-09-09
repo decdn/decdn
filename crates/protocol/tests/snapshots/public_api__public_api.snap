@@ -39,6 +39,7 @@ pub decdn_protocol::client::VoucherRejectReason::CapabilityExpired
 pub decdn_protocol::client::VoucherRejectReason::ChainIndexZero
 pub decdn_protocol::client::VoucherRejectReason::ChunkPriceMismatch
 pub decdn_protocol::client::VoucherRejectReason::PoolExhausted
+pub decdn_protocol::client::VoucherRejectReason::SignerCapExhausted
 pub decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted
 pub decdn_protocol::client::VoucherRejectReason::UnanchoredPreimage
 pub decdn_protocol::client::VoucherRejectReason::WrongPool
@@ -389,6 +390,7 @@ pub decdn_protocol::VoucherRejectReason::CapabilityExpired
 pub decdn_protocol::VoucherRejectReason::ChainIndexZero
 pub decdn_protocol::VoucherRejectReason::ChunkPriceMismatch
 pub decdn_protocol::VoucherRejectReason::PoolExhausted
+pub decdn_protocol::VoucherRejectReason::SignerCapExhausted
 pub decdn_protocol::VoucherRejectReason::SpendingCapExhausted
 pub decdn_protocol::VoucherRejectReason::UnanchoredPreimage
 pub decdn_protocol::VoucherRejectReason::WrongPool

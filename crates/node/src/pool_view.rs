@@ -134,6 +134,29 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
         let _ = (pool_id, signer);
         Some(u64::MAX)
     }
+
+    /// The mid-stream signer-drain read: a `signer`'s total on-chain `spent` across
+    /// every provider in `pool_id`, from the event-fed projection ONLY — never a
+    /// chain call. The serve loop pairs it with the `cap` the node already holds on
+    /// the lane to test `held_cap − spent` headroom at the [`POOL_RECHECK_INTERVAL`]
+    /// cadence, so a signer draining its shared `cap` at another node mid-stream stops
+    /// this stream before it over-delivers unredeemable bytes (ADR 003 §Pool
+    /// solvency).
+    ///
+    /// - `Some(spent)` — the folded cross-provider total, `0` for a signer that has
+    ///   redeemed nothing in a pool the projection knows.
+    /// - `None` — no projection is wired (a chain-free test double), so the re-check
+    ///   is skipped and delivery continues; the on-chain `redeemMany` `min(desired,
+    ///   cap − spent)` remains the backstop.
+    ///
+    /// The default returns `None`. [`PoolProjection`] and the production wrapper
+    /// ([`crate::payment_settlement::ResolvingPoolView`]) override it to read the
+    /// projection, matching how [`Self::cached_status`] reads a pool's `remaining`
+    /// without blocking.
+    async fn signer_spent_cached(&self, pool_id: B256, signer: Address) -> Option<u64> {
+        let _ = (pool_id, signer);
+        None
+    }
 }
 
 /// Per-pool state the projection folds from the `PaymentPool` event log.
@@ -360,12 +383,44 @@ impl PoolProjection {
     pub fn snapshot(&self, pool_id: B256) -> Option<PoolStatus> {
         self.pools.load().get(&pool_id).map(PoolEntry::status)
     }
+
+    /// A `signer`'s total on-chain `spent` in this pool: the sum of its lane
+    /// cumulatives across EVERY provider. A signer's `cap` is shared across all
+    /// providers (ADR 003 §Deposit Economics), and on-chain `spent` for a signer is
+    /// exactly what it has redeemed at each provider summed, so summing this signer's
+    /// `(signer, provider)` lanes — the same folded cumulatives `total_redeemed`
+    /// draws on — reconstructs it. The serve path's mid-stream signer cap-headroom
+    /// re-check reads this to catch a signer draining its shared `cap` at another node
+    /// mid-stream (ADR 003 §Pool solvency).
+    ///
+    /// `0` for a pool the projection has not folded, or one in which the signer has
+    /// redeemed nothing — both make the re-check's `held_cap − spent` headroom its
+    /// widest, so the re-check fails toward serving on a projection gap (the
+    /// admit-time `getAuthorization` already caught an already-exhausted signer
+    /// authoritatively; this only bounds drain SINCE admit). `saturating_add` cannot
+    /// exceed the folded `total_redeemed`, which is itself bounded by the deposit.
+    #[must_use]
+    pub fn signer_spent(&self, pool_id: B256, signer: Address) -> u64 {
+        let pools = self.pools.load();
+        let Some(entry) = pools.get(&pool_id) else {
+            return 0;
+        };
+        entry
+            .lanes
+            .iter()
+            .filter(|((lane_signer, _provider), _)| *lane_signer == signer)
+            .fold(0u64, |acc, (_, &cumulative)| acc.saturating_add(cumulative))
+    }
 }
 
 #[async_trait::async_trait]
 impl PoolView for PoolProjection {
     async fn status(&self, pool_id: B256) -> Option<PoolStatus> {
         self.pools.load().get(&pool_id).map(PoolEntry::status)
+    }
+
+    async fn signer_spent_cached(&self, pool_id: B256, signer: Address) -> Option<u64> {
+        Some(self.signer_spent(pool_id, signer))
     }
 }
 
@@ -616,6 +671,48 @@ mod tests {
                 deadline: 1_900_000_000
             }
         );
+    }
+
+    #[tokio::test]
+    async fn signer_spent_sums_a_signers_lanes_across_providers() {
+        let view = PoolProjection::new();
+        view.record_opened(pool(1), addr(7), U256::from(10_000u64));
+        // Signer 2 redeems at two providers; signer 3 redeems at one. `signer_spent`
+        // for signer 2 sums BOTH of its lanes (the shared-cap total), and ignores
+        // signer 3's lane.
+        view.record_redeemed(pool(1), addr(100), &[lane(addr(2), 200), lane(addr(3), 90)]);
+        view.record_redeemed(pool(1), addr(101), &[lane(addr(2), 350)]);
+        assert_eq!(view.signer_spent(pool(1), addr(2)), 550);
+        assert_eq!(view.signer_spent(pool(1), addr(3)), 90);
+        // A signer with no lane in the pool has spent nothing.
+        assert_eq!(view.signer_spent(pool(1), addr(9)), 0);
+        // The cross-provider view reads the same through the trait surface.
+        assert_eq!(view.signer_spent_cached(pool(1), addr(2)).await, Some(550));
+    }
+
+    #[tokio::test]
+    async fn signer_spent_unknown_pool_is_zero() {
+        // A pool the projection has not folded (opened before the watcher's
+        // cold-start head) reports zero spent, so the mid-stream re-check's
+        // `held_cap − spent` headroom is its widest — the fail-toward-serving
+        // direction.
+        let view = PoolProjection::new();
+        assert_eq!(view.signer_spent(pool(1), addr(2)), 0);
+    }
+
+    #[tokio::test]
+    async fn signer_spent_tracks_a_drain_since_admit() {
+        // Model the mid-stream drain the re-check catches: at admit the signer has
+        // spent little, then it drains its shared cap at OTHER providers while a
+        // stream is live here — `signer_spent` rises as those redemptions fold.
+        let view = PoolProjection::new();
+        view.record_opened(pool(1), addr(7), U256::from(10_000u64));
+        view.record_redeemed(pool(1), addr(100), &[lane(addr(2), 100)]);
+        assert_eq!(view.signer_spent(pool(1), addr(2)), 100);
+        // Drain at two more providers mid-stream.
+        view.record_redeemed(pool(1), addr(101), &[lane(addr(2), 4_000)]);
+        view.record_redeemed(pool(1), addr(102), &[lane(addr(2), 3_000)]);
+        assert_eq!(view.signer_spent(pool(1), addr(2)), 7_100);
     }
 
     #[tokio::test]

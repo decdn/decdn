@@ -828,6 +828,13 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
         self.projection.snapshot(pool_id)
     }
 
+    async fn signer_spent_cached(&self, pool_id: B256, signer: Address) -> Option<u64> {
+        // The mid-stream signer cap-headroom re-check: projection ONLY, never a
+        // `getAuthorization`. A signer that drains its shared `cap` at another node
+        // shows up here as the settlement watcher folds that node's `PoolRedeemed`.
+        Some(self.projection.signer_spent(pool_id, signer))
+    }
+
     async fn signer_cap_headroom_micro(&self, pool_id: B256, signer: Address) -> Option<u64> {
         // Fast path: a fresh cached headroom needs no `getAuthorization`.
         {

@@ -1206,6 +1206,18 @@ pub enum VoucherRejectReason {
     /// capability ownership; the open-time equivalent stays wire-`NotFound`
     /// (anti-enumeration). Not watermark-gated.
     PoolExhausted,
+    /// The signer's shared on-chain `cap − spent` headroom, tracked across every
+    /// provider, can no longer cover a serve floor — the signer has drained its
+    /// `cap` at OTHER nodes since this stream was admitted, so further vouchers
+    /// here would redeem `min(desired, cap − spent) ≈ 0` and the node would eat the
+    /// delivered bytes (ADR 003 §Pool solvency). A per-SIGNER condition, distinct
+    /// from [`Self::PoolExhausted`]: the pool's `remaining` can be healthy on other
+    /// signers' budgets while this one signer's cap is spent. Recovery: the pool
+    /// **owner** raises this signer's cap or delegates a fresh capability. Emitted
+    /// mid-stream after the client has proved capability ownership, so naming the
+    /// condition is post-auth and leaks nothing an open-time refusal must hide (the
+    /// admit-time equivalent stays wire-`NotFound`). Not watermark-gated.
+    SignerCapExhausted,
     /// A released [`ChunkPreimage`] does not hash to the stream's deepest
     /// verified preimage in `index − verified` steps (ADR 003 §Concurrent
     /// Streams, Rule 2). A payer bug — a wrong seed, a wrong chain, or a
@@ -1650,6 +1662,7 @@ mod tests {
             VoucherRejectReason::SpendingCapExhausted,
             VoucherRejectReason::CapabilityExpired,
             VoucherRejectReason::PoolExhausted,
+            VoucherRejectReason::SignerCapExhausted,
             VoucherRejectReason::BadPreimage,
             VoucherRejectReason::ChainIndexZero,
             VoucherRejectReason::UnanchoredPreimage,

@@ -1129,6 +1129,18 @@ pub struct DecdnMetrics {
     /// at other nodes. Visible name:
     /// `decdn_serve_stream_rejected_signer_cap_exhausted_total`.
     pub serve_stream_rejected_signer_cap_exhausted: Counter,
+    /// A live serve was stopped MID-STREAM because the request's voucher signer
+    /// drained its shared on-chain `cap` at other nodes AFTER admission — the
+    /// event-fed projection's `signer_spent` rose until the `cap − spent` headroom
+    /// the node holds on the lane no longer covers a serve floor (ADR 003 §Pool
+    /// solvency). The mid-stream twin of `serve_stream_rejected_signer_cap_exhausted`
+    /// (which is the admit-time refusal), kept distinct so a running value flags
+    /// cross-node cap drain on long streams — the large-blob over-delivery this
+    /// re-check bounds — rather than an open-time refusal. The stream stops in-band
+    /// with a `VoucherRejected { SignerCapExhausted }`, wire-`NotFound`-equivalent at
+    /// open time. Visible name:
+    /// `decdn_serve_stream_midstream_signer_cap_exhausted_total`.
+    pub serve_stream_midstream_signer_cap_exhausted: Counter,
     /// Delivery refused because ONE capability signer hit its per-signer live
     /// concurrency cap of un-vouchered reservation, while the pool itself can still
     /// pay (ADR 003 §Pool solvency, per-signer floor isolation).
@@ -1961,6 +1973,11 @@ recorders! {
     /// floor) or its authorization could not be confirmed — a capability this node
     /// could never cash.
     serve_stream_rejected_signer_cap_exhausted => serve_stream_rejected_signer_cap_exhausted.inc();
+
+    /// Record a live serve stopped mid-stream because its voucher signer drained
+    /// its shared on-chain `cap` at other nodes after admission, so the headroom the
+    /// node holds on the lane no longer covers a serve floor.
+    serve_stream_midstream_signer_cap_exhausted => serve_stream_midstream_signer_cap_exhausted.inc();
 
     /// Record a `serve_stream` delivery refused because this capability signer hit its
     /// per-signer live concurrency cap of un-vouchered reservation, while the pool as a
@@ -3175,6 +3192,7 @@ mod tests {
             "decdn_serve_stream_rejected_insufficient_deposit_total",
             "decdn_serve_stream_rejected_pool_unconfirmed_total",
             "decdn_serve_stream_rejected_signer_cap_exhausted_total",
+            "decdn_serve_stream_midstream_signer_cap_exhausted_total",
             "decdn_serve_stream_rejected_signer_floor_at_cap_total",
             // Completed in #1520. These four always exported (the fields have
             // existed as long as their siblings) — what was missing was any
@@ -3202,6 +3220,7 @@ mod tests {
         metrics.serve_stream_rejected_insufficient_deposit();
         metrics.serve_stream_rejected_pool_unconfirmed();
         metrics.serve_stream_rejected_signer_cap_exhausted();
+        metrics.serve_stream_midstream_signer_cap_exhausted();
         metrics.serve_stream_rejected_signer_floor_at_cap();
         metrics.serve_stream_rejected_range_not_satisfiable();
         metrics.serve_stream_rejected_hash_denied();
