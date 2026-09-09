@@ -24,11 +24,10 @@
 //! - **Redemption (per-chunk floor + on-shutdown).** On a redeem hint (a
 //!   [`LaneKey`]) emitted by the voucher-accept path, the node reads the lane's
 //!   owed voucher and its cached paid watermark and plans the lane for
-//!   redemption. A lane whose persisted `registered_until` is still live skips
-//!   the chain read entirely; every other candidate lane in the batch is
-//!   resolved with ONE `getAuthorizations` call rather than one
-//!   `getAuthorization` per lane, and an observed on-chain registration is
-//!   persisted back so later sweeps skip its read too. A low-frequency
+//!   redemption — with no chain read. A signer this node has not yet registered
+//!   attaches a `CapabilityReg` from its held `owner_sig`; on-chain registration
+//!   is idempotent, and the first landed redemption persists `registered_until`
+//!   so later passes attach nothing. A low-frequency
 //!   self-tick sweeps every persisted lane, packs the planned lanes into
 //!   chunks, and submits a chunk — one `redeemMany` — only once the aggregate
 //!   unredeemed value across that chunk's lanes clears a configurable floor,
@@ -73,7 +72,7 @@ use decdn_incentive::{
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::chain_events::REORG_MARGIN_BLOCKS;
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
@@ -1101,22 +1100,26 @@ const fn is_registered(registered_until: u64, now: u64) -> bool {
     registered_until > now
 }
 
-/// The on-chain registration status resolved for a lane before planning it.
+/// Whether this node has confirmed a lane's signer is registered on-chain,
+/// resolved from the persisted `registered_until` watermark alone — no chain read.
 enum RegistrationStatus {
-    /// `registered_until > now`: skip the chain read, attach no `CapabilityReg`.
+    /// `registered_until > now`: this node has landed the signer's registration;
+    /// attach no `CapabilityReg`.
     Registered,
-    /// A fresh `getAuthorization` for a lane whose persisted state was
-    /// unknown/expired. `cap == 0` means "attach a `CapabilityReg`".
-    Fetched(PaymentPool::Authorization),
+    /// Not yet confirmed registered by this node: attach a `CapabilityReg` built
+    /// from the lane's held `owner_sig`. On-chain registration is idempotent (a
+    /// duplicate or already-registered signer is a no-op), so this is safe even
+    /// when another provider already registered the signer; the first landed
+    /// redemption persists `registered_until` and every later one skips the reg.
+    Unregistered,
 }
 
 /// Plan one lane for redemption from its already-loaded state and a resolved
-/// registration status. Pure and I/O-free — the caller ([`plan_lanes`])
-/// resolves the registration status first (batched chain read or the
-/// persisted `registered_until` watermark). Returns `Ok(None)` when the lane
-/// is not this node's, has no signed voucher, has nothing unredeemed, or is
-/// an unregistered signer whose lane carries no owner-signed capability material
-/// (`owner_sig`).
+/// registration status. Pure and I/O-free — the caller ([`plan_lanes`]) resolves
+/// the status from the persisted `registered_until` watermark alone, with no chain
+/// read. Returns `Ok(None)` when the lane is not this node's, has no signed
+/// voucher, has nothing unredeemed, or — a node-durability fault that should not
+/// occur — is an unregistered signer whose lane has lost its `owner_sig`.
 fn plan_lane(
     st: &LaneState,
     paid: &PaidWatermarks,
@@ -1157,22 +1160,31 @@ fn plan_lane(
     }
 
     let register = match status {
-        RegistrationStatus::Fetched(auth) if auth.cap == 0 => {
+        RegistrationStatus::Registered => None,
+        RegistrationStatus::Unregistered => {
             let Some(owner_sig) = st.owner_sig else {
-                warn!(
+                // `owner_sig` is written in the SAME fsynced row as the frontier
+                // (#1906), so a crash loses the value and its `owner_sig` together —
+                // a lane with redeemable value always carries the material to
+                // register its signer. Reaching here means the durable row kept the
+                // value but lost the `owner_sig`, a node-side durability fault. The
+                // client already sent its capability once; it is not asked to
+                // re-send. Skip the lane and surface the invariant break.
+                error!(
                     pool_id = %key.pool_id,
                     signer = %key.signer,
-                    "signer not registered on-chain and the lane carries no owner-signed \
-                     capability (owner_sig); skipping redemption until the client re-sends \
-                     its capability"
+                    "BUG: redeemable lane has no owner_sig, so its signer cannot be \
+                     registered; skipping (node durability fault, not a client re-send)"
                 );
                 return Ok(None);
             };
             // Every field of the registration payload comes off the lane record
-            // itself — the same durable row as the frontier being redeemed — so a
-            // lane the redeemer can weigh always carries the material to register
-            // its signer (#1906). `cap` recovers the `u64` spending cap the intake
-            // path zero-extended into the lane's `U256`.
+            // itself — the same durable row as the frontier being redeemed (#1906).
+            // On-chain registration is idempotent, so attaching this when the signer
+            // is already registered elsewhere is a harmless no-op; the first landed
+            // redemption persists `registered_until` and every later one omits it.
+            // `cap` recovers the `u64` spending cap the intake path zero-extended
+            // into the lane's `U256`.
             Some(PaymentPool::CapabilityReg {
                 signer: key.signer,
                 spendingCap: to_pool_u64(st.cap, "capability spending cap")?,
@@ -1180,7 +1192,6 @@ fn plan_lane(
                 ownerSig: Bytes::from(owner_sig.to_vec()),
             })
         }
-        RegistrationStatus::Registered | RegistrationStatus::Fetched(_) => None,
     };
 
     let (r, vs) = compact_voucher_signature(&claim.signature)
@@ -1212,50 +1223,16 @@ fn plan_lane(
     }))
 }
 
-/// One `getAuthorizations` for every lane whose registration this node does not
-/// already know, returned as a `(pool_id, signer) -> Authorization` map. An
-/// empty input issues no call. A length skew in the reply (never expected from
-/// the contract) drops the unpaired tail — those lanes simply defer to the next
-/// sweep — rather than indexing out of bounds.
-async fn batched_authorizations<P: Provider + Clone>(
-    contract: &PaymentPool::PaymentPoolInstance<P>,
-    keys: &[LaneKey],
-) -> Result<HashMap<(B256, Address), PaymentPool::Authorization>> {
-    if keys.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let pool_ids: Vec<B256> = keys.iter().map(|k| k.pool_id).collect();
-    let signers: Vec<Address> = keys.iter().map(|k| k.signer).collect();
-    let auths = contract
-        .getAuthorizations(pool_ids, signers)
-        .call()
-        .await
-        .context("getAuthorizations for redemption")?;
-    if auths.len() != keys.len() {
-        warn!(
-            requested = keys.len(),
-            returned = auths.len(),
-            "getAuthorizations returned a mismatched count; deferring the unpaired lanes"
-        );
-    }
-    let mut map = HashMap::with_capacity(keys.len());
-    for (key, auth) in keys.iter().zip(auths) {
-        map.insert((key.pool_id, key.signer), auth);
-    }
-    Ok(map)
-}
-
-/// Plan a set of candidate lanes for redemption with ONE batched
-/// `getAuthorizations` for the lanes whose registration is unknown or expired.
-/// A lane whose persisted `registered_until` is still live skips the read
-/// entirely. For a freshly-read lane already registered on-chain (`cap != 0`),
-/// the observed `expiry` is persisted so later sweeps skip its read too. A batch
-/// read failure defers the read-needing lanes to the next sweep (their planning
-/// is dropped this pass) while still planning the known-registered lanes.
+/// Plan a set of candidate lanes for redemption. The only on-chain-derived gate
+/// is pool solvency (the event-fed [`PoolProjection`], read below); a lane's
+/// signer-registration status is resolved locally from its persisted
+/// `registered_until` watermark — no `getAuthorization` read. A lane not yet
+/// confirmed registered attaches a `CapabilityReg` from its held `owner_sig`
+/// ([`plan_lane`]); on-chain registration is idempotent, so this is safe even for
+/// a signer another provider already registered, and the first landed redemption
+/// persists `registered_until` so later passes skip the reg.
 #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
-async fn plan_lanes<P: Provider + Clone>(
-    contract: &PaymentPool::PaymentPoolInstance<P>,
-    store: &Arc<dyn PoolStateStore>,
+fn plan_lanes(
     paid: &PaidWatermarks,
     self_address: Address,
     states: Vec<LaneState>,
@@ -1263,8 +1240,9 @@ async fn plan_lanes<P: Provider + Clone>(
     pool_view: &PoolProjection,
 ) -> Vec<PlannedLane> {
     let now = unix_now();
-    // Solvency gate first: hold/drop lanes whose pool cannot pay, before any
-    // getAuthorizations read or planning. Fail open on an unknown pool.
+    // The redeemer's only on-chain-derived gate: hold/drop lanes whose pool cannot
+    // pay, read from the event-fed projection. Fail open on an unknown pool. A
+    // lane's signer-registration status is resolved locally below — no chain read.
     let mut snapshot: HashMap<PoolId, Option<PoolStatus>> = HashMap::new();
     for st in &states {
         snapshot
@@ -1275,44 +1253,18 @@ async fn plan_lanes<P: Provider + Clone>(
     if skipped > 0 {
         metrics.redemption_skipped_insolvent_by(skipped as u64);
     }
-    let read_keys: Vec<LaneKey> = states
-        .iter()
-        .filter(|st| st.provider == self_address && !is_registered(st.registered_until, now))
-        .map(LaneState::key)
-        .collect();
-    let auth_map = match batched_authorizations(contract, &read_keys).await {
-        Ok(m) => m,
-        Err(err) => {
-            metrics.redemption_failure();
-            warn!(err = %sanitize_rpc_display(&err), "batched getAuthorizations failed; deferring read-needing lanes");
-            HashMap::new()
-        }
-    };
-    // Persist observed expiry for signers already registered on-chain, so a
-    // restart or later sweep skips their read. `read_keys` already holds exactly
-    // the lanes queried (each a unique `(pool_id, signer)` at `provider ==
-    // self`), so walk it directly rather than rescanning `states` per auth.
-    for key in &read_keys {
-        if let Some(auth) = auth_map.get(&(key.pool_id, key.signer))
-            && auth.cap != 0
-            && let Err(err) = store.set_registered_until(*key, auth.expiry)
-        {
-            warn!(%err, pool_id = %key.pool_id, signer = %key.signer,
-                "failed to persist observed registration expiry");
-        }
-    }
     let mut plans: Vec<PlannedLane> = Vec::new();
     for st in &states {
         if st.provider != self_address {
             continue;
         }
+        // Registered iff this node has already landed the signer's registration
+        // (persisted `registered_until` still live); otherwise attach a
+        // `CapabilityReg` from the held `owner_sig` ([`plan_lane`]).
         let reg_status = if is_registered(st.registered_until, now) {
             RegistrationStatus::Registered
         } else {
-            match auth_map.get(&(st.pool_id, st.signer)) {
-                Some(auth) => RegistrationStatus::Fetched(auth.clone()),
-                None => continue, // read failed/omitted; defer to the next sweep
-            }
+            RegistrationStatus::Unregistered
         };
         match plan_lane(st, paid, self_address, &reg_status) {
             Ok(Some(lane)) => plans.push(lane),
@@ -1350,16 +1302,7 @@ async fn redeem_one<P: Provider + Clone>(
             return;
         }
     };
-    let plans = plan_lanes(
-        contract,
-        store,
-        paid,
-        self_address,
-        vec![st],
-        metrics,
-        pool_view,
-    )
-    .await;
+    let plans = plan_lanes(paid, self_address, vec![st], metrics, pool_view);
     // Hint path: require the durability floor and skip the submit on a failed
     // flush (`strict_flush`); the lane defers to the next sweep.
     redeem_planned_lanes(contract, store, plans, floor, max_vouchers, true, metrics).await;
@@ -1389,16 +1332,7 @@ async fn redeem_sweep<P: Provider + Clone>(
             return;
         }
     };
-    let plans = plan_lanes(
-        contract,
-        store,
-        paid,
-        self_address,
-        states,
-        metrics,
-        pool_view,
-    )
-    .await;
+    let plans = plan_lanes(paid, self_address, states, metrics, pool_view);
     redeem_planned_lanes(
         contract,
         store,
@@ -2616,16 +2550,8 @@ mod tests {
         st
     }
 
-    fn auth(cap: u64, expiry: u64) -> PaymentPool::Authorization {
-        PaymentPool::Authorization {
-            cap,
-            expiry,
-            spent: 0,
-        }
-    }
-
     #[test]
-    fn plan_lane_registered_status_skips_read_and_omits_capability_reg() -> Result<()> {
+    fn plan_lane_registered_omits_capability_reg() -> Result<()> {
         let st = signed_lane_state(1, 10, 20, None);
         let paid = PaidWatermarks::default();
         let plan = plan_lane(
@@ -2637,22 +2563,26 @@ mod tests {
         .ok_or_else(|| anyhow::anyhow!("registered lane with owed balance should plan"))?;
         assert!(
             plan.register.is_none(),
-            "registered lane attaches no CapabilityReg"
+            "a lane this node has registered attaches no CapabilityReg"
         );
         assert_eq!(plan.key, st.key());
         Ok(())
     }
 
     #[test]
-    fn plan_lane_fetched_unregistered_with_material_attaches_registration() -> Result<()> {
+    fn plan_lane_unregistered_with_material_attaches_registration() -> Result<()> {
         let st = signed_lane_state(1, 11, 21, Some(sig_with_v(1)));
         let paid = PaidWatermarks::default();
-        let status = RegistrationStatus::Fetched(auth(0, 0));
-        let plan = plan_lane(&st, &paid, Address::from([21u8; 20]), &status)?
-            .ok_or_else(|| anyhow::anyhow!("unregistered lane with held material should plan"))?;
-        let reg = plan
-            .register
-            .ok_or_else(|| anyhow::anyhow!("cap==0 + owner_sig attaches a CapabilityReg"))?;
+        let plan = plan_lane(
+            &st,
+            &paid,
+            Address::from([21u8; 20]),
+            &RegistrationStatus::Unregistered,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("unregistered lane with held material should plan"))?;
+        let reg = plan.register.ok_or_else(|| {
+            anyhow::anyhow!("an unregistered signer with owner_sig attaches a CapabilityReg")
+        })?;
         assert_eq!(reg.signer, st.signer, "reg names the lane's signer");
         assert_eq!(reg.expiry, st.expiry, "reg carries the lane's expiry");
         assert_eq!(
@@ -2665,31 +2595,19 @@ mod tests {
     }
 
     #[test]
-    fn plan_lane_fetched_unregistered_without_material_is_skipped() -> Result<()> {
+    fn plan_lane_unregistered_without_material_is_skipped() -> Result<()> {
         let st = signed_lane_state(1, 12, 22, None);
         let paid = PaidWatermarks::default();
-        let status = RegistrationStatus::Fetched(auth(0, 0));
-        let plan = plan_lane(&st, &paid, Address::from([22u8; 20]), &status)?;
+        let plan = plan_lane(
+            &st,
+            &paid,
+            Address::from([22u8; 20]),
+            &RegistrationStatus::Unregistered,
+        )?;
         assert!(
             plan.is_none(),
-            "no owner_sig on the lane and cap==0 skips the lane"
+            "an unregistered lane with no owner_sig is a durability fault and is skipped"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn plan_lane_fetched_already_registered_omits_registration() -> Result<()> {
-        let st = signed_lane_state(1, 13, 23, None);
-        let paid = PaidWatermarks::default();
-        let status = RegistrationStatus::Fetched(auth(5_000_000, 1_800_000_000));
-        let plan = plan_lane(&st, &paid, Address::from([23u8; 20]), &status)?.ok_or_else(|| {
-            anyhow::anyhow!("already-registered lane with owed balance should plan")
-        })?;
-        assert!(
-            plan.register.is_none(),
-            "cap!=0 rides the existing registration; no CapabilityReg attached"
-        );
-        assert_eq!(plan.key, st.key());
         Ok(())
     }
 }
