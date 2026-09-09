@@ -53,11 +53,13 @@ fn keystore(out: &TempDir) -> PathBuf {
     eth_identity::keystore_path(out.path())
 }
 
-/// `DECDN_KEYSTORE_PASSWORD=""` is a deliberate empty password, not an unset
-/// variable, so it is used — and being first in precedence, it outranks the
-/// `--keystore-password-file` alongside it.
+/// Creating under an empty `DECDN_KEYSTORE_PASSWORD` is refused (#1935): a
+/// set-but-empty env var is almost always a shell expanding an unset variable,
+/// and creation is the unverifiable direction. The error names the source and
+/// nothing is written. A deliberate empty password keeps a reachable path
+/// through an empty `--keystore-password-file` (covered below).
 #[test]
-fn an_empty_env_password_is_used_and_outranks_the_password_file() {
+fn creating_under_an_empty_env_password_is_refused_naming_the_source() {
     let (home, out) = dirs();
     let pw_file = out.path().join("pw.txt");
     fs::write(&pw_file, b"not-this-one").unwrap();
@@ -67,17 +69,45 @@ fn an_empty_env_password_is_used_and_outranks_the_password_file() {
         .arg(&pw_file)
         .env(eth_identity::KEYSTORE_PASSWORD_ENV, ""));
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an empty env password must not create a keystore: {stderr}"
+    );
+    assert!(
+        stderr.contains(eth_identity::KEYSTORE_PASSWORD_ENV),
+        "the error must name the env source: {stderr}"
+    );
+    assert!(
+        !keystore(&out).exists(),
+        "no key material may be written when an empty env password is refused"
+    );
+    assert!(
+        !decdn_common::identity::key_path(out.path()).exists(),
+        "node.secret must not be half-written either"
+    );
+}
+
+/// A `--keystore-password-file` shadowed by a set `DECDN_KEYSTORE_PASSWORD`
+/// warns that the file was not used (#1934) — a previously silent inert flag —
+/// while the env var still wins per precedence.
+#[test]
+fn a_shadowed_password_file_warns_and_env_still_wins() {
+    let (home, out) = dirs();
+    let pw_file = out.path().join("pw.txt");
+    fs::write(&pw_file, b"file-password").unwrap();
+
+    let output = run(key_gen(home.path(), out.path())
+        .arg("--keystore-password-file")
+        .arg(&pw_file)
+        .env(eth_identity::KEYSTORE_PASSWORD_ENV, "env-password"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "key-gen failed: {stderr}");
 
-    let path = keystore(&out);
-    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "keystore mode {mode:#o}");
-    eth_identity::load_signer(&path, "").expect("the empty password must open the keystore");
-    eth_identity::load_signer(&path, "not-this-one")
-        .expect_err("the password file must not have won over the set env var");
+    eth_identity::load_signer(&keystore(&out), "env-password")
+        .expect("the env var must win over the shadowed file");
     assert!(
-        stderr.contains("EMPTY password"),
-        "creating under an empty password must warn: {stderr}"
+        stderr.contains(&pw_file.display().to_string()) && stderr.contains("was not used"),
+        "a shadowed password file must be named in a warning: {stderr}"
     );
 }
 

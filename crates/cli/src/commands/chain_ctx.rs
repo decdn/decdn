@@ -15,7 +15,7 @@ use anyhow::Context;
 use decdn_common::cli;
 use decdn_common::cli::common::expand_tilde;
 use decdn_common::config::DEFAULT_CHAIN_ID;
-use decdn_incentive::eth_identity::{self, PasswordSource, PasswordUse};
+use decdn_incentive::eth_identity::{self, PasswordSource, PasswordUse, ResolvedPassword};
 use serde::Deserialize;
 
 /// Partial deserializer for the TOML config — only the `[blockchain]` and
@@ -238,6 +238,25 @@ pub(crate) fn password_sources(
     eth_identity::standard_sources(password_file.map(expand_tilde), usage)
 }
 
+/// Resolve the keystore password and print any source warnings to stderr. The
+/// shared CLI entry point to [`eth_identity::read_password`]: `decdn-incentive`
+/// denies `print_stderr`, so it returns the warnings for a caller to surface,
+/// and the CLI is where a mistyped `--keystore-password-file` is typed.
+///
+/// Returns the full [`ResolvedPassword`] so a caller that must inspect the
+/// winning source — `key-gen`'s empty-password guard — still can; callers that
+/// only need the secret take [`ResolvedPassword::into_secret`].
+pub(crate) fn read_keystore_password(
+    sources: &[PasswordSource],
+    prompt_label: &str,
+) -> anyhow::Result<ResolvedPassword> {
+    let resolved = eth_identity::read_password(sources, prompt_label)?;
+    for warning in resolved.warnings() {
+        eprintln!("warning: {warning}");
+    }
+    Ok(resolved)
+}
+
 /// Load an Ethereum keystore signer, sourcing the password per
 /// `password_sources`. The scrypt KDF is offloaded to `spawn_blocking` so it
 /// doesn't stall the async executor.
@@ -250,10 +269,11 @@ pub async fn load_signer_with_password_file(
     password_file: Option<&Path>,
     keystore: &Path,
 ) -> anyhow::Result<PrivateKeySigner> {
-    let password = eth_identity::read_password(
+    let password = read_keystore_password(
         &password_sources(password_file, PasswordUse::Unlock),
         "eth keystore password",
-    )?;
+    )?
+    .into_secret();
     let keystore = keystore.to_path_buf();
     let display = keystore.display().to_string();
     tokio::task::spawn_blocking(move || eth_identity::load_signer(&keystore, &password))

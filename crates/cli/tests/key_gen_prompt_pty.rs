@@ -213,6 +213,44 @@ fn a_password_file_wins_over_an_available_prompt() {
         .expect("keystore does not decrypt with the password from the file");
 }
 
+/// A mistyped `--keystore-password-file` falls through to the interactive
+/// prompt on a TTY, and the silent mode change is called out (#1934): the
+/// warning names the path that was not found, so the operator learns the file
+/// was the problem before the same typo fails headless under systemd. The
+/// prompt still drives the keystore to completion.
+#[test]
+fn a_missing_password_file_warns_then_falls_through_to_the_prompt() {
+    let (home, out) = dirs();
+    let typo = out.path().join("kesytore.pw"); // deliberately not created
+
+    let mut session = spawn(
+        home.path(),
+        &[
+            "key-gen",
+            "--output-dir",
+            &out.path().to_string_lossy(),
+            "--keystore-password-file",
+            &typo.to_string_lossy(),
+        ],
+    );
+
+    // The prompt is reached because the file fell through; the warning naming
+    // the skipped path is emitted once the password resolves.
+    session.exp_string(PROMPT).unwrap();
+    session.send_line(PASSWORD).unwrap();
+    session.exp_string(CONFIRM_PROMPT).unwrap();
+    session.send_line(PASSWORD).unwrap();
+
+    session
+        .exp_string(&format!("password file {} not found", typo.display()))
+        .unwrap();
+    session.exp_string("eth address: ").unwrap();
+    session.exp_eof().unwrap();
+    assert_eq!(exit_code(&session), 0, "expected a successful exit");
+    eth_identity::load_signer(&keystore_path(&out), PASSWORD)
+        .expect("keystore does not decrypt with the prompted password");
+}
+
 /// The `PasswordUse::Unlock` half: a command opening an existing keystore asks
 /// once and never confirms.
 ///

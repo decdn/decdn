@@ -91,10 +91,10 @@ fn keystore_state(keystore: &Path) -> anyhow::Result<KeystoreState> {
 fn resolve_password(password_file: Option<&Path>) -> anyhow::Result<KeystorePassword> {
     let sources = super::chain_ctx::password_sources(password_file, PasswordUse::Unlock);
     if password_source_present(&sources) {
-        Ok(KeystorePassword::Supplied(eth_identity::read_password(
-            &sources,
-            "eth keystore password",
-        )?))
+        Ok(KeystorePassword::Supplied(
+            super::chain_ctx::read_keystore_password(&sources, "eth keystore password")?
+                .into_secret(),
+        ))
     } else {
         Ok(KeystorePassword::Unavailable)
     }
