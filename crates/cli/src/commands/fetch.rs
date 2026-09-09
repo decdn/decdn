@@ -109,10 +109,12 @@ pub(crate) fn micros_now() -> u64 {
 /// TTY-aware — `indicatif` hides it automatically when stderr is not a terminal,
 /// so a piped/redirected fetch emits no bar. A steady tick animates the spinner
 /// during the pre-byte connect/handshake so the command never looks hung. The
-/// bar counts **delivered content bytes** against the blob's content size — the
-/// driver reports `base_present + received` (verified ranged-store leaf bytes),
-/// not the wire size, so its total matches the byte count printed on
-/// completion.
+/// bar counts **delivered content bytes** against the blob's content size —
+/// verified ranged-store leaf bytes, not the wire size — so its total matches the
+/// byte count printed on completion. On a single-source fetch the driver reports
+/// this lane's `base_present + received`; a multi-source fetch instead reports one
+/// monotonic total the lanes fold their per-leg deltas into, so the bar never
+/// jumps between lanes' divergent local positions.
 fn new_progress_bar() -> indicatif::ProgressBar {
     let style = indicatif::ProgressStyle::with_template(
         // Rate/ETA come from `{msg}` (see `delivery_progress`), not the built-in

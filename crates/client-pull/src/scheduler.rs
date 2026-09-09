@@ -78,7 +78,7 @@
 //! hanging.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -90,7 +90,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::coverage_plan::{SourceCoverage, covers_byte_range, spread_segments};
 use crate::driver::{
     DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PoolExhausted, SharedPool,
-    contiguous_byte_ranges, drive_with_interval_flush, fill_gap,
+    contiguous_byte_ranges, drive_with_interval_flush, fill_gap, ranges_content_len,
 };
 use crate::retry::{RetryDisposition, retry_disposition};
 use crate::segment::{split_evenly, steal_split};
@@ -555,6 +555,7 @@ async fn run_worker<St, S, P, F>(
     progress_wake: &Notify,
     faults: &Mutex<Vec<LaneFault>>,
     on_progress: Option<&ProgressCallback>,
+    progress_agg: &AtomicU64,
     unit_deadline: Duration,
     pool: &SharedPool<'_>,
     lane_coverage: &[Coverage],
@@ -654,6 +655,9 @@ where
                     drive,
                     &mut counters,
                     on_progress,
+                    // The shared whole-blob delivered counter: every lane folds its
+                    // own leg deltas in, so the bar reads one monotonic position.
+                    Some(progress_agg),
                     None,
                     None,
                     // Everything this lane must not treat as its own: the
@@ -972,6 +976,16 @@ where
         credit: &credit,
     };
 
+    // ONE monotonic whole-blob delivered-byte counter behind the progress bar,
+    // shared by every lane. Seeded with the bytes already present so a resumed
+    // fetch's bar starts where the last run left off, then each lane folds in its
+    // own leg deltas. Without this each lane reported its own `base_present +
+    // received`, so the bar jumped between lanes and the smoothed rate ramped
+    // without bound (the local absolute positions diverge and are non-monotonic
+    // when interleaved).
+    let base_present = ranges_content_len(&store.present_ranges().await?, total_bytes);
+    let progress_agg = AtomicU64::new(base_present);
+
     let workers = lanes.iter().enumerate().map(|(i, lane)| {
         run_worker(
             i,
@@ -988,6 +1002,7 @@ where
             &progress_wake,
             &faults,
             on_progress,
+            &progress_agg,
             ms.unit_deadline,
             &pool,
             &lane_coverage,
@@ -1217,6 +1232,91 @@ mod tests {
         assert!(
             src_a.opened_bytes() + src_b.opened_bytes() >= data.len() as u64,
             "the two sources together must cover the whole blob"
+        );
+        Ok(())
+    }
+
+    /// The delivery progress the bar reads is ONE monotonic whole-blob position,
+    /// not each lane's divergent local `base_present + received`. Two concurrent
+    /// full holders each split the blob and report through the SAME callback; the
+    /// callback records every position it is handed. A progress bar must never go
+    /// backwards, so the recorded sequence must be non-decreasing and end at the
+    /// whole-blob size — before the aggregator fix each lane reported its own
+    /// lane-local absolute position, so the sequence jumped between lanes and the
+    /// smoothed rate ramped without bound.
+    #[tokio::test]
+    async fn progress_positions_are_monotonic_across_lanes() -> anyhow::Result<()> {
+        let data = blob(64 * 1024 * 1024);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let total = src_a.total_bytes();
+        let (store, _dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        let samples: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let cb_samples = Arc::clone(&samples);
+        let on_progress: Box<super::ProgressCallback> = Box::new(move |received, expected| {
+            if let Ok(mut s) = cb_samples.lock() {
+                s.push((received, expected));
+            }
+        });
+
+        let lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+        ];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            Some(&on_progress),
+        )
+        .await?;
+
+        let samples = samples.lock().expect("samples lock").clone();
+        assert!(
+            !samples.is_empty(),
+            "progress callback must fire at least once"
+        );
+        // The bar can never move backwards: every reported position is >= the one
+        // before it, against a stable whole-blob total.
+        let mut prev = 0u64;
+        for (received, expected) in &samples {
+            assert_eq!(
+                *expected, total,
+                "the progress total must be the whole-blob size"
+            );
+            assert!(
+                *received >= prev,
+                "progress regressed: {received} after {prev} — the bar jumped backwards"
+            );
+            assert!(
+                *received <= total,
+                "progress overshot the blob size: {received} > {total}"
+            );
+            prev = *received;
+        }
+        // And it reaches the whole blob by the end.
+        assert_eq!(
+            prev, total,
+            "the final reported position must reach the blob size"
         );
         Ok(())
     }

@@ -327,7 +327,7 @@ pub(crate) fn contiguous_byte_ranges(ranges: &ChunkRanges, total_bytes: u64) -> 
 }
 
 /// Total content bytes a [`ChunkRanges`] covers (clamped to `total_bytes`).
-fn ranges_content_len(ranges: &ChunkRanges, total_bytes: u64) -> u64 {
+pub(crate) fn ranges_content_len(ranges: &ChunkRanges, total_bytes: u64) -> u64 {
     contiguous_byte_ranges(ranges, total_bytes)
         .iter()
         .map(|(_, len)| *len)
@@ -420,6 +420,10 @@ where
                 config,
                 &mut counters,
                 on_progress,
+                // `None`: `drive` is the single-source path, whose one lane reports
+                // its own present base directly — there is no cross-lane total to
+                // aggregate. Only the multi-source scheduler passes an aggregator.
+                None,
                 pacing_wait,
                 served_paid,
                 // `None` on the single-source path: this one lane IS the pool,
@@ -480,6 +484,13 @@ pub(crate) async fn fill_gap<St, S, P, F>(
     config: &DriveConfig,
     counters: &mut DriveCounters,
     on_progress: Option<&ProgressCallback>,
+    // Multi-source only: the shared whole-blob delivered-byte counter every lane
+    // folds its own leg deltas into, so the bar reads ONE monotonic position
+    // across interleaved lanes rather than each lane's divergent local
+    // `base_present + received`. `None` on the single-source path, which reports
+    // its own present base directly (there is only ever one lane, so that value is
+    // already the whole-blob position).
+    progress_agg: Option<&std::sync::atomic::AtomicU64>,
     pacing_wait: Option<&dyn PacingWait>,
     served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
     pool: Option<&SharedPool<'_>>,
@@ -742,10 +753,33 @@ where
                 // reports `base + received` against `total_bytes`.
                 let base_present =
                     ranges_content_len(&(store.present_ranges().await?), total_bytes);
+                // This leg's own previously-reported cumulative, so the multi-source
+                // aggregator folds in DELTAS (`received` is monotonic per leg, and
+                // resets to 0 on each new open — hence a fresh counter per leg).
+                let leg_reported = std::sync::atomic::AtomicU64::new(0);
                 let reporter = move |received: u64| {
-                    if let Some(cb) = on_progress {
-                        cb(base_present.saturating_add(received), total_bytes);
-                    }
+                    let Some(cb) = on_progress else { return };
+                    let position = match progress_agg {
+                        // Multi-source: fold this leg's monotonic per-leg `received`
+                        // into the shared whole-blob total as deltas, so the bar
+                        // reads one non-decreasing position across concurrent lanes.
+                        // Clamp the readout to the blob size — a bounded, idempotent
+                        // tail re-fetch can re-deliver a few already-counted bytes,
+                        // and the bar must never exceed 100%.
+                        Some(delivered) => {
+                            let delta =
+                                received.saturating_sub(leg_reported.load(Ordering::Relaxed));
+                            leg_reported.store(received, Ordering::Relaxed);
+                            delivered
+                                .fetch_add(delta, Ordering::Relaxed)
+                                .saturating_add(delta)
+                                .min(total_bytes)
+                        }
+                        // Single-source: this one lane's present base plus its leg
+                        // progress is already the whole-blob position.
+                        None => base_present.saturating_add(received),
+                    };
+                    cb(position, total_bytes);
                 };
 
                 // One paid leg: open -> stream into the store -> drain the pull.
