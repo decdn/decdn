@@ -298,7 +298,7 @@ pub struct BlockchainConfig {
     /// This bounds concurrency, not paid throughput: a signer that pays its vouchers
     /// releases that stream's reservation, so its cap recycles and a stream already
     /// under way is never slowed. It carries no permanent memory and never penalizes a
-    /// signer for quitting — that is the abandonment bucket's job.
+    /// signer for quitting.
     ///
     /// The window is the unit actually being rationed: honest need is `concurrent
     /// un-vouchered streams × one window` regardless of the pool's size, so an absolute
@@ -307,24 +307,6 @@ pub struct BlockchainConfig {
     /// always admissible). Absent => default (`8`). See
     /// `DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS`.
     pub pool_floor_signer_live_windows: Option<u64>,
-    /// Per-signer abandonment-bucket capacity, counted in ramp-start credit windows
-    /// (ADR 003 § Pool solvency, per-signer abandonment allowance): the un-recouped
-    /// floor a signer may drain from its node-local refilling allowance before this
-    /// node soft-throttles it. A stream that pays consumes nothing; a stream that
-    /// abandons consumes only the real un-recouped floor it left behind, and the bucket
-    /// refills over time, so occasional abandonment never trips it — only a burst does.
-    ///
-    /// The throttle is node-local and signer-isolated: it never reduces a co-tenant's
-    /// budget and never leaves the pool, and it is temporary (the client simply pulls
-    /// from another node while the bucket refills). Lower-clamped to one window. Absent
-    /// => default (`8`). See `DEFAULT_POOL_FLOOR_SIGNER_BUCKET_WINDOWS`.
-    pub pool_floor_signer_bucket_windows: Option<u64>,
-    /// Seconds to refill one window of the per-signer abandonment bucket (ADR 003
-    /// § Pool solvency, per-signer abandonment allowance). Faster refill forgives
-    /// bursts sooner; slower refill throttles a repeat-abandoner harder. Node-local
-    /// policy. Lower-clamped to one second. Absent => default (`60`). See
-    /// `DEFAULT_POOL_FLOOR_SIGNER_REFILL_SECS`.
-    pub pool_floor_signer_refill_secs: Option<u64>,
     /// USDC settlement-token contract address — the ERC-20 clients spend on
     /// deposits into a payment pool. Declared here so a client config that names
     /// it passes `decdn config validate` under this section's

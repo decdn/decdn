@@ -92,8 +92,8 @@ pub use rate::{
     verify_rate,
 };
 pub use store::{
-    CheckpointKey, KeyedCheckpointStore, MemoryPoolFloorLossStore, MemoryPoolStateStore,
-    PendingSettle, PendingSettleStore, PoolFloorLossStore, PoolStateStore, StoreError,
+    CheckpointKey, KeyedCheckpointStore, MemoryPoolStateStore, PendingSettle, PendingSettleStore,
+    PoolStateStore, StoreError,
 };
 pub use stream_sig::{STREAM_RESPONSE_TYPEHASH, StreamSlashData, StreamSlashError};
 pub use voucher::{

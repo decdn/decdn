@@ -425,61 +425,23 @@ impl ClientHandler {
             None => None,
         };
 
-        // Per-lane concurrent-stream admission cap (#1697). Runs ONCE here, before
-        // any serve-path branch, so every delivered stream — cache hit, backend-origin
-        // miss, window pull-through miss, or buffered miss — is counted. Each same-lane
-        // stream ALREADY in flight reserves one credit-window floor of pool headroom on
-        // top of this stream's own per-path floor gate, so a lane cannot put more unpaid
-        // downstream egress in flight than its refundable-floor headroom covers.
+        // Per-lane active-stream counter. Runs ONCE here, before any serve-path branch,
+        // so every delivered stream — cache hit, backend-origin miss, window
+        // pull-through miss, or buffered miss — is counted. The count is not a solvency
+        // gate: the per-pool ceiling and the per-signer live cap (both in
+        // `try_reserve_floor`, ADR 003 §Pool solvency) bound un-vouchered floor across
+        // and within lanes. The count exists for the wallet-less-resume heal
+        // (`commit_one_proof`), which reads `active_streams` to tell a lone wedged
+        // stream from a concurrent-sibling out-of-order voucher without depending on
+        // chain data.
         //
-        // A stream's window is FIXED at admission; this never re-divides a live stream's
-        // share — it gates NEW admissions only. `n_active == 0` (the single-stream case)
-        // applies NO surcharge, so a lone stream is admitted exactly as before the cap;
-        // its own per-path floor gate is the only solvency check it faces.
-        //
-        // The active-stream COUNT is maintained whenever the lane is known, but the
-        // solvency SURCHARGE runs only with a live `pool_status` (without one there is
-        // no on-chain `remaining` to check against). Keeping the count off-chain too is
-        // what lets the wallet-less-resume heal (`commit_one_proof`) tell a lone stream
-        // from a concurrent-sibling lane without depending on chain data.
-        //
-        // Checked-and-incremented under the lane lock so two simultaneous opens
-        // serialize and neither admits into the same last slot (TOCTOU → N+1). Only
-        // capability-bearing streams reach here with `known_lane` set — intake registers
-        // the lane from this request's own capability above, so concurrent first-streams
-        // on a fresh lane share one counter. `LaneSlot`'s drop releases the slot on every
-        // exit (success, `?`, disconnect, panic).
+        // Incremented under the lane lock so concurrent first-streams on a fresh lane
+        // share one counter. `LaneSlot`'s drop releases the slot on every exit (success,
+        // `?`, disconnect, panic).
         let mut lane_slot: Option<LaneSlot> = None;
         if let Some(lane) = known_lane.as_ref() {
             let guard = lane.lock().await;
             let active = guard.active_streams.clone();
-            let n_active = active.load(Ordering::Relaxed);
-            if let Some(status) = pool_status {
-                let floor = self.credit_window(CHUNK_BYTES, 0);
-                let reserved = floor.saturating_mul(u64::from(n_active).saturating_add(1));
-                if n_active > 0
-                    && !self.pool_remaining_covers_window(status.remaining, reserved, rate_per_mb)
-                {
-                    drop(guard);
-                    let headroom = status
-                        .remaining
-                        .saturating_sub(self.pool_min_remaining_deposit);
-                    self.log_deposit_refusal(
-                        B256::from(req.pool_id),
-                        hash,
-                        headroom,
-                        decdn_incentive::min_payment(reserved, rate_per_mb),
-                    );
-                    return self
-                        .respond_error(
-                            &mut send,
-                            &req,
-                            ServeRejectReason::LaneAtCapacity,
-                            rate_per_mb,
-                        )
-                        .await;
-                }
-            }
             active.fetch_add(1, Ordering::Relaxed);
             drop(guard);
             lane_slot = Some(LaneSlot::new(active));
@@ -487,10 +449,11 @@ impl ClientHandler {
         let _lane_slot = lane_slot;
 
         // Per-pool cumulative floor-credit admission reservation (ADR 003 §Pool
-        // solvency, stateful-B). Unlike the per-lane #1697 cap above, it sums floor
-        // credit across ALL distinct lanes on the pool and bounds it to
-        // `remaining − M`, closing the fan-out hole where many distinct signers each
-        // draw one un-vouchered floor on the same pool. The reservation is span-capped
+        // solvency, stateful-B). It sums floor credit across ALL distinct lanes on
+        // the pool and bounds it to `remaining − M`, closing the fan-out hole where
+        // many distinct signers each draw one un-vouchered floor on the same pool; a
+        // per-signer live cap `k · one window` bounds any one signer's share
+        // underneath it. The reservation is span-capped
         // to what THIS request can draw — at most one voucher-interval floor, less for
         // a bounded range or tail resume — and held for the stream's lifetime; the
         // `FloorReservation` guard reconciles it to the actual unpaid loss at stream
@@ -804,11 +767,6 @@ impl ClientHandler {
                                 .await;
                         }
                         Ok(guard) => {
-                            // This is the miss-fill admission: the fill below fronts
-                            // upstream USDC, so an abandon here strands that spend. Size
-                            // the abandonment debit to the reserved window, not the
-                            // downstream unpaid tail.
-                            guard.mark_fronted_upstream();
                             floor_reservation = Some(guard);
                         }
                     }

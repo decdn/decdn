@@ -243,25 +243,6 @@ impl ClientHandler {
                 unvouchered = 0;
             }
 
-            // Reconcile the pool floor reservation the SAME way the hit path does
-            // (`deliver`), so a cache-miss stream — which fronts upstream USDC — debits the
-            // abandonment bucket by its real un-recouped floor too. Capture this iteration's
-            // maximum in-flight unpaid balance NOW: after the deliver phase advanced
-            // `delivered` and before the recoup phase can advance `paid` or take the
-            // `VoucherStop::Rejected` early return / a `?` fault below. A stream that dies in
-            // its first iteration never reaches the end-of-iteration hook, so without this
-            // note its last-noted unpaid stays 0 and an abnormal `Drop` would debit nothing —
-            // letting "connect, take one free interval, vanish" escape the bucket accounting.
-            // `delivered`/`paid` are WIRE BYTES (see their declaration); the reservation
-            // accounts in µUSDC, so the byte quantity crosses over through `min_payment` —
-            // the two units are never compared directly (ADR 003 §Pool solvency).
-            if let Some(res) = floor_reservation {
-                res.note_unpaid(decdn_incentive::min_payment(
-                    delivered.saturating_sub(paid),
-                    rate_per_mb,
-                ));
-            }
-
             // --- recoup phase: collect proofs until each completed chunk is
             // paid for. The proof advances the in-memory lane watermark; the
             // background flush persists it (ADR 003 §Off-chain voucher state
@@ -380,14 +361,6 @@ impl ClientHandler {
                 // `credit_ramp_divisor` — with the ramp disabled the reservation is the
                 // full `credit_max`, so release waits for that much paid, not one chunk.
                 res.release_if_repaid(decdn_incentive::min_payment(paid, rate_per_mb));
-                // Keep the drop-time reconcile honest with the CURRENT unpaid balance: on
-                // an un-repaid stream's abnormal `Drop` debits `min(reserved, this)` into the bucket.
-                // A fully-settled stream ends `delivered == paid`, so the last note here is
-                // `min_payment(0, rate) == 0` and `Drop` charges nothing.
-                res.note_unpaid(decdn_incentive::min_payment(
-                    delivered.saturating_sub(paid),
-                    rate_per_mb,
-                ));
             }
 
             // Done when the whole range is on the wire and every interval — closing
@@ -479,15 +452,10 @@ impl ClientHandler {
             }
         }
 
-        // Fully delivered and fully paid: signal clean completion. Every byte was
-        // bao-verified into the cache by the pull leg's admit before this leg read
-        // it, so the served bytes are sound. Only reached on clean completion — every
-        // abnormal exit returns earlier — so mark the reservation settled, so its drop
-        // debits the abandonment bucket nothing rather than the real un-recouped floor
-        // an abnormal exit would (ADR 003 §Pool solvency).
-        if let Some(res) = floor_reservation {
-            res.mark_settled();
-        }
+        // Fully delivered and fully paid. Every byte was bao-verified into the cache by
+        // the pull leg's admit before this leg read it, so the served bytes are sound.
+        // The floor reservation was already released once payment reached the reserved
+        // floor; the guard drops as this leg returns.
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
         // Drain the client's send half to its FIN before `recv` drops, so its

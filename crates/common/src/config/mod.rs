@@ -138,16 +138,6 @@ pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
 /// permanent memory: it recycles as each stream pays, and never penalizes a signer for
 /// quitting.
 pub const DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS: u64 = 8;
-/// Default per-signer abandonment-bucket capacity, in ramp-start credit windows: `8`.
-/// A signer may drain `8 · one credit window` of un-recouped floor from its node-local
-/// refilling allowance before this node soft-throttles it (ADR 003 § Pool solvency,
-/// per-signer abandonment allowance). Wide enough to absorb ordinary abandonment and
-/// reactive-top-up chains; a burst that out-runs the refill is what trips it.
-pub const DEFAULT_POOL_FLOOR_SIGNER_BUCKET_WINDOWS: u64 = 8;
-/// Default seconds to refill one window of the per-signer abandonment bucket: `60`.
-/// Fast enough that only a genuine burst of abandonment trips the throttle, and the
-/// throttle then clears on its own as the bucket refills (ADR 003 § Pool solvency).
-pub const DEFAULT_POOL_FLOOR_SIGNER_REFILL_SECS: u64 = 60;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
 /// Default per-source rate-limit refill (cells/second). A single source
@@ -1638,17 +1628,6 @@ fn resolve_blockchain_into(
     let pool_floor_signer_live_windows = file
         .and_then(|b| b.pool_floor_signer_live_windows)
         .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS);
-    // Per-signer abandonment-bucket capacity, in credit windows (ADR 003 § Pool
-    // solvency, per-signer abandonment allowance). Lower-clamped to one window at
-    // use, so no bound to enforce.
-    let pool_floor_signer_bucket_windows = file
-        .and_then(|b| b.pool_floor_signer_bucket_windows)
-        .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_BUCKET_WINDOWS);
-    // Seconds to refill one window of the abandonment bucket. Lower-clamped to one
-    // second at use, so `0` behaves as one second rather than dividing by zero.
-    let pool_floor_signer_refill_secs = file
-        .and_then(|b| b.pool_floor_signer_refill_secs)
-        .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_REFILL_SECS);
 
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
@@ -1684,8 +1663,6 @@ fn resolve_blockchain_into(
         buyer_max_approve,
         pool_min_remaining_deposit_micro_usdc,
         pool_floor_signer_live_windows,
-        pool_floor_signer_bucket_windows,
-        pool_floor_signer_refill_secs,
     }
 }
 
@@ -9710,23 +9687,15 @@ usdc_address = \"0xUsdc\"
         // documented in several places that have to agree with it.
         assert_eq!(resolved.pool_floor_signer_live_windows, 8);
         assert_eq!(DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS, 8);
-        assert_eq!(resolved.pool_floor_signer_bucket_windows, 8);
-        assert_eq!(DEFAULT_POOL_FLOOR_SIGNER_BUCKET_WINDOWS, 8);
-        assert_eq!(resolved.pool_floor_signer_refill_secs, 60);
-        assert_eq!(DEFAULT_POOL_FLOOR_SIGNER_REFILL_SECS, 60);
 
         let explicit = types::BlockchainConfig {
             pool_floor_signer_live_windows: Some(16),
-            pool_floor_signer_bucket_windows: Some(32),
-            pool_floor_signer_refill_secs: Some(120),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
             ..Default::default()
         };
         let resolved = resolve_blockchain(&cli, Some(&explicit), dir.path())?;
         assert_eq!(resolved.pool_floor_signer_live_windows, 16);
-        assert_eq!(resolved.pool_floor_signer_bucket_windows, 32);
-        assert_eq!(resolved.pool_floor_signer_refill_secs, 120);
         Ok(())
     }
 

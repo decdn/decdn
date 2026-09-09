@@ -207,9 +207,8 @@ impl ClientHandler {
     ) -> anyhow::Result<()> {
         // Owned here so the pool floor reservation reconciles at every exit —
         // success, `?`, disconnect, panic — exactly like `LaneSlot`. The serve loop
-        // below keeps its `note_unpaid` current and releases it once the stream
-        // repays a floor; an abnormal `Drop` debits any residual unpaid loss into the
-        // signer's abandonment bucket.
+        // below releases it once the stream repays a floor; on any other exit the
+        // guard's `Drop` frees the pool's live floor headroom.
         let floor_reservation = floor_reservation;
         // The client-facing `cdn/client/v1` payload is ALWAYS the bao interleaved
         // verified-stream encoding — there is no raw-byte path (ADR 038 §Serve
@@ -353,22 +352,6 @@ impl ClientHandler {
                 unvouchered = 0;
             }
 
-            // Capture this iteration's maximum in-flight unpaid balance NOW — after
-            // the deliver phase advanced `delivered` and before the recoup phase can
-            // advance `paid` or take an early exit. A stream that dies in its first
-            // iteration (a rejected first voucher returns from the recoup block, or a
-            // `?` faults there) never reaches the end-of-iteration hook below, so
-            // without this note its last-noted unpaid stays 0 and an abnormal `Drop` would
-            // debit nothing — letting "connect, take one free interval, vanish" escape the
-            // bucket accounting. Noting here keeps the guard honest at every
-            // exit path (ADR 003 §Pool solvency).
-            if let Some(res) = floor_reservation.as_ref() {
-                res.note_unpaid(decdn_incentive::min_payment(
-                    delivered.saturating_sub(paid),
-                    rate_per_mb,
-                ));
-            }
-
             // --- recoup phase: collect proofs until each completed chunk is
             // paid for. The proof advances the in-memory lane watermark and the
             // background flush persists it (ADR 003 §Off-chain voucher state
@@ -441,15 +424,6 @@ impl ClientHandler {
                 // disabled the reservation is the full `credit_max`, so release waits
                 // for that much paid, not a single interval.
                 res.release_if_repaid(decdn_incentive::min_payment(paid, rate_per_mb));
-                // Keep the drop-time reconcile honest with the CURRENT unpaid
-                // balance: on an un-repaid stream an abnormal `Drop` debits
-                // `min(reserved, this)` into the abandonment bucket. A fully-settled
-                // stream ends `delivered == paid`, so the last note here is
-                // `min_payment(0, rate) == 0` and `Drop` debits nothing.
-                res.note_unpaid(decdn_incentive::min_payment(
-                    delivered.saturating_sub(paid),
-                    rate_per_mb,
-                ));
             }
 
             // Done when the whole blob is on the wire and every interval, closing
@@ -530,13 +504,9 @@ impl ClientHandler {
             }
         }
 
-        // Clean completion: the whole request delivered and every interval paid. Only
-        // reached here — every abnormal exit returns earlier — so mark the reservation
-        // settled, making its drop debit the abandonment bucket nothing rather than the
-        // real un-recouped floor an abnormal exit would (ADR 003 §Pool solvency).
-        if let Some(res) = floor_reservation.as_ref() {
-            res.mark_settled();
-        }
+        // Clean completion: the whole request delivered and every interval paid. The
+        // floor reservation was already released once payment reached the reserved
+        // floor; the guard drops as this function returns.
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
         // Drain the client's send half to its FIN before `recv` drops, so its

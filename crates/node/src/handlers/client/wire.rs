@@ -145,9 +145,6 @@ impl ClientHandler {
             ServeRejectReason::InsufficientDeposit => {
                 self.metrics.serve_stream_rejected_insufficient_deposit();
             }
-            ServeRejectReason::LaneAtCapacity => {
-                self.metrics.serve_stream_rejected_lane_at_capacity();
-            }
             ServeRejectReason::SignerFloorAtCap => {
                 self.metrics.serve_stream_rejected_signer_floor_at_cap();
             }

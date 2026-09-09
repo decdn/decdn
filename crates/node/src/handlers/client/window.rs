@@ -372,12 +372,11 @@ impl ClientHandler {
         // draws from (its own plus any attached sibling).
         //
         // The pool floor reservation (opened at the dispatch pre-spend gate) is OWNED
-        // here and passed by reference: the serve leg keeps its `note_unpaid` current
-        // and releases it once the stream repays one floor, exactly like the hit path,
-        // so this MISS leg — which fronts upstream USDC — debits its abandonment
-        // bucket by the reserved window on an abnormal exit. Holding ownership across the `await` keeps the guard alive
-        // for the whole serve; its `Drop` reconciles the residual unpaid loss AFTER
-        // `serve_leg` returns, at this function's scope end.
+        // here and passed by reference: the serve leg releases it once the stream
+        // repays one floor, exactly like the hit path. Holding ownership across the
+        // `await` keeps the guard alive for the whole serve; its `Drop` frees the
+        // pool's live floor headroom AFTER `serve_leg` returns, at this function's
+        // scope end.
         let serve_result = self
             .serve_leg(
                 &mut send,
