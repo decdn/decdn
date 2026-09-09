@@ -5206,7 +5206,8 @@ async fn buyer_aborts_oversized_small_blob_without_paying() -> anyhow::Result<()
     let payload = vec![0x5Au8; 8192];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
-    // Server ceiling 0 (unlimited) — it honestly serves all 8192 bytes.
+    // The server has no size ceiling — it honestly serves all 8192 bytes; the
+    // ceiling under test is the buyer's received-byte cap.
     let (target, server_eth, server_ep, server_task) =
         spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
@@ -5260,7 +5261,8 @@ async fn buyer_pays_for_received_bytes_then_aborts_over_ceiling() -> anyhow::Res
     let payload = vec![0x5Bu8; 4 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
-    // Server ceiling 0 (unlimited) — it honestly serves the whole 4 MiB blob.
+    // The server has no size ceiling — it honestly serves the whole 4 MiB blob;
+    // the ceiling under test is the buyer's received-byte cap.
     let (target, server_eth, server_ep, server_task) =
         spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
