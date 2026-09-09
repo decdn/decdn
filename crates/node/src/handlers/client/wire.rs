@@ -145,6 +145,9 @@ impl ClientHandler {
             ServeRejectReason::InsufficientDeposit => {
                 self.metrics.serve_stream_rejected_insufficient_deposit();
             }
+            ServeRejectReason::PoolUnconfirmed => {
+                self.metrics.serve_stream_rejected_pool_unconfirmed();
+            }
             ServeRejectReason::LaneAtCapacity => {
                 self.metrics.serve_stream_rejected_lane_at_capacity();
             }

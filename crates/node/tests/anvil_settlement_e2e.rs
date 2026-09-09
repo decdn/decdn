@@ -618,8 +618,6 @@ async fn run_e2e() -> anyhow::Result<()> {
     // receiver drives the service's redeemer loop.
     let (redeem_tx, redeem_rx) =
         tokio::sync::mpsc::channel(decdn_node::payment_settlement::REDEEM_HINT_CAPACITY);
-    let (_pool_resolve_tx, pool_resolve_rx) =
-        tokio::sync::mpsc::channel(decdn_node::payment_settlement::POOL_RESOLVE_HINT_CAPACITY);
     // Event-fed pool view, shared with the settlement service below (its watcher
     // is the writer). The capability-intake gate reads the on-chain pool owner
     // from it; without an owner the capability is dropped and no lane registers,
@@ -661,7 +659,6 @@ async fn run_e2e() -> anyhow::Result<()> {
         pool_view.clone(),
         redeem_tx,
         redeem_rx,
-        pool_resolve_rx,
     )
     .await?;
     // The paid-watermark watcher is now a route on the shared multiplexed poller,

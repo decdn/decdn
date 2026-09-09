@@ -941,6 +941,15 @@ enum ServeRejectReason {
     UnknownChannel,
     OwnerMismatch,
     InsufficientDeposit,
+    /// A wired `PoolView` could not confirm the request's pool on-chain: the pool
+    /// has no on-chain record, is closed/reclaimed, or the admit-path `getPool`
+    /// faulted. The node refuses rather than serve a pool it cannot confirm is live
+    /// and solvent (ADR 003 §Pool solvency). Distinct from [`Self::InsufficientDeposit`]
+    /// for the per-reason metric ONLY — both collapse to `NotFound` on the wire (see
+    /// [`Self::wire_error`]), so a client cannot tell an unconfirmed pool from a
+    /// drained one, and an operator can tell a chain/RPC problem from real
+    /// deposit exhaustion.
+    PoolUnconfirmed,
     /// The lane already has enough concurrent same-lane streams in flight that
     /// admitting one more would put more unpaid egress in flight than the pool's
     /// refundable-floor headroom covers. Distinct from [`Self::InsufficientDeposit`]
@@ -1018,6 +1027,7 @@ impl ServeRejectReason {
             | Self::UnknownChannel
             | Self::OwnerMismatch
             | Self::InsufficientDeposit
+            | Self::PoolUnconfirmed
             | Self::LaneAtCapacity
             | Self::SignerFloorAtCap
             | Self::LoadShedHit
@@ -1219,13 +1229,6 @@ pub struct ClientHandlerDeps {
     /// claim advanced; sent on every accepted voucher, against no threshold.
     /// `None` when no settlement service is wired.
     pub redeem_hint: Option<mpsc::Sender<LaneKey>>,
-    /// Best-effort nudge to the background pool-owner resolver: a `pool_id` whose
-    /// owner the projection does not yet know, so capability intake could not
-    /// verify a presented grant. The resolver does one `getPool` off the serve hot
-    /// path and folds the owner in for the client's next request (ADR 003
-    /// §Capability delegation; the cold-start `ColdStart::Head` gap). `None` when
-    /// no settlement service is wired (e.g. tests); a full channel drops the nudge.
-    pub pool_resolve_hint: Option<mpsc::Sender<B256>>,
     /// Deadline for the node-to-node cache-miss pull, so a slow upstream
     /// cannot pin the delivery path. `None` disables the node-to-node leg
     /// only; a miss can still fill from the local origin via
@@ -1377,7 +1380,6 @@ impl ClientHandlerDeps {
             max_concurrent_streams,
             content_deny,
             redeem_hint: None,
-            pool_resolve_hint: None,
             pull_through: None,
             local_populate: None,
             pull_through_origin: None,
@@ -1599,13 +1601,6 @@ pub struct ClientHandler {
     /// is wired (e.g. tests) — a hint is best-effort, so an absent sender or a
     /// full channel just skips it. Keyed by [`LaneKey`]: redemption is per-lane.
     redeem_hint: Option<mpsc::Sender<LaneKey>>,
-    /// Resolve-hint sender to the background pool-owner resolver, set at
-    /// construction via [`ClientHandlerDeps`]. When capability intake meets a pool
-    /// whose owner the projection does not yet know (a pool opened before this
-    /// node's cold-start head), it nudges the resolver here to fold the owner off
-    /// the serve hot path, so the client's next request registers the lane. `None`
-    /// (tests, or no settlement service) skips the nudge; a full channel drops it.
-    pool_resolve_hint: Option<mpsc::Sender<B256>>,
     /// Node-to-node cache-miss pull-through deadline (#831), set at construction
     /// via [`ClientHandlerDeps`]. `None` (the default — feature off, and in
     /// tests) keeps the pre-#831 behaviour: a cache miss returns `NotFound`. When
@@ -1827,7 +1822,6 @@ impl ClientHandler {
             pool_floor_signer_bucket_windows: deps.pool_floor_signer_bucket_windows,
             pool_floor_signer_refill_secs: deps.pool_floor_signer_refill_secs,
             redeem_hint: deps.redeem_hint,
-            pool_resolve_hint: deps.pool_resolve_hint,
             pull_through: deps.pull_through,
             local_populate: deps.local_populate,
             pull_through_origin: deps.pull_through_origin,
@@ -1988,14 +1982,12 @@ impl ClientHandler {
     ///
     /// The verification recovers the 65-byte EOA signature via
     /// [`Self::recover_capability_owner`] (canonical-`s` ecrecover, matching the
-    /// contract's verifiable set) and compares it to `pool_owner`. Two cases
-    /// drop rather than persist:
-    /// - `pool_owner` is `None` — no pool-view, an unknown pool, or an RPC fault
-    ///   left the owner unknown, so ownership cannot be confirmed. Intake is
-    ///   best-effort and the client re-sends the capability on its next request.
-    /// - a non-65-byte (contract-wallet / ERC-1271-shaped) owner signature, which
-    ///   cannot be recovered off-chain; this design does not accept contract
-    ///   wallets as pool owners.
+    /// contract's verifiable set) and compares it to `pool_owner` — the confirmed
+    /// on-chain owner the admit path already resolved (the dispatcher calls this
+    /// only past the refuse-on-unknown-pool gate). A non-65-byte (contract-wallet /
+    /// ERC-1271-shaped) owner signature drops rather than persists: it cannot be
+    /// recovered off-chain, and this design does not accept contract wallets as
+    /// pool owners.
     ///
     /// Best-effort and off the durability path otherwise: a persist failure never
     /// fails the stream. Lane registration is idempotent — a re-observed grant for
@@ -2006,26 +1998,9 @@ impl ClientHandler {
         &self,
         pool_id: B256,
         signer: Address,
-        pool_owner: Option<Address>,
+        pool_owner: Address,
         capability: &decdn_protocol::client::WireCapability,
     ) {
-        // Without the on-chain pool owner the grant cannot be confirmed to belong
-        // to this pool; persisting an unverified capability is exactly what
-        // strands the redeemer. Drop it — the client re-sends next request.
-        //
-        // A missing owner is also the cold-start signal: a pool opened before this
-        // node's settlement-watcher head never enters the projection, so its owner
-        // is unknown here even though the pool is live. Nudge the background
-        // resolver to fold the owner off the serve hot path (one `getPool`), so the
-        // client's re-send registers the lane. Best-effort — a full channel just
-        // defers to the next re-send.
-        let Some(pool_owner) = pool_owner else {
-            tracing::debug!(%pool_id, %signer, "dropping capability: pool owner unavailable, cannot verify");
-            if let Some(resolve) = self.pool_resolve_hint.as_ref() {
-                let _ = resolve.try_send(pool_id);
-            }
-            return;
-        };
         let spending_cap = capability.spending_cap;
         let expiry = capability.expiry;
         // Only the common EOA (65-byte) owner signature is recoverable off-chain;
@@ -3972,13 +3947,12 @@ mod tests {
     async fn handler_with_capability_intake(
         metrics: &Arc<Metrics>,
         owner: Address,
-    ) -> (Arc<ClientHandler>, tempfile::TempDir, mpsc::Receiver<B256>) {
+    ) -> (Arc<ClientHandler>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
             .await
             .expect("cache");
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
-        let (resolve_tx, resolve_rx) = mpsc::channel(8);
         let mut deps = ClientHandlerDeps::new(
             iroh::SecretKey::generate().public(),
             Arc::clone(metrics),
@@ -4010,9 +3984,8 @@ mod tests {
             always_admit_shed(),
         );
         deps.pool_view = Some(Arc::new(FixedPoolView { owner }));
-        deps.pool_resolve_hint = Some(resolve_tx);
         let handler = ClientHandler::new(deps).expect("handler");
-        (Arc::new(handler), dir, resolve_rx)
+        (Arc::new(handler), dir)
     }
 
     /// Fix 1 (security): capability intake verifies the owner signature against
@@ -4024,8 +3997,7 @@ mod tests {
     async fn intake_rejects_wrong_owner_capability() {
         let metrics = Arc::new(Metrics::new());
         let owner = PrivateKeySigner::random();
-        let (handler, _dir, _resolve_rx) =
-            handler_with_capability_intake(&metrics, owner.address()).await;
+        let (handler, _dir) = handler_with_capability_intake(&metrics, owner.address()).await;
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let pool_id = B256::repeat_byte(0x77);
         let signer = Address::repeat_byte(0x11);
@@ -4056,7 +4028,7 @@ mod tests {
 
         // A capability signed by a NON-owner is dropped: no lane, no material.
         let bad = make_wire(&PrivateKeySigner::random());
-        handler.intake_capability(pool_id, signer, Some(owner.address()), &bad);
+        handler.intake_capability(pool_id, signer, owner.address(), &bad);
         assert!(
             !handler.lanes.contains_key(&lane_key),
             "a forged-owner capability must not register a lane"
@@ -4071,7 +4043,7 @@ mod tests {
         let good = make_wire(&owner);
         let expected_sig =
             <[u8; 65]>::try_from(good.owner_signature.as_slice()).expect("65-byte owner sig");
-        handler.intake_capability(pool_id, signer, Some(owner.address()), &good);
+        handler.intake_capability(pool_id, signer, owner.address(), &good);
         assert!(
             handler.lanes.contains_key(&lane_key),
             "a correct-owner capability registers its lane so vouchers can be served"
@@ -4080,65 +4052,6 @@ mod tests {
             lane_owner_sig(&handler, &lane_key).await,
             Some(expected_sig),
             "the verified owner signature is captured on the lane record for the redeemer"
-        );
-    }
-
-    /// Cold-start (`ColdStart::Head`) gap: a pool opened before the settlement
-    /// watcher anchored is absent from the projection, so intake sees `None` for
-    /// the owner. The capability is dropped for THIS request (never persisted, no
-    /// lane) but the pool is hinted to the background resolver; once the resolver
-    /// has folded the owner (simulated here by passing it in), the client's
-    /// re-send registers the lane. Without the hint the node could never onboard
-    /// as a new provider to a pre-existing pool.
-    #[tokio::test]
-    async fn intake_hints_resolver_for_an_unknown_pool_then_registers_on_retry() {
-        let metrics = Arc::new(Metrics::new());
-        let owner = PrivateKeySigner::random();
-        let (handler, _dir, mut resolve_rx) =
-            handler_with_capability_intake(&metrics, owner.address()).await;
-        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
-        let pool_id = B256::repeat_byte(0x5a);
-        let signer = Address::repeat_byte(0x22);
-        let spending_cap = 1_000_000u64;
-        let expiry = 1_900_000_000u64;
-        let signed_cap = Capability {
-            signer,
-            spending_cap,
-            pool_id,
-            expiry,
-        }
-        .sign(&owner, &domain)
-        .expect("sign capability");
-        let wire = decdn_protocol::client::WireCapability {
-            spending_cap,
-            expiry,
-            owner_signature: signed_cap.signature.as_bytes().to_vec(),
-        };
-        let lane_key = LaneKey {
-            pool_id,
-            signer,
-            provider: handler.eth_signer.address(),
-        };
-
-        // Owner unknown (pool opened before the watcher's head): drop + hint, no
-        // lane, nothing persisted. The client would re-send on its next request.
-        handler.intake_capability(pool_id, signer, None, &wire);
-        assert!(
-            !handler.lanes.contains_key(&lane_key),
-            "an unknown-owner capability must not register a lane"
-        );
-        assert_eq!(
-            resolve_rx.try_recv().ok(),
-            Some(pool_id),
-            "an unknown pool must be hinted to the background resolver"
-        );
-
-        // Resolver has folded the owner; the client's re-send now registers the
-        // lane so the node-to-node pull path becomes reachable.
-        handler.intake_capability(pool_id, signer, Some(owner.address()), &wire);
-        assert!(
-            handler.lanes.contains_key(&lane_key),
-            "once the owner is resolved, the re-sent capability registers its lane"
         );
     }
 
@@ -4218,8 +4131,7 @@ mod tests {
 
         let metrics = Arc::new(Metrics::new());
         let owner = PrivateKeySigner::random();
-        let (handler, _dir, _resolve_rx) =
-            handler_with_capability_intake(&metrics, owner.address()).await;
+        let (handler, _dir) = handler_with_capability_intake(&metrics, owner.address()).await;
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let pool_id = B256::repeat_byte(0x12);
         let signer = Address::repeat_byte(0x34);
@@ -4248,8 +4160,8 @@ mod tests {
             expiry: signed.capability.expiry,
             owner_signature: bytes.to_vec(),
         };
-        handler.intake_capability(pool_id, signer, Some(owner.address()), &wire);
-        handler.intake_capability(pool_id, signer, Some(owner.address()), &wire);
+        handler.intake_capability(pool_id, signer, owner.address(), &wire);
+        handler.intake_capability(pool_id, signer, owner.address(), &wire);
 
         assert!(
             !handler.lanes.contains_key(&lane_key),
@@ -4283,8 +4195,7 @@ mod tests {
     async fn repeat_capability_send_hits_verify_cache_and_keeps_the_genuine_material() {
         let metrics = Arc::new(Metrics::new());
         let owner = PrivateKeySigner::random();
-        let (handler, _dir, _resolve_rx) =
-            handler_with_capability_intake(&metrics, owner.address()).await;
+        let (handler, _dir) = handler_with_capability_intake(&metrics, owner.address()).await;
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let pool_id = B256::repeat_byte(0x12);
         let signer = Address::repeat_byte(0x34);
@@ -4308,8 +4219,8 @@ mod tests {
             owner_signature: genuine_sig.to_vec(),
         };
 
-        handler.intake_capability(pool_id, signer, Some(owner.address()), &wire);
-        handler.intake_capability(pool_id, signer, Some(owner.address()), &wire);
+        handler.intake_capability(pool_id, signer, owner.address(), &wire);
+        handler.intake_capability(pool_id, signer, owner.address(), &wire);
         let cache_len = handler
             .capability_verify_cache
             .lock()
@@ -4344,7 +4255,7 @@ mod tests {
             expiry: forged.capability.expiry,
             owner_signature: forged.signature.as_bytes().to_vec(),
         };
-        handler.intake_capability(pool_id, signer, Some(owner.address()), &forged_wire);
+        handler.intake_capability(pool_id, signer, owner.address(), &forged_wire);
         assert_eq!(
             handler
                 .capability_verify_cache
