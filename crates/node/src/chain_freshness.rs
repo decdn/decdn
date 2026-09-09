@@ -39,9 +39,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Live wall clock in seconds since the Unix epoch, or `0` if the system clock
-/// is before the epoch. Both the stamp and the staleness read use this, so a
-/// backward clock step affects the difference only by the step size — well
-/// within a grace window measured in minutes.
+/// is before the epoch. Away from that boundary both the stamp and the staleness
+/// read use this, so a backward clock step affects the difference only by the
+/// step size — well within a grace window measured in minutes. The `0` case is
+/// the exception: it collides with the "never stamped" sentinel
+/// [`ChainFreshness::is_stale`] reads, so a clock stuck before the epoch keeps
+/// the node stale even after [`ChainFreshness::stamp`] runs. That is the
+/// fail-closed direction — a node that cannot read a sane clock refuses to serve
+/// rather than trust a staleness comparison it cannot make — so it needs no
+/// separate guard.
 fn live_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -81,8 +87,11 @@ impl ChainFreshness {
     }
 
     /// Has the node been unable to reach the chain for longer than the grace
-    /// window? A never-stamped cell (`0`) is stale by definition — the node has
-    /// no confirmed-fresh compliance state to serve against.
+    /// window? A `0` cell is stale by definition — either never stamped, or
+    /// stamped from a pre-epoch (or unreadable) clock, which the wall-clock
+    /// reader also reports as `0`; both fold into this one fail-closed branch,
+    /// because a node with no confirmed-fresh compliance state has nothing sound
+    /// to serve against.
     #[must_use]
     pub fn is_stale(&self) -> bool {
         let last = self.last_ok_secs.load(Ordering::Relaxed);
