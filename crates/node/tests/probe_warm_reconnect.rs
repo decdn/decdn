@@ -144,6 +144,7 @@ async fn spawn_probe_server(
         decdn_node::rate_bounds::RateBounds::new(0),
         None, // no stake-lane reservation (#757)
         true, // relay foreign namespaces (default; #1759)
+        None, // no chain-freshness gate (no chain wired in this test)
     ));
     let router = Router::builder(ep.clone())
         .accept(ALPN_PROBE, handler)

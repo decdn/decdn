@@ -122,6 +122,11 @@ pub struct ResolvedBlockchain {
     /// Defaults to [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`]. Only
     /// used when `content_blacklist_address` is set.
     pub content_blacklist_poll_interval_sec: u64,
+    /// Seconds the node may go without a successful chain read before the serve
+    /// and probe paths refuse (ADR 011 § Serving while chain-stale). Defaults to
+    /// [`super::DEFAULT_CHAIN_STALENESS_GRACE_SEC`]. Always evaluated; a large
+    /// value opts out. Only used when `content_blacklist_address` is set.
+    pub chain_staleness_grace_sec: u64,
     /// EIP-712 `chainId` for the `slash_sig` domain separator. Defaults to
     /// [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia) when unset.
     pub chain_id: u64,

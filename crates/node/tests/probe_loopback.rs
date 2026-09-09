@@ -307,6 +307,7 @@ fn build_handler_with_probe_limiter(
         // Relay foreign namespaces by default; the origin-only policy test
         // uses `build_handler_origin_only` (#1759).
         true,
+        None,
     ));
     (handler, signer, domain)
 }
@@ -342,6 +343,7 @@ fn build_handler_with_lane(
         decdn_node::rate_bounds::RateBounds::new(0),
         Some(policy),
         true,
+        None,
     ));
     (handler, signer, domain)
 }
@@ -371,6 +373,7 @@ fn build_handler_origin_only(
         decdn_node::rate_bounds::RateBounds::new(0),
         None,
         false,
+        None,
     ));
     (handler, signer, domain)
 }
@@ -1234,6 +1237,65 @@ async fn probe_has_blob_true_for_cached_blob() -> anyhow::Result<()> {
         resp_ext.total_bytes
     );
     anyhow::ensure!(resp.body.hash == *hash.as_bytes(), "hash echoed");
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+    Ok(())
+}
+
+/// ADR 011 §Serving while chain-stale: a node holding the blob but whose chain
+/// reads are stale answers `has_blob: false` — advertising it would be signed
+/// slash evidence for a hash the node can no longer confirm is not taken down.
+/// The freshness handle here is never stamped, so it reads stale, exactly as it
+/// would after the grace window elapsed with no successful poll tick.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_has_blob_false_when_chain_stale() -> anyhow::Result<()> {
+    let payload = b"probe content while the chain is unreachable";
+    let (cache, hash, _cache_tmp) = cache_with_blob(payload).await?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let domain = test_slash_domain();
+    // A never-stamped freshness handle reads stale (the boot enumeration and every
+    // successful poll tick stamp it; neither has run here).
+    let stale = decdn_node::chain_freshness::ChainFreshness::new(Duration::from_mins(30));
+    let handler = Arc::new(ProbeHandler::new(
+        server_id,
+        7,
+        Arc::clone(&metrics),
+        limiter,
+        permissive_probe_rate_limiter(&metrics),
+        cache,
+        Arc::clone(&signer),
+        domain.clone(),
+        decdn_node::rate_bounds::RateBounds::new(0),
+        None,
+        true,
+        Some(stale),
+    ));
+
+    let req = ProbeRequest {
+        hash: *hash.as_bytes(),
+        timestamp_us: 0xabc_def,
+    };
+    let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
+
+    anyhow::ensure!(
+        !resp.body.has_blob,
+        "a chain-stale node must not advertise a held blob"
+    );
+    anyhow::ensure!(
+        resp_ext.total_bytes.is_none(),
+        "a suppressed advertisement carries no size, got {:?}",
+        resp_ext.total_bytes
+    );
+    anyhow::ensure!(
+        resp_ext.consistent_with(resp.body.has_blob),
+        "has_blob and coverage.is_empty() must be a biconditional"
+    );
+    // Still a well-formed, signed response — this is a compliance posture, not a
+    // fault.
     assert_slash_sig_valid(&resp, &signer, &domain)?;
     Ok(())
 }

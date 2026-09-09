@@ -1210,6 +1210,16 @@ pub struct DecdnMetrics {
     /// [`Self::serve_stream_rejected_internal_error`] instead. Visible name:
     /// `decdn_serve_stream_rejected_foreign_declined_total`.
     pub serve_stream_rejected_foreign_declined: Counter,
+    /// A serve refused because the node has been unable to reach the chain for
+    /// longer than `blockchain.chain_staleness_grace_sec` (ADR 011 § Serving
+    /// while chain-stale): its deny-set, pool-solvency, and signer-cap guards
+    /// are all reading stale state, so it refuses rather than sign a serve it
+    /// cannot vouch for. Signed as `NotFound`, identically to
+    /// [`Self::serve_stream_rejected_cache_miss`] — the client should re-route
+    /// to a peer whose chain reads are live — so this counter is the only place
+    /// an operator sees the staleness refusals. Visible name:
+    /// `decdn_serve_stream_rejected_chain_stale_total`.
+    pub serve_stream_rejected_chain_stale: Counter,
     /// An ALREADY-RUNNING delivery cut off at an MB boundary because a takedown
     /// landed after the stream opened (ADR 011 §On Blacklist Event). Visible
     /// name: `decdn_serve_stream_terminated_takedown_total`.
@@ -2022,6 +2032,11 @@ recorders! {
     /// (#1759, #1766): a live probe of this node's own backend genuinely does
     /// not hold the hash.
     serve_stream_rejected_foreign_declined => serve_stream_rejected_foreign_declined.inc();
+
+    /// Record a `serve_stream` request refused because the node's chain reads
+    /// are stale past `blockchain.chain_staleness_grace_sec` (ADR 011 § Serving
+    /// while chain-stale).
+    serve_stream_rejected_chain_stale => serve_stream_rejected_chain_stale.inc();
 
     /// Record an in-flight delivery cut off at an MB boundary because a takedown
     /// landed after the stream opened (ADR 011 §On Blacklist Event).
@@ -3220,6 +3235,7 @@ mod tests {
             "decdn_serve_stream_rejected_chain_hash_denied_total",
             "decdn_serve_stream_rejected_origin_denied_total",
             "decdn_serve_stream_rejected_foreign_declined_total",
+            "decdn_serve_stream_rejected_chain_stale_total",
         ];
         let text = metrics.encode().unwrap();
         for name in reasons {
@@ -3244,6 +3260,7 @@ mod tests {
         metrics.serve_stream_rejected_chain_hash_denied();
         metrics.serve_stream_rejected_origin_denied();
         metrics.serve_stream_rejected_foreign_declined();
+        metrics.serve_stream_rejected_chain_stale();
 
         let text = metrics.encode().unwrap();
         for name in reasons {

@@ -358,6 +358,7 @@ fn build_config(
             slash_judge_address: addrs.slash_judge.to_string(),
             content_blacklist_address: Some(addrs.content_blacklist.to_string()),
             content_blacklist_poll_interval_sec: 600,
+            chain_staleness_grace_sec: 1800,
             chain_id: CHAIN_ID,
         },
         cache: ResolvedCache {

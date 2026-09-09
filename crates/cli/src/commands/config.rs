@@ -179,6 +179,11 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
+        "  chain_staleness_grace_sec: {}",
+        resolved.blockchain.chain_staleness_grace_sec
+    )?;
+    writeln!(
+        w,
         "  rpc_watchdog_interval_sec: {}",
         resolved.blockchain.rpc_watchdog_interval_sec
     )?;
@@ -940,6 +945,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # content_blacklist_address = ""     # REQUIRED: 0x-prefixed hex; deployed ContentBlacklist (ADR 011/031). Absent => startup fails before any ALPN accepts; the zero address is rejected (it is a fail-open compliance trap).
 # content_blacklist_poll_interval_sec = 600  # blacklist watcher periodic replay + re-scope cadence (ADR 011); must be > 0; default 600s
+# chain_staleness_grace_sec = 1800   # stop serving after this long without a successful chain read (ADR 011); guards deny-set/pool/signer-cap staleness; must be > 0; set large to opt out; default 1800s
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
 # event_poll_interval_ms = 7000      # eth_getLogs tick cadence for chain watchers + pending-tx receipt polling (#1011/#1106); default 7000ms, min 250ms (lower for a local anvil)
@@ -1207,6 +1213,7 @@ mod tests {
             slash_appeal_address,
             content_blacklist_address,
             content_blacklist_poll_interval_sec,
+            chain_staleness_grace_sec,
             chain_id,
             rpc_watchdog_interval_sec,
             event_poll_interval_ms,
@@ -1257,6 +1264,10 @@ mod tests {
             (
                 "content_blacklist_poll_interval_sec =",
                 content_blacklist_poll_interval_sec.is_none(),
+            ),
+            (
+                "chain_staleness_grace_sec =",
+                chain_staleness_grace_sec.is_none(),
             ),
             ("chain_id =", chain_id.is_none()),
             (

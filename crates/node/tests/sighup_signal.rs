@@ -84,6 +84,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
             content_blacklist_address: None,
             content_blacklist_poll_interval_sec: 600,
+            chain_staleness_grace_sec: 1800,
             chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
         },
         cache: ResolvedCache {

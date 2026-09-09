@@ -167,6 +167,9 @@ impl ClientHandler {
             ServeRejectReason::ForeignNamespaceDeclined => {
                 self.metrics.serve_stream_rejected_foreign_declined();
             }
+            ServeRejectReason::ChainStale => {
+                self.metrics.serve_stream_rejected_chain_stale();
+            }
         }
         let error = reason.wire_error();
         let body = StreamResponseBody {

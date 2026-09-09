@@ -115,6 +115,7 @@ use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
+use crate::chain_freshness::ChainFreshness;
 use crate::content_deny::ContentDenylist;
 use crate::metrics::{Metrics, metric_hook};
 use crate::warming_allowance::WarmingAllowance;
@@ -1025,6 +1026,7 @@ pub(crate) async fn bootstrap<P>(
     initial_sync_tx: oneshot::Sender<InitialSyncResult>,
     metrics: &Arc<Metrics>,
     denylist: Arc<ContentDenylist>,
+    chain_freshness: ChainFreshness,
 ) -> Result<Route>
 where
     P: Provider + Clone + 'static,
@@ -1081,6 +1083,10 @@ where
         metrics.blacklist_enforcement_failure(failed);
     }
     if clean {
+        // The boot enumeration + enforcement read the chain successfully, so seed
+        // the freshness clock: a node that has just vetted its deny-set must not
+        // read as stale in the window before the first poll tick stamps it.
+        chain_freshness.stamp();
         initial_sync.signal(Ok(()));
     } else {
         initial_sync.signal(Err(
@@ -1135,7 +1141,17 @@ where
             metrics,
             Metrics::blacklist_watcher_backoff_started,
         )),
-        on_tick_success: Some(metric_hook(metrics, Metrics::blacklist_watcher_tick)),
+        // Every successful poll tick (including idle ones) both stamps the
+        // liveness gauge and refreshes the serve-path staleness clock — the two
+        // are the same signal, so they fire from one hook.
+        on_tick_success: Some({
+            let metrics = Arc::clone(metrics);
+            let freshness = chain_freshness.clone();
+            Box::new(move || {
+                metrics.blacklist_watcher_tick();
+                freshness.stamp();
+            })
+        }),
         on_task_panic: Some(metric_hook(
             metrics,
             Metrics::blacklist_watcher_task_panicked,
