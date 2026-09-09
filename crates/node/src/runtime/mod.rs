@@ -1359,20 +1359,10 @@ async fn build_chain_and_handlers(
         frame_target_bytes: cfg.payment.frame_target_bytes,
         idle_timeout: None,
         pool_recheck_interval: None,
-        // Durable per-signer abandonment-bucket snapshots, keyed `(pool, signer)`
-        // (ADR 003 §Pool solvency): the same redb store that holds every lane record
-        // also mirrors each signer's bucket level + refill timestamp against each
-        // pool, so a restart resumes a signer's throttle where it left off rather
-        // than granting a fresh allowance.
-        floor_loss_store: Some(Arc::clone(&infra.concrete_channel_store)
-            as Arc<dyn decdn_incentive::PoolFloorLossStore>),
-        // Per-signer floor gates (ADR 003 §Pool solvency): the live concurrency cap
-        // `k` underneath the per-pool `remaining − M` ceiling, plus the node-local
-        // abandonment leaky-bucket (capacity + refill rate) that soft-throttles a
-        // burst-abandoner without ever touching the pool's money envelope.
+        // Per-signer floor gate (ADR 003 §Pool solvency): the live concurrency cap
+        // `k` underneath the per-pool `remaining − M` ceiling, which bounds how much
+        // live un-vouchered floor one capability signer may hold at once.
         pool_floor_signer_live_windows: cfg.blockchain.pool_floor_signer_live_windows,
-        pool_floor_signer_bucket_windows: cfg.blockchain.pool_floor_signer_bucket_windows,
-        pool_floor_signer_refill_secs: cfg.blockchain.pool_floor_signer_refill_secs,
         warming_credit,
         operator_shares: operator_shares.clone(),
         // Origin-only policy (#1759): backend-authoritative own/foreign decision.
@@ -3973,8 +3963,6 @@ mod tests {
                 buyer_max_approve: true,
                 pool_min_remaining_deposit_micro_usdc: 1_000_000,
                 pool_floor_signer_live_windows: 8,
-                pool_floor_signer_bucket_windows: 8,
-                pool_floor_signer_refill_secs: 60,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 content_blacklist_address: None,
                 content_blacklist_poll_interval_sec: 600,

@@ -682,7 +682,7 @@ impl PoolSettlementSink {
                 info!(pool_id = %pool_id, signer = %key.signer, "pool reclaimed; dropped tracked lane");
             }
         }
-        self.handler.forget_pool_floor(pool_id).await;
+        self.handler.forget_pool_floor(pool_id);
     }
 }
 

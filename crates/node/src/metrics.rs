@@ -555,20 +555,6 @@ pub struct DecdnMetrics {
     /// fsynced — the frontier-only replay surface is widening. Operator-visible
     /// name: `decdn_lane_flush_failures_total`.
     pub lane_flush_failures: Counter,
-    /// Floor abandonment-bucket writes that failed: a drop-time persist
-    /// (`record_bucket` on an abnormal `FloorReservation` drop) or a reclaimed pool's
-    /// `forget_loss`. Both are best-effort — the in-memory bucket stays authoritative
-    /// for the running process — so a failed persist widens the restart-time re-grant
-    /// window instead of breaking delivery (a restart hydrates a stale snapshot and
-    /// grants the affected signers a fresh abandonment allowance), and a failed forget
-    /// leaves the closed pool's row with no tombstone, open to permanent re-insertion
-    /// by a late persist (#1781's error-path residual). A sustained rate usually means
-    /// the `floor-loss.redb` file refuses writes (a prior failed commit latches redb
-    /// until the file is closed and reopened — restart the node) or is corrupt; pairs
-    /// with the per-failure `warn!`/`error!` lines ("floor abandonment-bucket persist
-    /// failed" / "pool floor-bucket forget failed"). Operator-visible name:
-    /// `decdn_floor_loss_persist_failures_total`.
-    pub floor_loss_persist_failures: Counter,
     /// Slashes detected against this node's operator by the slash watcher
     /// (`SlashJudge.Slashed`), counting each distinct `slashId` once across the
     /// bring-up backfill and the live stream (#1032). A non-zero value means the
@@ -1138,29 +1124,15 @@ pub struct DecdnMetrics {
     /// not conflated with an unconfirmed or unreachable pool. Visible name:
     /// `decdn_serve_stream_rejected_pool_unconfirmed_total`.
     pub serve_stream_rejected_pool_unconfirmed: Counter,
-    /// Delivery refused because the lane already has enough concurrent
-    /// same-lane streams in flight that admitting one more would exceed the
-    /// pool's refundable-floor headroom. Wire-indistinguishable from
-    /// `insufficient_deposit` (both signed as `NotFound`), so this counter is
-    /// the only place the distinction lives — a rising value signals a lane
-    /// experiencing sustained concurrency pressure. Visible name:
-    /// `decdn_serve_stream_rejected_lane_at_capacity_total`.
-    pub serve_stream_rejected_lane_at_capacity: Counter,
-    /// Delivery refused because ONE capability signer hit a per-signer floor gate —
-    /// either its live concurrency cap of un-vouchered reservation, or its refilling
-    /// node-local abandonment bucket (drained by a burst of abandons) — while the
-    /// pool itself can still pay (ADR 003
-    /// §Pool solvency, per-signer floor isolation). Wire-indistinguishable from
-    /// `insufficient_deposit` (both signed as `NotFound`), so this counter is the
-    /// only place the distinction lives — a rising value means one signer holds its
-    /// whole share un-vouchered while the pool as a whole is solvent, either by
-    /// abandoning streams or by running more concurrent un-vouchered streams than
-    /// its share covers. Wire-indistinguishable from `insufficient_deposit` (both
-    /// sign as `NotFound`, so a prober cannot map a pool's floor consumption), so
-    /// this counter is the only place the distinction survives — and the two
-    /// remedies differ: a pool shortfall clears with a top-up, a signer at its
-    /// share does not.
-    /// Visible name:
+    /// Delivery refused because ONE capability signer hit its per-signer live
+    /// concurrency cap of un-vouchered reservation, while the pool itself can still
+    /// pay (ADR 003 §Pool solvency, per-signer floor isolation).
+    /// Wire-indistinguishable from `insufficient_deposit` (both sign as `NotFound`,
+    /// so a prober cannot map a pool's floor consumption), so this counter is the
+    /// only place the distinction survives — a rising value means one signer runs
+    /// more concurrent un-vouchered streams than its share covers while the pool as a
+    /// whole is solvent. The two remedies differ: a pool shortfall clears with a
+    /// top-up, a signer at its share does not. Visible name:
     /// `decdn_serve_stream_rejected_signer_floor_at_cap_total`.
     pub serve_stream_rejected_signer_floor_at_cap: Counter,
     /// Delivery refused because the requested bounded range
@@ -1874,14 +1846,6 @@ recorders! {
     /// and the shutdown flush in `runtime/mod.rs`.
     lane_flush_failure => lane_flush_failures.inc();
 
-    /// A floor abandonment-bucket write failed: a drop-time persist (`record_bucket`
-    /// on an abnormal `FloorReservation` drop, leaving the durable snapshot behind the
-    /// in-memory bucket until a later drop re-persists it) or a reclaimed pool's
-    /// `forget_loss` (leaving the row deletable by nothing and untombstoned).
-    /// Pairs with the `warn!`/`error!` lines in `handlers/client/mod.rs`
-    /// ("floor abandonment-bucket persist failed" / "pool floor-bucket forget failed").
-    floor_loss_persist_failure => floor_loss_persist_failures.inc();
-
     /// A distinct slash against this node's operator was detected by the slash
     /// watcher (#1032). Counts each `slashId` once (backfill + live dedup).
     slash_detected => slashes_detected.inc();
@@ -1991,14 +1955,9 @@ recorders! {
     /// faulted) — kept distinct from a real deposit-exhaustion refusal.
     serve_stream_rejected_pool_unconfirmed => serve_stream_rejected_pool_unconfirmed.inc();
 
-    /// Record a `serve_stream` delivery refused because the lane already has
-    /// too many concurrent same-lane streams in flight and the pool's
-    /// refundable floor cannot cover the reserved cost of another.
-    serve_stream_rejected_lane_at_capacity => serve_stream_rejected_lane_at_capacity.inc();
-
-    /// Record a `serve_stream` delivery refused because this capability signer hit a
-    /// per-signer floor gate — its live concurrency cap or its drained abandonment
-    /// bucket — while the pool as a whole can still pay.
+    /// Record a `serve_stream` delivery refused because this capability signer hit its
+    /// per-signer live concurrency cap of un-vouchered reservation, while the pool as a
+    /// whole can still pay.
     serve_stream_rejected_signer_floor_at_cap => serve_stream_rejected_signer_floor_at_cap.inc();
 
     /// Record a `serve_stream` delivery refused because the requested bounded
@@ -3209,7 +3168,6 @@ mod tests {
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
             "decdn_serve_stream_rejected_pool_unconfirmed_total",
-            "decdn_serve_stream_rejected_lane_at_capacity_total",
             "decdn_serve_stream_rejected_signer_floor_at_cap_total",
             // Completed in #1520. These four always exported (the fields have
             // existed as long as their siblings) — what was missing was any
@@ -3237,7 +3195,6 @@ mod tests {
         metrics.serve_stream_rejected_owner_mismatch();
         metrics.serve_stream_rejected_insufficient_deposit();
         metrics.serve_stream_rejected_pool_unconfirmed();
-        metrics.serve_stream_rejected_lane_at_capacity();
         metrics.serve_stream_rejected_signer_floor_at_cap();
         metrics.serve_stream_rejected_range_not_satisfiable();
         metrics.serve_stream_rejected_hash_denied();

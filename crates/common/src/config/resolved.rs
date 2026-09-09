@@ -190,16 +190,6 @@ pub struct ResolvedBlockchain {
     /// window`. Lower-clamped to one window at use. Defaults to `8` — see
     /// `decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS`.
     pub pool_floor_signer_live_windows: u64,
-    /// Per-signer abandonment-bucket capacity, in ramp-start credit windows (ADR 003
-    /// § Pool solvency, per-signer abandonment allowance): the un-recouped floor a
-    /// signer may drain before this node soft-throttles it. Lower-clamped to one window
-    /// at use. Defaults to `8` — see
-    /// `decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_BUCKET_WINDOWS`.
-    pub pool_floor_signer_bucket_windows: u64,
-    /// Seconds to refill one window of the per-signer abandonment bucket (ADR 003
-    /// § Pool solvency). Lower-clamped to one second at use. Defaults to `60` — see
-    /// `decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_REFILL_SECS`.
-    pub pool_floor_signer_refill_secs: u64,
 }
 
 /// Resolved cache fields.

@@ -148,9 +148,6 @@ impl ClientHandler {
             ServeRejectReason::PoolUnconfirmed => {
                 self.metrics.serve_stream_rejected_pool_unconfirmed();
             }
-            ServeRejectReason::LaneAtCapacity => {
-                self.metrics.serve_stream_rejected_lane_at_capacity();
-            }
             ServeRejectReason::SignerFloorAtCap => {
                 self.metrics.serve_stream_rejected_signer_floor_at_cap();
             }
