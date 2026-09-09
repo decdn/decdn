@@ -151,9 +151,6 @@ impl ClientHandler {
             ServeRejectReason::SignerCapExhausted => {
                 self.metrics.serve_stream_rejected_signer_cap_exhausted();
             }
-            ServeRejectReason::LaneAtCapacity => {
-                self.metrics.serve_stream_rejected_lane_at_capacity();
-            }
             ServeRejectReason::SignerFloorAtCap => {
                 self.metrics.serve_stream_rejected_signer_floor_at_cap();
             }

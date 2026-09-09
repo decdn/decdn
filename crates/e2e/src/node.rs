@@ -233,31 +233,23 @@ impl NodeFixture {
         Ok(micro_usdc)
     }
 
-    /// Rewrite the three `[blockchain]` per-signer floor-throttle knobs
-    /// (`pool_floor_signer_bucket_windows`, `pool_floor_signer_live_windows`,
-    /// `pool_floor_signer_refill_secs`) in the daemon's config and restart the
-    /// daemon so the new values take effect.
+    /// Rewrite the `[blockchain]` per-signer floor knob
+    /// (`pool_floor_signer_live_windows`) in the daemon's config and restart the
+    /// daemon so the new value takes effect.
     ///
-    /// These size the node-local, signer-isolated abandonment bucket (ADR 003
-    /// § Pool solvency, per-signer abandonment allowance): its capacity in
-    /// ramp-start credit windows, the per-signer live-concurrency cap in windows,
-    /// and how many seconds refill one window. A journey shrinks the bucket (and
-    /// freezes its refill) so a short burst of withheld floors deterministically
-    /// drains one signer's allowance and soft-throttles it, without touching a
-    /// co-tenant's.
+    /// This sizes the per-signer LIVE concurrency cap `k` in ramp-start credit
+    /// windows (ADR 003 § Pool solvency, per-signer floor isolation): the most live
+    /// un-vouchered floor reservation one capability signer may hold underneath the
+    /// per-pool `remaining − M` ceiling. A journey shrinks it so one signer
+    /// deterministically fills its own share while the pool stays solvent, without
+    /// touching a co-tenant's.
     ///
     /// Restart-required for the same reason as [`Self::set_rate_per_mb`]: the
-    /// handler reads these once at runtime bring-up, so a running node only picks
-    /// them up by rewriting the config and bouncing the process ([`Self::restart`]).
-    pub async fn set_pool_floor_signer(
-        &self,
-        bucket_windows: u64,
-        live_windows: u64,
-        refill_secs: u64,
-    ) -> anyhow::Result<()> {
+    /// handler reads it once at runtime bring-up, so a running node only picks it up
+    /// by rewriting the config and bouncing the process ([`Self::restart`]).
+    pub async fn set_pool_floor_signer(&self, live_windows: u64) -> anyhow::Result<()> {
         let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
-        let rewritten =
-            rewrite_pool_floor_signer(&config, bucket_windows, live_windows, refill_secs)?;
+        let rewritten = rewrite_pool_floor_signer(&config, live_windows)?;
         std::fs::write(&self.config_path, rewritten).context("write node config")?;
 
         self.restart()
@@ -850,35 +842,24 @@ fn rewrite_buyer_working_deposit(config: &str, micro_usdc: u64) -> anyhow::Resul
     toml::to_string(&doc).context("render node config")
 }
 
-/// Rewrite the three `[blockchain]` per-signer floor-throttle knobs in a node
-/// TOML config, preserving every other key. Separate from
+/// Rewrite the `[blockchain]` per-signer floor knob (`pool_floor_signer_live_windows`)
+/// in a node TOML config, preserving every other key. Separate from
 /// [`NodeFixture::set_pool_floor_signer`] so its parse → mutate →
 /// `toml::to_string` round-trip is testable without a live daemon, mirroring
 /// [`rewrite_buyer_working_deposit`]. The `[blockchain]` table holds only
 /// scalars, so it is free of the `[cache]` `ValueAfterTable` serializer hazard.
-fn rewrite_pool_floor_signer(
-    config: &str,
-    bucket_windows: u64,
-    live_windows: u64,
-    refill_secs: u64,
-) -> anyhow::Result<String> {
+fn rewrite_pool_floor_signer(config: &str, live_windows: u64) -> anyhow::Result<String> {
     let mut doc: toml::Table = config.parse().context("parse node config")?;
     let blockchain = doc
         .get_mut("blockchain")
         .and_then(toml::Value::as_table_mut)
         .ok_or_else(|| anyhow::anyhow!("node config has no [blockchain] table"))?;
-    for (key, value) in [
-        ("pool_floor_signer_bucket_windows", bucket_windows),
-        ("pool_floor_signer_live_windows", live_windows),
-        ("pool_floor_signer_refill_secs", refill_secs),
-    ] {
-        blockchain.insert(
-            key.to_string(),
-            toml::Value::Integer(
-                i64::try_from(value).with_context(|| format!("{key} overflows i64"))?,
-            ),
-        );
-    }
+    blockchain.insert(
+        "pool_floor_signer_live_windows".to_string(),
+        toml::Value::Integer(
+            i64::try_from(live_windows).context("pool_floor_signer_live_windows overflows i64")?,
+        ),
+    );
     toml::to_string(&doc).context("render node config")
 }
 
@@ -1186,27 +1167,19 @@ mod tests {
     }
 
     /// `set_pool_floor_signer`'s parse → mutate → serialize step
-    /// (`rewrite_pool_floor_signer`) must round-trip: all three `[blockchain]`
-    /// knobs land and every other section — notably the `[cache]`
+    /// (`rewrite_pool_floor_signer`) must round-trip: the `[blockchain]` knob
+    /// lands and every other section — notably the `[cache]`
     /// scalar-after-subtable that trips the serializer hazard — survives.
     #[test]
     fn set_pool_floor_signer_round_trips_through_toml() {
-        let rewritten = rewrite_pool_floor_signer(&sample_rendered_config(), 2, 8, 3_600)
+        let rewritten = rewrite_pool_floor_signer(&sample_rendered_config(), 8)
             .expect("rewrite_pool_floor_signer must succeed");
         let doc: toml::Value =
             toml::from_str(&rewritten).expect("rewritten config must be valid TOML");
 
         assert_eq!(
-            doc["blockchain"]["pool_floor_signer_bucket_windows"].as_integer(),
-            Some(2)
-        );
-        assert_eq!(
             doc["blockchain"]["pool_floor_signer_live_windows"].as_integer(),
             Some(8)
-        );
-        assert_eq!(
-            doc["blockchain"]["pool_floor_signer_refill_secs"].as_integer(),
-            Some(3_600)
         );
         // Everything around the mutation is intact.
         assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
