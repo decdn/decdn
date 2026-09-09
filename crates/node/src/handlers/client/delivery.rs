@@ -297,6 +297,15 @@ impl ClientHandler {
         let pool_recheck_interval = self.pool_recheck_interval();
         let mut last_pool_check = std::time::Instant::now();
 
+        // The signer's capability `cap` the node holds on this lane, for the
+        // mid-stream signer cap-headroom re-check below (ADR 003 §Pool solvency).
+        // Fixed for the stream, so read once here. `None` when no lane is tracked
+        // (dev/test), which skips the re-check — the fail-toward-serving direction.
+        let held_signer_cap: Option<U256> = match lane {
+            Some(l) => Some(l.lock().await.state.cap),
+            None => None,
+        };
+
         loop {
             // The ramped window for the payment confirmed so far (ADR 003 §Credit
             // window). Recomputed each iteration: as `paid` advances in the recoup
@@ -474,6 +483,40 @@ impl ClientHandler {
                     tracing::warn!(
                         pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
                         "mid-stream PoolExhausted: pool can no longer fund the floor credit committed across its signers; owner should top up the deposit. This is the POOL level — stopped_signer names the terminated stream, not the cause; a per-signer gate refusal never reaches here"
+                    );
+                    return Ok(());
+                }
+
+                // Mid-stream SIGNER cap-headroom re-check (ADR 003 §Pool solvency),
+                // the per-signer sibling of the pool re-check above and on the same
+                // wall-clock cadence. A signer's `cap` is shared across every
+                // provider, so a client can drain it at ANOTHER node while streaming
+                // here; the pool re-check above cannot catch that — the pool's
+                // `remaining` stays healthy on other signers' budgets while THIS
+                // signer's `cap − spent` goes to zero. Left unchecked, this node keeps
+                // delivering and collecting vouchers `redeemMany` pays `min(desired,
+                // cap − spent) ≈ 0` for, eating the delivered bytes — unbounded for a
+                // large blob. `signer_cap_drained_midstream` reads the drain from the
+                // event-fed projection (no chain call) and stops IN-BAND with a clean
+                // `SignerCapExhausted` (post-auth, so naming it leaks nothing). It
+                // fails toward serving on a projection gap; the on-chain redeem
+                // `min(desired, cap − spent)` is the backstop and this only BOUNDS
+                // over-delivery to one interval.
+                if let Some(held) = held_signer_cap
+                    && self
+                        .signer_cap_drained_midstream(
+                            lane_key.pool_id,
+                            lane_key.signer,
+                            held,
+                            rate_per_mb,
+                        )
+                        .await
+                {
+                    self.write_reject(send, VoucherRejectReason::SignerCapExhausted, None)
+                        .await?;
+                    tracing::warn!(
+                        pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
+                        "mid-stream SignerCapExhausted: this signer drained its shared cap at other nodes since admission, so its cap−spent headroom no longer covers the committed floor; owner should raise the signer's cap or delegate a fresh capability. This is the SIGNER level, distinct from PoolExhausted — the pool may still be solvent on other signers' budgets"
                     );
                     return Ok(());
                 }
