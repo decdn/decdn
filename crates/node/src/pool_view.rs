@@ -175,6 +175,13 @@ struct PoolEntry {
     /// `PoolRedeemed` (watcher retry / reorg rewind) folds only the positive
     /// advance and the total stays exact under replay.
     lanes: HashMap<(Address, Address), u64>,
+    /// Per-signer `Σ` of that signer's lane advances across every provider — its
+    /// total on-chain `spent`, the same positive deltas `total_redeemed` folds but
+    /// bucketed by signer. Maintained in `record_redeemed` so the mid-stream signer
+    /// cap-headroom read ([`PoolProjection::signer_spent`]) is O(1) rather than a
+    /// scan of `lanes` on every voucher-boundary re-check. Idempotent and monotone
+    /// for the same reason `total_redeemed` is: only a lane's positive advance folds.
+    signer_spent: HashMap<Address, u64>,
     /// The pool's lifecycle: `Open` by default, `Closing { deadline }` after a
     /// `PoolCloseInitiated`. `PoolReclaimed` removes the whole entry.
     lifecycle: Lifecycle,
@@ -286,9 +293,10 @@ impl PoolProjection {
                 let key = (lane.signer, provider);
                 let prev = entry.lanes.get(&key).copied().unwrap_or(0);
                 if lane.newPaidCumulative > prev {
-                    entry.total_redeemed = entry
-                        .total_redeemed
-                        .saturating_add(lane.newPaidCumulative - prev);
+                    let delta = lane.newPaidCumulative - prev;
+                    entry.total_redeemed = entry.total_redeemed.saturating_add(delta);
+                    let signer_total = entry.signer_spent.entry(lane.signer).or_insert(0);
+                    *signer_total = signer_total.saturating_add(delta);
                     entry.lanes.insert(key, lane.newPaidCumulative);
                 }
             }
@@ -372,6 +380,7 @@ impl PoolProjection {
                     deposit: u64::try_from(deposit).unwrap_or(u64::MAX),
                     total_redeemed: 0,
                     lanes: HashMap::new(),
+                    signer_spent: HashMap::new(),
                     lifecycle,
                 },
             );
@@ -384,32 +393,26 @@ impl PoolProjection {
         self.pools.load().get(&pool_id).map(PoolEntry::status)
     }
 
-    /// A `signer`'s total on-chain `spent` in this pool: the sum of its lane
-    /// cumulatives across EVERY provider. A signer's `cap` is shared across all
-    /// providers (ADR 003 §Deposit Economics), and on-chain `spent` for a signer is
-    /// exactly what it has redeemed at each provider summed, so summing this signer's
-    /// `(signer, provider)` lanes — the same folded cumulatives `total_redeemed`
-    /// draws on — reconstructs it. The serve path's mid-stream signer cap-headroom
-    /// re-check reads this to catch a signer draining its shared `cap` at another node
-    /// mid-stream (ADR 003 §Pool solvency).
+    /// A `signer`'s total on-chain `spent` in this pool: `Σ` of its lane advances
+    /// across EVERY provider. A signer's `cap` is shared across all providers (ADR
+    /// 003 §Deposit Economics), and on-chain `spent` for a signer is exactly what it
+    /// has redeemed at each provider summed. The projection folds this per-signer
+    /// total in `record_redeemed` alongside `total_redeemed`, so this read is an O(1)
+    /// map lookup — the serve path's mid-stream signer cap-headroom re-check calls it
+    /// every voucher-boundary interval per live stream (ADR 003 §Pool solvency), and
+    /// a scan of the lane map here would cost `streams × lanes` on a busy pool.
     ///
     /// `0` for a pool the projection has not folded, or one in which the signer has
     /// redeemed nothing — both make the re-check's `held_cap − spent` headroom its
     /// widest, so the re-check fails toward serving on a projection gap (the
     /// admit-time `getAuthorization` already caught an already-exhausted signer
-    /// authoritatively; this only bounds drain SINCE admit). `saturating_add` cannot
-    /// exceed the folded `total_redeemed`, which is itself bounded by the deposit.
+    /// authoritatively; this only bounds drain SINCE admit). The folded total cannot
+    /// exceed `total_redeemed`, which is itself bounded by the deposit.
     #[must_use]
     pub fn signer_spent(&self, pool_id: B256, signer: Address) -> u64 {
-        let pools = self.pools.load();
-        let Some(entry) = pools.get(&pool_id) else {
-            return 0;
-        };
-        entry
-            .lanes
-            .iter()
-            .filter(|((lane_signer, _provider), _)| *lane_signer == signer)
-            .fold(0u64, |acc, (_, &cumulative)| acc.saturating_add(cumulative))
+        self.pools.load().get(&pool_id).map_or(0, |entry| {
+            entry.signer_spent.get(&signer).copied().unwrap_or(0)
+        })
     }
 }
 
@@ -713,6 +716,25 @@ mod tests {
         view.record_redeemed(pool(1), addr(101), &[lane(addr(2), 4_000)]);
         view.record_redeemed(pool(1), addr(102), &[lane(addr(2), 3_000)]);
         assert_eq!(view.signer_spent(pool(1), addr(2)), 7_100);
+    }
+
+    #[tokio::test]
+    async fn signer_spent_is_idempotent_and_monotone_under_replay() {
+        // The per-signer total is a folded aggregate, so it must fold only positive
+        // lane advances — a replayed or stale event must not double-count it, exactly
+        // like `total_redeemed`.
+        let view = PoolProjection::new();
+        view.record_opened(pool(1), addr(7), U256::from(10_000u64));
+        view.record_redeemed(pool(1), addr(100), &[lane(addr(2), 300)]);
+        // Replayed identical event (watcher retry / reorg rewind): no double count.
+        view.record_redeemed(pool(1), addr(100), &[lane(addr(2), 300)]);
+        assert_eq!(view.signer_spent(pool(1), addr(2)), 300);
+        // A stale (lower) cumulative never lowers the total.
+        view.record_redeemed(pool(1), addr(100), &[lane(addr(2), 100)]);
+        assert_eq!(view.signer_spent(pool(1), addr(2)), 300);
+        // A genuine advance folds only the delta.
+        view.record_redeemed(pool(1), addr(100), &[lane(addr(2), 450)]);
+        assert_eq!(view.signer_spent(pool(1), addr(2)), 450);
     }
 
     #[tokio::test]
