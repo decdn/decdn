@@ -1116,6 +1116,14 @@ pub struct DecdnMetrics {
     /// more load-bearing, since a third refusal path routes through it.
     /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
     pub serve_stream_rejected_insufficient_deposit: Counter,
+    /// Delivery refused at admission because a wired `PoolView` could not confirm
+    /// the pool on-chain — the pool has no on-chain record, is closed/reclaimed, or
+    /// the admit-path `getPool` faulted. Wire-indistinguishable from a cache miss
+    /// (signed as `NotFound`), so this counter is the only place the reason lives;
+    /// kept distinct from `insufficient_deposit` so a real drained-pool refusal is
+    /// not conflated with an unconfirmed or unreachable pool. Visible name:
+    /// `decdn_serve_stream_rejected_pool_unconfirmed_total`.
+    pub serve_stream_rejected_pool_unconfirmed: Counter,
     /// Delivery refused because ONE capability signer hit its per-signer live
     /// concurrency cap of un-vouchered reservation, while the pool itself can still
     /// pay (ADR 003 §Pool solvency, per-signer floor isolation).
@@ -1941,6 +1949,11 @@ recorders! {
     /// (#856): the requesting channel could not cover the worst-case blob cost,
     /// so no upstream pull was started.
     serve_stream_rejected_insufficient_deposit => serve_stream_rejected_insufficient_deposit.inc();
+
+    /// Record a `serve_stream` admission refused because a wired `PoolView` could
+    /// not confirm the pool on-chain (absent, closed, or the admit `getPool`
+    /// faulted) — kept distinct from a real deposit-exhaustion refusal.
+    serve_stream_rejected_pool_unconfirmed => serve_stream_rejected_pool_unconfirmed.inc();
 
     /// Record a `serve_stream` delivery refused because this capability signer hit its
     /// per-signer live concurrency cap of un-vouchered reservation, while the pool as a
@@ -3154,6 +3167,7 @@ mod tests {
             "decdn_serve_stream_rejected_unknown_lane_total",
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
+            "decdn_serve_stream_rejected_pool_unconfirmed_total",
             "decdn_serve_stream_rejected_signer_floor_at_cap_total",
             // Completed in #1520. These four always exported (the fields have
             // existed as long as their siblings) — what was missing was any
@@ -3180,6 +3194,7 @@ mod tests {
         metrics.serve_stream_rejected_unknown_lane();
         metrics.serve_stream_rejected_owner_mismatch();
         metrics.serve_stream_rejected_insufficient_deposit();
+        metrics.serve_stream_rejected_pool_unconfirmed();
         metrics.serve_stream_rejected_signer_floor_at_cap();
         metrics.serve_stream_rejected_range_not_satisfiable();
         metrics.serve_stream_rejected_hash_denied();
