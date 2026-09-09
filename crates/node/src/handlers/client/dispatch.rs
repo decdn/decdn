@@ -400,6 +400,31 @@ impl ClientHandler {
                 .await;
         }
 
+        // Signer cap-headroom confirm (ADR 003 §Pool solvency): a capability whose
+        // signer has already drawn its shared `cap` at other nodes is uncashable here.
+        // Confirm the signer's on-chain `cap - spent` covers a floor before admitting,
+        // so a "spent" capability sprayed to a fresh node is refused, not served for
+        // vouchers this node can never redeem. Unregistered signer or no chain wired ->
+        // u64::MAX (never refuse); a getAuthorization fault -> None -> refuse.
+        if let (Some(view), Some(signer)) = (self.pool_view.as_ref(), verified_client) {
+            let floor_micro =
+                decdn_incentive::min_payment(self.credit_window(CHUNK_BYTES, 0), rate_per_mb);
+            let headroom_ok = view
+                .signer_cap_headroom_micro(B256::from(req.pool_id), signer)
+                .await
+                .is_some_and(|h| U256::from(h) >= floor_micro);
+            if !headroom_ok {
+                return self
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::SignerCapExhausted,
+                        rate_per_mb,
+                    )
+                    .await;
+            }
+        }
+
         // Serve-path origin-blacklist gate (ADR 011 §On Blacklist Event): refuse a
         // pool whose FUNDER (`getPool.owner`) is on the operator's local
         // `denied_origins` or the on-chain origin blacklist. The funding address is

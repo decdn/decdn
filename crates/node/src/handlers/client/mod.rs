@@ -950,6 +950,15 @@ enum ServeRejectReason {
     /// drained one, and an operator can tell a chain/RPC problem from real
     /// deposit exhaustion.
     PoolUnconfirmed,
+    /// The request's voucher signer is registered on-chain with `cap − spent` below
+    /// a serve floor, or its authorization could not be confirmed. A signer's `cap`
+    /// is shared across every provider (ADR 003 §Pool solvency), so a "spent"
+    /// capability — one whose signer has already drawn its full `cap` at other nodes
+    /// — is uncashable here: the node would serve for vouchers it could never
+    /// redeem. Distinct from [`Self::InsufficientDeposit`] and [`Self::PoolUnconfirmed`]
+    /// for the per-reason metric ONLY — all three collapse to `NotFound` on the wire
+    /// (see [`Self::wire_error`]), so no pool or signer state leaks.
+    SignerCapExhausted,
     /// The lane already has enough concurrent same-lane streams in flight that
     /// admitting one more would put more unpaid egress in flight than the pool's
     /// refundable-floor headroom covers. Distinct from [`Self::InsufficientDeposit`]
@@ -1028,6 +1037,7 @@ impl ServeRejectReason {
             | Self::OwnerMismatch
             | Self::InsufficientDeposit
             | Self::PoolUnconfirmed
+            | Self::SignerCapExhausted
             | Self::LaneAtCapacity
             | Self::SignerFloorAtCap
             | Self::LoadShedHit
