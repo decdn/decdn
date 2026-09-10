@@ -33,13 +33,38 @@ struct Bundle<'a> {
 
 /// One manifest entry: a file's relative POSIX path, its `b3:<hex>` content
 /// address, and its byte length.
+///
+/// `hash`/`size` always describe the **whole file**. When `chunks` is present it
+/// is an ordered decomposition of that same file — a dedup helper — and the
+/// file's bytes are the in-order concatenation of the chunk blobs, validated
+/// against `hash`. A plain (unchunked) entry omits `chunks` entirely and
+/// serializes byte-identically to a bundle that predates chunked entries.
 #[derive(Serialize)]
 pub(crate) struct BundleEntry {
     /// Relative POSIX path within the bundle root (`a/b.txt`, never absolute).
     pub(crate) path: String,
-    /// The file's BLAKE3 content address, `b3:<64 lowercase hex>`.
+    /// The whole file's BLAKE3 content address, `b3:<64 lowercase hex>`.
     pub(crate) hash: String,
-    /// The file's length in bytes.
+    /// The whole file's length in bytes.
+    pub(crate) size: u64,
+    /// Optional ordered chunk decomposition of the file (a dedup helper). When
+    /// present, each chunk is an independently content-addressed blob and the
+    /// file is their in-order concatenation; when absent, the file is fetched as
+    /// one blob by `hash`. Skipped from the serialized form when absent so plain
+    /// entries keep their pre-chunks byte layout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) chunks: Option<Vec<Chunk>>,
+}
+
+/// One chunk of a chunked [`BundleEntry`]: an independently BLAKE3-addressed blob
+/// and its byte length. Chunks are listed in content order — the file is their
+/// concatenation — and a chunk `hash` shared across entries names one blob,
+/// fetched and paid for once.
+#[derive(Serialize)]
+pub(crate) struct Chunk {
+    /// The chunk blob's BLAKE3 content address, `b3:<64 lowercase hex>`.
+    pub(crate) hash: String,
+    /// The chunk's length in bytes. The chunk sizes sum to the entry's `size`.
     pub(crate) size: u64,
 }
 
@@ -208,6 +233,10 @@ where
             path: rel_str,
             hash,
             size,
+            // Generation of chunked entries is out of scope: the directory walk
+            // always emits whole-file entries. Chunked manifests are produced by
+            // an external chunker and consumed by `bundle pull`.
+            chunks: None,
         });
     }
 
@@ -394,6 +423,7 @@ mod tests {
             path: "a.txt".into(),
             hash: "b3:abc".into(),
             size: 12,
+            chunks: None,
         }];
         let bytes = serialize_canonical(&entries).unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();
@@ -402,6 +432,48 @@ mod tests {
             "{\"version\":1,\"entries\":[{\"path\":\"a.txt\",\"hash\":\"b3:abc\",\"size\":12}]}"
         );
         assert!(!s.ends_with('\n'));
+    }
+
+    #[test]
+    fn serialize_canonical_emits_chunks_after_size() {
+        let entries = vec![BundleEntry {
+            path: "model.safetensors".into(),
+            hash: "b3:whole".into(),
+            size: 100,
+            chunks: Some(vec![
+                Chunk {
+                    hash: "b3:c0".into(),
+                    size: 60,
+                },
+                Chunk {
+                    hash: "b3:c1".into(),
+                    size: 40,
+                },
+            ]),
+        }];
+        let bytes = serialize_canonical(&entries).unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(
+            s,
+            "{\"version\":1,\"entries\":[{\"path\":\"model.safetensors\",\"hash\":\"b3:whole\",\"size\":100,\"chunks\":[{\"hash\":\"b3:c0\",\"size\":60},{\"hash\":\"b3:c1\",\"size\":40}]}]}"
+        );
+    }
+
+    #[test]
+    fn serialize_canonical_omits_chunks_key_when_absent() {
+        // A plain (unchunked) entry must serialize byte-identically to the
+        // pre-chunks format: no `chunks` key at all.
+        let entries = vec![BundleEntry {
+            path: "a.txt".into(),
+            hash: "b3:abc".into(),
+            size: 12,
+            chunks: None,
+        }];
+        let bytes = serialize_canonical(&entries).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            "{\"version\":1,\"entries\":[{\"path\":\"a.txt\",\"hash\":\"b3:abc\",\"size\":12}]}"
+        );
     }
 
     #[test]
