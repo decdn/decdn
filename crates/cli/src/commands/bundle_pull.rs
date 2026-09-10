@@ -299,9 +299,12 @@ enum EntryOutcome {
 }
 
 /// One-line `--json` summary. `fetched`/`linked`/`skipped`/`failed` are entry
-/// counts; `downloaded` is the distinct bytes pulled over the wire (each shared
-/// chunk or duplicated blob once) and `reconstructed` is the total bytes written
-/// to disk this run — they diverge exactly when dedup saved a transfer.
+/// counts; `downloaded` is the distinct content bytes fetched (each shared chunk
+/// or duplicated blob counted once) and `reconstructed` is the total bytes
+/// written to disk this run — they diverge exactly when dedup saved a transfer.
+/// `downloaded` is a content-size tally, not an exact on-wire measurement: it
+/// excludes bao proof overhead and still counts a chunk served from an existing
+/// staging file on a resumed run.
 #[derive(Serialize)]
 struct PullReport {
     output: String,
@@ -313,11 +316,12 @@ struct PullReport {
     reconstructed: u64,
 }
 
-/// A pull's byte accounting: `downloaded` is the distinct content bytes actually
-/// pulled over the wire (a chunk or blob shared across entries counts once);
-/// `reconstructed` is the total bytes written to disk (every materialized copy).
-/// The two are equal unless dedup — shared chunks, or a blob at several paths —
-/// let one transfer serve several files.
+/// A pull's byte accounting: `downloaded` is the distinct content bytes fetched
+/// (a chunk or blob shared across entries counts once); `reconstructed` is the
+/// total bytes written to disk (every materialized copy). The two are equal
+/// unless dedup — shared chunks, or a blob at several paths — let one fetch serve
+/// several files. `downloaded` sums content lengths, not exact on-wire bytes: it
+/// omits bao proof overhead and still counts a chunk resumed from staging.
 #[derive(Clone, Copy, Default)]
 struct Transfer {
     downloaded: u64,
@@ -1189,7 +1193,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             }
         }
 
-        // `downloaded` is the distinct chunk bytes actually pulled (each shared
+        // `downloaded` is the distinct chunk content bytes fetched (each shared
         // chunk once); `reconstructed` is the assembled file bytes written to
         // disk (a shared chunk counted in every file it composes).
         let downloaded = fetched
