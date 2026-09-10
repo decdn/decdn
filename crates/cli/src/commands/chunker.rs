@@ -218,6 +218,82 @@ mod tests {
     }
 
     #[test]
+    fn cdc_resyncs_past_a_length_shift() {
+        // The shared region starts at different byte offsets in each file
+        // because the prefixes differ in LENGTH (1 MiB vs 1 MiB + 7 bytes) and
+        // in content. A fixed-size chunker would misalign every downstream
+        // chunk boundary and share zero chunks; CDC re-syncs its
+        // content-defined cut points once it re-enters the shared bytes, so
+        // the interior and trailing chunks of `shared` still come out
+        // identical in both files (only the chunk straddling the
+        // prefix->shared seam differs).
+        let shared = pseudo(3, 16 * 1024 * 1024);
+        let mut f1 = pseudo(10, 1024 * 1024);
+        f1.extend_from_slice(&shared);
+        let mut f2 = pseudo(20, 1024 * 1024 + 7);
+        f2.extend_from_slice(&shared);
+
+        let h = |d: &[u8]| -> std::collections::HashSet<String> {
+            chunk_file(d, &sizes(), |_h, _b| Ok(()))
+                .unwrap()
+                .chunks
+                .into_iter()
+                .map(|c| c.hash)
+                .collect()
+        };
+        let (s1, s2) = (h(&f1), h(&f2));
+        let shared_count = s1.intersection(&s2).count();
+        assert!(
+            shared_count >= 2,
+            "CDC should re-sync past the length shift and share several \
+             chunks of `shared`; got {shared_count} shared out of {} / {} \
+             chunks",
+            s1.len(),
+            s2.len()
+        );
+        // The differing prefixes mean the files are not chunk-for-chunk
+        // identical.
+        assert!(s1 != s2, "prefixes differ, so the chunk sets must too");
+    }
+
+    #[test]
+    fn shared_head_divergent_tail_dedups_head_not_tail() {
+        // A shared leading region followed by divergent tails: the head
+        // chunks dedup (proving CDC finds the shared content), while each
+        // file's tail produces chunks the other lacks (proving divergence
+        // still yields distinct chunks, not spurious matches).
+        let head = pseudo(5, 16 * 1024 * 1024);
+        let mut f1 = head.clone();
+        f1.extend_from_slice(&pseudo(30, 8 * 1024 * 1024));
+        let mut f2 = head.clone();
+        f2.extend_from_slice(&pseudo(40, 8 * 1024 * 1024));
+
+        let h = |d: &[u8]| -> std::collections::HashSet<String> {
+            chunk_file(d, &sizes(), |_h, _b| Ok(()))
+                .unwrap()
+                .chunks
+                .into_iter()
+                .map(|c| c.hash)
+                .collect()
+        };
+        let (s1, s2) = (h(&f1), h(&f2));
+        let shared_count = s1.intersection(&s2).count();
+        assert!(
+            shared_count >= 2,
+            "shared head should dedup several chunks; got {shared_count}"
+        );
+        let f1_only: std::collections::HashSet<_> = s1.difference(&s2).cloned().collect();
+        let f2_only: std::collections::HashSet<_> = s2.difference(&s1).cloned().collect();
+        assert!(
+            !f1_only.is_empty() && !f2_only.is_empty(),
+            "divergent tails should each produce chunks the other file lacks \
+             (f1_only={}, f2_only={})",
+            f1_only.len(),
+            f2_only.len()
+        );
+    }
+
+    #[test]
     fn empty_input_yields_empty_chunks_and_empty_hash() {
         let cf = chunk_file(&[][..], &sizes(), |_h, _b| Ok(())).unwrap();
         assert_eq!(cf.total_size, 0);
