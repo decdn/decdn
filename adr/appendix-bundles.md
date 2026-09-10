@@ -35,9 +35,12 @@ fetch every entry by hash. No out-of-band file distribution.
 ```
 
 Top-level keys are `version` (integer, currently `1`) and `entries`
-(array). Each entry has three required keys, in this order: `path`
-(string), `hash` (string), `size` (integer), and an optional fourth key
-`chunks` (array). Field declaration order is load-bearing — see
+(array). Each entry's keys come in this order: `path` (string), `hash`
+(string), `size` (integer), `chunks` (array). `path` and `hash` are
+required. `bundle create` always emits `size`, but a reader treats it as
+optional and informational (see the `size` bullet). `chunks` is optional
+and present only for a chunked file. When a key is present it holds this
+order — field declaration order is load-bearing, see
 [Determinism](#determinism).
 
 - `path` — relative POSIX path (`/` separator on every platform), UTF-8.

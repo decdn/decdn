@@ -963,22 +963,40 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let plain: Vec<&ManifestEntry> = entries.iter().filter(|e| e.chunks.is_none()).collect();
         let chunked: Vec<&ManifestEntry> = entries.iter().filter(|e| e.chunks.is_some()).collect();
 
-        let mut outcomes = self.pull_plain(&plain, out_root, overwrite, jobs).await;
+        // A blob can appear both as a whole-file entry `hash` and as a chunk of
+        // another entry (a chunk also published standalone). The two phases share
+        // one content-addressed staging dir, so the fix for "fetch/pay once" is to
+        // stop the plain phase from deleting a staging blob the chunked phase still
+        // needs: the chunked phase then resumes from the finalized blob and pays
+        // nothing, and its own cleanup removes it. Parse errors drop out — an
+        // unparseable chunk hash is never fetched and can't equal a valid plain one.
+        let chunk_keep: HashSet<[u8; 32]> = chunked
+            .iter()
+            .filter_map(|e| parse_chunk_hashes(e).ok())
+            .flatten()
+            .collect();
+
+        let mut outcomes = self
+            .pull_plain(&plain, out_root, overwrite, jobs, &chunk_keep)
+            .await;
         outcomes.extend(self.pull_chunked(&chunked, out_root, overwrite, jobs).await);
         outcomes
     }
 
     /// The whole-file path: fetch every distinct blob once (grouped by hash) and
-    /// materialize it at each destination path (#1306).
+    /// materialize it at each destination path (#1306). A group whose hash is in
+    /// `keep` (also a chunk of some chunked entry) leaves its staging blob in place
+    /// for the chunked phase to reuse.
     async fn pull_plain(
         &self,
         entries: &[&ManifestEntry],
         out_root: &Path,
         overwrite: bool,
         jobs: usize,
+        keep: &HashSet<[u8; 32]>,
     ) -> Vec<EntryOutcome> {
         futures_util::stream::iter(group_by_hash(entries))
-            .map(|group| self.fetch_group(group, out_root, overwrite))
+            .map(|group| self.fetch_group(group, out_root, overwrite, keep))
             .buffer_unordered(jobs)
             .collect::<Vec<Vec<EntryOutcome>>>()
             .await
@@ -1091,6 +1109,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         group: HashGroup<'_>,
         out_root: &Path,
         overwrite: bool,
+        keep: &HashSet<[u8; 32]>,
     ) -> Vec<EntryOutcome> {
         // The group's shared hash is carried explicitly; parse it once, and a bad
         // hash fails every path in the group.
@@ -1156,15 +1175,26 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // re-fetch — and re-payment — of an unrefunded blob in *every* case;
         // `fetch`'s single-blob path gets this free from its own ranged store, so
         // the copy-based fan-out must gate it.
-        if !outcomes
+        //
+        // A hash in `keep` is also a chunk of some chunked entry: leave it for the
+        // chunked phase to reuse (paid once), which then removes it in its own
+        // cleanup once every entry that needs it has landed.
+        let any_failed = outcomes
             .iter()
-            .any(|o| matches!(o, EntryOutcome::Failed { .. }))
-        {
+            .any(|o| matches!(o, EntryOutcome::Failed { .. }));
+        if should_remove_staging(any_failed, &hash, keep) {
             remove_staging(&staging);
         }
 
         outcomes
     }
+}
+
+/// Whether a whole-file group's staging blob may be removed after materializing:
+/// only when nothing failed (a failed entry keeps its resume prefix) and the hash
+/// is not also a chunk the chunked phase still needs (`keep`).
+fn should_remove_staging(any_failed: bool, hash: &[u8; 32], keep: &HashSet<[u8; 32]>) -> bool {
+    !any_failed && !keep.contains(hash)
 }
 
 /// Copy the already-fetched, already-verified blob at `staging` to `dest`,
@@ -1858,6 +1888,20 @@ mod tests {
             .map(|group| group.entries.iter().map(|e| e.path.as_str()).collect())
             .collect();
         assert_eq!(paths, vec![vec!["a.txt", "c.txt"], vec!["b.txt"]]);
+    }
+
+    #[test]
+    fn should_remove_staging_keeps_a_blob_the_chunked_phase_needs() {
+        let h = [0x11; 32];
+        let keep = HashSet::from([h]);
+        let empty = HashSet::new();
+        // Kept when the same blob is also a chunk — the chunked phase reuses it so
+        // it is fetched and paid for once across both phases.
+        assert!(!should_remove_staging(false, &h, &keep));
+        // Removed when it is not needed elsewhere and nothing failed.
+        assert!(should_remove_staging(false, &h, &empty));
+        // A failed entry always keeps its resume prefix.
+        assert!(!should_remove_staging(true, &h, &empty));
     }
 
     /// Distinct hashes never merge — each is its own unit of work, in order.
