@@ -109,12 +109,14 @@ pub(crate) fn micros_now() -> u64 {
 /// TTY-aware — `indicatif` hides it automatically when stderr is not a terminal,
 /// so a piped/redirected fetch emits no bar. A steady tick animates the spinner
 /// during the pre-byte connect/handshake so the command never looks hung. The
-/// bar counts **delivered content bytes** against the blob's content size —
-/// verified ranged-store leaf bytes, not the wire size — so its total matches the
-/// byte count printed on completion. On a single-source fetch the driver reports
-/// this lane's `base_present + received`; a multi-source fetch instead reports one
-/// monotonic total the lanes fold their per-leg deltas into, so the bar never
-/// jumps between lanes' divergent local positions.
+/// bar counts received **wire** bytes (bao content plus interleaved proof nodes)
+/// against the blob's aligned wire length — the same accounting the receive loop
+/// meters and the [`decdn_client_pull::ProgressCallback`] reports — so length and
+/// position share one unit and the bar fills to exactly 100% (the completion line
+/// prints the smaller content-byte count separately). On a single-source fetch the
+/// driver reports this lane's `base_present + received`; a multi-source fetch
+/// instead reports one monotonic total the lanes fold their per-leg deltas into,
+/// so the bar never jumps between lanes' divergent local positions.
 fn new_progress_bar() -> indicatif::ProgressBar {
     let style = indicatif::ProgressStyle::with_template(
         // Rate/ETA come from `{msg}` (see `delivery_progress`), not the built-in
@@ -2505,9 +2507,10 @@ const RATE_SMOOTHING_TAU_SECS: f64 = 3.0;
 /// Rolling delivery-rate estimate behind the progress bar's `{msg}`, and the
 /// running totals the end-of-fetch summary reads back.
 ///
-/// The bar's positions are cumulative **delivered content bytes** — the driver
-/// reports `base_present + received` against the blob's content size, where
-/// `received` is the ranged store's verified-leaf count — not wire bytes.
+/// The bar's positions are cumulative received **wire** bytes (bao content plus
+/// interleaved proof nodes) — what the receive loop meters and the
+/// [`decdn_client_pull::ProgressCallback`] reports — so the rate is a true
+/// on-the-wire throughput.
 ///
 /// Each `set_position` on the bar is bursty — many chunks land in one instant,
 /// then a gap — so a naive `delta / dt` per callback spikes and collapses. This
@@ -2522,7 +2525,7 @@ struct SpeedState {
     /// actually transferred rather than dividing already-present bytes by this
     /// run's short window.
     started: Option<(Instant, u64)>,
-    /// Instant and cumulative delivered content bytes at the previous sample.
+    /// Instant and cumulative received wire bytes at the previous sample.
     last: Option<(Instant, u64)>,
     /// Smoothed rate in bytes/sec. `None` until the second sample gives a `dt`.
     ewma_bps: Option<f64>,
@@ -2631,27 +2634,36 @@ pub(crate) fn labeled_delivery_bar() -> indicatif::ProgressBar {
 }
 
 /// Build the callback that drives `bar` — setting its length to the pull's
-/// content size once, advancing its position to the cumulative delivered
-/// content-byte count, and folding each update into a [`SpeedState`] for the
-/// rate/ETA `{msg}` — and return it with the [`DeliveryMeter`] the caller reads
-/// after the bar finishes.
+/// aligned **wire** size once, advancing its position to the cumulative received
+/// wire-byte count, and folding each update into a [`SpeedState`] for the rate/ETA
+/// `{msg}` — and return it with the [`DeliveryMeter`] the caller reads after the
+/// bar finishes.
 ///
-/// `on_byte_delta`, when set, receives the per-update byte delta: the increase in
-/// cumulative position since the previous callback. `bundle pull` folds every
-/// file bar's deltas into one bottom total bar through it; single-blob `fetch`
+/// The callback's `received`/`expected` are wire bytes (bao content plus
+/// interleaved proof nodes), per [`decdn_client_pull::ProgressCallback`] — not the
+/// blob's content size. Both the bar length and its position are therefore in wire
+/// bytes, so the bar fills to exactly 100% and never overshoots.
+///
+/// `on_progress`, when set, receives each update's `(received_delta,
+/// expected_delta)` — the increases in cumulative received and expected wire bytes
+/// since the previous callback. `bundle pull` folds every file bar's deltas into
+/// one bottom total bar through it (position by `received_delta`, length by
+/// `expected_delta`), keeping the total wire-consistent too; single-blob `fetch`
 /// passes `None`. `received` is cumulative and non-decreasing across an entry's
-/// fail-over resumes (each attempt continues from `base_present`), so the delta
-/// is a true increment and a folded total never double-counts.
+/// fail-over resumes (each attempt continues from `base_present`), so the deltas
+/// are true increments and a folded total never double-counts.
 pub(crate) fn bar_callback(
     bar: indicatif::ProgressBar,
-    on_byte_delta: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    on_progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
 ) -> (impl Fn(u64, u64) + 'static, DeliveryMeter) {
     // `expected` is constant across the pull, so set the bar length once (it
     // takes a write lock) rather than on every chunk in the hot receive loop.
     let length_set = std::sync::atomic::AtomicBool::new(false);
-    // Cumulative position at the previous callback, so the forwarded delta is a
-    // true per-update increment.
+    // Cumulative received and expected wire bytes at the previous callback, so the
+    // forwarded deltas are true per-update increments (`expected` is constant, so
+    // its delta is the full wire length on the first call and zero after).
     let prev = std::sync::atomic::AtomicU64::new(0);
+    let prev_expected = std::sync::atomic::AtomicU64::new(0);
     let state = Arc::new(Mutex::new(SpeedState::default()));
     let cb_state = Arc::clone(&state);
     let on_progress = move |received: u64, expected: u64| {
@@ -2660,9 +2672,14 @@ pub(crate) fn bar_callback(
         }
         bar.set_position(received);
 
-        if let Some(sink) = &on_byte_delta {
+        if let Some(sink) = &on_progress {
             let previous = prev.swap(received, std::sync::atomic::Ordering::Relaxed);
-            sink(received.saturating_sub(previous));
+            let previous_expected =
+                prev_expected.swap(expected, std::sync::atomic::Ordering::Relaxed);
+            sink(
+                received.saturating_sub(previous),
+                expected.saturating_sub(previous_expected),
+            );
         }
 
         let now = Instant::now();

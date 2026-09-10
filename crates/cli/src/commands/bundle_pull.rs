@@ -552,9 +552,9 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         return Ok(());
     };
 
-    // The kept manifest is known: enable the multi-bar renderer, its total-bar
-    // mode decided by whether every entry declared a size (bytes) or not (files).
-    ctx.progress = enable_progress(&manifest.entries, args.json);
+    // The kept manifest is known: enable the multi-bar renderer (silent off a
+    // terminal or under `--json`).
+    ctx.progress = PullProgress::new(args.json);
 
     let (outcomes, transfer) = ctx
         .pull_all(
@@ -600,16 +600,6 @@ async fn obtain_manifest<P: Provider + Clone>(
         return Ok(None);
     }
     Ok(Some(m))
-}
-
-/// Enable the run's multi-bar renderer for the kept `entries`, choosing byte-mode
-/// (every entry declared a size) or files-mode (some did not); see
-/// [`pull_progress::total_mode`]. Silent off a terminal or under `--json`.
-fn enable_progress(entries: &[ManifestEntry], json: bool) -> PullProgress {
-    PullProgress::new(
-        pull_progress::total_mode(entries.iter().map(|e| (e.hash.as_str(), e.size))),
-        json,
-    )
 }
 
 /// The bundle's per-provider lane locks. A `(signer, provider)` voucher lane is
@@ -1219,13 +1209,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             futures_util::stream::iter(plans.iter().enumerate())
                 .map(|(idx, plan)| {
                     let claims = &claims;
-                    // `idx` indexes `plans`, which is 1:1 with `entries`; `get` keeps the
-                    // access panic-free (a missing size just leaves the bar length unset).
-                    let size_hint = entries.get(idx).and_then(|e| e.size);
                     async move {
-                        let outcome = self
-                            .pull_chunked_file(plan, size_hint, out_root, claims)
-                            .await;
+                        let outcome = self.pull_chunked_file(plan, out_root, claims).await;
                         (idx, outcome)
                     }
                 })
@@ -1297,21 +1282,17 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     async fn pull_chunked_file(
         &self,
         plan: &ChunkedPlan<'_>,
-        size_hint: Option<u64>,
         out_root: &Path,
         claims: &tokio::sync::Mutex<HashMap<[u8; 32], ChunkCell>>,
     ) -> EntryOutcome {
         let (label, chunks) = match plan {
             ChunkedPlan::Failed(o) => return o.clone(),
-            ChunkedPlan::Skip => {
-                // Already present — count it toward the files-mode total, no bar.
-                self.progress.advance_files(1);
-                return EntryOutcome::Skipped;
-            }
+            // Already present — no fetch, no bar.
+            ChunkedPlan::Skip => return EntryOutcome::Skipped,
             // The single destination path labels the file's bar.
             ChunkedPlan::Assemble { label, chunks, .. } => ((*label).to_string(), chunks),
         };
-        let cf = self.progress.chunked_file(label, size_hint);
+        let cf = self.progress.chunked_file(label);
 
         // Resolve every chunk (fetch-once or reuse), collecting the per-chunk
         // results this file needs for assembly.
@@ -1349,9 +1330,6 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
         let outcome = assemble_plan(plan, out_root, &file_fetched);
         cf.finish();
-        if !matches!(outcome, EntryOutcome::Failed { .. }) {
-            self.progress.advance_files(1);
-        }
         outcome
     }
 
@@ -1408,17 +1386,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // payment. This is the whole point of the group: a duplicate path that is
         // already on disk costs nothing.
         if !slots.iter().any(|s| matches!(s, Slot::Write { .. })) {
-            let outcomes: Vec<EntryOutcome> = slots
+            return slots
                 .into_iter()
                 .map(|s| match s {
                     Slot::Failed(o) => o,
                     _ => EntryOutcome::Skipped,
                 })
                 .collect();
-            // No pull, but these paths are done (already present) — count them
-            // toward the files-mode total so it still reaches its length.
-            self.progress.advance_files(completed_files(&outcomes));
-            return outcomes;
         }
 
         // Staged once per group: `drive_fetch` finalizes to
@@ -1434,13 +1408,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
         // One per-file bar for this group's single pull, labeled by its
         // destination path(s) — a fetch-once hash group shows one bar for every
-        // path it lands at. The size hint (all entries share a blob, so one size)
-        // sets the bar length up front when the manifest declared it.
+        // path it lands at. The manifest's content size (all entries share a blob,
+        // so one size) seeds the bar length as a pre-byte estimate; the first
+        // delivered chunk replaces it with the authoritative wire length.
         let paths: Vec<String> = group.entries.iter().map(|e| e.path.clone()).collect();
-        let size_hint = group.entries.iter().find_map(|e| e.size);
+        let size_estimate = group.entries.iter().find_map(|e| e.size);
         let file_bar = self
             .progress
-            .file_bar(pull_progress::file_label(&paths), size_hint);
+            .file_bar(pull_progress::file_label(&paths), size_estimate);
         let fetched = self
             .fetch_to_staging(hash, &staging, file_bar.callback())
             .await;
@@ -1482,22 +1457,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             remove_staging(&staging);
         }
 
-        // Advance the files-mode total by the paths this pull landed (byte mode
-        // already tracked the delivered bytes through the bar callback).
-        self.progress.advance_files(completed_files(&outcomes));
-
         outcomes
     }
-}
-
-/// The number of `outcomes` that are not failures — the files a pull actually
-/// landed (written or already present), for advancing the files-mode total bar.
-fn completed_files(outcomes: &[EntryOutcome]) -> u64 {
-    let done = outcomes
-        .iter()
-        .filter(|o| !matches!(o, EntryOutcome::Failed { .. }))
-        .count();
-    u64::try_from(done).unwrap_or(u64::MAX)
 }
 
 /// Whether a whole-file group's staging blob may be removed after materializing:
