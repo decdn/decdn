@@ -298,8 +298,13 @@ enum EntryOutcome {
     Failed { path: String, err: String },
 }
 
-/// One-line `--json` summary. `fetched`/`total_bytes` count only paid network
-/// pulls; `linked` counts duplicate destinations satisfied locally.
+/// One-line `--json` summary. `fetched`/`linked`/`skipped`/`failed` are entry
+/// counts; `downloaded` is the distinct content bytes fetched (each shared chunk
+/// or duplicated blob counted once) and `reconstructed` is the total bytes
+/// written to disk this run — they diverge exactly when dedup saved a transfer.
+/// `downloaded` is a content-size tally, not an exact on-wire measurement: it
+/// excludes bao proof overhead and still counts a chunk served from an existing
+/// staging file on a resumed run.
 #[derive(Serialize)]
 struct PullReport {
     output: String,
@@ -307,7 +312,30 @@ struct PullReport {
     linked: u64,
     skipped: u64,
     failed: u64,
-    total_bytes: u64,
+    downloaded: u64,
+    reconstructed: u64,
+}
+
+/// A pull's byte accounting: `downloaded` is the distinct content bytes fetched
+/// (a chunk or blob shared across entries counts once); `reconstructed` is the
+/// total bytes written to disk (every materialized copy). The two are equal
+/// unless dedup — shared chunks, or a blob at several paths — let one fetch serve
+/// several files. `downloaded` sums content lengths, not exact on-wire bytes: it
+/// omits bao proof overhead and still counts a chunk resumed from staging.
+#[derive(Clone, Copy, Default)]
+struct Transfer {
+    downloaded: u64,
+    reconstructed: u64,
+}
+
+impl Transfer {
+    /// Combine two tallies (saturating — a pull never reports a wrapped total).
+    const fn add(self, other: Transfer) -> Transfer {
+        Transfer {
+            downloaded: self.downloaded.saturating_add(other.downloaded),
+            reconstructed: self.reconstructed.saturating_add(other.reconstructed),
+        }
+    }
 }
 
 /// Read the registry once and keep the region-nearest candidates, which every
@@ -527,7 +555,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         m
     };
 
-    let outcomes = ctx
+    let (outcomes, transfer) = ctx
         .pull_all(
             &manifest.entries,
             &args.output,
@@ -536,7 +564,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         )
         .await;
 
-    report(&outcomes, &args.output, args.json)
+    report(&outcomes, transfer, &args.output, args.json)
 }
 
 /// The bundle's per-provider lane locks. A `(signer, provider)` voucher lane is
@@ -1012,7 +1040,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         overwrite: bool,
         jobs: usize,
-    ) -> Vec<EntryOutcome> {
+    ) -> (Vec<EntryOutcome>, Transfer) {
         // Whole-file entries take the by-hash grouping path (fetch-once +
         // link-duplicates, #1306); chunked entries take the concatenation path
         // (fetch each distinct chunk blob once, then assemble). The two sets are
@@ -1034,11 +1062,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .flatten()
             .collect();
 
-        let mut outcomes = self
+        let (mut outcomes, plain_bytes) = self
             .pull_plain(&plain, out_root, overwrite, jobs, &chunk_keep)
             .await;
-        outcomes.extend(self.pull_chunked(&chunked, out_root, overwrite, jobs).await);
-        outcomes
+        let (chunked_outcomes, chunked_bytes) =
+            self.pull_chunked(&chunked, out_root, overwrite, jobs).await;
+        outcomes.extend(chunked_outcomes);
+        (outcomes, plain_bytes.add(chunked_bytes))
     }
 
     /// The whole-file path: fetch every distinct blob once (grouped by hash) and
@@ -1052,15 +1082,20 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         overwrite: bool,
         jobs: usize,
         keep: &HashSet<[u8; 32]>,
-    ) -> Vec<EntryOutcome> {
-        futures_util::stream::iter(group_by_hash(entries))
+    ) -> (Vec<EntryOutcome>, Transfer) {
+        let groups: Vec<Vec<EntryOutcome>> = futures_util::stream::iter(group_by_hash(entries))
             .map(|group| self.fetch_group(group, out_root, overwrite, keep))
             .buffer_unordered(jobs)
             .collect::<Vec<Vec<EntryOutcome>>>()
-            .await
-            .into_iter()
-            .flatten()
-            .collect()
+            .await;
+        // Byte tally is per-group (a blob pulled once, materialized to N paths),
+        // so sum it before flattening away the group boundaries.
+        let transfer = groups
+            .iter()
+            .map(|g| group_transfer(g))
+            .fold(Transfer::default(), Transfer::add);
+        let outcomes = groups.into_iter().flatten().collect();
+        (outcomes, transfer)
     }
 
     /// The concatenation path for chunked entries. Two phases:
@@ -1082,9 +1117,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         overwrite: bool,
         jobs: usize,
-    ) -> Vec<EntryOutcome> {
+    ) -> (Vec<EntryOutcome>, Transfer) {
         if entries.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Transfer::default());
         }
 
         // Resolve each entry to a plan before any fetch: a parse/path failure or
@@ -1109,15 +1144,20 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             }
         }
 
-        // Phase 1: fetch each distinct chunk blob once.
-        let fetched: HashMap<[u8; 32], Result<(), String>> =
+        // Phase 1: fetch each distinct chunk blob once. On success the value is
+        // the chunk's content size (the finalized staging blob's length), which
+        // feeds the `downloaded` tally — each distinct chunk counted a single
+        // time even when several entries share it.
+        let fetched: HashMap<[u8; 32], Result<u64, String>> =
             futures_util::stream::iter(fetch_order)
                 .map(|hash| async move {
                     let result = match staging_path(out_root, hash) {
-                        Ok(staging) => self
-                            .fetch_to_staging(hash, &staging)
-                            .await
-                            .map_err(|e| format!("{e:#}")),
+                        Ok(staging) => match self.fetch_to_staging(hash, &staging).await {
+                            Ok(()) => std::fs::metadata(&staging)
+                                .map(|m| m.len())
+                                .map_err(|e| format!("stat staged chunk: {e}")),
+                            Err(e) => Err(format!("{e:#}")),
+                        },
                         Err(e) => Err(format!("{e:#}")),
                     };
                     (hash, result)
@@ -1153,7 +1193,28 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             }
         }
 
-        outcomes
+        // `downloaded` is the distinct chunk content bytes fetched (each shared
+        // chunk once); `reconstructed` is the assembled file bytes written to
+        // disk (a shared chunk counted in every file it composes).
+        let downloaded = fetched
+            .values()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .fold(0u64, u64::saturating_add);
+        let reconstructed = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                EntryOutcome::Fetched(n) => Some(*n),
+                _ => None,
+            })
+            .fold(0u64, u64::saturating_add);
+
+        (
+            outcomes,
+            Transfer {
+                downloaded,
+                reconstructed,
+            },
+        )
     }
 
     /// Fetch the blob shared by one hash-group and write it under `out_root` at
@@ -1349,7 +1410,7 @@ fn plan_chunked<'a>(entry: &'a ManifestEntry, out_root: &Path, overwrite: bool) 
 fn assemble_plan(
     plan: &ChunkedPlan<'_>,
     out_root: &Path,
-    fetched: &HashMap<[u8; 32], Result<(), String>>,
+    fetched: &HashMap<[u8; 32], Result<u64, String>>,
 ) -> EntryOutcome {
     let (label, whole, chunks, dest) = match plan {
         ChunkedPlan::Failed(o) => return o.clone(),
@@ -1364,7 +1425,7 @@ fn assemble_plan(
 
     for h in chunks {
         match fetched.get(h) {
-            Some(Ok(())) => {}
+            Some(Ok(_)) => {}
             Some(Err(e)) => {
                 return EntryOutcome::Failed {
                     path: (*label).to_string(),
@@ -1681,20 +1742,19 @@ fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> 
 }
 
 /// Summarize outcomes; return an error if any entry failed (after reporting all).
-fn report(outcomes: &[EntryOutcome], output: &Path, json: bool) -> anyhow::Result<()> {
+fn report(
+    outcomes: &[EntryOutcome],
+    transfer: Transfer,
+    output: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
     let mut fetched = 0u64;
     let mut linked = 0u64;
     let mut skipped = 0u64;
     let mut failed = 0u64;
-    let mut total_bytes = 0u64;
     for o in outcomes {
         match o {
-            // `total_bytes` counts only paid network pulls; a linked duplicate
-            // adds a file on disk but no wire bytes and no payment (#1306).
-            EntryOutcome::Fetched(n) => {
-                fetched += 1;
-                total_bytes = total_bytes.saturating_add(*n);
-            }
+            EntryOutcome::Fetched(_) => fetched += 1,
             EntryOutcome::Linked => linked += 1,
             EntryOutcome::Skipped => skipped += 1,
             EntryOutcome::Failed { path, err } => {
@@ -1710,7 +1770,8 @@ fn report(outcomes: &[EntryOutcome], output: &Path, json: bool) -> anyhow::Resul
         linked,
         skipped,
         failed,
-        total_bytes,
+        downloaded: transfer.downloaded,
+        reconstructed: transfer.reconstructed,
     };
     if json {
         let line = serde_json::to_string(&rep).map_err(|e| anyhow!("serialize report: {e}"))?;
@@ -1718,15 +1779,81 @@ fn report(outcomes: &[EntryOutcome], output: &Path, json: bool) -> anyhow::Resul
     } else {
         println!(
             "pulled into {} ({fetched} fetched, {linked} linked, {skipped} skipped, \
-             {failed} failed, {total_bytes} bytes)",
+             {failed} failed)",
             output.display()
         );
+        // `downloaded X → reconstructed Y` only when dedup made them differ;
+        // otherwise a single `downloaded X`.
+        println!("{}", transfer_line(transfer));
     }
 
     if failed > 0 {
         bail!("{failed} entr(ies) failed to fetch");
     }
     Ok(())
+}
+
+/// Format a byte count as a short decimal-unit label (`13.8 GB`). SI (1000-based)
+/// units match how file and model sizes are usually quoted.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if n < 1000 {
+        return format!("{n} B");
+    }
+    // Precision loss is irrelevant here: the result is a one-decimal human label.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "display-only size label; exact integer value is not needed"
+    )]
+    let mut value = n as f64;
+    let mut unit = 0usize;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    let label = UNITS.get(unit).copied().unwrap_or("B");
+    format!("{value:.1} {label}")
+}
+
+/// The end-of-pull transfer line. When dedup saved a transfer the two totals
+/// differ and both are shown with an arrow; otherwise a single `downloaded X`
+/// (the `→ reconstructed` half is omitted rather than repeating the same figure).
+fn transfer_line(t: Transfer) -> String {
+    if t.downloaded == t.reconstructed {
+        format!("downloaded {}", human_bytes(t.downloaded))
+    } else {
+        format!(
+            "downloaded {} → reconstructed {}",
+            human_bytes(t.downloaded),
+            human_bytes(t.reconstructed)
+        )
+    }
+}
+
+/// The [`Transfer`] for one whole-file hash-group: the blob is pulled once
+/// (`downloaded` = its size, taken from the single `Fetched`), and every
+/// materialized copy — the `Fetched` plus each `Linked` duplicate path — is a
+/// full file on disk (`reconstructed` = size × copies). A group with nothing
+/// written (all skipped or failed) contributes nothing.
+fn group_transfer(outcomes: &[EntryOutcome]) -> Transfer {
+    let file_size = outcomes.iter().find_map(|o| match o {
+        EntryOutcome::Fetched(n) => Some(*n),
+        _ => None,
+    });
+    match file_size {
+        Some(n) => {
+            let copies = outcomes
+                .iter()
+                .filter(|o| matches!(o, EntryOutcome::Fetched(_) | EntryOutcome::Linked))
+                .count();
+            let copies = u64::try_from(copies).unwrap_or(u64::MAX);
+            Transfer {
+                downloaded: n,
+                reconstructed: n.saturating_mul(copies),
+            }
+        }
+        None => Transfer::default(),
+    }
 }
 
 #[cfg(test)]
@@ -1937,14 +2064,72 @@ mod tests {
                 err: "boom".into(),
             },
         ];
-        let err = report(&outcomes, Path::new("/out"), true).unwrap_err();
+        let err = report(&outcomes, Transfer::default(), Path::new("/out"), true).unwrap_err();
         assert!(format!("{err:#}").contains("1 entr"), "{err:#}");
     }
 
     #[test]
     fn report_ok_when_none_failed() {
         let outcomes = vec![EntryOutcome::Fetched(10), EntryOutcome::Skipped];
-        assert!(report(&outcomes, Path::new("/out"), false).is_ok());
+        assert!(report(&outcomes, Transfer::default(), Path::new("/out"), false).is_ok());
+    }
+
+    #[test]
+    fn human_bytes_scales_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1_500), "1.5 KB");
+        assert_eq!(human_bytes(27_600_000_000), "27.6 GB");
+    }
+
+    #[test]
+    fn transfer_line_shows_arrow_only_when_they_differ() {
+        // Equal → a single figure, no "→ reconstructed" clause.
+        assert_eq!(
+            transfer_line(Transfer {
+                downloaded: 27_600_000_000,
+                reconstructed: 27_600_000_000,
+            }),
+            "downloaded 27.6 GB"
+        );
+        // Differ (dedup saved bytes) → both figures with the arrow.
+        assert_eq!(
+            transfer_line(Transfer {
+                downloaded: 13_800_000_000,
+                reconstructed: 27_600_000_000,
+            }),
+            "downloaded 13.8 GB → reconstructed 27.6 GB"
+        );
+    }
+
+    #[test]
+    fn group_transfer_counts_the_blob_once_and_every_written_copy() {
+        // One paid fetch + two linked duplicate paths: downloaded once, three
+        // copies reconstructed on disk.
+        let outcomes = vec![
+            EntryOutcome::Fetched(100),
+            EntryOutcome::Linked,
+            EntryOutcome::Linked,
+        ];
+        let t = group_transfer(&outcomes);
+        assert_eq!(t.downloaded, 100);
+        assert_eq!(t.reconstructed, 300);
+    }
+
+    #[test]
+    fn group_transfer_skips_and_fails_contribute_nothing() {
+        let outcomes = vec![EntryOutcome::Fetched(100), EntryOutcome::Skipped];
+        let t = group_transfer(&outcomes);
+        assert_eq!(t.downloaded, 100);
+        assert_eq!(t.reconstructed, 100);
+
+        let none = vec![EntryOutcome::Failed {
+            path: "x".into(),
+            err: "boom".into(),
+        }];
+        let t = group_transfer(&none);
+        assert_eq!(t.downloaded, 0);
+        assert_eq!(t.reconstructed, 0);
     }
 
     fn entry(path: &str, hash: &str) -> ManifestEntry {
@@ -2287,7 +2472,8 @@ mod tests {
         std::fs::write(staging_path(dir.path(), h0).unwrap(), b"hello ").unwrap();
         std::fs::write(staging_path(dir.path(), h1).unwrap(), b"world").unwrap();
         let plan = plan_chunked(&entry, dir.path(), false);
-        let fetched = HashMap::from([(h0, Ok(())), (h1, Ok(()))]);
+        let fetched: HashMap<[u8; 32], Result<u64, String>> =
+            HashMap::from([(h0, Ok(6)), (h1, Ok(5))]);
 
         let outcome = assemble_plan(&plan, dir.path(), &fetched);
 
@@ -2305,7 +2491,8 @@ mod tests {
         // Only the first chunk landed; the second failed to fetch.
         std::fs::write(staging_path(dir.path(), h0).unwrap(), b"hello ").unwrap();
         let plan = plan_chunked(&entry, dir.path(), false);
-        let fetched = HashMap::from([(h0, Ok(())), (h1, Err("upstream gone".to_string()))]);
+        let fetched: HashMap<[u8; 32], Result<u64, String>> =
+            HashMap::from([(h0, Ok(6)), (h1, Err("upstream gone".to_string()))]);
 
         let outcome = assemble_plan(&plan, dir.path(), &fetched);
 
@@ -2486,7 +2673,7 @@ mod tests {
             EntryOutcome::Linked,
             EntryOutcome::Skipped,
         ];
-        assert!(report(&outcomes, Path::new("/out"), false).is_ok());
+        assert!(report(&outcomes, Transfer::default(), Path::new("/out"), false).is_ok());
     }
 
     /// `--namespace` on bundle pull is bundle-level: one id for the whole run. It

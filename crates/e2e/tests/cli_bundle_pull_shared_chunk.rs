@@ -177,7 +177,15 @@ async fn run() -> anyhow::Result<()> {
 
     // The node serves the freshly-opened pool once its `getPool` view resolves it;
     // retry until it lands, exactly as the pool-id bundle e2e does.
-    run_bundle_pull_until_ready(client_dir.path(), &args).await?;
+    let stdout = run_bundle_pull_until_ready(client_dir.path(), &args).await?;
+
+    // The report surfaces the dedup: because the two files share a chunk, the
+    // distinct bytes pulled are less than the bytes written to disk, so the line
+    // shows the `→ reconstructed` clause (it is omitted only when they are equal).
+    anyhow::ensure!(
+        stdout.contains("downloaded ") && stdout.contains("→ reconstructed "),
+        "expected a `downloaded X → reconstructed Y` line, got:\n{stdout}"
+    );
 
     // Both files assembled from their chunks, byte-exact and BLAKE3-exact.
     let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin")?;
@@ -232,7 +240,7 @@ fn whole_blob_wire_bytes(total: u64) -> u64 {
 async fn run_bundle_pull_until_ready(
     data_dir: &std::path::Path,
     args: &[String],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
@@ -243,7 +251,7 @@ async fn run_bundle_pull_until_ready(
             .await
             .context("spawn decdn bundle pull")?;
         if output.status.success() {
-            return Ok(());
+            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
