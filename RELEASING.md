@@ -237,11 +237,11 @@ leaves all ten crates owned by one person — whoever ran it. Hand them to the
 org straight afterwards, in the same sitting.
 
 The new owner has to be a GitHub team: crates.io has no organisation account,
-so a team is the only owner that outlives an individual. Create one under the
-`decdn` org, add yourself to it, then:
+so a team is the only owner that outlives an individual. The `crates-io` team
+under the `decdn` org is that owner. Confirm you are in it, then:
 
 ```bash
-TEAM=github:decdn:<team-slug>
+TEAM=github:decdn:crates-io
 for crate in decdn-protocol decdn-config-types decdn-bao-range decdn-common \
              decdn-cache decdn-incentive decdn-reputation decdn-client-pull \
              decdn-node decdn-cli; do
@@ -250,7 +250,8 @@ done
 ```
 
 crates.io resolves the team through your own GitHub authorisation, so it fails
-unless the team exists and you are a member of it.
+unless you are a member of `crates-io`. The team is `closed`, not secret, so
+crates.io can read it with the `read:org` scope it asks for at login.
 
 A team owner publishes updates but cannot change the owner list. Only an
 individual owner does that, so do not remove yourself once the team is added —
