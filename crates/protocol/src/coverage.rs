@@ -21,15 +21,17 @@ use serde::{Deserialize, Serialize};
 /// bitmaps — see [`num_blocks`] and [`Coverage`].
 pub const DISCOVERY_BLOCK_BYTES: u64 = 64 << 20;
 
-/// Largest blob the discovery layer describes on the wire: 1 TiB.
+/// Largest blob the discovery layer describes on the wire: 100 GiB.
 ///
 /// This is a protocol ceiling that sizes the coverage-bitmap bound
 /// ([`MAX_COVERAGE_BYTES`]), not a per-node store limit — `max_blob_size_mb`
 /// is the separate, operator-tunable cache cap. A blob larger than this spans
 /// more discovery blocks than a well-formed [`Coverage`] can name on the wire,
-/// so it is not partial-holder-discoverable. The AI-model delivery wedge (#1164)
-/// serves sub-TiB blobs, so this bound never rejects a legitimate advertisement.
-pub const MAX_DISCOVERABLE_BLOB_BYTES: u64 = 1 << 40;
+/// so it is not partial-holder-discoverable as a single blob. A blob this large
+/// is published as a chunked bundle of smaller content-addressed chunk-blobs
+/// (each independently discoverable) rather than one monolithic blob, so the
+/// ceiling never rejects a legitimate advertisement.
+pub const MAX_DISCOVERABLE_BLOB_BYTES: u64 = 100 << 30;
 
 /// Upper bound, in bytes, on a [`Coverage`] bitmap decoded from untrusted wire.
 ///
@@ -37,7 +39,7 @@ pub const MAX_DISCOVERABLE_BLOB_BYTES: u64 = 1 << 40;
 /// bytes: bit-packed at 8 blocks per byte over the fixed 64 MiB
 /// [`DISCOVERY_BLOCK_BYTES`] (never the `test-support` overridable size, so the
 /// bound is a stable security constant). A frame whose `Coverage` is longer
-/// names more discovery blocks than a 1 TiB blob spans — beyond what
+/// names more discovery blocks than a 100 GiB blob spans — beyond what
 /// partial-holder discovery represents — and is rejected at decode. This is a
 /// wire representability bound, not a serving cap: a node may still be
 /// configured to hold and serve a larger blob, it just cannot advertise partial
@@ -47,10 +49,10 @@ pub const MAX_DISCOVERABLE_BLOB_BYTES: u64 = 1 << 40;
 /// coverage length is otherwise bounded only by the 16 MiB frame, and the
 /// per-publisher record quota multiplies it (stored memory ≈ records × bitmap).
 /// The cap makes an oversized bitmap unrepresentable rather than defended after
-/// the fact. For 1 TiB it is 2048 bytes.
+/// the fact. For 100 GiB it is 200 bytes.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "1 TiB / 64 MiB / 8 = 2048, far within usize on every supported target"
+    reason = "100 GiB / 64 MiB / 8 = 200, far within usize on every supported target"
 )]
 pub const MAX_COVERAGE_BYTES: usize = MAX_DISCOVERABLE_BLOB_BYTES
     .div_ceil(DISCOVERY_BLOCK_BYTES)
@@ -343,9 +345,9 @@ mod tests {
     }
 
     #[test]
-    fn max_coverage_bytes_matches_one_tib_blob() {
-        // 1 TiB / 64 MiB = 16384 blocks, bit-packed at 8/byte = 2048 bytes.
-        assert_eq!(MAX_COVERAGE_BYTES, 2048);
+    fn max_coverage_bytes_matches_max_discoverable_blob() {
+        // 100 GiB / 64 MiB = 1600 blocks, bit-packed at 8/byte = 200 bytes.
+        assert_eq!(MAX_COVERAGE_BYTES, 200);
     }
 
     #[test]
