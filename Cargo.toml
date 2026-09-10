@@ -3,9 +3,9 @@
 # identical to resolver 2's; the only difference is that
 # `resolver.incompatible-rust-versions` defaults to `fallback` instead of
 # `allow`, so cargo prefers dependency versions whose declared `rust-version`
-# is <= ours. Paired with `rust-version = "1.95"` below, that stops a future
+# is <= ours. Paired with `rust-version = "1.95.0"` below, that stops a future
 # `cargo update` from silently pulling a dependency that raised its MSRV past
-# the pinned toolchain. Nothing is excluded at 1.95 today.
+# the pinned toolchain. Nothing is excluded at 1.95.0 today.
 resolver = "3"
 members = [
     "crates/node",
@@ -23,36 +23,49 @@ members = [
 exclude = ["contracts"]
 
 [workspace.package]
-# Every publishable crate inherits this. `cargo release` (shared-version) bumps
-# it here and rewrites the matching `version` on the internal
-# `[workspace.dependencies]` entries below in the same commit.
-version = "0.1.1"
+# Every crate inherits this, and it is the one version the workspace has:
+# `decdn --version` reports it, `cargo release` (shared-version) bumps it here
+# and rewrites the matching `version` on the internal `[workspace.dependencies]`
+# entries below in the same commit, and the tag it pushes is `v` + this.
+#
+# `0.0.0` means no release has been cut. It is never tagged: the first
+# `cargo release minor --execute` makes it `0.1.0`, and the line moves only
+# under cargo-release from then on. check_workspace_manifests.py refuses a
+# member that restates the version and an internal alias below that disagrees
+# with it, so a hand edit anywhere else fails before it ships.
+version = "0.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.95"
+# Three parts, not two: this string, `rust-toolchain.toml`'s channel and every
+# `dtolnay/rust-toolchain@…` ref in the workflows are compared byte-for-byte by
+# check_toolchain_pin.py, so they move together or the `packaging` job says
+# which one did not.
+rust-version = "1.95.0"
 repository = "https://github.com/decdn/decdn"
 homepage = "https://decdn.org"
 keywords = ["cdn", "p2p", "content-delivery", "iroh", "blake3"]
 categories = ["network-programming", "web-programming"]
-# `readme` is deliberately NOT here — not because inheritance would break
-# packaging (cargo copies a workspace-root readme into the .crate quite happily)
-# but because these are public crates.io landing pages and each one needs to
-# describe its own crate. Inheriting would put the same text on all eleven.
+# `readme` and `description` are deliberately NOT here — not because
+# inheritance would break packaging (cargo copies a workspace-root readme into
+# the .crate quite happily) but because these are public crates.io landing
+# pages and each one needs to describe its own crate. Inheriting would put the
+# same text on all eleven. check_workspace_manifests.py requires both per
+# publishable crate.
 
 [workspace.dependencies]
 # Internal crates. The `version` is what makes these publishable — cargo rejects
 # a path dependency with no version specifier, because a published crate has no
 # path to follow. Locally the `path` still wins; the version only applies to the
 # manifest cargo uploads.
-decdn-protocol = { path = "crates/protocol", version = "0.1.1" }
-decdn-config-types = { path = "crates/config-types", version = "0.1.1" }
-decdn-bao-range = { path = "crates/bao-range", version = "0.1.1" }
-decdn-cache = { path = "crates/cache", version = "0.1.1" }
-decdn-incentive = { path = "crates/incentive", version = "0.1.1" }
-decdn-reputation = { path = "crates/reputation", version = "0.1.1" }
-decdn-common = { path = "crates/common", version = "0.1.1" }
-decdn-client-pull = { path = "crates/client-pull", version = "0.1.1" }
-decdn-node = { path = "crates/node", version = "0.1.1" }
+decdn-protocol = { path = "crates/protocol", version = "0.0.0" }
+decdn-config-types = { path = "crates/config-types", version = "0.0.0" }
+decdn-bao-range = { path = "crates/bao-range", version = "0.0.0" }
+decdn-cache = { path = "crates/cache", version = "0.0.0" }
+decdn-incentive = { path = "crates/incentive", version = "0.0.0" }
+decdn-reputation = { path = "crates/reputation", version = "0.0.0" }
+decdn-common = { path = "crates/common", version = "0.0.0" }
+decdn-client-pull = { path = "crates/client-pull", version = "0.0.0" }
+decdn-node = { path = "crates/node", version = "0.0.0" }
 # No `decdn-cli` entry: it is a bin crate and a workspace *member*, but nothing
 # in the workspace depends on it, so it needs no `[workspace.dependencies]`
 # alias. Add one back only alongside a real dependant.

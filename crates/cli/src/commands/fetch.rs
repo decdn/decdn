@@ -2629,6 +2629,11 @@ fn delivery_progress() -> (
 /// inserts these into its own bottom-anchored `MultiProgress` (so the total bar
 /// stays last); single-blob `fetch` uses [`new_progress_bar`] instead, which
 /// self-attaches and needs no prefix.
+///
+/// The steady tick is intentionally not enabled here: the caller enables it only
+/// after inserting the bar into its `MultiProgress`, because a detached bar draws
+/// straight to stderr and a pre-insert tick paints an orphan line the container
+/// never accounts for, tearing every later redraw.
 pub(crate) fn labeled_delivery_bar() -> indicatif::ProgressBar {
     let style = indicatif::ProgressStyle::with_template(
         // Same rate/ETA-in-`{msg}` layout as `new_progress_bar`, with the
@@ -2639,7 +2644,6 @@ pub(crate) fn labeled_delivery_bar() -> indicatif::ProgressBar {
     .progress_chars("=>-");
     let bar = indicatif::ProgressBar::new(0);
     bar.set_style(style);
-    bar.enable_steady_tick(Duration::from_millis(120));
     bar
 }
 

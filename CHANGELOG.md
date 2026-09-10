@@ -1237,6 +1237,24 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **The workspace reads `0.0.0` until the first release is cut, and the
+  versioning invariants are enforced rather than described.** `decdn
+  --version` and the default user agent report `0.0.0`; the first `cargo
+  release minor` makes it `0.1.0`. Three guards under `.github/scripts/` run
+  in the `packaging` CI job and as pre-commit hooks: the Rust version must be
+  one identical `X.Y.Z` across `rust-toolchain.toml`, `Cargo.toml`'s
+  `rust-version` (now `1.95.0`) and every `dtolnay/rust-toolchain` step;
+  every member inherits `version`/`edition`/`license`/`rust-version` and the
+  workspace lint table, and reaches a sibling only through its
+  `[workspace.dependencies]` alias; and the crate dependency flow in CLAUDE.md
+  is held as a table over `cargo metadata`, with `decdn-cli`'s closure kept
+  free of `iroh-blobs` and the AWS SDK. GitHub release notes open with a
+  `### Breaking` section.
+  - Why: the manifest claimed `0.1.1`, a release that was never tagged or
+    published, and nothing compared the fourteen sites that spell the Rust
+    version, so a Dependabot action bump could move CI onto a compiler no
+    developer runs.
+
 - **`missing_docs` is on, and the 230 public items that lacked a doc comment
   have one.** 170 were struct fields and 24 enum variants — the shapes rustdoc
   renders as a bare name with no explanation, which is where the gap actually

@@ -986,6 +986,16 @@ where
     let base_present = ranges_content_len(&store.present_ranges().await?, total_bytes);
     let progress_agg = AtomicU64::new(base_present);
 
+    // Surface the resume base on the bar immediately, before any lane opens a
+    // channel. The aggregator is already seeded to `base_present` and each lane
+    // folds only its leg DELTAS on top, so emitting the seed here DISPLAYS that
+    // starting value — it is not a fold and cannot double-count. Without it the
+    // bar sits at `0` through discovery / channel open / pool resolve, then jumps
+    // to the resume point on the first delivered chunk.
+    if let Some(cb) = on_progress {
+        cb(base_present, total_bytes);
+    }
+
     let workers = lanes.iter().enumerate().map(|(i, lane)| {
         run_worker(
             i,
@@ -1317,6 +1327,86 @@ mod tests {
         assert_eq!(
             prev, total,
             "the final reported position must reach the blob size"
+        );
+        Ok(())
+    }
+
+    /// A resumed multi-source fetch surfaces the already-present base on the bar
+    /// BEFORE any lane opens a channel: the first reported position is the held
+    /// prefix's content length, not `0`. The aggregator is seeded to
+    /// `base_present`, but nothing emits it until the first delivered chunk, so
+    /// without the pre-stream emit a resumed blob's bar sits at `0` through
+    /// discovery / channel open / pool resolve, then jumps to the resume point.
+    #[tokio::test]
+    async fn resume_base_is_reported_before_the_first_chunk() -> anyhow::Result<()> {
+        use crate::driver::ranges_content_len;
+        use crate::source::BlobSource;
+        use decdn_bao_range::{CHUNK_GROUP_BYTES, align_range};
+
+        let total = 8 * CHUNK_GROUP_BYTES;
+        let data = blob(total as usize);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let (store, _dir) = fresh_store(root, total);
+
+        // Seed a two-group prefix through the real verified ingest path, using a
+        // throwaway source so the lane sources' opened-byte logs stay clean.
+        let held = align_range(0, 2 * CHUNK_GROUP_BYTES, total).expect("align held");
+        let seed = ScriptedSource::new(data.clone())?;
+        let (_h, reader) = seed.open(root, held.clone()).await?;
+        store.ingest_stream(&held, reader, None).await?;
+        let base_present = ranges_content_len(&store.present_ranges().await?, total);
+        assert_eq!(
+            base_present,
+            2 * CHUNK_GROUP_BYTES,
+            "scenario: two groups held"
+        );
+
+        let samples: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let cb_samples = Arc::clone(&samples);
+        let on_progress: Box<super::ProgressCallback> = Box::new(move |received, expected| {
+            if let Ok(mut s) = cb_samples.lock() {
+                s.push((received, expected));
+            }
+        });
+
+        let lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+        ];
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            Some(&on_progress),
+        )
+        .await?;
+
+        let samples = samples.lock().expect("samples lock").clone();
+        let first = *samples.first().expect("at least one progress sample");
+        assert_eq!(
+            first,
+            (base_present, total),
+            "the first reported position must be the resume base, emitted before \
+             any lane opens a channel"
         );
         Ok(())
     }

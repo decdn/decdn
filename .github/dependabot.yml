@@ -48,7 +48,9 @@ updates:
       prefix: chore
       include: scope
     # No dtolnay/rust-toolchain ignore: MSRV and the stable lint pin are both
-    # 1.95.0 right now (see Cargo.toml workspace.package.rust-version and the
-    # @1.95.0 refs in ci.yml / release.yml), so all refs should bump in
-    # lockstep. Re-add a version-specific ignore here if MSRV later drops below
-    # the stable pin.
+    # 1.95.0 (see Cargo.toml workspace.package.rust-version and the @1.95.0
+    # refs in ci.yml / release.yml). Dependabot bumps only the action refs, and
+    # that is fine: .github/scripts/check-toolchain-pin.sh fails the `packaging`
+    # job until rust-toolchain.toml and Cargo.toml's rust-version move in the
+    # same PR, so the bump cannot land half-applied. Re-add a version-specific
+    # ignore here if MSRV later drops below the stable pin.
