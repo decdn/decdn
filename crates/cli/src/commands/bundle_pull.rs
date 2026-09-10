@@ -236,7 +236,7 @@ struct ManifestChunk {
 /// The compiled `--include`/`--exclude` globs that select which manifest entries
 /// a pull run fetches. Both sets match an entry's POSIX relative `path` — the
 /// manifest field (`models/a.bin`), never the on-disk absolute path — with the
-/// same gitignore glob dialect `bundle create --exclude` uses (`*` does not
+/// same gitignore glob dialect `origin import --exclude` uses (`*` does not
 /// cross `/`, `**` recurses), via [`build_glob_set`].
 ///
 /// An entry is kept iff it passes the include gate AND matches no exclude. The
@@ -2399,7 +2399,7 @@ mod tests {
     }
 
     /// A bare `*.txt` does NOT cross `/`, so it leaves nested `.txt` entries in
-    /// place — the same gitignore separator rule `bundle create --exclude` uses.
+    /// place — the same gitignore separator rule `origin import --exclude` uses.
     #[test]
     fn entry_filter_star_does_not_cross_slash() {
         assert_eq!(

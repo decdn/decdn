@@ -7,9 +7,9 @@
 > mechanisms (tarballs and the like) remain valid for their own use
 > cases.
 
-**Date:** 2026-05-07 — **Status:** Accepted (`bundle create` and
-`bundle pull` both ship). **Touches:** `decdn` CLI, content
-publishing workflow.
+**Date:** 2026-05-07 — **Status:** Accepted (`decdn origin import`
+generates manifests and `bundle pull` consumes them; both ship).
+**Touches:** `decdn` CLI, content publishing workflow.
 
 ## Context
 
@@ -17,8 +17,8 @@ publishing workflow.
 content-addressed: every byte stream is identified by its BLAKE3 hash,
 and the protocol is "content-agnostic … applications may define their
 own metadata or manifest layers on top". Multi-file publishing is one
-such layer. Hand-authoring `path → hash` JSON is error-prone, so the
-`decdn bundle` subcommand ships a deterministic generator alongside the
+such layer. Hand-authoring `path → hash` JSON is error-prone, so `decdn
+origin import` ships a deterministic manifest generator alongside the
 on-disk format spec it produces — the format is validated by its own
 generator and publishers never write a bundle file by hand.
 
@@ -37,7 +37,7 @@ fetch every entry by hash. No out-of-band file distribution.
 Top-level keys are `version` (integer, currently `1`) and `entries`
 (array). Each entry's keys come in this order: `path` (string), `hash`
 (string), `size` (integer), `chunks` (array). `path` and `hash` are
-required. `bundle create` always emits `size`, but a reader treats it as
+required. `origin import` always emits `size`, but a reader treats it as
 optional and informational (see the `size` bullet). `chunks` is optional
 and present only for a chunked file. When a key is present it holds this
 order — field declaration order is load-bearing, see
@@ -91,7 +91,7 @@ publisher-side and free to set their own conventions.
 
 ## Path-safety rules (creation-time invariants)
 
-`bundle create` enforces every rule below; consumers SHOULD re-validate
+`origin import` enforces every rule below; consumers SHOULD re-validate
 on read.
 
 1. **Canonicalize-and-contain.** The `--input` directory is
@@ -166,14 +166,45 @@ manifest in the protocol sense.
 - `bundle inspect`, signing/attestation, encryption, compression,
   nested bundles, network publishing of the produced file — all v2+
   concerns, none of which the bundle BLAKE3 invariant depends on.
-- **Generation of chunked entries.** `bundle create` and `origin
-  import` emit whole-file entries. Choosing chunk boundaries that
-  maximize sharing across a directory is a separate indexing problem; an
-  external chunker produces a chunked manifest and `bundle pull`
-  consumes it.
 - This appendix does not add a wire format. Bundles never ride an ALPN;
   they exist only as on-disk JSON or as opaque blob bytes when published
   through the regular content path.
+
+## Generation
+
+`decdn origin import` walks a local file or directory and emits the
+canonical bundle manifest for it (see [Determinism](#determinism)). By
+default each file becomes one whole-file blob, addressed by `hash`.
+
+With `--optimize`, `origin import` splits each file into content-defined
+chunks (fastcdc v2020) instead of storing it as one blob. `--chunk-avg` is the
+primary dial: it sets the target chunk size and defaults to 4 MiB, the
+ceiling fastcdc's averaging window supports. `--chunk-min` and
+`--chunk-max` are advanced rails around that target; `--chunk-min` is
+pinned at a 1 MiB floor, matching `MB_BYTES`, the fixed payment interval
+— a chunk smaller than one payment interval buys nothing. Each chunk
+becomes its own BLAKE3-addressed blob. A chunk with the same content as
+one already seen — in the same file or a different one — is stored once:
+`origin import` deduplicates by content address, not by file. The
+whole-file blob is never stored under `--optimize`; the file's bytes are
+the in-order concatenation of its chunk blobs, and the entry's `hash`
+field is the end-to-end validator that the concatenation reproduces the
+original file (see [Chunked files](#chunked-files)).
+
+A single-file `--optimize` import produces one manifest entry with a
+`chunks` array; a directory import produces one entry per file, each
+independently chunked, with dedup applied across the whole directory.
+
+`bundle pull` consumes a chunked manifest exactly as it consumes an
+unchunked one — see [Chunked entries](#chunked-entries) under Pull.
+
+`--to <backend>:<location>` writes blobs into a cache origin store and
+is normally required. `--dry-run` makes it optional: it writes no blobs
+anywhere and prints the canonical manifest bytes to stdout instead, so
+`origin import --dry-run` is the local "just make me a manifest" path —
+a publisher who only wants the manifest, without seeding an origin
+store yet, runs this and nothing else. `--bundle FILE` additionally
+writes the manifest to a file, with or without `--dry-run`.
 
 ## Pull
 

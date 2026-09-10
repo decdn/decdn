@@ -359,7 +359,7 @@ async fn run_publish_expect_failure(node: &NodeFixture, args: &[&str]) -> anyhow
 
 /// Parse the `namespace_id` from a `decdn publish namespace create --json`
 /// receipt. The receipt is a single JSON object; take the last non-empty stdout
-/// line defensively (the `bundle create --json` CLI tests do the same).
+/// line defensively (other `--json` CLI tests do the same).
 fn parse_namespace_id(stdout: &[u8]) -> anyhow::Result<u64> {
     let text = String::from_utf8_lossy(stdout);
     let line = text

@@ -1,12 +1,13 @@
 //! Shared bundle-manifest machinery: the directory walk, path-safety rules,
-//! canonical JSON serialization, and atomic manifest write used by both
-//! `decdn bundle create` and `decdn origin import` (issues #391, #1904).
+//! canonical JSON serialization, and atomic manifest write used by
+//! `decdn origin import` (issues #391, #1904).
 //!
-//! Both commands walk a directory the same way and emit the **same** canonical
-//! manifest bytes, so a directory seeded with `origin import` is retrievable by
-//! the exact bundle hash `bundle create` would report for it. Keeping the walk
-//! and the serializer in one place is what makes that byte-identity hold by
-//! construction rather than by two copies staying in sync.
+//! `origin import` walks a directory and emits canonical manifest bytes; with
+//! `--dry-run` it prints the exact same bytes to stdout instead of importing,
+//! so operators can inspect or capture the manifest the import would produce.
+//! Keeping the walk and the serializer in one place is what makes that
+//! byte-identity hold by construction rather than by two copies staying in
+//! sync.
 //!
 //! The on-disk schema, hash format (`b3:<hex>`), path-safety rules, and the
 //! determinism contract that makes single-hash bundle distribution viable are
@@ -68,8 +69,8 @@ pub(crate) struct Chunk {
     pub(crate) size: u64,
 }
 
-/// The result of walking a directory: the sorted entries plus the two counters
-/// the operator-facing status reports (`bundle create`, `origin import`) surface.
+/// The result of walking a directory: the sorted entries plus the two
+/// counters the operator-facing status report (`origin import`) surfaces.
 pub(crate) struct WalkOutput {
     /// Manifest entries, sorted by path bytes (deterministic).
     pub(crate) entries: Vec<BundleEntry>,
@@ -91,8 +92,8 @@ pub(crate) fn build_excluder(patterns: &[String]) -> anyhow::Result<GlobSet> {
 
 /// Compile the repeatable glob `patterns` given for `flag` into a single
 /// matcher. `flag` names the source flag so a bad pattern reports the flag the
-/// operator actually typed. Shared by `--exclude` (bundle create / origin
-/// import) and bundle pull's `--include`/`--exclude` entry filter.
+/// operator actually typed. Shared by `origin import`'s `--exclude` and
+/// bundle pull's `--include`/`--exclude` entry filter.
 pub(crate) fn build_glob_set(patterns: &[String], flag: &str) -> anyhow::Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for raw in patterns {
@@ -134,8 +135,10 @@ fn keep_entry(rel: &Path, is_dir: bool, excluder: &GlobSet) -> bool {
 /// Walk `root` (already canonicalized by the caller), applying the exclude set
 /// and symlink-containment rules, and invoke `per_file` for every regular file
 /// kept. `per_file` receives the file's canonicalized path and its validated
-/// relative POSIX string, and returns the file's `b3:<hex>` address and size —
-/// `bundle create` just hashes; `origin import` hashes **and** writes the blob.
+/// relative POSIX string, and returns the file's whole-file `b3:<hex>` address,
+/// size, and an optional chunk decomposition — a dry-run caller just hashes;
+/// `origin import` (without `--dry-run`) hashes **and** writes the blob; a
+/// plain (non-chunking) caller always returns `None` for the third element.
 ///
 /// The entries are sorted by path bytes so the emitted manifest — and therefore
 /// its own BLAKE3 — is byte-stable across runs.
@@ -146,7 +149,7 @@ pub(crate) fn walk_and_collect<F>(
     mut per_file: F,
 ) -> anyhow::Result<WalkOutput>
 where
-    F: FnMut(&Path, &str) -> anyhow::Result<(String, u64)>,
+    F: FnMut(&Path, &str) -> anyhow::Result<(String, u64, Option<Vec<Chunk>>)>,
 {
     let mut entries: Vec<BundleEntry> = Vec::new();
     let mut skipped_symlinks: u64 = 0;
@@ -185,7 +188,7 @@ where
             continue;
         }
         // With follow_links=false, symlinks come through as symlink entries we
-        // never read — skip silently and surface the count in --json. With
+        // never read — skip silently and surface the count in the report. With
         // follow_links=true, walkdir resolves the link transparently and the
         // entry presents as a regular file; only then does the path-safety check
         // below run and catch escapes via in-tree symlinks.
@@ -230,7 +233,7 @@ where
             continue;
         }
 
-        let (hash, size) = per_file(&canonical, &rel_str)
+        let (hash, size, chunks) = per_file(&canonical, &rel_str)
             .with_context(|| format!("processing {}", canonical.display()))?;
 
         total_size = total_size.checked_add(size).ok_or_else(|| {
@@ -241,10 +244,7 @@ where
             path: rel_str,
             hash,
             size,
-            // Generation of chunked entries is out of scope: the directory walk
-            // always emits whole-file entries. Chunked manifests are produced by
-            // an external chunker and consumed by `bundle pull`.
-            chunks: None,
+            chunks,
         });
     }
 
@@ -264,7 +264,7 @@ where
 /// shouldn't produce these segments — but the manifest's `path` field is the
 /// contract verifiers re-validate against, so we assert here rather than
 /// trusting the upstream walker.
-fn validate_relpath(rel: &Path) -> anyhow::Result<String> {
+pub(crate) fn validate_relpath(rel: &Path) -> anyhow::Result<String> {
     let mut out = String::new();
     let mut empty = true;
     for comp in rel.components() {
@@ -558,7 +558,7 @@ mod tests {
     }
 
     // Collect a canonical-rooted tree and return the set of manifest paths,
-    // using the same per-file hasher `bundle create` uses.
+    // using the same per-file hasher `origin import` uses.
     fn collect_paths(
         root: &Path,
         follow_symlinks: bool,
@@ -569,9 +569,32 @@ mod tests {
             build_excluder(&exclude.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())?;
         let out = walk_and_collect(&canonical, follow_symlinks, &excluder, |canon, _rel| {
             let (h, s) = hash_file_at(canon)?;
-            Ok((b3_hex_str(h), s))
+            Ok((b3_hex_str(h), s, None))
         })?;
         Ok(out.entries.into_iter().map(|e| e.path).collect())
+    }
+
+    #[test]
+    fn walk_threads_chunks_from_closure_into_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"abc").unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let excluder = build_excluder(&[]).unwrap();
+        let out = walk_and_collect(&canonical, false, &excluder, |_c, _r| {
+            Ok((
+                "b3:whole".to_string(),
+                3,
+                Some(vec![Chunk {
+                    hash: "b3:c0".into(),
+                    size: 3,
+                }]),
+            ))
+        })
+        .unwrap();
+        assert_eq!(out.entries.len(), 1);
+        let e = out.entries.first().unwrap();
+        assert_eq!(e.chunks.as_ref().unwrap().len(), 1);
+        assert_eq!(e.chunks.as_ref().unwrap().first().unwrap().hash, "b3:c0");
     }
 
     #[test]

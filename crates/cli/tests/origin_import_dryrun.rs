@@ -1,9 +1,9 @@
-//! Integration tests for `decdn bundle create` (issue #391).
+//! Integration tests for `decdn origin import --dry-run` as a bundle-manifest
+//! generator (issue #391, #1904).
 //!
-//! Tests call `bundle_create` directly against `tempfile::TempDir`
-//! fixtures — same shape as `tests/config_validate.rs`. No `assert_cmd`,
-//! no shelling out except for the `--json` stdout test which exercises
-//! the actual binary so the public stdout path is covered.
+//! `--dry-run` prints the exact canonical manifest bytes to stdout and touches
+//! no filesystem target, so a subprocess is the only way to observe the actual
+//! stdout contract (no `assert_cmd`, plain `std::process::Command`).
 
 #![allow(
     clippy::unwrap_used,
@@ -12,30 +12,31 @@
     clippy::panic
 )]
 
-mod common;
-
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
-use decdn_cli::commands::bundle::bundle_create;
-use decdn_common::cli::BundleCreateArgs;
 use tempfile::TempDir;
 
-fn args(input: &Path, output: &Path) -> BundleCreateArgs {
-    BundleCreateArgs {
-        input: input.to_path_buf(),
-        output: output.to_path_buf(),
-        follow_symlinks: false,
-        exclude: Vec::new(),
-        json: false,
+fn dry_run(input: &Path, exclude: &[&str], follow_symlinks: bool) -> Output {
+    let mut args: Vec<String> = vec![
+        "origin".into(),
+        "import".into(),
+        "-i".into(),
+        input.to_str().unwrap().into(),
+        "--dry-run".into(),
+    ];
+    for pat in exclude {
+        args.push("--exclude".into());
+        args.push((*pat).into());
     }
-}
-
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
+    if follow_symlinks {
+        args.push("--follow-symlinks".into());
+    }
+    Command::new(env!("CARGO_BIN_EXE_decdn"))
+        .args(&args)
+        .output()
+        .expect("run decdn binary")
 }
 
 fn write_files(root: &Path, files: &[(&str, &[u8])]) {
@@ -48,9 +49,8 @@ fn write_files(root: &Path, files: &[(&str, &[u8])]) {
     }
 }
 
-fn read_bundle(path: &Path) -> serde_json::Value {
-    let bytes = fs::read(path).unwrap();
-    serde_json::from_slice(&bytes).unwrap()
+fn read_manifest(stdout: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(stdout).unwrap()
 }
 
 // Probe whether `dir` lives on a case-sensitive filesystem by writing a
@@ -67,8 +67,9 @@ fn is_case_sensitive(dir: &Path) -> bool {
     sensitive
 }
 
-// Two runs against the same dir produce byte-identical output. This is
-// the single strongest check on the determinism contract.
+// Two runs against the same dir produce byte-identical stdout, with no
+// trailing newline. This is the single strongest check on the determinism
+// contract.
 #[test]
 fn determinism_two_runs_byte_identical() {
     let dir = TempDir::new().unwrap();
@@ -83,29 +84,33 @@ fn determinism_two_runs_byte_identical() {
         ],
     );
 
-    let out1 = dir.path().join("bundle1.json");
-    let out2 = dir.path().join("bundle2.json");
-
-    let runtime = rt();
-    runtime.block_on(bundle_create(&args(&src, &out1))).unwrap();
-    runtime.block_on(bundle_create(&args(&src, &out2))).unwrap();
-
-    let bytes1 = fs::read(&out1).unwrap();
-    let bytes2 = fs::read(&out2).unwrap();
-    assert_eq!(
-        bytes1, bytes2,
-        "two runs must produce byte-identical output"
+    let out1 = dry_run(&src, &[], false);
+    let out2 = dry_run(&src, &[], false);
+    assert!(
+        out1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
     );
     assert!(
-        !bytes1.ends_with(b"\n"),
-        "bundle file must not have a trailing newline"
+        out2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    assert_eq!(
+        out1.stdout, out2.stdout,
+        "two runs must produce byte-identical stdout"
+    );
+    assert!(
+        !out1.stdout.ends_with(b"\n"),
+        "manifest stdout must not have a trailing newline"
     );
 }
 
 // The richer determinism fixture pins three properties at once:
 // (a) bytewise sort survives non-ASCII paths (raw UTF-8, not collation),
-// (b) the 64 KiB streaming-hash buffer correctly handles a file
-//     larger than one buffer, and
+// (b) the streaming-hash path correctly handles a file larger than one
+//     buffer, and
 // (c) the entries-array order is stable regardless of FS walk order.
 //
 // The mixed-case ASCII-uppercase-before-lowercase property lives in the
@@ -122,23 +127,25 @@ fn determinism_with_non_ascii_and_large_file() {
     // bytes; collation-aware sort would interleave with ASCII.
     write_files(&src, &[("\u{00e9}.txt", b"e-acute")]); // é
     write_files(&src, &[("\u{00f1}/x.txt", b"n-tilde")]); // ñ
-    // Large file (160 KiB > 2× HASH_BUF_SIZE) exercises the streaming
-    // hash loop end-to-end.
+    // Large file (160 KiB) exercises the streaming hash loop end-to-end.
     let big: Vec<u8> = (0u32..160 * 1024)
         .map(|i| u8::try_from(i % 251).unwrap())
         .collect();
     fs::write(src.join("big.bin"), &big).unwrap();
 
-    let out1 = dir.path().join("b1.json");
-    let out2 = dir.path().join("b2.json");
-    rt().block_on(bundle_create(&args(&src, &out1))).unwrap();
-    rt().block_on(bundle_create(&args(&src, &out2))).unwrap();
-    assert_eq!(fs::read(&out1).unwrap(), fs::read(&out2).unwrap());
+    let out1 = dry_run(&src, &[], false);
+    let out2 = dry_run(&src, &[], false);
+    assert!(
+        out1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert_eq!(out1.stdout, out2.stdout);
 
     // Sort order: ASCII first, then multi-byte UTF-8 (which all start
     // with bytes >= 0xC2).
-    let bundle = read_bundle(&out1);
-    let paths: Vec<&str> = bundle["entries"]
+    let manifest = read_manifest(&out1.stdout);
+    let paths: Vec<&str> = manifest["entries"]
         .as_array()
         .unwrap()
         .iter()
@@ -147,7 +154,7 @@ fn determinism_with_non_ascii_and_large_file() {
     assert_eq!(paths, vec!["big.bin", "\u{00e9}.txt", "\u{00f1}/x.txt"]);
 
     // Large-file hash matches the in-memory blake3 of the same bytes.
-    let big_entry = bundle["entries"]
+    let big_entry = manifest["entries"]
         .as_array()
         .unwrap()
         .iter()
@@ -182,11 +189,15 @@ fn determinism_mixed_case_bytewise_sort() {
     }
 
     write_files(&src, &[("A.txt", b"upper"), ("a.txt", b"lower")]);
-    let out = dir.path().join("b.json");
-    rt().block_on(bundle_create(&args(&src, &out))).unwrap();
+    let out = dry_run(&src, &[], false);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    let bundle = read_bundle(&out);
-    let paths: Vec<&str> = bundle["entries"]
+    let manifest = read_manifest(&out.stdout);
+    let paths: Vec<&str> = manifest["entries"]
         .as_array()
         .unwrap()
         .iter()
@@ -195,100 +206,21 @@ fn determinism_mixed_case_bytewise_sort() {
     assert_eq!(paths, vec!["A.txt", "a.txt"]);
 }
 
-// The bundle's own BLAKE3 is the contract publishers distribute. A
-// regression that flips compact to pretty would still pass byte-equality
-// tests against another run, so this test pins the actual published hash.
-#[test]
-fn bundle_hash_status_matches_blake3_of_bundle_bytes() {
-    let dir = TempDir::new().unwrap();
-    let src = dir.path().join("src");
-    fs::create_dir(&src).unwrap();
-    write_files(&src, &[("a.txt", b"alpha"), ("b.txt", b"beta")]);
-    let out = dir.path().join("b.json");
-
-    rt().block_on(bundle_create(&args(&src, &out))).unwrap();
-
-    let bytes = fs::read(&out).unwrap();
-    let actual = blake3::hash(&bytes);
-
-    // Recompute the bundle hash from a fresh run via the JSON status
-    // line. Couples the published `bundle_hash` to the same file's bytes.
-    let stdout = run_bundle_create_json(&src);
-    let line = stdout.lines().last().expect("at least one line of stdout");
-    let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
-    let reported = parsed["bundle_hash"].as_str().unwrap();
-    assert_eq!(reported, format!("b3:{}", actual.to_hex()));
-}
-
-// `--json` stdout via the built binary. Covers the path the unit test
-// of `write_create_report` cannot reach: `bundle_create` writes through
-// a locked stdout handle, and we want to know the operator sees what's
-// documented.
-#[test]
-fn json_status_line_shape_via_binary() {
-    let dir = TempDir::new().unwrap();
-    let src = dir.path().join("src");
-    fs::create_dir(&src).unwrap();
-    write_files(&src, &[("a.txt", b"x")]);
-    let out = dir.path().join("b.json");
-
-    let output = common::decdn_command(dir.path())
-        .args(["bundle", "create", "--json"])
-        .arg("-i")
-        .arg(&src)
-        .arg("-o")
-        .arg(&out)
-        .output()
-        .expect("run decdn binary");
-    assert!(
-        output.status.success(),
-        "binary failed: stderr = {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let line = stdout.lines().last().expect("stdout had at least one line");
-    let parsed: serde_json::Value = serde_json::from_str(line).expect("status line is JSON");
-    let obj = parsed.as_object().unwrap();
-    assert_eq!(obj.len(), 5);
-    assert!(obj["bundle"].as_str().unwrap().ends_with("b.json"));
-    assert_eq!(obj["entries"].as_u64(), Some(1));
-    assert_eq!(obj["total_size"].as_u64(), Some(1));
-    assert!(obj["bundle_hash"].as_str().unwrap().starts_with("b3:"));
-    assert_eq!(obj["skipped_symlinks"].as_u64(), Some(0));
-}
-
-fn run_bundle_create_json(src: &Path) -> String {
-    let dir = TempDir::new().unwrap();
-    let out = dir.path().join("b.json");
-    let output = common::decdn_command(dir.path())
-        .args(["bundle", "create", "--json"])
-        .arg("-i")
-        .arg(src)
-        .arg("-o")
-        .arg(&out)
-        .output()
-        .expect("run decdn binary");
-    assert!(
-        output.status.success(),
-        "binary failed: stderr = {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap()
-}
-
-// Empty directory produces a valid empty-entries bundle.
+// Empty directory produces a valid empty-entries manifest — the canonical
+// smallest-possible manifest.
 #[test]
 fn empty_directory_produces_empty_entries() {
     let dir = TempDir::new().unwrap();
     let src = dir.path().join("empty");
     fs::create_dir(&src).unwrap();
-    let out = dir.path().join("b.json");
 
-    rt().block_on(bundle_create(&args(&src, &out))).unwrap();
-
-    let bytes = fs::read(&out).unwrap();
-    assert_eq!(bytes, b"{\"version\":1,\"entries\":[]}");
+    let out = dry_run(&src, &[], false);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"version\":1,\"entries\":[]}");
 }
 
 #[test]
@@ -300,35 +232,21 @@ fn entries_are_sorted_by_posix_path_bytes() {
         &src,
         &[("b.txt", b"x"), ("a/c.txt", b"x"), ("a/b.txt", b"x")],
     );
-    let out = dir.path().join("b.json");
 
-    rt().block_on(bundle_create(&args(&src, &out))).unwrap();
+    let out = dry_run(&src, &[], false);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    let bundle = read_bundle(&out);
-    let entries = bundle["entries"].as_array().unwrap();
+    let manifest = read_manifest(&out.stdout);
+    let entries = manifest["entries"].as_array().unwrap();
     let paths: Vec<&str> = entries
         .iter()
         .map(|e| e["path"].as_str().unwrap())
         .collect();
     assert_eq!(paths, vec!["a/b.txt", "a/c.txt", "b.txt"]);
-}
-
-#[test]
-fn hash_matches_blake3_of_file_content() {
-    let dir = TempDir::new().unwrap();
-    let src = dir.path().join("src");
-    fs::create_dir(&src).unwrap();
-    write_files(&src, &[("hello.txt", b"hello world\n")]);
-    let out = dir.path().join("b.json");
-
-    rt().block_on(bundle_create(&args(&src, &out))).unwrap();
-
-    let bundle = read_bundle(&out);
-    let entry = &bundle["entries"][0];
-    let expected = format!("b3:{}", blake3::hash(b"hello world\n").to_hex());
-    assert_eq!(entry["hash"].as_str().unwrap(), expected);
-    assert_eq!(entry["size"].as_u64().unwrap(), 12);
-    assert_eq!(entry["path"].as_str().unwrap(), "hello.txt");
 }
 
 #[test]
@@ -344,14 +262,16 @@ fn exclude_root_and_nested_via_recursive_glob() {
             ("nested/skip.log", b"s"),
         ],
     );
-    let out = dir.path().join("b.json");
 
-    let mut a = args(&src, &out);
-    a.exclude = vec!["*.log".to_string(), "**/*.log".to_string()];
-    rt().block_on(bundle_create(&a)).unwrap();
+    let out = dry_run(&src, &["*.log", "**/*.log"], false);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    let bundle = read_bundle(&out);
-    let entries = bundle["entries"].as_array().unwrap();
+    let manifest = read_manifest(&out.stdout);
+    let entries = manifest["entries"].as_array().unwrap();
     let paths: Vec<&str> = entries
         .iter()
         .map(|e| e["path"].as_str().unwrap())
@@ -368,14 +288,16 @@ fn exclude_multiple_patterns_or_together() {
         &src,
         &[("a.log", b"x"), ("b.tmp", b"x"), ("keep.txt", b"x")],
     );
-    let out = dir.path().join("b.json");
 
-    let mut a = args(&src, &out);
-    a.exclude = vec!["*.log".to_string(), "*.tmp".to_string()];
-    rt().block_on(bundle_create(&a)).unwrap();
+    let out = dry_run(&src, &["*.log", "*.tmp"], false);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    let bundle = read_bundle(&out);
-    let paths: Vec<&str> = bundle["entries"]
+    let manifest = read_manifest(&out.stdout);
+    let paths: Vec<&str> = manifest["entries"]
         .as_array()
         .unwrap()
         .iter()
@@ -394,14 +316,16 @@ fn exclude_directory_prefix_glob_matches_one_level() {
         &src,
         &[("tmp/x", b"x"), ("tmp/sub/y", b"y"), ("keep.txt", b"k")],
     );
-    let out = dir.path().join("b.json");
 
-    let mut a = args(&src, &out);
-    a.exclude = vec!["tmp/*".to_string()];
-    rt().block_on(bundle_create(&a)).unwrap();
+    let out = dry_run(&src, &["tmp/*"], false);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    let bundle = read_bundle(&out);
-    let paths: Vec<&str> = bundle["entries"]
+    let manifest = read_manifest(&out.stdout);
+    let paths: Vec<&str> = manifest["entries"]
         .as_array()
         .unwrap()
         .iter()
@@ -417,31 +341,33 @@ fn invalid_glob_pattern_errors_with_clear_message() {
     let src = dir.path().join("src");
     fs::create_dir(&src).unwrap();
     write_files(&src, &[("a.txt", b"a")]);
-    let out = dir.path().join("b.json");
 
-    let mut a = args(&src, &out);
-    a.exclude = vec!["[".to_string()];
-    let err = rt().block_on(bundle_create(&a)).unwrap_err();
-    let msg = format!("{err:#}");
+    let out = dry_run(&src, &["["], false);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        msg.contains("invalid --exclude pattern"),
-        "expected glob-pattern error, got: {msg}"
+        stderr.contains("invalid --exclude pattern"),
+        "expected glob-pattern error, got: {stderr}"
     );
 }
 
-// Missing/non-directory --input is a hard error before walking.
+// Missing --input is a hard error before walking.
 #[test]
 fn missing_input_directory_errors() {
     let dir = TempDir::new().unwrap();
     let missing: PathBuf = dir.path().join("does-not-exist");
-    let out = dir.path().join("b.json");
-    let err = rt()
-        .block_on(bundle_create(&args(&missing, &out)))
-        .unwrap_err();
-    assert!(format!("{err:#}").contains("not an existing directory"));
+
+    let out = dry_run(&missing, &[], false);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--input"),
+        "expected --input error, got: {stderr}"
+    );
 }
 
-// Symlink that escapes the input root is a hard error when followed.
+// Symlink that escapes the input root is a hard error when followed — the
+// path-safety rejection the manifest's `path` field depends on.
 #[cfg(unix)]
 #[test]
 fn symlink_escape_errors_when_followed() {
@@ -454,14 +380,14 @@ fn symlink_escape_errors_when_followed() {
     fs::create_dir(&src).unwrap();
     write_files(&src, &[("real.txt", b"real")]);
     symlink(&outside, src.join("escape.txt")).unwrap();
-    let out = dir.path().join("b.json");
 
-    let mut a = args(&src, &out);
-    a.follow_symlinks = true;
-
-    let err = rt().block_on(bundle_create(&a)).unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(msg.contains("outside"), "expected escape error, got: {msg}");
+    let out = dry_run(&src, &[], true);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("outside"),
+        "expected escape error, got: {stderr}"
+    );
 }
 
 // Symlink that escapes is silently skipped (and counted) when not followed.
@@ -477,18 +403,114 @@ fn symlink_skipped_when_not_followed() {
     fs::create_dir(&src).unwrap();
     write_files(&src, &[("real.txt", b"r")]);
     symlink(&outside, src.join("escape.txt")).unwrap();
-    let out = dir.path().join("b.json");
 
-    rt().block_on(bundle_create(&args(&src, &out))).unwrap();
+    let out = dry_run(&src, &[], false);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    let bundle = read_bundle(&out);
-    let paths: Vec<&str> = bundle["entries"]
+    let manifest = read_manifest(&out.stdout);
+    let paths: Vec<&str> = manifest["entries"]
         .as_array()
         .unwrap()
         .iter()
         .map(|e| e["path"].as_str().unwrap())
         .collect();
     assert_eq!(paths, vec!["real.txt"]);
+}
+
+// A skipped symlink must not leak onto stdout (which owns only the manifest
+// bytes) but must be surfaced as an operator-visible warning on stderr: a
+// publisher must not be able to ship an incomplete bundle with zero signal
+// that a symlink was dropped.
+#[cfg(unix)]
+#[test]
+fn symlink_skipped_when_not_followed_warns_on_stderr_not_stdout() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    write_files(&src, &[("real.txt", b"r")]);
+    symlink(src.join("real.txt"), src.join("link.txt")).unwrap();
+
+    let out = dry_run(&src, &[], false);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // stdout is the clean canonical manifest: only the regular file, no
+    // trailing newline, and nothing symlink-related mixed in.
+    assert!(
+        !out.stdout.ends_with(b"\n"),
+        "manifest stdout must not have a trailing newline"
+    );
+    let manifest = read_manifest(&out.stdout);
+    let paths: Vec<&str> = manifest["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["real.txt"]);
+
+    // The warning rides on stderr with the count of skipped symlinks, so a
+    // publisher is never left to discover a silently incomplete manifest.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("skipped 1 symlink(s); pass --follow-symlinks to include"),
+        "stderr: {stderr}"
+    );
+}
+
+// Same case with `--json`: the status report (stderr under `--dry-run`)
+// carries `skipped_symlinks`, and stdout still carries only the manifest.
+#[cfg(unix)]
+#[test]
+fn symlink_skipped_when_not_followed_json_reports_count_on_stderr() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    write_files(&src, &[("real.txt", b"r")]);
+    symlink(src.join("real.txt"), src.join("link.txt")).unwrap();
+
+    let mut args: Vec<String> = vec![
+        "origin".into(),
+        "import".into(),
+        "-i".into(),
+        src.to_str().unwrap().into(),
+        "--dry-run".into(),
+        "--json".into(),
+    ];
+    let out = Command::new(env!("CARGO_BIN_EXE_decdn"))
+        .args(&mut args)
+        .output()
+        .expect("run decdn binary");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(!out.stdout.ends_with(b"\n"));
+    let manifest = read_manifest(&out.stdout);
+    let paths: Vec<&str> = manifest["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["real.txt"]);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let report: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(report["skipped_symlinks"].as_u64(), Some(1));
 }
 
 // Symlink within the root is followed and recorded under the link's
@@ -503,15 +525,16 @@ fn symlink_within_root_recorded_under_link_name() {
     fs::create_dir(&src).unwrap();
     write_files(&src, &[("target.txt", b"contents")]);
     symlink("target.txt", src.join("link.txt")).unwrap();
-    let out = dir.path().join("b.json");
 
-    let mut a = args(&src, &out);
-    a.follow_symlinks = true;
+    let out = dry_run(&src, &[], true);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    rt().block_on(bundle_create(&a)).unwrap();
-
-    let bundle = read_bundle(&out);
-    let paths: Vec<&str> = bundle["entries"]
+    let manifest = read_manifest(&out.stdout);
+    let paths: Vec<&str> = manifest["entries"]
         .as_array()
         .unwrap()
         .iter()
@@ -519,7 +542,7 @@ fn symlink_within_root_recorded_under_link_name() {
         .collect();
     assert_eq!(paths, vec!["link.txt", "target.txt"]);
     let expected = format!("b3:{}", blake3::hash(b"contents").to_hex());
-    for entry in bundle["entries"].as_array().unwrap() {
+    for entry in manifest["entries"].as_array().unwrap() {
         assert_eq!(entry["hash"].as_str().unwrap(), expected);
         assert_eq!(entry["size"].as_u64().unwrap(), 8);
     }
@@ -542,24 +565,23 @@ fn symlink_directory_self_loop_errors_finite() {
     write_files(&src, &[("real.txt", b"r")]);
     // `loop` -> `.` resolves back to the directory itself.
     symlink(".", src.join("loop")).unwrap();
-    let out = dir.path().join("b.json");
-
-    let mut a = args(&src, &out);
-    a.follow_symlinks = true;
 
     let started = Instant::now();
-    let result = rt().block_on(bundle_create(&a));
+    let out = dry_run(&src, &[], true);
     // walkdir should detect the cycle and surface an error well under
     // the timeout. This is the bound the test really cares about.
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "self-loop symlink must not hang"
     );
-    let err = result.expect_err("self-loop must error, not silently produce a partial bundle");
-    let msg = format!("{err:#}");
+    assert!(
+        !out.status.success(),
+        "self-loop must error, not silently produce a partial manifest"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
     // Don't pin walkdir's exact message — just the family.
     assert!(
-        msg.to_lowercase().contains("loop") || msg.contains("walking"),
-        "expected a loop / walk error, got: {msg}"
+        stderr.contains("loop") || stderr.contains("walking"),
+        "expected a loop / walk error, got: {stderr}"
     );
 }

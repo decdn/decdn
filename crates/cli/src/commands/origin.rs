@@ -11,9 +11,9 @@
 //!
 //! The work is synchronous (bao encoding + filesystem writes are sync), wrapped
 //! once in `tokio::task::spawn_blocking` from the async entry point so the CLI's
-//! runtime isn't held up — the same shape as `bundle create`.
+//! runtime isn't held up.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -23,8 +23,10 @@ use decdn_bao_range::{EncodedOutboard, encode_outboard};
 use decdn_common::cli::{OriginArgs, OriginCommand, OriginImportArgs};
 use serde::Serialize;
 
+use super::chunker::{ChunkSizes, chunk_file};
 use super::manifest::{
-    build_excluder, hash_file_at, serialize_canonical, walk_and_collect, write_bundle,
+    BundleEntry, b3_hex_str, build_excluder, hash_file_at, serialize_canonical, validate_relpath,
+    walk_and_collect, write_bundle,
 };
 
 /// Dispatcher for `decdn origin ...`. Every subcommand is offline, config-free
@@ -84,64 +86,140 @@ struct ImportReport {
     /// The bundle hash publishers distribute — `Some` for a directory import,
     /// `None` for a single file (which produces no manifest).
     bundle_hash: Option<String>,
-    /// Whether sources were moved (`--move`) rather than copied.
+    /// Whether sources were moved (`--move`) rather than copied. Always
+    /// `false` under `--dry-run`, since nothing is written; `--move` is
+    /// rejected together with `--optimize`, so this is never `true` for an
+    /// optimized import.
     moved: bool,
+    /// Whether content-defined chunking (`--optimize`) was applied — each file
+    /// stored as its content-addressed chunks instead of one whole-file blob.
+    optimized: bool,
+    /// Count of chunks across every file before cross-file dedup (0 unless
+    /// `--optimize`). Equals the sum of every entry's chunk count.
+    chunks_total: u64,
+    /// Count of distinct chunks after cross-file dedup (0 unless `--optimize`).
+    /// Under `--dry-run` no blob is written, but this still reports the distinct
+    /// count a real run would write, so a dry run previews the dedup ratio.
+    chunks_written: u64,
+    /// Count of symlinks skipped during a directory walk (0 for a single-file
+    /// import, and only non-zero without `--follow-symlinks`).
+    skipped_symlinks: u64,
 }
 
-/// Entry point. Parses the target, dispatches file vs directory import inside
-/// `spawn_blocking`, and prints the status report.
+/// The resolved import context, threaded through the sync import paths. It
+/// captures the two axes that steer every write decision — `write` (whether
+/// blobs land on disk at all, false under `--dry-run`) and `optimize` (whether
+/// files are content-defined-chunked) — plus the shared flags and the resolved
+/// filesystem `base` (`Some` exactly when `write`).
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent per-invocation toggles resolved from CLI flags, not modelled state"
+)]
+struct ImportCtx {
+    /// The origin store root the blobs are written under, `Some` iff `write`.
+    base: Option<PathBuf>,
+    /// Whether blobs are written. False under `--dry-run` (hash + manifest only).
+    write: bool,
+    /// Whether the status report and manifest bytes route for a dry run:
+    /// manifest to stdout, status to stderr.
+    dry_run: bool,
+    /// Move sources into the store instead of copying (`--move`).
+    move_source: bool,
+    /// Overwrite an object already present at its hash (`--force`).
+    force: bool,
+    /// Also write the canonical manifest to this file (`--bundle`).
+    bundle_out: Option<PathBuf>,
+    /// The `--to` target string surfaced in the report (a placeholder in a
+    /// no-target dry run).
+    origin_label: String,
+    /// Content-define-chunk each file and store its chunks (`--optimize`).
+    optimize: bool,
+    /// The validated chunk-size triple, `Some` iff `optimize`.
+    sizes: Option<ChunkSizes>,
+}
+
+/// Entry point. Resolves the target and chunk options, dispatches file vs
+/// directory import inside `spawn_blocking`, and routes the status report —
+/// stdout normally, stderr under `--dry-run` (where stdout carries the manifest).
 pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
-    let target = parse_target(&args.to)?;
-    let origin_label = args.to.clone();
+    // `--to` is required unless `--dry-run`; a dry run needs no target because it
+    // writes no blobs.
+    let target = match (&args.to, args.dry_run) {
+        (Some(t), _) => Some(parse_target(t)?),
+        (None, true) => None,
+        (None, false) => bail!("--to <target> is required unless --dry-run"),
+    };
+    // The chunk-size flags only mean something with `--optimize`; reject them
+    // otherwise so a typo like `--chunk-avg` without `--optimize` is not silently
+    // ignored.
+    if !args.optimize
+        && (args.chunk_avg.is_some() || args.chunk_min.is_some() || args.chunk_max.is_some())
+    {
+        bail!("--chunk-avg/--chunk-min/--chunk-max require --optimize");
+    }
+    // `--optimize` never touches the source file (it writes derived chunk
+    // blobs via `import_bytes`), so pairing it with `--move` would silently
+    // leave every source in place while the report claims a move.
+    if args.optimize && args.move_source {
+        bail!(
+            "--move is incompatible with --optimize (chunked import writes derived chunk blobs, not the source file)"
+        );
+    }
+    // The 4 MiB avg default lives here, not in clap, so an explicit `--chunk-avg`
+    // without `--optimize` stays detectable as `Some` above.
+    let avg = args.chunk_avg.unwrap_or(4 * 1024 * 1024);
+    let sizes = if args.optimize {
+        Some(ChunkSizes::resolve(avg, args.chunk_min, args.chunk_max)?)
+    } else {
+        None
+    };
+
+    let write = !args.dry_run;
+    let origin_label = args.to.clone().unwrap_or_else(|| "(dry-run)".to_string());
 
     let input = args.input.clone();
     let follow = args.follow_symlinks;
     let exclude = args.exclude.clone();
-    let bundle_out = args.bundle.clone();
-    let move_source = args.move_source;
-    let force = args.force;
+    let json = args.json;
+    let dry_run = args.dry_run;
+
+    let ctx = ImportCtx {
+        base: None,
+        write,
+        dry_run,
+        move_source: args.move_source,
+        force: args.force,
+        bundle_out: args.bundle.clone(),
+        origin_label,
+        optimize: args.optimize,
+        sizes,
+    };
 
     let report = tokio::task::spawn_blocking(move || -> anyhow::Result<ImportReport> {
-        let ImportTarget::Fs(base) = target;
-        // Create the origin root up front; a single file and a directory both
-        // need it to exist before the first shard `create_dir_all`.
-        std::fs::create_dir_all(&base)
-            .map_err(|e| anyhow!("create origin dir {}: {e}", base.display()))?;
-        let base = std::fs::canonicalize(&base)
-            .map_err(|e| anyhow!("canonicalize origin dir {}: {e}", base.display()))?;
+        let mut ctx = ctx;
+        // Create + canonicalize the origin root only when writing; a dry run
+        // must never touch the filesystem target.
+        if ctx.write {
+            let ImportTarget::Fs(base) =
+                target.ok_or_else(|| anyhow!("internal: write without a --to target"))?;
+            std::fs::create_dir_all(&base)
+                .map_err(|e| anyhow!("create origin dir {}: {e}", base.display()))?;
+            let base = std::fs::canonicalize(&base)
+                .map_err(|e| anyhow!("canonicalize origin dir {}: {e}", base.display()))?;
+            ctx.base = Some(base);
+        }
 
         let meta = std::fs::symlink_metadata(&input)
             .map_err(|e| anyhow!("--input {}: {e}", input.display()))?;
 
         if meta.is_dir() {
-            import_directory(
-                &base,
-                &input,
-                follow,
-                &exclude,
-                bundle_out.as_deref(),
-                move_source,
-                force,
-                origin_label,
-            )
+            import_directory(&ctx, &input, follow, &exclude)
         } else if meta.is_file() {
-            let blob = import_one_file(&base, &input, move_source, force)?;
-            // Key the single entry by the file's own name — the path it has
-            // relative to its parent (the "--input directory"), never the
-            // absolute or working-directory-relative path the operator typed.
-            let name = input.file_name().map_or_else(
-                || input.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            let files = BTreeMap::from([(name, b3_hex_str_from_hex(&blob.hash_hex))]);
-            Ok(ImportReport {
-                imported: 1,
-                bytes: blob.size,
-                origin: origin_label,
-                files,
-                bundle_hash: None,
-                moved: move_source,
-            })
+            if ctx.optimize {
+                import_single_optimized(&ctx, &input)
+            } else {
+                import_single_plain(&ctx, &input)
+            }
         } else {
             bail!(
                 "--input {} is neither a regular file nor a directory",
@@ -161,63 +239,255 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
         anyhow::Error::from(e).context(note)
     })??;
 
-    let mut stdout = std::io::stdout().lock();
-    write_import_report(&mut stdout, &report, args.json)
-        .map_err(|e| anyhow!("failed to write status report: {e}"))?;
+    // The manifest bytes already went to stdout inside `emit_manifest` during a
+    // dry run; the status report follows on stderr so stdout is exactly the
+    // manifest. A normal import prints the status to stdout.
+    if dry_run {
+        let mut stderr = std::io::stderr().lock();
+        write_import_report(&mut stderr, &report, json)
+            .map_err(|e| anyhow!("failed to write status report: {e}"))?;
+    } else {
+        let mut stdout = std::io::stdout().lock();
+        write_import_report(&mut stdout, &report, json)
+            .map_err(|e| anyhow!("failed to write status report: {e}"))?;
+    }
     Ok(())
 }
 
-/// Import a whole directory tree: import every regular file, emit the canonical
-/// bundle manifest, import the manifest blob itself, and (optionally) write the
-/// manifest file. The manifest bytes are byte-identical to `bundle create`, so
+/// Import a whole directory tree and emit its canonical bundle manifest. In
+/// plain mode every regular file is stored as one whole-file blob; in
+/// `--optimize` mode each file is content-defined-chunked and its distinct
+/// chunks are stored, with the whole-file blob left unstored. Either way the
+/// manifest bytes are the same canonical bytes `--dry-run` would print, so
 /// the tree is retrievable by the reported bundle hash.
-#[allow(clippy::too_many_arguments)] // one offline command's flags; a params struct would only indirect
 fn import_directory(
-    base: &Path,
+    ctx: &ImportCtx,
     input: &Path,
     follow: bool,
     exclude: &[String],
-    bundle_out: Option<&Path>,
-    move_source: bool,
-    force: bool,
-    origin_label: String,
 ) -> anyhow::Result<ImportReport> {
     let excluder = build_excluder(exclude)?;
     let root = std::fs::canonicalize(input)
         .map_err(|e| anyhow!("canonicalize --input {}: {e}", input.display()))?;
 
-    let collected = walk_and_collect(&root, follow, &excluder, |canonical, _rel| {
-        let blob = import_one_file(base, canonical, move_source, force)?;
-        Ok((b3_hex_str_from_hex(&blob.hash_hex), blob.size))
+    if ctx.optimize {
+        let sizes = ctx
+            .sizes
+            .as_ref()
+            .ok_or_else(|| anyhow!("internal: optimize without chunk sizes"))?;
+        // Shared across the whole walk so a chunk common to several files is
+        // written once; its byte-key membership is the post-dedup written count.
+        let mut written: HashSet<[u8; 32]> = HashSet::new();
+        let mut chunks_total: u64 = 0;
+        let collected = walk_and_collect(&root, follow, &excluder, |canonical, _rel| {
+            let file =
+                File::open(canonical).map_err(|e| anyhow!("open {}: {e}", canonical.display()))?;
+            let cf = chunk_file(file, sizes, |chash, data| {
+                // The dedup set is updated in both modes, so `--dry-run`
+                // previews the same distinct-chunk count a real write would
+                // produce; only the actual blob write is gated on `ctx.write`.
+                if written.insert(*chash.as_bytes())
+                    && ctx.write
+                    && let Some(base) = ctx.base.as_deref()
+                {
+                    import_bytes(base, data, ctx.force)?;
+                }
+                Ok(())
+            })?;
+            let n = u64::try_from(cf.chunks.len())
+                .map_err(|_| anyhow!("chunk count {} exceeds u64", cf.chunks.len()))?;
+            chunks_total = chunks_total
+                .checked_add(n)
+                .ok_or_else(|| anyhow!("chunk count overflow"))?;
+            Ok((b3_hex_str(cf.whole_hash), cf.total_size, Some(cf.chunks)))
+        })?;
+        let chunks_written =
+            u64::try_from(written.len()).map_err(|_| anyhow!("written-chunk count exceeds u64"))?;
+        emit_manifest(
+            ctx,
+            collected.entries,
+            collected.total_size,
+            true,
+            chunks_total,
+            chunks_written,
+            collected.skipped_symlinks,
+        )
+    } else {
+        let collected = walk_and_collect(&root, follow, &excluder, |canonical, _rel| {
+            if ctx.write {
+                let base = ctx
+                    .base
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("internal: write without a base"))?;
+                let blob = import_one_file(base, canonical, ctx.move_source, ctx.force)?;
+                Ok((b3_hex_str_from_hex(&blob.hash_hex), blob.size, None))
+            } else {
+                let (h, s) = hash_file_at(canonical)
+                    .map_err(|e| anyhow!("hash {}: {e}", canonical.display()))?;
+                Ok((b3_hex_str(h), s, None))
+            }
+        })?;
+        emit_manifest(
+            ctx,
+            collected.entries,
+            collected.total_size,
+            false,
+            0,
+            0,
+            collected.skipped_symlinks,
+        )
+    }
+}
+
+/// Import a single file with `--optimize`: chunk it, store its distinct chunks,
+/// and emit a one-entry manifest keyed by the file's own name. The whole-file
+/// blob is not stored (its chunks are).
+fn import_single_optimized(ctx: &ImportCtx, input: &Path) -> anyhow::Result<ImportReport> {
+    let sizes = ctx
+        .sizes
+        .as_ref()
+        .ok_or_else(|| anyhow!("internal: optimize without chunk sizes"))?;
+    let mut written: HashSet<[u8; 32]> = HashSet::new();
+    let file = File::open(input).map_err(|e| anyhow!("open {}: {e}", input.display()))?;
+    let cf = chunk_file(file, sizes, |chash, data| {
+        // The dedup set is updated in both modes, so `--dry-run` previews the
+        // same distinct-chunk count a real write would produce; only the
+        // actual blob write is gated on `ctx.write`.
+        if written.insert(*chash.as_bytes())
+            && ctx.write
+            && let Some(base) = ctx.base.as_deref()
+        {
+            import_bytes(base, data, ctx.force)?;
+        }
+        Ok(())
     })?;
 
-    let bundle_bytes = serialize_canonical(&collected.entries)?;
-    // Import the manifest blob itself so the whole tree is retrievable by one
-    // hash. The manifest is in-memory bytes, always copied (never moved).
-    let manifest_blob = import_bytes(base, &bundle_bytes, force)?;
+    // Key the one entry by the file's own name, validated to the same POSIX
+    // path rules a directory entry obeys.
+    let name = input
+        .file_name()
+        .ok_or_else(|| anyhow!("--input {} has no file name", input.display()))?;
+    let path = validate_relpath(Path::new(name))?;
+    let chunks_total =
+        u64::try_from(cf.chunks.len()).map_err(|_| anyhow!("chunk count exceeds u64"))?;
+    let chunks_written =
+        u64::try_from(written.len()).map_err(|_| anyhow!("written-chunk count exceeds u64"))?;
+    let total_size = cf.total_size;
+    let entry = BundleEntry {
+        path,
+        hash: b3_hex_str(cf.whole_hash),
+        size: total_size,
+        chunks: Some(cf.chunks),
+    };
+    emit_manifest(
+        ctx,
+        vec![entry],
+        total_size,
+        true,
+        chunks_total,
+        chunks_written,
+        0,
+    )
+}
 
-    if let Some(out) = bundle_out {
+/// Import a single file without optimization: one whole-file blob, no manifest.
+/// Honors `--dry-run` (hash only, no write); the report keys the file by its own
+/// name and carries the one blob's content hash.
+fn import_single_plain(ctx: &ImportCtx, input: &Path) -> anyhow::Result<ImportReport> {
+    let (hash_hex, size) = if ctx.write {
+        let base = ctx
+            .base
+            .as_deref()
+            .ok_or_else(|| anyhow!("internal: write without a base"))?;
+        let blob = import_one_file(base, input, ctx.move_source, ctx.force)?;
+        (blob.hash_hex, blob.size)
+    } else {
+        let (h, s) = hash_file_at(input).map_err(|e| anyhow!("hash {}: {e}", input.display()))?;
+        (h.to_hex().to_string(), s)
+    };
+    // Key the single entry by the file's own name — never the absolute or
+    // working-directory-relative path the operator typed.
+    let name = input.file_name().map_or_else(
+        || input.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let files = BTreeMap::from([(name, b3_hex_str_from_hex(&hash_hex))]);
+    Ok(ImportReport {
+        imported: 1,
+        bytes: size,
+        origin: ctx.origin_label.clone(),
+        files,
+        bundle_hash: None,
+        // A dry run writes nothing, so it never actually moved the source —
+        // even though `--move` was passed, don't claim it happened.
+        moved: ctx.move_source && ctx.write,
+        optimized: false,
+        chunks_total: 0,
+        chunks_written: 0,
+        skipped_symlinks: 0,
+    })
+}
+
+/// Shared manifest tail for every path that emits a bundle (a directory import
+/// and a single-file `--optimize`). Serializes the canonical manifest, then —
+/// gated on the context — imports the manifest blob (`write`), writes the
+/// `--bundle` file, and prints the exact canonical bytes to stdout (`--dry-run`,
+/// no trailing newline, so stdout equals the `--bundle` file equals the bundle
+/// hash preimage). Returns the assembled report; its `bundle_hash` is the
+/// manifest's own content address whether or not the blob was written.
+fn emit_manifest(
+    ctx: &ImportCtx,
+    entries: Vec<BundleEntry>,
+    total_size: u64,
+    optimized: bool,
+    chunks_total: u64,
+    chunks_written: u64,
+    skipped_symlinks: u64,
+) -> anyhow::Result<ImportReport> {
+    let bundle_bytes = serialize_canonical(&entries)?;
+
+    if ctx.write
+        && let Some(base) = ctx.base.as_deref()
+    {
+        // Import the manifest blob itself so the whole tree is retrievable by
+        // one hash. The manifest is in-memory bytes, always copied.
+        import_bytes(base, &bundle_bytes, ctx.force)?;
+    }
+    if let Some(out) = ctx.bundle_out.as_deref() {
         write_bundle(out, &bundle_bytes)
             .map_err(|e| anyhow!("write --bundle {}: {e}", out.display()))?;
     }
+    if ctx.dry_run {
+        // The canonical bytes are the sole stdout payload of a dry run.
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(&bundle_bytes)
+            .map_err(|e| anyhow!("write manifest to stdout: {e}"))?;
+    }
 
-    let imported = u64::try_from(collected.entries.len())
-        .map_err(|_| anyhow!("entry count {} exceeds u64", collected.entries.len()))?;
-    // Each manifest entry's `path` is already the validated POSIX path relative
-    // to the bundle root, and its `hash` is the `b3:<hex>` address — exactly the
-    // file→hash map the report surfaces.
-    let files = collected
-        .entries
-        .into_iter()
-        .map(|e| (e.path, e.hash))
-        .collect();
+    let bundle_hash = Some(b3_hex_str(blake3::hash(&bundle_bytes)));
+    let imported = u64::try_from(entries.len())
+        .map_err(|_| anyhow!("entry count {} exceeds u64", entries.len()))?;
+    // Each entry's `path` is the validated POSIX path and its `hash` the
+    // `b3:<hex>` address — exactly the file→hash map the report surfaces.
+    let files = entries.into_iter().map(|e| (e.path, e.hash)).collect();
     Ok(ImportReport {
         imported,
-        bytes: collected.total_size,
-        origin: origin_label,
+        bytes: total_size,
+        origin: ctx.origin_label.clone(),
         files,
-        bundle_hash: Some(format!("b3:{}", manifest_blob.hash_hex)),
-        moved: move_source,
+        bundle_hash,
+        // A dry run writes nothing, so it never actually moved a source, and
+        // the optimize path never moves sources at all (it writes derived
+        // chunk blobs via `import_bytes`) — `--optimize --move` is rejected
+        // up front in `origin_import`, so `ctx.write` alone would already be
+        // correct here, but gating on both keeps this line self-evidently
+        // truthful without relying on that earlier guard.
+        moved: ctx.move_source && ctx.write,
+        optimized,
+        chunks_total,
+        chunks_written,
+        skipped_symlinks,
     })
 }
 
@@ -498,14 +768,29 @@ fn write_import_report(
             "{verb} {} file(s), {} bytes, into {}",
             report.imported, report.bytes, report.origin
         )?;
+        if report.optimized {
+            write!(
+                w,
+                ", deduped {}/{} chunks",
+                report.chunks_written, report.chunks_total
+            )?;
+        }
         // A directory import is addressed by its bundle hash; a single-file
         // import has no manifest, so surface the one blob's content hash. The
         // full file→hash map is reserved for `--json`.
         match (&report.bundle_hash, single_file_hash(report)) {
-            (Some(b), _) => writeln!(w, " (bundle {b})"),
-            (None, Some(h)) => writeln!(w, " ({h})"),
-            (None, None) => writeln!(w),
+            (Some(b), _) => writeln!(w, " (bundle {b})")?,
+            (None, Some(h)) => writeln!(w, " ({h})")?,
+            (None, None) => writeln!(w)?,
         }
+        if report.skipped_symlinks > 0 {
+            writeln!(
+                w,
+                "skipped {} symlink(s); pass --follow-symlinks to include",
+                report.skipped_symlinks
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -562,12 +847,16 @@ mod tests {
             ]),
             bundle_hash: Some("b3:cafef00d".into()),
             moved: false,
+            optimized: false,
+            chunks_total: 0,
+            chunks_written: 0,
+            skipped_symlinks: 0,
         };
         let mut buf: Vec<u8> = Vec::new();
         write_import_report(&mut buf, &report, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(buf.trim_ascii_end()).unwrap();
         let obj = parsed.as_object().unwrap();
-        assert_eq!(obj.len(), 6);
+        assert_eq!(obj.len(), 10);
         assert_eq!(obj["imported"].as_u64(), Some(3));
         assert_eq!(obj["bytes"].as_u64(), Some(42));
         assert_eq!(obj["origin"].as_str(), Some("fs:/tmp/origin"));
@@ -575,6 +864,95 @@ mod tests {
         assert_eq!(obj["files"]["dir/b.txt"].as_str(), Some("b3:bbbb"));
         assert_eq!(obj["bundle_hash"].as_str(), Some("b3:cafef00d"));
         assert_eq!(obj["moved"].as_bool(), Some(false));
+        assert_eq!(obj["optimized"].as_bool(), Some(false));
+        assert_eq!(obj["chunks_total"].as_u64(), Some(0));
+        assert_eq!(obj["chunks_written"].as_u64(), Some(0));
+        assert_eq!(obj["skipped_symlinks"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn import_report_human_shows_skipped_symlinks_warning() {
+        let report = ImportReport {
+            imported: 1,
+            bytes: 10,
+            origin: "fs:/tmp/origin".into(),
+            files: BTreeMap::from([("a.txt".into(), "b3:aaaa".into())]),
+            bundle_hash: Some("b3:cafef00d".into()),
+            moved: false,
+            optimized: false,
+            chunks_total: 0,
+            chunks_written: 0,
+            skipped_symlinks: 2,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_import_report(&mut buf, &report, false).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert!(
+            line.contains("skipped 2 symlink(s); pass --follow-symlinks to include"),
+            "got: {line}"
+        );
+    }
+
+    #[test]
+    fn import_report_json_carries_skipped_symlinks() {
+        let report = ImportReport {
+            imported: 1,
+            bytes: 10,
+            origin: "fs:/tmp/origin".into(),
+            files: BTreeMap::from([("a.txt".into(), "b3:aaaa".into())]),
+            bundle_hash: Some("b3:cafef00d".into()),
+            moved: false,
+            optimized: false,
+            chunks_total: 0,
+            chunks_written: 0,
+            skipped_symlinks: 2,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_import_report(&mut buf, &report, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(buf.trim_ascii_end()).unwrap();
+        assert_eq!(parsed["skipped_symlinks"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn import_report_json_optimized_carries_chunk_counters() {
+        let report = ImportReport {
+            imported: 2,
+            bytes: 100,
+            origin: "fs:/tmp/origin".into(),
+            files: BTreeMap::from([("a.bin".into(), "b3:aaaa".into())]),
+            bundle_hash: Some("b3:cafef00d".into()),
+            moved: false,
+            optimized: true,
+            chunks_total: 7,
+            chunks_written: 5,
+            skipped_symlinks: 0,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_import_report(&mut buf, &report, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(buf.trim_ascii_end()).unwrap();
+        assert_eq!(parsed["optimized"].as_bool(), Some(true));
+        assert_eq!(parsed["chunks_total"].as_u64(), Some(7));
+        assert_eq!(parsed["chunks_written"].as_u64(), Some(5));
+    }
+
+    #[test]
+    fn import_report_human_optimized_shows_deduped_chunks() {
+        let report = ImportReport {
+            imported: 2,
+            bytes: 100,
+            origin: "fs:/tmp/origin".into(),
+            files: BTreeMap::from([("a.bin".into(), "b3:aaaa".into())]),
+            bundle_hash: Some("b3:cafef00d".into()),
+            moved: false,
+            optimized: true,
+            chunks_total: 7,
+            chunks_written: 5,
+            skipped_symlinks: 0,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_import_report(&mut buf, &report, false).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.contains("deduped 5/7 chunks"), "got: {line}");
     }
 
     #[test]
@@ -586,6 +964,10 @@ mod tests {
             files: BTreeMap::from([("blob.bin".into(), "b3:deadbeef".into())]),
             bundle_hash: None,
             moved: true,
+            optimized: false,
+            chunks_total: 0,
+            chunks_written: 0,
+            skipped_symlinks: 0,
         };
         let mut buf: Vec<u8> = Vec::new();
         write_import_report(&mut buf, &report, true).unwrap();
@@ -604,6 +986,10 @@ mod tests {
             files: BTreeMap::from([("blob.bin".into(), "b3:deadbeef".into())]),
             bundle_hash: None,
             moved: false,
+            optimized: false,
+            chunks_total: 0,
+            chunks_written: 0,
+            skipped_symlinks: 0,
         };
         let mut buf: Vec<u8> = Vec::new();
         write_import_report(&mut buf, &report, false).unwrap();
@@ -623,6 +1009,10 @@ mod tests {
             ]),
             bundle_hash: Some("b3:cafef00d".into()),
             moved: false,
+            optimized: false,
+            chunks_total: 0,
+            chunks_written: 0,
+            skipped_symlinks: 0,
         };
         let mut buf: Vec<u8> = Vec::new();
         write_import_report(&mut buf, &report, false).unwrap();

@@ -151,12 +151,18 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio-util = { version = "0.7", features = ["io"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
 
-# Bundle creation (`decdn bundle create`, issue #391):
+# Bundle + origin-import manifest tooling (issue #391):
 # walkdir for stable directory traversal, globset for `--exclude` patterns,
 # blake3 direct so the publisher CLI doesn't have to pull iroh-blobs.
 walkdir = "2"
 globset = "0.4"
 blake3 = "1"
+
+# Content-defined chunking (`decdn origin import --optimize`): fastcdc's
+# v2020 module implements the rolling-hash chunk-boundary algorithm and
+# publishes its own min/avg/max structural bounds as constants, which
+# `ChunkSizes::resolve` validates against directly.
+fastcdc = "5"
 
 # HTTP client (used by cache-origin backend)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }

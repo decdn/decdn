@@ -26,8 +26,8 @@ use std::process::Command;
 ///
 /// Neither is a live defect in this crate's tests today: `channel list`
 /// short-circuits config loading when `--data-dir` is given
-/// (`commands::channel::list`), and `bundle create` is never handed a
-/// `config_path` at all (`commands::bundle::bundle_dispatch`). That safety is a
+/// (`commands::channel::list`), and `origin import` is never handed a
+/// `config_path` at all (`commands::origin::origin_dispatch`). That safety is a
 /// property of those two subcommands, though, not of the tests — it evaporates
 /// if a subcommand changes or a new test drops the flag. `decdn-e2e` had the
 /// same latent shape and it became a real, environment-dependent failure
