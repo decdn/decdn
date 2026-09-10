@@ -35,9 +35,13 @@ fetch every entry by hash. No out-of-band file distribution.
 ```
 
 Top-level keys are `version` (integer, currently `1`) and `entries`
-(array). Each entry has exactly three keys, in this order: `path`
-(string), `hash` (string), `size` (integer). Field declaration order
-is load-bearing — see [Determinism](#determinism).
+(array). Each entry's keys come in this order: `path` (string), `hash`
+(string), `size` (integer), `chunks` (array). `path` and `hash` are
+required. `bundle create` always emits `size`, but a reader treats it as
+optional and informational (see the `size` bullet). `chunks` is optional
+and present only for a chunked file. When a key is present it holds this
+order — field declaration order is load-bearing, see
+[Determinism](#determinism).
 
 - `path` — relative POSIX path (`/` separator on every platform), UTF-8.
   `..`, absolute paths, root prefixes, and non-UTF-8 components are
@@ -47,6 +51,33 @@ is load-bearing — see [Determinism](#determinism).
 - `size` — file size in bytes, unsigned 64-bit integer. Optional and
   informational on the read side: `bundle pull` uses it for the dry-run
   plan and size hints, and fetches without it.
+- `chunks` — optional ordered chunk decomposition of the file. See
+  [Chunked files](#chunked-files). When absent, the file is one blob
+  addressed by `hash`.
+
+## Chunked files
+
+A `chunks` array represents a file as the in-order concatenation of
+independently content-addressed chunk blobs. It is a **dedup helper**: a
+chunk shared by two files (two textures that share a region) is one blob,
+fetched and paid for once.
+
+```json
+{"path":"model.safetensors","hash":"b3:whole...","size":100,"chunks":[{"hash":"b3:c0...","size":60},{"hash":"b3:c1...","size":40}]}
+```
+
+- `hash` and `size` always describe the **whole file**. `hash` is the
+  file's identity and the end-to-end validator.
+- Each element of `chunks` has `hash` (`b3:<hex>`, the chunk blob's
+  BLAKE3) then `size` (the chunk's byte length). The chunk sizes sum to
+  the entry `size`.
+- Chunks are listed in **content order** — the file is their
+  concatenation. This order is load-bearing and never sorted.
+
+The chunk blobs are ordinary blobs. The network sees only blobs, never
+chunk structure, exactly as it sees only the bundle blob and each entry
+blob. A file with unique chunks costs the same as an unchunked file plus
+the manifest; the win comes only from shared chunks.
 
 ## Hash format
 
@@ -97,8 +128,11 @@ bundle from the same source tree get the same hash. The exact axes:
   encoding, and matches every other content-addressed sort in the
   workspace.
 - **Key order.** Outer `(version, entries)`; per-entry `(path, hash,
-  size)`. `serde_json` serializes structs in declaration order — the
-  Rust struct definitions are the canonical key-order spec.
+  size, chunks)`, with `chunks` omitted entirely when the file is
+  unchunked; per-chunk `(hash, size)`. `serde_json` serializes structs
+  in declaration order — the Rust struct definitions are the canonical
+  key-order spec. An unchunked entry serializes byte-identically to a
+  bundle that predates chunked entries.
 - **Encoding.** UTF-8, no BOM.
 - **Single-line compact.** No whitespace between tokens, no indentation,
   no internal newlines. `jq .` pretty-prints when humans need it; the
@@ -132,6 +166,11 @@ manifest in the protocol sense.
 - `bundle inspect`, signing/attestation, encryption, compression,
   nested bundles, network publishing of the produced file — all v2+
   concerns, none of which the bundle BLAKE3 invariant depends on.
+- **Generation of chunked entries.** `bundle create` and `origin
+  import` emit whole-file entries. Choosing chunk boundaries that
+  maximize sharing across a directory is a separate indexing problem; an
+  external chunker produces a chunked manifest and `bundle pull`
+  consumes it.
 - This appendix does not add a wire format. Bundles never ride an ALPN;
   they exist only as on-disk JSON or as opaque blob bytes when published
   through the regular content path.
@@ -175,6 +214,24 @@ as `decdn fetch`):
 Verification is intrinsic: content addressing means every fetched blob
 is BLAKE3-checked against its `entries[].hash` by the fetch path, so
 there is no separate verify toggle.
+
+### Chunked entries
+
+A `chunks` entry (see [Chunked files](#chunked-files)) is pulled in two
+phases. First, `bundle pull` fetches every distinct chunk blob the
+about-to-be-written entries reference, once each, over the same paid
+path — so a chunk shared across entries is fetched and paid for once.
+Then it concatenates each entry's chunk blobs in order into the
+destination and verifies the assembled bytes against the whole-file
+`hash`. The destination appears only after that check passes, by atomic
+rename, so a present file is verified-good and re-runs resume. Each
+chunk blob is BLAKE3-checked against its own hash on the way in; the
+whole-file check additionally rejects a chunk list that is individually
+valid but wrong or misordered.
+
+Chunk dedup holds within one pull. Reuse across separate pulls — v2 of a
+model skipping the chunks it already fetched for v1 — needs a persistent
+chunk-addressed cache and is a follow-up.
 
 ### Deferred
 
