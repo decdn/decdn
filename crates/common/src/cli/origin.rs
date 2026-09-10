@@ -62,8 +62,10 @@ pub struct OriginImportArgs {
     ///
     /// An HTTP origin is a read-only static server, not a write target: seed the
     /// `fs:` layout onto the disk it serves instead.
+    ///
+    /// Required unless `--dry-run`.
     #[arg(long, value_name = "TARGET")]
-    pub to: String,
+    pub to: Option<String>,
 
     /// Move each source file into the target instead of copying it. Across
     /// filesystems this falls back to copy-then-unlink. A source whose content
@@ -100,4 +102,87 @@ pub struct OriginImportArgs {
     /// `{"imported":<n>,"bytes":<total>,"origin":"<target>","bundle_hash":"b3:<hex>"|null,"moved":<bool>}`.
     #[arg(long)]
     pub json: bool,
+
+    /// Content-defined-chunk each file and write each chunk as its own blob, so
+    /// a chunk shared across files is stored once. Emits chunked manifest
+    /// entries. Off by default (whole-file blobs).
+    #[arg(long)]
+    pub optimize: bool,
+
+    /// Target average chunk size (`--optimize` only). The primary dial. Must be
+    /// a power of two, at most 4 MiB (fastcdc's ceiling). Defaults to 4 MiB when
+    /// `--optimize` is set (applied in the import wiring, not by clap, so an
+    /// explicit `--chunk-avg` without `--optimize` is a detectable error).
+    #[arg(long, value_name = "SIZE", value_parser = super::parse_byte_size)]
+    pub chunk_avg: Option<u64>,
+
+    /// Minimum chunk size override (`--optimize` only). Defaults to `avg/4`.
+    /// At least 1 MiB (the payment interval), at most 1 MiB (fastcdc's ceiling).
+    #[arg(long, value_name = "SIZE", value_parser = super::parse_byte_size)]
+    pub chunk_min: Option<u64>,
+
+    /// Maximum chunk size override (`--optimize` only). Defaults to `2*avg`.
+    /// At most 16 MiB (fastcdc's ceiling).
+    #[arg(long, value_name = "SIZE", value_parser = super::parse_byte_size)]
+    pub chunk_max: Option<u64>,
+
+    /// Compute and emit the manifest without writing any blobs. Prints the
+    /// canonical manifest bytes to stdout (status goes to stderr). Makes `--to`
+    /// optional — this is the local "just make me a manifest" path.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrap {
+        #[command(flatten)]
+        args: OriginImportArgs,
+    }
+
+    #[test]
+    fn chunk_avg_is_none_by_default() {
+        // No clap default: `None` = unset, so the wiring (Task 6) can reject
+        // `--chunk-avg` given without `--optimize`. The 4 MiB default is applied
+        // downstream, not by clap.
+        let w = Wrap::try_parse_from(["x", "-i", "d", "--to", "fs:/o"]).unwrap();
+        assert_eq!(w.args.chunk_avg, None);
+        assert!(!w.args.optimize);
+        assert!(!w.args.dry_run);
+    }
+
+    #[test]
+    fn to_is_optional() {
+        let w = Wrap::try_parse_from(["x", "-i", "d", "--dry-run"]).unwrap();
+        assert!(w.args.to.is_none());
+        assert!(w.args.dry_run);
+    }
+
+    #[test]
+    fn parses_optimize_and_sizes() {
+        let w = Wrap::try_parse_from([
+            "x",
+            "-i",
+            "d",
+            "--to",
+            "fs:/o",
+            "--optimize",
+            "--chunk-avg",
+            "2MiB",
+            "--chunk-min",
+            "1MiB",
+            "--chunk-max",
+            "4MiB",
+        ])
+        .unwrap();
+        assert!(w.args.optimize);
+        assert_eq!(w.args.chunk_avg, Some(2 * 1024 * 1024));
+        assert_eq!(w.args.chunk_min, Some(1024 * 1024));
+        assert_eq!(w.args.chunk_max, Some(4 * 1024 * 1024));
+    }
 }

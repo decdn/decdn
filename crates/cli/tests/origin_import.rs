@@ -35,13 +35,18 @@ fn rt() -> tokio::runtime::Runtime {
 fn import_args(input: &Path, origin: &Path) -> OriginImportArgs {
     OriginImportArgs {
         input: input.to_path_buf(),
-        to: format!("fs:{}", origin.display()),
+        to: Some(format!("fs:{}", origin.display())),
         move_source: false,
         bundle: None,
         force: false,
         follow_symlinks: false,
         exclude: Vec::new(),
         json: false,
+        optimize: false,
+        chunk_avg: None,
+        chunk_min: None,
+        chunk_max: None,
+        dry_run: false,
     }
 }
 

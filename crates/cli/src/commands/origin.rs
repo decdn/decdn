@@ -91,8 +91,16 @@ struct ImportReport {
 /// Entry point. Parses the target, dispatches file vs directory import inside
 /// `spawn_blocking`, and prints the status report.
 pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
-    let target = parse_target(&args.to)?;
-    let origin_label = args.to.clone();
+    // Stopgap: `--to` is `Option<String>` as of the `--dry-run` flag surface,
+    // but the dry-run path itself isn't wired yet (a later task's job) — so for
+    // now `--to` is still effectively required. This bails cleanly instead of
+    // matching on `args.to` throughout the function.
+    let to = args
+        .to
+        .as_deref()
+        .ok_or_else(|| anyhow!("--to is required (--dry-run is not yet implemented)"))?;
+    let target = parse_target(to)?;
+    let origin_label = to.to_string();
 
     let input = args.input.clone();
     let follow = args.follow_symlinks;
