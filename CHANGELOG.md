@@ -1674,7 +1674,7 @@ since project inception and will roll into the first tagged release.
   derive a version from the `bookworm-slim` tag.
 - **`publish-crates.sh` refuses to start when more than five crates are new to
   crates.io.** `PublishNew` allows a burst of five and then roughly one per ten
-  minutes, and the first release creates eleven crates — one run would be
+  minutes, and the first release creates ten crates — one run would be
   rate-limited partway through, leaving some permanently published and the
   version spent. Clearing this is a one-time manual step; see RELEASING.md.
   Override with `DECDN_ALLOW_RATE_LIMIT=1` once the limit has been raised.
