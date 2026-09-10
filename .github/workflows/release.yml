@@ -131,7 +131,7 @@ jobs:
       # The version bump happens locally and is unpoliced by CI, so confirm the
       # tag matches the manifests it claims to describe. Catches a hand-typed
       # tag or a tag pushed without `cargo release`. Checks every crate, not
-      # just one: `shared-version` is supposed to move all twelve in lockstep,
+      # just one: `shared-version` is supposed to move all eleven in lockstep,
       # and a partially-applied bump is exactly what this is here to catch.
       # `shell: bash` is deliberate: the default shell for a `run:` block is
       # `bash -e` with NO pipefail, so a `cargo metadata` failure here would be
@@ -147,7 +147,7 @@ jobs:
               '.packages[] | select(.version != $v) | "\(.name)=\(.version)"')
           if [ -n "$MISMATCHED" ]; then
             echo "::error::tag says $VERSION but these crates disagree: $MISMATCHED"
-            echo "Cut releases with \`cargo release\` so all twelve stay in step."
+            echo "Cut releases with \`cargo release\` so all eleven stay in step."
             exit 1
           fi
           echo "All crates are at $VERSION."
