@@ -1314,7 +1314,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                         (chunk_hash, result)
                     }
                 })
-                .buffer_unordered(chunks.len().max(1))
+                // Chunk futures are offered up to `--jobs` at a time rather than
+                // all at once: the global gate is the real in-flight-fetch cap, so
+                // a file with very many chunks never buffers one future per chunk.
+                .buffer_unordered(self.jobs.min(chunks.len().max(1)))
                 .collect()
                 .await;
         let file_fetched: HashMap<[u8; 32], Result<u64, String>> = results.into_iter().collect();

@@ -1417,6 +1417,7 @@ mod tests {
                 unit_deadline: Duration::from_secs(10),
             },
             Some(&on_progress),
+            None,
         )
         .await?;
 
