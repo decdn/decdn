@@ -2765,6 +2765,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 1.1.3+spec-1.1.0",
+ "tracing",
  "tracing-subscriber",
  "url",
  "walkdir",

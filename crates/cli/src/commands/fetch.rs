@@ -163,12 +163,9 @@ pub(crate) struct ResolvedChain {
     /// narrows which peers `discover_provider` probes/discovers, never ranks
     /// them. Empty when the config omits `[client]` or the list, which is a
     /// no-op in [`discovery::select_candidates_filtered`]. Invalid entries
-    /// (fail `Region::parse`) are dropped with an `eprintln!` warning in
+    /// (fail `Region::parse`) are dropped with a `tracing::warn!` in
     /// [`resolve_chain`] rather than failing config resolution — a typo'd
     /// region code shrinks the filter, it does not break the fetch.
-    /// `eprintln!`, not `tracing::warn!`: `decdn` installs no tracing
-    /// subscriber (see [`discovery::bootstrap_nodes`]'s doc comment), so a
-    /// `warn!` here would reach nobody.
     pub(crate) region_allowlist: Vec<decdn_protocol::Region>,
     /// Deposit to escrow when OPENING a pool, and the target a reused pool's
     /// proactive refill restores toward once it has served verified bytes.
@@ -191,8 +188,8 @@ fn parse_region_allowlist(file: &FileConfig) -> Vec<decdn_protocol::Region> {
         .filter_map(|code| {
             let parsed = decdn_protocol::Region::parse(code);
             if parsed.is_none() {
-                eprintln!(
-                    "warning: client.region_allowlist entry {code:?} is not a recognized \
+                tracing::warn!(
+                    "client.region_allowlist entry {code:?} is not a recognized \
                      region code; dropping it from the filter"
                 );
             }
@@ -412,6 +409,13 @@ fn no_serve_target_error(
 /// When no candidate holds the blob, the order is instead the reachable
 /// non-holders, nearest RTT first, as pull-through serve targets — see
 /// [`failover_order`] for why an empty holder set bootstraps rather than fails.
+// One flat pass over the probe responses: verify, drop the inconsistent, split
+// holders from non-holders, then order. The branch count is that per-candidate
+// classification plus the `tracing` diagnostics on the drop and fallback arms.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "flat per-candidate classification pass, not nested control flow"
+)]
 pub(crate) async fn probe_and_order(
     endpoint: &Endpoint,
     candidates: &[NodeCandidate],
@@ -478,12 +482,11 @@ pub(crate) async fn probe_and_order(
             hash,
             timestamp_us,
         ) {
-            // `decdn` installs no tracing subscriber, so this goes to stderr —
-            // a candidate silently vanishing from selection is exactly what the
-            // user needs told.
+            // A candidate silently vanishing from selection is exactly what the
+            // operator needs told, so log why at `warn`.
             unverifiable += 1;
-            eprintln!(
-                "warning: dropping an unverifiable probe response from {}: {e}",
+            tracing::warn!(
+                "dropping an unverifiable probe response from {}: {e}",
                 cand.node_id
             );
             continue;
@@ -494,8 +497,8 @@ pub(crate) async fn probe_and_order(
         // rather than score it (same reasoning as an unrecovered `slash_sig`
         // above).
         if !resp_ext.consistent_with(resp.body.has_blob) {
-            eprintln!(
-                "warning: dropping a probe response from {} with has_blob/coverage mismatch",
+            tracing::warn!(
+                "dropping a probe response from {} with has_blob/coverage mismatch",
                 cand.node_id
             );
             continue;
@@ -532,9 +535,8 @@ pub(crate) async fn probe_and_order(
 
     if holders.is_empty() {
         // No cache holder, but reachable non-holders can serve via pull-through.
-        // `decdn` installs no tracing subscriber, so the operator learns on
-        // stderr why the fetch is talking to nodes that answered `has_blob:false`.
-        eprintln!(
+        // Log why the fetch is talking to nodes that answered `has_blob:false`.
+        tracing::info!(
             "no probed node holds the blob in cache; falling back to {} reachable bonded \
              non-holder(s) as pull-through serve targets — a node serves an authorized miss \
              from its own origin (#1911)",
@@ -544,7 +546,7 @@ pub(crate) async fn probe_and_order(
 
     let ordered = failover_order(holders, &non_holders, warming);
     if let Some((node_id, proxy_rtt, best_holder_rtt)) = ordered.warming_lead {
-        eprintln!(
+        tracing::info!(
             "proxy-warming: routing through nearer non-holder {node_id} ({proxy_rtt:.1}ms) \
              instead of the best holder ({best_holder_rtt:.1}ms) to seed a regional copy, \
              falling back to the holder if it declines (ADR 037)",
@@ -771,11 +773,11 @@ async fn discover_provider(
     // by region risks starving the fetch entirely over data that is already
     // possibly stale.
     let is_live_registry = matches!(bootstrap, discovery::Bootstrap::Live { .. });
-    // `client-pull` cannot log this itself — `decdn` installs no tracing
-    // subscriber — and a silently stale peer list is exactly what the user
-    // needs told, so the provenance comes back in the return value.
+    // `client-pull` returns the provenance rather than logging it itself; a
+    // silently stale peer list is exactly what the operator needs told, so
+    // surface it here at `warn`.
     if let Some(warning) = bootstrap.warning() {
-        eprintln!("{warning}");
+        tracing::warn!("{warning}");
     }
     let all = bootstrap.into_peers();
     if all.is_empty() {
@@ -1065,9 +1067,11 @@ pub(crate) async fn resolve_target_node(
     let order =
         discover_provider(endpoint, chain, capacity_bond, relays.first(), hash, args).await?;
     if !order.candidates.is_empty() {
-        eprintln!("Discovered {} node(s):", order.candidates.len());
+        // A header event, then one event per candidate — the log-side shape of
+        // the previous per-line stderr listing.
+        tracing::info!("discovered {} node(s):", order.candidates.len());
         for c in &order.candidates {
-            eprintln!(
+            tracing::info!(
                 "  * {} / {} / {}",
                 c.region_hint.as_ref().map_or("??", |r| r.as_str()),
                 node_id_tail(&c.node_id),
@@ -1203,14 +1207,14 @@ fn persist_watermark(
     // surface it too rather than dropping it on the floor.
     match store.advance_progress(owner, pool_id, lane, bytes_delivered, amount) {
         Ok(AdvanceOutcome::Advanced) => {}
-        Ok(other) => eprintln!(
-            "warning: voucher watermark not persisted for pool {pool_id} (provider {}): \
+        Ok(other) => tracing::warn!(
+            "voucher watermark not persisted for pool {pool_id} (provider {}): \
              {other:?}; the next reuse may re-sign a stale watermark, which that provider \
              rejects — close and reopen the pool if reuse starts failing",
             lane.provider
         ),
-        Err(e) => eprintln!(
-            "warning: failed to persist voucher watermark for pool {pool_id} (provider {}): {e}; \
+        Err(e) => tracing::warn!(
+            "failed to persist voucher watermark for pool {pool_id} (provider {}): {e}; \
              the next reuse may re-sign a stale watermark, which that provider rejects — close \
              and reopen the pool if reuse starts failing",
             lane.provider
@@ -1228,8 +1232,15 @@ fn persist_watermark(
 /// region-nearest candidates, and derive `--provider-address` from each
 /// candidate's registry entry, failing over across them (#1174).
 // Linear provider-failover loop over the resolved candidates plus the one-time
-// provider-independent setup — long but flat, not complex.
+// provider-independent setup: long, and its branch count is the fallback ladder
+// itself (multi-source, per-candidate failover, one-shot rediscovery), each arm
+// carrying a `tracing` diagnostic. Kept as one flat orchestrator rather than
+// split across helpers that would only pass the shared loop state back and forth.
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "flat failover ladder; the branches are the fallback arms, not nesting"
+)]
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
@@ -1407,7 +1418,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
                     });
                 }
                 Err(err) => {
-                    eprintln!(
+                    tracing::warn!(
                         "multi-source fetch failed ({err:#}); falling back to single-source \
                          failover over the same candidates"
                     );
@@ -1515,7 +1526,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
                 last_err = Some(err);
                 break;
             }
-            eprintln!(
+            tracing::warn!(
                 "fetch: provider {provider} could not deliver ({err:#}); failing over to the \
                  next of {} candidate(s)",
                 candidates.len(),
@@ -1546,7 +1557,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             && retry_disposition(&exhausted_err) != RetryDisposition::Terminal
         {
             rediscovered = true;
-            eprintln!(
+            tracing::warn!(
                 "fetch: every cached-membership candidate was unreachable ({exhausted_err:#}); \
                  re-resolving via full discovery within this fetch and resuming the partial \
                  already held (ADR 037)"
@@ -1651,7 +1662,7 @@ pub(crate) fn multi_source_gate_declines(
         return true;
     }
     if admitted.len() < 2 {
-        eprintln!(
+        tracing::info!(
             "multi-source: not engaging — {} operator-distinct holder(s) among {} candidate(s), \
              and fan-out needs two (one lane per operator: two nodes of one operator would \
              share a voucher lane)",
@@ -1668,7 +1679,7 @@ pub(crate) fn multi_source_gate_declines(
     if let Some(hint) = size_hint
         && !should_multi_source(true, hint, common.multi_source_min_bytes, admitted.len())
     {
-        eprintln!(
+        tracing::info!(
             "multi-source: not engaging — the blob is ~{hint} bytes, below the {} byte fan-out \
              floor (--multi-source-min-bytes)",
             common.multi_source_min_bytes
@@ -1893,9 +1904,8 @@ where
         let _ = peer_store.record_failure(&node_id, now_secs_cli());
     }
 
-    // Clear the progress bar (or run the caller's no-op, for `bundle pull`) now —
-    // BEFORE `persist_watermark`, which can `eprintln!` a rare non-advance
-    // warning that must never race the still-active bar.
+    // Finalize the progress bar (or run the caller's no-op, for `bundle pull`)
+    // now that the transfer has settled, before persisting the watermark.
     finish_progress();
 
     // Persist the voucher watermark from the shared ledger: on an explicit
@@ -2239,7 +2249,7 @@ where
         common.multi_source_min_bytes,
         admitted.len(),
     ) {
-        eprintln!(
+        tracing::info!(
             "multi-source: not engaging — the blob is {total_bytes} bytes, below the {} byte \
              fan-out floor (--multi-source-min-bytes)",
             common.multi_source_min_bytes
@@ -2942,7 +2952,7 @@ where
         let state = if additional.is_zero() {
             state
         } else {
-            eprintln!(
+            tracing::info!(
                 "buyer pool {} low on deposit ({} µUSDC remaining of {} deposited); topping up \
                  {additional} µUSDC",
                 state.pool_id,
