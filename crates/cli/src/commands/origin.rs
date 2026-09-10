@@ -86,7 +86,10 @@ struct ImportReport {
     /// The bundle hash publishers distribute — `Some` for a directory import,
     /// `None` for a single file (which produces no manifest).
     bundle_hash: Option<String>,
-    /// Whether sources were moved (`--move`) rather than copied.
+    /// Whether sources were moved (`--move`) rather than copied. Always
+    /// `false` under `--dry-run`, since nothing is written; `--move` is
+    /// rejected together with `--optimize`, so this is never `true` for an
+    /// optimized import.
     moved: bool,
     /// Whether content-defined chunking (`--optimize`) was applied — each file
     /// stored as its content-addressed chunks instead of one whole-file blob.
@@ -152,6 +155,14 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
         && (args.chunk_avg.is_some() || args.chunk_min.is_some() || args.chunk_max.is_some())
     {
         bail!("--chunk-avg/--chunk-min/--chunk-max require --optimize");
+    }
+    // `--optimize` never touches the source file (it writes derived chunk
+    // blobs via `import_bytes`), so pairing it with `--move` would silently
+    // leave every source in place while the report claims a move.
+    if args.optimize && args.move_source {
+        bail!(
+            "--move is incompatible with --optimize (chunked import writes derived chunk blobs, not the source file)"
+        );
     }
     // The 4 MiB avg default lives here, not in clap, so an explicit `--chunk-avg`
     // without `--optimize` stays detectable as `Some` above.
@@ -271,8 +282,11 @@ fn import_directory(
             let file =
                 File::open(canonical).map_err(|e| anyhow!("open {}: {e}", canonical.display()))?;
             let cf = chunk_file(file, sizes, |chash, data| {
-                if ctx.write
-                    && written.insert(*chash.as_bytes())
+                // The dedup set is updated in both modes, so `--dry-run`
+                // previews the same distinct-chunk count a real write would
+                // produce; only the actual blob write is gated on `ctx.write`.
+                if written.insert(*chash.as_bytes())
+                    && ctx.write
                     && let Some(base) = ctx.base.as_deref()
                 {
                     import_bytes(base, data, ctx.force)?;
@@ -335,8 +349,11 @@ fn import_single_optimized(ctx: &ImportCtx, input: &Path) -> anyhow::Result<Impo
     let mut written: HashSet<[u8; 32]> = HashSet::new();
     let file = File::open(input).map_err(|e| anyhow!("open {}: {e}", input.display()))?;
     let cf = chunk_file(file, sizes, |chash, data| {
-        if ctx.write
-            && written.insert(*chash.as_bytes())
+        // The dedup set is updated in both modes, so `--dry-run` previews the
+        // same distinct-chunk count a real write would produce; only the
+        // actual blob write is gated on `ctx.write`.
+        if written.insert(*chash.as_bytes())
+            && ctx.write
             && let Some(base) = ctx.base.as_deref()
         {
             import_bytes(base, data, ctx.force)?;
@@ -400,7 +417,9 @@ fn import_single_plain(ctx: &ImportCtx, input: &Path) -> anyhow::Result<ImportRe
         origin: ctx.origin_label.clone(),
         files,
         bundle_hash: None,
-        moved: ctx.move_source,
+        // A dry run writes nothing, so it never actually moved the source —
+        // even though `--move` was passed, don't claim it happened.
+        moved: ctx.move_source && ctx.write,
         optimized: false,
         chunks_total: 0,
         chunks_written: 0,
@@ -457,7 +476,13 @@ fn emit_manifest(
         origin: ctx.origin_label.clone(),
         files,
         bundle_hash,
-        moved: ctx.move_source,
+        // A dry run writes nothing, so it never actually moved a source, and
+        // the optimize path never moves sources at all (it writes derived
+        // chunk blobs via `import_bytes`) — `--optimize --move` is rejected
+        // up front in `origin_import`, so `ctx.write` alone would already be
+        // correct here, but gating on both keeps this line self-evidently
+        // truthful without relying on that earlier guard.
+        moved: ctx.move_source && ctx.write,
         optimized,
         chunks_total,
         chunks_written,

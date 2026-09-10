@@ -176,8 +176,8 @@ manifest in the protocol sense.
 canonical bundle manifest for it (see [Determinism](#determinism)). By
 default each file becomes one whole-file blob, addressed by `hash`.
 
-With `--optimize`, `origin import` content-defines-chunks each file
-(fastcdc v2020) instead of storing it as one blob. `--chunk-avg` is the
+With `--optimize`, `origin import` splits each file into content-defined
+chunks (fastcdc v2020) instead of storing it as one blob. `--chunk-avg` is the
 primary dial: it sets the target chunk size and defaults to 4 MiB, the
 ceiling fastcdc's averaging window supports. `--chunk-min` and
 `--chunk-max` are advanced rails around that target; `--chunk-min` is

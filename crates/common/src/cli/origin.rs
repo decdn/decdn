@@ -100,7 +100,7 @@ pub struct OriginImportArgs {
 
     /// Emit a one-line JSON status report to stdout instead of a human summary.
     /// Shape:
-    /// `{"imported":<n>,"bytes":<total>,"origin":"<target>","bundle_hash":"b3:<hex>"|null,"moved":<bool>}`.
+    /// `{"imported":<n>,"bytes":<total>,"origin":"<target>","files":{"<path>":"b3:<hex>",...},"bundle_hash":"b3:<hex>"|null,"moved":<bool>,"optimized":<bool>,"chunks_total":<n>,"chunks_written":<n>,"skipped_symlinks":<n>}`.
     #[arg(long)]
     pub json: bool,
 

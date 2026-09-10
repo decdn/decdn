@@ -551,6 +551,57 @@ fn optimize_writes_chunk_blobs_and_chunked_entries() {
     }
 }
 
+// `--dry-run --optimize` must preview dedup: the distinct-chunk count is
+// computed the same way a real write would, even though no blob is written.
+// Regression for the bug where the dedup set was only populated when
+// `write` was true, so a dry run always reported `chunks_written: 0`.
+#[test]
+fn optimize_dry_run_previews_dedup_without_writing() {
+    let tree = shared_region_tree();
+    let origin = TempDir::new().unwrap();
+    // A --to path that must NEVER be created by a dry run.
+    let ghost = origin.path().join("never-created");
+
+    let out = decdn(&[
+        "origin",
+        "import",
+        "-i",
+        tree.path().to_str().unwrap(),
+        "--optimize",
+        "--dry-run",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Status JSON is on stderr under --dry-run; stdout carries only the
+    // canonical manifest.
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(report["optimized"].as_bool(), Some(true));
+    let total = report["chunks_total"].as_u64().unwrap();
+    let written = report["chunks_written"].as_u64().unwrap();
+    assert!(
+        total > written,
+        "dedup expected to be visible in dry-run: total={total} written={written}"
+    );
+    assert!(written > 0, "written must be nonzero: {written}");
+
+    // Stdout is still the clean chunked manifest.
+    let manifest: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let entries = manifest["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    for e in entries {
+        assert!(e["chunks"].as_array().is_some(), "entry must be chunked");
+    }
+
+    // No blobs written, and the never-requested origin dir was never created.
+    assert!(!ghost.exists(), "dry-run must not create any origin dir");
+}
+
 #[test]
 fn optimize_single_file_emits_one_entry_manifest() {
     let src = TempDir::new().unwrap();
@@ -596,6 +647,41 @@ fn optimize_single_file_emits_one_entry_manifest() {
 // Generation is self-consistent WITHOUT a node: concatenating an entry's chunk
 // blobs (read from the sharded store, in `chunks` order) must reproduce the
 // whole-file bytes hashed by the entry's `hash`.
+// `--optimize` writes derived chunk blobs via `import_bytes`, never touching
+// the source file, so pairing it with `--move` would silently leave every
+// source on disk while the report claims a move. The combo is rejected
+// up front, before any filesystem work happens.
+#[test]
+fn optimize_and_move_are_rejected_together() {
+    let src = TempDir::new().unwrap();
+    let origin = TempDir::new().unwrap();
+    let file = src.path().join("blob.bin");
+    fs::write(&file, pseudo(1, 8 * 1024 * 1024)).unwrap();
+
+    let out = decdn(&[
+        "origin",
+        "import",
+        "-i",
+        file.to_str().unwrap(),
+        "--to",
+        &format!("fs:{}", origin.path().display()),
+        "--optimize",
+        "--move",
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--move is incompatible with --optimize"),
+        "stderr was: {stderr}"
+    );
+    // Nothing should have been written or moved.
+    assert!(file.exists(), "source must be left untouched");
+    assert!(
+        fs::read_dir(origin.path()).unwrap().next().is_none(),
+        "origin dir must stay empty"
+    );
+}
+
 #[test]
 fn optimize_chunks_concatenate_to_whole_entry_hash() {
     let tree = shared_region_tree();
