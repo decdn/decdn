@@ -159,8 +159,9 @@ jobs:
       - run: cargo test --doc --workspace
 
   # NOTE: there is intentionally no separate "MSRV check" job. The workspace
-  # MSRV (`rust-version = "1.95"`) equals the toolchain pinned in
-  # rust-toolchain.toml (1.95.0), which every Rust job here installs. A
+  # MSRV (`rust-version = "1.95.0"`) equals the toolchain pinned in
+  # rust-toolchain.toml (1.95.0), which every Rust job here installs — the
+  # `packaging` job's toolchain-pin check refuses the two to differ. A
   # `cargo check` on that same toolchain is a strict subset of the `clippy`
   # job's `cargo clippy --workspace --all-targets` (clippy is rustc + extra
   # lints), so it added runner-minutes for zero additional signal. Reintroduce
@@ -1453,7 +1454,8 @@ jobs:
   # publish runs, the release is signed and its dependency crates are already
   # uploaded, so a packaging error found there has no clean recovery.
   #
-  # Cheap by design — no toolchain, no build. The authoritative check is
+  # Cheap by design — a toolchain for `cargo metadata` and `cargo package
+  # --no-verify`, but no build. The authoritative check is
   # `cargo publish --workspace --dry-run` in release.yml, which verify-builds
   # every packaged crate; that costs a full rebuild and belongs on tags, not on
   # every PR. Unconditional (no `changes` gate) because it takes seconds, which
@@ -1476,7 +1478,29 @@ jobs:
       - name: Image name agrees across workflows and the signing script
         run: .github/scripts/check-image-name.sh
 
+      # The Rust version is written in rust-toolchain.toml, Cargo.toml's
+      # rust-version and every dtolnay/rust-toolchain step in this file and
+      # release.yml; each is read by a different tool. Dependabot bumps only the
+      # action refs, so this is what turns that PR red until the two TOML sites
+      # move with it. Runs before the toolchain install on purpose: it needs no
+      # cargo, and a drifted pin is the one thing that should fail first.
+      - name: Rust version agrees across toolchain, manifest and workflows
+        run: .github/scripts/check-toolchain-pin.sh
+
+      # A member that restates `version` or omits `[lints] workspace = true`
+      # compiles green and ships its own value. release.yml catches the version
+      # half at tag time; this catches both on every PR.
+      - name: Every member inherits the workspace version and lints
+        run: .github/scripts/check-workspace-manifests.sh
+
       - uses: dtolnay/rust-toolchain@1.95.0
+
+      # Cargo enforces acyclicity and nothing more. The dependency flow in
+      # CLAUDE.md § Crate Structure — three leaves, cli/e2e as sinks, an
+      # iroh-blobs-free CLI — is held by the table in check_crate_edges.py.
+      # Needs `cargo metadata`, hence after the toolchain step.
+      - name: Crate dependency direction matches CLAUDE.md
+        run: .github/scripts/check-crate-edges.sh
 
       # The authoritative packaging check is `cargo publish --workspace
       # --dry-run` in release.yml, which verify-BUILDS every crate. This is the

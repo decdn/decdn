@@ -8,6 +8,7 @@ A release is therefore three commands with a CI build between the first two:
 
 ```bash
 cargo release patch --execute              # cut, sign and push the tag
+                                           # (the FIRST release is `minor`: 0.0.0 -> 0.1.0)
 # ...wait for the tag-push run to finish...
 .github/scripts/sign-release.sh v0.1.2     # verify, sign, publish, tag images
 .github/scripts/publish-crates.sh v0.1.2   # publish the crates to crates.io
@@ -78,6 +79,14 @@ separate, later `publish-crates.sh` step below.
 
 Cut from `main`, with a clean tree and CI green on the commit you are tagging.
 
+The workspace reads `0.0.0` until the first release is cut. That is a
+statement, not a placeholder: `0.0.0` is never tagged, and the first cut is
+`cargo release minor --execute`, which makes it `0.1.0`. From then on the
+version moves only under `cargo release`. The `packaging` CI job and the
+`workspace-manifests` pre-commit hook refuse a member that restates the
+version or an internal `[workspace.dependencies]` alias that disagrees with
+it, so a hand edit fails before it ships.
+
 `CHANGELOG.md` is **not** touched by `cargo release` — it is maintained by hand,
 one entry per PR. git-cliff is used only to generate the GitHub release notes,
 inside the workflow. Write the changelog entry as part of the work, not at
@@ -102,7 +111,7 @@ which:
    it looks — `v0$(whoami)` matches it);
 2. imports `KEYS` **from `origin/main`** and refuses the tag if it is not signed
    by a key published there;
-3. checks all twelve crate versions match the tag;
+3. checks all eleven crate versions match the tag;
 4. re-runs `cargo fmt`, `clippy` and the test suite, plus `cargo semver-checks`
    against the previous tag — skipped for major bumps, for minor bumps while the
    major is `0`, and for the first release (no prior tag to diff against);
