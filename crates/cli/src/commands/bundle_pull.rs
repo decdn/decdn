@@ -50,7 +50,8 @@ use decdn_client_pull::discovery::{self, NodeCandidate};
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::provider;
 use decdn_client_pull::{
-    PoolExhausted, ProgressCallback, PullDeadlines, RetryDisposition, retry_disposition,
+    LaneLedgers, PoolExhausted, ProgressCallback, PullDeadlines, RetryDisposition,
+    retry_disposition,
 };
 
 type FetchTarget = (PublicKey, Address);
@@ -535,9 +536,8 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         common,
         namespace_id,
         grant,
-        locks: LaneLocks::default(),
+        ledgers: LaneLedgers::new(),
         open_lock: tokio::sync::Mutex::new(()),
-        pool_serial: tokio::sync::Mutex::new(()),
         // Silent during the manifest fetch below (a single blob); replaced once
         // the kept entries are known and their sizes decide the total-bar mode.
         progress: PullProgress::disabled(),
@@ -602,58 +602,10 @@ async fn obtain_manifest<P: Provider + Clone>(
     Ok(Some(m))
 }
 
-/// The bundle's per-provider lane locks. A `(signer, provider)` voucher lane is
-/// cumulative, so two in-flight fetches sharing one lane would race its
-/// watermark; the lock serializes them. Locks are lazily created per provider
-/// and held across one entry's fetch.
-///
-/// A single-source entry takes the one lock for its provider; a multi-source
-/// entry (ADR 039, #1774) takes the locks for its whole admitted provider set
-/// via [`Self::lock_set`], acquired in one global order — sorted by `Address`,
-/// deduplicated. Consistent ordering is what keeps two concurrent entries with
-/// overlapping provider sets deadlock-free: an entry only ever waits on the
-/// lowest unacquired lock of its sorted set, so no hold-and-wait cycle can
-/// form. The nesting also matches the single-source path's provider-lock →
-/// `open_lock` order, so the two lock kinds cannot deadlock each other either.
-///
-/// The map is a `tokio::sync::Mutex`: `LaneLocks` is `Sync` so `PullCtx` is
-/// `Sync` and safe to share across `tokio::spawn` if needed. The map guard is
-/// held only to `entry` + `clone` the `Arc`, never across a provider-lock
-/// await. The locks themselves are `Arc` because `OwnedMutexGuard` — which lets
-/// a multi-source entry carry its whole lock-set in one `Vec` — needs it.
-#[derive(Default)]
-struct LaneLocks {
-    map: tokio::sync::Mutex<HashMap<Address, Arc<tokio::sync::Mutex<()>>>>,
-}
-
-impl LaneLocks {
-    /// The per-provider lane lock, created on first use.
-    async fn lock(&self, provider: Address) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.map.lock().await;
-        Arc::clone(
-            map.entry(provider)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
-    }
-
-    /// Acquire the lane locks for every provider in `providers`, in the global
-    /// order, and return the guards in acquisition order.
-    async fn lock_set(&self, providers: &[Address]) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
-        let mut ordered = providers.to_vec();
-        ordered.sort_unstable();
-        ordered.dedup();
-        let mut guards = Vec::with_capacity(ordered.len());
-        for provider in ordered {
-            guards.push(self.lock(provider).await.lock_owned().await);
-        }
-        guards
-    }
-}
-
 /// Shared, by-reference state for the entry fetch loop. Borrowed by every
-/// in-flight entry future. `LaneLocks` is `Sync` via `tokio::sync::Mutex`, so
-/// `PullCtx` is `Sync` and safe to share across `tokio::spawn` if needed;
-/// `buffer_unordered` currently polls in one task.
+/// in-flight entry future. `LaneLedgers` is `Sync`, so `PullCtx` is `Sync` and
+/// safe to share across `tokio::spawn` if needed; `buffer_unordered` currently
+/// polls in one task.
 struct PullCtx<'a, P: Provider + Clone> {
     endpoint: &'a Endpoint,
     store: &'a RedbBuyerPoolStore,
@@ -681,9 +633,11 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// `--namespace <id>` as a big-endian `uint256`; `NO_NAMESPACE` when the flag
     /// was omitted.
     namespace_id: [u8; 32],
-    /// Per-provider lane locks (voucher-watermark serialization), see
-    /// [`LaneLocks`].
-    locks: LaneLocks,
+    /// The run's shared per-lane voucher ledgers (ADR 039): every entry and
+    /// chunk on a `(pool_id, signer, provider)` lane draws on one monotonic
+    /// issuer, so concurrent same-lane fetches never race the cumulative
+    /// watermark.
+    ledgers: LaneLedgers,
     /// Serializes every pool open-or-reuse across the whole bundle. The
     /// bundle's every entry shares ONE `PaymentPool` deposit (ADR 003), so
     /// distinct providers cannot open concurrently: its on-chain state (deposit,
@@ -692,16 +646,6 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// also perform a low-water top-up) and released before streaming, so
     /// delivery itself still runs concurrently once each entry has its context.
     open_lock: tokio::sync::Mutex<()>,
-    /// Serializes the pool's streaming phase across the whole bundle. Every
-    /// entry shares ONE `PaymentPool` deposit, but the scheduler's `spent`
-    /// view (`scheduler.rs:769`) sums only the lanes of the current fetch.
-    /// Without this, two `--jobs` entries on disjoint provider sets have
-    /// independent remaining-deposit views and can jointly over-issue vouchers
-    /// that exceed the single deposit and cannot all redeem. Holding this
-    /// across the whole payment section (`try_multi_source` + fallback) ensures
-    /// only one entry drives at a time; probes remain concurrent and
-    /// multi-source within an entry still fans out via its own `SharedPool`.
-    pool_serial: tokio::sync::Mutex<()>,
     /// The run's multi-bar progress renderer: one per-file bar per active pull
     /// above a bottom total bar (silent off a terminal or under `--json`). Set
     /// once the kept manifest is known — its entries decide the total-bar mode —
@@ -710,20 +654,6 @@ struct PullCtx<'a, P: Provider + Clone> {
 }
 
 impl<P: Provider + Clone> PullCtx<'_, P> {
-    /// The per-provider lane lock, created on first use.
-    async fn provider_lock(&self, provider: Address) -> Arc<tokio::sync::Mutex<()>> {
-        self.locks.lock(provider).await
-    }
-
-    /// Acquire the lane locks for every provider in `providers`, in one global
-    /// order (see [`LaneLocks::lock_set`]).
-    async fn provider_lock_set(
-        &self,
-        providers: &[Address],
-    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
-        self.locks.lock_set(providers).await
-    }
-
     /// The shared gap-driven deps, assembled from `PullCtx`'s borrowed chain
     /// plumbing plus this run's per-fetch budgets — the same shape `decdn fetch`
     /// builds. `drive_fetch` bao-verifies every ingested byte and, on
@@ -763,23 +693,19 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// the single-source failover loop), and `Err` when the fan-out engaged and
     /// failed.
     ///
-    /// The lane locks for the whole admitted provider set are held across the
-    /// fan-out — acquired in one global order so a concurrent entry with an
-    /// overlapping provider set waits rather than deadlocks — and the bundle's
-    /// `open_lock` is passed through so every lane's pool open-or-reuse still
-    /// serializes against the other entries sharing the one on-chain pool. The
-    /// pre-probe gate (kill switch, holder count, size-hint floor) runs BEFORE
-    /// the lock-set: a fetch the gate declines never fans out, so taking the
-    /// lanes would only block concurrent entries sharing those providers.
+    /// The bundle's `open_lock` is passed through so every lane's pool
+    /// open-or-reuse still serializes against the other entries sharing the
+    /// one on-chain pool. The pre-probe gate (kill switch, holder count,
+    /// size-hint floor) runs before the fan-out: a fetch the gate declines
+    /// never engages a lane.
     ///
-    /// Held across the whole streaming transfer (header probe + `multi_source_fetch`):
-    /// vouchers are cumulative per `(signer, provider)` lane and the ledger arms
-    /// the voucher before the ack, so releasing between intervals would race the
-    /// watermark. This intentionally serializes concurrent entries sharing any
-    /// provider for the full large-blob transfer — with `--jobs 3` and overlapping
-    /// provider sets parallelism degrades to serial. Narrowing to the
-    /// voucher-exchange critical section is future work if the ledger can be made
-    /// per-interval (see ADR 039).
+    /// Every admitted provider's lane draws vouchers from the run's shared
+    /// `LaneLedgers` (ADR 039): each `(pool_id, signer, provider)` lane has one
+    /// monotonic issuer, so concurrent entries fanning out over the same
+    /// provider issue vouchers off the same watermark instead of racing it.
+    /// `--jobs 3` with overlapping provider sets runs those entries'
+    /// transfers concurrently; only the per-lane voucher issuance
+    /// serializes, not the transfer.
     async fn try_multi_source(
         &self,
         order: &fetch::ResolvedTargets,
@@ -787,9 +713,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         staging: &Path,
         progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<Option<()>> {
-        // Admission is computed once and reused for the gate, the lane-lock set,
-        // and the fan-out itself — `try_multi_source_fetch` would otherwise
-        // recompute the same `admit_sources` from `order.candidates`.
+        // Admission is computed once and reused for the gate and the fan-out
+        // itself — `try_multi_source_fetch` would otherwise recompute the
+        // same `admit_sources` from `order.candidates`.
         let admitted = discovery::admit_sources(order.candidates.clone(), self.common.max_sources);
         if fetch::multi_source_gate_declines(
             self.common,
@@ -799,15 +725,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         ) {
             return Ok(None);
         }
-        let providers: Vec<Address> = admitted.iter().map(|c| c.eth_address).collect();
-        let _guards = self.provider_lock_set(&providers).await;
-
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
         // The entry's per-file bar callback (ADR 039 fan-out reports one monotonic
         // total the lanes fold their per-leg deltas into, so the bar never jumps
-        // between lanes). The admitted set already computed for the gate and the
-        // lock is moved into the fan-out so `admit_sources` runs only once.
+        // between lanes). The admitted set already computed for the gate is
+        // moved into the fan-out so `admit_sources` runs only once.
         fetch::try_multi_source_fetch_from_admitted(
             &deps,
             self.common,
@@ -821,9 +744,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             staging,
             progress,
             Some(&self.open_lock),
-            // Task 4 flips this to `Some(&self.ledgers)` once the registry is
-            // wired into bundle pull; Task 3 keeps behavior unchanged.
-            None,
+            Some(&self.ledgers),
         )
         .await
         .map(|opt| opt.map(|_bytes| ()))
@@ -868,26 +789,22 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         )
         .await?;
 
-        // Pool-level serialization (see `Self::pool_serial`): every bundle entry
-        // shares ONE `PaymentPool` deposit, but the scheduler's `spent` view
-        // (`scheduler.rs:769`) sums only the lanes of the current fetch. Two
-        // `--jobs` entries on disjoint provider sets would otherwise have
-        // independent remaining-deposit views and could jointly over-issue
-        // vouchers that exceed the single deposit and cannot all redeem. Probes
-        // remain concurrent (above), but the payment + streaming section is
-        // serialized here; multi-source within an entry still fans out via its
-        // own `SharedPool`.
-        let _pool_guard = self.pool_serial.lock().await;
+        // Every bundle entry shares ONE `PaymentPool` deposit, but each lane's
+        // voucher issuance draws on the run's shared `LaneLedgers` (ADR 039):
+        // one monotonic issuer per `(pool_id, signer, provider)` lane keeps
+        // concurrent `--jobs` entries on disjoint provider sets from jointly
+        // over-issuing past the single deposit. Probes, transfers, and the
+        // payment section below all run concurrently across entries; only the
+        // per-lane voucher watermark is serialized, by the ledger itself.
 
         // Multi-source fan-out (ADR 039, #1774): the same pre-branch `decdn
-        // fetch` runs. One entry engages N provider lanes at once, so it takes
-        // the lane locks for its whole admitted set — in one global order, so
-        // two entries with overlapping sets cannot deadlock — then fans out. The
-        // engagement gate (kill switch off, too few admissible holders, below the
-        // size floor) is decided inside `try_multi_source` BEFORE the locks are
-        // taken and falls through to the single-source failover loop below
-        // unchanged; a retryable fan-out failure does the same, resuming the
-        // entry's `.partial` so nothing paid for is re-bought.
+        // fetch` runs. One entry engages N provider lanes at once, drawing
+        // each lane's vouchers from the shared ledger, then fans out. The
+        // engagement gate (kill switch off, too few admissible holders, below
+        // the size floor) is decided inside `try_multi_source` and falls
+        // through to the single-source failover loop below unchanged; a
+        // retryable fan-out failure does the same, resuming the entry's
+        // `.partial` so nothing paid for is re-bought.
         match self.try_multi_source(&order, hash, staging, progress).await {
             Ok(Some(())) => return Ok(()),
             Ok(None) => {}
@@ -951,11 +868,6 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         staging: &Path,
         progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<()> {
-        // Serialize all access to this provider's lane: the voucher-signing
-        // critical section must be atomic per lane.
-        let lock = self.provider_lock(provider).await;
-        let _guard = lock.lock().await;
-
         // Owned and local to one entry's fetch: `drive_fetch` takes `ctx` by
         // value (it wraps it in `Arc<Mutex>` so its source and driver can share a
         // mid-fetch top-up's new deposit), so this binding just supplies it once
@@ -1050,9 +962,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             staging,
             progress,
             || {},
-            // Task 4 flips this to `Some(&self.ledgers)` once the registry is
-            // wired into bundle pull; Task 3 keeps behavior unchanged.
-            None,
+            Some(&self.ledgers),
         )
         .await;
         // On the delegated path a terminal owner-remedy reason (`SpendingCapExhausted`,
@@ -2019,118 +1929,6 @@ fn group_transfer(outcomes: &[EntryOutcome]) -> Transfer {
 )]
 mod tests {
     use super::*;
-
-    fn addr(byte: u8) -> Address {
-        Address::from([byte; 20])
-    }
-
-    #[tokio::test]
-    async fn lane_lock_set_dedups_and_covers_every_provider() {
-        let locks = LaneLocks::default();
-        let (p1, p2, p3) = (addr(1), addr(2), addr(3));
-        let guards = locks.lock_set(&[p2, p1, p2]).await;
-        assert_eq!(guards.len(), 2, "duplicate providers lock once");
-        // Every named provider's lane is held; an un-named one is free.
-        assert!(locks.lock(p1).await.try_lock().is_err());
-        assert!(locks.lock(p2).await.try_lock().is_err());
-        assert!(locks.lock(p3).await.try_lock().is_ok());
-        drop(guards);
-        assert!(locks.lock(p1).await.try_lock().is_ok());
-        assert!(locks.lock(p2).await.try_lock().is_ok());
-    }
-
-    #[tokio::test]
-    async fn lane_lock_set_serializes_same_provider_across_entries() {
-        let locks = LaneLocks::default();
-        let p1 = addr(1);
-        let guard = locks.lock(p1).await.lock_owned().await;
-        // A second entry's lock-set touching the same lane cannot complete
-        // while the first holds it, and completes once it is released.
-        let providers = [p1];
-        let pending = locks.lock_set(&providers);
-        tokio::pin!(pending);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending)
-                .await
-                .is_err(),
-            "lock-set must wait on the held same-lane guard"
-        );
-        drop(guard);
-        tokio::time::timeout(std::time::Duration::from_secs(5), &mut pending)
-            .await
-            .expect("lock-set completes once the lane is released");
-    }
-
-    #[tokio::test]
-    async fn lane_lock_set_overlapping_sets_do_not_deadlock() {
-        // Two concurrent multi-source entries with overlapping provider sets
-        // ({P1,P2} vs {P2,P3}): ordered acquisition means the second waits on
-        // P2 without holding anything the first still needs, so both complete.
-        let locks = LaneLocks::default();
-        let (p1, p2, p3) = (addr(1), addr(2), addr(3));
-        let held = tokio::sync::Notify::new();
-        let first_dropped = std::cell::Cell::new(false);
-
-        let first = async {
-            let guards = locks.lock_set(&[p2, p1]).await;
-            held.notify_one();
-            // Hold both lanes across "streaming" so the second entry genuinely
-            // blocks on P2 mid-acquisition.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            drop(guards);
-            first_dropped.set(true);
-        };
-        let second = async {
-            held.notified().await;
-            let _guards = locks.lock_set(&[p3, p2]).await;
-            // P2 was held by the first entry when this acquisition started, so
-            // completing proves it waited for the release rather than skipping.
-            assert!(
-                first_dropped.get(),
-                "overlapping lane was acquired before its holder released it"
-            );
-        };
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            futures_util::future::join(first, second).await;
-        })
-        .await
-        .expect("overlapping lock-sets must not deadlock");
-    }
-
-    #[tokio::test]
-    async fn lane_lock_set_opposite_orders_do_not_deadlock() {
-        // Classic hold-and-wait cycle: {P1,P2} vs {P2,P1} deadlocks with naive
-        // unordered acquisition; sorted global order (ADR 039) prevents it.
-        // Both entries sort to [P1,P2], so the second waits on P1 rather than
-        // holding P2 and waiting on P1.
-        let locks = LaneLocks::default();
-        let (p1, p2) = (addr(1), addr(2));
-        let held = tokio::sync::Notify::new();
-        let first_dropped = std::cell::Cell::new(false);
-
-        let first = async {
-            let guards = locks.lock_set(&[p1, p2]).await;
-            held.notify_one();
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            drop(guards);
-            first_dropped.set(true);
-        };
-        let second = async {
-            held.notified().await;
-            let _guards = locks.lock_set(&[p2, p1]).await;
-            assert!(
-                first_dropped.get(),
-                "opposite-order lane was acquired before holder released it"
-            );
-        };
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            futures_util::future::join(first, second).await;
-        })
-        .await
-        .expect("opposite-order lock-sets must not deadlock");
-    }
 
     #[test]
     fn safe_join_builds_nested_path_under_root() {
