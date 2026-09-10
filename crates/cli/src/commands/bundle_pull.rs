@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use super::chain_ctx;
 use super::fetch;
+use super::manifest::build_glob_set;
 use decdn_client_pull::discovery::{self, NodeCandidate};
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::provider;
@@ -208,6 +209,48 @@ struct ManifestEntry {
     size: Option<u64>,
 }
 
+/// The compiled `--include`/`--exclude` globs that select which manifest entries
+/// a pull run fetches. Both sets match an entry's POSIX relative `path` — the
+/// manifest field (`models/a.bin`), never the on-disk absolute path — with the
+/// same gitignore glob dialect `bundle create --exclude` uses (`*` does not
+/// cross `/`, `**` recurses), via [`build_glob_set`].
+///
+/// An entry is kept iff it passes the include gate AND matches no exclude. The
+/// include gate is open when no `--include` was given (every entry passes) and
+/// otherwise requires a match against at least one include pattern; `--exclude`
+/// always wins over `--include`.
+#[derive(Debug)]
+struct EntryFilter {
+    include: globset::GlobSet,
+    /// Whether any `--include` was given. False leaves the include gate open —
+    /// distinct from an empty [`globset::GlobSet`], which matches nothing.
+    has_include: bool,
+    exclude: globset::GlobSet,
+}
+
+impl EntryFilter {
+    /// Compile the run's `--include`/`--exclude` patterns. A malformed glob is a
+    /// hard error naming the flag it came from.
+    fn compile(include: &[String], exclude: &[String]) -> anyhow::Result<Self> {
+        Ok(Self {
+            include: build_glob_set(include, "--include")?,
+            has_include: !include.is_empty(),
+            exclude: build_glob_set(exclude, "--exclude")?,
+        })
+    }
+
+    /// Whether an entry at POSIX relative `path` survives the filter.
+    fn keep(&self, path: &str) -> bool {
+        let p = Path::new(path);
+        (!self.has_include || self.include.is_match(p)) && !self.exclude.is_match(p)
+    }
+
+    /// Retain only the entries the filter keeps, preserving manifest order.
+    fn apply(&self, entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
+        entries.into_iter().filter(|e| self.keep(&e.path)).collect()
+    }
+}
+
 /// A group of manifest entries that all name the same blob `hash` — one file
 /// published at two (or more) bundle paths. Non-empty by construction; the
 /// shared `hash` is carried explicitly so consumers never re-derive it from an
@@ -350,23 +393,34 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // is cheap and side-effect-free.
     args.common.validate()?;
 
+    // Compile the `--include`/`--exclude` entry filter BEFORE the dry-run
+    // short-circuit — same rationale as `validate()`: a malformed glob is
+    // rejected before any network, chain, or keystore work, and `--dry-run`
+    // reflects the filtered plan too.
+    let filter = EntryFilter::compile(&args.include, &args.exclude)?;
+    let filters_given = !args.include.is_empty() || !args.exclude.is_empty();
+
     // Dry-run short-circuits before any network/chain/keystore activity.
     if args.dry_run {
-        return dry_run(args);
+        return dry_run(args, &filter, filters_given);
     }
 
-    // A local manifest is read up front (no network): an empty bundle then needs
-    // no endpoint or keystore password at all.
+    // A local manifest is read up front (no network) and filtered here, so a
+    // bundle that is empty — or emptied by the filter — needs no endpoint or
+    // keystore password at all.
     let local_manifest = match &args.input {
-        Some(path) => Some(read_local_manifest(path)?),
+        Some(path) => {
+            let mut m = read_local_manifest(path)?;
+            let raw_empty = m.entries.is_empty();
+            m.entries = filter.apply(m.entries);
+            if m.entries.is_empty() {
+                report_nothing_to_fetch(filters_given && !raw_empty);
+                return Ok(());
+            }
+            Some(m)
+        }
         None => None,
     };
-    if let Some(m) = &local_manifest
-        && m.entries.is_empty()
-    {
-        println!("bundle has no entries; nothing to fetch");
-        return Ok(());
-    }
 
     let common = &args.common;
     let relays = client_endpoint::resolve_relays(common.relay_url.as_deref(), config_path)?;
@@ -433,7 +487,8 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         pool_serial: tokio::sync::Mutex::new(()),
     };
 
-    // Obtain the manifest: the pre-read local one, or fetch the bundle blob.
+    // Obtain the manifest: the pre-read local one (already filtered up front), or
+    // fetch the bundle blob and filter it here.
     let manifest = if let Some(m) = local_manifest {
         m
     } else {
@@ -446,12 +501,15 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
             .fetch_to_memory(hash, &args.output)
             .await
             .context("fetch bundle manifest blob")?;
-        parse_manifest(&bytes)?
+        let mut m = parse_manifest(&bytes)?;
+        let raw_empty = m.entries.is_empty();
+        m.entries = filter.apply(m.entries);
+        if m.entries.is_empty() {
+            report_nothing_to_fetch(filters_given && !raw_empty);
+            return Ok(());
+        }
+        m
     };
-    if manifest.entries.is_empty() {
-        println!("bundle has no entries; nothing to fetch");
-        return Ok(());
-    }
 
     let outcomes = ctx
         .pull_all(
@@ -1201,14 +1259,27 @@ fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     Ok(out)
 }
 
+/// Report an empty would-fetch set. `by_filter` is true only when a non-empty
+/// bundle was emptied by `--include`/`--exclude`, so the operator learns their
+/// globs matched nothing rather than mistaking it for an empty bundle.
+fn report_nothing_to_fetch(by_filter: bool) {
+    if by_filter {
+        println!("no bundle entries match the include/exclude filters; nothing to fetch");
+    } else {
+        println!("bundle has no entries; nothing to fetch");
+    }
+}
+
 /// Print the would-fetch plan and exit (no network/chain/keystore activity).
 /// With `--hash` the entries can't be enumerated offline, so only the intent is
-/// reported.
-fn dry_run(args: &BundlePullArgs) -> anyhow::Result<()> {
+/// reported. The `--include`/`--exclude` `filter` is applied to a local
+/// manifest's entries so the plan reflects exactly what a real run would fetch.
+fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> anyhow::Result<()> {
     let out = args.output.display();
     match (&args.input, &args.hash) {
         (Some(path), _) => {
-            let manifest = read_local_manifest(path)?;
+            let mut manifest = read_local_manifest(path)?;
+            manifest.entries = filter.apply(manifest.entries);
             if args.json {
                 let plan = serde_json::json!({
                     "output": args.output.display().to_string(),
@@ -1232,9 +1303,14 @@ fn dry_run(args: &BundlePullArgs) -> anyhow::Result<()> {
             }
         }
         (None, Some(h)) => {
+            let filter_note = if filters_given {
+                " (the include/exclude filters then apply)"
+            } else {
+                ""
+            };
             println!(
                 "--dry-run with --hash: would fetch bundle {h} then its entries into {out} \
-                 (entries are not enumerable without fetching the manifest)"
+                 (entries are not enumerable without fetching the manifest){filter_note}"
             );
         }
         (None, None) => bail!("no bundle source (expected -i or --hash)"),
@@ -1525,6 +1601,127 @@ mod tests {
         let groups = group_by_hash(&entries);
         assert_eq!(groups.len(), 3);
         assert!(groups.iter().all(|group| group.entries.len() == 1));
+    }
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn filtered_paths(
+        include: &[&str],
+        exclude: &[&str],
+        entries: Vec<ManifestEntry>,
+    ) -> Vec<String> {
+        let filter = EntryFilter::compile(&strs(include), &strs(exclude)).unwrap();
+        filter.apply(entries).into_iter().map(|e| e.path).collect()
+    }
+
+    fn sample() -> Vec<ManifestEntry> {
+        vec![
+            entry("models/a.bin", "b3:1"),
+            entry("models/b.txt", "b3:2"),
+            entry("docs/readme.md", "b3:3"),
+            entry("docs/deep/notes.txt", "b3:4"),
+        ]
+    }
+
+    /// No flags => every entry passes, in manifest order.
+    #[test]
+    fn entry_filter_passthrough_when_no_flags() {
+        assert_eq!(
+            filtered_paths(&[], &[], sample()),
+            vec![
+                "models/a.bin",
+                "models/b.txt",
+                "docs/readme.md",
+                "docs/deep/notes.txt"
+            ]
+        );
+    }
+
+    /// `--include` is a whitelist gate: absent it opens, present an entry must
+    /// match at least one pattern. `*` does not cross `/`, so `models/*` keeps
+    /// only the direct children of `models/`.
+    #[test]
+    fn entry_filter_include_is_a_whitelist_gate() {
+        assert_eq!(
+            filtered_paths(&["models/*"], &[], sample()),
+            vec!["models/a.bin", "models/b.txt"]
+        );
+    }
+
+    /// Multiple `--include` patterns are OR-ed.
+    #[test]
+    fn entry_filter_includes_are_ored() {
+        assert_eq!(
+            filtered_paths(&["models/*.bin", "docs/readme.md"], &[], sample()),
+            vec!["models/a.bin", "docs/readme.md"]
+        );
+    }
+
+    /// `--exclude` drops matches; multiple patterns are OR-ed. A leading `**/`
+    /// is what makes a suffix glob match at any depth — a bare `*.txt` matches
+    /// only a root-level file, since `*` never crosses `/`.
+    #[test]
+    fn entry_filter_excludes_are_ored() {
+        assert_eq!(
+            filtered_paths(&[], &["**/*.txt", "**/*.md"], sample()),
+            vec!["models/a.bin"]
+        );
+    }
+
+    /// A bare `*.txt` does NOT cross `/`, so it leaves nested `.txt` entries in
+    /// place — the same gitignore separator rule `bundle create --exclude` uses.
+    #[test]
+    fn entry_filter_star_does_not_cross_slash() {
+        assert_eq!(
+            filtered_paths(&[], &["*.txt"], sample()),
+            vec![
+                "models/a.bin",
+                "models/b.txt",
+                "docs/readme.md",
+                "docs/deep/notes.txt"
+            ]
+        );
+    }
+
+    /// `--exclude` wins over `--include`: an entry matching both is dropped.
+    #[test]
+    fn entry_filter_exclude_beats_include() {
+        assert_eq!(
+            filtered_paths(&["models/*"], &["**/*.txt"], sample()),
+            vec!["models/a.bin"]
+        );
+    }
+
+    /// `**` recurses across `/` where a one-level `*` does not.
+    #[test]
+    fn entry_filter_double_star_recurses() {
+        assert_eq!(
+            filtered_paths(&["docs/**"], &[], sample()),
+            vec!["docs/readme.md", "docs/deep/notes.txt"]
+        );
+        assert_eq!(
+            filtered_paths(&["docs/*"], &[], sample()),
+            vec!["docs/readme.md"]
+        );
+    }
+
+    /// A filter that matches nothing yields an empty set (the caller then
+    /// reports "no entries match"), never an error.
+    #[test]
+    fn entry_filter_can_empty_the_set() {
+        assert!(filtered_paths(&["no/such/*"], &[], sample()).is_empty());
+    }
+
+    /// A malformed glob is a hard error naming the flag it came from.
+    #[test]
+    fn entry_filter_rejects_bad_glob() {
+        let err = EntryFilter::compile(&strs(&["["]), &[]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("--include"),
+            "error should name the offending flag: {err:#}"
+        );
     }
 
     /// A duplicate destination is materialized from the canonical file (no second
