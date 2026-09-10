@@ -1338,14 +1338,25 @@ pub async fn stream_fetch_tracked(
     .await
 }
 
-/// Delivery-progress callback: invoked with `(wire_bytes_received,
-/// wire_bytes_expected)` after each chunk arrives, so a caller (e.g. `decdn
-/// fetch`) can render a progress bar. Both counts are **wire** bytes — bao
-/// content plus interleaved proof nodes (ADR 038 §Payment metering) — matching
-/// the receive loop's own accounting; `wire_bytes_expected` is the aligned wire
-/// length, known from the signed `StreamResponse` before the first chunk and
-/// constant across the pull. It must not panic (it runs inside the hot receive
-/// loop) and must be `Send + Sync` so the pull future stays spawnable.
+/// Delivery-progress callback: invoked with `(received, expected)` after each
+/// chunk arrives, so a caller (e.g. `decdn fetch`) can render a progress bar.
+/// Both slots are the SAME unit within a given pull, and `expected` is that
+/// pull's whole-blob total, constant across the pull — so a bar keyed on the two
+/// fills to exactly 100% regardless of which unit the path reports. The unit
+/// differs by call site:
+///
+/// - `stream_fetch*` (the `receive_and_pay` receive loop) reports **wire**
+///   bytes — bao content plus interleaved proof nodes (ADR 038 §Payment
+///   metering) — matching its own accounting; there `expected` is the aligned
+///   wire length, known from the signed `StreamResponse` before the first chunk.
+/// - `drive` / `multi_source_fetch` (the resumable [`crate::driver`] path the
+///   CLI `fetch` and `bundle pull` use) report **content** bytes: the store's
+///   `ingest_stream` counts delivered content, and `expected` is the blob's
+///   content `total_bytes`. This path also emits the already-present resume base
+///   (`base_present`, content bytes) once before streaming begins.
+///
+/// It must not panic (it runs inside the hot receive loop) and must be `Send +
+/// Sync` so the pull future stays spawnable.
 pub type ProgressCallback = dyn Fn(u64, u64) + Send + Sync;
 
 /// Like [`stream_fetch_tracked`], but also reports per-chunk delivery progress
