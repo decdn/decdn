@@ -538,6 +538,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         grant,
         ledgers: LaneLedgers::new(),
         open_lock: tokio::sync::Mutex::new(()),
+        gate: tokio::sync::Semaphore::new(args.jobs.max(1)),
         // Silent during the manifest fetch below (a single blob); replaced once
         // the kept entries are known and their sizes decide the total-bar mode.
         progress: PullProgress::disabled(),
@@ -646,6 +647,11 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// also perform a low-water top-up) and released before streaming, so
     /// delivery itself still runs concurrently once each entry has its context.
     open_lock: tokio::sync::Mutex<()>,
+    /// Global cap on concurrent blob fetches — whole-file entries and chunks of a
+    /// chunked file alike — so one many-chunk file can saturate `--jobs` by itself
+    /// while the run never exceeds it. A chunk reused from another file is deduped
+    /// before it reaches the fetch path, so it never takes a permit.
+    gate: tokio::sync::Semaphore,
     /// The run's multi-bar progress renderer: one per-file bar per active pull
     /// above a bottom total bar (silent off a terminal or under `--json`). Set
     /// once the kept manifest is known — its entries decide the total-bar mode —
@@ -768,6 +774,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         staging: &Path,
         progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<()> {
+        let _permit = self
+            .gate
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("bundle pull concurrency gate closed"))?;
         if let Some(pinned) = self.explicit {
             // A `--node-id`-pinned target takes its direct address from `--addr`,
             // not the registry, so no on-chain dial hints apply.
