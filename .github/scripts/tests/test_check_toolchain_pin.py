@@ -126,3 +126,87 @@ def test_missing_workspace_rust_version_is_a_failure(tmp_path):
 
 def test_the_real_repository_agrees():
     assert ctp.check(REPO_ROOT) == []
+
+
+def test_with_toolchain_override_is_the_site_value(tmp_path):
+    """`with: toolchain:` wins over the `@ref`, so it is what CI compiles on."""
+    repo = build_repo(tmp_path, refs={"ci.yml": ["1.95.0"]})
+    ci = repo / ".github/workflows/ci.yml"
+    ci.write_text(ci.read_text() + "        with:\n          toolchain: 1.96.0\n")
+    errors = ctp.check(repo)
+    assert len(errors) == 1, errors
+    assert "ci.yml:4" in errors[0] and "1.96.0" in errors[0], errors[0]
+
+
+def test_with_toolchain_expression_is_unverifiable_not_a_pass(tmp_path):
+    repo = build_repo(tmp_path, refs={"ci.yml": ["1.95.0"]})
+    ci = repo / ".github/workflows/ci.yml"
+    ci.write_text(ci.read_text() + "        with:\n          toolchain: ${{ matrix.rust }}\n")
+    errors = ctp.check(repo)
+    assert len(errors) == 1, errors
+    assert "${{" in errors[0]
+
+
+def test_with_block_of_the_next_step_does_not_leak(tmp_path):
+    """A `toolchain:` under a later step's `with:` is not this step's override."""
+    repo = build_repo(tmp_path, refs={"ci.yml": ["1.95.0"]})
+    ci = repo / ".github/workflows/ci.yml"
+    ci.write_text(
+        ci.read_text()
+        + "        with:\n          components: clippy\n"
+        + "      - uses: some/other-action@v1\n        with:\n          toolchain: 1.96.0\n"
+    )
+    assert ctp.check(repo) == []
+
+
+def test_quoted_uses_value_is_a_site(tmp_path):
+    repo = build_repo(tmp_path, refs={"ci.yml": ["1.95.0"]})
+    ci = repo / ".github/workflows/ci.yml"
+    ci.write_text(ci.read_text() + '      - uses: "dtolnay/rust-toolchain@1.96.0"\n')
+    errors = ctp.check(repo)
+    assert len(errors) == 1, errors
+    assert "ci.yml:5" in errors[0] and "1.96.0" in errors[0]
+
+
+def test_commented_out_step_is_not_a_site(tmp_path):
+    repo = build_repo(tmp_path, refs={"ci.yml": ["1.95.0"]})
+    ci = repo / ".github/workflows/ci.yml"
+    ci.write_text(ci.read_text() + "      # - uses: dtolnay/rust-toolchain@1.90.0\n")
+    assert ctp.check(repo) == []
+
+
+def test_only_a_commented_out_step_is_zero_sites(tmp_path):
+    repo = build_repo(tmp_path, refs={"ci.yml": []})
+    ci = repo / ".github/workflows/ci.yml"
+    ci.write_text(ci.read_text() + "      # - uses: dtolnay/rust-toolchain@1.95.0\n")
+    errors = ctp.check(repo)
+    assert len(errors) == 1, errors
+    assert "no dtolnay/rust-toolchain" in errors[0]
+
+
+def test_composite_action_is_a_site(tmp_path):
+    repo = build_repo(tmp_path, refs={"ci.yml": ["1.95.0"]})
+    action = repo / ".github/actions/rust-setup/action.yml"
+    action.parent.mkdir(parents=True)
+    action.write_text("runs:\n  steps:\n    - uses: dtolnay/rust-toolchain@1.96.0\n")
+    errors = ctp.check(repo)
+    assert len(errors) == 1, errors
+    assert "actions/rust-setup/action.yml:3" in errors[0]
+
+
+def test_majority_tie_reports_every_site(tmp_path):
+    repo = build_repo(
+        tmp_path, channel="1.96.0", rust_version="1.95.0", refs={"ci.yml": ["1.96.0", "1.95.0"]}
+    )
+    errors = ctp.check(repo)
+    assert len(errors) == 1, errors
+    for site in ("rust-toolchain.toml", "Cargo.toml", "ci.yml:4", "ci.yml:5"):
+        assert site in errors[0], (site, errors[0])
+
+
+def test_missing_channel_is_a_failure(tmp_path):
+    repo = build_repo(tmp_path)
+    (repo / "rust-toolchain.toml").write_text('[toolchain]\ncomponents = ["rustfmt"]\n')
+    errors = ctp.check(repo)
+    assert len(errors) == 1, errors
+    assert "channel" in errors[0]

@@ -5,21 +5,25 @@ Cargo enforces acyclicity and nothing more. The direction the workspace's
 crates depend on each other is a design decision — three leaves that pull in
 no sibling, `cli` and `e2e` as sinks nothing depends on, a publisher CLI that
 links no blob store or AWS SDK — and CLAUDE.md § Crate Structure states it.
-Nothing enforced it: an edge added the wrong way compiles green, and the first
-thing to notice is a `decdn` binary that has grown an S3 client.
+Without this check nothing enforces it: an edge added the wrong way compiles
+green, and the first thing to notice is a `decdn` binary that has grown an S3
+client.
 
-Two passes over `cargo metadata`:
+Two passes over `cargo metadata --all-features` (all features, because an
+optional dependency is absent from the resolve graph until its feature is on,
+and `cargo install decdn-cli --features x` would still link it):
 
-* **Direct edges.** Each member's normal dependencies on other members must
-  be a subset of its ALLOWED row. Dev-dependencies are excluded on purpose:
-  the only cycle-shaped edges in the workspace are dev-only (`cli` tests the
-  daemon it is shipped beside), and that is the invariant. The table is the
-  design, so a member with no row fails, and a row for a member that no longer
-  exists fails too — the table cannot rot.
-* **Closure.** `decdn-cli`'s transitive normal dependencies must not include
-  any of CLI_MUST_NOT_LINK. The direct table cannot see this: `cli → common`
-  is allowed, so `common` quietly growing an `iroh-blobs` edge would pass the
-  first pass and still put the blob store in the CLI.
+* **Direct edges.** Each member's normal and build dependencies on other
+  members must equal its ALLOWED row — equal, not a subset: the table is the
+  graph transcribed, so an edge the graph lacks is rot in the other direction.
+  Dev-dependencies are not constrained; the design accepts dev-only cycles
+  (`cli` tests the daemon it is shipped beside). A member with no row fails,
+  and a row for a member that does not exist fails too.
+* **Closure.** `decdn-cli`'s transitive normal and build dependencies must
+  not include the blob store or the AWS SDK (CLI_MUST_NOT_LINK). The direct
+  table cannot see this: `cli → common` is allowed, so `common` quietly growing
+  an `iroh-blobs` edge would pass the first pass and still put the blob store
+  in the CLI. A walk that visits nothing is a failure, not a clean closure.
 
 The table is the actual graph, transcribed. Changing it is a design change and
 CLAUDE.md's Dependency flow paragraph moves with it.
@@ -76,11 +80,24 @@ SINKS = frozenset({"decdn-cli", "decdn-e2e"})
 # The publisher CLI is iroh-blobs-free and AWS-free (#578): it links no blob
 # store and no S3 SDK, so `cargo install decdn-cli` builds no such thing.
 CLI = "decdn-cli"
-CLI_MUST_NOT_LINK = frozenset({"iroh-blobs", "aws-sdk-s3", "aws-config"})
+CLI_MUST_NOT_LINK = frozenset(
+    {"iroh-blobs", "aws-config", "aws-credential-types", "aws-runtime", "aws-types", "aws-sigv4"}
+)
+# The SDK's service and smithy crates by prefix. Not a bare `aws-` prefix:
+# `aws-lc-rs` is rustls's crypto provider and legitimately in the CLI tree.
+CLI_MUST_NOT_LINK_PREFIXES = ("aws-sdk-", "aws-smithy-")
+# A build script compiles the crate too, so a build-dependency is an edge the
+# design has to allow; only dev-dependencies are exempt.
+EDGE_KINDS = frozenset({None, "build"})
+METADATA_ARGS = ("cargo", "metadata", "--format-version", "1", "--locked", "--all-features")
 
 
-def is_normal(dep_kinds: list[dict]) -> bool:
-    return any(k.get("kind") is None for k in dep_kinds)
+def is_forbidden_for_cli(name: str) -> bool:
+    return name in CLI_MUST_NOT_LINK or name.startswith(CLI_MUST_NOT_LINK_PREFIXES)
+
+
+def is_edge(dep_kinds: list[dict]) -> bool:
+    return any(k.get("kind") in EDGE_KINDS for k in dep_kinds)
 
 
 def check(metadata: dict) -> list[str]:
@@ -106,7 +123,7 @@ def check(metadata: dict) -> list[str]:
         if allowed is None:
             continue
         internal = sorted(
-            d["name"] for d in pkg["dependencies"] if d.get("kind") is None and d["name"] in members
+            {d["name"] for d in pkg["dependencies"] if d.get("kind") in EDGE_KINDS and d["name"] in members}
         )
         for dep in internal:
             if dep in SINKS:
@@ -120,6 +137,13 @@ def check(metadata: dict) -> list[str]:
                     "Structure). Move the shared code down to a crate both may reach, or "
                     "change the design and the table together"
                 )
+        if allowed is not ANY:
+            for dep in sorted(allowed - set(internal)):
+                errors.append(
+                    f"{name} does not have the edge → {dep} that its ALLOWED row lists — the "
+                    "table is the graph transcribed, so drop the entry (and update CLAUDE.md "
+                    "§ Crate Structure)"
+                )
 
     # --- cli closure --------------------------------------------------------
     cli = members.get(CLI)
@@ -130,13 +154,18 @@ def check(metadata: dict) -> list[str]:
         while queue:
             current = queue.popleft()
             for dep in nodes.get(current, {}).get("deps", []):
-                if not is_normal(dep["dep_kinds"]) or dep["pkg"] in parent:
+                if not is_edge(dep["dep_kinds"]) or dep["pkg"] in parent:
                     continue
                 parent[dep["pkg"]] = current
                 queue.append(dep["pkg"])
+        if len(parent) <= 1:
+            errors.append(
+                f"{CLI} has no dependencies in the resolve graph — the closure walk "
+                "inspected nothing"
+            )
         for pkg_id, via in sorted(parent.items()):
             name = by_id[pkg_id]["name"]
-            if name in CLI_MUST_NOT_LINK:
+            if is_forbidden_for_cli(name):
                 path = [name]
                 while via is not None:
                     path.append(by_id[via]["name"])
@@ -150,10 +179,15 @@ def check(metadata: dict) -> list[str]:
 
 
 def main() -> int:
+    repo_root = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], check=True, stdout=subprocess.PIPE, text=True
+    ).stdout.strip()
+    # stderr passes through: a stale lock under `--locked` is the common local
+    # failure, and cargo's own line says how to fix it.
     out = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--locked"],
+        [*METADATA_ARGS, "--manifest-path", f"{repo_root}/Cargo.toml"],
         check=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
         text=True,
     ).stdout
     errors = check(json.loads(out))
@@ -168,7 +202,7 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"crate edges OK ({len(ALLOWED)} members, {CLI} closure clean)")
+    print(f"crate edges OK ({len(ALLOWED)} members, {CLI} closure clean)")  # noqa: E501
     return 0
 
 

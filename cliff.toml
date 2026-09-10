@@ -27,8 +27,9 @@ body = """
 
 {#- Breaking changes first, in their own section, and nowhere else: a release
     that breaks the wire or the config is read for that before anything. A
-    commit is breaking via `!` in its subject or a `BREAKING CHANGE:` footer;
-    the footer text is what the section shows, falling back to the subject. -#}
+    commit is breaking via `!` in its subject or a `BREAKING CHANGE:` footer.
+    Each entry shows the subject; when a footer carries different text, that
+    text follows as a nested bullet. -#}
 {% set breaking = commits | filter(attribute="breaking", value=true) -%}
 {% if breaking | length > 0 %}
   ### Breaking
@@ -52,23 +53,29 @@ trim = true
 
 [git]
 conventional_commits = true
-# A non-conventional subject is dropped from the notes — with one exception.
+# A subject that does not parse as conventional is dropped from the notes.
+# This is the first filter, and nothing below rescues a commit it drops — the
+# `pr-title` CI gate is what keeps subjects conventional.
 filter_unconventional = true
 split_commits = false
-# The exception: a commit marked breaking (`!` or a `BREAKING CHANGE:` footer)
-# is kept even when its subject does not parse. Pre-launch, wire- and
-# config-breaking changes are the commits an operator most needs to see, and
-# a typo in the prefix must not be what hides one.
+# A commit marked breaking (`!` or a `BREAKING CHANGE:` footer) is kept even
+# when a `skip = true` parser below matches it. Pre-launch, wire- and
+# config-breaking changes are the commits an operator most needs to see, and a
+# `chore(deps)!:` must not vanish with the routine bumps.
 protect_breaking_commits = true
 filter_commits = false
-# Release tags only. `v[0-9].*` rather than `v*`, so a working tag such as
-# `<topic>-prerebase` never bounds `--latest`.
+# Release tags only. `v[0-9].*` rather than `v*`, so a working tag whose topic
+# starts with a `v` (`versioning-guards-prerebase`) never bounds `--latest`.
 tag_pattern = "v[0-9].*"
 # Newest first within a group, matching how the hand-written CHANGELOG.md
 # orders entries.
 sort_commits = "newest"
 
+# The two `skip` rules come before `^chore`, which would otherwise match first
+# and file them under Miscellaneous.
 commit_parsers = [
+  { message = "^chore\\(deps\\)", skip = true },
+  { message = "^chore\\(release\\)", skip = true },
   { message = "^feat", group = "<!-- 0 -->Features" },
   { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
   { message = "^perf", group = "<!-- 2 -->Performance" },
@@ -79,6 +86,4 @@ commit_parsers = [
   { message = "^chore", group = "<!-- 7 -->Miscellaneous" },
   { message = "^build", group = "<!-- 7 -->Miscellaneous" },
   { message = "^Merge", skip = true },
-  { message = "^chore\\(deps\\)", skip = true },
-  { message = "^chore\\(release\\)", skip = true },
 ]

@@ -129,22 +129,36 @@ def test_well_formed_workspace_passes(tmp_path):
     assert cwm.check(build_repo(tmp_path)) == []
 
 
+def private_cli(repo: Path) -> Path:
+    """Rewrite the sink as `publish = false`, the shape `crates/e2e` has."""
+    return write_member(
+        repo, "crates/cli", PRIVATE, name="demo-cli", deps='demo-core = { workspace = true }\n'
+    )
+
+
 @pytest.mark.parametrize("key", ["version", "edition", "license", "rust-version"])
-def test_member_restating_an_inherited_key_is_an_error(tmp_path, key):
+@pytest.mark.parametrize("private", [False, True], ids=["publishable", "private"])
+def test_member_restating_an_inherited_key_is_an_error(tmp_path, key, private):
     repo = build_repo(tmp_path)
-    manifest = repo / "crates/core/Cargo.toml"
+    manifest = private_cli(repo) if private else repo / "crates/core/Cargo.toml"
     text = manifest.read_text().replace(f"\n{key}.workspace = true", f'\n{key} = "0.9.9"')
     manifest.write_text(text)
     errors = cwm.check(repo)
     assert len(errors) == 1, errors
-    assert "crates/core/Cargo.toml" in errors[0]
+    assert str(manifest.relative_to(repo)) in errors[0]
     assert key in errors[0]
 
 
-def test_member_without_workspace_lints_is_an_error(tmp_path):
+@pytest.mark.parametrize(
+    "lints",
+    ["", "[lints.clippy]\nunwrap_used = \"deny\"\n", "[lints]\nworkspace = false\n"],
+    ids=["absent", "own-table", "false"],
+)
+@pytest.mark.parametrize("private", [False, True], ids=["publishable", "private"])
+def test_member_without_workspace_lints_is_an_error(tmp_path, lints, private):
     repo = build_repo(tmp_path)
-    manifest = repo / "crates/core/Cargo.toml"
-    manifest.write_text(manifest.read_text().replace("[lints]\nworkspace = true\n", ""))
+    manifest = private_cli(repo) if private else repo / "crates/core/Cargo.toml"
+    manifest.write_text(manifest.read_text().replace("[lints]\nworkspace = true\n", lints))
     errors = cwm.check(repo)
     assert len(errors) == 1, errors
     assert "[lints]" in errors[0]
@@ -205,9 +219,20 @@ def test_depended_upon_member_without_an_alias_is_an_error(tmp_path):
         deps='demo-core = { path = "../core" }\n',
     )
     errors = cwm.check(repo)
-    assert len(errors) == 1, errors
-    assert "demo-core" in errors[0]
-    assert "[workspace.dependencies]" in errors[0]
+    assert any("demo-core" in e and "[workspace.dependencies]" in e for e in errors), errors
+
+
+def test_self_dev_dependency_is_not_a_sibling(tmp_path):
+    """`decdn-node` dev-depends on itself with `path = "."` to turn a feature on."""
+    repo = build_repo(tmp_path)
+    write_member(
+        repo,
+        "crates/core",
+        PUBLISHABLE,
+        name="demo-core",
+        dev_deps='demo-core = { path = ".", features = ["test-support"] }\n',
+    )
+    assert cwm.check(repo) == []
 
 
 def test_dev_dependency_counts_as_depended_upon(tmp_path):
@@ -261,3 +286,82 @@ def test_empty_workspace_is_a_failure_not_a_pass(tmp_path):
 
 def test_the_real_repository_passes():
     assert cwm.check(REPO_ROOT) == []
+
+
+def test_internal_dependency_must_go_through_the_alias(tmp_path):
+    """A member naming a sibling by `path` + its own `version` bypasses the alias."""
+    repo = build_repo(tmp_path)
+    write_member(
+        repo,
+        "crates/cli",
+        PUBLISHABLE,
+        name="demo-cli",
+        deps='demo-core = { path = "../core", version = "0.1.1" }\n',
+    )
+    errors = cwm.check(repo)
+    assert len(errors) == 1, errors
+    assert "crates/cli/Cargo.toml" in errors[0]
+    assert "demo-core" in errors[0] and "workspace = true" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "table",
+    ["build-dependencies", "target.'cfg(unix)'.dependencies"],
+    ids=["build", "target"],
+)
+def test_other_dependency_tables_count_as_depended_upon(tmp_path, table):
+    repo = build_repo(tmp_path)
+    write_root(repo, version="0.0.0", members=["crates/core", "crates/cli"], internal={})
+    manifest = write_member(repo, "crates/cli", PUBLISHABLE, name="demo-cli")
+    manifest.write_text(manifest.read_text() + f"\n[{table}]\ndemo-core = {{ workspace = true }}\n")
+    errors = cwm.check(repo)
+    assert len(errors) == 1, errors
+    assert "demo-core" in errors[0] and "[workspace.dependencies]" in errors[0]
+
+
+def test_alias_without_a_version_is_an_error(tmp_path):
+    repo = build_repo(tmp_path)
+    root = repo / "Cargo.toml"
+    root.write_text(
+        root.read_text().replace(
+            'demo-core = { path = "crates/core", version = "0.0.0" }',
+            'demo-core = { path = "crates/core" }',
+        )
+    )
+    errors = cwm.check(repo)
+    assert len(errors) == 1, errors
+    assert "demo-core" in errors[0] and "version" in errors[0]
+
+
+def test_alias_path_that_is_not_a_member_is_an_error(tmp_path):
+    repo = build_repo(tmp_path)
+    root = repo / "Cargo.toml"
+    root.write_text(
+        root.read_text().replace(
+            'demo-core = { path = "crates/core", version = "0.0.0" }',
+            'demo-core = { path = "crates/kore", version = "0.0.0" }',
+        )
+    )
+    errors = cwm.check(repo)
+    assert any("crates/kore" in e and "not a workspace member" in e for e in errors), errors
+
+
+def test_missing_workspace_version_is_named(tmp_path):
+    repo = build_repo(tmp_path)
+    root = repo / "Cargo.toml"
+    root.write_text(root.read_text().replace('version = "0.0.0"\nedition', "edition"))
+    errors = cwm.check(repo)
+    assert any("[workspace.package] version" in e and "missing" in e for e in errors), errors
+
+
+def test_member_without_a_manifest_is_an_error(tmp_path):
+    repo = build_repo(tmp_path)
+    write_root(
+        repo,
+        version="0.0.0",
+        members=["crates/core", "crates/cli", "crates/ghost"],
+        internal={"demo-core": ("crates/core", "0.0.0")},
+    )
+    errors = cwm.check(repo)
+    assert len(errors) == 1, errors
+    assert "crates/ghost" in errors[0] and "no Cargo.toml" in errors[0]

@@ -8,6 +8,7 @@ A release is therefore three commands with a CI build between the first two:
 
 ```bash
 cargo release patch --execute              # cut, sign and push the tag
+                                           # (the FIRST release is `minor`: 0.0.0 -> 0.1.0)
 # ...wait for the tag-push run to finish...
 .github/scripts/sign-release.sh v0.1.2     # verify, sign, publish, tag images
 .github/scripts/publish-crates.sh v0.1.2   # publish the crates to crates.io

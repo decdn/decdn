@@ -98,17 +98,18 @@ repos:
         name: rust version agrees across toolchain, manifest and workflows
         entry: .github/scripts/check-toolchain-pin.sh
         language: system
-        files: '^(rust-toolchain\.toml|Cargo\.toml|\.github/workflows/.*\.ya?ml)$'
+        files: '^(rust-toolchain\.toml|Cargo\.toml|\.github/(workflows|actions)/.*\.ya?ml|\.github/scripts/check[-_]toolchain[-_]pin\.(py|sh))$'
         pass_filenames: false
 
       # A member that restates `version` ships its own number; one without
       # `[lints] workspace = true` runs under default lint levels. Neither
-      # warns. The `packaging` CI job is authoritative.
+      # warns. Editing the guard re-runs it, as adr-ref-hygiene does for its
+      # awk helpers. The `packaging` CI job is authoritative.
       - id: workspace-manifests
         name: every member inherits the workspace version and lints
         entry: .github/scripts/check-workspace-manifests.sh
         language: system
-        files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml)$'
+        files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml|\.github/scripts/check[-_]workspace[-_]manifests\.(py|sh))$'
         pass_filenames: false
 
       # Cargo enforces acyclicity only. The dependency flow in CLAUDE.md
@@ -119,7 +120,7 @@ repos:
         name: crate dependency direction matches CLAUDE.md
         entry: .github/scripts/check-crate-edges.sh
         language: system
-        files: '^(Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml)$'
+        files: '^(Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml|\.github/scripts/check[-_]crate[-_]edges\.(py|sh))$'
         pass_filenames: false
 
       # --- Solidity ----------------------------------------------------

@@ -8,7 +8,7 @@ and a member that does not ask gets no warning: a crate restating
 `version = "0.1.0"` compiles green and is simply not the version that shipped,
 and a crate without `[lints] workspace = true` compiles green under default
 lint levels. release.yml's tag-vs-manifest check catches the first only after
-the tag exists; nothing catches the second.
+the tag exists; without this check nothing catches the second.
 
 Per member:
 
@@ -18,12 +18,18 @@ Per member:
   `homepage`, `keywords`, `categories`, and carries its own `description` and
   `readme` — the crates.io landing page is per crate, so those two are never
   inherited (the root manifest says why beside `[workspace.package]`).
+* A dependency on a sibling member is `{ workspace = true }`, so the alias
+  below carries the version. A `path` + `version` written in the member
+  packages fine and then requires a sibling version that was never released.
+  A crate's dev-dependency on itself (`path = "."`, to turn a feature on for
+  its own integration tests) is the one exception: it is not a sibling.
 
 Across the workspace:
 
 * Every internal `[workspace.dependencies]` alias (a `path` into a member)
-  carries `version` equal to `[workspace.package] version`. `cargo release`
-  keeps them in step (`dependent-version = "upgrade"`); a hand edit does not.
+  resolves to a member and carries `version` equal to `[workspace.package]
+  version`. `cargo release` keeps them in step (`dependent-version =
+  "upgrade"`); a hand edit does not.
 * A member some other member depends on has an alias; a member nothing depends
   on has none — an unread alias is one more version to forget on release.
 * Every `crates/*/Cargo.toml` on disk is listed in `members`. The list is
@@ -78,10 +84,13 @@ def check(repo_root: Path) -> list[str]:
 
     if not members:
         return ["Cargo.toml: [workspace] members is empty — this check inspected nothing"]
+    if ws_version is None:
+        errors.append("Cargo.toml: [workspace.package] version is missing")
 
     # --- per-member shape --------------------------------------------------
     name_by_dir: dict[Path, str] = {}
     depended_upon: set[str] = set()
+    internal_deps: list[tuple[Path, str, object]] = []
     for crate_root in members:
         rel = crate_root.relative_to(repo_root) / "Cargo.toml"
         manifest_path = crate_root / "Cargo.toml"
@@ -115,13 +124,22 @@ def check(repo_root: Path) -> list[str]:
                         "crates.io landing page is per crate, never inherited"
                     )
 
-        for table in DEP_TABLES:
-            depended_upon.update(manifest.get(table, {}).keys())
+        dep_tables = [manifest.get(table, {}) for table in DEP_TABLES]
         for target in manifest.get("target", {}).values():
-            for table in DEP_TABLES:
-                depended_upon.update(target.get(table, {}).keys())
+            dep_tables.extend(target.get(table, {}) for table in DEP_TABLES)
+        for deps in dep_tables:
+            depended_upon.update(deps.keys())
+            internal_deps.extend((rel, dep, spec) for dep, spec in deps.items() if dep != name)
 
     member_names = set(name_by_dir.values())
+    for rel, dep, spec in internal_deps:
+        if dep in member_names and not (isinstance(spec, dict) and spec.get("workspace") is True):
+            errors.append(
+                f"{rel}: internal dependency {dep} must be `{{ workspace = true }}` — the "
+                "[workspace.dependencies] alias carries the version; a path + version "
+                "written here packages fine and then requires a sibling version that was "
+                "never released"
+            )
 
     # --- internal aliases --------------------------------------------------
     aliases: dict[str, dict] = {}
@@ -130,6 +148,11 @@ def check(repo_root: Path) -> list[str]:
             target = (repo_root / spec["path"]).resolve()
             if target in name_by_dir:
                 aliases[name] = spec
+            else:
+                errors.append(
+                    f"Cargo.toml: [workspace.dependencies] {name} has path = {spec['path']!r}, "
+                    "which is not a workspace member"
+                )
 
     for name, spec in sorted(aliases.items()):
         version = spec.get("version")
@@ -170,7 +193,7 @@ def main() -> int:
         subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             check=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
             text=True,
         ).stdout.strip()
     )

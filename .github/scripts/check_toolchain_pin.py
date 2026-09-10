@@ -8,19 +8,29 @@ and none derivable from another:
     Cargo.toml            [workspace.package]        what cargo refuses to build
                           rust-version               with (the MSRV)
     .github/workflows/*   dtolnay/rust-toolchain@X   what CI actually compiles on
-    (.yml and .yaml)
+    .github/actions/*/    (or its `with: toolchain:`
+      action.y*ml         input, which overrides the @ref)
 
-Nothing compares them. Dependabot's github-actions ecosystem bumps every
-action ref on its own and touches neither TOML file, so one merged Dependabot
-PR leaves CI compiling on a different compiler from every developer — which is
-exactly the drift `rust-toolchain.toml` is pinned to prevent. This check turns
-that PR red until the two TOML sites move in the same change.
+Without this check nothing compares them. Dependabot's github-actions
+ecosystem bumps every action ref on its own and touches neither TOML file, so
+one merged Dependabot PR leaves CI compiling on a different compiler from
+every developer — which is exactly the drift `rust-toolchain.toml` is pinned
+to prevent. This check turns that PR red until the two TOML sites move in the
+same change.
 
 All sites must carry the identical `X.Y.Z` string. A two-part `rust-version`
 ("1.95") satisfies cargo but is not the string the other sites carry, and
 `stable` is the floating spelling the pin exists to refuse, so both fail here
 rather than being normalised. Zero action refs is a failure too: a regex that
 matches nothing must not report agreement.
+
+The workflow text is read line by line with YAML comments stripped, so a
+commented-out step is neither a site nor enough to satisfy the zero-refs
+floor. A `with: toolchain:` input under a `dtolnay/rust-toolchain` step is
+the version that step installs, whatever the `@ref` says, so it replaces the
+ref as that site's value; an expression there (`${{ … }}`) cannot be read and
+is refused rather than skipped. Out of scope: a `RUSTUP_TOOLCHAIN` env var,
+which no workflow here sets.
 
 There is no Dockerfile site. The image is a single Debian stage that copies
 prebuilt release binaries, so no `rust:` tag ever names a version.
@@ -41,10 +51,55 @@ if sys.version_info < (3, 11):  # tomllib, and the syntax used below
 import tomllib  # noqa: E402  (must follow the version guard)
 
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
-# Text, not YAML: the workflows are read with the standard library only, and
-# the shape being matched is one literal `uses:` value. Anchored on `uses:` so
-# a comment that mentions the action is not read as a site.
-ACTION_REF = re.compile(r"\buses:\s*dtolnay/rust-toolchain@(\S+)")
+# Text, not YAML: the workflows are read with the standard library only. Each
+# line has its comment stripped first, so `uses:` is matched only on a live
+# step; the value may be bare or quoted.
+ACTION_REF = re.compile(r"\buses:\s*['\"]?dtolnay/rust-toolchain@([^\s'\"]+)")
+WITH_KEY = re.compile(r"^\s*with:\s*$")
+TOOLCHAIN_INPUT = re.compile(r"^\s*toolchain:\s*['\"]?(.+?)['\"]?\s*$")
+# A `#` at line start or after whitespace opens a YAML comment; one inside a
+# value does not, and a `uses:` value never carries one.
+COMMENT = re.compile(r"(^|\s)#.*$")
+
+
+def indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def action_sites(path: Path, label: str) -> list[tuple[str, str]]:
+    """Every `dtolnay/rust-toolchain` step in one file, as (label:line, version).
+
+    The version is the `with: toolchain:` input when the step has one — that
+    is what the action installs — and the `@ref` otherwise.
+    """
+    lines = [COMMENT.sub("", raw) for raw in path.read_text().splitlines()]
+    sites: list[tuple[str, str]] = []
+    for i, line in enumerate(lines):
+        m = ACTION_REF.search(line)
+        if not m:
+            continue
+        version = m.group(1)
+        # `uses:` sits at the step's key indent (`- uses:` puts it two past the
+        # dash). Sibling keys share that indent; the next step's dash or an
+        # outer key sits at less. A `with:` sibling's inputs sit deeper.
+        key_indent = line.index("uses:")
+        in_with = False
+        for follow in lines[i + 1 :]:
+            if not follow.strip():
+                continue
+            ind = indent_of(follow)
+            if ind < key_indent:
+                break
+            if ind == key_indent:
+                in_with = bool(WITH_KEY.match(follow))
+                continue
+            if in_with:
+                t = TOOLCHAIN_INPUT.match(follow)
+                if t:
+                    version = t.group(1).strip()
+                    break
+        sites.append((f"{label}:{i + 1}", version))
+    return sites
 
 
 def collect_sites(repo_root: Path) -> tuple[list[tuple[str, str]], list[str]]:
@@ -66,20 +121,25 @@ def collect_sites(repo_root: Path) -> tuple[list[tuple[str, str]], list[str]]:
     else:
         sites.append(("Cargo.toml", str(rust_version)))
 
+    # Both spellings: GitHub Actions reads `.yml` and `.yaml` alike, so a file
+    # added under the other extension must not escape the scan. Composite
+    # actions under .github/actions/ run steps too.
+    github = repo_root / ".github"
+    files = sorted(
+        list((github / "workflows").glob("*.yml"))
+        + list((github / "workflows").glob("*.yaml"))
+        + list(github.glob("actions/*/action.yml"))
+        + list(github.glob("actions/*/action.yaml"))
+    )
     refs = 0
-    # Both spellings: GitHub Actions reads `.yml` and `.yaml` alike, so a
-    # workflow added under the other extension must not escape the scan.
-    workflows_dir = repo_root / ".github" / "workflows"
-    workflows = sorted(list(workflows_dir.glob("*.yml")) + list(workflows_dir.glob("*.yaml")))
-    for workflow in workflows:
-        for lineno, line in enumerate(workflow.read_text().splitlines(), start=1):
-            for m in ACTION_REF.finditer(line):
-                refs += 1
-                sites.append((f"{workflow.relative_to(repo_root)}:{lineno}", m.group(1)))
+    for path in files:
+        found = action_sites(path, str(path.relative_to(repo_root)))
+        refs += len(found)
+        sites.extend(found)
     if refs == 0:
         errors.append(
-            "no dtolnay/rust-toolchain@… ref found under .github/workflows — "
-            "this check inspected no CI site"
+            "no dtolnay/rust-toolchain@… step found under .github/workflows or "
+            ".github/actions — this check inspected no CI site"
         )
 
     return sites, errors
@@ -88,9 +148,14 @@ def collect_sites(repo_root: Path) -> tuple[list[tuple[str, str]], list[str]]:
 def check(repo_root: Path) -> list[str]:
     sites, errors = collect_sites(repo_root)
 
-    malformed = [(label, value) for label, value in sites if not SEMVER.match(value)]
-    for label, value in malformed:
-        errors.append(f"{label}: {value!r} is not an exact X.Y.Z version")
+    for label, value in sites:
+        if "${{" in value:
+            errors.append(
+                f"{label}: `with: toolchain: {value}` is an expression this check cannot "
+                "read — write the version literally"
+            )
+        elif not SEMVER.match(value):
+            errors.append(f"{label}: {value!r} is not an exact X.Y.Z version")
     if errors:
         return errors
 
@@ -119,7 +184,7 @@ def main() -> int:
         subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             check=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
             text=True,
         ).stdout.strip()
     )
@@ -130,9 +195,8 @@ def main() -> int:
             print(f"  {e}", file=sys.stderr)
         print(
             "\nrust-toolchain.toml, Cargo.toml's rust-version and every\n"
-            "dtolnay/rust-toolchain@… ref in .github/workflows must carry the same\n"
-            "X.Y.Z. Move them together in one change (see CONTRIBUTING.md § Rust\n"
-            "Toolchain).",
+            "dtolnay/rust-toolchain step under .github/ must carry the same X.Y.Z.\n"
+            "Move them together in one change (see CONTRIBUTING.md § Rust Toolchain).",
             file=sys.stderr,
         )
         return 1
