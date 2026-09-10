@@ -233,6 +233,37 @@ struct ManifestChunk {
     hash: String,
 }
 
+/// The run's whole-download content size — the fixed denominator for the total
+/// progress bar. Whole-file blobs are deduped by hash (a blob fetched once and
+/// materialized to several paths counts once, matching the fetch-once grouping);
+/// chunked files count once each. A blob whose manifest `size` is absent
+/// contributes nothing, exactly as it then moves the total bar not at all, so the
+/// numerator and denominator stay consistent. `None` when nothing kept declares a
+/// size — the total bar is then omitted and only per-file bars render.
+fn total_content_bytes(entries: &[ManifestEntry]) -> Option<u64> {
+    // Whole-file entries keyed by hash, OR-ing in a declared size wherever one of
+    // the same-hash entries carries it (the file bar picks its size the same way).
+    let mut plain: HashMap<&str, Option<u64>> = HashMap::new();
+    let mut sum: u64 = 0;
+    let mut any_sized = false;
+    for entry in entries {
+        if entry.chunks.is_some() {
+            if let Some(s) = entry.size {
+                sum = sum.saturating_add(s);
+                any_sized = true;
+            }
+        } else {
+            let slot = plain.entry(entry.hash.as_str()).or_insert(None);
+            *slot = slot.or(entry.size);
+        }
+    }
+    for size in plain.values().flatten() {
+        sum = sum.saturating_add(*size);
+        any_sized = true;
+    }
+    any_sized.then_some(sum)
+}
+
 /// The compiled `--include`/`--exclude` globs that select which manifest entries
 /// a pull run fetches. Both sets match an entry's POSIX relative `path` — the
 /// manifest field (`models/a.bin`), never the on-disk absolute path — with the
@@ -553,8 +584,9 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     };
 
     // The kept manifest is known: enable the multi-bar renderer (silent off a
-    // terminal or under `--json`).
-    ctx.progress = PullProgress::new(args.json);
+    // terminal or under `--json`). Its total bar's denominator is the run's whole
+    // content size, fixed now from the manifest's declared sizes.
+    ctx.progress = PullProgress::new(args.json, total_content_bytes(&manifest.entries));
 
     let (outcomes, transfer) = ctx
         .pull_all(
@@ -1281,14 +1313,19 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         claims: &tokio::sync::Mutex<HashMap<[u8; 32], ChunkCell>>,
     ) -> EntryOutcome {
-        let (label, chunks) = match plan {
+        let (label, chunks, size) = match plan {
             ChunkedPlan::Failed(o) => return o.clone(),
             // Already present — no fetch, no bar.
             ChunkedPlan::Skip => return EntryOutcome::Skipped,
             // The single destination path labels the file's bar.
-            ChunkedPlan::Assemble { label, chunks, .. } => ((*label).to_string(), chunks),
+            ChunkedPlan::Assemble {
+                label,
+                chunks,
+                size,
+                ..
+            } => ((*label).to_string(), chunks, *size),
         };
-        let cf = self.progress.chunked_file(label);
+        let cf = self.progress.chunked_file(label, size);
 
         // Resolve every chunk (fetch-once or reuse), collecting the per-chunk
         // results this file needs for assembly.
@@ -1510,6 +1547,9 @@ enum ChunkedPlan<'a> {
         chunks: Vec<[u8; 32]>,
         /// The resolved on-disk destination.
         dest: PathBuf,
+        /// The file's declared content size, for the total progress bar. `None`
+        /// when the manifest entry omits it.
+        size: Option<u64>,
     },
 }
 
@@ -1549,6 +1589,7 @@ fn plan_chunked<'a>(entry: &'a ManifestEntry, out_root: &Path, overwrite: bool) 
         whole,
         chunks,
         dest,
+        size: entry.size,
     }
 }
 
@@ -1568,6 +1609,7 @@ fn assemble_plan(
             whole,
             chunks,
             dest,
+            ..
         } => (label, whole, chunks, dest),
     };
 
