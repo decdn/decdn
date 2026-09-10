@@ -23,10 +23,6 @@ impl ChunkSizes {
     /// `min > avg` or `avg > max`, and (d) any value outside fastcdc
     /// v2020's own bounds — so `StreamCDC::new`'s internal asserts can
     /// never fire.
-    #[allow(
-        dead_code,
-        reason = "wired to a CLI flag in a follow-up change; exercised by tests and chunk_file's own test helpers today"
-    )]
     pub(crate) fn resolve(avg: u64, min: Option<u64>, max: Option<u64>) -> Result<Self> {
         if !avg.is_power_of_two() {
             bail!("--chunk-avg {avg} must be a power of two");
@@ -76,15 +72,6 @@ impl ChunkSizes {
 }
 
 /// A file's whole-file identity plus its ordered chunk decomposition.
-// `chunk_file` is only wired to a CLI flag in a follow-up change; until then
-// this type is constructed solely by `chunk_file`'s own tests, so non-test
-// builds see it as dead. `#[allow]`, not `#[expect]`: the lint only fires
-// outside `cfg(test)`, and an `#[expect]` would go unfulfilled in the test
-// build that exercises this type.
-#[allow(
-    dead_code,
-    reason = "constructed by chunk_file, wired to a CLI flag in a follow-up change"
-)]
 pub(crate) struct ChunkedFile {
     /// BLAKE3 of the whole file — the manifest entry's end-to-end validator.
     pub(crate) whole_hash: blake3::Hash,
@@ -99,10 +86,6 @@ pub(crate) struct ChunkedFile {
 /// address), invoke `sink(chunk_hash, bytes)` (the caller writes the blob, or
 /// no-ops in dry-run), and record the `Chunk`. Returns the whole-file hash, the
 /// summed size, and the ordered chunk list.
-#[allow(
-    dead_code,
-    reason = "wired to a CLI flag in a follow-up change; exercised by tests today"
-)]
 pub(crate) fn chunk_file<R, F>(source: R, sizes: &ChunkSizes, mut sink: F) -> Result<ChunkedFile>
 where
     R: std::io::Read,

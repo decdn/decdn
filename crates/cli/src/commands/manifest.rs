@@ -263,7 +263,7 @@ where
 /// shouldn't produce these segments — but the manifest's `path` field is the
 /// contract verifiers re-validate against, so we assert here rather than
 /// trusting the upstream walker.
-fn validate_relpath(rel: &Path) -> anyhow::Result<String> {
+pub(crate) fn validate_relpath(rel: &Path) -> anyhow::Result<String> {
     let mut out = String::new();
     let mut empty = true;
     for comp in rel.components() {
