@@ -253,6 +253,12 @@ fn total_sink(total: &indicatif::ProgressBar) -> Arc<dyn Fn(u64, u64) + Send + S
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
 
@@ -274,5 +280,88 @@ mod tests {
     #[test]
     fn file_label_empty_is_placeholder() {
         assert_eq!(file_label(&[]), "(entry)");
+    }
+
+    // A hidden but length-bounded bar (as production builds via `ProgressBar::new(0)`)
+    // tracks position/length, so the wire-byte accounting is testable without a
+    // terminal. `ProgressBar::hidden()` starts unbounded (length `None`), where
+    // `inc_length` is a no-op — so tests must start from `Some(0)`.
+    fn test_bar() -> indicatif::ProgressBar {
+        indicatif::ProgressBar::with_draw_target(Some(0), indicatif::ProgressDrawTarget::hidden())
+    }
+
+    #[test]
+    fn total_sink_grows_length_by_expected_and_position_by_received() {
+        let total = test_bar();
+        let sink = total_sink(&total);
+        // First update learns the pull's full wire length; later updates only move
+        // the position.
+        sink(0, 100);
+        assert_eq!(total.length(), Some(100));
+        assert_eq!(total.position(), 0);
+        sink(40, 0);
+        sink(60, 0);
+        // Ends at exactly 100% — position caught up to length, no overshoot.
+        assert_eq!(total.position(), 100);
+        assert_eq!(total.length(), Some(100));
+    }
+
+    #[test]
+    fn chunked_file_sums_chunks_and_folds_into_total() {
+        let total_bar = test_bar();
+        let cf = ChunkedFile {
+            bar: Some(test_bar()),
+            total: Some(total_sink(&total_bar)),
+        };
+
+        // Chunk 1: 50 wire bytes, delivered in two updates.
+        let cb1 = cf.chunk_callback().expect("enabled -> Some callback");
+        cb1(0, 50);
+        cb1(30, 50);
+        cb1(50, 50);
+        // Chunk 2: 40 wire bytes. A fresh callback tracks its own cumulative.
+        let cb2 = cf.chunk_callback().expect("enabled -> Some callback");
+        cb2(0, 40);
+        cb2(40, 40);
+
+        let bar = cf.bar.as_ref().expect("bar present");
+        assert_eq!(bar.length(), Some(90));
+        assert_eq!(bar.position(), 90);
+        // The total folds the same wire deltas.
+        assert_eq!(total_bar.length(), Some(90));
+        assert_eq!(total_bar.position(), 90);
+    }
+
+    #[test]
+    fn advance_reused_completes_file_bar_without_touching_total() {
+        let total_bar = test_bar();
+        let cf = ChunkedFile {
+            bar: Some(test_bar()),
+            total: Some(total_sink(&total_bar)),
+        };
+
+        // A chunk another file already fetched: length and position grow together
+        // so it reads as complete, and the total is untouched (already counted).
+        cf.advance_reused(25);
+
+        let bar = cf.bar.as_ref().expect("bar present");
+        assert_eq!(bar.length(), Some(25));
+        assert_eq!(bar.position(), 25);
+        assert_eq!(total_bar.position(), 0);
+        assert_eq!(total_bar.length(), Some(0));
+    }
+
+    #[test]
+    fn disabled_chunked_file_has_no_callback() {
+        let cf = ChunkedFile::disabled();
+        assert!(cf.chunk_callback().is_none());
+        // A silent advance is a no-op, not a panic.
+        cf.advance_reused(10);
+    }
+
+    #[test]
+    fn disabled_file_bar_has_no_callback() {
+        let fb = FileBar::disabled();
+        assert!(fb.callback().is_none());
     }
 }
