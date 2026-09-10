@@ -2326,6 +2326,10 @@ where
         &drive_config,
         &ms_config,
         progress,
+        // Task 3 threads the run-wide registry through for `bundle pull`; a
+        // solo `decdn fetch` has no concurrent siblings on this deposit, so
+        // the per-fetch view is the whole story.
+        None,
     )
     .await;
 
