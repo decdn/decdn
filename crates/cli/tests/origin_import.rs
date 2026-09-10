@@ -20,9 +20,8 @@ use decdn_cache::{
     CHUNK_GROUP_BYTES, FilesystemOrigin, Hash, Origin, OriginFetch, OriginRangeFetch,
     OriginRangeRequest,
 };
-use decdn_cli::commands::bundle::bundle_create;
 use decdn_cli::commands::origin::origin_import;
-use decdn_common::cli::{BundleCreateArgs, OriginImportArgs};
+use decdn_common::cli::OriginImportArgs;
 use tempfile::TempDir;
 
 fn rt() -> tokio::runtime::Runtime {
@@ -251,7 +250,7 @@ fn stale_obao4_is_replaced() {
 }
 
 #[test]
-fn directory_import_matches_bundle_create_and_imports_manifest() {
+fn directory_import_matches_dry_run_and_imports_manifest() {
     let src = TempDir::new().unwrap();
     let origin = TempDir::new().unwrap();
     // Manifest outputs live OUTSIDE the walked tree so neither walk sees them.
@@ -262,17 +261,25 @@ fn directory_import_matches_bundle_create_and_imports_manifest() {
     fs::write(src.path().join("a.txt"), b"alpha").unwrap();
     fs::write(src.path().join("sub/b.bin"), vec![7u8; 33 * 1024]).unwrap();
 
-    // Reference manifest bytes from `bundle create` on the same fileset.
-    let ref_bundle = out.path().join("ref.json");
-    rt().block_on(bundle_create(&BundleCreateArgs {
-        input: src.path().to_path_buf(),
-        output: ref_bundle.clone(),
-        follow_symlinks: false,
-        exclude: Vec::new(),
-        json: false,
-    }))
-    .unwrap();
-    let ref_bytes = fs::read(&ref_bundle).unwrap();
+    // Reference manifest bytes: what `origin import --dry-run` prints on the
+    // same fileset, via the real binary (a subprocess is the only way to
+    // observe the dry-run stdout contract).
+    let dry_run_out = Command::new(env!("CARGO_BIN_EXE_decdn"))
+        .args([
+            "origin",
+            "import",
+            "-i",
+            src.path().to_str().unwrap(),
+            "--dry-run",
+        ])
+        .output()
+        .expect("run decdn binary");
+    assert!(
+        dry_run_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&dry_run_out.stderr)
+    );
+    let ref_bytes = dry_run_out.stdout;
 
     // Import the directory, asking for the manifest to be written out too.
     let out_bundle = out.path().join("out.json");
@@ -280,12 +287,12 @@ fn directory_import_matches_bundle_create_and_imports_manifest() {
     args.bundle = Some(out_bundle.clone());
     rt().block_on(origin_import(&args)).unwrap();
 
-    // The `--bundle` output is byte-identical to `bundle create` — that is what
-    // makes the reported bundle hash the one publishers distribute.
+    // The `--bundle` output is byte-identical to the `--dry-run` stdout — that
+    // is what makes the reported bundle hash the one publishers distribute.
     let out_bytes = fs::read(&out_bundle).unwrap();
     assert_eq!(
         out_bytes, ref_bytes,
-        "manifest must match bundle create bytes"
+        "manifest must match origin import --dry-run bytes"
     );
 
     // The manifest blob itself must be present in the origin under its own hash,

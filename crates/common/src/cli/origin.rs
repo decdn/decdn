@@ -32,8 +32,9 @@ pub enum OriginCommand {
     /// Import local content into a cache origin store, writing each blob's
     /// sharded data object and its `{hex}.obao4` outboard in the layout the
     /// daemon reads. A directory is walked, every regular file imported, and a
-    /// canonical bundle manifest (byte-identical to `bundle create`) emitted and
-    /// itself imported, so the whole tree is retrievable by one bundle hash.
+    /// canonical bundle manifest emitted (with `--dry-run`, printed to stdout
+    /// instead) and itself imported, so the whole tree is retrievable by one
+    /// bundle hash.
     Import(OriginImportArgs),
 }
 

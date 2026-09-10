@@ -11,7 +11,7 @@
 //!
 //! The work is synchronous (bao encoding + filesystem writes are sync), wrapped
 //! once in `tokio::task::spawn_blocking` from the async entry point so the CLI's
-//! runtime isn't held up — the same shape as `bundle create`.
+//! runtime isn't held up.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
@@ -243,8 +243,8 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
 /// plain mode every regular file is stored as one whole-file blob; in
 /// `--optimize` mode each file is content-defined-chunked and its distinct
 /// chunks are stored, with the whole-file blob left unstored. Either way the
-/// manifest bytes are byte-identical to `bundle create`, so the tree is
-/// retrievable by the reported bundle hash.
+/// manifest bytes are the same canonical bytes `--dry-run` would print, so
+/// the tree is retrievable by the reported bundle hash.
 fn import_directory(
     ctx: &ImportCtx,
     input: &Path,

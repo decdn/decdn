@@ -1,12 +1,13 @@
 //! Shared bundle-manifest machinery: the directory walk, path-safety rules,
-//! canonical JSON serialization, and atomic manifest write used by both
-//! `decdn bundle create` and `decdn origin import` (issues #391, #1904).
+//! canonical JSON serialization, and atomic manifest write used by
+//! `decdn origin import` (issues #391, #1904).
 //!
-//! Both commands walk a directory the same way and emit the **same** canonical
-//! manifest bytes, so a directory seeded with `origin import` is retrievable by
-//! the exact bundle hash `bundle create` would report for it. Keeping the walk
-//! and the serializer in one place is what makes that byte-identity hold by
-//! construction rather than by two copies staying in sync.
+//! `origin import` walks a directory and emits canonical manifest bytes; with
+//! `--dry-run` it prints the exact same bytes to stdout instead of importing,
+//! so operators can inspect or capture the manifest the import would produce.
+//! Keeping the walk and the serializer in one place is what makes that
+//! byte-identity hold by construction rather than by two copies staying in
+//! sync.
 //!
 //! The on-disk schema, hash format (`b3:<hex>`), path-safety rules, and the
 //! determinism contract that makes single-hash bundle distribution viable are
@@ -68,13 +69,11 @@ pub(crate) struct Chunk {
     pub(crate) size: u64,
 }
 
-/// The result of walking a directory: the sorted entries plus the two counters
-/// the operator-facing status reports (`bundle create`, `origin import`) surface.
+/// The result of walking a directory: the sorted entries plus the running
+/// total the operator-facing status report (`origin import`) surfaces.
 pub(crate) struct WalkOutput {
     /// Manifest entries, sorted by path bytes (deterministic).
     pub(crate) entries: Vec<BundleEntry>,
-    /// Count of symlinks skipped (only non-zero without `--follow-symlinks`).
-    pub(crate) skipped_symlinks: u64,
     /// Sum of every recorded entry's size.
     pub(crate) total_size: u64,
 }
@@ -91,8 +90,8 @@ pub(crate) fn build_excluder(patterns: &[String]) -> anyhow::Result<GlobSet> {
 
 /// Compile the repeatable glob `patterns` given for `flag` into a single
 /// matcher. `flag` names the source flag so a bad pattern reports the flag the
-/// operator actually typed. Shared by `--exclude` (bundle create / origin
-/// import) and bundle pull's `--include`/`--exclude` entry filter.
+/// operator actually typed. Shared by `origin import`'s `--exclude` and
+/// bundle pull's `--include`/`--exclude` entry filter.
 pub(crate) fn build_glob_set(patterns: &[String], flag: &str) -> anyhow::Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for raw in patterns {
@@ -135,9 +134,9 @@ fn keep_entry(rel: &Path, is_dir: bool, excluder: &GlobSet) -> bool {
 /// and symlink-containment rules, and invoke `per_file` for every regular file
 /// kept. `per_file` receives the file's canonicalized path and its validated
 /// relative POSIX string, and returns the file's whole-file `b3:<hex>` address,
-/// size, and an optional chunk decomposition — `bundle create` just hashes;
-/// `origin import` hashes **and** writes the blob; a plain (non-chunking)
-/// caller always returns `None` for the third element.
+/// size, and an optional chunk decomposition — a dry-run caller just hashes;
+/// `origin import` (without `--dry-run`) hashes **and** writes the blob; a
+/// plain (non-chunking) caller always returns `None` for the third element.
 ///
 /// The entries are sorted by path bytes so the emitted manifest — and therefore
 /// its own BLAKE3 — is byte-stable across runs.
@@ -151,7 +150,6 @@ where
     F: FnMut(&Path, &str) -> anyhow::Result<(String, u64, Option<Vec<Chunk>>)>,
 {
     let mut entries: Vec<BundleEntry> = Vec::new();
-    let mut skipped_symlinks: u64 = 0;
     let mut total_size: u64 = 0;
 
     // Skip / prune excluded entries *lexically*, before any canonicalize.
@@ -187,12 +185,11 @@ where
             continue;
         }
         // With follow_links=false, symlinks come through as symlink entries we
-        // never read — skip silently and surface the count in --json. With
-        // follow_links=true, walkdir resolves the link transparently and the
-        // entry presents as a regular file; only then does the path-safety check
-        // below run and catch escapes via in-tree symlinks.
+        // never read — skip silently. With follow_links=true, walkdir resolves
+        // the link transparently and the entry presents as a regular file; only
+        // then does the path-safety check below run and catch escapes via
+        // in-tree symlinks.
         if ftype.is_symlink() {
-            skipped_symlinks = skipped_symlinks.saturating_add(1);
             continue;
         }
         if !ftype.is_file() {
@@ -253,7 +250,6 @@ where
 
     Ok(WalkOutput {
         entries,
-        skipped_symlinks,
         total_size,
     })
 }
@@ -557,7 +553,7 @@ mod tests {
     }
 
     // Collect a canonical-rooted tree and return the set of manifest paths,
-    // using the same per-file hasher `bundle create` uses.
+    // using the same per-file hasher `origin import` uses.
     fn collect_paths(
         root: &Path,
         follow_symlinks: bool,

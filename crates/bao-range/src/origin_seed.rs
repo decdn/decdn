@@ -107,7 +107,7 @@ mod tests {
 
     /// The root hash equals the plain BLAKE3 hash of the content — the bao tree
     /// root is the content address, so the data object's file name matches what
-    /// `bundle create` records for the same file.
+    /// `origin import --dry-run` records for the same file.
     #[test]
     fn encode_outboard_root_is_content_blake3() {
         let payload = vec![7u8; 40 * 1024];
