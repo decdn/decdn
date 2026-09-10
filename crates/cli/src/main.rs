@@ -1,10 +1,10 @@
 //! deCDN user CLI — `decdn` binary entry point.
 //!
 //! Pairs with the `decdn-node` daemon: this binary carries every command
-//! a human types in a terminal (probe, node admin, key-gen, config). The
-//! `node` subcommand group talks to a running daemon over the loopback
-//! admin RPC surface (ADR 025) and fails cleanly on a publisher's laptop
-//! where no daemon is running.
+//! a human types in a terminal (probe, fetch, pools, publishing, node
+//! admin). The `node` subcommand group talks to a running daemon over the
+//! loopback admin RPC surface (`appendix-local-admin-http.md`) and fails
+//! cleanly on a publisher's laptop where no daemon is running.
 //!
 //! Its one direct write is the top-level error boundary in `main`; everything
 //! else prints from [`decdn_cli::commands`].

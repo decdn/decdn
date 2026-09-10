@@ -46,18 +46,19 @@ cargo release patch --execute              # cut, sign and push the tag
 5. **A crates.io token.** `cargo login`, with a token scoped to
    publish-update (and publish-new for the first release). Membership of the
    `decdn` crates.io owner set is what makes it work; the token itself is
-   personal and never leaves your machine.
+   personal and never leaves your machine. That owner set does not exist until
+   the first publish creates it — see [Crate ownership](#crate-ownership).
 
 6. **Before the *first* release only — clear the new-crate rate limit.**
    crates.io limits crate *creation* far harder than updates: `PublishNew`
    allows a burst of 5, then roughly one per 10 minutes. The first release
-   creates **eleven** crates at once, so a single run would be rate-limited
+   creates **ten** crates at once, so a single run would be rate-limited
    partway through — and since a published version is immutable, that leaves
    some crates uploaded, the version spent, and no clean retry.
 
    `publish-crates.sh` refuses to start in that situation, but clearing it is a
    manual step. Either ask the crates.io team to raise this repo's publish-new
-   limit (the documented route, and the tidier one), or publish the eleven
+   limit (the documented route, and the tidier one), or publish the ten
    crates by hand ahead of the tag, in dependency order, spacing them out. Once
    the names exist, every later release is `PublishUpdate` and unconstrained.
    Set `DECDN_ALLOW_RATE_LIMIT=1` to proceed once the limit has been raised.
@@ -213,8 +214,9 @@ leak into the upload. `cargo publish --workspace` resolves the order itself and
 waits for each crate to reach the index before publishing its dependents. After
 a dry run it prints the crate list and asks you to type the version to confirm.
 
-Eleven crates are published; `decdn-e2e` is `publish = false` (test fixtures)
-and cargo skips it.
+Ten crates are published; `decdn-e2e` is `publish = false` (test fixtures)
+and cargo skips it. The workspace has eleven members, and the CI version check
+covers all eleven — only the upload is ten.
 
 **This step is not re-runnable.** A published version is immutable — yanking
 hides it from new resolutions but never frees the version. If it fails partway,
@@ -226,6 +228,39 @@ A failure here does not invalidate the release. The GitHub Release, the
 signatures and the container images are all already published and stand on
 their own; crates.io is an additional distribution channel, so the recovery is
 to finish the remaining crates, not to re-cut the version.
+
+### Crate ownership
+
+crates.io gives a new crate to whoever publishes the name first, and
+`publish-crates.sh` does nothing about ownership. The first release therefore
+leaves all ten crates owned by one person — whoever ran it. Hand them to the
+org straight afterwards, in the same sitting.
+
+The new owner has to be a GitHub team: crates.io has no organisation account,
+so a team is the only owner that outlives an individual. The `crates-io` team
+under the `decdn` org is that owner. Confirm you are in it, then:
+
+```bash
+TEAM=github:decdn:crates-io
+for crate in decdn-protocol decdn-config-types decdn-bao-range decdn-common \
+             decdn-cache decdn-incentive decdn-reputation decdn-client-pull \
+             decdn-node decdn-cli; do
+  cargo owner --add "$TEAM" "$crate"
+done
+```
+
+crates.io resolves the team through your own GitHub authorisation, so it fails
+unless you are a member of `crates-io`. The team is `closed`, not secret, so
+crates.io can read it with the `read:org` scope it asks for at login.
+
+A team owner publishes updates but cannot change the owner list. Only an
+individual owner does that, so do not remove yourself once the team is added —
+that would leave nobody able to grant or revoke access again.
+
+This runs once. Later releases publish updates to names that already exist and
+add no crates, which is also why step 5's owner-set membership only starts
+meaning something after the first release. `cargo owner --list <crate>`
+confirms the result.
 
 ## Recovery
 

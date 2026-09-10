@@ -1975,7 +1975,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         None
     };
 
-    // Admin HTTP surface (ADR 025). Bind here so startup fails fast on a port
+    // Admin HTTP surface (`appendix-local-admin-http.md`). Bind here so startup fails fast on a port
     // collision rather than after side-effectful subscriptions have
     // registered. The `serve` task itself is spawned later, once the rest of
     // the runtime state it reads is wired.

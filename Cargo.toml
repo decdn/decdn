@@ -142,7 +142,7 @@ thiserror = "2"
 
 # Config
 toml = "1"
-dirs = "6"
+dirs = "7"
 
 # Misc
 bytes = "1"
@@ -303,7 +303,7 @@ http-body-util = "0.1"
 # `decdn-node` tree via `hyper-util`, so this pins no new crate.
 socket2 = "0.6"
 
-# Admin JSON-RPC surface (ADR 025)
+# Admin JSON-RPC surface (appendix-local-admin-http.md)
 jsonrpsee = { version = "0.26", features = ["server", "http-client", "macros"] }
 
 # Embedded persistent KV (used by `node` to fence voucher replay across
