@@ -1315,8 +1315,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     ) -> EntryOutcome {
         let (label, chunks, size) = match plan {
             ChunkedPlan::Failed(o) => return o.clone(),
-            // Already present — no fetch, no bar.
-            ChunkedPlan::Skip => return EntryOutcome::Skipped,
+            // Already present — no fetch, no bar. Credit its content to the total,
+            // which no fetch callback will otherwise reach.
+            ChunkedPlan::Skip(size) => {
+                self.progress.credit_skipped(*size);
+                return EntryOutcome::Skipped;
+            }
             // The single destination path labels the file's bar.
             ChunkedPlan::Assemble {
                 label,
@@ -1417,8 +1421,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
         // Every destination already present (or failed to resolve) → no fetch, no
         // payment. This is the whole point of the group: a duplicate path that is
-        // already on disk costs nothing.
+        // already on disk costs nothing. The group's content is still part of the
+        // whole-download total, so credit it straight to the total bar — no fetch
+        // callback will, and the total would otherwise never reach 100%.
         if !slots.iter().any(|s| matches!(s, Slot::Write { .. })) {
+            self.progress
+                .credit_skipped(group.entries.iter().find_map(|e| e.size));
             return slots
                 .into_iter()
                 .map(|s| match s {
@@ -1535,8 +1543,9 @@ fn materialize(staging: &Path, dest: &Path) -> anyhow::Result<u64> {
 enum ChunkedPlan<'a> {
     /// Resolve/parse failure — no chunk of this entry is fetched.
     Failed(EntryOutcome),
-    /// Destination already present and `--overwrite` not set.
-    Skip,
+    /// Destination already present and `--overwrite` not set. Carries the file's
+    /// declared content size so the total bar can credit it (no fetch runs).
+    Skip(Option<u64>),
     /// Fetch these chunks and concatenate them into `dest`, verifying `whole`.
     Assemble {
         /// The entry's manifest path, retained to tag an outcome.
@@ -1582,7 +1591,7 @@ fn plan_chunked<'a>(entry: &'a ManifestEntry, out_root: &Path, overwrite: bool) 
         ));
     }
     if !overwrite && dest.try_exists().unwrap_or(false) {
-        return ChunkedPlan::Skip;
+        return ChunkedPlan::Skip(entry.size);
     }
     ChunkedPlan::Assemble {
         label: entry.path.as_str(),
@@ -1603,7 +1612,7 @@ fn assemble_plan(
 ) -> EntryOutcome {
     let (label, whole, chunks, dest) = match plan {
         ChunkedPlan::Failed(o) => return o.clone(),
-        ChunkedPlan::Skip => return EntryOutcome::Skipped,
+        ChunkedPlan::Skip(_) => return EntryOutcome::Skipped,
         ChunkedPlan::Assemble {
             label,
             whole,
@@ -2638,7 +2647,7 @@ mod tests {
 
         assert!(matches!(
             plan_chunked(&entry, dir.path(), false),
-            ChunkedPlan::Skip
+            ChunkedPlan::Skip(_)
         ));
     }
 

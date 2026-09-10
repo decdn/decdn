@@ -184,6 +184,21 @@ impl PullProgress {
         }
     }
 
+    /// Credit an already-present unit's content `size` straight to the total bar.
+    /// A skipped file (every destination on disk) does no fetch and drives no
+    /// delivery callback, but its content is part of the whole-download total
+    /// (`total_content_bytes` counts it), so without this credit the total could
+    /// never reach 100% on a resumed or already-present run. A no-op when disabled,
+    /// when there is no total bar, or when `size` is absent (then it is not in the
+    /// denominator either). Shows no per-file bar — a skip is instantaneous.
+    pub(crate) fn credit_skipped(&self, size: Option<u64>) {
+        if let Some(i) = &self.inner
+            && let (Some(total), Some(s)) = (&i.total, size)
+        {
+            total.inc(s);
+        }
+    }
+
     /// Clear the total bar at the end of the run; the command then prints its own
     /// summary line. A no-op when disabled or when there is no total bar.
     pub(crate) fn finish(&self) {
@@ -541,5 +556,36 @@ mod tests {
     fn disabled_file_bar_has_no_callback() {
         let fb = FileBar::disabled();
         assert!(fb.callback().is_none());
+    }
+
+    #[test]
+    fn credit_skipped_advances_total_by_the_skipped_content_size() {
+        // An already-present file drives no delivery callback, so its content is
+        // credited straight to the total; a run of all-skipped files still reaches
+        // 100%.
+        let total = indicatif::ProgressBar::with_draw_target(
+            Some(300),
+            indicatif::ProgressDrawTarget::hidden(),
+        );
+        let pp = PullProgress {
+            inner: Some(Inner {
+                mp: indicatif::MultiProgress::with_draw_target(
+                    indicatif::ProgressDrawTarget::hidden(),
+                ),
+                total: Some(total.clone()),
+            }),
+        };
+        pp.credit_skipped(Some(100));
+        pp.credit_skipped(Some(200));
+        assert_eq!(total.position(), 300);
+        // A sizeless skip is inert (it is not in the denominator either).
+        pp.credit_skipped(None);
+        assert_eq!(total.position(), 300);
+    }
+
+    #[test]
+    fn credit_skipped_is_a_no_op_when_disabled() {
+        // No total bar, no panic.
+        PullProgress::disabled().credit_skipped(Some(100));
     }
 }
