@@ -8,6 +8,7 @@
 
 pub mod appeal;
 pub mod bundle;
+pub mod byte_size;
 pub mod common;
 pub mod config_cmd;
 pub mod fetch;
@@ -23,6 +24,7 @@ pub mod whoami;
 
 pub use appeal::{AppealArgs, AppealCommand, AppealSlashArgs};
 pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs, BundlePullArgs};
+pub use byte_size::parse_byte_size;
 pub use common::{
     CommonChainArgs, ConfigPathSource, LogFormat, default_client_data_dir, default_config_path,
     default_data_dir,
