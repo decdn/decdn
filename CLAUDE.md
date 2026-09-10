@@ -60,7 +60,7 @@ Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots
 ```
 crates/
   node/         — daemon binary `decdn-node`: runtime bring-up, handlers, admin RPC server, dispatch limiter
-  cli/          — user CLI binary `decdn`: probe, node admin, key-gen, config, bundle, origin import
+  cli/          — user CLI binary `decdn`: every command a human types (see the Status note above for the group list)
   common/       — shared types: config schema + resolver, identity loading, AdminRpc trait + DTOs
   protocol/     — shared types, wire format, ALPN message definitions (leaf crate, minimal deps)
   config-types/ — config-vocabulary value types (RetryPolicy, DecompressMode, OriginUrl, OriginKind, Hash, PinnedHashes) shared by cache + common (leaf crate: serde + url + anyhow, no iroh-blobs / no AWS — #578)

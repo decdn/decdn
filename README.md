@@ -130,7 +130,7 @@ Chain endpoints and contract addresses come from the config file, or from explic
 ```
 crates/
   node/         — daemon binary `decdn-node`: runtime bring-up, handlers, admin RPC server, dispatch limiter
-  cli/          — user CLI binary `decdn`: probe, node admin, key-gen, config, bundle, origin import
+  cli/          — user CLI binary `decdn`: every command a human types (see the CLI Surface table above)
   common/       — shared types: config schema + resolver, identity loading, AdminRpc trait + DTOs, and the clap definitions for both binaries
   protocol/     — shared types, wire format, ALPN message definitions (leaf crate, minimal deps)
   config-types/ — config-vocabulary value types shared by cache + common (leaf crate)
