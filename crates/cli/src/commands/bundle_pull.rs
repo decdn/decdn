@@ -1321,7 +1321,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 self.progress.credit_skipped(*size);
                 return EntryOutcome::Skipped;
             }
-            // The single destination path labels the file's bar.
+            // The single destination path labels the file's bar; its whole-file
+            // size presets the bar denominator.
             ChunkedPlan::Assemble {
                 label,
                 chunks,
@@ -1554,11 +1555,14 @@ enum ChunkedPlan<'a> {
         whole: [u8; 32],
         /// The chunk blob hashes, in content (concatenation) order.
         chunks: Vec<[u8; 32]>,
+        /// The whole-file content size from the manifest (the chunk sizes sum to
+        /// it). It presets the per-file bar's denominator and is the file's
+        /// contribution to the total bar. `None` when the manifest omits it, which
+        /// drops the per-file bar back to growing its length per chunk and adds
+        /// nothing to the total.
+        size: Option<u64>,
         /// The resolved on-disk destination.
         dest: PathBuf,
-        /// The file's declared content size, for the total progress bar. `None`
-        /// when the manifest entry omits it.
-        size: Option<u64>,
     },
 }
 
@@ -1597,8 +1601,8 @@ fn plan_chunked<'a>(entry: &'a ManifestEntry, out_root: &Path, overwrite: bool) 
         label: entry.path.as_str(),
         whole,
         chunks,
-        dest,
         size: entry.size,
+        dest,
     }
 }
 
