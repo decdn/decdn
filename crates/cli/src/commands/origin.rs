@@ -13,6 +13,7 @@
 //! once in `tokio::task::spawn_blocking` from the async entry point so the CLI's
 //! runtime isn't held up — the same shape as `bundle create`.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -75,6 +76,11 @@ struct ImportReport {
     bytes: u64,
     /// The `--to` target string the blobs were written to.
     origin: String,
+    /// Every imported source file's path, relative to `--input`, mapped to its
+    /// `b3:<hex>` content address. For a single-file import the one key is the
+    /// file's own name; for a directory it is the POSIX relative path within the
+    /// tree. Excludes the derived bundle manifest — that is `bundle_hash`.
+    files: BTreeMap<String, String>,
     /// The bundle hash publishers distribute — `Some` for a directory import,
     /// `None` for a single file (which produces no manifest).
     bundle_hash: Option<String>,
@@ -120,10 +126,19 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
             )
         } else if meta.is_file() {
             let blob = import_one_file(&base, &input, move_source, force)?;
+            // Key the single entry by the file's own name — the path it has
+            // relative to its parent (the "--input directory"), never the
+            // absolute or working-directory-relative path the operator typed.
+            let name = input.file_name().map_or_else(
+                || input.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let files = BTreeMap::from([(name, b3_hex_str_from_hex(&blob.hash_hex))]);
             Ok(ImportReport {
                 imported: 1,
                 bytes: blob.size,
                 origin: origin_label,
+                files,
                 bundle_hash: None,
                 moved: move_source,
             })
@@ -188,10 +203,19 @@ fn import_directory(
 
     let imported = u64::try_from(collected.entries.len())
         .map_err(|_| anyhow!("entry count {} exceeds u64", collected.entries.len()))?;
+    // Each manifest entry's `path` is already the validated POSIX path relative
+    // to the bundle root, and its `hash` is the `b3:<hex>` address — exactly the
+    // file→hash map the report surfaces.
+    let files = collected
+        .entries
+        .into_iter()
+        .map(|e| (e.path, e.hash))
+        .collect();
     Ok(ImportReport {
         imported,
         bytes: collected.total_size,
         origin: origin_label,
+        files,
         bundle_hash: Some(format!("b3:{}", manifest_blob.hash_hex)),
         moved: move_source,
     })
@@ -444,6 +468,20 @@ impl<R: Read, W: Write> Read for TeeReader<R, W> {
     }
 }
 
+/// The sole blob's content hash when the report describes a single-file import
+/// (no manifest, exactly one entry), else `None` — used for the concise human
+/// line, where a directory's full file map would be noise.
+fn single_file_hash(report: &ImportReport) -> Option<&str> {
+    if report.bundle_hash.is_some() {
+        return None;
+    }
+    let mut it = report.files.values();
+    match (it.next(), it.next()) {
+        (Some(h), None) => Some(h.as_str()),
+        _ => None,
+    }
+}
+
 fn write_import_report(
     w: &mut impl Write,
     report: &ImportReport,
@@ -460,9 +498,13 @@ fn write_import_report(
             "{verb} {} file(s), {} bytes, into {}",
             report.imported, report.bytes, report.origin
         )?;
-        match &report.bundle_hash {
-            Some(h) => writeln!(w, " (bundle {h})"),
-            None => writeln!(w),
+        // A directory import is addressed by its bundle hash; a single-file
+        // import has no manifest, so surface the one blob's content hash. The
+        // full file→hash map is reserved for `--json`.
+        match (&report.bundle_hash, single_file_hash(report)) {
+            (Some(b), _) => writeln!(w, " (bundle {b})"),
+            (None, Some(h)) => writeln!(w, " ({h})"),
+            (None, None) => writeln!(w),
         }
     }
 }
@@ -514,6 +556,10 @@ mod tests {
             imported: 3,
             bytes: 42,
             origin: "fs:/tmp/origin".into(),
+            files: BTreeMap::from([
+                ("a.txt".into(), "b3:aaaa".into()),
+                ("dir/b.txt".into(), "b3:bbbb".into()),
+            ]),
             bundle_hash: Some("b3:cafef00d".into()),
             moved: false,
         };
@@ -521,27 +567,70 @@ mod tests {
         write_import_report(&mut buf, &report, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(buf.trim_ascii_end()).unwrap();
         let obj = parsed.as_object().unwrap();
-        assert_eq!(obj.len(), 5);
+        assert_eq!(obj.len(), 6);
         assert_eq!(obj["imported"].as_u64(), Some(3));
         assert_eq!(obj["bytes"].as_u64(), Some(42));
         assert_eq!(obj["origin"].as_str(), Some("fs:/tmp/origin"));
+        assert_eq!(obj["files"]["a.txt"].as_str(), Some("b3:aaaa"));
+        assert_eq!(obj["files"]["dir/b.txt"].as_str(), Some("b3:bbbb"));
         assert_eq!(obj["bundle_hash"].as_str(), Some("b3:cafef00d"));
         assert_eq!(obj["moved"].as_bool(), Some(false));
     }
 
     #[test]
-    fn import_report_json_single_file_has_null_bundle_hash() {
+    fn import_report_json_single_file_maps_name_to_hash_null_bundle_hash() {
         let report = ImportReport {
             imported: 1,
             bytes: 10,
             origin: "fs:/tmp/origin".into(),
+            files: BTreeMap::from([("blob.bin".into(), "b3:deadbeef".into())]),
             bundle_hash: None,
             moved: true,
         };
         let mut buf: Vec<u8> = Vec::new();
         write_import_report(&mut buf, &report, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(buf.trim_ascii_end()).unwrap();
+        assert_eq!(parsed["files"]["blob.bin"].as_str(), Some("b3:deadbeef"));
         assert!(parsed["bundle_hash"].is_null());
         assert_eq!(parsed["moved"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn import_report_human_single_file_shows_hash() {
+        let report = ImportReport {
+            imported: 1,
+            bytes: 10,
+            origin: "fs:/tmp/origin".into(),
+            files: BTreeMap::from([("blob.bin".into(), "b3:deadbeef".into())]),
+            bundle_hash: None,
+            moved: false,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_import_report(&mut buf, &report, false).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.contains("(b3:deadbeef)"), "got: {line}");
+    }
+
+    #[test]
+    fn import_report_human_directory_shows_bundle_not_file_map() {
+        let report = ImportReport {
+            imported: 2,
+            bytes: 20,
+            origin: "fs:/tmp/origin".into(),
+            files: BTreeMap::from([
+                ("a.txt".into(), "b3:aaaa".into()),
+                ("b.txt".into(), "b3:bbbb".into()),
+            ]),
+            bundle_hash: Some("b3:cafef00d".into()),
+            moved: false,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_import_report(&mut buf, &report, false).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.contains("(bundle b3:cafef00d)"), "got: {line}");
+        assert!(
+            !line.contains("b3:aaaa"),
+            "file map must stay out of human line: {line}"
+        );
     }
 }
