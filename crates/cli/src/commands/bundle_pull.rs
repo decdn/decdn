@@ -233,6 +233,37 @@ struct ManifestChunk {
     hash: String,
 }
 
+/// The run's whole-download content size — the fixed denominator for the total
+/// progress bar. Whole-file blobs are deduped by hash (a blob fetched once and
+/// materialized to several paths counts once, matching the fetch-once grouping);
+/// chunked files count once each. A blob whose manifest `size` is absent
+/// contributes nothing, exactly as it then moves the total bar not at all, so the
+/// numerator and denominator stay consistent. `None` when nothing kept declares a
+/// size — the total bar is then omitted and only per-file bars render.
+fn total_content_bytes(entries: &[ManifestEntry]) -> Option<u64> {
+    // Whole-file entries keyed by hash, OR-ing in a declared size wherever one of
+    // the same-hash entries carries it (the file bar picks its size the same way).
+    let mut plain: HashMap<&str, Option<u64>> = HashMap::new();
+    let mut sum: u64 = 0;
+    let mut any_sized = false;
+    for entry in entries {
+        if entry.chunks.is_some() {
+            if let Some(s) = entry.size {
+                sum = sum.saturating_add(s);
+                any_sized = true;
+            }
+        } else {
+            let slot = plain.entry(entry.hash.as_str()).or_insert(None);
+            *slot = slot.or(entry.size);
+        }
+    }
+    for size in plain.values().flatten() {
+        sum = sum.saturating_add(*size);
+        any_sized = true;
+    }
+    any_sized.then_some(sum)
+}
+
 /// The compiled `--include`/`--exclude` globs that select which manifest entries
 /// a pull run fetches. Both sets match an entry's POSIX relative `path` — the
 /// manifest field (`models/a.bin`), never the on-disk absolute path — with the
@@ -553,8 +584,9 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     };
 
     // The kept manifest is known: enable the multi-bar renderer (silent off a
-    // terminal or under `--json`).
-    ctx.progress = PullProgress::new(args.json);
+    // terminal or under `--json`). Its total bar's denominator is the run's whole
+    // content size, fixed now from the manifest's declared sizes.
+    ctx.progress = PullProgress::new(args.json, total_content_bytes(&manifest.entries));
 
     let (outcomes, transfer) = ctx
         .pull_all(
@@ -1281,14 +1313,23 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         claims: &tokio::sync::Mutex<HashMap<[u8; 32], ChunkCell>>,
     ) -> EntryOutcome {
-        let (label, chunks) = match plan {
+        let (label, chunks, size) = match plan {
             ChunkedPlan::Failed(o) => return o.clone(),
-            // Already present — no fetch, no bar.
-            ChunkedPlan::Skip => return EntryOutcome::Skipped,
+            // Already present — no fetch, no bar. Credit its content to the total,
+            // which no fetch callback will otherwise reach.
+            ChunkedPlan::Skip(size) => {
+                self.progress.credit_skipped(*size);
+                return EntryOutcome::Skipped;
+            }
             // The single destination path labels the file's bar.
-            ChunkedPlan::Assemble { label, chunks, .. } => ((*label).to_string(), chunks),
+            ChunkedPlan::Assemble {
+                label,
+                chunks,
+                size,
+                ..
+            } => ((*label).to_string(), chunks, *size),
         };
-        let cf = self.progress.chunked_file(label);
+        let cf = self.progress.chunked_file(label, size);
 
         // Resolve every chunk (fetch-once or reuse), collecting the per-chunk
         // results this file needs for assembly.
@@ -1380,8 +1421,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
         // Every destination already present (or failed to resolve) → no fetch, no
         // payment. This is the whole point of the group: a duplicate path that is
-        // already on disk costs nothing.
+        // already on disk costs nothing. The group's content is still part of the
+        // whole-download total, so credit it straight to the total bar — no fetch
+        // callback will, and the total would otherwise never reach 100%.
         if !slots.iter().any(|s| matches!(s, Slot::Write { .. })) {
+            self.progress
+                .credit_skipped(group.entries.iter().find_map(|e| e.size));
             return slots
                 .into_iter()
                 .map(|s| match s {
@@ -1498,8 +1543,9 @@ fn materialize(staging: &Path, dest: &Path) -> anyhow::Result<u64> {
 enum ChunkedPlan<'a> {
     /// Resolve/parse failure — no chunk of this entry is fetched.
     Failed(EntryOutcome),
-    /// Destination already present and `--overwrite` not set.
-    Skip,
+    /// Destination already present and `--overwrite` not set. Carries the file's
+    /// declared content size so the total bar can credit it (no fetch runs).
+    Skip(Option<u64>),
     /// Fetch these chunks and concatenate them into `dest`, verifying `whole`.
     Assemble {
         /// The entry's manifest path, retained to tag an outcome.
@@ -1510,6 +1556,9 @@ enum ChunkedPlan<'a> {
         chunks: Vec<[u8; 32]>,
         /// The resolved on-disk destination.
         dest: PathBuf,
+        /// The file's declared content size, for the total progress bar. `None`
+        /// when the manifest entry omits it.
+        size: Option<u64>,
     },
 }
 
@@ -1542,13 +1591,14 @@ fn plan_chunked<'a>(entry: &'a ManifestEntry, out_root: &Path, overwrite: bool) 
         ));
     }
     if !overwrite && dest.try_exists().unwrap_or(false) {
-        return ChunkedPlan::Skip;
+        return ChunkedPlan::Skip(entry.size);
     }
     ChunkedPlan::Assemble {
         label: entry.path.as_str(),
         whole,
         chunks,
         dest,
+        size: entry.size,
     }
 }
 
@@ -1562,12 +1612,13 @@ fn assemble_plan(
 ) -> EntryOutcome {
     let (label, whole, chunks, dest) = match plan {
         ChunkedPlan::Failed(o) => return o.clone(),
-        ChunkedPlan::Skip => return EntryOutcome::Skipped,
+        ChunkedPlan::Skip(_) => return EntryOutcome::Skipped,
         ChunkedPlan::Assemble {
             label,
             whole,
             chunks,
             dest,
+            ..
         } => (label, whole, chunks, dest),
     };
 
@@ -2596,7 +2647,7 @@ mod tests {
 
         assert!(matches!(
             plan_chunked(&entry, dir.path(), false),
-            ChunkedPlan::Skip
+            ChunkedPlan::Skip(_)
         ));
     }
 
