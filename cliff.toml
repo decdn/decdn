@@ -13,6 +13,11 @@ body = """
 {%- macro remote_url() -%}
   https://github.com/decdn/decdn
 {%- endmacro -%}
+{%- macro line(commit) -%}
+  - {% if commit.scope %}**{{ commit.scope }}**: {% endif %}\
+    {{ commit.message | split(pat="\n") | first | upper_first }} \
+    ([{{ commit.id | truncate(length=7, end="") }}]({{ self::remote_url() }}/commit/{{ commit.id }}))
+{%- endmacro -%}
 
 {% if version -%}
   ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
@@ -20,18 +25,26 @@ body = """
   ## [Unreleased]
 {% endif -%}
 
-{% for group, commits in commits | group_by(attribute="group") %}
+{#- Breaking changes first, in their own section, and nowhere else: a release
+    that breaks the wire or the config is read for that before anything. A
+    commit is breaking via `!` in its subject or a `BREAKING CHANGE:` footer;
+    the footer text is what the section shows, falling back to the subject. -#}
+{% set breaking = commits | filter(attribute="breaking", value=true) -%}
+{% if breaking | length > 0 %}
+  ### Breaking
+  {% for commit in breaking %}
+    {{ self::line(commit=commit) }}
+    {%- if commit.breaking_description and commit.breaking_description != commit.message %}
+      {{ "  - " }}{{ commit.breaking_description | replace(from="\n", to=" ") | trim }}
+    {%- endif %}
+  {%- endfor %}
+{% endif -%}
+
+{% for group, commits in commits | filter(attribute="breaking", value=false) | group_by(attribute="group") %}
   ### {{ group | striptags | trim | upper_first }}
   {% for commit in commits %}
-    - {% if commit.scope %}**{{ commit.scope }}**: {% endif %}\
-      {{ commit.message | upper_first }} \
-      ([{{ commit.id | truncate(length=7, end="") }}]({{ self::remote_url() }}/commit/{{ commit.id }}))
-    {%- if commit.breaking %}
-      {% for footer in commit.footers -%}
-        - **BREAKING**: {{ footer.value }}
-      {% endfor -%}
-    {% endif -%}
-  {% endfor %}
+    {{ self::line(commit=commit) }}
+  {%- endfor %}
 {% endfor %}
 """
 footer = ""
@@ -39,11 +52,20 @@ trim = true
 
 [git]
 conventional_commits = true
+# A non-conventional subject is dropped from the notes — with one exception.
 filter_unconventional = true
 split_commits = false
-protect_breaking_commits = false
+# The exception: a commit marked breaking (`!` or a `BREAKING CHANGE:` footer)
+# is kept even when its subject does not parse. Pre-launch, wire- and
+# config-breaking changes are the commits an operator most needs to see, and
+# a typo in the prefix must not be what hides one.
+protect_breaking_commits = true
 filter_commits = false
+# Release tags only. `v[0-9].*` rather than `v*`, so a working tag such as
+# `<topic>-prerebase` never bounds `--latest`.
 tag_pattern = "v[0-9].*"
+# Newest first within a group, matching how the hand-written CHANGELOG.md
+# orders entries.
 sort_commits = "newest"
 
 commit_parsers = [
