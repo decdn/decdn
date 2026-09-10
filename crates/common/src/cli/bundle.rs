@@ -66,11 +66,11 @@ pub struct BundlePullArgs {
     #[arg(short = 'o', long, value_name = "DIR")]
     pub output: PathBuf,
 
-    /// Maximum entries fetched concurrently. Fetches sharing one provider's
-    /// channel are still serialized (a channel's vouchers use a strictly
-    /// increasing nonce), so effective parallelism is bounded by the number of
-    /// distinct providers in flight.
-    #[arg(long, value_name = "N", default_value_t = 4)]
+    /// Maximum concurrent blob fetches — whole-file entries and chunks of a
+    /// chunked file alike — across the whole run. One many-chunk file can use the
+    /// full budget by itself; a chunk shared between files is fetched once and does
+    /// not consume an extra slot.
+    #[arg(long, value_name = "N", default_value_t = 16)]
     pub jobs: usize,
 
     /// Only pull entries whose POSIX relative path matches one of these globs
