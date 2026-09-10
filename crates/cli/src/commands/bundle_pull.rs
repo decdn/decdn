@@ -21,8 +21,8 @@
 //! including every leg of a multi-source entry's admitted provider set — draw
 //! from the same watermark instead of racing it, while their transfers still
 //! run concurrently; and a single global mutex serializes every open-or-reuse
-//! call — the pool's on-chain state (deposit, allowance) is one shared resource
-//! now, regardless of which provider an entry is bound for.
+//! call — the pool's on-chain state (deposit, allowance) is one shared resource,
+//! regardless of which provider an entry is bound for.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -541,6 +541,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         grant,
         ledgers: LaneLedgers::new(),
         open_lock: tokio::sync::Mutex::new(()),
+        jobs: args.jobs.max(1),
         gate: tokio::sync::Semaphore::new(args.jobs.max(1)),
         // Silent during the manifest fetch below (a single blob); replaced once
         // the kept entries are known and their sizes decide the total-bar mode.
@@ -645,6 +646,11 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// also perform a low-water top-up) and released before streaming, so
     /// delivery itself still runs concurrently once each entry has its context.
     open_lock: tokio::sync::Mutex<()>,
+    /// Live per-file/group bar fan-out bound; the actual in-flight-fetch cap is
+    /// `gate`. Set from `--jobs` (min 1) so a bundle with many entries never
+    /// instantiates more live progress bars than the run can actually service
+    /// at once.
+    jobs: usize,
     /// Global cap on concurrent blob fetches — whole-file entries and chunks of a
     /// chunked file alike — so one many-chunk file can saturate `--jobs` by itself
     /// while the run never exceeds it. A chunk reused from another file is deduped
@@ -1006,12 +1012,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// Fetch every entry into `out_root`, one unit of work per *distinct* blob
     /// hash: entries sharing a hash (one file at two bundle paths) are fetched and
     /// reconstructed once, then materialized at each path (#1306) — never fetched,
-    /// nor *paid for*, twice. Every unit of work is offered to `buffer_unordered`
-    /// at once (no `tokio::spawn`, by choice — nothing here is `!Send`);
-    /// `PullCtx.gate` is the real `--jobs` cap on in-flight fetches, so
-    /// parallelism comes from concurrent in-flight network I/O, while the
-    /// shared `LaneLedgers` inside `fetch_to_staging_from` keep same-lane
-    /// voucher issuance monotonic — now over unique blobs.
+    /// nor *paid for*, twice. Each unit of work runs via `buffer_unordered` (no
+    /// `tokio::spawn`, by choice — nothing here is `!Send`), offered `--jobs` at
+    /// a time so live per-file/group bars stay bounded; `PullCtx.gate` is the
+    /// real cap on in-flight fetches, so parallelism comes from concurrent
+    /// in-flight network I/O, while the shared `LaneLedgers` inside
+    /// `fetch_to_staging_from` keep same-lane voucher issuance monotonic,
+    /// scoped to each unique blob.
     async fn pull_all(
         &self,
         entries: &[ManifestEntry],
@@ -1051,8 +1058,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// The whole-file path: fetch every distinct blob once (grouped by hash) and
     /// materialize it at each destination path (#1306). A group whose hash is in
     /// `keep` (also a chunk of some chunked entry) leaves its staging blob in place
-    /// for the chunked phase to reuse. Every group is offered at once;
-    /// `PullCtx.gate` is the real cap on in-flight fetches.
+    /// for the chunked phase to reuse. Live per-group bars are bounded at
+    /// `--jobs`; `PullCtx.gate` is the real cap on in-flight fetches.
     async fn pull_plain(
         &self,
         entries: &[&ManifestEntry],
@@ -1060,12 +1067,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         overwrite: bool,
         keep: &HashSet<[u8; 32]>,
     ) -> (Vec<EntryOutcome>, Transfer) {
-        // Offered unbounded; PullCtx.gate is the global --jobs cap.
         let groups_by_hash = group_by_hash(entries);
         let group_count = groups_by_hash.len().max(1);
         let groups: Vec<Vec<EntryOutcome>> = futures_util::stream::iter(groups_by_hash)
             .map(|group| self.fetch_group(group, out_root, overwrite, keep))
-            .buffer_unordered(group_count)
+            // Live-bar fan-out bounded by --jobs; the global gate is the real in-flight-fetch cap.
+            .buffer_unordered(self.jobs.min(group_count))
             .collect::<Vec<Vec<EntryOutcome>>>()
             .await;
         // Byte tally is per-group (a blob pulled once, materialized to N paths),
@@ -1079,8 +1086,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     }
 
     /// The concatenation path for chunked entries, one unit of work per *file*.
-    /// Every file is offered at once; `PullCtx.gate` (acquired inside
-    /// `fetch_to_staging`) is the real cap on in-flight fetches:
+    /// Live per-file bars are bounded at `--jobs`; `PullCtx.gate` (acquired
+    /// inside `fetch_to_staging`) is the real cap on in-flight fetches:
     ///
     /// 1. **Fetch** each of a file's chunks — the first file to need a distinct
     ///    chunk fetches and **pays for it once** through the shared `claims`
@@ -1127,9 +1134,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let claims: tokio::sync::Mutex<HashMap<[u8; 32], ChunkCell>> =
             tokio::sync::Mutex::new(HashMap::new());
 
-        // One future per FILE, offered unbounded — `PullCtx.gate` is the global
-        // --jobs cap; results carry their plan index so the outcome vector is
-        // restored to manifest order after the unordered run.
+        // One future per FILE, offered up to --jobs at a time (bounding live
+        // per-file bars); `PullCtx.gate` is the real cap on in-flight fetches.
+        // Results carry their plan index so the outcome vector is restored to
+        // manifest order after the unordered run.
         let plan_count = plans.len().max(1);
         let mut indexed: Vec<(usize, EntryOutcome)> =
             futures_util::stream::iter(plans.iter().enumerate())
@@ -1140,7 +1148,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                         (idx, outcome)
                     }
                 })
-                .buffer_unordered(plan_count)
+                // Live-bar fan-out bounded by --jobs; the global gate is the real in-flight-fetch cap.
+                .buffer_unordered(self.jobs.min(plan_count))
                 .collect::<Vec<_>>()
                 .await;
         indexed.sort_by_key(|(idx, _)| *idx);

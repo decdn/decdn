@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
@@ -1760,6 +1760,17 @@ fn select_watermark(
 /// The lane's shared ledger + context: from the run registry when bundle pull
 /// supplies one (so every entry/chunk on the lane shares one monotonic issuer),
 /// else a fresh pair for a standalone `decdn fetch`.
+///
+/// On a registry reuse (an already-registered lane, second+ touch), `ctx` — this
+/// call's freshly built context, which may reflect an `open_or_reuse_pool`
+/// low-water top-up the registry's stored context predates — is otherwise
+/// discarded in favor of the shared handle. Deposit only ever grows via
+/// top-ups and the on-chain deposit is the hard backstop, so raising the
+/// shared handle's `deposit` toward this call's fresh reading is always safe;
+/// reconciling it here stops the pool-wide gate from reading a stale, lower
+/// deposit and refusing prematurely (`PoolExhausted`) once the true balance
+/// has grown. The reconcile also runs (as a no-op) when this call's build won
+/// the registry race, since the shared value already equals the fresh one.
 fn lane_ledger(
     ledgers: Option<&LaneLedgers>,
     lane: LaneKey,
@@ -1769,12 +1780,19 @@ fn lane_ledger(
         bytes: ctx.prior_bytes_delivered,
         amount: ctx.prior_amount,
     };
+    // `U256` is `Copy`; capture the fresh deposit before `ctx` moves into the
+    // `get_or_insert` build closure below.
+    let fresh_deposit = ctx.deposit;
     match ledgers {
         Some(reg) => {
             let h = reg.get_or_insert(lane, || LaneHandle {
                 ledger: Arc::new(PoolLedger::new(seed)),
                 ctx: Arc::new(Mutex::new(ctx)),
             });
+            {
+                let mut g = h.ctx.lock().unwrap_or_else(PoisonError::into_inner);
+                g.deposit = g.deposit.max(fresh_deposit);
+            }
             (h.ledger, h.ctx)
         }
         None => (Arc::new(PoolLedger::new(seed)), Arc::new(Mutex::new(ctx))),
@@ -3452,10 +3470,17 @@ mod tests {
     }
 
     fn ctx_with(binding: Option<decdn_protocol::client::ClientBinding>) -> PoolContext {
+        ctx_with_deposit(binding, U256::ZERO)
+    }
+
+    fn ctx_with_deposit(
+        binding: Option<decdn_protocol::client::ClientBinding>,
+        deposit: U256,
+    ) -> PoolContext {
         PoolContext {
             pool_id: B256::ZERO,
             provider: Address::ZERO,
-            deposit: U256::ZERO,
+            deposit,
             client_signer: Arc::new(PrivateKeySigner::random()),
             voucher_domain: bind_node_id_domain(1, Address::ZERO),
             prior_bytes_delivered: U256::ZERO,
@@ -3486,6 +3511,56 @@ mod tests {
         let (ledger_none_a, _) = lane_ledger(None, lane, ctx_with(None));
         let (ledger_none_b, _) = lane_ledger(None, lane, ctx_with(None));
         assert!(!Arc::ptr_eq(&ledger_none_a, &ledger_none_b));
+    }
+
+    /// A second `lane_ledger` touch of an already-registered lane must reconcile
+    /// the shared handle's `ctx.deposit` UPWARD to a freshly-read higher deposit
+    /// (a low-water top-up `open_or_reuse_pool` performed between the two
+    /// touches) rather than silently discarding it. The pool-wide spent/credit
+    /// gate reads this shared value, so a stale low deposit would refuse
+    /// (`PoolExhausted`) prematurely even though the on-chain balance grew.
+    #[test]
+    fn lane_ledger_reconciles_shared_deposit_upward_on_reuse() {
+        let lane = LaneKey {
+            pool_id: B256::ZERO,
+            signer: Address::ZERO,
+            provider: Address::from([9u8; 20]),
+        };
+        let registry = LaneLedgers::new();
+        let (_, ctx_a) = lane_ledger(
+            Some(&registry),
+            lane,
+            ctx_with_deposit(None, U256::from(100)),
+        );
+        assert_eq!(
+            ctx_a.lock().unwrap_or_else(PoisonError::into_inner).deposit,
+            U256::from(100)
+        );
+
+        // A later touch on the same lane with a higher freshly-read deposit
+        // (simulating a top-up) must raise the shared handle, not discard it.
+        let (_, ctx_b) = lane_ledger(
+            Some(&registry),
+            lane,
+            ctx_with_deposit(None, U256::from(250)),
+        );
+        assert!(Arc::ptr_eq(&ctx_a, &ctx_b));
+        assert_eq!(
+            ctx_b.lock().unwrap_or_else(PoisonError::into_inner).deposit,
+            U256::from(250)
+        );
+
+        // A lower freshly-read deposit than the shared handle's current value
+        // must never lower it (deposit only ever grows via top-ups).
+        let (_, ctx_c) = lane_ledger(
+            Some(&registry),
+            lane,
+            ctx_with_deposit(None, U256::from(10)),
+        );
+        assert_eq!(
+            ctx_c.lock().unwrap_or_else(PoisonError::into_inner).deposit,
+            U256::from(250)
+        );
     }
 
     /// The refusal these tests annotate, built the way the fetch path builds it: the typed
