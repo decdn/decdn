@@ -1279,8 +1279,11 @@ fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> 
     match (&args.input, &args.hash) {
         (Some(path), _) => {
             let mut manifest = read_local_manifest(path)?;
+            let raw_empty = manifest.entries.is_empty();
             manifest.entries = filter.apply(manifest.entries);
             if args.json {
+                // The `--json` plan stays machine-readable — an empty set is
+                // `count: 0` with an empty `entries` array, no prose line.
                 let plan = serde_json::json!({
                     "output": args.output.display().to_string(),
                     "count": manifest.entries.len(),
@@ -1289,6 +1292,11 @@ fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> 
                     })).collect::<Vec<_>>(),
                 });
                 println!("{plan}");
+            } else if manifest.entries.is_empty() {
+                // Match the real run's empty-result message rather than printing a
+                // "would fetch 0 entr(ies)" plan, so `--dry-run` and a live pull
+                // agree on what an emptied set looks like.
+                report_nothing_to_fetch(filters_given && !raw_empty);
             } else {
                 println!(
                     "would fetch {} entr(ies) into {out}:",
