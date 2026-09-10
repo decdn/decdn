@@ -98,7 +98,10 @@ pub struct OriginImportArgs {
     #[arg(long = "exclude", value_name = "GLOB", action = clap::ArgAction::Append)]
     pub exclude: Vec<String>,
 
-    /// Emit a one-line JSON status report to stdout instead of a human summary.
+    /// Emit a one-line JSON status report instead of a human summary. Written to
+    /// stdout normally; under `--dry-run` it goes to stderr, because stdout then
+    /// carries the canonical manifest bytes. `origin` is the `--to` target, or
+    /// the literal `(dry-run)` when a dry run runs without `--to`.
     /// Shape:
     /// `{"imported":<n>,"bytes":<total>,"origin":"<target>","files":{"<path>":"b3:<hex>",...},"bundle_hash":"b3:<hex>"|null,"moved":<bool>,"optimized":<bool>,"chunks_total":<n>,"chunks_written":<n>,"skipped_symlinks":<n>}`.
     #[arg(long)]

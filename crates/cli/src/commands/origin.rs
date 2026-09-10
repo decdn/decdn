@@ -97,8 +97,9 @@ struct ImportReport {
     /// Count of chunks across every file before cross-file dedup (0 unless
     /// `--optimize`). Equals the sum of every entry's chunk count.
     chunks_total: u64,
-    /// Count of distinct chunk blobs actually written after dedup (0 unless
-    /// `--optimize`, and 0 in `--dry-run` since no blob is written).
+    /// Count of distinct chunks after cross-file dedup (0 unless `--optimize`).
+    /// Under `--dry-run` no blob is written, but this still reports the distinct
+    /// count a real run would write, so a dry run previews the dedup ratio.
     chunks_written: u64,
     /// Count of symlinks skipped during a directory walk (0 for a single-file
     /// import, and only non-zero without `--follow-symlinks`).
