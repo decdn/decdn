@@ -1850,7 +1850,7 @@ mod tests {
         assert_eq!(resp.routing.last_refresh_us, Some(1_700_000_000_000_000));
         assert_eq!(resp.known_stakers, 2);
         assert_eq!(resp.record_store.records, 1);
-        assert_eq!(resp.record_store.capacity, 100_000);
+        assert_eq!(resp.record_store.capacity, 1_000_000);
         assert_eq!(resp.republish.scheduled_records, 1);
     }
 
