@@ -2575,7 +2575,7 @@ fn fmt_eta(remaining_bytes: u64, bps: f64) -> String {
 /// Reads the transfer duration and bytes moved this run back from a
 /// [`SpeedState`] after the bar finishes, for the end-of-fetch summary.
 #[derive(Clone)]
-struct DeliveryMeter {
+pub(crate) struct DeliveryMeter {
     state: Arc<Mutex<SpeedState>>,
 }
 
@@ -2606,19 +2606,64 @@ fn delivery_progress() -> (
 ) {
     let bar = new_progress_bar();
     // `ProgressBar` is `Arc`-backed, so the clone the callback owns drives the
-    // same bar the caller clears. The callback must be `'static`
-    // (`ProgressCallback`), hence the owned clone rather than a borrow.
-    let cb_bar = bar.clone();
+    // same bar the caller clears.
+    let (on_progress, meter) = bar_callback(bar.clone(), None);
+    (bar, on_progress, meter)
+}
+
+/// A styled delivery bar not yet attached to any [`indicatif::MultiProgress`],
+/// carrying a `{prefix}` slot the caller sets to a per-file label. `bundle pull`
+/// inserts these into its own bottom-anchored `MultiProgress` (so the total bar
+/// stays last); single-blob `fetch` uses [`new_progress_bar`] instead, which
+/// self-attaches and needs no prefix.
+pub(crate) fn labeled_delivery_bar() -> indicatif::ProgressBar {
+    let style = indicatif::ProgressStyle::with_template(
+        // Same rate/ETA-in-`{msg}` layout as `new_progress_bar`, with the
+        // leading spinner replaced by the file label.
+        "{prefix:.bold} {bytes}/{total_bytes} {msg}[{wide_bar:.cyan/blue}]",
+    )
+    .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+    .progress_chars("=>-");
+    let bar = indicatif::ProgressBar::new(0);
+    bar.set_style(style);
+    bar.enable_steady_tick(Duration::from_millis(120));
+    bar
+}
+
+/// Build the callback that drives `bar` — setting its length to the pull's
+/// content size once, advancing its position to the cumulative delivered
+/// content-byte count, and folding each update into a [`SpeedState`] for the
+/// rate/ETA `{msg}` — and return it with the [`DeliveryMeter`] the caller reads
+/// after the bar finishes.
+///
+/// `on_byte_delta`, when set, receives the per-update byte delta: the increase in
+/// cumulative position since the previous callback. `bundle pull` folds every
+/// file bar's deltas into one bottom total bar through it; single-blob `fetch`
+/// passes `None`. `received` is cumulative and non-decreasing across an entry's
+/// fail-over resumes (each attempt continues from `base_present`), so the delta
+/// is a true increment and a folded total never double-counts.
+pub(crate) fn bar_callback(
+    bar: indicatif::ProgressBar,
+    on_byte_delta: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+) -> (impl Fn(u64, u64) + 'static, DeliveryMeter) {
     // `expected` is constant across the pull, so set the bar length once (it
     // takes a write lock) rather than on every chunk in the hot receive loop.
     let length_set = std::sync::atomic::AtomicBool::new(false);
+    // Cumulative position at the previous callback, so the forwarded delta is a
+    // true per-update increment.
+    let prev = std::sync::atomic::AtomicU64::new(0);
     let state = Arc::new(Mutex::new(SpeedState::default()));
     let cb_state = Arc::clone(&state);
     let on_progress = move |received: u64, expected: u64| {
         if !length_set.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            cb_bar.set_length(expected);
+            bar.set_length(expected);
         }
-        cb_bar.set_position(received);
+        bar.set_position(received);
+
+        if let Some(sink) = &on_byte_delta {
+            let previous = prev.swap(received, std::sync::atomic::Ordering::Relaxed);
+            sink(received.saturating_sub(previous));
+        }
 
         let now = Instant::now();
         // A poisoned lock only costs this one rate update; the bar still advances.
@@ -2635,20 +2680,20 @@ fn delivery_progress() -> (
                     // makes `inst` huge, but `alpha * inst = (1 - exp(-dt/tau)) *
                     // (delta/dt) -> delta/tau` as `dt -> 0`, so the estimate
                     // stays bounded instead of spiking, then converges upward.
-                    let prev = s.ewma_bps.unwrap_or(0.0);
-                    s.ewma_bps = Some(prev + alpha * (inst - prev));
+                    let prev_bps = s.ewma_bps.unwrap_or(0.0);
+                    s.ewma_bps = Some(prev_bps + alpha * (inst - prev_bps));
                 }
             }
             s.last = Some((now, received));
             let bps = s.ewma_bps.unwrap_or(0.0);
-            cb_bar.set_message(format!(
+            bar.set_message(format!(
                 "({}, {}) ",
                 fmt_rate(bps),
                 fmt_eta(expected.saturating_sub(received), bps)
             ));
         }
     };
-    (bar, on_progress, DeliveryMeter { state })
+    (on_progress, DeliveryMeter { state })
 }
 
 /// Print the terminal line after a successful fetch: content bytes, and — when

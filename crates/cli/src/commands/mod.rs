@@ -22,6 +22,7 @@ pub mod origin;
 pub mod pool;
 pub mod probe;
 pub mod publish;
+pub mod pull_progress;
 pub mod register;
 pub mod rotate_key;
 pub mod setup;

@@ -45,12 +45,21 @@ use serde::{Deserialize, Serialize};
 use super::chain_ctx;
 use super::fetch;
 use super::manifest::build_glob_set;
+use super::pull_progress::{self, PullProgress};
 use decdn_client_pull::discovery::{self, NodeCandidate};
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::provider;
-use decdn_client_pull::{PoolExhausted, PullDeadlines, RetryDisposition, retry_disposition};
+use decdn_client_pull::{
+    PoolExhausted, ProgressCallback, PullDeadlines, RetryDisposition, retry_disposition,
+};
 
 type FetchTarget = (PublicKey, Address);
+
+/// A shared, fetch-once cell for one chunk blob's result — its content size, or a
+/// formatted fetch error. Resolved by the first chunked file to need the chunk and
+/// reused by any other file that shares it, so a shared chunk is fetched and paid
+/// for exactly once. A cached `Err` fails every dependent file without a re-fetch.
+type ChunkCell = Arc<tokio::sync::OnceCell<Result<u64, String>>>;
 
 /// Group manifest entries by their blob `hash`, preserving first-seen order both
 /// across groups and within each group. Entries that name the same blob (one
@@ -509,7 +518,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
             alloy::primitives::U256::from(n).to_be_bytes()
         });
 
-    let ctx = PullCtx {
+    let mut ctx = PullCtx {
         endpoint: &endpoint,
         store: &store,
         contract: &contract,
@@ -529,31 +538,23 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         locks: LaneLocks::default(),
         open_lock: tokio::sync::Mutex::new(()),
         pool_serial: tokio::sync::Mutex::new(()),
+        // Silent during the manifest fetch below (a single blob); replaced once
+        // the kept entries are known and their sizes decide the total-bar mode.
+        progress: PullProgress::disabled(),
     };
 
-    // Obtain the manifest: the pre-read local one (already filtered up front), or
-    // fetch the bundle blob and filter it here.
-    let manifest = if let Some(m) = local_manifest {
-        m
-    } else {
-        let raw = args
-            .hash
-            .as_deref()
-            .ok_or_else(|| anyhow!("no bundle source (expected -i or --hash)"))?;
-        let hash = fetch::parse_hash(raw)?;
-        let bytes = ctx
-            .fetch_to_memory(hash, &args.output)
-            .await
-            .context("fetch bundle manifest blob")?;
-        let mut m = parse_manifest(&bytes)?;
-        let raw_empty = m.entries.is_empty();
-        m.entries = filter.apply(m.entries);
-        if m.entries.is_empty() {
-            report_nothing_to_fetch(filters_given && !raw_empty);
-            return Ok(());
-        }
-        m
+    // Obtain the manifest: the pre-read local one, or the `--hash` bundle blob
+    // fetched and filtered here. `None` means it filtered down to empty (already
+    // reported), so the run is done.
+    let Some(manifest) =
+        obtain_manifest(&ctx, args, &filter, filters_given, local_manifest).await?
+    else {
+        return Ok(());
     };
+
+    // The kept manifest is known: enable the multi-bar renderer, its total-bar
+    // mode decided by whether every entry declared a size (bytes) or not (files).
+    ctx.progress = enable_progress(&manifest.entries, args.json);
 
     let (outcomes, transfer) = ctx
         .pull_all(
@@ -563,8 +564,52 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
             args.jobs.max(1),
         )
         .await;
+    ctx.progress.finish();
 
     report(&outcomes, transfer, &args.output, args.json)
+}
+
+/// The kept manifest for the run: the pre-read local one (already filtered up
+/// front), or the `--hash` bundle blob fetched into memory and filtered here.
+/// `Ok(None)` means the manifest is empty after filtering — [`report_nothing_to_fetch`]
+/// was already called, so the caller returns `Ok(())`.
+async fn obtain_manifest<P: Provider + Clone>(
+    ctx: &PullCtx<'_, P>,
+    args: &BundlePullArgs,
+    filter: &EntryFilter,
+    filters_given: bool,
+    local_manifest: Option<Manifest>,
+) -> anyhow::Result<Option<Manifest>> {
+    if let Some(m) = local_manifest {
+        return Ok(Some(m));
+    }
+    let raw = args
+        .hash
+        .as_deref()
+        .ok_or_else(|| anyhow!("no bundle source (expected -i or --hash)"))?;
+    let hash = fetch::parse_hash(raw)?;
+    let bytes = ctx
+        .fetch_to_memory(hash, &args.output)
+        .await
+        .context("fetch bundle manifest blob")?;
+    let mut m = parse_manifest(&bytes)?;
+    let raw_empty = m.entries.is_empty();
+    m.entries = filter.apply(m.entries);
+    if m.entries.is_empty() {
+        report_nothing_to_fetch(filters_given && !raw_empty);
+        return Ok(None);
+    }
+    Ok(Some(m))
+}
+
+/// Enable the run's multi-bar renderer for the kept `entries`, choosing byte-mode
+/// (every entry declared a size) or files-mode (some did not); see
+/// [`pull_progress::total_mode`]. Silent off a terminal or under `--json`.
+fn enable_progress(entries: &[ManifestEntry], json: bool) -> PullProgress {
+    PullProgress::new(
+        pull_progress::total_mode(entries.iter().map(|e| (e.hash.as_str(), e.size))),
+        json,
+    )
 }
 
 /// The bundle's per-provider lane locks. A `(signer, provider)` voucher lane is
@@ -667,6 +712,11 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// only one entry drives at a time; probes remain concurrent and
     /// multi-source within an entry still fans out via its own `SharedPool`.
     pool_serial: tokio::sync::Mutex<()>,
+    /// The run's multi-bar progress renderer: one per-file bar per active pull
+    /// above a bottom total bar (silent off a terminal or under `--json`). Set
+    /// once the kept manifest is known — its entries decide the total-bar mode —
+    /// so it starts [disabled](PullProgress::disabled) during the manifest fetch.
+    progress: PullProgress,
 }
 
 impl<P: Provider + Clone> PullCtx<'_, P> {
@@ -745,6 +795,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         order: &fetch::ResolvedTargets,
         hash: [u8; 32],
         staging: &Path,
+        progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<Option<()>> {
         // Admission is computed once and reused for the gate, the lane-lock set,
         // and the fan-out itself — `try_multi_source_fetch` would otherwise
@@ -763,10 +814,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
-        // No progress callback: per-entry byte bars would interleave illegibly
-        // across a manifest's many concurrent pulls (#1118). The admitted set
-        // already computed for the gate and the lock is moved into the fan-out
-        // so `admit_sources` runs only once per entry.
+        // The entry's per-file bar callback (ADR 039 fan-out reports one monotonic
+        // total the lanes fold their per-leg deltas into, so the bar never jumps
+        // between lanes). The admitted set already computed for the gate and the
+        // lock is moved into the fan-out so `admit_sources` runs only once.
         fetch::try_multi_source_fetch_from_admitted(
             &deps,
             self.common,
@@ -778,7 +829,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             self.relays,
             hash,
             staging,
-            None,
+            progress,
             Some(&self.open_lock),
         )
         .await
@@ -797,11 +848,18 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// candidate, a terminal one stops, and the last error surfaces once the list
     /// is exhausted. Every attempt draws on the ONE shared pool and resumes the
     /// entry's `.partial` beside `staging`, so a fail-over re-pays nothing.
-    async fn fetch_to_staging(&self, hash: [u8; 32], staging: &Path) -> anyhow::Result<()> {
+    async fn fetch_to_staging(
+        &self,
+        hash: [u8; 32],
+        staging: &Path,
+        progress: Option<&ProgressCallback>,
+    ) -> anyhow::Result<()> {
         if let Some(pinned) = self.explicit {
             // A `--node-id`-pinned target takes its direct address from `--addr`,
             // not the registry, so no on-chain dial hints apply.
-            return self.fetch_to_staging_from(hash, pinned, &[], staging).await;
+            return self
+                .fetch_to_staging_from(hash, pinned, &[], staging, progress)
+                .await;
         }
         let candidates = self
             .candidates
@@ -837,7 +895,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // taken and falls through to the single-source failover loop below
         // unchanged; a retryable fan-out failure does the same, resuming the
         // entry's `.partial` so nothing paid for is re-bought.
-        match self.try_multi_source(&order, hash, staging).await {
+        match self.try_multi_source(&order, hash, staging, progress).await {
             Ok(Some(())) => return Ok(()),
             Ok(None) => {}
             Err(err)
@@ -853,10 +911,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 });
             }
             Err(err) => {
-                eprintln!(
-                    "bundle pull: multi-source fetch of an entry failed ({err:#}); falling \
-                     back to single-source failover over the same candidates"
-                );
+                self.progress.suspend(|| {
+                    eprintln!(
+                        "bundle pull: multi-source fetch of an entry failed ({err:#}); falling \
+                         back to single-source failover over the same candidates"
+                    );
+                });
             }
         }
 
@@ -869,7 +929,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // to a reachable node (ADR 001 § Node Discovery).
             let dial_addrs = cand.dial_addrs();
             let err = match self
-                .fetch_to_staging_from(hash, target, &dial_addrs, staging)
+                .fetch_to_staging_from(hash, target, &dial_addrs, staging, progress)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -879,12 +939,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             if retry_disposition(&err) == RetryDisposition::Terminal || !more {
                 return Err(err);
             }
-            eprintln!(
-                "bundle pull: provider {} could not deliver an entry ({err:#}); failing over to \
-                 the next of {} candidate(s)",
-                cand.eth_address,
-                order.len(),
-            );
+            self.progress.suspend(|| {
+                eprintln!(
+                    "bundle pull: provider {} could not deliver an entry ({err:#}); failing over \
+                     to the next of {} candidate(s)",
+                    cand.eth_address,
+                    order.len(),
+                );
+            });
             last_err = Some(err);
         }
         Err(last_err.unwrap_or_else(|| anyhow!("no candidate node could deliver the entry")))
@@ -898,6 +960,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         (node_id, provider): FetchTarget,
         dial_addrs: &[std::net::SocketAddr],
         staging: &Path,
+        progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<()> {
         // Serialize all access to this provider's lane: the voucher-signing
         // critical section must be atomic per lane.
@@ -983,10 +1046,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // `drive_fetch` owns the `.partial` + `.obao4`/`.ranges` sidecars beside
         // `staging` and finalizes to the plain `staging` file this fetch's caller
         // (`materialize`/`fetch_to_memory`) reads. On error those sidecars are left
-        // in place — the resume prefix a retried entry `open_or_create`s from. No
-        // progress bar: per-entry byte bars would interleave illegibly across a
-        // manifest's many concurrent pulls, so the callback and finish hook are
-        // both no-ops (#1118 scopes the byte bar to single-blob `fetch`).
+        // in place — the resume prefix a retried entry `open_or_create`s from. The
+        // per-file `progress` callback advances this entry's bar (and folds its
+        // bytes into the run's total bar); the bar's lifecycle is owned by the
+        // caller (`fetch_group` / `pull_chunked`), so the finish hook here is a
+        // no-op — a mid-fetch fail-over must not clear the bar.
         let result = fetch::drive_fetch(
             &deps,
             ctx,
@@ -995,7 +1059,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             pool_id,
             hash,
             staging,
-            None,
+            progress,
             || {},
         )
         .await;
@@ -1019,7 +1083,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// nothing further to resume once its bytes are safely in memory.
     async fn fetch_to_memory(&self, hash: [u8; 32], out_root: &Path) -> anyhow::Result<Vec<u8>> {
         let staging = staging_path(out_root, hash)?;
-        self.fetch_to_staging(hash, &staging).await?;
+        // The manifest blob fetch is silent (no bar): `progress` is disabled here
+        // anyway, and the per-file bars belong to the entries, not the manifest.
+        self.fetch_to_staging(hash, &staging, None).await?;
         let bytes =
             std::fs::read(&staging).with_context(|| format!("read {}", staging.display()))?;
         remove_staging(&staging);
@@ -1098,15 +1164,17 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         (outcomes, transfer)
     }
 
-    /// The concatenation path for chunked entries. Two phases:
+    /// The concatenation path for chunked entries, one unit of work per *file*
+    /// (bounded by `jobs`) so at most `jobs` per-file bars are live at once:
     ///
-    /// 1. **Fetch** every *distinct* chunk blob referenced by an entry that will
-    ///    actually be written (not skipped, not resolve-failed) exactly once,
-    ///    with `jobs` concurrency — so a chunk shared across entries (the two
-    ///    textures sharing a half) is fetched and **paid for once**. Chunk blobs
-    ///    land in the same content-addressed staging dir the whole-file path uses.
-    /// 2. **Assemble** each entry by concatenating its chunk staging files in
-    ///    order and verifying the whole-file BLAKE3 ([`assemble_chunks`]).
+    /// 1. **Fetch** each of a file's chunks — the first file to need a distinct
+    ///    chunk fetches and **pays for it once** through the shared `claims`
+    ///    ledger; a concurrent file that shares the chunk awaits that one result
+    ///    and reuses the staged blob (never re-paying). Chunk blobs land in the
+    ///    same content-addressed staging dir the whole-file path uses.
+    /// 2. **Assemble** the file by concatenating its chunk staging files in order
+    ///    and verifying the whole-file BLAKE3 ([`assemble_chunks`]), as soon as
+    ///    its own chunks are ready.
     ///
     /// A chunk's staging blob is removed only when every entry that referenced it
     /// succeeded; otherwise it is kept as the resume prefix for a rerun (the same
@@ -1129,50 +1197,54 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .map(|e| plan_chunked(e, out_root, overwrite))
             .collect();
 
-        // The distinct chunk-hash set to fetch — only chunks an assembled entry
-        // actually needs (skipped/failed entries contribute none). First-seen
-        // order keeps the fetch schedule deterministic.
-        let mut fetch_order: Vec<[u8; 32]> = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        // The union of every assembled entry's chunks, for the final cleanup sweep.
+        let mut all_chunks: HashSet<[u8; 32]> = HashSet::new();
         for plan in &plans {
             if let ChunkedPlan::Assemble { chunks, .. } = plan {
-                for h in chunks {
-                    if seen.insert(*h) {
-                        fetch_order.push(*h);
-                    }
-                }
+                all_chunks.extend(chunks.iter().copied());
             }
         }
 
-        // Phase 1: fetch each distinct chunk blob once. On success the value is
-        // the chunk's content size (the finalized staging blob's length), which
-        // feeds the `downloaded` tally — each distinct chunk counted a single
-        // time even when several entries share it.
-        let fetched: HashMap<[u8; 32], Result<u64, String>> =
-            futures_util::stream::iter(fetch_order)
-                .map(|hash| async move {
-                    let result = match staging_path(out_root, hash) {
-                        Ok(staging) => match self.fetch_to_staging(hash, &staging).await {
-                            Ok(()) => std::fs::metadata(&staging)
-                                .map(|m| m.len())
-                                .map_err(|e| format!("stat staged chunk: {e}")),
-                            Err(e) => Err(format!("{e:#}")),
-                        },
-                        Err(e) => Err(format!("{e:#}")),
-                    };
-                    (hash, result)
+        // The shared fetch-once ledger: the first file to need a chunk fetches (and
+        // pays for) it and publishes the result into that chunk's cell; concurrent
+        // files sharing it await the same cell and reuse the staged blob. A cell
+        // caches its `Result` whether the fetch succeeded or failed, so a failed
+        // shared chunk fails every dependent file without a re-fetch.
+        let claims: tokio::sync::Mutex<HashMap<[u8; 32], ChunkCell>> =
+            tokio::sync::Mutex::new(HashMap::new());
+
+        // One future per FILE, bounded by `jobs`; results carry their plan index so
+        // the outcome vector is restored to manifest order after the unordered run.
+        let mut indexed: Vec<(usize, EntryOutcome)> =
+            futures_util::stream::iter(plans.iter().enumerate())
+                .map(|(idx, plan)| {
+                    let claims = &claims;
+                    // `idx` indexes `plans`, which is 1:1 with `entries`; `get` keeps the
+                    // access panic-free (a missing size just leaves the bar length unset).
+                    let size_hint = entries.get(idx).and_then(|e| e.size);
+                    async move {
+                        let outcome = self
+                            .pull_chunked_file(plan, size_hint, out_root, claims)
+                            .await;
+                        (idx, outcome)
+                    }
                 })
                 .buffer_unordered(jobs)
                 .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .collect();
+                .await;
+        indexed.sort_by_key(|(idx, _)| *idx);
+        let outcomes: Vec<EntryOutcome> = indexed.into_iter().map(|(_, o)| o).collect();
 
-        // Phase 2: assemble each entry from its (now-fetched) chunk staging files.
-        let mut outcomes = Vec::with_capacity(plans.len());
-        for plan in &plans {
-            outcomes.push(assemble_plan(plan, out_root, &fetched));
-        }
+        // Read the resolved chunk results back out of the ledger for the tally and
+        // the cleanup sweep. Every fetched chunk's cell is set by now (its file
+        // future completed before the collect above returned).
+        let fetched: HashMap<[u8; 32], Result<u64, String>> = {
+            let guard = claims.lock().await;
+            guard
+                .iter()
+                .filter_map(|(h, cell)| cell.get().map(|r| (*h, r.clone())))
+                .collect()
+        };
 
         // Cleanup: a chunk blob is safe to remove only if every entry that
         // referenced it produced a non-failed outcome. Otherwise keep it as the
@@ -1185,7 +1257,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 chunk_failed.extend(chunks.iter().copied());
             }
         }
-        for hash in &seen {
+        for hash in &all_chunks {
             if !chunk_failed.contains(hash)
                 && let Ok(staging) = staging_path(out_root, *hash)
             {
@@ -1215,6 +1287,93 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 reconstructed,
             },
         )
+    }
+
+    /// Fetch (or reuse) every chunk of one chunked entry, then assemble it. Each
+    /// distinct chunk is fetched and paid for once through the shared `claims`
+    /// ledger; a chunk another file already fetched is reused from staging. The
+    /// per-file bar sums the file's chunks — advancing in real time for chunks this
+    /// file fetches, and jumping by a whole chunk for ones it reuses.
+    async fn pull_chunked_file(
+        &self,
+        plan: &ChunkedPlan<'_>,
+        size_hint: Option<u64>,
+        out_root: &Path,
+        claims: &tokio::sync::Mutex<HashMap<[u8; 32], ChunkCell>>,
+    ) -> EntryOutcome {
+        let (label, chunks) = match plan {
+            ChunkedPlan::Failed(o) => return o.clone(),
+            ChunkedPlan::Skip => {
+                // Already present — count it toward the files-mode total, no bar.
+                self.progress.advance_files(1);
+                return EntryOutcome::Skipped;
+            }
+            // The single destination path labels the file's bar.
+            ChunkedPlan::Assemble { label, chunks, .. } => ((*label).to_string(), chunks),
+        };
+        let cf = self.progress.chunked_file(label, size_hint);
+
+        // Resolve every chunk (fetch-once or reuse), collecting the per-chunk
+        // results this file needs for assembly.
+        let mut file_fetched: HashMap<[u8; 32], Result<u64, String>> = HashMap::new();
+        for &chunk_hash in chunks {
+            let cell = {
+                let mut guard = claims.lock().await;
+                Arc::clone(
+                    guard
+                        .entry(chunk_hash)
+                        .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+                )
+            };
+            // A private flag the fetch closure flips — only the file that actually
+            // runs the fetch sets it, so a reusing file knows to jump its bar.
+            let i_fetched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ran = Arc::clone(&i_fetched);
+            let cb = cf.chunk_callback();
+            let result = cell
+                .get_or_init(|| async move {
+                    ran.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.fetch_chunk_staged(chunk_hash, out_root, cb.as_deref())
+                        .await
+                })
+                .await;
+            if !i_fetched.load(std::sync::atomic::Ordering::Relaxed)
+                && let Ok(size) = result
+            {
+                // Reused a chunk another file fetched: its callback never fired
+                // here, so advance this file's bar by the whole chunk at once.
+                cf.advance_reused(*size);
+            }
+            file_fetched.insert(chunk_hash, result.clone());
+        }
+
+        let outcome = assemble_plan(plan, out_root, &file_fetched);
+        cf.finish();
+        if !matches!(outcome, EntryOutcome::Failed { .. }) {
+            self.progress.advance_files(1);
+        }
+        outcome
+    }
+
+    /// Fetch one chunk blob into its content-addressed staging file and return its
+    /// content size, or a formatted error. Mirrors the whole-file staging fetch,
+    /// so a chunk gets the same reactive top-up and resume; `progress` drives the
+    /// owning file's bar.
+    async fn fetch_chunk_staged(
+        &self,
+        hash: [u8; 32],
+        out_root: &Path,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, String> {
+        match staging_path(out_root, hash) {
+            Ok(staging) => match self.fetch_to_staging(hash, &staging, progress).await {
+                Ok(()) => std::fs::metadata(&staging)
+                    .map(|m| m.len())
+                    .map_err(|e| format!("stat staged chunk: {e}")),
+                Err(e) => Err(format!("{e:#}")),
+            },
+            Err(e) => Err(format!("{e:#}")),
+        }
     }
 
     /// Fetch the blob shared by one hash-group and write it under `out_root` at
@@ -1249,13 +1408,17 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // payment. This is the whole point of the group: a duplicate path that is
         // already on disk costs nothing.
         if !slots.iter().any(|s| matches!(s, Slot::Write { .. })) {
-            return slots
+            let outcomes: Vec<EntryOutcome> = slots
                 .into_iter()
                 .map(|s| match s {
                     Slot::Failed(o) => o,
                     _ => EntryOutcome::Skipped,
                 })
                 .collect();
+            // No pull, but these paths are done (already present) — count them
+            // toward the files-mode total so it still reaches its length.
+            self.progress.advance_files(completed_files(&outcomes));
+            return outcomes;
         }
 
         // Staged once per group: `drive_fetch` finalizes to
@@ -1268,7 +1431,21 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             Ok(p) => p,
             Err(e) => return fail_all(slots, &e),
         };
-        if let Err(e) = self.fetch_to_staging(hash, &staging).await {
+
+        // One per-file bar for this group's single pull, labeled by its
+        // destination path(s) — a fetch-once hash group shows one bar for every
+        // path it lands at. The size hint (all entries share a blob, so one size)
+        // sets the bar length up front when the manifest declared it.
+        let paths: Vec<String> = group.entries.iter().map(|e| e.path.clone()).collect();
+        let size_hint = group.entries.iter().find_map(|e| e.size);
+        let file_bar = self
+            .progress
+            .file_bar(pull_progress::file_label(&paths), size_hint);
+        let fetched = self
+            .fetch_to_staging(hash, &staging, file_bar.callback())
+            .await;
+        file_bar.finish();
+        if let Err(e) = fetched {
             // `drive_fetch` leaves its `<hex>.partial` + `.obao4`/`.ranges`
             // sidecars in place on error — they are what the next run resumes from
             // rather than re-paying for bytes already landed (same contract as
@@ -1305,8 +1482,22 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             remove_staging(&staging);
         }
 
+        // Advance the files-mode total by the paths this pull landed (byte mode
+        // already tracked the delivered bytes through the bar callback).
+        self.progress.advance_files(completed_files(&outcomes));
+
         outcomes
     }
+}
+
+/// The number of `outcomes` that are not failures — the files a pull actually
+/// landed (written or already present), for advancing the files-mode total bar.
+fn completed_files(outcomes: &[EntryOutcome]) -> u64 {
+    let done = outcomes
+        .iter()
+        .filter(|o| !matches!(o, EntryOutcome::Failed { .. }))
+        .count();
+    u64::try_from(done).unwrap_or(u64::MAX)
 }
 
 /// Whether a whole-file group's staging blob may be removed after materializing:
