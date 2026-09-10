@@ -109,19 +109,27 @@ impl PullProgress {
     }
 
     /// A chunked file's bar (summed across its chunk pulls), inserted above the
-    /// total bar. Its length is not preset — a chunked file's whole-file size is a
-    /// content size, and the bar is metered in wire bytes — so the length grows as
-    /// each chunk's wire size is learned. Silent when disabled.
-    pub(crate) fn chunked_file(&self, label: String) -> ChunkedFile {
+    /// total bar. `size_estimate` (the manifest's whole-file content size) presets
+    /// the bar length so it fills smoothly 0→100% across the file's chunks; without
+    /// it the length would grow chunk-by-chunk and read as complete at every chunk
+    /// boundary (the file's chunks are fetched in sequence, so each finished chunk
+    /// would momentarily fill the bar). The whole-file `hash`/`size` is always
+    /// written for a chunked entry, so `size_estimate` is normally `Some`; when
+    /// absent the length falls back to growing per chunk. Silent when disabled.
+    pub(crate) fn chunked_file(&self, label: String, size_estimate: Option<u64>) -> ChunkedFile {
         let Some(i) = &self.inner else {
             return ChunkedFile::disabled();
         };
         let bar = fetch::labeled_delivery_bar();
         bar.set_prefix(label);
+        if let Some(n) = size_estimate {
+            bar.set_length(n);
+        }
         let bar = i.mp.insert_before(&i.total, bar);
         ChunkedFile {
             bar: Some(bar),
             total: Some(total_sink(&i.total)),
+            preset_length: size_estimate.is_some(),
         }
     }
 
@@ -177,6 +185,11 @@ pub(crate) struct ChunkedFile {
     /// *fetched* chunk folds into it — a reused chunk was already counted by the
     /// file that fetched it.
     total: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
+    /// Whether the bar length was preset to the whole-file size. When true, the
+    /// file bar advances position only (its denominator is already the whole
+    /// file); when false, the length grows per chunk as a fallback. The run total
+    /// still folds each fetched chunk's length delta either way.
+    preset_length: bool,
 }
 
 impl ChunkedFile {
@@ -185,24 +198,29 @@ impl ChunkedFile {
         Self {
             bar: None,
             total: None,
+            preset_length: false,
         }
     }
 
-    /// A fresh delivery callback for ONE chunk pull: it grows this file's bar
-    /// length by the chunk's expected wire size and advances its position by each
-    /// received-wire delta, and folds the same deltas into the run total. `None`
-    /// when disabled (the chunk fetch then runs bar-free). Built per chunk, since
-    /// each chunk's callback tracks its own cumulative from zero.
+    /// A fresh delivery callback for ONE chunk pull: it advances this file's bar
+    /// position by each received delta, and folds each `(received, expected)` delta
+    /// into the run total. When the file bar's length was not preset to the
+    /// whole-file size it also grows the length by the expected delta (the fallback
+    /// path). `None` when disabled (the chunk fetch then runs bar-free). Built per
+    /// chunk, since each chunk's callback tracks its own cumulative from zero.
     pub(crate) fn chunk_callback(&self) -> Option<Box<ProgressCallback>> {
         let bar = self.bar.clone()?;
         let total = self.total.clone();
+        let preset_length = self.preset_length;
         let prev = AtomicU64::new(0);
         let prev_expected = AtomicU64::new(0);
         Some(Box::new(move |received: u64, expected: u64| {
             let received_delta = received.saturating_sub(prev.swap(received, Ordering::Relaxed));
             let expected_delta =
                 expected.saturating_sub(prev_expected.swap(expected, Ordering::Relaxed));
-            bar.inc_length(expected_delta);
+            if !preset_length {
+                bar.inc_length(expected_delta);
+            }
             bar.inc(received_delta);
             if let Some(sink) = &total {
                 sink(received_delta, expected_delta);
@@ -211,14 +229,16 @@ impl ChunkedFile {
     }
 
     /// Advance the file bar by a whole chunk that another file already fetched (so
-    /// no callback fired for it here), growing the length by the same amount so the
-    /// chunk reads as complete. `chunk_size` is the staged content size — the file
-    /// bar is internally consistent because it grows length and position together —
-    /// and the run total is left untouched, since the fetching file already counted
-    /// this chunk's wire bytes there.
+    /// no callback fired for it here). `chunk_size` is the staged content size. The
+    /// position advances by it; the length grows too only when it was not preset to
+    /// the whole-file size (the fallback path), so the bar stays internally
+    /// consistent either way. The run total is left untouched, since the fetching
+    /// file already counted this chunk there.
     pub(crate) fn advance_reused(&self, chunk_size: u64) {
         if let Some(bar) = &self.bar {
-            bar.inc_length(chunk_size);
+            if !self.preset_length {
+                bar.inc_length(chunk_size);
+            }
             bar.inc(chunk_size);
         }
     }
@@ -299,9 +319,11 @@ mod tests {
     #[test]
     fn chunked_file_sums_chunks_and_folds_into_total() {
         let total_bar = test_bar();
+        // Fallback (no preset length): the denominator grows per chunk.
         let cf = ChunkedFile {
             bar: Some(test_bar()),
             total: Some(total_sink(&total_bar)),
+            preset_length: false,
         };
 
         // Chunk 1: 50 wire bytes, delivered in two updates.
@@ -323,11 +345,47 @@ mod tests {
     }
 
     #[test]
+    fn preset_length_bar_climbs_to_full_without_growing_denominator() {
+        let total_bar = test_bar();
+        // The whole-file size (90) is known up front, as it is for a real chunked
+        // entry (the manifest always carries the whole-file `size`).
+        let whole = test_bar();
+        whole.set_length(90);
+        let cf = ChunkedFile {
+            bar: Some(whole),
+            total: Some(total_sink(&total_bar)),
+            preset_length: true,
+        };
+
+        // Chunk 1 of 2 (50 of 90 bytes) fully delivered. The denominator must stay
+        // the whole-file size — the bug was the bar reading 50/50 = 100% here, at
+        // every chunk boundary, because the length grew chunk-by-chunk.
+        let cb1 = cf.chunk_callback().expect("enabled -> Some callback");
+        cb1(0, 50);
+        cb1(50, 50);
+        let bar = cf.bar.as_ref().expect("bar present");
+        assert_eq!(bar.length(), Some(90), "denominator stays the whole file");
+        assert_eq!(bar.position(), 50, "half done, not full");
+
+        // Chunk 2 (40 bytes) finishes the file at exactly 100%.
+        let cb2 = cf.chunk_callback().expect("enabled -> Some callback");
+        cb2(0, 40);
+        cb2(40, 40);
+        assert_eq!(bar.length(), Some(90));
+        assert_eq!(bar.position(), 90);
+        // The total still folds every chunk's length + position delta.
+        assert_eq!(total_bar.length(), Some(90));
+        assert_eq!(total_bar.position(), 90);
+    }
+
+    #[test]
     fn advance_reused_completes_file_bar_without_touching_total() {
         let total_bar = test_bar();
+        // Fallback (no preset length): length and position grow together.
         let cf = ChunkedFile {
             bar: Some(test_bar()),
             total: Some(total_sink(&total_bar)),
+            preset_length: false,
         };
 
         // A chunk another file already fetched: length and position grow together
@@ -336,6 +394,28 @@ mod tests {
 
         let bar = cf.bar.as_ref().expect("bar present");
         assert_eq!(bar.length(), Some(25));
+        assert_eq!(bar.position(), 25);
+        assert_eq!(total_bar.position(), 0);
+        assert_eq!(total_bar.length(), Some(0));
+    }
+
+    #[test]
+    fn advance_reused_on_preset_bar_advances_position_only() {
+        let total_bar = test_bar();
+        let whole = test_bar();
+        whole.set_length(60);
+        let cf = ChunkedFile {
+            bar: Some(whole),
+            total: Some(total_sink(&total_bar)),
+            preset_length: true,
+        };
+
+        // A reused chunk of a preset-length bar advances the position without
+        // touching the whole-file denominator, and never the total.
+        cf.advance_reused(25);
+
+        let bar = cf.bar.as_ref().expect("bar present");
+        assert_eq!(bar.length(), Some(60), "denominator unchanged");
         assert_eq!(bar.position(), 25);
         assert_eq!(total_bar.position(), 0);
         assert_eq!(total_bar.length(), Some(0));

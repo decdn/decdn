@@ -1281,14 +1281,20 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         claims: &tokio::sync::Mutex<HashMap<[u8; 32], ChunkCell>>,
     ) -> EntryOutcome {
-        let (label, chunks) = match plan {
+        let (label, chunks, size) = match plan {
             ChunkedPlan::Failed(o) => return o.clone(),
             // Already present — no fetch, no bar.
             ChunkedPlan::Skip => return EntryOutcome::Skipped,
-            // The single destination path labels the file's bar.
-            ChunkedPlan::Assemble { label, chunks, .. } => ((*label).to_string(), chunks),
+            // The single destination path labels the file's bar; its whole-file
+            // size presets the bar denominator.
+            ChunkedPlan::Assemble {
+                label,
+                chunks,
+                size,
+                ..
+            } => ((*label).to_string(), chunks, *size),
         };
-        let cf = self.progress.chunked_file(label);
+        let cf = self.progress.chunked_file(label, size);
 
         // Resolve every chunk (fetch-once or reuse), collecting the per-chunk
         // results this file needs for assembly.
@@ -1508,6 +1514,11 @@ enum ChunkedPlan<'a> {
         whole: [u8; 32],
         /// The chunk blob hashes, in content (concatenation) order.
         chunks: Vec<[u8; 32]>,
+        /// The whole-file content size from the manifest, used to preset the
+        /// file's progress-bar denominator (the chunk sizes sum to it). `None`
+        /// when the manifest omits it, which drops the bar back to growing its
+        /// length per chunk.
+        size: Option<u64>,
         /// The resolved on-disk destination.
         dest: PathBuf,
     },
@@ -1548,6 +1559,7 @@ fn plan_chunked<'a>(entry: &'a ManifestEntry, out_root: &Path, overwrite: bool) 
         label: entry.path.as_str(),
         whole,
         chunks,
+        size: entry.size,
         dest,
     }
 }
@@ -1568,6 +1580,7 @@ fn assemble_plan(
             whole,
             chunks,
             dest,
+            ..
         } => (label, whole, chunks, dest),
     };
 
