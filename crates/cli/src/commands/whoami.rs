@@ -17,10 +17,13 @@
 //! node id and paths print first and unconditionally, so the command stays
 //! useful for the node-id diagnosis even when no password is at hand.
 //!
-//! The eth address lives inside the encrypted keystore, so it prints only when
-//! a keystore password is available (the `DECDN_KEYSTORE_PASSWORD` env var, a
-//! `--keystore-password-file`, or an interactive prompt on a TTY). One resolved
-//! password unlocks whichever keystores are present.
+//! An `eth address:` line always prints; only the decrypted address *value* is
+//! gated by a password. The address lives inside the encrypted keystore, so it
+//! shows only when a keystore password is available (the
+//! `DECDN_KEYSTORE_PASSWORD` env var, a `--keystore-password-file`, or an
+//! interactive prompt on a TTY); otherwise the line is a note (no keystore, or a
+//! password is needed). One resolved password unlocks whichever keystores are
+//! present.
 
 use std::path::Path;
 
