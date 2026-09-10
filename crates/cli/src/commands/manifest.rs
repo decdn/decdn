@@ -134,8 +134,10 @@ fn keep_entry(rel: &Path, is_dir: bool, excluder: &GlobSet) -> bool {
 /// Walk `root` (already canonicalized by the caller), applying the exclude set
 /// and symlink-containment rules, and invoke `per_file` for every regular file
 /// kept. `per_file` receives the file's canonicalized path and its validated
-/// relative POSIX string, and returns the file's `b3:<hex>` address and size —
-/// `bundle create` just hashes; `origin import` hashes **and** writes the blob.
+/// relative POSIX string, and returns the file's whole-file `b3:<hex>` address,
+/// size, and an optional chunk decomposition — `bundle create` just hashes;
+/// `origin import` hashes **and** writes the blob; a plain (non-chunking)
+/// caller always returns `None` for the third element.
 ///
 /// The entries are sorted by path bytes so the emitted manifest — and therefore
 /// its own BLAKE3 — is byte-stable across runs.
@@ -146,7 +148,7 @@ pub(crate) fn walk_and_collect<F>(
     mut per_file: F,
 ) -> anyhow::Result<WalkOutput>
 where
-    F: FnMut(&Path, &str) -> anyhow::Result<(String, u64)>,
+    F: FnMut(&Path, &str) -> anyhow::Result<(String, u64, Option<Vec<Chunk>>)>,
 {
     let mut entries: Vec<BundleEntry> = Vec::new();
     let mut skipped_symlinks: u64 = 0;
@@ -230,7 +232,7 @@ where
             continue;
         }
 
-        let (hash, size) = per_file(&canonical, &rel_str)
+        let (hash, size, chunks) = per_file(&canonical, &rel_str)
             .with_context(|| format!("processing {}", canonical.display()))?;
 
         total_size = total_size.checked_add(size).ok_or_else(|| {
@@ -241,10 +243,7 @@ where
             path: rel_str,
             hash,
             size,
-            // Generation of chunked entries is out of scope: the directory walk
-            // always emits whole-file entries. Chunked manifests are produced by
-            // an external chunker and consumed by `bundle pull`.
-            chunks: None,
+            chunks,
         });
     }
 
@@ -569,9 +568,32 @@ mod tests {
             build_excluder(&exclude.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())?;
         let out = walk_and_collect(&canonical, follow_symlinks, &excluder, |canon, _rel| {
             let (h, s) = hash_file_at(canon)?;
-            Ok((b3_hex_str(h), s))
+            Ok((b3_hex_str(h), s, None))
         })?;
         Ok(out.entries.into_iter().map(|e| e.path).collect())
+    }
+
+    #[test]
+    fn walk_threads_chunks_from_closure_into_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"abc").unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let excluder = build_excluder(&[]).unwrap();
+        let out = walk_and_collect(&canonical, false, &excluder, |_c, _r| {
+            Ok((
+                "b3:whole".to_string(),
+                3,
+                Some(vec![Chunk {
+                    hash: "b3:c0".into(),
+                    size: 3,
+                }]),
+            ))
+        })
+        .unwrap();
+        assert_eq!(out.entries.len(), 1);
+        let e = out.entries.first().unwrap();
+        assert_eq!(e.chunks.as_ref().unwrap().len(), 1);
+        assert_eq!(e.chunks.as_ref().unwrap().first().unwrap().hash, "b3:c0");
     }
 
     #[test]

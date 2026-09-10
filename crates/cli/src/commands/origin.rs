@@ -196,7 +196,7 @@ fn import_directory(
 
     let collected = walk_and_collect(&root, follow, &excluder, |canonical, _rel| {
         let blob = import_one_file(base, canonical, move_source, force)?;
-        Ok((b3_hex_str_from_hex(&blob.hash_hex), blob.size))
+        Ok((b3_hex_str_from_hex(&blob.hash_hex), blob.size, None))
     })?;
 
     let bundle_bytes = serialize_canonical(&collected.entries)?;

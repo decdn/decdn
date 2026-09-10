@@ -69,7 +69,7 @@ pub async fn bundle_create(args: &BundleCreateArgs) -> anyhow::Result<()> {
         // on each entry's lexical prefix.
         let collected = walk_and_collect(&root, follow, &excluder, |canonical, _rel| {
             let (hash, size) = hash_file_at(canonical)?;
-            Ok((b3_hex_str(hash), size))
+            Ok((b3_hex_str(hash), size, None))
         })?;
         let bundle_bytes = serialize_canonical(&collected.entries)?;
         let bundle_hash = blake3::hash(&bundle_bytes);
