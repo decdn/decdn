@@ -37,7 +37,11 @@ pub const MAX_DISCOVERABLE_BLOB_BYTES: u64 = 1 << 40;
 /// bytes: bit-packed at 8 blocks per byte over the fixed 64 MiB
 /// [`DISCOVERY_BLOCK_BYTES`] (never the `test-support` overridable size, so the
 /// bound is a stable security constant). A frame whose `Coverage` is longer
-/// describes a blob no node on this network serves and is rejected at decode.
+/// names more discovery blocks than a 1 TiB blob spans — beyond what
+/// partial-holder discovery represents — and is rejected at decode. This is a
+/// wire representability bound, not a serving cap: a node may still be
+/// configured to hold and serve a larger blob, it just cannot advertise partial
+/// coverage for one over the DHT.
 ///
 /// Without this cap a bonded publisher could pin arbitrary receiver memory:
 /// coverage length is otherwise bounded only by the 16 MiB frame, and the
@@ -184,9 +188,11 @@ pub struct Coverage {
 
 /// Bounds a wire `Coverage` bitmap to [`MAX_COVERAGE_BYTES`] at decode.
 ///
-/// A longer bitmap describes a blob larger than [`MAX_DISCOVERABLE_BLOB_BYTES`],
-/// which no node serves, so it is rejected rather than stored — an untrusted
-/// peer cannot amplify one record into arbitrary receiver memory. Decoding the
+/// A longer bitmap names more blocks than a [`MAX_DISCOVERABLE_BLOB_BYTES`] blob
+/// spans — beyond what partial-holder discovery represents — so it is rejected
+/// rather than stored, and an untrusted peer cannot amplify one record into
+/// arbitrary receiver memory. This bounds what the wire represents, not what a
+/// node may serve. Decoding the
 /// bytes before the length check is safe: the enclosing 16 MiB frame cap and
 /// serde's cautious capacity hint bound the allocation independently of the
 /// wire length prefix, so the prefix is never trusted for sizing (#845).
