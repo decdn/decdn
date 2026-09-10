@@ -354,9 +354,9 @@ async fn discover_candidates(
         discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir, registry_cap)
             .await?;
     // See `fetch::discover_provider`: the degraded bootstrap paths reach the
-    // user through the return value, because the CLI has no log sink.
+    // operator through the return value; surface it here at `warn`.
     if let Some(warning) = bootstrap.warning() {
-        eprintln!("{warning}");
+        tracing::warn!("{warning}");
     }
     let all = bootstrap.into_peers();
     if all.is_empty() {
@@ -853,7 +853,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 });
             }
             Err(err) => {
-                eprintln!(
+                tracing::warn!(
                     "bundle pull: multi-source fetch of an entry failed ({err:#}); falling \
                      back to single-source failover over the same candidates"
                 );
@@ -879,7 +879,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             if retry_disposition(&err) == RetryDisposition::Terminal || !more {
                 return Err(err);
             }
-            eprintln!(
+            tracing::warn!(
                 "bundle pull: provider {} could not deliver an entry ({err:#}); failing over to \
                  the next of {} candidate(s)",
                 cand.eth_address,
@@ -1573,10 +1573,7 @@ fn remove_staging(staging: &Path) {
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
-            eprintln!(
-                "warning: failed to remove staging file {}: {e}",
-                path.display()
-            );
+            tracing::warn!("failed to remove staging file {}: {e}", path.display());
         }
     }
 }
@@ -1759,6 +1756,9 @@ fn report(
             EntryOutcome::Skipped => skipped += 1,
             EntryOutcome::Failed { path, err } => {
                 failed += 1;
+                // A per-entry failure is a command result the user needs, not
+                // routing narration: keep it on stderr (unconditional, and clear
+                // of the `--json` report on stdout) rather than behind logging.
                 eprintln!("failed: {path}: {err}");
             }
         }
