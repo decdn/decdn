@@ -421,6 +421,98 @@ fn symlink_skipped_when_not_followed() {
     assert_eq!(paths, vec!["real.txt"]);
 }
 
+// A skipped symlink must not leak onto stdout (which owns only the manifest
+// bytes) but must be surfaced as an operator-visible warning on stderr — the
+// `bundle create` parity the review flagged: a publisher must not be able to
+// ship an incomplete bundle with zero signal that a symlink was dropped.
+#[cfg(unix)]
+#[test]
+fn symlink_skipped_when_not_followed_warns_on_stderr_not_stdout() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    write_files(&src, &[("real.txt", b"r")]);
+    symlink(src.join("real.txt"), src.join("link.txt")).unwrap();
+
+    let out = dry_run(&src, &[], false);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // stdout is the clean canonical manifest: only the regular file, no
+    // trailing newline, and nothing symlink-related mixed in.
+    assert!(
+        !out.stdout.ends_with(b"\n"),
+        "manifest stdout must not have a trailing newline"
+    );
+    let manifest = read_manifest(&out.stdout);
+    let paths: Vec<&str> = manifest["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["real.txt"]);
+
+    // The warning rides on stderr, matching the retired `bundle create`
+    // wording, with the count of skipped symlinks.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("skipped 1 symlink(s); pass --follow-symlinks to include"),
+        "stderr: {stderr}"
+    );
+}
+
+// Same case with `--json`: the status report (stderr under `--dry-run`)
+// carries `skipped_symlinks`, and stdout still carries only the manifest.
+#[cfg(unix)]
+#[test]
+fn symlink_skipped_when_not_followed_json_reports_count_on_stderr() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    write_files(&src, &[("real.txt", b"r")]);
+    symlink(src.join("real.txt"), src.join("link.txt")).unwrap();
+
+    let mut args: Vec<String> = vec![
+        "origin".into(),
+        "import".into(),
+        "-i".into(),
+        src.to_str().unwrap().into(),
+        "--dry-run".into(),
+        "--json".into(),
+    ];
+    let out = Command::new(env!("CARGO_BIN_EXE_decdn"))
+        .args(&mut args)
+        .output()
+        .expect("run decdn binary");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(!out.stdout.ends_with(b"\n"));
+    let manifest = read_manifest(&out.stdout);
+    let paths: Vec<&str> = manifest["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["real.txt"]);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let report: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(report["skipped_symlinks"].as_u64(), Some(1));
+}
+
 // Symlink within the root is followed and recorded under the link's
 // name (not the target's), so both link and target get distinct entries.
 #[cfg(unix)]

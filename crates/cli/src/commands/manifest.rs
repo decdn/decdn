@@ -69,11 +69,13 @@ pub(crate) struct Chunk {
     pub(crate) size: u64,
 }
 
-/// The result of walking a directory: the sorted entries plus the running
-/// total the operator-facing status report (`origin import`) surfaces.
+/// The result of walking a directory: the sorted entries plus the two
+/// counters the operator-facing status report (`origin import`) surfaces.
 pub(crate) struct WalkOutput {
     /// Manifest entries, sorted by path bytes (deterministic).
     pub(crate) entries: Vec<BundleEntry>,
+    /// Count of symlinks skipped (only non-zero without `--follow-symlinks`).
+    pub(crate) skipped_symlinks: u64,
     /// Sum of every recorded entry's size.
     pub(crate) total_size: u64,
 }
@@ -150,6 +152,7 @@ where
     F: FnMut(&Path, &str) -> anyhow::Result<(String, u64, Option<Vec<Chunk>>)>,
 {
     let mut entries: Vec<BundleEntry> = Vec::new();
+    let mut skipped_symlinks: u64 = 0;
     let mut total_size: u64 = 0;
 
     // Skip / prune excluded entries *lexically*, before any canonicalize.
@@ -185,11 +188,12 @@ where
             continue;
         }
         // With follow_links=false, symlinks come through as symlink entries we
-        // never read — skip silently. With follow_links=true, walkdir resolves
-        // the link transparently and the entry presents as a regular file; only
-        // then does the path-safety check below run and catch escapes via
-        // in-tree symlinks.
+        // never read — skip silently and surface the count in the report. With
+        // follow_links=true, walkdir resolves the link transparently and the
+        // entry presents as a regular file; only then does the path-safety check
+        // below run and catch escapes via in-tree symlinks.
         if ftype.is_symlink() {
+            skipped_symlinks = skipped_symlinks.saturating_add(1);
             continue;
         }
         if !ftype.is_file() {
@@ -250,6 +254,7 @@ where
 
     Ok(WalkOutput {
         entries,
+        skipped_symlinks,
         total_size,
     })
 }

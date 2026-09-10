@@ -97,6 +97,9 @@ struct ImportReport {
     /// Count of distinct chunk blobs actually written after dedup (0 unless
     /// `--optimize`, and 0 in `--dry-run` since no blob is written).
     chunks_written: u64,
+    /// Count of symlinks skipped during a directory walk (0 for a single-file
+    /// import, and only non-zero without `--follow-symlinks`).
+    skipped_symlinks: u64,
 }
 
 /// The resolved import context, threaded through the sync import paths. It
@@ -292,6 +295,7 @@ fn import_directory(
             true,
             chunks_total,
             chunks_written,
+            collected.skipped_symlinks,
         )
     } else {
         let collected = walk_and_collect(&root, follow, &excluder, |canonical, _rel| {
@@ -308,7 +312,15 @@ fn import_directory(
                 Ok((b3_hex_str(h), s, None))
             }
         })?;
-        emit_manifest(ctx, collected.entries, collected.total_size, false, 0, 0)
+        emit_manifest(
+            ctx,
+            collected.entries,
+            collected.total_size,
+            false,
+            0,
+            0,
+            collected.skipped_symlinks,
+        )
     }
 }
 
@@ -356,6 +368,7 @@ fn import_single_optimized(ctx: &ImportCtx, input: &Path) -> anyhow::Result<Impo
         true,
         chunks_total,
         chunks_written,
+        0,
     )
 }
 
@@ -391,6 +404,7 @@ fn import_single_plain(ctx: &ImportCtx, input: &Path) -> anyhow::Result<ImportRe
         optimized: false,
         chunks_total: 0,
         chunks_written: 0,
+        skipped_symlinks: 0,
     })
 }
 
@@ -408,6 +422,7 @@ fn emit_manifest(
     optimized: bool,
     chunks_total: u64,
     chunks_written: u64,
+    skipped_symlinks: u64,
 ) -> anyhow::Result<ImportReport> {
     let bundle_bytes = serialize_canonical(&entries)?;
 
@@ -446,6 +461,7 @@ fn emit_manifest(
         optimized,
         chunks_total,
         chunks_written,
+        skipped_symlinks,
     })
 }
 
@@ -737,10 +753,18 @@ fn write_import_report(
         // import has no manifest, so surface the one blob's content hash. The
         // full file→hash map is reserved for `--json`.
         match (&report.bundle_hash, single_file_hash(report)) {
-            (Some(b), _) => writeln!(w, " (bundle {b})"),
-            (None, Some(h)) => writeln!(w, " ({h})"),
-            (None, None) => writeln!(w),
+            (Some(b), _) => writeln!(w, " (bundle {b})")?,
+            (None, Some(h)) => writeln!(w, " ({h})")?,
+            (None, None) => writeln!(w)?,
         }
+        if report.skipped_symlinks > 0 {
+            writeln!(
+                w,
+                "skipped {} symlink(s); pass --follow-symlinks to include",
+                report.skipped_symlinks
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -800,12 +824,13 @@ mod tests {
             optimized: false,
             chunks_total: 0,
             chunks_written: 0,
+            skipped_symlinks: 0,
         };
         let mut buf: Vec<u8> = Vec::new();
         write_import_report(&mut buf, &report, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(buf.trim_ascii_end()).unwrap();
         let obj = parsed.as_object().unwrap();
-        assert_eq!(obj.len(), 9);
+        assert_eq!(obj.len(), 10);
         assert_eq!(obj["imported"].as_u64(), Some(3));
         assert_eq!(obj["bytes"].as_u64(), Some(42));
         assert_eq!(obj["origin"].as_str(), Some("fs:/tmp/origin"));
@@ -816,6 +841,50 @@ mod tests {
         assert_eq!(obj["optimized"].as_bool(), Some(false));
         assert_eq!(obj["chunks_total"].as_u64(), Some(0));
         assert_eq!(obj["chunks_written"].as_u64(), Some(0));
+        assert_eq!(obj["skipped_symlinks"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn import_report_human_shows_skipped_symlinks_warning() {
+        let report = ImportReport {
+            imported: 1,
+            bytes: 10,
+            origin: "fs:/tmp/origin".into(),
+            files: BTreeMap::from([("a.txt".into(), "b3:aaaa".into())]),
+            bundle_hash: Some("b3:cafef00d".into()),
+            moved: false,
+            optimized: false,
+            chunks_total: 0,
+            chunks_written: 0,
+            skipped_symlinks: 2,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_import_report(&mut buf, &report, false).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert!(
+            line.contains("skipped 2 symlink(s); pass --follow-symlinks to include"),
+            "got: {line}"
+        );
+    }
+
+    #[test]
+    fn import_report_json_carries_skipped_symlinks() {
+        let report = ImportReport {
+            imported: 1,
+            bytes: 10,
+            origin: "fs:/tmp/origin".into(),
+            files: BTreeMap::from([("a.txt".into(), "b3:aaaa".into())]),
+            bundle_hash: Some("b3:cafef00d".into()),
+            moved: false,
+            optimized: false,
+            chunks_total: 0,
+            chunks_written: 0,
+            skipped_symlinks: 2,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_import_report(&mut buf, &report, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(buf.trim_ascii_end()).unwrap();
+        assert_eq!(parsed["skipped_symlinks"].as_u64(), Some(2));
     }
 
     #[test]
@@ -830,6 +899,7 @@ mod tests {
             optimized: true,
             chunks_total: 7,
             chunks_written: 5,
+            skipped_symlinks: 0,
         };
         let mut buf: Vec<u8> = Vec::new();
         write_import_report(&mut buf, &report, true).unwrap();
@@ -851,6 +921,7 @@ mod tests {
             optimized: true,
             chunks_total: 7,
             chunks_written: 5,
+            skipped_symlinks: 0,
         };
         let mut buf: Vec<u8> = Vec::new();
         write_import_report(&mut buf, &report, false).unwrap();
@@ -870,6 +941,7 @@ mod tests {
             optimized: false,
             chunks_total: 0,
             chunks_written: 0,
+            skipped_symlinks: 0,
         };
         let mut buf: Vec<u8> = Vec::new();
         write_import_report(&mut buf, &report, true).unwrap();
@@ -891,6 +963,7 @@ mod tests {
             optimized: false,
             chunks_total: 0,
             chunks_written: 0,
+            skipped_symlinks: 0,
         };
         let mut buf: Vec<u8> = Vec::new();
         write_import_report(&mut buf, &report, false).unwrap();
@@ -913,6 +986,7 @@ mod tests {
             optimized: false,
             chunks_total: 0,
             chunks_written: 0,
+            skipped_symlinks: 0,
         };
         let mut buf: Vec<u8> = Vec::new();
         write_import_report(&mut buf, &report, false).unwrap();
