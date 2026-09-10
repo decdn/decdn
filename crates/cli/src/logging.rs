@@ -109,6 +109,19 @@ pub fn attach_progress_bar(bar: indicatif::ProgressBar) -> indicatif::ProgressBa
     }
 }
 
+/// The [`indicatif::MultiProgress`] a multi-bar command (`bundle pull`) draws its
+/// bars into: the process-global one when a subscriber is installed — so its bars
+/// share stderr with log lines through [`indicatif::MultiProgress::suspend`] — or
+/// a fresh standalone container on the default silent path, where there are no log
+/// lines to coordinate with. Either way the bars stack coherently, and a
+/// non-terminal stderr auto-hides them.
+pub fn progress_container() -> indicatif::MultiProgress {
+    match PROGRESS.get() {
+        Some(progress) => progress.clone(),
+        None => indicatif::MultiProgress::new(),
+    }
+}
+
 /// [`tracing_subscriber::fmt::MakeWriter`] that emits each log line through
 /// [`indicatif::MultiProgress::suspend`], so writing never overlaps a redraw of
 /// the fetch progress bar.
