@@ -142,7 +142,7 @@ thiserror = "2"
 
 # Config
 toml = "1"
-dirs = "6"
+dirs = "7"
 
 # Misc
 bytes = "1"
