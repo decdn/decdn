@@ -463,11 +463,10 @@ fn resolve_bootstrap(
 
 /// Where a bootstrap peer set came from.
 ///
-/// The provenance is in the return type rather than in a log line because
-/// `decdn` installs no `tracing` subscriber — a warning here would reach
-/// nobody, and "the registry is down and this list may be months old" is
-/// exactly what a user must not miss. Callers render [`Self::warning`] to
-/// stderr and then take [`Self::into_peers`].
+/// The provenance is returned rather than logged from here so the caller
+/// decides how to surface "the registry is down and this list may be months
+/// old" — exactly what a user must not miss. Callers log [`Self::warning`] and
+/// then take [`Self::into_peers`].
 #[derive(Debug)]
 pub enum Bootstrap {
     /// Read live from the on-chain registry.
@@ -510,15 +509,14 @@ fn format_age_secs(age_secs: u64) -> String {
 }
 
 impl Bootstrap {
-    /// A line to print to stderr, or `None` when the bootstrap was wholly
-    /// healthy.
+    /// A degraded-bootstrap message for the caller to log at `WARN`, or `None`
+    /// when the bootstrap was wholly healthy. Carries no severity prefix — the
+    /// caller's log level supplies it.
     #[must_use]
     pub fn warning(&self) -> Option<String> {
         match self {
             Self::Live { store_warning, .. } => store_warning.as_ref().map(|e| {
-                format!(
-                    "warning: peer store write failed: {e} (selection may be degraded next run)"
-                )
+                format!("peer store write failed: {e} (selection may be degraded next run)")
             }),
             Self::Cached {
                 peers,
@@ -527,7 +525,7 @@ impl Bootstrap {
             } => {
                 let age = format_age_secs(now_secs().saturating_sub(*oldest_identity_secs));
                 Some(format!(
-                    "warning: could not reach the node registry ({registry_error}); using {} \
+                    "could not reach the node registry ({registry_error}); using {} \
                      previously known node(s) from the local peer store, identity up to {age} \
                      old. These nodes may have been deactivated or slashed since.",
                     peers.len()
@@ -553,7 +551,7 @@ impl Bootstrap {
 /// `data_dir` is the resolved client data dir, so an explicit `--data-dir`
 /// moves the peer store with the rest of the client's state.
 ///
-/// Callers must print [`Bootstrap::warning`] — the degraded paths are invisible
+/// Callers must log [`Bootstrap::warning`] — the degraded paths are invisible
 /// otherwise.
 ///
 /// # Errors
