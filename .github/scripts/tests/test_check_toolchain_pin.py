@@ -105,6 +105,17 @@ def test_a_comment_naming_the_action_is_not_a_site(tmp_path):
     assert ctp.check(repo) == []
 
 
+def test_a_yaml_extension_workflow_is_a_site_too(tmp_path):
+    """GitHub Actions accepts both spellings; a `.yaml` workflow must not escape."""
+    repo = build_repo(tmp_path, refs={"ci.yml": ["1.95.0"]})
+    (repo / ".github/workflows/extra.yaml").write_text(
+        "jobs:\n  build:\n    steps:\n      - uses: dtolnay/rust-toolchain@1.96.0\n"
+    )
+    errors = ctp.check(repo)
+    assert len(errors) == 1, errors
+    assert "extra.yaml:4" in errors[0]
+
+
 def test_missing_workspace_rust_version_is_a_failure(tmp_path):
     repo = build_repo(tmp_path)
     (repo / "Cargo.toml").write_text("[workspace]\nmembers = []\n")

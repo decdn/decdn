@@ -98,7 +98,7 @@ repos:
         name: rust version agrees across toolchain, manifest and workflows
         entry: .github/scripts/check-toolchain-pin.sh
         language: system
-        files: '^(rust-toolchain\.toml|Cargo\.toml|\.github/workflows/.*\.yml)$'
+        files: '^(rust-toolchain\.toml|Cargo\.toml|\.github/workflows/.*\.ya?ml)$'
         pass_filenames: false
 
       # A member that restates `version` ships its own number; one without

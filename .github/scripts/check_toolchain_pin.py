@@ -8,6 +8,7 @@ and none derivable from another:
     Cargo.toml            [workspace.package]        what cargo refuses to build
                           rust-version               with (the MSRV)
     .github/workflows/*   dtolnay/rust-toolchain@X   what CI actually compiles on
+    (.yml and .yaml)
 
 Nothing compares them. Dependabot's github-actions ecosystem bumps every
 action ref on its own and touches neither TOML file, so one merged Dependabot
@@ -66,7 +67,11 @@ def collect_sites(repo_root: Path) -> tuple[list[tuple[str, str]], list[str]]:
         sites.append(("Cargo.toml", str(rust_version)))
 
     refs = 0
-    for workflow in sorted((repo_root / ".github" / "workflows").glob("*.yml")):
+    # Both spellings: GitHub Actions reads `.yml` and `.yaml` alike, so a
+    # workflow added under the other extension must not escape the scan.
+    workflows_dir = repo_root / ".github" / "workflows"
+    workflows = sorted(list(workflows_dir.glob("*.yml")) + list(workflows_dir.glob("*.yaml")))
+    for workflow in workflows:
         for lineno, line in enumerate(workflow.read_text().splitlines(), start=1):
             for m in ACTION_REF.finditer(line):
                 refs += 1
