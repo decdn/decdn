@@ -158,6 +158,12 @@ walkdir = "2"
 globset = "0.4"
 blake3 = "1"
 
+# Content-defined chunking (`decdn origin import --optimize`): fastcdc's
+# v2020 module implements the rolling-hash chunk-boundary algorithm and
+# publishes its own min/avg/max structural bounds as constants, which
+# `ChunkSizes::resolve` validates against directly.
+fastcdc = "5"
+
 # HTTP client (used by cache-origin backend)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 

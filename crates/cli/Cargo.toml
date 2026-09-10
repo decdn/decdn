@@ -71,6 +71,10 @@ walkdir = { workspace = true }
 globset = { workspace = true }
 blake3 = { workspace = true }
 tempfile = { workspace = true }
+# `decdn origin import --optimize` (content-defined chunking): splits a
+# publisher file into `fastcdc::v2020` chunks so cross-file dedup can work at
+# chunk granularity instead of whole-file.
+fastcdc = { workspace = true }
 # `decdn fetch` (#1118) renders a delivery progress bar to stderr. TTY-aware, so
 # a piped/redirected fetch stays silent. Small dep tree (console, unicode-width),
 # unrelated to the iroh-blobs/AWS-free invariant above.

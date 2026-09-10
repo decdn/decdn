@@ -10,6 +10,7 @@ pub mod bond;
 pub mod bundle;
 pub mod bundle_pull;
 pub mod chain_ctx;
+pub mod chunker;
 pub mod config;
 pub mod deregister;
 pub mod doctor;
