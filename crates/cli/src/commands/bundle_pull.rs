@@ -558,12 +558,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     ctx.progress = PullProgress::new(args.json);
 
     let (outcomes, transfer) = ctx
-        .pull_all(
-            &manifest.entries,
-            &args.output,
-            args.overwrite,
-            args.jobs.max(1),
-        )
+        .pull_all(&manifest.entries, &args.output, args.overwrite)
         .await;
     ctx.progress.finish();
 
@@ -1008,8 +1003,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// Fetch every entry into `out_root`, one unit of work per *distinct* blob
     /// hash: entries sharing a hash (one file at two bundle paths) are fetched and
     /// reconstructed once, then materialized at each path (#1306) — never fetched,
-    /// nor *paid for*, twice. `buffer_unordered` polls up to `jobs` futures in
-    /// this one task (no `tokio::spawn`, by choice — nothing here is `!Send`);
+    /// nor *paid for*, twice. Every unit of work is offered to `buffer_unordered`
+    /// at once (no `tokio::spawn`, by choice — nothing here is `!Send`);
+    /// `PullCtx.gate` is the real `--jobs` cap on in-flight fetches, so
     /// parallelism comes from concurrent in-flight network I/O, while the
     /// per-provider locks inside `fetch_to_staging_from` serialize same-lane
     /// access — now over unique blobs.
@@ -1018,7 +1014,6 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         entries: &[ManifestEntry],
         out_root: &Path,
         overwrite: bool,
-        jobs: usize,
     ) -> (Vec<EntryOutcome>, Transfer) {
         // Whole-file entries take the by-hash grouping path (fetch-once +
         // link-duplicates, #1306); chunked entries take the concatenation path
@@ -1042,10 +1037,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .collect();
 
         let (mut outcomes, plain_bytes) = self
-            .pull_plain(&plain, out_root, overwrite, jobs, &chunk_keep)
+            .pull_plain(&plain, out_root, overwrite, &chunk_keep)
             .await;
         let (chunked_outcomes, chunked_bytes) =
-            self.pull_chunked(&chunked, out_root, overwrite, jobs).await;
+            self.pull_chunked(&chunked, out_root, overwrite).await;
         outcomes.extend(chunked_outcomes);
         (outcomes, plain_bytes.add(chunked_bytes))
     }
@@ -1053,18 +1048,21 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// The whole-file path: fetch every distinct blob once (grouped by hash) and
     /// materialize it at each destination path (#1306). A group whose hash is in
     /// `keep` (also a chunk of some chunked entry) leaves its staging blob in place
-    /// for the chunked phase to reuse.
+    /// for the chunked phase to reuse. Every group is offered at once;
+    /// `PullCtx.gate` is the real cap on in-flight fetches.
     async fn pull_plain(
         &self,
         entries: &[&ManifestEntry],
         out_root: &Path,
         overwrite: bool,
-        jobs: usize,
         keep: &HashSet<[u8; 32]>,
     ) -> (Vec<EntryOutcome>, Transfer) {
-        let groups: Vec<Vec<EntryOutcome>> = futures_util::stream::iter(group_by_hash(entries))
+        // Offered unbounded; PullCtx.gate is the global --jobs cap.
+        let groups_by_hash = group_by_hash(entries);
+        let group_count = groups_by_hash.len().max(1);
+        let groups: Vec<Vec<EntryOutcome>> = futures_util::stream::iter(groups_by_hash)
             .map(|group| self.fetch_group(group, out_root, overwrite, keep))
-            .buffer_unordered(jobs)
+            .buffer_unordered(group_count)
             .collect::<Vec<Vec<EntryOutcome>>>()
             .await;
         // Byte tally is per-group (a blob pulled once, materialized to N paths),
@@ -1077,8 +1075,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         (outcomes, transfer)
     }
 
-    /// The concatenation path for chunked entries, one unit of work per *file*
-    /// (bounded by `jobs`) so at most `jobs` per-file bars are live at once:
+    /// The concatenation path for chunked entries, one unit of work per *file*.
+    /// Every file is offered at once; `PullCtx.gate` (acquired inside
+    /// `fetch_to_staging`) is the real cap on in-flight fetches:
     ///
     /// 1. **Fetch** each of a file's chunks — the first file to need a distinct
     ///    chunk fetches and **pays for it once** through the shared `claims`
@@ -1097,7 +1096,6 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         entries: &[&ManifestEntry],
         out_root: &Path,
         overwrite: bool,
-        jobs: usize,
     ) -> (Vec<EntryOutcome>, Transfer) {
         if entries.is_empty() {
             return (Vec::new(), Transfer::default());
@@ -1126,8 +1124,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let claims: tokio::sync::Mutex<HashMap<[u8; 32], ChunkCell>> =
             tokio::sync::Mutex::new(HashMap::new());
 
-        // One future per FILE, bounded by `jobs`; results carry their plan index so
-        // the outcome vector is restored to manifest order after the unordered run.
+        // One future per FILE, offered unbounded — `PullCtx.gate` is the global
+        // --jobs cap; results carry their plan index so the outcome vector is
+        // restored to manifest order after the unordered run.
+        let plan_count = plans.len().max(1);
         let mut indexed: Vec<(usize, EntryOutcome)> =
             futures_util::stream::iter(plans.iter().enumerate())
                 .map(|(idx, plan)| {
@@ -1137,7 +1137,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                         (idx, outcome)
                     }
                 })
-                .buffer_unordered(jobs)
+                .buffer_unordered(plan_count)
                 .collect::<Vec<_>>()
                 .await;
         indexed.sort_by_key(|(idx, _)| *idx);
@@ -1218,38 +1218,52 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let cf = self.progress.chunked_file(label);
 
         // Resolve every chunk (fetch-once or reuse), collecting the per-chunk
-        // results this file needs for assembly.
-        let mut file_fetched: HashMap<[u8; 32], Result<u64, String>> = HashMap::new();
-        for &chunk_hash in chunks {
-            let cell = {
-                let mut guard = claims.lock().await;
-                Arc::clone(
-                    guard
-                        .entry(chunk_hash)
-                        .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
-                )
-            };
-            // A private flag the fetch closure flips — only the file that actually
-            // runs the fetch sets it, so a reusing file knows to jump its bar.
-            let i_fetched = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let ran = Arc::clone(&i_fetched);
-            let cb = cf.chunk_callback();
-            let result = cell
-                .get_or_init(|| async move {
-                    ran.store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.fetch_chunk_staged(chunk_hash, out_root, cb.as_deref())
-                        .await
+        // results this file needs for assembly. All of the file's chunks are
+        // offered at once — `PullCtx.gate` (acquired inside `fetch_to_staging`)
+        // is the true cap on in-flight fetches, so this stream just needs to be
+        // generous enough not to itself become a bottleneck.
+        let results: Vec<([u8; 32], Result<u64, String>)> =
+            futures_util::stream::iter(chunks.iter().copied())
+                .map(|chunk_hash| {
+                    let cf = &cf;
+                    async move {
+                        let cell = {
+                            let mut guard = claims.lock().await;
+                            Arc::clone(
+                                guard
+                                    .entry(chunk_hash)
+                                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+                            )
+                        };
+                        // A private flag the fetch closure flips — only the file
+                        // that actually runs the fetch sets it, so a reusing file
+                        // knows to jump its bar.
+                        let i_fetched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let ran = Arc::clone(&i_fetched);
+                        let cb = cf.chunk_callback();
+                        let result = cell
+                            .get_or_init(|| async move {
+                                ran.store(true, std::sync::atomic::Ordering::Relaxed);
+                                self.fetch_chunk_staged(chunk_hash, out_root, cb.as_deref())
+                                    .await
+                            })
+                            .await
+                            .clone();
+                        if !i_fetched.load(std::sync::atomic::Ordering::Relaxed)
+                            && let Ok(size) = &result
+                        {
+                            // Reused a chunk another file fetched: its callback
+                            // never fired here, so advance this file's bar by the
+                            // whole chunk at once.
+                            cf.advance_reused(*size);
+                        }
+                        (chunk_hash, result)
+                    }
                 })
+                .buffer_unordered(chunks.len().max(1))
+                .collect()
                 .await;
-            if !i_fetched.load(std::sync::atomic::Ordering::Relaxed)
-                && let Ok(size) = result
-            {
-                // Reused a chunk another file fetched: its callback never fired
-                // here, so advance this file's bar by the whole chunk at once.
-                cf.advance_reused(*size);
-            }
-            file_fetched.insert(chunk_hash, result.clone());
-        }
+        let file_fetched: HashMap<[u8; 32], Result<u64, String>> = results.into_iter().collect();
 
         let outcome = assemble_plan(plan, out_root, &file_fetched);
         cf.finish();
