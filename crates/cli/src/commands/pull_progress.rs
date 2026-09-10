@@ -83,16 +83,6 @@ impl PullProgress {
         Self { inner: None }
     }
 
-    /// Run `f` with the bars cleared for the duration of its stderr write, so a
-    /// fail-over notice printed mid-run does not tear the bars. A plain
-    /// passthrough when disabled.
-    pub(crate) fn suspend<F: FnOnce() -> R, R>(&self, f: F) -> R {
-        match &self.inner {
-            Some(i) => i.mp.suspend(f),
-            None => f(),
-        }
-    }
-
     /// A per-file bar for a whole-blob pull, labeled `label` and inserted above the
     /// total bar. `size_estimate` (the manifest's content size, when declared) sets
     /// an initial length so the bar reads sensibly during the pre-byte handshake;

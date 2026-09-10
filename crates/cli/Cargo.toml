@@ -77,8 +77,12 @@ tempfile = { workspace = true }
 indicatif = { workspace = true }
 # Opt-in client-side logging (`--log-level` / `RUST_LOG`): the CLI installs no
 # subscriber by default, so verbose fetch/incentive/iroh spans are diagnosable
-# on demand without disturbing the terminal UI. Already in this binary's tree
-# via `decdn-node`'s daemon path; env-filter + fmt only.
+# on demand without disturbing the terminal UI. The `fetch`/`bundle pull`
+# commands emit their own status and warning spans through these macros, so the
+# routing narration is silent by default and visible at the requested level.
+# Already in this binary's tree via `decdn-node`'s daemon path; env-filter + fmt
+# only.
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # `node top` (issue #275) scrapes the daemon's loopback /metrics HTTP
 # endpoint. Workspace-pinned with rustls + no default features — same
