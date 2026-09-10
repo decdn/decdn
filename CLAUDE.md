@@ -4,8 +4,7 @@
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC shared payment pools. Rust implementation; the initial network deployment targets tens of nodes on an Arbitrum Sepolia testnet. "PoC" in code and ADR comments refers to that network-scale milestone, not contract-surface scope — the on-chain surface ships at full production shape with governance-tunable economics from day one (see [ADR 016 § Contract Inventory](adr/016-contract-interactions.md) and [§ Tunable Economics](adr/016-contract-interactions.md#tunable-economics)).
 
-**Status: Early implementation.** Cargo workspace with 11 crates and two binaries (#421): the `node` crate builds the `decdn-node` daemon (runtime bring-up, admin RPC server, dispatch limiter, probe handler); the `cli` crate builds the user-facing `decdn` binary (`probe`, `node {health,region-stats,drain,evict,reload}`, `key-gen`, `config {…}`, `bundle {pull}`, `origin {import}` with
-`--optimize` / `--dry-run`). See the [Crate Structure](#crate-structure) section for what each crate owns. No crate is a stub.
+**Status: Early implementation.** Cargo workspace with 11 crates and two binaries (#421): the `node` crate builds the `decdn-node` daemon (runtime bring-up, admin RPC server, dispatch limiter, probe handler); the `cli` crate builds the user-facing `decdn` binary (`key-gen`, `whoami`, `config {…}`, `probe`, `fetch`, `setup`, `node {…}`, `bundle {pull}`, `origin {import}`, `pool {…}`, `publish {…}`, `appeal {slash}`). See the [Crate Structure](#crate-structure) section for what each crate owns. No crate is a stub.
 
 **Pre-launch: wire-breaking changes are fine.** Nothing is deployed and there are no live peers. Do not add backward-compatibility shims, version negotiation, dual-format readers, or migration paths for wire, postcard, ABI, config, or storage changes. Change the format, update every side in the same PR, and delete the old shape. Compatibility work only becomes real after the first public deployment.
 
@@ -17,9 +16,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-
 
 **ADRs.** ADRs live in `adr/`. They are the primary design artifacts. `adr/architecture.md` is the living overview. See [CONTRIBUTING.md](CONTRIBUTING.md) for ADR conventions.
 
-- The next ADR number is 040. Name each file `NNN-topic.md`. Use a 3-digit prefix.
+- The next ADR number is 042. Name each file `NNN-topic.md`. Use a 3-digit prefix.
 - List `adr/` and find the highest number before you make a new ADR. Do not trust this note for the current number.
-- Do not use these numbers again: 004, 006, 010, 015, 027, 029, 031, 032, 033, 034, 035. Each one is retired or reclassified.
+- Do not use these numbers again: 004, 006, 007, 010, 015, 020, 021, 023, 025, 027, 029, 031, 032, 033, 034, 035. Each one is retired or reclassified.
 - Retired ADRs move to `adr/_history/`. Read the file there if you need the history. Do not add the history to this file.
 - Write ADRs in ASD-STE100 Simplified Technical English: short sentences, active voice, present tense, one idea per sentence. Every ADR follows this. Keep new ADRs and edits the same.
 
@@ -61,7 +60,7 @@ Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots
 ```
 crates/
   node/         — daemon binary `decdn-node`: runtime bring-up, handlers, admin RPC server, dispatch limiter
-  cli/          — user CLI binary `decdn`: probe, node admin, key-gen, config, bundle, origin import
+  cli/          — user CLI binary `decdn`: every command a human types (see the Status note above for the group list)
   common/       — shared types: config schema + resolver, identity loading, AdminRpc trait + DTOs
   protocol/     — shared types, wire format, ALPN message definitions (leaf crate, minimal deps)
   config-types/ — config-vocabulary value types (RetryPolicy, DecompressMode, OriginUrl, OriginKind, Hash, PinnedHashes) shared by cache + common (leaf crate: serde + url + anyhow, no iroh-blobs / no AWS — #578)

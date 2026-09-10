@@ -1,7 +1,7 @@
 //! Arguments for the `decdn node` subcommand group.
 //!
 //! `node` is the operator-local admin namespace: subcommands talk to the
-//! loopback admin HTTP surface (ADR 025) exposed by a running node.
+//! loopback admin HTTP surface (`adr/appendix-local-admin-http.md`) exposed by a running node.
 
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -81,7 +81,7 @@ pub enum NodeCommand {
     /// a path on disk there's nothing to re-read.
     Reload(ReloadArgs),
     /// Trigger graceful shutdown of the running node via `admin_v1_drain`
-    /// (issue #244, ADR 025). Equivalent to `kill -TERM <pid>` but goes
+    /// (issue #244, `adr/appendix-local-admin-http.md`). Equivalent to `kill -TERM <pid>` but goes
     /// through the loopback admin surface, so operator tooling that already
     /// speaks JSON-RPC doesn't need to also know which PID to signal. The
     /// runtime begins the same graceful shutdown sequence SIGTERM triggers
@@ -421,7 +421,7 @@ pub struct ReloadArgs {
 }
 
 /// `decdn node drain` — trigger graceful shutdown of the running node via
-/// `admin_v1_drain` (issue #244, ADR 025). Fires the same runtime shutdown
+/// `admin_v1_drain` (issue #244, `adr/appendix-local-admin-http.md`). Fires the same runtime shutdown
 /// path as SIGTERM without needing the process PID.
 ///
 /// Without `--wait`, the command is fire-and-forget: it returns

@@ -55,8 +55,8 @@ friendly redirect — operators starting the daemon use `decdn-node run`.
 
 ### Why the `node` admin namespace lives on `decdn`, not `decdn-node`
 
-Operator-local admin (`health`, `region-stats`, `evict`, `reload`,
-`drain`) is loopback-HTTP-only per the [ADR 025 admin appendix](appendix-local-admin-http.md#appendix-local-admin-http-surface):
+Operator-local admin (`health`, `status`, `evict`, `reload`,
+`drain`) is loopback-HTTP-only per the [admin appendix](appendix-local-admin-http.md#appendix-local-admin-http-surface):
 the binary running the commands need not be the daemon, just on the
 daemon's host. So the `node` namespace fits the user CLI naturally —
 operators don't track which binary owns it, the daemon stays focused

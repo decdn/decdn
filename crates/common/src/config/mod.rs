@@ -53,7 +53,7 @@ pub const DEFAULT_METRICS_PORT: u16 = 9090;
 /// Default metrics bind address (loopback). Operators in containerised
 /// deployments override to `0.0.0.0` via CLI/env/config.
 const DEFAULT_METRICS_BIND: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-/// Default loopback admin HTTP port (ADR 025). Exposed to the rest of
+/// Default loopback admin HTTP port (`appendix-local-admin-http.md`). Exposed to the rest of
 /// the `node` crate so `decdn node <sub>` clients can fall back to the
 /// same default the server binds on, without duplicating the number.
 pub const DEFAULT_ADMIN_PORT: u16 = 9191;

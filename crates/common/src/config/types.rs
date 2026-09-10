@@ -1155,7 +1155,7 @@ pub struct ObservabilityConfig {
     /// IP address to bind the metrics HTTP server on. Defaults to
     /// `127.0.0.1`. Set to `0.0.0.0` for containerised deployments.
     pub metrics_bind: Option<std::net::IpAddr>,
-    /// Loopback admin HTTP port (ADR 025). Explicit `0` disables the
+    /// Loopback admin HTTP port (`appendix-local-admin-http.md`). Explicit `0` disables the
     /// admin server; if the key is absent, resolution defaults to
     /// `9191`. Any positive value binds on `127.0.0.1:<port>`.
     pub admin_port: Option<u16>,

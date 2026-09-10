@@ -176,7 +176,7 @@ pub struct DecdnMetrics {
     /// Seconds since node start.
     pub node_uptime_seconds: Gauge,
     /// JSON-RPC endpoint reachability per the watchdog task. `1` =
-    /// reachable, `0` = unreachable. ADR 020 names operational gauges in
+    /// reachable, `0` = unreachable. `adr/appendix-observability.md` names operational gauges in
     /// the `decdn_*` family; this is the per-tick mirror of the startup
     /// `check_rpc_reachability` probe so dashboards/alerts can fire on
     /// a sustained outage rather than relying on a one-shot startup line.
@@ -1511,7 +1511,7 @@ impl Metrics {
 
     /// Register iroh's transport metrics under the `decdn_iroh_` prefix so
     /// `magicsock_*`, `net_report_*`, etc. come out as
-    /// `decdn_iroh_magicsock_*`, matching ADR 020's naming convention.
+    /// `decdn_iroh_magicsock_*`, matching `adr/appendix-observability.md`'s naming convention.
     ///
     /// # Errors
     ///

@@ -1048,7 +1048,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # log_format = "pretty"
 # metrics_port = 9090
 # metrics_bind = "127.0.0.1"               # IP the metrics HTTP server binds; default loopback only
-# admin_port = 9191                        # loopback-only; 0 disables (ADR 025)
+# admin_port = 9191                        # loopback-only; 0 disables (appendix-local-admin-http.md)
 # otlp_endpoint = "http://localhost:4317"  # requires --features otlp
 
 [security]

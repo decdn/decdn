@@ -56,19 +56,21 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 /// User-facing deCDN CLI. The daemon lives in the separate `decdn-node`
-/// binary; this CLI is what you type from a terminal — probe, node admin,
-/// key-gen, config.
+/// binary; this CLI is what you type from a terminal — probe, fetch, pools,
+/// publishing, node admin.
 #[derive(Parser, Debug)]
 #[command(
     name = "decdn",
     version,
-    about = "deCDN user CLI — probe, node admin, key-gen, config",
+    about = "deCDN user CLI — probe, fetch, pools, publishing, node admin",
     long_about = "User-facing deCDN CLI. Pairs with the `decdn-node` daemon: \
                   this binary carries every command a human types in a \
-                  terminal (probe, node admin, key-gen, config). The \
+                  terminal (probe, fetch, payment pools, publishing, \
+                  origin import, node admin, key-gen, config). The \
                   `node` subcommand group talks to a running daemon over \
-                  the loopback admin RPC surface (ADR 025) and fails \
-                  cleanly on a host with no daemon running."
+                  the loopback admin RPC surface \
+                  (`appendix-local-admin-http.md`) and fails cleanly on a \
+                  host with no daemon running."
 )]
 pub struct Cli {
     /// Path to TOML config file [default: ~/.decdn/node.toml].
@@ -114,21 +116,21 @@ pub enum Command {
     /// `node register` — submits no transaction the primitives don't.
     Setup(SetupArgs),
     /// Operator-local admin commands that query a running node
-    /// over its loopback HTTP surface (ADR 025).
+    /// over its loopback HTTP surface (`appendix-local-admin-http.md`).
     Node(NodeArgs),
-    /// Build and (eventually) fetch directory bundles — a JSON manifest
-    /// linking BLAKE3-content-addressed blobs by relative path. See
-    /// `appendix-bundles.md` for the format and issue #391 for status.
+    /// Fetch directory bundles — a JSON manifest linking
+    /// BLAKE3-content-addressed blobs by relative path. See
+    /// `appendix-bundles.md` for the format.
     Bundle(BundleArgs),
     /// Seed a cache origin store from local content (`import`) — offline,
     /// config-free filesystem work that writes each blob's sharded data object
     /// and its `{hex}.obao4` outboard in the layout the daemon reads (ADR 037).
     Origin(OriginArgs),
     /// Client-side payment-pool lifecycle (`list`/`status`, `open`, `top-up`,
-    /// `close`, `reclaim`).
+    /// `close`, `reclaim`, `assign`).
     Pool(PoolArgs),
-    /// Publisher control plane: create namespaces, request publisher vetting,
-    /// and seat or unseat authorized origins on-chain (issues #1029 / #1491).
+    /// Publisher control plane: create namespaces, and seat or unseat
+    /// authorized origins on-chain (issues #1029 / #1491).
     /// Content is bound to a namespace off-chain at fetch time, so there is no
     /// per-hash on-chain claim.
     Publish(PublishArgs),

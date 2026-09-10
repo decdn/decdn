@@ -6,7 +6,7 @@
 //! the exact layout the daemon reads back. It is offline, config-free local
 //! work — no running daemon, no `node.toml`, no chain — so it lives in its own
 //! group rather than under `decdn node` (whose every subcommand talks to a
-//! running node over the loopback admin surface, ADR 025).
+//! running node over the loopback admin surface, `appendix-local-admin-http.md`).
 //!
 //! The hash + outboard computation is backend-independent (an origin store is
 //! content-addressed with an identical object layout across the fs and s3

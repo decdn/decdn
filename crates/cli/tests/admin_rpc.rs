@@ -1,4 +1,4 @@
-//! Integration tests for the loopback admin JSON-RPC surface (ADR 025).
+//! Integration tests for the loopback admin JSON-RPC surface (`appendix-local-admin-http.md`).
 //!
 //! Spawns the admin server directly and verifies each RPC method round-
 //! trips through real HTTP via jsonrpsee's generated client bindings.

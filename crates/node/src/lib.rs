@@ -1,5 +1,5 @@
 //! deCDN node daemon library — runtime, handlers, dispatch rate limiting,
-//! metrics, and the admin RPC server (ADR 025).
+//! metrics, and the admin RPC server (`appendix-local-admin-http.md`).
 //!
 //! The binary target (`src/main.rs`) is a thin clap shell: parse `--config`
 //! plus a single `run` subcommand and call into [`commands::run`].

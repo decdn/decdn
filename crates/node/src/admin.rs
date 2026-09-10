@@ -1,4 +1,4 @@
-//! Loopback-only admin JSON-RPC server (ADR 025).
+//! Loopback-only admin JSON-RPC server (`appendix-local-admin-http.md`).
 //!
 //! Wire types (the `AdminRpc` trait, DTOs, error codes, [`parse_hash_arg`]) live
 //! in [`decdn_common::admin`] so the user-facing `decdn` CLI can speak the
