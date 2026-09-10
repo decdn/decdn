@@ -296,7 +296,7 @@ pub async fn reload(args: &cli::ReloadArgs, global_config: Option<&Path>) -> any
 }
 
 /// `decdn node drain`: call `admin_v1_drain` on the running node to trigger
-/// graceful shutdown (issue #244, ADR 025).
+/// graceful shutdown (issue #244, `appendix-local-admin-http.md`).
 ///
 /// Without `--wait`: fire-and-forget — returns `drain_initiated=true` as
 /// soon as the trigger is queued; observe completion via process exit

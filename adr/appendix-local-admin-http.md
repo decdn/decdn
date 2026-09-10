@@ -87,5 +87,5 @@ CLI shape:
 
 - `crates/common/src/admin.rs` defines the `AdminRpc` trait with `#[rpc(server, client, namespace = "admin_v1")]`, the JSON DTOs, error code constants, and the `parse_hash_arg` helper; both binaries import from there.
 - `crates/node/src/admin.rs` carries the daemon-side server impl: `AdminState` (the cache, reload hook, drain trigger), `AdminRpcImpl`, and the `bind` / `serve` helpers.
-- JSON DTOs (`HealthResponse`, `DrainResponse`, `RegionStatsResponse`, etc.) live in the shared crate rather than derived from internal types, so the wire format stays stable when internal structs change.
+- JSON DTOs (`HealthResponse`, `StatusResponse`, `DrainResponse`, etc.) live in the shared crate rather than derived from internal types, so the wire format stays stable when internal structs change.
 - `decdn node health` lives in `crates/cli/src/commands/node.rs` and uses `jsonrpsee::http_client::HttpClient` with the generated `AdminRpcClient` trait — no hand-rolled JSON or HTTP on the client side.

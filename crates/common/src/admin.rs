@@ -1,4 +1,4 @@
-//! Wire types for the loopback admin JSON-RPC surface (ADR 025).
+//! Wire types for the loopback admin JSON-RPC surface (`appendix-local-admin-http.md`).
 //!
 //! Shared between the daemon (which implements [`AdminRpcServer`] over a
 //! local cache + peer table) and the user CLI (which speaks
@@ -250,7 +250,7 @@ pub struct DrainRequest {
     /// #604). This is the opt-in seam for `decdn node drain --wait`: the
     /// CLI polls `admin_v1_health` for `in_flight_streams == 0` and the
     /// admin port must stay open long enough for that loop to observe
-    /// completion. Default `false` preserves the deliberate ADR-025
+    /// completion. Default `false` preserves the deliberate
     /// SIGTERM ordering (admin closes before `router.shutdown`); setting
     /// `true` only reorders that single drain.
     #[serde(default)]
@@ -272,7 +272,7 @@ pub struct DrainResponse {
     /// shutdown sequence is underway. "Initiated", not "completed":
     /// when `wait_admin_honored` is `false`, the admin server may
     /// close before the response itself is delivered (the original
-    /// ADR-025 ordering).
+    /// default ordering).
     pub initiated: bool,
     /// `true` when the server received `wait_admin: true` *and* is
     /// keeping admin alive through `router.shutdown` on this drain.
@@ -604,7 +604,7 @@ pub trait AdminRpc {
     async fn reload(&self) -> RpcResult<ReloadResponse>;
 
     /// Trigger graceful shutdown via the same path SIGTERM exercises (issue
-    /// #244, ADR 025). Stops the iroh router's accept loop and awaits
+    /// #244, `appendix-local-admin-http.md`). Stops the iroh router's accept loop and awaits
     /// in-flight `ProtocolHandler::shutdown` calls; the subsequent task
     /// drain is bounded by the runtime's 15s `SHUTDOWN_DEADLINE` (the
     /// router-shutdown step itself is unbounded — a stuck handler hangs
