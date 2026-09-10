@@ -393,6 +393,20 @@ where
 {
     let total_bytes = store.total_bytes();
 
+    // Surface the already-present resume base on the progress bar immediately —
+    // before the pre-fetch window (channel open, first chunk). `fill_gap`'s
+    // per-gap reporter fires only from inside `ingest_stream` once streaming
+    // begins (as `base_present + received`), so without this a resumed blob's bar
+    // sits at `0` until the first byte arrives, then jumps to the resume point.
+    // This is exactly the value that reporter emits at `received == 0`: content
+    // bytes, matching the reporter's own unit and whole-blob `total_bytes`
+    // denominator. A no-op on the node's serve legs, which pass `on_progress =
+    // None`.
+    if let Some(cb) = on_progress {
+        let base_present = ranges_content_len(&store.present_ranges().await?, total_bytes);
+        cb(base_present, total_bytes);
+    }
+
     let missing = store.missing_ranges(offset, len).await?;
     let gaps = contiguous_byte_ranges(&missing, total_bytes);
 
@@ -917,7 +931,8 @@ mod tests {
     };
     use decdn_incentive::DepositOutcome;
 
-    use super::{DriveConfig, contiguous_byte_ranges, drive};
+    use super::{DriveConfig, contiguous_byte_ranges, drive, ranges_content_len};
+    use crate::ProgressCallback;
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState};
     use crate::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
     use crate::{
@@ -1109,6 +1124,83 @@ mod tests {
     async fn disjoint_holds_leave_three_gaps() {
         // Hold groups 1 and 3 of a 5-group blob -> gaps [0], [2], [4].
         assert_drives_only_gaps(5 * GROUP, &[(GROUP, GROUP), (3 * GROUP, GROUP)], 3).await;
+    }
+
+    /// A resumed drive surfaces the already-present base on the progress bar
+    /// BEFORE the first chunk is delivered: the very first `on_progress` position
+    /// is the held prefix's content length (against the whole-blob total), not
+    /// `0` and not `base + first-chunk`. `fill_gap`'s per-gap reporter fires only
+    /// from inside `ingest_stream` once streaming begins, so without the
+    /// pre-stream emit a resumed blob's bar sits at `0` through the pre-fetch
+    /// window (discovery, channel open, pool resolve), then jumps to the resume
+    /// point on the first delivered chunk.
+    #[tokio::test]
+    async fn resume_base_is_reported_before_the_first_chunk() {
+        let total = 4 * GROUP;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+
+        // Hold the first two groups: the resume base is two groups of content.
+        let held = align_range(0, 2 * GROUP, total).expect("align held");
+        preadmit(&store, &plaintext, &outboard, &held).await;
+        let base_present =
+            ranges_content_len(&store.present_ranges().await.expect("present"), total);
+        assert_eq!(base_present, 2 * GROUP, "scenario: two groups held");
+
+        let samples: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let cb_samples = Arc::clone(&samples);
+        let on_progress: Box<ProgressCallback> = Box::new(move |received, expected| {
+            if let Ok(mut s) = cb_samples.lock() {
+                s.push((received, expected));
+            }
+        });
+
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        let pacer = BudgetPacer::new();
+        let funder = healthy_funder();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+
+        drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &config(),
+            Some(&on_progress),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("drive resumes");
+
+        let samples = samples.lock().expect("samples lock").clone();
+        let first = *samples.first().expect("at least one progress sample");
+        assert_eq!(
+            first,
+            (base_present, total),
+            "the first reported position must be the resume base, emitted before \
+             the first delivered chunk"
+        );
+        // And it never regresses and reaches the whole blob.
+        let mut prev = 0u64;
+        for (received, expected) in &samples {
+            assert_eq!(*expected, total, "the total stays the whole-blob size");
+            assert!(
+                *received >= prev,
+                "progress regressed: {received} after {prev}"
+            );
+            prev = *received;
+        }
+        assert_eq!(prev, total, "the final position reaches the whole blob");
     }
 
     #[tokio::test]
