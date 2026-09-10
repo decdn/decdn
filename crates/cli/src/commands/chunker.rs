@@ -5,16 +5,8 @@ use anyhow::{Result, bail};
 use decdn_protocol::client::MB_BYTES;
 use fastcdc::v2020;
 
-/// Validated fastcdc chunk-size triple (bytes). fastcdc takes `u32`.
-// `chunk_file` (the streaming consumer that builds a `StreamCDC` from this
-// triple) lands separately; until it does, the struct is only constructed
-// by its own tests, so non-test builds see it as dead. `#[allow]`, not
-// `#[expect]`: the lint only fires outside `cfg(test)`, and an `#[expect]`
-// would go unfulfilled in the test build that exercises this type.
-#[allow(
-    dead_code,
-    reason = "consumed by chunk_file, added in a follow-up change"
-)]
+/// Validated fastcdc chunk-size triple (bytes). fastcdc v2020 takes `usize`;
+/// this struct stores `u32` (bounded <= 16 MiB) and widens at the call site.
 pub(crate) struct ChunkSizes {
     /// Minimum chunk size in bytes.
     pub(crate) min: u32,
@@ -33,7 +25,7 @@ impl ChunkSizes {
     /// never fire.
     #[allow(
         dead_code,
-        reason = "consumed by chunk_file, added in a follow-up change"
+        reason = "wired to a CLI flag in a follow-up change; exercised by tests and chunk_file's own test helpers today"
     )]
     pub(crate) fn resolve(avg: u64, min: Option<u64>, max: Option<u64>) -> Result<Self> {
         if !avg.is_power_of_two() {
@@ -83,6 +75,75 @@ impl ChunkSizes {
     }
 }
 
+/// A file's whole-file identity plus its ordered chunk decomposition.
+// `chunk_file` is only wired to a CLI flag in a follow-up change; until then
+// this type is constructed solely by `chunk_file`'s own tests, so non-test
+// builds see it as dead. `#[allow]`, not `#[expect]`: the lint only fires
+// outside `cfg(test)`, and an `#[expect]` would go unfulfilled in the test
+// build that exercises this type.
+#[allow(
+    dead_code,
+    reason = "constructed by chunk_file, wired to a CLI flag in a follow-up change"
+)]
+pub(crate) struct ChunkedFile {
+    /// BLAKE3 of the whole file — the manifest entry's end-to-end validator.
+    pub(crate) whole_hash: blake3::Hash,
+    /// Sum of the chunk sizes; equals the file length.
+    pub(crate) total_size: u64,
+    /// Chunks in content order (the file is their concatenation).
+    pub(crate) chunks: Vec<crate::commands::manifest::Chunk>,
+}
+
+/// Stream `source` through fastcdc v2020. For each chunk, in content order:
+/// feed its bytes to a whole-file BLAKE3 hasher, BLAKE3 the chunk (its content
+/// address), invoke `sink(chunk_hash, bytes)` (the caller writes the blob, or
+/// no-ops in dry-run), and record the `Chunk`. Returns the whole-file hash, the
+/// summed size, and the ordered chunk list.
+#[allow(
+    dead_code,
+    reason = "wired to a CLI flag in a follow-up change; exercised by tests today"
+)]
+pub(crate) fn chunk_file<R, F>(source: R, sizes: &ChunkSizes, mut sink: F) -> Result<ChunkedFile>
+where
+    R: std::io::Read,
+    F: FnMut(blake3::Hash, &[u8]) -> Result<()>,
+{
+    use crate::commands::manifest::{Chunk, b3_hex_str};
+
+    let mut whole = blake3::Hasher::new();
+    let mut total: u64 = 0;
+    let mut chunks: Vec<Chunk> = Vec::new();
+
+    // fastcdc v2020's StreamCDC::new takes `usize` sizes; ChunkSizes stores
+    // `u32` (bounded <= 16 MiB), so widen here via try_from (infallible on all
+    // real >=32-bit targets; never `as`).
+    let min = usize::try_from(sizes.min).map_err(|_| anyhow::anyhow!("chunk min exceeds usize"))?;
+    let avg = usize::try_from(sizes.avg).map_err(|_| anyhow::anyhow!("chunk avg exceeds usize"))?;
+    let max = usize::try_from(sizes.max).map_err(|_| anyhow::anyhow!("chunk max exceeds usize"))?;
+    let chunker = v2020::StreamCDC::new(source, min, avg, max);
+    for result in chunker {
+        let chunk = result.map_err(|e| anyhow::anyhow!("fastcdc streaming error: {e}"))?;
+        let data = chunk.data.as_slice();
+        whole.update(data);
+        let size = u64::try_from(chunk.length)
+            .map_err(|_| anyhow::anyhow!("chunk length {} exceeds u64", chunk.length))?;
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("total size overflow"))?;
+        let chash = blake3::hash(data);
+        sink(chash, data)?;
+        chunks.push(Chunk {
+            hash: b3_hex_str(chash),
+            size,
+        });
+    }
+    Ok(ChunkedFile {
+        whole_hash: whole.finalize(),
+        total_size: total,
+        chunks,
+    })
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -92,6 +153,94 @@ impl ChunkSizes {
 )]
 mod tests {
     use super::*;
+    use crate::commands::manifest::b3_hex_str;
+
+    // Deterministic pseudo-random bytes so chunk boundaries actually form.
+    fn pseudo(seed: u64, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        while out.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn sizes() -> ChunkSizes {
+        ChunkSizes::resolve(4 * 1024 * 1024, None, None).unwrap()
+    }
+
+    #[test]
+    fn whole_hash_and_total_match_direct_blake3() {
+        let data = pseudo(1, 20 * 1024 * 1024);
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let cf = chunk_file(&data[..], &sizes(), |_h, b| {
+            seen.push(b.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(cf.whole_hash, blake3::hash(&data));
+        assert_eq!(cf.total_size, data.len() as u64);
+        // sink saw the file in order, exactly once.
+        assert_eq!(seen.concat(), data);
+        // chunk sizes sum to total.
+        assert_eq!(cf.chunks.iter().map(|c| c.size).sum::<u64>(), cf.total_size);
+    }
+
+    #[test]
+    fn deterministic_boundaries() {
+        let data = pseudo(2, 20 * 1024 * 1024);
+        let a = chunk_file(&data[..], &sizes(), |_h, _b| Ok(())).unwrap();
+        let b = chunk_file(&data[..], &sizes(), |_h, _b| Ok(())).unwrap();
+        let ha: Vec<_> = a.chunks.iter().map(|c| c.hash.clone()).collect();
+        let hb: Vec<_> = b.chunks.iter().map(|c| c.hash.clone()).collect();
+        assert_eq!(ha, hb);
+        assert!(ha.len() >= 2, "expected multiple chunks, got {}", ha.len());
+    }
+
+    #[test]
+    fn shared_region_dedups_distinct_does_not() {
+        // Two files sharing a big identical middle region share >=1 chunk hash;
+        // a fully distinct file shares none.
+        let shared = pseudo(3, 16 * 1024 * 1024);
+        let mut f1 = pseudo(10, 4 * 1024 * 1024);
+        f1.extend_from_slice(&shared);
+        f1.extend_from_slice(&pseudo(11, 4 * 1024 * 1024));
+        let mut f2 = pseudo(20, 4 * 1024 * 1024);
+        f2.extend_from_slice(&shared);
+        f2.extend_from_slice(&pseudo(21, 4 * 1024 * 1024));
+        let distinct = pseudo(99, 24 * 1024 * 1024);
+        let h = |d: &[u8]| -> std::collections::HashSet<String> {
+            chunk_file(d, &sizes(), |_h, _b| Ok(()))
+                .unwrap()
+                .chunks
+                .into_iter()
+                .map(|c| c.hash)
+                .collect()
+        };
+        let (s1, s2, sd) = (h(&f1), h(&f2), h(&distinct));
+        assert!(
+            s1.intersection(&s2).count() >= 1,
+            "shared region should dedup"
+        );
+        assert_eq!(
+            s1.intersection(&sd).count(),
+            0,
+            "distinct file should not dedup"
+        );
+        let _ = b3_hex_str; // keep the import used
+    }
+
+    #[test]
+    fn empty_input_yields_empty_chunks_and_empty_hash() {
+        let cf = chunk_file(&[][..], &sizes(), |_h, _b| Ok(())).unwrap();
+        assert_eq!(cf.total_size, 0);
+        assert!(cf.chunks.is_empty());
+        assert_eq!(cf.whole_hash, blake3::hash(&[]));
+    }
 
     #[test]
     fn defaults_derive_rails_from_avg() {
