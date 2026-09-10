@@ -1,16 +1,26 @@
 //! `decdn whoami` — print the local identity read-only.
 //!
-//! Loads the persisted node key and reports the iroh node id (its Ed25519
-//! public key — the value a serving node logs as `remote` on `cdn/client/v1`),
-//! the eth address, and the resolved key paths. It generates, stages, rotates,
-//! and overwrites nothing: an absent node key is an error, not a trigger to
-//! mint one.
+//! Reports the persistent identity under the data dir and generates, stages,
+//! rotates, and overwrites nothing.
+//!
+//! Two identities can share one data dir, and the command reports both:
+//!  - the **node** identity at the top level: the persisted `node.secret` iroh
+//!    key (its Ed25519 public key — the value a serving node logs as `remote`
+//!    on `cdn/client/v1`) and the eth keystore at `<data_dir>/keystore.json`.
+//!  - the **client** identity in the `client/` subdir: only its eth keystore at
+//!    `<data_dir>/client/keystore.json`. A client's iroh key is ephemeral (a
+//!    fresh key per fetch), so a client has no persistent node id to report. The
+//!    client line prints only when that keystore exists.
+//!
+//! An absent node key is a note, not an error: a client-only install has no
+//! `node.secret`, and the command still reports its client eth address. The
+//! node id and paths print first and unconditionally, so the command stays
+//! useful for the node-id diagnosis even when no password is at hand.
 //!
 //! The eth address lives inside the encrypted keystore, so it prints only when
 //! a keystore password is available (the `DECDN_KEYSTORE_PASSWORD` env var, a
-//! `--keystore-password-file`, or an interactive prompt on a TTY). The node id
-//! and paths print first and unconditionally, so the command stays useful for
-//! the node-id diagnosis even when no password is at hand.
+//! `--keystore-password-file`, or an interactive prompt on a TTY). One resolved
+//! password unlocks whichever keystores are present.
 
 use std::path::Path;
 
@@ -38,7 +48,7 @@ enum KeystorePassword {
     Unavailable,
 }
 
-/// Print the local identity read-only: node id, key paths, and eth address.
+/// Print the local identity read-only: node id, key paths, and eth addresses.
 pub fn whoami(args: &cli::WhoamiArgs) -> anyhow::Result<()> {
     let data_dir = args
         .output_dir
@@ -47,27 +57,81 @@ pub fn whoami(args: &cli::WhoamiArgs) -> anyhow::Result<()> {
         .or_else(cli::default_data_dir)
         .ok_or_else(|| anyhow::anyhow!("cannot determine data directory: home dir not found"))?;
 
-    let keystore = eth_identity::keystore_path(&data_dir);
-
-    // Print the primary diagnostic — the node id and paths — FIRST, before any
-    // keystore password resolution that could prompt on a TTY. A stuck-fetch
-    // diagnosis needs the node id even when no password is at hand or the prompt
-    // is unwanted; gating it behind the prompt would defeat the command's point.
-    let secret = identity::load(&data_dir)?;
-    println!("node id: {}", secret.public());
-    println!("key path: {}", identity::key_path(&data_dir).display());
-    println!("keystore path: {}", keystore.display());
-
-    // The eth address lives inside the encrypted keystore, so it is resolved
-    // last: a missing keystore or absent password degrades to a note, while a
-    // supplied password decrypts it.
-    let state = keystore_state(&keystore)?;
-    let password = match state {
-        KeystoreState::Present => resolve_password(args.keystore_password_file.as_deref())?,
-        KeystoreState::Absent => KeystorePassword::Unavailable,
-    };
-    println!("{}", eth_address_line(&keystore, &state, &password)?);
+    for line in report(&data_dir, args.keystore_password_file.as_deref())? {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// Build the read-only whoami report for `data_dir` as the lines to print.
+///
+/// The node id and paths come first, before any keystore password resolution
+/// that could prompt on a TTY: a stuck-fetch diagnosis needs the node id even
+/// when no password is at hand, so gating it behind the prompt would defeat the
+/// command's point. An absent node key is a note here, not an error — a
+/// client-only install has no persistent node key, and the client eth address
+/// still reports.
+///
+/// The password is resolved once, and only when a keystore is present, then
+/// applied to whichever keystores exist. Split from [`whoami`] so the ordering
+/// and the client/node sections are testable without capturing stdout.
+fn report(data_dir: &Path, password_file: Option<&Path>) -> anyhow::Result<Vec<String>> {
+    let mut lines = Vec::new();
+
+    let node_keystore = eth_identity::keystore_path(data_dir);
+    // The client identity is scoped to the `client/` subdir; only its eth
+    // keystore persists (the client iroh key is ephemeral, so no client node id).
+    let client_keystore = eth_identity::keystore_path(&data_dir.join("client"));
+    let key_path = identity::key_path(data_dir);
+
+    // Node id — read-only. A definitively-absent `node.secret` is a note; any
+    // other stat/load failure (insecure permissions, wrong size, IO) still
+    // propagates so a real problem is not hidden behind the note.
+    match std::fs::symlink_metadata(&key_path) {
+        Ok(_) => {
+            let secret = identity::load(data_dir)?;
+            lines.push(format!("node id: {}", secret.public()));
+            lines.push(format!("key path: {}", key_path.display()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            lines.push(format!(
+                "node id: (none — no node key at {}; run `decdn key-gen` to create one)",
+                key_path.display()
+            ));
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context(format!("failed to stat node key at {}", key_path.display())));
+        }
+    }
+    lines.push(format!("keystore path: {}", node_keystore.display()));
+
+    // The eth addresses live inside the encrypted keystores, so they resolve
+    // last: a missing keystore or absent password degrades to a note, while a
+    // supplied password decrypts them. One password unlocks either keystore.
+    let node_state = keystore_state(&node_keystore)?;
+    let client_state = keystore_state(&client_keystore)?;
+    let password = if matches!(node_state, KeystoreState::Present)
+        || matches!(client_state, KeystoreState::Present)
+    {
+        resolve_password(password_file)?
+    } else {
+        KeystorePassword::Unavailable
+    };
+
+    lines.push(eth_address_line(&node_keystore, &node_state, &password)?);
+    if matches!(client_state, KeystoreState::Present) {
+        lines.push(format!(
+            "client keystore path: {}",
+            client_keystore.display()
+        ));
+        lines.push(format!(
+            "client {}",
+            eth_address_line(&client_keystore, &client_state, &password)?
+        ));
+    }
+
+    Ok(lines)
 }
 
 /// Classify the keystore path without letting a non-`NotFound` stat error read
@@ -287,6 +351,70 @@ mod tests {
         assert!(
             !identity::key_path(dir.path()).exists(),
             "a failed whoami must not create node.secret"
+        );
+    }
+
+    /// A client-only install (a keystore under `client/`, no node key) reports
+    /// the client eth keystore instead of erroring, and the node id degrades to
+    /// a note. `report` mutates nothing — it never mints the missing node key.
+    #[test]
+    fn report_notes_absent_node_key_and_reports_client_keystore() {
+        let dir = secure_tempdir();
+        let client_dir = dir.path().join("client");
+        // `generate_and_persist` creates the `client/` subdir at 0o700.
+        generate_and_persist(&client_dir, TEST_PASSWORD, false).unwrap();
+
+        // No password source (no env, no TTY under the test runner), so the
+        // client eth line is the "needs a password" note — but it is present,
+        // which is the point: the client keystore is reported at all.
+        let lines = report(dir.path(), None).unwrap();
+
+        assert!(
+            lines.iter().any(|l| l.starts_with("node id:")
+                && l.contains("no node key")
+                && l.contains("key-gen")),
+            "absent node key must be a note, got {lines:?}"
+        );
+        let client_keystore = eth_identity::keystore_path(&client_dir);
+        assert!(
+            lines.contains(&format!(
+                "client keystore path: {}",
+                client_keystore.display()
+            )),
+            "the client keystore path must be reported, got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("client eth address:")),
+            "the client eth address line must be reported, got {lines:?}"
+        );
+
+        assert!(
+            !identity::key_path(dir.path()).exists(),
+            "report must not mint a node key"
+        );
+        assert!(
+            !eth_identity::keystore_path(dir.path()).exists(),
+            "report must not create a node keystore"
+        );
+    }
+
+    /// A node install (node key + node keystore, no `client/`) reports the node
+    /// identity and omits the client section entirely.
+    #[test]
+    fn report_shows_node_identity_and_omits_absent_client() {
+        let dir = secure_tempdir();
+        let secret = identity::load_or_generate(dir.path()).unwrap();
+        generate_and_persist(dir.path(), TEST_PASSWORD, false).unwrap();
+
+        let lines = report(dir.path(), None).unwrap();
+
+        assert!(
+            lines.contains(&format!("node id: {}", secret.public())),
+            "the real node id must print, got {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("client ")),
+            "no client section without a client keystore, got {lines:?}"
         );
     }
 }
