@@ -422,9 +422,9 @@ fn symlink_skipped_when_not_followed() {
 }
 
 // A skipped symlink must not leak onto stdout (which owns only the manifest
-// bytes) but must be surfaced as an operator-visible warning on stderr — the
-// `bundle create` parity the review flagged: a publisher must not be able to
-// ship an incomplete bundle with zero signal that a symlink was dropped.
+// bytes) but must be surfaced as an operator-visible warning on stderr: a
+// publisher must not be able to ship an incomplete bundle with zero signal
+// that a symlink was dropped.
 #[cfg(unix)]
 #[test]
 fn symlink_skipped_when_not_followed_warns_on_stderr_not_stdout() {
@@ -458,8 +458,8 @@ fn symlink_skipped_when_not_followed_warns_on_stderr_not_stdout() {
         .collect();
     assert_eq!(paths, vec!["real.txt"]);
 
-    // The warning rides on stderr, matching the retired `bundle create`
-    // wording, with the count of skipped symlinks.
+    // The warning rides on stderr with the count of skipped symlinks, so a
+    // publisher is never left to discover a silently incomplete manifest.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("skipped 1 symlink(s); pass --follow-symlinks to include"),
