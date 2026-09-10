@@ -233,6 +233,12 @@ Chunk dedup holds within one pull. Reuse across separate pulls — v2 of a
 model skipping the chunks it already fetched for v1 — needs a persistent
 chunk-addressed cache and is a follow-up.
 
+At the end of a pull the report states the distinct bytes pulled and the
+bytes written to disk — `downloaded X → reconstructed Y` — whenever dedup
+made them differ (a shared chunk, or a blob at several paths, served more
+than one file from one transfer). When the two are equal the report shows a
+single `downloaded X`.
+
 ### Deferred
 
 - Coverage is limited to the region-nearest candidate set probed per
