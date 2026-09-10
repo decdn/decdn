@@ -44,10 +44,9 @@ pub mod driver;
 /// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
 pub mod endpoint;
 mod ledger;
-/// Run-scoped registry of live per-lane voucher ledgers (Task 1 of the shared
-/// `bundle pull` ledger plan): [`ledgers::LaneLedgers`] maps each
-/// `(pool_id, signer, provider)` lane to the one [`ledgers::LaneHandle`]
-/// every concurrent fetch on that lane shares.
+/// Run-scoped registry of live per-lane voucher ledgers:
+/// [`ledgers::LaneLedgers`] maps each `(pool_id, signer, provider)` lane to
+/// the one [`ledgers::LaneHandle`] every concurrent fetch on that lane shares.
 pub mod ledgers;
 /// The pure pacing axis (#1608): [`pacer::Pacer`] / [`pacer::BudgetPacer`] decide
 /// draw / top-up / wait / done / refuse for the gap-driven driver, with no I/O.

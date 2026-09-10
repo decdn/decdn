@@ -7,19 +7,22 @@
 //! and paid for — once and hard-linked (or copied) to each path (#1306). Node selection is
 //! per blob (#936): with an explicit `--node-id` every entry is pulled from that
 //! one node, otherwise each distinct blob discovers its own holder among the
-//! region-nearest active nodes. Distinct blobs are fetched with `--jobs`
-//! concurrency.
+//! region-nearest active nodes. Whole-file entries and the chunks of a chunked
+//! file all fan out concurrently, bounded by one global `--jobs` cap
+//! (`PullCtx.gate`) — a many-chunk file can saturate that budget by itself, and
+//! a chunk shared between files is fetched once regardless of how many files
+//! reference it.
 //!
 //! **One shared pool.** The whole bundle pulls from the caller's single
 //! `PaymentPool` deposit (ADR 003) — opened once and reused across every
-//! provider the manifest touches. Two concurrency guards follow from that: per-provider
-//! async mutexes serialize voucher signing on each provider's lane (vouchers are
-//! cumulative per `(signer, provider)` lane, so two in-flight fetches sharing
-//! one lane would race it) — a multi-source entry (ADR 039) holds the locks for
-//! its whole admitted provider set, acquired in one global order so overlapping
-//! sets cannot deadlock — and a single global mutex serializes every
-//! open-or-reuse call — the pool's on-chain state (deposit, allowance) is one
-//! shared resource now, regardless of which provider an entry is bound for.
+//! provider the manifest touches. Two concurrency guards follow from that: the
+//! run's shared `LaneLedgers` (ADR 039) give each `(pool_id, signer, provider)`
+//! lane one monotonic voucher issuer, so concurrent fetches sharing a lane —
+//! including every leg of a multi-source entry's admitted provider set — draw
+//! from the same watermark instead of racing it, while their transfers still
+//! run concurrently; and a single global mutex serializes every open-or-reuse
+//! call — the pool's on-chain state (deposit, allowance) is one shared resource
+//! now, regardless of which provider an entry is bound for.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -1007,8 +1010,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// at once (no `tokio::spawn`, by choice — nothing here is `!Send`);
     /// `PullCtx.gate` is the real `--jobs` cap on in-flight fetches, so
     /// parallelism comes from concurrent in-flight network I/O, while the
-    /// per-provider locks inside `fetch_to_staging_from` serialize same-lane
-    /// access — now over unique blobs.
+    /// shared `LaneLedgers` inside `fetch_to_staging_from` keep same-lane
+    /// voucher issuance monotonic — now over unique blobs.
     async fn pull_all(
         &self,
         entries: &[ManifestEntry],
