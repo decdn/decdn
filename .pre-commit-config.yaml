@@ -88,6 +88,40 @@ repos:
         files: '^(contracts|crates/cli)/deployments/.*\.json$'
         pass_filenames: false
 
+      # --- workspace shape ---------------------------------------------
+      # The Rust version lives in rust-toolchain.toml, Cargo.toml's
+      # rust-version and every dtolnay/rust-toolchain@… ref in the workflows,
+      # each read by a different tool. Dependabot bumps only the action refs,
+      # so without this CI quietly compiles on a different compiler from every
+      # developer. The `packaging` CI job is authoritative.
+      - id: toolchain-pin
+        name: rust version agrees across toolchain, manifest and workflows
+        entry: .github/scripts/check-toolchain-pin.sh
+        language: system
+        files: '^(rust-toolchain\.toml|Cargo\.toml|\.github/workflows/.*\.yml)$'
+        pass_filenames: false
+
+      # A member that restates `version` ships its own number; one without
+      # `[lints] workspace = true` runs under default lint levels. Neither
+      # warns. The `packaging` CI job is authoritative.
+      - id: workspace-manifests
+        name: every member inherits the workspace version and lints
+        entry: .github/scripts/check-workspace-manifests.sh
+        language: system
+        files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml)$'
+        pass_filenames: false
+
+      # Cargo enforces acyclicity only. The dependency flow in CLAUDE.md
+      # § Crate Structure (three leaves, cli/e2e as sinks, an iroh-blobs-free
+      # CLI) is held by the table in check_crate_edges.py. Needs cargo. The
+      # `packaging` CI job is authoritative.
+      - id: crate-edges
+        name: crate dependency direction matches CLAUDE.md
+        entry: .github/scripts/check-crate-edges.sh
+        language: system
+        files: '^(Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml)$'
+        pass_filenames: false
+
       # --- Solidity ----------------------------------------------------
       # commit-stage (every commit, fast):
 

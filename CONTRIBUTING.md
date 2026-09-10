@@ -55,7 +55,9 @@ pre-commit install --hook-type pre-commit --hook-type pre-push   # one-time setu
 pre-commit run --all-files        # run all hooks manually
 ```
 
-Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo doc`, `cargo deny`.
+Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo doc`, `cargo deny`, adr-book-list, adr-ref-hygiene, package-embeds, deployment-manifest-mirror, toolchain-pin, workspace-manifests, crate-edges, forge-fmt, solhint, forge-build, forge-test, slither, aderyn.
+
+The repo-shape hooks (package-embeds, deployment-manifest-mirror, toolchain-pin, workspace-manifests, crate-edges) are stdlib-Python guards under `.github/scripts/`, each with a thin `.sh` wrapper and a pytest suite under `.github/scripts/tests/`. They mirror the `packaging` CI job, which is authoritative. A new guard follows the same shape: a `check(...)` function the tests can drive on a fixture, a module docstring saying what breaks silently without it, a `repo: local` hook with a scoped `files:` regex, and a named step in `packaging`.
 
 ## Build and Test
 
@@ -237,9 +239,9 @@ Notes and common snags:
 
 `rust-toolchain.toml` pins an exact stable release (currently `1.95.0`); CI uses the same pin via `dtolnay/rust-toolchain@1.95.0` so pre-commit's `cargo clippy` runs the identical lint *rules* as CI. Identical rules, not identical coverage: the hook runs one invocation over the default-feature workspace, while the `clippy` job runs four (see [Build and Test](#build-and-test)). Under a rustup-managed `cargo`, the pinned toolchain auto-installs and is selected on first `cargo` invocation; other setups need to install `1.95.0` manually.
 
-Dependabot auto-bumps the GitHub Actions refs only — it does **not** touch `rust-toolchain.toml` or `Cargo.toml`'s `rust-version`. When accepting a Dependabot toolchain bump, update those two files in the same PR (and `Cargo.toml`'s `rust-version` if MSRV is moving in lockstep) so developer machines and CI stay aligned.
+Dependabot auto-bumps the GitHub Actions refs only — it does **not** touch `rust-toolchain.toml` or `Cargo.toml`'s `rust-version`. A toolchain bump is therefore a three-file edit: `.github/scripts/check-toolchain-pin.sh` (the `toolchain-pin` hook and the `packaging` CI job) refuses the three kinds of site to differ, so a Dependabot bump stays red until `rust-toolchain.toml` and `Cargo.toml` move in the same PR. All three carry the same `X.Y.Z`; a two-part `rust-version` is refused for that reason.
 
-MSRV (`rust-version.workspace = true` → 1.95) is the lower bound the workspace must compile under; it's checked separately by the `msrv` job in `.github/workflows/ci.yml` and is a distinct knob from the stable lint pin (currently set to the same value).
+MSRV (`rust-version.workspace = true` → 1.95.0) is the lower bound the workspace must compile under. It equals the stable lint pin, so there is no separate MSRV job: every Rust job compiles on that toolchain, and the pin check keeps the two from drifting apart. If MSRV is ever lowered below the pinned toolchain, reintroduce a dedicated `cargo check` job on the older floor and relax the pin check to a floor comparison.
 
 The workspace is on `resolver = "3"`, which reads that `rust-version`: it defaults `resolver.incompatible-rust-versions` to `fallback`, so `cargo update` prefers dependency versions whose own declared MSRV is at or below ours instead of silently pulling one that raised it past the pinned toolchain. Resolver 3's feature-unification rules are identical to resolver 2's. If a dependency you need resolves to an older version than expected, that is this fallback at work — raise the workspace MSRV and the toolchain pin together rather than reaching for `--ignore-rust-version`.
 

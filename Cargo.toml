@@ -3,9 +3,9 @@
 # identical to resolver 2's; the only difference is that
 # `resolver.incompatible-rust-versions` defaults to `fallback` instead of
 # `allow`, so cargo prefers dependency versions whose declared `rust-version`
-# is <= ours. Paired with `rust-version = "1.95"` below, that stops a future
+# is <= ours. Paired with `rust-version = "1.95.0"` below, that stops a future
 # `cargo update` from silently pulling a dependency that raised its MSRV past
-# the pinned toolchain. Nothing is excluded at 1.95 today.
+# the pinned toolchain. Nothing is excluded at 1.95.0 today.
 resolver = "3"
 members = [
     "crates/node",
@@ -36,7 +36,11 @@ exclude = ["contracts"]
 version = "0.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.95"
+# Three parts, not two: this string, `rust-toolchain.toml`'s channel and every
+# `dtolnay/rust-toolchain@…` ref in the workflows are compared byte-for-byte by
+# check_toolchain_pin.py, so they move together or the `packaging` job says
+# which one did not.
+rust-version = "1.95.0"
 repository = "https://github.com/decdn/decdn"
 homepage = "https://decdn.org"
 keywords = ["cdn", "p2p", "content-delivery", "iroh", "blake3"]
