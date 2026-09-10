@@ -122,6 +122,21 @@ pub struct BundlePullArgs {
     #[arg(long, value_name = "N", default_value_t = 4)]
     pub jobs: usize,
 
+    /// Only pull entries whose POSIX relative path matches one of these globs
+    /// (`models/*.bin`), matched against the manifest's `path` field, never the
+    /// on-disk absolute path. Repeatable — an entry passes the include gate if it
+    /// matches any one. Absent => every entry passes the gate. gitignore
+    /// semantics: `*` does not cross `/`, `**` recurses.
+    #[arg(long = "include", value_name = "GLOB", action = clap::ArgAction::Append)]
+    pub include: Vec<String>,
+
+    /// Skip entries whose POSIX relative path matches one of these globs,
+    /// matched against the manifest's `path` field. Repeatable — every pattern
+    /// is OR-ed. `--exclude` wins over `--include`: an entry matching both is
+    /// skipped. Same gitignore glob semantics as `--include`.
+    #[arg(long = "exclude", value_name = "GLOB", action = clap::ArgAction::Append)]
+    pub exclude: Vec<String>,
+
     /// Re-fetch and overwrite entries whose destination file already exists.
     /// Default is skip-existing (resume-friendly: a completed file is only
     /// renamed into place after BLAKE3 verification, so a present file is good).

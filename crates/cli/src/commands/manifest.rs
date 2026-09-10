@@ -61,6 +61,14 @@ pub(crate) fn b3_hex_str(h: blake3::Hash) -> String {
 
 /// Compile the repeatable `--exclude` globs into a single matcher.
 pub(crate) fn build_excluder(patterns: &[String]) -> anyhow::Result<GlobSet> {
+    build_glob_set(patterns, "--exclude")
+}
+
+/// Compile the repeatable glob `patterns` given for `flag` into a single
+/// matcher. `flag` names the source flag so a bad pattern reports the flag the
+/// operator actually typed. Shared by `--exclude` (bundle create / origin
+/// import) and bundle pull's `--include`/`--exclude` entry filter.
+pub(crate) fn build_glob_set(patterns: &[String], flag: &str) -> anyhow::Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for raw in patterns {
         // `literal_separator(true)` aligns with gitignore semantics: `*` does
@@ -70,7 +78,7 @@ pub(crate) fn build_excluder(patterns: &[String]) -> anyhow::Result<GlobSet> {
         let glob = GlobBuilder::new(raw)
             .literal_separator(true)
             .build()
-            .with_context(|| format!("invalid --exclude pattern {raw:?}"))?;
+            .with_context(|| format!("invalid {flag} pattern {raw:?}"))?;
         builder.add(glob);
     }
     builder
