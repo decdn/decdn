@@ -42,10 +42,11 @@ use decdn_client_pull::buyer_pool::{
 use decdn_client_pull::driver::{DriveConfig, drive};
 use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
-    BudgetPacer, ClientRangedStore, Cumulative, MultiSourceConfig, PeerSource, PoolContext,
-    PoolExhausted, PoolLedger, ProgressCallback, PullDeadlines, RetryDisposition, SourceLane,
-    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, multi_source_fetch,
-    open_progressive_pull, retry_disposition, sign_client_binding,
+    BudgetPacer, ClientRangedStore, Cumulative, LaneHandle, LaneLedgers, MultiSourceConfig,
+    PeerSource, PoolContext, PoolExhausted, PoolLedger, ProgressCallback, PullDeadlines,
+    RetryDisposition, SharedPool, SourceLane, UpstreamRefused, UpstreamVoucherRejected,
+    VoucherProgress, multi_source_fetch, open_progressive_pull, retry_disposition,
+    sign_client_binding,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -1495,6 +1496,9 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
                 &args.output,
                 Some(&on_progress),
                 || bar.finish_and_clear(),
+                // A solo `decdn fetch` has no concurrent siblings on this
+                // deposit, so the per-fetch ledger view is the whole story.
+                None,
             )
             .await;
             // Safety net for the header-probe-failure early-return path inside
@@ -1753,6 +1757,30 @@ fn select_watermark(
     VoucherProgress::from_cumulative(cum, prior_amount)
 }
 
+/// The lane's shared ledger + context: from the run registry when bundle pull
+/// supplies one (so every entry/chunk on the lane shares one monotonic issuer),
+/// else a fresh pair for a standalone `decdn fetch`.
+fn lane_ledger(
+    ledgers: Option<&LaneLedgers>,
+    lane: LaneKey,
+    ctx: PoolContext,
+) -> (Arc<PoolLedger>, Arc<Mutex<PoolContext>>) {
+    let seed = Cumulative {
+        bytes: ctx.prior_bytes_delivered,
+        amount: ctx.prior_amount,
+    };
+    match ledgers {
+        Some(reg) => {
+            let h = reg.get_or_insert(lane, || LaneHandle {
+                ledger: Arc::new(PoolLedger::new(seed)),
+                ctx: Arc::new(Mutex::new(ctx)),
+            });
+            (h.ledger, h.ctx)
+        }
+        None => (Arc::new(PoolLedger::new(seed)), Arc::new(Mutex::new(ctx))),
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn drive_fetch<P>(
     deps: &DriveFetchDeps<'_, P>,
@@ -1764,6 +1792,7 @@ pub(crate) async fn drive_fetch<P>(
     output: &Path,
     progress: Option<&ProgressCallback>,
     finish_progress: impl FnOnce(),
+    ledgers: Option<&LaneLedgers>,
 ) -> anyhow::Result<u64>
 where
     P: alloy::providers::Provider + Clone,
@@ -1777,11 +1806,14 @@ where
         provider,
     };
 
-    // One ledger for this lane, seeded from its persisted cumulative state so
+    // The lane's ledger + context, seeded from its persisted cumulative state so
     // the first voucher continues at `prior_amount` (a restart-from-zero would
-    // be rejected as a regression). Shared (`Arc`) with the driver and source;
-    // the watermark to persist afterwards is read straight back off it.
-    let ledger = Arc::new(ctx.new_ledger());
+    // be rejected as a regression) — from the run registry when `ledgers` is
+    // `Some` (bundle pull, sharing one issuer across the lane's concurrent
+    // entries/chunks), else a fresh pair. Shared (`Arc`) with the driver and
+    // source; the watermark to persist afterwards is read straight back off the
+    // ledger.
+    let (ledger, ctx) = lane_ledger(ledgers, lane, ctx);
 
     // Captured before `target` moves into `PeerSource::new` below — the key the
     // peer store's stream-derived sample/failure is filed under (#1906-series).
@@ -1801,10 +1833,14 @@ where
     // (#1906-series): a source that cannot even complete it is stamped as a
     // failure, and one that does hands back a real stream-derived latency —
     // best-effort in both directions (`let _ =`), never failing the fetch.
+    let header_ctx = ctx
+        .lock()
+        .map_err(|_| anyhow::anyhow!("lane context lock poisoned"))?
+        .clone();
     let (header, first_pull) = match open_progressive_pull(
         deps.endpoint,
         target.clone(),
-        &ctx,
+        &header_ctx,
         Arc::clone(&ledger),
         deps.slash_dom,
         provider,
@@ -1823,7 +1859,7 @@ where
         Ok(opened) => opened,
         Err(err) => {
             let _ = peer_store.record_failure(&node_id, now_secs_cli());
-            return Err(annotate_unbound_cache_miss(err, &ctx));
+            return Err(annotate_unbound_cache_miss(err, &header_ctx));
         }
     };
     // The stream's own quoted rate supersedes any remembered probe rate — it is
@@ -1858,10 +1894,10 @@ where
         max_approve: deps.chain.max_approve,
     };
 
-    // Share the context behind interior mutability: the source clones it to open
-    // each gap's pull, and the driver credits a mid-fetch top-up's new deposit
-    // through the same handle so the next open sees it.
-    let ctx = Arc::new(Mutex::new(ctx));
+    // The context is already shared behind interior mutability (from
+    // `lane_ledger`): the source clones it to open each gap's pull, and the
+    // driver credits a mid-fetch top-up's new deposit through the same handle
+    // so the next open sees it.
     let peer_source = PeerSource::new(
         deps.endpoint,
         target,
@@ -1876,6 +1912,27 @@ where
     );
     let pacer = BudgetPacer::new();
     let drive_config = DriveConfig::cli(deps.chain.working_deposit);
+
+    // With a run registry (`ledgers: Some`), the shared pool's `spent`/`credit`
+    // must read and write EVERY lane the registry holds — this fetch's
+    // concurrent siblings on the same deposit included — not just this one
+    // lane, so a solo `decdn fetch` (`ledgers: None`) keeps `pool = None`
+    // exactly as before (one lane IS the whole pool).
+    let topups_used = std::sync::atomic::AtomicU32::new(0);
+    let spent: Box<dyn Fn() -> U256 + Send + Sync>;
+    let credit: Box<dyn Fn(U256) -> anyhow::Result<()> + Send + Sync>;
+    let pool = match ledgers {
+        Some(reg) => {
+            spent = Box::new(move || reg.total_committed());
+            credit = Box::new(move |new_deposit| reg.credit_all(new_deposit));
+            Some(SharedPool {
+                spent: &*spent,
+                topups_used: &topups_used,
+                credit: &*credit,
+            })
+        }
+        None => None,
+    };
 
     // The gap-driven fetch: `drive` pulls ONLY `missing_ranges(0, 0)` — the whole
     // blob on a fresh fetch, just the gap on a resume — into the ranged store,
@@ -1895,7 +1952,7 @@ where
         progress,
         None, // pacing_wait: BudgetPacer never returns PaceDecision::Wait
         None, // served_paid: no downstream leg on the client path
-        None, // pool: single-source client fetch — one lane is the whole pool
+        pool.as_ref(),
     )
     .await;
     // The handshake succeeded (the sample above is real) but delivery itself
@@ -2023,6 +2080,7 @@ async fn build_multi_lane<'a, P>(
     candidate: &NodeCandidate,
     relays: &[RelayUrl],
     open_lock: Option<&tokio::sync::Mutex<()>>,
+    ledgers: Option<&LaneLedgers>,
 ) -> anyhow::Result<MultiLane<'a>>
 where
     P: alloy::providers::Provider + Clone,
@@ -2055,15 +2113,21 @@ where
     };
     let pool_id = ctx.pool_id;
     let prior_amount = ctx.prior_amount;
-    // One ledger per lane, seeded from its persisted `(signer, provider)`
-    // cumulative so the first voucher continues the lane (a restart from zero is
-    // rejected as a regression) — the same seeding `drive_fetch` does per lane.
-    let ledger = Arc::new(PoolLedger::new(Cumulative {
-        bytes: ctx.prior_bytes_delivered,
-        amount: ctx.prior_amount,
-    }));
+    // The lane's ledger + context, seeded from its persisted `(signer,
+    // provider)` cumulative so the first voucher continues the lane (a restart
+    // from zero is rejected as a regression) — from the run registry when
+    // `ledgers` is `Some`, else a fresh pair; the same seeding `drive_fetch`
+    // does per lane.
+    let (ledger, ctx) = lane_ledger(
+        ledgers,
+        LaneKey {
+            pool_id,
+            signer: deps.self_address,
+            provider,
+        },
+        ctx,
+    );
     let target = multi_source_target(candidate, relays);
-    let ctx = Arc::new(Mutex::new(ctx));
     let source = PeerSource::new(
         deps.endpoint,
         target,
@@ -2144,6 +2208,9 @@ where
         output,
         progress,
         open_lock,
+        // A solo `decdn fetch` has no concurrent siblings on this deposit, so
+        // the per-fetch ledger view is the whole story.
+        None,
     )
     .await
 }
@@ -2168,6 +2235,7 @@ pub(crate) async fn try_multi_source_fetch_from_admitted<P>(
     output: &Path,
     progress: Option<&ProgressCallback>,
     open_lock: Option<&tokio::sync::Mutex<()>>,
+    ledgers: Option<&LaneLedgers>,
 ) -> anyhow::Result<Option<u64>>
 where
     P: alloy::providers::Provider + Clone,
@@ -2188,6 +2256,7 @@ where
         first_candidate,
         relays,
         open_lock,
+        ledgers,
     )
     .await?;
     let probe_target = multi_source_target(first_candidate, relays);
@@ -2271,6 +2340,7 @@ where
                 candidate,
                 relays,
                 open_lock,
+                ledgers,
             )
             .await?,
         );
@@ -2326,10 +2396,7 @@ where
         &drive_config,
         &ms_config,
         progress,
-        // Task 3 threads the run-wide registry through for `bundle pull`; a
-        // solo `decdn fetch` has no concurrent siblings on this deposit, so
-        // the per-fetch view is the whole story.
-        None,
+        ledgers,
     )
     .await;
 
@@ -3396,6 +3463,29 @@ mod tests {
             client_binding: binding,
             capability: None,
         }
+    }
+
+    /// A registry-backed `lane_ledger` call for the same lane must return the
+    /// SAME ledger `Arc` on a second call (no fresh mint per fetch/chunk) — the
+    /// invariant `LaneLedgers::get_or_insert` exists to guarantee. A `None`
+    /// registry (standalone `decdn fetch`) must mint a distinct ledger every
+    /// call.
+    #[test]
+    fn lane_ledger_shares_one_arc_through_the_registry_but_not_without_one() {
+        let lane = LaneKey {
+            pool_id: B256::ZERO,
+            signer: Address::ZERO,
+            provider: Address::from([7u8; 20]),
+        };
+        let registry = LaneLedgers::new();
+        let (ledger_a, ctx_a) = lane_ledger(Some(&registry), lane, ctx_with(None));
+        let (ledger_b, ctx_b) = lane_ledger(Some(&registry), lane, ctx_with(None));
+        assert!(Arc::ptr_eq(&ledger_a, &ledger_b));
+        assert!(Arc::ptr_eq(&ctx_a, &ctx_b));
+
+        let (ledger_none_a, _) = lane_ledger(None, lane, ctx_with(None));
+        let (ledger_none_b, _) = lane_ledger(None, lane, ctx_with(None));
+        assert!(!Arc::ptr_eq(&ledger_none_a, &ledger_none_b));
     }
 
     /// The refusal these tests annotate, built the way the fetch path builds it: the typed

@@ -821,6 +821,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             staging,
             progress,
             Some(&self.open_lock),
+            // Task 4 flips this to `Some(&self.ledgers)` once the registry is
+            // wired into bundle pull; Task 3 keeps behavior unchanged.
+            None,
         )
         .await
         .map(|opt| opt.map(|_bytes| ()))
@@ -1047,6 +1050,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             staging,
             progress,
             || {},
+            // Task 4 flips this to `Some(&self.ledgers)` once the registry is
+            // wired into bundle pull; Task 3 keeps behavior unchanged.
+            None,
         )
         .await;
         // On the delegated path a terminal owner-remedy reason (`SpendingCapExhausted`,
