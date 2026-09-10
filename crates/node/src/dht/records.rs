@@ -10,18 +10,21 @@
 //!
 //! | Limit | Default | Behaviour at cap |
 //! |-------|---------|-------------------|
-//! | Per-publisher records | 200 | Hard reject — `StoreAck { accepted: false }` |
+//! | Per-publisher records | 100,000 | Hard reject — `StoreAck { accepted: false }` |
 //! | Per-hash providers | 50 | Evict oldest holder for that hash |
-//! | Per-node global records | 100,000 | Evict globally-oldest record (only when inserting publisher is below per-publisher cap) |
+//! | Per-node global records | 1,000,000 | Evict globally-oldest record (only when inserting publisher is below per-publisher cap) |
 //! | Record TTL | 1 hour | Receiver-anchored; refreshed on re-publish |
 //!
-//! The per-publisher hard cap is the load-bearing defense against the
-//! exhaustion attack where one publisher fills every slot and forces
-//! eviction of other publishers' records. With that cap in place, the
-//! global LRU only fires when *the inserting publisher is below quota*
-//! — i.e. there is a non-malicious publisher pushing the total over
-//! capacity, and evicting the globally-oldest record (likely from a
-//! publisher who has stopped re-publishing) is the right call.
+//! The active-staker filter in the handler is the security boundary: a
+//! publisher must be a bonded operator to insert at all, so record spam
+//! carries a stake cost. The per-publisher cap is a fairness bound on top
+//! of that — it keeps one publisher's footprint from dominating a
+//! receiver's store, so the global set stays a broad sample rather than
+//! one node's catalogue. With the cap in place, the global LRU only fires
+//! when *the inserting publisher is below quota* — i.e. a below-quota
+//! publisher is pushing the total over capacity, and evicting the
+//! globally-oldest record (likely from a publisher who has stopped
+//! re-publishing) is the right call.
 //!
 //! # Re-publish semantics
 //!
@@ -86,9 +89,9 @@ struct HolderEntry {
 /// Configuration for the record store (ADR 022 §Content Records and TTL).
 #[derive(Debug, Clone)]
 pub struct RecordStoreConfig {
-    /// `Max records per publisher (per receiver)`. ADR 022 default: 200.
+    /// `Max records per publisher (per receiver)`. ADR 022 default: 100,000.
     pub max_records_per_publisher: usize,
-    /// `Max records per node`. ADR 022 default: 100,000.
+    /// `Max records per node`. ADR 022 default: 1,000,000.
     pub max_records_global: usize,
     /// `Max providers per hash`. ADR 022 default: 50 — pinned to the
     /// wire response cap so a fully-populated record can be serialised
@@ -102,8 +105,8 @@ pub struct RecordStoreConfig {
 impl Default for RecordStoreConfig {
     fn default() -> Self {
         Self {
-            max_records_per_publisher: 200,
-            max_records_global: 100_000,
+            max_records_per_publisher: 100_000,
+            max_records_global: 1_000_000,
             max_providers_per_hash: MAX_PROVIDERS_PER_HASH,
             ttl_us: 3_600_000_000,
         }
@@ -623,8 +626,8 @@ mod tests {
     #[test]
     fn default_config_matches_adr_022() {
         let d = RecordStoreConfig::default();
-        assert_eq!(d.max_records_per_publisher, 200);
-        assert_eq!(d.max_records_global, 100_000);
+        assert_eq!(d.max_records_per_publisher, 100_000);
+        assert_eq!(d.max_records_global, 1_000_000);
         assert_eq!(d.max_providers_per_hash, MAX_PROVIDERS_PER_HASH);
         assert_eq!(d.max_providers_per_hash, 50);
         // 1 hour in microseconds.

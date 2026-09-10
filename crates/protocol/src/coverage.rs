@@ -21,6 +21,37 @@ use serde::{Deserialize, Serialize};
 /// bitmaps — see [`num_blocks`] and [`Coverage`].
 pub const DISCOVERY_BLOCK_BYTES: u64 = 64 << 20;
 
+/// Largest blob the discovery layer describes on the wire: 1 TiB.
+///
+/// This is a protocol ceiling that sizes the coverage-bitmap bound
+/// ([`MAX_COVERAGE_BYTES`]), not a per-node store limit — `max_blob_size_mb`
+/// is the separate, operator-tunable cache cap. A blob larger than this spans
+/// more discovery blocks than a well-formed [`Coverage`] can name on the wire,
+/// so it is not partial-holder-discoverable. The AI-model delivery wedge (#1164)
+/// serves sub-TiB blobs, so this bound never rejects a legitimate advertisement.
+pub const MAX_DISCOVERABLE_BLOB_BYTES: u64 = 1 << 40;
+
+/// Upper bound, in bytes, on a [`Coverage`] bitmap decoded from untrusted wire.
+///
+/// A well-formed bitmap for a [`MAX_DISCOVERABLE_BLOB_BYTES`] blob is this many
+/// bytes: bit-packed at 8 blocks per byte over the fixed 64 MiB
+/// [`DISCOVERY_BLOCK_BYTES`] (never the `test-support` overridable size, so the
+/// bound is a stable security constant). A frame whose `Coverage` is longer
+/// describes a blob no node on this network serves and is rejected at decode.
+///
+/// Without this cap a bonded publisher could pin arbitrary receiver memory:
+/// coverage length is otherwise bounded only by the 16 MiB frame, and the
+/// per-publisher record quota multiplies it (stored memory ≈ records × bitmap).
+/// The cap makes an oversized bitmap unrepresentable rather than defended after
+/// the fact. For 1 TiB it is 2048 bytes.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "1 TiB / 64 MiB / 8 = 2048, far within usize on every supported target"
+)]
+pub const MAX_COVERAGE_BYTES: usize = MAX_DISCOVERABLE_BLOB_BYTES
+    .div_ceil(DISCOVERY_BLOCK_BYTES)
+    .div_ceil(8) as usize;
+
 /// The active discovery-block size in bytes.
 ///
 /// Production reads the fixed [`DISCOVERY_BLOCK_BYTES`] constant — this
@@ -147,7 +178,30 @@ impl Drop for TestBlockSizeGuard {
 /// exist.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Coverage {
+    #[serde(deserialize_with = "deserialize_bounded_blocks")]
     blocks: Vec<u8>,
+}
+
+/// Bounds a wire `Coverage` bitmap to [`MAX_COVERAGE_BYTES`] at decode.
+///
+/// A longer bitmap describes a blob larger than [`MAX_DISCOVERABLE_BLOB_BYTES`],
+/// which no node serves, so it is rejected rather than stored — an untrusted
+/// peer cannot amplify one record into arbitrary receiver memory. Decoding the
+/// bytes before the length check is safe: the enclosing 16 MiB frame cap and
+/// serde's cautious capacity hint bound the allocation independently of the
+/// wire length prefix, so the prefix is never trusted for sizing (#845).
+fn deserialize_bounded_blocks<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let blocks = Vec::<u8>::deserialize(d)?;
+    if blocks.len() > MAX_COVERAGE_BYTES {
+        return Err(serde::de::Error::custom(format!(
+            "Coverage bitmap length {} exceeds MAX_COVERAGE_BYTES ({MAX_COVERAGE_BYTES})",
+            blocks.len(),
+        )));
+    }
+    Ok(blocks)
 }
 
 impl Coverage {
@@ -280,5 +334,35 @@ mod tests {
         let bytes = postcard::to_allocvec(&empty).expect("postcard serialize");
         let back: Coverage = postcard::from_bytes(&bytes).expect("postcard deserialize");
         assert_eq!(empty, back);
+    }
+
+    #[test]
+    fn max_coverage_bytes_matches_one_tib_blob() {
+        // 1 TiB / 64 MiB = 16384 blocks, bit-packed at 8/byte = 2048 bytes.
+        assert_eq!(MAX_COVERAGE_BYTES, 2048);
+    }
+
+    #[test]
+    fn deserialize_accepts_bitmap_at_the_cap() {
+        // A single-field struct postcard-encodes identically to its `Vec<u8>`
+        // field, so an at-cap byte vector is a valid at-cap `Coverage`.
+        let at_cap = vec![0xFFu8; MAX_COVERAGE_BYTES];
+        let bytes = postcard::to_allocvec(&at_cap).expect("postcard serialize");
+        let back: Coverage = postcard::from_bytes(&bytes).expect("at-cap coverage must decode");
+        assert_eq!(back.blocks.len(), MAX_COVERAGE_BYTES);
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_bitmap() {
+        // One byte past the cap describes a blob larger than
+        // MAX_DISCOVERABLE_BLOB_BYTES and must fail at decode rather than be
+        // stored — this is the memory-amplification guard.
+        let oversized = vec![0u8; MAX_COVERAGE_BYTES + 1];
+        let bytes = postcard::to_allocvec(&oversized).expect("postcard serialize");
+        let decoded: Result<Coverage, _> = postcard::from_bytes(&bytes);
+        assert!(
+            decoded.is_err(),
+            "oversized coverage bitmap must be rejected"
+        );
     }
 }

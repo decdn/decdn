@@ -140,6 +140,8 @@ pub struct decdn_protocol::coverage::TestBlockSizeGuard
 impl core::ops::drop::Drop for decdn_protocol::coverage::TestBlockSizeGuard
 pub fn decdn_protocol::coverage::TestBlockSizeGuard::drop(&mut self)
 pub const decdn_protocol::coverage::DISCOVERY_BLOCK_BYTES: u64
+pub const decdn_protocol::coverage::MAX_COVERAGE_BYTES: usize
+pub const decdn_protocol::coverage::MAX_DISCOVERABLE_BLOB_BYTES: u64
 pub fn decdn_protocol::coverage::discovery_block_bytes() -> u64
 pub fn decdn_protocol::coverage::num_blocks(u64) -> u32
 pub fn decdn_protocol::coverage::override_discovery_block_bytes_for_test(u64) -> decdn_protocol::coverage::TestBlockSizeGuard
