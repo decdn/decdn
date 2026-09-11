@@ -1,12 +1,12 @@
 //! The live voucher ledger for each buyer lane's current pool.
 //!
 //! One [`PoolLedger`] per [`LaneKey`] is a CORRECTNESS requirement, not a
-//! cache. `stream_fetch_shared` states the contract it exists to satisfy:
-//!
-//! > each `stream_fetch`/`stream_fetch_tracked` call seeds its own voucher state from
-//! > `ctx.prior_*`, so N concurrent pulls on the same lane all sign the next cumulative
-//! > voucher from the same watermark and collide — the node accepts exactly one and
-//! > rejects the rest as an amount regression.
+//! cache. The contract it exists to satisfy: a pull that seeds its own voucher
+//! state from `ctx.prior_*` shares that watermark with every other pull on the
+//! lane, so N concurrent pulls with N ledgers all sign the next cumulative voucher
+//! from the same baseline and collide — the node accepts exactly one and rejects
+//! the rest as an amount regression. `open_progressive_pull` therefore takes the
+//! CHANNEL's `Arc<PoolLedger>`, never a per-pull one.
 //!
 //! Both node pull paths built a FRESH ledger per pull and so broke that contract (#1145
 //! review). It is reachable at the defaults, on an ordinary node doing nothing unusual: the

@@ -70,30 +70,119 @@ pub const CHUNK_GROUP_BYTES: u64 = 1u64 << (IROH_BLOCK_SIZE.chunk_log() + 10);
 /// bytes — content **plus** proof (ADR 038 §Payment metering) — not content
 /// bytes. `chunk_ranges` should be the [`AlignedRange::chunk_ranges`] both sides
 /// derive from [`align_range`], keeping encoder and decoder in lock-step.
+///
+/// Cost: `O(log groups)` for the group-aligned contiguous range [`align_range`]
+/// produces (a closed-form count over the tree's shape, see
+/// `aligned_wire_size`); every other range shape falls back to walking the
+/// encoder's node set, which is `O(groups in range)`. The closed form is what
+/// keeps a receiver's wire bound cheap against a peer-claimed or ceiling-sized
+/// `total_bytes` in the terabytes, where a walk would visit tens of millions of
+/// groups before the first byte arrives.
 #[must_use]
 pub fn bao_encoded_size(total_bytes: u64, chunk_ranges: &ChunkRanges) -> u64 {
-    // Walk exactly the node set the serve-side encoder emits. `encode_ranges` /
-    // `encode_ranges_validated` iterate `ranges_pre_order_chunks_iter_ref(ranges,
-    // 0)` over the real `IROH_BLOCK_SIZE` tree (sync.rs), so the same walk yields
-    // the same Parent (64 B) + Leaf (data) sequence — and thus the same byte
-    // count — that travels on the wire. (The `ResponseIterRef` convenience walks a
-    // block-size-zero tree and descends to 1 KiB chunks, over-counting parents on
-    // partial groups, so it must NOT be used here.) `align_range`'s ranges are
-    // already clamped to the blob, so the encoder's `truncate_ranges` step is a
-    // no-op and is not reachable here (its module is private upstream).
     // A 0-byte blob (#1054) has no proof and no data — zero wire bytes for ANY
     // requested range. An empty range set likewise encodes to nothing. Short-
-    // circuit both before walking the tree: `bao-tree`'s pre-order chunk iterator
+    // circuit both before touching the tree: `bao-tree`'s pre-order chunk iterator
     // `debug_assert!`s `!ranges.is_empty()` (and would otherwise mis-walk an empty
     // set in release), and a 0-byte `BaoTree` walked over a non-empty range like
     // `ChunkRanges::all()` is a degenerate the callers never intend to bill for.
     if total_bytes == 0 || chunk_ranges.is_empty() {
         return 0;
     }
+    if let Some(size) = aligned_wire_size(total_bytes, chunk_ranges) {
+        return size;
+    }
+    walked_wire_size(total_bytes, chunk_ranges)
+}
+
+/// [`bao_encoded_size`] by walking exactly the node set the serve-side encoder
+/// emits: `encode_ranges` / `encode_ranges_validated` iterate
+/// `ranges_pre_order_chunks_iter_ref(ranges, 0)` over the real
+/// [`IROH_BLOCK_SIZE`] tree (sync.rs), so the same walk yields the same Parent
+/// (64 B) + Leaf (data) sequence — and thus the same byte count — that travels on
+/// the wire. (The `ResponseIterRef` convenience walks a block-size-zero tree and
+/// descends to 1 KiB chunks, over-counting parents on partial groups, so it must
+/// NOT be used here.) [`align_range`]'s ranges are already clamped to the blob,
+/// so the encoder's `truncate_ranges` step is a no-op and is not reachable here
+/// (its module is private upstream).
+///
+/// The reference the closed-form [`aligned_wire_size`] is checked against, and
+/// the fallback for range shapes it does not cover. `total_bytes` must be
+/// non-zero and `chunk_ranges` non-empty.
+fn walked_wire_size(total_bytes: u64, chunk_ranges: &ChunkRanges) -> u64 {
     let tree = BaoTree::new(total_bytes, IROH_BLOCK_SIZE);
     tree.ranges_pre_order_chunks_iter_ref(chunk_ranges.as_ref(), 0)
         .map(|chunk| u64::try_from(chunk.without_ranges().size()).unwrap_or(u64::MAX))
         .fold(0u64, u64::saturating_add)
+}
+
+/// Proof bytes per parent node on the wire: two 32-byte child hashes.
+const PARENT_WIRE_BYTES: u64 = 64;
+
+/// [`bao_encoded_size`] in closed form for ONE contiguous chunk range that starts
+/// on a chunk-group boundary and ends on one (or at the blob's end) — the shape
+/// [`align_range`] produces. `None` for any other shape (a sub-group start or
+/// end, several ranges, an open-ended range), which the caller walks instead.
+///
+/// What the encoder emits for such a range, per [`walked_wire_size`]'s iterator
+/// over the [`IROH_BLOCK_SIZE`]-shifted tree, whose leaves are whole chunk groups:
+///
+/// - the data of every group in the range — one leaf per group (the iterator's
+///   leaf split into 1 KiB halves only applies to a block-size-zero tree);
+/// - one parent for every internal node of the shifted tree whose group span
+///   intersects the range ([`intersecting_parents`]).
+///
+/// The shifted tree is bao's left-full binary tree over `n` groups: a lone group
+/// is a leaf, otherwise the left child is the full tree over the largest power of
+/// two below `n` and the right child the tree over the rest. Every internal node
+/// has two children, so a full tree over `n` groups has exactly `n - 1` parents.
+fn aligned_wire_size(total_bytes: u64, chunk_ranges: &ChunkRanges) -> Option<u64> {
+    let group_chunks: u64 = 1u64 << IROH_BLOCK_SIZE.chunk_log();
+    let &[start, end] = chunk_ranges.boundaries() else {
+        return None;
+    };
+    let (start, end) = (start.0, end.0);
+    let total_chunks = total_bytes.div_ceil(1024);
+    let start_on_group = start % group_chunks == 0;
+    let end_on_group = end % group_chunks == 0 || end == total_chunks;
+    if !start_on_group || !end_on_group || end <= start || end > total_chunks {
+        return None;
+    }
+    let groups = total_chunks.div_ceil(group_chunks);
+    let first_group = start / group_chunks;
+    let end_group = end.div_ceil(group_chunks);
+
+    let data_start = start.saturating_mul(1024);
+    let data_end = end.saturating_mul(1024).min(total_bytes);
+    let data = data_end.saturating_sub(data_start);
+
+    let parents = intersecting_parents(groups, 0, first_group, end_group);
+    Some(data.saturating_add(parents.saturating_mul(PARENT_WIRE_BYTES)))
+}
+
+/// Internal nodes of bao's left-full tree over `n` groups at `base` whose group
+/// span intersects `[a, b)`. A node either lies entirely outside the range (adds
+/// nothing), entirely inside it (adds every parent of its full subtree, `n - 1`),
+/// or straddles a boundary (adds itself and recurses) — so the recursion visits
+/// only the two boundary paths, `O(log n)` nodes.
+fn intersecting_parents(n: u64, base: u64, a: u64, b: u64) -> u64 {
+    let span_end = base.saturating_add(n);
+    if n <= 1 || b <= base || a >= span_end {
+        return 0;
+    }
+    if a <= base && span_end <= b {
+        return n - 1;
+    }
+    // Largest power of two strictly below `n` (`n >= 2` here): the left child's
+    // group count.
+    let left = 1u64 << (n - 1).ilog2();
+    1u64.saturating_add(intersecting_parents(left, base, a, b))
+        .saturating_add(intersecting_parents(
+            n - left,
+            base.saturating_add(left),
+            a,
+            b,
+        ))
 }
 
 /// Errors from preparing a verified origin range pull.
@@ -381,6 +470,96 @@ pub fn encode_verified_range(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
 mod tests {
     use super::*;
+
+    /// The closed-form [`aligned_wire_size`] must equal the encoder walk
+    /// byte-for-byte for every group-aligned contiguous range: it is what the
+    /// receiver's overrun / short-delivery / ceiling bounds and the voucher
+    /// cadence are computed from, so a one-byte drift is a money bug. Swept over
+    /// blob sizes that exercise every tree shape up to several groups (full,
+    /// ragged, half-group tails, exact multiples) and every aligned `[offset, end)`
+    /// window inside each.
+    #[test]
+    fn closed_form_wire_size_matches_the_encoder_walk() {
+        let g = CHUNK_GROUP_BYTES;
+        let mut sizes = vec![1, 1023, 1024, 1025, g / 2, g / 2 + 1, g - 1, g, g + 1];
+        for groups in 2..=9u64 {
+            for tail in [0, 1, g / 2, g / 2 + 1, g - 1] {
+                sizes.push((groups - 1) * g + tail.max(1));
+                sizes.push(groups * g + tail);
+            }
+        }
+        for total in sizes {
+            let groups = total.div_ceil(g);
+            for first in 0..groups {
+                for last in first + 1..=groups {
+                    let offset = first * g;
+                    let len = (last * g).min(total) - offset;
+                    let aligned = align_range(offset, len, total).expect("aligned");
+                    let closed = aligned_wire_size(total, aligned.chunk_ranges())
+                        .expect("aligned ranges take the closed form");
+                    let walked = walked_wire_size(total, aligned.chunk_ranges());
+                    assert_eq!(
+                        closed, walked,
+                        "total={total} offset={offset} len={len}: closed form {closed} != walk {walked}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Large trees, small windows: the walk is `O(window)` so it stays testable,
+    /// and the closed form must agree on offsets deep inside multi-level trees —
+    /// including the ragged final group of a blob in the gigabytes.
+    #[test]
+    fn closed_form_wire_size_matches_the_encoder_walk_deep_in_large_trees() {
+        let g = CHUNK_GROUP_BYTES;
+        for total in [
+            1_000_000_007u64,
+            (1u64 << 30) + 12_345,
+            (1u64 << 33) - g / 2,
+            (1u64 << 34) + 1,
+        ] {
+            let groups = total.div_ceil(g);
+            for first in [
+                0u64,
+                1,
+                2,
+                3,
+                1000,
+                groups / 3,
+                groups / 2,
+                groups - 4,
+                groups - 1,
+            ] {
+                for span in [1u64, 2, 3, 5] {
+                    let last = (first + span).min(groups);
+                    let offset = first * g;
+                    let len = (last * g).min(total) - offset;
+                    let aligned = align_range(offset, len, total).expect("aligned");
+                    let closed = aligned_wire_size(total, aligned.chunk_ranges())
+                        .expect("aligned ranges take the closed form");
+                    let walked = walked_wire_size(total, aligned.chunk_ranges());
+                    assert_eq!(
+                        closed, walked,
+                        "total={total} offset={offset} len={len}: closed form {closed} != walk {walked}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A range the closed form does not cover (a sub-group start) falls back to the
+    /// walk rather than answering wrongly.
+    #[test]
+    fn closed_form_declines_sub_group_ranges() {
+        let total = 3 * CHUNK_GROUP_BYTES;
+        let ranges = ChunkRanges::from(ChunkNum(3)..ChunkNum(40));
+        assert!(aligned_wire_size(total, &ranges).is_none());
+        assert_eq!(
+            bao_encoded_size(total, &ranges),
+            walked_wire_size(total, &ranges)
+        );
+    }
 
     // A blob spanning several chunk groups so the aligned fetch window has a
     // non-trivial length we can over- and under-shoot.

@@ -5,18 +5,18 @@
 //! **total** bar, all sharing an [`indicatif::MultiProgress`]. A finished file's
 //! bar clears, so only active pulls stay on screen.
 //!
-//! The two rows measure different units on purpose. A per-file bar is in **wire**
-//! bytes — bao content plus interleaved proof nodes — because that is the only
-//! unit a single pull's delivery [`ProgressCallback`] reports (a blob's aligned
-//! wire length is known from its signed `StreamResponse`, its content size is
-//! not). The **total** bar is in **content** bytes, with its denominator fixed on
-//! the first frame from the manifest's declared sizes (`total_content_bytes`):
-//! the run knows up front exactly how many content bytes it will deliver, so the
-//! total reads "delivered of the whole download" from the start rather than
-//! growing as pulls begin. Each pull folds its wire progress into the total scaled
-//! to its content size — `size × received_wire / expected_wire` — a monotonic
-//! value that lands on exactly the pull's content size at completion, so the total
-//! ends at exactly 100%.
+//! Both rows are in **content** bytes. A per-file bar tracks the `(received,
+//! expected)` pair a single pull's delivery [`ProgressCallback`] reports — the
+//! verified content position against the blob's `total_bytes`, known from its
+//! signed `StreamResponse`. The **total** bar has its denominator fixed on the
+//! first frame from the manifest's declared sizes (`total_content_bytes`): the run
+//! knows up front exactly how many content bytes it will deliver, so the total
+//! reads "delivered of the whole download" from the start rather than growing as
+//! pulls begin. Each pull folds its progress into the total scaled to the
+//! manifest's declared size — `size × received / expected`, which pins the
+//! contribution to the manifest's figure even if the delivered blob's
+//! `total_bytes` differs from it — a monotonic value that lands on exactly the
+//! declared size at completion, so the total ends at exactly 100%.
 //!
 //! The total bar is shown only when the manifest declares sizes. A blob with no
 //! declared size contributes nothing to the denominator and moves the total not at
@@ -126,8 +126,9 @@ impl PullProgress {
     /// A per-file bar for a whole-blob pull, labeled `label` and inserted above the
     /// total bar. `size` (the manifest's content size, when declared) sets an
     /// initial bar length so it reads sensibly during the pre-byte handshake; the
-    /// first delivered chunk replaces it with the authoritative wire length. It is
-    /// also the pull's scaled contribution to the total bar.
+    /// first progress callback (the driver's pre-stream `base_present` report)
+    /// replaces it with the authoritative `total_bytes`. It is also the pull's
+    /// scaled contribution to the total bar.
     ///
     /// When disabled the returned [`FileBar`] is silent and its
     /// [`FileBar::callback`] is `None`, so the fetch path runs byte-bar-free
@@ -142,9 +143,9 @@ impl PullProgress {
             bar.set_length(n);
         }
         let bar = self.insert_file_bar(bar);
-        // The file bar tracks wire bytes; the total bar gets this pull's wire
-        // progress scaled to its content `size`. A pull with no declared size
-        // still shows its own bar but adds nothing to the total.
+        // The file bar tracks the pull's own progress; the total bar gets that
+        // progress scaled to the manifest's declared `size`. A pull with no
+        // declared size still shows its own bar but adds nothing to the total.
         let (file_cb, _meter) = fetch::bar_callback(bar.clone(), None);
         let contrib = i
             .total
@@ -253,7 +254,7 @@ impl FileBar {
 /// A chunked file's bar, advanced across its several chunk pulls. Unlike a
 /// whole-file [`FileBar`] — one pull, one `set_position` callback — a chunked file
 /// sums many chunk pulls, so its callbacks *increment* the bar and grow its length
-/// as each chunk's wire size is learned. Silent when the renderer is disabled.
+/// as each chunk's `total_bytes` is learned. Silent when the renderer is disabled.
 pub(crate) struct ChunkedFile {
     /// The file's bar; `None` when disabled.
     bar: Option<indicatif::ProgressBar>,
@@ -341,7 +342,7 @@ impl ChunkedFile {
     }
 
     /// Clear the bar once the file's chunks are fetched and it is assembled, and
-    /// true up its total contribution to exactly its content `size` (the wire
+    /// true up its total contribution to exactly its declared `size` (the scaled
     /// fraction lands there, but round-off could leave a byte or two short).
     pub(crate) fn finish(self) {
         if let (Some(total), Some(size)) = (&self.total, self.size) {
@@ -370,11 +371,11 @@ fn scaled(size: u64, num: u64, den: u64) -> u64 {
     }
 }
 
-/// A whole-file pull's fold into the total bar: it maps the pull's cumulative wire
-/// `(received, expected)` to content bytes (`size × received / expected`) and adds
-/// only the increase since the previous update. `expected` (the pull's wire
-/// length) is constant, so the mapped value is monotonic and reaches exactly
-/// `size` when the pull completes.
+/// A whole-file pull's fold into the total bar: it maps the pull's cumulative
+/// `(received, expected)` onto the manifest's declared size (`size × received /
+/// expected`) and adds only the increase since the previous update. `expected`
+/// (the pull's `total_bytes`) is constant, so the mapped value is monotonic and
+/// reaches exactly `size` when the pull completes.
 fn content_contributor(total: indicatif::ProgressBar, size: u64) -> impl Fn(u64, u64) {
     let prev = AtomicU64::new(0);
     move |received: u64, expected: u64| {
@@ -389,7 +390,7 @@ fn content_contributor(total: indicatif::ProgressBar, size: u64) -> impl Fn(u64,
     }
 }
 
-/// Fold a chunked file's current wire progress into `total`, scaled to its content
+/// Fold a chunked file's current progress into `total`, scaled to its declared
 /// `size`: `size × bar.position / bar.length`, advanced only upward. The file
 /// bar's length grows as chunks start, so the ratio can dip momentarily — the
 /// upward-only [`AtomicU64::fetch_max`] keeps the total from regressing. A no-op
@@ -446,9 +447,9 @@ mod tests {
         assert_eq!(scaled(1000, 0, 4000), 0);
         assert_eq!(scaled(1000, 1000, 4000), 250);
         assert_eq!(scaled(1000, 4000, 4000), 1000);
-        // `received` past `expected` (wire overshoot) is clamped, never over 100%.
+        // `received` past `expected` (overshoot) is clamped, never over 100%.
         assert_eq!(scaled(1000, 5000, 4000), 1000);
-        // A zero denominator (no wire length yet) is zero, not a divide-by-zero.
+        // A zero denominator (no length yet) is zero, not a divide-by-zero.
         assert_eq!(scaled(1000, 10, 0), 0);
     }
 
@@ -461,9 +462,9 @@ mod tests {
     }
 
     #[test]
-    fn content_contributor_scales_wire_progress_to_content_size() {
-        // A pull of 1000 content bytes whose wire length is 4000 (bao overhead):
-        // the total advances in content bytes and ends on exactly 1000.
+    fn content_contributor_scales_progress_to_declared_size() {
+        // A pull reporting progress against an `expected` of 4000 for a declared
+        // size of 1000: the total advances in declared bytes and ends on exactly 1000.
         let total = indicatif::ProgressBar::with_draw_target(
             Some(1000),
             indicatif::ProgressDrawTarget::hidden(),
@@ -506,7 +507,7 @@ mod tests {
         cb1(0, 50);
         cb1(30, 50);
         cb1(50, 50);
-        // Chunk 2: 40 wire bytes. A fresh callback tracks its own cumulative.
+        // Chunk 2: 40 bytes expected. A fresh callback tracks its own cumulative.
         let cb2 = cf.chunk_callback().expect("enabled -> Some callback");
         cb2(0, 40);
         cb2(40, 40);
@@ -514,7 +515,7 @@ mod tests {
         let bar = cf.bar.as_ref().expect("bar present");
         assert_eq!(bar.length(), Some(90));
         assert_eq!(bar.position(), 90);
-        // 90/90 of the wire → the file's full 1000 content bytes fold into the total.
+        // 90/90 delivered → the file's full 1000 declared bytes fold into the total.
         assert_eq!(total.position(), 1000);
         // A completed file trues up to exactly its size (idempotent here).
         cf.finish();

@@ -39,7 +39,15 @@ decdn-node = { workspace = true }
 decdn-incentive = { workspace = true }
 decdn-cache = { workspace = true }
 decdn-common = { workspace = true }
-decdn-client-pull = { workspace = true }
+# `test-util` exposes the in-memory `stream_fetch*` wrappers `ClientFixture`
+# drives (the fixture wants the decoded bytes back, not a store) and
+# `ClientRangedStore::seed_checkpointed_prefix`, which the resume e2e uses to
+# construct a real checkpointed on-disk state. On the normal edge rather than a
+# dev-dep because the fixture lives in this crate's library. Resolver-3 feature
+# unification makes the feature visible to every member of a `--workspace`
+# build; the shipped binaries build per package, which is where the "a production
+# caller cannot name them" guard matters.
+decdn-client-pull = { workspace = true, features = ["test-util"] }
 decdn-protocol = { workspace = true }
 decdn-config-types = { workspace = true }
 # Outboard construction for `seed_origin_blob_with_outboard`: seeds the sibling
@@ -61,11 +69,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
-# `test-util` exposes `ClientRangedStore::seed_checkpointed_prefix`, which the
-# resume e2e uses to construct a real new-model checkpointed on-disk state
-# (positioned `.partial` + `.obao4` outboard + `.ranges` record) instead of the
-# old raw-`.partial` seeding the gap-driven fetch no longer resumes from.
-decdn-client-pull = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

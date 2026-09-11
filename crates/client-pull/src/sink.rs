@@ -4,8 +4,9 @@
 //! byte-reader trait while [`StashedFault`] preserves the pull's typed faults
 //! (stall, refusal, voucher rejection) so a misbehaving peer stays scoreable —
 //! the decoder itself can only say "the bytes stopped arriving". The streaming
-//! decode loop that consumes these lives in
-//! [`crate::ranged_store::ClientRangedStore::ingest_stream`].
+//! decode loops that consume these are
+//! [`crate::ranged_store::ClientRangedStore::ingest_stream`], the node's cache
+//! admit, and (`test-util`) the in-memory `stream_fetch*` wrappers.
 //!
 //! [`content_paid_frontier`] maps a paid WIRE-byte watermark back to the
 //! content-byte frontier it covers, for the resume-at-paid-frontier gate.
@@ -28,7 +29,9 @@ use crate::{HashMismatch, UpstreamPull};
 /// `io::Error` would silently downgrade, say, a peer's mid-stream refusal into
 /// an anonymous decode failure and stop it being scored. So the original
 /// `anyhow::Error` is parked in `fault` and the trait returns a placeholder; the
-/// driver below checks `fault` first and returns the real error, using the
+/// decode loop that owns the reader
+/// ([`crate::ranged_store::ClientRangedStore::ingest_stream`], or the `test-util`
+/// in-memory decoder) checks `fault` first and returns the real error, using the
 /// decoder's complaint only when there is no parked fault.
 #[derive(Debug)]
 pub struct PullReader {
@@ -52,13 +55,13 @@ impl PullReader {
     }
 
     /// Recover the inner [`UpstreamPull`] once the decode loop is done with this
-    /// reader, so [`crate::source::BlobSource::finish`] can drain it to the
-    /// stream end and recover the acked voucher watermark.
+    /// reader, so [`crate::source::BlobSource::finish`] (or the `test-util`
+    /// in-memory wrapper) can drain it to the stream end and recover the acked
+    /// voucher watermark.
     ///
     /// Any buffered-but-unconsumed wire bytes and a parked fault are dropped
-    /// silently: the driver only calls this after
-    /// [`crate::source::BaoRangeReader`]'s decode loop reached its clean `Done`
-    /// state.
+    /// silently: a caller only calls this after the decode loop reached its clean
+    /// `Done` state.
     pub(crate) fn into_inner(self) -> UpstreamPull {
         self.pull
     }
@@ -142,12 +145,12 @@ impl StashedFault for Bytes {
 }
 
 /// Split a bao decode failure into "the peer lied" and "the stream ended early",
-/// matching the taxonomy the buffered decoder and the node-side tee both use
-/// (ADR 038). Only a hash mismatch is provably corruption; a truncated stream is
+/// the taxonomy every decoding consumer and the node-side tee share (ADR 038).
+/// Only a hash mismatch is provably corruption; a truncated stream is
 /// transport-class and must not tar the peer as a liar.
 ///
-/// `pub(crate)`: [`crate::ranged_store::ClientRangedStore::ingest_stream`] reuses
-/// this exact classification for the streaming ingest path rather than
+/// `pub(crate)`: [`crate::ranged_store::ClientRangedStore::ingest_stream`] and the
+/// in-memory `stream_fetch*` decoder reuse this exact classification rather than
 /// duplicating the match.
 pub(crate) fn classify_decode_error(err: DecodeError) -> anyhow::Error {
     match err {

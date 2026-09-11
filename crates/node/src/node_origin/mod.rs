@@ -1601,6 +1601,7 @@ async fn pull_from_candidate(
         NO_NAMESPACE,
         0,
         now_micros(),
+        deps.config.max_blob_size_bytes,
         rate_ceiling,
         deadlines,
         0,
@@ -2950,8 +2951,8 @@ mod tests {
     ///
     /// The wiring is guarded where the wiring lives:
     /// - `the_range_helpers_mark_their_own_faults_as_local` (in `decdn-client-pull`) drives
-    ///   the REAL `aligned_wire_len` / `decode_verified_range` into their REAL errors and
-    ///   asserts the marker is on them, never attaching it itself.
+    ///   the REAL `aligned_wire_len` into its REAL error and asserts the marker is on it,
+    ///   never attaching it itself.
     /// - `node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one` drives a
     ///   real pull whose signature the upstream cannot verify — the production shape of "our
     ///   buyer key is broken" — and asserts `node_pull_local_fault_total` moves while the
