@@ -480,7 +480,7 @@ fn shared_region_tree() -> TempDir {
 }
 
 #[test]
-fn optimize_writes_chunk_blobs_and_chunked_entries() {
+fn optimize_stores_whole_file_blobs_and_chunk_hints() {
     let tree = shared_region_tree();
     let origin = TempDir::new().unwrap();
 
@@ -503,15 +503,15 @@ fn optimize_writes_chunk_blobs_and_chunked_entries() {
     let report: serde_json::Value = serde_json::from_slice(out.stdout.trim_ascii_end()).unwrap();
     assert_eq!(report["optimized"].as_bool(), Some(true));
     let total = report["chunks_total"].as_u64().unwrap();
-    let written = report["chunks_written"].as_u64().unwrap();
+    assert!(total > 0, "expected at least one chunk hint, got {total}");
     assert!(
-        written < total,
-        "dedup expected: written={written} total={total}"
+        report.get("chunks_written").is_none(),
+        "chunks_written must be dropped now that optimize stores no per-chunk blobs"
     );
 
-    // The written manifest blob is retrievable; every entry is chunked and its
-    // chunk blobs (data + .obao4) exist at sharded paths. The whole-file hashes
-    // are NOT stored (optimize stores chunks, not the whole blob).
+    // The written manifest blob is retrievable; every entry's WHOLE-FILE hash
+    // (+ its .obao4 outboard) is stored, exactly like a plain import — the
+    // chunk list is manifest-only dedup hints, never separately stored blobs.
     let bundle_hex = report["bundle_hash"]
         .as_str()
         .unwrap()
@@ -525,38 +525,63 @@ fn optimize_writes_chunk_blobs_and_chunked_entries() {
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
     let entries = manifest["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2);
+
+    let mut whole_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_hint_hashes: Vec<String> = Vec::new();
     for e in entries {
         let whole_hex = e["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
+        whole_hashes.insert(whole_hex.to_string());
+        let data = data_object_path(origin.path(), whole_hex);
+        let obao4 = origin
+            .path()
+            .join(&whole_hex[..2])
+            .join(format!("{whole_hex}.obao4"));
+        assert!(data.is_file(), "whole-file blob {whole_hex} must be stored");
         assert!(
-            !data_object_path(origin.path(), whole_hex).is_file(),
-            "whole-file blob {whole_hex} must NOT be stored in optimize mode"
+            obao4.is_file(),
+            "whole-file outboard missing: {}",
+            obao4.display()
         );
-        let chunks = e["chunks"].as_array().expect("entry must be chunked");
+
+        let size = e["size"].as_u64().unwrap();
+        let chunks = e["chunks"].as_array().expect("entry must carry hints");
         assert!(!chunks.is_empty());
+        let sum: u64 = chunks.iter().map(|c| c["size"].as_u64().unwrap()).sum();
+        assert_eq!(sum, size, "chunk hint sizes must sum to the entry size");
         for c in chunks {
             let chex = c["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
-            let data = data_object_path(origin.path(), chex);
-            let obao4 = origin.path().join(&chex[..2]).join(format!("{chex}.obao4"));
-            assert!(
-                data.is_file(),
-                "chunk data object missing: {}",
-                data.display()
-            );
-            assert!(
-                obao4.is_file(),
-                "chunk outboard missing: {}",
-                obao4.display()
-            );
+            all_hint_hashes.push(chex.to_string());
         }
     }
+
+    // No stored object exists for a chunk-hash-only hint (one that isn't also
+    // some entry's whole-file hash) — optimize stores whole files, not chunks.
+    for chex in &all_hint_hashes {
+        if whole_hashes.contains(chex) {
+            continue;
+        }
+        assert!(
+            !data_object_path(origin.path(), chex).is_file(),
+            "chunk hint {chex} must NOT be stored as a data object"
+        );
+    }
+
+    // The two files share an identical middle region, so their hint lists
+    // must share at least one identical chunk hash.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut shared = false;
+    for h in &all_hint_hashes {
+        if !seen.insert(h.as_str()) {
+            shared = true;
+        }
+    }
+    assert!(shared, "expected the two entries to share >=1 chunk hint");
 }
 
-// `--dry-run --optimize` must preview dedup: the distinct-chunk count is
-// computed the same way a real write would, even though no blob is written.
-// Regression for the bug where the dedup set was only populated when
-// `write` was true, so a dry run always reported `chunks_written: 0`.
+// `--dry-run --optimize` must preview the chunk-hint count the same way a real
+// run would compute it, even though no blob is written.
 #[test]
-fn optimize_dry_run_previews_dedup_without_writing() {
+fn optimize_dry_run_previews_chunk_hints_without_writing() {
     let tree = shared_region_tree();
     let origin = TempDir::new().unwrap();
     // A --to path that must NEVER be created by a dry run.
@@ -583,19 +608,18 @@ fn optimize_dry_run_previews_dedup_without_writing() {
         serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
     assert_eq!(report["optimized"].as_bool(), Some(true));
     let total = report["chunks_total"].as_u64().unwrap();
-    let written = report["chunks_written"].as_u64().unwrap();
+    assert!(total > 0, "expected at least one chunk hint, got {total}");
     assert!(
-        total > written,
-        "dedup expected to be visible in dry-run: total={total} written={written}"
+        report.get("chunks_written").is_none(),
+        "chunks_written must be dropped"
     );
-    assert!(written > 0, "written must be nonzero: {written}");
 
-    // Stdout is still the clean chunked manifest.
+    // Stdout is still the clean manifest, carrying chunk hints.
     let manifest: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let entries = manifest["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2);
     for e in entries {
-        assert!(e["chunks"].as_array().is_some(), "entry must be chunked");
+        assert!(e["chunks"].as_array().is_some(), "entry must carry hints");
     }
 
     // No blobs written, and the never-requested origin dir was never created.
@@ -633,24 +657,39 @@ fn optimize_single_file_emits_one_entry_manifest() {
     assert_eq!(entries.len(), 1, "single file → exactly one entry");
     let e = &entries[0];
     assert_eq!(e["path"].as_str(), Some("model.bin"));
-    let chunks = e["chunks"].as_array().expect("entry must be chunked");
+    let whole_hex = e["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
+    assert!(
+        data_object_path(origin.path(), whole_hex).is_file(),
+        "whole-file blob {whole_hex} must be written"
+    );
+    let obao4 = origin
+        .path()
+        .join(&whole_hex[..2])
+        .join(format!("{whole_hex}.obao4"));
+    assert!(obao4.is_file(), "whole-file outboard must be written");
+
+    let chunks = e["chunks"].as_array().expect("entry must carry hints");
     assert!(!chunks.is_empty());
+    let size = e["size"].as_u64().unwrap();
+    let sum: u64 = chunks.iter().map(|c| c["size"].as_u64().unwrap()).sum();
+    assert_eq!(sum, size, "chunk hint sizes must sum to the entry size");
     for c in chunks {
         let chex = c["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
+        if chex == whole_hex {
+            continue;
+        }
         assert!(
-            data_object_path(origin.path(), chex).is_file(),
-            "chunk blob {chex} must be written"
+            !data_object_path(origin.path(), chex).is_file(),
+            "chunk hint {chex} must NOT be stored as its own data object"
         );
     }
 }
 
-// Generation is self-consistent WITHOUT a node: concatenating an entry's chunk
-// blobs (read from the sharded store, in `chunks` order) must reproduce the
-// whole-file bytes hashed by the entry's `hash`.
-// `--optimize` writes derived chunk blobs via `import_bytes`, never touching
-// the source file, so pairing it with `--move` would silently leave every
-// source on disk while the report claims a move. The combo is rejected
-// up front, before any filesystem work happens.
+// `--optimize` never touches the source file (it writes the derived
+// whole-file blob into the origin store, source untouched), so pairing it
+// with `--move` would silently leave every source on disk while the report
+// claims a move. The combo is rejected up front, before any filesystem work
+// happens.
 #[test]
 fn optimize_and_move_are_rejected_together() {
     let src = TempDir::new().unwrap();
@@ -682,8 +721,12 @@ fn optimize_and_move_are_rejected_together() {
     );
 }
 
+// The stored whole-file blob is byte-identical to the source, and its content
+// hash is exactly the entry's `hash` and the BLAKE3 the chunker independently
+// computed over the same bytes — the two streaming passes (`import_one_file`
+// and `chunk_file`) agree on both hash and size.
 #[test]
-fn optimize_chunks_concatenate_to_whole_entry_hash() {
+fn optimize_whole_file_blob_matches_entry_hash() {
     let tree = shared_region_tree();
     let origin = TempDir::new().unwrap();
 
@@ -711,12 +754,11 @@ fn optimize_chunks_concatenate_to_whole_entry_hash() {
     let manifest_bytes = fs::read(data_object_path(origin.path(), bundle_hex)).unwrap();
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
 
-    let e = &manifest["entries"].as_array().unwrap()[0];
-    let whole_hex = e["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
-    let mut concat: Vec<u8> = Vec::new();
-    for c in e["chunks"].as_array().unwrap() {
-        let chex = c["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
-        concat.extend_from_slice(&fs::read(data_object_path(origin.path(), chex)).unwrap());
+    for e in manifest["entries"].as_array().unwrap() {
+        let whole_hex = e["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
+        let stored = fs::read(data_object_path(origin.path(), whole_hex)).unwrap();
+        assert_eq!(blake3::hash(&stored).to_hex().as_str(), whole_hex);
+        let source = fs::read(tree.path().join(e["path"].as_str().unwrap())).unwrap();
+        assert_eq!(stored, source, "stored blob must equal the source bytes");
     }
-    assert_eq!(blake3::hash(&concat).to_hex().as_str(), whole_hex);
 }
