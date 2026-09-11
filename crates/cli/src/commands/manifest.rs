@@ -35,11 +35,14 @@ struct Bundle<'a> {
 /// One manifest entry: a file's relative POSIX path, its `b3:<hex>` content
 /// address, and its byte length.
 ///
-/// `hash`/`size` always describe the **whole file**. When `chunks` is present it
-/// is an ordered decomposition of that same file — a dedup helper — and the
-/// file's bytes are the in-order concatenation of the chunk blobs, validated
-/// against `hash`. A plain (unchunked) entry omits `chunks` entirely and
-/// serializes byte-identically to a bundle that predates chunked entries.
+/// `hash`/`size` always describe the **whole file**, stored and served as one
+/// blob. When `chunks` is present it lists advisory `{hash, size}`
+/// range-dedup hints over that same file's byte layout, in content order; a
+/// hint's hash is never independently stored or fetched, only matched
+/// against bytes a client already holds. `hash` is the authoritative
+/// end-to-end validator regardless of whether hints are present. A plain
+/// (unhinted) entry omits `chunks` entirely and serializes byte-identically
+/// to a bundle that predates chunk hints.
 #[derive(Serialize)]
 pub(crate) struct BundleEntry {
     /// Relative POSIX path within the bundle root (`a/b.txt`, never absolute).
@@ -48,22 +51,25 @@ pub(crate) struct BundleEntry {
     pub(crate) hash: String,
     /// The whole file's length in bytes.
     pub(crate) size: u64,
-    /// Optional ordered chunk decomposition of the file (a dedup helper). When
-    /// present, each chunk is an independently content-addressed blob and the
-    /// file is their in-order concatenation; when absent, the file is fetched as
-    /// one blob by `hash`. Skipped from the serialized form when absent so plain
-    /// entries keep their pre-chunks byte layout.
+    /// Optional ordered range-dedup hints over the file's bytes. The file is
+    /// always stored and fetched as the one whole-file blob named by `hash`;
+    /// a hint only lets a client recognize a byte range it already holds (a
+    /// sibling entry with a matching chunk hash) and skip re-downloading it.
+    /// Skipped from the serialized form when absent so plain entries keep
+    /// their pre-hints byte layout.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) chunks: Option<Vec<Chunk>>,
 }
 
-/// One chunk of a chunked [`BundleEntry`]: an independently BLAKE3-addressed blob
-/// and its byte length. Chunks are listed in content order — the file is their
-/// concatenation — and a chunk `hash` shared across entries names one blob,
-/// fetched and paid for once.
+/// One range-dedup hint over a hinted [`BundleEntry`]'s bytes: a BLAKE3 over
+/// that byte range and its length. Hints are listed in content order — the
+/// range they cover, in sequence, spans the whole file — and a hint `hash`
+/// shared across entries tells a client the two files share that byte range,
+/// so it fetches and pays for it once and splices the other copy in locally.
+/// The hash is never independently stored, served, or fetched as a blob.
 #[derive(Serialize)]
 pub(crate) struct Chunk {
-    /// The chunk blob's BLAKE3 content address, `b3:<64 lowercase hex>`.
+    /// The BLAKE3 content address of this byte range, `b3:<64 lowercase hex>`.
     pub(crate) hash: String,
     /// The chunk's length in bytes. The chunk sizes sum to the entry's `size`.
     pub(crate) size: u64,

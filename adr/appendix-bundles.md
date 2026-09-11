@@ -51,33 +51,45 @@ order — field declaration order is load-bearing, see
 - `size` — file size in bytes, unsigned 64-bit integer. Optional and
   informational on the read side: `bundle pull` uses it for the dry-run
   plan and size hints, and fetches without it.
-- `chunks` — optional ordered chunk decomposition of the file. See
-  [Chunked files](#chunked-files). When absent, the file is one blob
-  addressed by `hash`.
+- `chunks` — optional ordered list of range-dedup hints over the file's
+  bytes. See [Chunked files](#chunked-files). When absent, the file is
+  one blob addressed by `hash`.
 
 ## Chunked files
 
-A `chunks` array represents a file as the in-order concatenation of
-independently content-addressed chunk blobs. It is a **dedup helper**: a
-chunk shared by two files (two textures that share a region) is one blob,
-fetched and paid for once.
+A node stores and serves one file as one whole-file blob. It never
+stores or serves a chunk as its own blob. A chunk hash is not an
+address a client can fetch.
+
+A `chunks` array is a list of hints. Each hint names a byte range of
+the file and its BLAKE3 hash. A client uses a hint to recognize bytes
+it already holds from another file in the same pull. It skips the
+download of that byte range and splices its local copy in. The
+`hash` field stays the file's only fetchable and authoritative
+identity: the client verifies the assembled file against `hash`, and
+a wrong or stale hint only costs a re-download, never a wrong file.
 
 ```json
 {"path":"model.safetensors","hash":"b3:whole...","size":100,"chunks":[{"hash":"b3:c0...","size":60},{"hash":"b3:c1...","size":40}]}
 ```
 
 - `hash` and `size` always describe the **whole file**. `hash` is the
-  file's identity and the end-to-end validator.
-- Each element of `chunks` has `hash` (`b3:<hex>`, the chunk blob's
-  BLAKE3) then `size` (the chunk's byte length). The chunk sizes sum to
+  file's identity and the end-to-end validator. The client always
+  fetches (or completes, via splice) the whole file and always checks
+  it against `hash`.
+- Each element of `chunks` has `hash` (`b3:<hex>`, a hash over that
+  byte range) then `size` (the range's byte length). The sizes sum to
   the entry `size`.
-- Chunks are listed in **content order** — the file is their
-  concatenation. This order is load-bearing and never sorted.
+- Hints are listed in **content order**: the ranges they name, in
+  sequence, cover the whole file. This order is load-bearing and never
+  sorted.
 
-The chunk blobs are ordinary blobs. The network sees only blobs, never
-chunk structure, exactly as it sees only the bundle blob and each entry
-blob. A file with unique chunks costs the same as an unchunked file plus
-the manifest; the win comes only from shared chunks.
+A hint earns its keep only when two files in the same pull share a byte
+range (two textures that share a region, or two model checkpoints that
+share most of their weights). The client fetches that range once, pays
+for it once, and splices it into every file that names it. A file with
+no shared ranges costs the same as an unchunked file plus the manifest
+entry.
 
 ## Hash format
 
@@ -176,24 +188,24 @@ manifest in the protocol sense.
 canonical bundle manifest for it (see [Determinism](#determinism)). By
 default each file becomes one whole-file blob, addressed by `hash`.
 
-With `--optimize`, `origin import` splits each file into content-defined
-chunks (fastcdc v2020) instead of storing it as one blob. `--chunk-avg` is the
-primary dial: it sets the target chunk size and defaults to 4 MiB, the
-ceiling fastcdc's averaging window supports. `--chunk-min` and
-`--chunk-max` are advanced rails around that target; `--chunk-min` is
-pinned at a 1 MiB floor, matching `MB_BYTES`, the fixed payment interval
-— a chunk smaller than one payment interval buys nothing. Each chunk
-becomes its own BLAKE3-addressed blob. A chunk with the same content as
-one already seen — in the same file or a different one — is stored once:
-`origin import` deduplicates by content address, not by file. The
-whole-file blob is never stored under `--optimize`; the file's bytes are
-the in-order concatenation of its chunk blobs, and the entry's `hash`
-field is the end-to-end validator that the concatenation reproduces the
-original file (see [Chunked files](#chunked-files)).
+With `--optimize`, `origin import` stores each file as one whole-file blob
+(as it always does) and additionally content-defines chunks (fastcdc
+v2020) over its bytes to compute the manifest's range-dedup hints.
+`--chunk-avg` is the primary dial: it sets the target chunk size and
+defaults to 4 MiB, the ceiling fastcdc's averaging window supports.
+`--chunk-min` and `--chunk-max` are advanced rails around that target;
+`--chunk-min` is pinned at a 1 MiB floor, matching `MB_BYTES`, the fixed
+payment interval — a hint smaller than one payment interval buys nothing.
+Each chunk becomes one hint: its BLAKE3 and its byte length. A chunk hash
+is never stored or served as its own blob; `origin import` writes only
+the one whole-file blob, and the hint exists solely so a later `bundle
+pull` can recognize the same bytes in another file (see
+[Chunked files](#chunked-files)).
 
 A single-file `--optimize` import produces one manifest entry with a
-`chunks` array; a directory import produces one entry per file, each
-independently chunked, with dedup applied across the whole directory.
+`chunks` hint list; a directory import produces one entry per file, each
+with its own hints computed over the whole directory's files so a shared
+range between two files is recognized either way.
 
 `bundle pull` consumes a chunked manifest exactly as it consumes an
 unchunked one — see [Chunked entries](#chunked-entries) under Pull.
@@ -248,21 +260,27 @@ there is no separate verify toggle.
 
 ### Chunked entries
 
-A `chunks` entry (see [Chunked files](#chunked-files)) is pulled in two
-phases. First, `bundle pull` fetches every distinct chunk blob the
-about-to-be-written entries reference, once each, over the same paid
-path — so a chunk shared across entries is fetched and paid for once.
-Then it concatenates each entry's chunk blobs in order into the
-destination and verifies the assembled bytes against the whole-file
-`hash`. The destination appears only after that check passes, by atomic
-rename, so a present file is verified-good and re-runs resume. Each
-chunk blob is BLAKE3-checked against its own hash on the way in; the
-whole-file check additionally rejects a chunk list that is individually
-valid but wrong or misordered.
+A `chunks` entry (see [Chunked files](#chunked-files)) is still one
+whole-file blob. `bundle pull` fetches it whole over the paid path,
+except for a byte range whose hint hash matches a range another entry
+in the same run already fetched and verified — that range is spliced in
+from the sibling's on-disk bytes instead, and the client pays only for
+the remaining, "complement," ranges. A splice source is always the
+verified bytes of a completed, whole-file-hash-checked entry, never an
+independently fetched chunk.
 
-Chunk dedup holds within one pull. Reuse across separate pulls — v2 of a
-model skipping the chunks it already fetched for v1 — needs a persistent
-chunk-addressed cache and is a follow-up.
+The reassembled bytes are verified against the whole-file `hash` before
+the destination appears, by atomic rename, so a present file is
+verified-good and re-runs resume. A spliced range is re-checked against
+its own hint hash before it is trusted, so a donor entry whose bytes
+were tampered with cannot poison a recipient; the whole-file check is
+the final backstop against a hint that is individually valid but wrong
+or misordered — the client re-fetches the entry whole rather than trust
+it.
+
+Range-dedup holds within one pull. Reuse across separate pulls — v2 of a
+model skipping the ranges it already fetched for v1 — needs a persistent
+range-addressed cache and is a follow-up.
 
 At the end of a pull the report states the distinct content bytes fetched
 and the bytes written to disk — `downloaded X → reconstructed Y` — whenever

@@ -7,11 +7,12 @@
 //! and paid for — once and hard-linked (or copied) to each path (#1306). Node selection is
 //! per blob (#936): with an explicit `--node-id` every entry is pulled from that
 //! one node, otherwise each distinct blob discovers its own holder among the
-//! region-nearest active nodes. Whole-file entries and the chunks of a chunked
-//! file all fan out concurrently, bounded by one global `--jobs` cap
-//! (`PullCtx.gate`) — a many-chunk file can saturate that budget by itself, and
-//! a chunk shared between files is fetched once regardless of how many files
-//! reference it.
+//! region-nearest active nodes. Every group's fetch — a plain whole-file blob,
+//! or a hint-carrying entry's complement-range fetch — fans out concurrently,
+//! bounded by one global `--jobs` cap (`PullCtx.gate`). A manifest `chunks`
+//! entry is never fetched or stored as its own blob: its hints only let a
+//! byte range shared with another entry be recognized and spliced from disk
+//! instead of paid for again.
 //!
 //! **One shared pool.** The whole bundle pulls from the caller's single
 //! `PaymentPool` deposit (ADR 003) — opened once and reused across every
@@ -679,10 +680,11 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// instantiates more live progress bars than the run can actually service
     /// at once.
     jobs: usize,
-    /// Global cap on concurrent blob fetches — whole-file entries and chunks of a
-    /// chunked file alike — so one many-chunk file can saturate `--jobs` by itself
-    /// while the run never exceeds it. A chunk reused from another file is deduped
-    /// before it reaches the fetch path, so it never takes a permit.
+    /// Global cap on concurrent blob fetches, one permit per group: a plain
+    /// whole-file fetch, or a hint-carrying entry's complement-range fetch (plus
+    /// its donor splice and any re-fetch), held as one logical fetch unit. A
+    /// byte range a sibling entry already holds is spliced from disk instead of
+    /// fetched, so it never takes a permit of its own.
     gate: tokio::sync::Semaphore,
     /// The run's multi-bar progress renderer: one per-file bar per active pull
     /// above a bottom total bar (silent off a terminal or under `--json`). Set
