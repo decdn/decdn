@@ -1,7 +1,8 @@
 //! Client fixture: drives the real paid client path (`cdn/client/v1`) against a
 //! [`crate::node::NodeFixture`] — open an on-chain `PaymentPool`, self-issue the
 //! owner capability delegating spend to the buyer's own key, dial the daemon's
-//! QUIC endpoint, and run a voucher-signed `stream_fetch`, returning the
+//! QUIC endpoint, and run a voucher-signed `stream_fetch_tracked` (the
+//! `test-util` in-memory driver of the one receive loop), returning the
 //! delivered (BLAKE3-verified) bytes.
 //!
 //! The client runs in-process (it is not a daemon, so it has none of the
@@ -858,7 +859,7 @@ impl PoolSession {
     /// The trailing [`StreamRequestExt`] this session's manual-wire helpers send:
     /// the client identity binding plus the owner capability, so the node's
     /// serve/fill gates authorize the request and can register the lane. Mirrors
-    /// what `client-pull` attaches to a `stream_fetch` request.
+    /// what `client-pull` attaches to a `StreamRequest`.
     fn request_ext(&self) -> StreamRequestExt {
         StreamRequestExt {
             binding: self.ctx.client_binding.clone(),
@@ -868,7 +869,7 @@ impl PoolSession {
 }
 
 /// Lower a [`SignedCapability`] into its wire form for a manual `StreamRequestExt`
-/// (`client-pull` does the same internally on the `stream_fetch` path).
+/// (`client-pull` does the same internally when it opens a pull).
 fn signed_to_wire_capability(signed: &SignedCapability) -> WireCapability {
     WireCapability {
         spending_cap: signed.capability.spending_cap,

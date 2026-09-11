@@ -7,8 +7,8 @@
 //! A [`BlobSource`] never decodes and never verifies. It opens a pull over the
 //! raw bao encoding of one [`decdn_bao_range::AlignedRange`] and yields the wire
 //! bytes on demand; the STORE's ingest decoder (rooted at the blob hash `H`)
-//! verifies each chunk group exactly once, exactly as `sink::decode_to_sink` does
-//! today. This keeps a source — `PeerSource` (paid `cdn/client/v1`) or a
+//! verifies each chunk group exactly once, as the bytes arrive. This keeps a
+//! source — `PeerSource` (paid `cdn/client/v1`) or a
 //! future `BackendSource` (origin re-encode) — free of bao logic, and matches the
 //! "admit verifies once" contract of [`decdn_bao_range::RangedStore`].
 //!
@@ -343,6 +343,7 @@ impl BlobSource for PeerSource<'_> {
                 self.namespace_id,
                 range.fetch_start(),
                 micros_now(),
+                self.max_blob_size_bytes,
                 self.max_rate_per_mb,
                 self.deadlines,
                 range.fetch_len(),
@@ -483,7 +484,7 @@ mod doubles {
         /// Delay every `finish` by `stall` after its range is fully delivered,
         /// holding the completed range in the scheduler's `in_flight` so a peer's
         /// steal of an already-present range fires deterministically (see
-        /// [`finish_stall`](Self::finish_stall)).
+        /// `finish_stall`).
         #[must_use]
         pub const fn slow_finish(mut self, stall: Duration) -> Self {
             self.finish_stall = Some(stall);
@@ -513,7 +514,7 @@ mod doubles {
         }
 
         /// Total WIRE bytes actually delivered across every reader (see
-        /// [`delivered`](Self::delivered)). The honest "fetched and paid" proxy
+        /// `delivered`). The honest "fetched and paid" proxy
         /// the no-double-pay assertion reads.
         #[must_use]
         pub fn delivered_bytes(&self) -> u64 {
@@ -521,7 +522,7 @@ mod doubles {
         }
 
         /// Model payment: on every clean `finish`, advance `ledger`'s committed
-        /// watermark by the leg's drained WIRE bytes (at [`SCRIPTED_RATE_PER_MB`]),
+        /// watermark by the leg's drained WIRE bytes (at `SCRIPTED_RATE_PER_MB`),
         /// exactly as a real pull's acked vouchers do. Required by any test that
         /// drives a gap to completion, since the driver's `Done` is paid-frontier
         /// based. Pass the SAME `Arc<PoolLedger>` the driver is handed.
@@ -684,7 +685,8 @@ mod doubles {
         wire: Bytes,
         fault: Option<anyhow::Error>,
         /// The wire byte count this reader was handed (before consumption), used by
-        /// [`ScriptedSource::finish`] to advance a paying ledger by this leg's spend.
+        /// `ScriptedSource`'s [`BlobSource::finish`](crate::BlobSource::finish) to advance a paying ledger by
+        /// this leg's spend.
         wire_len: u64,
         /// Shared with the parent [`ScriptedSource`]: bumped by the bytes each
         /// `read_bytes` actually yields, so a mid-stream drop stops counting the
@@ -856,8 +858,8 @@ mod tests {
     /// `PeerSource` implements `BlobSource` — checked at compile time rather than
     /// exercised end-to-end, since a real run needs a live `Endpoint`/connection.
     /// The driver tests exercise the trait's behavior against `ScriptedSource`;
-    /// the loopback pull tests in `lib.rs`/`sink.rs` (`open_progressive_pull`,
-    /// `decode_to_sink`, the `byte_len` plumbing above) cover `PeerSource`'s own
+    /// the loopback suites (`open_progressive_pull` under the `stream_fetch*`
+    /// wrappers, the `byte_len` plumbing above) cover `PeerSource`'s own
     /// building blocks. `'static` is just a concrete lifetime to instantiate the
     /// generic type parameter with — no value is constructed.
     #[test]

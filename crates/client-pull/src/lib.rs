@@ -1,14 +1,18 @@
 //! Reusable `cdn/client/v1` paid-pull requester, shared by the node
 //! (node-to-node miss pulls, #317) and the CLI (client fetch / bundle pull).
 //!
-//! `stream_fetch` performs one full delivery exchange against a remote node:
-//! it sends a [`StreamRequest`], validates and verifies the signed
-//! [`StreamResponse`], receives `ChunkData` while releasing one hash-chain
-//! preimage per delivered `CHUNK_BYTES` chunk (plus a signed voucher to open a
-//! chain, to roll one, and to settle a sub-chunk residual), and returns the
-//! assembled blob on `StreamEnd`. It is the receive-side call site for the #252 rule (reject a
-//! `rate_per_mb == 0` response) and the `slash_sig` verification obligation
-//! (ADR 014 §1).
+//! [`open_progressive_pull`] performs the open stage of one delivery exchange
+//! against a remote node — it sends a [`StreamRequest`] and validates and
+//! verifies the signed [`StreamResponse`] — and hands back a live
+//! [`UpstreamPull`], the ONE receive loop: it reads `ChunkData` while releasing
+//! one hash-chain preimage per delivered `CHUNK_BYTES` chunk (plus a signed
+//! voucher to open a chain, to roll one, and to settle a sub-chunk residual) and
+//! yields each chunk to its caller. It is the receive-side call site for the #252
+//! rule (reject a `rate_per_mb == 0` response) and the `slash_sig` verification
+//! obligation (ADR 014 §1). The gap-driven [`driver::drive`] (via
+//! [`PeerSource`]) is how the node's cache-miss leg and the CLI's `fetch` /
+//! `bundle pull` consume it; the `test-util` `stream_fetch*` wrappers consume it
+//! into memory for suites that want the decoded bytes back.
 //!
 //! Mirrors [`probe::probe_once`] in spirit, but for the paid path: it signs
 //! vouchers, so it needs the incentive layer and a signer.
@@ -16,13 +20,16 @@
 //! # Bao verified-range decoding (ADR 038)
 //!
 //! The `ChunkData` payload is bao's interleaved verified-stream encoding, not
-//! raw bytes. The buffered path feeds the reassembled stream to a `bao-tree`
-//! verifying decoder that checks every chunk group against the requested
-//! content-hash root, so a range fetched at any `byte_offset > 0` self-verifies
-//! (a corrupt tail is rejected) with no dependency on earlier bytes. The
-//! progressive (window pull-through) path forwards the bao stream verbatim and
-//! tees it into the cache's verifying decoder (`import_and_verify_stream`),
-//! which checks the cached copy against the same root.
+//! raw bytes. Every consumer feeds the stream to a `bao-tree` verifying decoder
+//! AS IT ARRIVES — the ranged store's [`ClientRangedStore::ingest_stream`], the
+//! cache's `admit_bao_stream`, or the in-memory wrapper's decoder — through a
+//! [`sink::PullReader`] over the live pull. The decoder checks every chunk group
+//! against the requested content-hash root, so a range fetched at any
+//! `byte_offset > 0` self-verifies (a corrupt tail is rejected) with no dependency
+//! on earlier bytes, and a corrupt group aborts the pull at that group rather than
+//! at finalization: a reveal pays for received-but-unverified wire bytes, so what a
+//! lying peer can bill is bounded by one framed message plus one metering
+//! interval, never by its `total_bytes` claim.
 
 /// Buyer-side `PaymentPool` open kernel (#940), shared by the node service
 /// and the CLI.
@@ -106,11 +113,16 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Signature, U256};
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
+#[cfg(any(test, feature = "test-util"))]
 use bao_tree::BaoTree;
-use bao_tree::io::sync::DecodeResponseIter;
-use bao_tree::io::{BaoContentItem, DecodeError};
-use bytes::{Bytes, BytesMut};
-use decdn_bao_range::{IROH_BLOCK_SIZE, align_range};
+#[cfg(any(test, feature = "test-util"))]
+use bao_tree::io::BaoContentItem;
+#[cfg(any(test, feature = "test-util"))]
+use bao_tree::io::fsm::{ResponseDecoder, ResponseDecoderNext};
+use bytes::Bytes;
+use decdn_bao_range::align_range;
+#[cfg(any(test, feature = "test-util"))]
+use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE};
 use decdn_incentive::{
     BuyerPoolState, EPHEMERAL_BINDING_NONCE, SignedCapability, SignedVoucher, StreamSlashData,
     Voucher, binding_signing_hash, signed_to_wire_voucher,
@@ -125,6 +137,8 @@ use decdn_protocol::{
 };
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
+#[cfg(any(test, feature = "test-util"))]
+use sink::{PullReader, StashedFault};
 
 /// Per-lane context the requester needs to sign pool vouchers.
 ///
@@ -315,9 +329,8 @@ pub fn sign_client_binding(
 /// Build the trailing [`StreamRequestExt`] carrying the context's client
 /// identity binding and/or owner capability, or `None` when the context
 /// carries neither — in which case `encode_stream_request` appends no ext
-/// bytes. Shared by `fetch_inner` and `open_progressive_pull` (both go
-/// through `open_stream`), so the capability rides the same session-start
-/// request as the binding.
+/// bytes. Applied by `open_stream`, the single request site, so the capability
+/// rides the same session-start request as the binding.
 fn client_binding_ext(ctx: &PoolContext) -> Option<StreamRequestExt> {
     if ctx.client_binding.is_none() && ctx.capability.is_none() {
         return None;
@@ -342,13 +355,14 @@ impl std::fmt::Debug for PoolContext {
     }
 }
 
-/// The lane's committed voucher watermark, threaded through
-/// [`stream_fetch_tracked`] as an out-param so the caller can persist what it
-/// paid (#852).
+/// The lane's committed voucher watermark, returned by [`UpstreamPull::finish`] /
+/// [`UpstreamPull::abort`] / [`UpstreamPull::progress`] and threaded through the
+/// `test-util` `stream_fetch_tracked` wrapper as an out-param, so the caller can
+/// persist what it paid (#852).
 ///
-/// [`stream_fetch_tracked`] drives the pull through a one-shot [`PoolLedger`]
-/// seeded from the lane's prior cumulative state, then copies that ledger back
-/// into this watermark ([`VoucherProgress::from_ledger`]) before returning — so it
+/// A pull runs through a [`PoolLedger`] seeded from the lane's prior cumulative
+/// state; this watermark is that ledger read back
+/// ([`VoucherProgress::from_ledger`]) — so it
 /// always holds the **absolute** cumulative totals of the last presumed-accepted
 /// voucher (not per-stream deltas), exactly the `(bytes_delivered, amount)` pair
 /// the buyer-pool lane record expects. Because the
@@ -411,9 +425,9 @@ impl VoucherProgress {
 /// The upstream delivered bytes that failed bao verification against the
 /// requested content root — a paid-but-corrupt delivery (the content-addressing
 /// invariant, ADR 014/038). Under ADR 038 the verifier is the per-chunk-group
-/// `bao-tree` decoder (`decode_verified_range`), not a whole-blob re-hash, so
-/// this fires the moment any group's proof mismatches. Returned (via `anyhow`)
-/// by `stream_fetch` so callers can `downcast_ref` to classify corruption
+/// `bao-tree` decoder fed as bytes arrive, not a whole-blob re-hash, so this
+/// fires the moment any group's proof mismatches. Returned (via `anyhow`) by
+/// every decoding consumer so callers can `downcast_ref` to classify corruption
 /// (e.g. a reputation `Corruption` outcome) without matching on the error
 /// message string. The `Display` text is kept stable for logs and the existing
 /// requester tests.
@@ -441,18 +455,18 @@ impl std::error::Error for HashMismatch {}
 /// **Units.** `received` and `ceiling` are ALWAYS the same unit within one error —
 /// the comparison at each enforcement site is apples-to-apples — but that unit
 /// differs by site, so neither field is a raw `max_blob_size_bytes` config value
-/// across all call sites. The buffered receive loop (`receive_and_pay`) meters bao
+/// across all call sites. The receive loop ([`UpstreamPull::next_chunk`]) meters bao
 /// WIRE bytes (content plus interleaved proof, ADR 038) and compares against the
 /// wire size of a ceiling-sized blob. The gap-driven driver (`fill_gap`) meters
-/// CONTENT bytes (the store's delivered frontier) and the buffered resume-offset
-/// guard meters a CONTENT offset, both against the configured `max_blob_size_bytes`
-/// directly. Every one is a faithful "the byte position crossed the ceiling"
-/// report.
+/// CONTENT bytes (the store's delivered frontier) and the resume-offset guard in
+/// [`open_progressive_pull`] meters a CONTENT offset, both against the configured
+/// `max_blob_size_bytes` directly. Every one is a faithful "the byte position
+/// crossed the ceiling" report.
 #[derive(Debug)]
 pub struct BlobTooLarge {
     /// The byte position that crossed `ceiling` — wire bytes taken off the stream
-    /// (buffered receive loop), the store's content frontier (gap-driven driver),
-    /// or a content resume offset already past it. Same unit as `ceiling` (see the
+    /// (receive loop), the store's content frontier (gap-driven driver), or a
+    /// content resume offset already past it. Same unit as `ceiling` (see the
     /// type's **Units** note).
     pub received: u64,
     /// The ceiling `received` crossed, in the same unit as `received`.
@@ -546,8 +560,8 @@ pub struct RateAboveCeiling {
 
 impl RateAboveCeiling {
     /// Build the abort error for an open-stage quote above `ceiling`. Crate-private
-    /// and the SINGLE construction path (both `fetch_inner` and
-    /// `open_progressive_pull` route through it), so `quoted_rate_per_mb` is always
+    /// and the SINGLE construction path (`open_progressive_pull` routes through
+    /// it), so `quoted_rate_per_mb` is always
     /// *derived* from `response.body.rate_per_mb` and cannot desync from the
     /// retained evidence — the same "derive, don't trust the caller to set it
     /// consistently" discipline as [`UpstreamRefused::open`]. Callers MUST have run
@@ -628,9 +642,9 @@ pub const fn effective_rate_ceiling(probe_relative: u64, config_absolute: u64) -
 ///
 /// Since #1134 it is raised by OUR OWN wall clocks only, and the message is
 /// deliberately stage-NEUTRAL because there are THREE of them: the shared
-/// `open_stream` open bound (`PullDeadlines::open`, on both the buffered and the
-/// progressive path), the optional overall `hard_cap`, and the stall clock elapsing
-/// before the FIRST byte (`cumulative == 0`) in either streaming loop — where it is
+/// `open_stream` open bound (`PullDeadlines::open`), the optional overall
+/// `hard_cap` the `test-util` wrappers apply, and the stall clock elapsing before
+/// the FIRST byte (`cumulative == 0`) in the streaming loop — where it is
 /// measuring the server's time-to-first-byte, not mid-stream inactivity. `decdn-node`
 /// also wraps `open_progressive_pull` in its per-candidate budget as belt-and-braces,
 /// which raises the same sentinel.
@@ -772,9 +786,9 @@ enum Kind {
 impl UpstreamRefused {
     /// Build the open-stage refusal for a `body.ok == false` response, deriving
     /// the wire `error` *from* the response's trailing [`StreamResponseExt`] so
-    /// the two can never disagree (#1377 invariant 2). Shared by the buffered [`fetch_inner`] and
-    /// progressive [`open_progressive_pull`] open stages so they cannot drift in
-    /// how they classify a refusal.
+    /// the two can never disagree (#1377 invariant 2). The one construction site
+    /// [`open_progressive_pull`]'s open stage uses, so every caller classifies a
+    /// refusal the same way.
     ///
     /// Returns `anyhow::Error` rather than `Self` because the `None`-error arm is
     /// a protocol violation, not a refusal: callers MUST have run
@@ -925,13 +939,11 @@ impl std::error::Error for UpstreamRefused {}
 /// Two things, and it is worth being precise about both, because scoring a peer on a bound
 /// that does not hold is how an honest node's local reputation gets unfairly defamed.
 ///
-/// **The non-empty-`ChunkData` invariant (#1088), on BOTH pull paths.** With empty frames
-/// banned, "a frame arrived" and "bytes made progress" are the same statement, so a peer
-/// cannot hold the deadline open with padding. Neither path has an independent progress
-/// check behind that floor: the buffered loop (`receive_and_pay`) resets its deadline inside
-/// the `ChunkData` arm, and the progressive path ([`UpstreamPull::next_chunk`]) re-arms a
-/// fresh per-call `tokio::time::timeout` on every read. Both are safe because no frame a
-/// peer can send makes zero progress, not because either verifies that it did. Since the
+/// **The non-empty-`ChunkData` invariant (#1088).** With empty frames banned, "a frame
+/// arrived" and "bytes made progress" are the same statement, so a peer cannot hold the
+/// floor open with padding. The receive loop ([`UpstreamPull::next_chunk`]) has no
+/// independent progress check behind that floor: it is safe because no frame a peer can
+/// send makes zero progress, not because it verifies that it did. Since the
 /// #1145 review the floor is structural rather than advisory — `ChunkData`'s field is
 /// private, and its constructor and decode gate both reject an empty payload — so it cannot
 /// be relaxed by forgetting to call a validator.
@@ -1025,11 +1037,12 @@ impl std::error::Error for LocalPullFault {}
 ///   the blob, so a slow one really is a stall and a wall clock is the right tool.
 ///
 /// Every stage must carry a bound of its own. It is not enough for a caller to
-/// wrap the whole pull in a timeout and call the open "bounded": the buffered
-/// path's handshake happens *inside* [`stream_fetch_tracked`], so a caller that
-/// sets `hard_cap: None` would leave the `StreamResponse` read with no bound at
-/// all, and a peer that accepts a connection and then says nothing would hang the
-/// pull forever. `open` exists so that cannot be expressed.
+/// wrap the whole pull in a timeout and call the open "bounded": the handshake
+/// happens *inside* [`open_progressive_pull`], and the production callers run
+/// with no overall cap, so leaving the bound to the caller would leave the
+/// `StreamResponse` read with no bound at all — a peer that accepts a connection
+/// and then says nothing would hang the pull forever. `open` exists so that
+/// cannot be expressed.
 /// # The relational invariant
 ///
 /// `hard_cap`, when set, must STRICTLY EXCEED `open + window`. Both clocks below run inside
@@ -1233,16 +1246,20 @@ impl PullDeadlines {
     }
 }
 
-/// Fetch `hash` from `target` over `cdn/client/v1`, paying as bytes arrive.
+/// Fetch `hash` from `target` over `cdn/client/v1` into memory, paying as bytes
+/// arrive and verifying each bao chunk group as it lands.
 ///
 /// `expected_signer` is the delivering node's Ethereum address, used to verify
 /// the response `slash_sig`. `byte_offset` resumes a partial fetch. Use
 /// [`stream_fetch_tracked`] instead if you need to persist the voucher watermark
 /// the channel reached (#852); this convenience wrapper discards it.
 ///
-/// TEST-ONLY: gated behind the `test-util` feature alongside
-/// [`PullDeadlines::whole_transfer`], the single-deadline shape it passes (#1145 review).
-/// Production callers use [`stream_fetch_tracked`] directly with a split [`PullDeadlines`].
+/// TEST-ONLY, like the whole `stream_fetch*` family: gated behind the `test-util`
+/// feature alongside [`PullDeadlines::whole_transfer`], the single-deadline shape
+/// it passes (#1145 review). The wrappers are thin in-memory drivers of the one
+/// receive loop, [`UpstreamPull`], for suites that want the decoded bytes back;
+/// production callers stream into a store through [`driver::drive`] /
+/// [`PeerSource`].
 ///
 /// # Errors
 ///
@@ -1269,8 +1286,8 @@ pub async fn stream_fetch(
         slash_domain,
         expected_signer,
         hash,
-        // `stream_fetch` is a test/loopback convenience for node-to-node pulls; a
-        // client that routes on a namespace calls `stream_fetch_tracked` directly.
+        // `stream_fetch` models a node-to-node pull; a suite that routes on a
+        // namespace calls `stream_fetch_tracked` directly.
         decdn_protocol::client::NO_NAMESPACE,
         byte_offset,
         timestamp_us,
@@ -1279,10 +1296,8 @@ pub async fn stream_fetch(
         // the overall cap and the stall bound is harmless. Production paths take
         // `PullDeadlines` directly and split the two.
         PullDeadlines::whole_transfer(timeout),
-        // No buyer-side blob-size or rate ceiling on this test/loopback helper. The
-        // production pull path does not go through here — it calls
-        // `stream_fetch_tracked` directly (`node_origin::pull_from_candidate`)
-        // with its configured `max_blob_size_bytes` / `max_rate_per_mb`.
+        // No buyer-side blob-size or rate ceiling on this loopback helper; a suite
+        // that exercises either passes it through `stream_fetch_tracked`.
         0,
         0,
         &mut VoucherProgress::default(),
@@ -1303,6 +1318,7 @@ pub async fn stream_fetch(
 /// # Errors
 ///
 /// Same as `stream_fetch`.
+#[cfg(any(test, feature = "test-util"))]
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_fetch_tracked(
     endpoint: &Endpoint,
@@ -1339,21 +1355,15 @@ pub async fn stream_fetch_tracked(
 }
 
 /// Delivery-progress callback: invoked with `(received, expected)` after each
-/// chunk arrives, so a caller (e.g. `decdn fetch`) can render a progress bar.
-/// Both slots are the SAME unit within a given pull, and `expected` is that
-/// pull's whole-blob total, constant across the pull — so a bar keyed on the two
-/// fills to exactly 100% regardless of which unit the path reports. The unit
-/// differs by call site:
-///
-/// - `stream_fetch*` (the `receive_and_pay` receive loop) reports **wire**
-///   bytes — bao content plus interleaved proof nodes (ADR 038 §Payment
-///   metering) — matching its own accounting; there `expected` is the aligned
-///   wire length, known from the signed `StreamResponse` before the first chunk.
-/// - `drive` / `multi_source_fetch` (the resumable [`crate::driver`] path the
-///   CLI `fetch` and `bundle pull` use) report **content** bytes: the store's
-///   `ingest_stream` counts delivered content, and `expected` is the blob's
-///   content `total_bytes`. This path also emits the already-present resume base
-///   (`base_present`, content bytes) once before streaming begins.
+/// verified leaf lands, so a caller (e.g. `decdn fetch`) can render a progress
+/// bar. Both slots are **content** bytes: `received` is the content position the
+/// verifying decoder has reached and `expected` is the blob's content
+/// `total_bytes`, constant across the pull — so a bar keyed on the two fills to
+/// exactly 100%. `drive` / `multi_source_fetch` (the resumable [`crate::driver`]
+/// path the CLI `fetch` and `bundle pull` use) additionally emit the
+/// already-present resume base (`base_present`) once before streaming begins; the
+/// `test-util` `stream_fetch_tracked_with_progress` wrapper reports the same
+/// unit from its in-memory decoder.
 ///
 /// It must not panic (it runs inside the hot receive loop) and must be `Send +
 /// Sync` so the pull future stays spawnable.
@@ -1367,6 +1377,7 @@ pub type ProgressCallback = dyn Fn(u64, u64) + Send + Sync;
 /// # Errors
 ///
 /// Same as `stream_fetch`.
+#[cfg(any(test, feature = "test-util"))]
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_fetch_tracked_with_progress(
     endpoint: &Endpoint,
@@ -1387,7 +1398,7 @@ pub async fn stream_fetch_tracked_with_progress(
     // One-shot ledger seeded from the channel's prior cumulative state. A single
     // (non-shared) pull owns its ledger; concurrent shared-channel pulls use
     // `stream_fetch_shared` with a caller-owned ledger instead.
-    let ledger = ctx.new_ledger();
+    let ledger = Arc::new(ctx.new_ledger());
     let result = with_hard_cap(
         deadlines.hard_cap,
         fetch_inner(
@@ -1402,9 +1413,7 @@ pub async fn stream_fetch_tracked_with_progress(
             timestamp_us,
             max_blob_size_bytes,
             max_rate_per_mb,
-            deadlines.open,
-            deadlines.window,
-            deadlines.floor_bps,
+            deadlines,
             &ledger,
             on_progress,
         ),
@@ -1429,6 +1438,7 @@ pub async fn stream_fetch_tracked_with_progress(
 /// bound inside bounds every streaming read. A pull with no cap cannot hang; it
 /// can only take as long as the upstream keeps feeding it bytes, which is the
 /// point (#1134).
+#[cfg(any(test, feature = "test-util"))]
 async fn with_hard_cap<F>(hard_cap: Option<Duration>, fut: F) -> anyhow::Result<Bytes>
 where
     F: std::future::Future<Output = anyhow::Result<Bytes>>,
@@ -1464,12 +1474,13 @@ where
 /// # Errors
 ///
 /// Same as `stream_fetch`.
+#[cfg(any(test, feature = "test-util"))]
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_fetch_shared(
     endpoint: &Endpoint,
     target: EndpointAddr,
     ctx: &PoolContext,
-    ledger: &PoolLedger,
+    ledger: &Arc<PoolLedger>,
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
@@ -1488,16 +1499,14 @@ pub async fn stream_fetch_shared(
             slash_domain,
             expected_signer,
             hash,
-            // Shared-channel pulls are node-to-node cache-miss fills (the daemon
-            // as buyer); the requester already discovered the holder.
+            // Shared-channel pulls model the daemon as buyer on a node-to-node
+            // fill; the requester already discovered the holder, so no namespace.
             decdn_protocol::client::NO_NAMESPACE,
             byte_offset,
             timestamp_us,
             max_blob_size_bytes,
             max_rate_per_mb,
-            deadlines.open,
-            deadlines.window,
-            deadlines.floor_bps,
+            deadlines,
             ledger,
             // Shared concurrent pulls interleave many blobs on one channel; a
             // single unified byte-progress readout would be meaningless, so this
@@ -1519,11 +1528,11 @@ pub async fn stream_fetch_shared(
 /// publisher CLI, one long-lived runtime) passes `None` and pays nothing.
 pub type DialObserver<'a> = dyn Fn(iroh::endpoint::WeakConnectionHandle) + Send + Sync + 'a;
 
-/// The OPEN stage of a `cdn/client/v1` pull, shared by the buffered
-/// [`fetch_inner`] and the progressive [`open_progressive_pull`] so the two cannot
-/// drift: dial, open the bi-stream, send the [`StreamRequest`], and read + verify
-/// the signed [`StreamResponse`]. Returns the live connection, its streams, and the
-/// verified response; the caller decides whether to buffer or stream from there.
+/// The OPEN stage of a `cdn/client/v1` pull, the single request site behind
+/// [`open_progressive_pull`]: dial, open the bi-stream, send the
+/// [`StreamRequest`], and read + verify the signed [`StreamResponse`]. Returns the
+/// live connection, its streams, and the verified response for the caller to
+/// stream from.
 ///
 /// **Bounded as a whole by `open`** (#1134), and that bound lives HERE rather than
 /// in the caller for a reason worth stating: the production pull paths run with no
@@ -1648,7 +1657,7 @@ pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 /// attempts.
 pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 
-/// Buffered fetch with wallet-less resume (issue #1481 §5): if a mid-stream
+/// In-memory fetch with wallet-less resume (issue #1481 §5): if a mid-stream
 /// voucher rejection carries a signer-verified [`WatermarkBundle`] for one of
 /// the four regression/exhaustion reasons, reseed `ledger` from it and reopen
 /// the pull — at the **same** `byte_offset` the caller originally requested,
@@ -1662,46 +1671,38 @@ pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 /// voucher's EIP-712 `bytesDelivered`, ADR 005 — [`Voucher`] carries no such
 /// field on the wire), not a position within THIS blob's byte range. A
 /// channel can fund many blobs; jumping the wire offset ahead to the
-/// channel's cumulative would, for every caller that requested
-/// `byte_offset == 0` (only `stream_fetch`'s test-only callers reach this
-/// wrapper at that offset; the CLI's `fetch_blob` and bundle-pull commands
-/// stream through `open_progressive_pull`), silently return a
-/// TRUNCATED tail instead of the full blob the caller is relying on getting
-/// back. The bytes already streamed in the failed attempt were never decoded
-/// (the error path never reaches `decode_verified_range`), so there is
-/// nothing to legitimately splice a jump with. Retrying at the caller's
-/// original offset is always safe and is the only thing this bundle field
-/// is actually needed for: fixing the ledger's amount/bytes BASELINE
-/// so the resumed stream's vouchers verify against what the node now
-/// expects, not re-deriving where in the blob to resume.
+/// channel's cumulative would, for a caller that requested `byte_offset == 0`,
+/// silently return a TRUNCATED tail instead of the full blob the caller is
+/// relying on getting back. The bytes already decoded in the failed attempt
+/// were dropped with it, so there is nothing to legitimately splice a jump
+/// with. Retrying at the caller's original offset is always safe and is the
+/// only thing this bundle field is actually needed for: fixing the ledger's
+/// amount/bytes BASELINE so the resumed stream's vouchers verify against what
+/// the node now expects, not re-deriving where in the blob to resume.
 ///
-/// This is the ONLY retry loop in the crate for this case —
-/// [`UpstreamPull::pay_one`]/[`receive_and_pay`] never retry themselves, because the
-/// stream they hold is already dead by the time a mid-stream
-/// `VoucherRejected` reaches them (the node finishes its send side before
-/// replying, `handlers/client/wire.rs::write_reject`); a fresh stream can
-/// only be opened by whoever owns the connection, which is here.
+/// This is the retry loop for this case on the in-memory path —
+/// [`UpstreamPull::pay_one`] never retries itself, because the stream it holds
+/// is already dead by the time a mid-stream `VoucherRejected` reaches it (the
+/// node finishes its send side before replying,
+/// `handlers/client/wire.rs::write_reject`); a fresh stream can only be opened
+/// by whoever owns the connection, which is here.
 ///
-/// Every caller of the BUFFERED path — `stream_fetch` (test-only),
-/// [`stream_fetch_tracked`], [`stream_fetch_tracked_with_progress`], and
-/// [`stream_fetch_shared`] — goes through this wrapper, so a resumable rejection
-/// on any of those paths is retried transparently and the caller only ever sees
-/// the FINAL outcome (success, or the original terminal error once
-/// [`MAX_RESUME_ATTEMPTS`] is exhausted or the reason/bundle isn't eligible).
+/// Every `stream_fetch*` wrapper goes through here, so a resumable rejection is
+/// retried transparently and the caller only ever sees the FINAL outcome
+/// (success, or the original terminal error once [`MAX_RESUME_ATTEMPTS`] is
+/// exhausted or the reason/bundle isn't eligible).
 ///
-/// The daemon's node-to-node cache-miss buyer leg does not use this wrapper: it
-/// reaches the same reseed loop through [`open_progressive_pull`], and
-/// additionally answers a genuine `SpendingCapExhausted` with an on-chain top-up —
-/// `decdn-node`'s `node_origin/funder.rs` supplies the `Funder` that does it, the
-/// thing a from-zero buffered retry could never do without re-paying for the
-/// delivered prefix. Either way `pull_verdict` / `voucher_verdict` in `decdn-node`
-/// see only the terminal outcome, so the `OurDeadLane` classification there
-/// stays correct as the fallback.
+/// The production callers do not use this wrapper: the gap-driven
+/// [`driver::drive`] reaches the same reseed loop around [`open_progressive_pull`],
+/// and additionally answers a genuine `SpendingCapExhausted` with an on-chain
+/// top-up through its [`Funder`] — the thing a from-zero retry could never do
+/// without re-paying for the delivered prefix.
 ///
 /// A bundle-less rejection, a non-gated reason, or a bundle that fails
 /// [`WatermarkBundle::validate`] (malformed `last_signature` length) is
 /// never treated as resumable and is returned to the caller unchanged on
 /// the first attempt.
+#[cfg(any(test, feature = "test-util"))]
 #[allow(clippy::too_many_arguments)]
 async fn fetch_inner(
     endpoint: &Endpoint,
@@ -1715,17 +1716,16 @@ async fn fetch_inner(
     timestamp_us: u64,
     max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
-    open: Duration,
-    window: Duration,
-    floor_bps: u64,
-    ledger: &PoolLedger,
+    deadlines: PullDeadlines,
+    ledger: &Arc<PoolLedger>,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Bytes> {
     for attempt in 0..=MAX_RESUME_ATTEMPTS {
-        let result = fetch_inner_once(
+        let result = fetch_in_memory_once(
             endpoint,
             target.clone(),
             ctx,
+            Arc::clone(ledger),
             slash_domain,
             expected_signer,
             hash,
@@ -1734,10 +1734,7 @@ async fn fetch_inner(
             timestamp_us,
             max_blob_size_bytes,
             max_rate_per_mb,
-            open,
-            window,
-            floor_bps,
-            ledger,
+            deadlines,
             on_progress,
         )
         .await;
@@ -1770,6 +1767,170 @@ async fn fetch_inner(
     // triggers on the final iteration). Kept as a typed bail rather than
     // `unreachable!()`/`panic!()` per the workspace anti-panic policy.
     Err(anyhow::anyhow!("resume loop exited without returning"))
+}
+
+/// One attempt of the in-memory `stream_fetch*` path: open a progressive pull,
+/// feed its wire bytes through the bao verifying decoder AS THEY ARRIVE, and
+/// return the decoded plaintext span `[byte_offset, total_bytes)`.
+///
+/// This is the same receive loop the production callers drive
+/// ([`UpstreamPull::next_chunk`] under a [`PullReader`]) with an in-memory `Vec`
+/// standing in for the ranged store / cache admit; there is no second receive
+/// implementation. A corrupt chunk group therefore aborts the pull at that group
+/// (ADR 038 §Receive side), before the rest of the stream is pulled or paid for —
+/// so a peer that signs an inflated `total_bytes` and streams framed garbage can
+/// bill at most the bytes that arrived before the first unverifiable group, never
+/// its claim.
+///
+/// # Errors
+///
+/// Everything [`open_progressive_pull`] raises, plus [`HashMismatch`] for a
+/// paid-but-corrupt delivery (including a non-empty root claimed against an empty
+/// blob, #1054), the typed pull faults [`PullReader`] stashes (stall, refusal,
+/// voucher rejection), a truncated stream, or a short delivery at `finish`.
+#[cfg(any(test, feature = "test-util"))]
+#[allow(clippy::too_many_arguments)]
+async fn fetch_in_memory_once(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    ctx: &PoolContext,
+    ledger: Arc<PoolLedger>,
+    slash_domain: &Eip712Domain,
+    expected_signer: Address,
+    hash: [u8; 32],
+    namespace_id: [u8; 32],
+    byte_offset: u64,
+    timestamp_us: u64,
+    max_blob_size_bytes: u64,
+    max_rate_per_mb: u64,
+    deadlines: PullDeadlines,
+    on_progress: Option<&ProgressCallback>,
+) -> anyhow::Result<Bytes> {
+    let (header, pull) = open_progressive_pull(
+        endpoint,
+        target,
+        ctx,
+        ledger,
+        slash_domain,
+        expected_signer,
+        hash,
+        namespace_id,
+        byte_offset,
+        timestamp_us,
+        max_blob_size_bytes,
+        max_rate_per_mb,
+        deadlines,
+        // Whole tail: the in-memory wrapper has no store to compute gaps against.
+        0,
+        // One long-lived test runtime: nothing to strand, so no dial observer.
+        None,
+    )
+    .await?;
+    let total_bytes = header.total_bytes;
+    // A 0-byte blob (#1054) aligns to an empty range: the decoder has no chunk
+    // group to anchor and would accept the empty stream for ANY root. Prove the
+    // empty stream against the empty root explicitly; a non-empty requested hash
+    // is a paid-but-wrong delivery, so surface the typed `HashMismatch`.
+    if total_bytes == 0 {
+        if hash != *blake3::hash(&[]).as_bytes() {
+            return Err(anyhow::Error::new(HashMismatch));
+        }
+        pull.finish().await?;
+        return Ok(Bytes::new());
+    }
+    let aligned = align_range(byte_offset, 0, total_bytes)
+        .map_err(|e| anyhow::anyhow!("range alignment: {e}").context(LocalPullFault))?;
+    let reader = PullReader::new(pull);
+    let (plaintext, reader) =
+        decode_to_vec(hash, total_bytes, &aligned, reader, on_progress).await?;
+    // Wire completeness (the full promised bao wire size arrived before
+    // `StreamEnd`) and a clean close; the watermark it returns is read back from
+    // the shared ledger by the caller, so it is not needed here.
+    reader.into_inner().finish().await?;
+    // The decoded buffer spans the aligned superset `[fetch_start, total_bytes)`;
+    // trim back to the caller's requested span. Guard the bound explicitly:
+    // `Bytes::slice` panics out of range, and a short decode must surface as a
+    // clean error.
+    let lead = usize::try_from(byte_offset.saturating_sub(aligned.fetch_start()))?;
+    let bytes = Bytes::from(plaintext);
+    if lead > bytes.len() {
+        anyhow::bail!("decoded range shorter than requested span");
+    }
+    if lead == 0 {
+        return Ok(bytes);
+    }
+    Ok(bytes.slice(lead..))
+}
+
+/// Feed a bao interleaved wire stream through the verifying decoder, appending
+/// each verified leaf to an in-memory buffer, and return the buffer plus the
+/// reader for the caller to finish. Every chunk group is checked against the
+/// content-hash root `root` as it is decoded, so a corrupt group — at any offset,
+/// including a resumed tail — is rejected at that group without needing earlier
+/// bytes or the rest of the stream (ADR 038 §Receive side).
+///
+/// The decoded buffer spans the chunk-group-aligned **superset**
+/// `[aligned.fetch_start(), aligned.fetch_end())` the server serves (a bao proof
+/// anchors whole 16 KiB groups); the caller trims the lead. The buffer is grown
+/// leaf by leaf rather than pre-sized: `aligned` derives from the peer's
+/// unverified `total_bytes`, so a capacity hint would let an inflated claim drive
+/// an over-allocation before a single byte verifies.
+///
+/// `on_progress`, when set, is called with `(content_position, total_bytes)` after
+/// each verified leaf lands — the same content-byte unit [`driver::drive`] reports.
+///
+/// Same loop shape as [`ClientRangedStore::ingest_stream`], minus the durable
+/// checkpointing; a typed fault the reader stashed ([`StashedFault`]) takes
+/// precedence over the decoder's own complaint, and a decode failure is
+/// classified by [`sink::classify_decode_error`] ([`HashMismatch`] for a
+/// verification failure, a truncation error for a short stream).
+///
+/// # Errors
+///
+/// The reader's stashed typed fault, [`HashMismatch`], or a truncation / IO fault.
+#[cfg(any(test, feature = "test-util"))]
+async fn decode_to_vec<R>(
+    root: [u8; 32],
+    total_bytes: u64,
+    aligned: &AlignedRange,
+    reader: R,
+    on_progress: Option<&ProgressCallback>,
+) -> anyhow::Result<(Vec<u8>, R)>
+where
+    R: iroh_io::AsyncStreamReader + StashedFault + Send,
+{
+    let tree = BaoTree::new(total_bytes, IROH_BLOCK_SIZE);
+    let root = blake3::Hash::from_bytes(root);
+    let mut decoder = ResponseDecoder::new(root, aligned.chunk_ranges().clone(), tree, reader);
+    let mut out = Vec::new();
+    loop {
+        match decoder.next().await {
+            ResponseDecoderNext::More((rest, Ok(BaoContentItem::Leaf(leaf)))) => {
+                out.extend_from_slice(&leaf.data);
+                if let Some(cb) = on_progress {
+                    let position = aligned
+                        .fetch_start()
+                        .saturating_add(u64::try_from(out.len()).unwrap_or(u64::MAX));
+                    cb(position, total_bytes);
+                }
+                decoder = rest;
+            }
+            ResponseDecoderNext::More((rest, Ok(BaoContentItem::Parent(_)))) => decoder = rest,
+            ResponseDecoderNext::More((rest, Err(decode_err))) => {
+                let mut r = rest.finish();
+                if let Some(fault) = r.take_fault() {
+                    return Err(fault);
+                }
+                return Err(sink::classify_decode_error(decode_err));
+            }
+            ResponseDecoderNext::Done(mut r) => {
+                if let Some(fault) = r.take_fault() {
+                    return Err(fault);
+                }
+                return Ok((out, r));
+            }
+        }
+    }
 }
 
 /// The security-critical core shared by every "did WE sign this?" check: does `signature` recover
@@ -1969,200 +2130,20 @@ pub fn resume_may_be_stale(err: &anyhow::Error) -> bool {
         .is_some_and(|refused| matches!(refused.error(), StreamError::NotFound))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn fetch_inner_once(
-    endpoint: &Endpoint,
-    target: EndpointAddr,
-    ctx: &PoolContext,
-    slash_domain: &Eip712Domain,
-    expected_signer: Address,
-    hash: [u8; 32],
-    namespace_id: [u8; 32],
-    byte_offset: u64,
-    timestamp_us: u64,
-    max_blob_size_bytes: u64,
-    max_rate_per_mb: u64,
-    open: Duration,
-    window: Duration,
-    floor_bps: u64,
-    ledger: &PoolLedger,
-    on_progress: Option<&ProgressCallback>,
-) -> anyhow::Result<Bytes> {
-    let (conn, mut send, mut recv, resp, resp_ext) = open_stream(
-        endpoint,
-        target,
-        ctx,
-        slash_domain,
-        expected_signer,
-        hash,
-        // A client fetch routes on the namespace it published under (ADR 005
-        // §Namespace routing). The node-to-node callers that reach *this*
-        // function (shared-channel / loopback fills) pass NO_NAMESPACE — the
-        // requester already discovered a holder, so the downstream node needs no
-        // hint (ADR 002 §Retrieval by namespace). The directory-discovered
-        // cold-origin leg, which *does* carry a real namespace, goes through
-        // `open_progressive_pull` → `open_stream` directly, not here.
-        namespace_id,
-        byte_offset,
-        // Whole-tail fetch; a bounded range is plumbed via `open_progressive_pull`
-        // (the gap-driven driver, #1608), not this buffered/loopback path.
-        0,
-        timestamp_us,
-        open,
-        None,
-    )
-    .await?;
-
-    if !resp.body.ok {
-        return Err(UpstreamRefused::open(resp, &resp_ext));
-    }
-    // The peer's signed `total_bytes` never drives a refusal here (#1895): it is
-    // peer-controlled and unverified (`StreamResponse::validate()` does not bound
-    // it), so an inflated claim on a small blob could otherwise make every
-    // finite-ceiling relay refuse to pull/cache/serve while the holder monopolises
-    // the traffic. The `max_blob_size_bytes` ceiling is enforced instead on the
-    // bytes that ACTUALLY arrive, inside `receive_and_pay`. A lie is inert — it
-    // cannot produce bytes that verify against the true root — while an honest
-    // giant is streamed and paid for only up to one ceiling before it aborts.
-    // Reject an over-ceiling rate before paying a single voucher (#1375). `resp`
-    // is `ok == true` and already verified against `expected_signer`, so it is
-    // the operator's own signed quote — carry it into the error as replayable
-    // rate-manipulation evidence. `0` = unbounded.
-    if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
-        return Err(RateAboveCeiling::over_ceiling(resp, max_rate_per_mb));
-    }
-    // A `total_bytes` below `byte_offset` would underflow the wire bound to `0`
-    // (saturating), so the loop ends on the first `StreamEnd` and returns an
-    // empty buffer. An empty range decodes trivially (no chunk group to verify),
-    // so that empty buffer would surface as success — a silent verification
-    // bypass. A legitimate server always claims `total_bytes >= byte_offset`;
-    // reject anything less before the loop. (A non-empty but *short* delivery is
-    // caught by the completeness check after the loop.)
-    // A resume offset the blob cannot satisfy. `<=` rather than `<`: an offset
-    // exactly AT the end has no chunk group to anchor either, and `align_range`
-    // would reject it a few lines later with an untyped fault — this way both
-    // land on the same typed sentinel. Guarded on `byte_offset > 0` so a 0-byte
-    // blob fetched from 0 (#1054) is untouched.
-    if resp.body.total_bytes <= byte_offset && byte_offset > 0 {
-        return Err(anyhow::Error::new(ResumeOffsetPastEnd {
-            total_bytes: resp.body.total_bytes,
-            byte_offset,
-        }));
-    }
-
-    let rate_per_mb = resp.body.rate_per_mb;
-    // Paid/received bytes are **wire** bytes — content plus interleaved bao proof
-    // nodes (ADR 038 §Payment metering) — not the content-byte remainder.
-    let total_bytes = resp.body.total_bytes;
-    let expected_wire = aligned_wire_len(byte_offset, 0, total_bytes)?;
-
-    // Received-byte ceiling (#1895), expressed as a WIRE bound so the buffered loop
-    // can enforce it without decoding: the wire size of a ceiling-sized blob's
-    // content from this offset. Enforced on the bytes that ACTUALLY arrive, never on
-    // the peer's unverified `total_bytes` claim. A resume offset already at/past the
-    // ceiling means the blob is genuinely oversized — abort before the loop. `0` =
-    // unlimited.
-    let max_received_wire = if max_blob_size_bytes == 0 {
-        0
-    } else {
-        match aligned_wire_len(byte_offset, 0, max_blob_size_bytes) {
-            Ok(wire) => wire,
-            Err(_) => {
-                return Err(anyhow::Error::new(BlobTooLarge {
-                    received: byte_offset,
-                    ceiling: max_blob_size_bytes,
-                }));
-            }
-        }
-    };
-
-    let (buf, cumulative) = receive_and_pay(
-        &mut send,
-        &mut recv,
-        ctx,
-        ledger,
-        rate_per_mb,
-        expected_wire,
-        max_received_wire,
-        window,
-        floor_bps,
-        on_progress,
-    )
-    .await?;
-
-    // No more vouchers will be sent — the loop paid its last one above. Finish
-    // the send half now so the node sees our FIN promptly and can drain it to a
-    // clean close instead of stopping it (the `STOP_SENDING(0)` that the receive
-    // loop's `terminal_after_write_failure` recovery otherwise has to absorb). A
-    // stop that already landed makes this a no-op; either way the bytes are in and
-    // the decode below is what decides success.
-    let _ = send.finish();
-
-    // A truncated stream (fewer wire bytes than the aligned range needs) cannot
-    // decode; reject cleanly before the decoder hits an EOF mid-proof. There is no
-    // whole-blob-hash fallback anymore, so this bound applies to every fetch
-    // (full and resumed) rather than only resumes.
-    if cumulative < expected_wire {
-        conn.close(0u32.into(), b"short-delivery");
-        anyhow::bail!(
-            "server sent {cumulative} of {expected_wire} promised wire bytes before StreamEnd"
-        );
-    }
-    // Decode the bao interleaved stream, verifying every chunk group against the
-    // content-hash root, and trim to the requested span. A corrupt group at ANY
-    // offset (including a resumed tail) yields `HashMismatch` — the resume gap is
-    // closed. `HashMismatch` stays the typed sentinel so callers `downcast_ref` to
-    // classify a paid-but-corrupt delivery.
-    let blob = match decode_verified_range(hash, total_bytes, byte_offset, 0, buf.as_ref()) {
-        Ok(blob) => blob,
-        Err(e) => {
-            conn.close(0u32.into(), b"verify-failed");
-            return Err(e);
-        }
-    };
-    conn.close(0u32.into(), b"done");
-    Ok(blob)
-}
-
 /// The wire-byte bound for a fetch of `[byte_offset, byte_offset + byte_len)`
 /// (`byte_len == 0` meaning "to end") of a `total_bytes` blob: the bao-encoded
 /// size of the chunk-group-aligned range (content plus interleaved proof, ADR
 /// 038 §Payment metering), exactly the byte count the server emits. The server
 /// widens the request to enclosing 16 KiB groups; [`align_range`] /
 /// [`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
-/// reproduce that, keeping encoder and receiver in lock-step. Shared by the
-/// buffered [`fetch_inner`] and progressive [`open_progressive_pull`] paths so
-/// the two can't drift.
+/// reproduce that, keeping encoder and receiver in lock-step. The one site every
+/// pull derives its wire bound (and its received-byte ceiling) through.
 fn aligned_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow::Result<u64> {
     let aligned = align_range(byte_offset, byte_len, total_bytes)
         .map_err(|e| anyhow::anyhow!("range alignment: {e}").context(LocalPullFault))?;
     Ok(aligned.wire_len())
 }
 
-/// Drive the buffered receive loop: read `ChunkData` into a buffer, paying one
-/// voucher per `interval_bytes` boundary (and a closing voucher once all
-/// `expected_wire_bytes` have arrived) through the shared `ledger`, until
-/// `StreamEnd`. Returns the assembled buffer and the cumulative byte count for
-/// the caller's completeness check (integrity is verified per bao chunk group by
-/// the decoder, not here). Enforces `ChunkData`'s non-empty FLOOR (#1088) — an
-/// oversized frame is refused earlier still, by the framing layer's
-/// `MAX_MESSAGE_SIZE`, before it allocates — plus the `cumulative <= expected_wire_bytes` overrun guard
-/// (ADR 005 §`cdn/client/v1`). The non-empty floor ties every frame to payload, so a run of
-/// empty frames cannot drive this loop while `cumulative` and the voucher accounting stand
-/// still. Separately, `max_received_wire` (`0` = unlimited) caps the bytes that
-/// ACTUALLY arrive against the buyer's received-byte ceiling (#1895): once
-/// `cumulative` crosses it the pull aborts with [`BlobTooLarge`], so an inflated
-/// `total_bytes` claim on a small blob cannot drive us toward OOM and a genuine
-/// giant is paid for only up to one ceiling.
-///
-/// `window` + `floor_bps` bound this loop by THROUGHPUT (#1797): bytes are counted off the
-/// QUIC stream sub-frame through a `ProgressReader`, and a `ThroughputFloor` aborts when
-/// the bytes across the trailing `window` fall below `floor_bps · window` (below one byte
-/// when `floor_bps == 0`). The signal is frame-size-independent, so a large frame arriving
-/// slowly but continuously is not mistaken for a stall, and a slow drip below the floor is
-/// caught even though frames keep arriving. The abort is requester-local policy: before the
-/// first byte it is [`PullTimeout`] (our own budget, blob-size-dependent), after bytes it is
-/// [`PullStalled`]; neither scores the peer.
 /// How often the throughput floor samples the byte counter: a fraction of the window, so a
 /// stall is detected within roughly one extra sample period beyond the window, floored at
 /// 100 ms so a tiny window cannot spin the sampler.
@@ -2177,317 +2158,6 @@ fn stall_sample_period(window: Duration) -> Duration {
 /// silent from pinning this recovery read. It is an error-path bound, not a
 /// steady-state one.
 const TERMINAL_AFTER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The outcome of looking for a terminal message after a voucher write failed.
-enum TerminalAfterWrite {
-    /// A `StreamEnd` was waiting: the node delivered everything and considered the
-    /// stream fully paid, so the failed write was superfluous. The delivery
-    /// completes (the caller's byte-completeness check still guards a short one).
-    Complete,
-    /// No terminal message rescued the write — either a typed `StreamError` the
-    /// node sent (surfaced through [`voucher_rejection`]) or the original write
-    /// failure, when nothing terminal was waiting.
-    Fail(anyhow::Error),
-}
-
-/// Decide what a voucher write failure really means.
-///
-/// A node stops our send half only once it needs nothing more from us: a
-/// completed delivery leaves a `StreamEnd` on the wire, a mid-stream rejection a
-/// `StreamError`. The write half and the read half run in lock-step in the
-/// receive loop, so a raw voucher-write failure — the end-of-stream
-/// `STOP_SENDING(0)` a node emits when it finishes and drops `recv` — would
-/// otherwise mask that terminal signal and abort a complete, paid fetch (or
-/// swallow a typed rejection the reactive top-up path keys on). Read the terminal
-/// signal, briefly, and prefer it. A write we caused ourselves (a
-/// [`LocalPullFault`] encode fault) is never masked; nor is a stream that yields
-/// no terminal signal before the bound.
-async fn terminal_after_write_failure<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut R,
-    ledger: &PoolLedger,
-    meter: &StreamMeter,
-    write_err: anyhow::Error,
-) -> TerminalAfterWrite {
-    if write_err.is::<LocalPullFault>() {
-        return TerminalAfterWrite::Fail(write_err);
-    }
-    match tokio::time::timeout(TERMINAL_AFTER_WRITE_TIMEOUT, read_client_message(reader)).await {
-        Ok(Ok(ClientMessage::StreamEnd)) => TerminalAfterWrite::Complete,
-        Ok(Ok(ClientMessage::StreamError(e))) => {
-            TerminalAfterWrite::Fail(voucher_rejection(ledger, meter, e))
-        }
-        // Any other message, a read error, or the timeout: nothing terminal is
-        // waiting, so the write failure stands as the honest outcome.
-        _ => TerminalAfterWrite::Fail(write_err),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn receive_and_pay(
-    send: &mut SendStream,
-    recv: &mut RecvStream,
-    ctx: &PoolContext,
-    ledger: &PoolLedger,
-    rate_per_mb: u64,
-    expected_wire_bytes: u64,
-    max_received_wire: u64,
-    window: Duration,
-    floor_bps: u64,
-    on_progress: Option<&ProgressCallback>,
-) -> anyhow::Result<(BytesMut, u64)> {
-    let mut buf = BytesMut::new();
-    let mut cumulative: u64 = 0;
-    // Bytes received but not yet covered by a proof. Every whole chunk in here
-    // is released as a preimage; whatever is left over at the end of the
-    // transfer settles through one closing signature, because a preimage always
-    // advances the claim by a whole chunk and cannot price a partial one.
-    let mut unproved: u64 = 0;
-    // This stream's anchor: which epoch it has told the node about.
-    let mut meter = StreamMeter::default();
-    // Byte-progress stall detection (#1797). The `ProgressReader` tallies bytes off the
-    // QUIC stream sub-frame into `counter`; the `ThroughputFloor` reads that counter on a
-    // sampling tick and aborts when throughput over the trailing window drops below the
-    // floor. Because the counter moves on bytes, not on decoded frames, a large frame
-    // arriving slowly is not mistaken for a stall.
-    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut reader = progress::ProgressReader::new(recv, Arc::clone(&counter));
-    let mut floor = progress::ThroughputFloor::new(
-        progress::FloorConfig { window, floor_bps },
-        Arc::clone(&counter),
-        tokio::time::Instant::now(),
-    );
-    let mut sampler = tokio::time::interval(stall_sample_period(window));
-    sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        // Read the next frame while the sampler ticks. The floor is judged only when a read
-        // is slow enough that the tick wins the `select!`; a healthy stream keeps the read
-        // arm ready and the floor rarely runs. `biased` cannot starve the floor: the read arm
-        // is ready only once a whole frame has come off the wire, which is byte progress the
-        // counter has already recorded, and the very next poll finds the following frame
-        // incomplete unless the sender is outrunning this loop. Skipping the tick therefore
-        // means throughput above the floor, which is the case the floor would clear anyway.
-        // The read future is pinned and polled across
-        // ticks rather than recreated each tick: `read_client_message` is not
-        // cancellation-safe (`read_frame` fills a frame with `read_exact`), so dropping it
-        // mid-frame would lose the bytes already read and desynchronise the stream. It is
-        // dropped only when the floor aborts (#1797).
-        let msg = {
-            let read = read_client_message(&mut reader);
-            tokio::pin!(read);
-            loop {
-                tokio::select! {
-                    biased;
-                    r = &mut read => break r?,
-                    _ = sampler.tick() => {
-                        // Which fault this is depends on whether a byte has EVER arrived (#1145
-                        // review). Before the first byte the floor is measuring the server's
-                        // time-to-first-byte, which scales with BLOB SIZE (the serve path
-                        // materialises the whole bao wire encoding via `export_bao_range` before
-                        // chunk #1) — that is our own budget, not the peer's fault, so it raises
-                        // the exonerating `PullTimeout`. After bytes have flowed it raises
-                        // `PullStalled`. Neither scores the peer: a throughput abort is
-                        // requester-local policy (ADR 005 §Retry behavior, ADR 008), metered and
-                        // suppressed on the node path but never folded into reputation.
-                        if let progress::FloorVerdict::Stalled =
-                            floor.evaluate(tokio::time::Instant::now())
-                        {
-                            return Err(if cumulative == 0 {
-                                anyhow::Error::new(PullTimeout { after: window })
-                            } else {
-                                anyhow::Error::new(PullStalled { after: window })
-                            });
-                        }
-                    }
-                }
-            }
-        };
-        match msg {
-            ClientMessage::ChunkData(chunk) => {
-                // The running total must not exceed what the response promised —
-                // otherwise a malicious server could stream unbounded bytes (OOM) and
-                // we would overpay (ADR 005 §`cdn/client/v1`). The non-empty floor
-                // needed no check here: the frame could not have been decoded otherwise.
-                let chunk_len = chunk.bytes().len() as u64;
-                cumulative = cumulative.saturating_add(chunk_len);
-                if cumulative > expected_wire_bytes {
-                    anyhow::bail!(
-                        "server sent {cumulative} bytes, more than the {expected_wire_bytes} promised"
-                    );
-                }
-                // Received-byte ceiling (#1895): enforce the size cap on the bytes
-                // that ACTUALLY arrive, never on the peer's unverified `total_bytes`
-                // claim. `max_received_wire` is the wire size of a ceiling-sized
-                // blob's content (computed by the caller), so this is the wire form of
-                // "received content > ceiling" — distinct from the claim-derived
-                // `expected_wire_bytes` overrun guard above. Abort BEFORE paying for
-                // the chunk that crosses it, so the spend stays bounded to roughly one
-                // ceiling. `0` = unlimited.
-                if max_received_wire > 0 && cumulative > max_received_wire {
-                    return Err(anyhow::Error::new(BlobTooLarge {
-                        received: cumulative,
-                        ceiling: max_received_wire,
-                    }));
-                }
-                buf.extend_from_slice(chunk.bytes());
-                // Surface delivery progress after each chunk. `cumulative` and
-                // `expected_wire_bytes` are both wire bytes, so the readout is
-                // consistent (and can't overshoot — the guard above caps it).
-                if let Some(cb) = on_progress {
-                    cb(cumulative, expected_wire_bytes);
-                }
-                unproved = unproved.saturating_add(chunk_len);
-                // Meter at each chunk boundary, and close with one signature
-                // once every expected byte has arrived — matching the node's
-                // pacing. A reveal is released only AFTER the bytes it pays for
-                // have been received and verified, so the payer's exposure stays
-                // at zero. Nothing is acknowledged: continued delivery IS
-                // acceptance (ADR 005), so the loop keeps reading and only a
-                // rejection (a mid-stream `StreamError`) ever comes back.
-                //
-                // Gate the floor across our own payment. While we owe the covering proof the
-                // node legitimately pauses delivery (ADR 005 §Payment pacing), so that pause
-                // is self-inflicted, not a sender stall — exclude it from the window (#1797).
-                floor.pause(tokio::time::Instant::now());
-                let paid = meter
-                    .pay(
-                        send,
-                        ctx,
-                        ledger,
-                        rate_per_mb,
-                        unproved,
-                        cumulative >= expected_wire_bytes,
-                    )
-                    .await;
-                floor.resume(tokio::time::Instant::now());
-                match paid {
-                    Ok(remaining) => unproved = remaining,
-                    // A voucher write that failed at end-of-stream may only mean the
-                    // node stopped our send after it finished (or is rejecting us):
-                    // prefer the terminal signal it left to the opaque write failure.
-                    // Boxed so this cold error-path future does not enlarge the steady
-                    // receive loop's future (`clippy::large_futures`); the allocation
-                    // only happens on the failure path.
-                    Err(write_err) => {
-                        let recovered = Box::pin(terminal_after_write_failure(
-                            &mut reader,
-                            ledger,
-                            &meter,
-                            write_err,
-                        ))
-                        .await;
-                        match recovered {
-                            TerminalAfterWrite::Complete => break,
-                            TerminalAfterWrite::Fail(err) => return Err(err),
-                        }
-                    }
-                }
-            }
-            // Acceptance is implicit — continued delivery IS acceptance (ADR 005),
-            // so there is no positive ack to consume. Only a rejection is signalled,
-            // as a mid-stream `StreamError`: a `VoucherRejected` disarms the rewound
-            // voucher and surfaces the typed payment fault (with the self-heal
-            // bundle), any other `StreamError` is a mid-stream refusal.
-            ClientMessage::StreamError(e) => {
-                return Err(voucher_rejection(ledger, &meter, e));
-            }
-            ClientMessage::StreamEnd => break,
-            other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
-        }
-    }
-
-    Ok((buf, cumulative))
-}
-
-/// Decode and verify the reassembled bao interleaved stream `bao_wire` against the
-/// content-hash root `hash`, returning the requested plaintext span
-/// `[byte_offset, byte_offset + byte_len)` (`byte_len == 0` ⇒ to end). Every chunk
-/// group is checked against the root as it is decoded, so a corrupt group — at any
-/// offset, including a resumed tail — is rejected without needing earlier bytes
-/// (ADR 038 §Receive side; closes the old `byte_offset > 0` gap).
-///
-/// The server serves the chunk-group-aligned **superset** of the request (a bao
-/// proof anchors whole 16 KiB groups), so the decoder yields
-/// `[align.fetch_start, align.fetch_end)` and we trim the leading bytes before
-/// `byte_offset` here — the serve side never trims (trimming would break the
-/// proof). `bao_wire` must be exactly the header-less response stream the server
-/// emitted for `align_range(byte_offset, byte_len, total_bytes)`; the shared
-/// [`align_range`]/[`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
-/// keep encoder and decoder in lock-step.
-///
-/// # Errors
-///
-/// [`HashMismatch`] if any chunk group or the root fails verification (a
-/// paid-but-corrupt delivery); a decode/`Io` error (e.g. truncated stream) or an
-/// out-of-range trim otherwise.
-fn decode_verified_range(
-    hash: [u8; 32],
-    total_bytes: u64,
-    byte_offset: u64,
-    byte_len: u64,
-    bao_wire: &[u8],
-) -> anyhow::Result<Bytes> {
-    let aligned = align_range(byte_offset, byte_len, total_bytes)
-        .map_err(|e| anyhow::anyhow!("range alignment: {e}").context(LocalPullFault))?;
-    // A 0-byte blob (#1054) aligns to an empty range: the decoder below has no
-    // chunk group to anchor and would accept the empty stream for ANY root. This
-    // is the same trivial-empty-range bypass `fetch_inner` guards against for the
-    // `total_bytes < byte_offset` underflow (a different trigger, same root
-    // cause). Prove the empty stream against the empty root explicitly; a
-    // non-empty requested hash is a paid-but-wrong delivery, so surface the typed
-    // `HashMismatch`.
-    if total_bytes == 0 {
-        if hash != *blake3::hash(&[]).as_bytes() {
-            return Err(anyhow::Error::new(HashMismatch));
-        }
-        return Ok(Bytes::new());
-    }
-    let tree = BaoTree::new(total_bytes, IROH_BLOCK_SIZE);
-    let root = blake3::Hash::from_bytes(hash);
-    let chunk_ranges = aligned.chunk_ranges();
-    let reader = std::io::Cursor::new(bao_wire);
-    // Cap the capacity hint at the received wire length: decoded plaintext can
-    // never exceed the bytes actually received, so an untrusted `total_bytes`
-    // header (via `fetch_len`) can't drive an over-allocation / OOM.
-    let cap = usize::try_from(aligned.fetch_len())
-        .unwrap_or(0)
-        .min(bao_wire.len());
-    let mut plaintext = Vec::with_capacity(cap);
-    for item in DecodeResponseIter::new(root, tree, reader, chunk_ranges.as_ref()) {
-        match item {
-            Ok(BaoContentItem::Leaf(leaf)) => plaintext.extend_from_slice(&leaf.data),
-            Ok(BaoContentItem::Parent(_)) => {}
-            // A group/leaf/root hash mismatch is the content-addressing violation
-            // (ADR 014); surface the typed sentinel so callers classify corruption.
-            Err(DecodeError::ParentHashMismatch(_) | DecodeError::LeafHashMismatch(_)) => {
-                return Err(anyhow::Error::new(HashMismatch));
-            }
-            // A short/truncated stream or other IO fault — not provably corruption.
-            Err(e) => anyhow::bail!("bao decode failed: {e}"),
-        }
-    }
-    // The decoded buffer spans the aligned superset `[fetch_start, fetch_end)`;
-    // trim back to the caller's requested span.
-    let lead = usize::try_from(byte_offset.saturating_sub(aligned.fetch_start()))?;
-    let want = if byte_len == 0 {
-        plaintext.len().saturating_sub(lead)
-    } else {
-        usize::try_from(byte_len)?
-    };
-    // Take ownership of the decoded buffer as `Bytes` once, then trim with a
-    // zero-copy `slice` view (no second allocation/copy). Guard the upper bound
-    // explicitly: `Bytes::slice` panics out of range, and a short decode must
-    // surface as a clean error (`lead <= end` always, since `want >= 0`).
-    let end = lead.saturating_add(want);
-    let bytes = Bytes::from(plaintext);
-    if end > bytes.len() {
-        anyhow::bail!("decoded range shorter than requested span");
-    }
-    if lead == 0 && end == bytes.len() {
-        return Ok(bytes);
-    }
-    Ok(bytes.slice(lead..end))
-}
 
 /// Header fields from the upstream `StreamResponse`, surfaced by
 /// [`open_progressive_pull`] before the first chunk so the fused serve path
@@ -2515,23 +2185,23 @@ pub struct UpstreamPullHeader {
     pub ttfb_ms: f64,
 }
 
-/// A live, progressive `cdn/client/v1` pull (#856), the streaming counterpart of
-/// the buffered `stream_fetch`. Opened by [`open_progressive_pull`] (which has
-/// already done the handshake and verified the response), driven chunk-by-chunk
-/// via [`Self::next_chunk`], and closed by [`Self::finish`] (a wire-completeness
-/// check — integrity is verified per bao chunk group by the tee's decoder and the
-/// downstream client's own decoder, not by a whole-blob re-hash) or
-/// [`Self::abort`].
+/// A live, progressive `cdn/client/v1` pull (#856) — the ONE receive loop for
+/// paid delivery. Opened by [`open_progressive_pull`] (which has already done the
+/// handshake and verified the response), driven chunk-by-chunk via
+/// [`Self::next_chunk`], and closed by [`Self::finish`] (a wire-completeness
+/// check — integrity is verified per bao chunk group by the consumer's decoder
+/// as the bytes land, not by a whole-blob re-hash) or [`Self::abort`].
 ///
-/// It pays the upstream per chunk *inside* `next_chunk` — identical
-/// pacing to `stream_fetch` — but yields each chunk to the caller (which
-/// forwards it to the paying downstream client and tees it into the cache)
-/// instead of buffering the whole blob. This is what lets the serving node cap
-/// its speculative exposure to a bounded window rather than fronting the entire
-/// upstream cost before any downstream voucher arrives.
+/// It pays the upstream per chunk *inside* `next_chunk` and yields each chunk to
+/// the caller — a [`sink::PullReader`] feeding a verifying decoder into the ranged
+/// store, the cache admit, or (`test-util`) memory — instead of buffering the
+/// whole blob. This is what lets the serving node cap its speculative exposure to
+/// a bounded window rather than fronting the entire upstream cost before any
+/// downstream voucher arrives, and what bounds a lying peer's bill to the bytes
+/// that arrived before its first unverifiable chunk group.
 ///
-/// Unlike `stream_fetch_tracked`, the acked voucher watermark is OWNED here (not
-/// threaded as a `&mut` out-param) and read back via [`Self::progress`] /
+/// The acked voucher watermark is OWNED here (not threaded as a `&mut`
+/// out-param) and read back via [`Self::progress`] /
 /// returned by `finish`/`abort` — the caller (`node_origin`) persists it. On any
 /// exit, the caller MUST call `progress`/`finish`/`abort` to recover the
 /// watermark for `record_progress` (#852); a [`Drop`] guard closes the
@@ -2541,8 +2211,8 @@ pub struct UpstreamPullHeader {
 /// **Deadlines.** The *open* (handshake) phase is bounded inside
 /// [`open_progressive_pull`] by `PullDeadlines::open`, via the shared `open_stream`
 /// helper — NOT by the caller (#1134). `decdn-node` does additionally wrap the open
-/// in its per-candidate budget, but that is belt-and-braces: leaving the bound to
-/// the caller is what let the buffered handshake ship unbounded once already.
+/// in its per-candidate budget, but that is belt-and-braces: a bound left to the
+/// caller is a bound a caller can forget.
 ///
 /// The streaming `next_chunk`/`finish` reads are bounded here, by a THROUGHPUT FLOOR
 /// (#1797): bytes are counted off the QUIC stream sub-frame, and a read is abandoned when
@@ -2561,8 +2231,8 @@ pub struct UpstreamPull {
     ctx: PoolContext,
     /// The channel's voucher ledger, SHARED with every other concurrent pull on this
     /// channel (#1145 review). Not a per-pull one-shot: that made two concurrent pulls
-    /// each compute the same next cumulative `amount` independently and collide — see
-    /// [`stream_fetch_shared`], whose doc describes the same bug on the buffered path.
+    /// each compute the same next cumulative `amount` independently and collide
+    /// (`AmountRegression`).
     ledger: Arc<PoolLedger>,
     hash: [u8; 32],
     rate_per_mb: u64,
@@ -2583,6 +2253,11 @@ pub struct UpstreamPull {
     /// chunk-group-aligned range (content plus interleaved proof, ADR 038), not
     /// the content-byte remainder. Bounds the receive loop and the closing voucher.
     expected_wire_bytes: u64,
+    /// The buyer's received-byte ceiling (#1895) as a WIRE bound: the wire size of a
+    /// ceiling-sized blob's content from this stream's offset, so `next_chunk` can
+    /// enforce `max_blob_size_bytes` on the bytes that ACTUALLY arrive without
+    /// decoding. `0` = unlimited.
+    max_received_wire: u64,
     /// Wire bytes received so far on this stream.
     cumulative: u64,
     /// Wire bytes received but not yet covered by a proof.
@@ -2606,20 +2281,20 @@ impl std::fmt::Debug for UpstreamPull {
 /// Open a progressive `cdn/client/v1` pull (#856): connect, send the
 /// [`StreamRequest`], read and verify the signed [`StreamResponse`] (so
 /// `total_bytes` is known up front), and return its header plus a live
-/// [`UpstreamPull`] to drive. The same response-validation rules as
-/// `stream_fetch` apply — zero-rate rejection, `slash_sig` recovery, echoed
-/// field checks, and the `total_bytes >= byte_offset` floor — all enforced BEFORE
-/// the first chunk. The `max_blob_size_bytes` ceiling is NOT one of them (#1895):
-/// the peer's `total_bytes` claim is unverified, so the ceiling is enforced on the
-/// bytes that ACTUALLY arrive, inside [`UpstreamPull::next_chunk`], as
-/// [`BlobTooLarge`].
+/// [`UpstreamPull`] to drive. Zero-rate rejection, `slash_sig` recovery, echoed
+/// field checks, the buyer's rate ceiling, and the `total_bytes >= byte_offset`
+/// floor are all enforced BEFORE the first chunk. The `max_blob_size_bytes`
+/// ceiling is NOT one of them (#1895): the peer's `total_bytes` claim is
+/// unverified, so the ceiling is enforced on the bytes that ACTUALLY arrive,
+/// inside [`UpstreamPull::next_chunk`], as [`BlobTooLarge`]. `0` = unlimited.
 ///
 /// # Errors
 ///
-/// Same set as `stream_fetch` for the handshake/response phase (connect /
-/// transport, refused or zero-rate response, bad `slash_sig`, mismatched echoed
-/// field). The size ceiling surfaces later, as a [`BlobTooLarge`] abort once
-/// received bytes cross it.
+/// Connect / transport faults, a refused or zero-rate response, a bad `slash_sig`,
+/// a mismatched echoed field, a [`RateAboveCeiling`] quote, a
+/// [`ResumeOffsetPastEnd`] offset, or a resume offset already at/past the size
+/// ceiling ([`BlobTooLarge`]). The size ceiling otherwise surfaces later, as a
+/// [`BlobTooLarge`] abort once received bytes cross it.
 ///
 /// The open stage is bounded by `deadlines.open`, inside the shared `open_stream`
 /// helper — NOT left to the caller (#1134). `node_origin` additionally wraps this
@@ -2629,9 +2304,9 @@ impl std::fmt::Debug for UpstreamPull {
 /// here (the caller owns the streaming lifetime on this path).
 ///
 /// `ledger` is the CHANNEL's voucher ledger, not this pull's: pass the same
-/// `Arc<PoolLedger>` to every concurrent pull on one channel, exactly as with
-/// [`stream_fetch_shared`], or they will each compute the same next cumulative
-/// `amount` independently and collide (#1145 review). The caller reads what to
+/// `Arc<PoolLedger>` to every concurrent pull on one channel, or they will each
+/// compute the same next cumulative `amount` independently and collide
+/// (`AmountRegression`, #1145 review). The caller reads what to
 /// persist from it — including after a drop — via [`PoolLedger::settlement`].
 #[allow(clippy::too_many_arguments)]
 pub async fn open_progressive_pull(
@@ -2645,6 +2320,7 @@ pub async fn open_progressive_pull(
     namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
+    max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
     // Upper bound on the requested range: `[byte_offset, byte_offset + byte_len)`.
@@ -2692,16 +2368,17 @@ pub async fn open_progressive_pull(
     if !resp.body.ok {
         return Err(UpstreamRefused::open(resp, &resp_ext));
     }
-    // Same as `fetch_inner` (#1895): the peer's signed `total_bytes` never drives a
-    // refusal — it is unverified — so the `max_blob_size_bytes` ceiling is enforced
-    // on the bytes that ACTUALLY arrive, inside `UpstreamPull::next_chunk`, not on
-    // the claim. This is the fused serve leg, so refusing on an inflated claim here
-    // would let a holder centralise a small blob's traffic across every
-    // finite-ceiling relay; a lie cannot produce bytes that verify against the true
-    // root, and an honest giant is streamed and paid for only up to one ceiling.
-    // Same buyer-side rate ceiling as `fetch_inner` (#1375): refuse an over-ceiling
-    // quote before the first paid interval, carrying the signed quote out as
-    // rate-manipulation evidence. `0` = unbounded.
+    // The peer's signed `total_bytes` never drives a refusal (#1895): it is
+    // peer-controlled and unverified (`StreamResponse::validate()` does not bound
+    // it), so the `max_blob_size_bytes` ceiling is enforced on the bytes that
+    // ACTUALLY arrive, inside `UpstreamPull::next_chunk`, not on the claim. Refusing
+    // on an inflated claim would let a holder centralise a small blob's traffic
+    // across every finite-ceiling relay; a lie cannot produce bytes that verify
+    // against the true root, and an honest giant is streamed and paid for only up
+    // to one ceiling.
+    // Buyer-side rate ceiling (#1375): refuse an over-ceiling quote before the
+    // first paid interval, carrying the signed quote out as rate-manipulation
+    // evidence. `0` = unbounded.
     if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
         return Err(RateAboveCeiling::over_ceiling(resp, max_rate_per_mb));
     }
@@ -2720,9 +2397,28 @@ pub async fn open_progressive_pull(
     let rate_per_mb = resp.body.rate_per_mb;
     // Wire-byte bound (bao-encoded size of the aligned range), not content bytes —
     // the window path forwards this stream verbatim and pays the upstream in wire
-    // bytes (ADR 038 §Payment metering). Same derivation as `fetch_inner`.
+    // bytes (ADR 038 §Payment metering).
     let total_bytes = resp.body.total_bytes;
     let expected_wire_bytes = aligned_wire_len(byte_offset, byte_len, total_bytes)?;
+    // Received-byte ceiling (#1895), expressed as a WIRE bound so `next_chunk` can
+    // enforce it without decoding: the wire size of a ceiling-sized blob's content
+    // from this offset. Enforced on the bytes that ACTUALLY arrive, never on the
+    // peer's unverified `total_bytes` claim. A resume offset already at/past the
+    // ceiling means the blob is genuinely oversized — abort before the first chunk.
+    // `0` = unlimited.
+    let max_received_wire = if max_blob_size_bytes == 0 {
+        0
+    } else {
+        match aligned_wire_len(byte_offset, 0, max_blob_size_bytes) {
+            Ok(wire) => wire,
+            Err(_) => {
+                return Err(anyhow::Error::new(BlobTooLarge {
+                    received: byte_offset,
+                    ceiling: max_blob_size_bytes,
+                }));
+            }
+        }
+    };
     let ttfb_ms = started.elapsed().as_secs_f64() * 1000.0;
     let header = UpstreamPullHeader {
         total_bytes,
@@ -2752,6 +2448,7 @@ pub async fn open_progressive_pull(
         rate_per_mb,
         meter: StreamMeter::default(),
         expected_wire_bytes,
+        max_received_wire,
         cumulative: 0,
         unproved: 0,
         ended: false,
@@ -2785,7 +2482,7 @@ impl UpstreamPull {
     /// Send one voucher for `delta_bytes` newly delivered since the last voucher,
     /// through the CHANNEL's ledger — shared with every other concurrent pull on it, so
     /// their vouchers are serialized into strict cumulative-amount order rather than
-    /// colliding (see [`stream_fetch_shared`]). Sends optimistically (#1484): the ack is
+    /// colliding. Sends optimistically (#1484): the ack is
     /// read back by [`Self::next_chunk`] / [`Self::finish`], not awaited here.
     async fn pay_one(&mut self, unproved: u64, complete: bool) -> anyhow::Result<u64> {
         let ledger = Arc::clone(&self.ledger);
@@ -2849,8 +2546,10 @@ impl UpstreamPull {
     ///
     /// # Errors
     ///
-    /// More bytes than promised, a mid-stream `StreamError` (typed [`UpstreamRefused`]), an
-    /// unexpected message, a [`UpstreamVoucherRejected`] / transport error while paying, or —
+    /// More bytes than promised, received bytes crossing the buyer's size ceiling
+    /// ([`BlobTooLarge`], raised before the crossing chunk is paid), a mid-stream `StreamError`
+    /// (typed [`UpstreamRefused`]), an unexpected message, a [`UpstreamVoucherRejected`] /
+    /// transport error while paying, or —
     /// on the throughput floor — [`PullStalled`] once bytes have flowed, or [`PullTimeout`] if
     /// the floor trips before the first byte (`cumulative == 0`). A malformed `ChunkData` is
     /// not raised here: an empty payload is rejected at decode by `ChunkData`'s
@@ -2889,11 +2588,29 @@ impl UpstreamPull {
                             self.expected_wire_bytes
                         );
                     }
+                    // Received-byte ceiling (#1895): enforce the size cap on the bytes
+                    // that ACTUALLY arrive, never on the peer's unverified `total_bytes`
+                    // claim. `max_received_wire` is the wire size of a ceiling-sized
+                    // blob's content, so this is the wire form of "received content >
+                    // ceiling" — distinct from the claim-derived `expected_wire_bytes`
+                    // overrun guard above. Abort BEFORE paying for the chunk that
+                    // crosses it, so the spend stays bounded to roughly one ceiling.
+                    // `0` = unlimited.
+                    if self.max_received_wire > 0 && self.cumulative > self.max_received_wire {
+                        return Err(anyhow::Error::new(BlobTooLarge {
+                            received: self.cumulative,
+                            ceiling: self.max_received_wire,
+                        }));
+                    }
                     // No per-chunk hashing here: this stream's bytes are bao wire
-                    // bytes forwarded verbatim downstream and teed into the cache's
-                    // verifying decoder (`import_and_verify_stream`), which checks the
-                    // cached copy against the root (ADR 038); the downstream client
-                    // verifies its own copy with its decoder.
+                    // bytes the caller feeds to a verifying decoder — the cache's
+                    // (`admit_bao_stream`), the ranged store's, or the in-memory
+                    // test wrapper's — which checks every chunk group against the
+                    // root as it lands (ADR 038). A reveal therefore pays for wire
+                    // bytes that have been RECEIVED but not yet verified; the decoder
+                    // aborts the pull at the first bad group, so what a lying peer
+                    // can bill is bounded by one framed message plus one metering
+                    // interval, never by its `total_bytes` claim.
                     self.unproved = self.unproved.saturating_add(chunk_len);
                     // One reveal per whole chunk, plus one closing signature for
                     // the residual once every promised byte has arrived. The
@@ -2905,8 +2622,20 @@ impl UpstreamPull {
                     // the upstream legitimately pauses (ADR 005 §Payment pacing), so that
                     // pause is self-inflicted, not a sender stall (#1797).
                     self.floor.pause(tokio::time::Instant::now());
-                    self.unproved = self.pay_one(unproved, complete).await?;
+                    let paid = self.pay_one(unproved, complete).await;
                     self.floor.resume(tokio::time::Instant::now());
+                    match paid {
+                        Ok(remaining) => self.unproved = remaining,
+                        // A voucher write that failed at end-of-stream may only mean the
+                        // node stopped our send after it finished (or is rejecting us):
+                        // prefer the terminal signal it left to the opaque write failure.
+                        // Boxed so this cold error-path future does not enlarge the steady
+                        // receive loop's future (`clippy::large_futures`); the allocation
+                        // only happens on the failure path.
+                        Err(write_err) => {
+                            Box::pin(self.terminal_after_write_failure(write_err)).await?;
+                        }
+                    }
                     Ok(Some(Bytes::from(chunk.into_bytes())))
                 }
                 // A mid-stream `StreamError` is either a `VoucherRejected` (our
@@ -2923,6 +2652,41 @@ impl UpstreamPull {
                     anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other))
                 }
             }
+        }
+    }
+
+    /// Decide what a voucher write failure really means.
+    ///
+    /// A node stops our send half only once it needs nothing more from us: a
+    /// completed delivery leaves a `StreamEnd` on the wire, a mid-stream rejection a
+    /// `StreamError`. The write half and the read half run in lock-step in the
+    /// receive loop, so a raw voucher-write failure — the end-of-stream
+    /// `STOP_SENDING(0)` a node emits when it finishes and drops `recv` — would
+    /// otherwise mask that terminal signal and abort a complete, paid fetch (or
+    /// swallow a typed rejection the reactive top-up path keys on). Read the terminal
+    /// signal, briefly, and prefer it: a `StreamEnd` marks the stream ended (the
+    /// chunk that triggered the write is still delivered; the next read returns
+    /// `None`), a `StreamError` surfaces as the typed rejection. A write we caused
+    /// ourselves (a [`LocalPullFault`] encode fault) is never masked; nor is a stream
+    /// that yields no terminal signal before the bound.
+    async fn terminal_after_write_failure(
+        &mut self,
+        write_err: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        if write_err.is::<LocalPullFault>() {
+            return Err(write_err);
+        }
+        match tokio::time::timeout(TERMINAL_AFTER_WRITE_TIMEOUT, self.read_under_floor()).await {
+            Ok(Ok(ClientMessage::StreamEnd)) => {
+                self.ended = true;
+                Ok(())
+            }
+            Ok(Ok(ClientMessage::StreamError(e))) => {
+                Err(voucher_rejection(&self.ledger, &self.meter, e))
+            }
+            // Any other message, a read error, or the timeout: nothing terminal is
+            // waiting, so the write failure stands as the honest outcome.
+            _ => Err(write_err),
         }
     }
 
@@ -3294,8 +3058,9 @@ impl StreamMeter {
 /// A `VoucherRejected` is OUR payment-side fault: rewind the proof `meter` last sent
 /// (known-not-taken, so it must not be settled optimistically) and carry its typed
 /// reason — plus the wallet-less-resume `bundle` (#1481) — so the orchestrator can
-/// exonerate the provider (#857) and `fetch_inner` can self-heal from an
-/// authenticated watermark instead of treating the rejection as terminal. Any
+/// exonerate the provider (#857) and the reseed loops (`driver::fill_gap`, the
+/// `test-util` `fetch_inner`) can self-heal from an authenticated watermark
+/// instead of treating the rejection as terminal. Any
 /// OTHER `StreamError` is the upstream refusing mid-stream; carry the typed wire
 /// code as [`UpstreamRefused`] so an honest `Overloaded`/`NotFound` peer is scored
 /// on its real code rather than the `Unreachable` catch-all (#1145 review).
@@ -3413,9 +3178,11 @@ mod tests {
     use bao_tree::io::outboard::PreOrderMemOutboard;
     use decdn_bao_range::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
 
+    use bytes::Bytes;
+
     use super::{
         Cumulative, HashMismatch, LocalPullFault, PoolContext, U256, UpstreamVoucherRejected,
-        Voucher, VoucherRejectReason, WatermarkBundle, aligned_wire_len, decode_verified_range,
+        Voucher, VoucherRejectReason, WatermarkBundle, aligned_wire_len, decode_to_vec,
         genuine_exhaustion, resumable_watermark,
     };
 
@@ -3432,8 +3199,8 @@ mod tests {
     ///
     /// So: real functions, real errors, marker never touched by the test. `align_range`
     /// rejects an offset at or past the end of the blob (never clamps — ADR 005), which is
-    /// the one local-fault trigger reachable without mocking a signer, and it is shared by
-    /// both the buffered and window-paced paths.
+    /// the one local-fault trigger reachable without mocking a signer, and
+    /// `aligned_wire_len` is the one site every pull passes it through.
     ///
     /// The stakes, and why an unguarded marker here is not cosmetic: every arm BELOW
     /// `LocalPullFault` in the ladder blames the peer to some degree, and the catch-all
@@ -3559,7 +3326,7 @@ mod tests {
     #[test]
     fn the_range_helpers_mark_their_own_faults_as_local() {
         // A 4 KiB blob cannot be resumed from byte 8192 — `align_range` errors rather than
-        // clamping (ADR 005), and both callers must own that as OURS. Each assertion covers
+        // clamping (ADR 005), and the caller must own that as OURS. The assertion covers
         // both halves at once: `None` here means the call wrongly SUCCEEDED, and a `Some`
         // without the marker means it failed and blamed the peer.
         let aligned = aligned_wire_len(8192, 0, 4096).err();
@@ -3571,23 +3338,14 @@ mod tests {
              without the marker it falls through every downcast to the catch-all and \
              scores the peer as unreachable. Got: {aligned:?}"
         );
-
-        let decoded = decode_verified_range([0u8; 32], 4096, 8192, 0, &[]).err();
-        assert!(
-            decoded
-                .as_ref()
-                .is_some_and(|e| e.downcast_ref::<LocalPullFault>().is_some()),
-            "decode_verified_range must reject an out-of-range offset and mark it OUR fault, \
-             for the same reason. Got: {decoded:?}"
-        );
     }
 
     /// `client_binding_ext` maps an unbound context to `None` (so
     /// `encode_stream_request` appends no ext bytes — byte-for-byte the pre-#1115
     /// wire) and a bound one to `Some` carrying exactly the binding at the default
-    /// voucher cadence. This is the shared mapping BOTH request sites
-    /// (`fetch_inner` and `open_progressive_pull`) rely on, so it guards a
-    /// refactor that would silently drop the ext on either path (#1115).
+    /// voucher cadence. This is the mapping the single request site
+    /// (`open_stream`) relies on, so it guards a refactor that would silently
+    /// drop the ext (#1115).
     #[test]
     fn client_binding_ext_reflects_binding_presence() -> anyhow::Result<()> {
         use std::sync::Arc;
@@ -4185,51 +3943,70 @@ mod tests {
         Ok((root, wire))
     }
 
-    #[test]
-    fn decode_verified_range_round_trips_whole_blob() -> anyhow::Result<()> {
+    /// Drive `decode_to_vec` over a fixed wire buffer (a `Bytes` reader stashes
+    /// no fault, so the decoder's verdict is the whole story) and trim the
+    /// aligned superset back to `[byte_offset, total_bytes)` — the receive side
+    /// of `fetch_in_memory_once` with the live pull swapped for memory.
+    async fn decode_wire(
+        root: [u8; 32],
+        total_bytes: u64,
+        byte_offset: u64,
+        wire: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let aligned = align_range(byte_offset, 0, total_bytes)?;
+        let (out, _reader) = decode_to_vec(
+            root,
+            total_bytes,
+            &aligned,
+            Bytes::copy_from_slice(wire),
+            None,
+        )
+        .await?;
+        let lead = usize::try_from(byte_offset.saturating_sub(aligned.fetch_start()))?;
+        out.get(lead..)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| anyhow::anyhow!("decoded range shorter than requested span"))
+    }
+
+    #[tokio::test]
+    async fn decode_to_vec_round_trips_whole_blob() -> anyhow::Result<()> {
         let blob = make_blob(200 * 1024 + 777);
         let (root, wire) = wire_for(&blob, 0, 0)?;
-        let out = decode_verified_range(root, u64::try_from(blob.len())?, 0, 0, &wire)?;
-        anyhow::ensure!(out.as_ref() == blob.as_slice(), "whole-blob round-trip");
+        let out = decode_wire(root, u64::try_from(blob.len())?, 0, &wire).await?;
+        anyhow::ensure!(out == blob, "whole-blob round-trip");
         Ok(())
     }
 
     /// A resumed fetch at a group-aligned offset self-verifies against the root —
     /// no dependency on the bytes before the offset (the old gap is closed).
-    #[test]
-    fn decode_verified_range_resumed_group_aligned_offset() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn decode_to_vec_resumed_group_aligned_offset() -> anyhow::Result<()> {
         let blob = make_blob(200 * 1024 + 777);
         let off = 64 * 1024; // 16 KiB-group aligned
         let (root, wire) = wire_for(&blob, off, 0)?;
-        let out = decode_verified_range(root, u64::try_from(blob.len())?, off, 0, &wire)?;
+        let out = decode_wire(root, u64::try_from(blob.len())?, off, &wire).await?;
         let want = sub(&blob, off, u64::try_from(blob.len())?)?;
-        anyhow::ensure!(
-            out.as_ref() == want.as_slice(),
-            "resumed tail self-verifies"
-        );
+        anyhow::ensure!(out == want, "resumed tail self-verifies");
         Ok(())
     }
 
     /// A non-group-aligned resume offset: the server serves the aligned superset
     /// and the receiver trims the leading bytes back to the exact requested span.
-    #[test]
-    fn decode_verified_range_trims_non_aligned_offset() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn decode_to_vec_trims_non_aligned_offset() -> anyhow::Result<()> {
         let blob = make_blob(200 * 1024 + 777);
         let off = 70 * 1024; // inside a group, not on a boundary
         let (root, wire) = wire_for(&blob, off, 0)?;
-        let out = decode_verified_range(root, u64::try_from(blob.len())?, off, 0, &wire)?;
+        let out = decode_wire(root, u64::try_from(blob.len())?, off, &wire).await?;
         let want = sub(&blob, off, u64::try_from(blob.len())?)?;
-        anyhow::ensure!(
-            out.as_ref() == want.as_slice(),
-            "trimmed to requested offset"
-        );
+        anyhow::ensure!(out == want, "trimmed to requested offset");
         Ok(())
     }
 
     /// A corrupt tail byte is rejected at its chunk group with the typed
     /// `HashMismatch` — even on a resumed fetch with no earlier bytes (ADR 038 #1).
-    #[test]
-    fn decode_verified_range_rejects_corrupt_tail() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn decode_to_vec_rejects_corrupt_tail() -> anyhow::Result<()> {
         let blob = make_blob(200 * 1024 + 777);
         let off = 64 * 1024;
         let (root, mut wire) = wire_for(&blob, off, 0)?;
@@ -4241,7 +4018,8 @@ mod tests {
         if let Some(b) = wire.get_mut(last) {
             *b ^= 0xff;
         }
-        let err = decode_verified_range(root, u64::try_from(blob.len())?, off, 0, &wire)
+        let err = decode_wire(root, u64::try_from(blob.len())?, off, &wire)
+            .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected corrupt tail to be rejected"))?;
         anyhow::ensure!(
@@ -4253,10 +4031,10 @@ mod tests {
 
     /// ADR 038 AC#2 (early rejection at the offending group): a corrupt MIDDLE
     /// group is rejected as `HashMismatch` even when everything AFTER it is
-    /// missing — detection needs no tail, so a streaming consumer can stop
-    /// paying at group *k* instead of buffering to the end.
-    #[test]
-    fn decode_verified_range_rejects_corrupt_middle_group_without_tail() -> anyhow::Result<()> {
+    /// missing — detection needs no tail, which is what lets the live receive
+    /// loop stop pulling (and paying) at group *k*.
+    #[tokio::test]
+    async fn decode_to_vec_rejects_corrupt_middle_group_without_tail() -> anyhow::Result<()> {
         let blob = make_blob(200 * 1024 + 777);
         let (root, mut wire) = wire_for(&blob, 0, 0)?;
         // Corrupt a byte ~55% in (inside a middle group's data), then TRUNCATE
@@ -4268,7 +4046,8 @@ mod tests {
             *b ^= 0xff;
         }
         wire.truncate(truncate_at);
-        let err = decode_verified_range(root, u64::try_from(blob.len())?, 0, 0, &wire)
+        let err = decode_wire(root, u64::try_from(blob.len())?, 0, &wire)
+            .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected corrupt middle group to be rejected"))?;
         anyhow::ensure!(
@@ -4282,12 +4061,13 @@ mod tests {
     /// corruption: it must NOT downcast to `HashMismatch`, because callers use
     /// that sentinel to score the provider `Corruption` (tarring a peer for a
     /// dropped connection would misattribute blame — #915 review).
-    #[test]
-    fn decode_verified_range_truncation_is_not_hash_mismatch() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn decode_to_vec_truncation_is_not_hash_mismatch() -> anyhow::Result<()> {
         let blob = make_blob(200 * 1024 + 777);
         let (root, mut wire) = wire_for(&blob, 0, 0)?;
         wire.truncate(wire.len() * 60 / 100);
-        let err = decode_verified_range(root, u64::try_from(blob.len())?, 0, 0, &wire)
+        let err = decode_wire(root, u64::try_from(blob.len())?, 0, &wire)
+            .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected truncated stream to be rejected"))?;
         anyhow::ensure!(
@@ -4297,43 +4077,15 @@ mod tests {
         Ok(())
     }
 
-    /// A 0-byte blob (#1054) delivers an empty stream that is proven against the
-    /// empty root `blake3::hash(&[])`, decoding to empty bytes.
-    #[test]
-    fn decode_verified_range_empty_blob_accepts_empty_root() -> anyhow::Result<()> {
-        let root = *blake3::hash(&[]).as_bytes();
-        let out = decode_verified_range(root, 0, 0, 0, &[])?;
-        anyhow::ensure!(out.is_empty(), "empty blob decodes to empty bytes");
-        Ok(())
-    }
-
-    /// A server claiming `total_bytes == 0` for a NON-empty requested hash must be
-    /// rejected: the empty stream must be proven against the empty root, never
-    /// accepted for an arbitrary root. Without the explicit check the empty range
-    /// decodes trivially (no chunk group to verify) and the bypass would surface
-    /// as success — the exact hole `fetch_inner` warns about (#1054).
-    #[test]
-    fn decode_verified_range_empty_claim_rejects_wrong_root() -> anyhow::Result<()> {
-        let blob = make_blob(4096);
-        let root = *blake3::hash(&blob).as_bytes();
-        let err = decode_verified_range(root, 0, 0, 0, &[])
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected wrong-root rejection for empty claim"))?;
-        anyhow::ensure!(
-            err.downcast_ref::<HashMismatch>().is_some(),
-            "empty claim for a non-empty root must surface HashMismatch, got: {err}"
-        );
-        Ok(())
-    }
-
     /// Decoding an honest stream against the WRONG root fails closed (the range
     /// can't be re-anchored), so a source serving a different blob is rejected.
-    #[test]
-    fn decode_verified_range_rejects_wrong_root() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn decode_to_vec_rejects_wrong_root() -> anyhow::Result<()> {
         let blob = make_blob(200 * 1024 + 777);
         let (_root, wire) = wire_for(&blob, 0, 0)?;
         let wrong = [0xABu8; 32];
-        let err = decode_verified_range(wrong, u64::try_from(blob.len())?, 0, 0, &wire)
+        let err = decode_wire(wrong, u64::try_from(blob.len())?, 0, &wire)
+            .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected wrong-root rejection"))?;
         anyhow::ensure!(
@@ -4357,7 +4109,7 @@ mod tests {
     /// operator's key and synthesises its own evidence.
     ///
     /// Deliberately routed through the private [`UpstreamRefused::open`] — the one
-    /// constructor both the buffered and progressive open stages share — rather
+    /// constructor the open stage uses — rather
     /// than a hand-built value, which #1377's newtype now makes impossible outside
     /// this crate anyway.
     #[test]

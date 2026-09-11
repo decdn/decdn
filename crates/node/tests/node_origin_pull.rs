@@ -4331,9 +4331,9 @@ const EMPTY_CHUNK_STALL_BUDGET: Duration = Duration::from_secs(30);
 /// which is immediate.
 const EMPTY_CHUNK_ASSERT_WINDOW: Duration = Duration::from_secs(10);
 
-/// #1088, BUFFERED receive loop (`client_pull::receive_and_pay`, reached via
-/// `Origin::fetch`): an upstream that streams empty `ChunkData` frames forever
-/// must be rejected AT ONCE, on the frame itself.
+/// #1088, receive loop (`UpstreamPull::next_chunk`, reached via `Origin::fetch`):
+/// an upstream that streams empty `ChunkData` frames forever must be rejected AT
+/// ONCE, on the frame itself.
 ///
 /// `ChunkData::validate` has a unit test; this is the one that proves the receive
 /// loop CALLS it. Drop the non-empty check and an empty frame passes every
@@ -7499,8 +7499,8 @@ async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> R
 /// #1054: an empty (0-byte) blob served via the fused window pull-through path.
 /// This exercises the window pull leg's tee — `open_pull_leg` →
 /// `UpstreamPull::finish` → tee promote → downstream `leaf_paced_pull` verify —
-/// which never calls `decode_verified_range`, so the buffered-path e2e
-/// (`client_delivers_empty_blob`) does not cover it. For 0 wire bytes the window
+/// which the in-memory loopback e2e (`client_delivers_empty_blob`) does not
+/// cover. For 0 wire bytes the window
 /// never pauses, B pays A no voucher, and B still promotes the empty blob against
 /// the empty root `Hash::new(&[])`.
 #[tokio::test(flavor = "multi_thread")]

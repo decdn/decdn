@@ -480,8 +480,8 @@ impl PoolLedger {
 
     /// Read the committed cumulative WITHOUT awaiting — the drop-safe reader, and
     /// the only one a `Drop` impl can call. It is the highest voucher whose send
-    /// succeeded (implicit acceptance), so it is exactly what a *completed*
-    /// buffered pull persists.
+    /// succeeded (implicit acceptance), so it is exactly what a *completed* pull
+    /// persists.
     #[must_use]
     pub fn committed(&self) -> Cumulative {
         let pipeline = self.pipeline();

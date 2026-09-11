@@ -4,9 +4,10 @@
 //! Turnkey paying sibling of [`super::probe`]: dial a node by explicit
 //! `--node-id`/`--addr`/`--relay-url` (or auto-discover one, #936),
 //! **auto-open-or-reuse** the caller's own `PaymentPool` deposit, run one
-//! delivery exchange via [`decdn_client_pull::stream_fetch_tracked`]-shaped
-//! gap-driven core (signing cumulative vouchers, resuming the pool lane's
-//! persisted watermark), verify the `slash_sig` recovers to the provider
+//! delivery exchange through the gap-driven [`decdn_client_pull::drive`] core
+//! over a [`decdn_client_pull::PeerSource`] (signing cumulative vouchers,
+//! resuming the pool lane's persisted watermark), verify the `slash_sig`
+//! recovers to the provider
 //! (ADR 014 §1), BLAKE3-check the whole blob, persist the new watermark, and
 //! write the bytes atomically.
 //!
@@ -1192,7 +1193,7 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyhow:
 /// Persist what the pool lane paid, warning rather than masking the fetch
 /// outcome.
 ///
-/// Shared by the buffered and streaming paths: the bytes were paid for either
+/// Shared by the single- and multi-source paths: the bytes were paid for either
 /// way, and a failure to record that only risks a rejected reuse next time.
 fn persist_watermark(
     store: &RedbBuyerPoolStore,
@@ -1812,6 +1813,7 @@ where
         deps.namespace_id,
         0,
         micros_now(),
+        deps.max_blob_bytes,
         deps.max_rate_per_mb,
         deps.deadlines,
         0,
@@ -2215,6 +2217,7 @@ where
             deps.namespace_id,
             0,
             micros_now(),
+            deps.max_blob_bytes,
             deps.max_rate_per_mb,
             deps.deadlines,
             0,

@@ -12,10 +12,12 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-# Exposes the legacy single-deadline test helpers (`PullDeadlines::whole_transfer`,
-# `stream_fetch`) that deliberately build the zero-stall / uncapped state the production
-# constructors reject. Gated so a production caller cannot even name them (#1145 review);
-# enabled by downstream test suites via `dev-dependencies`.
+# Exposes the in-memory `stream_fetch*` wrappers — thin drivers of the one receive
+# loop (`UpstreamPull`) that hand the decoded bytes back instead of streaming into a
+# store — and the single-deadline `PullDeadlines::whole_transfer` shape they pass,
+# which deliberately builds the zero-stall / uncapped state the production
+# constructors reject. Gated so a production caller cannot even name them (#1145
+# review); enabled by downstream test suites via `dev-dependencies`.
 test-util = []
 
 [dependencies]

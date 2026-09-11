@@ -3388,7 +3388,7 @@ async fn client_restart_with_stale_watermark_heals_and_resumes() -> anyhow::Resu
 
 /// Resume with a NON-EMPTY proof spine (#1060): a ~200 KiB blob spans many 16 KiB
 /// chunk groups, so the offset resume exercises the production
-/// `export_bao_range` ↔ `decode_verified_range` pair over real proof PARENT
+/// `export_bao_range` ↔ verifying-decoder pair over real proof PARENT
 /// nodes — not the degenerate single-leaf tree `client_byte_offset_returns_suffix`
 /// covers. The non-group-aligned offset (70 KiB) also verifies the decoder trims
 /// the leading bytes of the widened [64 KiB, 200 KiB) fetch back to the request.
@@ -9634,6 +9634,14 @@ enum Lie {
     /// Stream the bao encoding of a different blob of the SAME length under the
     /// requested hash — a paid-but-corrupt delivery the client's verifier rejects.
     WrongBytes,
+    /// Sign an inflated `total_bytes` and stream framed garbage in `frame`-byte
+    /// messages for as long as the buyer keeps reading (#1985) — the
+    /// bill-for-garbage shape whose exposure the as-it-arrives verifier bounds to
+    /// the bytes that landed before the first unverifiable chunk group.
+    InflatedGarbage {
+        /// Payload size of each garbage `ChunkData` frame.
+        frame: usize,
+    },
 }
 
 /// A raw `cdn/client/v1` upstream that accepts the request, signs a VALID
@@ -9688,6 +9696,24 @@ async fn serve_lying_stream(
     }
 
     match lie {
+        Lie::InflatedGarbage { frame } => {
+            // Keep pushing garbage until the buyer closes the connection: a
+            // write error is the expected end of this lie, not a test fault.
+            let mut garbage = vec![0u8; frame];
+            let mut noise: u64 = 0x9e37_79b9_7f4a_7c15;
+            loop {
+                for b in &mut garbage {
+                    noise ^= noise << 13;
+                    noise ^= noise >> 7;
+                    noise ^= noise << 17;
+                    *b = noise.to_le_bytes().first().copied().unwrap_or(0);
+                }
+                let msg = ClientMessage::ChunkData(ChunkData::new(garbage.clone())?);
+                if write_client_msg(&mut send, &msg).await.is_err() {
+                    break;
+                }
+            }
+        }
         Lie::OverSend => {
             // One extra full frame past the promised length trips the buyer's
             // `cumulative > expected_wire` overrun guard; it bails before any
@@ -9699,12 +9725,13 @@ async fn serve_lying_stream(
             .await?;
         }
         Lie::WrongBytes => {
-            // The promised byte count is honest, so the buyer reads to the end,
-            // pays the closing voucher, and only then verifies. Consume that
-            // voucher and close cleanly so the failure is unambiguously the
-            // integrity check, not a truncated stream.
+            // The promised byte count is honest. The buyer verifies each chunk
+            // group as it lands and drops the connection at the first mismatch;
+            // tolerate whatever it sent before that and close cleanly so the
+            // failure is unambiguously the integrity check, not a truncated
+            // stream.
             let _ = read_client_msg(&mut recv).await;
-            write_client_msg(&mut send, &ClientMessage::StreamEnd).await?;
+            let _ = write_client_msg(&mut send, &ClientMessage::StreamEnd).await;
         }
     }
     let _ = send.finish();
@@ -9737,9 +9764,12 @@ fn spawn_lying_server(
 }
 
 /// The buyer rejects a server that streams more bytes than its signed
-/// `StreamResponse` promised: the `cumulative > expected_wire` overrun guard bails
-/// the fetch before the extra bytes can drive an OOM or an overpay (ADR 005
-/// §`cdn/client/v1`).
+/// `StreamResponse` promised (ADR 005 §`cdn/client/v1`). The decoder consumes
+/// exactly the promised wire, so the extra frame surfaces at `finish` as
+/// `ChunkData` after the promised total; a frame that lands mid-stream trips the
+/// `cumulative > expected_wire` overrun guard instead. Either way the fetch
+/// bails before the extra bytes can drive an OOM or an overpay, and the node's
+/// `is_bao_corruption` classifies both messages as the same over-delivery.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_rejects_a_server_that_oversends_past_the_promised_length() -> anyhow::Result<()> {
     // Under one interval, so the honest wire is a single closing-voucher span and
@@ -9785,8 +9815,8 @@ async fn client_rejects_a_server_that_oversends_past_the_promised_length() -> an
     .ok_or_else(|| anyhow::anyhow!("an over-sending server must fail the fetch"))?;
     let msg = format!("{err:#}");
     anyhow::ensure!(
-        msg.contains("more than"),
-        "the fetch must fail on the overrun guard, got: {msg}"
+        msg.contains("more than") || msg.contains("after the promised total"),
+        "the fetch must fail on the over-delivery guard, got: {msg}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -9848,6 +9878,165 @@ async fn client_rejects_hash_mismatched_bytes() -> anyhow::Result<()> {
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// A server claiming `total_bytes == 0` for a NON-empty requested hash is
+/// rejected with the typed [`HashMismatch`] (#1054): an empty range has no chunk
+/// group for the decoder to anchor, so the empty stream must be proven against
+/// the empty root explicitly rather than accepted for an arbitrary one.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_rejects_an_empty_claim_for_a_non_empty_hash() -> anyhow::Result<()> {
+    let wanted_hash = Hash::new(b"not the empty blob");
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    // No wire at all and an honest-looking `total_bytes = 0`: `WrongBytes` then
+    // just tolerates the buyer's abort and sends `StreamEnd`.
+    let server_task = spawn_lying_server(
+        server_ep.clone(),
+        Arc::clone(&server_eth),
+        slash_domain(),
+        Vec::new(),
+        0,
+        Lie::WrongBytes,
+    );
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(
+        &client_ep,
+        Arc::new(PrivateKeySigner::random()),
+        U256::from(10_000_000u64),
+    );
+    let err = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *wanted_hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("an empty claim for a non-empty hash must fail the fetch"))?;
+    anyhow::ensure!(
+        err.downcast_ref::<HashMismatch>().is_some(),
+        "the fetch must fail with the typed HashMismatch, got: {err:#}"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// Run one `stream_fetch_tracked` against a [`Lie::InflatedGarbage`] server that
+/// signs a 32 MiB `total_bytes` for `hash` and streams `frame`-byte garbage,
+/// returning the error and the buyer's paid watermark.
+async fn fetch_inflated_garbage(frame: usize) -> anyhow::Result<(anyhow::Error, VoucherProgress)> {
+    // Any non-empty root the garbage cannot verify against.
+    let hash = Hash::new(b"the blob the buyer actually asked for");
+    let claimed_total: u64 = 32 << 20;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_lying_server(
+        server_ep.clone(),
+        Arc::clone(&server_eth),
+        slash_domain(),
+        Vec::new(),
+        claimed_total,
+        Lie::InflatedGarbage { frame },
+    );
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    // A deposit that could pay for the whole inflated claim many times over, so
+    // the spend bound under test is the verifier's, not the deposit's.
+    let ctx = channel_context(
+        &client_ep,
+        Arc::new(PrivateKeySigner::random()),
+        U256::from(1_000_000_000u64),
+    );
+    let mut progress = VoucherProgress::default();
+    let err = stream_fetch_tracked(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        0x00c0_ffee,
+        PullDeadlines::whole_transfer(Duration::from_secs(20)),
+        // No buyer-side size ceiling: the bound under test is verification, not
+        // `max_blob_size_bytes`.
+        0,
+        0,
+        &mut progress,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("a garbage delivery must fail the fetch"))?;
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok((err, progress))
+}
+
+/// A provider that signs an inflated `total_bytes` and streams framed garbage
+/// (#1985) bills NOTHING when its frames are smaller than the 1 MiB metering
+/// interval: the verifier rejects the first chunk group as it lands, before one
+/// reveal's worth of unproved bytes accrues, and the fetch surfaces the typed
+/// [`HashMismatch`]. The signed claim never enters the buyer's accounting.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_pays_nothing_for_an_inflated_garbage_claim() -> anyhow::Result<()> {
+    let (err, progress) = fetch_inflated_garbage(LYING_FRAME).await?;
+    anyhow::ensure!(
+        err.downcast_ref::<HashMismatch>().is_some(),
+        "garbage must surface the typed HashMismatch, got: {err:#}"
+    );
+    anyhow::ensure!(
+        progress.advanced().is_none(),
+        "the first chunk group fails before a metering interval accrues, so nothing is \
+         paid: {:?}",
+        progress.advanced()
+    );
+    Ok(())
+}
+
+/// The exposure bound (#1985): what an inflated-garbage provider can bill is the
+/// wire bytes that arrived before the first unverifiable chunk group — here one
+/// oversized 3 MiB frame, which releases its whole reveals before the decoder
+/// sees a byte — and never the 32 MiB it signed for. A reveal pays for received
+/// bytes, not verified ones, so the bound is a frame plus a metering interval,
+/// not zero; pinning it here is what keeps the buffered pay-then-verify shape
+/// from returning.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_spend_on_a_garbage_stream_is_bounded_by_one_frame() -> anyhow::Result<()> {
+    let frame: usize = 3 * 1024 * 1024;
+    let (err, progress) = fetch_inflated_garbage(frame).await?;
+    anyhow::ensure!(
+        err.downcast_ref::<HashMismatch>().is_some(),
+        "garbage must surface the typed HashMismatch, got: {err:#}"
+    );
+    let (paid_bytes, _amount) = progress.advanced().ok_or_else(|| {
+        anyhow::anyhow!("a frame larger than the metering interval releases at least one reveal")
+    })?;
+    anyhow::ensure!(
+        paid_bytes <= U256::from(frame),
+        "paid {paid_bytes} bytes, more than the single {frame}-byte frame that arrived"
+    );
+    anyhow::ensure!(
+        paid_bytes < U256::from(32u64 << 20),
+        "paid {paid_bytes} bytes against a 32 MiB claim: the claim must never be billed"
+    );
     Ok(())
 }
 
