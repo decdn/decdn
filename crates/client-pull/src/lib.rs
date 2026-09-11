@@ -3362,9 +3362,14 @@ async fn write_message(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Re
     // The encode is ours; the write below is the peer's connection.
     let payload = encode_message(msg)
         .map_err(|e| anyhow::anyhow!("encode failed: {e}").context(LocalPullFault))?;
+    // A mid-stream voucher write, past the open handshake: `APP_ERR_RATE_LIMITED`
+    // (`0x10`) is only ever sent before any application stream exists (ADR 013
+    // §Application Error Codes), so it cannot reach this site. Keep the plain text
+    // rather than route through `transport_error` — typing a shed here would trust
+    // that invariant instead of scoping the recovery to the open-stage sites.
     write_frame(send, &payload)
         .await
-        .map_err(|e| rate_limited::transport_error("write failed", e))
+        .map_err(|e| anyhow::anyhow!("write failed: {e}"))
 }
 
 /// Read the open-stage `StreamResponse` together with its trailing
@@ -3392,9 +3397,13 @@ async fn read_stream_response(
 async fn read_client_message<R: tokio::io::AsyncRead + Unpin>(
     recv: &mut R,
 ) -> anyhow::Result<ClientMessage> {
+    // A mid-stream read, past the open handshake. `0x10` reaches only the
+    // open-stage sites (`connect` / `open_bi` / the initial request write and
+    // [`read_stream_response`]), never here — the limiters shed before any stream
+    // exists (ADR 013 §Application Error Codes). Plain text, not `transport_error`.
     let frame = read_frame(recv)
         .await
-        .map_err(|e| rate_limited::transport_error("frame read failed", e))?;
+        .map_err(|e| anyhow::anyhow!("frame read failed: {e}"))?;
     let (msg, _rest) = decode_message::<ClientMessage>(&frame)
         .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
     Ok(msg)
