@@ -49,6 +49,11 @@ anyhow = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 iroh = { workspace = true }
+# `select_candidates` shuffles the registry/peer-store candidate set before the
+# region sort + truncate, so the probed K is a random sample rather than a
+# prefix of on-chain insertion order or `read_dir` order (#1988). Same defense
+# the node's DHT lookup applies (ADR 022 § FIND_VALUE Flow).
+rand = { workspace = true }
 # Peer store (one JSON file per peer under `<data_dir>/peers`) persistence for
 # the ADR 012 bootstrap fallback.
 serde = { workspace = true }

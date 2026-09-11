@@ -36,6 +36,7 @@ use decdn_common::redact::{sanitize_err_chain, sanitize_rpc_display};
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_protocol::{Coverage, Region};
 use iroh::PublicKey;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 /// Page size for the paginated `getRegisteredNodes` read (ADR 019 § Step 3.3's
@@ -585,16 +586,27 @@ pub async fn bootstrap_nodes(
     resolve_bootstrap(registry, data_dir)
 }
 
-/// Candidates probed before ranking (decision 3): take the top-K by region,
+/// Candidates probed before ranking (decision 3): a random K, region-first,
 /// then probe those K for liveness + blob-holding. At `PoC` scale a small K
 /// keeps the probe fan-out cheap while still giving the ranker a choice.
 pub const SELECT_K: usize = 5;
 
-/// Order `candidates` for probing (decision 3): same-region candidates first
-/// (equality on `region_hint` — locality, not geo distance), then the rest,
-/// capped at `k`. When `client_region` is `None`, empty, or not an accepted
-/// region code the region-first ordering is skipped and the first `k`
-/// candidates are returned unreordered.
+/// Pick `candidates` for probing (decision 3): shuffle, then same-region
+/// candidates first (equality on `region_hint` — locality, not geo distance),
+/// then the rest, capped at `k`. When `client_region` is `None`, empty, or not
+/// an accepted region code the region-first ordering is skipped and the result
+/// is a uniform random sample of `k`.
+///
+/// The shuffle is the load-bearing step. The input order is never one the
+/// ranker chose: a live registry read arrives in `CapacityBond` insertion
+/// order, which any operator who submits a `register` transaction influences,
+/// and a peer-store fallback arrives in `read_dir` order, keyed on node-id
+/// hex. Truncating either as-is hands out the probe slots by registration
+/// timing or filename, and every client on the same platform lands on the
+/// same K. Shuffling before the stable sort keeps region-first intact while
+/// making the sample *within* each group uniform — the same requester-side
+/// defense the node's DHT lookup applies (ADR 022 § `FIND_VALUE` Flow). It
+/// runs on the client, the party it protects, so no node can patch it out.
 ///
 /// Both sides are [`Region`]s, so this is a plain equality: the trim +
 /// case-fold runs at the parse boundary, not on every comparison (#1348).
@@ -604,6 +616,11 @@ pub fn select_candidates(
     client_region: Option<&str>,
     k: usize,
 ) -> Vec<NodeCandidate> {
+    // Shuffle FIRST: the sort below is stable, so a shuffle before it leaves
+    // region-first in place and randomizes the order within each group. A
+    // shuffle after the sort would undo the region preference; a shuffle
+    // after the truncate would only permute the deterministic prefix.
+    candidates.shuffle(&mut rand::rng());
     // `client_region` stays a `&str` and is parsed HERE, not assumed valid.
     // `decdn-common`'s `normalize_region` validates the node daemon's config
     // region, but the client path does not go through it: `decdn fetch`'s
@@ -613,7 +630,7 @@ pub fn select_candidates(
     // skipped rather than applied against a value that means nothing.
     if let Some(region) = client_region.and_then(Region::parse) {
         // Stable sort by a bool key: same-region (`false`) sorts before the rest
-        // (`true`), and within each group the on-chain order is preserved.
+        // (`true`), and within each group the shuffled order is preserved.
         candidates.sort_by_key(|c| c.region_hint != Some(region));
     }
     candidates.truncate(k);
@@ -921,6 +938,12 @@ mod tests {
         }
     }
 
+    /// Runs of the shuffle-then-sort used by the selection tests below. The
+    /// distribution checks want enough draws that a real shuffle almost surely
+    /// shows variety, while a degenerate one (identity, or a tiny-prefix
+    /// permutation) cannot.
+    const SHUFFLE_RUNS: usize = 16;
+
     #[test]
     fn select_puts_same_region_first_and_caps_at_k() {
         // Regions are on-chain self-attested ISO 3166-1 alpha-2 codes (ADR 030);
@@ -932,12 +955,62 @@ mod tests {
             candidate(3, "DE"),
             candidate(4, " us "),
         ];
-        let out = select_candidates(cands, Some("US"), 3);
-        assert_eq!(out.len(), 3, "capped at k");
-        // Both US entries (seeds 2 and 4) come first, in their original order.
-        assert_eq!(out[0].eth_address, Address::repeat_byte(2));
-        assert_eq!(out[1].eth_address, Address::repeat_byte(4));
-        assert_eq!(out[2].eth_address, Address::repeat_byte(1));
+        let us: HashSet<Address> = [2u8, 4].into_iter().map(Address::repeat_byte).collect();
+        let de: HashSet<Address> = [1u8, 3].into_iter().map(Address::repeat_byte).collect();
+        // Which DE candidate takes the one non-US slot varies across runs: the
+        // within-group sample is random, not the insertion-order prefix.
+        let mut de_slot_seen: HashSet<Address> = HashSet::new();
+        for _ in 0..SHUFFLE_RUNS {
+            let out = select_candidates(cands.clone(), Some("US"), 3);
+            assert_eq!(out.len(), 3, "capped at k");
+            // Both US entries come first, in either order.
+            let first_two: HashSet<Address> = out[..2].iter().map(|c| c.eth_address).collect();
+            assert_eq!(
+                first_two, us,
+                "same-region candidates fill the leading slots"
+            );
+            assert!(
+                de.contains(&out[2].eth_address),
+                "the last slot is a DE candidate"
+            );
+            de_slot_seen.insert(out[2].eth_address);
+        }
+        assert_eq!(
+            de_slot_seen, de,
+            "the non-US slot never rotated across {SHUFFLE_RUNS} runs — \
+             the shuffle is degenerate and the prefix is registry order"
+        );
+    }
+
+    /// Region-first survives the shuffle when the same-region group is smaller
+    /// than `k`: every same-region candidate is always selected and always
+    /// leads, and the remaining slots are a random draw from the rest.
+    #[test]
+    fn select_keeps_region_first_while_sampling_the_rest() {
+        let mut cands: Vec<NodeCandidate> = (1u8..=3).map(|s| candidate(s, "US")).collect();
+        cands.extend((4u8..=8).map(|s| candidate(s, "DE")));
+        let us: HashSet<Address> = (1u8..=3).map(Address::repeat_byte).collect();
+        let de: HashSet<Address> = (4u8..=8).map(Address::repeat_byte).collect();
+        let mut de_pairs_seen: HashSet<Vec<Address>> = HashSet::new();
+        for _ in 0..SHUFFLE_RUNS {
+            let out = select_candidates(cands.clone(), Some("US"), 5);
+            assert_eq!(out.len(), 5, "capped at k");
+            let lead: HashSet<Address> = out[..3].iter().map(|c| c.eth_address).collect();
+            assert_eq!(lead, us, "all same-region candidates lead");
+            let tail: Vec<Address> = out[3..].iter().map(|c| c.eth_address).collect();
+            assert!(
+                tail.iter().all(|a| de.contains(a)),
+                "the tail is drawn from the rest"
+            );
+            de_pairs_seen.insert(tail);
+        }
+        // 5 DE candidates, 2 slots, ordered: 20 possible tails. A real shuffle
+        // across 16 runs shows well over 2; a degenerate one shows 1.
+        assert!(
+            de_pairs_seen.len() >= 3,
+            "the non-region tail produced only {} distinct draws across {SHUFFLE_RUNS} runs",
+            de_pairs_seen.len()
+        );
     }
 
     /// The normalization lives in the type, so ` us ` and `US` are the same
@@ -957,26 +1030,55 @@ mod tests {
         );
     }
 
+    /// Without a usable client region there is no region preference, so the
+    /// result is a uniform random sample of `k` — never the first `k` of the
+    /// input, which is registry insertion order or `read_dir` order.
     #[test]
-    fn select_without_region_preserves_order_and_caps() {
-        let cands = vec![candidate(1, "DE"), candidate(2, "US")];
-        // No region, a blank one, and an unrecognized code all skip reordering
-        // rather than reordering against a value that means nothing.
+    fn select_without_region_is_a_random_sample_capped_at_k() {
+        // With 20 candidates truncated to 10, a real Fisher-Yates yields ~16
+        // distinct orderings across 16 runs (the sample space is 20!/10! ≈
+        // 6.7e11, collisions are negligible). A 1-or-2-element-cycle shuffle
+        // yields ≤ 6 orderings; a fully degenerate (identity) shuffle yields 1.
+        // Threshold of 8 catches both classes while leaving margin for a
+        // real-but-unlucky shuffle to pass. Mirrors the node-side check in
+        // `dht::lookup`.
+        let cands: Vec<NodeCandidate> = (1u8..=20).map(|s| candidate(s, "DE")).collect();
+        let canonical: HashSet<Address> = cands.iter().map(|c| c.eth_address).collect();
+        // No region, a blank one, and an unrecognized code all skip the region
+        // sort rather than sorting against a value that means nothing.
         for region in [None, Some("  "), Some("not-a-region")] {
-            let out = select_candidates(cands.clone(), region, 5);
-            assert_eq!(out[0].eth_address, Address::repeat_byte(1));
-            assert_eq!(out[1].eth_address, Address::repeat_byte(2));
+            let mut seen_orderings: HashSet<Vec<Address>> = HashSet::new();
+            for _ in 0..SHUFFLE_RUNS {
+                let out = select_candidates(cands.clone(), region, 10);
+                assert_eq!(out.len(), 10, "capped at k");
+                let ids: Vec<Address> = out.iter().map(|c| c.eth_address).collect();
+                assert!(
+                    ids.iter().all(|a| canonical.contains(a)),
+                    "selection invented candidates not in the input"
+                );
+                seen_orderings.insert(ids);
+            }
+            assert!(
+                seen_orderings.len() >= 8,
+                "region {region:?}: fewer than 8 distinct orderings across \
+                 {SHUFFLE_RUNS} runs — shuffle is degenerate or only permutes a \
+                 tiny prefix"
+            );
         }
     }
 
     /// A candidate whose hint did not parse sorts into the "rest" bucket — it
-    /// must never be treated as matching the client's region.
+    /// must never be treated as matching the client's region. With two
+    /// candidates the region sort fully determines the order, so this holds
+    /// exactly on every run regardless of the shuffle.
     #[test]
     fn select_never_promotes_an_unparseable_region() {
         let cands = vec![candidate(1, "nonsense"), candidate(2, "US")];
-        let out = select_candidates(cands, Some("US"), 5);
-        assert_eq!(out[0].eth_address, Address::repeat_byte(2));
-        assert_eq!(out[1].eth_address, Address::repeat_byte(1));
+        for _ in 0..SHUFFLE_RUNS {
+            let out = select_candidates(cands.clone(), Some("US"), 5);
+            assert_eq!(out[0].eth_address, Address::repeat_byte(2));
+            assert_eq!(out[1].eth_address, Address::repeat_byte(1));
+        }
     }
 
     /// With allowlist `["US"]`, a `Some(DE)` candidate is dropped, a

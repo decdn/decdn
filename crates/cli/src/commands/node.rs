@@ -1133,10 +1133,11 @@ pub async fn lookup(args: &cli::LookupArgs, global_config: Option<&Path>) -> any
     let rows = if args.probe {
         // Cap probe fan-out the same way the paid discovery path does
         // (`select_candidates`, `SELECT_K`) — probing every active node on
-        // the network does not scale. The region reorder is a no-op here
-        // when `--region` was also passed (already exact-filtered above);
-        // it only matters when `--node-id`/`--region` left more than
-        // `SELECT_K` candidates.
+        // the network does not scale. The shortlist is a random region-first
+        // sample, not the registry's leading `SELECT_K` entries. The region
+        // reorder is a no-op here when `--region` was also passed (already
+        // exact-filtered above); it only matters when `--node-id`/`--region`
+        // left more than `SELECT_K` candidates.
         let shortlisted = select_candidates(filtered, args.region.as_deref(), SELECT_K);
         probe_and_rank(shortlisted, config_path, args.timeout_ms).await?
     } else {
