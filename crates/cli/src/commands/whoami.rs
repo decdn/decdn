@@ -25,7 +25,7 @@
 //! password is needed). One resolved password unlocks whichever keystores are
 //! present.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use decdn_common::{cli, identity};
@@ -52,18 +52,44 @@ enum KeystorePassword {
 }
 
 /// Print the local identity read-only: node id, key paths, and eth addresses.
-pub fn whoami(args: &cli::WhoamiArgs) -> anyhow::Result<()> {
-    let data_dir = args
-        .output_dir
-        .as_deref()
-        .map(cli::common::expand_tilde)
-        .or_else(cli::default_data_dir)
+///
+/// The data directory resolves with the same precedence the daemon uses, so
+/// `whoami` reports the paths the running node actually reads: an explicit
+/// `--output-dir` wins, then `identity.data_dir` from the config file (the
+/// global `--config`, or the default `~/.decdn/node.toml`), and finally the
+/// `~/.decdn` default. Without the config-file step, a node whose `data_dir` is
+/// set in `node.toml` — the common service layout, where the `decdn` user's home
+/// is the data dir itself — would report a phantom `~/.decdn` path the node
+/// never uses.
+pub fn whoami(args: &cli::WhoamiArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let file = decdn_common::config::load_file_config(config_path)?;
+    let data_dir = resolve_data_dir(args.output_dir.as_deref(), &file)
         .ok_or_else(|| anyhow::anyhow!("cannot determine data directory: home dir not found"))?;
 
     for line in report(&data_dir, args.keystore_password_file.as_deref())? {
         println!("{line}");
     }
     Ok(())
+}
+
+/// Resolve the data directory with the daemon's precedence: an explicit
+/// `--output-dir` first, then `identity.data_dir` from the config file, then the
+/// `~/.decdn` default. Returns `None` only when every source is absent and the
+/// home directory cannot be found. A leading `~` in either explicit source is
+/// expanded, mirroring `resolve_identity_into`.
+fn resolve_data_dir(
+    output_dir: Option<&Path>,
+    file: &decdn_common::config::FileConfig,
+) -> Option<PathBuf> {
+    output_dir
+        .map(cli::common::expand_tilde)
+        .or_else(|| {
+            file.identity
+                .as_ref()
+                .and_then(|i| i.data_dir.as_deref())
+                .map(cli::common::expand_tilde)
+        })
+        .or_else(cli::default_data_dir)
 }
 
 /// Build the read-only whoami report for `data_dir` as the lines to print.
@@ -227,6 +253,37 @@ mod tests {
     use decdn_incentive::eth_identity::generate_and_persist;
 
     const TEST_PASSWORD: &str = "hunter2";
+
+    /// Write a `node.toml` with the given `identity.data_dir` and load it the
+    /// way `whoami` does, so the resolution tests exercise the real file path.
+    fn file_config_with_data_dir(data_dir: &str) -> decdn_common::config::FileConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, format!("[identity]\ndata_dir = \"{data_dir}\"\n")).unwrap();
+        decdn_common::config::load_file_config(Some(&path)).unwrap()
+    }
+
+    /// The config file's `identity.data_dir` is honored when no `--output-dir`
+    /// is given. This is the reported bug: a node whose `data_dir` lives in
+    /// `node.toml` must not resolve to the `~/.decdn` default.
+    #[test]
+    fn resolve_data_dir_honors_config_file() {
+        let file = file_config_with_data_dir("/var/lib/decdn");
+        assert_eq!(
+            resolve_data_dir(None, &file),
+            Some(PathBuf::from("/var/lib/decdn"))
+        );
+    }
+
+    /// An explicit `--output-dir` wins over the config file's `identity.data_dir`.
+    #[test]
+    fn resolve_data_dir_output_dir_overrides_config_file() {
+        let file = file_config_with_data_dir("/var/lib/decdn");
+        assert_eq!(
+            resolve_data_dir(Some(Path::new("/opt/keys")), &file),
+            Some(PathBuf::from("/opt/keys"))
+        );
+    }
 
     #[cfg(unix)]
     fn secure_tempdir() -> tempfile::TempDir {
