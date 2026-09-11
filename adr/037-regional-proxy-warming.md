@@ -22,7 +22,7 @@ A client that finds only distant holders for a cache miss routes its paid `cdn/c
 
 ### Client selection policy: latency-driven proxy preference
 
-On a cache miss for hash `H`, the client discovers holders via `cdn/dht/v1` FIND_VALUE and assesses their RTT — from its RTT map, or by probing them if it wants fresh RTT or price (§ [Probe roles](#probe-roles-client-optional-node-to-node-load-bearing)). It then applies a proxy-warming pre-step before committing to a holder:
+On a cache miss for hash `H`, the client takes its candidates from its peer store or the on-chain registry ([ADR 039 § Source set and selection](039-multi-source-parallel-fetch.md#source-set-and-selection)) and assesses their RTT — from its RTT map, or by probing them if it wants fresh RTT or price (§ [Probe roles](#probe-roles-client-optional-node-to-node-load-bearing)). It then applies a proxy-warming pre-step before committing to a holder:
 
 - **Trigger.** Proxy warming engages only when the best holder's RTT exceeds `proxy_warming.rtt_threshold_ms` (the holders are all distant) **and** the client's cumulative RTT map contains a bonded node whose measured RTT is lower than the best holder's by at least `proxy_warming.margin_ms`. If no measured candidate clears the margin, the client routes directly to the best holder — proxy warming is a no-op, never a gamble.
 - **Candidate pool.** The bonded nodes in the client's registry-backed discovery set ([ADR 001 § Node Discovery](001-network.md#node-discovery-registry)), excluding the distant holders.
