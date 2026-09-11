@@ -1029,6 +1029,104 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
     Ok(())
 }
 
+/// The requester side of the close the test above proves is emitted (#1986):
+/// `probe_once` — the shared `cdn/probe/v1` client the node's cache-miss probe
+/// fan-out and the CLI both use — must surface a `0x10` shed as the typed
+/// [`UpstreamRateLimited`] sentinel carrying the layer label, recoverable with
+/// `downcast_ref` through the stage context it adds. Without that the node's
+/// `probe_candidate` sees a bare `open_bi failed` string and scores the shedding
+/// peer `Unreachable`, the penalty the handler-level `Overloaded` refusal is
+/// exonerated from.
+///
+/// Same strict per-source fixture as `probe_rate_limit_returns_rate_limited_close_code`,
+/// and the same bounded retry over the #1594 close-frame race: an attempt whose
+/// error is NOT the sentinel is retried on a fresh endpoint, and only a `0x10`
+/// carrying the wrong label fails at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_once_types_a_rate_limit_close_as_upstream_rate_limited() -> anyhow::Result<()> {
+    use decdn_client_pull::UpstreamRateLimited;
+    use decdn_client_pull::probe::probe_once;
+
+    const MAX_ATTEMPTS: usize = 8;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+
+    let strict = ResolvedSecurity {
+        max_concurrent_handlers: 64,
+        per_source_rate_per_sec: 0.001,
+        per_source_burst: 1,
+        max_tracked_sources: 32,
+    };
+    let limiter = Arc::new(ConnectionLimiter::new(&strict, Arc::clone(&metrics)));
+    drop(
+        limiter
+            .acquire_for_test(Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)))
+            .map_err(|r| anyhow::anyhow!("pre-drain unexpectedly rejected: {r:?}"))?,
+    );
+
+    let (cache, _cache_tmp) = empty_cache().await?;
+    let (handler, _signer, _domain) = build_handler(server_id, 1, &metrics, limiter, cache);
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
+    let server_ep_bg = server_ep.clone();
+    let handler_bg = Arc::clone(&handler);
+    let accept_task = tokio::spawn(async move {
+        while let Some(incoming) = server_ep_bg.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else {
+                continue;
+            };
+            let _ = handler_bg.accept(conn).await;
+        }
+    });
+
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let mut last_transient = None;
+    let mut observed = None;
+    for _ in 0..MAX_ATTEMPTS {
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let res = probe_once(
+            &client_ep,
+            target.clone(),
+            [0x11u8; 32],
+            1_700_000_000_000_000,
+            Duration::from_secs(5),
+        )
+        .await;
+        shutdown([], [&client_ep]).await?;
+        let Err(err) = res else {
+            anyhow::bail!("a pre-drained per-source bucket must reject every probe");
+        };
+        match err.downcast_ref::<UpstreamRateLimited>() {
+            Some(shed) => {
+                observed = Some(shed.clone());
+                break;
+            }
+            // Transport race (#1594): the reject frame lost to an implicit code-0
+            // close or a transport teardown. Retry on a fresh connection.
+            None => last_transient = Some(err),
+        }
+    }
+    let shed = observed.ok_or_else(|| {
+        anyhow::anyhow!(
+            "never observed an UpstreamRateLimited probe error in {MAX_ATTEMPTS} attempts; \
+             last transient error: {last_transient:?}"
+        )
+    })?;
+    assert_eq!(
+        shed.label.as_deref(),
+        Some(RejectReason::PerSource.as_str()),
+        "the sentinel must carry the per-source layer label off the close reason bytes"
+    );
+
+    shutdown([accept_task], [&server_ep]).await?;
+    Ok(())
+}
+
 /// End-to-end check that the ADR 005 §Probe rate limiting three-layer limiter
 /// (#982) — distinct from the `ConnectionLimiter` exercised above — rejects a
 /// probe with `APP_ERR_RATE_LIMITED` (`0x10`) and the `per_peer` layer label on

@@ -722,12 +722,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             max_blob_bytes,
             // Same shape as `fetch` (#1134): a node that accepts the connection and
             // never answers is as dead as one that stops mid-stream, so the same
-            // budget bounds both stages, under a cap that must outlast them both.
-            deadlines: PullDeadlines::capped(
+            // budget bounds both stages. The pull carries no overall wall-clock cap —
+            // `drive` never consults one — so it completes for any blob size as long
+            // as the upstream keeps feeding it bytes.
+            deadlines: PullDeadlines::new(
                 self.common.stall_timeout(),
                 self.common.stall_timeout(),
                 self.common.min_throughput_bps(),
-                self.common.hard_cap(),
             )?,
         })
     }

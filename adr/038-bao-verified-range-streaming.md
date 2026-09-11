@@ -46,7 +46,7 @@ The **origin acquisition hop is internal, not `cdn/client/v1`**, so which source
 
 ### Receive side
 
-The receiver replaces the flat `blake3::Hasher` with a bao verifying decoder fed the reassembled stream. A range beginning at `byte_offset > 0` verifies on its own against the root, closing the resumed-tail gap with no dependency on earlier bytes. The buffered whole-blob fallback for resumed requests is removed.
+The receiver feeds the stream to a bao verifying decoder as it arrives. A corrupt chunk group aborts the pull at that group. A range beginning at `byte_offset > 0` verifies on its own against the root, with no dependency on earlier bytes. There is no whole-blob fallback for resumed requests.
 
 ### Payment metering
 

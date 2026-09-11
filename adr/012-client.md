@@ -31,9 +31,9 @@ This ADR targets **desktop and server clients** — POSIX or Windows hosts with 
 A client is a lightweight QUIC endpoint that streams content and pays per MB. It is **not** a bonded node and has no on-chain registration requirement. Capabilities:
 
 - Opens `cdn/client/v1` connections to nodes for paid content delivery
-- Uses `cdn/dht/v1` FIND_VALUE for content discovery; falls back to `cdn/probe/v1` broadcast during bootstrap (see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale))
-- Contributes only local reputation observations ([ADR 008](008-reputation.md#adr-008-reputation-system)); it shares them with no one
-- Maintains a local node list (from the on-chain registry) and reputation scores
+- Picks the node to stream from out of the bonded set it already knows — its persisted peer store, or the on-chain registry — and probes candidates over `cdn/probe/v1` ([ADR 039 § Source set and selection](039-multi-source-parallel-fetch.md#source-set-and-selection)). It issues no `cdn/dht/v1` lookup: a node that lacks the blob resolves holders on the client's behalf through its own pull leg ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale))
+- Ranks candidates by measured RTT only ([ADR 037 § Client selection policy](037-regional-proxy-warming.md#client-selection-policy-latency-driven-proxy-preference)); it keeps no reputation score and shares no observations with anyone
+- Maintains a local peer store: registry-fed identity plus a per-peer latency EWMA and a failure-suppression stamp ([ADR 037 § Client RTT map](037-regional-proxy-warming.md#client-rtt-map-and-latency-discovery))
 - Signs vouchers authorizing off-chain USDC payments, from a capability-authorized signer key the pool owner delegates (its own key by default)
 
 ### Bootstrap Procedure
@@ -155,8 +155,8 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 #### Not trusted — the client does not rely on these
 
-- Any individual node's self-reported metadata (region) beyond what is signed and slashable. The region claim itself is mitigated by latency-based reputation: a node whose observed RTT contradicts its claimed region is penalized ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)).
-- Reputation reported by other peers. The client scores nodes solely from its own local observations ([ADR 008](008-reputation.md#adr-008-reputation-system)).
+- Any individual node's self-reported metadata (region) beyond what is signed and slashable. The region claim only shortlists which registry candidates the client probes; it is never a rank key. The failover order is measured RTT, which a node cannot forge ([ADR 037 § Client selection policy](037-regional-proxy-warming.md#client-selection-policy-latency-driven-proxy-preference)).
+- Reputation reported by other peers. The client ranks nodes solely from its own measured RTT and failure history; it consumes no reputation score, its own or anyone else's.
 - Node availability promises beyond signed probe responses.
 
 ### Client Configuration

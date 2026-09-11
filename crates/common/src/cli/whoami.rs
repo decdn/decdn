@@ -8,7 +8,8 @@ use clap::Args;
 /// paths — read-only, without generating or rotating any keys.
 #[derive(Args, Debug)]
 pub struct WhoamiArgs {
-    /// Directory holding the keys [default: ~/.decdn].
+    /// Directory holding the keys. Overrides `identity.data_dir` from the
+    /// config file; when neither is set, defaults to `~/.decdn`.
     #[arg(long, value_name = "DIR")]
     pub output_dir: Option<PathBuf>,
 

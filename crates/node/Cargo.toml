@@ -112,9 +112,10 @@ tracing-opentelemetry = { workspace = true, optional = true }
 # does not propagate, so the feature — not `cfg(test)` — is what exposes them
 # here; same shape as the `test-util` dev-deps below.
 decdn-node = { path = ".", features = ["test-support"] }
-# Enable the client-pull test helpers (`stream_fetch`, `PullDeadlines::whole_transfer`) for
-# the loopback/e2e suites. Dev-only, so a normal `cargo build -p decdn-node` never sees them
-# and a production caller cannot reach the zero-stall/uncapped deadline shape (#1145 review).
+# Enable the client-pull test helpers (the in-memory `stream_fetch*` wrappers,
+# `PullDeadlines::whole_transfer`) for the loopback/e2e suites. Dev-only, so a normal
+# `cargo build -p decdn-node` never sees them and a production caller cannot reach the
+# zero-stall/uncapped deadline shape (#1145 review).
 decdn-client-pull = { workspace = true, features = ["test-util"] }
 # `insert_raw_buyer_record` (`#[cfg(any(test, feature = "anvil-e2e"))]`) delegates
 # to `BuyerChannelTable::insert_raw`, which is `test-util`-gated so a corruption

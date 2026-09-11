@@ -891,6 +891,20 @@ pub struct DecdnMetrics {
     /// peer health first; a small fraction is the healthy "that peer did not
     /// have it".
     pub node_pull_refused_unattributable: Counter,
+    /// `decdn_node_upstream_rate_limited_total` (#1986): a probe or pull to a
+    /// candidate was shed at the transport with `APP_ERR_RATE_LIMITED` (`0x10`,
+    /// ADR 013 §Application Error Codes) — the upstream's connection limiter,
+    /// probe limiter, or per-connection stream cap refused the work before any
+    /// signed message existed. The transport-level twin of an `Overloaded`
+    /// refusal, treated the same way: the `(peer, hash)` pair is suppressed for
+    /// the short refusal TTL and NO reputation outcome is recorded, so this is
+    /// the only trace the event leaves at the default `RUST_LOG=info`.
+    ///
+    /// A sustained rate is peer-side load, not a local fault — but a rate that
+    /// tracks `node_pull_unreachable` is worth a look: a `global-full` shed skips
+    /// the upstream's close ack-wait and can still arrive as a bare drop, which
+    /// lands in the unreachable counter instead of here.
+    pub node_upstream_rate_limited: Counter,
     /// `decdn_node_pull_stalled_total` (#1797): an upstream's throughput fell below the
     /// floor mid-stream — the bytes across `node_pull_stall_window_sec` dropped under
     /// `node_pull_min_throughput_bps` — so the pull was abandoned after at least one byte had
@@ -2092,6 +2106,10 @@ recorders! {
     /// or `Overloaded`. A rate approaching `node_pull_refused` means nobody will
     /// serve us, which is usually our own deposit or binding, not their fault.
     node_pull_refused_unattributable => node_pull_refused_unattributable.inc();
+
+    /// An upstream shed a probe or pull at the transport with `APP_ERR_RATE_LIMITED`
+    /// (#1986). Suppressed briefly, never scored — see the counter's docs.
+    node_upstream_rate_limited => node_upstream_rate_limited.inc();
 
     /// An upstream went silent mid-stream (#1134); the pull was abandoned and the
     /// provider scored `Unreachable`.

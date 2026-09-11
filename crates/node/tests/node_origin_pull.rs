@@ -2188,7 +2188,7 @@ fn spawn_a_voucher_rejecting_server_with_counters(
 
 /// Spawn a provider that answers probes truthfully but HARD-FAILS the client
 /// stream at the transport: it accepts the connection and immediately closes it,
-/// so the buyer's `stream_fetch` errors on connect/read rather than stalling to a
+/// so the buyer's `open_progressive_pull` errors on connect/read rather than stalling to a
 /// timeout. Models a genuine reachability failure (NOT a `PullTimeout`,
 /// `UpstreamVoucherRejected`, or `HashMismatch`) — the #857 regression guard that
 /// such failures must STILL score `Unreachable` and the fix did not over-exonerate.
@@ -2222,7 +2222,7 @@ fn spawn_a_probe_ok_client_dead_server(
 
 /// Spawn a provider that answers probes truthfully but *stalls* on the client
 /// stream: it accepts the bidi stream and reads the request, then never sends a
-/// `StreamResponse` and holds the send side open, so the buyer's `stream_fetch`
+/// `StreamResponse` and holds the send side open, so the buyer's `open_progressive_pull`
 /// blocks until its per-candidate `pull_timeout` fires. Models the slow-stall
 /// failure shape whose outer-deadline interaction #859 fixes.
 fn spawn_a_stalling_server(
@@ -2845,9 +2845,10 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
     Ok(())
 }
 
-/// A dishonest upstream (valid response, wrong bytes) is detected at the
-/// whole-blob integrity check and scored `Corruption` (`data_correct`: false),
-/// the local score drops, the corruption counter moves, and no bytes surface.
+/// A dishonest upstream (valid response, wrong bytes) is detected by the
+/// verifying decoder at the first chunk group and scored `Corruption`
+/// (`data_correct`: false), the local score drops, the corruption counter moves,
+/// and no bytes surface.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
@@ -4331,9 +4332,9 @@ const EMPTY_CHUNK_STALL_BUDGET: Duration = Duration::from_secs(30);
 /// which is immediate.
 const EMPTY_CHUNK_ASSERT_WINDOW: Duration = Duration::from_secs(10);
 
-/// #1088, BUFFERED receive loop (`client_pull::receive_and_pay`, reached via
-/// `Origin::fetch`): an upstream that streams empty `ChunkData` frames forever
-/// must be rejected AT ONCE, on the frame itself.
+/// #1088, receive loop (`UpstreamPull::next_chunk`, reached via `Origin::fetch`):
+/// an upstream that streams empty `ChunkData` frames forever must be rejected AT
+/// ONCE, on the frame itself.
 ///
 /// `ChunkData::validate` has a unit test; this is the one that proves the receive
 /// loop CALLS it. Drop the non-empty check and an empty frame passes every
@@ -4405,7 +4406,7 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
     .await
     .map_err(|_| {
         anyhow::anyhow!(
-            "the buffered receive loop never returned: it spun on empty ChunkData frames, \
+            "the receive loop never returned: it spun on empty ChunkData frames, \
              which advance neither the byte total nor the voucher cadence (#1088)"
         )
     })?
@@ -7499,8 +7500,8 @@ async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> R
 /// #1054: an empty (0-byte) blob served via the fused window pull-through path.
 /// This exercises the window pull leg's tee — `open_pull_leg` →
 /// `UpstreamPull::finish` → tee promote → downstream `leaf_paced_pull` verify —
-/// which never calls `decode_verified_range`, so the buffered-path e2e
-/// (`client_delivers_empty_blob`) does not cover it. For 0 wire bytes the window
+/// which the in-memory loopback e2e (`client_delivers_empty_blob`) does not
+/// cover. For 0 wire bytes the window
 /// never pauses, B pays A no voucher, and B still promotes the empty blob against
 /// the empty root `Hash::new(&[])`.
 #[tokio::test(flavor = "multi_thread")]
@@ -8936,10 +8937,12 @@ async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Re
         !cache_b.has(hash).await?,
         "an oversized-upstream abort must not promote the blob into B's cache"
     );
-    // B paid the upstream for the received prefix — bounded to roughly one ceiling plus
-    // the speculative pull window, never the whole 4 MiB blob.
+    // B paid the upstream for the received prefix — bounded to the ceiling's own
+    // wire, never the whole 4 MiB blob: the receive loop's received-byte ceiling
+    // aborts BEFORE the crossing chunk is paid, so the speculative pull window
+    // cannot push the spend past it.
     let upstream_bytes: u64 = u64::try_from(settled).unwrap_or(u64::MAX);
-    let bound_content = max_blob_size_bytes.saturating_add(decdn_client_pull::PULL_WINDOW_FLOOR);
+    let bound_content = max_blob_size_bytes;
     let bound_wire = support::bao_wire_len(total_bytes, 0, bound_content);
     anyhow::ensure!(
         upstream_bytes > 0,

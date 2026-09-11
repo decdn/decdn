@@ -94,8 +94,8 @@ use crate::buyer_ledgers::BuyerLedgers;
 use crate::client_requester::probe::probe_once;
 use crate::client_requester::{
     BlobTooLarge, Cumulative, HashMismatch, LocalPullFault, PoolContext, PoolLedger, PullDeadlines,
-    PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd, UpstreamRefused,
-    UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
+    PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd, UpstreamRateLimited,
+    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
     open_progressive_pull as open_progressive_upstream, sign_client_binding,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
@@ -911,8 +911,10 @@ fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
 /// Probe a single provider, returning a ranked-ready [`Candidate`] paired with
 /// the holder's reported blob size (`ProbeResponseExt.total_bytes`, for the
 /// coverage-union gather) iff it responds, validates, and reports holding the
-/// blob. Side effects: a failed probe scores the provider [`Outcome::Unreachable`];
-/// a reachable-but-absent provider is recorded in the negative-probe cache.
+/// blob. Side effects: a failed probe scores the provider [`Outcome::Unreachable`],
+/// except a probe the provider shed with `APP_ERR_RATE_LIMITED`, which suppresses
+/// the pair for [`REFUSAL_SUPPRESSION_TTL`] and scores nothing (#1986); a
+/// reachable-but-absent provider is recorded in the negative-probe cache.
 // Straight-line probe → classify → build; the tracing macros and the three
 // sequential drop-conditions inflate the cognitive-complexity metric past the
 // threshold (same inflation noted in `chain_staker_set`), and splitting the
@@ -940,6 +942,22 @@ async fn probe_candidate(
     {
         Ok(ok) => ok,
         Err(err) => {
+            // A `0x10` shed is the peer ANSWERING — "not now" — not the peer being
+            // unreachable (#1986). It gets what the handler-level `Overloaded` refusal
+            // gets in `classify_refusal`: the pair is suppressed for the short TTL so
+            // a retry burst stops re-spending a probe slot on it, and no reputation
+            // outcome is recorded. A `global-full` shed skips the node's close ack-wait
+            // and can still arrive as a bare drop; that residue scores below.
+            if err.downcast_ref::<UpstreamRateLimited>().is_some() {
+                debug!(%err, "node-origin: probe shed by the upstream's rate limiter; suppressing briefly, not scoring");
+                deps.metrics.node_upstream_rate_limited();
+                deps.negative_cache.record_failure_with_ttl(
+                    peer,
+                    DhtHash::from_bytes(hash_bytes),
+                    REFUSAL_SUPPRESSION_TTL,
+                );
+                return None;
+            }
             // A failed probe is a reachability signal: the upstream could not be
             // reached for this interaction (ADR 008 §Local Score).
             debug!(%err, "node-origin: probe failed; scoring provider unreachable");
@@ -1221,16 +1239,17 @@ impl PullMiss {
         match verdict {
             PullVerdict::OurLocalFault => Self::LocalFault,
             // Every other verdict is either about the peer (`Refused` of the first three
-            // kinds, `Stalled`, `Corruption`, `Unreachable`), about OUR configuration of
-            // what we will accept from it (`Oversize`, `RateCeiling`, `OurDeadline`),
-            // or about one lane to one provider (the two voucher arms). None of them
-            // is evidence that THIS node is broken for every client and every blob, so
-            // none earns an `InternalError`: a node with one wedged lane is still a
-            // healthy node that simply cannot serve this blob right now.
+            // kinds, `Stalled`, `RateLimited`, `Corruption`, `Unreachable`), about OUR
+            // configuration of what we will accept from it (`Oversize`, `RateCeiling`,
+            // `OurDeadline`), or about one lane to one provider (the two voucher arms).
+            // None of them is evidence that THIS node is broken for every client and
+            // every blob, so none earns an `InternalError`: a node with one wedged lane
+            // is still a healthy node that simply cannot serve this blob right now.
             PullVerdict::Oversize
             | PullVerdict::RateCeiling
             | PullVerdict::OurDeadline
             | PullVerdict::Stalled
+            | PullVerdict::RateLimited
             | PullVerdict::OurDeadLane(_)
             | PullVerdict::OurVoucherRetryable(_)
             | PullVerdict::Refused(
@@ -1601,6 +1620,7 @@ async fn pull_from_candidate(
         NO_NAMESPACE,
         0,
         now_micros(),
+        deps.config.max_blob_size_bytes,
         rate_ceiling,
         deadlines,
         0,
@@ -2080,6 +2100,14 @@ enum PullVerdict {
     /// The peer went SILENT mid-stream (#1134). Unlike [`Self::OurDeadline`] this IS about
     /// the peer: a clock that resets on every byte can only fire on one that stopped.
     Stalled,
+    /// The peer shed the connection or stream at the transport with
+    /// `APP_ERR_RATE_LIMITED` (ADR 013 §Application Error Codes) before any signed
+    /// message existed (#1986). The transport-level twin of
+    /// `Refused(Transient)` for `StreamError::Overloaded`, and it gets the same
+    /// treatment: backpressure is respected, not punished. Metered and suppressed for
+    /// [`REFUSAL_SUPPRESSION_TTL`], never scored — the peer answered, it just declined
+    /// the work, and the `global-full` layer is not about this caller at all.
+    RateLimited,
     /// The peer rejected a voucher and this lane to this provider is finished, but the
     /// shared pool deposit is NOT: it still backs every other lane and is refundable through
     /// the pool's own grace-window close and reclaim.
@@ -2283,6 +2311,14 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     if err.downcast_ref::<PullStalled>().is_some() {
         return PullVerdict::Stalled;
     }
+    // Ahead of the catch-all, deliberately: a `0x10` close is the ONE transport failure
+    // that is a statement by the peer rather than an absence of one (#1986). Left to the
+    // residual it scores `Unreachable` for exactly the condition the handler-level
+    // `Overloaded` refusal is exonerated for, and a `global-full` shed scores every
+    // concurrent prober at once.
+    if err.downcast_ref::<UpstreamRateLimited>().is_some() {
+        return PullVerdict::RateLimited;
+    }
     if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {
         return voucher_verdict(rejected.reason);
     }
@@ -2325,8 +2361,9 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
 /// shared by the buffered and window-paced paths (#856). Buyer-side faults are
 /// exonerated (don't tar the provider); an honest refusal is exonerated too
 /// (#1144 — a peer that answers is reachable, whatever it answers), except
-/// `InternalError`, by which a peer reports its own degradation; a hash mismatch
-/// is `Corruption`; everything else is `Unreachable`.
+/// `InternalError`, by which a peer reports its own degradation; a transport-level
+/// rate-limit shed is exonerated the same way (#1986); a hash mismatch is
+/// `Corruption`; everything else is `Unreachable`.
 ///
 /// [`pull_verdict`] makes the decision; this acts on it, and RETURNS it so the
 /// caller can act on it too (#1560). The two consumers want different halves of the
@@ -2428,6 +2465,17 @@ fn classify_pull_failure(
             deps.metrics.node_pull_stalled();
             suppress(Some(REFUSAL_SUPPRESSION_TTL));
             debug!(%provider_addr, %err, "node-origin: upstream fell below the throughput floor; suppressing briefly, not tarring upstream reputation");
+        }
+        // The peer shed us at the transport with `APP_ERR_RATE_LIMITED` (#1986): the same
+        // event as a handler-level `Overloaded` refusal, one layer down, and it earns the
+        // same remedy. Suppressing the `(peer, hash)` pair briefly stops a shedding peer
+        // from burning a candidate slot on every retry of this miss; scoring it would tar
+        // a peer for honestly saying "not now" — and, for the node-wide `global-full`
+        // layer, tar every peer probing it in that window at once.
+        PullVerdict::RateLimited => {
+            deps.metrics.node_upstream_rate_limited();
+            suppress(Some(REFUSAL_SUPPRESSION_TTL));
+            debug!(%provider_addr, %err, ttl = ?REFUSAL_SUPPRESSION_TTL, "node-origin: upstream shed the pull at the transport (rate-limited); suppressing briefly, not tarring upstream reputation");
         }
         // Our payment-side fault — the provider is not scored (#857). What separates this arm
         // from the retryable one below is what it costs the LANE.
@@ -2788,6 +2836,10 @@ mod tests {
         assert!(rejected.downcast_ref::<UpstreamVoucherRejected>().is_some());
         assert!(rejected.downcast_ref::<PullTimeout>().is_none());
 
+        let shed: anyhow::Error = anyhow::Error::new(UpstreamRateLimited { label: None });
+        assert!(shed.downcast_ref::<UpstreamRateLimited>().is_some());
+        assert!(shed.downcast_ref::<PullStalled>().is_none());
+
         // Even with an added context layer, the plain `downcast_ref` the
         // orchestrator uses still recovers the sentinel (no `root_cause()` needed).
         let wrapped = timeout.context("added context in some future propagation path");
@@ -2950,8 +3002,8 @@ mod tests {
     ///
     /// The wiring is guarded where the wiring lives:
     /// - `the_range_helpers_mark_their_own_faults_as_local` (in `decdn-client-pull`) drives
-    ///   the REAL `aligned_wire_len` / `decode_verified_range` into their REAL errors and
-    ///   asserts the marker is on them, never attaching it itself.
+    ///   the REAL `aligned_wire_len` into its REAL error and asserts the marker is on it,
+    ///   never attaching it itself.
     /// - `node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one` drives a
     ///   real pull whose signature the upstream cannot verify — the production shape of "our
     ///   buyer key is broken" — and asserts `node_pull_local_fault_total` moves while the
@@ -3026,6 +3078,7 @@ mod tests {
             PullVerdict::Refused(RefusalVerdict::DurableMiss(DurableMissCause::BlobTooLarge)),
             PullVerdict::Corruption,
             PullVerdict::Unreachable,
+            PullVerdict::RateLimited,
         ] {
             assert_eq!(
                 PullMiss::for_verdict(verdict),
@@ -3193,5 +3246,26 @@ mod tests {
         .context("pull from candidate");
         assert_eq!(pull_verdict(&ours), PullVerdict::OurDeadline);
         assert_eq!(pull_verdict(&theirs), PullVerdict::Stalled);
+    }
+
+    /// A transport-level `APP_ERR_RATE_LIMITED` shed (#1986) is the same event as
+    /// the handler-level `Overloaded` refusal, and must get the same verdict: brief
+    /// suppression, no reputation. Before this arm the sentinel fell through the
+    /// ladder to `Unreachable` — a 0.0 EWMA sample for a peer that answered, and
+    /// one every prober in a `GlobalFull` window recorded at once.
+    #[test]
+    fn a_rate_limit_shed_is_suppressed_not_scored() {
+        let shed = anyhow::Error::new(UpstreamRateLimited {
+            label: Some("global-full".to_owned()),
+        })
+        .context("open_bi failed")
+        .context("pull from candidate");
+        assert_eq!(pull_verdict(&shed), PullVerdict::RateLimited);
+        assert_eq!(
+            PullMiss::for_verdict(PullVerdict::RateLimited),
+            PullMiss::Clean,
+            "a peer shedding load says nothing about THIS node, so the client gets an \
+             honest miss"
+        );
     }
 }

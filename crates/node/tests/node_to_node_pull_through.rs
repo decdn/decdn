@@ -674,8 +674,8 @@ async fn lying_upstream(
     write_client_msg(&mut send, &ClientMessage::StreamEnd).await?;
     let _ = send.finish();
     // Hold the connection open until the requester has read `StreamEnd` and
-    // closed (it closes with `verify-failed` once a bao chunk group fails to
-    // verify against the content root). Returning here would drop `conn` and
+    // closed (it drops the pull, closing with `upstream-pull-dropped`, once a bao
+    // chunk group fails to verify against the content root). Returning here would drop `conn` and
     // abort the still-in-flight `StreamEnd` before it lands, surfacing a spurious
     // "connection lost" instead.
     conn.closed().await;

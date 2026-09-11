@@ -57,5 +57,7 @@ pub const ALPN_DHT: &[u8] = b"cdn/dht/v1";
 /// (e.g. `global-full`, `per-source`) so the peer can pick an appropriate
 /// backoff. Peers that receive this code SHOULD back off before
 /// reconnecting; they MUST NOT treat it as a protocol error (the server is
-/// functioning normally — the client is overloading it).
+/// functioning normally — the client is overloading it). The requester side
+/// (`decdn-client-pull`) types this code as `UpstreamRateLimited` so the pull
+/// orchestrator suppresses the peer briefly instead of scoring it unreachable.
 pub const APP_ERR_RATE_LIMITED: u32 = 0x10;

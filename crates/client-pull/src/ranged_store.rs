@@ -505,10 +505,9 @@ impl ClientRangedStore {
     /// # Errors
     ///
     /// - The typed [`StashedFault`] the reader parked, if any (a stalled or
-    ///   refusing peer) — takes precedence over the decoder's own complaint,
-    ///   mirroring `sink::decode_to_sink`.
-    /// - Otherwise the bao decode failure, classified the same way
-    ///   `sink::decode_to_sink` does: [`crate::HashMismatch`] for a
+    ///   refusing peer) — takes precedence over the decoder's own complaint.
+    /// - Otherwise the bao decode failure, classified by
+    ///   `sink::classify_decode_error`: [`crate::HashMismatch`] for a
     ///   verification failure, a truncation error for a short stream.
     /// - Any I/O failure opening or writing the `.partial`/`.obao4` files, or
     ///   persisting the `.ranges` record.

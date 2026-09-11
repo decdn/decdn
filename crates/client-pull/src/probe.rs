@@ -26,6 +26,8 @@ use decdn_protocol::{
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 
+use crate::rate_limited::transport_error;
+
 /// Run one probe round trip and return the decoded response together with
 /// the measured round-trip time in milliseconds.
 ///
@@ -39,6 +41,14 @@ use iroh::{Endpoint, EndpointAddr};
 /// policy on the same transport. The only check performed internally is the
 /// protocol-level one that the server sent a `Response` (not a `Request`)
 /// variant.
+///
+/// # Errors
+///
+/// A node that sheds the probe at the transport with `APP_ERR_RATE_LIMITED`
+/// surfaces as the [`UpstreamRateLimited`](crate::UpstreamRateLimited) sentinel
+/// (recoverable with `downcast_ref` through any added context), so a caller can
+/// tell a peer refusing work from a peer that could not be reached. Every other
+/// failure is a plain message naming the stage.
 pub async fn probe_once(
     endpoint: &Endpoint,
     target: EndpointAddr,
@@ -52,7 +62,7 @@ pub async fn probe_once(
         let conn = endpoint
             .connect(target, ALPN_PROBE)
             .await
-            .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
+            .map_err(|e| transport_error("connect failed", e))?;
         let resp = exchange(&conn, hash, timestamp_us).await?;
         Ok::<_, anyhow::Error>((conn, resp))
     })
@@ -129,7 +139,7 @@ async fn exchange(
     let (mut send, recv) = conn
         .open_bi()
         .await
-        .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
+        .map_err(|e| transport_error("open_bi failed", e))?;
     write_request(&mut send, hash, timestamp_us).await?;
     read_response(recv).await
 }
@@ -144,7 +154,7 @@ async fn write_request(
         .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
     write_frame(send, &payload)
         .await
-        .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
+        .map_err(|e| transport_error("write request", e))?;
     send.finish()
         .map_err(|e| anyhow::anyhow!("finish stream: {e}"))?;
     Ok(())
@@ -157,7 +167,7 @@ async fn write_request(
 async fn read_response(mut recv: RecvStream) -> anyhow::Result<(ProbeResponse, ProbeResponseExt)> {
     let frame = read_frame(&mut recv)
         .await
-        .map_err(|e| anyhow::anyhow!("read response: {e}"))?;
+        .map_err(|e| transport_error("read response", e))?;
     let (msg, rest) = decode_message::<ProbeMessage>(&frame)
         .map_err(|e| anyhow::anyhow!("decode response: {e}"))?;
     match msg {

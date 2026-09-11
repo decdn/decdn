@@ -4,9 +4,10 @@
 //! Turnkey paying sibling of [`super::probe`]: dial a node by explicit
 //! `--node-id`/`--addr`/`--relay-url` (or auto-discover one, #936),
 //! **auto-open-or-reuse** the caller's own `PaymentPool` deposit, run one
-//! delivery exchange via [`decdn_client_pull::stream_fetch_tracked`]-shaped
-//! gap-driven core (signing cumulative vouchers, resuming the pool lane's
-//! persisted watermark), verify the `slash_sig` recovers to the provider
+//! delivery exchange through the gap-driven [`decdn_client_pull::drive`] core
+//! over a [`decdn_client_pull::PeerSource`] (signing cumulative vouchers,
+//! resuming the pool lane's persisted watermark), verify the `slash_sig`
+//! recovers to the provider
 //! (ADR 014 §1), BLAKE3-check the whole blob, persist the new watermark, and
 //! write the bytes atomically.
 //!
@@ -110,11 +111,9 @@ pub(crate) fn micros_now() -> u64 {
 /// TTY-aware — `indicatif` hides it automatically when stderr is not a terminal,
 /// so a piped/redirected fetch emits no bar. A steady tick animates the spinner
 /// during the pre-byte connect/handshake so the command never looks hung. The
-/// bar counts received **wire** bytes (bao content plus interleaved proof nodes)
-/// against the blob's aligned wire length — the same accounting the receive loop
-/// meters and the [`decdn_client_pull::ProgressCallback`] reports — so length and
-/// position share one unit and the bar fills to exactly 100% (the completion line
-/// prints the smaller content-byte count separately). On a single-source fetch the
+/// bar counts verified **content** bytes against the blob's `total_bytes` — the
+/// unit the [`decdn_client_pull::ProgressCallback`] reports — so length and
+/// position share one unit and the bar fills to exactly 100%. On a single-source fetch the
 /// driver reports this lane's `base_present + received`; a multi-source fetch
 /// instead reports one monotonic total the lanes fold their per-leg deltas into,
 /// so the bar never jumps between lanes' divergent local positions.
@@ -389,13 +388,17 @@ fn no_serve_target_error(
 /// Every response is verified before it can influence the order: value
 /// invariants, echoed-field correlation, and `slash_sig` recovery to the
 /// candidate's on-chain operator address (ADR 014 §1). Selection reads
-/// `has_blob` and `rate_per_mb` off the response, and both are only meaningful
-/// once the signature attributes them to the peer — an unverified quote is a
-/// claim no one is accountable for, so a node could win selection on a rate it
-/// never committed to. A response that fails is dropped and its candidate
-/// skipped, exactly as for a timeout; it is requester-local policy and never
-/// scored against the peer, since a signature that does not recover attributes
-/// nothing to anyone.
+/// `has_blob` and coverage off the response and pairs them with the measured
+/// RTT; `rate_per_mb` is harvested into `probed_samples` for the peer store
+/// only, never ranked on — the fetch pays the stream's own signed quote, gated
+/// by `--max-rate-per-mb`. `has_blob` and the harvested rate are only
+/// meaningful once the signature attributes them to the peer (coverage is
+/// unsigned; the consistency check below ties it to `has_blob`): an unverified
+/// quote is a claim no one is accountable for, so a node could seed the store
+/// with a rate it never committed to. A response that fails is
+/// dropped and its candidate skipped, exactly as for a timeout; it is
+/// requester-local policy and never scored against the peer, since a signature
+/// that does not recover attributes nothing to anyone.
 ///
 /// Every candidate is probed on equal footing: opening cost is
 /// provider-independent, because the caller has ONE pool that fans out to
@@ -1193,7 +1196,7 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyhow:
 /// Persist what the pool lane paid, warning rather than masking the fetch
 /// outcome.
 ///
-/// Shared by the buffered and streaming paths: the bytes were paid for either
+/// Shared by the single- and multi-source paths: the bytes were paid for either
 /// way, and a failure to record that only risks a rejected reuse next time.
 fn persist_watermark(
     store: &RedbBuyerPoolStore,
@@ -1247,11 +1250,9 @@ fn persist_watermark(
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
-    // Before any network or keystore work: a hard cap at or below TWICE the stall budget
-    // parses fine and silently disables stall detection — the open stage is bounded by that
-    // same budget, so both can run inside the cap consecutively (#1145 review). The
-    // `PullDeadlines::capped` below refuses it too; this is the early error, in the flags the
-    // user actually typed.
+    // Before any network or keystore work, reject a `--timeout-ms` / `--stall-timeout-ms`
+    // pair the flags cannot honor, naming the flags the user actually typed rather than
+    // failing several frames into a fetch (#1145 review).
     common.validate()?;
 
     // Relays: `--relay-url` overrides `network.relay_urls` (#935). Discovery:
@@ -1324,17 +1325,17 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             alloy::primitives::U256::from(n).to_be_bytes()
         });
     // A node that accepts the connection and never answers is as dead as one that
-    // stops mid-stream, so the same budget answers both (#1134). `capped` enforces
-    // that the hard cap outlasts them both — `ClientFetchArgs::validate` has already
-    // said so in the user's own flags, so this `?` is the belt to those braces.
-    // This same stall budget is the ADR 037 § Fallback progress deadline: a proxy
-    // (or holder) that makes no progress within it trips the stall, and the
-    // failover loop below routes to the next candidate.
-    let deadlines = PullDeadlines::capped(
+    // stops mid-stream, so the same budget answers both (#1134). The pull carries no
+    // overall wall-clock cap: a progressing pull is bounded only by the open bound
+    // and the stall window, so it completes for any blob size as long as the upstream
+    // keeps feeding it bytes (#1134) — `drive` never consults a hard cap. This same
+    // stall budget is the ADR 037 § Fallback progress deadline: a proxy (or holder)
+    // that makes no progress within it trips the stall, and the failover loop below
+    // routes to the next candidate.
+    let deadlines = PullDeadlines::new(
         common.stall_timeout(),
         common.stall_timeout(),
         common.min_throughput_bps(),
-        common.hard_cap(),
     )?;
 
     // The shared pull/funding deps the driver core borrows for the whole fetch.
@@ -1949,6 +1950,7 @@ where
         deps.namespace_id,
         0,
         micros_now(),
+        deps.max_blob_bytes,
         deps.max_rate_per_mb,
         deps.deadlines,
         0,
@@ -2410,7 +2412,7 @@ where
     P: alloy::providers::Provider + Clone,
 {
     // Spread the ranked candidate set across distinct operators (ADR 039
-    // § Source diversity and reputation). Every gate that can be decided without
+    // § Source diversity and per-peer memory). Every gate that can be decided without
     // a probe short-circuits BEFORE any chain/network work. Admission is computed
     // once and reused for the gate and the lane set.
     let admitted = discovery::admit_sources(candidates.to_vec(), common.max_sources);
@@ -2506,6 +2508,7 @@ where
             deps.namespace_id,
             0,
             micros_now(),
+            deps.max_blob_bytes,
             deps.max_rate_per_mb,
             deps.deadlines,
             0,
@@ -2810,10 +2813,10 @@ const RATE_SMOOTHING_TAU_SECS: f64 = 3.0;
 /// Rolling delivery-rate estimate behind the progress bar's `{msg}`, and the
 /// running totals the end-of-fetch summary reads back.
 ///
-/// The bar's positions are cumulative received **wire** bytes (bao content plus
-/// interleaved proof nodes) — what the receive loop meters and the
-/// [`decdn_client_pull::ProgressCallback`] reports — so the rate is a true
-/// on-the-wire throughput.
+/// The bar's positions are cumulative verified **content** bytes — what the
+/// [`decdn_client_pull::ProgressCallback`] reports — so the rate is content
+/// throughput (the interleaved bao proof nodes the wire also carries are not
+/// counted).
 ///
 /// Each `set_position` on the bar is bursty — many chunks land in one instant,
 /// then a gap — so a naive `delta / dt` per callback spikes and collapses. This
@@ -2828,7 +2831,7 @@ struct SpeedState {
     /// actually transferred rather than dividing already-present bytes by this
     /// run's short window.
     started: Option<(Instant, u64)>,
-    /// Instant and cumulative received wire bytes at the previous sample.
+    /// Instant and cumulative received content bytes at the previous sample.
     last: Option<(Instant, u64)>,
     /// Smoothed rate in bytes/sec. `None` until the second sample gives a `dt`.
     ewma_bps: Option<f64>,
@@ -2940,22 +2943,22 @@ pub(crate) fn labeled_delivery_bar() -> indicatif::ProgressBar {
     bar
 }
 
-/// Build the callback that drives `bar` — setting its length to the pull's
-/// aligned **wire** size once, advancing its position to the cumulative received
-/// wire-byte count, and folding each update into a [`SpeedState`] for the rate/ETA
-/// `{msg}` — and return it with the [`DeliveryMeter`] the caller reads after the
-/// bar finishes.
+/// Build the callback that drives `bar` — setting its length to the blob's
+/// `total_bytes` once, advancing its position to the cumulative verified
+/// content-byte count, and folding each update into a [`SpeedState`] for the
+/// rate/ETA `{msg}` — and return it with the [`DeliveryMeter`] the caller reads
+/// after the bar finishes.
 ///
-/// The callback's `received`/`expected` are wire bytes (bao content plus
-/// interleaved proof nodes), per [`decdn_client_pull::ProgressCallback`] — not the
-/// blob's content size. Both the bar length and its position are therefore in wire
-/// bytes, so the bar fills to exactly 100% and never overshoots.
+/// The callback's `received`/`expected` are content bytes, per
+/// [`decdn_client_pull::ProgressCallback`]. Both the bar length and its position
+/// are therefore in the same unit, so the bar fills to exactly 100% and never
+/// overshoots.
 ///
 /// `on_progress`, when set, receives each update's `(received_delta,
-/// expected_delta)` — the increases in cumulative received and expected wire bytes
-/// since the previous callback. `bundle pull` folds every file bar's deltas into
-/// one bottom total bar through it (position by `received_delta`, length by
-/// `expected_delta`), keeping the total wire-consistent too; single-blob `fetch`
+/// expected_delta)` — the increases in cumulative received and expected content
+/// bytes since the previous callback. `bundle pull` folds every file bar's deltas
+/// into one bottom total bar through it (position by `received_delta`, length by
+/// `expected_delta`), keeping the total unit-consistent too; single-blob `fetch`
 /// passes `None`. `received` is cumulative and non-decreasing across an entry's
 /// fail-over resumes (each attempt continues from `base_present`), so the deltas
 /// are true increments and a folded total never double-counts.
@@ -2966,9 +2969,9 @@ pub(crate) fn bar_callback(
     // `expected` is constant across the pull, so set the bar length once (it
     // takes a write lock) rather than on every chunk in the hot receive loop.
     let length_set = std::sync::atomic::AtomicBool::new(false);
-    // Cumulative received and expected wire bytes at the previous callback, so the
-    // forwarded deltas are true per-update increments (`expected` is constant, so
-    // its delta is the full wire length on the first call and zero after).
+    // Cumulative received and expected content bytes at the previous callback, so
+    // the forwarded deltas are true per-update increments (`expected` is constant,
+    // so its delta is the full `total_bytes` on the first call and zero after).
     let prev = std::sync::atomic::AtomicU64::new(0);
     let prev_expected = std::sync::atomic::AtomicU64::new(0);
     let state = Arc::new(Mutex::new(SpeedState::default()));
