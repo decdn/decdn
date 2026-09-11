@@ -74,6 +74,14 @@ const TAIL_BYTES: u64 = 200_000 + 123;
 /// The lone no-overlap file used for the parity assertion.
 const LONE_BYTES: u64 = 300_000;
 
+/// The fixed chunk size the real-import journey (below) pins
+/// `--chunk-avg`/`--chunk-min`/`--chunk-max` to. This is `fastcdc` v2020's own
+/// `MINIMUM_MAX` — the largest value it accepts for `--chunk-min` — so it is
+/// the biggest fixed chunk size reachable via `min == avg == max`.
+/// `SHARED_BYTES` is an exact multiple of it, so the forced fixed-size cuts
+/// land exactly on the shared/tail seam.
+const IMPORT_CHUNK_BYTES: u64 = 1024 * 1024;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_bundle_pull_dedups_an_overlapping_range() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
@@ -448,6 +456,349 @@ async fn run_self_heal() -> anyhow::Result<()> {
 
     drop(node);
     Ok(())
+}
+
+/// Live seam test: the two journeys above seed whole-file blobs directly and
+/// hand-build the manifest, so the `origin import --optimize` -> chunk-hint ->
+/// `bundle pull` seam is never exercised end-to-end. This journey runs the
+/// REAL `decdn origin import --optimize` over an on-disk source tree, serves
+/// the manifest + whole-file blobs it actually wrote (read back from the
+/// import store, not the in-memory originals), and `bundle pull --hash`es the
+/// import-emitted bundle hash — asserting the same dedup money property as
+/// [`cli_bundle_pull_dedups_an_overlapping_range`].
+///
+/// `--chunk-avg`/`--chunk-min`/`--chunk-max` are all pinned to
+/// [`IMPORT_CHUNK_BYTES`] (fastcdc v2020's own `MINIMUM_MAX`, the largest
+/// value its `--chunk-min` accepts): fastcdc can never cut before `min` and is
+/// forced to cut at `max`, so with `min == avg == max` the real chunker
+/// degenerates to fixed-size cuts — while still being the genuine `fastcdc`
+/// code path, not a stand-in. `SHARED_BYTES` is an exact multiple of
+/// `IMPORT_CHUNK_BYTES`, so the fixed cuts land exactly on the shared/tail
+/// seam: each file gets `SHARED_BYTES / IMPORT_CHUNK_BYTES` identical leading
+/// chunks (byte-identical prefix -> identical fastcdc cut decisions -> equal
+/// hashes) plus one distinct final chunk covering its own tail.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_bundle_pull_from_optimize_import_dedups() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_from_optimize_import()))
+        .await
+        .context("cli bundle pull from-optimize-import e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey mirroring the hand-built dedup test's shape"
+)]
+async fn run_from_optimize_import() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    ensure_decdn_cli_built()?;
+    let chain = ChainFixture::launch().await?;
+
+    // Real files on disk: `a.bin`/`b.bin` share the same chunk-group-aligned
+    // `SHARED_BYTES` prefix as the hand-built dedup journey, each with a
+    // distinct, ragged `TAIL_BYTES` tail.
+    let shared = deterministic_bytes(SHARED_BYTES, 0x0F71_5EED);
+    let tail_a = deterministic_bytes(TAIL_BYTES, 0x0F71_00A1);
+    let tail_b = deterministic_bytes(TAIL_BYTES, 0x0F71_00B2);
+    let mut file_a = shared.clone();
+    file_a.extend_from_slice(&tail_a);
+    let mut file_b = shared;
+    file_b.extend_from_slice(&tail_b);
+
+    let src_dir = tempfile::tempdir().context("source tempdir")?;
+    std::fs::write(src_dir.path().join("a.bin"), &file_a).context("write a.bin source")?;
+    std::fs::write(src_dir.path().join("b.bin"), &file_b).context("write b.bin source")?;
+
+    // A HOME for the offline `origin import` invocation. It touches no
+    // keystore/chain, but `decdn_command` requires an absolute HOME regardless.
+    let import_home = tempfile::tempdir().context("import home tempdir")?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        import_home.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .context("chmod import home 0o700")?;
+    let import_store = import_home.path().join("import-store");
+    let bundle_out = import_home.path().join("bundle.json");
+    let chunk_bytes = IMPORT_CHUNK_BYTES.to_string();
+
+    let output =
+        tokio::process::Command::from(decdn_command(import_home.path(), KEYSTORE_PASSWORD)?)
+            .arg("origin")
+            .arg("import")
+            .arg("-i")
+            .arg(src_dir.path())
+            .arg("--to")
+            .arg(format!("fs:{}", import_store.display()))
+            .arg("--optimize")
+            .arg("--chunk-avg")
+            .arg(&chunk_bytes)
+            .arg("--chunk-min")
+            .arg(&chunk_bytes)
+            .arg("--chunk-max")
+            .arg(&chunk_bytes)
+            .arg("--bundle")
+            .arg(&bundle_out)
+            .arg("--json")
+            .output()
+            .await
+            .context("spawn decdn origin import --optimize")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "decdn origin import --optimize failed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // --- Import-half assertions: the real `--optimize` output shape ---------
+    let report: serde_json::Value = serde_json::from_slice(output.stdout.trim_ascii_end())
+        .context("parse origin import --json report")?;
+    anyhow::ensure!(
+        report["optimized"].as_bool() == Some(true),
+        "report: {report}"
+    );
+    let chunks_per_file = SHARED_BYTES / IMPORT_CHUNK_BYTES + 1;
+    anyhow::ensure!(
+        report["chunks_total"].as_u64() == Some(chunks_per_file * 2),
+        "expected {} chunk hints across both files, report: {report}",
+        chunks_per_file * 2
+    );
+    let bundle_hex = report["bundle_hash"]
+        .as_str()
+        .and_then(|s| s.strip_prefix("b3:"))
+        .context("report missing bundle_hash")?
+        .to_string();
+    let bundle_hash: Hash = bundle_hex.parse().context("parse bundle_hash hex")?;
+
+    let manifest_bytes = std::fs::read(import_object_path(&import_store, &bundle_hex))
+        .context("read manifest blob from import store")?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).context("parse manifest json")?;
+    let entries = manifest["entries"].as_array().context("manifest entries")?;
+    anyhow::ensure!(
+        entries.len() == 2,
+        "expected 2 entries, manifest: {manifest}"
+    );
+
+    // Every entry's WHOLE-FILE hash (+ its `.obao4` outboard) is a stored data
+    // object, exactly like a plain import; a chunk-hint hash that is not also
+    // some entry's whole-file hash is checked NOT stored — chunks are
+    // manifest-only dedup hints, never separately stored blobs.
+    let mut whole_hex_by_path: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut all_hint_hexes: Vec<String> = Vec::new();
+    for e in entries {
+        let path = e["path"].as_str().context("entry path")?.to_string();
+        let whole_hex = e["hash"]
+            .as_str()
+            .and_then(|s| s.strip_prefix("b3:"))
+            .context("entry hash")?
+            .to_string();
+        anyhow::ensure!(
+            import_object_path(&import_store, &whole_hex).is_file(),
+            "whole-file blob {whole_hex} must be stored"
+        );
+        anyhow::ensure!(
+            import_obao4_path(&import_store, &whole_hex).is_file(),
+            "whole-file outboard for {whole_hex} must be stored"
+        );
+        let chunks = e["chunks"].as_array().context("entry chunks")?;
+        anyhow::ensure!(
+            chunks.len() as u64 == chunks_per_file,
+            "expected exactly {chunks_per_file} chunk hints, entry: {e}"
+        );
+        for c in chunks {
+            let chex = c["hash"]
+                .as_str()
+                .and_then(|s| s.strip_prefix("b3:"))
+                .context("chunk hash")?
+                .to_string();
+            all_hint_hexes.push(chex);
+        }
+        whole_hex_by_path.insert(path, whole_hex);
+    }
+    for chex in &all_hint_hexes {
+        if whole_hex_by_path.values().any(|w| w == chex) {
+            continue;
+        }
+        anyhow::ensure!(
+            !import_object_path(&import_store, chex).is_file(),
+            "chunk hint {chex} must NOT be stored as its own data object"
+        );
+    }
+    let whole_a_hex = whole_hex_by_path
+        .get("a.bin")
+        .context("manifest missing a.bin entry")?
+        .clone();
+    let whole_b_hex = whole_hex_by_path
+        .get("b.bin")
+        .context("manifest missing b.bin entry")?
+        .clone();
+    let whole_a: Hash = whole_a_hex.parse().context("parse a.bin whole hash")?;
+    let whole_b: Hash = whole_b_hex.parse().context("parse b.bin whole hash")?;
+    anyhow::ensure!(whole_a == Hash::new(&file_a), "a.bin whole hash mismatch");
+    anyhow::ensure!(whole_b == Hash::new(&file_b), "b.bin whole hash mismatch");
+
+    // --- Serve the import's ACTUAL bytes -------------------------------------
+    // The manifest and both whole-file blobs the node serves are read back
+    // from the import store `--optimize` actually wrote, not the in-memory
+    // source bytes — the seeded node is provably driven by the real import
+    // output, not a reconstruction of it.
+    let stored_a = std::fs::read(import_object_path(&import_store, &whole_a_hex))
+        .context("read a.bin blob from import store")?;
+    let stored_b = std::fs::read(import_object_path(&import_store, &whole_b_hex))
+        .context("read b.bin blob from import store")?;
+    anyhow::ensure!(stored_a == file_a, "stored a.bin bytes differ from source");
+    anyhow::ensure!(stored_b == file_b, "stored b.bin bytes differ from source");
+
+    let (node, hashes) = NodeFixture::launch_with_blobs(
+        &chain,
+        "US",
+        &[
+            manifest_bytes.as_slice(),
+            stored_a.as_slice(),
+            stored_b.as_slice(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        hashes == vec![bundle_hash, whole_a, whole_b],
+        "seeded blob hashes mismatch: {hashes:?}"
+    );
+    let provider_addr = node.operator_addr();
+
+    // --- Buyer setup (mirrors the hand-built dedup journey) ------------------
+    let client_dir = tempfile::tempdir().context("client tempdir")?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        client_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .context("chmod client dir 0o700")?;
+    eth_identity::generate_and_persist(client_dir.path(), KEYSTORE_PASSWORD, false)
+        .context("generate buyer keystore")?;
+    let keystore = eth_identity::keystore_path(client_dir.path());
+    let buyer = eth_identity::load_signer(&keystore, KEYSTORE_PASSWORD).context("load buyer")?;
+    let buyer_addr = buyer.address();
+    chain.fund_eth(buyer_addr, 100).await?;
+    chain
+        .mint_usdc(
+            buyer_addr,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(6u64),
+        )
+        .await
+        .context("mint buyer USDC")?;
+
+    let out_dir = client_dir.path().join("out");
+    let args = bundle_pull_hash_argv(
+        &chain,
+        &node,
+        &bundle_hex,
+        &out_dir,
+        client_dir.path(),
+        &keystore,
+        1,
+    );
+
+    let before = billed_bytes(client_dir.path(), provider_addr)?;
+    anyhow::ensure!(before == 0, "lane must be unbilled before the first pull");
+    run_bundle_pull_until_ready(client_dir.path(), &args).await?;
+    let paid = billed_bytes(client_dir.path(), provider_addr)?.saturating_sub(before);
+
+    // (1) Byte-exact + whole-file-BLAKE3-exact outputs.
+    let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin")?;
+    let got_b = std::fs::read(out_dir.join("b.bin")).context("read b.bin")?;
+    anyhow::ensure!(got_a == file_a, "a.bin mismatch: {} bytes", got_a.len());
+    anyhow::ensure!(got_b == file_b, "b.bin mismatch: {} bytes", got_b.len());
+    anyhow::ensure!(Hash::new(&got_a) == whole_a, "a.bin BLAKE3 mismatch");
+    anyhow::ensure!(Hash::new(&got_b) == whole_b, "b.bin BLAKE3 mismatch");
+
+    // (2) Dedup happened. `--hash` fetches the manifest blob itself over the
+    // SAME paid lane before any entry (`fetch_to_memory`), so the exact
+    // watermark is the manifest's own whole-file wire cost PLUS the same money
+    // property the hand-built manifest journey asserts: `a`'s whole file plus
+    // only `b`'s chunk-group-aligned COMPLEMENT past the shared run.
+    let wire_manifest = whole_blob_wire_bytes(manifest_bytes.len() as u64);
+    let wire_a_whole = whole_blob_wire_bytes(file_a.len() as u64);
+    let wire_b_whole = whole_blob_wire_bytes(file_b.len() as u64);
+    let wire_b_complement = range_wire_bytes(SHARED_BYTES, TAIL_BYTES, file_b.len() as u64)?;
+    let expected_paid = wire_manifest
+        .checked_add(wire_a_whole)
+        .and_then(|v| v.checked_add(wire_b_complement))
+        .context("expected-paid overflow")?;
+    let no_dedup_total = wire_manifest
+        .checked_add(wire_a_whole)
+        .and_then(|v| v.checked_add(wire_b_whole))
+        .context("no-dedup total overflow")?;
+    anyhow::ensure!(
+        paid == expected_paid,
+        "shared lane must bill exactly the manifest ({wire_manifest}) plus a's whole file \
+         ({wire_a_whole}) plus b's complement ({wire_b_complement}) = {expected_paid}, got {paid}"
+    );
+    anyhow::ensure!(
+        paid < no_dedup_total,
+        "dedup must strictly undercut re-downloading both whole files (plus the manifest): \
+         paid {paid} is not less than {no_dedup_total}"
+    );
+
+    drop(node);
+    Ok(())
+}
+
+/// The sharded data-object path `{store}/{hex[..2]}/{hex}` `origin import`
+/// writes for content addressed by `hex` — mirrors the private `object_paths`
+/// helper in `crates/cli/src/commands/origin.rs`, not visible from here.
+fn import_object_path(store: &std::path::Path, hex: &str) -> std::path::PathBuf {
+    store.join(&hex[..2]).join(hex)
+}
+
+/// The sibling `{hex}.obao4` outboard path next to [`import_object_path`].
+fn import_obao4_path(store: &std::path::Path, hex: &str) -> std::path::PathBuf {
+    store.join(&hex[..2]).join(format!("{hex}.obao4"))
+}
+
+/// `decdn bundle pull --hash <bundle_hex>` argv — the `--hash` twin of
+/// [`bundle_pull_argv`], fetching the manifest blob itself first instead of
+/// reading it from a local file.
+fn bundle_pull_hash_argv(
+    chain: &ChainFixture,
+    node: &NodeFixture,
+    bundle_hex: &str,
+    out_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    keystore: &std::path::Path,
+    jobs: u32,
+) -> Vec<String> {
+    vec![
+        "--hash".into(),
+        bundle_hex.to_string(),
+        "-o".into(),
+        out_dir.display().to_string(),
+        "--jobs".into(),
+        jobs.to_string(),
+        "--node-id".into(),
+        node.node_id().to_string(),
+        "--addr".into(),
+        format!("127.0.0.1:{}", node.bind_port()),
+        "--provider-address".into(),
+        format!("{}", node.operator_addr()),
+        "--rpc-url".into(),
+        chain.rpc_url(),
+        "--payment-pool-address".into(),
+        format!("{}", chain.addrs().payment_pool),
+        "--capacity-bond-address".into(),
+        format!("{}", chain.addrs().capacity_bond),
+        "--slash-judge-address".into(),
+        format!("{}", chain.addrs().slash_judge),
+        "--chain-id".into(),
+        chain.chain_id().to_string(),
+        "--data-dir".into(),
+        data_dir.display().to_string(),
+        "--keystore".into(),
+        keystore.display().to_string(),
+    ]
 }
 
 /// Deterministic pseudo-random bytes (xorshift32), seeded distinctly per
