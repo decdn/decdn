@@ -52,7 +52,7 @@ async fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Command::KeyGen(args) => commands::key_gen::key_gen(&args),
-        Command::Whoami(args) => commands::whoami::whoami(&args),
+        Command::Whoami(args) => commands::whoami::whoami(&args, config_path.as_deref()),
         Command::Config(args) => match args.command {
             ConfigCommand::Init(init) => commands::config::config_init(&init),
             ConfigCommand::Validate(validate) => {
