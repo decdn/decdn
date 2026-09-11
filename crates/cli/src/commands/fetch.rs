@@ -1245,11 +1245,9 @@ fn persist_watermark(
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
-    // Before any network or keystore work: a hard cap at or below TWICE the stall budget
-    // parses fine and silently disables stall detection — the open stage is bounded by that
-    // same budget, so both can run inside the cap consecutively (#1145 review). The
-    // `PullDeadlines::capped` below refuses it too; this is the early error, in the flags the
-    // user actually typed.
+    // Before any network or keystore work, reject a `--timeout-ms` / `--stall-timeout-ms`
+    // pair the flags cannot honor, naming the flags the user actually typed rather than
+    // failing several frames into a fetch (#1145 review).
     common.validate()?;
 
     // Relays: `--relay-url` overrides `network.relay_urls` (#935). Discovery:
@@ -1322,17 +1320,17 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             alloy::primitives::U256::from(n).to_be_bytes()
         });
     // A node that accepts the connection and never answers is as dead as one that
-    // stops mid-stream, so the same budget answers both (#1134). `capped` enforces
-    // that the hard cap outlasts them both — `ClientFetchArgs::validate` has already
-    // said so in the user's own flags, so this `?` is the belt to those braces.
-    // This same stall budget is the ADR 037 § Fallback progress deadline: a proxy
-    // (or holder) that makes no progress within it trips the stall, and the
-    // failover loop below routes to the next candidate.
-    let deadlines = PullDeadlines::capped(
+    // stops mid-stream, so the same budget answers both (#1134). The pull carries no
+    // overall wall-clock cap: a progressing pull is bounded only by the open bound
+    // and the stall window, so it completes for any blob size as long as the upstream
+    // keeps feeding it bytes (#1134) — `drive` never consults a hard cap. This same
+    // stall budget is the ADR 037 § Fallback progress deadline: a proxy (or holder)
+    // that makes no progress within it trips the stall, and the failover loop below
+    // routes to the next candidate.
+    let deadlines = PullDeadlines::new(
         common.stall_timeout(),
         common.stall_timeout(),
         common.min_throughput_bps(),
-        common.hard_cap(),
     )?;
 
     // The shared pull/funding deps the driver core borrows for the whole fetch.

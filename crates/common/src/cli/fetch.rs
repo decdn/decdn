@@ -294,27 +294,21 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "BPS", default_value_t = 4096)]
     pub min_throughput_bps: u64,
 
-    /// Hard cap on the total wall-clock time of the `CapacityBond` registry read, and
-    /// separately of a single blob fetch, in milliseconds. Defaults to 1 hour. For
-    /// `bundle pull` the fetch half applies per entry.
+    /// Hard cap on the total wall-clock time of the `CapacityBond` registry read
+    /// (discovery), in milliseconds. Defaults to 1 hour.
     ///
-    /// This is a leak guard, not the health signal — `--stall-timeout-ms` is what catches
-    /// a dead provider. Lower it when you must bound total runtime regardless of whether
-    /// the transfer is progressing.
+    /// It does NOT bound the blob fetch: a progressing pull carries no overall wall-clock cap
+    /// and is bounded only by `--stall-timeout-ms` and `--min-throughput-bps`, which together
+    /// catch a dead or drip-feeding provider (#1134, #1797) — so a healthy transfer of any
+    /// size completes as long as the upstream keeps feeding it bytes.
     ///
-    /// The registry read (including its retry schedule) gets its own budget of this size
-    /// rather than sharing the transfer's, so `bundle pull`'s per-entry accounting is
-    /// unaffected. Before #1349 nothing bounded it at all: a failing read could burn its
-    /// full retry schedule with `--timeout-ms 5000` set. Exceeding the budget is treated
-    /// as a read failure, so a cached peer list is still used if one is present.
+    /// Exceeding this budget on the registry read (including its retry schedule) is treated
+    /// as a read failure, so a cached peer list is still used if one is present. It does NOT
+    /// bound the probe fan-out that ranks candidates either — probing is bounded per node by
+    /// the probe timeout, not by this flag.
     ///
-    /// It does NOT bound the probe fan-out that ranks candidates. Probing is bounded per
-    /// node by the probe timeout, not by this flag.
-    ///
-    /// It must exceed TWICE `--stall-timeout-ms`. The cap bounds the whole exchange, and the
-    /// open stage is bounded by the same stall budget, so both can run inside it
-    /// consecutively; below `2 ×` the cap always elapses first and a stalled provider could
-    /// never be detected.
+    /// It must exceed TWICE `--stall-timeout-ms`: a discovery budget at or below twice a
+    /// single delivery attempt's stall budget is almost certainly a misconfiguration.
     #[arg(long, value_name = "MS", default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_ms: u64,
 
@@ -354,30 +348,16 @@ impl ClientFetchArgs {
         self.min_throughput_bps
     }
 
-    /// Overall wall-clock cap on one blob fetch — always present, so a fetch always
-    /// terminates even against a provider that drip-feeds bytes to keep the stall
-    /// deadline alive.
-    ///
-    /// # Why it exists, and why it is not the health signal
-    ///
-    /// It is a poor health signal on its own: an overall deadline has to be sized against
-    /// `blob size × link speed`, so it kills legitimate large or slow-but-healthy
-    /// transfers, while a value small enough to catch a dead node quickly cannot serve
-    /// a big blob at all (#1134).
-    ///
-    /// It cannot simply be removed, though, because inactivity is not liveness: the stall
-    /// clock resets on ANY byte, so a provider trickling one byte per stall window would
-    /// hang the fetch forever with no error. The default is therefore deliberately
-    /// generous — far above any honest transfer of a typical blob.
+    /// The `--timeout-ms` value as a `Duration`. It bounds discovery ([`Self::discovery_cap`]
+    /// returns the same value); the delivery pull itself carries no overall wall-clock cap
+    /// and is bounded only by its open bound and stall window (#1134). Despite the name, this
+    /// value does not cap the whole exchange.
     ///
     /// Returns a `Duration`, not an `Option<Duration>`. `--timeout-ms` has a default and clap
-    /// rejects a zero, so the cap is ALWAYS present on this path; an `Option` here would be
-    /// structurally always `Some`, and would exist only to shape-match
-    /// `PullDeadlines`'s optional cap — misinforming every reader and forcing a pointless
-    /// match (#1145 review). A caller that wants the optional form wraps it.
-    ///
-    /// The same value also bounds the registry read, as a SEPARATE budget rather than a
-    /// shared one — see [`Self::discovery_cap`].
+    /// rejects a zero, so it is ALWAYS present on this path; an `Option` here would be
+    /// structurally always `Some` and would exist only to shape-match `PullDeadlines`'s
+    /// optional cap — misinforming every reader and forcing a pointless match (#1145 review).
+    /// A caller that wants the optional form wraps it.
     #[must_use]
     pub const fn hard_cap(&self) -> Duration {
         Duration::from_millis(self.timeout_ms)
@@ -405,38 +385,29 @@ impl ClientFetchArgs {
         Duration::from_millis(self.timeout_ms)
     }
 
-    /// Reject a deadline pair whose hard cap would silently disable stall detection.
+    /// Reject a `--timeout-ms` / `--stall-timeout-ms` pair the flags cannot sensibly honor.
     ///
     /// Clap enforces each knob is non-zero, but the two are only meaningful in relation to
-    /// each other, and the relation is not the obvious one. `--timeout-ms` is a cap on the
-    /// WHOLE exchange, and both CLI call sites build `PullDeadlines` with the open bound
-    /// ALSO set from `--stall-timeout-ms` (a node that accepts a connection and never
-    /// answers is as dead as one that stops mid-stream, so the same budget answers both).
-    /// So before the streaming window even starts, up to `stall_timeout_ms` may already have
-    /// gone on the open — and the throughput floor can only fire if the cap outlasts both:
+    /// each other. `--timeout-ms` bounds discovery ([`Self::discovery_cap`]); the delivery
+    /// pull itself carries NO overall wall-clock cap — a progressing pull is bounded only by
+    /// its open bound and stall window, so it completes for any blob size as long as the
+    /// upstream keeps feeding it bytes (#1134). `--stall-timeout-ms` sets both that open
+    /// bound and that stall window on every delivery attempt (a node that accepts a
+    /// connection and never answers is as dead as one that stops mid-stream, so the same
+    /// budget answers both).
+    ///
+    /// The check keeps the discovery budget from being set implausibly small next to a
+    /// single delivery attempt's stall budget:
     ///
     /// ```text
-    /// timeout_ms > open (= stall_timeout_ms) + stall_timeout_ms  =  2 × stall_timeout_ms
+    /// timeout_ms > 2 × stall_timeout_ms
     /// ```
     ///
-    /// A check of merely `timeout_ms > stall_timeout_ms` admits the whole band up to
-    /// `2 × stall_timeout_ms`, where the health signal is still dead — no error, no
-    /// warning, just a bound that cannot do its job.
-    ///
-    /// # This is the early check, not the enforcement
-    ///
-    /// `PullDeadlines::capped` is what actually enforces `hard_cap > open + window`, on the
-    /// type that holds the values, and both CLI call sites go through it (#1145
-    /// review). This exists so the user gets the error at argument-parse time — naming the
-    /// flags they typed — rather than several frames into a fetch.
-    ///
-    /// It restates the rule rather than calling it because `decdn-common` sits UPSTREAM of
-    /// `decdn-client-pull` in the dependency flow and cannot import `PullDeadlines`. The
-    /// `2 ×` is that rule specialised to these two call sites, which set the open bound from
-    /// `--stall-timeout-ms` as well. If a future `--open-timeout-ms` breaks that assumption,
-    /// this check goes stale — but it cannot go WRONG, because the constructor
-    /// downstream still refuses to build a `PullDeadlines` whose cap cannot outlast its
-    /// stages. That is why the invariant lives on the type.
+    /// A `--timeout-ms` at or below `2 × --stall-timeout-ms` is almost certainly a
+    /// misconfiguration, so it is rejected at argument-parse time — naming the flags the
+    /// user typed — rather than surfacing several frames into a fetch. `decdn-common` sits
+    /// UPSTREAM of `decdn-client-pull` in the dependency flow and cannot name the delivery
+    /// deadline type, so the relationship is stated here rather than imported.
     ///
     /// # Errors
     ///
@@ -447,10 +418,10 @@ impl ClientFetchArgs {
         let need = self.stall_timeout_ms.saturating_mul(2);
         anyhow::ensure!(
             self.timeout_ms > need,
-            "--timeout-ms ({}) must exceed twice --stall-timeout-ms ({} × 2 = {}): the hard \
-             cap bounds the whole exchange, and the open stage is bounded by the SAME window \
-             budget — so below that, the cap always elapses before the throughput floor \
-             can fire and a stalled provider could never be detected",
+            "--timeout-ms ({}) must exceed twice --stall-timeout-ms ({} × 2 = {}): \
+             --timeout-ms bounds discovery and --stall-timeout-ms bounds each delivery \
+             attempt, so a discovery budget at or below twice a single attempt's is almost \
+             certainly a misconfiguration",
             self.timeout_ms,
             self.stall_timeout_ms,
             need,
@@ -603,11 +574,11 @@ mod tests {
         );
     }
 
-    /// The headline of #1134: the default deadlines are sized so that blob size and
-    /// link speed cannot kill a healthy transfer. Liveness comes from the STALL bound;
-    /// the overall cap is a leak guard set far above any honest transfer.
+    /// The default deadlines (#1134): blob size and link speed cannot kill a healthy
+    /// transfer. Liveness on the delivery pull comes from the STALL bound and the throughput
+    /// floor; `--timeout-ms` bounds discovery and defaults far above any honest registry read.
     #[test]
-    fn the_stall_bound_is_the_health_signal_and_the_hard_cap_is_a_leak_guard() {
+    fn the_default_stall_and_timeout_values() {
         let c = parse(&[]);
         assert_eq!(c.stall_timeout(), Duration::from_secs(30));
         assert_eq!(c.hard_cap(), Duration::from_hours(1));
@@ -634,24 +605,20 @@ mod tests {
         assert_eq!(parse(&[]).region, None, "the flag stays optional");
     }
 
-    /// A fetch must ALWAYS terminate (#1145 review). The stall clock resets on any
-    /// byte, so with no overall cap a provider trickling one byte per stall window
-    /// hangs `decdn fetch` forever, with no error and no diagnostic — and hangs the
-    /// whole manifest for `bundle pull`. The cap is what makes that impossible, so it
-    /// cannot be absent, and it cannot be zero.
-    ///
-    /// "Cannot be absent" is a fact about the TYPE — `hard_cap()` returns a `Duration`,
-    /// not an `Option<Duration>` — so the only thing left for a test to pin is that it cannot
-    /// be zero, which is clap's job.
+    /// Discovery must ALWAYS have a non-zero bound. `--timeout-ms` supplies it
+    /// (`discovery_cap`) and is a non-optional `Duration` — never absent — so the only thing
+    /// left for a test to pin is that it cannot be zero, which is clap's job. (The delivery
+    /// pull itself carries no overall wall-clock cap; a progressing pull is bounded only by
+    /// its stall window, #1134.)
     #[test]
-    fn a_fetch_always_has_an_overall_cap() {
+    fn discovery_always_has_a_nonzero_bound() {
         assert!(
-            !parse(&[]).hard_cap().is_zero(),
-            "an unbounded fetch can be hung forever by a drip-feeding provider"
+            !parse(&[]).discovery_cap().is_zero(),
+            "an unbounded discovery could sit through the registry read's full retry schedule"
         );
         assert!(
             TestCli::try_parse_from(["test", "--timeout-ms", "0"]).is_err(),
-            "a zero hard cap would abort every fetch on the first poll"
+            "a zero --timeout-ms would abort discovery on the first poll"
         );
     }
 
@@ -661,14 +628,13 @@ mod tests {
         assert_eq!(c.hard_cap(), Duration::from_secs(5));
     }
 
-    /// `--timeout-ms` bounds discovery as well as the transfer (#1349), from the
-    /// same value and with no separate flag. Before this, `--timeout-ms 5000`
-    /// could still sit through the registry read's full 36 s retry schedule
-    /// before the transfer it capped had started.
+    /// `--timeout-ms` bounds discovery (#1349), from the same value the type exposes as
+    /// `hard_cap`, with no separate flag — so a small `--timeout-ms` does not sit through
+    /// the registry read's full retry schedule.
     ///
-    /// Asserted as equality to `hard_cap` rather than a literal so the two
-    /// cannot silently diverge: if a future change gives discovery its own
-    /// knob, this is the test that says so out loud.
+    /// Asserted as equality to `hard_cap` rather than a literal so the two cannot silently
+    /// diverge: if a future change gives discovery its own knob, this is the test that says
+    /// so out loud.
     #[test]
     fn discovery_is_bounded_by_the_same_flag() {
         let c = parse(&["--timeout-ms", "5000"]);
@@ -682,48 +648,42 @@ mod tests {
     }
 
     /// The two deadlines are only meaningful in relation to each other, and the threshold
-    /// is `2 × stall`, not `1 × stall` (#1145 review).
-    ///
-    /// Both CLI call sites set the OPEN bound from `--stall-timeout-ms` too, and
-    /// `--timeout-ms` caps the whole exchange — so up to one stall budget can be spent on
-    /// the open before the inactivity clock even starts. A cap of `stall + 1ms` therefore
-    /// still leaves `PullStalled` unable to fire in practice: the health signal is quietly
-    /// dead while both knobs look configured.
-    ///
-    /// Hence the `5000/5001` case below: it clears a naive `timeout > stall` check while
-    /// sitting squarely in the dead band, so it is pinned as an ERROR.
+    /// is `2 × stall`, not `1 × stall` (#1145 review). `--timeout-ms` bounds discovery and
+    /// `--stall-timeout-ms` bounds each delivery attempt (both its open bound and its stall
+    /// window), so a discovery budget at or below twice a single attempt's stall budget is a
+    /// misconfiguration `validate` rejects. The threshold is strict `> 2 ×`, so the boundary
+    /// (`10000` for a `5000` stall) is pinned as an ERROR and `10001` as OK.
     #[test]
-    fn a_hard_cap_that_would_disable_stall_detection_is_rejected() {
+    fn validate_rejects_a_timeout_at_or_below_twice_the_stall_budget() {
         assert!(
             parse(&["--stall-timeout-ms", "60000", "--timeout-ms", "1000"])
                 .validate()
                 .is_err(),
-            "a cap below the stall budget makes a stalled provider undetectable"
+            "a discovery budget far below the per-attempt stall budget is rejected"
         );
         assert!(
             parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "5000"])
                 .validate()
                 .is_err(),
-            "equal is no better: the cap's clock starts first, so it still always wins"
+            "equal is rejected: the threshold is twice the stall budget, not once"
         );
         assert!(
             parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "5001"])
                 .validate()
                 .is_err(),
-            "a cap of stall+1ms leaves nothing for the stall clock: the open stage alone is \
-             bounded by the same 5000ms, so the cap fires first unless the open took <1ms"
+            "stall+1ms clears a naive `timeout > stall` check but sits below `2 × stall`"
         );
         assert!(
             parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "10000"])
                 .validate()
                 .is_err(),
-            "exactly 2× is still not enough — the cap must strictly exceed open + stall"
+            "exactly 2× is rejected — the threshold is strict"
         );
         assert!(
             parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "10001"])
                 .validate()
                 .is_ok(),
-            "past open + stall, the inactivity deadline can actually fire"
+            "just past 2 × the stall budget is accepted"
         );
         assert!(
             parse(&[]).validate().is_ok(),
