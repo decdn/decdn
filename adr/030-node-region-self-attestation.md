@@ -9,7 +9,7 @@
 Each node declares a region — an ISO 3166-1 alpha-2 country code — at registration as `regionHint` on `CapacityBond` (see [ADR 001 § Node Region Metadata](001-network.md#node-region-metadata)). The `CapacityBond` registry watcher resolves the active set into a `NodeId → region` map. The declared region is load-bearing in two places:
 
 - **Regional blacklist enforcement.** A node applies only blacklist entries that are global or match its declared region ([ADR 011 § Regional Scope](011-content-takedown.md#regional-scope)), and is slashable only for serving a hash blacklisted in its declared scope ([ADR 011 § Slashing](011-content-takedown.md#slashing)).
-- **Peer-selection penalty.** A client applies the RTT-vs-claim reputation penalty against a node whose measured latency contradicts its declared region ([ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm), implemented in `crates/node/src/node_origin/mod.rs`).
+- **Peer-selection penalty.** A pulling node applies the RTT-vs-claim reputation penalty against a node whose measured latency contradicts its declared region ([ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm), implemented in `crates/node/src/node_origin/mod.rs`).
 
 Three ADRs ([001 § Consequences](001-network.md#consequences), [011 § Regional Scope](011-content-takedown.md#regional-scope), [019 § Deferred & Open](019-node-onboarding.md#deferred--open)) name "a decentralized oracle or third-party attestation service" as the production mitigation against region misreporting, but specify no design — oracle choice, IP→region resolution, mismatch handling, slashing implications, and operator UX are all open. This gap is production-blocking: without a decision, regional compliance under [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) is structurally fragile, and the reactive blacklist-scope flip ([ADR 011 § Regional Scope](011-content-takedown.md#regional-scope)) remains open.
 
@@ -23,7 +23,7 @@ A node's region is whatever the operator declares — at `CapacityBond.registerN
 
 ### Soft mitigation: latency-vs.-claim reputation penalty (canonical)
 
-The penalty in [ADR 001 § Consequences](001-network.md#consequences) — clients apply a reputation penalty when observed latency contradicts the claimed region (default heuristic: RTT > 150ms to a node in the same claimed region) — is the canonical continuous mitigation. It is self-correcting: a misdeclaring node loses payouts proportional to how badly its declared region contradicts measured RTT, with no new protocol surface. This ADR does not respecify the threshold, sample size, or decay curve; that tuning is a follow-up in the [ADR 008](008-reputation.md#adr-008-reputation-system) reputation domain, not a precondition here.
+The penalty in [ADR 001 § Consequences](001-network.md#consequences) — a pulling node applies a reputation penalty when observed latency contradicts the claimed region (default heuristic: RTT > 150ms to a node in the same claimed region) — is the canonical continuous mitigation. It is self-correcting: a misdeclaring node loses payouts proportional to how badly its declared region contradicts measured RTT, with no new protocol surface. This ADR does not respecify the threshold, sample size, or decay curve; that tuning is a follow-up in the [ADR 008](008-reputation.md#adr-008-reputation-system) reputation domain, not a precondition here.
 
 ### Region-stability window
 
