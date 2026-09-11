@@ -427,10 +427,13 @@ impl VoucherProgress {
 /// invariant, ADR 014/038). Under ADR 038 the verifier is the per-chunk-group
 /// `bao-tree` decoder fed as bytes arrive, not a whole-blob re-hash, so this
 /// fires the moment any group's proof mismatches. Returned (via `anyhow`) by
-/// every decoding consumer so callers can `downcast_ref` to classify corruption
+/// this crate's decoding consumers — [`ClientRangedStore::ingest_stream`] and the
+/// `test-util` in-memory decoder — so callers can `downcast_ref` to classify corruption
 /// (e.g. a reputation `Corruption` outcome) without matching on the error
 /// message string. The `Display` text is kept stable for logs and the existing
-/// requester tests.
+/// requester tests. The node's cache admit reports the same fault as
+/// `CacheError::VerifyFailed` / `CacheError::HashMismatch`, which `decdn-node`'s
+/// `is_bao_corruption` folds together with this type.
 #[derive(Debug)]
 pub struct HashMismatch;
 
@@ -943,10 +946,10 @@ impl std::error::Error for UpstreamRefused {}
 /// arrived" and "bytes made progress" are the same statement, so a peer cannot hold the
 /// floor open with padding. The receive loop ([`UpstreamPull::next_chunk`]) has no
 /// independent progress check behind that floor: it is safe because no frame a peer can
-/// send makes zero progress, not because it verifies that it did. Since the
-/// #1145 review the floor is structural rather than advisory — `ChunkData`'s field is
-/// private, and its constructor and decode gate both reject an empty payload — so it cannot
-/// be relaxed by forgetting to call a validator.
+/// send makes zero progress, not because it verifies that it did. The floor is
+/// structural rather than advisory — `ChunkData`'s field is private, and its constructor
+/// and decode gate both reject an empty payload — so it cannot be relaxed by forgetting
+/// to call a validator (#1145 review).
 ///
 /// **At least one byte having already arrived.** The reset is what makes a stall the peer's
 /// fault, so before the FIRST byte there has been no reset and the argument does not apply:
@@ -1219,11 +1222,11 @@ impl PullDeadlines {
     /// `node_origin_mid_stream_silence_does_not_score_stalled_upstream`, which builds its
     /// deadlines explicitly.
     ///
-    /// That is a statement about the BUFFERED path, where the cap wraps the whole
-    /// exchange. The progressive path never consults `hard_cap` at all (see
-    /// [`open_progressive_pull`]), so a `whole_transfer` used there would leave `PullStalled`
-    /// perfectly able to fire — which is not a reprieve, just a different reason not to
-    /// reach for this (#1145 review).
+    /// That is a statement about the `test-util` `stream_fetch*` wrappers, where
+    /// `with_hard_cap` wraps the whole exchange. [`open_progressive_pull`] and
+    /// [`driver::drive`] never consult `hard_cap` at all, so a `whole_transfer` used there
+    /// would leave `PullStalled` perfectly able to fire — which is not a reprieve, just a
+    /// different reason not to reach for this (#1145 review).
     ///
     /// It is also the reason this constructor stays infallible while [`Self::capped`] is not:
     /// it deliberately builds the very state `capped` refuses.
@@ -1458,8 +1461,8 @@ where
 /// own voucher state from `ctx.prior_*`, so N concurrent pulls on the same channel
 /// each compute the next cumulative `amount` independently and collide — the node
 /// accepts exactly one and rejects the rest as `AmountRegression`. Passing every
-/// concurrent caller the SAME `&PoolLedger` (typically an `Arc<PoolLedger>` shared
-/// across `tokio::spawn`/`join!`) serializes their voucher issuance through the
+/// concurrent caller the SAME `&Arc<PoolLedger>` (shared across
+/// `tokio::spawn`/`join!`) serializes their voucher issuance through the
 /// ledger's mutex: each issue advances the cumulative `amount`/`bytes_delivered`
 /// in turn, the channel advances monotonically, and all pulls succeed.
 ///
@@ -1855,9 +1858,6 @@ async fn fetch_in_memory_once(
     let bytes = Bytes::from(plaintext);
     if lead > bytes.len() {
         anyhow::bail!("decoded range shorter than requested span");
-    }
-    if lead == 0 {
-        return Ok(bytes);
     }
     Ok(bytes.slice(lead..))
 }
@@ -2408,16 +2408,13 @@ pub async fn open_progressive_pull(
     // `0` = unlimited.
     let max_received_wire = if max_blob_size_bytes == 0 {
         0
+    } else if byte_offset >= max_blob_size_bytes {
+        return Err(anyhow::Error::new(BlobTooLarge {
+            received: byte_offset,
+            ceiling: max_blob_size_bytes,
+        }));
     } else {
-        match aligned_wire_len(byte_offset, 0, max_blob_size_bytes) {
-            Ok(wire) => wire,
-            Err(_) => {
-                return Err(anyhow::Error::new(BlobTooLarge {
-                    received: byte_offset,
-                    ceiling: max_blob_size_bytes,
-                }));
-            }
-        }
+        aligned_wire_len(byte_offset, 0, max_blob_size_bytes)?
     };
     let ttfb_ms = started.elapsed().as_secs_f64() * 1000.0;
     let header = UpstreamPullHeader {
@@ -2541,7 +2538,8 @@ impl UpstreamPull {
 
     /// Read the next `ChunkData`, paying the upstream at each voucher-interval
     /// boundary (and a closing voucher once all promised bytes have arrived),
-    /// and return the chunk for the caller to forward downstream + tee to cache.
+    /// and return the chunk for the caller's verifying decoder (and, on the node's
+    /// serve leg, to forward downstream).
     /// Returns `Ok(None)` on `StreamEnd`.
     ///
     /// # Errors
@@ -2676,6 +2674,10 @@ impl UpstreamPull {
         if write_err.is::<LocalPullFault>() {
             return Err(write_err);
         }
+        // Any outcome other than a terminal message means nothing terminal was
+        // waiting, so the write failure stands as the honest outcome (its typed
+        // cause still downcasts through the added context); what the recovery saw
+        // rides along so the log can tell a silent peer from a chatty one.
         match tokio::time::timeout(TERMINAL_AFTER_WRITE_TIMEOUT, self.read_under_floor()).await {
             Ok(Ok(ClientMessage::StreamEnd)) => {
                 self.ended = true;
@@ -2684,9 +2686,18 @@ impl UpstreamPull {
             Ok(Ok(ClientMessage::StreamError(e))) => {
                 Err(voucher_rejection(&self.ledger, &self.meter, e))
             }
-            // Any other message, a read error, or the timeout: nothing terminal is
-            // waiting, so the write failure stands as the honest outcome.
-            _ => Err(write_err),
+            Ok(Ok(other)) => Err(write_err.context(format!(
+                "no terminal signal after the voucher write failed; peer sent {}",
+                variant_name(&other)
+            ))),
+            Ok(Err(read_err)) => Err(write_err.context(format!(
+                "no terminal signal after the voucher write failed; recovery read failed: \
+                 {read_err:#}"
+            ))),
+            Err(_) => Err(write_err.context(format!(
+                "no terminal signal within {TERMINAL_AFTER_WRITE_TIMEOUT:?} of the voucher \
+                 write failing"
+            ))),
         }
     }
 
@@ -2694,8 +2705,8 @@ impl UpstreamPull {
     /// wire-byte completeness (the full promised bao wire size was received),
     /// close the connection cleanly, and return the final acked watermark to
     /// persist. Per ADR 038 this does not re-hash the whole blob — bao
-    /// verification is delegated to the tee's verifying decoder (cached copy) and
-    /// the downstream client's own decoder.
+    /// verification is the caller's decoder's job, group by group as the bytes
+    /// land.
     ///
     /// # Errors
     ///
@@ -2725,11 +2736,10 @@ impl UpstreamPull {
             }
         }
         // Completeness for every fetch (full and resumed): bao verification is
-        // delegated to the tee's verifying decoder (cached copy) and the
-        // downstream client's own decoder, so `finish` does not re-hash the
-        // whole blob. A
-        // truncated stream (fewer wire bytes than promised) can't be decoded, so
-        // require the full promised wire size as the completeness signal.
+        // the caller's decoder's job, group by group as the bytes land, so
+        // `finish` does not re-hash the whole blob. A truncated stream (fewer
+        // wire bytes than promised) can't be decoded, so require the full
+        // promised wire size as the completeness signal.
         if self.cumulative < self.expected_wire_bytes {
             self.conn.close(0u32.into(), b"short-delivery");
             anyhow::bail!(
@@ -2977,7 +2987,13 @@ impl StreamMeter {
                     self.anchored_root = ledger.chain_root();
                 }
                 Metered::Exhausted => {
-                    anyhow::bail!("hash chain still exhausted after a rollover")
+                    // A ledger self-contradiction, not a peer fault: marked as OURS so
+                    // it is scored as a local fault and never rescued by the
+                    // voucher-write recovery into a clean completion.
+                    return Err(
+                        anyhow::anyhow!("hash chain still exhausted after a rollover")
+                            .context(LocalPullFault),
+                    );
                 }
             }
         }

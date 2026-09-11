@@ -29,7 +29,9 @@ use crate::{HashMismatch, UpstreamPull};
 /// `io::Error` would silently downgrade, say, a peer's mid-stream refusal into
 /// an anonymous decode failure and stop it being scored. So the original
 /// `anyhow::Error` is parked in `fault` and the trait returns a placeholder; the
-/// driver below checks `fault` first and returns the real error, using the
+/// decode loop that owns the reader
+/// ([`crate::ranged_store::ClientRangedStore::ingest_stream`], or the `test-util`
+/// in-memory decoder) checks `fault` first and returns the real error, using the
 /// decoder's complaint only when there is no parked fault.
 #[derive(Debug)]
 pub struct PullReader {
@@ -53,8 +55,9 @@ impl PullReader {
     }
 
     /// Recover the inner [`UpstreamPull`] once the decode loop is done with this
-    /// reader, so [`crate::source::BlobSource::finish`] can drain it to the
-    /// stream end and recover the acked voucher watermark.
+    /// reader, so [`crate::source::BlobSource::finish`] (or the `test-util`
+    /// in-memory wrapper) can drain it to the stream end and recover the acked
+    /// voucher watermark.
     ///
     /// Any buffered-but-unconsumed wire bytes and a parked fault are dropped
     /// silently: a caller only calls this after the decode loop reached its clean

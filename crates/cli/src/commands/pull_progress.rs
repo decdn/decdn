@@ -126,8 +126,9 @@ impl PullProgress {
     /// A per-file bar for a whole-blob pull, labeled `label` and inserted above the
     /// total bar. `size` (the manifest's content size, when declared) sets an
     /// initial bar length so it reads sensibly during the pre-byte handshake; the
-    /// first delivered chunk replaces it with the authoritative `total_bytes`. It
-    /// is also the pull's scaled contribution to the total bar.
+    /// first progress callback (the driver's pre-stream `base_present` report)
+    /// replaces it with the authoritative `total_bytes`. It is also the pull's
+    /// scaled contribution to the total bar.
     ///
     /// When disabled the returned [`FileBar`] is silent and its
     /// [`FileBar::callback`] is `None`, so the fetch path runs byte-bar-free
@@ -253,7 +254,7 @@ impl FileBar {
 /// A chunked file's bar, advanced across its several chunk pulls. Unlike a
 /// whole-file [`FileBar`] — one pull, one `set_position` callback — a chunked file
 /// sums many chunk pulls, so its callbacks *increment* the bar and grow its length
-/// as each chunk's wire size is learned. Silent when the renderer is disabled.
+/// as each chunk's `total_bytes` is learned. Silent when the renderer is disabled.
 pub(crate) struct ChunkedFile {
     /// The file's bar; `None` when disabled.
     bar: Option<indicatif::ProgressBar>,
@@ -461,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn content_contributor_scales_wire_progress_to_content_size() {
+    fn content_contributor_scales_progress_to_declared_size() {
         // A pull reporting progress against an `expected` of 4000 for a declared
         // size of 1000: the total advances in declared bytes and ends on exactly 1000.
         let total = indicatif::ProgressBar::with_draw_target(
@@ -506,7 +507,7 @@ mod tests {
         cb1(0, 50);
         cb1(30, 50);
         cb1(50, 50);
-        // Chunk 2: 40 wire bytes. A fresh callback tracks its own cumulative.
+        // Chunk 2: 40 bytes expected. A fresh callback tracks its own cumulative.
         let cb2 = cf.chunk_callback().expect("enabled -> Some callback");
         cb2(0, 40);
         cb2(40, 40);
@@ -514,7 +515,7 @@ mod tests {
         let bar = cf.bar.as_ref().expect("bar present");
         assert_eq!(bar.length(), Some(90));
         assert_eq!(bar.position(), 90);
-        // 90/90 of the wire → the file's full 1000 content bytes fold into the total.
+        // 90/90 delivered → the file's full 1000 declared bytes fold into the total.
         assert_eq!(total.position(), 1000);
         // A completed file trues up to exactly its size (idempotent here).
         cf.finish();

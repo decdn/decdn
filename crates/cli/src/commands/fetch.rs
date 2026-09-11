@@ -110,11 +110,9 @@ pub(crate) fn micros_now() -> u64 {
 /// TTY-aware — `indicatif` hides it automatically when stderr is not a terminal,
 /// so a piped/redirected fetch emits no bar. A steady tick animates the spinner
 /// during the pre-byte connect/handshake so the command never looks hung. The
-/// bar counts received **wire** bytes (bao content plus interleaved proof nodes)
-/// against the blob's aligned wire length — the same accounting the receive loop
-/// meters and the [`decdn_client_pull::ProgressCallback`] reports — so length and
-/// position share one unit and the bar fills to exactly 100% (the completion line
-/// prints the smaller content-byte count separately). On a single-source fetch the
+/// bar counts verified **content** bytes against the blob's `total_bytes` — the
+/// unit the [`decdn_client_pull::ProgressCallback`] reports — so length and
+/// position share one unit and the bar fills to exactly 100%. On a single-source fetch the
 /// driver reports this lane's `base_present + received`; a multi-source fetch
 /// instead reports one monotonic total the lanes fold their per-leg deltas into,
 /// so the bar never jumps between lanes' divergent local positions.
@@ -2520,10 +2518,10 @@ const RATE_SMOOTHING_TAU_SECS: f64 = 3.0;
 /// Rolling delivery-rate estimate behind the progress bar's `{msg}`, and the
 /// running totals the end-of-fetch summary reads back.
 ///
-/// The bar's positions are cumulative received **wire** bytes (bao content plus
-/// interleaved proof nodes) — what the receive loop meters and the
-/// [`decdn_client_pull::ProgressCallback`] reports — so the rate is a true
-/// on-the-wire throughput.
+/// The bar's positions are cumulative verified **content** bytes — what the
+/// [`decdn_client_pull::ProgressCallback`] reports — so the rate is content
+/// throughput (the interleaved bao proof nodes the wire also carries are not
+/// counted).
 ///
 /// Each `set_position` on the bar is bursty — many chunks land in one instant,
 /// then a gap — so a naive `delta / dt` per callback spikes and collapses. This
@@ -2538,7 +2536,7 @@ struct SpeedState {
     /// actually transferred rather than dividing already-present bytes by this
     /// run's short window.
     started: Option<(Instant, u64)>,
-    /// Instant and cumulative received wire bytes at the previous sample.
+    /// Instant and cumulative received content bytes at the previous sample.
     last: Option<(Instant, u64)>,
     /// Smoothed rate in bytes/sec. `None` until the second sample gives a `dt`.
     ewma_bps: Option<f64>,
@@ -2650,22 +2648,22 @@ pub(crate) fn labeled_delivery_bar() -> indicatif::ProgressBar {
     bar
 }
 
-/// Build the callback that drives `bar` — setting its length to the pull's
-/// aligned **wire** size once, advancing its position to the cumulative received
-/// wire-byte count, and folding each update into a [`SpeedState`] for the rate/ETA
-/// `{msg}` — and return it with the [`DeliveryMeter`] the caller reads after the
-/// bar finishes.
+/// Build the callback that drives `bar` — setting its length to the blob's
+/// `total_bytes` once, advancing its position to the cumulative verified
+/// content-byte count, and folding each update into a [`SpeedState`] for the
+/// rate/ETA `{msg}` — and return it with the [`DeliveryMeter`] the caller reads
+/// after the bar finishes.
 ///
-/// The callback's `received`/`expected` are wire bytes (bao content plus
-/// interleaved proof nodes), per [`decdn_client_pull::ProgressCallback`] — not the
-/// blob's content size. Both the bar length and its position are therefore in wire
-/// bytes, so the bar fills to exactly 100% and never overshoots.
+/// The callback's `received`/`expected` are content bytes, per
+/// [`decdn_client_pull::ProgressCallback`]. Both the bar length and its position
+/// are therefore in the same unit, so the bar fills to exactly 100% and never
+/// overshoots.
 ///
 /// `on_progress`, when set, receives each update's `(received_delta,
-/// expected_delta)` — the increases in cumulative received and expected wire bytes
-/// since the previous callback. `bundle pull` folds every file bar's deltas into
-/// one bottom total bar through it (position by `received_delta`, length by
-/// `expected_delta`), keeping the total wire-consistent too; single-blob `fetch`
+/// expected_delta)` — the increases in cumulative received and expected content
+/// bytes since the previous callback. `bundle pull` folds every file bar's deltas
+/// into one bottom total bar through it (position by `received_delta`, length by
+/// `expected_delta`), keeping the total unit-consistent too; single-blob `fetch`
 /// passes `None`. `received` is cumulative and non-decreasing across an entry's
 /// fail-over resumes (each attempt continues from `base_present`), so the deltas
 /// are true increments and a folded total never double-counts.
@@ -2676,9 +2674,9 @@ pub(crate) fn bar_callback(
     // `expected` is constant across the pull, so set the bar length once (it
     // takes a write lock) rather than on every chunk in the hot receive loop.
     let length_set = std::sync::atomic::AtomicBool::new(false);
-    // Cumulative received and expected wire bytes at the previous callback, so the
-    // forwarded deltas are true per-update increments (`expected` is constant, so
-    // its delta is the full wire length on the first call and zero after).
+    // Cumulative received and expected content bytes at the previous callback, so
+    // the forwarded deltas are true per-update increments (`expected` is constant,
+    // so its delta is the full `total_bytes` on the first call and zero after).
     let prev = std::sync::atomic::AtomicU64::new(0);
     let prev_expected = std::sync::atomic::AtomicU64::new(0);
     let state = Arc::new(Mutex::new(SpeedState::default()));

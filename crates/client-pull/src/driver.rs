@@ -80,8 +80,9 @@ use decdn_incentive::DepositOutcome;
 use crate::pacer::{PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{
-    Cumulative, MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, ProgressCallback,
-    UpstreamPullHeader, genuine_exhaustion, resumable_watermark, resume_may_be_stale,
+    Cumulative, HashMismatch, MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger,
+    ProgressCallback, UpstreamPullHeader, genuine_exhaustion, resumable_watermark,
+    resume_may_be_stale,
 };
 
 /// The shared pool cannot fund the next voucher: its remaining deposit is below
@@ -392,6 +393,17 @@ where
     F: Funder,
 {
     let total_bytes = store.total_bytes();
+    // A 0-byte blob (#1054) has no chunk group for any decoder to anchor: a store
+    // sized from a `total_bytes == 0` claim has no gaps to fill and is complete
+    // as created, so nothing downstream ever verifies the empty stream against
+    // the root. Prove it here, before the empty store can be finalized: the
+    // only hash an empty blob can carry is the empty root, and a source that
+    // claims `0` for any other hash is a paid-but-wrong delivery — the same
+    // trivial-empty-range bypass every other verify site guards — so it surfaces
+    // as the typed [`HashMismatch`].
+    if total_bytes == 0 && hash != *blake3::hash(&[]).as_bytes() {
+        return Err(anyhow::Error::new(HashMismatch));
+    }
 
     // Surface the already-present resume base on the progress bar immediately —
     // before the pre-fetch window (channel open, first chunk). `fill_gap`'s
@@ -2056,5 +2068,84 @@ mod tests {
             prefix.chunk_ranges().clone(),
             "the interval-flushed record must persist the checkpointed prefix"
         );
+    }
+
+    /// A source that claims `total_bytes == 0` for a NON-empty root (#1054) is a
+    /// paid-but-wrong delivery: the empty store has no gap to pull and no chunk
+    /// group for any decoder to anchor, so without the up-front root check the
+    /// driver would finalize an empty blob under an arbitrary hash. The check is
+    /// the driver's, so it holds for every consumer the driver serves — the CLI's
+    /// ranged store and the node's cache admit alike.
+    #[tokio::test]
+    async fn drive_rejects_an_empty_claim_for_a_non_empty_root() {
+        let wanted = *blake3::hash(b"not the empty blob").as_bytes();
+        let store = fresh_store(wanted, 0);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(Vec::new()).expect("source");
+        let pacer = BudgetPacer::new();
+        let funder = healthy_funder();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+
+        let err = drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            wanted,
+            0,
+            0,
+            &config(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("an empty claim for a non-empty root must fail");
+        assert!(
+            err.downcast_ref::<crate::HashMismatch>().is_some(),
+            "must surface the typed HashMismatch, got: {err:#}"
+        );
+        assert_eq!(
+            source.opened_ranges(),
+            Vec::new(),
+            "nothing is pulled on the way out"
+        );
+    }
+
+    /// The empty root IS the one hash a `total_bytes == 0` claim can carry: the
+    /// driver finalizes it with nothing pulled and nothing paid.
+    #[tokio::test]
+    async fn drive_accepts_the_empty_blob_under_the_empty_root() {
+        let root = *blake3::hash(&[]).as_bytes();
+        let store = fresh_store(root, 0);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(Vec::new()).expect("source");
+        let pacer = BudgetPacer::new();
+        let funder = healthy_funder();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+
+        drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &config(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("the empty blob under the empty root completes");
+        assert_eq!(source.delivered_bytes(), 0, "nothing to pull");
+        assert_eq!(ledger.committed().bytes, U256::ZERO, "nothing to pay");
     }
 }

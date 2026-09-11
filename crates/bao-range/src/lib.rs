@@ -143,10 +143,9 @@ fn aligned_wire_size(total_bytes: u64, chunk_ranges: &ChunkRanges) -> Option<u64
     };
     let (start, end) = (start.0, end.0);
     let total_chunks = total_bytes.div_ceil(1024);
-    if start % group_chunks != 0 || end <= start || end > total_chunks {
-        return None;
-    }
-    if end % group_chunks != 0 && end != total_chunks {
+    let start_on_group = start % group_chunks == 0;
+    let end_on_group = end % group_chunks == 0 || end == total_chunks;
+    if !start_on_group || !end_on_group || end <= start || end > total_chunks {
         return None;
     }
     let groups = total_chunks.div_ceil(group_chunks);
@@ -176,7 +175,7 @@ fn intersecting_parents(n: u64, base: u64, a: u64, b: u64) -> u64 {
     }
     // Largest power of two strictly below `n` (`n >= 2` here): the left child's
     // group count.
-    let left = 1u64 << (u64::BITS - 1 - (n - 1).leading_zeros());
+    let left = 1u64 << (n - 1).ilog2();
     1u64.saturating_add(intersecting_parents(left, base, a, b))
         .saturating_add(intersecting_parents(
             n - left,
