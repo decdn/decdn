@@ -61,6 +61,9 @@ pub mod provider;
 /// Client-side [`decdn_bao_range::RangedStore`] backend (#1621): a
 /// `.partial` + sidecar store built on `bao-tree`/`decdn-bao-range` only.
 pub mod ranged_store;
+/// The `APP_ERR_RATE_LIMITED` (`0x10`) transport shed, typed for the pull
+/// orchestrator (ADR 013 §Application Error Codes).
+pub mod rate_limited;
 /// Failover classification (#1174, ADR 037 § Fallback): decide whether a fetch
 /// failure is terminal or worth retrying against another provider/lane. Shared by
 /// the CLI single-source loop and the multi-source scheduler.
@@ -92,6 +95,7 @@ pub use pacer::{
 };
 pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
 pub use ranged_store::ClientRangedStore;
+pub use rate_limited::{UpstreamRateLimited, rate_limit_shed};
 pub use retry::{RetryDisposition, retry_disposition};
 pub use scheduler::{MultiSourceConfig, SourceLane, multi_source_fetch};
 pub use source::{BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource};
@@ -1566,7 +1570,7 @@ async fn open_stream(
         let conn = endpoint
             .connect(target, ALPN_CLIENT)
             .await
-            .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
+            .map_err(|e| rate_limited::transport_error("connect failed", e))?;
         // Hand the caller its handle HERE, before the handshake — every step below
         // can fail with the connection already dialled and its driver already on
         // this runtime, and a caller that must observe the drain needs those too.
@@ -1576,7 +1580,7 @@ async fn open_stream(
         let (mut send, mut recv) = conn
             .open_bi()
             .await
-            .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
+            .map_err(|e| rate_limited::transport_error("open_bi failed", e))?;
 
         let req = StreamRequest {
             hash,
@@ -1605,7 +1609,7 @@ async fn open_stream(
             .map_err(|e| anyhow::anyhow!("encode stream request: {e}").context(LocalPullFault))?;
         write_frame(&mut send, &payload)
             .await
-            .map_err(|e| anyhow::anyhow!("write stream request: {e}"))?;
+            .map_err(|e| rate_limited::transport_error("write stream request", e))?;
 
         let (resp, resp_ext) = read_stream_response(&mut recv).await?;
         verify_response(
@@ -3360,7 +3364,7 @@ async fn write_message(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Re
         .map_err(|e| anyhow::anyhow!("encode failed: {e}").context(LocalPullFault))?;
     write_frame(send, &payload)
         .await
-        .map_err(|e| anyhow::anyhow!("write failed: {e}"))
+        .map_err(|e| rate_limited::transport_error("write failed", e))
 }
 
 /// Read the open-stage `StreamResponse` together with its trailing
@@ -3374,7 +3378,7 @@ async fn read_stream_response(
 ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
     let frame = read_frame(recv)
         .await
-        .map_err(|e| anyhow::anyhow!("frame read failed: {e}"))?;
+        .map_err(|e| rate_limited::transport_error("frame read failed", e))?;
     let (msg, tail) = decode_message::<ClientMessage>(&frame)
         .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
     let ClientMessage::StreamResponse(response) = msg else {
@@ -3390,7 +3394,7 @@ async fn read_client_message<R: tokio::io::AsyncRead + Unpin>(
 ) -> anyhow::Result<ClientMessage> {
     let frame = read_frame(recv)
         .await
-        .map_err(|e| anyhow::anyhow!("frame read failed: {e}"))?;
+        .map_err(|e| rate_limited::transport_error("frame read failed", e))?;
     let (msg, _rest) = decode_message::<ClientMessage>(&frame)
         .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
     Ok(msg)
