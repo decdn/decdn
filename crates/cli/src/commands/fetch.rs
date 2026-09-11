@@ -1799,19 +1799,107 @@ fn lane_ledger(
     }
 }
 
+/// Pool-wide "total spent" reader a [`FetchPrelude`] owns for [`SharedPool`],
+/// bound to the same `'a` as the `&'a LaneLedgers` registry it closes over.
+type SpentFn<'a> = Box<dyn Fn() -> U256 + Send + Sync + 'a>;
+/// Pool-wide "credit a landed top-up" writer a [`FetchPrelude`] owns for
+/// [`SharedPool`], bound to the same `'a` as the `&'a LaneLedgers` registry it
+/// closes over.
+type CreditFn<'a> = Box<dyn Fn(U256) -> anyhow::Result<()> + Send + Sync + 'a>;
+
+/// Everything [`drive_fetch`] and [`drive_ranges`] need before they can call
+/// [`drive`]: the handshake-derived `total_bytes`, the opened
+/// [`ClientRangedStore`] beside the caller's file, and the payment plumbing
+/// (source/pacer/funder/ledger/ctx) both callers hand to `drive`.
+///
+/// Owns the pool-wide `spent`/`credit` closures and the per-fetch top-up
+/// counter [`SharedPool`] borrows from, so a caller builds its `Option<SharedPool>`
+/// straight off this struct's fields (via [`FetchPrelude::pool`]) rather than
+/// juggling separately-scoped locals — the closures capture the registry by
+/// value and never outlive the prelude that owns them.
+struct FetchPrelude<'a, P> {
+    /// Whole-blob size, learned from the handshake's signed `StreamResponse`
+    /// header — the authoritative source `ClientRangedStore` keys on.
+    total_bytes: u64,
+    /// Opened (or resumed) beside the caller's file; `drive` ingests into this
+    /// and — only once the WHOLE blob is present — finalizes it itself.
+    ranged_store: ClientRangedStore,
+    peer_source: PeerSource<'a>,
+    pacer: BudgetPacer,
+    funder: CliFunder<'a, P>,
+    /// Shared (`Arc<Mutex<_>>`) with the driver and source: the source clones
+    /// it to open each gap's pull, and the driver credits a mid-fetch top-up's
+    /// new deposit through this same handle so the next open sees it.
+    ctx: Arc<Mutex<PoolContext>>,
+    ledger: Arc<PoolLedger>,
+    drive_config: DriveConfig,
+    /// The lane's persisted prior amount, captured before `ctx` moved behind
+    /// the shared handle — the baseline a caller's watermark update advances
+    /// against.
+    prior_amount: U256,
+    /// The key the peer store's stream-derived sample/failure is filed under
+    /// (#1906-series), captured before `target` moved into `PeerSource::new`.
+    node_id: PublicKey,
+    peer_store: decdn_client_pull::PeerStore,
+    /// Reactive top-ups this fetch has spent, across every lane a shared pool
+    /// (`ledgers: Some`) tracks. Zeroed here; `drive` advances it.
+    topups_used: std::sync::atomic::AtomicU32,
+    /// `Some` only when `ledgers` was `Some` — a solo `decdn fetch` keeps no
+    /// pool-wide view (one lane IS the whole pool). Bound to `'a` since each
+    /// closure borrows the caller's `&'a LaneLedgers` registry directly rather
+    /// than owning a clone (`LaneLedgers` holds its state behind a `Mutex`, not
+    /// behind `Arc`, so it is not `Clone`).
+    spent: Option<SpentFn<'a>>,
+    credit: Option<CreditFn<'a>>,
+}
+
+impl<P> FetchPrelude<'_, P> {
+    /// Build this call's `Option<SharedPool>` from the owned closures above:
+    /// `None` for a solo `decdn fetch` (`ledgers: None` at [`open_fetch_prelude`]),
+    /// `Some` when a run registry means `spent`/`credit` must read and write
+    /// EVERY lane the registry holds, this fetch's concurrent siblings on the
+    /// same deposit included.
+    fn pool(&self) -> Option<SharedPool<'_>> {
+        match (&self.spent, &self.credit) {
+            (Some(spent), Some(credit)) => Some(SharedPool {
+                spent: &**spent,
+                topups_used: &self.topups_used,
+                credit: &**credit,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Open the shared prelude both `drive_fetch` and `drive_ranges` need: learn
+/// `total_bytes` from a throwaway header-only handshake (paying nothing — no
+/// voucher is signed until the first paid interval), open the
+/// [`ClientRangedStore`] beside `entry_path`, and build the lane's
+/// source/pacer/funder/ledger/ctx.
+///
+/// The store sits beside `entry_path`, keyed by its file name, so its
+/// eventually-promoted path IS `entry_path` (no post-finalize rename) and its
+/// `.partial` matches the `<entry_path>.partial` placement. A prior
+/// `.partial.ranges` record resumes; only the still-missing bytes are ever
+/// re-pulled and no already-held byte is re-paid.
+///
+/// This handshake is also the observed-TTFB boundary the peer store wants
+/// (#1906-series): a source that cannot even complete it is stamped as a
+/// failure, and one that does hands back a real stream-derived latency —
+/// best-effort in both directions (`let _ =`), never failing the fetch. The
+/// cache-miss annotation is applied here too, so an unbound or underfunded
+/// refusal is explained at this first contact.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(crate) async fn drive_fetch<P>(
-    deps: &DriveFetchDeps<'_, P>,
+async fn open_fetch_prelude<'a, P>(
+    deps: &DriveFetchDeps<'a, P>,
     ctx: PoolContext,
     target: EndpointAddr,
     provider: Address,
     pool_id: PoolId,
     hash: [u8; 32],
-    output: &Path,
-    progress: Option<&ProgressCallback>,
-    finish_progress: impl FnOnce(),
-    ledgers: Option<&LaneLedgers>,
-) -> anyhow::Result<u64>
+    entry_path: &Path,
+    ledgers: Option<&'a LaneLedgers>,
+) -> anyhow::Result<FetchPrelude<'a, P>>
 where
     P: alloy::providers::Provider + Clone,
 {
@@ -1846,11 +1934,6 @@ where
     // — and its pull is dropped immediately; `drive` re-opens exactly the gaps it
     // needs. The cache-miss annotation is applied here too, so an unbound or
     // underfunded refusal is still explained at this first contact.
-    //
-    // This handshake is also the observed-TTFB boundary the peer store wants
-    // (#1906-series): a source that cannot even complete it is stamped as a
-    // failure, and one that does hands back a real stream-derived latency —
-    // best-effort in both directions (`let _ =`), never failing the fetch.
     let header_ctx = ctx
         .lock()
         .map_err(|_| anyhow::anyhow!("lane context lock poisoned"))?
@@ -1892,14 +1975,9 @@ where
     let total_bytes = header.total_bytes;
     drop(first_pull);
 
-    // The store sits beside `output`, keyed by the output's own file name, so its
-    // promoted final path IS `output` (no post-finalize rename) and its `.partial`
-    // matches the `<output>.partial` placement. A prior `.partial.ranges` record
-    // resumes; only `missing_ranges(R)` is re-pulled and no already-held byte is
-    // re-paid.
-    let (store_dir, stem) = ranged_store_location(output)?;
+    let (store_dir, stem) = ranged_store_location(entry_path)?;
     let ranged_store = ClientRangedStore::open_or_create(&store_dir, &stem, hash, total_bytes)
-        .map_err(|e| anyhow::anyhow!("open ranged store for {}: {e}", output.display()))?;
+        .map_err(|e| anyhow::anyhow!("open ranged store for {}: {e}", entry_path.display()))?;
 
     let funder = CliFunder {
         contract: deps.contract,
@@ -1936,37 +2014,72 @@ where
     // concurrent siblings on the same deposit included — not just this one
     // lane, so a solo `decdn fetch` (`ledgers: None`) keeps `pool = None`
     // exactly as before (one lane IS the whole pool).
-    let topups_used = std::sync::atomic::AtomicU32::new(0);
-    let spent: Box<dyn Fn() -> U256 + Send + Sync>;
-    let credit: Box<dyn Fn(U256) -> anyhow::Result<()> + Send + Sync>;
-    let pool = match ledgers {
-        Some(reg) => {
-            spent = Box::new(move || reg.total_committed());
-            credit = Box::new(move |new_deposit| reg.credit_all(new_deposit));
-            Some(SharedPool {
-                spent: &*spent,
-                topups_used: &topups_used,
-                credit: &*credit,
-            })
-        }
-        None => None,
+    let (spent, credit): (Option<SpentFn<'a>>, Option<CreditFn<'a>>) = match ledgers {
+        Some(reg) => (
+            Some(Box::new(move || reg.total_committed())),
+            Some(Box::new(move |new_deposit| reg.credit_all(new_deposit))),
+        ),
+        None => (None, None),
     };
+
+    Ok(FetchPrelude {
+        total_bytes,
+        ranged_store,
+        peer_source,
+        pacer,
+        funder,
+        ctx,
+        ledger,
+        drive_config,
+        prior_amount,
+        node_id,
+        peer_store,
+        topups_used: std::sync::atomic::AtomicU32::new(0),
+        spent,
+        credit,
+    })
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn drive_fetch<P>(
+    deps: &DriveFetchDeps<'_, P>,
+    ctx: PoolContext,
+    target: EndpointAddr,
+    provider: Address,
+    pool_id: PoolId,
+    hash: [u8; 32],
+    output: &Path,
+    progress: Option<&ProgressCallback>,
+    finish_progress: impl FnOnce(),
+    ledgers: Option<&LaneLedgers>,
+) -> anyhow::Result<u64>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let lane = LaneKey {
+        pool_id,
+        signer: deps.self_address,
+        provider,
+    };
+    let prelude =
+        open_fetch_prelude(deps, ctx, target, provider, pool_id, hash, output, ledgers).await?;
+    let pool = prelude.pool();
 
     // The gap-driven fetch: `drive` pulls ONLY `missing_ranges(0, 0)` — the whole
     // blob on a fresh fetch, just the gap on a resume — into the ranged store,
     // which bao-verifies every byte on `ingest_stream` and promotes the `.partial`
     // to `output` on `finalize`.
     let drive_result = drive(
-        &ranged_store,
-        &peer_source,
-        &pacer,
-        &funder,
-        &ctx,
-        &ledger,
+        &prelude.ranged_store,
+        &prelude.peer_source,
+        &prelude.pacer,
+        &prelude.funder,
+        &prelude.ctx,
+        &prelude.ledger,
         hash,
         0,
         0,
-        &drive_config,
+        &prelude.drive_config,
         progress,
         None, // pacing_wait: BudgetPacer never returns PaceDecision::Wait
         None, // served_paid: no downstream leg on the client path
@@ -1975,10 +2088,12 @@ where
     .await;
     // The handshake succeeded (the sample above is real) but delivery itself
     // failed — still a failure of this source for selection purposes, so stamp
-    // it. This runs AFTER `record_sample` above, so a failing body transfer
-    // always wins the suppression: `record_failure` is the last write.
+    // it. This runs AFTER the handshake's `record_sample`, so a failing body
+    // transfer always wins the suppression: `record_failure` is the last write.
     if drive_result.is_err() {
-        let _ = peer_store.record_failure(&node_id, now_secs_cli());
+        let _ = prelude
+            .peer_store
+            .record_failure(&prelude.node_id, now_secs_cli());
     }
 
     // Finalize the progress bar (or run the caller's no-op, for `bundle pull`)
@@ -1991,9 +2106,9 @@ where
     // state.
     let vprogress = select_watermark(
         &drive_result,
-        ledger.committed(),
-        ledger.settlement(),
-        prior_amount,
+        prelude.ledger.committed(),
+        prelude.ledger.settlement(),
+        prelude.prior_amount,
     );
     persist_watermark(deps.store, deps.self_address, pool_id, lane, &vprogress);
 
@@ -2002,12 +2117,80 @@ where
     // re-pulled, and no held byte is re-paid). The store bao-verifies every
     // ingested byte and `finalize` runs a whole-blob `valid_ranges` sweep, so an
     // inherited prefix is verified structurally, not by a second full re-hash.
-    drive_result.map_err(|err| match ctx.lock() {
+    drive_result.map_err(|err| match prelude.ctx.lock() {
         Ok(guard) => annotate_unbound_cache_miss(err, &guard),
         Err(_) => err,
     })?;
 
-    Ok(total_bytes)
+    Ok(prelude.total_bytes)
+}
+
+/// Fetch the given byte ranges of blob `hash` into the entry's `.partial`
+/// beside `staging`, opening the pool + store once. Each range is bao-verified
+/// against `hash`; the `.partial` is left unfinalized (the caller assembles and
+/// promotes — `drive` only finalizes once the WHOLE blob is present, and
+/// `ranges` here is expected to be a proper subset donated ranges cover).
+/// Returns the store so the caller can `read` verified ranges.
+///
+/// Reuses the same prelude [`drive_fetch`] opens (handshake, ranged store,
+/// source/pacer/funder/ledger/ctx) rather than re-deriving it; unlike
+/// `drive_fetch`, this never persists a voucher watermark — the caller drives
+/// the lane across multiple `drive_ranges`/`drive_fetch` calls sharing one
+/// `ledgers` registry and persists once, at the end of that sequence.
+// Range-dedup hints (chunk manifest) wiring lands in a later change; until
+// then this has no caller — exercised by that follow-up's e2e, not a unit
+// test (a live source is awkward to unit-test here).
+#[expect(dead_code, reason = "wired by the range-dedup hints follow-up")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn drive_ranges<P>(
+    deps: &DriveFetchDeps<'_, P>,
+    ctx: PoolContext,
+    target: EndpointAddr,
+    provider: Address,
+    pool_id: PoolId,
+    hash: [u8; 32],
+    staging: &Path,
+    ranges: &[(u64, u64)],
+    ledgers: Option<&LaneLedgers>,
+    progress: Option<&ProgressCallback>,
+) -> anyhow::Result<ClientRangedStore>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let prelude =
+        open_fetch_prelude(deps, ctx, target, provider, pool_id, hash, staging, ledgers).await?;
+    let pool = prelude.pool();
+
+    for &(offset, len) in ranges {
+        let drive_result = drive(
+            &prelude.ranged_store,
+            &prelude.peer_source,
+            &prelude.pacer,
+            &prelude.funder,
+            &prelude.ctx,
+            &prelude.ledger,
+            hash,
+            offset,
+            len,
+            &prelude.drive_config,
+            progress,
+            None, // pacing_wait: BudgetPacer never returns PaceDecision::Wait
+            None, // served_paid: no downstream leg on the client path
+            pool.as_ref(),
+        )
+        .await;
+        if drive_result.is_err() {
+            let _ = prelude
+                .peer_store
+                .record_failure(&prelude.node_id, now_secs_cli());
+        }
+        drive_result.map_err(|err| match prelude.ctx.lock() {
+            Ok(guard) => annotate_unbound_cache_miss(err, &guard),
+            Err(_) => err,
+        })?;
+    }
+
+    Ok(prelude.ranged_store)
 }
 
 /// One built payment lane for a multi-source fetch: the per-provider

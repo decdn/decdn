@@ -1712,6 +1712,65 @@ fn staging_path(out_root: &Path, hash: [u8; 32]) -> anyhow::Result<PathBuf> {
     Ok(dir.join(name))
 }
 
+/// The `(offset, len)` runs of `[0, total)` NOT covered by `donor_aligned`.
+///
+/// `donor_aligned` holds chunk-group-aligned ranges already available from a
+/// donor (a sibling entry's already-pulled bytes) — possibly unsorted and
+/// possibly overlapping. This sorts and coalesces them first, then emits the
+/// gaps between (and around) the coalesced runs as the complement to drive:
+/// the bytes a donor does NOT cover, which still need a paid pull.
+///
+/// A donor range past `total`, or one that overlaps `total`, is clamped to
+/// `total` — `total` is the whole blob's authoritative length. `total == 0`
+/// always returns an empty complement (there is nothing to cover).
+// Range-dedup hints (chunk manifest) wiring lands in a later change; until
+// then this pure helper has no caller outside its own tests, so it is dead in
+// a non-test build but live in a test build — `#[expect]` would flip between
+// fulfilled and unfulfilled across those two targets, so this uses `#[allow]`.
+#[allow(dead_code, reason = "wired by the range-dedup hints follow-up")]
+pub(crate) fn complement_runs(donor_aligned: &[(u64, u64)], total: u64) -> Vec<(u64, u64)> {
+    if total == 0 {
+        return Vec::new();
+    }
+
+    // Clamp each donor range to `[0, total)` and drop empty/out-of-range ones,
+    // then sort by start so overlapping/adjacent runs coalesce in one pass.
+    let mut runs: Vec<(u64, u64)> = donor_aligned
+        .iter()
+        .filter_map(|&(offset, len)| {
+            let start = offset.min(total);
+            let end = offset.checked_add(len).unwrap_or(total).min(total);
+            (end > start).then_some((start, end))
+        })
+        .collect();
+    runs.sort_unstable_by_key(|&(start, _)| start);
+
+    let mut coalesced: Vec<(u64, u64)> = Vec::with_capacity(runs.len());
+    for (start, end) in runs {
+        match coalesced.last_mut() {
+            Some((_, last_end)) if start <= *last_end => {
+                *last_end = (*last_end).max(end);
+            }
+            _ => coalesced.push((start, end)),
+        }
+    }
+
+    // Walk the coalesced donor runs, emitting the gap before each one and,
+    // at the end, the gap after the last one up to `total`.
+    let mut gaps = Vec::with_capacity(coalesced.len() + 1);
+    let mut cursor = 0u64;
+    for (start, end) in coalesced {
+        if start > cursor {
+            gaps.push((cursor, start - cursor));
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < total {
+        gaps.push((cursor, total - cursor));
+    }
+    gaps
+}
+
 /// Best-effort cleanup of a finalized staging blob whose content is safely
 /// elsewhere (materialized to disk, or read into memory) and so has nothing left
 /// to resume. Removes the plain `<hex>` finalized blob itself and, best-effort,
@@ -2050,6 +2109,38 @@ mod tests {
         assert!(safe_join(Path::new("/out"), "./a").is_err());
         // Empty.
         assert!(safe_join(Path::new("/out"), "").is_err());
+    }
+
+    #[test]
+    fn complement_runs_gap_in_the_middle() {
+        let donor = [(16384u64, 16384u64)];
+        assert_eq!(
+            complement_runs(&donor, 49152),
+            vec![(0, 16384), (32768, 16384)]
+        );
+    }
+
+    #[test]
+    fn complement_runs_empty_donor_is_the_whole_blob() {
+        assert_eq!(complement_runs(&[], 49152), vec![(0, 49152)]);
+    }
+
+    #[test]
+    fn complement_runs_full_coverage_is_empty() {
+        assert_eq!(complement_runs(&[(0, 49152)], 49152), Vec::new());
+    }
+
+    #[test]
+    fn complement_runs_coalesces_unsorted_overlapping_donor() {
+        // Two abutting ranges covering [16384, 49152) in reverse, overlapping
+        // order — coalesces to one run, leaving only the leading gap.
+        let donor = [(32768u64, 16384u64), (16384u64, 16384u64)];
+        assert_eq!(complement_runs(&donor, 49152), vec![(0, 16384)]);
+    }
+
+    #[test]
+    fn complement_runs_total_zero_is_empty() {
+        assert_eq!(complement_runs(&[(0, 10)], 0), Vec::new());
     }
 
     #[test]
