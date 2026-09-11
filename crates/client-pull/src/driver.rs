@@ -80,9 +80,9 @@ use decdn_incentive::DepositOutcome;
 use crate::pacer::{PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{
-    Cumulative, HashMismatch, MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger,
-    ProgressCallback, UpstreamPullHeader, genuine_exhaustion, resumable_watermark,
-    resume_may_be_stale,
+    Cumulative, MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, ProgressCallback,
+    UpstreamPullHeader, genuine_exhaustion, reject_empty_claim_for_nonempty_root,
+    resumable_watermark, resume_may_be_stale,
 };
 
 /// The shared pool cannot fund the next voucher: its remaining deposit is below
@@ -393,17 +393,11 @@ where
     F: Funder,
 {
     let total_bytes = store.total_bytes();
-    // A 0-byte blob (#1054) has no chunk group for any decoder to anchor: a store
-    // sized from a `total_bytes == 0` claim has no gaps to fill and is complete
-    // as created, so nothing downstream ever verifies the empty stream against
-    // the root. Prove it here, before the empty store can be finalized: the
-    // only hash an empty blob can carry is the empty root, and a source that
-    // claims `0` for any other hash is a paid-but-wrong delivery — the same
-    // trivial-empty-range bypass every other verify site guards — so it surfaces
-    // as the typed [`HashMismatch`].
-    if total_bytes == 0 && hash != *blake3::hash(&[]).as_bytes() {
-        return Err(anyhow::Error::new(HashMismatch));
-    }
+    // A store sized from a `total_bytes == 0` claim has no gap to fill and is
+    // complete as created, so nothing downstream ever verifies the empty stream
+    // against the root. Prove it here, before the empty store can be finalized
+    // (see [`reject_empty_claim_for_nonempty_root`]).
+    reject_empty_claim_for_nonempty_root(total_bytes, hash)?;
 
     // Surface the already-present resume base on the progress bar immediately —
     // before the pre-fetch window (channel open, first chunk). `fill_gap`'s

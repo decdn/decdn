@@ -445,6 +445,29 @@ impl std::fmt::Display for HashMismatch {
 
 impl std::error::Error for HashMismatch {}
 
+/// Reject a `total_bytes == 0` claim for a non-empty root as the typed
+/// [`HashMismatch`] (#1054).
+///
+/// A 0-byte blob aligns to an empty range: the bao decoder has no chunk group to
+/// anchor and would accept the empty stream for ANY root, and a store sized from a
+/// `total_bytes == 0` claim has no gap to pull and is complete as created — so
+/// nothing downstream ever verifies the empty stream against the root. The only
+/// hash an empty blob can carry is the empty root; a source that claims `0` for any
+/// other hash is a paid-but-wrong delivery. This is the one explicit verify site
+/// the trivial-empty-range bypass has, shared by [`driver::drive`] (before the
+/// empty store is finalized) and the in-memory `fetch_in_memory_once` path so the
+/// two cannot drift. A `total_bytes > 0` claim is untouched: the streaming decoder
+/// verifies it group by group.
+pub(crate) fn reject_empty_claim_for_nonempty_root(
+    total_bytes: u64,
+    hash: [u8; 32],
+) -> anyhow::Result<()> {
+    if total_bytes == 0 && hash != *blake3::hash(&[]).as_bytes() {
+        return Err(anyhow::Error::new(HashMismatch));
+    }
+    Ok(())
+}
+
 /// Typed sentinel for a pull aborted because the bytes that ACTUALLY arrived
 /// crossed the buyer's `max_blob_size_bytes` ceiling (#1895). The peer's signed
 /// `total_bytes` claim never drives a refusal — it is peer-controlled and
@@ -1830,14 +1853,11 @@ async fn fetch_in_memory_once(
     )
     .await?;
     let total_bytes = header.total_bytes;
-    // A 0-byte blob (#1054) aligns to an empty range: the decoder has no chunk
-    // group to anchor and would accept the empty stream for ANY root. Prove the
-    // empty stream against the empty root explicitly; a non-empty requested hash
-    // is a paid-but-wrong delivery, so surface the typed `HashMismatch`.
+    // A 0-byte blob (#1054) aligns to an empty range the decoder cannot anchor, so
+    // the empty stream must be proven against the empty root explicitly rather than
+    // accepted for an arbitrary one (see [`reject_empty_claim_for_nonempty_root`]).
     if total_bytes == 0 {
-        if hash != *blake3::hash(&[]).as_bytes() {
-            return Err(anyhow::Error::new(HashMismatch));
-        }
+        reject_empty_claim_for_nonempty_root(total_bytes, hash)?;
         pull.finish().await?;
         return Ok(Bytes::new());
     }

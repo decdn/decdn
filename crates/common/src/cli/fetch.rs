@@ -423,20 +423,22 @@ impl ClientFetchArgs {
     /// `2 × stall_timeout_ms`, where the health signal is still dead — no error, no
     /// warning, just a bound that cannot do its job.
     ///
-    /// # This is the early check, not the enforcement
+    /// # Where the value goes
     ///
-    /// `PullDeadlines::capped` is what actually enforces `hard_cap > open + window`, on the
-    /// type that holds the values, and both CLI call sites go through it (#1145
-    /// review). This exists so the user gets the error at argument-parse time — naming the
-    /// flags they typed — rather than several frames into a fetch.
+    /// `--timeout-ms` bounds discovery ([`Self::discovery_cap`]); the delivery pull itself
+    /// carries NO overall wall-clock cap — a progressing pull is bounded only by the open
+    /// bound and the stall window, so it completes for any blob size as long as the upstream
+    /// keeps feeding it bytes (#1134). This check therefore guards the flag relationship at
+    /// argument-parse time — naming the flags the user typed rather than surfacing several
+    /// frames into a fetch — for the shape both CLI call sites build: the open bound is set
+    /// from `--stall-timeout-ms` as well, so `--timeout-ms` must outlast open + window
+    /// (`2 × --stall-timeout-ms`) for a hypothetical whole-exchange cap to leave the
+    /// throughput floor room to fire.
     ///
-    /// It restates the rule rather than calling it because `decdn-common` sits UPSTREAM of
-    /// `decdn-client-pull` in the dependency flow and cannot import `PullDeadlines`. The
-    /// `2 ×` is that rule specialised to these two call sites, which set the open bound from
-    /// `--stall-timeout-ms` as well. If a future `--open-timeout-ms` breaks that assumption,
-    /// this check goes stale — but it cannot go WRONG, because the constructor
-    /// downstream still refuses to build a `PullDeadlines` whose cap cannot outlast its
-    /// stages. That is why the invariant lives on the type.
+    /// It restates the rule rather than importing it because `decdn-common` sits UPSTREAM of
+    /// `decdn-client-pull` in the dependency flow and cannot name `PullDeadlines`. The `2 ×`
+    /// is that rule specialised to these two call sites. If a future `--open-timeout-ms`
+    /// breaks the "open == stall window" assumption, this check goes stale.
     ///
     /// # Errors
     ///
