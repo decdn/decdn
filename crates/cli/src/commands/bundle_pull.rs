@@ -2450,6 +2450,160 @@ mod tests {
         assert_eq!(plan.complement, vec![(0, total)]);
     }
 
+    /// `splice_donors` happy path: a donor file holds a verified chunk at some
+    /// offset (with padding on both sides), and the aligned subset lands at the
+    /// correct recipient offset in `.partial` — nothing else in `.partial` is
+    /// touched, and nothing is queued for refetch.
+    #[test]
+    fn splice_donors_copies_a_verified_subset_into_partial() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let donor_path = tmp.path().join("donor");
+        let partial = tmp.path().join("out.partial");
+
+        // The chunk occupies exactly one group, padded on both sides in the donor
+        // file so the source offset is not trivially zero.
+        let chunk_bytes: Vec<u8> = (0..GROUP)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let pad_before = 100usize;
+        let mut donor_data = vec![0xEEu8; pad_before];
+        donor_data.extend_from_slice(&chunk_bytes);
+        donor_data.extend_from_slice(&[0xEE; 50]);
+        std::fs::write(&donor_path, &donor_data).expect("write donor");
+
+        let chunk_hash = *blake3::hash(&chunk_bytes).as_bytes();
+        let total = 2 * GROUP;
+        // splice_donors only opens `partial` for write, so pre-size it (zeros)
+        // the way the ranged store would before splicing runs.
+        std::fs::File::create(&partial)
+            .and_then(|f| f.set_len(total))
+            .expect("presize partial");
+
+        let donor = DonorRange {
+            aligned: (GROUP, GROUP),
+            source: donor_path,
+            src_offset: u64::try_from(pad_before).expect("pad_before fits in u64"),
+            chunk_hash,
+            chunk_src_offset: u64::try_from(pad_before).expect("pad_before fits in u64"),
+            chunk_len: GROUP,
+        };
+
+        let refetch = splice_donors(&partial, std::slice::from_ref(&donor)).expect("splice");
+        assert!(refetch.is_empty(), "{refetch:?}");
+
+        let got = std::fs::read(&partial).expect("read partial");
+        let g = usize::try_from(GROUP).expect("GROUP fits in usize");
+        assert_eq!(&got[g..2 * g], &chunk_bytes[..], "spliced subset mismatch");
+        assert!(
+            got[..g].iter().all(|&b| b == 0),
+            "untouched region must stay zero"
+        );
+    }
+
+    /// A donor whose recorded chunk bytes no longer hash to the hint's chunk hash
+    /// (corruption, or a stale/overwritten donor file) is never trusted: its range
+    /// is pushed to the refetch list and no bytes are written into `.partial` for
+    /// it.
+    #[test]
+    fn splice_donors_refetches_a_corrupted_donor_chunk() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let donor_path = tmp.path().join("donor");
+        let partial = tmp.path().join("out.partial");
+
+        let chunk_bytes: Vec<u8> = (0..GROUP)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let chunk_hash = *blake3::hash(&chunk_bytes).as_bytes();
+
+        // Write a CORRUPTED copy of the chunk to the donor file (flip one byte),
+        // so the on-disk bytes no longer match `chunk_hash`.
+        let mut corrupted = chunk_bytes.clone();
+        let mid = corrupted.len() / 2;
+        corrupted[mid] ^= 0xFF;
+        std::fs::write(&donor_path, &corrupted).expect("write corrupted donor");
+
+        let total = 2 * GROUP;
+        std::fs::File::create(&partial)
+            .and_then(|f| f.set_len(total))
+            .expect("presize partial");
+
+        let donor = DonorRange {
+            aligned: (GROUP, GROUP),
+            source: donor_path,
+            src_offset: 0,
+            chunk_hash,
+            chunk_src_offset: 0,
+            chunk_len: GROUP,
+        };
+
+        let refetch = splice_donors(&partial, std::slice::from_ref(&donor)).expect("splice");
+        assert_eq!(refetch, vec![donor.aligned]);
+
+        // No (wrong) bytes were written for the untrusted donor: the recipient
+        // range stays at its pre-sized zero value.
+        let got = std::fs::read(&partial).expect("read partial");
+        let g = usize::try_from(GROUP).expect("GROUP fits in usize");
+        assert!(
+            got[g..2 * g].iter().all(|&b| b == 0),
+            "untrusted donor must not write into partial"
+        );
+    }
+
+    /// `chunk_verified` is a straightforward hash-match gate: true for bytes that
+    /// hash to `expected`, false for a mismatch — the boundary condition
+    /// `splice_donors` relies on to decide trust.
+    #[test]
+    fn chunk_verified_matches_true_and_false() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let p = tmp.path().join("f");
+        let data = vec![9u8; 2000];
+        std::fs::write(&p, &data).expect("write");
+        let hash = *blake3::hash(&data).as_bytes();
+
+        let mut f = std::fs::File::open(&p).expect("open");
+        assert!(chunk_verified(&mut f, 0, 2000, hash));
+
+        let mut f2 = std::fs::File::open(&p).expect("open");
+        assert!(!chunk_verified(&mut f2, 0, 2000, [0u8; 32]));
+    }
+
+    /// `copy_exact` copies precisely the requested length, no more, from the
+    /// source's current position to the destination's current position.
+    #[test]
+    fn copy_exact_copies_only_the_requested_length() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let src_path = tmp.path().join("src");
+        let out_path = tmp.path().join("out");
+        std::fs::write(&src_path, b"hello world").expect("write src");
+        std::fs::write(&out_path, []).expect("write out");
+
+        let mut src = std::fs::File::open(&src_path).expect("open src");
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&out_path)
+            .expect("open out");
+        copy_exact(&mut src, &mut out, 5).expect("copy_exact");
+        drop(out);
+
+        let got = std::fs::read(&out_path).expect("read out");
+        assert_eq!(&got[..], b"hello");
+    }
+
+    /// `hash_partial` streams the whole file and returns its BLAKE3 hash, matching
+    /// a direct in-memory hash of the same bytes.
+    #[test]
+    fn hash_partial_matches_direct_blake3_of_file_contents() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let p = tmp.path().join("f");
+        let data: Vec<u8> = (0..5000u32)
+            .map(|i| u8::try_from(i % 256).expect("i % 256 fits in u8"))
+            .collect();
+        std::fs::write(&p, &data).expect("write");
+
+        let got = hash_partial(&p).expect("hash_partial");
+        assert_eq!(got, *blake3::hash(&data).as_bytes());
+    }
+
     #[test]
     fn staging_path_is_the_plain_hex_final_blob_not_a_partial() {
         let tmp = tempfile::tempdir().expect("tmp");
