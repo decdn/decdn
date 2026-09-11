@@ -70,7 +70,7 @@ pub struct BundlePullArgs {
     /// chunked file alike — across the whole run. One many-chunk file can use the
     /// full budget by itself; a chunk shared between files is fetched once and does
     /// not consume an extra slot.
-    #[arg(long, value_name = "N", default_value_t = 16)]
+    #[arg(long, value_name = "N", default_value_t = 4)]
     pub jobs: usize,
 
     /// Only pull entries whose POSIX relative path matches one of these globs
