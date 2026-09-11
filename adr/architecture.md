@@ -42,7 +42,7 @@ graph TD
     N2 -.->|opaque fetch| S3
 ```
 
-Clients probe candidate nodes, pick the best by the unified selection score (see [ADR 001](001-network.md#node-selection-algorithm) for the full formula), stream over `cdn/client/v1`, and pay via off-chain payment vouchers (denominated in the payment token). On a cache miss, a node performs a DHT FIND_VALUE lookup (`cdn/dht/v1`), probes the returned candidates via `cdn/probe/v1`, selects the best, and pulls via `cdn/client/v1` (paid). When DHT returns no providers, the on-chain origin directory ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)) is the deterministic last-resort fallback. Every byte delivered — whether client→node or node→node — is paid.
+Clients probe candidate nodes from the on-chain registry (or their persisted peer store), pick the RTT-nearest ([ADR 037](037-regional-proxy-warming.md#client-selection-policy-latency-driven-proxy-preference)), stream over `cdn/client/v1`, and pay via off-chain payment vouchers (denominated in the payment token). On a cache miss, a node performs a DHT FIND_VALUE lookup (`cdn/dht/v1`), probes the returned candidates via `cdn/probe/v1`, selects the best, and pulls via `cdn/client/v1` (paid). When DHT returns no providers, the on-chain origin directory ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)) is the deterministic last-resort fallback. Every byte delivered — whether client→node or node→node — is paid.
 
 ## Reading Order
 
@@ -62,7 +62,7 @@ The implementation language, the peer mesh's shape, the content-addressing primi
 
 ### Chapter 2 — Discovery
 
-How a client or node finds the right peer for a given hash. The DHT is the primary mechanism; proxy warming bootstraps the first regional copy when discovery returns only distant holders.
+How a node finds the right peer for a given hash. The DHT is the primary mechanism; a client picks its node from the registry by measured RTT ([ADR 037](037-regional-proxy-warming.md#client-selection-policy-latency-driven-proxy-preference)); proxy warming bootstraps the first regional copy when discovery returns only distant holders.
 
 1. [ADR 022 — Content Discovery at Scale (DHT)](022-content-discovery.md#adr-022--content-discovery-at-scale)
 2. [ADR 037 — Latency-Driven Proxy Warming for Regional Locality](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)

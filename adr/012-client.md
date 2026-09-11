@@ -155,7 +155,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 #### Not trusted — the client does not rely on these
 
-- Any individual node's self-reported metadata (region) beyond what is signed and slashable. The region claim never enters selection: the client ranks by measured RTT, which a node cannot forge ([ADR 037 § Client selection policy](037-regional-proxy-warming.md#client-selection-policy-latency-driven-proxy-preference)).
+- Any individual node's self-reported metadata (region) beyond what is signed and slashable. The region claim only shortlists which registry candidates the client probes; it is never a rank key. The failover order is measured RTT, which a node cannot forge ([ADR 037 § Client selection policy](037-regional-proxy-warming.md#client-selection-policy-latency-driven-proxy-preference)).
 - Reputation reported by other peers. The client ranks nodes solely from its own measured RTT and failure history; it consumes no reputation score, its own or anyone else's.
 - Node availability promises beyond signed probe responses.
 

@@ -19,7 +19,7 @@ compatibility shims — there are no live peers to keep in step.
 ## How It Works
 
 - **Nodes** bond TOKEN proportional to declared bandwidth capacity, cache content, and serve BLAKE3-addressed blobs over QUIC
-- **Clients** probe candidate nodes, pick the best by the unified selection score `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` ([ADR 001](adr/001-network.md)), stream content, and pay via off-chain USDC vouchers
+- **Clients** probe candidate nodes from the on-chain registry, pick the RTT-nearest ([ADR 037](adr/037-regional-proxy-warming.md)), stream content, and pay via off-chain USDC vouchers
 - On a **cache miss**, nodes pull from peers (paid), cache locally, and stream to the client simultaneously
 - All byte transfers are paid — client-to-node and node-to-node
 

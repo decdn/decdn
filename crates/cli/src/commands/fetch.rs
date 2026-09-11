@@ -388,12 +388,14 @@ fn no_serve_target_error(
 /// Every response is verified before it can influence the order: value
 /// invariants, echoed-field correlation, and `slash_sig` recovery to the
 /// candidate's on-chain operator address (ADR 014 §1). Selection reads
-/// `has_blob`, RTT, and coverage off the response; `rate_per_mb` is harvested
-/// into `probed_samples` for the peer store only, never ranked on — the fetch
-/// pays the stream's own signed quote, gated by `--max-rate-per-mb`. All of it
-/// is only meaningful once the signature attributes it to the peer: an
-/// unverified quote is a claim no one is accountable for, so a node could seed
-/// the store with a rate it never committed to. A response that fails is
+/// `has_blob` and coverage off the response and pairs them with the measured
+/// RTT; `rate_per_mb` is harvested into `probed_samples` for the peer store
+/// only, never ranked on — the fetch pays the stream's own signed quote, gated
+/// by `--max-rate-per-mb`. `has_blob` and the harvested rate are only
+/// meaningful once the signature attributes them to the peer (coverage is
+/// unsigned; the consistency check below ties it to `has_blob`): an unverified
+/// quote is a claim no one is accountable for, so a node could seed the store
+/// with a rate it never committed to. A response that fails is
 /// dropped and its candidate skipped, exactly as for a timeout; it is
 /// requester-local policy and never scored against the peer, since a signature
 /// that does not recover attributes nothing to anyone.
