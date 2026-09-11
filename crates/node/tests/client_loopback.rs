@@ -9705,23 +9705,7 @@ const LYING_FRAME: usize = 64 * 1024;
 /// 038) — the header-stripped stream a `cdn/client/v1` server emits. Lets a
 /// hostile server serve the encoding of a DIFFERENT blob under the requested hash.
 fn honest_bao_wire(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let hash = Hash::new(payload);
-    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-    let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
-        payload,
-        decdn_cache::range_pull::IROH_BLOCK_SIZE,
-    );
-    let aligned = decdn_cache::range_pull::align_range(0, 0, total_bytes)?;
-    let combined = decdn_cache::range_pull::encode_verified_range(
-        *hash.as_bytes(),
-        &aligned,
-        payload,
-        bytes::Bytes::from(ob.data),
-    )?;
-    Ok(combined
-        .get(8..)
-        .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its header"))?
-        .to_vec())
+    support::honest_bao_wire_range(payload, 0, 0)
 }
 
 /// How a [`serve_lying_stream`] upstream misbehaves after signing a valid
@@ -10436,9 +10420,21 @@ enum StopThenSignal {
     Reject(VoucherRejectReason),
 }
 
-/// A raw `cdn/client/v1` upstream that signs a valid `StreamResponse`, then STOPS
-/// the buyer's send half *before* any covering voucher can be written, streams the
-/// whole blob, and finally sends a terminal signal.
+/// Where [`serve_stop_send_then_signal`] stops the buyer's send half.
+#[derive(Clone, Copy)]
+enum StopPoint {
+    /// Before any chunk data: the buyer's FIRST proof write fails. For a blob under
+    /// one chunk that is the closing voucher.
+    BeforeData,
+    /// After enough wire for one whole chunk has been served and the buyer's proofs
+    /// for it (the anchoring voucher and the reveal) have been read: only the
+    /// closing voucher for the residual fails, the reveals stand.
+    AfterFirstReveal,
+}
+
+/// A raw `cdn/client/v1` upstream that signs a valid `StreamResponse`, STOPS the
+/// buyer's send half at `stop` — *before* the closing voucher can be written —
+/// streams the requested range, and finally sends a terminal signal.
 ///
 /// The stop is issued causally before the chunk data the buyer must read to reach
 /// its closing-voucher write: on localhost, in-order delivery means the buyer's
@@ -10451,10 +10447,11 @@ async fn serve_stop_send_then_signal(
     conn: Connection,
     eth: &Arc<PrivateKeySigner>,
     slash: &Eip712Domain,
-    served_wire: &[u8],
-    total_bytes: u64,
+    payload: &[u8],
+    stop: StopPoint,
     signal: StopThenSignal,
 ) -> anyhow::Result<()> {
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let (mut send, mut recv) = conn
         .accept_bi()
         .await
@@ -10485,6 +10482,38 @@ async fn serve_stop_send_then_signal(
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
 
+    // Honour the requested range: a gap-driven re-open lands at the paid frontier,
+    // and the honest wire for `[byte_offset, byte_len)` is its own range encoding.
+    let served_wire = support::honest_bao_wire_range(payload, req.byte_offset, req.byte_len)?;
+    let mut frames = served_wire.chunks(LYING_FRAME);
+
+    // A re-opened range too short to earn a reveal meets the stop before any data.
+    let chunk_bytes = usize::try_from(CHUNK_BYTES)?;
+    if matches!(stop, StopPoint::AfterFirstReveal) && served_wire.len() >= chunk_bytes {
+        // Serve one whole chunk's worth of wire, then take the buyer's proofs for it
+        // off the stream — the anchoring voucher, then the reveal — so those stand
+        // and only the closing voucher below meets the stop.
+        let mut served = 0usize;
+        while served < chunk_bytes {
+            let chunk = frames
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("wire shorter than one chunk"))?;
+            served += chunk.len();
+            write_client_msg(
+                &mut send,
+                &ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?),
+            )
+            .await?;
+        }
+        loop {
+            match read_client_msg(&mut recv).await? {
+                ClientMessage::ChunkPreimage(_) => break,
+                ClientMessage::Voucher(_) => {}
+                other => anyhow::bail!("stop-send upstream: expected a proof, got {other:?}"),
+            }
+        }
+    }
+
     // Stop the buyer's send half NOW — before the chunk data below, so the
     // `STOP_SENDING(0)` is processed by the buyer before it can read the bytes it
     // needs to reach its closing-voucher write. `0` is the no-error code a node's
@@ -10492,7 +10521,7 @@ async fn serve_stop_send_then_signal(
     recv.stop(VarInt::from_u32(0))
         .map_err(|e| anyhow::anyhow!("stop recv: {e}"))?;
 
-    for chunk in served_wire.chunks(LYING_FRAME) {
+    for chunk in frames {
         write_client_msg(
             &mut send,
             &ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?),
@@ -10525,15 +10554,54 @@ fn spawn_stop_send_server(
     ep: Endpoint,
     eth: Arc<PrivateKeySigner>,
     slash: Eip712Domain,
-    served_wire: Vec<u8>,
-    total_bytes: u64,
+    payload: Vec<u8>,
     signal: StopThenSignal,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_stop_send_server_counting(
+        ep,
+        eth,
+        slash,
+        payload,
+        StopPoint::BeforeData,
+        signal,
+        1,
+        Arc::default(),
+    )
+}
+
+/// Spawn a [`serve_stop_send_then_signal`] server that accepts up to `max_conns`
+/// connections, counting each accept into `accepted`. A gap-driven buyer that does
+/// not take the stopped leg as paid re-opens the gap on a fresh connection; the cap
+/// turns such a re-leg loop into a fast open failure rather than a hang, and the
+/// count is what a test asserts on.
+#[allow(clippy::too_many_arguments)]
+fn spawn_stop_send_server_counting(
+    ep: Endpoint,
+    eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    payload: Vec<u8>,
+    stop: StopPoint,
+    signal: StopThenSignal,
+    max_conns: usize,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
     tokio::spawn(async move {
-        if let Ok(conn) = support::accept_one(&ep).await {
-            let _ =
-                serve_stop_send_then_signal(conn, &eth, &slash, &served_wire, total_bytes, signal)
-                    .await;
+        let payload = Arc::new(payload);
+        let mut serves = Vec::new();
+        for _ in 0..max_conns {
+            let Ok(conn) = support::accept_one(&ep).await else {
+                break;
+            };
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let (eth, slash, payload) = (Arc::clone(&eth), slash.clone(), Arc::clone(&payload));
+            serves.push(tokio::spawn(async move {
+                let _ =
+                    serve_stop_send_then_signal(conn, &eth, &slash, &payload, stop, signal).await;
+            }));
+        }
+        for serve in serves {
+            let _ = serve.await;
         }
     })
 }
@@ -10550,8 +10618,6 @@ async fn client_completes_when_its_send_is_stopped_before_the_closing_voucher() 
     // write the node's teardown races.
     let payload = vec![0x5Au8; 256 * 1024];
     let hash = Hash::new(&payload);
-    let wire = honest_bao_wire(&payload)?;
-    let total_bytes = payload.len() as u64;
 
     let server_sk = fresh_key();
     let server_id = server_sk.public();
@@ -10561,8 +10627,7 @@ async fn client_completes_when_its_send_is_stopped_before_the_closing_voucher() 
         server_ep.clone(),
         Arc::clone(&server_eth),
         slash_domain(),
-        wire,
-        total_bytes,
+        payload.clone(),
         StopThenSignal::End,
     );
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
@@ -10608,8 +10673,6 @@ async fn client_surfaces_typed_rejection_when_its_send_is_stopped_before_the_clo
 -> anyhow::Result<()> {
     let payload = vec![0x5Bu8; 256 * 1024];
     let hash = Hash::new(&payload);
-    let wire = honest_bao_wire(&payload)?;
-    let total_bytes = payload.len() as u64;
 
     let server_sk = fresh_key();
     let server_id = server_sk.public();
@@ -10619,8 +10682,7 @@ async fn client_surfaces_typed_rejection_when_its_send_is_stopped_before_the_clo
         server_ep.clone(),
         Arc::clone(&server_eth),
         slash_domain(),
-        wire,
-        total_bytes,
+        payload.clone(),
         StopThenSignal::Reject(VoucherRejectReason::SpendingCapExhausted),
     );
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
@@ -10651,5 +10713,210 @@ async fn client_surfaces_typed_rejection_when_its_send_is_stopped_before_the_clo
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// What one gap-driven `drive` against a stop-sending upstream left behind.
+struct StopSendDrive {
+    /// The `drive` outcome.
+    result: anyhow::Result<()>,
+    /// The lane the drive paid out of, read after `drive` returns.
+    ledger: Arc<PoolLedger>,
+    /// Connections the upstream accepted.
+    accepted: usize,
+    /// The bytes the ranged store promoted, if it finalized.
+    promoted: Option<Vec<u8>>,
+}
+
+/// Run the production gap-driven fetch — `drive` over a `PeerSource` into a
+/// `ClientRangedStore` — against a [`spawn_stop_send_server_counting`] upstream
+/// serving `payload`, wired as `decdn fetch` wires it. The upstream accepts up to
+/// three connections so a buyer that re-opens the gap fails fast instead of hanging.
+async fn drive_against_stop_send_server(
+    payload: Vec<u8>,
+    stop: StopPoint,
+    signal: StopThenSignal,
+) -> anyhow::Result<StopSendDrive> {
+    use decdn_node::client_requester::driver::{DriveConfig, drive};
+    use decdn_node::client_requester::{BudgetPacer, ClientRangedStore, FakeFunder, PeerSource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload.len())?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let server_task = spawn_stop_send_server_counting(
+        server_ep.clone(),
+        Arc::clone(&server_eth),
+        slash_domain(),
+        payload,
+        stop,
+        signal,
+        3,
+        Arc::clone(&accepted),
+    );
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(
+        &client_ep,
+        Arc::new(PrivateKeySigner::random()),
+        U256::from(10_000_000u64),
+    );
+    let ledger = Arc::new(ctx.new_ledger());
+    let ctx = Arc::new(std::sync::Mutex::new(ctx));
+    let store_dir = tempfile::tempdir()?;
+    let store = ClientRangedStore::create(store_dir.path(), "blob", *hash.as_bytes(), total_bytes)?;
+    let slash = slash_domain();
+    let source = PeerSource::new(
+        &client_ep,
+        target,
+        Arc::clone(&ctx),
+        Arc::clone(&ledger),
+        &slash,
+        server_eth.address(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        u64::MAX,
+        PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
+    );
+    let pacer = BudgetPacer::new();
+    let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);
+    let config = DriveConfig::cli(U256::ZERO);
+    let result = drive(
+        &store,
+        &source,
+        &pacer,
+        &funder,
+        &ctx,
+        &ledger,
+        *hash.as_bytes(),
+        0,
+        0,
+        &config,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    drop(source);
+    let promoted = std::fs::read(store_dir.path().join("blob")).ok();
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(StopSendDrive {
+        result,
+        ledger,
+        accepted: accepted.load(Ordering::SeqCst),
+        promoted,
+    })
+}
+
+/// A drive that completed on the one connection, with the closing voucher
+/// COMMITTED (not merely armed) and exactly one honest wire billed.
+fn ensure_one_leg_fully_paid(d: &StopSendDrive, payload: &[u8]) -> anyhow::Result<()> {
+    let wire = honest_bao_wire(payload)?;
+    anyhow::ensure!(
+        d.promoted.as_deref() == Some(payload),
+        "the drive must finalize the whole blob into the ranged store"
+    );
+    anyhow::ensure!(
+        d.accepted == 1,
+        "the fetch must complete on one connection, dialled {}",
+        d.accepted
+    );
+    let committed = d.ledger.committed();
+    anyhow::ensure!(
+        committed == d.ledger.settlement(),
+        "the closing voucher must be committed, not merely armed: committed {committed:?} vs \
+         settlement {:?}",
+        d.ledger.settlement()
+    );
+    anyhow::ensure!(
+        committed.bytes == U256::from(wire.len()),
+        "exactly the one honest wire is billed, got {} for a {}-byte wire",
+        committed.bytes,
+        wire.len()
+    );
+    Ok(())
+}
+
+/// The same closing-voucher peer-stop on the PRODUCTION gap-driven path, where
+/// completion is payment-based (`fill_gap` reads `ledger.committed()`), not
+/// decoder-based. A node writes `StreamEnd` only once every interval — the closing
+/// voucher included — is paid, so the `StreamEnd` the recovery reads proves the node
+/// holds the voucher whose write failed: the leg is paid through its end, the fetch
+/// finalizes on that ONE connection, and nothing is re-pulled or re-billed.
+#[tokio::test(flavor = "multi_thread")]
+async fn drive_completes_in_one_leg_when_its_send_is_stopped_before_the_closing_voucher()
+-> anyhow::Result<()> {
+    // Under one chunk, so the buyer owes exactly one closing voucher.
+    let payload = vec![0x5Au8; 256 * 1024];
+    let mut d =
+        drive_against_stop_send_server(payload.clone(), StopPoint::BeforeData, StopThenSignal::End)
+            .await?;
+    std::mem::replace(&mut d.result, Ok(()))?;
+    ensure_one_leg_fully_paid(&d, &payload)
+}
+
+/// The multi-chunk twin: the reveals for the whole chunks commit as they go, and
+/// the residual's closing voucher — the one write the peer-stop fails — folds them
+/// (rolling the chain). The recovery must confirm THAT voucher too, or the paid
+/// frontier stops short of the gap end and the tail is re-pulled and re-billed.
+#[tokio::test(flavor = "multi_thread")]
+async fn drive_completes_in_one_leg_after_reveals_when_its_send_is_stopped_before_the_closing_voucher()
+-> anyhow::Result<()> {
+    let payload = vec![0x5Bu8; 3 * usize::try_from(CHUNK_BYTES)? / 2];
+    let mut d = drive_against_stop_send_server(
+        payload.clone(),
+        StopPoint::AfterFirstReveal,
+        StopThenSignal::End,
+    )
+    .await?;
+    std::mem::replace(&mut d.result, Ok(()))?;
+    ensure_one_leg_fully_paid(&d, &payload)
+}
+
+/// The typed-rejection twin on the gap-driven path: a `VoucherRejected` read in
+/// place of the failed write surfaces as [`UpstreamVoucherRejected`] out of `drive`
+/// on the one connection — never rescued into a completion, never re-legged (no
+/// bundle to reseed from, and the deposit covers the next voucher so the refusal is
+/// not a genuine exhaustion) — and confirms nothing on the ledger.
+#[tokio::test(flavor = "multi_thread")]
+async fn drive_surfaces_typed_rejection_when_its_send_is_stopped_before_the_closing_voucher()
+-> anyhow::Result<()> {
+    let payload = vec![0x5Au8; 256 * 1024];
+    let d = drive_against_stop_send_server(
+        payload,
+        StopPoint::BeforeData,
+        StopThenSignal::Reject(VoucherRejectReason::SpendingCapExhausted),
+    )
+    .await?;
+    let err = d
+        .result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a rejected drive must fail"))?;
+    anyhow::ensure!(
+        err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
+        "the drive must surface the typed UpstreamVoucherRejected, got: {err:#}"
+    );
+    anyhow::ensure!(
+        d.accepted == 1,
+        "a rejection must not re-leg, dialled {}",
+        d.accepted
+    );
+    anyhow::ensure!(
+        d.promoted.is_none(),
+        "a rejected drive must not promote the blob"
+    );
+    anyhow::ensure!(
+        d.ledger.committed() == Cumulative::default(),
+        "a rejection confirms nothing: committed {:?}",
+        d.ledger.committed()
+    );
     Ok(())
 }

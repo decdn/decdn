@@ -2653,9 +2653,11 @@ impl UpstreamPull {
                         // prefer the terminal signal it left to the opaque write failure.
                         // Boxed so this cold error-path future does not enlarge the steady
                         // receive loop's future (`clippy::large_futures`); the allocation
-                        // only happens on the failure path.
+                        // only happens on the failure path. A clean end confirms the
+                        // voucher, so nothing stays unproved.
                         Err(write_err) => {
                             Box::pin(self.terminal_after_write_failure(write_err)).await?;
+                            self.unproved = 0;
                         }
                     }
                     Ok(Some(Bytes::from(chunk.into_bytes())))
@@ -2688,9 +2690,13 @@ impl UpstreamPull {
     /// swallow a typed rejection the reactive top-up path keys on). Read the terminal
     /// signal, briefly, and prefer it: a `StreamEnd` marks the stream ended (the
     /// chunk that triggered the write is still delivered; the next read returns
-    /// `None`), a `StreamError` surfaces as the typed rejection. A write we caused
-    /// ourselves (a [`LocalPullFault`] encode fault) is never masked; nor is a stream
-    /// that yields no terminal signal before the bound.
+    /// `None`) and confirms the armed voucher — a node ends a stream only once every
+    /// interval is paid, so the voucher whose write failed reached it, and
+    /// payment-based completion ([`driver::drive`]) must see this leg paid through
+    /// its end rather than re-pull and re-bill the tail; a `StreamError` surfaces as
+    /// the typed rejection. A write we caused ourselves (a [`LocalPullFault`] encode
+    /// fault) is never masked; nor is a stream that yields no terminal signal before
+    /// the bound.
     async fn terminal_after_write_failure(
         &mut self,
         write_err: anyhow::Error,
@@ -2704,6 +2710,12 @@ impl UpstreamPull {
         // rides along so the log can tell a silent peer from a chatty one.
         match tokio::time::timeout(TERMINAL_AFTER_WRITE_TIMEOUT, self.read_under_floor()).await {
             Ok(Ok(ClientMessage::StreamEnd)) => {
+                if let Some(confirmed) = self.ledger.confirm_armed().await {
+                    self.meter.last_proof = Some(StreamProof::Voucher {
+                        amount: confirmed.amount,
+                    });
+                    self.meter.anchored_root = self.ledger.chain_root();
+                }
                 self.ended = true;
                 Ok(())
             }
