@@ -271,6 +271,185 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Self-heal regression (bundle-chunk-hints range-dedup, final review Finding
+/// #1). A *lying recipient hint* names a real donor chunk (a chunk the donor
+/// genuinely holds, so the donor splice VERIFIES) at an offset where the
+/// recipient's actual bytes differ, so the reassembled whole-file BLAKE3
+/// mismatches. `pull_entry` must then re-drive the whole blob, let `drive`
+/// finalize+promote it, and SUCCEED — the recovered file byte- and BLAKE3-exact.
+///
+/// This exercises the previously-uncovered self-heal path. Before the
+/// finalize-aware guard, the whole-file re-drive completed the blob (so `drive`
+/// renamed `<hex>.partial` -> `<hex>`), and the very next line called
+/// `hash_partial` on the now-absent `.partial` — an `Err(open: No such file)`
+/// that failed the entry spuriously. With the guard the pull succeeds; without
+/// it, `bundle pull` exits non-zero and `run_bundle_pull_until_ready` never
+/// succeeds (the test times out).
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_bundle_pull_self_heals_a_lying_recipient_hint() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_self_heal()))
+        .await
+        .context("cli bundle pull self-heal e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey mirroring the dedup test's shape"
+)]
+async fn run_self_heal() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    ensure_decdn_cli_built()?;
+    let chain = ChainFixture::launch().await?;
+
+    // `donor` is a real chunk file A genuinely holds. File B's REAL first
+    // `SHARED_BYTES` (`prefix_b`) are DIFFERENT bytes, but B's manifest LIES that
+    // its first chunk is `donor`'s hash. So the donor splice verifies (A really
+    // has `donor`) yet placing `donor` at B's head makes B's whole-file BLAKE3
+    // mismatch — the exact trigger for the whole-file re-drive self-heal.
+    let donor = deterministic_bytes(SHARED_BYTES, 0x5EED_D010);
+    let tail_a = deterministic_bytes(TAIL_BYTES, 0x5EED_D0A1);
+    let prefix_b = deterministic_bytes(SHARED_BYTES, 0x5EED_D0B0);
+    let tail_b = deterministic_bytes(TAIL_BYTES, 0x5EED_D0B2);
+
+    let mut file_a = donor.clone();
+    file_a.extend_from_slice(&tail_a);
+    // B's real content — its head is `prefix_b`, NOT `donor`.
+    let mut file_b = prefix_b.clone();
+    file_b.extend_from_slice(&tail_b);
+
+    let hash_donor = Hash::new(&donor);
+    let hash_tail_a = Hash::new(&tail_a);
+    // B's chunk[1] hash — B's real tail, a hash no entry registers, so it
+    // contributes no donor (only the lying chunk[0] does).
+    let hash_tail_b = Hash::new(&tail_b);
+    let whole_a = Hash::new(&file_a);
+    let whole_b = Hash::new(&file_b);
+
+    // The node holds each file as ONE whole-file blob (the `--optimize` model);
+    // it serves B's REAL bytes when the self-heal re-drive asks for the whole blob.
+    let (node, hashes) =
+        NodeFixture::launch_with_blobs(&chain, "US", &[file_a.as_slice(), file_b.as_slice()])
+            .await?;
+    anyhow::ensure!(
+        hashes == vec![whole_a, whole_b],
+        "seeded blob hashes mismatch: {hashes:?}"
+    );
+    let provider_addr = node.operator_addr();
+
+    let client_dir = tempfile::tempdir().context("client tempdir")?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        client_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .context("chmod client dir 0o700")?;
+    eth_identity::generate_and_persist(client_dir.path(), KEYSTORE_PASSWORD, false)
+        .context("generate buyer keystore")?;
+    let keystore = eth_identity::keystore_path(client_dir.path());
+    let buyer = eth_identity::load_signer(&keystore, KEYSTORE_PASSWORD).context("load buyer")?;
+    let buyer_addr = buyer.address();
+    chain.fund_eth(buyer_addr, 100).await?;
+    chain
+        .mint_usdc(
+            buyer_addr,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(6u64),
+        )
+        .await
+        .context("mint buyer USDC")?;
+
+    // `--jobs 1` forces `a.bin` to finalize (and register `hash_donor`) before
+    // `b.bin` starts, so `b` is the recipient whose lying hint splices `donor`.
+    let manifest_path = client_dir.path().join("self_heal.json");
+    let manifest = format!(
+        r#"{{"version":1,"entries":[{{"path":"a.bin","hash":"b3:{whole_a}","size":{size_a},"chunks":[{{"hash":"b3:{donor}","size":{shared_sz}}},{{"hash":"b3:{tail_a}","size":{tail_sz}}}]}},{{"path":"b.bin","hash":"b3:{whole_b}","size":{size_b},"chunks":[{{"hash":"b3:{donor}","size":{shared_sz}}},{{"hash":"b3:{tail_b}","size":{tail_sz}}}]}}]}}"#,
+        whole_a = whole_a.to_hex(),
+        whole_b = whole_b.to_hex(),
+        donor = hash_donor.to_hex(),
+        tail_a = hash_tail_a.to_hex(),
+        tail_b = hash_tail_b.to_hex(),
+        size_a = file_a.len(),
+        size_b = file_b.len(),
+        shared_sz = SHARED_BYTES,
+        tail_sz = TAIL_BYTES,
+    );
+    std::fs::write(&manifest_path, manifest).context("write self-heal manifest")?;
+
+    // Warm-up into a throwaway dir, via the retrying runner, ONLY to open the
+    // on-chain pool and let the node's serve path resolve it — the same serve
+    // race every sibling bundle-pull e2e absorbs. This is not the assertion: the
+    // retrying runner would MASK the self-heal bug (a spurious first-attempt
+    // failure leaves the blob finalized at staging, so the retry recovers). The
+    // measured run below is the SINGLE-shot pull that must not fail at all.
+    let warm_out = client_dir.path().join("warm");
+    let warm_args = bundle_pull_argv(
+        &chain,
+        &node,
+        &manifest_path,
+        &warm_out,
+        client_dir.path(),
+        &keystore,
+        1,
+    );
+    run_bundle_pull_until_ready(client_dir.path(), &warm_args).await?;
+
+    // The measured run: a fresh output dir (so `a.bin` is re-pulled and
+    // re-registers `hash_donor`, arming `b.bin`'s self-heal) and EXACTLY ONE
+    // `bundle pull` invocation. The pool is already open, so the only way this
+    // exits non-zero is the self-heal bug — a `.partial` `drive` already renamed
+    // to `staging` after the whole-file re-drive. Without the finalize-aware
+    // guard the entry fails here; the retry loop is deliberately not used.
+    let out_dir = client_dir.path().join("out");
+    let out_args = bundle_pull_argv(
+        &chain,
+        &node,
+        &manifest_path,
+        &out_dir,
+        client_dir.path(),
+        &keystore,
+        1,
+    );
+    let output =
+        tokio::process::Command::from(decdn_command(client_dir.path(), KEYSTORE_PASSWORD)?)
+            .arg("bundle")
+            .arg("pull")
+            .args(&out_args)
+            .output()
+            .await
+            .context("spawn single-shot self-heal bundle pull")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "self-heal bundle pull must succeed in one attempt; without the finalize-aware guard the \
+         re-driven entry fails spuriously. stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Both outputs byte-exact and whole-file BLAKE3-exact — self-heal is sound.
+    let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin")?;
+    let got_b = std::fs::read(out_dir.join("b.bin")).context("read b.bin")?;
+    anyhow::ensure!(got_a == file_a, "a.bin mismatch: {} bytes", got_a.len());
+    anyhow::ensure!(got_b == file_b, "b.bin mismatch: {} bytes", got_b.len());
+    anyhow::ensure!(Hash::new(&got_a) == whole_a, "a.bin BLAKE3 mismatch");
+    anyhow::ensure!(Hash::new(&got_b) == whole_b, "b.bin BLAKE3 mismatch");
+
+    // Sanity: `b.bin` was actually re-driven whole by the self-heal, so the lane
+    // billed at least A's whole file plus B's whole file across the run.
+    let paid = billed_bytes(client_dir.path(), provider_addr)?;
+    let wire_min = whole_blob_wire_bytes(file_a.len() as u64)
+        .checked_add(whole_blob_wire_bytes(file_b.len() as u64))
+        .context("wire-min overflow")?;
+    anyhow::ensure!(
+        paid >= wire_min,
+        "self-heal must pay for both whole files (at least {wire_min}), billed {paid}"
+    );
+
+    drop(node);
+    Ok(())
+}
+
 /// Deterministic pseudo-random bytes (xorshift32), seeded distinctly per
 /// caller so every blob in this journey is content-distinct except where the
 /// test explicitly shares bytes (the `shared` run reused verbatim in both

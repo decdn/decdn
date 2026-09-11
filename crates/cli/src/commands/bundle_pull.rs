@@ -340,12 +340,14 @@ enum EntryOutcome {
 }
 
 /// One-line `--json` summary. `fetched`/`linked`/`skipped`/`failed` are entry
-/// counts; `downloaded` is the distinct content bytes fetched (each shared chunk
-/// or duplicated blob counted once) and `reconstructed` is the total bytes
-/// written to disk this run — they diverge exactly when dedup saved a transfer.
-/// `downloaded` is a content-size tally, not an exact on-wire measurement: it
-/// excludes bao proof overhead and still counts a chunk served from an existing
-/// staging file on a resumed run.
+/// counts; `downloaded` is the whole-file content bytes of each distinct blob
+/// fetched (a blob shared across several paths counts once, #1306) and
+/// `reconstructed` is the total bytes written to disk this run — they diverge
+/// when one blob is materialized to several paths. `downloaded` is a content-size
+/// tally, not an exact on-wire measurement: it excludes bao proof overhead, counts
+/// a chunk served from an existing staging file on a resumed run, and counts a
+/// blob's whole size even when range-dedup paid for only its complement — so it
+/// equals `reconstructed` per single-path blob and does not report chunk savings.
 #[derive(Serialize)]
 struct PullReport {
     output: String,
@@ -357,12 +359,15 @@ struct PullReport {
     reconstructed: u64,
 }
 
-/// A pull's byte accounting: `downloaded` is the distinct content bytes fetched
-/// (a chunk or blob shared across entries counts once); `reconstructed` is the
-/// total bytes written to disk (every materialized copy). The two are equal
-/// unless dedup — shared chunks, or a blob at several paths — let one fetch serve
-/// several files. `downloaded` sums content lengths, not exact on-wire bytes: it
-/// omits bao proof overhead and still counts a chunk resumed from staging.
+/// A pull's byte accounting: `downloaded` is the whole-file content bytes of each
+/// distinct blob fetched (a blob materialized to several paths counts once, #1306);
+/// `reconstructed` is the total bytes written to disk (every materialized copy).
+/// The two are equal unless one blob serves several paths. `downloaded` sums whole
+/// content lengths, not exact on-wire bytes: it omits bao proof overhead, still
+/// counts a chunk resumed from staging, and counts a blob's whole size even when
+/// range-dedup paid for only its complement — it tracks distinct blobs fetched, not
+/// the bytes range-dedup saved, so it does not fall below `reconstructed` on a
+/// single-path blob whose chunks were spliced from a sibling.
 #[derive(Clone, Copy, Default)]
 struct Transfer {
     downloaded: u64,
@@ -1183,6 +1188,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // A donor entry's finalized staging blob is the source a recipient splices
         // from, so it is kept past its own group's cleanup. With the run over,
         // every registered donor source is safe to remove.
+        //
+        // Disk cost: `materialize` copies rather than hard-links, so every
+        // hint-carrying entry keeps its finalized staging blob here until this
+        // sweep, on top of the materialized output. Peak disk for an optimized
+        // bundle is therefore about output + staging (~2× the bundle size) — parity
+        // with the prior chunked path. A follow-up can hard-link the first
+        // materialize so the staging blob shares storage with its output.
         for source in index.sources() {
             remove_staging(&source);
         }
@@ -1299,6 +1311,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         if !refetch.is_empty() {
             self.drive_ranges_failover(hash, staging, &refetch, progress)
                 .await?;
+            // If every donor was untrusted, `refetch` is the whole donor set, so the
+            // driven complement plus this re-fetch cover the whole blob: `drive` then
+            // ran its whole-blob bao sweep against `hash` and renamed `.partial` ->
+            // `staging`. The blob is finalized and verified — do not hash/promote a
+            // `.partial` that no longer exists; register the donor chunks and return.
+            if staging.try_exists()? {
+                index.register(hints, staging);
+                return Ok(());
+            }
         }
 
         // The authoritative check: the whole reassembled blob must hash to `hash`.
@@ -1318,6 +1339,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             );
             self.drive_ranges_failover(hash, staging, &[(0, total)], progress)
                 .await?;
+            // The whole-blob re-drive covers `[0, total)`, so `drive` finalized it:
+            // its bao sweep verified the bytes against `hash` and renamed `.partial`
+            // -> `staging`. The blob is verified — do not re-hash a `.partial` that no
+            // longer exists; register the donor chunks and return.
+            if staging.try_exists()? {
+                index.register(hints, staging);
+                return Ok(());
+            }
             let partial_for_hash = partial.clone();
             let got = tokio::task::spawn_blocking(move || hash_partial(&partial_for_hash))
                 .await
