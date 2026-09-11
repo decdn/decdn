@@ -2129,18 +2129,16 @@ where
 /// beside `staging`, opening the pool + store once. Each range is bao-verified
 /// against `hash`; the `.partial` is left unfinalized (the caller assembles and
 /// promotes — `drive` only finalizes once the WHOLE blob is present, and
-/// `ranges` here is expected to be a proper subset donated ranges cover).
+/// `ranges` here is expected to be a proper subset the donated ranges cover).
 /// Returns the store so the caller can `read` verified ranges.
 ///
 /// Reuses the same prelude [`drive_fetch`] opens (handshake, ranged store,
-/// source/pacer/funder/ledger/ctx) rather than re-deriving it; unlike
-/// `drive_fetch`, this never persists a voucher watermark — the caller drives
-/// the lane across multiple `drive_ranges`/`drive_fetch` calls sharing one
-/// `ledgers` registry and persists once, at the end of that sequence.
-// Range-dedup hints (chunk manifest) wiring lands in a later change; until
-// then this has no caller — exercised by that follow-up's e2e, not a unit
-// test (a live source is awkward to unit-test here).
-#[expect(dead_code, reason = "wired by the range-dedup hints follow-up")]
+/// source/pacer/funder/ledger/ctx) rather than re-deriving it. Like
+/// `drive_fetch`, it persists the lane's voucher watermark once, after its
+/// ranges are driven: on success at the committed cumulative, and on an
+/// ambiguous failure HIGH (`settlement`), so a failed or resumed chunked pull
+/// never re-pays a byte already bought. The `.partial` and its sidecars are left
+/// in place on error — the resume prefix a retry inherits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_ranges<P>(
     deps: &DriveFetchDeps<'_, P>,
@@ -2157,12 +2155,21 @@ pub(crate) async fn drive_ranges<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
+    let lane = LaneKey {
+        pool_id,
+        signer: deps.self_address,
+        provider,
+    };
     let prelude =
         open_fetch_prelude(deps, ctx, target, provider, pool_id, hash, staging, ledgers).await?;
     let pool = prelude.pool();
 
+    // Drive every range, stopping at the first failure but recording it rather
+    // than returning immediately — the watermark below must be persisted whether
+    // the sequence succeeded or failed, exactly as `drive_fetch` does.
+    let mut drive_result: anyhow::Result<()> = Ok(());
     for &(offset, len) in ranges {
-        let drive_result = drive(
+        let one = drive(
             &prelude.ranged_store,
             &prelude.peer_source,
             &prelude.pacer,
@@ -2179,17 +2186,31 @@ where
             pool.as_ref(),
         )
         .await;
-        if drive_result.is_err() {
+        if let Err(err) = one {
             let _ = prelude
                 .peer_store
                 .record_failure(&prelude.node_id, now_secs_cli());
+            drive_result = Err(match prelude.ctx.lock() {
+                Ok(guard) => annotate_unbound_cache_miss(err, &guard),
+                Err(_) => err,
+            });
+            break;
         }
-        drive_result.map_err(|err| match prelude.ctx.lock() {
-            Ok(guard) => annotate_unbound_cache_miss(err, &guard),
-            Err(_) => err,
-        })?;
     }
 
+    // Persist the voucher watermark from the shared ledger, the same money-safe
+    // rule `drive_fetch` applies: the committed cumulative on success or an
+    // explicit voucher rejection, the armed settlement (HIGH) on any other
+    // failure so a reuse never re-signs a spent lane state.
+    let vprogress = select_watermark(
+        &drive_result,
+        prelude.ledger.committed(),
+        prelude.ledger.settlement(),
+        prelude.prior_amount,
+    );
+    persist_watermark(deps.store, deps.self_address, pool_id, lane, &vprogress);
+
+    drive_result?;
     Ok(prelude.ranged_store)
 }
 

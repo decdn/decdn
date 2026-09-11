@@ -27,7 +27,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
@@ -49,21 +49,16 @@ use super::chain_ctx;
 use super::fetch;
 use super::manifest::build_glob_set;
 use super::pull_progress::{self, PullProgress};
+use decdn_bao_range::CHUNK_GROUP_BYTES;
 use decdn_client_pull::discovery::{self, NodeCandidate};
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::provider;
 use decdn_client_pull::{
-    LaneLedgers, PoolExhausted, ProgressCallback, PullDeadlines, RetryDisposition,
-    retry_disposition,
+    ClientRangedStore, LaneLedgers, PoolContext, PoolExhausted, ProgressCallback, PullDeadlines,
+    RetryDisposition, retry_disposition,
 };
 
 type FetchTarget = (PublicKey, Address);
-
-/// A shared, fetch-once cell for one chunk blob's result — its content size, or a
-/// formatted fetch error. Resolved by the first chunked file to need the chunk and
-/// reused by any other file that shares it, so a shared chunk is fetched and paid
-/// for exactly once. A cached `Err` fails every dependent file without a re-fetch.
-type ChunkCell = Arc<tokio::sync::OnceCell<Result<u64, String>>>;
 
 /// Group manifest entries by their blob `hash`, preserving first-seen order both
 /// across groups and within each group. Entries that name the same blob (one
@@ -220,48 +215,49 @@ struct ManifestEntry {
     hash: String,
     #[serde(default)]
     size: Option<u64>,
-    /// Optional ordered chunk decomposition (a dedup helper, per
-    /// `appendix-bundles.md`). When present the file is fetched as the in-order
-    /// concatenation of these chunk blobs and validated against the whole-file
-    /// `hash`; when absent the file is fetched as one blob by `hash`.
+    /// Optional ordered chunk decomposition (a range-dedup hint, per
+    /// `appendix-bundles.md`). The whole file is always fetched and verified by
+    /// the authoritative whole-file `hash`; when this list is present its chunk
+    /// `(hash, size)` pairs let a fetch splice byte ranges already materialized
+    /// on disk by a sibling entry that shares a chunk, and pay only for the
+    /// complement. When absent the file is fetched as one blob by `hash`.
     #[serde(default)]
     chunks: Option<Vec<ManifestChunk>>,
 }
 
-/// One chunk of a chunked [`ManifestEntry`]: an independently BLAKE3-addressed
-/// blob. Only `hash` is read — the file is fetched chunk-by-chunk and validated
-/// by the whole-file BLAKE3, so a chunk's informational `size` in the JSON is
-/// accepted and ignored (serde drops the unknown field).
+/// One chunk of a hint-carrying [`ManifestEntry`]: an independently
+/// BLAKE3-addressed run of the file's bytes. Both fields are read — `hash`
+/// identifies the chunk in the in-run [`ChunkIndex`], and `size` places it at a
+/// byte offset (the running sum of prior chunk sizes) and bounds the range a
+/// sibling may splice.
 #[derive(Debug, Deserialize)]
 struct ManifestChunk {
+    /// The chunk's BLAKE3 content address (`b3:`hex).
     hash: String,
+    /// The chunk's length in bytes; the chunk sizes sum to the entry's
+    /// whole-file `size`.
+    size: u64,
 }
 
 /// The run's whole-download content size — the fixed denominator for the total
-/// progress bar. Whole-file blobs are deduped by hash (a blob fetched once and
-/// materialized to several paths counts once, matching the fetch-once grouping);
-/// chunked files count once each. A blob whose manifest `size` is absent
-/// contributes nothing, exactly as it then moves the total bar not at all, so the
-/// numerator and denominator stay consistent. `None` when nothing kept declares a
-/// size — the total bar is then omitted and only per-file bars render.
+/// progress bar. Every entry declares its whole-file `size` and is deduped by
+/// `hash` (a blob fetched once and materialized to several paths counts once,
+/// matching the fetch-once grouping), whether or not it carries range-dedup
+/// chunk hints. A blob whose manifest `size` is absent contributes nothing,
+/// exactly as it then moves the total bar not at all, so the numerator and
+/// denominator stay consistent. `None` when nothing kept declares a size — the
+/// total bar is then omitted and only per-file bars render.
 fn total_content_bytes(entries: &[ManifestEntry]) -> Option<u64> {
-    // Whole-file entries keyed by hash, OR-ing in a declared size wherever one of
+    // Entries keyed by whole-file hash, OR-ing in a declared size wherever one of
     // the same-hash entries carries it (the file bar picks its size the same way).
-    let mut plain: HashMap<&str, Option<u64>> = HashMap::new();
+    let mut by_hash: HashMap<&str, Option<u64>> = HashMap::new();
+    for entry in entries {
+        let slot = by_hash.entry(entry.hash.as_str()).or_insert(None);
+        *slot = slot.or(entry.size);
+    }
     let mut sum: u64 = 0;
     let mut any_sized = false;
-    for entry in entries {
-        if entry.chunks.is_some() {
-            if let Some(s) = entry.size {
-                sum = sum.saturating_add(s);
-                any_sized = true;
-            }
-        } else {
-            let slot = plain.entry(entry.hash.as_str()).or_insert(None);
-            *slot = slot.or(entry.size);
-        }
-    }
-    for size in plain.values().flatten() {
+    for size in by_hash.values().flatten() {
         sum = sum.saturating_add(*size);
         any_sized = true;
     }
@@ -905,27 +901,22 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         Err(last_err.unwrap_or_else(|| anyhow!("no candidate node could deliver the entry")))
     }
 
-    /// Fetch directly from `node_id`/`provider`, bypassing discovery, streaming
-    /// into `staging`.
-    async fn fetch_to_staging_from(
+    /// Build one entry's ready-to-drive [`PoolContext`] and dial target for
+    /// `provider`, shared by the whole-blob ([`Self::fetch_to_staging_from`]) and
+    /// ranged ([`Self::drive_ranges_from`]) drive paths.
+    ///
+    /// Delegated (`--capability`): every entry adopts the named pool + owner
+    /// capability (no on-chain open). Self-owned: open-or-reuse the caller's pool
+    /// under the global open lock (every entry shares the one on-chain pool this
+    /// bundle pulls from), then attach the ADR 005 client binding — without it the
+    /// request carries no verified buyer identity, so the node's `pull_authorized`
+    /// gate never fires a cache-miss origin pull and `--namespace` would be inert.
+    /// The binding is signed outside `open_lock` (it touches no on-chain state).
+    async fn build_pull_ctx(
         &self,
-        hash: [u8; 32],
         (node_id, provider): FetchTarget,
         dial_addrs: &[std::net::SocketAddr],
-        staging: &Path,
-        progress: Option<&ProgressCallback>,
-    ) -> anyhow::Result<()> {
-        // Owned and local to one entry's fetch: `drive_fetch` takes `ctx` by
-        // value (it wraps it in `Arc<Mutex>` so its source and driver can share a
-        // mid-fetch top-up's new deposit), so this binding just supplies it once
-        // and moves it in below.
-        // Delegated: adopt the pool + capability from the token (the whole
-        // binding+capability context is built by the shared helper). Self-owned:
-        // open-or-reuse the caller's pool under the global open lock, then attach
-        // the ADR 005 client binding. Both yield a ready-to-drive context.
-        // Delegated (`--capability`): every entry adopts the named pool + owner
-        // capability (no open). Self-owned: open-or-reuse the caller's pool under
-        // the global open lock, then attach the ADR 005 client binding.
+    ) -> anyhow::Result<(PoolContext, EndpointAddr)> {
         let ctx = if let Some(grant) = &self.grant {
             fetch::build_delegated_pool_ctx(
                 self.store,
@@ -958,12 +949,6 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 )
                 .await?
             };
-            // Attach the ADR 005 client binding, exactly as
-            // `fetch::build_pool_ctx` does on its open path. Without it the
-            // request carries no verified buyer identity, so the node's
-            // `pull_authorized` gate never fires a cache-miss origin pull and
-            // `--namespace` would be inert here. Signed outside `open_lock` — it
-            // touches no on-chain state.
             fetch::attach_client_binding(ctx, self.chain, self.endpoint, self.signer)?
         };
 
@@ -984,6 +969,21 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         for sock in dial_addrs {
             target = target.with_ip_addr(*sock);
         }
+        Ok((ctx, target))
+    }
+
+    /// Fetch directly from `node_id`/`provider`, bypassing discovery, streaming
+    /// into `staging`.
+    async fn fetch_to_staging_from(
+        &self,
+        hash: [u8; 32],
+        fetch_target: FetchTarget,
+        dial_addrs: &[std::net::SocketAddr],
+        staging: &Path,
+        progress: Option<&ProgressCallback>,
+    ) -> anyhow::Result<()> {
+        let provider = fetch_target.1;
+        let (ctx, target) = self.build_pull_ctx(fetch_target, dial_addrs).await?;
 
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
@@ -997,7 +997,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // in place — the resume prefix a retried entry `open_or_create`s from. The
         // per-file `progress` callback advances this entry's bar (and folds its
         // bytes into the run's total bar); the bar's lifecycle is owned by the
-        // caller (`fetch_group` / `pull_chunked`), so the finish hook here is a
+        // caller (`fetch_group` / `pull_entry`), so the finish hook here is a
         // no-op — a mid-fetch fail-over must not clear the bar.
         let result = fetch::drive_fetch(
             &deps,
@@ -1020,6 +1020,113 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             (Err(err), true) => Err(fetch::annotate_delegated_exhaustion(err)),
             (Err(err), false) => Err(err),
         }
+    }
+
+    /// Drive the given byte `ranges` of `hash` directly from `node_id`/`provider`
+    /// into `staging`'s `.partial`, returning the ranged store. The ranged twin of
+    /// [`Self::fetch_to_staging_from`]: builds the same context and target, then calls
+    /// [`fetch::drive_ranges`] (which bao-verifies each range against `hash`,
+    /// leaves the `.partial` unfinalized for the caller's splice-and-promote, and
+    /// persists the lane's voucher watermark so a resume never re-pays).
+    async fn drive_ranges_from(
+        &self,
+        hash: [u8; 32],
+        fetch_target: FetchTarget,
+        dial_addrs: &[std::net::SocketAddr],
+        staging: &Path,
+        ranges: &[(u64, u64)],
+        progress: Option<&ProgressCallback>,
+    ) -> anyhow::Result<ClientRangedStore> {
+        let provider = fetch_target.1;
+        let (ctx, target) = self.build_pull_ctx(fetch_target, dial_addrs).await?;
+
+        let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
+        let deps = self.drive_deps(max_blob_bytes)?;
+        let pool_id = ctx.pool_id;
+
+        let result = fetch::drive_ranges(
+            &deps,
+            ctx,
+            target,
+            provider,
+            pool_id,
+            hash,
+            staging,
+            ranges,
+            Some(&self.ledgers),
+            progress,
+        )
+        .await;
+        match (result, self.grant.is_some()) {
+            (Ok(store), _) => Ok(store),
+            (Err(err), true) => Err(fetch::annotate_delegated_exhaustion(err)),
+            (Err(err), false) => Err(err),
+        }
+    }
+
+    /// Drive `ranges` of `hash` into `staging`'s `.partial`, selecting a provider
+    /// the same way [`Self::fetch_to_staging`] does — the pinned `--node-id`, or the
+    /// probed discovery order walked with single-source failover (a retryable
+    /// failure advances to the next candidate). The caller already holds a
+    /// [`gate`](PullCtx::gate) permit, so this does not take one itself.
+    ///
+    /// Unlike [`Self::fetch_to_staging`] there is no multi-source fan-out here: the
+    /// range-dedup path is an optimization over one source, and every driven range
+    /// is still bao-verified against `hash`, so a single lane stays sound.
+    async fn drive_ranges_failover(
+        &self,
+        hash: [u8; 32],
+        staging: &Path,
+        ranges: &[(u64, u64)],
+        progress: Option<&ProgressCallback>,
+    ) -> anyhow::Result<ClientRangedStore> {
+        if let Some(pinned) = self.explicit {
+            return self
+                .drive_ranges_from(hash, pinned, &[], staging, ranges, progress)
+                .await;
+        }
+        let candidates = self
+            .candidates
+            .as_deref()
+            .ok_or_else(|| anyhow!("no discovery candidates available"))?;
+        let order = fetch::probe_and_order(
+            self.endpoint,
+            candidates,
+            self.relays.first(),
+            hash,
+            fetch::ProxyWarmingParams::from_args(self.common),
+            self.slash_dom,
+        )
+        .await?
+        .candidates;
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for (attempt, cand) in order.iter().enumerate() {
+            let target = (cand.node_id, cand.eth_address);
+            let dial_addrs = cand.dial_addrs();
+            let err = match self
+                .drive_ranges_from(hash, target, &dial_addrs, staging, ranges, progress)
+                .await
+            {
+                Ok(store) => return Ok(store),
+                Err(err) => err,
+            };
+            let more = attempt + 1 < order.len();
+            if retry_disposition(&err) == RetryDisposition::Terminal
+                || err.downcast_ref::<PoolExhausted>().is_some()
+                || !more
+            {
+                return Err(err);
+            }
+            tracing::warn!(
+                "bundle pull: provider {} could not deliver an entry's ranges ({err:#}); failing \
+                 over to the next of {} candidate(s)",
+                cand.eth_address,
+                order.len(),
+            );
+            last_err = Some(err);
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no candidate node could deliver the entry ranges")))
     }
 
     /// Fetch one blob fully into memory — used only for the bundle manifest
@@ -1051,58 +1158,51 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// in-flight network I/O, while the shared `LaneLedgers` inside
     /// `fetch_to_staging_from` keep same-lane voucher issuance monotonic,
     /// scoped to each unique blob.
+    ///
+    /// A run-wide [`ChunkIndex`] threads through every group: an entry that
+    /// carries chunk hints and completes registers its chunks, and a later entry
+    /// that shares a chunk splices those already-materialized byte ranges from
+    /// disk instead of paying to fetch them (range-dedup). A donor's finalized
+    /// staging blob is therefore kept until the whole run finishes, then swept.
     async fn pull_all(
         &self,
         entries: &[ManifestEntry],
         out_root: &Path,
         overwrite: bool,
     ) -> (Vec<EntryOutcome>, Transfer) {
-        // Whole-file entries take the by-hash grouping path (fetch-once +
-        // link-duplicates, #1306); chunked entries take the concatenation path
-        // (fetch each distinct chunk blob once, then assemble). The two sets are
-        // disjoint by construction — an entry either has a `chunks` list or does
-        // not — so they run independently and their outcomes concatenate.
-        let plain: Vec<&ManifestEntry> = entries.iter().filter(|e| e.chunks.is_none()).collect();
-        let chunked: Vec<&ManifestEntry> = entries.iter().filter(|e| e.chunks.is_some()).collect();
+        // Every entry declares an authoritative whole-file `hash`, so the by-hash
+        // grouping path (fetch-once + link-duplicates, #1306) covers plain and
+        // hint-carrying entries alike — the chunk hints only change HOW a group's
+        // one blob is assembled, never that it is one paid unit per distinct hash.
+        let index = ChunkIndex::default();
+        let refs: Vec<&ManifestEntry> = entries.iter().collect();
+        let (outcomes, transfer) = self.pull_plain(&refs, out_root, overwrite, &index).await;
 
-        // A blob can appear both as a whole-file entry `hash` and as a chunk of
-        // another entry (a chunk also published standalone). The two phases share
-        // one content-addressed staging dir, so the fix for "fetch/pay once" is to
-        // stop the plain phase from deleting a staging blob the chunked phase still
-        // needs: the chunked phase then resumes from the finalized blob and pays
-        // nothing, and its own cleanup removes it. Parse errors drop out — an
-        // unparseable chunk hash is never fetched and can't equal a valid plain one.
-        let chunk_keep: HashSet<[u8; 32]> = chunked
-            .iter()
-            .filter_map(|e| parse_chunk_hashes(e).ok())
-            .flatten()
-            .collect();
-
-        let (mut outcomes, plain_bytes) = self
-            .pull_plain(&plain, out_root, overwrite, &chunk_keep)
-            .await;
-        let (chunked_outcomes, chunked_bytes) =
-            self.pull_chunked(&chunked, out_root, overwrite).await;
-        outcomes.extend(chunked_outcomes);
-        (outcomes, plain_bytes.add(chunked_bytes))
+        // A donor entry's finalized staging blob is the source a recipient splices
+        // from, so it is kept past its own group's cleanup. With the run over,
+        // every registered donor source is safe to remove.
+        for source in index.sources() {
+            remove_staging(&source);
+        }
+        (outcomes, transfer)
     }
 
-    /// The whole-file path: fetch every distinct blob once (grouped by hash) and
-    /// materialize it at each destination path (#1306). A group whose hash is in
-    /// `keep` (also a chunk of some chunked entry) leaves its staging blob in place
-    /// for the chunked phase to reuse. Live per-group bars are bounded at
-    /// `--jobs`; `PullCtx.gate` is the real cap on in-flight fetches.
+    /// Fetch every distinct blob once (grouped by hash) and materialize it at each
+    /// destination path (#1306), routing each group through [`Self::pull_entry`] so a
+    /// blob whose chunk hints overlap an already-materialized sibling pays only for
+    /// the complement. Live per-group bars are bounded at `--jobs`; `PullCtx.gate`
+    /// is the real cap on in-flight fetches.
     async fn pull_plain(
         &self,
         entries: &[&ManifestEntry],
         out_root: &Path,
         overwrite: bool,
-        keep: &HashSet<[u8; 32]>,
+        index: &ChunkIndex,
     ) -> (Vec<EntryOutcome>, Transfer) {
         let groups_by_hash = group_by_hash(entries);
         let group_count = groups_by_hash.len().max(1);
         let groups: Vec<Vec<EntryOutcome>> = futures_util::stream::iter(groups_by_hash)
-            .map(|group| self.fetch_group(group, out_root, overwrite, keep))
+            .map(|group| self.fetch_group(group, out_root, overwrite, index))
             // Live-bar fan-out bounded by --jobs; the global gate is the real in-flight-fetch cap.
             .buffer_unordered(self.jobs.min(group_count))
             .collect::<Vec<Vec<EntryOutcome>>>()
@@ -1117,235 +1217,128 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         (outcomes, transfer)
     }
 
-    /// The concatenation path for chunked entries, one unit of work per *file*.
-    /// Live per-file bars are bounded at `--jobs`; `PullCtx.gate` (acquired
-    /// inside `fetch_to_staging`) is the real cap on in-flight fetches:
+    /// Reconstruct one entry's blob into `staging` (the finalized per-hash staging
+    /// file [`Self::fetch_group`] then materializes to each destination), using chunk
+    /// hints to dedup byte ranges against the run's [`ChunkIndex`] when they help.
     ///
-    /// 1. **Fetch** each of a file's chunks — the first file to need a distinct
-    ///    chunk fetches and **pays for it once** through the shared `claims`
-    ///    ledger; a concurrent file that shares the chunk awaits that one result
-    ///    and reuses the staged blob (never re-paying). Chunk blobs land in the
-    ///    same content-addressed staging dir the whole-file path uses.
-    /// 2. **Assemble** the file by concatenating its chunk staging files in order
-    ///    and verifying the whole-file BLAKE3 ([`assemble_chunks`]), as soon as
-    ///    its own chunks are ready.
+    /// - No hints (or `total` unknown, or the blob is already finalized at
+    ///   `staging`), or no chunk overlaps a materialized sibling → the plain
+    ///   whole-file [`Self::fetch_to_staging`] path.
+    /// - Otherwise the dedup path: pay to [`Self::drive_ranges_failover`] only the
+    ///   *complement* (the group-aligned bytes no donor covers) into `staging`'s
+    ///   `.partial`, then splice each donor range from its sibling's on-disk blob.
+    ///   Each donor chunk is confirmed present at the recorded source offset by
+    ///   re-hashing the whole chunk against its hint hash before its bytes are
+    ///   trusted; a chunk that fails (a lying donor hint, a short read) is added to
+    ///   a re-fetch list and driven normally. The reassembled `.partial` is then
+    ///   verified whole against the authoritative `hash`; on a match it is promoted
+    ///   to `staging`, and on a mismatch (a lying *recipient* hint mis-placed a
+    ///   chunk) the whole blob is re-driven and re-verified before the entry fails.
     ///
-    /// A chunk's staging blob is removed only when every entry that referenced it
-    /// succeeded; otherwise it is kept as the resume prefix for a rerun (the same
-    /// rule the whole-file path applies per group).
-    async fn pull_chunked(
-        &self,
-        entries: &[&ManifestEntry],
-        out_root: &Path,
-        overwrite: bool,
-    ) -> (Vec<EntryOutcome>, Transfer) {
-        if entries.is_empty() {
-            return (Vec::new(), Transfer::default());
-        }
-
-        // Resolve each entry to a plan before any fetch: a parse/path failure or
-        // an already-present destination decides an outcome with no network cost.
-        let plans: Vec<ChunkedPlan<'_>> = entries
-            .iter()
-            .map(|e| plan_chunked(e, out_root, overwrite))
-            .collect();
-
-        // The union of every assembled entry's chunks, for the final cleanup sweep.
-        let mut all_chunks: HashSet<[u8; 32]> = HashSet::new();
-        for plan in &plans {
-            if let ChunkedPlan::Assemble { chunks, .. } = plan {
-                all_chunks.extend(chunks.iter().copied());
-            }
-        }
-
-        // The shared fetch-once ledger: the first file to need a chunk fetches (and
-        // pays for) it and publishes the result into that chunk's cell; concurrent
-        // files sharing it await the same cell and reuse the staged blob. A cell
-        // caches its `Result` whether the fetch succeeded or failed, so a failed
-        // shared chunk fails every dependent file without a re-fetch.
-        let claims: tokio::sync::Mutex<HashMap<[u8; 32], ChunkCell>> =
-            tokio::sync::Mutex::new(HashMap::new());
-
-        // One future per FILE, offered up to --jobs at a time (bounding live
-        // per-file bars); `PullCtx.gate` is the real cap on in-flight fetches.
-        // Results carry their plan index so the outcome vector is restored to
-        // manifest order after the unordered run.
-        let plan_count = plans.len().max(1);
-        let mut indexed: Vec<(usize, EntryOutcome)> =
-            futures_util::stream::iter(plans.iter().enumerate())
-                .map(|(idx, plan)| {
-                    let claims = &claims;
-                    async move {
-                        let outcome = self.pull_chunked_file(plan, out_root, claims).await;
-                        (idx, outcome)
-                    }
-                })
-                // Live-bar fan-out bounded by --jobs; the global gate is the real in-flight-fetch cap.
-                .buffer_unordered(self.jobs.min(plan_count))
-                .collect::<Vec<_>>()
-                .await;
-        indexed.sort_by_key(|(idx, _)| *idx);
-        let outcomes: Vec<EntryOutcome> = indexed.into_iter().map(|(_, o)| o).collect();
-
-        // Read the resolved chunk results back out of the ledger for the tally and
-        // the cleanup sweep. Every fetched chunk's cell is set by now (its file
-        // future completed before the collect above returned).
-        let fetched: HashMap<[u8; 32], Result<u64, String>> = {
-            let guard = claims.lock().await;
-            guard
-                .iter()
-                .filter_map(|(h, cell)| cell.get().map(|r| (*h, r.clone())))
-                .collect()
-        };
-
-        // Cleanup: a chunk blob is safe to remove only if every entry that
-        // referenced it produced a non-failed outcome. Otherwise keep it as the
-        // resume prefix (its dependent entry, or its own fetch, failed).
-        let mut chunk_failed: HashSet<[u8; 32]> = HashSet::new();
-        for (plan, outcome) in plans.iter().zip(outcomes.iter()) {
-            if let ChunkedPlan::Assemble { chunks, .. } = plan
-                && matches!(outcome, EntryOutcome::Failed { .. })
-            {
-                chunk_failed.extend(chunks.iter().copied());
-            }
-        }
-        for hash in &all_chunks {
-            if !chunk_failed.contains(hash)
-                && let Ok(staging) = staging_path(out_root, *hash)
-            {
-                remove_staging(&staging);
-            }
-        }
-
-        // `downloaded` is the distinct chunk content bytes fetched (each shared
-        // chunk once); `reconstructed` is the assembled file bytes written to
-        // disk (a shared chunk counted in every file it composes).
-        let downloaded = fetched
-            .values()
-            .filter_map(|r| r.as_ref().ok().copied())
-            .fold(0u64, u64::saturating_add);
-        let reconstructed = outcomes
-            .iter()
-            .filter_map(|o| match o {
-                EntryOutcome::Fetched(n) => Some(*n),
-                _ => None,
-            })
-            .fold(0u64, u64::saturating_add);
-
-        (
-            outcomes,
-            Transfer {
-                downloaded,
-                reconstructed,
-            },
-        )
-    }
-
-    /// Fetch (or reuse) every chunk of one chunked entry, then assemble it. Each
-    /// distinct chunk is fetched and paid for once through the shared `claims`
-    /// ledger; a chunk another file already fetched is reused from staging. The
-    /// per-file bar sums the file's chunks — advancing in real time for chunks this
-    /// file fetches, and jumping by a whole chunk for ones it reuses.
-    async fn pull_chunked_file(
-        &self,
-        plan: &ChunkedPlan<'_>,
-        out_root: &Path,
-        claims: &tokio::sync::Mutex<HashMap<[u8; 32], ChunkCell>>,
-    ) -> EntryOutcome {
-        let (label, chunks, size) = match plan {
-            ChunkedPlan::Failed(o) => return o.clone(),
-            // Already present — no fetch, no bar. Credit its content to the total,
-            // which no fetch callback will otherwise reach.
-            ChunkedPlan::Skip(size) => {
-                self.progress.credit_skipped(*size);
-                return EntryOutcome::Skipped;
-            }
-            // The single destination path labels the file's bar; its whole-file
-            // size presets the bar denominator.
-            ChunkedPlan::Assemble {
-                label,
-                chunks,
-                size,
-                ..
-            } => ((*label).to_string(), chunks, *size),
-        };
-        let cf = self.progress.chunked_file(label, size);
-
-        // Resolve every chunk (fetch-once or reuse), collecting the per-chunk
-        // results this file needs for assembly. All of the file's chunks are
-        // offered at once — `PullCtx.gate` (acquired inside `fetch_to_staging`)
-        // is the true cap on in-flight fetches, so this stream just needs to be
-        // generous enough not to itself become a bottleneck.
-        let results: Vec<([u8; 32], Result<u64, String>)> =
-            futures_util::stream::iter(chunks.iter().copied())
-                .map(|chunk_hash| {
-                    let cf = &cf;
-                    async move {
-                        let cell = {
-                            let mut guard = claims.lock().await;
-                            Arc::clone(
-                                guard
-                                    .entry(chunk_hash)
-                                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
-                            )
-                        };
-                        // A private flag the fetch closure flips — only the file
-                        // that actually runs the fetch sets it, so a reusing file
-                        // knows to jump its bar.
-                        let i_fetched = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        let ran = Arc::clone(&i_fetched);
-                        let cb = cf.chunk_callback();
-                        let result = cell
-                            .get_or_init(|| async move {
-                                ran.store(true, std::sync::atomic::Ordering::Relaxed);
-                                self.fetch_chunk_staged(chunk_hash, out_root, cb.as_deref())
-                                    .await
-                            })
-                            .await
-                            .clone();
-                        if !i_fetched.load(std::sync::atomic::Ordering::Relaxed)
-                            && let Ok(size) = &result
-                        {
-                            // Reused a chunk another file fetched: its callback
-                            // never fired here, so advance this file's bar by the
-                            // whole chunk at once.
-                            cf.advance_reused(*size);
-                        }
-                        (chunk_hash, result)
-                    }
-                })
-                // Chunk futures are offered up to `--jobs` at a time rather than
-                // all at once: the global gate is the real in-flight-fetch cap, so
-                // a file with very many chunks never buffers one future per chunk.
-                .buffer_unordered(self.jobs.min(chunks.len().max(1)))
-                .collect()
-                .await;
-        let file_fetched: HashMap<[u8; 32], Result<u64, String>> = results.into_iter().collect();
-
-        let outcome = assemble_plan(plan, out_root, &file_fetched);
-        cf.finish();
-        outcome
-    }
-
-    /// Fetch one chunk blob into its content-addressed staging file and return its
-    /// content size, or a formatted error. Mirrors the whole-file staging fetch,
-    /// so a chunk gets the same reactive top-up and resume; `progress` drives the
-    /// owning file's bar.
-    async fn fetch_chunk_staged(
+    /// On success the entry's chunks are registered into `index` so later entries
+    /// can splice from this blob.
+    async fn pull_entry(
         &self,
         hash: [u8; 32],
-        out_root: &Path,
+        hints: Option<&[Hint]>,
+        total: Option<u64>,
+        staging: &Path,
+        index: &ChunkIndex,
         progress: Option<&ProgressCallback>,
-    ) -> Result<u64, String> {
-        match staging_path(out_root, hash) {
-            Ok(staging) => match self.fetch_to_staging(hash, &staging, progress).await {
-                Ok(()) => std::fs::metadata(&staging)
-                    .map(|m| m.len())
-                    .map_err(|e| format!("stat staged chunk: {e}")),
-                Err(e) => Err(format!("{e:#}")),
-            },
-            Err(e) => Err(format!("{e:#}")),
+    ) -> anyhow::Result<()> {
+        // Plan the dedup only when there is something to dedup against: hints, a
+        // known total, and a not-yet-finalized blob. A blob already promoted at
+        // `staging` (a resumed run) needs neither path — `fetch_to_staging` sees
+        // the complete ranged store and no-ops.
+        let plan = match (hints, total) {
+            (Some(hints), Some(total))
+                if !hints.is_empty() && !staging.try_exists().unwrap_or(false) =>
+            {
+                let guard = index.map.lock().unwrap_or_else(PoisonError::into_inner);
+                let plan = plan_dedup(hints, &guard, total);
+                drop(guard);
+                (!plan.donor.is_empty()).then_some((plan, total))
+            }
+            _ => None,
+        };
+
+        let Some((plan, total)) = plan else {
+            // No donor overlap — pay for the whole file, then register its chunks
+            // so a *later* entry can dedup against it.
+            self.fetch_to_staging(hash, staging, progress).await?;
+            index.register(hints, staging);
+            return Ok(());
+        };
+
+        // Dedup path. Hold one fetch permit across the complement drive, the donor
+        // splice, and any re-fetch — one logical fetch unit, exactly as
+        // `fetch_to_staging` scopes its permit.
+        let _permit = self
+            .gate
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("bundle pull concurrency gate closed"))?;
+
+        // Pay only for the bytes no donor covers.
+        self.drive_ranges_failover(hash, staging, &plan.complement, progress)
+            .await?;
+
+        let partial = partial_path(staging);
+
+        // Verify + splice each donor range off the executor. A donor whose chunk
+        // no longer hashes to its hint (a lying donor hint, or a short read) is
+        // re-fetched normally rather than trusted.
+        let donors = plan.donor.clone();
+        let partial_for_splice = partial.clone();
+        let refetch: Vec<(u64, u64)> =
+            tokio::task::spawn_blocking(move || splice_donors(&partial_for_splice, &donors))
+                .await
+                .map_err(|e| anyhow!("donor splice task: {e}"))??;
+        if !refetch.is_empty() {
+            self.drive_ranges_failover(hash, staging, &refetch, progress)
+                .await?;
         }
+
+        // The authoritative check: the whole reassembled blob must hash to `hash`.
+        let partial_for_hash = partial.clone();
+        let got = tokio::task::spawn_blocking(move || hash_partial(&partial_for_hash))
+            .await
+            .map_err(|e| anyhow!("whole-file hash task: {e}"))??;
+        if got != hash {
+            // A lying recipient hint placed a chunk at the wrong offset. Drop the
+            // spliced ranges by re-driving the whole blob (the ranged store fetches
+            // exactly the bytes the splice wrote, bao-verified against `hash`) and
+            // re-verify.
+            tracing::warn!(
+                "bundle pull: entry {} failed its whole-file hash after range-dedup; \
+                 re-fetching the whole blob",
+                blake3::Hash::from_bytes(hash).to_hex()
+            );
+            self.drive_ranges_failover(hash, staging, &[(0, total)], progress)
+                .await?;
+            let partial_for_hash = partial.clone();
+            let got = tokio::task::spawn_blocking(move || hash_partial(&partial_for_hash))
+                .await
+                .map_err(|e| anyhow!("whole-file hash task: {e}"))??;
+            if got != hash {
+                bail!(
+                    "reconstructed blob {} does not match its whole-file hash after a full re-fetch",
+                    blake3::Hash::from_bytes(hash).to_hex()
+                );
+            }
+        }
+
+        // Promote the verified `.partial` to the plain staging file and clean up
+        // the ranged-store sidecars, then register this blob's chunks as donors.
+        let partial_for_promote = partial.clone();
+        let staging_for_promote = staging.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            promote_partial(&partial_for_promote, &staging_for_promote)
+        })
+        .await
+        .map_err(|e| anyhow!("promote task: {e}"))??;
+        index.register(hints, staging);
+        Ok(())
     }
 
     /// Fetch the blob shared by one hash-group and write it under `out_root` at
@@ -1359,7 +1352,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         group: HashGroup<'_>,
         out_root: &Path,
         overwrite: bool,
-        keep: &HashSet<[u8; 32]>,
+        index: &ChunkIndex,
     ) -> Vec<EntryOutcome> {
         // The group's shared hash is carried explicitly; parse it once, and a bad
         // hash fails every path in the group.
@@ -1373,6 +1366,17 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                     .collect();
             }
         };
+
+        // Every entry in the group shares this blob (same whole-file hash), so its
+        // chunk decomposition is identical; take the first entry's hints. `None`
+        // (no `chunks`, an unparseable chunk hash, or chunk sizes that do not sum
+        // to the whole-file size) drops back to a plain whole-file fetch.
+        let hints = group.entries.first().and_then(|e| hints_of(e));
+        let total = group.entries.iter().find_map(|e| e.size);
+        // An entry that registers chunks can serve as a donor, so its finalized
+        // staging blob must outlive this group's cleanup — the run-end sweep in
+        // `pull_all` removes it once every recipient has had its chance.
+        let is_donor = hints.as_ref().is_some_and(|h| !h.is_empty());
 
         let slots = plan_slots(&group.entries, out_root, overwrite);
 
@@ -1415,14 +1419,21 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .progress
             .file_bar(pull_progress::file_label(&paths), size_estimate);
         let fetched = self
-            .fetch_to_staging(hash, &staging, file_bar.callback())
+            .pull_entry(
+                hash,
+                hints.as_deref(),
+                total,
+                &staging,
+                index,
+                file_bar.callback(),
+            )
             .await;
         file_bar.finish();
         if let Err(e) = fetched {
-            // `drive_fetch` leaves its `<hex>.partial` + `.obao4`/`.ranges`
-            // sidecars in place on error — they are what the next run resumes from
-            // rather than re-paying for bytes already landed (same contract as
-            // `fetch`'s `<output>.partial` store).
+            // `pull_entry` (whole-file or dedup) leaves the `<hex>.partial` +
+            // `.obao4`/`.ranges` sidecars in place on error — they are what the
+            // next run resumes from rather than re-paying for bytes already landed
+            // (same contract as `fetch`'s `<output>.partial` store).
             return fail_all(slots, &e);
         }
 
@@ -1438,20 +1449,20 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // Remove the paid staging blob (and its sidecars) ONLY when every
         // destination landed. If any materialize failed (unwritable dir, ENOSPC, a
         // link failure), keep it: the blob is fully fetched and paid for, and
-        // `drive_fetch` already finalized `<hex>` — a rerun sees the finalized
+        // `pull_entry` already finalized `<hex>` — a rerun sees the finalized
         // staging file and re-pulls only the still-missing ranges (typically
         // none), never the whole blob. Deleting staging here would force a full
         // re-fetch — and re-payment — of an unrefunded blob in *every* case;
         // `fetch`'s single-blob path gets this free from its own ranged store, so
         // the copy-based fan-out must gate it.
         //
-        // A hash in `keep` is also a chunk of some chunked entry: leave it for the
-        // chunked phase to reuse (paid once), which then removes it in its own
-        // cleanup once every entry that needs it has landed.
+        // A donor blob (`is_donor`) is a splice source a later entry may still
+        // read, so it is kept here regardless and swept once at run end by
+        // `pull_all`.
         let any_failed = outcomes
             .iter()
             .any(|o| matches!(o, EntryOutcome::Failed { .. }));
-        if should_remove_staging(any_failed, &hash, keep) {
+        if !is_donor && should_remove_staging(any_failed) {
             remove_staging(&staging);
         }
 
@@ -1459,11 +1470,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     }
 }
 
-/// Whether a whole-file group's staging blob may be removed after materializing:
-/// only when nothing failed (a failed entry keeps its resume prefix) and the hash
-/// is not also a chunk the chunked phase still needs (`keep`).
-fn should_remove_staging(any_failed: bool, hash: &[u8; 32], keep: &HashSet<[u8; 32]>) -> bool {
-    !any_failed && !keep.contains(hash)
+/// Whether a group's staging blob may be removed right after materializing: only
+/// when nothing failed (a failed entry keeps its `.partial` resume prefix). A
+/// donor blob is retained separately by [`PullCtx::fetch_group`] and swept at run
+/// end, so this gate does not see it.
+const fn should_remove_staging(any_failed: bool) -> bool {
+    !any_failed
 }
 
 /// Copy the already-fetched, already-verified blob at `staging` to `dest`,
@@ -1493,200 +1505,321 @@ fn materialize(staging: &Path, dest: &Path) -> anyhow::Result<u64> {
     Ok(written)
 }
 
-/// A chunked entry resolved to what to do before any fetch: a failure fixed at
-/// plan time (bad hash or unsafe path), an already-present destination to skip,
-/// or an assembly with the whole-file hash, the ordered chunk hashes, and the
-/// destination path.
-enum ChunkedPlan<'a> {
-    /// Resolve/parse failure — no chunk of this entry is fetched.
-    Failed(EntryOutcome),
-    /// Destination already present and `--overwrite` not set. Carries the file's
-    /// declared content size so the total bar can credit it (no fetch runs).
-    Skip(Option<u64>),
-    /// Fetch these chunks and concatenate them into `dest`, verifying `whole`.
-    Assemble {
-        /// The entry's manifest path, retained to tag an outcome.
-        label: &'a str,
-        /// The whole-file BLAKE3 the assembled bytes must match.
-        whole: [u8; 32],
-        /// The chunk blob hashes, in content (concatenation) order.
-        chunks: Vec<[u8; 32]>,
-        /// The whole-file content size from the manifest (the chunk sizes sum to
-        /// it). It presets the per-file bar's denominator and is the file's
-        /// contribution to the total bar. `None` when the manifest omits it, which
-        /// drops the per-file bar back to growing its length per chunk and adds
-        /// nothing to the total.
-        size: Option<u64>,
-        /// The resolved on-disk destination.
-        dest: PathBuf,
-    },
+/// One chunk of a hint-carrying entry, resolved to an absolute byte placement in
+/// the whole file: `offset` is the running sum of prior chunk sizes and `len` the
+/// chunk's own size, so `[offset, offset + len)` is the chunk's span.
+#[derive(Debug, Clone, Copy)]
+struct Hint {
+    /// The chunk's BLAKE3 content address.
+    hash: [u8; 32],
+    /// Byte offset of the chunk within the whole file.
+    offset: u64,
+    /// Chunk length in bytes.
+    len: u64,
 }
 
-/// Resolve one chunked entry to a [`ChunkedPlan`] with no network activity: parse
-/// its whole-file and chunk hashes, resolve+validate its destination path, and
-/// apply skip-existing (a present final file is verified-good, so re-runs
-/// resume). Mirrors [`plan_slots`] for the whole-file path.
-fn plan_chunked<'a>(entry: &'a ManifestEntry, out_root: &Path, overwrite: bool) -> ChunkedPlan<'a> {
-    let whole = match fetch::parse_hash(&entry.hash) {
-        Ok(h) => h,
-        Err(e) => return ChunkedPlan::Failed(EntryOutcome::failed(&entry.path, &e)),
-    };
-    let chunks = match parse_chunk_hashes(entry) {
-        Ok(c) => c,
-        Err(e) => return ChunkedPlan::Failed(EntryOutcome::failed(&entry.path, &e)),
-    };
-    let dest = match safe_join(out_root, &entry.path) {
-        Ok(d) => d,
-        Err(e) => return ChunkedPlan::Failed(EntryOutcome::failed(&entry.path, &e)),
-    };
-    // Reserve the staging dir, same as `plan_slots`: a destination inside it
-    // would collide with a per-hash staging file and could be deleted by cleanup.
-    if dest.starts_with(out_root.join(STAGING_DIR)) {
-        return ChunkedPlan::Failed(EntryOutcome::failed(
-            &entry.path,
-            &anyhow!(
-                "manifest path {:?} is inside the reserved staging directory {STAGING_DIR}/",
-                entry.path
-            ),
-        ));
-    }
-    if !overwrite && dest.try_exists().unwrap_or(false) {
-        return ChunkedPlan::Skip(entry.size);
-    }
-    ChunkedPlan::Assemble {
-        label: entry.path.as_str(),
-        whole,
-        chunks,
-        size: entry.size,
-        dest,
-    }
+/// Where one chunk's verified bytes are already materialized on disk this run.
+struct MaterializedRange {
+    /// The finalized staging file (a completed entry's whole-file blob) that
+    /// contains the chunk.
+    source: PathBuf,
+    /// Byte offset of the chunk within `source`.
+    offset: u64,
+    /// Chunk length in bytes.
+    len: u64,
 }
 
-/// Turn one resolved [`ChunkedPlan`] into an outcome: propagate a plan-time
-/// failure or skip, else confirm every chunk fetched and assemble the file. A
-/// chunk whose fetch failed (or is somehow absent) fails just this entry.
-fn assemble_plan(
-    plan: &ChunkedPlan<'_>,
-    out_root: &Path,
-    fetched: &HashMap<[u8; 32], Result<u64, String>>,
-) -> EntryOutcome {
-    let (label, whole, chunks, dest) = match plan {
-        ChunkedPlan::Failed(o) => return o.clone(),
-        ChunkedPlan::Skip(_) => return EntryOutcome::Skipped,
-        ChunkedPlan::Assemble {
-            label,
-            whole,
-            chunks,
-            dest,
-            ..
-        } => (label, whole, chunks, dest),
-    };
+/// In-run index from a chunk's BLAKE3 hash to where its verified bytes live on
+/// disk. Shared across the run's concurrent entries behind a mutex; an entry
+/// registers its chunks only after it fully completes and its staging blob is
+/// finalized, so a donor is always fully written before a recipient reads it.
+#[derive(Default)]
+struct ChunkIndex {
+    /// First-writer-wins map; a chunk registered by one completed entry serves
+    /// every later entry that shares it.
+    map: std::sync::Mutex<HashMap<[u8; 32], MaterializedRange>>,
+}
 
-    for h in chunks {
-        match fetched.get(h) {
-            Some(Ok(_)) => {}
-            Some(Err(e)) => {
-                return EntryOutcome::Failed {
-                    path: (*label).to_string(),
-                    err: format!("chunk {}: {e}", blake3::Hash::from_bytes(*h).to_hex()),
-                };
-            }
-            None => {
-                return EntryOutcome::Failed {
-                    path: (*label).to_string(),
-                    err: format!(
-                        "chunk {} was not fetched",
-                        blake3::Hash::from_bytes(*h).to_hex()
-                    ),
-                };
-            }
+impl ChunkIndex {
+    /// Register a completed entry's chunks, all pointing at its finalized
+    /// `source` blob. First writer wins, so a chunk shared by several entries
+    /// keeps the first donor. A `None` hint list (a plain entry) registers
+    /// nothing.
+    fn register(&self, hints: Option<&[Hint]>, source: &Path) {
+        let Some(hints) = hints else {
+            return;
+        };
+        let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        for h in hints {
+            map.entry(h.hash).or_insert_with(|| MaterializedRange {
+                source: source.to_path_buf(),
+                offset: h.offset,
+                len: h.len,
+            });
         }
     }
 
-    let staging: Vec<PathBuf> = match chunks
-        .iter()
-        .map(|h| staging_path(out_root, *h))
-        .collect::<anyhow::Result<Vec<_>>>()
-    {
-        Ok(v) => v,
-        Err(e) => return EntryOutcome::failed(label, &e),
-    };
-    match assemble_chunks(&staging, dest, *whole) {
-        Ok(n) => EntryOutcome::Fetched(n),
-        Err(e) => EntryOutcome::failed(label, &e),
-    }
-}
-
-/// Parse a chunked entry's chunk `hash` list into raw BLAKE3 addresses, in
-/// content order. A single unparseable chunk hash fails the whole entry — the
-/// concatenation is only meaningful if every piece resolves.
-fn parse_chunk_hashes(entry: &ManifestEntry) -> anyhow::Result<Vec<[u8; 32]>> {
-    entry
-        .chunks
-        .iter()
-        .flatten()
-        .map(|c| fetch::parse_hash(&c.hash))
-        .collect()
-}
-
-/// Assemble a chunked entry's file at `dest` by concatenating the already-fetched
-/// chunk blobs — `chunk_staging` in content order — and verifying the whole-file
-/// BLAKE3 of the concatenation against `expected`. The bytes are streamed through
-/// a hasher into a temp file beside `dest`; `dest` is created by an atomic rename
-/// **only after** the hash matches, so a consumer never sees a half-assembled or
-/// unverified file (the same "a present final file is verified-good" invariant
-/// the plain path relies on). Each chunk blob was already BLAKE3-checked against
-/// its own hash by the fetch path; this whole-file check additionally catches a
-/// manifest whose chunk list is individually valid but wrong or misordered.
-fn assemble_chunks(
-    chunk_staging: &[PathBuf],
-    dest: &Path,
-    expected: [u8; 32],
-) -> anyhow::Result<u64> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let mut tmp =
-        fetch::temp_in_parent(dest).with_context(|| format!("stage {}", dest.display()))?;
-    let mut hasher = blake3::Hasher::new();
-    let mut total: u64 = 0;
-    let mut buf = vec![0u8; 1 << 20];
-    for chunk in chunk_staging {
-        let mut src = std::fs::File::open(chunk)
-            .with_context(|| format!("open chunk {}", chunk.display()))?;
-        loop {
-            let n = std::io::Read::read(&mut src, &mut buf)
-                .with_context(|| format!("read chunk {}", chunk.display()))?;
-            if n == 0 {
-                break;
+    /// The distinct donor staging blobs registered this run, for the run-end
+    /// sweep in [`PullCtx::pull_all`].
+    fn sources(&self) -> Vec<PathBuf> {
+        let map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut seen: HashSet<&Path> = HashSet::new();
+        let mut out = Vec::new();
+        for m in map.values() {
+            if seen.insert(m.source.as_path()) {
+                out.push(m.source.clone());
             }
-            let slice = buf
-                .get(..n)
-                .ok_or_else(|| anyhow!("short read buffer slice"))?;
-            hasher.update(slice);
-            std::io::Write::write_all(tmp.as_file_mut(), slice)
-                .with_context(|| format!("write {}", dest.display()))?;
-            let n = u64::try_from(n).map_err(|_| anyhow!("chunk read size overflow"))?;
-            total = total.saturating_add(n);
         }
+        out
     }
-    let got = *hasher.finalize().as_bytes();
-    if got != expected {
-        // Drop the temp (never persisted) so `dest` stays absent — the assembled
-        // bytes did not reconstruct the file the entry names.
-        bail!(
-            "assembled chunks hash {} does not match entry whole-file hash {}",
-            blake3::Hash::from(got).to_hex(),
-            blake3::Hash::from(expected).to_hex()
+}
+
+/// One splice source for the dedup path: a chunk-group-aligned run of the
+/// recipient blob whose bytes a materialized donor already holds.
+#[derive(Debug, Clone)]
+struct DonorRange {
+    /// `(offset, len)` in the recipient blob to write — chunk-group-aligned, so
+    /// the ranged store's complement (fetched on group boundaries) and this
+    /// splice tile the blob without overlap.
+    aligned: (u64, u64),
+    /// The donor blob to read from.
+    source: PathBuf,
+    /// Source offset of the aligned subset within `source`.
+    src_offset: u64,
+    /// The whole chunk's hash — the aligned subset is trusted only after the
+    /// whole chunk at `[chunk_src_offset, chunk_src_offset + chunk_len)` in
+    /// `source` re-hashes to this.
+    chunk_hash: [u8; 32],
+    /// Whole chunk start in `source` (for the verification re-hash).
+    chunk_src_offset: u64,
+    /// Whole chunk length in bytes (for the verification re-hash).
+    chunk_len: u64,
+}
+
+/// The dedup plan for one entry: donor ranges to splice from disk and the
+/// complement ranges to pay for.
+struct DedupPlan {
+    /// Group-aligned ranges a materialized sibling already holds.
+    donor: Vec<DonorRange>,
+    /// The `(offset, len)` runs no donor covers — the bytes to drive and pay for.
+    complement: Vec<(u64, u64)>,
+}
+
+/// Turn an entry's optional chunk list into placed [`Hint`]s, or `None` when the
+/// entry should be fetched as a plain whole-file blob: no `chunks`, no whole-file
+/// `size` to validate against, an unparseable chunk hash, or chunk sizes that do
+/// not sum to the whole-file `size` (a malformed hint set, logged at debug). The
+/// whole-file `hash` is authoritative in every case, so ignoring hints only ever
+/// costs dedup, never correctness.
+fn hints_of(entry: &ManifestEntry) -> Option<Vec<Hint>> {
+    let chunks = entry.chunks.as_ref()?;
+    let total = entry.size?;
+    let mut hints = Vec::with_capacity(chunks.len());
+    let mut offset = 0u64;
+    for c in chunks {
+        let hash = fetch::parse_hash(&c.hash).ok()?;
+        hints.push(Hint {
+            hash,
+            offset,
+            len: c.size,
+        });
+        offset = offset.checked_add(c.size)?;
+    }
+    if offset != total {
+        tracing::debug!(
+            "bundle entry {:?}: chunk sizes sum to {offset}, expected whole-file size {total}; \
+             ignoring range-dedup hints",
+            entry.path
         );
+        return None;
     }
-    tmp.as_file()
-        .sync_all()
-        .with_context(|| format!("sync staged assembly for {}", dest.display()))?;
-    tmp.persist(dest)
-        .map_err(|e| e.error)
-        .with_context(|| format!("write {}", dest.display()))?;
-    Ok(total)
+    Some(hints)
+}
+
+/// Plan the range-dedup for one entry against the run's chunk `index`.
+///
+/// For each hint whose chunk is already materialized, `[offset, offset + len)` is
+/// aligned INWARD to 16 KiB chunk groups — only whole groups fully inside the hint
+/// become a donor range, and the ≤1 partial group at each edge falls into the
+/// complement (the ranged store bao-verifies on group boundaries, so a donor
+/// splice must land on them). A hint smaller than one group, or unaligned so no
+/// whole group fits, contributes no donor range. The complement is `total` minus
+/// the union of the donor ranges — the bytes that must still be paid for.
+fn plan_dedup(
+    hints: &[Hint],
+    index: &HashMap<[u8; 32], MaterializedRange>,
+    total: u64,
+) -> DedupPlan {
+    let group = CHUNK_GROUP_BYTES;
+    let mut donor = Vec::new();
+    let mut donor_union: Vec<(u64, u64)> = Vec::new();
+    for h in hints {
+        let Some(m) = index.get(&h.hash) else {
+            continue;
+        };
+        let hint_end = h.offset.saturating_add(h.len);
+        // Inward alignment: first group boundary at or after `offset`, last group
+        // boundary at or before `hint_end`.
+        let g_start = h.offset.div_ceil(group).saturating_mul(group);
+        let g_end = (hint_end / group) * group;
+        if g_start >= g_end {
+            continue;
+        }
+        let alen = g_end - g_start;
+        let src_offset = m.offset.saturating_add(g_start - h.offset);
+        donor.push(DonorRange {
+            aligned: (g_start, alen),
+            source: m.source.clone(),
+            src_offset,
+            chunk_hash: h.hash,
+            chunk_src_offset: m.offset,
+            chunk_len: m.len,
+        });
+        donor_union.push((g_start, alen));
+    }
+    DedupPlan {
+        complement: complement_runs(&donor_union, total),
+        donor,
+    }
+}
+
+/// The `.partial` data file the ranged store keeps beside a finalized `staging`
+/// blob — `<hex>.partial` — where driven ranges and spliced donor bytes land
+/// before promotion.
+fn partial_path(staging: &Path) -> PathBuf {
+    staging.with_extension("partial")
+}
+
+/// Verify and splice every donor range into `partial`, returning the aligned
+/// ranges that could NOT be trusted (a donor whose chunk no longer hashes to its
+/// hint, or an unreadable source) and so must be re-fetched and paid for.
+///
+/// A donor's bytes are trusted only after the WHOLE chunk at its recorded source
+/// offset re-hashes to the chunk hash — a donor's own chunk placement is an
+/// unverified manifest claim until then. The trusted group-aligned subset is then
+/// written at the recipient offset; the whole-file BLAKE3 the caller runs next is
+/// the authoritative backstop against a lying recipient placement.
+fn splice_donors(partial: &Path, donors: &[DonorRange]) -> anyhow::Result<Vec<(u64, u64)>> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut refetch = Vec::new();
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .open(partial)
+        .with_context(|| format!("open {}", partial.display()))?;
+    for d in donors {
+        let (dst_offset, len) = d.aligned;
+        // An unreadable donor source is not trusted — pay to fetch it.
+        let Ok(mut src) = std::fs::File::open(&d.source) else {
+            refetch.push(d.aligned);
+            continue;
+        };
+        if !chunk_verified(&mut src, d.chunk_src_offset, d.chunk_len, d.chunk_hash) {
+            refetch.push(d.aligned);
+            continue;
+        }
+        // The chunk is confirmed present at `chunk_src_offset`; copy its
+        // group-aligned subset into the recipient's `.partial`.
+        src.seek(SeekFrom::Start(d.src_offset))
+            .with_context(|| format!("seek donor {}", d.source.display()))?;
+        out.seek(SeekFrom::Start(dst_offset))
+            .with_context(|| format!("seek {}", partial.display()))?;
+        copy_exact(&mut src, &mut out, len)
+            .with_context(|| format!("splice donor into {}", partial.display()))?;
+    }
+    out.sync_all()
+        .with_context(|| format!("sync {}", partial.display()))?;
+    Ok(refetch)
+}
+
+/// Whether the `len` bytes at `offset` in `src` hash to `expected`. Any read
+/// failure (a short source, an I/O error) returns `false`: the bytes are simply
+/// not trusted, and the caller re-fetches them rather than splicing.
+fn chunk_verified(src: &mut std::fs::File, offset: u64, len: u64, expected: [u8; 32]) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    if src.seek(SeekFrom::Start(offset)).is_err() {
+        return false;
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut remaining = len;
+    let mut buf = vec![0u8; 1 << 20];
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(1 << 20)).unwrap_or(1 << 20);
+        let Some(slice) = buf.get_mut(..want) else {
+            return false;
+        };
+        if src.read_exact(slice).is_err() {
+            return false;
+        }
+        hasher.update(slice);
+        remaining = remaining.saturating_sub(u64::try_from(want).unwrap_or(remaining));
+    }
+    *hasher.finalize().as_bytes() == expected
+}
+
+/// Copy exactly `len` bytes from `src` to `out`, both already positioned, in
+/// bounded chunks so a large range never loads into memory at once.
+fn copy_exact(src: &mut std::fs::File, out: &mut std::fs::File, len: u64) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    let mut remaining = len;
+    let mut buf = vec![0u8; 1 << 20];
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(1 << 20)).unwrap_or(1 << 20);
+        let slice = buf
+            .get_mut(..want)
+            .ok_or_else(|| std::io::Error::other("copy buffer slice"))?;
+        src.read_exact(slice)?;
+        out.write_all(slice)?;
+        remaining = remaining.saturating_sub(u64::try_from(want).unwrap_or(remaining));
+    }
+    Ok(())
+}
+
+/// BLAKE3 of the whole `partial` data file, streamed so an arbitrarily large blob
+/// never loads into memory at once.
+fn hash_partial(partial: &Path) -> anyhow::Result<[u8; 32]> {
+    use std::io::Read;
+    let mut f =
+        std::fs::File::open(partial).with_context(|| format!("open {}", partial.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .with_context(|| format!("read {}", partial.display()))?;
+        if n == 0 {
+            break;
+        }
+        let slice = buf
+            .get(..n)
+            .ok_or_else(|| anyhow!("short read buffer slice"))?;
+        hasher.update(slice);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// Promote a verified `.partial` to the plain `staging` blob (an atomic
+/// same-directory rename) and best-effort remove the ranged-store sidecars the
+/// dedup path no longer needs. `staging` is then the finalized blob `fetch_group`
+/// materializes at each destination — the same shape `drive_fetch`'s own finalize
+/// leaves for the whole-file path.
+fn promote_partial(partial: &Path, staging: &Path) -> anyhow::Result<()> {
+    std::fs::rename(partial, staging)
+        .with_context(|| format!("promote {} -> {}", partial.display(), staging.display()))?;
+    for sidecar in [
+        staging.with_extension("partial.obao4"),
+        staging.with_extension("partial.ranges"),
+    ] {
+        if let Err(e) = std::fs::remove_file(&sidecar)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "failed to remove staging sidecar {}: {e}",
+                sidecar.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Per-hash staging file [`fetch::drive_fetch`] finalizes to before `fetch_group`
@@ -1723,11 +1856,6 @@ fn staging_path(out_root: &Path, hash: [u8; 32]) -> anyhow::Result<PathBuf> {
 /// A donor range past `total`, or one that overlaps `total`, is clamped to
 /// `total` — `total` is the whole blob's authoritative length. `total == 0`
 /// always returns an empty complement (there is nothing to cover).
-// Range-dedup hints (chunk manifest) wiring lands in a later change; until
-// then this pure helper has no caller outside its own tests, so it is dead in
-// a non-test build but live in a test build — `#[expect]` would flip between
-// fulfilled and unfulfilled across those two targets, so this uses `#[allow]`.
-#[allow(dead_code, reason = "wired by the range-dedup hints follow-up")]
 pub(crate) fn complement_runs(donor_aligned: &[(u64, u64)], total: u64) -> Vec<(u64, u64)> {
     if total == 0 {
         return Vec::new();
@@ -2143,6 +2271,185 @@ mod tests {
         assert_eq!(complement_runs(&[(0, 10)], 0), Vec::new());
     }
 
+    const GROUP: u64 = CHUNK_GROUP_BYTES;
+
+    fn chunk(size: u64, byte: u8) -> ManifestChunk {
+        ManifestChunk {
+            hash: format!("b3:{}", blake3::Hash::from_bytes([byte; 32]).to_hex()),
+            size,
+        }
+    }
+
+    /// A chunked entry's hints accumulate offsets by the running size sum, in
+    /// order, and validate that the chunk sizes reconstruct the whole-file size.
+    #[test]
+    fn hints_of_accumulates_offsets_and_validates_the_size_sum() {
+        let e = ManifestEntry {
+            path: "m.bin".into(),
+            hash: format!("b3:{}", blake3::Hash::from_bytes([0xff; 32]).to_hex()),
+            size: Some(100),
+            chunks: Some(vec![chunk(60, 0xaa), chunk(40, 0xbb)]),
+        };
+        let hints = hints_of(&e).expect("valid hints");
+        assert_eq!(hints.len(), 2);
+        assert_eq!(
+            (hints[0].hash, hints[0].offset, hints[0].len),
+            ([0xaa; 32], 0, 60)
+        );
+        assert_eq!(
+            (hints[1].hash, hints[1].offset, hints[1].len),
+            ([0xbb; 32], 60, 40)
+        );
+    }
+
+    /// Chunk sizes that do not sum to the whole-file size are a malformed hint set:
+    /// the entry falls back to a plain whole-file fetch (`None`).
+    #[test]
+    fn hints_of_rejects_a_size_sum_that_disagrees_with_the_whole_file() {
+        let e = ManifestEntry {
+            path: "m.bin".into(),
+            hash: format!("b3:{}", blake3::Hash::from_bytes([0xff; 32]).to_hex()),
+            size: Some(100),
+            chunks: Some(vec![chunk(60, 0xaa), chunk(30, 0xbb)]),
+        };
+        assert!(hints_of(&e).is_none());
+    }
+
+    /// No whole-file `size` to validate against, or an unparseable chunk hash, both
+    /// drop back to a plain fetch.
+    #[test]
+    fn hints_of_needs_a_size_and_valid_chunk_hashes() {
+        let no_size = ManifestEntry {
+            path: "m.bin".into(),
+            hash: "b3:ff".into(),
+            size: None,
+            chunks: Some(vec![chunk(60, 0xaa)]),
+        };
+        assert!(hints_of(&no_size).is_none());
+
+        let bad_hash = ManifestEntry {
+            path: "m.bin".into(),
+            hash: "b3:ff".into(),
+            size: Some(4),
+            chunks: Some(vec![ManifestChunk {
+                hash: "not-a-hash".into(),
+                size: 4,
+            }]),
+        };
+        assert!(hints_of(&bad_hash).is_none());
+    }
+
+    /// A materialized chunk placed at a group-aligned offset yields a donor range
+    /// equal to the inward-aligned hint span, read from the donor at the matching
+    /// source offset; the complement is `total` minus that range.
+    #[test]
+    fn plan_dedup_aligns_a_donor_inward_and_takes_the_complement() {
+        let total = 3 * GROUP;
+        let h = [0x11; 32];
+        let mut index = HashMap::new();
+        // The chunk lives at offset 0 (len one group) in the donor file.
+        index.insert(
+            h,
+            MaterializedRange {
+                source: PathBuf::from("/tmp/donorA"),
+                offset: 0,
+                len: GROUP,
+            },
+        );
+        // The recipient places the same chunk at the second group.
+        let hints = [Hint {
+            hash: h,
+            offset: GROUP,
+            len: GROUP,
+        }];
+        let plan = plan_dedup(&hints, &index, total);
+
+        assert_eq!(plan.donor.len(), 1);
+        let d = &plan.donor[0];
+        assert_eq!(d.aligned, (GROUP, GROUP));
+        assert_eq!(d.source, PathBuf::from("/tmp/donorA"));
+        assert_eq!(d.src_offset, 0);
+        assert_eq!(d.chunk_hash, h);
+        assert_eq!((d.chunk_src_offset, d.chunk_len), (0, GROUP));
+        assert_eq!(plan.complement, vec![(0, GROUP), (2 * GROUP, GROUP)]);
+    }
+
+    /// An unaligned hint contributes only its interior whole groups; the donor's
+    /// source offset tracks the inward shift, and the partial edge groups fall into
+    /// the complement.
+    #[test]
+    fn plan_dedup_drops_partial_edge_groups_into_the_complement() {
+        let total = 4 * GROUP;
+        let h = [0x22; 32];
+        let mut index = HashMap::new();
+        // Chunk at donor offset 5000, spanning 2*GROUP + a bit.
+        index.insert(
+            h,
+            MaterializedRange {
+                source: PathBuf::from("/tmp/donorB"),
+                offset: 5000,
+                len: 2 * GROUP + 500,
+            },
+        );
+        // Recipient places it at offset 100, so [100, 100 + 2*GROUP + 500).
+        let hints = [Hint {
+            hash: h,
+            offset: 100,
+            len: 2 * GROUP + 500,
+        }];
+        let plan = plan_dedup(&hints, &index, total);
+
+        assert_eq!(plan.donor.len(), 1);
+        let d = &plan.donor[0];
+        // The span [100, 100 + 2*GROUP + 500) straddles boundaries GROUP and
+        // 2*GROUP, so exactly ONE whole group — [GROUP, 2*GROUP) — is inside it;
+        // the sub-group head and tail fall into the complement.
+        assert_eq!(d.aligned, (GROUP, GROUP));
+        // Source offset shifts by (GROUP - 100) from the chunk's donor start.
+        assert_eq!(d.src_offset, 5000 + (GROUP - 100));
+        assert_eq!(plan.complement, vec![(0, GROUP), (2 * GROUP, 2 * GROUP)]);
+    }
+
+    /// A chunk not in the index contributes no donor: the complement is the whole
+    /// blob (the plain path then handles it).
+    #[test]
+    fn plan_dedup_with_no_materialized_chunk_is_all_complement() {
+        let total = 2 * GROUP;
+        let hints = [Hint {
+            hash: [0x33; 32],
+            offset: 0,
+            len: GROUP,
+        }];
+        let plan = plan_dedup(&hints, &HashMap::new(), total);
+        assert!(plan.donor.is_empty());
+        assert_eq!(plan.complement, vec![(0, total)]);
+    }
+
+    /// A hint smaller than one chunk group (or unaligned so no whole group fits)
+    /// contributes no donor, even when the chunk is materialized.
+    #[test]
+    fn plan_dedup_sub_group_hint_contributes_no_donor() {
+        let total = GROUP;
+        let h = [0x44; 32];
+        let mut index = HashMap::new();
+        index.insert(
+            h,
+            MaterializedRange {
+                source: PathBuf::from("/tmp/donorC"),
+                offset: 0,
+                len: 1000,
+            },
+        );
+        let hints = [Hint {
+            hash: h,
+            offset: 0,
+            len: 1000,
+        }];
+        let plan = plan_dedup(&hints, &index, total);
+        assert!(plan.donor.is_empty());
+        assert_eq!(plan.complement, vec![(0, total)]);
+    }
+
     #[test]
     fn staging_path_is_the_plain_hex_final_blob_not_a_partial() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -2298,17 +2605,11 @@ mod tests {
     }
 
     #[test]
-    fn should_remove_staging_keeps_a_blob_the_chunked_phase_needs() {
-        let h = [0x11; 32];
-        let keep = HashSet::from([h]);
-        let empty = HashSet::new();
-        // Kept when the same blob is also a chunk — the chunked phase reuses it so
-        // it is fetched and paid for once across both phases.
-        assert!(!should_remove_staging(false, &h, &keep));
-        // Removed when it is not needed elsewhere and nothing failed.
-        assert!(should_remove_staging(false, &h, &empty));
-        // A failed entry always keeps its resume prefix.
-        assert!(!should_remove_staging(true, &h, &empty));
+    fn should_remove_staging_keeps_a_failed_entrys_resume_prefix() {
+        // Removed when nothing failed (its content is safely materialized).
+        assert!(should_remove_staging(false));
+        // A failed entry always keeps its `.partial` resume prefix.
+        assert!(!should_remove_staging(true));
     }
 
     /// Distinct hashes never merge — each is its own unit of work, in order.
@@ -2518,179 +2819,6 @@ mod tests {
     /// `materialize` (the paid-path writer) atomically replaces an existing
     /// destination from the staging file, and leaves the staging file intact so a
     /// retry for the next duplicate path can read it again.
-    #[test]
-    fn parse_chunk_hashes_preserves_order() {
-        let e = ManifestEntry {
-            path: "m".into(),
-            hash: "b3:whole".into(),
-            size: None,
-            chunks: Some(vec![
-                ManifestChunk {
-                    hash: format!("b3:{}", "a".repeat(64)),
-                },
-                ManifestChunk {
-                    hash: format!("b3:{}", "b".repeat(64)),
-                },
-            ]),
-        };
-        let got = parse_chunk_hashes(&e).unwrap();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0], [0xaa; 32]);
-        assert_eq!(got[1], [0xbb; 32]);
-    }
-
-    #[test]
-    fn parse_chunk_hashes_rejects_a_bad_chunk_hash() {
-        let e = ManifestEntry {
-            path: "m".into(),
-            hash: "b3:whole".into(),
-            size: None,
-            chunks: Some(vec![ManifestChunk {
-                hash: "not-a-hash".into(),
-            }]),
-        };
-        assert!(parse_chunk_hashes(&e).is_err());
-    }
-
-    // Build a chunked entry whose two chunks concatenate to `whole_bytes`, and
-    // return (entry, chunk0_hash, chunk1_hash) with real BLAKE3 content addresses.
-    fn chunked_entry(path: &str, c0: &[u8], c1: &[u8]) -> (ManifestEntry, [u8; 32], [u8; 32]) {
-        let h0 = *blake3::hash(c0).as_bytes();
-        let h1 = *blake3::hash(c1).as_bytes();
-        let mut whole = Vec::new();
-        whole.extend_from_slice(c0);
-        whole.extend_from_slice(c1);
-        let hw = blake3::hash(&whole);
-        let entry = ManifestEntry {
-            path: path.into(),
-            hash: format!("b3:{}", hw.to_hex()),
-            size: Some(u64::try_from(whole.len()).unwrap()),
-            chunks: Some(vec![
-                ManifestChunk {
-                    hash: format!("b3:{}", blake3::Hash::from_bytes(h0).to_hex()),
-                },
-                ManifestChunk {
-                    hash: format!("b3:{}", blake3::Hash::from_bytes(h1).to_hex()),
-                },
-            ]),
-        };
-        (entry, h0, h1)
-    }
-
-    #[test]
-    fn plan_chunked_skips_existing_destination() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (entry, _, _) = chunked_entry("a/m.bin", b"hello ", b"world");
-        std::fs::create_dir_all(dir.path().join("a")).unwrap();
-        std::fs::write(dir.path().join("a/m.bin"), b"already here").unwrap();
-
-        assert!(matches!(
-            plan_chunked(&entry, dir.path(), false),
-            ChunkedPlan::Skip(_)
-        ));
-    }
-
-    #[test]
-    fn plan_chunked_rejects_bad_whole_file_hash() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut entry = chunked_entry("m.bin", b"a", b"b").0;
-        entry.hash = "not-a-hash".into();
-
-        assert!(matches!(
-            plan_chunked(&entry, dir.path(), false),
-            ChunkedPlan::Failed(_)
-        ));
-    }
-
-    #[test]
-    fn assemble_plan_assembles_from_fetched_chunks() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (entry, h0, h1) = chunked_entry("out/m.bin", b"hello ", b"world");
-        // Stage the two chunk blobs where `assemble_plan` will look for them.
-        std::fs::write(staging_path(dir.path(), h0).unwrap(), b"hello ").unwrap();
-        std::fs::write(staging_path(dir.path(), h1).unwrap(), b"world").unwrap();
-        let plan = plan_chunked(&entry, dir.path(), false);
-        let fetched: HashMap<[u8; 32], Result<u64, String>> =
-            HashMap::from([(h0, Ok(6)), (h1, Ok(5))]);
-
-        let outcome = assemble_plan(&plan, dir.path(), &fetched);
-
-        assert!(matches!(outcome, EntryOutcome::Fetched(11)));
-        assert_eq!(
-            std::fs::read(dir.path().join("out/m.bin")).unwrap(),
-            b"hello world"
-        );
-    }
-
-    #[test]
-    fn assemble_plan_fails_entry_when_a_chunk_fetch_failed() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (entry, h0, h1) = chunked_entry("m.bin", b"hello ", b"world");
-        // Only the first chunk landed; the second failed to fetch.
-        std::fs::write(staging_path(dir.path(), h0).unwrap(), b"hello ").unwrap();
-        let plan = plan_chunked(&entry, dir.path(), false);
-        let fetched: HashMap<[u8; 32], Result<u64, String>> =
-            HashMap::from([(h0, Ok(6)), (h1, Err("upstream gone".to_string()))]);
-
-        let outcome = assemble_plan(&plan, dir.path(), &fetched);
-
-        match outcome {
-            EntryOutcome::Failed { err, .. } => assert!(err.contains("upstream gone"), "{err}"),
-            _ => panic!("expected Failed, got a success"),
-        }
-        // No half-file left behind.
-        assert!(!dir.path().join("m.bin").exists());
-    }
-
-    #[test]
-    fn assemble_chunks_concatenates_in_order_and_verifies() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let c0 = dir.path().join("c0");
-        std::fs::write(&c0, b"hello ").unwrap();
-        let c1 = dir.path().join("c1");
-        std::fs::write(&c1, b"world").unwrap();
-        let dest = dir.path().join("out/file.bin");
-        let expected = *blake3::hash(b"hello world").as_bytes();
-
-        let n = assemble_chunks(&[c0, c1], &dest, expected).unwrap();
-
-        assert_eq!(n, 11);
-        assert_eq!(std::fs::read(&dest).unwrap(), b"hello world");
-    }
-
-    #[test]
-    fn assemble_chunks_rejects_whole_file_hash_mismatch() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let c0 = dir.path().join("c0");
-        std::fs::write(&c0, b"hello ").unwrap();
-        let c1 = dir.path().join("c1");
-        std::fs::write(&c1, b"world").unwrap();
-        let dest = dir.path().join("file.bin");
-        let wrong = *blake3::hash(b"not the concatenation").as_bytes();
-
-        let err = assemble_chunks(&[c0, c1], &dest, wrong).unwrap_err();
-
-        assert!(format!("{err:#}").contains("hash"), "{err:#}");
-        // Nothing half-assembled is left behind for a caller to trust.
-        assert!(!dest.exists(), "dest must be absent on mismatch");
-    }
-
-    #[test]
-    fn assemble_chunks_order_is_load_bearing() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let c0 = dir.path().join("c0");
-        std::fs::write(&c0, b"hello ").unwrap();
-        let c1 = dir.path().join("c1");
-        std::fs::write(&c1, b"world").unwrap();
-        let dest = dir.path().join("file.bin");
-        // Hash of the in-order concatenation; passing the chunks reversed must fail.
-        let expected = *blake3::hash(b"hello world").as_bytes();
-
-        let err = assemble_chunks(&[c1, c0], &dest, expected).unwrap_err();
-
-        assert!(format!("{err:#}").contains("hash"), "{err:#}");
-    }
-
     #[test]
     fn materialize_replaces_dest_and_keeps_staging() {
         let dir = tempfile::tempdir().unwrap();
