@@ -61,9 +61,12 @@ enum KeystorePassword {
 /// set in `node.toml` — the common service layout, where the `decdn` user's home
 /// is the data dir itself — would report a phantom `~/.decdn` path the node
 /// never uses.
+///
+/// The config file is read only when `--output-dir` is absent: the flag wins
+/// outright, so an explicit `--output-dir` must not fail on an unrelated broken
+/// `node.toml` it never consults.
 pub fn whoami(args: &cli::WhoamiArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
-    let file = decdn_common::config::load_file_config(config_path)?;
-    let data_dir = resolve_data_dir(args.output_dir.as_deref(), &file)
+    let data_dir = resolve_data_dir(args.output_dir.as_deref(), config_path)?
         .ok_or_else(|| anyhow::anyhow!("cannot determine data directory: home dir not found"))?;
 
     for line in report(&data_dir, args.keystore_password_file.as_deref())? {
@@ -74,22 +77,26 @@ pub fn whoami(args: &cli::WhoamiArgs, config_path: Option<&Path>) -> anyhow::Res
 
 /// Resolve the data directory with the daemon's precedence: an explicit
 /// `--output-dir` first, then `identity.data_dir` from the config file, then the
-/// `~/.decdn` default. Returns `None` only when every source is absent and the
-/// home directory cannot be found. A leading `~` in either explicit source is
-/// expanded, mirroring `resolve_identity_into`.
+/// `~/.decdn` default. Returns `Ok(None)` only when every source is absent and
+/// the home directory cannot be found. A leading `~` in either explicit source
+/// is expanded, mirroring `resolve_identity_into`.
+///
+/// The config file is loaded (and parsed) only when `output_dir` is `None`, so a
+/// caller that passed `--output-dir` never surfaces a config-parse error for a
+/// file whose value the flag overrides anyway.
 fn resolve_data_dir(
     output_dir: Option<&Path>,
-    file: &decdn_common::config::FileConfig,
-) -> Option<PathBuf> {
-    output_dir
-        .map(cli::common::expand_tilde)
-        .or_else(|| {
-            file.identity
-                .as_ref()
-                .and_then(|i| i.data_dir.as_deref())
-                .map(cli::common::expand_tilde)
-        })
-        .or_else(cli::default_data_dir)
+    config_path: Option<&Path>,
+) -> anyhow::Result<Option<PathBuf>> {
+    if let Some(dir) = output_dir {
+        return Ok(Some(cli::common::expand_tilde(dir)));
+    }
+    let file = decdn_common::config::load_file_config(config_path)?;
+    Ok(file
+        .identity
+        .and_then(|i| i.data_dir)
+        .map(|p| cli::common::expand_tilde(&p))
+        .or_else(cli::default_data_dir))
 }
 
 /// Build the read-only whoami report for `data_dir` as the lines to print.
@@ -254,13 +261,13 @@ mod tests {
 
     const TEST_PASSWORD: &str = "hunter2";
 
-    /// Write a `node.toml` with the given `identity.data_dir` and load it the
-    /// way `whoami` does, so the resolution tests exercise the real file path.
-    fn file_config_with_data_dir(data_dir: &str) -> decdn_common::config::FileConfig {
+    /// Write a `node.toml` with the given `identity.data_dir` and return its
+    /// path (plus the owning tempdir, which the caller must keep alive).
+    fn node_toml_with_data_dir(data_dir: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node.toml");
         std::fs::write(&path, format!("[identity]\ndata_dir = \"{data_dir}\"\n")).unwrap();
-        decdn_common::config::load_file_config(Some(&path)).unwrap()
+        (dir, path)
     }
 
     /// The config file's `identity.data_dir` is honored when no `--output-dir`
@@ -268,9 +275,9 @@ mod tests {
     /// `node.toml` must not resolve to the `~/.decdn` default.
     #[test]
     fn resolve_data_dir_honors_config_file() {
-        let file = file_config_with_data_dir("/var/lib/decdn");
+        let (_dir, path) = node_toml_with_data_dir("/var/lib/decdn");
         assert_eq!(
-            resolve_data_dir(None, &file),
+            resolve_data_dir(None, Some(&path)).unwrap(),
             Some(PathBuf::from("/var/lib/decdn"))
         );
     }
@@ -278,11 +285,34 @@ mod tests {
     /// An explicit `--output-dir` wins over the config file's `identity.data_dir`.
     #[test]
     fn resolve_data_dir_output_dir_overrides_config_file() {
-        let file = file_config_with_data_dir("/var/lib/decdn");
+        let (_dir, path) = node_toml_with_data_dir("/var/lib/decdn");
         assert_eq!(
-            resolve_data_dir(Some(Path::new("/opt/keys")), &file),
+            resolve_data_dir(Some(Path::new("/opt/keys")), Some(&path)).unwrap(),
             Some(PathBuf::from("/opt/keys"))
         );
+    }
+
+    /// An explicit `--output-dir` must not read the config file at all, so a
+    /// broken `node.toml` it would override never turns into an error.
+    #[test]
+    fn resolve_data_dir_output_dir_ignores_broken_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, "this is not = valid = toml\n").unwrap();
+        assert_eq!(
+            resolve_data_dir(Some(Path::new("/opt/keys")), Some(&path)).unwrap(),
+            Some(PathBuf::from("/opt/keys"))
+        );
+    }
+
+    /// An explicit but broken `--config` still errors when it is actually
+    /// consulted (no `--output-dir` to short-circuit it).
+    #[test]
+    fn resolve_data_dir_errors_on_broken_config_without_output_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, "this is not = valid = toml\n").unwrap();
+        assert!(resolve_data_dir(None, Some(&path)).is_err());
     }
 
     #[cfg(unix)]
