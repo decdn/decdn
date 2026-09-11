@@ -86,7 +86,7 @@ Lower is better. Reputation is clamped to a minimum of 0.1 to prevent division b
 
 For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md#adr-008-reputation-system)), the 4× multiplier means they must be ~4× cheaper or faster to compete with established nodes — a bootstrap barrier they clear by pricing or performing competitively until they accrue reputation.
 
-**Inputs:** `rate_per_mb` and `rtt_ms` come from `ProbeResponse` (see [ADR 005](005-protocol.md#adr-005-wire-protocol)). `reputation` is the client's own local score for the node from [ADR 008 § Local Score Calculation](008-reputation.md#local-score-calculation) (a never-interacted node is treated as the neutral 0.5).
+**Inputs:** `rate_per_mb` and `rtt_ms` come from `ProbeResponse` (see [ADR 005](005-protocol.md#adr-005-wire-protocol)). `reputation` is the pulling node's own local score for the peer from [ADR 008 § Local Score Calculation](008-reputation.md#local-score-calculation) (a never-interacted peer is treated as the neutral 0.5).
 
 **Reputation is a graded weight, not a veto.** It enters selection only through the `1 / max(reputation, 0.1)²` term above, which caps the worst-case penalty at 100×. There is no pre-scoring minimum-reputation filter: a sufficiently cheap or close node can outrank a poorly-reputed one, and that is intended — [ADR 008](008-reputation.md#adr-008-reputation-system) treats the local score as a subjective preference signal, not admission control. Pool membership is decided by bonding and authorization, not by reputation.
 
@@ -94,7 +94,7 @@ For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md#ad
 
 (scores within 1% of each other): see [ADR 008, Tie-Breaking](008-reputation.md#tie-breaking).
 
-This score is used in Content Discovery above and in all other node selection contexts. The simpler `rate_per_mb × rtt_ms` product is the price×latency component; the full selection algorithm adds reputation weighting as shown above.
+This score ranks a node's upstream candidates on its cache-miss pull leg — the node-to-node FIND_VALUE → probe → select flow of Content Discovery above. The client path does not compute it: a client ranks candidates by measured RTT only and takes price from the signed `StreamResponse` ([ADR 037 § Client selection policy](037-regional-proxy-warming.md#client-selection-policy-latency-driven-proxy-preference)). The simpler `rate_per_mb × rtt_ms` product is the price×latency component; the full selection algorithm adds reputation weighting as shown above.
 
 ### On-chain Registration
 
