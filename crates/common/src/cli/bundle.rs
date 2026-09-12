@@ -66,10 +66,11 @@ pub struct BundlePullArgs {
     #[arg(short = 'o', long, value_name = "DIR")]
     pub output: PathBuf,
 
-    /// Maximum concurrent blob fetches — whole-file entries and chunks of a
-    /// chunked file alike — across the whole run. One many-chunk file can use the
-    /// full budget by itself; a chunk shared between files is fetched once and does
-    /// not consume an extra slot.
+    /// Maximum concurrent entry fetches across the whole run. Each distinct blob
+    /// is one unit of work holding one slot: a plain whole-file entry, or a
+    /// range-dedup entry across its complement drive, donor splice, and any
+    /// re-fetch. A byte range a sibling entry already holds is spliced from disk,
+    /// not fetched, so it never takes a slot of its own.
     #[arg(long, value_name = "N", default_value_t = 4)]
     pub jobs: usize,
 
