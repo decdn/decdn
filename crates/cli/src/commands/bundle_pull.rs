@@ -61,6 +61,16 @@ use decdn_client_pull::{
 
 type FetchTarget = (PublicKey, Address);
 
+/// A dedup entry's resolved range-drive provider order, computed once per entry
+/// and reused across its complement drive, donor re-fetch, and any whole-blob
+/// re-drive (so a self-heal entry probes once, not per sub-drive). `Pinned` is
+/// the `--node-id` target — its own only candidate; `Discovered` is the probed
+/// discovery order walked with single-source failover.
+enum RangeTargets {
+    Pinned(FetchTarget),
+    Discovered(Vec<NodeCandidate>),
+}
+
 /// Group manifest entries by their blob `hash`, preserving first-seen order both
 /// across groups and within each group. Entries that name the same blob (one
 /// file published at two paths) land in one group so it is fetched once (#1306).
@@ -1072,26 +1082,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         }
     }
 
-    /// Drive `ranges` of `hash` into `staging`'s `.partial`, selecting a provider
-    /// the same way [`Self::fetch_to_staging`] does — the pinned `--node-id`, or the
-    /// probed discovery order walked with single-source failover (a retryable
-    /// failure advances to the next candidate). The caller already holds a
-    /// [`gate`](PullCtx::gate) permit, so this does not take one itself.
-    ///
-    /// Unlike [`Self::fetch_to_staging`] there is no multi-source fan-out here: the
-    /// range-dedup path is an optimization over one source, and every driven range
-    /// is still bao-verified against `hash`, so a single lane stays sound.
-    async fn drive_ranges_failover(
-        &self,
-        hash: [u8; 32],
-        staging: &Path,
-        ranges: &[(u64, u64)],
-        progress: Option<&ProgressCallback>,
-    ) -> anyhow::Result<ClientRangedStore> {
+    /// Resolve the provider order for one dedup entry's range drives ONCE — the
+    /// pinned `--node-id`, or a single [`fetch::probe_and_order`] over the
+    /// discovery candidates. [`Self::pull_entry`] resolves this before its first
+    /// sub-drive and threads it into every one (the complement drive, a donor
+    /// re-fetch, and any whole-blob re-drive), so a self-heal entry probes the
+    /// candidate set once rather than up to three times.
+    async fn resolve_range_targets(&self, hash: [u8; 32]) -> anyhow::Result<RangeTargets> {
         if let Some(pinned) = self.explicit {
-            return self
-                .drive_ranges_from(hash, pinned, &[], staging, ranges, progress)
-                .await;
+            return Ok(RangeTargets::Pinned(pinned));
         }
         let candidates = self
             .candidates
@@ -1107,6 +1106,36 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         )
         .await?
         .candidates;
+        Ok(RangeTargets::Discovered(order))
+    }
+
+    /// Drive `ranges` of `hash` into `staging`'s `.partial` over a PRE-RESOLVED
+    /// provider order (from [`Self::resolve_range_targets`]) — the pinned
+    /// `--node-id`, or the probed discovery order walked with single-source
+    /// failover (a retryable failure advances to the next candidate). Re-dials the
+    /// resolved candidates without re-probing, so repeated sub-drives of one entry
+    /// share a single probe round. The caller already holds a
+    /// [`gate`](PullCtx::gate) permit, so this does not take one itself.
+    ///
+    /// Unlike [`Self::fetch_to_staging`] there is no multi-source fan-out here: the
+    /// range-dedup path is an optimization over one source, and every driven range
+    /// is still bao-verified against `hash`, so a single lane stays sound.
+    async fn drive_ranges_ordered(
+        &self,
+        targets: &RangeTargets,
+        hash: [u8; 32],
+        staging: &Path,
+        ranges: &[(u64, u64)],
+        progress: Option<&ProgressCallback>,
+    ) -> anyhow::Result<ClientRangedStore> {
+        let order = match targets {
+            RangeTargets::Pinned(pinned) => {
+                return self
+                    .drive_ranges_from(hash, *pinned, &[], staging, ranges, progress)
+                    .await;
+            }
+            RangeTargets::Discovered(order) => order,
+        };
 
         let mut last_err: Option<anyhow::Error> = None;
         for (attempt, cand) in order.iter().enumerate() {
@@ -1188,7 +1217,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
         // A donor entry's finalized staging blob is the source a recipient splices
         // from, so it is kept past its own group's cleanup. With the run over,
-        // every registered donor source is safe to remove.
+        // every registered donor source is safe to remove — EXCEPT one a
+        // `mark_retained` flagged: its blob is paid for but a destination failed to
+        // materialize, so the finalized `<hex>` is the resume prefix a rerun needs
+        // (deleting it would force a full re-fetch and re-payment).
         //
         // Disk cost: `materialize` copies rather than hard-links, so every
         // hint-carrying entry keeps its finalized staging blob here until this
@@ -1196,9 +1228,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // bundle is therefore about output + staging (~2× the bundle size) — parity
         // with the prior chunked path. A follow-up can hard-link the first
         // materialize so the staging blob shares storage with its output.
-        for source in index.sources() {
-            remove_staging(&source);
-        }
+        sweep_donor_sources(&index);
         (outcomes, transfer)
     }
 
@@ -1239,7 +1269,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// - No hints (or `total` unknown, or the blob is already finalized at
     ///   `staging`), or no chunk overlaps a materialized sibling → the plain
     ///   whole-file [`Self::fetch_to_staging`] path.
-    /// - Otherwise the dedup path: pay to [`Self::drive_ranges_failover`] only the
+    /// - Otherwise the dedup path: pay to [`Self::drive_ranges_ordered`] only the
     ///   *complement* (the group-aligned bytes no donor covers) into `staging`'s
     ///   `.partial`, then splice each donor range from its sibling's on-disk blob.
     ///   Each donor chunk is confirmed present at the recorded source offset by
@@ -1294,83 +1324,30 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .await
             .map_err(|_| anyhow!("bundle pull concurrency gate closed"))?;
 
-        // Pay only for the bytes no donor covers.
-        self.drive_ranges_failover(hash, staging, &plan.complement, progress)
-            .await?;
+        // Resolve the range-drive provider order ONCE for this entry and reuse it
+        // across every sub-drive below (complement, donor re-fetch, whole-blob
+        // re-drive) — the happy path (complement only) still probes exactly once.
+        let targets = self.resolve_range_targets(hash).await?;
+        let driver = CtxRangeDriver {
+            ctx: self,
+            targets: &targets,
+            hash,
+            staging,
+            progress,
+        };
 
-        let partial = partial_path(staging);
-
-        // Verify + splice each donor range off the executor. A donor whose chunk
-        // no longer hashes to its hint (a lying donor hint, or a short read) is
-        // re-fetched normally rather than trusted.
-        let donors = plan.donor.clone();
-        let partial_for_splice = partial.clone();
-        let refetch: Vec<(u64, u64)> =
-            tokio::task::spawn_blocking(move || splice_donors(&partial_for_splice, &donors))
-                .await
-                .map_err(|e| anyhow!("donor splice task: {e}"))??;
-        if !refetch.is_empty() {
-            self.drive_ranges_failover(hash, staging, &refetch, progress)
-                .await?;
-            // If every donor was untrusted, `refetch` is the whole donor set, so the
-            // driven complement plus this re-fetch cover the whole blob: `drive` then
-            // ran its whole-blob bao sweep against `hash` and renamed `.partial` ->
-            // `staging`. The blob is finalized and verified — do not hash/promote a
-            // `.partial` that no longer exists; register the donor chunks and return.
-            if staging.try_exists()? {
-                index.register(hints, staging);
-                return Ok(());
+        // On any dedup-path success, true up the file + total progress bars to
+        // 100%: donor bytes are spliced from disk and never flow through `drive`'s
+        // progress callback, so a mostly-spliced entry would otherwise leave its
+        // bars short of the blob's full size. Both bars are monotonic, so a path
+        // that already reached 100% (a whole-blob re-drive) is unaffected.
+        let finish_progress = || {
+            if let Some(cb) = progress {
+                cb(total, total);
             }
-        }
+        };
 
-        // The authoritative check: the whole reassembled blob must hash to `hash`.
-        let partial_for_hash = partial.clone();
-        let got = tokio::task::spawn_blocking(move || hash_partial(&partial_for_hash))
-            .await
-            .map_err(|e| anyhow!("whole-file hash task: {e}"))??;
-        if got != hash {
-            // A lying recipient hint placed a chunk at the wrong offset. Drop the
-            // spliced ranges by re-driving the whole blob (the ranged store fetches
-            // exactly the bytes the splice wrote, bao-verified against `hash`) and
-            // re-verify.
-            tracing::warn!(
-                "bundle pull: entry {} failed its whole-file hash after range-dedup; \
-                 re-fetching the whole blob",
-                blake3::Hash::from_bytes(hash).to_hex()
-            );
-            self.drive_ranges_failover(hash, staging, &[(0, total)], progress)
-                .await?;
-            // The whole-blob re-drive covers `[0, total)`, so `drive` finalized it:
-            // its bao sweep verified the bytes against `hash` and renamed `.partial`
-            // -> `staging`. The blob is verified — do not re-hash a `.partial` that no
-            // longer exists; register the donor chunks and return.
-            if staging.try_exists()? {
-                index.register(hints, staging);
-                return Ok(());
-            }
-            let partial_for_hash = partial.clone();
-            let got = tokio::task::spawn_blocking(move || hash_partial(&partial_for_hash))
-                .await
-                .map_err(|e| anyhow!("whole-file hash task: {e}"))??;
-            if got != hash {
-                bail!(
-                    "reconstructed blob {} does not match its whole-file hash after a full re-fetch",
-                    blake3::Hash::from_bytes(hash).to_hex()
-                );
-            }
-        }
-
-        // Promote the verified `.partial` to the plain staging file and clean up
-        // the ranged-store sidecars, then register this blob's chunks as donors.
-        let partial_for_promote = partial.clone();
-        let staging_for_promote = staging.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            promote_partial(&partial_for_promote, &staging_for_promote)
-        })
-        .await
-        .map_err(|e| anyhow!("promote task: {e}"))??;
-        index.register(hints, staging);
-        Ok(())
+        reassemble_dedup(&driver, &plan, total, hints, index, &finish_progress).await
     }
 
     /// Fetch the blob shared by one hash-group and write it under `out_root` at
@@ -1494,20 +1471,206 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let any_failed = outcomes
             .iter()
             .any(|o| matches!(o, EntryOutcome::Failed { .. }));
-        if !is_donor && should_remove_staging(any_failed) {
+        if !is_donor && !any_failed {
+            // A non-donor whose every destination landed: its content is safely on
+            // disk, so drop the staging blob now. A failed non-donor keeps its
+            // `.partial` resume prefix; a donor is kept for splicing and swept at
+            // run end.
             remove_staging(&staging);
+        } else if is_donor && any_failed {
+            // A donor whose blob is fully fetched and paid for but whose
+            // materialize failed: retain its finalized `<hex>` from the run-end
+            // sweep so a rerun resumes from it instead of re-paying the whole blob.
+            index.mark_retained(&staging);
         }
 
         outcomes
     }
 }
 
-/// Whether a group's staging blob may be removed right after materializing: only
-/// when nothing failed (a failed entry keeps its `.partial` resume prefix). A
-/// donor blob is retained separately by [`PullCtx::fetch_group`] and swept at run
-/// end, so this gate does not see it.
-const fn should_remove_staging(any_failed: bool) -> bool {
-    !any_failed
+/// The range-drive step [`reassemble_dedup`] performs against one entry: drive
+/// exactly `ranges` into the entry's `.partial` (bao-verified against the
+/// whole-file hash), or let the ranged store finalize `staging` when they complete
+/// it. Abstracted from the reassembly control flow so that flow — which must treat
+/// a drive that finalized the blob as done, rather than open a now-renamed
+/// `.partial` — is unit-testable without a live endpoint or pool.
+trait RangeDriver {
+    /// The entry's authoritative whole-file BLAKE3 hash.
+    fn hash(&self) -> [u8; 32];
+
+    /// The entry's finalized staging path (`<out_root>/.decdn-partial/<hex>`); its
+    /// `.partial` is what the splice writes into.
+    fn staging(&self) -> &Path;
+
+    /// Drive `ranges` for the entry. On return the entry's `staging` is either
+    /// finalized (the store completed and renamed `<hex>.partial` -> `<hex>`) or
+    /// still a `.partial` the caller splices into.
+    fn drive<'a>(
+        &'a self,
+        ranges: &'a [(u64, u64)],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>>;
+}
+
+/// The production [`RangeDriver`]: the live paid range-drive path over a
+/// pre-resolved provider order (so repeated sub-drives of one entry share one
+/// probe round).
+struct CtxRangeDriver<'a, P: Provider + Clone> {
+    ctx: &'a PullCtx<'a, P>,
+    targets: &'a RangeTargets,
+    hash: [u8; 32],
+    staging: &'a Path,
+    progress: Option<&'a ProgressCallback>,
+}
+
+impl<P: Provider + Clone> RangeDriver for CtxRangeDriver<'_, P> {
+    fn hash(&self) -> [u8; 32] {
+        self.hash
+    }
+
+    fn staging(&self) -> &Path {
+        self.staging
+    }
+
+    fn drive<'a>(
+        &'a self,
+        ranges: &'a [(u64, u64)],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
+        Box::pin(async move {
+            self.ctx
+                .drive_ranges_ordered(self.targets, self.hash, self.staging, ranges, self.progress)
+                .await
+                .map(|_store| ())
+        })
+    }
+}
+
+/// Reassemble one dedup entry's blob into `staging`: drive the complement, splice
+/// the donor ranges from disk, verify the whole-file BLAKE3, and promote — using
+/// `driver` for every paid range drive.
+///
+/// The authoritative gate throughout is the whole-file BLAKE3; a bad or lying hint
+/// only ever costs a re-download, never a corrupt output or a spuriously-failed
+/// entry. After EVERY range drive (the complement, a donor re-fetch, and the
+/// whole-blob re-drive) the store may have completed — `drive` then finalized and
+/// renamed `<hex>.partial` -> `<hex>`. Each such point checks `staging.try_exists()`
+/// and returns success rather than opening a `.partial` that no longer exists: a
+/// resumed run whose prior `.partial` already held the donor-overlap ranges hits
+/// this on the very FIRST complement drive.
+///
+/// `finish_progress` trues the file + total bars up to 100% on success: donor
+/// bytes are spliced from disk and never flow through `drive`'s progress callback,
+/// so a mostly-spliced entry would otherwise leave its bars short.
+async fn reassemble_dedup(
+    driver: &dyn RangeDriver,
+    plan: &DedupPlan,
+    total: u64,
+    hints: Option<&[Hint]>,
+    index: &ChunkIndex,
+    finish_progress: &dyn Fn(),
+) -> anyhow::Result<()> {
+    let hash = driver.hash();
+    let staging = driver.staging();
+
+    // Pay only for the bytes no donor covers.
+    driver.drive(&plan.complement).await?;
+
+    // A resumed run may already hold the donor-overlap bytes in `.partial`, so this
+    // first complement drive can COMPLETE the store — `drive` then ran its
+    // whole-blob bao sweep against `hash` and renamed `<hex>.partial` -> `<hex>`.
+    // The blob is finalized and verified; splicing would open a `.partial` that no
+    // longer exists. Register the donor chunks and return.
+    if staging.try_exists()? {
+        finish_progress();
+        index.register(hints, staging);
+        return Ok(());
+    }
+
+    let partial = partial_path(staging);
+
+    // Verify + splice each donor range off the executor. A donor whose chunk no
+    // longer hashes to its hint (a lying donor hint, or a short read) is re-fetched
+    // normally rather than trusted.
+    let donors = plan.donor.clone();
+    let partial_for_splice = partial.clone();
+    let refetch: Vec<(u64, u64)> =
+        tokio::task::spawn_blocking(move || splice_donors(&partial_for_splice, &donors))
+            .await
+            .map_err(|e| anyhow!("donor splice task: {e}"))??;
+    if !refetch.is_empty() {
+        driver.drive(&refetch).await?;
+        // If every donor was untrusted, `refetch` is the whole donor set, so the
+        // driven complement plus this re-fetch cover the whole blob: `drive` then
+        // ran its whole-blob bao sweep against `hash` and renamed `.partial` ->
+        // `staging`. The blob is finalized and verified — do not hash/promote a
+        // `.partial` that no longer exists; register the donor chunks and return.
+        if staging.try_exists()? {
+            finish_progress();
+            index.register(hints, staging);
+            return Ok(());
+        }
+    }
+
+    // The authoritative check: the whole reassembled blob must hash to `hash`.
+    let partial_for_hash = partial.clone();
+    let got = tokio::task::spawn_blocking(move || hash_partial(&partial_for_hash))
+        .await
+        .map_err(|e| anyhow!("whole-file hash task: {e}"))??;
+    if got != hash {
+        // A lying recipient hint placed a chunk at the wrong offset. Drop the
+        // spliced ranges by re-driving the whole blob (the ranged store fetches
+        // exactly the bytes the splice wrote, bao-verified against `hash`) and
+        // re-verify.
+        tracing::warn!(
+            "bundle pull: entry {} failed its whole-file hash after range-dedup; \
+             re-fetching the whole blob",
+            blake3::Hash::from_bytes(hash).to_hex()
+        );
+        driver.drive(&[(0, total)]).await?;
+        // The whole-blob re-drive covers `[0, total)`, so `drive` finalized it: its
+        // bao sweep verified the bytes against `hash` and renamed `.partial` ->
+        // `staging`. The blob is verified — do not re-hash a `.partial` that no
+        // longer exists; register the donor chunks and return.
+        if staging.try_exists()? {
+            finish_progress();
+            index.register(hints, staging);
+            return Ok(());
+        }
+        let partial_for_hash = partial.clone();
+        let got = tokio::task::spawn_blocking(move || hash_partial(&partial_for_hash))
+            .await
+            .map_err(|e| anyhow!("whole-file hash task: {e}"))??;
+        if got != hash {
+            bail!(
+                "reconstructed blob {} does not match its whole-file hash after a full re-fetch",
+                blake3::Hash::from_bytes(hash).to_hex()
+            );
+        }
+    }
+
+    // Promote the verified `.partial` to the plain staging file and clean up the
+    // ranged-store sidecars, then register this blob's chunks as donors.
+    let partial_for_promote = partial.clone();
+    let staging_for_promote = staging.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        promote_partial(&partial_for_promote, &staging_for_promote)
+    })
+    .await
+    .map_err(|e| anyhow!("promote task: {e}"))??;
+    finish_progress();
+    index.register(hints, staging);
+    Ok(())
+}
+
+/// The run-end sweep of donor staging blobs: remove every registered donor
+/// source EXCEPT one [`ChunkIndex::mark_retained`] flagged (its blob is paid for
+/// but a destination failed to materialize, so its finalized `<hex>` is the resume
+/// prefix a rerun needs — deleting it would force a full re-fetch and re-payment).
+fn sweep_donor_sources(index: &ChunkIndex) {
+    for source in index.sources() {
+        if !index.retained(&source) {
+            remove_staging(&source);
+        }
+    }
 }
 
 /// Copy the already-fetched, already-verified blob at `staging` to `dest`,
@@ -1570,6 +1733,12 @@ struct ChunkIndex {
     /// First-writer-wins map; a chunk registered by one completed entry serves
     /// every later entry that shares it.
     map: std::sync::Mutex<HashMap<[u8; 32], MaterializedRange>>,
+    /// Donor staging blobs the run-end sweep in [`PullCtx::pull_all`] must NOT
+    /// delete: a donor group whose blob is fully fetched and registered but
+    /// whose materialize to disk failed (ENOSPC, an unwritable dest). Its
+    /// finalized `<hex>` is the resume prefix a rerun needs — deleting it would
+    /// force a full re-fetch and re-payment of an unrefunded blob.
+    retain: std::sync::Mutex<HashSet<PathBuf>>,
 }
 
 impl ChunkIndex {
@@ -1603,6 +1772,21 @@ impl ChunkIndex {
             }
         }
         out
+    }
+
+    /// Mark a donor `source` as a resume prefix the run-end sweep must keep: its
+    /// blob is fully fetched and paid for, but at least one destination failed to
+    /// materialize, so a rerun needs the finalized `<hex>` rather than re-paying.
+    fn mark_retained(&self, source: &Path) {
+        let mut retain = self.retain.lock().unwrap_or_else(PoisonError::into_inner);
+        retain.insert(source.to_path_buf());
+    }
+
+    /// Whether `source` was retained by [`Self::mark_retained`] and so must
+    /// survive the run-end sweep.
+    fn retained(&self, source: &Path) -> bool {
+        let retain = self.retain.lock().unwrap_or_else(PoisonError::into_inner);
+        retain.contains(source)
     }
 }
 
@@ -1689,6 +1873,13 @@ fn plan_dedup(
         let Some(m) = index.get(&h.hash) else {
             continue;
         };
+        // The same chunk hash but a different claimed length: one side's manifest
+        // lies about this chunk. Don't dedup it — leave the hint's range in the
+        // complement (paid for and bao-verified) instead of trusting a placement
+        // that would run past the donor's real chunk end.
+        if m.len != h.len {
+            continue;
+        }
         let hint_end = h.offset.saturating_add(h.len);
         // Inward alignment: first group boundary at or after `offset`, last group
         // boundary at or before `hint_end`.
@@ -1751,13 +1942,19 @@ fn splice_donors(partial: &Path, donors: &[DonorRange]) -> anyhow::Result<Vec<(u
             continue;
         }
         // The chunk is confirmed present at `chunk_src_offset`; copy its
-        // group-aligned subset into the recipient's `.partial`.
-        src.seek(SeekFrom::Start(d.src_offset))
-            .with_context(|| format!("seek donor {}", d.source.display()))?;
-        out.seek(SeekFrom::Start(dst_offset))
-            .with_context(|| format!("seek {}", partial.display()))?;
-        copy_exact(&mut src, &mut out, len)
-            .with_context(|| format!("splice donor into {}", partial.display()))?;
+        // group-aligned subset into the recipient's `.partial`. A seek/copy error
+        // here (a truncated or racing donor file, an I/O fault) is not fatal: the
+        // donor bytes are simply not trusted, so queue the aligned range for a
+        // paid, bao-verified re-fetch that overwrites exactly it — nothing torn by
+        // a partial copy survives, and the whole-file BLAKE3 the caller runs next
+        // is the authoritative backstop.
+        let copied = src
+            .seek(SeekFrom::Start(d.src_offset))
+            .and_then(|_| out.seek(SeekFrom::Start(dst_offset)))
+            .and_then(|_| copy_exact(&mut src, &mut out, len));
+        if copied.is_err() {
+            refetch.push(d.aligned);
+        }
     }
     out.sync_all()
         .with_context(|| format!("sync {}", partial.display()))?;
@@ -2482,6 +2679,202 @@ mod tests {
         assert_eq!(plan.complement, vec![(0, total)]);
     }
 
+    /// Review #2 (money-band): a recipient hint that names a real donor chunk hash
+    /// but claims a DIFFERENT length is one side lying about the chunk. It must not
+    /// dedup — leaving its range in the complement (paid for and bao-verified)
+    /// instead of trusting a placement that would run past the donor's real chunk
+    /// end. Without the length check `plan_dedup` produces a donor of the longer
+    /// claimed span, which `splice_donors` then cannot copy.
+    #[test]
+    fn plan_dedup_skips_a_donor_whose_claimed_length_disagrees() {
+        let total = 2 * GROUP;
+        let h = [0x55; 32];
+        let mut index = HashMap::new();
+        // The donor genuinely holds a ONE-group chunk under this hash.
+        index.insert(
+            h,
+            MaterializedRange {
+                source: PathBuf::from("/tmp/donorX"),
+                offset: 0,
+                len: GROUP,
+            },
+        );
+        // The recipient claims the SAME hash but a longer, two-group length.
+        let hints = [Hint {
+            hash: h,
+            offset: 0,
+            len: 2 * GROUP,
+        }];
+        let plan = plan_dedup(&hints, &index, total);
+        assert!(
+            plan.donor.is_empty(),
+            "a length-mismatched donor must not be spliced"
+        );
+        assert_eq!(plan.complement, vec![(0, total)]);
+    }
+
+    /// Review #2 (money-band): a per-donor copy that would run past the donor
+    /// file's end (a mismatched aligned span, a truncated or racing donor) is not a
+    /// hard failure — `splice_donors` queues the aligned range for a paid,
+    /// bao-verified re-fetch and leaves `.partial` untouched for it, rather than
+    /// returning `Err` and failing the whole entry.
+    #[test]
+    fn splice_donors_refetches_when_a_copy_would_run_past_the_donor_end() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let donor_path = tmp.path().join("donor");
+        let partial = tmp.path().join("out.partial");
+
+        // The donor holds exactly ONE group of bytes, so its chunk verifies — but
+        // the donor range below asks to copy TWO groups from offset 0, which EOFs.
+        let chunk_bytes: Vec<u8> = (0..GROUP)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        std::fs::write(&donor_path, &chunk_bytes).expect("write donor");
+        let chunk_hash = *blake3::hash(&chunk_bytes).as_bytes();
+
+        let total = 3 * GROUP;
+        std::fs::File::create(&partial)
+            .and_then(|f| f.set_len(total))
+            .expect("presize partial");
+
+        let donor = DonorRange {
+            // Aligned span of TWO groups, but only one group is readable at
+            // `src_offset` — the copy hits EOF.
+            aligned: (GROUP, 2 * GROUP),
+            source: donor_path,
+            src_offset: 0,
+            chunk_hash,
+            chunk_src_offset: 0,
+            chunk_len: GROUP,
+        };
+
+        let refetch = splice_donors(&partial, std::slice::from_ref(&donor))
+            .expect("a copy that EOFs must not fail the splice");
+        assert_eq!(refetch, vec![(GROUP, 2 * GROUP)]);
+
+        // Nothing was written into `.partial` for the untrusted donor — the whole
+        // file stays at its pre-sized zero value, so the coming re-fetch overwrites
+        // clean bytes.
+        let got = std::fs::read(&partial).expect("read partial");
+        assert!(
+            got.iter().all(|&b| b == 0),
+            "an EOF-ing donor copy must leave partial untouched"
+        );
+    }
+
+    /// Review #1 (money-band): when a range drive COMPLETES the store — a resumed
+    /// run whose `.partial` already held the donor-overlap ranges, so the very first
+    /// complement drive finalizes and renames `<hex>.partial` -> `<hex>` —
+    /// `reassemble_dedup` must treat the entry as done and NOT open a `.partial`
+    /// that no longer exists. The [`FinalizingDriver`] simulates that finalize on
+    /// its first drive; without the post-drive `staging.try_exists()` guard the
+    /// reassembly would call `splice_donors` on the absent `.partial` and fail.
+    #[tokio::test]
+    async fn reassemble_dedup_succeeds_when_the_first_drive_finalizes_the_blob() {
+        // A driver that, on its first (complement) drive, finalizes the blob by
+        // creating the plain `<hex>` staging file and leaving no `.partial`.
+        struct FinalizingDriver {
+            hash: [u8; 32],
+            staging: PathBuf,
+            drives: std::cell::Cell<u32>,
+        }
+        impl RangeDriver for FinalizingDriver {
+            fn hash(&self) -> [u8; 32] {
+                self.hash
+            }
+            fn staging(&self) -> &Path {
+                &self.staging
+            }
+            fn drive<'a>(
+                &'a self,
+                _ranges: &'a [(u64, u64)],
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>>
+            {
+                Box::pin(async move {
+                    self.drives.set(self.drives.get() + 1);
+                    std::fs::write(&self.staging, b"finalized").expect("finalize staging");
+                    Ok(())
+                })
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let staging = tmp.path().join("blob");
+        let driver = FinalizingDriver {
+            hash: [0x11; 32],
+            staging: staging.clone(),
+            drives: std::cell::Cell::new(0),
+        };
+        // A dedup plan with a real donor (the path is never read — the guard
+        // returns before any splice).
+        let plan = DedupPlan {
+            donor: vec![DonorRange {
+                aligned: (GROUP, GROUP),
+                source: tmp.path().join("donor-never-read"),
+                src_offset: 0,
+                chunk_hash: [0x11; 32],
+                chunk_src_offset: 0,
+                chunk_len: GROUP,
+            }],
+            complement: vec![(0, GROUP)],
+        };
+        let index = ChunkIndex::default();
+
+        let res = reassemble_dedup(&driver, &plan, 2 * GROUP, None, &index, &|| {}).await;
+
+        assert!(
+            res.is_ok(),
+            "a first complement drive that finalizes the blob must succeed, not \
+             fail on a missing .partial: {res:?}"
+        );
+        assert_eq!(driver.drives.get(), 1, "only the complement drive ran");
+        assert!(staging.try_exists().expect("stat staging"));
+    }
+
+    /// Review #3 (money-band): the run-end sweep removes a normal donor staging
+    /// blob but KEEPS one `mark_retained` flagged (its group failed to
+    /// materialize), so a rerun resumes from the finalized `<hex>` instead of
+    /// re-paying the whole blob.
+    #[test]
+    fn run_end_sweep_keeps_a_retained_donor_and_removes_a_normal_one() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let normal = tmp.path().join("normal");
+        let retained = tmp.path().join("retained");
+        std::fs::write(&normal, b"n").expect("write normal");
+        std::fs::write(&retained, b"r").expect("write retained");
+
+        let index = ChunkIndex::default();
+        index.register(
+            Some(&[Hint {
+                hash: [1; 32],
+                offset: 0,
+                len: 1,
+            }]),
+            &normal,
+        );
+        index.register(
+            Some(&[Hint {
+                hash: [2; 32],
+                offset: 0,
+                len: 1,
+            }]),
+            &retained,
+        );
+        // The retained donor's blob is paid for but its materialize failed.
+        index.mark_retained(&retained);
+
+        sweep_donor_sources(&index);
+
+        assert!(
+            !normal.exists(),
+            "a normal donor source is swept at run end"
+        );
+        assert!(
+            retained.exists(),
+            "a retained (materialize-failed) donor source survives the sweep"
+        );
+    }
+
     /// `splice_donors` happy path: a donor file holds a verified chunk at some
     /// offset (with padding on both sides), and the aligned subset lands at the
     /// correct recipient offset in `.partial` — nothing else in `.partial` is
@@ -2788,14 +3181,6 @@ mod tests {
             .map(|group| group.entries.iter().map(|e| e.path.as_str()).collect())
             .collect();
         assert_eq!(paths, vec![vec!["a.txt", "c.txt"], vec!["b.txt"]]);
-    }
-
-    #[test]
-    fn should_remove_staging_keeps_a_failed_entrys_resume_prefix() {
-        // Removed when nothing failed (its content is safely materialized).
-        assert!(should_remove_staging(false));
-        // A failed entry always keeps its `.partial` resume prefix.
-        assert!(!should_remove_staging(true));
     }
 
     /// Distinct hashes never merge — each is its own unit of work, in order.

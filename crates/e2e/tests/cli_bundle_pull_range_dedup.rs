@@ -832,7 +832,7 @@ fn whole_blob_wire_bytes(total: u64) -> u64 {
 
 /// The exact wire bytes a driven `[offset, offset + len)` range of a
 /// `total`-byte blob vouchers for — the same quantity `bundle_pull`'s
-/// `drive_ranges_failover` pays for one complement run. Mirrors
+/// `drive_ranges_ordered` pays for one complement run. Mirrors
 /// `plan_dedup`/`drive`'s per-run accounting: each `(offset, len)` complement
 /// run is driven (and billed) independently via its own `align_range`.
 fn range_wire_bytes(offset: u64, len: u64, total: u64) -> anyhow::Result<u64> {
