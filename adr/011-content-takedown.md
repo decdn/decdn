@@ -510,7 +510,7 @@ Clients should retry on a different node for `HashBlacklisted`: a local entry bi
 
 ## Slashing
 
-Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn). Repeated offenses trigger cumulative bond loss; nodes whose bond drops below 50% of the minimum are auto-ejected. Individual slash percentages are capped at 50% per offense ([ADR 009 § Safety bounds](009-governance.md#governable-parameters-with-safety-bounds)). The standard 100 TOKEN challenge bond from [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) applies.
+Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn). Repeated offenses trigger cumulative bond loss; nodes whose bond drops below 50% of the minimum are auto-ejected. A single offense slashes at most 50% of the bond — the top tier of the fixed ladder in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn). The standard 100 TOKEN challenge bond from [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) applies.
 
 ### Slash evidence
 

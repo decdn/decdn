@@ -118,13 +118,11 @@ The α range upper-bounds at 1.8 to prevent a concentration penalty so steep tha
 
 | Parameter | Contract | Min | Max |
 | --- | --- | --- | --- |
-| Slash percentage (per offense) | CapacityBond | 5% | 50% |
 | Multiaddr update cooldown | CapacityBond | 0 (disabled) | 86400 seconds (1 day) |
 | Max multiaddr size | CapacityBond | 64 bytes | 1024 bytes |
 | Dispute window (default: 48h) | PaymentPool | 48 hours | 72 hours (3 days) |
 | Rate floor | PaymentPool | 1 base unit | `MAX_RATE_PER_MB` (10^12, the [ADR 005](005-protocol.md#adr-005-wire-protocol) wire cap) |
 | Challenge bond | SlashJudge | 1 TOKEN | 1,000 TOKEN |
-| Base slash reset period | CapacityBond | 30 days | 365 days |
 | Compliance window | ContentBlacklist | 1 hour | 7 days |
 | Max origins per namespace | OriginAssignment | 1 | 50 |
 | Max namespaces per publisher | PublisherRegistry | 1 | 1000 |
@@ -141,8 +139,7 @@ CapacityBond parameters are defined in [ADR 026 § Capacity-bond curve](026-toke
 
 **Safety bound rationale:**
 
-- **Slash 5%–50% per offense:** A 1% slash is economically negligible and provides no deterrence. A 100% single-offense slash enables governance to fully confiscate the bond, which is disproportionate. The 5%–50% range ensures each individual slash is meaningful but not existential. Full ejection (effectively 100% loss) is still possible through **cumulative** slashing per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn).
-- **Base slash reset period 30–365 days:** Bounds apply to the base reset period only; the hardcoded escalation multiplier (1×/2×/4×) on lifetime offense count is not governable, to prevent flattening the anti-gaming curve.
+- **Slash ladder (not governable):** `CapacityBond` slashes a fixed 5% / 15% / 50% of the bond on the first, second, and third-or-later offense. The tier is keyed on the operator's lifetime offense counter, which only increases and never resets. The ladder is a compile-time constant with no setter, so governance cannot flatten the anti-gaming curve or confiscate a bond in one step. Full ejection (effectively 100% loss) is still reachable through **cumulative** slashing per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn).
 - **Max evidence age 1–30 days and Unbonding period 7–60 days:** The individual bounds permit a configuration where evidence age ≥ unbonding period, which would let an operator commit any of the three on-chain offenses ([ADR 014 § `Slashed` event and `slashId` allocation](014-on-chain-verification.md#slashed-event-and-slashid-allocation)), initiate unbonding, and complete withdrawal before the evidence window opens. **Cross-parameter invariant:** `SlashJudge` and `CapacityBond` enforce `MAX_EVIDENCE_AGE_US < unbondingPeriod * 1_000_000` at the contract layer on every `setMaxEvidenceAge` / `setUnbondingPeriod` call; updates that would violate this revert. The check applies at deployment as well. See [ADR 014 § Interaction with unbonding period](014-on-chain-verification.md#interaction-with-unbonding-period) for the exact revert conditions.
 - **Rate floor ≥ 1 base unit:** A zero floor allows free-riding nodes that advertise zero rates to attract traffic without generating protocol fees. The minimum of 1 USDC base unit ($0.000001/MB for 6-decimal USDC) is negligibly small but prevents true zero-rate abuse.
 - **Grace window 48h–72h:** A shorter window is too short for a node to redeem outstanding vouchers before the owner reclaims, and it must stay above the L2 force-inclusion delay (≤ 24h) so censorship cannot burn the whole window. A 7-day window locks owner funds for an unacceptably long period. The floor equals the 48h default, so the baseline can only be tightened upward; PoC deploys at 48 hours to guarantee 24 hours of effective redemption time under worst-case L2 sequencer censorship. See [ADR 003](003-payments.md#adr-003-payment-model).

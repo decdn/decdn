@@ -246,7 +246,7 @@ Group 4 (19% / 190M TOKEN) funds demand-side adoption — publishers serving con
 
 ### Slashing and burn
 
-**Slashing rates.** 5% / 15% / 50% escalation tiers, lifetime offense counter (`uint32`, monotonically increasing), increasing reset periods, challenge-bond mechanics. Applied to the `CapacityBond`.
+**Slashing rates.** 5% / 15% / 50% escalation tiers keyed on a lifetime offense counter (`uint32`, monotonically increasing, never reset), plus challenge-bond mechanics. The ladder is a fixed constant in `CapacityBond`; it is not governable.
 
 **Auto-ejection.** At 50% of minimum bond for the operator's declared tier. This slash-driven auto-ejection is **recoverable** — re-bonding back to `minBond` clears the `ejected` flag. It does **not** override a concurrent governance blacklist, which sets a separate `blacklistEjected` latch that re-bonding cannot clear (see [ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)).
 
