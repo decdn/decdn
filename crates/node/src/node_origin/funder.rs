@@ -6,13 +6,14 @@
 //! leg (B2) shares that driver instead of running its own copy of the top-up
 //! loop. `NodeFunder` is the bridge.
 //!
-//! `Funder::top_up(additional)` means "add exactly `additional` to the deposit"
-//! — the same contract the CLI's `CliFunder` honours by calling `topUp` with
-//! `additional` directly. A `topUp` leaves the pool's committed spend untouched,
-//! so adding `additional` to the deposit adds exactly `additional` to the
-//! spendable headroom too. [`PoolOpener::top_up_pool`] takes the same amount and
-//! reports how much of it landed, so `NodeFunder` passes `additional` through and
-//! grades the landing on that report. The driver sizes it from the pull's live
+//! `Funder::top_up(additional)` asks to add `additional` to the deposit — the same
+//! request the CLI's `CliFunder` makes by calling `topUp` with `additional`
+//! directly. A `topUp` leaves the pool's committed spend untouched, so what lands
+//! on the deposit lands on the spendable headroom too. What lands can be less than
+//! `additional`. [`PoolOpener::top_up_pool`] takes the same amount and reports how
+//! much of it landed, so `NodeFunder` passes `additional` through and grades the
+//! landing on that report: a full landing is a success, and a short one is still
+//! returned as `Added` so the driver keeps the headroom that did land. The driver sizes it from the pull's live
 //! ledger; the buyer service's persisted lane progress lags a running pull and
 //! cannot size it.
 //!

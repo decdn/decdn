@@ -11078,6 +11078,9 @@ struct FundingOpener {
     topups: Arc<Mutex<Vec<(Address, U256)>>>,
     /// Whether a top-up actually adds headroom. `false` models a refusal.
     funds: bool,
+    /// The most one top-up lands. `None` lands the full request; `Some` models a
+    /// short landing, such as a joined `topUp` that credited less than requested.
+    landing_cap: Option<U256>,
 }
 
 #[async_trait]
@@ -11138,10 +11141,16 @@ impl PoolOpener for FundingOpener {
             .deposit
             .lock()
             .map_err(|_| anyhow::anyhow!("deposit lock poisoned"))?;
-        // Add exactly `additional`, as the real `BuyerPoolService::top_up_pool` does.
-        let funded = self.funds && !additional.is_zero();
-        if funded {
-            *deposit = deposit.saturating_add(additional);
+        // Add `additional`, capped at `landing_cap`, and report what landed, as the
+        // real `BuyerPoolService::top_up_pool` does.
+        let added = if self.funds {
+            self.landing_cap
+                .map_or(additional, |cap| additional.min(cap))
+        } else {
+            U256::ZERO
+        };
+        if !added.is_zero() {
+            *deposit = deposit.saturating_add(added);
             // The escrow the upstream can see rises with it — a real `topUp` raises one
             // number, and the buyer's belief and the seller's gate are both views of it.
             *self
@@ -11151,7 +11160,7 @@ impl PoolOpener for FundingOpener {
         }
         Ok(TopUpLanded {
             new_deposit: *deposit,
-            added: if funded { additional } else { U256::ZERO },
+            added,
         })
     }
 }
@@ -11416,6 +11425,8 @@ struct TopUpSetup {
     working_micro_usdc: u64,
     /// Whether a top-up adds headroom.
     funds: bool,
+    /// The most one top-up lands, if it must land short. `None` lands the request.
+    landing_cap_micro_usdc: Option<u64>,
     /// What the UPSTREAM enforces, if it must differ from what the buyer believes.
     /// `None` keeps them equal, which is the honest case.
     ceiling_micro_usdc: Option<u64>,
@@ -11432,6 +11443,7 @@ impl TopUpSetup {
             initial_micro_usdc,
             working_micro_usdc,
             funds,
+            landing_cap_micro_usdc: None,
             ceiling_micro_usdc: None,
             resume_delay: Duration::ZERO,
         }
@@ -11510,6 +11522,7 @@ async fn top_up_fixture_multi_rep(
         recorded: Arc::clone(&recorded),
         topups: Arc::new(Mutex::new(Vec::new())),
         funds: setup.funds,
+        landing_cap: setup.landing_cap_micro_usdc.map(U256::from),
     });
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
@@ -11834,6 +11847,7 @@ async fn a_node_crying_poverty_while_our_ledger_has_headroom_is_not_funded() -> 
             initial_micro_usdc: 10_000 * RATE,
             working_micro_usdc: 20_000 * RATE,
             funds: true,
+            landing_cap_micro_usdc: None,
             ceiling_micro_usdc: Some(0),
             resume_delay: Duration::ZERO,
         },
@@ -11899,6 +11913,67 @@ async fn a_topup_that_adds_no_headroom_ends_the_pull() -> Result<()> {
     anyhow::ensure!(
         log.len() == 1,
         "the funding attempt must be made exactly once, then abandoned — got {log:?}"
+    );
+    assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 0)?;
+    assert_counter(
+        &fixture.metrics,
+        "node_pull_reactive_topup_refused_total",
+        1,
+    )?;
+
+    fixture.shutdown().await?;
+    Ok(())
+}
+
+/// A top-up that lands SHORT of its request (#2012): the pull keeps the headroom that
+/// landed and spends it, uses its single reactive top-up, and is metered once as
+/// refused — not as a success, and not a second time as an extortion refusal.
+///
+/// The initial deposit covers two MiB at `RATE` and the capped landing one more,
+/// short of the 3 MiB + 777 byte blob, so the pull ends without the blob.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_topup_that_lands_short_keeps_what_landed_and_is_metered_once() -> Result<()> {
+    let payload = multi_interval_payload();
+    let initial = 2 * RATE;
+    let cap = RATE;
+    let fixture = top_up_fixture(
+        Arc::clone(&payload),
+        TopUpSetup {
+            landing_cap_micro_usdc: Some(cap),
+            ..TopUpSetup::honest(initial, 200 * RATE, true)
+        },
+    )
+    .await?;
+
+    let got = tokio::time::timeout(
+        Duration::from_mins(1),
+        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("an underfunded pull must not hang"))?
+    .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::NotFound),
+        "a pull the short landing cannot finish must not surface bytes"
+    );
+
+    let log = topup_log(&fixture.opener)?;
+    anyhow::ensure!(
+        log.len() == 1,
+        "the single reactive top-up must be spent exactly once — got {log:?}"
+    );
+    anyhow::ensure!(
+        read_deposit(&fixture.opener.deposit)? == U256::from(initial + cap),
+        "the short landing must raise the deposit by exactly what landed"
+    );
+    let paid = progress_log(&fixture.recorded)?
+        .iter()
+        .map(|(_, _, amount)| *amount)
+        .max()
+        .unwrap_or(U256::ZERO);
+    anyhow::ensure!(
+        paid > U256::from(initial),
+        "the pull must spend the headroom that landed: paid {paid}, initial deposit {initial}"
     );
     assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 0)?;
     assert_counter(

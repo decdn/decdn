@@ -143,27 +143,39 @@ enum TopUpFunder {
 enum TopUpClaim {
     /// The call started a `topUp` for its own amount.
     Spawned,
-    /// The call joined a `topUp` another funder started, and claimed this much of
-    /// its unclaimed amount. The claim can be zero.
-    Joined(U256),
+    /// The call joined a `topUp` another funder started, and claimed part of its
+    /// unclaimed amount.
+    Joined {
+        /// How much of the joined `topUp` this call claimed. It can be zero.
+        claimed: U256,
+        /// The amount the joined `topUp` asked for. Claims are made against this
+        /// amount before the `topUp` lands, so they hold only if all of it lands.
+        requested: U256,
+    },
 }
 
 /// The single in-flight funding `topUp` and the part of its amount no caller has
 /// claimed yet.
 struct InFlightTopUp {
     fut: SharedTopUp,
+    /// The amount this `topUp` asks the chain for.
+    requested: U256,
     /// Headroom this `topUp` adds that no pull relies on yet. A refill starts with
     /// its full amount; a reactive top-up starts with zero.
     unclaimed: U256,
 }
 
 impl InFlightTopUp {
-    fn new(fut: SharedTopUp, amount: U256, funder: TopUpFunder) -> Self {
+    fn new(fut: SharedTopUp, requested: U256, funder: TopUpFunder) -> Self {
         let unclaimed = match funder {
-            TopUpFunder::Refill => amount,
+            TopUpFunder::Refill => requested,
             TopUpFunder::Reactive => U256::ZERO,
         };
-        Self { fut, unclaimed }
+        Self {
+            fut,
+            requested,
+            unclaimed,
+        }
     }
 
     /// Join this `topUp`. A reactive joiner claims up to `want` of the unclaimed
@@ -174,7 +186,24 @@ impl InFlightTopUp {
             TopUpFunder::Reactive => self.unclaimed.min(want),
         };
         self.unclaimed = self.unclaimed.saturating_sub(claimed);
-        (self.fut.clone(), TopUpClaim::Joined(claimed))
+        let claim = TopUpClaim::Joined {
+            claimed,
+            requested: self.requested,
+        };
+        (self.fut.clone(), claim)
+    }
+}
+
+/// The headroom a join counts once its `topUp` has landed. Claims are split out of
+/// the requested amount before the chain answers. The contract credits the measured
+/// transfer, which can be less than requested, and the claims can then add up to
+/// more than landed. So a join counts its claim only when the whole requested amount
+/// landed. Otherwise it counts nothing and funds its need with its own `topUp`.
+fn joined_headroom(claimed: U256, requested: U256, landed: U256) -> U256 {
+    if landed >= requested {
+        claimed
+    } else {
+        U256::ZERO
     }
 }
 
@@ -192,8 +221,9 @@ const MAX_TOPUP_CALLS: u32 = 3;
 /// - A spawned `topUp` escrows this caller's own amount, so its result is final.
 ///   A spawned `topUp` that credits less than requested is not retried: the
 ///   shortfall is not from a join, and another call escrows a second `topUp`.
-/// - A joined `topUp` counts only for the amount the join claimed. When that is
-///   less than the remainder, or when the joined `topUp` fails, this warns and asks
+/// - A joined `topUp` counts only for the amount the join claimed, and only when
+///   the whole requested amount landed (see [`joined_headroom`]). When that is less
+///   than the remainder, or when the joined `topUp` fails, this warns and asks
 ///   again for the rest.
 ///
 /// When [`MAX_TOPUP_CALLS`] calls end short, this returns what landed and warns.
@@ -229,8 +259,8 @@ where
                 }
                 return Ok(out);
             }
-            (Ok(landed), TopUpClaim::Joined(claimed)) => {
-                added = added.saturating_add(claimed.min(landed.added));
+            (Ok(landed), TopUpClaim::Joined { claimed, requested }) => {
+                added = added.saturating_add(joined_headroom(claimed, requested, landed.added));
                 TopUpLanded {
                     new_deposit: landed.new_deposit,
                     added,
@@ -1343,8 +1373,11 @@ mod tests {
         U256::from(v)
     }
 
-    fn joined(v: u64) -> TopUpClaim {
-        TopUpClaim::Joined(u(v))
+    fn joined(claimed: u64, requested: u64) -> TopUpClaim {
+        TopUpClaim::Joined {
+            claimed: u(claimed),
+            requested: u(requested),
+        }
     }
 
     fn landed(new_deposit: u64, added: u64) -> TopUpLanded {
@@ -1385,7 +1418,7 @@ mod tests {
     #[tokio::test]
     async fn top_up_at_least_exact_join_needs_no_follow_up() {
         let asked = std::cell::RefCell::new(Vec::new());
-        let f = scripted(vec![(joined(100), Step::Lands(1_500, 500))], &asked);
+        let f = scripted(vec![(joined(100, 500), Step::Lands(1_500, 500))], &asked);
 
         let got = top_up_at_least(POOL, u(100), f).await.unwrap();
 
@@ -1399,7 +1432,7 @@ mod tests {
         let asked = std::cell::RefCell::new(Vec::new());
         let f = scripted(
             vec![
-                (joined(40), Step::Lands(1_040, 40)),
+                (joined(40, 40), Step::Lands(1_040, 40)),
                 (TopUpClaim::Spawned, Step::Lands(1_100, 60)),
             ],
             &asked,
@@ -1419,7 +1452,7 @@ mod tests {
         let asked = std::cell::RefCell::new(Vec::new());
         let f = scripted(
             vec![
-                (joined(0), Step::Lands(1_100, 100)),
+                (joined(0, 100), Step::Lands(1_100, 100)),
                 (TopUpClaim::Spawned, Step::Lands(1_200, 100)),
             ],
             &asked,
@@ -1438,8 +1471,8 @@ mod tests {
         let asked = std::cell::RefCell::new(Vec::new());
         let f = scripted(
             vec![
-                (joined(30), Step::Lands(1_300, 300)),
-                (joined(70), Step::Lands(1_500, 200)),
+                (joined(30, 300), Step::Lands(1_300, 300)),
+                (joined(70, 200), Step::Lands(1_500, 200)),
             ],
             &asked,
         );
@@ -1450,6 +1483,27 @@ mod tests {
         assert_eq!(*asked.borrow(), vec![u(100), u(70)]);
     }
 
+    /// A joined refill that asked for 100 but the chain credited only 50 (the
+    /// contract credits the measured transfer). Claims of 60 and 40 were split out
+    /// of the 100 before it landed, so they add up to more than landed. The join
+    /// counts none of its claim and funds its whole need itself.
+    #[tokio::test]
+    async fn top_up_at_least_short_joined_topup_counts_no_claim() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let f = scripted(
+            vec![
+                (joined(60, 100), Step::Lands(1_050, 50)),
+                (TopUpClaim::Spawned, Step::Lands(1_110, 60)),
+            ],
+            &asked,
+        );
+
+        let got = top_up_at_least(POOL, u(60), f).await.unwrap();
+
+        assert_eq!(got, landed(1_110, 60));
+        assert_eq!(*asked.borrow(), vec![u(60), u(60)]);
+    }
+
     /// A failed joined `topUp` is another funder's failure: this caller funds the
     /// same amount again with a `topUp` of its own.
     #[tokio::test]
@@ -1457,7 +1511,7 @@ mod tests {
         let asked = std::cell::RefCell::new(Vec::new());
         let f = scripted(
             vec![
-                (joined(100), Step::Fails("refill rpc error")),
+                (joined(100, 100), Step::Fails("refill rpc error")),
                 (TopUpClaim::Spawned, Step::Lands(1_100, 100)),
             ],
             &asked,
@@ -1474,7 +1528,7 @@ mod tests {
     #[tokio::test]
     async fn top_up_at_least_untracked_join_is_not_retried() {
         let asked = std::cell::RefCell::new(Vec::new());
-        let f = scripted(vec![(joined(100), Step::Untracked)], &asked);
+        let f = scripted(vec![(joined(100, 100), Step::Untracked)], &asked);
 
         let err = top_up_at_least(POOL, u(100), f).await.unwrap_err();
 
@@ -1487,7 +1541,7 @@ mod tests {
         let asked = std::cell::RefCell::new(Vec::new());
         let f = scripted(
             vec![
-                (joined(40), Step::Lands(1_040, 40)),
+                (joined(40, 40), Step::Lands(1_040, 40)),
                 (TopUpClaim::Spawned, Step::Fails("chain rejected")),
             ],
             &asked,
@@ -1506,9 +1560,9 @@ mod tests {
         let asked = std::cell::RefCell::new(Vec::new());
         let f = scripted(
             vec![
-                (joined(10), Step::Lands(1_010, 10)),
-                (joined(10), Step::Lands(1_020, 10)),
-                (joined(10), Step::Lands(1_030, 10)),
+                (joined(10, 10), Step::Lands(1_010, 10)),
+                (joined(10, 10), Step::Lands(1_020, 10)),
+                (joined(10, 10), Step::Lands(1_030, 10)),
             ],
             &asked,
         );
@@ -1525,9 +1579,9 @@ mod tests {
         let asked = std::cell::RefCell::new(Vec::new());
         let f = scripted(
             vec![
-                (joined(0), Step::Fails("rpc down")),
-                (joined(0), Step::Fails("rpc down")),
-                (joined(0), Step::Fails("rpc still down")),
+                (joined(0, 100), Step::Fails("rpc down")),
+                (joined(0, 100), Step::Fails("rpc down")),
+                (joined(0, 100), Step::Fails("rpc still down")),
             ],
             &asked,
         );
@@ -1549,9 +1603,9 @@ mod tests {
     fn in_flight_refill_is_claimed_at_most_once() {
         let mut slot = in_flight(100, TopUpFunder::Refill);
 
-        assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(60));
-        assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(40));
-        assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(0));
+        assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(60, 100));
+        assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(40, 100));
+        assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(0, 100));
     }
 
     /// A reactive top-up's amount is its spawner's: a second reactive top-up that
@@ -1560,7 +1614,7 @@ mod tests {
     fn in_flight_reactive_topup_leaves_nothing_to_claim() {
         let mut slot = in_flight(100, TopUpFunder::Reactive);
 
-        assert_eq!(slot.join(u(100), TopUpFunder::Reactive).1, joined(0));
+        assert_eq!(slot.join(u(100), TopUpFunder::Reactive).1, joined(0, 100));
     }
 
     /// A refill that joins claims nothing, so it cannot take headroom a reactive
@@ -1569,8 +1623,8 @@ mod tests {
     fn in_flight_refill_joiner_claims_nothing() {
         let mut slot = in_flight(100, TopUpFunder::Refill);
 
-        assert_eq!(slot.join(u(100), TopUpFunder::Refill).1, joined(0));
-        assert_eq!(slot.join(u(100), TopUpFunder::Reactive).1, joined(100));
+        assert_eq!(slot.join(u(100), TopUpFunder::Refill).1, joined(0, 100));
+        assert_eq!(slot.join(u(100), TopUpFunder::Reactive).1, joined(100, 100));
     }
 
     #[test]
