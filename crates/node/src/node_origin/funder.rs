@@ -28,6 +28,8 @@ use decdn_client_pull::source::SourceFuture;
 use decdn_client_pull::{Funder, PoolContext};
 use decdn_incentive::DepositOutcome;
 
+use tracing::warn;
+
 use crate::buyer_channel::PoolOpener;
 
 /// How many times ONE call of the node's miss-pull driver answers a genuine
@@ -109,8 +111,8 @@ const MAX_SETTLE_WAITS: u32 = 60;
 ///   Locked only to copy `deposit` out; the guard is never held across `.await`
 ///   (`top_up_pool` is a network+chain round trip).
 /// - `metrics`: the node's metrics handle. `top_up` records
-///   `node_pull_reactive_topup` on a headroom-adding success and
-///   `node_pull_reactive_topup_refused` on a no-headroom landing or a
+///   `node_pull_reactive_topup` on a landing that adds at least the requested
+///   amount and `node_pull_reactive_topup_refused` on a short landing or a
 ///   `top_up_pool` error — the one seam both the window-paced serve leg and the
 ///   gap-driven pull leg fund through, so metering here covers both.
 pub(crate) struct NodeFunder {
@@ -155,7 +157,7 @@ impl Funder for NodeFunder {
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
         Box::pin(async move {
             // The raw deposit before the call: the baseline that tells a landing that
-            // added headroom from one that joined a refill already in flight.
+            // added the requested headroom from one that added less.
             let current_deposit = {
                 let guard = self
                     .ctx
@@ -164,7 +166,7 @@ impl Funder for NodeFunder {
                 guard.deposit
             };
             match self.opener.top_up_pool(additional).await {
-                Ok(new_deposit) if new_deposit > current_deposit => {
+                Ok(new_deposit) if new_deposit >= current_deposit.saturating_add(additional) => {
                     self.metrics.node_pull_reactive_topup();
                     // Record the headroom-adding success so a later terminal
                     // `SpendingCapExhausted` on this pull is NOT metered as a refusal — a pull
@@ -173,9 +175,14 @@ impl Funder for NodeFunder {
                     Ok(DepositOutcome::Added(new_deposit))
                 }
                 Ok(new_deposit) => {
-                    // Landed but added no headroom (a concurrent proactive refill
-                    // already held the slot). The driver treats a non-advancing
-                    // deposit as an unmet top-up.
+                    // Landed less than requested. The driver still credits the new
+                    // deposit and spends a unit of its top-up budget on any `Added`,
+                    // so the short landing is logged and metered here.
+                    warn!(
+                        requested = %additional,
+                        landed = %new_deposit.saturating_sub(current_deposit),
+                        "reactive top-up landed less than requested"
+                    );
                     self.metrics.node_pull_reactive_topup_refused();
                     Ok(DepositOutcome::Added(new_deposit))
                 }
@@ -405,6 +412,39 @@ mod tests {
         assert!(
             !text.contains("decdn_node_pull_reactive_topup_total 1"),
             "expected a no-headroom landing NOT to bump the success counter: {text}"
+        );
+    }
+
+    /// A landing that adds headroom but less than `additional` is a refusal: it
+    /// warns, meters refused, and does not mark the pull as funded (#2012).
+    #[tokio::test]
+    async fn top_up_short_landing_is_refused() {
+        let deposit = U256::from(1_000u64);
+        let opener = Arc::new(MockOpener::new(Ok(U256::from(1_100u64))));
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let funded = test_funded();
+        let f = NodeFunder::new(
+            opener,
+            test_ctx(deposit),
+            Arc::clone(&metrics),
+            Arc::clone(&funded),
+        );
+
+        let outcome = f
+            .top_up(U256::from(250u64))
+            .await
+            .expect("a short landing still credits the deposit");
+
+        assert_eq!(outcome, DepositOutcome::Added(U256::from(1_100u64)));
+        assert!(!funded.load(Ordering::Relaxed));
+        let text = metrics.encode().expect("metrics should encode");
+        assert!(
+            text.contains("decdn_node_pull_reactive_topup_refused_total 1"),
+            "expected a short landing to bump the refused counter: {text}"
+        );
+        assert!(
+            !text.contains("decdn_node_pull_reactive_topup_total 1"),
+            "expected a short landing NOT to bump the success counter: {text}"
         );
     }
 
