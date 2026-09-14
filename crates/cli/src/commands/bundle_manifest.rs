@@ -6,19 +6,6 @@
 //! every skip is re-verified against the new manifest and every spliced chunk is
 //! re-hashed, so a missing, corrupt, or stale file only costs speed.
 
-// `bundle_pull`'s pre-pass reads the saved-manifest cache through this module
-// (`load`, `SavedManifest::get`, `SavedMtime::of`); the write side
-// (`merge_and_write`, `saved_hints`) awaits its `bundle_pull` caller in a later
-// task. Restricted to the non-test build: the module's own tests already
-// exercise every item, so in a `cfg(test)` build nothing here is dead.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "merge_and_write/saved_hints await their bundle_pull caller in a later task"
-    )
-)]
-
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
@@ -102,6 +89,10 @@ impl SavedMtime {
 /// Place a saved file's chunks at absolute offsets: `(hash, offset, len)` in
 /// content order. `None` when the file has no chunks or the sizes do not sum to
 /// its whole-file `size` (a malformed record — ignored, never fatal).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired in Task 5: seeds old chunks as donors")
+)]
 pub(crate) fn saved_hints(rec: &SavedFile) -> Option<Vec<(String, u64, u64)>> {
     let chunks = rec.chunks.as_ref()?;
     let mut out = Vec::with_capacity(chunks.len());

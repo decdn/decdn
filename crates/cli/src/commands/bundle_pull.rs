@@ -25,7 +25,7 @@
 //! call — the pool's on-chain state (deposit, allowance) is one shared resource,
 //! regardless of which provider an entry is bound for.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -759,6 +759,16 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         .pull_all(&manifest.entries, &args.output, args.overwrite, &saved)
         .await;
     ctx.progress.finish();
+
+    // Persist the skip-cache: prior state merged with what this run landed. A
+    // write failure is non-fatal (the cache is advisory) — log and continue.
+    let updates = build_saved_updates(&manifest.entries, &args.output);
+    if let Err(e) = bundle_manifest::merge_and_write(&args.output, saved, updates) {
+        tracing::warn!(
+            "failed to write {}: {e}",
+            bundle_manifest::SAVED_MANIFEST_NAME
+        );
+    }
 
     // Every entry has joined, so the shared dedup counters are now stable.
     let dedup = DedupSummary {
@@ -2573,6 +2583,49 @@ fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     Ok(out)
 }
 
+/// Build the saved-manifest updates for this run from the FINAL on-disk state:
+/// every in-scope entry whose output file is present (a present final file is
+/// BLAKE3-verified, so presence == good) contributes a record built from the new
+/// manifest entry plus the file's observed size and mtime. Entries whose output
+/// is absent (a failed fetch) are omitted, so the saved manifest never claims a
+/// file this run did not land. Excluded paths are not in `entries`, so they are
+/// never recorded.
+fn build_saved_updates(
+    entries: &[ManifestEntry],
+    out_root: &Path,
+) -> BTreeMap<String, bundle_manifest::SavedFile> {
+    let mut updates = BTreeMap::new();
+    for en in entries {
+        let Ok(dest) = safe_join(out_root, &en.path) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&dest) else {
+            continue; // absent → this run did not land it
+        };
+        let Some(mtime) = SavedMtime::of(&meta) else {
+            continue; // no usable mtime → omit rather than record an unverifiable gate
+        };
+        let chunks = en.chunks.as_ref().map(|cs| {
+            cs.iter()
+                .map(|c| bundle_manifest::SavedChunk {
+                    hash: c.hash.clone(),
+                    size: c.size,
+                })
+                .collect()
+        });
+        updates.insert(
+            en.path.clone(),
+            bundle_manifest::SavedFile {
+                hash: en.hash.clone(),
+                size: meta.len(),
+                mtime,
+                chunks,
+            },
+        );
+    }
+    updates
+}
+
 /// Report an empty would-fetch set. `by_filter` is true only when a non-empty
 /// bundle was emptied by `--include`/`--exclude`, so the operator learns their
 /// globs matched nothing rather than mistaking it for an empty bundle.
@@ -2788,6 +2841,36 @@ fn group_transfer(outcomes: &[EntryOutcome]) -> Transfer {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_saved_updates_records_present_omits_failed() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        std::fs::write(tmp.path().join("ok.txt"), b"data").expect("write");
+        let entries = vec![
+            ManifestEntry {
+                path: "ok.txt".into(),
+                hash: "b3:aa".into(),
+                size: Some(4),
+                chunks: Some(vec![ManifestChunk {
+                    hash: "b3:bb".into(),
+                    size: 4,
+                }]),
+            },
+            ManifestEntry {
+                path: "bad.txt".into(),
+                hash: "b3:cc".into(),
+                size: Some(9),
+                chunks: None,
+            },
+        ];
+        let upd = build_saved_updates(&entries, tmp.path());
+        assert!(upd.contains_key("ok.txt"));
+        let rec = upd.get("ok.txt").expect("rec");
+        assert_eq!(rec.hash, "b3:aa");
+        assert_eq!(rec.size, 4);
+        assert!(rec.chunks.is_some());
+        assert!(!upd.contains_key("bad.txt")); // failed → omitted
+    }
 
     #[test]
     fn safe_join_builds_nested_path_under_root() {
