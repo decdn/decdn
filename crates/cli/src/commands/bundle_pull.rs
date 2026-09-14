@@ -204,9 +204,17 @@ async fn resolve_disk_state(
         if dest.starts_with(out_root.join(STAGING_DIR)) {
             continue;
         }
-        let Ok(meta) = std::fs::metadata(&dest) else {
+        // `symlink_metadata` does not follow links: a symlink or any
+        // non-regular file is never skipped, re-hashed, or seeded as a donor —
+        // it is left to the fetch path, whose atomic materialize replaces it
+        // with the manifest's regular file. This avoids hashing a symlink target
+        // and avoids keeping a non-regular file in place on a fast-skip.
+        let Ok(meta) = std::fs::symlink_metadata(&dest) else {
             continue; // absent/unreadable → fetch
         };
+        if !meta.is_file() {
+            continue; // symlink / dir / non-regular → not skippable, not a donor
+        }
         // Fast-skip: saved record agrees on hash, size, and mtime.
         let fast = saved.get(&en.path).is_some_and(|rec| {
             rec.hash == en.hash
@@ -2683,9 +2691,16 @@ fn build_saved_updates(
         let Ok(dest) = safe_join(out_root, &en.path) else {
             continue;
         };
-        let Ok(meta) = std::fs::metadata(&dest) else {
+        // `symlink_metadata` does not follow links: only a regular file this run
+        // landed is recorded, so a symlink or non-regular file at `dest` is never
+        // written into the skip-cache (its later fast-skip would trust a target
+        // this run never verified).
+        let Ok(meta) = std::fs::symlink_metadata(&dest) else {
             continue; // absent → this run did not land it
         };
+        if !meta.is_file() {
+            continue; // only record regular files
+        }
         let Some(mtime) = SavedMtime::of(&meta) else {
             continue; // no usable mtime → omit rather than record an unverifiable gate
         };
@@ -4014,6 +4029,33 @@ mod tests {
         }];
         let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), true).await;
         assert!(st.skip.is_empty());
+    }
+
+    /// A symlink at a destination path is never fast-skipped, even when it
+    /// points at content whose bytes match the manifest hash: the pre-pass uses
+    /// `symlink_metadata` and requires a regular file, so the symlink is left to
+    /// the fetch path (which materializes a regular file over it) rather than
+    /// hashing the link target or keeping the link in place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_disk_state_does_not_skip_a_symlink() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let body = b"hello world";
+        // The real bytes live outside the manifest path; the manifest path is a
+        // symlink to them, so following it would hash a match.
+        std::fs::write(tmp.path().join("target.bin"), body).expect("write target");
+        std::os::unix::fs::symlink(tmp.path().join("target.bin"), tmp.path().join("link.txt"))
+            .expect("symlink");
+        let h = format!("b3:{}", blake3::hash(body).to_hex());
+        let entries = vec![ManifestEntry {
+            path: "link.txt".into(),
+            hash: h,
+            size: Some(u64::try_from(body.len()).expect("len")),
+            chunks: None,
+        }];
+        let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
+        assert!(!st.skip.contains("link.txt"));
+        assert!(st.seed.is_empty());
     }
 
     /// A skipped (unchanged) path seeds the NEW manifest entry's chunks, sourced

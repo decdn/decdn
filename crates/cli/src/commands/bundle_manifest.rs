@@ -2,9 +2,17 @@
 //! writes into an output directory. It indexes every file the bundle(s) have
 //! placed there — keyed by bundle-relative POSIX path, merged across runs — so a
 //! later pull skips unchanged files without re-hashing and splices unchanged
-//! byte ranges from bytes already on disk. It is never trusted for correctness:
-//! every skip is re-verified against the new manifest and every spliced chunk is
-//! re-hashed, so a missing, corrupt, or stale file only costs speed.
+//! byte ranges from bytes already on disk.
+//!
+//! The cache is advisory, not authoritative. A skip takes one of two paths: the
+//! re-hash path confirms the on-disk bytes against the new manifest hash before
+//! skipping; the fast path skips without re-hashing when the saved record's hash
+//! agrees and the file's size and mtime are unchanged since that record was
+//! written. A missing, corrupt, unreadable, or superseded record costs only a
+//! re-hash, and `--overwrite` (or deleting the file) forces a full re-fetch. The
+//! one residual trust is the fast path: a file edited in place without changing
+//! its size or mtime is not re-hashed. Every spliced donor chunk is always
+//! re-hashed before its bytes are used, so donor reuse never risks correctness.
 
 use std::collections::BTreeMap;
 use std::path::Path;
