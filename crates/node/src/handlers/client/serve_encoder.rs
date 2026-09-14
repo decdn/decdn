@@ -649,6 +649,77 @@ mod tests {
         );
     }
 
+    /// An encode parked on a LEAF the pull has not fetched demands that leaf's end,
+    /// so a pull whose window has closed still fetches it (#1893). The root pair is
+    /// already captured here, so only the data reader can raise the demand — the
+    /// outboard reader never parks.
+    #[tokio::test]
+    async fn a_parked_leaf_read_demands_the_end_of_its_leaf() {
+        let total = 2 * G;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let hash = Hash::from(root);
+        let a_root = bao_tree::blake3::Hash::from(root);
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await.unwrap();
+
+        let FillClaim::Owner { session, lease: _l } =
+            engine.claim_fill(hash, 0, total, total, || FillSession::new(a_root, total))
+        else {
+            panic!("sole claimant owns its whole request");
+        };
+        // The pull has fetched the left leaf (and with it the root pair) only.
+        admit(
+            &engine, hash, root, &plaintext, &outboard, total, 0, G, &session,
+        )
+        .await;
+
+        let store = NodeRangedStore::new(engine.clone(), hash, total);
+        let producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total)
+            .expect("align");
+        let serve = tokio::spawn(drain(producer));
+
+        let demanded = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while session
+                .serve_demand()
+                .load(std::sync::atomic::Ordering::Acquire)
+                < total
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            demanded.is_ok(),
+            "the parked leaf read must demand its leaf end, got {}",
+            session
+                .serve_demand()
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert_eq!(
+            session
+                .serve_demand()
+                .load(std::sync::atomic::Ordering::Acquire),
+            total,
+            "the demand stops at the awaited leaf's end"
+        );
+        assert!(
+            !serve.is_finished(),
+            "the encode parks until the leaf lands"
+        );
+
+        admit(
+            &engine, hash, root, &plaintext, &outboard, total, G, G, &session,
+        )
+        .await;
+        session.mark_ended(Ok(()));
+        let got = serve
+            .await
+            .unwrap()
+            .expect("serve completes once the leaf lands");
+        let whole = range_wire(root, &plaintext, &outboard, total, 0, total).1;
+        assert_eq!(got, whole.as_ref(), "the coherent stream is byte-exact");
+    }
+
     /// A frame wider than one encoder output chunk must arrive as several `Bytes`.
     /// The coherent encoder emits 64-byte proof pairs ahead of its leaves, so any
     /// frame past the first proof node spans items — the zero-copy claim this path

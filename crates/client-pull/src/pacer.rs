@@ -52,7 +52,7 @@ use decdn_protocol::client::CHUNK_BYTES;
 /// Past the floor the ramp carries no such padding, and the two windows diverge:
 /// the serve leg ramps on paid wire, this pacer on the smaller paid content
 /// frontier. There, liveness rests on [`PaceState::serve_demand_frontier`], which
-/// lets the pull fetch whatever span the parked serve leg waits on.
+/// lets the pull fetch one more floor when a serve leg is parked at its frontier.
 pub const PULL_WINDOW_FLOOR: u64 = CHUNK_BYTES + 3 * CHUNK_GROUP_BYTES;
 
 /// A snapshot of one fetch's budget state at a gap boundary, everything a
@@ -103,11 +103,12 @@ pub struct PaceState {
     /// [`WindowPacer`]'s window check; ignored by [`BudgetPacer`]. Inert on the
     /// client path, same as `pulled_frontier`.
     pub served_paid_frontier: u64,
-    /// Content end of the furthest span the node's downstream serve leg awaits.
-    /// [`WindowPacer`] may always draw up to it, even with its window full: the
-    /// serve leg reads only what its own credit window lets it deliver, and while
-    /// it waits on this span it collects no payment, so a pull that waits too
-    /// never moves again. Ignored by [`BudgetPacer`]; `0` on the client path.
+    /// Content end of the furthest span the node's downstream serve legs have waited
+    /// on (a high-water mark, never lowered). When it lies within one chunk group
+    /// past [`Self::pulled_frontier`], a serve leg is parked on this pull, collecting
+    /// no payment; [`WindowPacer`] then draws one [`PULL_WINDOW_FLOOR`] even with its
+    /// window full, or neither leg moves again. A demand further out is ignored. Ignored by
+    /// [`BudgetPacer`]; `0` on the client path.
     pub serve_demand_frontier: u64,
 }
 
@@ -131,7 +132,8 @@ pub enum PaceDecision {
     /// top-up is disabled/exhausted, or there is nothing left to add). Terminal.
     Refuse,
     /// The pull leg has run its full window ahead of the downstream paid frontier
-    /// ([`WindowPacer`], ADR 037): pause and re-decide once `served_paid_frontier`
+    /// ([`WindowPacer`], ADR 037) and no serve leg is parked at its frontier: pause
+    /// and re-decide once `served_paid_frontier` or `serve_demand_frontier`
     /// advances. [`BudgetPacer`] never returns this — only a window-bounded pacer
     /// does, so it only appears on the node's pull leg, never on the client path.
     Wait,
@@ -198,10 +200,10 @@ impl Pacer for BudgetPacer {
 /// The node's pull-leg pacing policy (ADR 037): reuse [`BudgetPacer`]'s
 /// money logic VERBATIM — a window pacer never overrides a money decision — and,
 /// only on a `Draw`, clamp `up_to_bytes` so the pull never runs more than
-/// `window_bytes` ahead of the downstream serve leg's paid frontier — except to
-/// reach [`PaceState::serve_demand_frontier`], the span a parked serve leg waits
-/// on. When the window is already full and nothing is demanded past the pull,
-/// wait instead of drawing zero bytes.
+/// `window_bytes` ahead of the downstream serve leg's paid frontier — plus one
+/// [`PULL_WINDOW_FLOOR`] when [`PaceState::serve_demand_frontier`] shows a serve leg parked
+/// at the pull's frontier. When the window is already full and no serve leg is
+/// parked there, wait instead of drawing zero bytes.
 ///
 /// Composition, not reimplementation: `WindowPacer::decide` calls
 /// `BudgetPacer::decide` and only touches the `Draw` arm. `Done` / `TopUp` /
@@ -239,15 +241,22 @@ impl Pacer for WindowPacer {
                 // never draw a fraction that `align_range` would round past the window.
                 let room = self.window_bytes.saturating_sub(ahead);
                 let room = room - room % CHUNK_GROUP_BYTES;
-                // The span a waiting serve leg needs overrides a full window. Round
-                // it UP to a whole group so the draw reaches the demanded end; the
-                // demand is bounded by the serve leg's own credit window, not this
-                // one, so the rounding cannot run past what the client may receive.
-                let demanded = s
-                    .serve_demand_frontier
-                    .saturating_sub(s.pulled_frontier)
-                    .div_ceil(CHUNK_GROUP_BYTES)
-                    .saturating_mul(CHUNK_GROUP_BYTES);
+                // A serve leg parked AT this pull's frontier overrides a full window
+                // by one pull-window floor. Its encoder waits on the first byte the
+                // pull has not fetched, so the demand lands within one group past
+                // `pulled_frontier`. A serve leg parks only while its own credit
+                // window has room, so a client that stops paying stops raising
+                // demand after at most one floor past what it may receive. A floor,
+                // not one group, keeps each unpark to one upstream open instead of
+                // one per group. A demand further out came from a serve leg that is
+                // not blocked on this pull — honouring it would let an unpaid request
+                // far down the blob drag the pull across the whole gap.
+                let demand_ahead = s.serve_demand_frontier.saturating_sub(s.pulled_frontier);
+                let demanded = if demand_ahead > 0 && demand_ahead <= CHUNK_GROUP_BYTES {
+                    PULL_WINDOW_FLOOR
+                } else {
+                    0
+                };
                 let room = room.max(demanded);
                 if room == 0 {
                     PaceDecision::Wait
@@ -266,8 +275,9 @@ impl Pacer for WindowPacer {
 /// compose [`WindowPacer`] over a window that itself ramps with the downstream
 /// served-paid frontier, so on the fused serve-miss path the upstream pull never
 /// runs further ahead of cleared client payment than the ramped credit window
-/// allows. With a nonzero divisor a non-paying client's request therefore fronts
-/// at most one chunk (the floor) of speculative upstream spend, and the window
+/// allows, plus the one serve-demand floor [`WindowPacer`] may add. With a nonzero
+/// divisor a non-paying client's request therefore fronts at most about two floors
+/// of speculative upstream spend, and the window
 /// widens only as the client pays; a divisor of `0` opens the full `credit_max`
 /// from the first byte, the same instant-ceiling behavior as the downstream window.
 #[derive(Debug, Clone, Copy)]
@@ -467,18 +477,43 @@ mod tests {
     }
 
     #[test]
-    fn serve_demand_past_a_full_window_draws_to_the_demanded_group() {
-        // Window full (ahead == window), but the serve leg waits on content up to a
-        // point inside the next group plus one byte: draw whole groups to reach it.
+    fn serve_demand_at_a_full_window_draws_one_floor() {
+        // Window full (ahead == window), but a serve leg is parked on the next group
+        // past the pull — a proof node (demand = frontier + 1) or a whole leaf
+        // (demand = frontier + one group). Both draw one pull-window floor.
+        let mut s = healthy();
+        s.requested_bytes = 64 * CHUNK_BYTES;
+        s.pulled_frontier = 5 * CHUNK_GROUP_BYTES;
+        s.served_paid_frontier = 2 * CHUNK_GROUP_BYTES;
+        for demand in [5 * CHUNK_GROUP_BYTES + 1, 6 * CHUNK_GROUP_BYTES] {
+            s.serve_demand_frontier = demand;
+            assert_eq!(
+                WindowPacer::new(3 * CHUNK_GROUP_BYTES).decide(&s),
+                PaceDecision::Draw {
+                    up_to_bytes: PULL_WINDOW_FLOOR
+                },
+                "demand {demand}"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_demand_far_past_the_pull_is_ignored() {
+        // A demand more than one group past the pull comes from a serve leg that is
+        // not parked on this pull (an attached request far down the blob). It must
+        // not open a full window, or an unpaid request would pull the whole gap.
         let mut s = healthy();
         s.pulled_frontier = 5 * CHUNK_GROUP_BYTES;
         s.served_paid_frontier = 2 * CHUNK_GROUP_BYTES;
         s.serve_demand_frontier = 6 * CHUNK_GROUP_BYTES + 1;
         assert_eq!(
             WindowPacer::new(3 * CHUNK_GROUP_BYTES).decide(&s),
-            PaceDecision::Draw {
-                up_to_bytes: 2 * CHUNK_GROUP_BYTES
-            }
+            PaceDecision::Wait
+        );
+        s.serve_demand_frontier = 1 << 30;
+        assert_eq!(
+            WindowPacer::new(3 * CHUNK_GROUP_BYTES).decide(&s),
+            PaceDecision::Wait
         );
     }
 
@@ -496,16 +531,17 @@ mod tests {
     }
 
     #[test]
-    fn serve_demand_inside_the_window_changes_nothing() {
-        // Window room already exceeds the demand, so the window decides the draw.
+    fn serve_demand_inside_a_wider_window_changes_nothing() {
+        // Window room already exceeds the demand's floor, so the window decides.
         let mut s = healthy();
+        s.requested_bytes = 64 * CHUNK_BYTES;
         s.pulled_frontier = 2 * CHUNK_GROUP_BYTES;
         s.served_paid_frontier = 2 * CHUNK_GROUP_BYTES;
         s.serve_demand_frontier = 3 * CHUNK_GROUP_BYTES;
         assert_eq!(
-            WindowPacer::new(4 * CHUNK_GROUP_BYTES).decide(&s),
+            WindowPacer::new(4 * CHUNK_BYTES).decide(&s),
             PaceDecision::Draw {
-                up_to_bytes: 4 * CHUNK_GROUP_BYTES
+                up_to_bytes: 4 * CHUNK_BYTES
             }
         );
     }

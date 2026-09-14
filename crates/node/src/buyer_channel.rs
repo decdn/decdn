@@ -726,13 +726,17 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
 
     /// Add `additional` to the node's pool deposit and return the pool's NEW total
     /// deposit (#1530). The reactive counterpart of the proactive low-water refill:
-    /// the node-to-node pull loop calls this when its own deposit can no longer
-    /// cover the next voucher, then resumes on the larger deposit.
+    /// the node-to-node pull loop calls this when an upstream's cap rejection is
+    /// backed by its own ledger, or when its deposit can no longer cover the next
+    /// voucher, then resumes on the larger deposit.
     ///
     /// The caller sizes `additional` from its live pull ledger. This method does
     /// not re-derive a shortfall from the persisted lane progress: that progress is
     /// recorded when a pull ends, so mid-pull it omits the spend of the pull that
     /// asks, and a shortfall computed from it tops up too little.
+    ///
+    /// A `topUp` already in flight is JOINED, not duplicated, and its amount wins:
+    /// the returned deposit can then have grown by less than `additional`.
     ///
     /// Routes through the detached, join-or-spawn funding task (never an inline
     /// `.await`): `topUp` waits on an unbounded `get_receipt`, and this runs inside
@@ -758,7 +762,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
                     pool_id = %state.pool_id,
                     %additional,
                     %new_deposit,
-                    "reactive top-up: pool exhausted mid-pull; raised toward the working deposit (#1530)"
+                    "reactive top-up: pool exhausted mid-pull; requested amount added, or a topUp already in flight joined (#1530)"
                 );
                 Ok(new_deposit)
             }

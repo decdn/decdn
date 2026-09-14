@@ -118,7 +118,8 @@ struct ServedPaidWait {
     /// `served_paid`.
     serve_demand: Arc<AtomicU64>,
     /// Bumps `node_pull_through_window_paused` on each pause — the pull hit its ADR
-    /// 037 window and is waiting for downstream payment to clear.
+    /// 037 window and is waiting for downstream payment to clear or a serve leg to
+    /// park at its frontier.
     metrics: Arc<crate::metrics::Metrics>,
 }
 
@@ -460,7 +461,8 @@ impl NodeOrigin {
 /// built from `credit_ramp_divisor`, `credit_floor`, and `credit_max` — the same
 /// ramped credit window the serve leg computes from its own paid frontier (ADR 003
 /// §Credit window / ADR 037), so the pull never runs further ahead of the
-/// downstream serve leg's paid frontier than that window allows.
+/// downstream serve leg's paid frontier than that window allows, plus the one
+/// window floor a serve leg parked at the pull's frontier demands.
 ///
 /// # Ranged assembly across partial holders
 ///
@@ -565,8 +567,9 @@ pub(crate) async fn run_pull_leg(
         max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
         settle_backoff: SETTLE_POLL_STEP,
     };
-    // The downstream demand window, SHARED across every run's lane so the window is
-    // continuous — keyed on the session's downstream frontiers, not on the run.
+    // The downstream pacing wait and frontier reader, SHARED across every run's lane
+    // so the window is continuous — keyed on the session's downstream frontiers, not
+    // on the run.
     let pacing_wait = ServedPaidWait::for_session(&session, Arc::clone(&deps.metrics));
     // Index-aligned with `candidates`: `SourceCoverage.source_ix` is a position here.
     let coverages: Vec<decdn_protocol::Coverage> =
@@ -1040,7 +1043,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 ///
 /// The downstream [`RampPacer`] is KEPT (bound on `served_paid`): the pull still
 /// never runs further ahead of the real downstream client's paid frontier than the
-/// ramped credit window allows (#1610 — ingest only behind a waiting, paying client
+/// ramped credit window allows, plus one serve-demand floor (#1610 — ingest only behind a waiting, paying client
 /// — and the storage/egress exposure bound).
 ///
 /// # Off the accept task, on its own runtime
@@ -1503,6 +1506,40 @@ mod served_paid_wait_tests {
         )
         .await
         .expect("wait must observe the raced demand advance, not wedge on a lost notify");
+    }
+
+    /// A pull already parked on its window wakes when a serve leg raises the demand,
+    /// with no payment at all — and a demand that does not move the frontier leaves
+    /// it parked. Pins that `FillSession::demand_up_to` notifies the same wakeup
+    /// `ServedPaidWait::for_session` arms (#1893).
+    #[tokio::test]
+    async fn a_demand_raise_wakes_a_parked_pull_and_a_stale_one_does_not() {
+        let session = decdn_cache::FillSession::new(bao_tree::blake3::Hash::from([7; 32]), 1 << 20);
+        session.demand_up_to(64 * 1024);
+        let hook = ServedPaidWait::for_session(&session, Arc::new(Metrics::new()));
+        let observed = hook.frontier();
+
+        let wait = hook.wait(observed);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), wait.as_mut())
+                .await
+                .is_err(),
+            "with no advance the wait stays parked"
+        );
+
+        session.demand_up_to(32 * 1024);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), wait.as_mut())
+                .await
+                .is_err(),
+            "a demand below the frontier moves nothing and wakes nothing"
+        );
+
+        session.demand_up_to(80 * 1024);
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("a demand raise must wake the parked pull");
     }
 
     /// The #1673 race: the serve leg advances the frontier and fires

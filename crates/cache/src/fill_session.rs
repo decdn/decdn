@@ -289,20 +289,21 @@ pub struct FillSession {
     ended: StdMutex<Option<Result<(), FillError>>>,
     /// The client's PAID content frontier: the serve leg stores it after each
     /// voucher batch commits, the pull leg's `WindowPacer` reads it to bound
-    /// `pulled − served_paid ≤ window`. An `Arc` so a pull leg on its own runtime
+    /// `pulled − served_paid ≤ window`, plus one floor to serve `serve_demand`. An
+    /// `Arc` so a pull leg on its own runtime
     /// can hold an owned handle.
     served_paid: Arc<AtomicU64>,
     /// Notified after each `served_paid` or `serve_demand` advance, so a parked pull
     /// re-decides exactly when a downstream voucher clears or a serve leg starts
     /// waiting on bytes.
     served_paid_advanced: Arc<Notify>,
-    /// The content end of the furthest span a serve leg awaits: its data reader
-    /// raises it before it parks on a leaf the store does not hold yet, and its
-    /// [`SessionOutboardReader`] before it parks on a proof node no pull has
-    /// captured. The pull leg's pacer may always draw up to it, because the serve
-    /// leg only reads a span it is already allowed to deliver. Without it, a pull
-    /// window that closes before the serve leg's credit window leaves both legs
-    /// waiting on each other.
+    /// The content end of the furthest span a serve leg has waited on (a high-water
+    /// mark, never lowered): its data reader raises it when its present-range
+    /// snapshot misses a leaf, and its [`SessionOutboardReader`] before it parks on
+    /// a proof node no pull has captured. When it lies within one chunk group past a
+    /// pull's frontier, that pull's pacer draws one window floor even with its window
+    /// full. Without it, a pull window that closes before the serve leg's credit
+    /// window leaves both legs waiting on each other.
     serve_demand: Arc<AtomicU64>,
     /// The chunk ranges THIS fill will produce — exactly the bytes this pull
     /// fetches (its `missing_ranges ∩ R`). [`FillRegistry::range_still_live`]
@@ -497,10 +498,10 @@ impl FillSession {
     }
 
     /// Record that a serve leg awaits content up to `end`, and wake each parked pull
-    /// whose demand frontier that raises. The demand goes to every live fill of the
+    /// whose demand frontier this raises. The demand goes to every live fill of the
     /// hash, not only this one: under coalescing a sibling pull may be the one that
-    /// produces the awaited span, and a pull whose gaps end before `end` draws no
-    /// further than its own gaps.
+    /// produces the awaited span. A pull acts on it only when `end` lies within one
+    /// chunk group past its own frontier, so a demand far from a pull costs nothing.
     pub fn demand_up_to(&self, end: u64) {
         let registry = self
             .registry

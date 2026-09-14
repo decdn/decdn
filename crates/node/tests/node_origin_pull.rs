@@ -11034,7 +11034,7 @@ fn honest_bao_wire_from(payload: &[u8], byte_offset: u64) -> Result<Vec<u8>> {
 /// signer's capability cap (`VoucherRejectReason::SpendingCapExhausted`), and a real
 /// `topUp` raises the pool's escrowed deposit backing that cap. Modelling it
 /// as one shared cell is what makes the round trip real here:
-/// [`FundingOpener::top_up_channel`] raises the same
+/// `FundingOpener`'s `top_up_pool` raises the same
 /// number the server enforces, so the resumed leg succeeds for the RIGHT reason
 /// rather than because the fixture stopped objecting.
 type SharedDeposit = Arc<Mutex<U256>>;
@@ -11052,7 +11052,7 @@ fn read_deposit(cell: &SharedDeposit) -> Result<U256> {
 /// A buyer-channel opener that FUNDS, so the reactive leg has something to spend.
 ///
 /// [`StubOpener`] with two differences that matter: its deposit is a live cell an
-/// upstream fixture reads (see [`SharedDeposit`]), and `top_up_channel` raises that
+/// upstream fixture reads (see [`SharedDeposit`]), and `top_up_pool` adds to that
 /// cell and logs the call. `funds` is what a test flips to model the two ways a
 /// real top-up can decline to add headroom — a reverted transaction, and a
 /// concurrent proactive refill already holding the provider's slot.
