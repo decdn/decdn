@@ -155,21 +155,44 @@ impl std::fmt::Debug for SharedPool<'_> {
     }
 }
 
+/// The node serve leg's two content frontiers the pull leg paces against (ADR
+/// 037): what the downstream client has paid for, and how far the serve leg waits
+/// on bytes. The node hands `drive` a reader of these; the client path has no
+/// downstream leg and passes none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DownstreamFrontier {
+    /// Content bytes the serve leg has delivered AND been paid for
+    /// ([`PaceState::served_paid_frontier`]).
+    pub served_paid: u64,
+    /// Content end of the furthest span the serve leg awaits
+    /// ([`PaceState::serve_demand_frontier`]).
+    pub serve_demand: u64,
+}
+
+impl DownstreamFrontier {
+    /// Whether either frontier in `self` moved past `observed`.
+    #[must_use]
+    pub const fn advanced_past(self, observed: Self) -> bool {
+        self.served_paid > observed.served_paid || self.serve_demand > observed.serve_demand
+    }
+}
+
 /// The injected wait signal for [`PaceDecision::Wait`] (ADR 037): the
 /// node hands in an implementor that resolves once its serve leg's paid frontier
-/// has advanced (so a re-decide has a chance of finding window room); the client
-/// path never needs one, since `BudgetPacer` never returns `Wait`.
+/// or demand frontier has advanced (so a re-decide has a chance of finding room);
+/// the client path never needs one, since `BudgetPacer` never returns `Wait`.
 pub trait PacingWait: Send + Sync {
-    /// Resolve once the caller judges it worth re-deciding (e.g. the served-paid
+    /// Resolve once the caller judges it worth re-deciding (e.g. a downstream
     /// frontier advanced, or a bounded poll interval elapsed).
     ///
-    /// `observed` is the served-paid frontier value the caller's `Wait` decision was
+    /// `observed` holds the downstream frontiers the caller's `Wait` decision was
     /// computed from. An implementor backed by an edge-triggered wakeup (a
     /// [`tokio::sync::Notify`], which stores no permit across `notify_waiters`) MUST
-    /// register its wakeup BEFORE re-reading the live frontier and return immediately
-    /// if it already moved past `observed` — otherwise an advance that races between
-    /// the decision and the park is lost and the caller wedges forever (#1673).
-    fn wait(&self, observed: u64) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// register its wakeup BEFORE re-reading the live frontiers and return
+    /// immediately if either already moved past `observed` — otherwise an advance
+    /// that races between the decision and the park is lost and the caller wedges
+    /// forever (#1673).
+    fn wait(&self, observed: DownstreamFrontier) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Read the channel context's current deposit through the shared handle. A tiny
@@ -383,7 +406,7 @@ pub async fn drive<St, S, P, F>(
     config: &DriveConfig,
     on_progress: Option<&ProgressCallback>,
     pacing_wait: Option<&dyn PacingWait>,
-    served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
+    downstream: Option<&(dyn Fn() -> DownstreamFrontier + Send + Sync)>,
     pool: Option<&SharedPool<'_>>,
 ) -> anyhow::Result<()>
 where
@@ -445,7 +468,7 @@ where
                 // aggregate. Only the multi-source scheduler passes an aggregator.
                 None,
                 pacing_wait,
-                served_paid,
+                downstream,
                 // `None` on the single-source path: this one lane IS the pool,
                 // so its own `counters` and `ctx` already hold the spend, the
                 // top-up budget, and the deposit. The node's ranged-drive loop
@@ -512,7 +535,7 @@ pub(crate) async fn fill_gap<St, S, P, F>(
     // already the whole-blob position).
     progress_agg: Option<&std::sync::atomic::AtomicU64>,
     pacing_wait: Option<&dyn PacingWait>,
-    served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
+    downstream: Option<&(dyn Fn() -> DownstreamFrontier + Send + Sync)>,
     pool: Option<&SharedPool<'_>>,
 ) -> anyhow::Result<()>
 where
@@ -627,6 +650,13 @@ where
                 .min(delivered_frontier);
         let paid_cleared = paid_frontier.saturating_sub(gap_start);
 
+        let downstream_now = downstream.map_or(
+            DownstreamFrontier {
+                served_paid: paid_frontier,
+                serve_demand: 0,
+            },
+            |f| f(),
+        );
         let state = PaceState {
             cleared_bytes: paid_cleared,
             requested_bytes: gap_len,
@@ -650,7 +680,7 @@ where
             // `served_paid_frontier` is NOT this leg's own state — it is the
             // DOWNSTREAM client's paid frontier, which only the node's serve leg
             // (a separate, future task) can advance. On the client path
-            // (`served_paid == None`) there is no downstream leg, so this
+            // (`downstream == None`) there is no downstream leg, so this
             // collapses to the inert local `paid_frontier`: harmless, because
             // `BudgetPacer` never reads `served_paid_frontier`. The NODE pull leg
             // MUST pass `Some(reader)` here, reading the shared downstream
@@ -659,18 +689,20 @@ where
             // upstream paid frontier, which would be category-wrong (it would
             // make the window track the node's own credit-window lag instead of
             // the client it is serving).
-            served_paid_frontier: served_paid.map_or(paid_frontier, |f| f()),
+            served_paid_frontier: downstream_now.served_paid,
+            // Inert `0` on the client path, which never waits on a serve leg.
+            serve_demand_frontier: downstream_now.serve_demand,
         };
 
         match pacer.decide(&state) {
             PaceDecision::Done => return Ok(()),
             PaceDecision::Wait => {
                 if let Some(hook) = pacing_wait {
-                    // Hand the hook the frontier value THIS decision read, so it can
+                    // Hand the hook the frontiers THIS decision read, so it can
                     // register its wakeup then re-check for an advance that raced the
                     // decision — closing the lost-wakeup that wedged the window-paused
                     // pull under CI scheduling gaps (#1673).
-                    hook.wait(state.served_paid_frontier).await;
+                    hook.wait(downstream_now).await;
                     continue;
                 }
                 anyhow::bail!(
@@ -1766,7 +1798,7 @@ mod tests {
     impl super::PacingWait for CountingWait {
         fn wait(
             &self,
-            _observed: u64,
+            _observed: super::DownstreamFrontier,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async {})
@@ -1853,7 +1885,7 @@ mod tests {
     impl super::PacingWait for BumpServedPaidWait {
         fn wait(
             &self,
-            _observed: u64,
+            _observed: super::DownstreamFrontier,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             self.served_paid
                 .fetch_add(self.bump_bytes, std::sync::atomic::Ordering::SeqCst);
@@ -1889,7 +1921,10 @@ mod tests {
         };
         let served_paid_reader = {
             let counter = Arc::clone(&served_paid_counter);
-            move || counter.load(std::sync::atomic::Ordering::SeqCst)
+            move || super::DownstreamFrontier {
+                served_paid: counter.load(std::sync::atomic::Ordering::SeqCst),
+                serve_demand: 0,
+            }
         };
 
         drive(

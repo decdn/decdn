@@ -142,6 +142,12 @@ impl AsyncSliceReader for AwaitingDataReader {
                 break;
             }
 
+            // The span is not here yet, so this read is about to wait on a pull.
+            // Tell every pull that may produce it: a pull whose window has closed
+            // would otherwise wait for a payment that this parked read blocks.
+            self.session
+                .demand_up_to(offset.saturating_add(need).min(self.total));
+
             // Register the liveness waiter BEFORE re-inspecting shared state, so a
             // terminal outcome recorded concurrently cannot slip past the check. Clone
             // the `Arc` to a local so the waiter borrows it, not `self` — leaving

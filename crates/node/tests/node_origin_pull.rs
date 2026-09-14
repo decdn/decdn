@@ -7183,6 +7183,93 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     Ok(())
 }
 
+/// A multi-MB blob completes on the fused serve-miss path once both credit windows
+/// have left their floors and ramp with payment (#1893).
+///
+/// The serve leg ramps its window on paid WIRE bytes; the pull leg ramps on the
+/// paid CONTENT frontier, which is always smaller. Past the floor, the pull window
+/// therefore closes while the serve window still has room, and the serve encoder
+/// waits on a leaf or a proof node that only the pull can fetch — while it waits,
+/// it collects no voucher. The pull must still fetch the span the encoder waits on,
+/// or neither leg ever moves again. At 8 MiB and the default ramp divisor, several
+/// MiB of the delivery run in the ramp regime.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_completes_a_blob_past_the_ramp_floor() -> Result<()> {
+    let payload_len: usize = 8 * 1024 * 1024;
+    let mut payload = vec![0u8; payload_len];
+    let mut x: u32 = 0x2545_f491;
+    for b in &mut payload {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes().first().copied().unwrap_or(0);
+    }
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
+
+    let ab_channel_id = B256::repeat_byte(0xA3);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x3F);
+    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, _local_rep, b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let outcome = tokio::time::timeout(
+        Duration::from_mins(1),
+        leaf_paced_pull(
+            &leaf_ep,
+            b_target,
+            leaf_node_id,
+            &leaf_eth,
+            b_operator,
+            leaf_channel_id,
+            hash,
+            RATE,
+            None,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the fused serve-miss delivery stalled"))??;
+
+    anyhow::ensure!(outcome.completed, "leaf delivery did not complete");
+    anyhow::ensure!(outcome.hash_ok, "leaf received bytes failed the hash check");
+    anyhow::ensure!(
+        outcome.received == total_bytes,
+        "leaf received {} of {total_bytes} bytes",
+        outcome.received
+    );
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_window_paused_total")? >= 1,
+        "the pull must have paused on its window for a blob this far past the floor"
+    );
+    anyhow::ensure!(
+        cache_b.has(hash).await?,
+        "B must promote the teed blob on a complete delivery"
+    );
+
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
 /// COMPLIANCE REGRESSION GUARD (ADR 011 §On Blacklist Event), WINDOW half.
 ///
 /// `client_loopback.rs`'s `blacklisting_the_funder_mid_stream_cuts_off_a_

@@ -22,8 +22,14 @@
 //!   stores it after every voucher batch commits (mapped from paid WIRE bytes
 //!   through [`content_paid_frontier`]); the pull leg's `WindowPacer` reads it to
 //!   bound `pulled − served_paid ≤ window`.
-//! - **`served_paid_advanced`** — notified after each advance, so a pull leg
-//!   parked in `PaceDecision::Wait` re-decides exactly when payment clears.
+//! - **`serve_demand`** — the content end of the span this leg's encoder waits
+//!   on, for a leaf or a proof node the store does not hold yet. The serve window
+//!   meters wire and the pull window meters content, so the pull window can close
+//!   while this leg still has credit room and waits on bytes. The pull may always
+//!   fetch up to `serve_demand`, so neither leg waits on the other forever.
+//! - **`served_paid_advanced`** — notified after each `served_paid` or
+//!   `serve_demand` advance, so a pull leg parked in `PaceDecision::Wait`
+//!   re-decides exactly when payment clears or this leg starts waiting.
 //! - **`pull_ended` + `pull_result`** — the pull leg records its terminal
 //!   outcome in `pull_result` and THEN fires `pull_ended`. Whenever the serve
 //!   leg must await a gap becoming present it races the present-range watch

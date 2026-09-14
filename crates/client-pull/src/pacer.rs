@@ -48,6 +48,11 @@ use decdn_protocol::client::CHUNK_BYTES;
 /// may not draw until a payment that the parked serve leg is the one blocked from
 /// collecting. The two rounding groups cannot pay for it: the liveness invariant
 /// below spends them in full.
+///
+/// Past the floor the ramp carries no such padding, and the two windows diverge:
+/// the serve leg ramps on paid wire, this pacer on the smaller paid content
+/// frontier. There, liveness rests on [`PaceState::serve_demand_frontier`], which
+/// lets the pull fetch whatever span the parked serve leg waits on.
 pub const PULL_WINDOW_FLOOR: u64 = CHUNK_BYTES + 3 * CHUNK_GROUP_BYTES;
 
 /// A snapshot of one fetch's budget state at a gap boundary, everything a
@@ -98,6 +103,12 @@ pub struct PaceState {
     /// [`WindowPacer`]'s window check; ignored by [`BudgetPacer`]. Inert on the
     /// client path, same as `pulled_frontier`.
     pub served_paid_frontier: u64,
+    /// Content end of the furthest span the node's downstream serve leg awaits.
+    /// [`WindowPacer`] may always draw up to it, even with its window full: the
+    /// serve leg reads only what its own credit window lets it deliver, and while
+    /// it waits on this span it collects no payment, so a pull that waits too
+    /// never moves again. Ignored by [`BudgetPacer`]; `0` on the client path.
+    pub serve_demand_frontier: u64,
 }
 
 /// What the driver should do next for the current gap. See [`Pacer::decide`].
@@ -187,8 +198,10 @@ impl Pacer for BudgetPacer {
 /// The node's pull-leg pacing policy (ADR 037): reuse [`BudgetPacer`]'s
 /// money logic VERBATIM — a window pacer never overrides a money decision — and,
 /// only on a `Draw`, clamp `up_to_bytes` so the pull never runs more than
-/// `window_bytes` ahead of the downstream serve leg's paid frontier. When the
-/// window is already full, wait instead of drawing zero bytes.
+/// `window_bytes` ahead of the downstream serve leg's paid frontier — except to
+/// reach [`PaceState::serve_demand_frontier`], the span a parked serve leg waits
+/// on. When the window is already full and nothing is demanded past the pull,
+/// wait instead of drawing zero bytes.
 ///
 /// Composition, not reimplementation: `WindowPacer::decide` calls
 /// `BudgetPacer::decide` and only touches the `Draw` arm. `Done` / `TopUp` /
@@ -218,13 +231,24 @@ impl Pacer for WindowPacer {
                 // rounds a draw's END up to a chunk-group boundary, so a room that is
                 // not group-aligned would let the open overshoot the window by up to
                 // one group. Flooring keeps `pulled_frontier - served_paid_frontier <=
-                // window_bytes` EXACT (ADR 037). `window_bytes` is always at least one
+                // window_bytes` EXACT (ADR 037) whenever the window, not the serve
+                // demand below, sets the draw. `window_bytes` is always at least one
                 // chunk — orders of magnitude larger than a 16 KiB group —
                 // so a healthy window never floors to zero; only a sub-group remainder
                 // (the window all but full) floors to 0 -> `Wait`, which is correct:
                 // never draw a fraction that `align_range` would round past the window.
                 let room = self.window_bytes.saturating_sub(ahead);
                 let room = room - room % CHUNK_GROUP_BYTES;
+                // The span a waiting serve leg needs overrides a full window. Round
+                // it UP to a whole group so the draw reaches the demanded end; the
+                // demand is bounded by the serve leg's own credit window, not this
+                // one, so the rounding cannot run past what the client may receive.
+                let demanded = s
+                    .serve_demand_frontier
+                    .saturating_sub(s.pulled_frontier)
+                    .div_ceil(CHUNK_GROUP_BYTES)
+                    .saturating_mul(CHUNK_GROUP_BYTES);
+                let room = room.max(demanded);
                 if room == 0 {
                     PaceDecision::Wait
                 } else {
@@ -294,6 +318,7 @@ mod tests {
             exhaustion_confirmed: false,
             pulled_frontier: 0,
             served_paid_frontier: 0,
+            serve_demand_frontier: 0,
         }
     }
 
@@ -438,6 +463,50 @@ mod tests {
         assert_eq!(
             WindowPacer::new(3 * CHUNK_GROUP_BYTES).decide(&s),
             PaceDecision::Wait
+        );
+    }
+
+    #[test]
+    fn serve_demand_past_a_full_window_draws_to_the_demanded_group() {
+        // Window full (ahead == window), but the serve leg waits on content up to a
+        // point inside the next group plus one byte: draw whole groups to reach it.
+        let mut s = healthy();
+        s.pulled_frontier = 5 * CHUNK_GROUP_BYTES;
+        s.served_paid_frontier = 2 * CHUNK_GROUP_BYTES;
+        s.serve_demand_frontier = 6 * CHUNK_GROUP_BYTES + 1;
+        assert_eq!(
+            WindowPacer::new(3 * CHUNK_GROUP_BYTES).decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: 2 * CHUNK_GROUP_BYTES
+            }
+        );
+    }
+
+    #[test]
+    fn serve_demand_already_pulled_still_waits() {
+        // The demanded span is present, so it grants no room: a full window waits.
+        let mut s = healthy();
+        s.pulled_frontier = 5 * CHUNK_GROUP_BYTES;
+        s.served_paid_frontier = 2 * CHUNK_GROUP_BYTES;
+        s.serve_demand_frontier = 5 * CHUNK_GROUP_BYTES;
+        assert_eq!(
+            WindowPacer::new(3 * CHUNK_GROUP_BYTES).decide(&s),
+            PaceDecision::Wait
+        );
+    }
+
+    #[test]
+    fn serve_demand_inside_the_window_changes_nothing() {
+        // Window room already exceeds the demand, so the window decides the draw.
+        let mut s = healthy();
+        s.pulled_frontier = 2 * CHUNK_GROUP_BYTES;
+        s.served_paid_frontier = 2 * CHUNK_GROUP_BYTES;
+        s.serve_demand_frontier = 3 * CHUNK_GROUP_BYTES;
+        assert_eq!(
+            WindowPacer::new(4 * CHUNK_GROUP_BYTES).decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: 4 * CHUNK_GROUP_BYTES
+            }
         );
     }
 
