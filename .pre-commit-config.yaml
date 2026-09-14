@@ -37,9 +37,13 @@ repos:
         types: [rust]
         pass_filenames: false
 
+      # Findings print (`verbose`) and never block the commit. A missing
+      # cargo-deny install or a run that checked nothing blocks it. The CI
+      # `deny` job runs the same script. See cargo_deny_warn.py.
       - id: cargo-deny
-        name: cargo deny
-        entry: cargo deny check
+        name: cargo deny (findings warn)
+        entry: .github/scripts/cargo-deny-warn.sh
+        verbose: true
         language: system
         pass_filenames: false
 
