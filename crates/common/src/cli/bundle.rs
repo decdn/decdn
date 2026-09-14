@@ -103,7 +103,9 @@ pub struct BundlePullArgs {
     /// Default is skip-existing (resume-friendly): a path skips when it
     /// matches the saved `.decdn-manifest.json` record or, failing that, when
     /// re-hashing its on-disk bytes matches the new manifest. `--overwrite`
-    /// bypasses `.decdn-manifest.json` and re-fetches every entry.
+    /// skips consulting `.decdn-manifest.json` for skip decisions and
+    /// re-fetches every entry; the file is still read and rewritten with the
+    /// run's results.
     #[arg(long)]
     pub overwrite: bool,
 
