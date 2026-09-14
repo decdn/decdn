@@ -127,13 +127,15 @@ fn new_progress_bar() -> indicatif::ProgressBar {
     // built-in bar rather than panic (clippy forbids `unwrap`/`expect`).
     .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
     .progress_chars("=>-");
-    let bar = indicatif::ProgressBar::new(0);
-    bar.set_style(style);
-    bar.enable_steady_tick(Duration::from_millis(120));
     // When client logging is enabled, share stderr with the tracing subscriber
     // through its `MultiProgress` so log lines do not corrupt the bar; a no-op
-    // (returns the bar unchanged) on the default no-subscriber path.
-    crate::logging::attach_progress_bar(bar)
+    // (returns the bar unchanged) on the default no-subscriber path. The bar is
+    // attached before it is styled or ticked: either would draw a detached bar
+    // straight to stderr, leaving an orphan line the container never clears.
+    let bar = crate::logging::attach_progress_bar(indicatif::ProgressBar::new(0));
+    bar.set_style(style);
+    bar.enable_steady_tick(Duration::from_millis(120));
+    bar
 }
 
 /// Chain coordinates resolved flag > `[blockchain]`/`[identity]` config >
@@ -2969,32 +2971,24 @@ fn delivery_progress() -> (
     (bar, on_progress, meter)
 }
 
-/// A styled delivery bar not yet attached to any [`indicatif::MultiProgress`],
-/// carrying a `{prefix}` slot the caller sets to a per-file label. `bundle pull`
-/// inserts these into its own bottom-anchored `MultiProgress` (so the total bar
-/// stays last); single-blob `fetch` uses [`new_progress_bar`] instead, which
-/// self-attaches and needs no prefix.
+/// The style of a `bundle pull` per-file bar: the [`new_progress_bar`] layout with
+/// the leading spinner replaced by a `{prefix}` file label and no rate/ETA
+/// `{msg}`. A per-file rate in a concurrent pull is one lane's share of the link
+/// and its ETA reads as stuck whenever another file has the bandwidth, so
+/// `bundle pull` shows one rate and ETA on its total bar instead, where they
+/// describe the whole download.
 ///
-/// Unlike the single-blob bar this one carries no rate/ETA `{msg}`: a per-file
-/// rate in a concurrent pull is one lane's share of the link and its ETA reads as
-/// stuck whenever another file has the bandwidth. `bundle pull` shows one rate
-/// and ETA on its total bar instead, where they describe the whole download.
-///
-/// The steady tick is intentionally not enabled here: the caller enables it only
-/// after inserting the bar into its `MultiProgress`, because a detached bar draws
-/// straight to stderr and a pre-insert tick paints an orphan line the container
-/// never accounts for, tearing every later redraw.
-pub(crate) fn labeled_delivery_bar() -> indicatif::ProgressBar {
-    let style = indicatif::ProgressStyle::with_template(
-        // The `new_progress_bar` layout with the leading spinner replaced by the
-        // file label and no rate/ETA slot.
+/// This is a style, not a bar: `bundle pull` builds each bar inside its
+/// `MultiProgress` (`mp.insert_before(.., ProgressBar::new(0))`) and applies the
+/// style afterwards. A bar styled, labeled, or sized before it joins the container
+/// draws itself straight to stderr, and the container never accounts for that
+/// orphan line, so every later redraw scrolls instead of overwriting it.
+pub(crate) fn labeled_delivery_style() -> indicatif::ProgressStyle {
+    indicatif::ProgressStyle::with_template(
         "{prefix:.bold} {bytes}/{total_bytes} [{wide_bar:.cyan/blue}]",
     )
     .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
-    .progress_chars("=>-");
-    let bar = indicatif::ProgressBar::new(0);
-    bar.set_style(style);
-    bar
+    .progress_chars("=>-")
 }
 
 /// Build the callback that drives `bar` — setting its length to the blob's
