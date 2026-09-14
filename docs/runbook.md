@@ -649,9 +649,12 @@ actionable gap.
 
 **Attribute:** `decdn_node_pull_{success,unreachable,corruption}_total` carry no
 peer label. To find the peer behind a rise, run with
-`RUST_LOG=info,decdn::reputation=debug`. Every local reputation change then logs
-one `decdn::reputation` event with the peer's `NodeId`, the outcome, and the
-peer's new local score.
+`RUST_LOG=info,decdn::reputation=debug`. Every recorded reputation outcome then
+logs one `decdn::reputation` event with the peer's `NodeId`, the outcome, and the
+peer's new local score. The two `pull_through` counters above get no attribution
+from this event. `RUST_LOG` applies at startup only: a config reload (SIGHUP or
+`decdn node reload`) replaces the filter with `observability.log_level` and drops
+the per-target setting, so restart the daemon with `RUST_LOG` set to restore it.
 
 **The real blind spot is the serve leg.** `HashMismatch` is deliberately *not*
 classified as a `HardFault` (`crates/node/src/handlers/client/mod.rs`) — it is

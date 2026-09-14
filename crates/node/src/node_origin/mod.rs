@@ -914,7 +914,9 @@ fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
 /// blob. Side effects: a failed probe scores the provider [`Outcome::Unreachable`],
 /// except a probe the provider shed with `APP_ERR_RATE_LIMITED`, which suppresses
 /// the pair for [`REFUSAL_SUPPRESSION_TTL`] and scores nothing (#1986); a
-/// reachable-but-absent provider is recorded in the negative-probe cache.
+/// same-region claim answered slower than [`REGION_LATENCY_MAX_MS`] scores
+/// [`Outcome::RegionLatencyMismatch`] (ADR 030); a reachable-but-absent provider
+/// is recorded in the negative-probe cache.
 // Straight-line probe → classify → build; the tracing macros and the three
 // sequential drop-conditions inflate the cognitive-complexity metric past the
 // threshold (same inflation noted in `chain_staker_set`), and splitting the
@@ -2609,11 +2611,14 @@ fn peer_reputation(deps: &NodeOriginDeps, pk: PublicKey) -> f32 {
 }
 
 /// Tracing target of the per-peer reputation event [`record_outcome`] emits on
-/// every score change. The `decdn_node_pull_{success,unreachable,corruption}_total`
-/// counters are aggregates; this event names the peer behind each increment and
-/// the score it now holds. It logs at `debug!`, because a dead peer is re-probed
-/// on every cache miss. Enable it alone with
-/// `RUST_LOG=info,decdn::reputation=debug`.
+/// every recorded outcome. The `decdn_node_pull_{success,unreachable,corruption}_total`
+/// counters are aggregates; this event names the peer and outcome behind each fold,
+/// including ADR 030 region penalties, which have no counter, and the score the peer
+/// now holds. Idle decay moves scores without an event. It logs at `debug!`, because
+/// a dead peer is re-probed on every cache miss. Enable it alone with
+/// `RUST_LOG=info,decdn::reputation=debug`. `RUST_LOG` applies at startup only: a
+/// config reload replaces the filter with `observability.log_level` and drops the
+/// per-target setting.
 const REPUTATION_LOG_TARGET: &str = "decdn::reputation";
 
 /// Fold a pull/probe outcome into the local EWMA reputation score (ADR 008
@@ -2622,8 +2627,9 @@ fn record_outcome(deps: &NodeOriginDeps, pk: PublicKey, outcome: &Outcome) {
     fold_outcome(&deps.local_rep, &deps.metrics, pk, outcome);
 }
 
-/// [`record_outcome`] over the two stores it touches, so the fold, the metric,
-/// and the attribution event are testable without a full [`NodeOriginDeps`].
+/// The body of [`record_outcome`], taking the reputation table and the metrics
+/// directly so the fold, the metric, and the attribution event are testable
+/// without a full [`NodeOriginDeps`].
 fn fold_outcome(local_rep: &LocalReputation, metrics: &Metrics, pk: PublicKey, outcome: &Outcome) {
     let score = local_rep.record(pk, *outcome);
     debug!(
@@ -3311,11 +3317,13 @@ mod tests {
         }
     }
 
-    /// Every score change names its peer and the score it leaves (#1987). The
+    /// Every recorded outcome names its peer and the score it leaves. The
     /// `node_pull_*` counters are unlabeled aggregates, so without this event an
     /// `Unreachable` penalty is a counter tick that no operator can attribute.
     #[test]
     fn a_reputation_penalty_names_the_peer_and_its_new_score() -> anyhow::Result<()> {
+        // `docs/runbook.md` names this filter string verbatim.
+        assert_eq!(REPUTATION_LOG_TARGET, "decdn::reputation");
         let local_rep = LocalReputation::new(decdn_reputation::LocalReputationConfig::default())?;
         let metrics = Metrics::new();
         let pk = iroh::SecretKey::generate().public();
