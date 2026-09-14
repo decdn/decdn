@@ -24,6 +24,17 @@
 //! run concurrently; and a single global mutex serializes every open-or-reuse
 //! call — the pool's on-chain state (deposit, allowance) is one shared resource,
 //! regardless of which provider an entry is bound for.
+//!
+//! **Incremental re-runs.** A run reads `<out_root>/.decdn-manifest.json`
+//! before fetching and writes a merged copy back after. An in-scope path is
+//! skipped when the saved record's hash, size, and mtime match the new
+//! manifest. A path with no matching saved record is still skipped when
+//! re-hashing its on-disk bytes matches the new manifest hash. A path whose
+//! on-disk content no longer matches the new manifest hash is re-fetched, not
+//! silently kept. Every skipped or freshly written path also seeds its
+//! on-disk byte ranges as chunk donors, so a later run's or bundle's
+//! complement-range fetch can splice an unchanged range from disk instead of
+//! paying for it again.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -110,8 +121,8 @@ fn group_by_hash<'a>(entries: &[&'a ManifestEntry]) -> Vec<HashGroup<'a>> {
 /// a hard link where the filesystem allows it, else a full copy (cross-device
 /// `EXDEV`, or a filesystem that can't link). Staged in `dest`'s parent and
 /// renamed into place so `dest` is only ever absent or complete — the same
-/// atomic-replace invariant [`materialize`] upholds, which bundle pull's
-/// skip-existing relies on ("a present final file is verified-good").
+/// atomic-replace invariant [`materialize`] upholds, which [`resolve_disk_state`]
+/// and [`plan_slots`] rely on when deciding a path is skip-safe.
 fn link_or_copy_atomic(src: &Path, dest: &Path) -> anyhow::Result<()> {
     let parent = dest
         .parent()
@@ -261,14 +272,13 @@ fn seed_new_chunks(state: &mut DiskState, en: &ManifestEntry, dest: &Path) {
 }
 
 /// Resolve each entry's on-disk destination and classify it — a resolve failure,
-/// an already-present file to skip, or a path to write — before any fetch.
-/// Skip-existing (default): a present final file is verified-good (renamed into
-/// place only after a BLAKE3 check), so re-runs resume. Evaluated **per
-/// destination**, so one path of a duplicated blob can be skipped while another
-/// is written. `skip` is the [`resolve_disk_state`] pre-pass result: it replaces
-/// a plain `dest.try_exists()` check with a re-hash-confirmed decision (or a
-/// saved-manifest fast-skip), so an UPDATED file at an existing path is written,
-/// not silently skipped.
+/// a path to skip, or a path to write — before any fetch. `skip` is the
+/// [`resolve_disk_state`] pre-pass result: a path lands in it on a matching
+/// saved-manifest record (fast-skip) or, failing that, on a re-hash of the
+/// on-disk bytes against the new manifest hash. A path whose content changed
+/// is written, not silently kept. Evaluated **per destination**, so one path
+/// of a duplicated blob can be skipped while another is written. With
+/// `overwrite` set, `skip` is empty and every destination is written.
 fn plan_slots<'a>(
     entries: &[&'a ManifestEntry],
     out_root: &Path,
