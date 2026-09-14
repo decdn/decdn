@@ -6,12 +6,17 @@
 //! every skip is re-verified against the new manifest and every spliced chunk is
 //! re-hashed, so a missing, corrupt, or stale file only costs speed.
 
-// This module's public API has no caller yet: `bundle_pull` reads the
-// saved-manifest cache through it in a later task. Until then the lib target
-// (no test cfg) sees every item as unreachable.
-#![expect(
-    dead_code,
-    reason = "leaf module awaiting its `bundle_pull` caller in a later task"
+// `bundle_pull`'s pre-pass reads the saved-manifest cache through this module
+// (`load`, `SavedManifest::get`, `SavedMtime::of`); the write side
+// (`merge_and_write`, `saved_hints`) awaits its `bundle_pull` caller in a later
+// task. Restricted to the non-test build: the module's own tests already
+// exercise every item, so in a `cfg(test)` build nothing here is dead.
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "merge_and_write/saved_hints await their bundle_pull caller in a later task"
+    )
 )]
 
 use std::collections::BTreeMap;

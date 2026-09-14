@@ -47,6 +47,7 @@ use futures_util::StreamExt as _;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 
+use super::bundle_manifest::{self, SavedManifest, SavedMtime};
 use super::chain_ctx;
 use super::fetch;
 use super::manifest::build_glob_set;
@@ -143,16 +144,106 @@ fn link_or_copy_atomic(src: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A disk-seeded chunk donor: a byte range already on disk whose bytes back a
+/// chunk `hash`. Fed into [`ChunkIndex`] before fetching so a splice can reuse
+/// on-disk bytes across runs. The source is an OUTPUT path (not a staging blob),
+/// verified by the existing per-chunk re-hash before any splice trusts it.
+#[expect(
+    dead_code,
+    reason = "populated and consumed starting the ChunkIndex-seeding task"
+)]
+struct SeedDonor {
+    /// The chunk's BLAKE3 hash — the [`ChunkIndex`] key.
+    hash: [u8; 32],
+    /// The on-disk output file that holds the chunk's bytes.
+    source: PathBuf,
+    /// Byte offset of the chunk within `source`.
+    offset: u64,
+    /// Chunk length in bytes.
+    len: u64,
+}
+
+/// The result of inspecting the output tree against the new manifest and the
+/// saved skip-cache before fetching: which in-scope paths to skip, and the
+/// on-disk chunk donors to seed.
+#[derive(Default)]
+struct DiskState {
+    /// In-scope manifest paths whose on-disk file already matches the new
+    /// manifest hash (fast-skip or re-hash-confirmed) — not fetched.
+    skip: HashSet<String>,
+    /// On-disk chunk donors to seed into the run's [`ChunkIndex`].
+    #[expect(
+        dead_code,
+        reason = "populated and consumed starting the ChunkIndex-seeding task"
+    )]
+    seed: Vec<SeedDonor>,
+}
+
+/// Classify every in-scope entry against the output tree and the saved
+/// skip-cache: fast-skip on a matching saved record (hash + size + mtime), else
+/// re-hash the on-disk bytes against the new manifest hash, else fetch. With
+/// `overwrite` nothing is skipped. The whole-file `hash` is authoritative, so a
+/// stale or absent saved record only costs a re-hash, never correctness.
+async fn resolve_disk_state(
+    entries: &[ManifestEntry],
+    saved: &SavedManifest,
+    out_root: &Path,
+    overwrite: bool,
+) -> DiskState {
+    let mut state = DiskState::default();
+    if overwrite {
+        return state;
+    }
+    for en in entries {
+        let Ok(dest) = safe_join(out_root, &en.path) else {
+            continue; // a bad path fails later in plan_slots; not skippable
+        };
+        if dest.starts_with(out_root.join(STAGING_DIR)) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&dest) else {
+            continue; // absent/unreadable → fetch
+        };
+        // Fast-skip: saved record agrees on hash, size, and mtime.
+        let fast = saved.get(&en.path).is_some_and(|rec| {
+            rec.hash == en.hash
+                && rec.size == meta.len()
+                && en.size.is_none_or(|s| s == rec.size)
+                && SavedMtime::of(&meta).as_ref() == Some(&rec.mtime)
+        });
+        if fast {
+            state.skip.insert(en.path.clone());
+            continue;
+        }
+        // Re-hash gate: confirm the on-disk bytes against the new manifest hash.
+        let Ok(want) = fetch::parse_hash(&en.hash) else {
+            continue;
+        };
+        let dest_buf = dest.clone();
+        let got = tokio::task::spawn_blocking(move || hash_partial(&dest_buf)).await;
+        if let Ok(Ok(got)) = got
+            && got == want
+        {
+            state.skip.insert(en.path.clone());
+        }
+    }
+    state
+}
+
 /// Resolve each entry's on-disk destination and classify it — a resolve failure,
 /// an already-present file to skip, or a path to write — before any fetch.
 /// Skip-existing (default): a present final file is verified-good (renamed into
 /// place only after a BLAKE3 check), so re-runs resume. Evaluated **per
 /// destination**, so one path of a duplicated blob can be skipped while another
-/// is written.
+/// is written. `skip` is the [`resolve_disk_state`] pre-pass result: it replaces
+/// a plain `dest.try_exists()` check with a re-hash-confirmed decision (or a
+/// saved-manifest fast-skip), so an UPDATED file at an existing path is written,
+/// not silently skipped.
 fn plan_slots<'a>(
     entries: &[&'a ManifestEntry],
     out_root: &Path,
     overwrite: bool,
+    skip: &HashSet<String>,
 ) -> Vec<Slot<'a>> {
     entries
         .iter()
@@ -170,7 +261,7 @@ fn plan_slots<'a>(
                     ),
                 ))
             }
-            Ok(dest) if !overwrite && dest.try_exists().unwrap_or(false) => Slot::Skip,
+            Ok(_) if !overwrite && skip.contains(en.path.as_str()) => Slot::Skip,
             Ok(dest) => Slot::Write {
                 label: en.path.as_str(),
                 dest,
@@ -661,8 +752,11 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // content size, fixed now from the manifest's declared sizes.
     ctx.progress = PullProgress::new(args.json, total_content_bytes(&manifest.entries));
 
+    // Loaded once for the whole run: the pre-pass skip decisions above consult it,
+    // and a later write reuses this same binding (never a second load).
+    let saved = bundle_manifest::load(&args.output);
     let (outcomes, transfer) = ctx
-        .pull_all(&manifest.entries, &args.output, args.overwrite)
+        .pull_all(&manifest.entries, &args.output, args.overwrite, &saved)
         .await;
     ctx.progress.finish();
 
@@ -1356,6 +1450,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         entries: &[ManifestEntry],
         out_root: &Path,
         overwrite: bool,
+        saved: &SavedManifest,
     ) -> (Vec<EntryOutcome>, Transfer) {
         // Every entry declares an authoritative whole-file `hash`, so the by-hash
         // grouping path (fetch-once + link-duplicates, #1306) covers plain and
@@ -1363,7 +1458,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // one blob is assembled, never that it is one paid unit per distinct hash.
         let index = ChunkIndex::default();
         let refs: Vec<&ManifestEntry> = entries.iter().collect();
-        let (outcomes, transfer) = self.pull_plain(&refs, out_root, overwrite, &index).await;
+        // Pre-pass: classify every entry against the output tree and the saved
+        // skip-cache before any fetch, so an updated file at an already-present
+        // path is written rather than silently skipped.
+        let disk = resolve_disk_state(entries, saved, out_root, overwrite).await;
+        let (outcomes, transfer) = self
+            .pull_plain(&refs, out_root, overwrite, &index, &disk.skip)
+            .await;
 
         // A donor entry's finalized staging blob is the source a recipient splices
         // from, so it is kept past its own group's cleanup. With the run over,
@@ -1393,11 +1494,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         overwrite: bool,
         index: &ChunkIndex,
+        skip: &HashSet<String>,
     ) -> (Vec<EntryOutcome>, Transfer) {
         let groups_by_hash = group_by_hash(entries);
         let group_count = groups_by_hash.len().max(1);
         let groups: Vec<Vec<EntryOutcome>> = futures_util::stream::iter(groups_by_hash)
-            .map(|group| self.fetch_group(group, out_root, overwrite, index))
+            .map(|group| self.fetch_group(group, out_root, overwrite, index, skip))
             // Live-bar fan-out bounded by --jobs; the global gate is the real in-flight-fetch cap.
             .buffer_unordered(self.jobs.min(group_count))
             .collect::<Vec<Vec<EntryOutcome>>>()
@@ -1549,6 +1651,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         overwrite: bool,
         index: &ChunkIndex,
+        skip: &HashSet<String>,
     ) -> Vec<EntryOutcome> {
         // The group's shared hash is carried explicitly; parse it once, and a bad
         // hash fails every path in the group.
@@ -1588,7 +1691,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // `pull_all` removes it once every recipient has had its chance.
         let is_donor = hints.as_ref().is_some_and(|h| !h.is_empty());
 
-        let slots = plan_slots(&group.entries, out_root, overwrite);
+        let slots = plan_slots(&group.entries, out_root, overwrite, skip);
 
         // Every destination already present (or failed to resolve) → no fetch, no
         // payment. This is the whole point of the group: a duplicate path that is
@@ -3606,9 +3709,10 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
     }
 
-    /// Skip-existing / `--overwrite` are decided **per destination**: one path of a
-    /// duplicated blob can be already-present (Skip) while its twin is absent
-    /// (Write), and `--overwrite` forces both to Write.
+    /// Skip-existing / `--overwrite` are decided **per destination** from the
+    /// [`resolve_disk_state`] pre-pass's skip set (not a raw existence check): one
+    /// path of a duplicated blob can be in the skip set (Skip) while its twin is
+    /// not (Write), and `--overwrite` forces both to Write regardless of `skip`.
     #[test]
     fn plan_slots_classifies_each_destination_independently() {
         let dir = tempfile::tempdir().unwrap();
@@ -3616,12 +3720,13 @@ mod tests {
         std::fs::write(out.join("present.txt"), b"x").unwrap();
         let entries = [entry("present.txt", "b3:h"), entry("absent.txt", "b3:h")];
         let refs: Vec<&ManifestEntry> = entries.iter().collect();
+        let skip = HashSet::from(["present.txt".to_string()]);
 
-        let slots = plan_slots(&refs, out, false);
+        let slots = plan_slots(&refs, out, false, &skip);
         assert!(matches!(slots[0], Slot::Skip));
         assert!(matches!(slots[1], Slot::Write { .. }));
 
-        let slots = plan_slots(&refs, out, true);
+        let slots = plan_slots(&refs, out, true, &skip);
         assert!(matches!(slots[0], Slot::Write { .. }));
         assert!(matches!(slots[1], Slot::Write { .. }));
     }
@@ -3632,7 +3737,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let entries = [entry("../escape", "b3:h")];
         let refs: Vec<&ManifestEntry> = entries.iter().collect();
-        let slots = plan_slots(&refs, dir.path(), false);
+        let slots = plan_slots(&refs, dir.path(), false, &HashSet::new());
         assert!(matches!(slots[0], Slot::Failed(_)));
     }
 
@@ -3644,8 +3749,75 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let entries = [entry(&format!("{STAGING_DIR}/deadbeef.partial"), "b3:h")];
         let refs: Vec<&ManifestEntry> = entries.iter().collect();
-        let slots = plan_slots(&refs, dir.path(), false);
+        let slots = plan_slots(&refs, dir.path(), false, &HashSet::new());
         assert!(matches!(slots[0], Slot::Failed(_)));
+    }
+
+    /// An unrecorded (empty saved manifest) file still skips via the re-hash gate
+    /// when its on-disk bytes already match the new manifest hash.
+    #[tokio::test]
+    async fn resolve_disk_state_skips_matching_file_by_rehash() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let body = b"hello world";
+        std::fs::write(tmp.path().join("a.txt"), body).expect("write");
+        let h = format!("b3:{}", blake3::hash(body).to_hex());
+        let entries = vec![ManifestEntry {
+            path: "a.txt".into(),
+            hash: h,
+            size: Some(u64::try_from(body.len()).expect("len")),
+            chunks: None,
+        }];
+        // Empty saved manifest → falls to the re-hash gate, still skips (content matches).
+        let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
+        assert!(st.skip.contains("a.txt"));
+    }
+
+    /// A changed file (content no longer matches the new manifest hash) is never
+    /// skipped, whether or not a saved record exists for it.
+    #[tokio::test]
+    async fn resolve_disk_state_fetches_changed_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        std::fs::write(tmp.path().join("a.txt"), b"OLD CONTENT").expect("write");
+        let new = format!("b3:{}", blake3::hash(b"NEW CONTENT").to_hex());
+        let entries = vec![ManifestEntry {
+            path: "a.txt".into(),
+            hash: new,
+            size: Some(11),
+            chunks: None,
+        }];
+        let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
+        assert!(!st.skip.contains("a.txt")); // hash mismatch → fetch
+    }
+
+    /// An absent file always fetches — nothing to re-hash, no fast-skip possible.
+    #[tokio::test]
+    async fn resolve_disk_state_absent_file_fetches() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let entries = vec![ManifestEntry {
+            path: "missing.txt".into(),
+            hash: "b3:00".into(),
+            size: Some(1),
+            chunks: None,
+        }];
+        let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
+        assert!(!st.skip.contains("missing.txt"));
+    }
+
+    /// `--overwrite` bypasses the pre-pass entirely: nothing is ever skipped.
+    #[tokio::test]
+    async fn resolve_disk_state_overwrite_skips_nothing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let body = b"hello world";
+        std::fs::write(tmp.path().join("a.txt"), body).expect("write");
+        let h = format!("b3:{}", blake3::hash(body).to_hex());
+        let entries = vec![ManifestEntry {
+            path: "a.txt".into(),
+            hash: h,
+            size: Some(u64::try_from(body.len()).expect("len")),
+            chunks: None,
+        }];
+        let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), true).await;
+        assert!(st.skip.is_empty());
     }
 
     /// `materialize` (the paid-path writer) atomically replaces an existing
