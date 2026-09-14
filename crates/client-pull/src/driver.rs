@@ -2058,6 +2058,196 @@ mod tests {
         );
     }
 
+    /// A [`BlobSource`] whose upstream payment trails its delivery: each clean
+    /// leg commits only half of the leg's wire, so the paid frontier the driver
+    /// opens at stays behind the delivered frontier the pacer measures. Opens past
+    /// `max_opens` fail, so a driver that keeps re-opening without parking fails
+    /// the test instead of hanging it.
+    struct HalfPaySource {
+        inner: ScriptedSource,
+        ledger: Arc<PoolLedger>,
+        leg_wire: Mutex<u64>,
+        opens: std::sync::atomic::AtomicUsize,
+        max_opens: usize,
+    }
+
+    impl BlobSource for HalfPaySource {
+        type Reader = crate::source::ScriptedReader;
+
+        fn open(
+            &self,
+            hash: [u8; 32],
+            range: AlignedRange,
+        ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
+            Box::pin(async move {
+                let opens = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::ensure!(
+                    opens < self.max_opens,
+                    "open budget of {} spent: {:?}",
+                    self.max_opens,
+                    self.inner.opened_ranges()
+                );
+                *self.leg_wire.lock().expect("leg wire lock") = range.wire_len();
+                self.inner.open(hash, range).await
+            })
+        }
+
+        fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async move {
+                self.inner.finish(reader).await?;
+                let half = *self.leg_wire.lock().expect("leg wire lock") / 2;
+                self.ledger
+                    .issue(half, 1, crate::EpochAction::Keep, |_next, _chain| async {
+                        Ok(())
+                    })
+                    .await?;
+                Ok(VoucherProgress::from_cumulative(
+                    self.ledger.committed(),
+                    U256::ZERO,
+                ))
+            })
+        }
+    }
+
+    /// A [`PacingWait`] hook that counts calls and then never resolves, so a
+    /// drive whose window stays closed parks on it.
+    struct ParkingWait {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl super::PacingWait for ParkingWait {
+        fn wait(
+            &self,
+            _observed: super::DownstreamFrontier,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// An in-band serve demand is fetched even when upstream payment lags
+    /// delivery by about one pull-window floor. The pacer measures the demand
+    /// from the delivered frontier, but the driver opens each draw at the paid
+    /// frontier, so one floor drawn from the paid frontier does not reach the
+    /// demand. The drive still fetches the demand within a bounded number of
+    /// opens of at most one floor each, stops once the demand is covered, and
+    /// then parks. The downstream client pays nothing throughout.
+    #[tokio::test(start_paused = true)]
+    async fn in_band_demand_converges_when_upstream_payment_lags_delivery() {
+        use crate::pacer::{PULL_WINDOW_FLOOR, RampPacer};
+
+        const FLOOR: u64 = PULL_WINDOW_FLOOR;
+        // Room past `window + 2 * FLOOR`, so an over-sized demand draw is not
+        // clipped by the blob end.
+        let total = 5 * FLOOR;
+        let (_root, plaintext, _outboard) = synth_blob(total as usize);
+
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let inner = ScriptedSource::new(plaintext).expect("source");
+        let root = inner.root();
+        let store = fresh_store(root, total);
+        let source = HalfPaySource {
+            inner,
+            ledger: Arc::clone(&ledger),
+            leg_wire: Mutex::new(0),
+            opens: std::sync::atomic::AtomicUsize::new(0),
+            max_opens: 8,
+        };
+
+        // A window of two floors: `divisor: 0` fixes the window at `credit_max`,
+        // and `served_paid` stays 0, so the window never slides. The first leg
+        // fills it, and half payment leaves the paid frontier about one floor
+        // behind delivery.
+        let window = 2 * FLOOR;
+        let pacer = RampPacer {
+            divisor: 0,
+            floor: FLOOR,
+            credit_max: window,
+        };
+        // The serve leg is parked on the first byte past the closed window: one
+        // byte ahead of the pull once the window fills, and so in band.
+        let demand = window + 1;
+        // The fixture really lags: after the first leg, one floor drawn from the
+        // paid frontier stops short of the demand.
+        let first_leg_wire = align_range(0, window, total).expect("align").wire_len();
+        let paid_after_first_leg = crate::sink::content_paid_frontier(0, total, first_leg_wire / 2);
+        assert!(
+            paid_after_first_leg + FLOOR < demand,
+            "one floor from the paid frontier ({paid_after_first_leg}) must not reach \
+             the demand ({demand}), or this test does not cover the lag"
+        );
+        let downstream = || super::DownstreamFrontier {
+            served_paid: 0,
+            serve_demand: demand,
+        };
+        let wait_hook = ParkingWait {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let funder = healthy_funder();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_mins(1),
+            drive(
+                &store,
+                &source,
+                &pacer,
+                &funder,
+                &ctx,
+                &ledger,
+                root,
+                0,
+                0,
+                &config(),
+                None,
+                Some(&wait_hook),
+                Some(&downstream),
+                None,
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the drive must park on the closed window, not end: {outcome:?}"
+        );
+
+        let opened = source.inner.opened_ranges();
+        assert_eq!(
+            opened.first(),
+            Some(&(0, window)),
+            "the first leg fills the window: {opened:?}"
+        );
+        let covering = opened
+            .iter()
+            .position(|&(start, len)| start < demand && start + len >= demand)
+            .unwrap_or_else(|| panic!("no open covers the demand {demand}: {opened:?}"));
+        assert_eq!(
+            covering + 1,
+            opened.len(),
+            "the pull stops once the demand is covered: {opened:?}"
+        );
+        // After the window fills, every open is a serve-demand draw, and each
+        // draws at most one floor.
+        assert!(
+            opened.iter().skip(1).all(|&(_, len)| len <= FLOOR),
+            "each serve-demand draw is at most one floor ({FLOOR}): {opened:?}"
+        );
+        assert_eq!(
+            wait_hook.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the pull waits only after the demand is fetched"
+        );
+        assert!(
+            store
+                .missing_ranges(0, demand)
+                .await
+                .expect("missing")
+                .is_empty(),
+            "the demanded byte is in the store"
+        );
+        assert!(funder.calls().is_empty(), "no top-up was needed");
+    }
+
     /// An [`IngestStore`] wrapper that counts `flush_present_record` calls and
     /// delegates every real operation to an inner [`ClientRangedStore`]. It lets
     /// a test observe the interval flush firing during a still-running fetch.
