@@ -1,5 +1,7 @@
 //! Content-defined chunking for `origin import --optimize` (fastcdc v2020).
-//! Pure CDC + hashing; writing chunk blobs stays in `origin.rs`.
+//! Pure CDC + hashing: it produces the manifest's range-dedup chunk hints. No
+//! chunk is ever written as its own blob — `origin.rs` stores each file as one
+//! whole-file blob and calls this only to compute the hints over its bytes.
 
 use anyhow::{Result, bail};
 use decdn_protocol::client::MB_BYTES;
@@ -71,21 +73,24 @@ impl ChunkSizes {
     }
 }
 
-/// A file's whole-file identity plus its ordered chunk decomposition.
+/// A file's whole-file identity plus its ordered range-dedup chunk hints.
 pub(crate) struct ChunkedFile {
     /// BLAKE3 of the whole file — the manifest entry's end-to-end validator.
     pub(crate) whole_hash: blake3::Hash,
     /// Sum of the chunk sizes; equals the file length.
     pub(crate) total_size: u64,
-    /// Chunks in content order (the file is their concatenation).
+    /// Chunk hints in content order (the byte ranges they cover span the
+    /// whole file, in sequence).
     pub(crate) chunks: Vec<crate::commands::manifest::Chunk>,
 }
 
 /// Stream `source` through fastcdc v2020. For each chunk, in content order:
-/// feed its bytes to a whole-file BLAKE3 hasher, BLAKE3 the chunk (its content
-/// address), invoke `sink(chunk_hash, bytes)` (the caller writes the blob, or
-/// no-ops in dry-run), and record the `Chunk`. Returns the whole-file hash, the
-/// summed size, and the ordered chunk list.
+/// feed its bytes to a whole-file BLAKE3 hasher, BLAKE3 the chunk range (its
+/// hint hash), invoke `sink(chunk_hash, bytes)`, and record the `Chunk` hint.
+/// `sink` never writes a chunk blob — every caller passes a no-op, since a
+/// chunk hash is never independently stored or served — it exists only as a
+/// hook a caller could use over the streamed bytes (e.g. for diagnostics).
+/// Returns the whole-file hash, the summed size, and the ordered hint list.
 pub(crate) fn chunk_file<R, F>(source: R, sizes: &ChunkSizes, mut sink: F) -> Result<ChunkedFile>
 where
     R: std::io::Read,

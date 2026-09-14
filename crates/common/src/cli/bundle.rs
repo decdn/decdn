@@ -66,12 +66,20 @@ pub struct BundlePullArgs {
     #[arg(short = 'o', long, value_name = "DIR")]
     pub output: PathBuf,
 
-    /// Maximum entries fetched concurrently. Fetches sharing one provider's
-    /// channel are still serialized (a channel's vouchers use a strictly
-    /// increasing nonce), so effective parallelism is bounded by the number of
-    /// distinct providers in flight.
+    /// Maximum concurrent entry fetches across the whole run. Each distinct blob
+    /// is one unit of work holding one slot: a plain whole-file entry, or a
+    /// range-dedup entry across its complement drive, donor splice, and any
+    /// re-fetch. A byte range a sibling entry already holds is spliced from disk,
+    /// not fetched, so it never takes a slot of its own.
     #[arg(long, value_name = "N", default_value_t = 4)]
     pub jobs: usize,
+
+    /// Maximum concurrent streams to one `(pool, signer, provider)` lane. 1 keeps
+    /// a single ordered voucher sequence per lane (the safe default); a higher
+    /// value allows N concurrent same-lane streams. Cross-lane parallelism is
+    /// bounded by `--jobs` regardless.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub max_lane_streams: usize,
 
     /// Only pull entries whose POSIX relative path matches one of these globs
     /// (`models/*.bin`), matched against the manifest's `path` field, never the

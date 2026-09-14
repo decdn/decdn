@@ -92,6 +92,7 @@ use crate::driver::{
     DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PoolExhausted, SharedPool,
     contiguous_byte_ranges, drive_with_interval_flush, fill_gap, ranges_content_len,
 };
+use crate::ledgers::LaneLedgers;
 use crate::retry::{RetryDisposition, retry_disposition};
 use crate::segment::{split_evenly, steal_split};
 use crate::source::{BlobSource, Funder, IngestStore};
@@ -773,13 +774,16 @@ where
 /// at the boundary, rather than assumed from the caller's admission policy.
 ///
 /// One shared pool DEPOSIT backs the whole set, and every lane draws through one
-/// shared view of it: the deposit gate subtracts `Σ lanes[j].ledger.committed()`
-/// rather than this lane's own spend, the reactive-top-up budget is counted once
-/// for the fetch rather than once per lane, and a landed top-up is credited to
-/// every lane's context. The gate is evaluated at each `fill_gap` leg boundary;
-/// the hard backstop against a node redeeming past the deposit stays on-chain
-/// (the pool pays first-come up to its deposit), exactly as on the single-source
-/// path.
+/// shared view of it. `ledgers` picks which view: `None` subtracts
+/// `Σ lanes[j].ledger.committed()` over just this fetch's own lanes (a solo
+/// `decdn fetch`); `Some(reg)` subtracts `reg.total_committed()`, the sum over
+/// every lane a `bundle pull` run has registered — spanning this fetch's
+/// concurrent siblings on the same deposit, not just its own lanes. Either way
+/// the reactive-top-up budget is counted once for the fetch rather than once per
+/// lane, and a landed top-up is credited to every lane the view covers. The gate
+/// is evaluated at each `fill_gap` leg boundary; the hard backstop against a
+/// node redeeming past the deposit stays on-chain (the pool pays first-come up
+/// to its deposit), exactly as on the single-source path.
 ///
 /// Returns once every gap is filled, or once a worker hits a TERMINAL fault (a
 /// retryable one only drops that lane). Finalization is the caller's job —
@@ -812,6 +816,7 @@ pub async fn multi_source_fetch<St, S, P, F>(
     drive: &DriveConfig,
     ms: &MultiSourceConfig,
     on_progress: Option<&ProgressCallback>,
+    ledgers: Option<&LaneLedgers>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -952,28 +957,43 @@ where
     // The three facts that belong to the POOL and not to any lane (see
     // [`SharedPool`]). Cloning the `Arc` handles keeps the closures free of the
     // borrow on `lanes` and lets every worker share one view.
+    //
+    // With a run registry (`ledgers: Some`), `spent`/`credit` read and write
+    // EVERY lane the run has registered — spanning this fetch's concurrent
+    // siblings on the same deposit, the pool-wide view a `bundle pull` run's
+    // deposit gate needs. Without one (`ledgers: None`), they fold over only
+    // this fetch's own lanes, exactly as a solo `decdn fetch` always has.
     let lane_ledgers: Vec<Arc<PoolLedger>> = lanes.iter().map(|l| Arc::clone(&l.ledger)).collect();
-    let spent = move || {
-        lane_ledgers
-            .iter()
-            .map(|l| l.committed().amount)
-            .fold(U256::ZERO, U256::saturating_add)
-    };
     let lane_ctxs: Vec<Arc<Mutex<PoolContext>>> =
         lanes.iter().map(|l| Arc::clone(&l.ctx)).collect();
-    let credit = move |new_deposit: U256| -> anyhow::Result<()> {
-        for ctx in &lane_ctxs {
-            ctx.lock()
-                .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
-                .deposit = new_deposit;
-        }
-        Ok(())
+    let spent: Box<dyn Fn() -> U256 + Send + Sync> = match ledgers {
+        Some(reg) => Box::new(move || reg.total_committed()),
+        None => Box::new(move || {
+            lane_ledgers
+                .iter()
+                .map(|l| l.committed().amount)
+                .fold(U256::ZERO, U256::saturating_add)
+        }),
+    };
+    let credit: Box<dyn Fn(U256) -> anyhow::Result<()> + Send + Sync> = match ledgers {
+        Some(reg) => Box::new(move |new_deposit| {
+            reg.credit_all(new_deposit);
+            Ok(())
+        }),
+        None => Box::new(move |new_deposit: U256| -> anyhow::Result<()> {
+            for ctx in &lane_ctxs {
+                ctx.lock()
+                    .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+                    .deposit = new_deposit;
+            }
+            Ok(())
+        }),
     };
     let topups_used = AtomicU32::new(0);
     let pool = SharedPool {
-        spent: &spent,
+        spent: &*spent,
         topups_used: &topups_used,
-        credit: &credit,
+        credit: &*credit,
     };
 
     // ONE monotonic whole-blob delivered-byte counter behind the progress bar,
@@ -1102,12 +1122,13 @@ mod tests {
 
     use alloy::primitives::{Address, B256, U256};
     use alloy::signers::local::PrivateKeySigner;
-    use decdn_incentive::DepositOutcome;
+    use decdn_incentive::{DepositOutcome, LaneKey};
     use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
     use super::{MultiSourceConfig, SourceLane, multi_source_fetch};
     use crate::driver::DriveConfig;
     use crate::driver::PoolExhausted;
+    use crate::ledgers::{LaneHandle, LaneLedgers};
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState, Pacer};
     use crate::source::{FakeFunder, ScriptedSource};
     use crate::{ClientRangedStore, Cumulative, PoolContext, PoolLedger};
@@ -1219,6 +1240,7 @@ mod tests {
                 unit_deadline: Duration::from_secs(10),
             },
             None,
+            None,
         )
         .await?;
 
@@ -1297,6 +1319,7 @@ mod tests {
                 unit_deadline: Duration::from_secs(10),
             },
             Some(&on_progress),
+            None,
         )
         .await?;
 
@@ -1397,6 +1420,7 @@ mod tests {
                 unit_deadline: Duration::from_secs(10),
             },
             Some(&on_progress),
+            None,
         )
         .await?;
 
@@ -1452,6 +1476,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
         )
         .await?;
@@ -1528,6 +1553,7 @@ mod tests {
                 unit_deadline: Duration::from_secs(10),
             },
             None,
+            None,
         )
         .await?;
 
@@ -1603,6 +1629,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
         )
         .await?;
@@ -1684,6 +1711,7 @@ mod tests {
                 unit_deadline: Duration::from_secs(30),
             },
             None,
+            None,
         )
         .await?;
 
@@ -1741,6 +1769,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
         )
         .await?;
@@ -1804,6 +1833,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
         )
         .await?;
@@ -1962,6 +1992,7 @@ mod tests {
                 unit_deadline: Duration::from_secs(30),
             },
             None,
+            None,
         )
         .await?;
 
@@ -2049,6 +2080,7 @@ mod tests {
                 unit_deadline: Duration::from_secs(30),
             },
             None,
+            None,
         )
         .await?;
 
@@ -2116,6 +2148,7 @@ mod tests {
                     max_sources: 2,
                     unit_deadline: Duration::from_secs(10),
                 },
+                None,
                 None,
             ),
         )
@@ -2192,6 +2225,7 @@ mod tests {
                     max_sources: 2,
                     unit_deadline: Duration::from_secs(30),
                 },
+                None,
                 None,
             ),
         )
@@ -2304,6 +2338,7 @@ mod tests {
                     unit_deadline: Duration::from_secs(30),
                 },
                 None,
+                None,
             ),
         )
         .await
@@ -2332,6 +2367,142 @@ mod tests {
             src_a.delivered_bytes() < total,
             "A delivered only its own segment, never the refused reassigned one: {}",
             src_a.delivered_bytes()
+        );
+        Ok(())
+    }
+
+    /// The pool-wide gate: a run registry's `total_committed()` sums EVERY
+    /// registered lane, including one this fetch never touches — a concurrent
+    /// fetch's lane sharing the same deposit. Lane C is registered but never
+    /// passed to `multi_source_fetch` in `lanes`; it carries the same prior
+    /// spend as the single-fetch `pool_exhaustion_aborts_the_scheduler_and_is_not_reassigned`
+    /// test's lane B. Summed over just this fetch's own `lanes` (both fresh),
+    /// the pool looks fully solvent and the fetch draws past the
+    /// true remaining deposit; summed the pool-wide way (`Some(&reg)`), C's
+    /// spend already claims most of the deposit, so the second leg's voucher is
+    /// `Refuse`d exactly as it is when the spend sits on an in-fetch lane.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // mirrors the full-drive shape of the
+    // adjacent `pool_exhaustion_aborts_the_scheduler_and_is_not_reassigned` test
+    async fn pool_wide_spent_gates_on_other_run_lanes() -> anyhow::Result<()> {
+        let data = blob(64 * 1024 * 1024);
+        let total = data.len() as u64;
+        let deposit = U256::from(100u64);
+        let other_lane_spend = U256::from(68u64);
+
+        let reg = LaneLedgers::new();
+        let handle_a = reg.get_or_insert(
+            LaneKey {
+                pool_id: B256::ZERO,
+                signer: Address::ZERO,
+                provider: Address::repeat_byte(0xA1),
+            },
+            || LaneHandle {
+                ledger: Arc::new(PoolLedger::new(Cumulative::default())),
+                ctx: Arc::new(Mutex::new(ctx_with(0xA1, deposit))),
+            },
+        );
+        let handle_b = reg.get_or_insert(
+            LaneKey {
+                pool_id: B256::ZERO,
+                signer: Address::ZERO,
+                provider: Address::repeat_byte(0xB2),
+            },
+            || LaneHandle {
+                ledger: Arc::new(PoolLedger::new(Cumulative::default())),
+                ctx: Arc::new(Mutex::new(ctx_with(0xB2, deposit))),
+            },
+        );
+        // Lane C belongs to a DIFFERENT concurrent fetch on the same run: it is
+        // registered on `reg` but never appears in this fetch's `lanes`.
+        reg.get_or_insert(
+            LaneKey {
+                pool_id: B256::ZERO,
+                signer: Address::ZERO,
+                provider: Address::repeat_byte(0xC3),
+            },
+            || LaneHandle {
+                ledger: Arc::new(PoolLedger::new(Cumulative {
+                    bytes: U256::from(68u64 * 1024 * 1024),
+                    amount: other_lane_spend,
+                })),
+                ctx: Arc::new(Mutex::new(ctx_with(0xC3, deposit))),
+            },
+        );
+
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&handle_a.ledger));
+        // Lane B faults at its first byte: it contributes nothing, so its 32 MiB
+        // segment is reassigned to lane A as a second leg.
+        let src_b = ScriptedSource::new(data.clone())?
+            .with_fault_after(0, || anyhow::anyhow!("scripted immediate fault"))
+            .paying(Arc::clone(&handle_b.ledger));
+        let root = src_a.root();
+        let (store, _dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        let full = Coverage::full(num_blocks(total));
+        let lanes = vec![
+            SourceLane {
+                source: &src_a,
+                ctx: Arc::clone(&handle_a.ctx),
+                ledger: Arc::clone(&handle_a.ledger),
+                coverage: full.clone(),
+            },
+            SourceLane {
+                source: &src_b,
+                ctx: Arc::clone(&handle_b.ctx),
+                ledger: Arc::clone(&handle_b.ledger),
+                coverage: full,
+            },
+        ];
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            multi_source_fetch(
+                &store,
+                &lanes,
+                &pacer,
+                &funder,
+                root,
+                0,
+                total,
+                &DriveConfig {
+                    // Reactive top-up disabled: a budget refusal is a hard
+                    // `PoolExhausted`, not a top-up.
+                    working_deposit: U256::ZERO,
+                    max_settle_waits: 0,
+                    settle_backoff: Duration::from_millis(1),
+                },
+                &MultiSourceConfig {
+                    max_sources: 2,
+                    unit_deadline: Duration::from_secs(30),
+                },
+                None,
+                Some(&reg),
+            ),
+        )
+        .await
+        .expect("pool exhaustion must abort promptly, not hang");
+
+        // The typed `PoolExhausted` propagated: the pool-wide view (this
+        // fetch's two fresh lanes PLUS lane C's prior spend registered
+        // elsewhere) is what refused the second leg, not a per-fetch sum that
+        // would have seen only the two fresh lanes and called the pool
+        // solvent.
+        let err = result.expect_err("the pool-wide spend must refuse the second leg");
+        assert!(
+            err.downcast_ref::<PoolExhausted>().is_some(),
+            "the pool-exhaustion error must propagate verbatim from the scheduler, \
+             not be masked as 'all sources failed': {err:#}"
+        );
+
+        let missing =
+            crate::driver::contiguous_byte_ranges(&store.missing_ranges(0, total).await?, total);
+        let missing_bytes: u64 = missing.iter().map(|(_, l)| *l).fold(0, u64::saturating_add);
+        assert!(
+            missing_bytes >= 30 * 1024 * 1024,
+            "the refused segment must stay unfetched (a whole ~32 MiB): only \
+             {missing_bytes} bytes missing"
         );
         Ok(())
     }
@@ -2385,6 +2556,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
         )
         .await?;
@@ -2496,6 +2668,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
         )
         .await?;
@@ -2627,6 +2800,7 @@ mod tests {
                     max_sources: 2,
                     unit_deadline: Duration::from_secs(30),
                 },
+                None,
                 None,
             ),
         )
@@ -2923,6 +3097,7 @@ mod tests {
                 unit_deadline: CEILING,
             },
             None,
+            None,
         )
         .await;
         // A healthy single lane with nothing to reassign to, so the only
@@ -3006,6 +3181,7 @@ mod tests {
                     unit_deadline: budget.unit_deadline,
                 },
                 None,
+                None,
             ),
         )
         .await
@@ -3071,6 +3247,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
         )
         .await
@@ -3139,6 +3316,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
         )
         .await
@@ -3211,6 +3389,7 @@ mod tests {
                 max_sources: 2,
                 unit_deadline: Duration::from_secs(30),
             },
+            None,
             None,
         )
         .await?;
