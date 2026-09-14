@@ -20,7 +20,7 @@ pub struct ServeEconomicsCtx {
     pub operator_bps: u16,
     /// ADR-040 frequency estimate for the hash; 0 = cold.
     pub heat_estimate: u32,
-    /// The source node still has warming allowance (Task 7): buy at market to warm.
+    /// The source node still has warming allowance: buy at market to warm.
     /// False once the source's allowance is spent: buy only at the amortized floor.
     pub warming_available: bool,
 }
@@ -90,7 +90,7 @@ impl ServeEconomicsPolicy for MarginPolicy {
 }
 
 /// Build the configured policy. Unknown names are impossible: config validation
-/// (Task 1) restricts `policy` to `"off"` | `"margin"` at load; anything else here
+/// restricts `policy` to `"off"` | `"margin"` at load; anything else here
 /// falls back to `OffPolicy` (safe: only the static ceiling applies).
 #[must_use]
 pub fn select_policy(cfg: &ResolvedServeEconomics) -> Arc<dyn ServeEconomicsPolicy> {

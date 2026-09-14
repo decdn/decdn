@@ -97,10 +97,11 @@ const SERVER_BUYER_USDC: u64 = 1_000_000_000;
 
 /// The blob under test: 9 MiB of content. At [`RATE_PER_MB`] its whole-blob wire
 /// cost (content + interleaved bao proof, ADR 038) is ~4.52 USDC — strictly above
-/// the 4 USDC working deposit (so the pull must top up) and strictly below the
-/// 5 USDC per-source warming allowance (`serve_economics.warming_budget`, so the
-/// buy stays in the market regime for the whole pull and the seeder's equal rate
-/// keeps clearing the buy-margin gate).
+/// the 4 USDC working deposit, so the pull must top up. The buy clears the ADR 041
+/// margin gate in the market regime: the SERVER checks the seeder's warming
+/// allowance (`serve_economics.warming_budget`, 5 USDC, starting full) before each
+/// pull run and debits it only after the run, and the warm-up's 1 MB debit
+/// (0.5 USDC) leaves it positive when the blob's pull starts.
 const BLOB_BYTES: usize = 9 * 1024 * 1024;
 
 /// Deterministic pseudo-random blob spanning many chunk groups, so a delivery
@@ -142,56 +143,32 @@ async fn server_upstream_pool_id(
         .with_context(|| format!("seeder lane pool_id is not a B256: {pool_hex}"))
 }
 
-/// IGNORED — the reactive-top-up path this journey exercises is correct and its
-/// prerequisite daemon fix has landed (see below), but the journey is blocked on a
-/// SEPARATE daemon issue this test is the first to surface: a HIGH-RATE
-/// node-to-node pull deterministically fails. Un-ignore once that is fixed; the
-/// sizing and assertions below are already correct.
+/// IGNORED — the journey's sizing and assertions are correct, but a multi-MB
+/// node-to-node pull on the fused serve-miss path stalls partway through, so the
+/// deposit-exhausting fetch never completes. Un-ignore once that stall is fixed.
 ///
-/// # What already works
+/// # The blocker: the fused serve-miss pull stalls on a multi-MB blob
 ///
-/// The blocker the prior attempt hit — a pre-spend upstream refusal permanently
-/// dead-charging the requesting client's per-signer floor credit — is FIXED in
-/// this same change ([`decdn_node`]'s `FloorReservation::release_unspent`, called
-/// on the window/own-origin miss legs' pre-serve refusal paths). Before it, the
-/// node-to-node warm-up below could not even complete: each pool-view-lag refusal
-/// folded a permanent dead charge, and a handful stranded the client's whole
-/// floor share (`serve_stream_rejected_signer_floor_at_cap`), so the session
-/// never opened. With the fix the warm-up completes and the session opens.
+/// The SERVER admits the fetch, signs `ok: true`, and streams. Its upstream pull
+/// from the seeder and its downstream serve to the client both advance, and then
+/// both stop: the client fails `upstream stalled: no progress for 30s`. At the
+/// stall the SERVER's `decdn_node_pull_through_window_paused_total` is non-zero,
+/// it holds no outbound stream, and no reactive top-up, stall, refusal, or
+/// voucher rejection counter moved on either node. The upstream paid frontier
+/// sits about one ramped credit window (`served_paid / credit_ramp_divisor`)
+/// ahead of the client's, so the pull leg is parked on `RampPacer` returning
+/// `PaceDecision::Wait` for a served-paid advance that never arrives.
 ///
-/// # The remaining blocker: high-rate node-to-node pulls fail
+/// The stall is independent of the rate and of the top-up: the same journey at
+/// the default rate, with the default working deposit, is observed to stall at
+/// the same point.
+/// A small blob (the warm-up) completes, because it fits inside the pull
+/// window's floor and never waits on a served-paid advance.
 ///
-/// The deposit-exhausting fetch never succeeds: the server misses and its
-/// node-to-node pull of the ~9 MiB blob from the seeder clean-misses, so the
-/// client is refused `NotFound` (`serve_stream_rejected_cache_miss`) on every
-/// attempt. This was localized by elimination against the passing
-/// `node_to_node_coalesce.rs`:
-///
-///   * NOT environmental — `node_to_node_coalesce` passes on the same host and
-///     fixture (it pulls node-to-node at the DEFAULT ~10 µUSDC/MB rate).
-///   * NOT flakiness / connectivity — the failure is DETERMINISTIC (a 90 s,
-///     ~160-attempt retry loop never lands one success), and forcing the daemon
-///     endpoint to `RelayMode::Disabled` removes the incidental non-loopback dial
-///     noise without changing the outcome.
-///   * NOT the top-up, the deposit, or exhaustion — an ample 20 USDC working
-///     deposit (blob well within it, no top-up needed) fails identically, and
-///     `decdn_node_pull_reactive_topup{,_refused}` never move.
-///   * NOT the seeder refusing, the buy-margin gate, the warming allowance, the
-///     blob-size gate, or a voucher rejection — every corresponding reject/refuse
-///     counter on both nodes stays flat (only a single startup pool-view-lag
-///     `unknown_lane`), ruling each out by metric panel.
-///
-/// The one systematic difference from the green coalesce path is the RATE: this
-/// journey must price at ~0.5 USDC/MB, because the seeder-side refundable floor
-/// `M` (default 1 USDC) forces the working deposit above ~1 USDC, and only an
-/// elevated per-MB rate lets a sane-sized blob's wire cost exceed that deposit to
-/// trigger the reactive branch at all. So the high rate is intrinsic to the
-/// scenario, not incidental — and something on the high-rate node-to-node pull
-/// path deterministically fails where the default-rate path does not. Pinning the
-/// exact step needs daemon-side pull-leg instrumentation (the subprocess daemon's
-/// debug logs do not surface through the e2e harness); that is a separate fix.
-#[ignore = "surfaces a separate daemon bug: high-rate node-to-node pulls fail \
-            deterministically (coalesce passes at default rate); see the doc comment"]
+/// Run the daemons with `DECDN_NODE_LOG="warn,decdn_node=debug"` to see their
+/// debug logs through the harness.
+#[ignore = "#1893: blocked on a fused serve-miss pull stall on multi-MB node-to-node \
+            blobs; see the doc comment"]
 #[tokio::test(flavor = "multi_thread")]
 async fn node_pull_larger_than_working_deposit_tops_up_once_and_completes() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))

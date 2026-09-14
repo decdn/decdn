@@ -98,7 +98,10 @@ on-chain visible. A node cannot lose its bond this way, but it can lose its
 deposit.
 
 The warming allowance bounds this. Each upstream source, a bonded seller node,
-carries an allowance capped at `B`. The allowance refills by serve-vindicated
+carries an allowance capped at `B`. A source's allowance starts full at `B`. A
+one-hit dud reduces the allowance by its loss and does not cut the source off;
+the node stops warming from the source only when its duds exhaust `B`. The
+allowance refills by serve-vindicated
 profit and loss. A speculative buy of a blob from a source — one that clears only
 because of the market-price band, not the profit-guarantee price — debits that
 source's allowance by the buy cost and tags the blob with its source. Every serve
@@ -106,7 +109,7 @@ of a tagged blob credits the source's allowance the realized margin, capped at
 `B`. The node applies that credit off the serve path. A serve puts the credit on
 a bounded queue. A background task takes it off the queue and applies it. The
 serve's last step then never waits on the allowance ledger. A full queue drops
-the credit. A drop leaves the source more negative than its true profit and
+the credit. A drop leaves the source's allowance lower than its true profit and
 loss. It can only throttle warming from that source. It can never over-fund the
 source, and the time refill forgives it.
 `decdn_warming_credits_dropped_total` counts every drop, and
@@ -295,9 +298,10 @@ deposit.
 3. A cold blob (`n_hat = 1`) clears at the market price while the source has
    allowance, so warming works on a flat market; once the source's allowance is
    spent, its cold blobs clear only at `amortized`.
-4. Each source (a seller node identity) has a warming allowance capped at `B`; a
-   speculative buy debits it, and each re-serve of a source-tagged blob enqueues
-   a credit for it (serve-vindicated), with a slow time refill. The allowance is
+4. Each source (a seller node identity) has a warming allowance capped at `B`
+   that starts full at `B`; a speculative buy debits it, a dud does not cut the
+   source off until the duds exhaust `B`, and each re-serve of a source-tagged
+   blob enqueues a credit for it (serve-vindicated), with a slow time refill. The allowance is
    keyed on the source node, not the client. A credit binds to the source that
    the tag names at serve time. A re-warm from a different source before the
    node applies the credit cannot redirect it.

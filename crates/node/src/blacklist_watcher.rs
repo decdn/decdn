@@ -1708,7 +1708,7 @@ mod tests {
             },
             operator: Address::repeat_byte(0x22),
             cache,
-            warming: Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
+            warming: Arc::new(crate::warming_allowance::WarmingAllowance::new(1000, 0)),
             state: state(),
             shutdown: CancellationToken::new(),
             rescan_interval: Duration::from_secs(1),
@@ -1744,7 +1744,7 @@ mod tests {
             },
             operator: Address::repeat_byte(0x22),
             cache,
-            warming: Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
+            warming: Arc::new(crate::warming_allowance::WarmingAllowance::new(1000, 0)),
             state,
             shutdown: CancellationToken::new(),
             rescan_interval: Duration::from_secs(1),
@@ -1798,7 +1798,8 @@ mod tests {
         let source = crate::warming_allowance::SourceId::from_bytes([9u8; 32]);
         sink.state.add_entry(US, h);
 
-        // Tag the hash as speculatively bought from `source`, fully draining it.
+        // Tag the hash as speculatively bought from `source`, spending the
+        // fixture's whole 1000-unit budget.
         sink.warming.debit_speculative(source, h, 1000);
         assert!(
             !sink.warming.available(source),

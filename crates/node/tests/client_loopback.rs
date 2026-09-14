@@ -8355,6 +8355,7 @@ async fn a_completed_serve_credits_the_source_through_the_background_aggregator(
     const SOURCE: decdn_node::warming_allowance::SourceId =
         decdn_node::warming_allowance::SourceId::from_bytes([0xA1u8; 32]);
     const OP_BPS: u16 = 6000;
+    const BUDGET: u64 = 1_000_000;
 
     let payload = vec![0x5Cu8; 64 * 1024];
     let (cache, hash, _cache_metrics, _origin_tmp, _cache_tmp) =
@@ -8367,14 +8368,14 @@ async fn a_completed_serve_credits_the_source_through_the_background_aggregator(
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
 
-    // Tag the blob to SOURCE with a one-unit speculative debit: the source reads
-    // as spent until a serve credits it, and any positive margin vindicates it.
-    // So `available` flips exactly when the aggregator applies the credit, which
-    // is the signal this test waits on.
+    // Tag the blob to SOURCE with a speculative debit of the whole budget: the
+    // source reads as spent until a serve credits it, and any positive margin
+    // makes it available again. So `available` flips exactly when the aggregator
+    // applies the credit, which is the signal this test waits on.
     let warming = Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
-        1_000_000, 0,
+        BUDGET, 0,
     ));
-    warming.debit_speculative(SOURCE, hash, 1);
+    warming.debit_speculative(SOURCE, hash, BUDGET);
     anyhow::ensure!(
         !warming.available(SOURCE),
         "precondition: the speculative buy must leave the source spent"

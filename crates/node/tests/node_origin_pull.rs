@@ -12610,16 +12610,18 @@ async fn attack_b_attempt(
 }
 
 /// Attack B (per-source dud-flood bound + vindication): (a) flooding distinct
-/// at-market one-hit blobs from ONE source drains its warming allowance after
-/// the FIRST dud — a buy debited at the full market price, netted against just
-/// one downstream serve's margin, is already negative — so every FURTHER
-/// at-market cold buy from that same source refuses `BelowMargin` rather than
-/// buying: the loss never compounds past one dud's worth. A second, independent
-/// source is completely untouched by the first source's flood. (b) A blob
-/// re-served at least twice from a source nets positive and refunds the
-/// allowance (serve-vindicated), so an honest, popular source keeps warming.
+/// at-market one-hit blobs from ONE source spends its warming allowance `B`
+/// down by each dud's loss. A single dud does not cut the source off — the
+/// budget covers it — but once the duds exhaust `B`, every FURTHER at-market
+/// cold buy from that same source refuses `BelowMargin` rather than buying. The
+/// buys run one at a time here, so exactly one buy overshoots zero; concurrent
+/// pulls from one source can each overshoot (see
+/// `WarmingAllowance::debit_speculative`). A second, independent source is
+/// completely untouched by the first source's flood. (b) A blob re-served twice
+/// from a source refunds its buy (serve-vindicated), so an honest, popular
+/// source keeps warming even from a mostly-spent allowance.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::too_many_lines)]
 async fn attack_b_dud_flood_is_bounded_and_vindication_works() -> Result<()> {
     const N_MAX: u32 = 64;
     const DISCOUNT_BPS: u32 = 5000;
@@ -12629,10 +12631,15 @@ async fn attack_b_dud_flood_is_bounded_and_vindication_works() -> Result<()> {
     // amortized floor, so a fresh (warm) source's buy is flagged speculative and
     // debited the full buy cost — the regime this attack lives in.
     const QUOTE_MARKET: u64 = 1000;
+    // `B` is exactly ONE market buy of the 1.5 MiB `PAYLOAD_LEN` blob, billed as
+    // 2 whole MB: a buy debits 1000·2 = 2000, and each downstream serve credits
+    // 600·2 = 1200.
+    // One dud served once leaves 1200 (still warm); a second, unserved dud
+    // takes the source to -800 (spent).
+    const BUDGET: u64 = 2000;
 
     let warming = Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
-        1_000_000_000,
-        0,
+        BUDGET, 0,
     ));
 
     // Source A: the first buy is a dud — bought at market, served exactly once.
@@ -12655,14 +12662,37 @@ async fn attack_b_dud_flood_is_bounded_and_vindication_works() -> Result<()> {
         "the first (dud) at-market buy from a fresh source must be admitted"
     );
     anyhow::ensure!(
-        !warming.available(src1_id),
-        "one dud (bought at market, served once) must already drain the source below \
-         available — the buy debit outweighs a single serve's margin credit"
+        warming.available(src1_id),
+        "one dud (bought at market, served once) costs only its fee skim; the budget \
+         covers it and the source keeps warming"
     );
 
-    // Flood: further distinct cold blobs from the SAME source refuse BelowMargin
-    // at the amortized floor rather than buying — the loss never compounds.
-    for salt in [0xB2u8, 0xB3u8] {
+    // A second dud from the same source is still admitted, and it spends the
+    // budget: the source now reads as spent.
+    let (second_dud_admitted, _) = attack_b_attempt(
+        src1_sk.clone(),
+        0xB2,
+        QUOTE_MARKET,
+        SELL,
+        OP_BPS,
+        DISCOUNT_BPS,
+        N_MAX,
+        &warming,
+        0,
+    )
+    .await?;
+    anyhow::ensure!(
+        second_dud_admitted,
+        "a dud while the source's allowance is still positive must be admitted"
+    );
+    anyhow::ensure!(
+        !warming.available(src1_id),
+        "the duds must exhaust the budget and cut the source off"
+    );
+
+    // Flood: further distinct cold blobs from the SAME, spent source refuse
+    // BelowMargin at the amortized floor rather than buying — the loss stops.
+    for salt in [0xB3u8, 0xB4u8] {
         let (flood_admitted, flood_metrics) = attack_b_attempt(
             src1_sk.clone(),
             salt,
@@ -12706,10 +12736,20 @@ async fn attack_b_dud_flood_is_bounded_and_vindication_works() -> Result<()> {
         "a second source's allowance must be untouched by another source's flood"
     );
 
-    // (b) Vindication: a THIRD source, bought once and served TWICE, nets
-    // positive and stays warm.
+    // (b) Vindication: a THIRD source that earlier duds already spent down to
+    // 500 buys once (-1500) and is served TWICE. One serve alone leaves it at
+    // -300 (spent), so only the second serve's credit (+900) keeps it warming.
     let src3_sk = fresh_key();
     let src3_id = decdn_node::warming_allowance::SourceId::from_bytes(*src3_sk.public().as_bytes());
+    warming.debit_speculative(
+        src3_id,
+        decdn_cache::Hash::from_bytes([0xD0u8; 32]),
+        BUDGET - 500,
+    );
+    anyhow::ensure!(
+        warming.available(src3_id),
+        "precondition: the earlier duds leave the source warm"
+    );
     let (vindicated_admitted, _) = attack_b_attempt(
         src3_sk,
         0xD1,
@@ -12725,7 +12765,7 @@ async fn attack_b_dud_flood_is_bounded_and_vindication_works() -> Result<()> {
     anyhow::ensure!(vindicated_admitted, "the vindication buy must be admitted");
     anyhow::ensure!(
         warming.available(src3_id),
-        "a blob re-served >= 2x must refund the source's allowance and keep it warming"
+        "a blob re-served twice must refund its buy and keep the source warming"
     );
 
     Ok(())
