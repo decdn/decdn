@@ -439,13 +439,43 @@ impl ClientHandler {
         };
 
         // A reveal that advanced nothing — at or below the frontier, or naming a
-        // superseded epoch — is benign, exactly like an already-satisfied
-        // voucher: nothing is recorded, nothing is credited, and delivery
-        // continues. Placement is by index rather than arrival order, so a fast
-        // stream skipping ahead of a slow one is ordinary, not a fault.
+        // superseded epoch — advances the lane's claim by nothing, so nothing is
+        // recorded and no redeem hint fires. But this stream still DELIVERED
+        // `delta_bytes`, and a concurrent same-lane sibling that raced the shared
+        // chain index ahead has ALREADY paid the lane for them. So credit this
+        // stream from that lane headroom rather than throttling it to a
+        // `MAX_PROOFS_PER_CHUNK` stall — the same fungible-credit rule the benign
+        // already-satisfied VOUCHER path applies (`verify_voucher`'s
+        // `AmountRegression` arm). Without it, cross-stream reveal reordering
+        // starves the slower stream: its reveals keep landing below the frontier,
+        // credit nothing, and its unpaid frontier is throttled into a
+        // `ClientPaymentFault` (the concurrent same-lane voucher-starvation bug).
+        //
+        // The credit is bounded by the lane's proven `owed_bytes`, and
+        // `paid_credited` is monotone, so total credit across every same-lane
+        // stream can never exceed money the node can redeem — no double-pay, no
+        // under-pay. If the payer has genuinely under-paid, there is no headroom,
+        // `credit_advance` returns zero, and the throttle correctly holds.
         if !applied.advanced() {
+            // Frontier unchanged, so `guard.state`'s owed claim is what a sibling
+            // has already paid the lane for. Read the receipt amount before the
+            // drop, mirroring the advanced path below.
+            let owed_bytes = guard.state.owed_bytes();
+            let amount = u64::try_from(guard.state.owed()).unwrap_or(u64::MAX);
+            let (new_credited, credited_bytes) =
+                credit_advance(guard.paid_credited, delta_bytes, owed_bytes)?;
+            guard.paid_credited = new_credited;
+            guard
+                .last_voucher_at
+                .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
             drop(guard);
-            return Ok(VoucherStop::Continue { credited_bytes: 0 });
+            // Only bytes actually credited get a receipt, exactly as the advanced
+            // reveal and benign voucher paths gate it; receipts sum to
+            // `paid_credited`, so this cannot double-count.
+            if credited_bytes > 0 {
+                self.record_receipt(hash, credited_bytes, client_node_id, amount);
+            }
+            return Ok(VoucherStop::Continue { credited_bytes });
         }
 
         let owed_bytes = next_state.owed_bytes();

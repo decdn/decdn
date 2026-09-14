@@ -922,6 +922,105 @@ async fn two_streams_on_one_lane_converge_on_the_deepest_index() -> anyhow::Resu
     Ok(())
 }
 
+/// A slow co-stream must not STARVE when its reveal for its OWN delivered chunk
+/// lands below a fast sibling's frontier.
+///
+/// The chain index is lane-global, so cross-stream reordering routinely puts one
+/// stream's reveal at or below the frontier a faster sibling already advanced.
+/// That reveal folds nothing — but the lane has ALREADY been paid for those
+/// bytes by the sibling's deeper reveal, so the node must credit this stream from
+/// that lane headroom and reopen its window, exactly as it does for a benign
+/// already-satisfied VOUCHER. Crediting nothing throttles the slow stream to a
+/// `MAX_PROOFS_PER_CHUNK` stall — the concurrent same-lane voucher-starvation bug
+/// (the concrete #1689 "needs a rendezvous" case).
+///
+/// The construction isolates the reveal-credit path. Stream A skips ahead to
+/// index 5 and reads its chunk, so the lane is paid several chunks ahead. Stream
+/// B then anchors — its anchor is a benign already-satisfied voucher, which
+/// credits B's first delivered chunk from that headroom (the voucher path), so B
+/// reads a second chunk. B pays for THAT chunk with a below-frontier reveal, its
+/// sole proof: the node must credit it from the remaining headroom, or B never
+/// reads its third chunk.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_below_frontier_reveal_is_credited_from_lane_headroom() -> anyhow::Result<()> {
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
+    let payload = vec![0x4Bu8; 8 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    let (mut send_a, mut recv_a) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    let (mut send_b, mut recv_b) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    read_exact_chunks(&mut recv_a, HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+
+    // The fast sibling anchors and pays its delivered chunk with a DEEP index,
+    // advancing the lane frontier to 5. Reading its next chunk confirms the
+    // advance landed before B pays below it — so B's reveal is unambiguously
+    // below the frontier, with several chunks of paid headroom behind it.
+    open_chain(
+        &mut send_a,
+        &signer,
+        chain_root(),
+        RATE_PER_MB,
+        U256::ZERO,
+        0,
+    )
+    .await?;
+    release(&mut send_a, 5).await?;
+    read_exact_chunks(&mut recv_a, HARNESS_INTERVAL_BYTES).await?;
+
+    // B anchors: a benign already-satisfied voucher that credits B's first chunk
+    // from the lane headroom the sibling's reveal opened, so B reads a second.
+    open_chain(
+        &mut send_b,
+        &signer,
+        chain_root(),
+        RATE_PER_MB,
+        U256::ZERO,
+        0,
+    )
+    .await?;
+    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+
+    // B pays for that second chunk with a BELOW-frontier reveal — its only proof.
+    // It folds nothing, but the lane has been paid for these bytes, so the node
+    // must credit it and reopen the window. Pre-fix it credits zero and B stalls,
+    // so this read times out; post-fix B reads its third chunk.
+    release(&mut send_b, 3).await?;
+    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+
+    // Billing is a MAXIMUM over the streams, never a sum: the deepest index wins,
+    // and the benign below-frontier reveal took no new money.
+    let lane = store
+        .get(lane_key(signer.address()))?
+        .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
+    anyhow::ensure!(
+        lane.chain().verified_index == 5,
+        "the lane stays at the deepest index proved, got {}",
+        lane.chain().verified_index
+    );
+    anyhow::ensure!(
+        lane.owed() == U256::from(5 * RATE_PER_MB),
+        "the below-frontier reveal must take no new money: {}",
+        lane.owed()
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// #1669: with the ramp enabled (a non-zero `credit_ramp_divisor`), a stream that
 /// has paid nothing is served only the floor — one chunk — and then
 /// parks, exactly the pre-ramp stop-and-wait cadence. `credit_max` being large

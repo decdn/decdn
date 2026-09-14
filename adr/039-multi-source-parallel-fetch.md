@@ -53,7 +53,7 @@ When a source finishes its segment, it does not idle: the scheduler finds the so
 
 **Concurrency invariants:**
 
-- **Exactly one outstanding segment per source (`per_source_inflight = 1`, fixed, not configurable).** This is a correctness constraint, not a simplification: two concurrent segments to one node share its `(signer, provider)` payment lane and its single cumulative voucher watermark. A fast segment advances that watermark ahead of a slow co-segment, so the node cannot attribute the slow segment's payment and stalls it. The scheduler keeps one segment per source to avoid this; bundle pull bounds same-lane concurrency with `--max-lane-streams` (default 1). Parallelism comes from the number of sources, not from stacking requests on one source.
+- **Exactly one outstanding segment per source (`per_source_inflight = 1`, fixed, not configurable).** A source is bandwidth-bound, so a second concurrent segment to one node adds no throughput and only fragments its stream. Same-lane concurrency is safe on the payment side: several streams on one `(signer, provider)` lane share its single cumulative voucher watermark, and the serving node credits each stream's delivered bytes from that shared watermark fairly — it pays a slower stream, whose per-chunk reveal can land below a faster sibling's frontier, from the lane headroom the sibling opens ([ADR 003 § Concurrent Streams](003-payments.md#adr-003-payment-model)). So one segment per source is a throughput choice, and bundle pull, whose entries each drive their own stream, allows several concurrent streams per lane (`--max-lane-streams`, default 4). Parallelism comes from the number of sources, not from stacking requests on one source.
 - Global in-flight equals the count of active sources, bounded by `max_sources`; no separate global concurrency cap exists or is needed.
 - At most one source owns any given byte range at a time.
 
@@ -104,7 +104,7 @@ The same scheduler drives two consumers over one shared code path: the client fe
 | `min_split_size` | const, bao-group-aligned | 16 MiB | Floor below which an idle source does not split and steal a remaining range, so a tiny tail never triggers a restart. |
 | `unit_deadline_ms` | config | 10,000 | No-verified-progress deadline before a source's remaining range is reassigned. Balances stall detection against premature reassignment of a merely-slow source. |
 
-`per_source_inflight` is **fixed at 1** and is not a tunable: it is the lane-collision correctness constraint from [§ Dynamic segmentation and tail-stealing](#dynamic-segmentation-and-tail-stealing). The load-bearing commitments are that `max_sources` is finite, and that `min_split_size` and every split are bao-group-aligned, so each range stays independently verifiable.
+`per_source_inflight` is **fixed at 1** and is not a tunable: a source is bandwidth-bound, so a second in-flight segment to it buys no throughput, only stream fragmentation ([§ Dynamic segmentation and tail-stealing](#dynamic-segmentation-and-tail-stealing)). The load-bearing commitments are that `max_sources` is finite, and that `min_split_size` and every split are bao-group-aligned, so each range stays independently verifiable.
 
 ## Consequences
 
