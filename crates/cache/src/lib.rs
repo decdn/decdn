@@ -44,7 +44,7 @@ pub use engine::{
 };
 pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
 pub use fill_session::{
-    FillClaim, FillError, FillRegistry, FillSession, HashOutboard, ObserverLease,
+    FillClaim, FillError, FillRegistry, FillSession, Frontier, HashOutboard, ObserverLease,
     SessionOutboardReader,
 };
 /// The blob-store hash. `decdn_cache::Hash` continues to mean

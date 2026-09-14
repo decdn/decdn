@@ -19,7 +19,7 @@
 //! plain `Arc`, never `tokio::spawn`ed across threads:
 //!
 //! - **`served_paid`** — the client's PAID *content* frontier. The serve leg
-//!   stores it after every voucher batch commits (mapped from paid WIRE bytes
+//!   raises it after every voucher batch commits (mapped from paid WIRE bytes
 //!   through [`content_paid_frontier`]); the pull leg's `WindowPacer` reads it to
 //!   bound `pulled − served_paid ≤ window`, plus one floor to serve `serve_demand`.
 //! - **`serve_demand`** — the content end of the span this leg's encoder waits
@@ -30,7 +30,7 @@
 //!   the first byte the pull has not fetched, so `serve_demand` lands within one
 //!   group past the pull's frontier, and the pull fetches one window floor past its
 //!   window, so neither leg waits on the other forever.
-//! - **`served_paid_advanced`** — notified after each `served_paid` or
+//! - **`downstream_advanced`** — notified after each `served_paid` or
 //!   `serve_demand` advance, so a pull leg parked in `PaceDecision::Wait`
 //!   re-decides exactly when payment clears or this leg starts waiting.
 //! - **`pull_ended` + `pull_result`** — the pull leg records its terminal
@@ -51,7 +51,7 @@ use super::voucher::StreamAnchor;
 use super::wire::chunk_frame_bufs;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, FloorReservation,
-    Hash, LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream, U256, VecDeque,
+    Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VecDeque,
     VoucherRejectReason, VoucherStop,
 };
 
@@ -324,16 +324,13 @@ impl ClientHandler {
                             // window). One contiguous delivery from `offset`, so `offset`
                             // is the single fetch-start.
                             let served = content_paid_frontier(offset, total_bytes, paid);
-                            // `fetch_max`, not `store`: N observers advance the SHARED
+                            // Forward-only: N observers advance the SHARED
                             // frontier and the pull's `WindowPacer` binds on the
                             // MAX-over-observers paid frontier (DECISION-B), so a slower
                             // observer must not regress a faster one. Behavior-preserving
                             // for N=1 (a single contiguous delivery is already monotone,
-                            // so `fetch_max == store`).
-                            session
-                                .served_frontier()
-                                .fetch_max(served, Ordering::Relaxed);
-                            session.served_advanced().notify_waiters();
+                            // so the raise always moves it).
+                            session.advance_served(served);
                             // Under partial-overlap coalescing this serve leg is fed by
                             // more than its own pull: each attached sibling pull produces
                             // the OVERLAP this leg also consumes and bills. The sibling's
@@ -349,9 +346,8 @@ impl ClientHandler {
                             // overlap payer would relax the sibling pull's window over bytes
                             // no one has paid for. Empty in the common N=1 case.
                             for extra in also_pace {
-                                if extra.served_frontier().load(Ordering::Relaxed) >= offset {
-                                    extra.served_frontier().fetch_max(served, Ordering::Relaxed);
-                                    extra.served_advanced().notify_waiters();
+                                if extra.served_frontier().get() >= offset {
+                                    extra.advance_served(served);
                                 }
                             }
                             continue 'chunk;
