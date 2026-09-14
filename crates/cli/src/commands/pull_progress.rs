@@ -18,6 +18,14 @@
 //! `total_bytes` differs from it — a monotonic value that lands on exactly the
 //! declared size at completion, so the total ends at exactly 100%.
 //!
+//! Rate and ETA are shown on the **total** bar only, computed from total content
+//! bytes with the same time-weighted moving average `decdn fetch` uses. A per-file
+//! bar shows just its byte counts: with `--jobs` pulls sharing one link, a single
+//! file's rate is only its share of the bandwidth and its ETA reads as stuck
+//! whenever another file is being served, while the whole download keeps moving.
+//! Bytes credited for already-present files shift the meter's baseline without
+//! feeding the rate, so a resumed run reports transfer speed, not disk speed.
+//!
 //! The total bar is shown only when the manifest declares sizes. A blob with no
 //! declared size contributes nothing to the denominator and moves the total not at
 //! all; if nothing kept declares a size the total bar is omitted and only per-file
@@ -28,9 +36,9 @@
 //! piped and scripted output is byte-for-byte what it was before per-file bars.
 
 use std::io::IsTerminal;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use decdn_client_pull::ProgressCallback;
 
@@ -63,10 +71,95 @@ struct Inner {
     /// The shared container every bar draws into — the process-global one when
     /// logging is on (so bars and log lines coexist), else a standalone one.
     mp: indicatif::MultiProgress,
-    /// The bottom total bar, in content bytes with a fixed denominator; per-file
-    /// bars insert before it. `None` when the manifest declares no sizes, in which
-    /// case only per-file bars render.
-    total: Option<indicatif::ProgressBar>,
+    /// The bottom total bar, in content bytes with a fixed denominator, carrying
+    /// the run's rate/ETA; per-file bars insert before it. `None` when the manifest
+    /// declares no sizes, in which case only per-file bars render.
+    total: Option<TotalBar>,
+}
+
+/// The bottom total bar plus the rate meter behind its `{msg}`. Every content
+/// byte folded into the total passes through [`inc`](Self::inc), which samples
+/// the meter; already-present bytes pass through [`credit`](Self::credit), which
+/// moves the bar without feeding the rate. Cloning shares the same bar and meter.
+#[derive(Clone)]
+pub(crate) struct TotalBar {
+    /// The `indicatif` bar, in content bytes with a fixed length.
+    bar: indicatif::ProgressBar,
+    /// The whole-download rate estimate, sampled on every transferred increment.
+    speed: Arc<Mutex<fetch::SpeedState>>,
+}
+
+impl TotalBar {
+    /// A styled total bar of fixed content length `len`, not yet attached to any
+    /// [`indicatif::MultiProgress`].
+    fn new(len: u64) -> Self {
+        let style = indicatif::ProgressStyle::with_template(
+            // Rate/ETA come from `{msg}` (see `refresh_rate`), not the built-in
+            // `{bytes_per_sec}`/`{eta}` — those swing wildly on bursty arrival.
+            "{prefix:.bold} {bytes}/{total_bytes} {msg}[{wide_bar:.green}]",
+        )
+        .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+        .progress_chars("=>-");
+        let bar = indicatif::ProgressBar::new(len);
+        bar.set_style(style);
+        bar.set_prefix("total");
+        Self::wrap(bar)
+    }
+
+    /// Wrap an existing bar with a fresh meter.
+    fn wrap(bar: indicatif::ProgressBar) -> Self {
+        Self {
+            bar,
+            speed: Arc::new(Mutex::new(fetch::SpeedState::default())),
+        }
+    }
+
+    /// Advance the total by `bytes` of transferred content and refresh the
+    /// rate/ETA from the new position.
+    fn inc(&self, bytes: u64) {
+        self.bar.inc(bytes);
+        self.refresh_rate();
+    }
+
+    /// Advance the total by `bytes` that were not transferred (already on disk)
+    /// without feeding the rate: the meter's baseline shifts past them so the
+    /// next transferred increment is measured on its own.
+    fn credit(&self, bytes: u64) {
+        self.bar.inc(bytes);
+        if let Ok(mut s) = self.speed.lock() {
+            s.shift(bytes);
+        }
+    }
+
+    /// Sample the meter at the bar's current position and rewrite the `{msg}` as
+    /// `(rate, ETA) `. A poisoned lock only costs this one refresh.
+    fn refresh_rate(&self) {
+        let position = self.bar.position();
+        if let Ok(mut s) = self.speed.lock() {
+            let bps = s.observe(Instant::now(), position);
+            let remaining = self
+                .bar
+                .length()
+                .unwrap_or(position)
+                .saturating_sub(position);
+            self.bar.set_message(format!(
+                "({}, {}) ",
+                fetch::fmt_rate(bps),
+                fetch::fmt_eta(remaining, bps)
+            ));
+        }
+    }
+
+    /// Clear the bar at the end of the run.
+    fn finish_and_clear(&self) {
+        self.bar.finish_and_clear();
+    }
+
+    /// The bar's content-byte position.
+    #[cfg(test)]
+    fn position(&self) -> u64 {
+        self.bar.position()
+    }
 }
 
 impl PullProgress {
@@ -92,17 +185,10 @@ impl PullProgress {
 
     /// Build the bottom total bar with a fixed content-byte length and add it to
     /// the container. Its steady tick is enabled after the add, never before.
-    fn add_total_bar(mp: &indicatif::MultiProgress, len: u64) -> indicatif::ProgressBar {
-        let total = indicatif::ProgressBar::new(len);
-        let style = indicatif::ProgressStyle::with_template(
-            "{prefix:.bold} {bytes}/{total_bytes} [{wide_bar:.green}]",
-        )
-        .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
-        .progress_chars("=>-");
-        total.set_style(style);
-        total.set_prefix("total");
-        let total = mp.add(total);
-        total.enable_steady_tick(TICK);
+    fn add_total_bar(mp: &indicatif::MultiProgress, len: u64) -> TotalBar {
+        let total = TotalBar::new(len);
+        let bar = mp.add(total.bar.clone());
+        bar.enable_steady_tick(TICK);
         total
     }
 
@@ -116,7 +202,7 @@ impl PullProgress {
     fn insert_file_bar(&self, bar: indicatif::ProgressBar) -> indicatif::ProgressBar {
         let Some(i) = &self.inner else { return bar };
         let bar = match &i.total {
-            Some(total) => i.mp.insert_before(total, bar),
+            Some(total) => i.mp.insert_before(&total.bar, bar),
             None => i.mp.add(bar),
         };
         bar.enable_steady_tick(TICK);
@@ -146,7 +232,7 @@ impl PullProgress {
         // The file bar tracks the pull's own progress; the total bar gets that
         // progress scaled to the manifest's declared `size`. A pull with no
         // declared size still shows its own bar but adds nothing to the total.
-        let (file_cb, _meter) = fetch::bar_callback(bar.clone(), None);
+        let file_cb = file_position_callback(bar.clone());
         let contrib = i
             .total
             .as_ref()
@@ -204,7 +290,7 @@ impl PullProgress {
         if let Some(i) = &self.inner
             && let (Some(total), Some(s)) = (&i.total, size)
         {
-            total.inc(s);
+            total.credit(s);
         }
     }
 
@@ -260,7 +346,7 @@ pub(crate) struct ChunkedFile {
     bar: Option<indicatif::ProgressBar>,
     /// The run total bar this file folds its scaled content progress into; `None`
     /// when disabled or when the run has no total bar.
-    total: Option<indicatif::ProgressBar>,
+    total: Option<TotalBar>,
     /// The file's declared content size — its full contribution to the total bar
     /// and, when present, the preset denominator of the file bar. `None` adds
     /// nothing to the total.
@@ -371,12 +457,27 @@ fn scaled(size: u64, num: u64, den: u64) -> u64 {
     }
 }
 
+/// The delivery callback for one whole-file bar: it sets the bar length to the
+/// pull's `total_bytes` once and advances the position to the cumulative verified
+/// content-byte count. No rate — that lives on the total bar.
+fn file_position_callback(bar: indicatif::ProgressBar) -> impl Fn(u64, u64) {
+    // `expected` is constant across the pull, so set the length once (it takes a
+    // write lock) rather than on every chunk in the hot receive loop.
+    let length_set = AtomicBool::new(false);
+    move |received: u64, expected: u64| {
+        if !length_set.swap(true, Ordering::Relaxed) {
+            bar.set_length(expected);
+        }
+        bar.set_position(received);
+    }
+}
+
 /// A whole-file pull's fold into the total bar: it maps the pull's cumulative
 /// `(received, expected)` onto the manifest's declared size (`size × received /
 /// expected`) and adds only the increase since the previous update. `expected`
 /// (the pull's `total_bytes`) is constant, so the mapped value is monotonic and
 /// reaches exactly `size` when the pull completes.
-fn content_contributor(total: indicatif::ProgressBar, size: u64) -> impl Fn(u64, u64) {
+fn content_contributor(total: TotalBar, size: u64) -> impl Fn(u64, u64) {
     let prev = AtomicU64::new(0);
     move |received: u64, expected: u64| {
         if expected == 0 {
@@ -396,7 +497,7 @@ fn content_contributor(total: indicatif::ProgressBar, size: u64) -> impl Fn(u64,
 /// upward-only [`AtomicU64::fetch_max`] keeps the total from regressing. A no-op
 /// with no total bar, no size, or an unbounded bar.
 fn bump_chunked_total(
-    total: Option<&indicatif::ProgressBar>,
+    total: Option<&TotalBar>,
     size: Option<u64>,
     bar: Option<&indicatif::ProgressBar>,
     prev: &AtomicU64,
@@ -461,14 +562,19 @@ mod tests {
         indicatif::ProgressBar::with_draw_target(Some(0), indicatif::ProgressDrawTarget::hidden())
     }
 
+    /// A hidden total bar of fixed content length `len`, with its own rate meter.
+    fn hidden_total(len: u64) -> TotalBar {
+        TotalBar::wrap(indicatif::ProgressBar::with_draw_target(
+            Some(len),
+            indicatif::ProgressDrawTarget::hidden(),
+        ))
+    }
+
     #[test]
     fn content_contributor_scales_progress_to_declared_size() {
         // A pull reporting progress against an `expected` of 4000 for a declared
         // size of 1000: the total advances in declared bytes and ends on exactly 1000.
-        let total = indicatif::ProgressBar::with_draw_target(
-            Some(1000),
-            indicatif::ProgressDrawTarget::hidden(),
-        );
+        let total = hidden_total(1000);
         let contrib = content_contributor(total.clone(), 1000);
         contrib(0, 4000);
         assert_eq!(total.position(), 0);
@@ -480,7 +586,7 @@ mod tests {
 
     #[test]
     fn content_contributor_without_expected_is_inert() {
-        let total = test_bar();
+        let total = hidden_total(1000);
         let contrib = content_contributor(total.clone(), 1000);
         // Pre-byte handshake: expected not yet known, so nothing folds in.
         contrib(0, 0);
@@ -489,10 +595,7 @@ mod tests {
 
     #[test]
     fn chunked_file_folds_scaled_content_into_total_and_trues_up() {
-        let total = indicatif::ProgressBar::with_draw_target(
-            Some(1000),
-            indicatif::ProgressDrawTarget::hidden(),
-        );
+        let total = hidden_total(1000);
         // Fallback (no preset length): the denominator grows per chunk.
         let cf = ChunkedFile {
             bar: Some(test_bar()),
@@ -527,10 +630,7 @@ mod tests {
         // The whole-file content size (90) is known up front, as the manifest
         // normally declares for a chunked entry, so the bar length is preset. The
         // total bar is content-metered.
-        let total = indicatif::ProgressBar::with_draw_target(
-            Some(90),
-            indicatif::ProgressDrawTarget::hidden(),
-        );
+        let total = hidden_total(90);
         let whole = test_bar();
         whole.set_length(90);
         let cf = ChunkedFile {
@@ -564,10 +664,7 @@ mod tests {
 
     #[test]
     fn chunked_total_never_regresses_when_length_grows() {
-        let total = indicatif::ProgressBar::with_draw_target(
-            Some(1000),
-            indicatif::ProgressDrawTarget::hidden(),
-        );
+        let total = hidden_total(1000);
         // Fallback (no preset length): the denominator grows per chunk.
         let cf = ChunkedFile {
             bar: Some(test_bar()),
@@ -590,10 +687,7 @@ mod tests {
 
     #[test]
     fn advance_reused_folds_into_total_without_double_counting() {
-        let total = indicatif::ProgressBar::with_draw_target(
-            Some(50),
-            indicatif::ProgressDrawTarget::hidden(),
-        );
+        let total = hidden_total(50);
         // Fallback (no preset length): length and position grow together.
         let cf = ChunkedFile {
             bar: Some(test_bar()),
@@ -613,10 +707,7 @@ mod tests {
 
     #[test]
     fn advance_reused_on_preset_bar_advances_position_only() {
-        let total = indicatif::ProgressBar::with_draw_target(
-            Some(60),
-            indicatif::ProgressDrawTarget::hidden(),
-        );
+        let total = hidden_total(60);
         let whole = test_bar();
         whole.set_length(60);
         let cf = ChunkedFile {
@@ -658,10 +749,7 @@ mod tests {
         // An already-present file drives no delivery callback, so its content is
         // credited straight to the total; a run of all-skipped files still reaches
         // 100%.
-        let total = indicatif::ProgressBar::with_draw_target(
-            Some(300),
-            indicatif::ProgressDrawTarget::hidden(),
-        );
+        let total = hidden_total(300);
         let pp = PullProgress {
             inner: Some(Inner {
                 mp: indicatif::MultiProgress::with_draw_target(
@@ -682,5 +770,58 @@ mod tests {
     fn credit_skipped_is_a_no_op_when_disabled() {
         // No total bar, no panic.
         PullProgress::disabled().credit_skipped(Some(100));
+    }
+
+    #[test]
+    fn file_position_callback_sets_length_once_and_tracks_position() {
+        let bar = test_bar();
+        let cb = file_position_callback(bar.clone());
+        cb(0, 400);
+        assert_eq!(bar.length(), Some(400));
+        assert_eq!(bar.position(), 0);
+        cb(250, 400);
+        assert_eq!(bar.position(), 250);
+        // No rate/ETA message on a per-file bar.
+        assert_eq!(bar.message(), "");
+    }
+
+    #[test]
+    fn total_bar_inc_writes_rate_and_eta_message() {
+        let total = hidden_total(1000);
+        assert_eq!(total.bar.message(), "", "nothing until a byte moves");
+        total.inc(100);
+        assert_eq!(total.position(), 100);
+        let msg = total.bar.message();
+        assert!(msg.starts_with('('), "{msg}");
+        assert!(msg.contains("ETA"), "{msg}");
+    }
+
+    #[test]
+    fn total_bar_credit_moves_the_bar_but_not_the_rate() {
+        let t0 = Instant::now();
+        let total = hidden_total(1000);
+        // Two transferred samples one second apart establish a rate.
+        total.inc(100);
+        let before = total
+            .speed
+            .lock()
+            .map(|mut s| s.observe(t0 + Duration::from_secs(1), 200))
+            .expect("unpoisoned");
+        assert!(before > 0.0);
+        // A credited (already-present) chunk moves the bar only: the next sample
+        // one second later sees just its own 100 transferred bytes.
+        total.credit(500);
+        let after = total
+            .speed
+            .lock()
+            .map(|mut s| s.observe(t0 + Duration::from_secs(2), 800))
+            .expect("unpoisoned");
+        assert_eq!(total.position(), 600, "inc(100) + credit(500)");
+        // 100 B/s both times, smoothed toward the same value: had the credit fed
+        // the rate, the second sample would have read a 600 B/s burst.
+        assert!(
+            after < 2.0 * before,
+            "credit leaked into the rate: {before} -> {after}"
+        );
     }
 }
