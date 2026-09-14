@@ -89,10 +89,6 @@ impl SavedMtime {
 /// Place a saved file's chunks at absolute offsets: `(hash, offset, len)` in
 /// content order. `None` when the file has no chunks or the sizes do not sum to
 /// its whole-file `size` (a malformed record — ignored, never fatal).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired in Task 5: seeds old chunks as donors")
-)]
 pub(crate) fn saved_hints(rec: &SavedFile) -> Option<Vec<(String, u64, u64)>> {
     let chunks = rec.chunks.as_ref()?;
     let mut out = Vec::with_capacity(chunks.len());

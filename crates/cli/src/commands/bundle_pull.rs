@@ -148,10 +148,6 @@ fn link_or_copy_atomic(src: &Path, dest: &Path) -> anyhow::Result<()> {
 /// chunk `hash`. Fed into [`ChunkIndex`] before fetching so a splice can reuse
 /// on-disk bytes across runs. The source is an OUTPUT path (not a staging blob),
 /// verified by the existing per-chunk re-hash before any splice trusts it.
-#[expect(
-    dead_code,
-    reason = "populated and consumed starting the ChunkIndex-seeding task"
-)]
 struct SeedDonor {
     /// The chunk's BLAKE3 hash — the [`ChunkIndex`] key.
     hash: [u8; 32],
@@ -172,10 +168,6 @@ struct DiskState {
     /// manifest hash (fast-skip or re-hash-confirmed) — not fetched.
     skip: HashSet<String>,
     /// On-disk chunk donors to seed into the run's [`ChunkIndex`].
-    #[expect(
-        dead_code,
-        reason = "populated and consumed starting the ChunkIndex-seeding task"
-    )]
     seed: Vec<SeedDonor>,
 }
 
@@ -213,6 +205,7 @@ async fn resolve_disk_state(
         });
         if fast {
             state.skip.insert(en.path.clone());
+            seed_new_chunks(&mut state, en, &dest);
             continue;
         }
         // Re-hash gate: confirm the on-disk bytes against the new manifest hash.
@@ -225,9 +218,46 @@ async fn resolve_disk_state(
             && got == want
         {
             state.skip.insert(en.path.clone());
+            seed_new_chunks(&mut state, en, &dest);
+            continue;
+        }
+        // Present but mismatched: this path will be fetched. Its current bytes
+        // are the OLD file and survive on disk until this entry's own group
+        // atomically materializes (temp + rename), so they are a safe donor for
+        // any other entry that shares an old chunk in the meantime.
+        if let Some(rec) = saved.get(&en.path)
+            && let Some(old) = bundle_manifest::saved_hints(rec)
+        {
+            for (chash, offset, len) in old {
+                if let Ok(h) = fetch::parse_hash(&chash) {
+                    state.seed.push(SeedDonor {
+                        hash: h,
+                        source: dest.clone(),
+                        offset,
+                        len,
+                    });
+                }
+            }
         }
     }
     state
+}
+
+/// Seed `state.seed` with the NEW manifest entry's chunk donors, sourced from
+/// `dest` — the entry's own output file, confirmed unchanged (skipped) this
+/// run. Seeding never gates skip/fetch; it only supplies optional splice
+/// donors for other entries.
+fn seed_new_chunks(state: &mut DiskState, en: &ManifestEntry, dest: &Path) {
+    if let Some(hints) = hints_of(en) {
+        for h in hints {
+            state.seed.push(SeedDonor {
+                hash: h.hash,
+                source: dest.to_path_buf(),
+                offset: h.offset,
+                len: h.len,
+            });
+        }
+    }
 }
 
 /// Resolve each entry's on-disk destination and classify it — a resolve failure,
@@ -1472,6 +1502,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // skip-cache before any fetch, so an updated file at an already-present
         // path is written rather than silently skipped.
         let disk = resolve_disk_state(entries, saved, out_root, overwrite).await;
+        for d in &disk.seed {
+            index.seed_disk(d.hash, &d.source, d.offset, d.len);
+        }
         let (outcomes, transfer) = self
             .pull_plain(&refs, out_root, overwrite, &index, &disk.skip)
             .await;
@@ -2082,6 +2115,10 @@ struct ChunkIndex {
     /// finalized `<hex>` is the resume prefix a rerun needs — deleting it would
     /// force a full re-fetch and re-payment of an unrefunded blob.
     retain: std::sync::Mutex<HashSet<PathBuf>>,
+    /// Output-file donor sources seeded from disk before the run. Excluded from
+    /// [`Self::sources`] so the run-end staging sweep never deletes a
+    /// materialized output.
+    seeded: std::sync::Mutex<HashSet<PathBuf>>,
 }
 
 impl ChunkIndex {
@@ -2104,17 +2141,38 @@ impl ChunkIndex {
     }
 
     /// The distinct donor staging blobs registered this run, for the run-end
-    /// sweep in [`PullCtx::pull_all`].
+    /// sweep in [`PullCtx::pull_all`]. Excludes any [`Self::seed_disk`] source —
+    /// an on-disk OUTPUT file the sweep must never delete.
     fn sources(&self) -> Vec<PathBuf> {
+        let seeded = self.seeded.lock().unwrap_or_else(PoisonError::into_inner);
         let map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
         let mut seen: HashSet<&Path> = HashSet::new();
         let mut out = Vec::new();
         for m in map.values() {
-            if seen.insert(m.source.as_path()) {
+            if !seeded.contains(&m.source) && seen.insert(m.source.as_path()) {
                 out.push(m.source.clone());
             }
         }
         out
+    }
+
+    /// Seed a donor whose bytes live in an on-disk OUTPUT file (a skipped
+    /// entry's current file, or a changed entry's old copy still present until
+    /// its atomic materialize). First-writer-wins, like [`Self::register`]; the
+    /// source is recorded as seeded so the sweep never removes it. The existing
+    /// per-chunk re-hash guard verifies the bytes before any splice trusts them,
+    /// so a stale offset or edited/removed file simply falls back to a fetch.
+    fn seed_disk(&self, hash: [u8; 32], source: &Path, offset: u64, len: u64) {
+        {
+            let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+            map.entry(hash).or_insert_with(|| MaterializedRange {
+                source: source.to_path_buf(),
+                offset,
+                len,
+            });
+        }
+        let mut seeded = self.seeded.lock().unwrap_or_else(PoisonError::into_inner);
+        seeded.insert(source.to_path_buf());
     }
 
     /// Mark a donor `source` as a resume prefix the run-end sweep must keep: its
@@ -3306,6 +3364,24 @@ mod tests {
         );
     }
 
+    /// A [`ChunkIndex::seed_disk`] source is an on-disk OUTPUT file, not a
+    /// staging blob: [`ChunkIndex::sources`] (the run-end sweep's deletion list)
+    /// must exclude it, or a materialized output would be deleted. It is still
+    /// resolvable as a splice donor for planning.
+    #[test]
+    fn chunk_index_seeded_source_survives_sweep() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let out = tmp.path().join("kept.bin");
+        std::fs::write(&out, b"donorbytes").expect("write");
+        let idx = ChunkIndex::default();
+        idx.seed_disk([7u8; 32], &out, 0, 10);
+        // A seeded output path is NOT a sweepable staging source.
+        assert!(idx.sources().is_empty());
+        // But it IS resolvable as a donor for planning.
+        let guard = idx.map.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(guard.contains_key(&[7u8; 32]));
+    }
+
     /// `splice_donors` happy path: a donor file holds a verified chunk at some
     /// offset (with padding on both sides), and the aligned subset lands at the
     /// correct recipient offset in `.partial` — nothing else in `.partial` is
@@ -3901,6 +3977,81 @@ mod tests {
         }];
         let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), true).await;
         assert!(st.skip.is_empty());
+    }
+
+    /// A skipped (unchanged) path seeds the NEW manifest entry's chunks, sourced
+    /// from its own output file — a donor future entries can splice from without
+    /// paying, spanning cross-run and cross-bundle reuse.
+    #[tokio::test]
+    async fn resolve_disk_state_seeds_unchanged_and_old_chunks() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // unchanged file present, matches new manifest, has chunks → seed NEW chunks
+        let body = vec![9u8; 20];
+        std::fs::write(tmp.path().join("u.bin"), &body).expect("write");
+        let uh = format!("b3:{}", blake3::hash(&body).to_hex());
+        let ch = format!("b3:{}", blake3::hash(&body).to_hex()); // single-chunk == whole file
+        let entries = vec![ManifestEntry {
+            path: "u.bin".into(),
+            hash: uh,
+            size: Some(20),
+            chunks: Some(vec![ManifestChunk { hash: ch, size: 20 }]),
+        }];
+        let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
+        assert!(st.skip.contains("u.bin"));
+        assert_eq!(st.seed.len(), 1);
+        assert_eq!(st.seed[0].offset, 0);
+        assert_eq!(st.seed[0].len, 20);
+    }
+
+    /// A changed path (present but hash-mismatched against the new manifest)
+    /// with a prior saved record carrying chunks seeds the OLD chunks, sourced
+    /// from the still-present old file — it survives on disk until this entry's
+    /// own group atomically materializes.
+    #[tokio::test]
+    async fn resolve_disk_state_seeds_old_chunks_of_a_changed_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_body = vec![1u8; 20];
+        let path = tmp.path().join("c.bin");
+        std::fs::write(&path, &old_body).expect("write old");
+
+        // Build a saved record (as a prior run would have) carrying chunk hints
+        // for the OLD content, then persist and reload it via the real
+        // merge_and_write / load round trip.
+        let old_hash = format!("b3:{}", blake3::hash(&old_body).to_hex());
+        let old_chunk_hash = old_hash.clone(); // single-chunk == whole file
+        let old_entries = vec![ManifestEntry {
+            path: "c.bin".into(),
+            hash: old_hash,
+            size: Some(20),
+            chunks: Some(vec![ManifestChunk {
+                hash: old_chunk_hash.clone(),
+                size: 20,
+            }]),
+        }];
+        let updates = build_saved_updates(&old_entries, tmp.path());
+        bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
+            .expect("write saved manifest");
+        let saved = bundle_manifest::load(tmp.path());
+
+        // The new manifest declares different content, but the OLD file is
+        // still on disk (not yet overwritten) — a fetch, not a skip, and the
+        // old bytes remain a valid donor until this entry's own materialize.
+        let new_hash = format!("b3:{}", blake3::hash(&[2u8; 20]).to_hex());
+        let new_entries = vec![ManifestEntry {
+            path: "c.bin".into(),
+            hash: new_hash,
+            size: Some(20),
+            chunks: None,
+        }];
+
+        let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
+        assert!(!st.skip.contains("c.bin"), "changed content must fetch");
+        assert_eq!(st.seed.len(), 1);
+        let want_hash = fetch::parse_hash(&old_chunk_hash).expect("parse old chunk hash");
+        assert_eq!(st.seed[0].hash, want_hash);
+        assert_eq!(st.seed[0].source, path);
+        assert_eq!(st.seed[0].offset, 0);
+        assert_eq!(st.seed[0].len, 20);
     }
 
     /// `materialize` (the paid-path writer) atomically replaces an existing
