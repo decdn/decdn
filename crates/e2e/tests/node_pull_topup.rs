@@ -4,7 +4,7 @@
 //! The loopback suite (`crates/node/tests/node_origin_pull.rs`,
 //! `a_pull_larger_than_the_working_deposit_tops_up_once_and_completes` and
 //! siblings) drives the reactive top-up through a `FundingOpener` double whose
-//! `top_up_pool` just adds to an in-memory cell. That proves the DECISION —
+//! `top_up_pool_by` just adds to an in-memory cell. That proves the DECISION —
 //! detect exhaustion, resume at the paid frontier, do not re-pay delivered
 //! bytes — but by construction it cannot exercise three things that only exist
 //! against a real chain and a real upstream daemon:

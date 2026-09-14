@@ -999,7 +999,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// `topUp` mined but the local row could not be credited (terminal — the
     /// deposit is escrowed-and-untracked; a retry would escrow again), or if every
     /// funding call joined a `topUp` that failed.
-    pub async fn top_up_pool(&self, additional: U256) -> Result<TopUpLanded> {
+    pub async fn top_up_pool_by(&self, additional: U256) -> Result<TopUpLanded> {
         let state = self
             .reuse_or_report()?
             .with_context(|| "no buyer pool tracked to top up")?;
@@ -1074,7 +1074,7 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
     ) -> Result<()>;
 
     /// Fund `additional` of new headroom in the node's pool, returning its NEW total
-    /// deposit and the amount this call added. See [`BuyerPoolService::top_up_pool`].
+    /// deposit and the amount this call added. See [`BuyerPoolService::top_up_pool_by`].
     /// An implementation reports what really landed in [`TopUpLanded::added`], which
     /// can be less than `additional`.
     ///
@@ -1086,7 +1086,7 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
     ///
     /// Implementations error when no pool is tracked, when the allowance or `topUp`
     /// fails, or when the tx lands but the local row can no longer be credited.
-    async fn top_up_pool(&self, _additional: U256) -> Result<TopUpLanded> {
+    async fn top_up_pool_by(&self, _additional: U256) -> Result<TopUpLanded> {
         Ok(TopUpLanded {
             new_deposit: U256::ZERO,
             added: U256::ZERO,
@@ -1114,8 +1114,8 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
         BuyerPoolService::record_progress(self, provider_addr, pool_id, bytes_delivered, amount)
     }
 
-    async fn top_up_pool(&self, additional: U256) -> Result<TopUpLanded> {
-        BuyerPoolService::top_up_pool(self, additional).await
+    async fn top_up_pool_by(&self, additional: U256) -> Result<TopUpLanded> {
+        BuyerPoolService::top_up_pool_by(self, additional).await
     }
 }
 

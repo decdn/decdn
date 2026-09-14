@@ -1,4 +1,4 @@
-//! `NodeFunder` — the node's [`Funder`] adapter over [`PoolOpener::top_up_pool`].
+//! `NodeFunder` — the node's [`Funder`] adapter over [`PoolOpener::top_up_pool_by`].
 //!
 //! [`client-pull`](decdn_client_pull)'s gap-driven `drive()` reactively tops up
 //! the buyer deposit through the injected [`Funder`] seam (`source.rs`) rather
@@ -10,7 +10,7 @@
 //! request the CLI's `CliFunder` makes by calling `topUp` with `additional`
 //! directly. A `topUp` leaves the pool's committed spend untouched, so what lands
 //! on the deposit lands on the spendable headroom too. What lands can be less than
-//! `additional`. [`PoolOpener::top_up_pool`] takes the same amount and reports how
+//! `additional`. [`PoolOpener::top_up_pool_by`] takes the same amount and reports how
 //! much of it landed, so `NodeFunder` passes `additional` through and grades the
 //! landing on that report: a full landing is a success, and a short one is still
 //! returned as `Added` so the driver keeps the headroom that did land. The driver sizes it from the pull's live
@@ -108,11 +108,11 @@ const MAX_SETTLE_WAITS: u32 = 60;
 ///   `deposit` field grows across the fetch as earlier top-ups land. `top_up`
 ///   reads it as a floor, so a landing never lowers the deposit the driver
 ///   credits. Locked only to copy fields out; the guard is never held across
-///   `.await` (`top_up_pool` is a network+chain round trip).
+///   `.await` (`top_up_pool_by` is a network+chain round trip).
 /// - `metrics`: the node's metrics handle. `top_up` records
 ///   `node_pull_reactive_topup` on a landing that adds the full requested amount
 ///   and `node_pull_reactive_topup_refused` on a short landing or a
-///   `top_up_pool` error — the one seam both the window-paced serve leg and the
+///   `top_up_pool_by` error — the one seam both the window-paced serve leg and the
 ///   gap-driven pull leg fund through, so metering here covers both.
 pub(crate) struct NodeFunder {
     opener: Arc<dyn PoolOpener>,
@@ -164,7 +164,7 @@ impl Funder for NodeFunder {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (guard.pool_id, guard.deposit)
             };
-            match self.opener.top_up_pool(additional).await {
+            match self.opener.top_up_pool_by(additional).await {
                 Ok(landed) => {
                     let new_deposit = landed.new_deposit.max(current_deposit);
                     if !landed.added.is_zero() {
@@ -179,7 +179,7 @@ impl Funder for NodeFunder {
                     } else {
                         // The driver still credits the new deposit and spends a unit
                         // of its top-up budget on any `Added`, so the short landing is
-                        // logged and metered here. `BuyerPoolService::top_up_pool`
+                        // logged and metered here. `BuyerPoolService::top_up_pool_by`
                         // funds the remainder of a short join itself, so this arm sees
                         // only what is left when its funding calls run out.
                         warn!(
@@ -226,9 +226,9 @@ mod tests {
     use super::*;
     use crate::buyer_channel::{PoolOpener, TopUpLanded};
 
-    /// A configurable [`PoolOpener`] double: `top_up_pool` records the
+    /// A configurable [`PoolOpener`] double: `top_up_pool_by` records the
     /// `additional` it was called with (and how many times) and returns a
-    /// fixed outcome. Only `top_up_pool` is exercised by `NodeFunder`; the rest of
+    /// fixed outcome. Only `top_up_pool_by` is exercised by `NodeFunder`; the rest of
     /// the trait is required by its signature but unreachable from these tests.
     #[derive(Debug)]
     struct MockOpener {
@@ -286,7 +286,7 @@ mod tests {
             unreachable!("not exercised by NodeFunder tests")
         }
 
-        async fn top_up_pool(&self, additional: U256) -> Result<TopUpLanded> {
+        async fn top_up_pool_by(&self, additional: U256) -> Result<TopUpLanded> {
             self.top_up_calls.fetch_add(1, Ordering::SeqCst);
             *self
                 .last_additional
@@ -368,7 +368,7 @@ mod tests {
     }
 
     /// A top-up that adds the full request bumps `node_pull_reactive_topup_total`
-    /// and marks the pull funded; a `top_up_pool` failure bumps
+    /// and marks the pull funded; a `top_up_pool_by` failure bumps
     /// `node_pull_reactive_topup_refused_total` instead (and still propagates the
     /// error) — the seam both pull paths share for metering.
     #[tokio::test]
