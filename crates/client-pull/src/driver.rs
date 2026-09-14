@@ -665,7 +665,7 @@ where
             pulled_frontier: delivered_frontier,
             // `downstream.served_paid` is NOT this leg's own state — it is the
             // DOWNSTREAM client's paid frontier, which only the node's serve leg
-            // (a separate, future task) can advance. On the client path
+            // advances (`FillSession::advance_served`). On the client path
             // (`downstream == None`) there is no downstream leg, so this
             // collapses to the inert local `paid_frontier`: harmless, because
             // `BudgetPacer` never reads `downstream`. The NODE pull leg

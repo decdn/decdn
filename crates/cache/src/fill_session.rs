@@ -269,9 +269,9 @@ impl HashOutboard {
 /// A forward-only content frontier shared between a fill's serve legs and its pull.
 ///
 /// Holders read it with [`Self::get`]. Only the owning [`FillSession`] raises it,
-/// and every raise that moves the value wakes the pull parked on the session's
-/// [`FillSession::downstream_advanced`] signal. No holder can lower the frontier or
-/// raise it without that wakeup, so a parked pull never misses an advance.
+/// and every raise that moves the value wakes a pull parked in
+/// [`DownstreamWatch::past`]. No holder can lower the frontier or raise it without
+/// that wakeup, so a parked pull never misses an advance.
 #[derive(Debug, Clone)]
 pub struct Frontier {
     /// The frontier value, a high-water mark.
@@ -304,14 +304,61 @@ impl Frontier {
     }
 }
 
+/// A pull leg's view of its session's two downstream frontiers: the paid frontier
+/// ([`FillSession::served_frontier`]) and the serve demand
+/// ([`FillSession::serve_demand`]). Read-only and cheap to clone, so a pull on its
+/// own runtime holds an owned copy. Minted by [`FillSession::downstream_watch`].
+#[derive(Debug, Clone)]
+pub struct DownstreamWatch {
+    /// The session's paid content frontier.
+    served_paid: Frontier,
+    /// The session's serve-demand frontier. Shares its wakeup with `served_paid`.
+    serve_demand: Frontier,
+}
+
+impl DownstreamWatch {
+    /// The current paid content frontier.
+    #[must_use]
+    pub fn served_paid(&self) -> u64 {
+        self.served_paid.get()
+    }
+
+    /// The current serve-demand frontier.
+    #[must_use]
+    pub fn serve_demand(&self) -> u64 {
+        self.serve_demand.get()
+    }
+
+    /// Resolve once either frontier lies past the observed value: `served_paid`
+    /// past `observed_paid`, or `serve_demand` past `observed_demand`. Returns at
+    /// once when one already does.
+    ///
+    /// Registers the wakeup BEFORE it re-reads the frontiers. `notify_waiters` wakes
+    /// only waiters registered when it fires and stores no permit, so an advance
+    /// that lands between the caller reading the frontiers and this park would
+    /// otherwise be lost, and the pull would wait forever (#1673).
+    pub async fn past(&self, observed_paid: u64, observed_demand: u64) {
+        let notified = self.served_paid.advanced.notified();
+        tokio::pin!(notified);
+        loop {
+            notified.as_mut().enable();
+            if self.served_paid() > observed_paid || self.serve_demand() > observed_demand {
+                return;
+            }
+            notified.as_mut().await;
+            notified.set(self.served_paid.advanced.notified());
+        }
+    }
+}
+
 /// One in-flight fill of a `total_bytes`-byte blob rooted at `root`.
 ///
 /// Holds a reference to the per-hash [`HashOutboard`] (captured by the cache admit
 /// path via [`Self::capture`], read by [`SessionOutboardReader`]), the pull's
 /// terminal outcome ([`Self::mark_ended`] / [`Self::outcome`]), the ranges this fill
 /// covers ([`Self::set_covered`]), and the shared downstream frontiers the pull
-/// leg paces against ([`Self::served_frontier`] / [`Self::serve_demand`], woken by
-/// [`Self::downstream_advanced`]). Shared
+/// leg paces against ([`Self::served_frontier`] / [`Self::serve_demand`], awaited
+/// through [`Self::downstream_watch`]). Shared
 /// behind an `Arc`; every field is interior-mutable, so both legs hold
 /// `Arc<FillSession>` and coordinate on it.
 #[derive(Debug)]
@@ -332,19 +379,16 @@ pub struct FillSession {
     /// `serve_demand`. A cloneable handle, so a pull leg on its own runtime can hold
     /// an owned copy.
     served_paid: Frontier,
-    /// Notified after each `served_paid` or `serve_demand` advance, so a parked pull
-    /// re-decides exactly when a downstream voucher clears or a serve leg starts
-    /// waiting on bytes.
-    downstream_advanced: Arc<Notify>,
     /// The content end of the furthest span a serve leg has been stuck on (a
     /// high-water mark, never lowered): the serve leg's frame consumer raises it
     /// when it has no encoded bytes left and its encode is parked on a leaf or a
     /// proof node no pull has produced ([`SessionOutboardReader::parked_on`]). A park
     /// with encoded bytes still buffered is look-ahead and raises nothing, so a
-    /// client that stops paying cannot drag a pull past its window. When it lies within one chunk group past a
-    /// pull's frontier, that pull's pacer draws one window floor even with its window
-    /// full. Without it, a pull window that closes before the serve leg's credit
-    /// window leaves both legs waiting on each other.
+    /// client that stops paying cannot drag a pull past its window. When it lies
+    /// within one chunk group past a pull's frontier, that pull's pacer draws one
+    /// window floor even with its window full. Without it, a pull window that closes
+    /// before the serve leg's credit window leaves both legs waiting on each other.
+    /// Shares one wakeup with `served_paid`, so a parked pull wakes on either.
     serve_demand: Frontier,
     /// The chunk ranges THIS fill will produce — exactly the bytes this pull
     /// fetches (its `missing_ranges ∩ R`). [`FillRegistry::range_still_live`]
@@ -380,7 +424,8 @@ pub struct FillSession {
 
 impl FillSession {
     /// Construct the fill session for a `total_bytes`-byte blob rooted at `root`,
-    /// with its served frontier at 0. See [`Self::starting_at`].
+    /// with its served frontier at 0. An owning branch for a request that starts
+    /// past byte 0 uses [`Self::starting_at`] instead.
     #[must_use]
     pub fn new(root: blake3::Hash, total_bytes: u64) -> Arc<Self> {
         Self::starting_at(root, total_bytes, 0)
@@ -398,8 +443,7 @@ impl FillSession {
             outboard: StdMutex::new(HashOutboard::new(root, total_bytes)),
             ended: StdMutex::new(None),
             served_paid: Frontier::new(served_start, Arc::clone(&downstream_advanced)),
-            serve_demand: Frontier::new(0, Arc::clone(&downstream_advanced)),
-            downstream_advanced,
+            serve_demand: Frontier::new(0, downstream_advanced),
             covered: StdMutex::new(ChunkRanges::all()),
             observers: AtomicUsize::new(0),
             cancel: CancellationToken::new(),
@@ -541,15 +585,34 @@ impl FillSession {
         self.served_paid.raise(served);
     }
 
-    /// Notified after each [`Self::served_frontier`] or [`Self::serve_demand`]
-    /// advance.
-    #[must_use]
-    pub const fn downstream_advanced(&self) -> &Arc<Notify> {
-        &self.downstream_advanced
+    /// Raise the PAID content frontier to `served` on behalf of an observer whose
+    /// delivery starts at content `offset`, but only when this session's frontier
+    /// already reaches `offset`.
+    ///
+    /// Under partial-overlap coalescing an observer consumes a SUFFIX of this fill's
+    /// covered range, starting at `offset`. Its payment extends this fill's paid
+    /// PREFIX only once that prefix reaches `offset`. Before that, the bytes in
+    /// `[frontier, offset)` are unpaid, and raising the frontier past them would let
+    /// the pull run its window over bytes no observer of this fill has paid for.
+    pub fn extend_served_from(&self, offset: u64, served: u64) {
+        if self.served_paid.get() >= offset {
+            self.served_paid.raise(served);
+        }
     }
 
-    /// The content end of the furthest span a serve leg awaits. The pull leg's pacer
-    /// may always draw up to it.
+    /// A read-only watch over both downstream frontiers, for a pull leg to pace
+    /// against and park on.
+    #[must_use]
+    pub fn downstream_watch(&self) -> DownstreamWatch {
+        DownstreamWatch {
+            served_paid: self.served_paid.clone(),
+            serve_demand: self.serve_demand.clone(),
+        }
+    }
+
+    /// The content end of the furthest span a serve leg awaits. When it lies within
+    /// one chunk group past a pull's frontier, that pull's pacer draws one window
+    /// floor even with its window full; a demand further out is ignored.
     #[must_use]
     pub const fn serve_demand(&self) -> &Frontier {
         &self.serve_demand
@@ -1515,32 +1578,83 @@ mod fill_registry_tests {
         assert_eq!(standalone.serve_demand().get(), total);
     }
 
-    /// A served-frontier advance is forward-only and wakes a parked pull only when it
-    /// moves the frontier.
-    #[tokio::test]
-    async fn advance_served_is_forward_only() {
-        let session = FillSession::starting_at(hb(0x4E), 8 * G, 2 * G);
-        assert_eq!(session.served_frontier().get(), 2 * G);
+    /// A served-frontier advance is forward-only and wakes a parked watch only when it
+    /// moves the frontier: a lower or an equal value wakes nothing.
+    #[test]
+    fn advance_served_is_forward_only() {
+        use futures_util::FutureExt;
 
-        let woken = session.downstream_advanced().notified();
-        tokio::pin!(woken);
-        woken.as_mut().enable();
+        let session = FillSession::starting_at(hb(0x4E), 8 * G, 2 * G);
+        let watch = session.downstream_watch();
+        assert_eq!(watch.served_paid(), 2 * G);
+
+        let past = watch.past(2 * G, 0);
+        futures_util::pin_mut!(past);
+        assert!(past.as_mut().now_or_never().is_none(), "nothing moved yet");
+
         session.advance_served(G);
-        assert_eq!(
-            session.served_frontier().get(),
-            2 * G,
-            "a lower value is ignored"
-        );
+        assert_eq!(watch.served_paid(), 2 * G, "a lower value is ignored");
         assert!(
-            futures_util::FutureExt::now_or_never(woken.as_mut()).is_none(),
-            "a non-advance wakes nothing"
+            past.as_mut().now_or_never().is_none(),
+            "a lower value wakes nothing"
+        );
+
+        session.advance_served(2 * G);
+        assert!(
+            past.as_mut().now_or_never().is_none(),
+            "an equal value wakes nothing"
         );
 
         session.advance_served(3 * G);
-        assert_eq!(session.served_frontier().get(), 3 * G);
+        assert_eq!(watch.served_paid(), 3 * G);
         assert!(
-            futures_util::FutureExt::now_or_never(woken.as_mut()).is_some(),
-            "an advance wakes the parked pull"
+            past.now_or_never().is_some(),
+            "an advance wakes the parked watch"
+        );
+    }
+
+    /// A sibling's paid frontier extends only from a prefix that already reaches the
+    /// observer's start: below it the bytes are unpaid and the frontier stays put, at
+    /// it the frontier moves, and a frontier already past `served` never regresses.
+    #[test]
+    fn extend_served_from_requires_a_paid_prefix_to_the_offset() {
+        let below = FillSession::starting_at(hb(0x4F), 8 * G, 0);
+        below.extend_served_from(4 * G, 6 * G);
+        assert_eq!(
+            below.served_frontier().get(),
+            0,
+            "an unpaid gap blocks the raise"
+        );
+
+        let at = FillSession::starting_at(hb(0x50), 8 * G, 4 * G);
+        at.extend_served_from(4 * G, 6 * G);
+        assert_eq!(
+            at.served_frontier().get(),
+            6 * G,
+            "a prefix at the offset extends"
+        );
+
+        let ahead = FillSession::starting_at(hb(0x51), 8 * G, 7 * G);
+        ahead.extend_served_from(4 * G, 6 * G);
+        assert_eq!(ahead.served_frontier().get(), 7 * G, "never regresses");
+    }
+
+    /// A watch wakes on either frontier: a demand raise with no payment resolves a
+    /// watch parked on the paid frontier.
+    #[test]
+    fn a_watch_wakes_on_a_demand_raise() {
+        use futures_util::FutureExt;
+
+        let session = FillSession::new(hb(0x52), 8 * G);
+        let watch = session.downstream_watch();
+        let past = watch.past(0, 0);
+        futures_util::pin_mut!(past);
+        assert!(past.as_mut().now_or_never().is_none());
+
+        session.demand_up_to(G);
+        assert!(
+            past.now_or_never().is_some(),
+            "a demand raise wakes the watch"
         );
     }
 

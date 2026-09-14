@@ -241,10 +241,10 @@ impl ClientHandler {
         // decide whether this miss OWNS a fresh pull for `hash` or ATTACHES as an
         // observer to a live one. Two concurrent same-hash misses therefore share ONE
         // upstream pull (no double spend, #305) while each keeps its own per-channel
-        // voucher stream. `make_session` builds the shared `FillSession` ONLY on the owner branch,
-        // with its PAID content frontier at the request's ABSOLUTE content start
-        // (`req.byte_offset`), so a non-zero-offset request does not show a window of
-        // phantom lead and immediately `Wait`.
+        // voucher stream. `make_session` builds the shared `FillSession` only on an
+        // owning branch (`Owner` or `Mixed`), with its PAID content frontier at the
+        // request's ABSOLUTE content start (`req.byte_offset`), so a non-zero-offset
+        // request does not show a window of phantom lead and immediately `Wait`.
         let byte_offset = req.byte_offset;
         let byte_len = req.byte_len;
         let root = bao_tree::blake3::Hash::from(*hash.as_bytes());
@@ -586,9 +586,9 @@ impl ClientHandler {
         // OWN a fresh local pull for `hash` or ATTACH as an observer to a live same-hash
         // fill (any source — a peer pull and an own-origin pull for the same hash
         // coalesce, the byte fetched once). Two concurrent whole-blob own-origin misses
-        // therefore drive ONE origin fetch. `make_session` builds the session ONLY on the
-        // owner branch, with its PAID frontier at the request's ABSOLUTE content start
-        // (`req.byte_offset`) so it does not show a window of phantom lead.
+        // therefore drive ONE origin fetch. `make_session` builds the session only on an
+        // owning branch (`Owner` or `Mixed`), with its PAID frontier at the request's
+        // ABSOLUTE content start (`req.byte_offset`) so it shows no phantom lead.
         let byte_offset = req.byte_offset;
         let byte_len = req.byte_len;
         let root = bao_tree::blake3::Hash::from(*hash.as_bytes());

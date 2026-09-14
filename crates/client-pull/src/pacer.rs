@@ -55,7 +55,7 @@ use decdn_protocol::client::CHUNK_BYTES;
 /// lets the pull fetch one more floor when a serve leg is parked at its frontier.
 pub const PULL_WINDOW_FLOOR: u64 = CHUNK_BYTES + 3 * CHUNK_GROUP_BYTES;
 
-/// The node serve leg's two content frontiers the pull leg paces against (ADR
+/// The node's downstream content frontiers the pull leg paces against (ADR
 /// 037): what the downstream client has paid for, and how far the serve leg waits
 /// on bytes. The node hands `drive` a reader of these; the client path has no
 /// downstream leg and passes none. [`BudgetPacer`] ignores both.
@@ -136,7 +136,8 @@ pub struct PaceState {
     /// to `0` or to the already-computed delivered frontier — either is safe.
     pub pulled_frontier: u64,
     /// The downstream serve leg's paid and demand frontiers. Ignored by
-    /// [`BudgetPacer`]; on the client path the driver fills in inert values.
+    /// [`BudgetPacer`]; on the client path the driver fills in the leg's own paid
+    /// frontier and a `0` demand, both inert.
     pub downstream: DownstreamFrontier,
 }
 
@@ -161,8 +162,9 @@ pub enum PaceDecision {
     Refuse,
     /// The pull leg has run its full window ahead of the downstream paid frontier
     /// ([`WindowPacer`], ADR 037) and no serve leg is parked at its frontier: pause
-    /// and re-decide once either [`PaceState::downstream`] frontier advances. [`BudgetPacer`] never returns this — only a window-bounded pacer
-    /// does, so it only appears on the node's pull leg, never on the client path.
+    /// and re-decide once either [`PaceState::downstream`] frontier advances.
+    /// [`BudgetPacer`] never returns this — only a window-bounded pacer does, so it
+    /// only appears on the node's pull leg, never on the client path.
     Wait,
 }
 

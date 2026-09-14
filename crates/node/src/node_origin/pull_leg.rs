@@ -44,7 +44,7 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use bao_tree::ChunkRanges;
 use decdn_bao_range::RangedStore;
-use decdn_cache::{CacheEngine, CacheError, FillError, FillSession, Frontier, Hash};
+use decdn_cache::{CacheEngine, CacheError, DownstreamWatch, FillError, FillSession, Hash};
 use decdn_client_pull::driver::DriveConfig;
 use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
@@ -55,7 +55,6 @@ use decdn_incentive::DepositOutcome;
 
 use decdn_reputation::Outcome;
 use iroh::{EndpointAddr, PublicKey};
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -103,21 +102,13 @@ pub(crate) struct PullLegTarget {
 }
 
 /// The injected wait for [`RampPacer`]'s `Wait`: resolve once the serve leg's paid
-/// frontier or demand frontier advances. Awaits the shared `downstream_advanced`
-/// notify so a parked pull re-decides exactly when a downstream voucher clears or
-/// the serve leg starts waiting on bytes. Also the reader `drive` paces against, so
-/// the decision and the wait always read the same atomics.
+/// frontier or demand frontier moves past what the decision read
+/// ([`DownstreamWatch::past`], which owns the #1673 arm-then-recheck). Also the
+/// reader `drive` paces against, so the decision and the wait always read the same
+/// frontiers.
 struct DownstreamWait {
-    /// The session's downstream wakeup, notified on each frontier advance.
-    advanced: Arc<Notify>,
-    /// The live shared served-paid frontier. Re-read AFTER the wakeup is registered
-    /// so an advance that raced the pacer's `Wait` decision is not waited on forever
-    /// — `Notify::notify_waiters` stores no permit, so without this re-check the
-    /// window-paused pull wedges (the #1673 CI-starvation hang).
-    served_paid: Frontier,
-    /// The live shared serve-demand frontier, re-read after arming exactly like
-    /// `served_paid`.
-    serve_demand: Frontier,
+    /// The session's downstream frontiers.
+    watch: DownstreamWatch,
     /// Bumps `node_pull_through_window_paused` on each pause — the pull hit its ADR
     /// 037 window and is waiting for downstream payment to clear or a serve leg to
     /// park at its frontier.
@@ -128,9 +119,7 @@ impl DownstreamWait {
     /// A wait over `session`'s downstream frontiers.
     fn for_session(session: &FillSession, metrics: Arc<crate::metrics::Metrics>) -> Self {
         Self {
-            advanced: Arc::clone(session.downstream_advanced()),
-            served_paid: session.served_frontier().clone(),
-            serve_demand: session.serve_demand().clone(),
+            watch: session.downstream_watch(),
             metrics,
         }
     }
@@ -138,8 +127,8 @@ impl DownstreamWait {
     /// The live downstream frontiers, as the pacer reads them.
     fn frontier(&self) -> DownstreamFrontier {
         DownstreamFrontier {
-            served_paid: self.served_paid.get(),
-            serve_demand: self.serve_demand.get(),
+            served_paid: self.watch.served_paid(),
+            serve_demand: self.watch.serve_demand(),
         }
     }
 }
@@ -149,22 +138,7 @@ impl PacingWait for DownstreamWait {
         // The pull hit its ADR 037 window: count the pause (the decision was `Wait`),
         // independent of whether we then park or short-circuit on a raced advance.
         self.metrics.node_pull_through_window_paused();
-        Box::pin(async move {
-            // Register the wakeup FIRST, then re-read the frontier. `notify_waiters`
-            // wakes only waiters registered at the moment it fires and stores no
-            // permit, so the serve leg's `downstream_advanced()` notify that
-            // lands between the pacer reading `observed` and this park would be lost —
-            // wedging the pull (#1673). Arm the waiter, THEN check: if the frontier
-            // already moved past `observed`, the advance we would wait for has already
-            // happened, so re-decide at once instead of parking on a notify that will
-            // never repeat. Any advance AFTER this arm wakes the registered waiter.
-            let mut notified = Box::pin(self.advanced.notified());
-            notified.as_mut().enable();
-            if self.frontier().advanced_past(observed) {
-                return;
-            }
-            notified.await;
-        })
+        Box::pin(self.watch.past(observed.served_paid, observed.serve_demand))
     }
 }
 
@@ -474,7 +448,7 @@ impl NodeOrigin {
 /// sticky), and drives the runs in offset order. Each run opens ONE buyer lane to
 /// its source — one `(signer, provider)` payment lane — and runs are SEQUENTIAL,
 /// so two lanes never pay at once. The [`NodeAdmitStore`], [`RampPacer`], the
-/// downstream `served_paid` reader, and the [`DownstreamWait`] are SHARED across
+/// downstream frontier reader and wait ([`DownstreamWait`]) are SHARED across
 /// every run, so the demand window is continuous: it is keyed on the downstream
 /// paid frontier, not on the run, and a later run's lane still `Wait`s on the same
 /// frontier the earlier one did.
@@ -509,8 +483,8 @@ impl NodeOrigin {
 /// OWNED + `'static` (no borrow crosses the thread): `deps_lock` is a clone of
 /// [`NodeOrigin::deps_arc`], read via `get()` HERE so `&deps.endpoint` /
 /// `&deps.slash_domain` are borrowed only within this runtime's scope. The shared
-/// coordination state (the shared [`FillSession`]'s [`Frontier`] / [`Notify`]) crosses runtimes
-/// safely — atomics and `Notify` wakers are runtime-agnostic — and the
+/// coordination state (the shared [`FillSession`]'s [`DownstreamWatch`]) crosses
+/// runtimes safely — atomics and `Notify` wakers are runtime-agnostic — and the
 /// [`CacheEngine`] store actor and iroh [`Endpoint`](iroh::Endpoint) are reached
 /// through their own channels, so a second runtime talking to them is fine.
 #[allow(clippy::too_many_arguments)]
@@ -1053,7 +1027,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// Like [`run_pull_leg`], `drive`'s future is non-`Send`, so the orchestration
 /// `block_on`s this on a dedicated current-thread runtime. All inputs are
 /// therefore owned + `'static`; the shared coordination state
-/// (the shared [`FillSession`]'s [`Frontier`] / [`Notify`]) crosses runtimes safely.
+/// (the shared [`FillSession`]'s [`DownstreamWatch`]) crosses runtimes safely.
 #[allow(
     clippy::too_many_arguments,
     dead_code,
@@ -1461,10 +1435,9 @@ mod local_pull_leg_tests {
 
 /// Regression coverage for the window-pause lost-wakeup that wedged
 /// [`run_pull_leg`] / [`run_local_pull_leg`] under CI scheduling gaps (#1673).
-/// [`DownstreamWait`] is edge-triggered on a [`Notify`], which stores no permit
-/// across `notify_waiters`, so a serve-leg advance that races the pacer's `Wait`
-/// decision must be caught by re-reading the frontier AFTER arming the waiter — not
-/// waited on forever.
+/// [`DownstreamWait`] parks on an edge-triggered wakeup that stores no permit, so a
+/// serve-leg advance that races the pacer's `Wait` decision must be caught by
+/// re-reading the frontiers AFTER arming the waiter — not waited on forever.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
 mod downstream_wait_tests {
