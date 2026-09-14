@@ -802,7 +802,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
 
     // Persist the skip-cache: prior state merged with what this run landed. A
     // write failure is non-fatal (the cache is advisory) — log and continue.
-    let updates = build_saved_updates(&manifest.entries, &args.output);
+    let updates = build_saved_updates(&manifest.entries, &outcomes, &args.output);
     if let Err(e) = bundle_manifest::merge_and_write(&args.output, saved, updates) {
         tracing::warn!(
             "failed to write {}: {e}",
@@ -2652,18 +2652,34 @@ fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Build the saved-manifest updates for this run from the FINAL on-disk state:
-/// every in-scope entry whose output file is present (a present final file is
-/// BLAKE3-verified, so presence == good) contributes a record built from the new
-/// manifest entry plus the file's observed size and mtime. Entries whose output
-/// is absent (a failed fetch) are omitted, so the saved manifest never claims a
-/// file this run did not land. Excluded paths are not in `entries`, so they are
-/// never recorded.
+/// every in-scope entry whose output file is present AND whose fetch this run
+/// did not fail contributes a record built from the new manifest entry plus the
+/// file's observed size and mtime. Presence alone is not proof of freshness — a
+/// FAILED fetch leaves the file exactly as it was before this run (materialize
+/// only renames the new content into place on success), so a present-but-failed
+/// entry is skipped rather than recorded: recording it would pair the *new*
+/// manifest hash with the *old* file's bytes, and a later run's mtime/hash fast
+/// path would then wrongly treat that stale file as up to date and never
+/// re-fetch it. Omitting it instead leaves any prior record (or no record) in
+/// place, which always forces a re-check next run. Excluded paths are not in
+/// `entries`, so they are never recorded.
 fn build_saved_updates(
     entries: &[ManifestEntry],
+    outcomes: &[EntryOutcome],
     out_root: &Path,
 ) -> BTreeMap<String, bundle_manifest::SavedFile> {
+    let failed: HashSet<&str> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            EntryOutcome::Failed { path, .. } => Some(path.as_str()),
+            _ => None,
+        })
+        .collect();
     let mut updates = BTreeMap::new();
     for en in entries {
+        if failed.contains(en.path.as_str()) {
+            continue; // this run left the old bytes in place — never record
+        }
         let Ok(dest) = safe_join(out_root, &en.path) else {
             continue;
         };
@@ -2914,6 +2930,9 @@ mod tests {
     fn build_saved_updates_records_present_omits_failed() {
         let tmp = tempfile::tempdir().expect("tmp");
         std::fs::write(tmp.path().join("ok.txt"), b"data").expect("write");
+        // "bad.txt" has an OLD file present on disk (this run's fetch failed and
+        // left it untouched) — it must never be recorded with the NEW hash.
+        std::fs::write(tmp.path().join("bad.txt"), b"old-bytes").expect("write");
         let entries = vec![
             ManifestEntry {
                 path: "ok.txt".into(),
@@ -2931,13 +2950,21 @@ mod tests {
                 chunks: None,
             },
         ];
-        let upd = build_saved_updates(&entries, tmp.path());
+        let outcomes = vec![
+            EntryOutcome::Fetched(4),
+            EntryOutcome::Failed {
+                path: "bad.txt".into(),
+                err: "nope".into(),
+            },
+        ];
+        let upd = build_saved_updates(&entries, &outcomes, tmp.path());
         assert!(upd.contains_key("ok.txt"));
         let rec = upd.get("ok.txt").expect("rec");
         assert_eq!(rec.hash, "b3:aa");
         assert_eq!(rec.size, 4);
         assert!(rec.chunks.is_some());
-        assert!(!upd.contains_key("bad.txt")); // failed → omitted
+        // Failed → omitted even though the (stale) file is present on disk.
+        assert!(!upd.contains_key("bad.txt"));
     }
 
     #[test]
@@ -4038,7 +4065,8 @@ mod tests {
                 size: 20,
             }]),
         }];
-        let updates = build_saved_updates(&old_entries, tmp.path());
+        let old_outcomes = vec![EntryOutcome::Fetched(20)];
+        let updates = build_saved_updates(&old_entries, &old_outcomes, tmp.path());
         bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
             .expect("write saved manifest");
         let saved = bundle_manifest::load(tmp.path());
