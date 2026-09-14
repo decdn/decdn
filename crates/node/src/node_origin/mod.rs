@@ -1707,9 +1707,10 @@ async fn pull_from_candidate(
     let cancel = CancellationToken::new();
     let cancel_for_thread = cancel.clone();
     let _cancel_guard = cancel.drop_guard();
-    // Set on the drive thread the first time a reactive top-up ADDS headroom, so the
-    // refuse-metering below can tell a pull that never funded itself (an extortion
-    // `SpendingCapExhausted` to meter) from one that did (already metered on the wire).
+    // Set on the drive thread the first time a reactive top-up escrows any headroom, so
+    // the refuse-metering below can tell a pull that never funded itself (an extortion
+    // `SpendingCapExhausted` to meter) from one that did (already metered by `NodeFunder`,
+    // as a success or as a short landing).
     let reactive_funded = Arc::new(AtomicBool::new(false));
     let reactive_funded_for_thread = Arc::clone(&reactive_funded);
     let join = tokio::task::spawn_blocking(move || {
@@ -1855,11 +1856,13 @@ async fn pull_from_candidate(
             // saw the contradiction and never issued a `TopUp`, so `NodeFunder` was never
             // called and nothing else meters this; without it, a lying peer is invisible.
             // Guarded on `working_deposit != 0` (reactive top-up enabled) and on this pull
-            // NOT having funded itself — a pull that already topped up was metered on the
-            // wire (`node_pull_reactive_topup`) and is not being extorted. No double-count
-            // with `NodeFunder`'s own refused metering, which fires only when `top_up_pool`
-            // is actually called, which does not happen on this refuse path. No escrow, no
-            // bytes: the fetch still misses.
+            // NOT having funded itself — a pull that escrowed any headroom was already
+            // metered by `NodeFunder` (`node_pull_reactive_topup`, or
+            // `node_pull_reactive_topup_refused` for a short landing) and is not being
+            // extorted. A pull whose every top-up failed or added nothing stays unfunded;
+            // its refusal here counts the upstream's claim, a separate event from the
+            // funding outcome `NodeFunder` metered. No escrow, no bytes: the fetch still
+            // misses.
             if !deps.config.working_deposit.is_zero()
                 && !reactive_funded.load(Ordering::Relaxed)
                 && err

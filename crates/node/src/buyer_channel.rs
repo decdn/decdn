@@ -96,71 +96,210 @@ impl std::error::Error for OpenReported {}
 
 type OpenOutcome = Result<(), Arc<anyhow::Error>>;
 type SharedOpen = futures_util::future::Shared<BoxFuture<'static, OpenOutcome>>;
-type TopUpOutcome = Result<U256, Arc<anyhow::Error>>;
+type TopUpOutcome = Result<TopUpLanded, Arc<anyhow::Error>>;
 type SharedTopUp = futures_util::future::Shared<BoxFuture<'static, TopUpOutcome>>;
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
-/// Whether a funding call started its own `topUp` or joined one already in flight.
-/// A spawned `topUp` escrows the caller's amount; a joined one escrows whatever
-/// its spawner asked for.
+/// The result of a pool top-up: the pool's new total deposit, and how much of the
+/// growth belongs to the caller.
+///
+/// `added` is the caller's own share. Another funder's concurrent `topUp` can raise
+/// `new_deposit` by more than `added`, and that headroom is already spoken for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TopUpSlot {
-    /// The call joined a `topUp` another caller started.
-    Joined,
-    /// The call started a `topUp` for its own amount.
-    Spawned,
+pub struct TopUpLanded {
+    /// The pool's total deposit after the top-up, as the local pool row records it.
+    pub new_deposit: U256,
+    /// The part of the deposit growth that this call funded or claimed.
+    pub added: U256,
 }
 
-/// How many funding calls one reactive top-up makes before it gives up. Each join
-/// that lands short is followed by a call for the remainder, which normally spawns
-/// because the joined task has freed the slot. This bound stops a caller that keeps
-/// losing the slot to other funders from looping without end.
+/// Typed marker: a `topUp` mined but its deposit could not be credited to the local
+/// pool row. The deposit is escrowed and untracked, so no caller funds again on top
+/// of it — a second `topUp` would strand a second deposit the same way.
+#[derive(Debug)]
+struct EscrowedUntracked;
+
+impl std::fmt::Display for EscrowedUntracked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "topUp escrowed but not credited to the local pool row")
+    }
+}
+
+impl std::error::Error for EscrowedUntracked {}
+
+/// Who starts a funding `topUp`. The two differ in who may rely on its headroom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopUpFunder {
+    /// The proactive low-water refill. No pull waits on its amount, so a reactive
+    /// top-up that joins it can claim that amount as its own.
+    Refill,
+    /// A reactive mid-pull top-up. Its spawner relies on the whole amount, so no
+    /// joiner can claim any of it.
+    Reactive,
+}
+
+/// What a funding call gets from the `topUp` slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopUpClaim {
+    /// The call started a `topUp` for its own amount.
+    Spawned,
+    /// The call joined a `topUp` another funder started, and claimed this much of
+    /// its unclaimed amount. The claim can be zero.
+    Joined(U256),
+}
+
+/// The single in-flight funding `topUp` and the part of its amount no caller has
+/// claimed yet.
+struct InFlightTopUp {
+    fut: SharedTopUp,
+    /// Headroom this `topUp` adds that no pull relies on yet. A refill starts with
+    /// its full amount; a reactive top-up starts with zero.
+    unclaimed: U256,
+}
+
+impl InFlightTopUp {
+    fn new(fut: SharedTopUp, amount: U256, funder: TopUpFunder) -> Self {
+        let unclaimed = match funder {
+            TopUpFunder::Refill => amount,
+            TopUpFunder::Reactive => U256::ZERO,
+        };
+        Self { fut, unclaimed }
+    }
+
+    /// Join this `topUp`. A reactive joiner claims up to `want` of the unclaimed
+    /// amount. A refill joiner claims nothing, because no pull waits on it.
+    fn join(&mut self, want: U256, funder: TopUpFunder) -> (SharedTopUp, TopUpClaim) {
+        let claimed = match funder {
+            TopUpFunder::Refill => U256::ZERO,
+            TopUpFunder::Reactive => self.unclaimed.min(want),
+        };
+        self.unclaimed = self.unclaimed.saturating_sub(claimed);
+        (self.fut.clone(), TopUpClaim::Joined(claimed))
+    }
+}
+
+/// How many funding calls one reactive top-up makes before it gives up. A join that
+/// covers less than the request, or that fails, is followed by a call for the
+/// remainder. That call normally spawns, because the joined task frees the slot
+/// before its result reaches any waiter. This bound stops a caller that keeps losing
+/// the slot to other funders from looping without end.
 const MAX_TOPUP_CALLS: u32 = 3;
 
-/// Add at least `additional` to a deposit that stood at `deposit_before`, and
-/// return the new total deposit.
+/// Fund at least `additional` of new headroom for one reactive top-up on `pool_id`.
 ///
 /// `join_or_spawn(amount)` joins the in-flight `topUp` or spawns one for `amount`.
-/// A spawned `topUp` lands the requested amount, so its result is final. A joined
-/// `topUp` lands its spawner's amount, which can be less than the remainder. Then
-/// this warns with the requested and landed amounts and asks again for the rest.
+///
+/// - A spawned `topUp` escrows this caller's own amount, so its result is final.
+///   A spawned `topUp` that credits less than requested is not retried: the
+///   shortfall is not from a join, and another call escrows a second `topUp`.
+/// - A joined `topUp` counts only for the amount the join claimed. When that is
+///   less than the remainder, or when the joined `topUp` fails, this warns and asks
+///   again for the rest.
+///
+/// When [`MAX_TOPUP_CALLS`] calls end short, this returns what landed and warns.
+/// The caller compares [`TopUpLanded::added`] with its request.
 ///
 /// # Errors
 ///
-/// Propagates a funding error from any call. Errors when [`MAX_TOPUP_CALLS`]
-/// calls all join and still leave the deposit short of `additional`.
+/// Propagates the error of a spawned `topUp`, and of any `topUp` whose deposit is
+/// escrowed but untracked. Errors when every call joins a `topUp` that fails.
 async fn top_up_at_least<F, Fut>(
-    deposit_before: U256,
+    pool_id: PoolId,
     additional: U256,
     mut join_or_spawn: F,
-) -> Result<U256>
+) -> Result<TopUpLanded>
 where
-    F: FnMut(U256) -> (Fut, TopUpSlot),
+    F: FnMut(U256) -> (Fut, TopUpClaim),
     Fut: std::future::Future<Output = TopUpOutcome>,
 {
-    let mut landed = U256::ZERO;
+    let mut added = U256::ZERO;
+    let mut new_deposit = None;
+    let mut last_err = None;
     for _ in 0..MAX_TOPUP_CALLS {
-        let (fut, slot) = join_or_spawn(additional.saturating_sub(landed));
-        // `fund_pool` has already graded the escrowed-but-untracked case into this
-        // error, tx and all, so there is nothing to re-diagnose.
-        let new_deposit = fut
-            .await
-            .map_err(|err| anyhow::anyhow!("reactive top-up failed: {err:#}"))?;
-        landed = new_deposit.saturating_sub(deposit_before);
-        if slot == TopUpSlot::Spawned || landed >= additional {
-            return Ok(new_deposit);
+        let (fut, claim) = join_or_spawn(additional.saturating_sub(added));
+        let landed = match (fut.await, claim) {
+            (Ok(landed), TopUpClaim::Spawned) => {
+                added = added.saturating_add(landed.added);
+                let out = TopUpLanded {
+                    new_deposit: landed.new_deposit,
+                    added,
+                };
+                if added < additional {
+                    warn_short_top_up(pool_id, additional, out, "our own topUp credited less");
+                }
+                return Ok(out);
+            }
+            (Ok(landed), TopUpClaim::Joined(claimed)) => {
+                added = added.saturating_add(claimed.min(landed.added));
+                TopUpLanded {
+                    new_deposit: landed.new_deposit,
+                    added,
+                }
+            }
+            (Err(err), claim) => {
+                last_err = Some(retryable_join_error(pool_id, additional, err, claim)?);
+                continue;
+            }
+        };
+        if added >= additional {
+            return Ok(landed);
         }
-        warn!(
-            requested = %additional,
-            %landed,
-            "reactive top-up: the joined topUp landed less than requested; funding the \
-             remainder"
-        );
+        warn_short_top_up(pool_id, additional, landed, "joined topUp covered less");
+        new_deposit = Some(landed.new_deposit);
     }
-    anyhow::bail!(
-        "reactive top-up: {MAX_TOPUP_CALLS} joined topUps landed {landed} of the requested \
-         {additional}; the pool is still short"
-    )
+    match (new_deposit, last_err) {
+        (Some(new_deposit), _) => {
+            let out = TopUpLanded { new_deposit, added };
+            warn_short_top_up(pool_id, additional, out, "funding calls ran out");
+            Ok(out)
+        }
+        (None, Some(err)) => Err(anyhow::anyhow!(
+            "reactive top-up failed: every joined topUp failed, last: {err:#}"
+        )),
+        (None, None) => Err(anyhow::anyhow!(
+            "reactive top-up made no funding call (MAX_TOPUP_CALLS is zero)"
+        )),
+    }
+}
+
+/// Warn that a reactive top-up on `pool_id` has less than `requested` so far.
+fn warn_short_top_up(pool_id: PoolId, requested: U256, landed: TopUpLanded, why: &str) {
+    warn!(
+        %pool_id,
+        %requested,
+        landed = %landed.added,
+        new_deposit = %landed.new_deposit,
+        why,
+        "reactive top-up is short of the requested amount"
+    );
+}
+
+/// Decide whether a failed `topUp` lets the reactive top-up try again. A joined
+/// `topUp` failure is another funder's, so the caller funds with its own `topUp`
+/// and gets the error back to report if every call fails.
+///
+/// # Errors
+///
+/// A spawned `topUp` failure is this caller's own and is final. So is an
+/// escrowed-but-untracked failure: a second `topUp` against a row that cannot be
+/// credited strands a second deposit. `fund_pool` has already graded that case
+/// into the error, tx and all, so there is nothing to re-diagnose.
+fn retryable_join_error(
+    pool_id: PoolId,
+    requested: U256,
+    err: Arc<anyhow::Error>,
+    claim: TopUpClaim,
+) -> Result<Arc<anyhow::Error>> {
+    if claim == TopUpClaim::Spawned || err.downcast_ref::<EscrowedUntracked>().is_some() {
+        return Err(anyhow::anyhow!("reactive top-up failed: {err:#}"));
+    }
+    warn!(
+        %pool_id,
+        %requested,
+        error = %format!("{err:#}"),
+        "reactive top-up: the joined topUp failed; funding with our own topUp"
+    );
+    Ok(err)
 }
 
 /// Un-`Arc` a shared open error into a fresh chain for one waiter, preserving the
@@ -266,7 +405,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
     handles: &FundingHandles<P>,
     pool_id: PoolId,
     additional: U256,
-) -> Result<U256> {
+) -> Result<TopUpLanded> {
     // Daemon posture: attempt the transfer directly against the standing
     // unlimited allowance granted at bootstrap. Only when `topUp` reverts with
     // an allowance shortfall (the approval was revoked or never granted) do a
@@ -316,7 +455,10 @@ async fn fund_pool<P: Provider + Clone + 'static>(
     ) {
         Ok(new_deposit) => {
             handles.metrics.buyer_topup_ok();
-            Ok(new_deposit)
+            Ok(TopUpLanded {
+                new_deposit,
+                added: credited,
+            })
         }
         Err(err) => {
             error!(
@@ -328,7 +470,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
                  credited; the deposit is ESCROWED AND UNTRACKED — reconcile against the chain"
             );
             handles.metrics.buyer_topup_failure();
-            Err(err)
+            Err(err.context(EscrowedUntracked))
         }
     }
 }
@@ -423,8 +565,10 @@ pub struct BuyerPoolService<P: Provider + Clone + 'static> {
     open_in_flight: Arc<Mutex<Option<SharedOpen>>>,
     /// The single in-flight funding `topUp`, if one is running (#1146/#1530). Both
     /// the proactive low-water refill and the reactive mid-pull top-up dedup here,
-    /// so the two legs racing on the one pool cannot double-escrow one shortfall.
-    topup_in_flight: Arc<Mutex<Option<SharedTopUp>>>,
+    /// so the two legs racing on the one pool cannot double-escrow one shortfall. The
+    /// slot also tracks how much of the running `topUp` no pull has claimed, so two
+    /// reactive top-ups cannot both count one escrow as their own.
+    topup_in_flight: Arc<Mutex<Option<InFlightTopUp>>>,
     metrics: Arc<Metrics>,
     _reclaimer: AbortOnDrop,
 }
@@ -605,8 +749,9 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
              deposit (#1146)"
         );
         // Detached: the handle is DROPPED, not awaited — the task self-reports, and
-        // a reactive top-up arriving while it runs JOINS the same future.
-        drop(self.join_or_spawn_topup(state.pool_id, additional).0);
+        // a reactive top-up arriving while it runs JOINS the same future and can
+        // claim its amount.
+        drop(self.join_or_spawn_topup(state.pool_id, additional, TopUpFunder::Refill));
     }
 
     /// Everything the detached funding task needs, lifted off `&self` so the task
@@ -626,9 +771,15 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// Join the in-flight funding `topUp`, or spawn one escrowing `additional`.
     /// Reservation and spawn are one indivisible step under the slot lock, so two
     /// callers cannot both decide to spawn; the task holds a [`SlotGuard`] that
-    /// frees the slot when it ends (any path). The returned [`TopUpSlot`] says
-    /// which: a joined `topUp` escrows its spawner's amount, not `additional`.
-    fn join_or_spawn_topup(&self, pool_id: PoolId, additional: U256) -> (SharedTopUp, TopUpSlot) {
+    /// frees the slot when it ends (any path). The returned [`TopUpClaim`] says
+    /// which, and how much of a joined `topUp` this caller claimed (see
+    /// [`InFlightTopUp::join`]).
+    fn join_or_spawn_topup(
+        &self,
+        pool_id: PoolId,
+        additional: U256,
+        funder: TopUpFunder,
+    ) -> (SharedTopUp, TopUpClaim) {
         // Recover the slot on poison rather than treat a prior holder's panic as
         // node-fatal (as [`SlotGuard`]'s own Drop does): the guarded value is a
         // single `Option<Shared…>` move that cannot tear, so the worst a panic
@@ -639,9 +790,9 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if let Some(existing) = slot.as_ref() {
+        if let Some(existing) = slot.as_mut() {
             debug!(%pool_id, "joining a pool topUp already in flight");
-            return (existing.clone(), TopUpSlot::Joined);
+            return existing.join(additional, funder);
         }
 
         let handles = self.funding_handles();
@@ -664,8 +815,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             })
         });
         let shared = fut.shared();
-        *slot = Some(shared.clone());
-        (shared, TopUpSlot::Spawned)
+        *slot = Some(InFlightTopUp::new(shared.clone(), additional, funder));
+        (shared, TopUpClaim::Spawned)
     }
 
     /// Join the in-flight `openPool`, or spawn one. The one pool the node owns is
@@ -787,8 +938,9 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         }
     }
 
-    /// Add `additional` to the node's pool deposit and return the pool's NEW total
-    /// deposit (#1530). The reactive counterpart of the proactive low-water refill:
+    /// Fund `additional` of new headroom in the node's pool and return the pool's NEW
+    /// total deposit with the amount this call added (#1530). The reactive
+    /// counterpart of the proactive low-water refill:
     /// the node-to-node pull loop calls this when an upstream's cap rejection is
     /// backed by its own ledger, or when its deposit can no longer cover the next
     /// voucher, then resumes on the larger deposit.
@@ -798,10 +950,12 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// recorded when a pull ends, so mid-pull it omits the spend of the pull that
     /// asks, and a shortfall computed from it tops up too little.
     ///
-    /// A `topUp` already in flight is JOINED, not duplicated. Its amount is its
-    /// spawner's, so when it lands less than `additional` this method funds the
-    /// remainder with a further `topUp` (see `top_up_at_least`). The returned
-    /// deposit is therefore at least the deposit read at entry plus `additional`.
+    /// A `topUp` already in flight is JOINED, not duplicated. This call counts only
+    /// the part of it that no other pull relies on: all of a refill's amount, none of
+    /// another reactive top-up's. When that part is less than `additional`, this
+    /// method funds the remainder with a further `topUp` (see `top_up_at_least`).
+    /// `added` is below `additional` only when the funding calls run out, or when the
+    /// chain credits less than a `topUp` asked for. The caller compares the two.
     ///
     /// Routes through the detached, join-or-spawn funding task (never an inline
     /// `.await`): `topUp` waits on an unbounded `get_receipt`, and this runs inside
@@ -811,28 +965,32 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     ///
     /// # Errors
     ///
-    /// Errors if no pool is tracked, if the allowance/`topUp` fails, if the
+    /// Errors if no pool is tracked, if our own allowance/`topUp` fails, if a
     /// `topUp` mined but the local row could not be credited (terminal — the
-    /// deposit is escrowed-and-untracked; a retry would escrow again), or if
-    /// repeated joins leave the deposit short of `additional`.
-    pub async fn top_up_pool(&self, additional: U256) -> Result<U256> {
+    /// deposit is escrowed-and-untracked; a retry would escrow again), or if every
+    /// funding call joined a `topUp` that failed.
+    pub async fn top_up_pool(&self, additional: U256) -> Result<TopUpLanded> {
         let state = self
             .reuse_or_report()?
             .with_context(|| "no buyer pool tracked to top up")?;
         if additional.is_zero() {
-            return Ok(state.deposit);
+            return Ok(TopUpLanded {
+                new_deposit: state.deposit,
+                added: U256::ZERO,
+            });
         }
-        let new_deposit = top_up_at_least(state.deposit, additional, |amount| {
-            self.join_or_spawn_topup(state.pool_id, amount)
+        let landed = top_up_at_least(state.pool_id, additional, |amount| {
+            self.join_or_spawn_topup(state.pool_id, amount, TopUpFunder::Reactive)
         })
         .await?;
         info!(
             pool_id = %state.pool_id,
             %additional,
-            %new_deposit,
-            "reactive top-up: pool exhausted mid-pull; requested amount added (#1530)"
+            added = %landed.added,
+            new_deposit = %landed.new_deposit,
+            "reactive top-up: pool exhausted mid-pull; funded (#1530)"
         );
-        Ok(new_deposit)
+        Ok(landed)
     }
 
     /// Run one reclaim-sweep pass synchronously: complete the grace-window
@@ -885,16 +1043,24 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
         amount: U256,
     ) -> Result<()>;
 
-    /// Add at least `additional` to the node's pool deposit, returning its NEW
-    /// total deposit. See [`BuyerPoolService::top_up_pool`]. Defaults to "funding not
-    /// supported" (`U256::ZERO`) so a read-only or test double need not override it.
+    /// Fund `additional` of new headroom in the node's pool, returning its NEW total
+    /// deposit and the amount this call added. See [`BuyerPoolService::top_up_pool`].
+    /// An implementation reports what really landed in [`TopUpLanded::added`], which
+    /// can be less than `additional`.
+    ///
+    /// Defaults to "funding not supported", so a read-only or test double need not
+    /// override it: nothing is added, and `new_deposit` is `U256::ZERO`. Callers
+    /// never lower their deposit view from a landing that added nothing.
     ///
     /// # Errors
     ///
     /// Implementations error when no pool is tracked, when the allowance or `topUp`
     /// fails, or when the tx lands but the local row can no longer be credited.
-    async fn top_up_pool(&self, _additional: U256) -> Result<U256> {
-        Ok(U256::ZERO)
+    async fn top_up_pool(&self, _additional: U256) -> Result<TopUpLanded> {
+        Ok(TopUpLanded {
+            new_deposit: U256::ZERO,
+            added: U256::ZERO,
+        })
     }
 }
 
@@ -918,7 +1084,7 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
         BuyerPoolService::record_progress(self, provider_addr, pool_id, bytes_delivered, amount)
     }
 
-    async fn top_up_pool(&self, additional: U256) -> Result<U256> {
+    async fn top_up_pool(&self, additional: U256) -> Result<TopUpLanded> {
         BuyerPoolService::top_up_pool(self, additional).await
     }
 }
@@ -1138,106 +1304,273 @@ mod tests {
         state
     }
 
+    /// One scripted step of a funding call: the claim the slot hands out, and the
+    /// outcome of the `topUp` behind it.
+    enum Step {
+        /// The `topUp` lands with this `(new_deposit, credited)`.
+        Lands(u64, u64),
+        /// The `topUp` fails with a plain error.
+        Fails(&'static str),
+        /// The `topUp` mined but its deposit is escrowed and untracked.
+        Untracked,
+    }
+
     /// A scripted `join_or_spawn` for [`top_up_at_least`]: each call pops the next
-    /// `(slot, outcome)` and records the amount it was asked for.
-    fn scripted<'a>(
-        script: Vec<(TopUpSlot, Result<u64, &'static str>)>,
-        asked: &'a std::cell::RefCell<Vec<U256>>,
-    ) -> impl FnMut(U256) -> (futures_util::future::Ready<TopUpOutcome>, TopUpSlot) + 'a {
+    /// `(claim, step)` and records the amount it was asked for.
+    fn scripted(
+        script: Vec<(TopUpClaim, Step)>,
+        asked: &std::cell::RefCell<Vec<U256>>,
+    ) -> impl FnMut(U256) -> (futures_util::future::Ready<TopUpOutcome>, TopUpClaim) + '_ {
         let mut script = script.into_iter();
         move |amount| {
             asked.borrow_mut().push(amount);
-            let (slot, outcome) = script.next().expect("script ran out of calls");
-            let outcome = outcome
-                .map(U256::from)
-                .map_err(|e| Arc::new(anyhow::anyhow!(e)));
-            (futures_util::future::ready(outcome), slot)
+            let (claim, step) = script.next().expect("script ran out of calls");
+            let outcome = match step {
+                Step::Lands(new_deposit, credited) => Ok(TopUpLanded {
+                    new_deposit: U256::from(new_deposit),
+                    added: U256::from(credited),
+                }),
+                Step::Fails(msg) => Err(Arc::new(anyhow::anyhow!(msg))),
+                Step::Untracked => Err(Arc::new(
+                    anyhow::anyhow!("row replaced").context(EscrowedUntracked),
+                )),
+            };
+            (futures_util::future::ready(outcome), claim)
         }
     }
+
+    fn u(v: u64) -> U256 {
+        U256::from(v)
+    }
+
+    fn joined(v: u64) -> TopUpClaim {
+        TopUpClaim::Joined(u(v))
+    }
+
+    fn landed(new_deposit: u64, added: u64) -> TopUpLanded {
+        TopUpLanded {
+            new_deposit: u(new_deposit),
+            added: u(added),
+        }
+    }
+
+    const POOL: PoolId = PoolId::ZERO;
 
     #[tokio::test]
     async fn top_up_at_least_spawned_call_is_final() {
         let asked = std::cell::RefCell::new(Vec::new());
-        let f = scripted(vec![(TopUpSlot::Spawned, Ok(1_100))], &asked);
+        let f = scripted(vec![(TopUpClaim::Spawned, Step::Lands(1_100, 100))], &asked);
 
-        let got = top_up_at_least(U256::from(1_000u64), U256::from(100u64), f)
-            .await
-            .unwrap();
+        let got = top_up_at_least(POOL, u(100), f).await.unwrap();
 
-        assert_eq!(got, U256::from(1_100u64));
-        assert_eq!(*asked.borrow(), vec![U256::from(100u64)]);
+        assert_eq!(got, landed(1_100, 100));
+        assert_eq!(*asked.borrow(), vec![u(100)]);
     }
 
+    /// A spawned `topUp` that credits less than requested is NOT retried: the
+    /// shortfall is not from a join, and a retry escrows a second `topUp`.
     #[tokio::test]
-    async fn top_up_at_least_full_join_needs_no_follow_up() {
+    async fn top_up_at_least_short_spawn_is_not_retried() {
         let asked = std::cell::RefCell::new(Vec::new());
-        let f = scripted(vec![(TopUpSlot::Joined, Ok(1_500))], &asked);
+        let f = scripted(vec![(TopUpClaim::Spawned, Step::Lands(1_040, 40))], &asked);
 
-        let got = top_up_at_least(U256::from(1_000u64), U256::from(100u64), f)
-            .await
-            .unwrap();
+        let got = top_up_at_least(POOL, u(100), f).await.unwrap();
 
-        assert_eq!(got, U256::from(1_500u64));
+        assert_eq!(got, landed(1_040, 40));
         assert_eq!(asked.borrow().len(), 1);
     }
 
-    /// The #2012 case: a join lands 40 of 100, so a follow-up asks for the other 60.
+    /// A join whose claim exactly covers the request needs no follow-up, however
+    /// much the joined `topUp` itself raised the deposit.
+    #[tokio::test]
+    async fn top_up_at_least_exact_join_needs_no_follow_up() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let f = scripted(vec![(joined(100), Step::Lands(1_500, 500))], &asked);
+
+        let got = top_up_at_least(POOL, u(100), f).await.unwrap();
+
+        assert_eq!(got, landed(1_500, 100));
+        assert_eq!(asked.borrow().len(), 1);
+    }
+
+    /// The #2012 case: a join claims 40 of 100, so a follow-up asks for the other 60.
     #[tokio::test]
     async fn top_up_at_least_short_join_funds_the_remainder() {
         let asked = std::cell::RefCell::new(Vec::new());
         let f = scripted(
             vec![
-                (TopUpSlot::Joined, Ok(1_040)),
-                (TopUpSlot::Spawned, Ok(1_100)),
+                (joined(40), Step::Lands(1_040, 40)),
+                (TopUpClaim::Spawned, Step::Lands(1_100, 60)),
             ],
             &asked,
         );
 
-        let got = top_up_at_least(U256::from(1_000u64), U256::from(100u64), f)
-            .await
-            .unwrap();
+        let got = top_up_at_least(POOL, u(100), f).await.unwrap();
 
-        assert_eq!(got, U256::from(1_100u64));
-        assert_eq!(*asked.borrow(), vec![U256::from(100u64), U256::from(60u64)]);
+        assert_eq!(got, landed(1_100, 100));
+        assert_eq!(*asked.borrow(), vec![u(100), u(60)]);
     }
 
+    /// Two concurrent reactive top-ups: the joiner claims none of the spawner's
+    /// escrow, so it funds its whole request itself instead of counting the
+    /// spawner's deposit growth as its own.
     #[tokio::test]
-    async fn top_up_at_least_follow_up_error_propagates() {
+    async fn top_up_at_least_zero_claim_funds_the_whole_request() {
         let asked = std::cell::RefCell::new(Vec::new());
         let f = scripted(
             vec![
-                (TopUpSlot::Joined, Ok(1_040)),
-                (TopUpSlot::Spawned, Err("chain rejected")),
+                (joined(0), Step::Lands(1_100, 100)),
+                (TopUpClaim::Spawned, Step::Lands(1_200, 100)),
             ],
             &asked,
         );
 
-        let err = top_up_at_least(U256::from(1_000u64), U256::from(100u64), f)
-            .await
-            .unwrap_err();
+        let got = top_up_at_least(POOL, u(100), f).await.unwrap();
+
+        assert_eq!(got, landed(1_200, 100));
+        assert_eq!(*asked.borrow(), vec![u(100), u(100)]);
+    }
+
+    /// A short join followed by a join that covers the rest stops on the cumulative
+    /// claim.
+    #[tokio::test]
+    async fn top_up_at_least_second_join_covers_the_rest() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let f = scripted(
+            vec![
+                (joined(30), Step::Lands(1_300, 300)),
+                (joined(70), Step::Lands(1_500, 200)),
+            ],
+            &asked,
+        );
+
+        let got = top_up_at_least(POOL, u(100), f).await.unwrap();
+
+        assert_eq!(got, landed(1_500, 100));
+        assert_eq!(*asked.borrow(), vec![u(100), u(70)]);
+    }
+
+    /// A failed joined `topUp` is another funder's failure: this caller funds the
+    /// same amount again with a `topUp` of its own.
+    #[tokio::test]
+    async fn top_up_at_least_failed_join_funds_with_its_own_topup() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let f = scripted(
+            vec![
+                (joined(100), Step::Fails("refill rpc error")),
+                (TopUpClaim::Spawned, Step::Lands(1_100, 100)),
+            ],
+            &asked,
+        );
+
+        let got = top_up_at_least(POOL, u(100), f).await.unwrap();
+
+        assert_eq!(got, landed(1_100, 100));
+        assert_eq!(*asked.borrow(), vec![u(100), u(100)]);
+    }
+
+    /// An escrowed-but-untracked joined `topUp` stops the top-up: a second `topUp`
+    /// against a row that cannot be credited strands a second deposit.
+    #[tokio::test]
+    async fn top_up_at_least_untracked_join_is_not_retried() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let f = scripted(vec![(joined(100), Step::Untracked)], &asked);
+
+        let err = top_up_at_least(POOL, u(100), f).await.unwrap_err();
+
+        assert!(format!("{err:#}").contains("escrowed"), "{err:#}");
+        assert_eq!(asked.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn top_up_at_least_spawned_error_propagates() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let f = scripted(
+            vec![
+                (joined(40), Step::Lands(1_040, 40)),
+                (TopUpClaim::Spawned, Step::Fails("chain rejected")),
+            ],
+            &asked,
+        );
+
+        let err = top_up_at_least(POOL, u(100), f).await.unwrap_err();
 
         assert!(format!("{err:#}").contains("chain rejected"), "{err:#}");
+        assert_eq!(asked.borrow().len(), 2);
     }
 
+    /// When the funding calls run out short, the top-up returns what landed rather
+    /// than an error, so the pull keeps the headroom that is really escrowed.
     #[tokio::test]
-    async fn top_up_at_least_gives_up_after_repeated_short_joins() {
+    async fn top_up_at_least_returns_what_landed_after_repeated_short_joins() {
         let asked = std::cell::RefCell::new(Vec::new());
         let f = scripted(
             vec![
-                (TopUpSlot::Joined, Ok(1_010)),
-                (TopUpSlot::Joined, Ok(1_020)),
-                (TopUpSlot::Joined, Ok(1_030)),
+                (joined(10), Step::Lands(1_010, 10)),
+                (joined(10), Step::Lands(1_020, 10)),
+                (joined(10), Step::Lands(1_030, 10)),
             ],
             &asked,
         );
 
-        let err = top_up_at_least(U256::from(1_000u64), U256::from(100u64), f)
-            .await
-            .unwrap_err();
+        let got = top_up_at_least(POOL, u(100), f).await.unwrap();
 
-        let msg = format!("{err:#}");
-        assert!(msg.contains("landed 30 of the requested 100"), "{msg}");
+        assert_eq!(got, landed(1_030, 30));
+        assert_eq!(*asked.borrow(), vec![u(100), u(90), u(80)]);
         assert_eq!(asked.borrow().len(), MAX_TOPUP_CALLS as usize);
+    }
+
+    #[tokio::test]
+    async fn top_up_at_least_errors_when_every_join_fails() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let f = scripted(
+            vec![
+                (joined(0), Step::Fails("rpc down")),
+                (joined(0), Step::Fails("rpc down")),
+                (joined(0), Step::Fails("rpc still down")),
+            ],
+            &asked,
+        );
+
+        let err = top_up_at_least(POOL, u(100), f).await.unwrap_err();
+
+        assert!(format!("{err:#}").contains("rpc still down"), "{err:#}");
+    }
+
+    fn in_flight(amount: u64, funder: TopUpFunder) -> InFlightTopUp {
+        let fut: BoxFuture<'static, TopUpOutcome> =
+            Box::pin(futures_util::future::ready(Ok(landed(0, amount))));
+        InFlightTopUp::new(fut.shared(), u(amount), funder)
+    }
+
+    /// A refill's amount is claimable once: reactive joiners split it, and a claim
+    /// never exceeds what is left.
+    #[test]
+    fn in_flight_refill_is_claimed_at_most_once() {
+        let mut slot = in_flight(100, TopUpFunder::Refill);
+
+        assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(60));
+        assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(40));
+        assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(0));
+    }
+
+    /// A reactive top-up's amount is its spawner's: a second reactive top-up that
+    /// joins it claims nothing (#2012).
+    #[test]
+    fn in_flight_reactive_topup_leaves_nothing_to_claim() {
+        let mut slot = in_flight(100, TopUpFunder::Reactive);
+
+        assert_eq!(slot.join(u(100), TopUpFunder::Reactive).1, joined(0));
+    }
+
+    /// A refill that joins claims nothing, so it cannot take headroom a reactive
+    /// top-up could claim later.
+    #[test]
+    fn in_flight_refill_joiner_claims_nothing() {
+        let mut slot = in_flight(100, TopUpFunder::Refill);
+
+        assert_eq!(slot.join(u(100), TopUpFunder::Refill).1, joined(0));
+        assert_eq!(slot.join(u(100), TopUpFunder::Reactive).1, joined(100));
     }
 
     #[test]

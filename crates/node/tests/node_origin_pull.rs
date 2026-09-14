@@ -35,7 +35,7 @@ use decdn_incentive::{
     ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash,
     min_payment, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
-use decdn_node::buyer_channel::{PoolOpenPending, PoolOpener};
+use decdn_node::buyer_channel::{PoolOpenPending, PoolOpener, TopUpLanded};
 use decdn_node::client_requester::PoolContext;
 use decdn_node::client_requester::probe::probe_once;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
@@ -11058,9 +11058,8 @@ fn read_deposit(cell: &SharedDeposit) -> Result<U256> {
 ///
 /// [`StubOpener`] with two differences that matter: its deposit is a live cell an
 /// upstream fixture reads (see [`SharedDeposit`]), and `top_up_pool` adds to that
-/// cell and logs the call. `funds` is what a test flips to model the two ways a
-/// real top-up can decline to add headroom — a reverted transaction, and a
-/// concurrent proactive refill already holding the provider's slot.
+/// cell and logs the call. `funds` is what a test flips to model a top-up that
+/// lands but adds no headroom.
 #[derive(Debug)]
 struct FundingOpener {
     pool_id: B256,
@@ -11130,7 +11129,7 @@ impl PoolOpener for FundingOpener {
         Ok(())
     }
 
-    async fn top_up_pool(&self, additional: U256) -> Result<U256> {
+    async fn top_up_pool(&self, additional: U256) -> Result<TopUpLanded> {
         self.topups
             .lock()
             .map_err(|_| anyhow::anyhow!("topups lock poisoned"))?
@@ -11140,7 +11139,8 @@ impl PoolOpener for FundingOpener {
             .lock()
             .map_err(|_| anyhow::anyhow!("deposit lock poisoned"))?;
         // Add exactly `additional`, as the real `BuyerPoolService::top_up_pool` does.
-        if self.funds && !additional.is_zero() {
+        let funded = self.funds && !additional.is_zero();
+        if funded {
             *deposit = deposit.saturating_add(additional);
             // The escrow the upstream can see rises with it — a real `topUp` raises one
             // number, and the buyer's belief and the seller's gate are both views of it.
@@ -11149,7 +11149,10 @@ impl PoolOpener for FundingOpener {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("ceiling lock poisoned"))? = *deposit;
         }
-        Ok(*deposit)
+        Ok(TopUpLanded {
+            new_deposit: *deposit,
+            added: if funded { additional } else { U256::ZERO },
+        })
     }
 }
 
@@ -11869,9 +11872,7 @@ async fn a_node_crying_poverty_while_our_ledger_has_headroom_is_not_funded() -> 
 
 /// A top-up that lands but adds no headroom ends the pull instead of looping.
 ///
-/// Two real conditions produce this — a reverted transaction, and a concurrent
-/// proactive refill already holding the provider's slot — and both must be terminal:
-/// retrying on an unchanged deposit exhausts at exactly the same offset, so the loop
+/// Retrying on an unchanged deposit exhausts at exactly the same offset, so the loop
 /// would spin against a wall while a client waits.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_topup_that_adds_no_headroom_ends_the_pull() -> Result<()> {

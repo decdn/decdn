@@ -10,10 +10,11 @@
 //! — the same contract the CLI's `CliFunder` honours by calling `topUp` with
 //! `additional` directly. A `topUp` leaves the pool's committed spend untouched,
 //! so adding `additional` to the deposit adds exactly `additional` to the
-//! spendable headroom too. [`PoolOpener::top_up_pool`] takes the same amount, so
-//! `NodeFunder` passes `additional` through. The driver sizes it from the pull's
-//! live ledger; the buyer service's persisted lane progress lags a running pull
-//! and cannot size it.
+//! spendable headroom too. [`PoolOpener::top_up_pool`] takes the same amount and
+//! reports how much of it landed, so `NodeFunder` passes `additional` through and
+//! grades the landing on that report. The driver sizes it from the pull's live
+//! ledger; the buyer service's persisted lane progress lags a running pull and
+//! cannot size it.
 //!
 //! The pool has no expiry, so a `topUp` strands nothing time-bound — the node
 //! funds its own pool freely, and there is no near-expiry refusal to derive.
@@ -25,9 +26,8 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use async_trait::async_trait;
 use decdn_client_pull::source::SourceFuture;
-use decdn_client_pull::{Funder, PoolContext};
+use decdn_client_pull::{Funder, LocalPullFault, PoolContext};
 use decdn_incentive::DepositOutcome;
-
 use tracing::warn;
 
 use crate::buyer_channel::PoolOpener;
@@ -105,23 +105,21 @@ const MAX_SETTLE_WAITS: u32 = 60;
 ///   origin already stores its buyer service behind that same object-safe seam.
 /// - `ctx`: the driver's live [`PoolContext`], shared (not copied) because its
 ///   `deposit` field grows across the fetch as earlier top-ups land. `top_up`
-///   reads it as the baseline that tells a headroom-adding landing from a no-op
-///   one (the proactive low-water refill can fire concurrently; see
-///   `top_up_pool`'s own join-or-spawn dedup for why that race is expected).
-///   Locked only to copy `deposit` out; the guard is never held across `.await`
-///   (`top_up_pool` is a network+chain round trip).
+///   reads it as a floor, so a landing never lowers the deposit the driver
+///   credits. Locked only to copy fields out; the guard is never held across
+///   `.await` (`top_up_pool` is a network+chain round trip).
 /// - `metrics`: the node's metrics handle. `top_up` records
-///   `node_pull_reactive_topup` on a landing that adds at least the requested
-///   amount and `node_pull_reactive_topup_refused` on a short landing or a
+///   `node_pull_reactive_topup` on a landing that adds the full requested amount
+///   and `node_pull_reactive_topup_refused` on a short landing or a
 ///   `top_up_pool` error — the one seam both the window-paced serve leg and the
 ///   gap-driven pull leg fund through, so metering here covers both.
 pub(crate) struct NodeFunder {
     opener: Arc<dyn PoolOpener>,
     ctx: Arc<Mutex<PoolContext>>,
     metrics: Arc<crate::metrics::Metrics>,
-    /// Set the first time a top-up ADDS headroom, so the caller can tell a pull
-    /// that never funded itself (an extortion refusal to meter) from one that
-    /// did. Shared with `pull_from_candidate`, which reads it after the drive
+    /// Set the first time a top-up escrows any headroom for this pull, so the
+    /// caller can tell a pull that never funded itself (an extortion refusal to
+    /// meter) from one that did. Shared with `pull_from_candidate`, which reads it after the drive
     /// thread joins.
     funded: Arc<AtomicBool>,
 }
@@ -156,39 +154,50 @@ impl Funder for NodeFunder {
 
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
         Box::pin(async move {
-            // The raw deposit before the call: the baseline that tells a landing that
-            // added the requested headroom from one that added less.
-            let current_deposit = {
+            // The deposit the driver holds before the call: a floor for the deposit it
+            // credits, so a landing that reports a lower total cannot shrink it.
+            let (pool_id, current_deposit) = {
                 let guard = self
                     .ctx
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.deposit
+                (guard.pool_id, guard.deposit)
             };
             match self.opener.top_up_pool(additional).await {
-                Ok(new_deposit) if new_deposit >= current_deposit.saturating_add(additional) => {
-                    self.metrics.node_pull_reactive_topup();
-                    // Record the headroom-adding success so a later terminal
-                    // `SpendingCapExhausted` on this pull is NOT metered as a refusal — a pull
-                    // that funded itself is not being extorted.
-                    self.funded.store(true, Ordering::Relaxed);
+                Ok(landed) => {
+                    let new_deposit = landed.new_deposit.max(current_deposit);
+                    if !landed.added.is_zero() {
+                        // This pull escrowed headroom, so a later terminal
+                        // `SpendingCapExhausted` is NOT metered as an extortion
+                        // refusal: a pull that funded itself is not being extorted,
+                        // and a short landing is already metered below.
+                        self.funded.store(true, Ordering::Relaxed);
+                    }
+                    if landed.added >= additional {
+                        self.metrics.node_pull_reactive_topup();
+                    } else {
+                        // The driver still credits the new deposit and spends a unit
+                        // of its top-up budget on any `Added`, so the short landing is
+                        // logged and metered here. `BuyerPoolService::top_up_pool`
+                        // funds the remainder of a short join itself, so this arm sees
+                        // only what is left when its funding calls run out.
+                        warn!(
+                            %pool_id,
+                            requested = %additional,
+                            landed = %landed.added,
+                            %new_deposit,
+                            "reactive top-up landed less than requested"
+                        );
+                        self.metrics.node_pull_reactive_topup_refused();
+                    }
                     Ok(DepositOutcome::Added(new_deposit))
                 }
-                Ok(new_deposit) => {
-                    // Landed less than requested. The driver still credits the new
-                    // deposit and spends a unit of its top-up budget on any `Added`,
-                    // so the short landing is logged and metered here.
-                    warn!(
-                        requested = %additional,
-                        landed = %new_deposit.saturating_sub(current_deposit),
-                        "reactive top-up landed less than requested"
-                    );
-                    self.metrics.node_pull_reactive_topup_refused();
-                    Ok(DepositOutcome::Added(new_deposit))
-                }
+                // A funding failure is ours (allowance, RPC, a row we cannot credit),
+                // never the upstream's. Typed `LocalPullFault` so the pull verdict does
+                // not score an honest provider `Unreachable` for it.
                 Err(err) => {
                     self.metrics.node_pull_reactive_topup_refused();
-                    Err(err)
+                    Err(err.context(LocalPullFault))
                 }
             }
         })
@@ -214,7 +223,7 @@ mod tests {
     use decdn_incentive::PoolId;
 
     use super::*;
-    use crate::buyer_channel::PoolOpener;
+    use crate::buyer_channel::{PoolOpener, TopUpLanded};
 
     /// A configurable [`PoolOpener`] double: `top_up_pool` records the
     /// `additional` it was called with (and how many times) and returns a
@@ -222,18 +231,26 @@ mod tests {
     /// the trait is required by its signature but unreachable from these tests.
     #[derive(Debug)]
     struct MockOpener {
-        top_up_result: Result<U256, String>,
+        top_up_result: Result<TopUpLanded, String>,
         top_up_calls: AtomicU32,
         last_additional: StdMutex<Option<U256>>,
     }
 
     impl MockOpener {
-        fn new(top_up_result: Result<U256, String>) -> Self {
+        fn new(top_up_result: Result<TopUpLanded, String>) -> Self {
             Self {
                 top_up_result,
                 top_up_calls: AtomicU32::new(0),
                 last_additional: StdMutex::new(None),
             }
+        }
+
+        /// An opener whose top-up lands with `new_deposit` and adds `added`.
+        fn landing(new_deposit: u64, added: u64) -> Self {
+            Self::new(Ok(TopUpLanded {
+                new_deposit: U256::from(new_deposit),
+                added: U256::from(added),
+            }))
         }
 
         fn call_count(&self) -> u32 {
@@ -268,7 +285,7 @@ mod tests {
             unreachable!("not exercised by NodeFunder tests")
         }
 
-        async fn top_up_pool(&self, additional: U256) -> Result<U256> {
+        async fn top_up_pool(&self, additional: U256) -> Result<TopUpLanded> {
             self.top_up_calls.fetch_add(1, Ordering::SeqCst);
             *self
                 .last_additional
@@ -305,7 +322,7 @@ mod tests {
     async fn top_up_asks_the_opener_for_exactly_additional() {
         let deposit = U256::from(1_000u64);
         let additional = U256::from(250u64);
-        let opener = Arc::new(MockOpener::new(Ok(U256::from(1_250u64))));
+        let opener = Arc::new(MockOpener::landing(1_250, 250));
         let metrics = Arc::new(crate::metrics::Metrics::new());
         let f = NodeFunder::new(opener.clone(), test_ctx(deposit), metrics, test_funded());
 
@@ -315,8 +332,10 @@ mod tests {
         assert_eq!(outcome, DepositOutcome::Added(U256::from(1_250u64)));
     }
 
+    /// A funding failure is the node's own fault, so it carries `LocalPullFault`
+    /// and the pull verdict does not score the upstream `Unreachable` for it.
     #[tokio::test]
-    async fn top_up_pool_error_propagates() {
+    async fn top_up_pool_error_propagates_as_a_local_fault() {
         let opener = Arc::new(MockOpener::new(Err("chain rejected".to_string())));
         let metrics = Arc::new(crate::metrics::Metrics::new());
         let f = NodeFunder::new(
@@ -328,13 +347,18 @@ mod tests {
 
         let err = f.top_up(U256::from(50u64)).await.unwrap_err();
 
-        assert!(err.to_string().contains("chain rejected"));
+        assert!(format!("{err:#}").contains("chain rejected"), "{err:#}");
+        assert!(err.downcast_ref::<LocalPullFault>().is_some());
+        assert_eq!(
+            super::super::pull_verdict(&err),
+            super::super::PullVerdict::OurLocalFault
+        );
         assert_eq!(opener.call_count(), 1);
     }
 
     #[test]
     fn max_topups_reports_the_reactive_budget() {
-        let opener = Arc::new(MockOpener::new(Ok(U256::ZERO)));
+        let opener = Arc::new(MockOpener::landing(0, 0));
         let metrics = Arc::new(crate::metrics::Metrics::new());
         let f = NodeFunder::new(opener, test_ctx(U256::ZERO), metrics, test_funded());
 
@@ -342,39 +366,42 @@ mod tests {
         assert_eq!(f.max_topups(), 1);
     }
 
-    /// A headroom-adding top-up bumps `node_pull_reactive_topup_total`; a
-    /// `top_up_pool` failure bumps `node_pull_reactive_topup_refused_total`
-    /// instead (and still propagates the error) — the seam both pull paths
-    /// now share for metering.
+    /// A top-up that adds the full request bumps `node_pull_reactive_topup_total`
+    /// and marks the pull funded; a `top_up_pool` failure bumps
+    /// `node_pull_reactive_topup_refused_total` instead (and still propagates the
+    /// error) — the seam both pull paths share for metering.
     #[tokio::test]
     async fn top_up_meters_success_and_refusal() {
         let metrics = Arc::new(crate::metrics::Metrics::new());
 
-        let ok_opener = Arc::new(MockOpener::new(Ok(U256::from(1_250u64))));
+        let funded = test_funded();
         let f = NodeFunder::new(
-            ok_opener,
+            Arc::new(MockOpener::landing(1_250, 250)),
             test_ctx(U256::from(1_000u64)),
             Arc::clone(&metrics),
-            test_funded(),
+            Arc::clone(&funded),
         );
         let _ = f
             .top_up(U256::from(250u64))
             .await
             .expect("top-up should succeed");
+        assert!(funded.load(Ordering::Relaxed));
         let text = metrics.encode().expect("metrics should encode");
         assert!(
             text.contains("decdn_node_pull_reactive_topup_total 1"),
-            "expected a headroom-adding top-up to bump the success counter: {text}"
+            "expected a full top-up to bump the success counter: {text}"
         );
 
         let err_opener = Arc::new(MockOpener::new(Err("chain rejected".to_string())));
+        let funded = test_funded();
         let f = NodeFunder::new(
             err_opener,
             test_ctx(U256::from(1_000u64)),
             Arc::clone(&metrics),
-            test_funded(),
+            Arc::clone(&funded),
         );
         let _ = f.top_up(U256::from(250u64)).await;
+        assert!(!funded.load(Ordering::Relaxed));
         let text = metrics.encode().expect("metrics should encode");
         assert!(
             text.contains("decdn_node_pull_reactive_topup_refused_total 1"),
@@ -382,45 +409,48 @@ mod tests {
         );
     }
 
-    /// `top_up_pool`'s no-op path returns the deposit UNCHANGED (a concurrent
-    /// proactive refill already grabbed the slot). The funder classifies against the
-    /// raw pre-call deposit, so an unchanged deposit is a refusal, not a success.
+    /// An opener that adds nothing is a refusal, not a success, and leaves the pull
+    /// unfunded. A zero `new_deposit` (the trait default) never lowers the deposit
+    /// the driver credits.
     #[tokio::test]
-    async fn top_up_no_headroom_landing_is_refused() {
+    async fn top_up_that_adds_nothing_is_refused() {
         let deposit = U256::from(1_000u64);
-        // The no-op path: `top_up_pool` returns the pre-call raw deposit unchanged.
-        let opener = Arc::new(MockOpener::new(Ok(deposit)));
+        let opener = Arc::new(MockOpener::landing(0, 0));
         let metrics = Arc::new(crate::metrics::Metrics::new());
+        let funded = test_funded();
         let f = NodeFunder::new(
             opener,
             test_ctx(deposit),
             Arc::clone(&metrics),
-            test_funded(),
+            Arc::clone(&funded),
         );
 
         let outcome = f
             .top_up(U256::from(250u64))
             .await
-            .expect("top-up should succeed (a no-op landing is not an error)");
+            .expect("a landing that adds nothing is not an error");
 
         assert_eq!(outcome, DepositOutcome::Added(deposit));
+        assert!(!funded.load(Ordering::Relaxed));
         let text = metrics.encode().expect("metrics should encode");
         assert!(
             text.contains("decdn_node_pull_reactive_topup_refused_total 1"),
-            "expected a no-headroom landing to bump the refused counter: {text}"
+            "expected an empty landing to bump the refused counter: {text}"
         );
         assert!(
             !text.contains("decdn_node_pull_reactive_topup_total 1"),
-            "expected a no-headroom landing NOT to bump the success counter: {text}"
+            "expected an empty landing NOT to bump the success counter: {text}"
         );
     }
 
-    /// A landing that adds headroom but less than `additional` is a refusal: it
-    /// warns, meters refused, and does not mark the pull as funded (#2012).
+    /// A landing that adds less than `additional` is metered as refused (#2012),
+    /// even when the pool's total deposit grew by more — another funder's escrow is
+    /// not this pull's headroom. It still marks the pull funded, because it escrowed
+    /// something, so the extortion metering does not count it a second time.
     #[tokio::test]
     async fn top_up_short_landing_is_refused() {
         let deposit = U256::from(1_000u64);
-        let opener = Arc::new(MockOpener::new(Ok(U256::from(1_100u64))));
+        let opener = Arc::new(MockOpener::landing(1_400, 100));
         let metrics = Arc::new(crate::metrics::Metrics::new());
         let funded = test_funded();
         let f = NodeFunder::new(
@@ -435,8 +465,8 @@ mod tests {
             .await
             .expect("a short landing still credits the deposit");
 
-        assert_eq!(outcome, DepositOutcome::Added(U256::from(1_100u64)));
-        assert!(!funded.load(Ordering::Relaxed));
+        assert_eq!(outcome, DepositOutcome::Added(U256::from(1_400u64)));
+        assert!(funded.load(Ordering::Relaxed));
         let text = metrics.encode().expect("metrics should encode");
         assert!(
             text.contains("decdn_node_pull_reactive_topup_refused_total 1"),
