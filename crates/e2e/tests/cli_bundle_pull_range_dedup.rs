@@ -901,6 +901,306 @@ async fn run_from_optimize_import() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// End-to-end proof of the incremental-sync loop: publish a bundle, pull it,
+/// mutate one file, re-publish, and re-pull into the SAME output directory.
+///
+/// `a.bin` never changes across the two publishes; `b.bin`'s tail changes (so
+/// its whole-file hash changes) while its leading chunk keeps the exact bytes
+/// (and hash) it had before. The second pull must: skip `a.bin` entirely (the
+/// `.decdn-manifest.json` skip-cache fast-skip from task 3), and for `b.bin`
+/// splice its shared leading chunk from the OLD on-disk copy still sitting at
+/// `out_dir/b.bin` (the on-disk chunk-donor seeding from task 5) rather than
+/// re-downloading and re-paying for it — paying only for the changed tail.
+///
+/// `b.bin`'s v2 bytes are seeded into the SAME node's filesystem origin
+/// (`seed_origin_blob_with_outboard`, ADR-038 range tier) after the mutation,
+/// mirroring a real operator re-importing updated content: the client-visible
+/// picture is a single node whose held content changed between the two pulls.
+#[tokio::test(flavor = "multi_thread")]
+async fn bundle_pull_reuses_unchanged_and_splices_changed() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_delta_update()))
+        .await
+        .context("bundle pull delta-update e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey mirroring the sibling dedup tests' shape"
+)]
+async fn run_delta_update() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    ensure_decdn_cli_built()?;
+    let chain = ChainFixture::launch().await?;
+
+    // `a.bin`: unchanged across both publishes, no chunk hints (plain entry).
+    let file_a = deterministic_bytes(300_000, 0x0DE7_7A0A);
+    let whole_a = Hash::new(&file_a);
+
+    // `b.bin` v1: a chunk-group-aligned shared prefix plus a distinct, ragged
+    // tail — the same shape the hand-built dedup journeys above use.
+    let shared = deterministic_bytes(SHARED_BYTES, 0x0DE7_5EED);
+    let tail_v1 = deterministic_bytes(TAIL_BYTES, 0x0DE7_00B1);
+    let mut file_b_v1 = shared.clone();
+    file_b_v1.extend_from_slice(&tail_v1);
+    let hash_shared = Hash::new(&shared);
+    let hash_tail_v1 = Hash::new(&tail_v1);
+    let whole_b_v1 = Hash::new(&file_b_v1);
+
+    // The node is seeded with `a.bin` and `b.bin` v1 as whole-file blobs — the
+    // `--optimize` import model; chunk hints are manifest-only, never
+    // separately stored.
+    let (node, hashes) =
+        NodeFixture::launch_with_blobs(&chain, "US", &[file_a.as_slice(), file_b_v1.as_slice()])
+            .await?;
+    anyhow::ensure!(
+        hashes == vec![whole_a, whole_b_v1],
+        "seeded blob hashes mismatch: {hashes:?}"
+    );
+    let provider_addr = node.operator_addr();
+
+    // Funded buyer with an on-disk keystore under a `0o700` client data dir.
+    let client_dir = tempfile::tempdir().context("client tempdir")?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        client_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .context("chmod client dir 0o700")?;
+    eth_identity::generate_and_persist(client_dir.path(), KEYSTORE_PASSWORD, false)
+        .context("generate buyer keystore")?;
+    let keystore = eth_identity::keystore_path(client_dir.path());
+    let buyer = eth_identity::load_signer(&keystore, KEYSTORE_PASSWORD).context("load buyer")?;
+    let buyer_addr = buyer.address();
+    chain.fund_eth(buyer_addr, 100).await?;
+    chain
+        .mint_usdc(
+            buyer_addr,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(6u64),
+        )
+        .await
+        .context("mint buyer USDC")?;
+
+    let out_dir = client_dir.path().join("out");
+
+    // --- First pull: v1 manifest, fresh out_dir -----------------------------
+    let manifest_v1_path = client_dir.path().join("bundle_v1.json");
+    let manifest_v1 = format!(
+        r#"{{"version":1,"entries":[{{"path":"a.bin","hash":"b3:{whole_a}","size":{size_a}}},{{"path":"b.bin","hash":"b3:{whole_b_v1}","size":{size_b_v1},"chunks":[{{"hash":"b3:{shared}","size":{shared_sz}}},{{"hash":"b3:{tail_v1}","size":{tail_sz}}}]}}]}}"#,
+        whole_a = whole_a.to_hex(),
+        whole_b_v1 = whole_b_v1.to_hex(),
+        shared = hash_shared.to_hex(),
+        tail_v1 = hash_tail_v1.to_hex(),
+        size_a = file_a.len(),
+        size_b_v1 = file_b_v1.len(),
+        shared_sz = SHARED_BYTES,
+        tail_sz = TAIL_BYTES,
+    );
+    std::fs::write(&manifest_v1_path, manifest_v1).context("write v1 manifest")?;
+    let mut args_v1 = bundle_pull_argv(
+        &chain,
+        &node,
+        &manifest_v1_path,
+        &out_dir,
+        client_dir.path(),
+        &keystore,
+        1,
+    );
+    args_v1.push("--json".into());
+
+    let before_v1 = billed_bytes(client_dir.path(), provider_addr)?;
+    anyhow::ensure!(
+        before_v1 == 0,
+        "lane must be unbilled before the first pull"
+    );
+    let report1 = run_bundle_pull_json_until_ready(client_dir.path(), &args_v1).await?;
+
+    // (1) Both files landed, byte-exact, and the skip-cache exists.
+    let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin (first pull)")?;
+    let got_b = std::fs::read(out_dir.join("b.bin")).context("read b.bin (first pull)")?;
+    anyhow::ensure!(got_a == file_a, "a.bin mismatch on first pull");
+    anyhow::ensure!(got_b == file_b_v1, "b.bin mismatch on first pull");
+    anyhow::ensure!(
+        report1["fetched"].as_u64() == Some(2),
+        "first pull must fetch both entries fresh: {report1}"
+    );
+    anyhow::ensure!(
+        report1["failed"].as_u64() == Some(0),
+        "first pull must have no failures: {report1}"
+    );
+    let saved_manifest_path = out_dir.join(".decdn-manifest.json");
+    anyhow::ensure!(
+        saved_manifest_path.is_file(),
+        "first pull must write {}",
+        saved_manifest_path.display()
+    );
+    let saved_manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&saved_manifest_path).context("read skip-cache")?)
+            .context("parse skip-cache json")?;
+    anyhow::ensure!(
+        saved_manifest["files"]["a.bin"].is_object()
+            && saved_manifest["files"]["b.bin"].is_object(),
+        "skip-cache must record both a.bin and b.bin: {saved_manifest}"
+    );
+
+    // --- Mutate b.bin: new tail, same leading chunk -------------------------
+    let tail_v2 = deterministic_bytes(TAIL_BYTES, 0x0DE7_00B2);
+    anyhow::ensure!(tail_v2 != tail_v1, "tail must actually change");
+    let mut file_b_v2 = shared.clone();
+    file_b_v2.extend_from_slice(&tail_v2);
+    let hash_tail_v2 = Hash::new(&tail_v2);
+    let whole_b_v2 = Hash::new(&file_b_v2);
+    anyhow::ensure!(
+        whole_b_v2 != whole_b_v1,
+        "mutating the tail must change the whole-file hash"
+    );
+
+    // Seed the node with `b.bin` v2's bytes via its filesystem origin, WITH the
+    // sibling `.obao4` outboard so the reactive pull-through can serve the
+    // ranged complement fetch below (a missing outboard falls back to a
+    // whole-blob fill and would never exercise the range tier, #1372).
+    node.seed_origin_blob_with_outboard(&file_b_v2)
+        .context("seed b.bin v2 into node origin")?;
+
+    // Re-publish: `a.bin` entry is byte-identical to the v1 manifest; `b.bin`
+    // carries the NEW whole-file hash/size but its leading chunk hash is
+    // UNCHANGED (same `shared` bytes), only the tail chunk hash differs.
+    let manifest_v2_path = client_dir.path().join("bundle_v2.json");
+    let manifest_v2 = format!(
+        r#"{{"version":1,"entries":[{{"path":"a.bin","hash":"b3:{whole_a}","size":{size_a}}},{{"path":"b.bin","hash":"b3:{whole_b_v2}","size":{size_b_v2},"chunks":[{{"hash":"b3:{shared}","size":{shared_sz}}},{{"hash":"b3:{tail_v2}","size":{tail_sz}}}]}}]}}"#,
+        whole_a = whole_a.to_hex(),
+        whole_b_v2 = whole_b_v2.to_hex(),
+        shared = hash_shared.to_hex(),
+        tail_v2 = hash_tail_v2.to_hex(),
+        size_a = file_a.len(),
+        size_b_v2 = file_b_v2.len(),
+        shared_sz = SHARED_BYTES,
+        tail_sz = TAIL_BYTES,
+    );
+    std::fs::write(&manifest_v2_path, manifest_v2).context("write v2 manifest")?;
+    let mut args_v2 = bundle_pull_argv(
+        &chain,
+        &node,
+        &manifest_v2_path,
+        &out_dir,
+        client_dir.path(),
+        &keystore,
+        1,
+    );
+    args_v2.push("--json".into());
+
+    // --- Second pull: v2 manifest, SAME out_dir -----------------------------
+    let before_v2 = billed_bytes(client_dir.path(), provider_addr)?;
+    let report2 = run_bundle_pull_json_until_ready(client_dir.path(), &args_v2).await?;
+    let paid_v2 = billed_bytes(client_dir.path(), provider_addr)?.saturating_sub(before_v2);
+
+    // (2) `a.bin` is skipped (the unchanged file); `b.bin` is (re-)fetched.
+    anyhow::ensure!(
+        report2["skipped"].as_u64().unwrap_or(0) >= 1,
+        "second pull must skip at least the unchanged a.bin: {report2}"
+    );
+    anyhow::ensure!(
+        report2["failed"].as_u64() == Some(0),
+        "second pull must have no failures: {report2}"
+    );
+
+    // (3) `b.bin`'s shared leading chunk was spliced from the OLD on-disk
+    // copy, never downloaded or paid for again.
+    let spliced_bytes = report2["spliced_bytes"].as_u64().unwrap_or(0);
+    anyhow::ensure!(
+        spliced_bytes > 0,
+        "second pull must splice b.bin's unchanged leading chunk from disk: {report2}"
+    );
+
+    // (4) Only the complement (b.bin's changed tail) was paid for — `a.bin`
+    // contributes nothing (skipped, never billed) and `b.bin` bills exactly
+    // its chunk-group-aligned complement past the shared run, not its whole
+    // v2 size.
+    let full_bundle_content_size = file_a
+        .len()
+        .checked_add(file_b_v2.len())
+        .and_then(|v| u64::try_from(v).ok())
+        .context("full bundle size overflow")?;
+    let downloaded = report2["downloaded"].as_u64().unwrap_or(u64::MAX);
+    anyhow::ensure!(
+        downloaded < full_bundle_content_size,
+        "second pull must download less than the full bundle content size ({full_bundle_content_size}): {report2}"
+    );
+    let wire_b_complement = range_wire_bytes(SHARED_BYTES, TAIL_BYTES, file_b_v2.len() as u64)?;
+    anyhow::ensure!(
+        paid_v2 == wire_b_complement,
+        "second pull must bill EXACTLY b.bin's complement ({wire_b_complement}) — a.bin is \
+         skipped (unbilled) and b.bin's shared leading chunk is spliced from disk, not \
+         re-downloaded: got {paid_v2}"
+    );
+
+    // (5) The changed file on disk now hashes to the NEW manifest hash.
+    let got_a2 = std::fs::read(out_dir.join("a.bin")).context("read a.bin (second pull)")?;
+    let got_b2 = std::fs::read(out_dir.join("b.bin")).context("read b.bin (second pull)")?;
+    anyhow::ensure!(
+        got_a2 == file_a,
+        "a.bin must be untouched by the second pull"
+    );
+    anyhow::ensure!(
+        got_b2 == file_b_v2,
+        "b.bin must be byte-exact to the NEW content after the second pull"
+    );
+    anyhow::ensure!(
+        Hash::new(&got_b2) == whole_b_v2,
+        "b.bin must hash to the NEW manifest hash after the second pull"
+    );
+
+    drop(node);
+    Ok(())
+}
+
+/// Like [`run_bundle_pull_until_ready`], but for a `--json`-flagged invocation:
+/// retries on the same transient serve-path race, and returns the parsed
+/// [`serde_json::Value`] of the single `PullReport` line on success.
+async fn run_bundle_pull_json_until_ready(
+    data_dir: &std::path::Path,
+    args: &[String],
+) -> anyhow::Result<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
+            .arg("bundle")
+            .arg("pull")
+            .args(args)
+            .output()
+            .await
+            .context("spawn decdn bundle pull --json")?;
+        if output.status.success() {
+            let line = output
+                .stdout
+                .trim_ascii_end()
+                .split(|&b| b == b'\n')
+                .next_back()
+                .context("empty --json output")?;
+            return serde_json::from_slice(line).context("parse PullReport json");
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::ensure!(
+            !stderr.contains("does not match its whole-file hash")
+                && !stderr.contains("No such file")
+                && !stderr.contains(".partial"),
+            "decdn bundle pull --json failed with a non-transient reconstruction fault; \
+             stderr:\n{stderr}"
+        );
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "decdn bundle pull --json never succeeded; last stderr:\n{stderr}"
+        );
+        tracing::debug!(
+            "bundle pull --json not ready; retrying after serve-path catch-up:\n{stderr}"
+        );
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+}
+
 /// The sharded data-object path `{store}/{hex[..2]}/{hex}` `origin import`
 /// writes for content addressed by `hex` — mirrors the private `object_paths`
 /// helper in `crates/cli/src/commands/origin.rs`, not visible from here.
