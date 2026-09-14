@@ -478,6 +478,140 @@ async fn run_self_heal() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// End-to-end proof that raising `--max-lane-streams` above 1 is safe: two
+/// multi-chunk entries pinned to ONE provider (so they share ONE
+/// `(pool, signer, provider)` lane) are pulled CONCURRENTLY, and both complete
+/// with exactly-correct billing.
+///
+/// Both entries draw on one shared voucher watermark. With concurrent streams
+/// their per-chunk `PayWord` reveals interleave on the lane's shared chain
+/// index, so a slower stream's reveal for its own delivered chunk routinely
+/// lands at or below the frontier a faster sibling already advanced. The node
+/// must credit that below-frontier reveal from lane headroom (the same
+/// fungible-credit rule the benign-voucher path uses) rather than crediting
+/// nothing and throttling the slow stream into a `ClientPaymentFault`. Before
+/// that node-side fix, `--max-lane-streams 2` could starve one stream; this
+/// journey exercises the fixed path end to end.
+///
+/// Asserts: (1) both files byte- and BLAKE3-exact, and (2) the shared lane bills
+/// EXACTLY both whole files' wire bytes — no double-pay, no under-pay — the same
+/// total a sequential pull of the two would bill.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_bundle_pull_concurrent_same_lane_streams_bill_correctly() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_concurrent_same_lane()))
+        .await
+        .context("cli bundle pull concurrent same-lane e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey mirroring the dedup test's shape"
+)]
+async fn run_concurrent_same_lane() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    ensure_decdn_cli_built()?;
+    let chain = ChainFixture::launch().await?;
+
+    // Two content-distinct multi-chunk files (no shared bytes, no chunk hints):
+    // each pulls its WHOLE file, and each spans several 1 MiB `PayWord` chunks so
+    // the concurrent streams genuinely interleave reveals on the shared chain.
+    let file_a = deterministic_bytes(4 * 1024 * 1024 + 4_321, 0x5EED_5A1A);
+    let file_b = deterministic_bytes(4 * 1024 * 1024 + 8_765, 0x5EED_5B2B);
+    let whole_a = Hash::new(&file_a);
+    let whole_b = Hash::new(&file_b);
+
+    let (node, hashes) =
+        NodeFixture::launch_with_blobs(&chain, "US", &[file_a.as_slice(), file_b.as_slice()])
+            .await?;
+    anyhow::ensure!(
+        hashes == vec![whole_a, whole_b],
+        "seeded blob hashes mismatch: {hashes:?}"
+    );
+    let provider_addr = node.operator_addr();
+
+    // Funded buyer with an on-disk keystore under a `0o700` client data dir.
+    let client_dir = tempfile::tempdir().context("client tempdir")?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        client_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .context("chmod client dir 0o700")?;
+    eth_identity::generate_and_persist(client_dir.path(), KEYSTORE_PASSWORD, false)
+        .context("generate buyer keystore")?;
+    let keystore = eth_identity::keystore_path(client_dir.path());
+    let buyer = eth_identity::load_signer(&keystore, KEYSTORE_PASSWORD).context("load buyer")?;
+    let buyer_addr = buyer.address();
+    chain.fund_eth(buyer_addr, 100).await?;
+    chain
+        .mint_usdc(
+            buyer_addr,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(6u64),
+        )
+        .await
+        .context("mint buyer USDC")?;
+
+    let out_dir = client_dir.path().join("out");
+    let manifest_path = client_dir.path().join("concurrent.json");
+    std::fs::write(
+        &manifest_path,
+        format!(
+            r#"{{"version":1,"entries":[{{"path":"a.bin","hash":"b3:{}"}},{{"path":"b.bin","hash":"b3:{}"}}]}}"#,
+            whole_a.to_hex(),
+            whole_b.to_hex(),
+        ),
+    )
+    .context("write concurrent manifest")?;
+
+    // `--jobs 2` runs both entries at once; `--max-lane-streams 2` lets both
+    // share the one lane concurrently instead of serializing on it.
+    let mut args = bundle_pull_argv(
+        &chain,
+        &node,
+        &manifest_path,
+        &out_dir,
+        client_dir.path(),
+        &keystore,
+        2,
+    );
+    args.push("--max-lane-streams".into());
+    args.push("2".into());
+
+    let before = billed_bytes(client_dir.path(), provider_addr)?;
+    anyhow::ensure!(before == 0, "lane must be unbilled before the pull");
+    run_bundle_pull_until_ready(client_dir.path(), &args).await?;
+    let paid = billed_bytes(client_dir.path(), provider_addr)?.saturating_sub(before);
+
+    // (1) Both files byte- and BLAKE3-exact.
+    let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin")?;
+    let got_b = std::fs::read(out_dir.join("b.bin")).context("read b.bin")?;
+    anyhow::ensure!(got_a == file_a, "a.bin mismatch: {} bytes", got_a.len());
+    anyhow::ensure!(got_b == file_b, "b.bin mismatch: {} bytes", got_b.len());
+    anyhow::ensure!(Hash::new(&got_a) == whole_a, "a.bin BLAKE3 mismatch");
+    anyhow::ensure!(Hash::new(&got_b) == whole_b, "b.bin BLAKE3 mismatch");
+
+    // (2) The shared lane bills EXACTLY both whole files' wire bytes — the same
+    // total a sequential pull bills, so concurrent same-lane delivery neither
+    // double-pays nor under-pays.
+    let wire_a = whole_blob_wire_bytes(file_a.len() as u64);
+    let wire_b = whole_blob_wire_bytes(file_b.len() as u64);
+    let expected = wire_a
+        .checked_add(wire_b)
+        .context("expected-paid overflow")?;
+    anyhow::ensure!(
+        paid == expected,
+        "concurrent same-lane pull must bill exactly a's whole file ({wire_a}) plus b's whole \
+         file ({wire_b}) = {expected}, got {paid}"
+    );
+
+    drop(node);
+    Ok(())
+}
+
 /// Live seam test: the two journeys above seed whole-file blobs directly and
 /// hand-build the manifest, so the `origin import --optimize` -> chunk-hint ->
 /// `bundle pull` seam is never exercised end-to-end. This journey runs the

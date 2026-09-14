@@ -74,11 +74,14 @@ pub struct BundlePullArgs {
     #[arg(long, value_name = "N", default_value_t = 4)]
     pub jobs: usize,
 
-    /// Maximum concurrent streams to one `(pool, signer, provider)` lane. 1 keeps
-    /// a single ordered voucher sequence per lane (the safe default); a higher
-    /// value allows N concurrent same-lane streams. Cross-lane parallelism is
+    /// Maximum concurrent streams to one `(pool, signer, provider)` lane.
+    /// Same-lane streams share one cumulative voucher watermark, and the serving
+    /// node credits each stream's delivered bytes from that shared lane fairly
+    /// (a slow stream is paid from the headroom a faster sibling opened), so
+    /// same-lane concurrency is safe and this only bounds how many streams touch
+    /// one provider at once. Cross-lane parallelism (distinct providers) is
     /// bounded by `--jobs` regardless.
-    #[arg(long, value_name = "N", default_value_t = 1)]
+    #[arg(long, value_name = "N", default_value_t = 4)]
     pub max_lane_streams: usize,
 
     /// Only pull entries whose POSIX relative path matches one of these globs

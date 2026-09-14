@@ -708,13 +708,16 @@ async fn obtain_manifest<P: Provider + Clone>(
 }
 
 /// Per-provider cap on concurrent streams to one `(pool, signer, provider)`
-/// lane. A lane has one shared [`LaneLedgers`] voucher watermark; two concurrent
-/// streams on the same lane race that watermark — a fast stream advances it and
-/// a slow co-stream's vouchers fall behind — so this bounds how many streams
-/// touch a given provider at once. `--max-lane-streams` sets the cap (default 1):
-/// at 1 a `Semaphore(1)` runs a single ordered voucher sequence per lane, and a
-/// higher value admits that many concurrent same-lane streams. Cross-lane
-/// parallelism (distinct providers) is never bounded here — only by `--jobs`.
+/// lane. A lane has one shared [`LaneLedgers`] voucher watermark; concurrent
+/// streams on the same lane draw on it together, and the serving node credits
+/// each stream's delivered bytes from that shared watermark fairly — a slower
+/// stream, whose reveal for its own chunk can land below a faster sibling's
+/// frontier, is paid from the lane headroom the sibling opened rather than
+/// stalled. So same-lane concurrency is safe; this only bounds how many streams
+/// touch a given provider at once. `--max-lane-streams` sets the cap (default 4):
+/// a `Semaphore(N)` admits N concurrent same-lane streams, and N == 1 runs a
+/// single ordered voucher sequence per lane. Cross-lane parallelism (distinct
+/// providers) is never bounded here — only by `--jobs`.
 struct LaneStreamCap {
     /// Per-provider semaphores, created on first use. The `tokio::sync::Mutex`
     /// guards the map so the cap is `Sync` and shareable across the entry futures.
