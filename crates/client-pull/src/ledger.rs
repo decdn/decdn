@@ -164,9 +164,11 @@ impl ChainEpoch {
     }
 
     /// The next index to release, or `None` once the epoch is spent and the
-    /// payer must roll to a fresh root.
+    /// payer must roll to a fresh root. The increment is lazy: `released` sits at
+    /// `MAX_CHAIN_LENGTH` (`u8::MAX`) once the ladder is spent, where an eager
+    /// `+ 1` overflows before the guard can refuse it.
     fn next_index(&self) -> Option<u8> {
-        (self.released < MAX_CHAIN_LENGTH).then_some(self.released + 1)
+        (self.released < MAX_CHAIN_LENGTH).then(|| self.released + 1)
     }
 }
 
@@ -1850,5 +1852,17 @@ mod tests {
         let next = next_voucher(&cur, 0, 99);
         assert_eq!(next.bytes, U256::from(7u64));
         assert_eq!(next.amount, U256::from(3u64));
+    }
+
+    /// A fully released epoch (255 reveals out) reports no next index rather
+    /// than computing `255 + 1` in a `u8`; the depth before it still yields the
+    /// last releasable index.
+    #[test]
+    fn spent_epoch_has_no_next_index_and_does_not_overflow() {
+        let mut epoch = ChainEpoch::open(U256::from(1u64));
+        epoch.released = MAX_CHAIN_LENGTH - 1;
+        assert_eq!(epoch.next_index(), Some(MAX_CHAIN_LENGTH));
+        epoch.released = MAX_CHAIN_LENGTH;
+        assert_eq!(epoch.next_index(), None);
     }
 }
