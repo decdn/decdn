@@ -28,6 +28,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 
 use alloy::dyn_abi::Eip712Domain;
@@ -358,6 +359,15 @@ enum EntryOutcome {
 /// a chunk served from an existing staging file on a resumed run, and counts a
 /// blob's whole size even when range-dedup paid for only its complement — so it
 /// equals `reconstructed` per single-path blob and does not report chunk savings.
+///
+/// `spliced_bytes` and `hints_ignored` report the range-dedup outcome so a run
+/// whose hints saved bytes is distinguishable from one whose hints did not:
+/// `spliced_bytes` is the total bytes served from a local donor splice (bytes NOT
+/// downloaded or paid for), and `hints_ignored` counts range-dedup hints dropped
+/// by a fault — a chunk set that failed to parse or whose sizes did not sum to the
+/// file size, a donor that failed its verification re-hash (or was unreadable), or
+/// a self-heal whole-file re-drive that discarded already-spliced donors. Both are
+/// reporting only and never affect payment.
 #[derive(Serialize)]
 struct PullReport {
     output: String,
@@ -367,6 +377,38 @@ struct PullReport {
     failed: u64,
     downloaded: u64,
     reconstructed: u64,
+    spliced_bytes: u64,
+    hints_ignored: u64,
+}
+
+/// The run's range-dedup outcome, read off [`PullCtx::dedup_stats`] once the pull
+/// finishes and folded into the [`PullReport`] and the human summary. See
+/// [`PullReport`] for the exact meaning of each field.
+#[derive(Clone, Copy, Default)]
+struct DedupSummary {
+    spliced_bytes: u64,
+    hints_ignored: u64,
+}
+
+/// One dedup entry's range-dedup outcome, returned by [`reassemble_dedup`] and
+/// accumulated into [`PullCtx::dedup_stats`] by [`PullCtx::pull_entry`].
+#[derive(Clone, Copy, Default, Debug)]
+struct DedupOutcome {
+    /// Bytes this entry served from a local donor splice — never downloaded.
+    spliced_bytes: u64,
+    /// Range-dedup hints this entry dropped by a fault (a donor that failed its
+    /// verification re-hash or was unreadable, or a self-heal re-drive that
+    /// discarded every already-spliced donor).
+    hints_ignored: u64,
+}
+
+/// Run-scoped range-dedup counters, shared by every concurrent entry via
+/// `&PullCtx`. Atomics because entries run concurrently under `buffer_unordered`;
+/// `Relaxed` is enough — the totals are read once, after the pull joins.
+#[derive(Default)]
+struct DedupStats {
+    spliced_bytes: AtomicU64,
+    hints_ignored: AtomicU64,
 }
 
 /// A pull's byte accounting: `downloaded` is the whole-file content bytes of each
@@ -583,6 +625,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         namespace_id,
         grant,
         ledgers: LaneLedgers::new(),
+        dedup_stats: DedupStats::default(),
         open_lock: tokio::sync::Mutex::new(()),
         jobs: args.jobs.max(1),
         gate: tokio::sync::Semaphore::new(args.jobs.max(1)),
@@ -610,7 +653,12 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         .await;
     ctx.progress.finish();
 
-    report(&outcomes, transfer, &args.output, args.json)
+    // Every entry has joined, so the shared dedup counters are now stable.
+    let dedup = DedupSummary {
+        spliced_bytes: ctx.dedup_stats.spliced_bytes.load(Ordering::Relaxed),
+        hints_ignored: ctx.dedup_stats.hints_ignored.load(Ordering::Relaxed),
+    };
+    report(&outcomes, transfer, dedup, &args.output, args.json)
 }
 
 /// The kept manifest for the run: the pre-read local one (already filtered up
@@ -682,6 +730,9 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// issuer, so concurrent same-lane fetches never race the cumulative
     /// watermark.
     ledgers: LaneLedgers,
+    /// Run-scoped range-dedup counters (bytes spliced from disk, hints dropped by
+    /// a fault), accumulated by every entry and reported once the pull finishes.
+    dedup_stats: DedupStats,
     /// Serializes every pool open-or-reuse across the whole bundle. The
     /// bundle's every entry shares ONE `PaymentPool` deposit (ADR 003), so
     /// distinct providers cannot open concurrently: its on-chain state (deposit,
@@ -1291,14 +1342,37 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         index: &ChunkIndex,
         progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<()> {
-        // Plan the dedup only when there is something to dedup against: hints, a
-        // known total, and a not-yet-finalized blob. A blob already promoted at
-        // `staging` (a resumed run) needs neither path — `fetch_to_staging` sees
-        // the complete ranged store and no-ops.
+        // An already-finalized `<hex>` staging blob — a prior run promoted it, or
+        // this run finalized it and crashed in the promote-to-materialize window —
+        // is the complete blob, BLAKE3-verified when it was promoted. Materialize
+        // straight from it: `fetch_group` copies `staging` to each destination, so
+        // re-hash it once as a cheap guard and return. It must NEVER be re-driven:
+        // the ranged store keys resume on the `.ranges` sidecar, which promotion
+        // deletes, so `open_or_create` on a sidecar-less `<hex>` would `create`
+        // (truncate) it and re-pay for the whole blob. On a mismatch (a corrupt
+        // leftover) drop it and fall through to a normal fetch.
+        if staging.try_exists().unwrap_or(false) {
+            let staging_buf = staging.to_path_buf();
+            let verified = tokio::task::spawn_blocking(move || {
+                hash_partial(&staging_buf).is_ok_and(|got| got == hash)
+            })
+            .await
+            .map_err(|e| anyhow!("staging verify task: {e}"))?;
+            if verified {
+                if let (Some(cb), Some(total)) = (progress, total) {
+                    cb(total, total);
+                }
+                index.register(hints, staging);
+                return Ok(());
+            }
+            remove_staging(staging);
+        }
+
+        // Plan the dedup only when there is something to dedup against: hints and a
+        // known total. The finalized-staging fast path above already returned, so
+        // `staging` does not exist here.
         let plan = match (hints, total) {
-            (Some(hints), Some(total))
-                if !hints.is_empty() && !staging.try_exists().unwrap_or(false) =>
-            {
+            (Some(hints), Some(total)) if !hints.is_empty() => {
                 let guard = index.map.lock().unwrap_or_else(PoisonError::into_inner);
                 let plan = plan_dedup(hints, &guard, total);
                 drop(guard);
@@ -1347,7 +1421,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             }
         };
 
-        reassemble_dedup(&driver, &plan, total, hints, index, &finish_progress).await
+        let outcome =
+            reassemble_dedup(&driver, &plan, total, hints, index, &finish_progress).await?;
+        self.dedup_stats
+            .spliced_bytes
+            .fetch_add(outcome.spliced_bytes, Ordering::Relaxed);
+        self.dedup_stats
+            .hints_ignored
+            .fetch_add(outcome.hints_ignored, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Fetch the blob shared by one hash-group and write it under `out_root` at
@@ -1380,7 +1462,21 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // chunk decomposition is identical; take the first entry's hints. `None`
         // (no `chunks`, an unparseable chunk hash, or chunk sizes that do not sum
         // to the whole-file size) drops back to a plain whole-file fetch.
-        let hints = group.entries.first().and_then(|e| hints_of(e));
+        let first = group.entries.first();
+        let hints = first.and_then(|e| hints_of(e));
+        // A first entry that carries `chunks` but yields no usable hints had its
+        // hint set dropped by a fault — an unparseable chunk hash, or chunk sizes
+        // that do not sum to the whole-file size. Report the dropped hints so the
+        // outcome is not silent; the whole-file `hash` still fetches the blob.
+        if let Some(e) = first
+            && hints.is_none()
+            && let Some(chunks) = e.chunks.as_ref()
+        {
+            self.dedup_stats.hints_ignored.fetch_add(
+                u64::try_from(chunks.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
         let total = group.entries.iter().find_map(|e| e.size);
         // An entry that registers chunks can serve as a donor, so its finalized
         // staging blob must outlive this group's cleanup — the run-end sweep in
@@ -1560,6 +1656,12 @@ impl<P: Provider + Clone> RangeDriver for CtxRangeDriver<'_, P> {
 /// `finish_progress` trues the file + total bars up to 100% on success: donor
 /// bytes are spliced from disk and never flow through `drive`'s progress callback,
 /// so a mostly-spliced entry would otherwise leave its bars short.
+///
+/// Returns the entry's [`DedupOutcome`] — bytes actually spliced from disk and
+/// hints dropped by a fault — for the run-level report. A resume that finalized on
+/// the first complement drive spliced nothing this run; a self-heal whole-blob
+/// re-drive discards every splice, so it reports zero spliced bytes and counts all
+/// its donors as ignored.
 async fn reassemble_dedup(
     driver: &dyn RangeDriver,
     plan: &DedupPlan,
@@ -1567,9 +1669,14 @@ async fn reassemble_dedup(
     hints: Option<&[Hint]>,
     index: &ChunkIndex,
     finish_progress: &dyn Fn(),
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DedupOutcome> {
     let hash = driver.hash();
     let staging = driver.staging();
+    let donor_total = plan
+        .donor
+        .iter()
+        .map(|d| d.aligned.1)
+        .fold(0u64, u64::saturating_add);
 
     // Pay only for the bytes no donor covers.
     driver.drive(&plan.complement).await?;
@@ -1578,11 +1685,12 @@ async fn reassemble_dedup(
     // first complement drive can COMPLETE the store — `drive` then ran its
     // whole-blob bao sweep against `hash` and renamed `<hex>.partial` -> `<hex>`.
     // The blob is finalized and verified; splicing would open a `.partial` that no
-    // longer exists. Register the donor chunks and return.
+    // longer exists. Register the donor chunks and return. No splice ran this run,
+    // so nothing is reported spliced.
     if staging.try_exists()? {
         finish_progress();
         index.register(hints, staging);
-        return Ok(());
+        return Ok(DedupOutcome::default());
     }
 
     let partial = partial_path(staging);
@@ -1596,6 +1704,11 @@ async fn reassemble_dedup(
         tokio::task::spawn_blocking(move || splice_donors(&partial_for_splice, &donors))
             .await
             .map_err(|e| anyhow!("donor splice task: {e}"))??;
+    // Bytes served from a verified donor splice are `donor_total` minus what had to
+    // be re-fetched; each re-fetched donor is a dropped hint.
+    let refetch_total = refetch.iter().map(|r| r.1).fold(0u64, u64::saturating_add);
+    let mut spliced_bytes = donor_total.saturating_sub(refetch_total);
+    let mut hints_ignored = u64::try_from(refetch.len()).unwrap_or(u64::MAX);
     if !refetch.is_empty() {
         driver.drive(&refetch).await?;
         // If every donor was untrusted, `refetch` is the whole donor set, so the
@@ -1606,7 +1719,10 @@ async fn reassemble_dedup(
         if staging.try_exists()? {
             finish_progress();
             index.register(hints, staging);
-            return Ok(());
+            return Ok(DedupOutcome {
+                spliced_bytes,
+                hints_ignored,
+            });
         }
     }
 
@@ -1619,7 +1735,10 @@ async fn reassemble_dedup(
         // A lying recipient hint placed a chunk at the wrong offset. Drop the
         // spliced ranges by re-driving the whole blob (the ranged store fetches
         // exactly the bytes the splice wrote, bao-verified against `hash`) and
-        // re-verify.
+        // re-verify. Every donor is discarded, so nothing was saved and all of them
+        // count as ignored.
+        spliced_bytes = 0;
+        hints_ignored = u64::try_from(plan.donor.len()).unwrap_or(u64::MAX);
         tracing::warn!(
             "bundle pull: entry {} failed its whole-file hash after range-dedup; \
              re-fetching the whole blob",
@@ -1633,7 +1752,10 @@ async fn reassemble_dedup(
         if staging.try_exists()? {
             finish_progress();
             index.register(hints, staging);
-            return Ok(());
+            return Ok(DedupOutcome {
+                spliced_bytes,
+                hints_ignored,
+            });
         }
         let partial_for_hash = partial.clone();
         let got = tokio::task::spawn_blocking(move || hash_partial(&partial_for_hash))
@@ -1658,7 +1780,10 @@ async fn reassemble_dedup(
     .map_err(|e| anyhow!("promote task: {e}"))??;
     finish_progress();
     index.register(hints, staging);
-    Ok(())
+    Ok(DedupOutcome {
+        spliced_bytes,
+        hints_ignored,
+    })
 }
 
 /// The run-end sweep of donor staging blobs: remove every registered donor
@@ -2317,6 +2442,7 @@ fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> 
 fn report(
     outcomes: &[EntryOutcome],
     transfer: Transfer,
+    dedup: DedupSummary,
     output: &Path,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -2347,6 +2473,8 @@ fn report(
         failed,
         downloaded: transfer.downloaded,
         reconstructed: transfer.reconstructed,
+        spliced_bytes: dedup.spliced_bytes,
+        hints_ignored: dedup.hints_ignored,
     };
     if json {
         let line = serde_json::to_string(&rep).map_err(|e| anyhow!("serialize report: {e}"))?;
@@ -2360,6 +2488,18 @@ fn report(
         // `downloaded X → reconstructed Y` only when dedup made them differ;
         // otherwise a single `downloaded X`.
         println!("{}", transfer_line(transfer));
+        // The range-dedup outcome, shown only when a hint mattered: a run that
+        // spliced bytes from disk, or one whose hints were dropped by a fault. A
+        // plain pull with no usable hints stays silent (both are zero), so a
+        // hint-carrying bundle whose hints all lie (spliced 0, some ignored) no
+        // longer prints the same summary as an unhinted one.
+        if dedup.spliced_bytes > 0 || dedup.hints_ignored > 0 {
+            println!(
+                "range-dedup: spliced {} from disk, {} hint(s) ignored",
+                human_bytes(dedup.spliced_bytes),
+                dedup.hints_ignored
+            );
+        }
     }
 
     if failed > 0 {
@@ -3088,14 +3228,30 @@ mod tests {
                 err: "boom".into(),
             },
         ];
-        let err = report(&outcomes, Transfer::default(), Path::new("/out"), true).unwrap_err();
+        let err = report(
+            &outcomes,
+            Transfer::default(),
+            DedupSummary::default(),
+            Path::new("/out"),
+            true,
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("1 entr"), "{err:#}");
     }
 
     #[test]
     fn report_ok_when_none_failed() {
         let outcomes = vec![EntryOutcome::Fetched(10), EntryOutcome::Skipped];
-        assert!(report(&outcomes, Transfer::default(), Path::new("/out"), false).is_ok());
+        assert!(
+            report(
+                &outcomes,
+                Transfer::default(),
+                DedupSummary::default(),
+                Path::new("/out"),
+                false
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3510,7 +3666,16 @@ mod tests {
             EntryOutcome::Linked,
             EntryOutcome::Skipped,
         ];
-        assert!(report(&outcomes, Transfer::default(), Path::new("/out"), false).is_ok());
+        assert!(
+            report(
+                &outcomes,
+                Transfer::default(),
+                DedupSummary::default(),
+                Path::new("/out"),
+                false
+            )
+            .is_ok()
+        );
     }
 
     /// `--namespace` on bundle pull is bundle-level: one id for the whole run. It

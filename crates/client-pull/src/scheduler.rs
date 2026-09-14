@@ -976,7 +976,10 @@ where
         }),
     };
     let credit: Box<dyn Fn(U256) -> anyhow::Result<()> + Send + Sync> = match ledgers {
-        Some(reg) => Box::new(move |new_deposit| reg.credit_all(new_deposit)),
+        Some(reg) => Box::new(move |new_deposit| {
+            reg.credit_all(new_deposit);
+            Ok(())
+        }),
         None => Box::new(move |new_deposit: U256| -> anyhow::Result<()> {
             for ctx in &lane_ctxs {
                 ctx.lock()

@@ -2019,7 +2019,10 @@ where
     let (spent, credit): (Option<SpentFn<'a>>, Option<CreditFn<'a>>) = match ledgers {
         Some(reg) => (
             Some(Box::new(move || reg.total_committed())),
-            Some(Box::new(move |new_deposit| reg.credit_all(new_deposit))),
+            Some(Box::new(move |new_deposit| {
+                reg.credit_all(new_deposit);
+                Ok(())
+            })),
         ),
         None => (None, None),
     };

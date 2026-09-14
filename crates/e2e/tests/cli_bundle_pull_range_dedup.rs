@@ -404,6 +404,11 @@ async fn run_self_heal() -> anyhow::Result<()> {
     );
     run_bundle_pull_until_ready(client_dir.path(), &warm_args).await?;
 
+    // Snapshot the lane watermark AFTER the warm-up so the assertion below measures
+    // only the measured run's spend — the warm-up's own self-heal spend (and any
+    // serve-race retry it absorbed) is folded into `before` and excluded.
+    let before = billed_bytes(client_dir.path(), provider_addr)?;
+
     // The measured run: a fresh output dir (so `a.bin` is re-pulled and
     // re-registers `hash_donor`, arming `b.bin`'s self-heal) and EXACTLY ONE
     // `bundle pull` invocation. The pool is already open, so the only way this
@@ -443,15 +448,31 @@ async fn run_self_heal() -> anyhow::Result<()> {
     anyhow::ensure!(Hash::new(&got_a) == whole_a, "a.bin BLAKE3 mismatch");
     anyhow::ensure!(Hash::new(&got_b) == whole_b, "b.bin BLAKE3 mismatch");
 
-    // Sanity: `b.bin` was actually re-driven whole by the self-heal, so the lane
-    // billed at least A's whole file plus B's whole file across the run.
-    let paid = billed_bytes(client_dir.path(), provider_addr)?;
-    let wire_min = whole_blob_wire_bytes(file_a.len() as u64)
-        .checked_add(whole_blob_wire_bytes(file_b.len() as u64))
-        .context("wire-min overflow")?;
+    // Money assertion — EXACT delta, no `>=` slack (the whole point of Finding
+    // Critical-4: a cumulative `>=` was already satisfied by the warm-up, so it
+    // could not tell the self-heal path from any other outcome). The measured run
+    // re-fetches every byte of the recipient: `a.bin` is re-driven WHOLE (fresh out
+    // dir, first entry, no donor yet), then `b.bin` drives its complement (the tail
+    // past the shared run), splices the lying donor at its head, fails the
+    // whole-file BLAKE3, and re-drives the head range `[0, SHARED)`. So `b` costs
+    // its complement wire PLUS its head wire — two separately-metered ranges, not a
+    // single whole-file fetch and not a dedup discount. If `plan_dedup` stopped
+    // producing the donor, `b` would be fetched plain (one whole-file range) and
+    // this exact figure would not match; the delta is the falsifiable witness that
+    // the self-heal (drive complement -> splice -> mismatch -> re-drive head) ran.
+    let total_a = file_a.len() as u64;
+    let total_b = file_b.len() as u64;
+    let complement_wire = range_wire_bytes(SHARED_BYTES, TAIL_BYTES, total_b)?;
+    let head_wire = range_wire_bytes(0, SHARED_BYTES, total_b)?;
+    let expected_delta = whole_blob_wire_bytes(total_a)
+        .checked_add(complement_wire)
+        .and_then(|v| v.checked_add(head_wire))
+        .context("self-heal expected-delta overflow")?;
+    let paid = billed_bytes(client_dir.path(), provider_addr)?.saturating_sub(before);
     anyhow::ensure!(
-        paid >= wire_min,
-        "self-heal must pay for both whole files (at least {wire_min}), billed {paid}"
+        paid == expected_delta,
+        "self-heal must pay exactly a's whole file plus b's complement plus b's \
+         re-driven head = {expected_delta}, got {paid}"
     );
 
     drop(node);
@@ -883,15 +904,24 @@ async fn run_bundle_pull_until_ready(
         if output.status.success() {
             return Ok(());
         }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // A reconstruction/self-heal fault is never transient — retrying would
+        // absorb a real bug (and silently re-pay for it), the exact hazard
+        // Finding Critical-4 flags. Only the serve-path pool-resolution race is
+        // retryable; any `failed:` line naming a whole-file-hash mismatch or a
+        // missing `.partial` fails the test immediately.
+        anyhow::ensure!(
+            !stderr.contains("does not match its whole-file hash")
+                && !stderr.contains("No such file")
+                && !stderr.contains(".partial"),
+            "decdn bundle pull failed with a non-transient reconstruction fault; \
+             stderr:\n{stderr}"
+        );
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "decdn bundle pull never succeeded; last stderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
+            "decdn bundle pull never succeeded; last stderr:\n{stderr}"
         );
-        tracing::debug!(
-            "bundle pull not ready; retrying after serve-path catch-up:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        tracing::debug!("bundle pull not ready; retrying after serve-path catch-up:\n{stderr}");
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
 }

@@ -66,19 +66,27 @@ impl LaneLedgers {
 
     /// Write `new_deposit` onto every registered lane's pool context so no lane
     /// gates on a stale deposit after a reactive top-up lands.
-    pub fn credit_all(&self, new_deposit: U256) -> anyhow::Result<()> {
-        let map = self
-            .map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for handle in map.values() {
-            handle
-                .ctx
+    ///
+    /// The lane contexts are cloned out under the map lock, which is then
+    /// released BEFORE any `ctx` lock is taken: the driver holds a lane `ctx`
+    /// guard while it calls [`Self::total_committed`], which locks the map, so
+    /// locking a `ctx` while still holding the map lock would invert that order
+    /// and could deadlock. A poisoned `ctx` is recovered with
+    /// [`std::sync::PoisonError::into_inner`], the same as the other methods —
+    /// a stale deposit never fails a top-up.
+    pub fn credit_all(&self, new_deposit: U256) {
+        let ctxs: Vec<Arc<Mutex<PoolContext>>> = {
+            let map = self
+                .map
                 .lock()
-                .map_err(|_| anyhow::anyhow!("lane context lock poisoned"))?
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.values().map(|h| Arc::clone(&h.ctx)).collect()
+        };
+        for ctx in ctxs {
+            ctx.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .deposit = new_deposit;
         }
-        Ok(())
     }
 }
 
@@ -167,15 +175,40 @@ mod tests {
     #[test]
     fn credit_all_writes_deposit_on_every_lane() {
         let reg = LaneLedgers::new();
-        let handle = reg.get_or_insert(lane(1), || LaneHandle::for_test(Cumulative::default()));
-        reg.credit_all(U256::from(42u64)).expect("credit_all");
-        assert_eq!(
-            handle
-                .ctx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .deposit,
-            U256::from(42u64)
-        );
+        let h1 = reg.get_or_insert(lane(1), || LaneHandle::for_test(Cumulative::default()));
+        let h2 = reg.get_or_insert(lane(2), || LaneHandle::for_test(Cumulative::default()));
+        reg.credit_all(U256::from(42u64));
+        for h in [&h1, &h2] {
+            assert_eq!(
+                h.ctx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .deposit,
+                U256::from(42u64),
+                "credit_all must write every registered lane's deposit"
+            );
+        }
+    }
+
+    // The lock-order invariant `credit_all` relies on: `total_committed` locks the
+    // map but never a `ctx`, so it completes even while a caller holds a lane `ctx`
+    // guard — the opposite order `credit_all` avoids by releasing the map lock
+    // before touching any `ctx`. If `total_committed` ever locked a `ctx` under the
+    // map lock this would deadlock against the held guard.
+    #[test]
+    fn total_committed_does_not_lock_a_ctx_held_elsewhere() {
+        let reg = LaneLedgers::new();
+        let handle = reg.get_or_insert(lane(1), || {
+            LaneHandle::for_test(Cumulative {
+                bytes: U256::ZERO,
+                amount: U256::from(9u64),
+            })
+        });
+        // Hold the lane's ctx guard for the duration of the read.
+        let _guard = handle
+            .ctx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(reg.total_committed(), U256::from(9u64));
     }
 }
