@@ -28,8 +28,8 @@
 //!
 //! The total bar is shown only when the manifest declares sizes. A blob with no
 //! declared size contributes nothing to the denominator and moves the total not at
-//! all; if nothing kept declares a size the total bar is omitted and only per-file
-//! bars render.
+//! all. If no kept entry (one that survives the include/exclude filters) declares
+//! a size, the total bar is omitted and only per-file bars render.
 //!
 //! The whole renderer is silent — every bar a no-op, every file's delivery
 //! callback `None` — when stderr is not a terminal or the run is `--json`, so
