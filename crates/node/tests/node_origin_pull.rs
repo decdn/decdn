@@ -6614,8 +6614,22 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
 struct LeafOutcome {
     received: u64,
     acks: u64,
+    /// WIRE bytes the leaf's last voucher paid for.
+    paid_wire: u64,
     completed: bool,
     hash_ok: bool,
+}
+
+/// How a `leaf_paced_pull_mode` leaf pays.
+#[derive(Debug, Clone, Copy)]
+enum LeafMode {
+    /// Pay every interval until `StreamEnd`.
+    PayAll,
+    /// Close the connection right after paying the n-th voucher.
+    DropAfter(u64),
+    /// Pay `acks` vouchers, then stay connected and keep reading without paying
+    /// for `hold`, then close the connection.
+    StopPayingAfter { acks: u64, hold: Duration },
 }
 
 async fn read_client(recv: &mut iroh::endpoint::RecvStream) -> Result<ClientMessage> {
@@ -6683,7 +6697,7 @@ fn decode_bao_whole(hash: Hash, total: u64, wire: &[u8]) -> Option<Vec<u8>> {
 /// abandon shape. The wire carries the bao verified-stream (content + proof,
 /// ADR 038), so it paces on the bao-encoded WIRE size and decodes the buffer
 /// back to plaintext to verify the content hash.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn leaf_paced_pull(
     leaf_ep: &iroh::Endpoint,
     target: EndpointAddr,
@@ -6694,6 +6708,37 @@ async fn leaf_paced_pull(
     hash: Hash,
     rate: u64,
     drop_after_acks: Option<u64>,
+) -> Result<LeafOutcome> {
+    let mode = drop_after_acks.map_or(LeafMode::PayAll, LeafMode::DropAfter);
+    leaf_paced_pull_mode(
+        leaf_ep,
+        target,
+        leaf_node_id,
+        leaf_eth,
+        provider,
+        pool_id,
+        hash,
+        rate,
+        mode,
+    )
+    .await
+}
+
+/// [`leaf_paced_pull`] with an explicit [`LeafMode`]. In
+/// [`LeafMode::StopPayingAfter`] the leaf keeps reading after its last voucher
+/// until `hold` elapses or B ends the stream, then closes and reports the WIRE
+/// bytes it received.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn leaf_paced_pull_mode(
+    leaf_ep: &iroh::Endpoint,
+    target: EndpointAddr,
+    leaf_node_id: B256,
+    leaf_eth: &Arc<PrivateKeySigner>,
+    provider: Address,
+    pool_id: B256,
+    hash: Hash,
+    rate: u64,
+    mode: LeafMode,
 ) -> Result<LeafOutcome> {
     use alloy::signers::SignerSync;
 
@@ -6744,8 +6789,28 @@ async fn leaf_paced_pull(
     let mut cumulative: u64 = 0;
     let mut unvouchered: u64 = 0;
     let mut acks: u64 = 0;
+    let mut paid_wire: u64 = 0;
+    // Set once a `StopPayingAfter` leaf has paid its last voucher.
+    let mut hold_until: Option<tokio::time::Instant> = None;
     loop {
-        match read_client(&mut recv).await? {
+        let msg = match hold_until {
+            None => read_client(&mut recv).await?,
+            Some(deadline) => match tokio::time::timeout_at(deadline, read_client(&mut recv)).await
+            {
+                Ok(Ok(ClientMessage::StreamError(_)) | Err(_)) | Err(_) => {
+                    conn.close(0u32.into(), b"leaf-hold");
+                    return Ok(LeafOutcome {
+                        received: cumulative,
+                        acks,
+                        paid_wire,
+                        completed: false,
+                        hash_ok: false,
+                    });
+                }
+                Ok(Ok(msg)) => msg,
+            },
+        };
+        match msg {
             ClientMessage::ChunkData(chunk) => {
                 buf.extend_from_slice(chunk.bytes());
                 let len = chunk.bytes().len() as u64;
@@ -6753,7 +6818,7 @@ async fn leaf_paced_pull(
                 unvouchered = unvouchered.saturating_add(len);
                 let boundary = unvouchered >= interval_bytes && interval_bytes > 0;
                 let closing = cumulative >= expected_wire && unvouchered > 0;
-                if boundary || closing {
+                if (boundary || closing) && hold_until.is_none() {
                     acks += 1;
                     let amount = U256::from(cumulative)
                         .saturating_mul(U256::from(rate))
@@ -6777,14 +6842,22 @@ async fn leaf_paced_pull(
                     // Acceptance is implicit (ADR 005): no ack is read; a rejection
                     // would arrive as a mid-stream `StreamError`.
                     unvouchered = 0;
-                    if drop_after_acks == Some(acks) {
-                        conn.close(0u32.into(), b"leaf-drop");
-                        return Ok(LeafOutcome {
-                            received: cumulative,
-                            acks,
-                            completed: false,
-                            hash_ok: false,
-                        });
+                    paid_wire = cumulative;
+                    match mode {
+                        LeafMode::DropAfter(n) if n == acks => {
+                            conn.close(0u32.into(), b"leaf-drop");
+                            return Ok(LeafOutcome {
+                                received: cumulative,
+                                acks,
+                                paid_wire,
+                                completed: false,
+                                hash_ok: false,
+                            });
+                        }
+                        LeafMode::StopPayingAfter { acks: n, hold } if n == acks => {
+                            hold_until = Some(tokio::time::Instant::now() + hold);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -6802,6 +6875,7 @@ async fn leaf_paced_pull(
     Ok(LeafOutcome {
         received: decoded.as_ref().map_or(cumulative, |p| p.len() as u64),
         acks,
+        paid_wire,
         completed: true,
         hash_ok: decoded.is_some_and(|p| Hash::new(&p) == hash),
     })
@@ -8203,6 +8277,131 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
     // holds as bounded UNRECOUPED lead (above), not as total-pulled, so a leaf that
     // paid one interval of a 1.5-window blob may still leave B holding the finished
     // fill. No promotion assertion either way — this test polices spend, not caching.
+
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_spend() -> Result<()>
+{
+    // A leaf pays three vouchers, so both of B's windows ramp past their floors,
+    // then stays connected and keeps reading without paying. B's unrecouped
+    // upstream lead must stay within the ramped credit window plus one
+    // serve-demand pull-window floor (ADR 037), however large the blob is.
+    let payload_len = 8 * CHUNK_BYTES;
+    let payload = vec![0x5Au8; usize::try_from(payload_len)?];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA9);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x9A);
+    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep, b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    // Three paid intervals put `paid / 2` above `PULL_WINDOW_FLOOR`, so the pull
+    // window has ramped. The hold is shorter than B's voucher-read timeout, so
+    // the leaf is still connected while B's windows are closed.
+    let outcome = tokio::time::timeout(
+        Duration::from_mins(1),
+        leaf_paced_pull_mode(
+            &leaf_ep,
+            b_target,
+            leaf_node_id,
+            &leaf_eth,
+            b_operator,
+            leaf_channel_id,
+            hash,
+            RATE,
+            LeafMode::StopPayingAfter {
+                acks: 3,
+                hold: Duration::from_secs(2),
+            },
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("leaf pull did not finish within a minute"))??;
+    anyhow::ensure!(
+        !outcome.completed,
+        "leaf stopped paying, so B must not deliver the whole blob"
+    );
+    anyhow::ensure!(
+        outcome.acks == 3,
+        "leaf should have paid exactly three vouchers, got {}",
+        outcome.acks
+    );
+
+    // B records its upstream watermark when the pull leg ends, which the leaf's
+    // close triggers.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let upstream_wire = loop {
+        if let Some(&(_, bytes, _)) = progress_log(&recorded)?.last() {
+            break u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "B never recorded an upstream watermark: the pull leg did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    // Content never exceeds its wire, and the ramp only widens with payment, so
+    // taking the paid wire as the paid content over-states the window.
+    let paid = outcome.paid_wire;
+    let pull_floor = decdn_client_pull::PULL_WINDOW_FLOOR;
+    let ramped = decdn_incentive::ramped_credit_window(
+        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+        pull_floor,
+        decdn_common::config::DEFAULT_CREDIT_MAX,
+        paid,
+    );
+    anyhow::ensure!(
+        ramped > pull_floor,
+        "the pull window must have ramped past its floor ({ramped} <= {pull_floor}), \
+         or this test does not cover the ramp"
+    );
+    // ADR 037 bounds the unrecouped frontier as bytes pulled minus bytes paid.
+    // Measuring against the paid wire, not the larger wire the leaf received
+    // inside B's serve credit window, keeps the bound tight.
+    let bound_wire = support::bao_wire_len(payload_len, 0, ramped + pull_floor);
+    let lead = upstream_wire.saturating_sub(paid);
+    anyhow::ensure!(
+        lead <= bound_wire,
+        "B's unrecouped upstream lead ({upstream_wire} upstream - {paid} paid = {lead}) must \
+         stay within the ramped window ({ramped}) plus one pull-window floor ({pull_floor}) = \
+         {bound_wire} wire bytes; leaf received {}",
+        outcome.received
+    );
+    let whole_wire = support::bao_wire_len_whole(payload_len);
+    anyhow::ensure!(
+        upstream_wire < whole_wire,
+        "a leaf that stopped paying must not make B pull the whole blob \
+         ({upstream_wire} >= {whole_wire})"
+    );
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "B must not cache a blob it never finished pulling"
+    );
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
