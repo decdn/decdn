@@ -23,7 +23,8 @@
 //!   through [`content_paid_frontier`]); the pull leg's `WindowPacer` reads it to
 //!   bound `pulled − served_paid ≤ window`, plus one floor to serve `serve_demand`.
 //! - **`serve_demand`** — the content end of the span this leg's encoder waits
-//!   on, for a leaf or a proof node the store does not hold yet. The serve window
+//!   on, for a leaf or a proof node the store does not hold yet, published only
+//!   when this leg's frame producer has no encoded bytes left. The serve window
 //!   meters wire and the pull window meters content, so the pull window can close
 //!   while this leg still has credit room and waits on bytes. This leg waits on
 //!   the first byte the pull has not fetched, so `serve_demand` lands within one

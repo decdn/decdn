@@ -297,10 +297,12 @@ pub struct FillSession {
     /// re-decides exactly when a downstream voucher clears or a serve leg starts
     /// waiting on bytes.
     served_paid_advanced: Arc<Notify>,
-    /// The content end of the furthest span a serve leg has waited on (a high-water
-    /// mark, never lowered): its data reader raises it when its present-range
-    /// snapshot misses a leaf, and its [`SessionOutboardReader`] before it parks on
-    /// a proof node no pull has captured. When it lies within one chunk group past a
+    /// The content end of the furthest span a serve leg has been stuck on (a
+    /// high-water mark, never lowered): the serve leg's frame consumer raises it
+    /// when it has no encoded bytes left and its encode is parked on a leaf or a
+    /// proof node no pull has produced ([`SessionOutboardReader::parked_on`]). A park
+    /// with encoded bytes still buffered is look-ahead and raises nothing, so a
+    /// client that stops paying cannot drag a pull past its window. When it lies within one chunk group past a
     /// pull's frontier, that pull's pacer draws one window floor even with its window
     /// full. Without it, a pull window that closes before the serve leg's credit
     /// window leaves both legs waiting on each other.
@@ -474,6 +476,7 @@ impl FillSession {
         SessionOutboardReader {
             session: Arc::clone(self),
             outboard: self.outboard(),
+            parked_on: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -602,9 +605,24 @@ pub struct SessionOutboardReader {
     /// The shared per-hash outboard, snapshot at mint (after the session adopted the
     /// canonical one), so every `load` reads whatever any pull for the hash captured.
     outboard: Arc<HashOutboard>,
+    /// The content end this reader waits on, written before each park: one byte
+    /// into the node whose pair no pull has captured. The reader does NOT raise
+    /// serve demand itself — an encoder reads ahead of what its consumer needs, so
+    /// a park here alone does not mean the serve leg is stuck. The frame consumer
+    /// publishes this value via [`FillSession::demand_up_to`] only once it is
+    /// starved of encoded bytes ([`Self::parked_on`]).
+    parked_on: Arc<AtomicU64>,
 }
 
 impl SessionOutboardReader {
+    /// The cell this reader writes the content end it waits on into. A frame
+    /// consumer shares it with its data reader and publishes it as serve demand
+    /// once it has no encoded bytes left to take.
+    #[must_use]
+    pub fn parked_on(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.parked_on)
+    }
+
     /// The terminal error for a node no live fill will supply: a precise message
     /// when this session's own pull ended (the standalone / single-fill case), a
     /// generic one when the covering fills were siblings.
@@ -664,11 +682,13 @@ impl Outboard for SessionOutboardReader {
             }
 
             // A pull captures this pair only once it fetches into the node's range.
-            // Ask for the first byte of that range: a pull whose window has closed
-            // would otherwise wait for a payment that this parked encode blocks.
+            // Record the first byte of that range as what this encode waits on; the
+            // frame consumer turns it into serve demand if it starves on this park.
             let node_start = node.chunk_range().start.to_bytes();
-            self.session
-                .demand_up_to(node_start.saturating_add(1).min(self.outboard.tree.size()));
+            self.parked_on.store(
+                node_start.saturating_add(1).min(self.outboard.tree.size()),
+                Ordering::Relaxed,
+            );
 
             // Await the next capture or a liveness change, then re-check.
             tokio::select! {
@@ -1358,12 +1378,13 @@ mod fill_registry_tests {
         (s, lease)
     }
 
-    /// A proof read parked on an uncaptured node demands the first byte of that
-    /// node's range, so a pull whose window has closed still fetches far enough to
-    /// capture the pair. Without it the encode waits on the pull and the pull waits
-    /// on a payment the parked encode blocks (#1893).
+    /// A proof read parked on an uncaptured node records the first byte of that
+    /// node's range as what it waits on, so a starved frame consumer can demand it
+    /// from a pull whose window has closed (#1893). The park alone raises no serve
+    /// demand: an encoder reads ahead of its consumer, and only the consumer knows
+    /// when it is stuck.
     #[tokio::test]
-    async fn a_parked_proof_read_demands_the_first_byte_of_its_node() {
+    async fn a_parked_proof_read_records_the_first_byte_of_its_node() {
         let total = 8 * G;
         let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0x4A);
@@ -1373,14 +1394,20 @@ mod fill_registry_tests {
         let node_start = node.chunk_range().start.to_bytes();
         assert!(node_start >= 4 * G, "the node lies past the first half");
         let mut reader = owner.outboard_reader();
+        let parked_on = reader.parked_on();
 
         let load = tokio::spawn(async move { reader.load(node).await });
         tokio::task::yield_now().await;
         assert!(!load.is_finished(), "load parks until the node is captured");
         assert_eq!(
-            owner.serve_demand().load(Ordering::Acquire),
+            parked_on.load(Ordering::Acquire),
             node_start + 1,
-            "the parked read demands one byte into the node's range"
+            "the parked read records one byte into the node's range"
+        );
+        assert_eq!(
+            owner.serve_demand().load(Ordering::Acquire),
+            0,
+            "the park alone raises no serve demand"
         );
 
         let pair = (hb(3), hb(4));

@@ -26,6 +26,8 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::task::Poll;
 use std::time::Duration;
 
 use bao_tree::ChunkRanges;
@@ -73,10 +75,19 @@ struct AwaitingDataReader {
     /// monotonically and the encoder's forward walk reads each landed leaf with no
     /// store hop. Empty until the watch yields its first snapshot.
     present: ChunkRanges,
+    /// The content end this reader waits on, written before each park into the cell
+    /// it shares with the encode's outboard reader. [`CoherentFrameProducer`]
+    /// publishes it as serve demand only once its consumer is starved.
+    parked_on: Arc<AtomicU64>,
 }
 
 impl AwaitingDataReader {
-    fn new(store: NodeRangedStore, total: u64, session: Arc<FillSession>) -> Self {
+    fn new(
+        store: NodeRangedStore,
+        total: u64,
+        session: Arc<FillSession>,
+        parked_on: Arc<AtomicU64>,
+    ) -> Self {
         let liveness = session.liveness_signal();
         Self {
             store,
@@ -85,6 +96,7 @@ impl AwaitingDataReader {
             session,
             liveness,
             present: ChunkRanges::empty(),
+            parked_on,
         }
     }
 
@@ -189,11 +201,12 @@ impl AsyncSliceReader for AwaitingDataReader {
             }
 
             // A live fill still covers the span and it is not here yet, so this read
-            // is about to wait on a pull. Tell every pull that may produce it: a pull
-            // whose window has closed would otherwise wait for a payment that this
-            // parked read blocks.
-            self.session
-                .demand_up_to(offset.saturating_add(need).min(self.total));
+            // is about to wait on a pull. Record what it waits on; the frame consumer
+            // turns it into serve demand if it starves on this park.
+            self.parked_on.store(
+                offset.saturating_add(need).min(self.total),
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
             // Ensure a watch is open; it errors until the blob materializes —
             // tolerate that with a bounded poll racing the liveness signal, then retry.
@@ -295,6 +308,22 @@ pub(super) struct CoherentFrameProducer {
     /// operator's only signal — the cache-hit framer carries the same field for the
     /// same reason.
     hash: decdn_cache::Hash,
+    /// The fill session whose pulls this encode reads from, for publishing serve
+    /// demand.
+    session: Arc<FillSession>,
+    /// The content end the encode's data or outboard reader last parked on, shared
+    /// with both readers.
+    parked_on: Arc<AtomicU64>,
+    /// The highest `parked_on` value already published as serve demand, so a
+    /// starved consumer that wakes again without progress does not re-publish it.
+    published: u64,
+}
+
+/// One step of [`CoherentFrameProducer::pump`]: the encode finished (or faulted), or
+/// the channel yielded an encoded chunk (`None` if it closed).
+enum PumpStep {
+    Finished(anyhow::Result<()>),
+    Item(Option<Bytes>),
 }
 
 impl CoherentFrameProducer {
@@ -334,8 +363,10 @@ impl CoherentFrameProducer {
         };
 
         let outboard = session.outboard_reader();
+        let parked_on = outboard.parked_on();
         let hash = store.hash();
-        let data = AwaitingDataReader::new(store, total, session);
+        let data =
+            AwaitingDataReader::new(store, total, Arc::clone(&session), Arc::clone(&parked_on));
         let (tx, rx) = mpsc::channel(ENCODE_CHANNEL_CAP);
         let writer = ChannelWriter { tx };
 
@@ -354,6 +385,9 @@ impl CoherentFrameProducer {
             queue: FrameQueue::new(),
             faulted: false,
             hash,
+            session,
+            parked_on,
+            published: 0,
         })
     }
 
@@ -442,9 +476,37 @@ impl CoherentFrameProducer {
         loop {
             match self.enc.take() {
                 Some(mut fut) => {
-                    tokio::select! {
-                        biased;
-                        res = fut.as_mut() => {
+                    let step = {
+                        let rx = &mut self.rx;
+                        let parked_on = &self.parked_on;
+                        let session = &self.session;
+                        let published = &mut self.published;
+                        std::future::poll_fn(|cx| {
+                            if let Poll::Ready(res) = fut.as_mut().poll(cx) {
+                                return Poll::Ready(PumpStep::Finished(res));
+                            }
+                            if let Poll::Ready(recv) = rx.poll_recv(cx) {
+                                return Poll::Ready(PumpStep::Item(recv));
+                            }
+                            // Starved: no encoded chunk is buffered and the encode is
+                            // parked. The encode only parks here on a leaf or proof node
+                            // no pull has produced (a full channel would have yielded a
+                            // chunk above), so this consumer is stuck on that pull. Tell
+                            // the pulls: one whose window has closed would otherwise wait
+                            // for a payment this stuck consumer cannot collect (#1893).
+                            // A park that still has encoded bytes behind it is look-ahead,
+                            // not a stall, and publishes nothing.
+                            let end = parked_on.load(std::sync::atomic::Ordering::Relaxed);
+                            if end > *published {
+                                *published = end;
+                                session.demand_up_to(end);
+                            }
+                            Poll::Pending
+                        })
+                        .await
+                    };
+                    match step {
+                        PumpStep::Finished(res) => {
                             // Either way `fut` is NOT re-stored, so its channel sender
                             // drops and the receiver drains then ends. That makes a
                             // finished encoder and a faulted one look identical from
@@ -457,7 +519,7 @@ impl CoherentFrameProducer {
                                 return Err(e);
                             }
                         }
-                        recv = self.rx.recv() => {
+                        PumpStep::Item(recv) => {
                             self.enc = Some(fut); // still encoding — keep the future
                             // The encode future owns the only sender, so while it is
                             // live the channel cannot close. If it ever did, `None`
@@ -650,12 +712,14 @@ mod tests {
         );
     }
 
-    /// An encode parked on a LEAF the pull has not fetched demands that leaf's end,
-    /// so a pull whose window has closed still fetches it (#1893). The root pair is
-    /// already captured here, so only the data reader can raise the demand — the
-    /// outboard reader never parks.
+    /// A consumer starved on an encode parked at a LEAF the pull has not fetched
+    /// demands that leaf's end, so a pull whose window has closed still fetches it
+    /// (#1893). While encoded bytes are still buffered, the same park is look-ahead
+    /// and demands nothing — otherwise a client that has stopped paying could drag
+    /// the pull past its window. The root pair is already captured here, so only the
+    /// data reader parks.
     #[tokio::test]
-    async fn a_parked_leaf_read_demands_the_end_of_its_leaf() {
+    async fn a_starved_consumer_demands_the_parked_leaf_and_look_ahead_does_not() {
         let total = 2 * G;
         let (root, plaintext, outboard) = synth_blob(total as usize);
         let hash = Hash::from(root);
@@ -675,8 +739,40 @@ mod tests {
         .await;
 
         let store = NodeRangedStore::new(engine.clone(), hash, total);
-        let producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total)
+        let mut producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total)
             .expect("align");
+
+        // One small frame: the encode runs ahead into the channel (root pair, left
+        // leaf) and parks on the right leaf, but the consumer still has buffered bytes.
+        let first = producer
+            .next_frame(1024)
+            .await
+            .expect("first frame")
+            .expect("a first frame exists");
+        assert_eq!(first.len(), 1024);
+        assert_eq!(
+            producer
+                .parked_on
+                .load(std::sync::atomic::Ordering::Acquire),
+            total,
+            "the encode ran ahead and parked on the right leaf"
+        );
+        // The left leaf's first read may park until the present-range watch yields,
+        // and a consumer with nothing buffered yet publishes that — but it lies at or
+        // below the pull's frontier, where a pacer ignores it. The look-ahead park on
+        // the right leaf, with bytes still buffered, must not be published.
+        assert!(
+            session
+                .serve_demand()
+                .load(std::sync::atomic::Ordering::Acquire)
+                <= G,
+            "look-ahead with bytes still buffered demands nothing past the pulled leaf, \
+             got {}",
+            session
+                .serve_demand()
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+
         let serve = tokio::spawn(drain(producer));
 
         let demanded = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -718,7 +814,9 @@ mod tests {
             .unwrap()
             .expect("serve completes once the leaf lands");
         let whole = range_wire(root, &plaintext, &outboard, total, 0, total).1;
-        assert_eq!(got, whole.as_ref(), "the coherent stream is byte-exact");
+        let mut stream = first.to_vec();
+        stream.extend_from_slice(&got);
+        assert_eq!(stream, whole.as_ref(), "the coherent stream is byte-exact");
     }
 
     /// A frame wider than one encoder output chunk must arrive as several `Bytes`.
@@ -950,7 +1048,7 @@ mod tests {
         let engine = CacheEngine::open(tmp.path(), vec![], 64).await.unwrap();
         let session = FillSession::new(bao_tree::blake3::Hash::from(root), total);
         let store = NodeRangedStore::new(engine.clone(), hash, total);
-        let mut reader = super::AwaitingDataReader::new(store, total, session);
+        let mut reader = super::AwaitingDataReader::new(store, total, session, Arc::default());
 
         let range = align_range(0, G, total).unwrap().chunk_ranges().clone();
         assert!(
