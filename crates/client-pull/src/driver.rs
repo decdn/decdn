@@ -77,7 +77,7 @@ use bao_tree::ChunkRanges;
 use decdn_bao_range::{CHUNK_GROUP_BYTES, align_range};
 use decdn_incentive::DepositOutcome;
 
-use crate::pacer::{PaceDecision, PaceState};
+use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{
     Cumulative, MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, ProgressCallback,
@@ -152,28 +152,6 @@ impl std::fmt::Debug for SharedPool<'_> {
             .field("spent", &(self.spent)())
             .field("topups_used", &self.topups_used.load(Ordering::Relaxed))
             .finish_non_exhaustive()
-    }
-}
-
-/// The node serve leg's two content frontiers the pull leg paces against (ADR
-/// 037): what the downstream client has paid for, and how far the serve leg waits
-/// on bytes. The node hands `drive` a reader of these; the client path has no
-/// downstream leg and passes none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DownstreamFrontier {
-    /// Content bytes the serve leg has delivered AND been paid for
-    /// ([`PaceState::served_paid_frontier`]).
-    pub served_paid: u64,
-    /// Content end of the furthest span the serve leg awaits
-    /// ([`PaceState::serve_demand_frontier`]).
-    pub serve_demand: u64,
-}
-
-impl DownstreamFrontier {
-    /// Whether either frontier in `self` moved past `observed`.
-    #[must_use]
-    pub const fn advanced_past(self, observed: Self) -> bool {
-        self.served_paid > observed.served_paid || self.serve_demand > observed.serve_demand
     }
 }
 
@@ -685,21 +663,19 @@ where
             // THIS leg's delivery progress, never the downstream client's. No
             // seam needed.
             pulled_frontier: delivered_frontier,
-            // `served_paid_frontier` is NOT this leg's own state — it is the
+            // `downstream.served_paid` is NOT this leg's own state — it is the
             // DOWNSTREAM client's paid frontier, which only the node's serve leg
             // (a separate, future task) can advance. On the client path
             // (`downstream == None`) there is no downstream leg, so this
             // collapses to the inert local `paid_frontier`: harmless, because
-            // `BudgetPacer` never reads `served_paid_frontier`. The NODE pull leg
+            // `BudgetPacer` never reads `downstream`. The NODE pull leg
             // MUST pass `Some(reader)` here, reading the shared downstream
             // `served_paid` frontier, so its `WindowPacer` gates the pull against
             // the downstream client's payment — not against this leg's own
             // upstream paid frontier, which would be category-wrong (it would
             // make the window track the node's own credit-window lag instead of
             // the client it is serving).
-            served_paid_frontier: downstream_now.served_paid,
-            // Inert `0` on the client path, which never waits on a serve leg.
-            serve_demand_frontier: downstream_now.serve_demand,
+            downstream: downstream_now,
         };
 
         match pacer.decide(&state) {
@@ -1995,12 +1971,12 @@ mod tests {
     /// test stays deterministic. The SAME counter backs the `served_paid` reader
     /// passed to `drive`, so this is the only thing that can unstick a
     /// `WindowPacer::Wait`.
-    struct BumpServedPaidWait {
+    struct BumpDownstreamWait {
         served_paid: Arc<std::sync::atomic::AtomicU64>,
         bump_bytes: u64,
     }
 
-    impl super::PacingWait for BumpServedPaidWait {
+    impl super::PacingWait for BumpDownstreamWait {
         fn wait(
             &self,
             _observed: super::DownstreamFrontier,
@@ -2033,7 +2009,7 @@ mod tests {
         let ctx = Arc::new(Mutex::new(healthy_ctx()));
 
         let served_paid_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let wait_hook = BumpServedPaidWait {
+        let wait_hook = BumpDownstreamWait {
             served_paid: Arc::clone(&served_paid_counter),
             bump_bytes: GROUP,
         };
