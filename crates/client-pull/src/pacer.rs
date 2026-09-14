@@ -244,7 +244,11 @@ impl Pacer for WindowPacer {
                 // A serve leg parked AT this pull's frontier overrides a full window
                 // by one pull-window floor. Its encoder waits on the first byte the
                 // pull has not fetched, so the demand lands within one group past
-                // `pulled_frontier`. A serve leg parks only while its own credit
+                // `pulled_frontier`: a leaf read demands its end (at most one group
+                // out), and a proof read demands its node's first byte plus one. The
+                // encoder walks the tree in pre-order, so it loads a node's pair only
+                // after reading every leaf before the node — a node starting a whole
+                // group past the pull cannot be the one a parked encoder waits on. A serve leg parks only while its own credit
                 // window has room, so a client that stops paying stops raising
                 // demand after at most one floor past what it may receive. A floor,
                 // not one group, keeps each unpark to one upstream open instead of
