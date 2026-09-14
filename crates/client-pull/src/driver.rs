@@ -2061,12 +2061,13 @@ mod tests {
     /// A [`BlobSource`] whose upstream payment trails its delivery: each clean
     /// leg commits only half of the leg's wire, so the paid frontier the driver
     /// opens at stays behind the delivered frontier the pacer measures. Opens past
-    /// `max_opens` fail, so a driver that never reaches a demand ends the test
-    /// instead of spinning.
+    /// `max_opens` fail, so a driver that keeps re-opening without parking fails
+    /// the test instead of hanging it.
     struct HalfPaySource {
         inner: ScriptedSource,
         ledger: Arc<PoolLedger>,
         leg_wire: Mutex<u64>,
+        opens: std::sync::atomic::AtomicUsize,
         max_opens: usize,
     }
 
@@ -2079,7 +2080,7 @@ mod tests {
             range: AlignedRange,
         ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
             Box::pin(async move {
-                let opens = self.inner.opened_ranges().len();
+                let opens = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 anyhow::ensure!(
                     opens < self.max_opens,
                     "open budget of {} spent: {:?}",
@@ -2125,18 +2126,20 @@ mod tests {
     }
 
     /// An in-band serve demand is fetched even when upstream payment lags
-    /// delivery by a whole pull-window floor. The pacer measures the demand from
-    /// the delivered frontier, but the driver opens each draw at the paid
-    /// frontier, so the first demand draw stops short of the demand. Each
-    /// further draw pays for part of its leg and moves the paid frontier, so a
-    /// later draw covers the demand. The downstream client pays nothing
-    /// throughout.
+    /// delivery by about one pull-window floor. The pacer measures the demand
+    /// from the delivered frontier, but the driver opens each draw at the paid
+    /// frontier, so one floor drawn from the paid frontier does not reach the
+    /// demand. The drive still fetches the demand within a bounded number of
+    /// opens of at most one floor each, stops once the demand is covered, and
+    /// then parks. The downstream client pays nothing throughout.
     #[tokio::test(start_paused = true)]
     async fn in_band_demand_converges_when_upstream_payment_lags_delivery() {
         use crate::pacer::{PULL_WINDOW_FLOOR, RampPacer};
 
         const FLOOR: u64 = PULL_WINDOW_FLOOR;
-        let total = 3 * FLOOR;
+        // Room past `window + 2 * FLOOR`, so an over-sized demand draw is not
+        // clipped by the blob end.
+        let total = 5 * FLOOR;
         let (_root, plaintext, _outboard) = synth_blob(total as usize);
 
         let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
@@ -2147,13 +2150,14 @@ mod tests {
             inner,
             ledger: Arc::clone(&ledger),
             leg_wire: Mutex::new(0),
+            opens: std::sync::atomic::AtomicUsize::new(0),
             max_opens: 8,
         };
 
-        // A closed window of two floors: `divisor: 0` opens the full
-        // `credit_max`, and the client never pays, so the window never moves.
-        // The first leg fills it, and half payment leaves the paid frontier
-        // about one floor behind delivery.
+        // A window of two floors: `divisor: 0` fixes the window at `credit_max`,
+        // and `served_paid` stays 0, so the window never slides. The first leg
+        // fills it, and half payment leaves the paid frontier about one floor
+        // behind delivery.
         let window = 2 * FLOOR;
         let pacer = RampPacer {
             divisor: 0,
@@ -2163,6 +2167,15 @@ mod tests {
         // The serve leg is parked on the first byte past the closed window: one
         // byte ahead of the pull once the window fills, and so in band.
         let demand = window + 1;
+        // The fixture really lags: after the first leg, one floor drawn from the
+        // paid frontier stops short of the demand.
+        let first_leg_wire = align_range(0, window, total).expect("align").wire_len();
+        let paid_after_first_leg = crate::sink::content_paid_frontier(0, total, first_leg_wire / 2);
+        assert!(
+            paid_after_first_leg + FLOOR < demand,
+            "one floor from the paid frontier ({paid_after_first_leg}) must not reach \
+             the demand ({demand}), or this test does not cover the lag"
+        );
         let downstream = || super::DownstreamFrontier {
             served_paid: 0,
             serve_demand: demand,
@@ -2204,20 +2217,20 @@ mod tests {
             Some(&(0, window)),
             "the first leg fills the window: {opened:?}"
         );
-        let (first_demand_start, first_demand_len) = opened[1];
-        assert!(
-            first_demand_start + first_demand_len < demand,
-            "the first demand draw opens at the lagging paid frontier and stops \
-             short of the demand, so this test exercises the lag: {opened:?}"
-        );
         let covering = opened
             .iter()
             .position(|&(start, len)| start < demand && start + len >= demand)
-            .expect("a later draw covers the demand");
+            .unwrap_or_else(|| panic!("no open covers the demand {demand}: {opened:?}"));
+        assert_eq!(
+            covering + 1,
+            opened.len(),
+            "the pull stops once the demand is covered: {opened:?}"
+        );
+        // After the window fills, every open is a serve-demand draw, and each
+        // draws at most one floor.
         assert!(
-            covering >= 2 && covering + 1 == opened.len(),
-            "the demand converges over more than one draw and the pull stops once \
-             it is covered: {opened:?}"
+            opened.iter().skip(1).all(|&(_, len)| len <= FLOOR),
+            "each serve-demand draw is at most one floor ({FLOOR}): {opened:?}"
         );
         assert_eq!(
             wait_hook.calls.load(std::sync::atomic::Ordering::SeqCst),

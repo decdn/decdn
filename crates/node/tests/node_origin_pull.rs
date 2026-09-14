@@ -6612,6 +6612,8 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
 /// What a `leaf_paced_pull` observed.
 #[derive(Debug)]
 struct LeafOutcome {
+    /// Decoded content bytes when the stream completes, and WIRE bytes when the
+    /// leaf closes early.
     received: u64,
     acks: u64,
     /// WIRE bytes the leaf's last voucher paid for.
@@ -6628,7 +6630,8 @@ enum LeafMode {
     /// Close the connection right after paying the n-th voucher.
     DropAfter(u64),
     /// Pay `acks` vouchers, then stay connected and keep reading without paying
-    /// for `hold`, then close the connection.
+    /// for `hold`, then close the connection. A `StreamEnd` inside the hold
+    /// completes the pull normally.
     StopPayingAfter { acks: u64, hold: Duration },
 }
 
@@ -6727,7 +6730,8 @@ async fn leaf_paced_pull(
 /// [`leaf_paced_pull`] with an explicit [`LeafMode`]. In
 /// [`LeafMode::StopPayingAfter`] the leaf keeps reading after its last voucher
 /// until `hold` elapses, then closes and reports the WIRE bytes it received. A
-/// stream error or read failure during the hold is an error.
+/// stream error or read failure during the hold is an error, and a `StreamEnd`
+/// completes the pull.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn leaf_paced_pull_mode(
     leaf_ep: &iroh::Endpoint,
@@ -6797,9 +6801,8 @@ async fn leaf_paced_pull_mode(
             None => read_client(&mut recv).await?,
             Some(deadline) => match tokio::time::timeout_at(deadline, read_client(&mut recv)).await
             {
-                // Only the hold elapsing ends the pull as planned. An early
-                // stream error or read failure means B did not keep the
-                // connection open, which is the case this mode exists to test.
+                // An early stream error or read failure means B dropped the
+                // unpaid leaf, which this mode exists to catch.
                 Ok(Err(e)) => anyhow::bail!("leaf read failed during the unpaid hold: {e}"),
                 Ok(Ok(ClientMessage::StreamError(e))) => {
                     anyhow::bail!("B ended the stream during the unpaid hold: {e:?}")
@@ -8296,7 +8299,9 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
     // A leaf pays three vouchers, so both of B's windows ramp past their floors,
     // then stays connected and keeps reading without paying. B's unrecouped
     // upstream lead must stay within the ramped credit window plus one
-    // serve-demand pull-window floor (ADR 037), however large the blob is.
+    // serve-demand pull-window floor (ADR 037), however large the blob is. This
+    // bounds the lead from above; `serve_demand_at_a_full_window_draws_one_floor`
+    // in the pacer pins the exact demand draw.
     let payload_len = 8 * CHUNK_BYTES;
     let payload = vec![0x5Au8; usize::try_from(payload_len)?];
     let hash = Hash::new(&payload);
@@ -8308,7 +8313,7 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x9A);
-    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep, b_operator) =
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
@@ -8327,9 +8332,10 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
     let leaf_sk = fresh_key();
     let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
     let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
-    // Three paid intervals put `paid / 2` above `PULL_WINDOW_FLOOR`, so the pull
-    // window has ramped. The hold is shorter than B's voucher-read timeout, so
-    // the leaf is still connected while B's windows are closed.
+    // Three paid intervals put `paid / DEFAULT_CREDIT_RAMP_DIVISOR` above
+    // `PULL_WINDOW_FLOOR`, so the pull window has ramped. The 2 s hold is shorter
+    // than B's 10 s `VOUCHER_READ_TIMEOUT`, so B does not end the stream while
+    // the leaf holds it open.
     let outcome = tokio::time::timeout(
         Duration::from_mins(1),
         leaf_paced_pull_mode(
@@ -8358,12 +8364,26 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
         "leaf should have paid exactly three vouchers, got {}",
         outcome.acks
     );
+    // The hold reached saturation: B served its whole ramped serve window past
+    // the last voucher, and its pull leg paused on a closed window. Without
+    // these, a B that stalled early would pass every upper bound below.
+    let paid = outcome.paid_wire;
+    let group = decdn_cache::CHUNK_GROUP_BYTES;
+    let serve_window = decdn_incentive::ramped_credit_window(
+        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+        CHUNK_BYTES,
+        decdn_common::config::DEFAULT_CREDIT_MAX,
+        paid,
+    );
     anyhow::ensure!(
-        outcome.received > outcome.paid_wire,
-        "B must keep serving inside its credit window after the last voucher \
-         ({} received, {} paid)",
-        outcome.received,
-        outcome.paid_wire
+        outcome.received + group >= paid + serve_window,
+        "B must fill its serve credit window ({serve_window}) past the last voucher \
+         during the hold ({} received, {paid} paid)",
+        outcome.received
+    );
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_window_paused_total")? >= 1,
+        "B's pull leg must have paused on its window"
     );
 
     // B records its upstream watermark when the pull leg ends, which the leaf's
@@ -8371,18 +8391,20 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let upstream_wire = loop {
         if let Some(&(_, bytes, _)) = progress_log(&recorded)?.last() {
-            break u64::try_from(bytes).unwrap_or(u64::MAX);
+            break u64::try_from(bytes)
+                .map_err(|_| anyhow::anyhow!("upstream watermark {bytes} overflows u64"))?;
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "B never recorded an upstream watermark: the pull leg did not settle"
+            "B never recorded an upstream watermark: the pull leg did not settle \
+             (persist failures: {})",
+            counter_value(&b_metrics, "node_pull_progress_persist_failures_total")?
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
 
     // Content never exceeds its wire, and the ramp only widens with payment, so
     // taking the paid wire as the paid content over-states the window.
-    let paid = outcome.paid_wire;
     let pull_floor = decdn_client_pull::PULL_WINDOW_FLOOR;
     let ramped = decdn_incentive::ramped_credit_window(
         decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
@@ -8399,13 +8421,13 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
     // Measuring against the paid wire, not the larger wire the leaf received
     // inside B's serve credit window, keeps the bound tight.
     //
-    // The upstream watermark sums the wire of every pull-leg open, and each open
-    // re-sends the proof path to its start, which one range encoding counts once.
-    // A single-group range carries a full root-to-leaf path, so its wire minus its
-    // content is the most one extra open adds. B opens once per served-paid
-    // advance (one per voucher) and once per serve-demand floor, so 32 opens is
-    // generous; the allowance stays far below the one floor a breach would add.
-    let group = decdn_cache::CHUNK_GROUP_BYTES;
+    // The upstream watermark sums the wire B paid across every pull-leg open, and
+    // each open re-sends the proof path to its start, which one range encoding
+    // counts once. A single-group range carries a full root-to-leaf path, so its
+    // wire minus its content is the most one extra clean open adds. B opens at
+    // most once per served-paid advance and once per serve-demand floor, so an
+    // allowance of 32 opens is generous. The test does not count opens, and the
+    // allowance stays far below the one floor a breach would add.
     let proof_path = support::bao_wire_len(payload_len, 0, group).saturating_sub(group);
     let max_opens = 32;
     let bound_wire =
