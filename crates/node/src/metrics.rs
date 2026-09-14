@@ -475,8 +475,8 @@ pub struct DecdnMetrics {
     /// ADR 041 warming serve credits dropped before they reached the ledger,
     /// counted once per dropped credit. Either the bounded aggregator queue was
     /// full (`try_send` → `Full`) or the aggregator was gone (`Closed`). A drop
-    /// is conservative — it leaves the source's ledger more negative than
-    /// reality, never more positive — so it can only block speculative warming,
+    /// is conservative — it leaves the source's ledger lower than reality,
+    /// never higher — so it can only block speculative warming,
     /// never over-fund it. But a sustained non-zero rate means warming is being
     /// throttled by lost bookkeeping rather than by real losses, and a rate that
     /// tracks the serve rate exactly means the aggregator task is gone and every
@@ -1824,8 +1824,8 @@ recorders! {
 
     /// An ADR 041 warming serve credit was dropped before it reached the ledger
     /// — the bounded aggregator queue was full, or the aggregator was gone. The
-    /// drop is conservative (the source ledger stays more negative than
-    /// reality), but a sustained rate throttles speculative warming.
+    /// drop is conservative (the source ledger stays lower than reality), but a
+    /// sustained rate throttles speculative warming.
     warming_credit_dropped => warming_credits_dropped.inc();
 
     /// An ADR 041 warming serve credit reached the ledger. Paired with

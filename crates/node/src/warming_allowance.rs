@@ -10,9 +10,10 @@
 //! `[-budget, +budget]`. A never-touched source has no ledger entry and reads as
 //! full. A speculative buy debits the source's ledger by the buy cost and tags
 //! the blob's hash with its source. Every serve of a tagged hash credits the
-//! realized margin back to that source's ledger. A blob served at least twice
-//! refunds its buy (vindicated); a dud served once keeps the fee skim as a
-//! loss. The source keeps warming while its allowance is positive, so its duds
+//! realized margin back to that source's ledger. A blob re-served often enough
+//! refunds its buy (vindicated; at a market price and the default operator
+//! share, two serves do); a dud served once keeps the fee skim as a loss. The
+//! source keeps warming while its allowance is positive, so its duds
 //! spend the budget down, and once they exhaust it the source is blocked from
 //! further speculative buys until it recovers. Eviction forgets the tag so a
 //! stale hash can never credit a ledger again. A slow time-refill on top of the
@@ -201,11 +202,15 @@ impl WarmingAllowance {
     }
 
     /// Debits `source`'s ledger for a speculative buy of `hash` and tags the
-    /// hash with its source so a later serve can credit the right ledger. The
-    /// buy loop consults [`Self::available`] before every speculative buy, so
-    /// a source speculates only while its allowance is positive; the ledger is
-    /// floored at `-budget`, so one buy that overshoots zero leaves the source
-    /// at most one budget's worth of recovery.
+    /// hash with its source so a later serve can credit the right ledger.
+    ///
+    /// The buy loop checks [`Self::available`] when it selects a candidate and
+    /// debits only after the pull completes, so concurrent pulls from one source
+    /// can each pass the check and drive the ledger below zero: the real spend
+    /// past the allowance is every speculative buy still in flight when it
+    /// crossed zero. The ledger is floored at `-budget`, so however far those
+    /// buys overshoot, the source needs at most `budget + 1` units of credit or
+    /// refill to warm again. The floor bounds that recovery debt, not the spend.
     ///
     /// The tag lands before the debit. The tag map and the bucket ledger are
     /// separate locks, so the two writes are not one atomic step; ordering them
@@ -315,8 +320,8 @@ pub trait WarmingCreditSink: Send + Sync {
 ///
 /// A `Full` queue drops the credit and counts it
 /// ([`Metrics::warming_credit_dropped`]). The drop is conservative in the
-/// direction that matters: an un-applied credit leaves the source's ledger more
-/// negative than reality, so at worst it blocks speculative buys from a source
+/// direction that matters: an un-applied credit leaves the source's ledger lower
+/// than reality, so at worst it blocks speculative buys from a source
 /// that had earned its margin back, and the time refill forgives it. A
 /// sustained non-zero rate means the aggregator is not keeping up and warming
 /// is being throttled by bookkeeping loss rather than by real losses.
@@ -518,6 +523,7 @@ mod tests {
     const S1: SourceId = SourceId::from_bytes([1u8; 32]);
     const S2: SourceId = SourceId::from_bytes([2u8; 32]);
     const H1: Hash = Hash::from_bytes([10u8; 32]);
+    const H2: Hash = Hash::from_bytes([11u8; 32]);
 
     #[test]
     fn source_id_round_trips_through_its_accessors() {
@@ -534,13 +540,12 @@ mod tests {
         let a = WarmingAllowance::new(1000, 0); // no time refill
         a.debit_speculative(S1, H1, 999);
         assert!(a.available(S1)); // 1 unit left of the full budget
-        a.debit_speculative(S1, H1, 1);
+        a.debit_speculative(S1, H2, 1);
         assert!(!a.available(S1)); // budget spent
     }
 
     #[test]
     fn duds_spend_the_budget_then_block() {
-        const H2: Hash = Hash::from_bytes([11u8; 32]);
         let a = WarmingAllowance::new(1000, 0); // no time refill
         a.debit_speculative(S1, H1, 1000); // bought at full P_buy·mb
         a.credit_serve(H1, 600); // one serve (the requester): 0.6·P_sell·mb
@@ -549,12 +554,17 @@ mod tests {
         assert!(!a.available(S1)); // 600 - 1000: budget spent -> cut off
     }
 
+    /// Only the SECOND serve vindicates the buy: an unserved dud first spends
+    /// the budget, so the vindicated buy starts the ledger at the floor and one
+    /// serve's margin alone leaves the source spent.
     #[test]
     fn re_served_blob_refunds_and_keeps_warming() {
         let a = WarmingAllowance::new(1000, 0);
-        a.debit_speculative(S1, H1, 1000);
-        a.credit_serve(H1, 600); // serve #1
-        a.credit_serve(H1, 600); // serve #2 -> refunded, capped at budget
+        a.debit_speculative(S1, H2, 1000); // an unserved dud: budget spent
+        a.debit_speculative(S1, H1, 1000); // the buy to vindicate: -1000
+        a.credit_serve(H1, 600); // serve #1 -> -400
+        assert!(!a.available(S1));
+        a.credit_serve(H1, 600); // serve #2 -> +200
         assert!(a.available(S1)); // vindicated
     }
 
@@ -565,8 +575,20 @@ mod tests {
         for _ in 0..100 {
             a.credit_serve(H1, 600);
         }
-        // remaining never exceeds budget; a fresh source still reads full
-        assert!(a.available(S2));
+        // The credits bank no more than the budget, so one budget-sized debit
+        // spends the source.
+        a.debit_speculative(S1, H2, 1000);
+        assert!(!a.available(S1));
+    }
+
+    #[test]
+    fn debt_is_floored_at_minus_budget() {
+        let a = WarmingAllowance::new(1000, 0);
+        a.debit_speculative(S1, H1, 10_000); // floored at -1000
+        a.credit_serve(H1, 1000); // back to 0: still spent
+        assert!(!a.available(S1));
+        a.credit_serve(H1, 1); // budget + 1 units of credit warm it again
+        assert!(a.available(S1));
     }
 
     /// The background aggregator applies what the serve path enqueues: the same
@@ -576,9 +598,10 @@ mod tests {
     async fn channel_sink_credits_through_the_background_aggregator() {
         let allowance = Arc::new(WarmingAllowance::new(1000, 0));
         let (sink, _handle, _metrics) = creditor(&allowance);
-        allowance.debit_speculative(S1, H1, 1000);
-        sink.credit(H1, 600); // serve #1
-        sink.credit(H1, 600); // serve #2 -> refunded, vindicated
+        allowance.debit_speculative(S1, H2, 1000); // an unserved dud: budget spent
+        allowance.debit_speculative(S1, H1, 1000); // the buy to vindicate: -1000
+        sink.credit(H1, 600); // serve #1 -> -400
+        sink.credit(H1, 600); // serve #2 -> +200: only both credits vindicate
 
         assert!(
             eventually(|| allowance.available(S1)).await,
@@ -637,8 +660,8 @@ mod tests {
         let allowance = Arc::new(WarmingAllowance::new(1000, 0));
         let (sink, _handle, _metrics) = creditor(&allowance);
 
-        // S1 spends its whole budget warming H1, then serves it twice: enough to
-        // make it available again.
+        // S1 spends its whole budget warming H1, then serves it: any credit makes
+        // it available again.
         allowance.debit_speculative(S1, H1, 1000);
         sink.credit(H1, 600);
         sink.credit(H1, 600);
@@ -678,7 +701,7 @@ mod tests {
     /// A full queue drops the credit, counts it, and never blocks the serve.
     ///
     /// The drop must also be conservative: an un-applied credit leaves the
-    /// source more negative than reality, which can only *block* speculative
+    /// source's ledger lower than reality, which can only *block* speculative
     /// buys. The opposite direction — a credit applied twice, or a debit lost —
     /// would be a grief-cap bypass, so pin the direction rather than just the
     /// fact of the drop.

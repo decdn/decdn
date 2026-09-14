@@ -106,7 +106,7 @@ of a tagged blob credits the source's allowance the realized margin, capped at
 `B`. The node applies that credit off the serve path. A serve puts the credit on
 a bounded queue. A background task takes it off the queue and applies it. The
 serve's last step then never waits on the allowance ledger. A full queue drops
-the credit. A drop leaves the source more negative than its true profit and
+the credit. A drop leaves the source's allowance lower than its true profit and
 loss. It can only throttle warming from that source. It can never over-fund the
 source, and the time refill forgives it.
 `decdn_warming_credits_dropped_total` counts every drop, and

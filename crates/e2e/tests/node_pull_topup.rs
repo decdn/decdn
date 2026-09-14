@@ -97,10 +97,11 @@ const SERVER_BUYER_USDC: u64 = 1_000_000_000;
 
 /// The blob under test: 9 MiB of content. At [`RATE_PER_MB`] its whole-blob wire
 /// cost (content + interleaved bao proof, ADR 038) is ~4.52 USDC — strictly above
-/// the 4 USDC working deposit (so the pull must top up) and strictly below the
-/// 5 USDC per-source warming allowance (`serve_economics.warming_budget`, so the
-/// buy stays in the market regime for the whole pull and the seeder's equal rate
-/// keeps clearing the buy-margin gate).
+/// the 4 USDC working deposit, so the pull must top up. The buy clears the ADR 041
+/// margin gate in the market regime: the SERVER checks the seeder's warming
+/// allowance (`serve_economics.warming_budget`, 5 USDC, starting full) before each
+/// pull run and debits it only after the run, and the warm-up's 1 MB debit
+/// (0.5 USDC) leaves it positive when the blob's pull starts.
 const BLOB_BYTES: usize = 9 * 1024 * 1024;
 
 /// Deterministic pseudo-random blob spanning many chunk groups, so a delivery
@@ -151,22 +152,23 @@ async fn server_upstream_pool_id(
 /// The SERVER admits the fetch, signs `ok: true`, and streams. Its upstream pull
 /// from the seeder and its downstream serve to the client both advance, and then
 /// both stop: the client fails `upstream stalled: no progress for 30s`. At the
-/// stall the SERVER's `decdn_node_pull_through_window_paused_total` reads 4, it
-/// holds no outbound stream, and no reactive top-up, stall, refusal, or voucher
-/// rejection counter moved on either node. The upstream paid frontier sits about
-/// one ramped credit window (`served_paid / credit_ramp_divisor`) ahead of the
-/// client's, so the pull leg is parked on its `RampPacer` `Wait` for a
-/// served-paid advance that never arrives.
+/// stall the SERVER's `decdn_node_pull_through_window_paused_total` is non-zero,
+/// it holds no outbound stream, and no reactive top-up, stall, refusal, or
+/// voucher rejection counter moved on either node. The upstream paid frontier
+/// sits about one ramped credit window (`served_paid / credit_ramp_divisor`)
+/// ahead of the client's, so the pull leg is parked on `RampPacer` returning
+/// `PaceDecision::Wait` for a served-paid advance that never arrives.
 ///
 /// The stall is independent of the rate and of the top-up: the same journey at
-/// the default rate, with the default working deposit, stalls at the same point.
+/// the default rate, with the default working deposit, is observed to stall at
+/// the same point.
 /// A small blob (the warm-up) completes, because it fits inside the pull
 /// window's floor and never waits on a served-paid advance.
 ///
 /// Run the daemons with `DECDN_NODE_LOG="warn,decdn_node=debug"` to see their
 /// debug logs through the harness.
-#[ignore = "blocked on a fused serve-miss pull stall on multi-MB node-to-node blobs; \
-            see the doc comment"]
+#[ignore = "#1893: blocked on a fused serve-miss pull stall on multi-MB node-to-node \
+            blobs; see the doc comment"]
 #[tokio::test(flavor = "multi_thread")]
 async fn node_pull_larger_than_working_deposit_tops_up_once_and_completes() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
