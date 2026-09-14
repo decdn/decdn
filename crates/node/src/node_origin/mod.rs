@@ -1031,7 +1031,7 @@ async fn probe_candidate(
         // spoofer from a mis-set local `identity.region`): peer, both regions,
         // and the observed latency vs ceiling.
         debug!(
-            %pk,
+            peer = %pk,
             own_region = deps.config.own_region.as_deref().unwrap_or(""),
             claimed_region = %region,
             rtt_ms = rtt,
@@ -1040,7 +1040,7 @@ async fn probe_candidate(
              applying ADR 030 latency penalty"
         );
         deps.metrics.node_region_latency_penalty();
-        deps.local_rep.record(pk, Outcome::RegionLatencyMismatch);
+        record_outcome(deps, pk, &Outcome::RegionLatencyMismatch);
     }
     // The holder's reported blob size (`ProbeResponseExt.total_bytes`), read
     // before `coverage` is moved into the candidate. The coverage-union gather
