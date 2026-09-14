@@ -343,6 +343,21 @@ struct Inner {
     /// that stopped being served must not start again. [`MonotoneHashSet`]
     /// carries that difference.
     evicted: MonotoneHashSet,
+    /// Held hashes whose own serve export failed bao validation against the
+    /// content root: the stored bytes or outboard diverged after admission
+    /// (disk rot or tampering). [`CacheEngine::refuses`] honors membership, so
+    /// the node stops serving, announcing, and re-acquiring the hash while the
+    /// corrupt entry is on disk. The quarantine drops the protecting tags, so
+    /// the next GC sweep reclaims the entry, and the membership lifts once the
+    /// store no longer holds the hash. A later pull-through then admits a
+    /// freshly verified copy.
+    ///
+    /// In memory only. A restart before the sweep forgets the entry, and the
+    /// next serve of the corrupt bytes trips the validation and quarantines it
+    /// again. A durable record is unnecessary: the validated export aborts
+    /// every serve at the first mismatching chunk group, so no buyer pays for
+    /// a corrupt group in the window.
+    quarantined: DashMap<Hash, ()>,
     /// Probe-triggered eviction holds (#318, ADR 005 §Probe-triggered
     /// eviction hold). Maps a held hash to its hold *expiry* instant; a
     /// held hash is invisible to [`CacheEngine::eviction_candidates`] until
@@ -1330,6 +1345,7 @@ impl CacheEngine {
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
                 chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
                 evicted: MonotoneHashSet::new(evicted),
+                quarantined: DashMap::new(),
                 probe_holds: Mutex::new(HashMap::new()),
                 max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
                 frequency: ArcSwap::from_pointee(None),
@@ -1597,6 +1613,7 @@ impl CacheEngine {
 
     /// One rescan pass: gather candidates, resolve them, publish the index.
     async fn rescan_once(&self) {
+        self.lift_reclaimed_quarantines().await;
         let (candidates, enumerate_failures) = self.rescan_candidates().await;
         let RescanResolution {
             held,
@@ -2049,8 +2066,16 @@ impl CacheEngine {
     /// serve path refused it — which under ADR 005 § Probe response is exactly
     /// the signed evidence pair that makes the operator slashable for a
     /// takedown they were discharging.
+    ///
+    /// A [quarantined](Self::is_quarantined) hash is refused too. Its stored
+    /// bytes failed validation, so a serve or an announce only fails every
+    /// buyer, and a re-acquisition only lands on the corrupt entry until GC
+    /// reclaims it.
     pub fn refuses(&self, hash: Hash) -> bool {
-        self.is_denied(hash) || self.is_chain_denied(hash) || self.is_evicted(hash)
+        self.is_denied(hash)
+            || self.is_chain_denied(hash)
+            || self.is_evicted(hash)
+            || self.is_quarantined(hash)
     }
 
     /// Is this blob already present in the local store?
@@ -2060,6 +2085,7 @@ impl CacheEngine {
     /// who call `evict` expect the node to stop serving immediately, so
     /// `has` reports the blob as absent.
     pub async fn has(&self, hash: Hash) -> CacheResult<bool> {
+        self.lift_reclaimed_quarantine(hash).await;
         if self.refuses(hash) {
             return Ok(false);
         }
@@ -2085,8 +2111,9 @@ impl CacheEngine {
     /// audit answers what may go on the wire, and a partial blob's byte count
     /// is not that.
     pub async fn serve_audit(&self, hash: Hash) -> CacheResult<ServeAudit> {
+        self.lift_reclaimed_quarantine(hash).await;
         let evicted = self.is_evicted(hash);
-        let refused = self.is_denied(hash) || self.is_chain_denied(hash) || evicted;
+        let refused = self.refuses(hash);
         let status = self
             .inner
             .store
@@ -2293,8 +2320,10 @@ impl CacheEngine {
     /// blocked. The operator-visible behavior — the node stops serving the
     /// blob immediately, and reclaims its disk on the next sweep when GC is
     /// enabled and the tag delete succeeded — is what `decdn node evict`
-    /// (issue #279) needs for use cases like DMCA takedown and corruption
-    /// recovery.
+    /// (issue #279) needs for use cases like DMCA takedown. A stored hash
+    /// mismatch that a serve detects does not come here: it takes the
+    /// non-durable [quarantine](Self::is_quarantined), because a corrupt
+    /// local copy must stay re-acquirable.
     ///
     /// Persisted: the eviction is appended (with `fsync`) to
     /// `<cache_dir>/evicted.log` before this call returns successfully, so
@@ -2305,9 +2334,8 @@ impl CacheEngine {
     /// serving the content.
     ///
     /// Async because the durable append runs the blocking `fsync` on a
-    /// `spawn_blocking` thread rather than on the async runtime (#845): one
-    /// caller is the hash-mismatch path in pull-through, which executes on a
-    /// request-serving worker that must not stall on disk I/O.
+    /// `spawn_blocking` thread rather than on the async runtime (#845), so a
+    /// caller on a request-serving worker does not stall on disk I/O.
     pub async fn evict(&self, hash: Hash) -> CacheResult<()> {
         // Lock-free pre-check on a single snapshot: short-circuit on
         // already-evicted (a sequential repeat-evict of the same hash returns
@@ -2574,6 +2602,109 @@ impl CacheEngine {
     /// by every reader that linearizes after the swap.
     pub fn is_evicted(&self, hash: Hash) -> bool {
         self.inner.evicted.contains(hash)
+    }
+
+    /// Is this hash quarantined because its stored bytes failed validation on
+    /// a serve export?
+    ///
+    /// A `LeafHashMismatch` or `ParentHashMismatch` from
+    /// [`Self::export_bao_range_stream`] or [`Self::outboard_pairs`] quarantines
+    /// the hash. [`Self::refuses`] then withholds it from serving, announcing,
+    /// and re-acquisition. The engine drops its protecting tags, pin included,
+    /// so GC reclaims the entry, and the quarantine lifts once the store no
+    /// longer holds the hash. The quarantine is in memory only.
+    pub fn is_quarantined(&self, hash: Hash) -> bool {
+        self.inner.quarantined.contains_key(&hash)
+    }
+
+    /// Quarantine a held `hash` whose serve export failed bao validation
+    /// against the content root.
+    ///
+    /// The store bytes or outboard diverged after admission, so every later
+    /// serve fails the same way. The quarantine makes [`Self::refuses`]
+    /// withhold the hash from serving, announcing, and re-acquisition. It
+    /// drops the protecting named tags, so the next GC sweep reclaims the
+    /// entry, and it forgets the access-time and segment entries. The tags
+    /// drop for a pinned hash too: a pin protects content, and these bytes
+    /// are not that content. [`Self::lift_reclaimed_quarantine`] ends the
+    /// quarantine when the store no longer holds the hash.
+    ///
+    /// Idempotent: only the first trip per hash counts
+    /// `held_corruption_quarantined` and walks the tag store. A tag-drop
+    /// failure counts `tag_drop_failures` and leaves the bytes GC-protected.
+    /// The hash stays refused regardless.
+    async fn quarantine_corrupt(&self, hash: Hash) {
+        if self.inner.quarantined.insert(hash, ()).is_some() {
+            return;
+        }
+        if let Some(m) = &self.inner.metrics {
+            m.held_corruption_quarantined.inc();
+        }
+        tracing::warn!(
+            %hash,
+            "held blob failed bao validation on export; quarantined it and released it to GC"
+        );
+        self.inner.access_times.remove(&hash);
+        self.inner
+            .segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&hash);
+        if let Err(err) = self.drop_named_tags_for(hash).await {
+            if let Some(m) = &self.inner.metrics {
+                m.tag_drop_failures.inc();
+            }
+            tracing::warn!(
+                %hash,
+                error = %err,
+                "quarantine: dropping the protecting tags failed; the corrupt bytes stay on disk"
+            );
+        }
+    }
+
+    /// End the quarantine on `hash` when the store no longer holds it.
+    ///
+    /// GC reclaims a quarantined entry because [`Self::quarantine_corrupt`]
+    /// dropped its tags. After the sweep nothing corrupt remains, so a
+    /// pull-through may admit a freshly verified copy. A store fault keeps the
+    /// quarantine, and a later call retries. No-op for a hash that is not
+    /// quarantined.
+    async fn lift_reclaimed_quarantine(&self, hash: Hash) {
+        if !self.is_quarantined(hash) {
+            return;
+        }
+        if let Ok(iroh_blobs::api::blobs::BlobStatus::NotFound) =
+            self.inner.store.blobs().status(hash).await
+        {
+            self.inner.quarantined.remove(&hash);
+            tracing::info!(%hash, "quarantined blob reclaimed; lifted the quarantine");
+        }
+    }
+
+    /// Lift every quarantine whose entry GC has reclaimed. The periodic origin
+    /// rescan calls this, so a reclaimed hash rejoins the origin-held announce
+    /// set even when no request touches it.
+    async fn lift_reclaimed_quarantines(&self) {
+        let quarantined: Vec<Hash> = self.inner.quarantined.iter().map(|e| *e.key()).collect();
+        for hash in quarantined {
+            self.lift_reclaimed_quarantine(hash).await;
+        }
+    }
+
+    /// Quarantine `hash` when the export error `cause` is a stored-content
+    /// hash mismatch.
+    ///
+    /// Only `LeafHashMismatch` and `ParentHashMismatch` prove that the stored
+    /// bytes or outboard diverged from the root. An `Io` or `SizeMismatch`
+    /// error is a store fault or an absent range, not corruption.
+    async fn quarantine_on_mismatch(&self, hash: Hash, cause: &bao_tree::io::EncodeError) {
+        if matches!(
+            cause,
+            bao_tree::io::EncodeError::LeafHashMismatch(_)
+                | bao_tree::io::EncodeError::ParentHashMismatch(_)
+        ) {
+            self.quarantine_corrupt(hash).await;
+        }
     }
 
     /// Set the probe-hold budget cap from `cache.max_probe_holds` (ADR 005
@@ -3095,6 +3226,7 @@ impl CacheEngine {
         // pull must not silently re-fetch the evicted span from the origin and
         // undo the eviction — exactly as `get` / `populate` refuse. The
         // eviction is sticky for the life of `<cache_dir>/evicted.log`.
+        self.lift_reclaimed_quarantine(hash).await;
         if self.refuses(hash) {
             if let Some(m) = &self.inner.metrics {
                 m.misses.inc();
@@ -4066,7 +4198,7 @@ impl CacheEngine {
     /// ([`align_range`]) because a bao proof anchors whole groups; the serve side
     /// does **not** trim back to the requested offset (trimming would break
     /// verification). The receiver discards the group-aligned prefix. The outboard
-    /// is read from the store (built at import); no held content is re-hashed.
+    /// is read from the store (built at import).
     /// Works against a **partial** blob (only imported/verified chunk groups are
     /// exportable, exactly like [`Self::export_range`]).
     ///
@@ -4075,6 +4207,16 @@ impl CacheEngine {
     /// holds O(chunk group) rather than O(blob). This is what the paid serve path
     /// drives (#1132), so a 708 MB blob costs O(chunk group) resident per
     /// concurrent serve, not ~708 MB.
+    ///
+    /// # Held content is validated as it is exported
+    ///
+    /// The store validates each exported item against the content root before
+    /// it yields the item: every parent pair against the hash its parent
+    /// expects, and every leaf's data against its parent's hash. Bytes or an
+    /// outboard that diverged on disk after admission therefore never reach
+    /// the stream. The export ends at the first mismatching chunk group with a
+    /// terminal `Err` item, and the engine
+    /// [quarantines](Self::is_quarantined) the hash.
     ///
     /// # Truncation is reported mid-stream
     ///
@@ -4149,43 +4291,48 @@ impl CacheEngine {
         // The `bool` in the unfold state is "this stream is finished" — set after
         // yielding a terminal error so the consumer cannot poll past it into a
         // second, spurious truncation error.
+        let engine = self.clone();
         Ok(Box::pin(futures_util::stream::unfold(
             (stream, false),
-            move |(mut stream, finished)| async move {
-                if finished {
-                    return None;
-                }
-                loop {
-                    match stream.next().await {
-                        Some(EncodedItem::Size(_)) => {}
-                        Some(EncodedItem::Parent(parent)) => {
-                            let mut frame = BytesMut::with_capacity(64);
-                            frame.extend_from_slice(parent.pair.0.as_bytes());
-                            frame.extend_from_slice(parent.pair.1.as_bytes());
-                            return Some((Ok(frame.freeze()), (stream, false)));
-                        }
-                        Some(EncodedItem::Leaf(leaf)) => {
-                            return Some((Ok(leaf.data), (stream, false)));
-                        }
-                        Some(EncodedItem::Done) => return None,
-                        Some(EncodedItem::Error(cause)) => {
-                            let err = CacheError::Store(
-                                anyhow::Error::from(cause).context("export_bao stream failed"),
-                            );
-                            return Some((Err(err), (stream, true)));
-                        }
-                        // The store's item channel closing without a terminal
-                        // `Done`/`Error` (actor crash / shutdown race) would
-                        // otherwise yield a silently TRUNCATED wire that the serve
-                        // path bills the client for and the client rejects as a
-                        // short delivery — with no server-side signal. Refuse
-                        // instead (#915 review).
-                        None => {
-                            let err = CacheError::Store(anyhow::anyhow!(
-                                "export_bao stream for {hash} ended without Done; \
+            move |(mut stream, finished)| {
+                let engine = engine.clone();
+                async move {
+                    if finished {
+                        return None;
+                    }
+                    loop {
+                        match stream.next().await {
+                            Some(EncodedItem::Size(_)) => {}
+                            Some(EncodedItem::Parent(parent)) => {
+                                let mut frame = BytesMut::with_capacity(64);
+                                frame.extend_from_slice(parent.pair.0.as_bytes());
+                                frame.extend_from_slice(parent.pair.1.as_bytes());
+                                return Some((Ok(frame.freeze()), (stream, false)));
+                            }
+                            Some(EncodedItem::Leaf(leaf)) => {
+                                return Some((Ok(leaf.data), (stream, false)));
+                            }
+                            Some(EncodedItem::Done) => return None,
+                            Some(EncodedItem::Error(cause)) => {
+                                engine.quarantine_on_mismatch(hash, &cause).await;
+                                let err = CacheError::Store(
+                                    anyhow::Error::from(cause).context("export_bao stream failed"),
+                                );
+                                return Some((Err(err), (stream, true)));
+                            }
+                            // The store's item channel closing without a terminal
+                            // `Done`/`Error` (actor crash / shutdown race) would
+                            // otherwise yield a silently TRUNCATED wire that the serve
+                            // path bills the client for and the client rejects as a
+                            // short delivery — with no server-side signal. Refuse
+                            // instead (#915 review).
+                            None => {
+                                let err = CacheError::Store(anyhow::anyhow!(
+                                    "export_bao stream for {hash} ended without Done; \
                                  refusing truncated export"
-                            ));
-                            return Some((Err(err), (stream, true)));
+                                ));
+                                return Some((Err(err), (stream, true)));
+                            }
                         }
                     }
                 }
@@ -4194,7 +4341,12 @@ impl CacheEngine {
     }
 
     /// Collect the outboard `(node, (left, right))` hash pairs iroh-blobs emits for
-    /// `chunk_ranges` of `hash`, straight from the store's outboard — NO re-hashing.
+    /// `chunk_ranges` of `hash`, read from the store's outboard.
+    ///
+    /// The store validates each pair and each leaf of the range against the content
+    /// root as it exports them, like [`Self::export_bao_range_stream`]. A stored
+    /// hash mismatch returns `Err` and [quarantines](Self::is_quarantined) the
+    /// hash.
     ///
     /// The serve leg's shared outboard (ADR 038) is fed
     /// from these so it can drive a coherent whole-range bao encode while the pull
@@ -4230,6 +4382,7 @@ impl CacheEngine {
                 EncodedItem::Leaf(_) | EncodedItem::Size(_) => {}
                 EncodedItem::Done => break,
                 EncodedItem::Error(cause) => {
+                    self.quarantine_on_mismatch(hash, &cause).await;
                     return Err(CacheError::Store(
                         anyhow::Error::from(cause)
                             .context("outboard_pairs: export_bao stream failed"),

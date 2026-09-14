@@ -325,13 +325,26 @@ re-enters the eviction pool at whatever segment and frequency it already
 carries.
 
 **Durable operator-evict is orthogonal to eviction policy.**
-`CacheEngine::evict` is the DMCA and corruption-recovery path. It records the
+`CacheEngine::evict` is the operator takedown path. It records the
 hash in a durable, `fsync`-backed log and makes the engine treat the hash as
 absent for every subsequent lookup, independent of any cache-pressure
 eviction. Disk reclaim for an evicted hash follows on the next GC sweep, when
 periodic GC is enabled and the protecting tag deletion succeeds. Pinning
 protects a hash against eviction-policy pressure but not against
 `CacheEngine::evict`: a durable operator directive always wins.
+
+**A serve that detects stored corruption quarantines the hash.** Every serve
+export validates the held bytes and outboard against the content root. A hash
+mismatch means that the stored copy changed after admission, from disk rot or
+tampering. The engine then quarantines the hash. It stops serving,
+announcing, and re-acquiring the hash, and it drops the protecting tags, pin
+included. The next GC sweep reclaims the entry. When the store no longer holds
+the hash, the quarantine lifts, and a later pull-through admits a verified
+copy. The quarantine is in memory only. After a restart, the next serve of the
+corrupt bytes quarantines the hash again. `CacheEngine::evict` is not the
+recovery path, because a durable takedown would withhold legitimate content
+permanently. Reclaim needs periodic GC. When GC is off, the hash stays
+quarantined and the bytes stay on disk.
 
 **The probe-triggered hold composes above policy.** A hash a node has just
 advertised as present, per [ADR 005 § Probe-Triggered Eviction

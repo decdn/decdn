@@ -638,6 +638,18 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Cache: a held blob whose stored bytes change after admission is
+  quarantined on the first serve that trips it (#1984).** Every serve export
+  already validates each chunk group against the content root, so a rotten or
+  tampered group aborts the serve and no buyer pays for it. The node did not
+  act on the mismatch: the hash stayed advertised, and every buyer tripped it
+  again until an operator ran `decdn node evict`, which is a permanent
+  takedown. Now a `LeafHashMismatch` or `ParentHashMismatch` from the serve
+  export quarantines the hash in memory. The node stops serving, announcing,
+  and re-acquiring it and drops its protecting tags, pin included. When GC
+  reclaims the entry, the quarantine lifts and a pull-through re-admits a
+  verified copy. New counter: `decdn_cache_held_corruption_quarantined_total`.
+  Reclaim needs `cache.gc_interval_sec > 0`.
 - **CLI: `pool top-up`, `pool close`, `pool assign` and `fetch`'s auto-refill now
   exit non-zero when a landed on-chain effect cannot be recorded locally.**
   Four sites printed the failure to stderr and returned `Ok(())`. All shared one
