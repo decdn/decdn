@@ -1095,7 +1095,7 @@ fn format_interval(secs: u64) -> String {
 /// `keystore`/`data_dir` outputs are simply unused here.
 ///
 /// Filters (`--node-id`, `--region`) are applied by the pure, network-free
-/// `filter_candidates`. With `--probe`, the (region-shortlisted) result is
+/// `filter_candidates`. With `--probe`, the result, sampled down to `SELECT_K`, is
 /// ranked by measured `cdn/probe/v1` round-trip time via `probe_and_rank`;
 /// without it, candidates are printed as listed, with no RTT.
 pub async fn lookup(args: &cli::LookupArgs, global_config: Option<&Path>) -> anyhow::Result<()> {

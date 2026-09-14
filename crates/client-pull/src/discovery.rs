@@ -586,9 +586,9 @@ pub async fn bootstrap_nodes(
     resolve_bootstrap(registry, data_dir)
 }
 
-/// Candidates probed before ranking (decision 3): a random sample of K
-/// candidates, region-first, then probe those K for liveness + blob-holding. At `PoC` scale a small K
-/// keeps the probe fan-out cheap while still giving the ranker a choice.
+/// Candidates probed before ranking (decision 3): shuffle, order region-first,
+/// take K, then probe those K for liveness + blob-holding. At `PoC` scale a
+/// small K keeps the probe fan-out cheap while still giving the ranker a choice.
 pub const SELECT_K: usize = 5;
 
 /// Pick `candidates` for probing (decision 3): shuffle, then same-region
@@ -599,13 +599,13 @@ pub const SELECT_K: usize = 5;
 ///
 /// The shuffle is the load-bearing step. The input order is never one the
 /// ranker chose. A live registry read arrives in the `CapacityBond` registry
-/// array order — push on `registerNode`, swap-and-pop on deregister — which
-/// an operator steers for its own slot when it registers or leaves, and
-/// every client reading the same block sees the same order. A peer-store
-/// fallback arrives in whatever order the filesystem returns the
-/// `<node-id>.json` entries in, the same for every client on that
-/// filesystem. Truncating either as-is hands out the probe slots by
-/// registration timing or filename. The shuffle is the same requester-side
+/// array order — push on `registerNode`, swap-and-pop on deregister — so an
+/// operator that registers or leaves decides who takes the slot it frees,
+/// and every client reading the same block sees the same order. A
+/// peer-store fallback or the store's identity-fresh set arrives in
+/// whatever order the filesystem returns the `<node-id>.json` entries in,
+/// stable across runs for that client. Truncating any of them as-is hands
+/// out the probe slots by registration timing or filename. The shuffle is the same requester-side
 /// defense the node's DHT lookup applies (ADR 022 § `FIND_VALUE` Flow,
 /// *Lookup integrity*). It runs on the client, the party it protects, so no
 /// node can patch it out.
@@ -638,7 +638,7 @@ pub fn select_candidates(
     candidates
 }
 
-/// Pre-filter `candidates` by an optional region allowlist, then order via
+/// Pre-filter `candidates` by an optional region allowlist, then sample via
 /// [`select_candidates`].
 ///
 /// A candidate whose `region_hint` is `Some(r)` with `r` not in `allow` is
@@ -942,7 +942,7 @@ mod tests {
     /// Runs of the shuffle-then-sort used by the selection tests below. The
     /// distribution checks want enough draws that a real shuffle shows variety
     /// while a degenerate one (identity, or a tiny-prefix permutation) cannot.
-    /// The weakest check is the "≥ 3 distinct tails out of 20" one in
+    /// The weakest check is the "≥ 3 distinct tails of the 20 possible" one in
     /// `select_keeps_region_first_while_sampling_the_rest`, which a correct
     /// shuffle fails with probability ≈ 2e-14; the membership-set checks are
     /// far tighter.
@@ -1064,34 +1064,44 @@ mod tests {
     /// input, which is registry array order or filesystem order.
     #[test]
     fn select_without_region_is_a_random_sample_capped_at_k() {
-        // With 20 candidates truncated to 10, a real Fisher-Yates yields ~16
-        // distinct orderings across 16 runs (the sample space is 20!/10! ≈
-        // 6.7e11, collisions are negligible). A shuffle that only permutes a
-        // 2- or 3-element prefix yields ≤ 6 orderings; a fully degenerate
-        // (identity) shuffle yields 1. Threshold of 8 catches both classes
-        // while leaving margin for a real-but-unlucky shuffle to pass. Mirrors
-        // `decdn-node`'s `dht::lookup` check
-        // (`into_randomised_providers_truncates_to_k_and_shuffles`).
+        // 10 US + 10 DE candidates, cut to the production `SELECT_K` (5).
         //
-        // Orderings alone cannot tell "shuffle then truncate" from "truncate
-        // then shuffle": the latter still yields 10! orderings of one fixed
-        // prefix. So the MEMBERSHIP set is counted too — C(20, 10) = 184,756
-        // possible sets, of which a fixed prefix ever shows exactly one.
-        let cands: Vec<NodeCandidate> = (1u8..=20).map(|s| candidate(s, "DE")).collect();
+        // - Orderings: 20!/15! ≈ 1.9e6 possible; a real shuffle shows ~16
+        //   across 16 runs, a shuffle of a 2- or 3-element prefix ≤ 6, an
+        //   identity shuffle 1. Mirrors `decdn-node`'s `dht::lookup` check
+        //   (`into_randomised_providers_truncates_to_k_and_shuffles`).
+        // - Membership sets: orderings alone cannot tell "shuffle then
+        //   truncate" from "truncate then shuffle", which permutes one fixed
+        //   prefix. C(20, 5) = 15,504 possible sets; a fixed prefix shows 1.
+        // - Every candidate is left out at least once: a shuffle that never
+        //   moves the first entry (the slot registry order hands out) keeps
+        //   it on every run. A real shuffle keeps a given candidate on all
+        //   16 runs with p = 0.25^16 ≈ 2.3e-10, ≈ 5e-9 across all 20.
+        // - Some sample mixes both regions: a fallback region preference
+        //   would fill all 5 slots from one region every run. A real shuffle
+        //   draws a single-region set with p ≈ 0.033, so 16 in a row ≈ 1.6e-24.
+        let mut cands: Vec<NodeCandidate> = (1u8..=10).map(|s| candidate(s, "US")).collect();
+        cands.extend((11u8..=20).map(|s| candidate(s, "DE")));
         let canonical: HashSet<Address> = cands.iter().map(|c| c.eth_address).collect();
+        let us: HashSet<Address> = (1u8..=10).map(Address::repeat_byte).collect();
         // No region, a blank one, and an unrecognized code all skip the region
         // sort rather than sorting against a value that means nothing.
         for region in [None, Some("  "), Some("not-a-region")] {
             let mut seen_orderings: HashSet<Vec<Address>> = HashSet::new();
             let mut seen_sets: HashSet<Vec<Address>> = HashSet::new();
+            let mut left_out: HashSet<Address> = HashSet::new();
+            let mut mixed_regions = false;
             for _ in 0..SHUFFLE_RUNS {
-                let out = select_candidates(cands.clone(), region, 10);
-                assert_eq!(out.len(), 10, "capped at k");
+                let out = select_candidates(cands.clone(), region, SELECT_K);
+                assert_eq!(out.len(), SELECT_K, "capped at k");
                 let ids: Vec<Address> = out.iter().map(|c| c.eth_address).collect();
                 assert!(
                     ids.iter().all(|a| canonical.contains(a)),
                     "selection invented candidates not in the input"
                 );
+                left_out.extend(canonical.iter().filter(|&a| !ids.contains(a)));
+                let us_picked = ids.iter().filter(|&a| us.contains(a)).count();
+                mixed_regions |= us_picked != 0 && us_picked != SELECT_K;
                 let mut set = ids.clone();
                 set.sort_unstable();
                 seen_orderings.insert(ids);
@@ -1107,6 +1117,16 @@ mod tests {
                 seen_sets.len() >= 8,
                 "region {region:?}: fewer than 8 distinct membership sets across \
                  {SHUFFLE_RUNS} runs — the truncate ran before the shuffle"
+            );
+            assert_eq!(
+                left_out, canonical,
+                "region {region:?}: a candidate was selected on every run — the \
+                 shuffle leaves an input position in place"
+            );
+            assert!(
+                mixed_regions,
+                "region {region:?}: every sample came from one region — a region \
+                 preference applied without a usable client region"
             );
         }
     }

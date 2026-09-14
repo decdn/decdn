@@ -101,7 +101,7 @@ reqwest = { workspace = true }
 # `decdn-incentive` (a normal dep), so this exposes the existing crate to CLI
 # source without new bloat.
 alloy = { workspace = true }
-# `decdn fetch` auto-discovery (#936) probes its top-K candidates concurrently
+# `decdn fetch` auto-discovery (#936) probes its `SELECT_K` sample concurrently
 # via `join_all`, which borrows one shared `&endpoint` instead of cloning it
 # per probe. Combinators only — no iroh-blobs, so the #578 invariant holds.
 futures-util = { workspace = true }
