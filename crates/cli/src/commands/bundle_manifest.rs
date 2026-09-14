@@ -94,6 +94,20 @@ impl SavedMtime {
     }
 }
 
+/// Place a saved file's chunks at absolute offsets: `(hash, offset, len)` in
+/// content order. `None` when the file has no chunks or the sizes do not sum to
+/// its whole-file `size` (a malformed record — ignored, never fatal).
+pub(crate) fn saved_hints(rec: &SavedFile) -> Option<Vec<(String, u64, u64)>> {
+    let chunks = rec.chunks.as_ref()?;
+    let mut out = Vec::with_capacity(chunks.len());
+    let mut offset = 0u64;
+    for c in chunks {
+        out.push((c.hash.clone(), offset, c.size));
+        offset = offset.checked_add(c.size)?;
+    }
+    (offset == rec.size).then_some(out)
+}
+
 /// Load the skip-cache at `out_root`. A missing, unreadable, malformed, or
 /// wrong-version file yields an empty manifest — the cache is advisory, so its
 /// absence only means every path falls to the re-hash gate.
@@ -207,5 +221,42 @@ mod tests {
         let loaded = load(tmp.path());
         assert_eq!(loaded.get("keep.txt").expect("kept").hash, "b3:aa");
         assert_eq!(loaded.get("change.txt").expect("changed").hash, "b3:cc");
+    }
+
+    #[test]
+    fn saved_hints_places_offsets_and_validates_sum() {
+        let rec = SavedFile {
+            hash: "b3:aa".into(),
+            size: 30,
+            mtime: SavedMtime { secs: 1, nanos: 0 },
+            chunks: Some(vec![
+                SavedChunk {
+                    hash: "b3:c0".into(),
+                    size: 10,
+                },
+                SavedChunk {
+                    hash: "b3:c1".into(),
+                    size: 20,
+                },
+            ]),
+        };
+        let got = saved_hints(&rec).expect("hints");
+        assert_eq!(got, vec![("b3:c0".into(), 0, 10), ("b3:c1".into(), 10, 20)]);
+    }
+
+    #[test]
+    fn saved_hints_rejects_bad_sum_and_absent_chunks() {
+        let mut rec = SavedFile {
+            hash: "b3:aa".into(),
+            size: 99,
+            mtime: SavedMtime { secs: 1, nanos: 0 },
+            chunks: Some(vec![SavedChunk {
+                hash: "b3:c0".into(),
+                size: 10,
+            }]),
+        };
+        assert!(saved_hints(&rec).is_none()); // 10 != 99
+        rec.chunks = None;
+        assert!(saved_hints(&rec).is_none());
     }
 }
