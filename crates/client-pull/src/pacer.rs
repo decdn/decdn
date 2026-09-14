@@ -80,6 +80,15 @@ pub struct PaceState {
     /// The reactive top-up target. `U256::ZERO` disables reactive top-up (the
     /// pacer then refuses on exhaustion rather than funding).
     pub working_deposit: U256,
+    /// The buyer's estimate of the serving peer's refundable floor `M` (ADR 003
+    /// § Pool solvency). A serving node refuses a NEW stream once the pool's
+    /// remaining deposit, less `M`, cannot cover a window, and reports that refusal
+    /// as a plain miss. So a buyer that re-opens mid-fetch must top up while
+    /// `remaining_deposit` still covers `M` plus the next voucher, not only once it
+    /// cannot cover the voucher. It triggers a top-up only; it never refuses a
+    /// draw on its own, because a peer with a smaller `M` still serves. `U256::ZERO`
+    /// keeps the voucher-only trigger.
+    pub seller_reserve: U256,
     /// Reactive top-ups already spent on this fetch.
     pub topups_used: u32,
     /// Reactive top-ups allowed in total, from
@@ -177,16 +186,24 @@ impl Pacer for BudgetPacer {
         //    the next voucher. Either way, fund it if a top-up is enabled, budget
         //    remains, and there is something to add; otherwise refuse.
         let unaffordable = s.remaining_deposit < s.next_voucher_cost;
+        let additional = s.working_deposit.saturating_sub(s.remaining_deposit);
+        let can_topup =
+            s.topups_used < s.max_topups && !s.working_deposit.is_zero() && !additional.is_zero();
         if s.exhaustion_confirmed || unaffordable {
-            let additional = s.working_deposit.saturating_sub(s.remaining_deposit);
-            let can_topup = s.topups_used < s.max_topups
-                && !s.working_deposit.is_zero()
-                && !additional.is_zero();
             return if can_topup {
                 PaceDecision::TopUp(additional)
             } else {
                 PaceDecision::Refuse
             };
+        }
+        // 2b. The voucher is affordable, but the deposit has fallen into the band a
+        //     serving peer refuses new streams in (`remaining − M` below a window).
+        //     Top up now if a top-up is available; otherwise keep drawing and let the
+        //     peer decide — a peer with a smaller floor still serves.
+        let below_seller_floor =
+            s.remaining_deposit < s.next_voucher_cost.saturating_add(s.seller_reserve);
+        if below_seller_floor && can_topup {
+            return PaceDecision::TopUp(additional);
         }
         // 3. The deposit covers the next voucher and the range is not fully paid:
         //    keep drawing the UNPAID remainder (the driver re-opens it at the paid
@@ -327,6 +344,7 @@ mod tests {
             remaining_deposit: U256::from(1_000u64),
             next_voucher_cost: U256::from(10u64),
             working_deposit: U256::from(5_000u64),
+            seller_reserve: U256::ZERO,
             topups_used: 0,
             max_topups: 3,
             exhaustion_confirmed: false,
@@ -334,6 +352,66 @@ mod tests {
             served_paid_frontier: 0,
             serve_demand_frontier: 0,
         }
+    }
+
+    #[test]
+    fn a_deposit_inside_the_seller_floor_band_tops_up_before_the_voucher_is_short() {
+        // The voucher (10) is affordable at 500, but 500 < 10 + a 1_000 floor: a
+        // serving peer would refuse the next open. Top up to the working deposit now.
+        let mut s = healthy();
+        s.remaining_deposit = U256::from(500u64);
+        s.seller_reserve = U256::from(1_000u64);
+        assert_eq!(
+            BudgetPacer::new().decide(&s),
+            PaceDecision::TopUp(U256::from(4_500u64))
+        );
+    }
+
+    #[test]
+    fn a_deposit_above_the_seller_floor_band_draws() {
+        // 1_000 >= 10 + a 900 floor: the peer still admits new streams.
+        let mut s = healthy();
+        s.seller_reserve = U256::from(900u64);
+        assert!(matches!(
+            BudgetPacer::new().decide(&s),
+            PaceDecision::Draw { .. }
+        ));
+    }
+
+    #[test]
+    fn the_seller_floor_never_refuses_on_its_own() {
+        // Inside the band with no top-up left (or none enabled), the voucher is still
+        // affordable: keep drawing and let the peer decide, never refuse.
+        let mut s = healthy();
+        s.remaining_deposit = U256::from(500u64);
+        s.seller_reserve = U256::from(1_000u64);
+        s.topups_used = s.max_topups;
+        assert!(matches!(
+            BudgetPacer::new().decide(&s),
+            PaceDecision::Draw { .. }
+        ));
+        let mut s = healthy();
+        s.remaining_deposit = U256::from(500u64);
+        s.seller_reserve = U256::from(1_000u64);
+        s.working_deposit = U256::ZERO;
+        assert!(matches!(
+            BudgetPacer::new().decide(&s),
+            PaceDecision::Draw { .. }
+        ));
+    }
+
+    #[test]
+    fn a_working_deposit_inside_the_band_draws_after_its_top_up() {
+        // Topped up to a working deposit (600) that still sits inside the band
+        // (< 10 + 1_000): nothing more to add, so draw rather than loop on top-ups.
+        let mut s = healthy();
+        s.remaining_deposit = U256::from(600u64);
+        s.working_deposit = U256::from(600u64);
+        s.seller_reserve = U256::from(1_000u64);
+        assert!(matches!(
+            BudgetPacer::new().decide(&s),
+            PaceDecision::Draw { .. }
+        ));
     }
 
     #[test]

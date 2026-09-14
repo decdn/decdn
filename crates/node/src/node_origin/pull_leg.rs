@@ -564,6 +564,7 @@ pub(crate) async fn run_pull_leg(
     };
     let config = DriveConfig {
         working_deposit: deps.config.working_deposit,
+        seller_reserve: deps.config.seller_reserve,
         max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
         settle_backoff: SETTLE_POLL_STEP,
     };
@@ -1096,6 +1097,7 @@ pub(crate) async fn run_local_pull_leg(
     // the settle-wait budget is inert here; keep the smallest sane values.
     let config = DriveConfig {
         working_deposit: U256::ZERO,
+        seller_reserve: U256::ZERO,
         max_settle_waits: 0,
         settle_backoff: SETTLE_POLL_STEP,
     };

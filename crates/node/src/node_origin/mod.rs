@@ -305,6 +305,14 @@ pub struct NodeOriginConfig {
     /// [`decdn_client_pull::driver::DriveConfig`], where zero switches the
     /// pacer's reactive arm off.
     pub working_deposit: U256,
+    /// This node's estimate of an upstream's refundable floor `M` (ADR 003 § Pool
+    /// solvency): its own `blockchain.pool_min_remaining_deposit_micro_usdc`, the
+    /// floor it keeps on the pools it serves. An upstream refuses a new stream once
+    /// the pool's remaining deposit, less its `M`, cannot cover a window, and the
+    /// refusal reads as a plain miss. The pull leg's pacer therefore tops up while
+    /// the deposit still covers this floor plus the next voucher, so a mid-pull
+    /// re-open is not refused. It only triggers a top-up; it never refuses a draw.
+    pub seller_reserve: U256,
     /// How often this node's chain watcher polls for events
     /// (`blockchain.event_poll_interval_ms`), used to size the post-top-up settle
     /// wait (#1530).
@@ -1689,6 +1697,7 @@ async fn pull_from_candidate(
     let max_blob_size_bytes = deps.config.max_blob_size_bytes;
     let drive_config = DriveConfig {
         working_deposit: deps.config.working_deposit,
+        seller_reserve: deps.config.seller_reserve,
         max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
         settle_backoff: SETTLE_POLL_STEP,
     };

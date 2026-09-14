@@ -831,6 +831,7 @@ async fn build_origin_with_probe_caches(
             max_blob_size_bytes,
             max_rate_per_mb: 0,
             working_deposit,
+            seller_reserve: U256::ZERO,
             // A day's margin; the fixtures use never-expiring channels, so the
             // near-expiry guard (#1603) is inert unless a test sets an expiry.
             // Short, so a post-top-up settle wait cannot dominate a test's wall clock.
@@ -989,6 +990,7 @@ async fn build_origin_multi_hash(
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
             // does when its channel runs dry, which a self-funding one would hide.
             working_deposit: U256::ZERO,
+            seller_reserve: U256::ZERO,
             // Short, so a post-top-up settle wait cannot dominate a test's wall clock.
             // The fixtures accept the resumed open immediately, so the budget is only
             // ever spent when a test deliberately withholds settlement.
@@ -1545,6 +1547,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
             working_deposit: U256::ZERO,
+            seller_reserve: U256::ZERO,
             event_poll_interval: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
@@ -9207,6 +9210,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
             // does when its channel runs dry, which a self-funding one would hide.
             working_deposit: U256::ZERO,
+            seller_reserve: U256::ZERO,
             // Short, so a post-top-up settle wait cannot dominate a test's wall clock.
             // The fixtures accept the resumed open immediately, so the budget is only
             // ever spent when a test deliberately withholds settlement.
@@ -10918,6 +10922,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
             // does when its channel runs dry, which a self-funding one would hide.
             working_deposit: U256::ZERO,
+            seller_reserve: U256::ZERO,
             // Short, so a post-top-up settle wait cannot dominate a test's wall clock.
             // The fixtures accept the resumed open immediately, so the budget is only
             // ever spent when a test deliberately withholds settlement.
@@ -12157,6 +12162,7 @@ async fn build_origin_economics(
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
             working_deposit: U256::ZERO,
+            seller_reserve: U256::ZERO,
             event_poll_interval: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,

@@ -2059,6 +2059,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // reactive top-up when a single pull outruns the deposit (#1530). The
         // proactive low-water refill targets the same deposit.
         working_deposit: buyer_working_deposit,
+        // An upstream running this software keeps the same default floor `M`, so
+        // this node's own floor is its estimate of the one it must stay above.
+        seller_reserve: U256::from(cfg.blockchain.pool_min_remaining_deposit_micro_usdc),
         event_poll_interval: std::time::Duration::from_millis(
             cfg.blockchain.event_poll_interval_ms,
         ),
