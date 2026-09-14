@@ -2653,11 +2653,12 @@ impl UpstreamPull {
                         // prefer the terminal signal it left to the opaque write failure.
                         // Boxed so this cold error-path future does not enlarge the steady
                         // receive loop's future (`clippy::large_futures`); the allocation
-                        // only happens on the failure path. A clean end confirms the
-                        // voucher, so nothing stays unproved.
+                        // only happens on the failure path. A confirmed voucher covers
+                        // every byte this stream received, so nothing stays unproved.
                         Err(write_err) => {
-                            Box::pin(self.terminal_after_write_failure(write_err)).await?;
-                            self.unproved = 0;
+                            if Box::pin(self.terminal_after_write_failure(write_err)).await? {
+                                self.unproved = 0;
+                            }
                         }
                     }
                     Ok(Some(Bytes::from(chunk.into_bytes())))
@@ -2688,19 +2689,27 @@ impl UpstreamPull {
     /// `STOP_SENDING(0)` a node emits when it finishes and drops `recv` — would
     /// otherwise mask that terminal signal and abort a complete, paid fetch (or
     /// swallow a typed rejection the reactive top-up path keys on). Read the terminal
-    /// signal, briefly, and prefer it: a `StreamEnd` marks the stream ended (the
-    /// chunk that triggered the write is still delivered; the next read returns
-    /// `None`) and confirms the armed voucher — a node ends a stream only once every
-    /// interval is paid, so the voucher whose write failed reached it, and
-    /// payment-based completion ([`driver::drive`]) must see this leg paid through
-    /// its end rather than re-pull and re-bill the tail; a `StreamError` surfaces as
-    /// the typed rejection. A write we caused ourselves (a [`LocalPullFault`] encode
-    /// fault) is never masked; nor is a stream that yields no terminal signal before
-    /// the bound.
+    /// signal, briefly, and prefer it.
+    ///
+    /// A `StreamEnd` marks the stream ended: the chunk that triggered the write is
+    /// still delivered, and the next read returns `None`. When the failed write was
+    /// a voucher, the `StreamEnd` also confirms it. An honest node ends a stream
+    /// only once every interval, the closing one included, is credited. So
+    /// payment-based completion ([`driver::drive`]) sees this leg paid through its
+    /// end and does not re-pull and re-bill the tail. Confirming costs nothing
+    /// extra, because [`PoolLedger::settlement`] already reports the armed voucher.
+    ///
+    /// A `StreamError` surfaces as the typed rejection. A write we caused ourselves
+    /// (a [`LocalPullFault`]) is never masked, nor is a stream that yields no
+    /// terminal signal before the bound.
+    ///
+    /// Returns whether a voucher was confirmed. A `StreamEnd` after a failed reveal
+    /// or re-anchor write, or after a sibling's voucher replaced this stream's
+    /// armed one, ends the stream with nothing confirmed.
     async fn terminal_after_write_failure(
         &mut self,
         write_err: anyhow::Error,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         if write_err.is::<LocalPullFault>() {
             return Err(write_err);
         }
@@ -2710,14 +2719,35 @@ impl UpstreamPull {
         // rides along so the log can tell a silent peer from a chatty one.
         match tokio::time::timeout(TERMINAL_AFTER_WRITE_TIMEOUT, self.read_under_floor()).await {
             Ok(Ok(ClientMessage::StreamEnd)) => {
-                if let Some(confirmed) = self.ledger.confirm_armed().await {
+                self.ended = true;
+                let attempted = write_err
+                    .downcast_ref::<UnconfirmedVoucher>()
+                    .map(|voucher| voucher.amount);
+                let confirmed = match attempted {
+                    Some(amount) => self.ledger.confirm_armed(amount).await,
+                    None => None,
+                };
+                if let Some(confirmed) = confirmed {
+                    tracing::debug!(
+                        amount = %confirmed.amount,
+                        error = %format_args!("{write_err:#}"),
+                        "upstream ended the stream after a voucher write failed; confirmed \
+                         the voucher"
+                    );
                     self.meter.last_proof = Some(StreamProof::Voucher {
                         amount: confirmed.amount,
                     });
                     self.meter.anchored_root = self.ledger.chain_root();
+                    Ok(true)
+                } else {
+                    tracing::warn!(
+                        attempted = ?attempted,
+                        error = %format_args!("{write_err:#}"),
+                        "upstream ended the stream after a proof write failed; nothing \
+                         confirmed, so the leg's tail stays unpaid"
+                    );
+                    Ok(false)
                 }
-                self.ended = true;
-                Ok(())
             }
             Ok(Ok(ClientMessage::StreamError(e))) => {
                 Err(voucher_rejection(&self.ledger, &self.meter, e))
@@ -2844,17 +2874,47 @@ async fn send_voucher(
     delta_bytes: u64,
     epoch: EpochAction,
 ) -> anyhow::Result<Cumulative> {
-    anyhow::ensure!(
-        !ctx.provider.is_zero(),
-        "voucher provider is not pinned (Address::ZERO) — call PoolContext::with_provider \
-         before signing"
-    );
-    ledger
+    if ctx.provider.is_zero() {
+        return Err(anyhow::anyhow!(
+            "voucher provider is not pinned (Address::ZERO) — call PoolContext::with_provider \
+             before signing"
+        )
+        .context(LocalPullFault));
+    }
+    let mut attempted = None;
+    let issued = ledger
         .issue(delta_bytes, rate_per_mb, epoch, |next, chain| {
+            attempted = Some(next.amount);
             sign_and_write_voucher(send, ctx, next, chain)
         })
-        .await
+        .await;
+    issued.map_err(|err| match attempted {
+        Some(amount) => err.context(UnconfirmedVoucher { amount }),
+        None => err,
+    })
 }
+
+/// Names the voucher a failed [`send_voucher`] left armed, so a terminal
+/// `StreamEnd` read afterwards confirms that voucher and no other
+/// ([`PoolLedger::confirm_armed`]). Carried as error context: it composes with,
+/// and still downcasts through, the send error it wraps.
+#[derive(Debug)]
+struct UnconfirmedVoucher {
+    /// The cumulative amount the armed voucher signs.
+    amount: U256,
+}
+
+impl std::fmt::Display for UnconfirmedVoucher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "voucher for cumulative amount {} did not confirm",
+            self.amount
+        )
+    }
+}
+
+impl std::error::Error for UnconfirmedVoucher {}
 
 /// Sign one voucher over `next`/`chain` with the pool context's key and write it
 /// to `send` — the body both [`send_voucher`] and [`PoolLedger::reanchor`] hand to

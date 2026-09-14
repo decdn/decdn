@@ -10726,6 +10726,61 @@ struct StopSendDrive {
     accepted: usize,
     /// The bytes the ranged store promoted, if it finalized.
     promoted: Option<Vec<u8>>,
+    /// The `decdn_client_pull` events the drive emitted. The stop-send race only
+    /// tests the recovery when the voucher write actually fails, and a write that
+    /// wins the race leaves the ledger in the same end state. So the recovery's
+    /// own event is the proof that it ran.
+    logs: String,
+}
+
+/// A `std::io::Write` sink appending to a shared buffer, for capturing events.
+#[derive(Clone)]
+struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The event the voucher-write recovery emits when a `StreamEnd` confirms the
+/// voucher whose write failed.
+const CONFIRMED_EVENT: &str = "confirmed the voucher";
+
+/// Capture `decdn_client_pull` events on THIS thread until the guard drops.
+///
+/// Thread-local by design: `drive` is awaited inline on the test's thread and
+/// spawns nothing on the buyer side, so every recovery event lands here. Only the
+/// upstream's serve tasks run elsewhere, and they are not asserted on.
+fn capture_client_pull_events() -> (
+    tracing::subscriber::DefaultGuard,
+    Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = CapturedLogs(Arc::clone(&buf));
+    let guard = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || sink.clone())
+                .with_ansi(false)
+                .with_filter(
+                    tracing_subscriber::filter::Targets::new()
+                        .with_target("decdn_client_pull", tracing::Level::DEBUG),
+                ),
+        )
+        .set_default();
+    (guard, buf)
 }
 
 /// Run the production gap-driven fetch — `drive` over a `PeerSource` into a
@@ -10787,6 +10842,7 @@ async fn drive_against_stop_send_server(
     let pacer = BudgetPacer::new();
     let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);
     let config = DriveConfig::cli(U256::ZERO);
+    let (log_guard, log_buf) = capture_client_pull_events();
     let result = drive(
         &store,
         &source,
@@ -10804,6 +10860,13 @@ async fn drive_against_stop_send_server(
         None,
     )
     .await;
+    drop(log_guard);
+    let logs = String::from_utf8_lossy(
+        &log_buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .into_owned();
     drop(source);
     let promoted = std::fs::read(store_dir.path().join("blob")).ok();
 
@@ -10813,13 +10876,21 @@ async fn drive_against_stop_send_server(
         ledger,
         accepted: accepted.load(Ordering::SeqCst),
         promoted,
+        logs,
     })
 }
 
 /// A drive that completed on the one connection, with the closing voucher
-/// COMMITTED (not merely armed) and exactly one honest wire billed.
+/// COMMITTED (not merely armed) by the write-failure recovery and exactly one
+/// honest wire billed.
 fn ensure_one_leg_fully_paid(d: &StopSendDrive, payload: &[u8]) -> anyhow::Result<()> {
     let wire = honest_bao_wire(payload)?;
+    anyhow::ensure!(
+        d.logs.contains(CONFIRMED_EVENT),
+        "the closing-voucher write must fail and the recovery must confirm it; captured \
+         events:\n{}",
+        d.logs
+    );
     anyhow::ensure!(
         d.promoted.as_deref() == Some(payload),
         "the drive must finalize the whole blob into the ranged store"
@@ -10847,10 +10918,11 @@ fn ensure_one_leg_fully_paid(d: &StopSendDrive, payload: &[u8]) -> anyhow::Resul
 
 /// The same closing-voucher peer-stop on the PRODUCTION gap-driven path, where
 /// completion is payment-based (`fill_gap` reads `ledger.committed()`), not
-/// decoder-based. A node writes `StreamEnd` only once every interval — the closing
-/// voucher included — is paid, so the `StreamEnd` the recovery reads proves the node
-/// holds the voucher whose write failed: the leg is paid through its end, the fetch
-/// finalizes on that ONE connection, and nothing is re-pulled or re-billed.
+/// decoder-based. An honest node writes `StreamEnd` only once every interval — the
+/// closing voucher included — is credited, so the recovery confirms the voucher whose
+/// write failed. This upstream never reads that voucher; its `StreamEnd` stands in
+/// for the honest guarantee. The leg is paid through its end, the fetch finalizes on
+/// that ONE connection, and nothing is re-pulled or re-billed.
 #[tokio::test(flavor = "multi_thread")]
 async fn drive_completes_in_one_leg_when_its_send_is_stopped_before_the_closing_voucher()
 -> anyhow::Result<()> {
@@ -10917,6 +10989,11 @@ async fn drive_surfaces_typed_rejection_when_its_send_is_stopped_before_the_clos
         d.ledger.committed() == Cumulative::default(),
         "a rejection confirms nothing: committed {:?}",
         d.ledger.committed()
+    );
+    anyhow::ensure!(
+        !d.logs.contains(CONFIRMED_EVENT),
+        "a rejection confirms nothing; captured events:\n{}",
+        d.logs
     );
     Ok(())
 }

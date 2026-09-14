@@ -37,6 +37,16 @@ impl Cumulative {
             amount: self.amount.saturating_add(other.amount),
         }
     }
+
+    /// Componentwise saturating difference — what is left of an accrual once a
+    /// voucher has folded part of it.
+    #[must_use]
+    const fn minus(self, other: Self) -> Self {
+        Self {
+            bytes: self.bytes.saturating_sub(other.bytes),
+            amount: self.amount.saturating_sub(other.amount),
+        }
+    }
 }
 
 impl From<&WatermarkBundle> for Cumulative {
@@ -196,9 +206,9 @@ struct Pipeline {
     last_proof: Option<LastProof>,
     /// The highest voucher whose send SUCCEEDED — presumed accepted, because
     /// continued delivery IS acceptance (ADR 005: only rejection is signalled).
-    /// Advanced optimistically on each successful [`PoolLedger::issue`], rewound
-    /// one step by [`PoolLedger::resolve_reject`], and hard-set by
-    /// [`PoolLedger::reseed`].
+    /// Advanced optimistically on each successful [`PoolLedger::issue`] and on a
+    /// [`PoolLedger::confirm_armed`], rewound one step by
+    /// [`PoolLedger::resolve_reject`], and hard-set by [`PoolLedger::reseed`].
     committed: Cumulative,
     /// The committed watermark BEFORE the most-recent successful voucher, so a
     /// later [`PoolLedger::resolve_reject`] can un-commit exactly that voucher —
@@ -212,9 +222,20 @@ struct Pipeline {
     /// [`PoolLedger::settlement`] reports it (settle high — the upstream persists
     /// before it would reject, ADR 003), so a pull dropped inside the send still
     /// persists what the upstream may hold. Cleared on the next successful
-    /// [`PoolLedger::issue`], a [`PoolLedger::confirm_armed`], or a
-    /// [`PoolLedger::reseed`].
-    armed: Option<Cumulative>,
+    /// [`PoolLedger::issue`], a matching [`PoolLedger::confirm_armed`] or
+    /// [`PoolLedger::resolve_reject`], or a [`PoolLedger::reseed`].
+    armed: Option<Armed>,
+}
+
+/// A voucher whose send did not confirm, together with the accrual it folded.
+#[derive(Debug, Clone, Copy)]
+struct Armed {
+    /// The cumulative the voucher signs.
+    voucher: Cumulative,
+    /// The accrual outstanding when the voucher was armed — what committing it
+    /// takes out of `accrued`. Reveals released after the arming stay in
+    /// `accrued`, because the voucher never signed them.
+    folded: Cumulative,
 }
 
 /// What the most recent voucher did to the lane's chain slot, and therefore what
@@ -481,8 +502,9 @@ impl PoolLedger {
 
     /// Read the committed cumulative WITHOUT awaiting — the drop-safe reader, and
     /// the only one a `Drop` impl can call. It is the highest voucher whose send
-    /// succeeded (implicit acceptance), so it is exactly what a *completed* pull
-    /// persists.
+    /// succeeded (implicit acceptance) or that a terminal `StreamEnd` confirmed
+    /// ([`Self::confirm_armed`]), plus the accrual since, so it is exactly what a
+    /// *completed* pull persists.
     #[must_use]
     pub fn committed(&self) -> Cumulative {
         let pipeline = self.pipeline();
@@ -506,7 +528,7 @@ impl PoolLedger {
         let pipeline = self.pipeline();
         let owed = pipeline.committed.plus(pipeline.accrued);
         match pipeline.armed {
-            Some(armed) if armed.amount > owed.amount => armed,
+            Some(armed) if armed.voucher.amount > owed.amount => armed.voucher,
             _ => owed,
         }
     }
@@ -550,7 +572,7 @@ impl PoolLedger {
             let pipeline = self.pipeline();
             let owed = pipeline.committed.plus(pipeline.accrued);
             let frontier = match pipeline.armed {
-                Some(armed) if armed.amount > owed.amount => armed,
+                Some(armed) if armed.voucher.amount > owed.amount => armed.voucher,
                 _ => owed,
             };
             (frontier, pipeline.accrued)
@@ -573,7 +595,10 @@ impl PoolLedger {
         };
         let next = next_voucher(&frontier, delta_bytes, rate_per_mb);
         let commit = self.commit_epoch(epoch, rate_per_mb);
-        self.pipeline().armed = Some(next);
+        self.pipeline().armed = Some(Armed {
+            voucher: next,
+            folded: accrued,
+        });
         // Send. On ANY error the voucher stays armed and the anchor does not
         // advance: a send failure is as ambiguous as a drop, so `settlement`
         // settles high. A rejection is NOT an issuance outcome — it arrives later
@@ -597,31 +622,44 @@ impl PoolLedger {
         Ok(next)
     }
 
-    /// Commit the armed voucher as if its send had confirmed.
+    /// Commit the armed voucher signing `amount` as if its send had confirmed.
     ///
-    /// For when the upstream's terminal `StreamEnd` arrives after a voucher write
-    /// failed: a node ends a stream only once every interval — the closing voucher
-    /// included — is paid, so the `StreamEnd` proves it holds the voucher. This is
-    /// the same transition a successful [`Self::issue`] makes (the epoch already
-    /// rolled when the voucher was armed), so `committed` catches up to what
-    /// [`Self::settlement`] already reported and payment-based completion sees the
-    /// leg paid through its end instead of re-pulling and re-billing the tail.
+    /// For when the upstream's terminal `StreamEnd` arrives after this stream's
+    /// voucher write failed. An honest node ends a stream only once every interval
+    /// — the closing voucher included — is credited, so its `StreamEnd` implies it
+    /// holds the voucher. Trusting a dishonest one costs nothing:
+    /// [`Self::settlement`] already reports the armed voucher. The epoch already
+    /// rolled when the voucher was armed, so this is the commit a successful
+    /// [`Self::issue`] makes, and payment-based completion sees the leg paid
+    /// through its end instead of re-pulling and re-billing the tail.
     ///
-    /// Returns the confirmed cumulative, or `None` when nothing is armed — a
-    /// sibling stream on the shared lane has issued past it, and its own outcome
-    /// covers this one.
-    pub async fn confirm_armed(&self) -> Option<Cumulative> {
+    /// Two things differ from the in-`issue` commit, because the issuance lock
+    /// was released between the failed send and this call:
+    ///
+    /// - **Only the fold comes out of `accrued`.** A sibling stream on the shared
+    ///   lane may have released reveals on the new chain since the voucher was
+    ///   armed. The voucher never signed them, so they stay accrued.
+    /// - **Only the named voucher commits.** `armed` belongs to the lane, not the
+    ///   stream: a sibling's failed voucher may have been armed on top of this
+    ///   one. A `StreamEnd` read on this stream says nothing about that voucher.
+    ///
+    /// Returns the confirmed cumulative, or `None` when the armed voucher does not
+    /// sign `amount`: a later issue, reject, or reseed has already cleared it, or
+    /// a sibling's voucher replaced it. The ledger is then left untouched, and
+    /// [`Self::settlement`] still settles high on whatever is armed.
+    pub async fn confirm_armed(&self, amount: U256) -> Option<Cumulative> {
         let _issuing = self.issuance.lock().await;
         let mut pipeline = self.pipeline();
-        let next = pipeline.armed.take()?;
+        let armed = pipeline
+            .armed
+            .filter(|armed| armed.voucher.amount == amount)?;
+        pipeline.armed = None;
         pipeline.prev = Some(pipeline.committed);
-        pipeline.prev_accrued = pipeline.accrued;
-        pipeline.committed = next;
-        pipeline.accrued = Cumulative::default();
-        pipeline.last_proof = Some(LastProof::Voucher {
-            amount: next.amount,
-        });
-        Some(next)
+        pipeline.prev_accrued = armed.folded;
+        pipeline.committed = armed.voucher;
+        pipeline.accrued = pipeline.accrued.minus(armed.folded);
+        pipeline.last_proof = Some(LastProof::Voucher { amount });
+        Some(armed.voucher)
     }
 
     /// Re-state the lane's signed anchor under the live root, so a stream that
@@ -989,7 +1027,9 @@ impl PoolLedger {
             // The refused voucher never committed: its send was ambiguous, so the
             // anchor never advanced and disarming IS the whole rewind.
             (StreamProof::Voucher { amount }, _)
-                if pipeline.armed.is_some_and(|armed| armed.amount == amount) =>
+                if pipeline
+                    .armed
+                    .is_some_and(|armed| armed.voucher.amount == amount) =>
             {
                 pipeline.armed = None;
                 true
@@ -1090,10 +1130,18 @@ mod tests {
             bytes: U256::from(100u64),
             amount: U256::from(1u64),
         };
-        assert_eq!(ledger.confirm_armed().await, Some(armed));
+        assert_eq!(
+            ledger
+                .confirm_armed(armed.amount.saturating_add(U256::from(1u64)))
+                .await,
+            None,
+            "a StreamEnd confirms only the voucher its own stream sent"
+        );
+        assert_eq!(ledger.committed(), Cumulative::default());
+        assert_eq!(ledger.confirm_armed(armed.amount).await, Some(armed));
         assert_eq!(ledger.committed(), armed);
         assert_eq!(ledger.settlement(), armed);
-        assert_eq!(ledger.confirm_armed().await, None);
+        assert_eq!(ledger.confirm_armed(armed.amount).await, None);
         let next = ledger
             .issue(100, 10, EpochAction::Keep, |_signed, _chain| async {
                 Ok(())
@@ -1102,6 +1150,88 @@ mod tests {
         assert_eq!(next.bytes, U256::from(200u64));
         assert!(next.amount > armed.amount);
         assert_eq!(ledger.committed(), next);
+        Ok(())
+    }
+
+    /// Confirming takes out of `accrued` only what the armed voucher folded. The
+    /// issuance lock is free between the failed send and the confirm, so a
+    /// sibling stream can release a reveal on the freshly rolled chain in that
+    /// window. The voucher never signed that reveal, so it stays owed — and a
+    /// later rejection of the confirmed voucher still rewinds both halves.
+    #[tokio::test]
+    async fn confirming_an_armed_voucher_keeps_reveals_released_after_it() -> anyhow::Result<()> {
+        let ledger = metered_ledger(Cumulative::default());
+        ledger
+            .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
+            .await?;
+        let anchor = ledger.committed();
+        ledger.meter(|_r| async { Ok(()) }).await?;
+        let chunk = ledger.committed().minus(anchor);
+        assert!(!chunk.amount.is_zero(), "a reveal accrues one chunk");
+
+        // The closing voucher folds that reveal (so it rolls), and its write fails.
+        let mut sent = None;
+        let failed = ledger
+            .issue(100, 10, EpochAction::Keep, |next, _c| {
+                sent = Some(next);
+                async { anyhow::bail!("send stopped") }
+            })
+            .await;
+        assert!(failed.is_err());
+        let armed = sent.ok_or_else(|| anyhow::anyhow!("issue never reached the send"))?;
+
+        // A sibling releases a reveal on the rolled chain before the confirm.
+        ledger.meter(|_r| async { Ok(()) }).await?;
+        let owed_before_confirm = ledger.committed();
+
+        assert_eq!(ledger.confirm_armed(armed.amount).await, Some(armed));
+        assert_eq!(
+            ledger.committed(),
+            armed.plus(chunk),
+            "the sibling's reveal survives the confirm"
+        );
+        assert_eq!(ledger.settlement(), ledger.committed());
+
+        assert!(ledger.resolve_reject(voucher_proof(armed)));
+        assert_eq!(
+            ledger.committed(),
+            owed_before_confirm,
+            "rejecting the confirmed voucher gives back its fold on top of the later reveal"
+        );
+        Ok(())
+    }
+
+    /// A `StreamEnd` read on one stream never confirms a voucher a sibling armed
+    /// on top of its own. Both sends failed, so the lane settles high on the
+    /// sibling's voucher, and only the sibling's own `StreamEnd` commits it.
+    #[tokio::test]
+    async fn confirming_skips_a_sibling_voucher_armed_on_top() -> anyhow::Result<()> {
+        let ledger = PoolLedger::new(Cumulative::default());
+        let mut ours = None;
+        let mut theirs = None;
+        let first = ledger
+            .issue(100, 10, EpochAction::Keep, |next, _c| {
+                ours = Some(next);
+                async { anyhow::bail!("send stopped") }
+            })
+            .await;
+        let second = ledger
+            .issue(100, 10, EpochAction::Keep, |next, _c| {
+                theirs = Some(next);
+                async { anyhow::bail!("send stopped") }
+            })
+            .await;
+        assert!(first.is_err() && second.is_err());
+        let ours = ours.ok_or_else(|| anyhow::anyhow!("first issue never sent"))?;
+        let theirs = theirs.ok_or_else(|| anyhow::anyhow!("second issue never sent"))?;
+        assert!(theirs.amount > ours.amount, "the sibling built on ours");
+
+        assert_eq!(ledger.confirm_armed(ours.amount).await, None);
+        assert_eq!(ledger.committed(), Cumulative::default());
+        assert_eq!(ledger.settlement(), theirs, "the lane still settles high");
+
+        assert_eq!(ledger.confirm_armed(theirs.amount).await, Some(theirs));
+        assert_eq!(ledger.committed(), theirs);
         Ok(())
     }
 
