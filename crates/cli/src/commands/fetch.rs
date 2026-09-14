@@ -695,7 +695,7 @@ fn failover_order(
 }
 
 /// Auto-discover the failover order to fetch `hash` from (#936): read the
-/// active set from `CapacityBond`, take the region-nearest
+/// active set from `CapacityBond`, take a random, region-first sample of
 /// [`discovery::SELECT_K`] candidates, and [`probe_and_order`] them. Returns the
 /// ordered candidate list `fetch` tries in turn (#1174).
 /// Callers must have already unwrapped `chain.capacity_bond` into the
@@ -1233,8 +1233,8 @@ fn persist_watermark(
 /// coordinates.
 ///
 /// With `--node-id` the node is dialed explicitly. Without it, `fetch`
-/// auto-discovers (#936): read the active set from `CapacityBond`, probe the
-/// region-nearest candidates, and derive `--provider-address` from each
+/// auto-discovers (#936): read the active set from `CapacityBond`, probe a
+/// random, region-first sample of candidates, and derive `--provider-address` from each
 /// candidate's registry entry, failing over across them (#1174).
 // Linear provider-failover loop over the resolved candidates plus the one-time
 // provider-independent setup: long, and its branch count is the fallback ladder

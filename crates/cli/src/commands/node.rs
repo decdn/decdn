@@ -1095,7 +1095,7 @@ fn format_interval(secs: u64) -> String {
 /// `keystore`/`data_dir` outputs are simply unused here.
 ///
 /// Filters (`--node-id`, `--region`) are applied by the pure, network-free
-/// `filter_candidates`. With `--probe`, the (region-shortlisted) result is
+/// `filter_candidates`. With `--probe`, the result, sampled down to `SELECT_K`, is
 /// ranked by measured `cdn/probe/v1` round-trip time via `probe_and_rank`;
 /// without it, candidates are printed as listed, with no RTT.
 pub async fn lookup(args: &cli::LookupArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
@@ -1133,10 +1133,11 @@ pub async fn lookup(args: &cli::LookupArgs, global_config: Option<&Path>) -> any
     let rows = if args.probe {
         // Cap probe fan-out the same way the paid discovery path does
         // (`select_candidates`, `SELECT_K`) — probing every active node on
-        // the network does not scale. The region reorder is a no-op here
-        // when `--region` was also passed (already exact-filtered above);
-        // it only matters when `--node-id`/`--region` left more than
-        // `SELECT_K` candidates.
+        // the network does not scale. The shortlist is a random sample of
+        // `SELECT_K`, not the registry's leading entries. The region sort is
+        // always a no-op here: with `--region` every survivor of
+        // `filter_candidates` already matches, and without it no client
+        // region is passed. Only the shuffle and the cap apply.
         let shortlisted = select_candidates(filtered, args.region.as_deref(), SELECT_K);
         probe_and_rank(shortlisted, config_path, args.timeout_ms).await?
     } else {
