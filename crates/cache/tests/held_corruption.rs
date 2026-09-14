@@ -397,6 +397,116 @@ async fn a_partial_blob_quarantines_only_for_corruption_in_a_present_range() -> 
     Ok(())
 }
 
+/// Admit the first `prefix_len` bytes of `payload` into a fresh engine as a
+/// partial blob. Returns the engine, its directory, the hash, and the outboard
+/// tree geometry.
+async fn partial_prefix(
+    payload: &[u8],
+    prefix_len: u64,
+    metrics: &Arc<CacheMetrics>,
+) -> anyhow::Result<(CacheEngine, tempfile::TempDir, Hash, bao_tree::BaoTree)> {
+    let blob_size = u64::try_from(payload.len())?;
+    let ob = PreOrderMemOutboard::create(payload, IROH_BLOCK_SIZE);
+    let root: [u8; 32] = *ob.root.as_bytes();
+    let hash = Hash::from(root);
+    let prefix = align_range(0, prefix_len, blob_size)?;
+    let bao = encode_verified_range(
+        root,
+        &prefix,
+        payload
+            .get(..usize::try_from(prefix_len)?)
+            .unwrap_or_default(),
+        bytes::Bytes::from(ob.data),
+    )?;
+    let tmp = tempfile::tempdir()?;
+    let engine = open(
+        tmp.path(),
+        "http://127.0.0.1:9",
+        PinnedHashes::empty(),
+        metrics,
+        Duration::ZERO,
+    )
+    .await?;
+    engine
+        .admit_bao(hash, prefix.chunk_ranges().clone(), bao)
+        .await?;
+    anyhow::ensure!(!engine.present_ranges(hash).await?.is_complete());
+    Ok((engine, tmp, hash, ob.tree))
+}
+
+/// A parent mismatch names a tree node whose range is in 1 KiB chunks. A node
+/// that covers only present data must quarantine the partial.
+#[tokio::test]
+async fn a_parent_mismatch_inside_a_partial_blobs_present_ranges_quarantines() -> anyhow::Result<()>
+{
+    use bao_tree::ChunkRanges;
+    use bao_tree::iter::BaoChunk;
+
+    let payload = util::make_blob(LARGE_BLOB_LEN);
+    let prefix_len: u64 = 1024 * 1024;
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, tmp, hash, tree) = partial_prefix(&payload, prefix_len, &metrics).await?;
+
+    // The largest non-root parent that lies wholly inside the admitted prefix.
+    let prefix_ranges = ChunkRanges::from(..bao_tree::ChunkNum(prefix_len / 1024));
+    let node = tree
+        .ranges_pre_order_chunks_iter_ref(&prefix_ranges, 0)
+        .find_map(|chunk| match chunk {
+            BaoChunk::Parent { node, is_root, .. }
+                if !is_root
+                    && (ChunkRanges::from(node.chunk_range()) - &prefix_ranges).is_empty() =>
+            {
+                Some(node)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("no parent node inside the prefix"))?;
+    let offset = tree
+        .pre_order_offset(node)
+        .ok_or_else(|| anyhow::anyhow!("the node has no outboard slot"))?;
+    flip(tmp.path(), hash, "obao4", offset * 64)?;
+
+    let err = serve_error(&engine, hash, 0, prefix_len, LARGE_BLOB_LEN).await?;
+    anyhow::ensure!(
+        err.as_deref()
+            .is_some_and(|e| e.to_lowercase().contains("parent")),
+        "the export must fail parent validation; got {err:?}"
+    );
+    anyhow::ensure!(
+        engine.is_quarantined(hash),
+        "a parent mismatch inside the present ranges quarantines the partial"
+    );
+    Ok(())
+}
+
+/// A short read names no location, so it counts when the whole requested range
+/// is present.
+#[tokio::test]
+async fn a_short_read_over_a_partial_blobs_present_range_quarantines() -> anyhow::Result<()> {
+    let payload = util::make_blob(BLOB_LEN);
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, tmp, hash, _) = partial_prefix(&payload, 64 * 1024, &metrics).await?;
+
+    let file =
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(store_file(tmp.path(), hash, "data")?)?;
+    file.set_len(20 * 1024)?;
+    file.sync_all()?;
+
+    anyhow::ensure!(
+        serve_error(&engine, hash, 0, 64 * 1024, BLOB_LEN)
+            .await?
+            .is_some(),
+        "the export must fail on the short read"
+    );
+    anyhow::ensure!(
+        engine.is_quarantined(hash),
+        "a short read inside the present ranges quarantines the partial"
+    );
+    Ok(())
+}
+
 /// GC reclaims the quarantined entry, the quarantine lifts, and a pull-through
 /// admits a verified copy that serves. Pinned, so the test also proves the
 /// quarantine releases a pinned hash to GC.

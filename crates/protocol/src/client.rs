@@ -1091,7 +1091,7 @@ pub enum StreamError {
     BlobTooLarge,
     /// Unexpected failure; do not retry this node.
     InternalError,
-    /// Blob was evicted between probe and stream request. WARNING: still
+    /// The node withdrew the blob between probe and stream request. WARNING: still
     /// slashable after a signed `has_blob: true` probe (ADR 005).
     ///
     /// A withdrawal with no blacklist entry behind it — a manual

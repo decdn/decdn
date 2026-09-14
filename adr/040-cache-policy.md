@@ -337,7 +337,12 @@ protects a hash against eviction-policy pressure but not against
 export validates the exported chunk groups and their proof nodes against the
 content root. A hash mismatch or a short read over held content means that the
 stored copy changed after admission, from disk rot or tampering. The engine
-then quarantines the hash. The node stops serving, announcing, and
+then quarantines the hash. A complete blob holds all content, so every such
+error quarantines it. A partial blob holds only its present ranges. An absent
+range of a partial blob reads back as zeros or ends early, and that is not
+corruption. So a partial blob is quarantined only when the mismatching leaf or
+node lies inside its present ranges, or when a short read occurs in an export
+whose whole range is present. The node stops serving, announcing, and
 re-acquiring the hash. A stream request for it answers `EvictedSinceProbe`.
 The engine drops the protecting tags, also for a pinned hash. The pin does not
 keep corrupt bytes from GC. The next GC sweep reclaims the entry. The next

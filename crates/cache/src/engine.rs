@@ -620,9 +620,11 @@ pub enum ServeAudit {
         /// Whether this node withdrew the hash on its own authority: an
         /// operator eviction ([`CacheEngine::is_evicted`], #279) or a
         /// stored-corruption quarantine ([`CacheEngine::is_quarantined`]). The
-        /// miss path must not fill a withdrawn hash. A fill of an evicted hash
-        /// undoes the takedown. A fill of a quarantined hash lands on the
-        /// corrupt entry and pays for bytes it can never serve.
+        /// miss path must not fill a withdrawn hash: a fill of an evicted hash
+        /// would undo the takedown, and a fill of a quarantined hash would land
+        /// on the corrupt entry and pay for bytes it can never serve. A
+        /// quarantined hash becomes fillable again only after GC reclaims the
+        /// entry and the quarantine lifts; an evicted hash never does.
         withdrawn: bool,
     },
 }
@@ -2758,30 +2760,32 @@ impl CacheEngine {
     ///   than the size the store recorded.
     ///
     /// Each counts only over content the store holds. A partial blob's data
-    /// file is sparse, so an absent range reads back as zeros and fails the
-    /// hash check exactly like corruption. A complete blob holds every range,
+    /// file is sparse, so an absent range reads back as zeros or ends early,
+    /// and fails exactly like corruption. A complete blob holds every range,
     /// so any of the three errors quarantines it. A partial blob is
-    /// quarantined only when the failing chunk groups lie inside its present
-    /// ranges; a short read never quarantines a partial blob. Every other
-    /// error is a store fault or an absent blob, not corruption.
-    async fn quarantine_on_mismatch(&self, hash: Hash, cause: &bao_tree::io::EncodeError) {
+    /// quarantined only when the failing chunks lie inside its present ranges.
+    /// A hash mismatch names the failing leaf or node. A short read names no
+    /// location, so it counts only when the whole `requested` export range is
+    /// present. Every other error is a store fault or an absent blob, not
+    /// corruption.
+    async fn quarantine_on_mismatch(
+        &self,
+        hash: Hash,
+        cause: &bao_tree::io::EncodeError,
+        requested: &ChunkRanges,
+    ) {
         use bao_tree::ChunkNum;
         use bao_tree::io::EncodeError;
 
         let chunk_log = decdn_bao_range::IROH_BLOCK_SIZE.chunk_log();
+        // Leaf and node ranges are in 1 KiB chunks, the unit of `ChunkRanges`.
         let failing = match cause {
             EncodeError::LeafHashMismatch(start) => {
                 ChunkRanges::from(*start..ChunkNum(start.0.saturating_add(1 << chunk_log)))
             }
-            // A tree node's range is in chunk groups; shift it to chunks.
-            EncodeError::ParentHashMismatch(node) => {
-                let groups = node.chunk_range();
-                ChunkRanges::from(
-                    ChunkNum(groups.start.0 << chunk_log)..ChunkNum(groups.end.0 << chunk_log),
-                )
-            }
+            EncodeError::ParentHashMismatch(node) => ChunkRanges::from(node.chunk_range()),
             EncodeError::Io(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                ChunkRanges::all()
+                requested.clone()
             }
             _ => return,
         };
@@ -4383,10 +4387,12 @@ impl CacheEngine {
         // yielding a terminal error so the consumer cannot poll past it into a
         // second, spurious truncation error.
         let engine = self.clone();
+        let requested = aligned.chunk_ranges().clone();
         Ok(Box::pin(futures_util::stream::unfold(
             (stream, false),
             move |(mut stream, finished)| {
                 let engine = engine.clone();
+                let requested = requested.clone();
                 async move {
                     if finished {
                         return None;
@@ -4405,7 +4411,9 @@ impl CacheEngine {
                             }
                             Some(EncodedItem::Done) => return None,
                             Some(EncodedItem::Error(cause)) => {
-                                engine.quarantine_on_mismatch(hash, &cause).await;
+                                engine
+                                    .quarantine_on_mismatch(hash, &cause, &requested)
+                                    .await;
                                 let err = CacheError::Store(
                                     anyhow::Error::from(cause).context("export_bao stream failed"),
                                 );
@@ -4476,7 +4484,8 @@ impl CacheEngine {
                 EncodedItem::Leaf(_) | EncodedItem::Size(_) => {}
                 EncodedItem::Done => break,
                 EncodedItem::Error(cause) => {
-                    self.quarantine_on_mismatch(hash, &cause).await;
+                    self.quarantine_on_mismatch(hash, &cause, chunk_ranges)
+                        .await;
                     return Err(CacheError::Store(
                         anyhow::Error::from(cause)
                             .context("outboard_pairs: export_bao stream failed"),
