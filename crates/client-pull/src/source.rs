@@ -161,7 +161,7 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
 
 /// The injected pool top-up seam. Wraps the deployment's funding path — the
 /// CLI's `CliFunder` and the node's `NodeFunder`, both driving
-/// `PoolOpener::top_up_pool` over their own chain handle — so the driver and
+/// `PoolOpener::top_up_pool_by` over their own chain handle — so the driver and
 /// [`BlobSource`] never name a contract instance.
 ///
 /// A top-up is only ever attempted after a [`crate::pacer::Pacer`] returns

@@ -204,7 +204,7 @@ impl AsyncSliceReader for AwaitingDataReader {
             // is about to wait on a pull. Record what it waits on; the frame consumer
             // turns it into serve demand if it starves on this park.
             self.parked_on.store(
-                offset.saturating_add(need).min(self.total),
+                offset.saturating_add(need),
                 std::sync::atomic::Ordering::Relaxed,
             );
 
@@ -762,25 +762,16 @@ mod tests {
         // below the pull's frontier, where a pacer ignores it. The look-ahead park on
         // the right leaf, with bytes still buffered, must not be published.
         assert!(
-            session
-                .serve_demand()
-                .load(std::sync::atomic::Ordering::Acquire)
-                <= G,
+            session.serve_demand().get() <= G,
             "look-ahead with bytes still buffered demands nothing past the pulled leaf, \
              got {}",
-            session
-                .serve_demand()
-                .load(std::sync::atomic::Ordering::Acquire)
+            session.serve_demand().get()
         );
 
         let serve = tokio::spawn(drain(producer));
 
         let demanded = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while session
-                .serve_demand()
-                .load(std::sync::atomic::Ordering::Acquire)
-                < total
-            {
+            while session.serve_demand().get() < total {
                 tokio::task::yield_now().await;
             }
         })
@@ -788,14 +779,10 @@ mod tests {
         assert!(
             demanded.is_ok(),
             "the parked leaf read must demand its leaf end, got {}",
-            session
-                .serve_demand()
-                .load(std::sync::atomic::Ordering::Acquire)
+            session.serve_demand().get()
         );
         assert_eq!(
-            session
-                .serve_demand()
-                .load(std::sync::atomic::Ordering::Acquire),
+            session.serve_demand().get(),
             total,
             "the demand stops at the awaited leaf's end"
         );

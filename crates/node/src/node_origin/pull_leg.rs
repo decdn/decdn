@@ -36,7 +36,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -44,7 +44,7 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use bao_tree::ChunkRanges;
 use decdn_bao_range::RangedStore;
-use decdn_cache::{CacheEngine, CacheError, FillError, FillSession, Hash};
+use decdn_cache::{CacheEngine, CacheError, DownstreamWatch, FillError, FillSession, Hash};
 use decdn_client_pull::driver::DriveConfig;
 use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
@@ -55,7 +55,6 @@ use decdn_incentive::DepositOutcome;
 
 use decdn_reputation::Outcome;
 use iroh::{EndpointAddr, PublicKey};
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -103,33 +102,24 @@ pub(crate) struct PullLegTarget {
 }
 
 /// The injected wait for [`RampPacer`]'s `Wait`: resolve once the serve leg's paid
-/// frontier or demand frontier advances. Awaits the shared `served_paid_advanced`
-/// notify so a parked pull re-decides exactly when a downstream voucher clears or
-/// the serve leg starts waiting on bytes. Also the reader `drive` paces against, so
-/// the decision and the wait always read the same atomics.
-struct ServedPaidWait {
-    served_paid_advanced: Arc<Notify>,
-    /// The live shared served-paid frontier. Re-read AFTER the wakeup is registered
-    /// so an advance that raced the pacer's `Wait` decision is not waited on forever
-    /// — `Notify::notify_waiters` stores no permit, so without this re-check the
-    /// window-paused pull wedges (the #1673 CI-starvation hang).
-    served_paid: Arc<AtomicU64>,
-    /// The live shared serve-demand frontier, re-read after arming exactly like
-    /// `served_paid`.
-    serve_demand: Arc<AtomicU64>,
+/// frontier or demand frontier moves past what the decision read
+/// ([`DownstreamWatch::past`], which owns the #1673 arm-then-recheck). Also the
+/// reader `drive` paces against, so the decision and the wait always read the same
+/// frontiers.
+struct DownstreamWait {
+    /// The session's downstream frontiers.
+    watch: DownstreamWatch,
     /// Bumps `node_pull_through_window_paused` on each pause — the pull hit its ADR
     /// 037 window and is waiting for downstream payment to clear or a serve leg to
     /// park at its frontier.
     metrics: Arc<crate::metrics::Metrics>,
 }
 
-impl ServedPaidWait {
+impl DownstreamWait {
     /// A wait over `session`'s downstream frontiers.
     fn for_session(session: &FillSession, metrics: Arc<crate::metrics::Metrics>) -> Self {
         Self {
-            served_paid_advanced: Arc::clone(session.served_advanced()),
-            served_paid: Arc::clone(session.served_frontier()),
-            serve_demand: Arc::clone(session.serve_demand()),
+            watch: session.downstream_watch(),
             metrics,
         }
     }
@@ -137,33 +127,18 @@ impl ServedPaidWait {
     /// The live downstream frontiers, as the pacer reads them.
     fn frontier(&self) -> DownstreamFrontier {
         DownstreamFrontier {
-            served_paid: self.served_paid.load(Ordering::Relaxed),
-            serve_demand: self.serve_demand.load(Ordering::Relaxed),
+            served_paid: self.watch.served_paid(),
+            serve_demand: self.watch.serve_demand(),
         }
     }
 }
 
-impl PacingWait for ServedPaidWait {
+impl PacingWait for DownstreamWait {
     fn wait(&self, observed: DownstreamFrontier) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         // The pull hit its ADR 037 window: count the pause (the decision was `Wait`),
         // independent of whether we then park or short-circuit on a raced advance.
         self.metrics.node_pull_through_window_paused();
-        Box::pin(async move {
-            // Register the wakeup FIRST, then re-read the frontier. `notify_waiters`
-            // wakes only waiters registered at the moment it fires and stores no
-            // permit, so the serve leg's `served_advanced().notify_waiters()` that
-            // lands between the pacer reading `observed` and this park would be lost —
-            // wedging the pull (#1673). Arm the waiter, THEN check: if the frontier
-            // already moved past `observed`, the advance we would wait for has already
-            // happened, so re-decide at once instead of parking on a notify that will
-            // never repeat. Any advance AFTER this arm wakes the registered waiter.
-            let mut notified = Box::pin(self.served_paid_advanced.notified());
-            notified.as_mut().enable();
-            if self.frontier().advanced_past(observed) {
-                return;
-            }
-            notified.await;
-        })
+        Box::pin(self.watch.past(observed.served_paid, observed.serve_demand))
     }
 }
 
@@ -473,7 +448,7 @@ impl NodeOrigin {
 /// sticky), and drives the runs in offset order. Each run opens ONE buyer lane to
 /// its source — one `(signer, provider)` payment lane — and runs are SEQUENTIAL,
 /// so two lanes never pay at once. The [`NodeAdmitStore`], [`RampPacer`], the
-/// downstream `served_paid` reader, and the [`ServedPaidWait`] are SHARED across
+/// downstream frontier reader and wait ([`DownstreamWait`]) are SHARED across
 /// every run, so the demand window is continuous: it is keyed on the downstream
 /// paid frontier, not on the run, and a later run's lane still `Wait`s on the same
 /// frontier the earlier one did.
@@ -508,8 +483,8 @@ impl NodeOrigin {
 /// OWNED + `'static` (no borrow crosses the thread): `deps_lock` is a clone of
 /// [`NodeOrigin::deps_arc`], read via `get()` HERE so `&deps.endpoint` /
 /// `&deps.slash_domain` are borrowed only within this runtime's scope. The shared
-/// coordination state (the shared [`FillSession`]'s [`AtomicU64`] / [`Notify`]) crosses runtimes
-/// safely — atomics and `Notify` wakers are runtime-agnostic — and the
+/// coordination state (the shared [`FillSession`]'s [`DownstreamWatch`]) crosses
+/// runtimes safely — atomics and `Notify` wakers are runtime-agnostic — and the
 /// [`CacheEngine`] store actor and iroh [`Endpoint`](iroh::Endpoint) are reached
 /// through their own channels, so a second runtime talking to them is fine.
 #[allow(clippy::too_many_arguments)]
@@ -571,7 +546,7 @@ pub(crate) async fn run_pull_leg(
     // The downstream pacing wait and frontier reader, SHARED across every run's lane
     // so the window is continuous — keyed on the session's downstream frontiers, not
     // on the run.
-    let pacing_wait = ServedPaidWait::for_session(&session, Arc::clone(&deps.metrics));
+    let pacing_wait = DownstreamWait::for_session(&session, Arc::clone(&deps.metrics));
     // Index-aligned with `candidates`: `SourceCoverage.source_ix` is a position here.
     let coverages: Vec<decdn_protocol::Coverage> =
         candidates.iter().map(|c| c.coverage.clone()).collect();
@@ -631,7 +606,7 @@ struct PeerRunSink<'a> {
     config: &'a DriveConfig,
     /// The shared downstream wait, which is also the frontier reader every run's
     /// `drive` paces against, so the demand window is continuous across runs.
-    pacing_wait: &'a ServedPaidWait,
+    pacing_wait: &'a DownstreamWait,
     /// Reactive top-ups this assembly has escrowed, across EVERY run's lane
     /// (#1506). One pool deposit backs the whole set, so [`Funder::max_topups`]
     /// bounds the assembly, not each run — counting per-run would let a K-source
@@ -1052,7 +1027,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// Like [`run_pull_leg`], `drive`'s future is non-`Send`, so the orchestration
 /// `block_on`s this on a dedicated current-thread runtime. All inputs are
 /// therefore owned + `'static`; the shared coordination state
-/// (the shared [`FillSession`]'s [`AtomicU64`] / [`Notify`]) crosses runtimes safely.
+/// (the shared [`FillSession`]'s [`DownstreamWatch`]) crosses runtimes safely.
 #[allow(
     clippy::too_many_arguments,
     dead_code,
@@ -1101,7 +1076,7 @@ pub(crate) async fn run_local_pull_leg(
         max_settle_waits: 0,
         settle_backoff: SETTLE_POLL_STEP,
     };
-    let pacing_wait = ServedPaidWait::for_session(&session, Arc::clone(&metrics));
+    let pacing_wait = DownstreamWait::for_session(&session, Arc::clone(&metrics));
     let downstream_reader = || pacing_wait.frontier();
 
     // Cooperative cancellation exactly as the paid leg: the serve leg finishing
@@ -1172,7 +1147,6 @@ mod local_pull_leg_tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use bao_tree::io::outboard::PreOrderMemOutboard;
@@ -1366,11 +1340,9 @@ mod local_pull_leg_tests {
     ) -> anyhow::Result<Option<Result<(), FillError>>> {
         let hash = Hash::from(root);
         let source = BackendSource::new(engine.clone(), root, total, fresh_ledger());
-        let session = FillSession::new(bao_tree::blake3::Hash::from(root), total);
-        // Pre-advance the served frontier to `total` so the downstream `RampPacer`
-        // never gates the pull (this test exercises the completion path, not the
-        // window).
-        session.served_frontier().store(total, Ordering::Relaxed);
+        // Start the served frontier at `total` so the downstream `RampPacer` never
+        // gates the pull (this test exercises the completion path, not the window).
+        let session = FillSession::starting_at(bao_tree::blake3::Hash::from(root), total, total);
 
         let cancel = CancellationToken::new();
         let metrics = Arc::new(crate::metrics::Metrics::new());
@@ -1463,30 +1435,26 @@ mod local_pull_leg_tests {
 
 /// Regression coverage for the window-pause lost-wakeup that wedged
 /// [`run_pull_leg`] / [`run_local_pull_leg`] under CI scheduling gaps (#1673).
-/// [`ServedPaidWait`] is edge-triggered on a [`Notify`], which stores no permit
-/// across `notify_waiters`, so a serve-leg advance that races the pacer's `Wait`
-/// decision must be caught by re-reading the frontier AFTER arming the waiter — not
-/// waited on forever.
+/// [`DownstreamWait`] parks on an edge-triggered wakeup that stores no permit, so a
+/// serve-leg advance that races the pacer's `Wait` decision must be caught by
+/// re-reading the frontiers AFTER arming the waiter — not waited on forever.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
-mod served_paid_wait_tests {
+mod downstream_wait_tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    use tokio::sync::Notify;
+    use decdn_cache::FillSession;
 
-    use super::ServedPaidWait;
+    use super::DownstreamWait;
     use crate::metrics::Metrics;
     use decdn_client_pull::{DownstreamFrontier, PacingWait};
 
-    fn wait_hook(advanced: &Arc<Notify>, frontier: &Arc<AtomicU64>) -> ServedPaidWait {
-        ServedPaidWait {
-            served_paid_advanced: Arc::clone(advanced),
-            served_paid: Arc::clone(frontier),
-            serve_demand: Arc::new(AtomicU64::new(0)),
-            metrics: Arc::new(Metrics::new()),
-        }
+    /// A standalone session and a wait over its downstream frontiers.
+    fn session_and_hook() -> (Arc<FillSession>, DownstreamWait) {
+        let session = FillSession::new(bao_tree::blake3::Hash::from([7; 32]), 1 << 20);
+        let hook = DownstreamWait::for_session(&session, Arc::new(Metrics::new()));
+        (session, hook)
     }
 
     /// The #1673 race on the demand frontier: a serve encoder parks and raises the
@@ -1495,12 +1463,9 @@ mod served_paid_wait_tests {
     /// once, or the pull waits for a payment the parked encoder blocks (#1893).
     #[tokio::test]
     async fn a_racing_demand_advance_before_the_park_is_not_lost() {
-        let advanced = Arc::new(Notify::new());
-        let frontier = Arc::new(AtomicU64::new(0));
-        let hook = wait_hook(&advanced, &frontier);
+        let (session, hook) = session_and_hook();
 
-        hook.serve_demand.store(64 * 1024, Ordering::Relaxed);
-        advanced.notify_waiters();
+        session.demand_up_to(64 * 1024);
 
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -1513,12 +1478,11 @@ mod served_paid_wait_tests {
     /// A pull already parked on its window wakes when a serve leg raises the demand,
     /// with no payment at all — and a demand that does not move the frontier leaves
     /// it parked. Pins that `FillSession::demand_up_to` notifies the same wakeup
-    /// `ServedPaidWait::for_session` arms (#1893).
+    /// `DownstreamWait::for_session` arms (#1893).
     #[tokio::test]
     async fn a_demand_raise_wakes_a_parked_pull_and_a_stale_one_does_not() {
-        let session = decdn_cache::FillSession::new(bao_tree::blake3::Hash::from([7; 32]), 1 << 20);
+        let (session, hook) = session_and_hook();
         session.demand_up_to(64 * 1024);
-        let hook = ServedPaidWait::for_session(&session, Arc::new(Metrics::new()));
         let observed = hook.frontier();
 
         let wait = hook.wait(observed);
@@ -1544,20 +1508,17 @@ mod served_paid_wait_tests {
             .expect("a demand raise must wake the parked pull");
     }
 
-    /// The #1673 race: the serve leg advances the frontier and fires
-    /// `notify_waiters()` in the gap between the pacer reading `observed` and the
-    /// pull parking. The notify wakes nobody (no waiter registered, no permit
-    /// stored). `wait` must re-read the frontier after arming and return at once;
-    /// an edge-triggered wait wedges here forever.
+    /// The #1673 race: the serve leg advances the frontier and fires its wakeup in
+    /// the gap between the pacer reading `observed` and the pull parking. The
+    /// notify wakes nobody (no waiter registered, no permit stored). `wait` must
+    /// re-read the frontier after arming and return at once; an edge-triggered wait
+    /// wedges here forever.
     #[tokio::test]
     async fn a_racing_advance_before_the_park_is_not_lost() {
-        let advanced = Arc::new(Notify::new());
-        let frontier = Arc::new(AtomicU64::new(0));
-        let hook = wait_hook(&advanced, &frontier);
+        let (session, hook) = session_and_hook();
 
         // The advance + notify land BEFORE `wait` is polled — the lost-wakeup window.
-        frontier.store(64 * 1024, Ordering::Relaxed);
-        advanced.notify_waiters();
+        session.advance_served(64 * 1024);
 
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -1568,22 +1529,15 @@ mod served_paid_wait_tests {
     }
 
     /// The ordinary path still parks and wakes: with no advance yet, `wait` blocks,
-    /// then resolves on a later `notify_waiters()` from the serve leg.
+    /// then resolves on a later advance from the serve leg.
     #[tokio::test]
     async fn a_later_advance_wakes_the_parked_wait() {
-        let advanced = Arc::new(Notify::new());
-        let frontier = Arc::new(AtomicU64::new(0));
-        let hook = wait_hook(&advanced, &frontier);
+        let (session, hook) = session_and_hook();
 
-        let advance = {
-            let advanced = Arc::clone(&advanced);
-            let frontier = Arc::clone(&frontier);
-            async move {
-                // Let `wait` arm + park first, then advance and notify.
-                tokio::task::yield_now().await;
-                frontier.store(64 * 1024, Ordering::Relaxed);
-                advanced.notify_waiters();
-            }
+        let advance = async {
+            // Let `wait` arm + park first, then advance.
+            tokio::task::yield_now().await;
+            session.advance_served(64 * 1024);
         };
         tokio::join!(
             async {

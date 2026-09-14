@@ -1136,7 +1136,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // Top-up: add a margin to the pool and assert the on-chain deposit reflects it.
     let deposit_before = U256::from(buyer_pool.getPool(buyer_pool_id).call().await?.deposit);
     let landed = buyer_service
-        .top_up_pool(U256::from(TOPUP_MICRO_USDC))
+        .top_up_pool_by(U256::from(TOPUP_MICRO_USDC))
         .await?;
     anyhow::ensure!(
         U256::from(buyer_pool.getPool(buyer_pool_id).call().await?.deposit)
@@ -1145,7 +1145,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         landed.added == U256::from(TOPUP_MICRO_USDC),
-        "top_up_pool must report the requested amount as added, got {}",
+        "top_up_pool_by must report the requested amount as added, got {}",
         landed.added
     );
 
@@ -1155,8 +1155,8 @@ async fn run_e2e() -> anyhow::Result<()> {
     // under-fund this guards — and never more than both.
     let deposit_before = U256::from(buyer_pool.getPool(buyer_pool_id).call().await?.deposit);
     let (first, second) = tokio::join!(
-        buyer_service.top_up_pool(U256::from(TOPUP_MICRO_USDC)),
-        buyer_service.top_up_pool(U256::from(TOPUP_MICRO_USDC / 2)),
+        buyer_service.top_up_pool_by(U256::from(TOPUP_MICRO_USDC)),
+        buyer_service.top_up_pool_by(U256::from(TOPUP_MICRO_USDC / 2)),
     );
     let (first, second) = (first?, second?);
     anyhow::ensure!(

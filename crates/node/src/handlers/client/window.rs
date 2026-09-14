@@ -1,7 +1,5 @@
 //! Window-paced pull-through serve path (#856, ADR 037).
 
-use std::sync::atomic::Ordering;
-
 use alloy::primitives::U256;
 
 use crate::node_origin::PullLegTarget;
@@ -243,23 +241,17 @@ impl ClientHandler {
         // decide whether this miss OWNS a fresh pull for `hash` or ATTACHES as an
         // observer to a live one. Two concurrent same-hash misses therefore share ONE
         // upstream pull (no double spend, #305) while each keeps its own per-channel
-        // voucher stream. `make_session` builds the shared `FillSession` and seeds its
-        // PAID content frontier ONLY on the owner branch — it is a SYNC seed (no await
-        // in the closure, which runs under the registry lock). The frontier is an
-        // ABSOLUTE content offset, seeded to the request's content start
-        // (`req.byte_offset`) so a non-zero-offset request does not show a window of
-        // phantom lead and immediately `Wait`.
+        // voucher stream. `make_session` builds the shared `FillSession` only on an
+        // owning branch (`Owner` or `Mixed`), with its PAID content frontier at the
+        // request's ABSOLUTE content start (`req.byte_offset`), so a non-zero-offset
+        // request does not show a window of phantom lead and immediately `Wait`.
         let byte_offset = req.byte_offset;
         let byte_len = req.byte_len;
         let root = bao_tree::blake3::Hash::from(*hash.as_bytes());
         let claim = self
             .cache
             .claim_fill(hash, byte_offset, byte_len, total_bytes, || {
-                let session = decdn_cache::FillSession::new(root, total_bytes);
-                session
-                    .served_frontier()
-                    .store(byte_offset, Ordering::Relaxed);
-                session
+                decdn_cache::FillSession::starting_at(root, total_bytes, byte_offset)
             });
 
         // Resolve the claim into a uniform shape: the session to serve from, the
@@ -594,21 +586,16 @@ impl ClientHandler {
         // OWN a fresh local pull for `hash` or ATTACH as an observer to a live same-hash
         // fill (any source — a peer pull and an own-origin pull for the same hash
         // coalesce, the byte fetched once). Two concurrent whole-blob own-origin misses
-        // therefore drive ONE origin fetch. `make_session` builds the session and seeds
-        // its PAID frontier ONLY on the owner branch, a SYNC seed (no await under the
-        // registry lock). The frontier is an ABSOLUTE content offset seeded to the
-        // request start (`req.byte_offset`) so it does not show a window of phantom lead.
+        // therefore drive ONE origin fetch. `make_session` builds the session only on an
+        // owning branch (`Owner` or `Mixed`), with its PAID frontier at the request's
+        // ABSOLUTE content start (`req.byte_offset`) so it shows no phantom lead.
         let byte_offset = req.byte_offset;
         let byte_len = req.byte_len;
         let root = bao_tree::blake3::Hash::from(*hash.as_bytes());
         let claim = self
             .cache
             .claim_fill(hash, byte_offset, byte_len, total_bytes, || {
-                let session = decdn_cache::FillSession::new(root, total_bytes);
-                session
-                    .served_frontier()
-                    .store(byte_offset, Ordering::Relaxed);
-                session
+                decdn_cache::FillSession::starting_at(root, total_bytes, byte_offset)
             });
 
         // Resolve the claim into the uniform serve shape (twin of the peer path,

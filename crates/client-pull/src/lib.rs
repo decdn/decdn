@@ -97,13 +97,14 @@ pub use coverage_plan::{
     CoveredRun, SourceCoverage, covering_sources, plan_covered_runs, spread_segments,
 };
 pub use decdn_bao_range::RangedStore;
-pub use driver::{DownstreamFrontier, PacingWait, PoolExhausted, SharedPool, drive};
+pub use driver::{PacingWait, PoolExhausted, SharedPool, drive};
 pub use ledger::{
     ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Released, StreamProof,
 };
 pub use ledgers::{LaneHandle, LaneLedgers};
 pub use pacer::{
-    BudgetPacer, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer,
+    BudgetPacer, DownstreamFrontier, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer,
+    WindowPacer,
 };
 pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
 pub use ranged_store::ClientRangedStore;

@@ -13,13 +13,13 @@
 //! is the local store, read as a coherent verified stream, not an upstream
 //! connection.
 //!
-//! # Coordination with the pull leg (shared, single-task state)
+//! # Coordination with the pull leg (shared `FillSession` state)
 //!
-//! Both legs run as concurrent futures on ONE serve task, so the shared state is
-//! plain `Arc`, never `tokio::spawn`ed across threads:
+//! The pull leg runs on its own runtime. The legs share the `FillSession` behind an
+//! `Arc`, whose frontiers and wakeups work across runtimes:
 //!
 //! - **`served_paid`** — the client's PAID *content* frontier. The serve leg
-//!   stores it after every voucher batch commits (mapped from paid WIRE bytes
+//!   raises it after every voucher batch commits (mapped from paid WIRE bytes
 //!   through [`content_paid_frontier`]); the pull leg's `WindowPacer` reads it to
 //!   bound `pulled − served_paid ≤ window`, plus one floor to serve `serve_demand`.
 //! - **`serve_demand`** — the content end of the span this leg's encoder waits
@@ -30,15 +30,16 @@
 //!   the first byte the pull has not fetched, so `serve_demand` lands within one
 //!   group past the pull's frontier, and the pull fetches one window floor past its
 //!   window, so neither leg waits on the other forever.
-//! - **`served_paid_advanced`** — notified after each `served_paid` or
-//!   `serve_demand` advance, so a pull leg parked in `PaceDecision::Wait`
-//!   re-decides exactly when payment clears or this leg starts waiting.
-//! - **`pull_ended` + `pull_result`** — the pull leg records its terminal
-//!   outcome in `pull_result` and THEN fires `pull_ended`. Whenever the serve
-//!   leg must await a gap becoming present it races the present-range watch
-//!   against `pull_ended`: a pull that ended `Err` fails the serve (a gap the
-//!   pull could not fill can never be delivered); a pull that ended `Ok` means
-//!   the gap must now be present. This is the no-hang guarantee.
+//! - **Downstream wakeup** — every move of `served_paid` or `serve_demand` wakes
+//!   a pull leg parked in `PaceDecision::Wait` (`DownstreamWatch::past`), so it
+//!   re-decides exactly when the paid frontier advances or this leg starts
+//!   waiting. A voucher batch that stays inside one chunk group moves nothing and
+//!   wakes nothing.
+//! - **Pull outcome + liveness** — the pull records its outcome with
+//!   `FillSession::mark_ended`, which fires the per-hash liveness signal. A serve
+//!   read parked on a gap races the present-range watch against that signal and
+//!   re-checks `range_still_live`: once no live fill covers the gap the read
+//!   fails instead of hanging. This is the no-hang guarantee.
 //!
 //! The serve leg owns termination: it is what fulfils `R` for the client, so its
 //! completion (or error) ends the serve and drops the pull leg.
@@ -51,7 +52,7 @@ use super::voucher::StreamAnchor;
 use super::wire::chunk_frame_bufs;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, FloorReservation,
-    Hash, LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream, U256, VecDeque,
+    Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VecDeque,
     VoucherRejectReason, VoucherStop,
 };
 
@@ -324,35 +325,23 @@ impl ClientHandler {
                             // window). One contiguous delivery from `offset`, so `offset`
                             // is the single fetch-start.
                             let served = content_paid_frontier(offset, total_bytes, paid);
-                            // `fetch_max`, not `store`: N observers advance the SHARED
-                            // frontier and the pull's `WindowPacer` binds on the
-                            // MAX-over-observers paid frontier (DECISION-B), so a slower
-                            // observer must not regress a faster one. Behavior-preserving
-                            // for N=1 (a single contiguous delivery is already monotone,
-                            // so `fetch_max == store`).
-                            session
-                                .served_frontier()
-                                .fetch_max(served, Ordering::Relaxed);
-                            session.served_advanced().notify_waiters();
-                            // Under partial-overlap coalescing this serve leg is fed by
-                            // more than its own pull: each attached sibling pull produces
-                            // the OVERLAP this leg also consumes and bills. The sibling's
-                            // `served_paid` is a contiguous paid PREFIX, but this leg
-                            // consumes a SUFFIX of the sibling's covered range (starting at
-                            // `offset`) — so it may only EXTEND the sibling's frontier INTO
-                            // the overlap, never claim the sibling's `[start, offset)`
-                            // prefix, which only the sibling's OWN observers pay for. Guard
-                            // on the sibling having itself already cleared up to `offset`:
-                            // only then is this leg's payment a sound prefix extension (each
-                            // overlap byte is fetched once and recouped by the fastest of
-                            // its shared observers — DECISION-B). Without the guard a fast
-                            // overlap payer would relax the sibling pull's window over bytes
-                            // no one has paid for. Empty in the common N=1 case.
+                            // Forward-only: N observers advance the SHARED frontier and
+                            // the pull's `WindowPacer` binds on the MAX-over-observers
+                            // paid frontier (DECISION-B), so a slower observer never
+                            // regresses a faster one. With one observer `served` never
+                            // decreases, so forward-only discards nothing. A batch that
+                            // stays inside one chunk group leaves `served` unchanged and
+                            // wakes nothing.
+                            session.advance_served(served);
+                            // Under partial-overlap coalescing each attached sibling pull
+                            // produces the OVERLAP this leg also consumes and bills. This
+                            // leg's payment extends a sibling's paid prefix only once that
+                            // prefix reaches `offset` (`FillSession::extend_served_from`):
+                            // each overlap byte is fetched once and recouped by the
+                            // fastest of its shared observers (DECISION-B). Empty in the
+                            // common N=1 case.
                             for extra in also_pace {
-                                if extra.served_frontier().load(Ordering::Relaxed) >= offset {
-                                    extra.served_frontier().fetch_max(served, Ordering::Relaxed);
-                                    extra.served_advanced().notify_waiters();
-                                }
+                                extra.extend_served_from(offset, served);
                             }
                             continue 'chunk;
                         }

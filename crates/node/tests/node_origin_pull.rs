@@ -11039,7 +11039,7 @@ fn honest_bao_wire_from(payload: &[u8], byte_offset: u64) -> Result<Vec<u8>> {
 /// signer's capability cap (`VoucherRejectReason::SpendingCapExhausted`), and a real
 /// `topUp` raises the pool's escrowed deposit backing that cap. Modelling it
 /// as one shared cell is what makes the round trip real here:
-/// `FundingOpener`'s `top_up_pool` raises the same
+/// `FundingOpener`'s `top_up_pool_by` raises the same
 /// number the server enforces, so the resumed leg succeeds for the RIGHT reason
 /// rather than because the fixture stopped objecting.
 type SharedDeposit = Arc<Mutex<U256>>;
@@ -11057,7 +11057,7 @@ fn read_deposit(cell: &SharedDeposit) -> Result<U256> {
 /// A buyer-channel opener that FUNDS, so the reactive leg has something to spend.
 ///
 /// [`StubOpener`] with two differences that matter: its deposit is a live cell an
-/// upstream fixture reads (see [`SharedDeposit`]), and `top_up_pool` adds to that
+/// upstream fixture reads (see [`SharedDeposit`]), and `top_up_pool_by` adds to that
 /// cell and logs the call. `funds` is what a test flips to model a top-up that
 /// lands but adds no headroom.
 #[derive(Debug)]
@@ -11073,7 +11073,7 @@ struct FundingOpener {
     signer: Arc<PrivateKeySigner>,
     voucher_domain: Eip712Domain,
     recorded: Arc<Mutex<Vec<ProgressEntry>>>,
-    /// Every `top_up_pool(additional)` in order — the test's view of what the pull
+    /// Every `top_up_pool_by(additional)` in order — the test's view of what the pull
     /// tried to fund.
     topups: Arc<Mutex<Vec<(Address, U256)>>>,
     /// Whether a top-up actually adds headroom. `false` models a refusal.
@@ -11132,7 +11132,7 @@ impl PoolOpener for FundingOpener {
         Ok(())
     }
 
-    async fn top_up_pool(&self, additional: U256) -> Result<TopUpLanded> {
+    async fn top_up_pool_by(&self, additional: U256) -> Result<TopUpLanded> {
         self.topups
             .lock()
             .map_err(|_| anyhow::anyhow!("topups lock poisoned"))?
@@ -11142,7 +11142,7 @@ impl PoolOpener for FundingOpener {
             .lock()
             .map_err(|_| anyhow::anyhow!("deposit lock poisoned"))?;
         // Add `additional`, capped at `landing_cap`, and report what landed, as the
-        // real `BuyerPoolService::top_up_pool` does.
+        // real `BuyerPoolService::top_up_pool_by` does.
         let added = if self.funds {
             self.landing_cap
                 .map_or(additional, |cap| additional.min(cap))
@@ -11211,7 +11211,7 @@ async fn serve_with_deposit_ceiling(
     // (#1602). Zero for every test but the delivery-speed regression.
     //
     // The completing leg is the one served once a top-up has raised the shared escrow
-    // above its initial ceiling (`top_up_pool` raises `deposit` here). Keying on the
+    // above its initial ceiling (`top_up_pool_by` raises `deposit` here). Keying on the
     // raised ceiling — not on `req.byte_offset` — is deliberate: the buyer re-requests
     // the whole blob at `byte_offset == 0` and lets its ranged store dedupe the prefix,
     // so a `byte_offset > 0` gate never fires on this path and the throttle would be
