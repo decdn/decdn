@@ -359,4 +359,18 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_evicted_operator_total`.
     pub evicted_operator: Counter,
+    /// Held hashes quarantined because a serve export failed bao validation
+    /// against the content root: the stored bytes or outboard diverged after
+    /// admission. Bumped once per quarantine, not once per failed serve.
+    /// Distinct from `evicted_operator`: a quarantine is not durable, it
+    /// releases the entry to GC, and the hash is re-acquirable once the sweep
+    /// reclaims it.
+    ///
+    /// Operator-actionable: a nonzero rate means disk rot or tampering under
+    /// the cache directory. Check the disk, and confirm that GC is enabled so
+    /// the corrupt entries are reclaimed.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_held_corruption_quarantined_total`.
+    pub held_corruption_quarantined: Counter,
 }

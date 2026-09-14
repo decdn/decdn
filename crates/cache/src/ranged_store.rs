@@ -50,9 +50,9 @@ impl NodeRangedStore {
         &self.engine
     }
 
-    /// Does a deny/blacklist/evict gate currently refuse this hash? A pure
-    /// in-memory check ([`CacheEngine::refuses`] reads only lock-free sets, no
-    /// store hop), so the serve encoder can fold takedown into its per-leaf
+    /// Does a deny/blacklist/evict/quarantine gate currently refuse this hash? A
+    /// pure in-memory check ([`CacheEngine::refuses`] reads in-memory sets and
+    /// never awaits a store hop), so the serve encoder can fold takedown into its per-leaf
     /// presence check without a store round trip. Mirrors the guard
     /// [`CacheEngine::present_ranges`] applies before it answers presence.
     #[must_use]

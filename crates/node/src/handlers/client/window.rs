@@ -25,6 +25,33 @@ fn release_reservation_unspent(reservation: Option<&FloorReservation>) {
     }
 }
 
+/// End an owning serve-miss for a hash the engine refuses once its held-range
+/// seeding is done.
+///
+/// `seed_held_outboard` validates the held ranges. When they fail, the engine
+/// quarantines the hash. A takedown can also land between dispatch and this
+/// point. Either way the serve leg can never deliver the hash
+/// (`covers_locally` refuses it). Spawning the pull would pay
+/// upstream or origin egress for bytes that never go on the wire, so the owner
+/// skips it. It fails the session so attached observers stop, releases every
+/// lease, and frees the floor reservation, because no byte was delivered. The
+/// response is already sent, so the serve fails mid-stream.
+fn abort_withdrawn_fill(
+    hash: Hash,
+    serve_session: &decdn_cache::FillSession,
+    leases: Vec<decdn_cache::ObserverLease>,
+    floor_reservation: Option<&FloorReservation>,
+) -> anyhow::Error {
+    serve_session.mark_ended(Err(decdn_cache::FillError::new(
+        "the hash is refused: withdrawn or denied during the serve-miss",
+    )));
+    for lease in leases {
+        let _ = lease.release();
+    }
+    release_reservation_unspent(floor_reservation);
+    anyhow::anyhow!("serve-miss for {hash}: the hash is refused after seeding; skipped the pull")
+}
+
 impl ClientHandler {
     /// Serve a cache miss by running the two decoupled serve-miss legs (#856, ADR
     /// 037): the pull leg fills the cache from upstream for only the missing ranges
@@ -282,6 +309,14 @@ impl ClientHandler {
         // safe. Every serve leg seeds, so its encoder is self-sufficient regardless of
         // owner/attach ordering.
         self.seed_held_outboard(hash, &serve_session).await;
+        if pull_range.is_some() && self.cache.refuses(hash) {
+            return Err(abort_withdrawn_fill(
+                hash,
+                &serve_session,
+                leases,
+                floor_reservation.as_ref(),
+            ));
+        }
         // The serve leg reads the cache the pull leg fills — same engine, same hash.
         let serve_store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
 
@@ -588,6 +623,14 @@ impl ClientHandler {
         // Seed the shared per-hash outboard with proof for held ranges no pull admits.
         // OUTSIDE the claim lock; idempotent, so every serve leg is self-sufficient.
         self.seed_held_outboard(hash, &serve_session).await;
+        if pull_range.is_some() && self.cache.refuses(hash) {
+            return Err(abort_withdrawn_fill(
+                hash,
+                &serve_session,
+                leases,
+                floor_reservation.as_ref(),
+            ));
+        }
         // The serve leg reads the cache the pull leg fills — same engine, same hash.
         let serve_store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
 

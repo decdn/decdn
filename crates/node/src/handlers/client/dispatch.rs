@@ -612,9 +612,13 @@ impl ClientHandler {
                 }
             }
         } else {
-            // Eviction is sticky and authoritative — never pull-fill a
-            // hash an operator deliberately evicted (#279).
-            if audit.is_evicted() {
+            // A withdrawn hash is never pull-filled. An operator eviction is
+            // sticky and authoritative (#279). A stored-corruption quarantine
+            // holds the corrupt entry until GC reclaims it, so a fill would pay
+            // for bytes that can never serve. Both answer `EvictedSinceProbe`,
+            // because an earlier probe may have signed `has_blob: true` for
+            // the hash.
+            if audit.is_withdrawn() {
                 return self
                     .respond_error(
                         &mut send,

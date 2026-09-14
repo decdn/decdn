@@ -578,8 +578,8 @@ pub trait AdminRpc {
     /// When `req.dry_run` is `true` (issue #379) the cache state is
     /// *not* mutated: the response carries the pre-evict snapshot
     /// (size, last-access elapsed time, pin status, already-evicted
-    /// flag) so operators running DMCA takedowns or
-    /// corruption-recovery can confirm what the real evict will touch
+    /// flag) so operators running DMCA takedowns can confirm what the real
+    /// evict will touch
     /// before committing. The same response shape is used for the
     /// real-evict path with the snapshot reflecting the
     /// pre-mutation state.
