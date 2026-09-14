@@ -2425,15 +2425,17 @@ fn reset_stream(send: &mut SendStream, recv: &mut RecvStream, code: u32) {
 /// discarding whatever is left, then return so `recv` drops cleanly.
 ///
 /// Dropping an un-finished [`RecvStream`] issues an implicit `STOP_SENDING(0)` to
-/// the peer. A client pays its closing voucher and then finishes its send; the two
-/// halves race, and without this drain the node's drop can stop the client's send
-/// mid-voucher — surfacing to the client as an opaque write failure at the very end
-/// of an otherwise complete, fully-paid fetch. Draining to FIN first lets both
-/// halves close cleanly. The bound keeps a client that finishes delivery but never
-/// FINs from pinning the serve task here.
+/// the peer. `StreamEnd` is written only once every interval, the closing voucher
+/// included, is credited, but the client finishes its send half after that. Without
+/// this drain the node's drop can stop the client's send before its FIN — surfacing
+/// to the client as an opaque write failure at the very end of an otherwise
+/// complete, fully-paid fetch. Draining to FIN first lets both halves close cleanly.
+/// The bound keeps a client that finishes delivery but never FINs from pinning the
+/// serve task here.
 pub(super) async fn drain_recv_to_fin(recv: &mut RecvStream) {
-    // Read to FIN and discard. The cap covers the trailing closing voucher (a few
-    // hundred bytes) with room to spare; a client that keeps sending past it makes
+    // Read to FIN and discard. Every proof is already read, so only the FIN is
+    // expected; the cap leaves room for a few stray frames. A client that keeps
+    // sending past it makes
     // `read_to_end` error, which — like the timeout — just ends the drain and lets
     // `recv` drop. Buffering onto the heap keeps this future small (no large stack
     // scratch array to inflate the serve future — `clippy::large_futures`).
