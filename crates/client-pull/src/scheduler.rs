@@ -1232,6 +1232,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -1311,6 +1312,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -1412,6 +1414,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -1469,6 +1472,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -1545,6 +1549,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -1622,6 +1627,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -1703,6 +1709,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -1762,6 +1769,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -1826,6 +1834,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -1984,6 +1993,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -2072,6 +2082,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -2141,6 +2152,7 @@ mod tests {
                 total,
                 &DriveConfig {
                     working_deposit: U256::ZERO,
+                    seller_reserve: U256::ZERO,
                     max_settle_waits: 0,
                     settle_backoff: Duration::from_millis(1),
                 },
@@ -2218,6 +2230,7 @@ mod tests {
                 total,
                 &DriveConfig {
                     working_deposit: U256::ZERO,
+                    seller_reserve: U256::ZERO,
                     max_settle_waits: 0,
                     settle_backoff: Duration::from_millis(1),
                 },
@@ -2330,6 +2343,7 @@ mod tests {
                     // Reactive top-up disabled: a budget refusal is a hard
                     // `PoolExhausted`, not a top-up.
                     working_deposit: U256::ZERO,
+                    seller_reserve: U256::ZERO,
                     max_settle_waits: 0,
                     settle_backoff: Duration::from_millis(1),
                 },
@@ -2470,6 +2484,7 @@ mod tests {
                     // Reactive top-up disabled: a budget refusal is a hard
                     // `PoolExhausted`, not a top-up.
                     working_deposit: U256::ZERO,
+                    seller_reserve: U256::ZERO,
                     max_settle_waits: 0,
                     settle_backoff: Duration::from_millis(1),
                 },
@@ -2549,6 +2564,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -2661,6 +2677,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -2793,6 +2810,7 @@ mod tests {
                 total,
                 &DriveConfig {
                     working_deposit: U256::ZERO,
+                    seller_reserve: U256::ZERO,
                     max_settle_waits: 0,
                     settle_backoff: Duration::from_millis(1),
                 },
@@ -3087,6 +3105,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -3170,6 +3189,7 @@ mod tests {
                 total,
                 &DriveConfig {
                     working_deposit: U256::ZERO,
+                    seller_reserve: U256::ZERO,
                     max_settle_waits: 0,
                     settle_backoff: Duration::from_millis(1),
                 },
@@ -3240,6 +3260,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -3309,6 +3330,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },
@@ -3382,6 +3404,7 @@ mod tests {
             total,
             &DriveConfig {
                 working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 0,
                 settle_backoff: Duration::from_millis(1),
             },

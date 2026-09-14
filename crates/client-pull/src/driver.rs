@@ -155,21 +155,44 @@ impl std::fmt::Debug for SharedPool<'_> {
     }
 }
 
+/// The node serve leg's two content frontiers the pull leg paces against (ADR
+/// 037): what the downstream client has paid for, and how far the serve leg waits
+/// on bytes. The node hands `drive` a reader of these; the client path has no
+/// downstream leg and passes none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DownstreamFrontier {
+    /// Content bytes the serve leg has delivered AND been paid for
+    /// ([`PaceState::served_paid_frontier`]).
+    pub served_paid: u64,
+    /// Content end of the furthest span the serve leg awaits
+    /// ([`PaceState::serve_demand_frontier`]).
+    pub serve_demand: u64,
+}
+
+impl DownstreamFrontier {
+    /// Whether either frontier in `self` moved past `observed`.
+    #[must_use]
+    pub const fn advanced_past(self, observed: Self) -> bool {
+        self.served_paid > observed.served_paid || self.serve_demand > observed.serve_demand
+    }
+}
+
 /// The injected wait signal for [`PaceDecision::Wait`] (ADR 037): the
 /// node hands in an implementor that resolves once its serve leg's paid frontier
-/// has advanced (so a re-decide has a chance of finding window room); the client
-/// path never needs one, since `BudgetPacer` never returns `Wait`.
+/// or demand frontier has advanced (so a re-decide has a chance of finding room);
+/// the client path never needs one, since `BudgetPacer` never returns `Wait`.
 pub trait PacingWait: Send + Sync {
-    /// Resolve once the caller judges it worth re-deciding (e.g. the served-paid
+    /// Resolve once the caller judges it worth re-deciding (e.g. a downstream
     /// frontier advanced, or a bounded poll interval elapsed).
     ///
-    /// `observed` is the served-paid frontier value the caller's `Wait` decision was
+    /// `observed` holds the downstream frontiers the caller's `Wait` decision was
     /// computed from. An implementor backed by an edge-triggered wakeup (a
     /// [`tokio::sync::Notify`], which stores no permit across `notify_waiters`) MUST
-    /// register its wakeup BEFORE re-reading the live frontier and return immediately
-    /// if it already moved past `observed` — otherwise an advance that races between
-    /// the decision and the park is lost and the caller wedges forever (#1673).
-    fn wait(&self, observed: u64) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// register its wakeup BEFORE re-reading the live frontiers and return
+    /// immediately if either already moved past `observed` — otherwise an advance
+    /// that races between the decision and the park is lost and the caller wedges
+    /// forever (#1673).
+    fn wait(&self, observed: DownstreamFrontier) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Read the channel context's current deposit through the shared handle. A tiny
@@ -194,6 +217,10 @@ pub struct DriveConfig {
     /// The reactive top-up target passed to the pacer as
     /// [`PaceState::working_deposit`]. `U256::ZERO` disables reactive top-up.
     pub working_deposit: U256,
+    /// The buyer's estimate of a serving peer's refundable floor `M`, passed to the
+    /// pacer as [`PaceState::seller_reserve`]. `U256::ZERO` tops up only once the
+    /// next voucher is unaffordable.
+    pub seller_reserve: U256,
     /// How many settle-backoff steps the driver may spend, after a top-up,
     /// retrying an open that keeps failing with [`crate::resume_may_be_stale`]
     /// before giving up on the node's chain watcher.
@@ -208,6 +235,7 @@ impl DriveConfig {
     pub const fn cli(working_deposit: U256) -> Self {
         Self {
             working_deposit,
+            seller_reserve: U256::ZERO,
             max_settle_waits: MAX_TOPUP_SETTLE_WAITS,
             settle_backoff: TOPUP_SETTLE_BACKOFF,
         }
@@ -383,7 +411,7 @@ pub async fn drive<St, S, P, F>(
     config: &DriveConfig,
     on_progress: Option<&ProgressCallback>,
     pacing_wait: Option<&dyn PacingWait>,
-    served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
+    downstream: Option<&(dyn Fn() -> DownstreamFrontier + Send + Sync)>,
     pool: Option<&SharedPool<'_>>,
 ) -> anyhow::Result<()>
 where
@@ -445,7 +473,7 @@ where
                 // aggregate. Only the multi-source scheduler passes an aggregator.
                 None,
                 pacing_wait,
-                served_paid,
+                downstream,
                 // `None` on the single-source path: this one lane IS the pool,
                 // so its own `counters` and `ctx` already hold the spend, the
                 // top-up budget, and the deposit. The node's ranged-drive loop
@@ -512,7 +540,7 @@ pub(crate) async fn fill_gap<St, S, P, F>(
     // already the whole-blob position).
     progress_agg: Option<&std::sync::atomic::AtomicU64>,
     pacing_wait: Option<&dyn PacingWait>,
-    served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
+    downstream: Option<&(dyn Fn() -> DownstreamFrontier + Send + Sync)>,
     pool: Option<&SharedPool<'_>>,
 ) -> anyhow::Result<()>
 where
@@ -532,11 +560,13 @@ where
     // still reads THIS lane's own `committed.bytes`.
     let spent = move |own_amount: U256| pool.map_or(own_amount, |p| (p.spent)());
 
-    // Per-open state; reset the moment an open succeeds. `awaiting_settle` is set
-    // only right after a top-up, and consulted ONLY in the error-classification
-    // path below: it gates the bounded settle-wait on an ACTUAL stale-resume
-    // refusal from the re-open, not proactively before the retry is even
-    // attempted (the pacer always retries the open immediately after a top-up).
+    // Post-top-up settle state. `awaiting_settle` is set only right after a top-up,
+    // and consulted ONLY in the error-classification path below: it gates the
+    // bounded settle-wait on an ACTUAL stale-resume refusal from a re-open, not
+    // proactively before the retry is even attempted (the pacer always retries the
+    // open immediately after a top-up). It stays armed across landed legs until a
+    // non-stale fault or the settle budget ends it; `exhaustion_confirmed` is
+    // per-open and resets the moment a leg lands.
     let mut awaiting_settle = false;
     let mut settle_waits = 0u32;
     let mut exhaustion_confirmed = false;
@@ -627,12 +657,20 @@ where
                 .min(delivered_frontier);
         let paid_cleared = paid_frontier.saturating_sub(gap_start);
 
+        let downstream_now = downstream.map_or(
+            DownstreamFrontier {
+                served_paid: paid_frontier,
+                serve_demand: 0,
+            },
+            |f| f(),
+        );
         let state = PaceState {
             cleared_bytes: paid_cleared,
             requested_bytes: gap_len,
             remaining_deposit,
             next_voucher_cost: counters.next_voucher_cost,
             working_deposit: config.working_deposit,
+            seller_reserve: config.seller_reserve,
             // The reactive-top-up budget is a property of the POOL, not of a
             // lane: `Funder::max_topups` bounds what ONE fetch may escrow, and
             // every lane escrows into the ONE deposit. Multi-source reads the
@@ -650,7 +688,7 @@ where
             // `served_paid_frontier` is NOT this leg's own state — it is the
             // DOWNSTREAM client's paid frontier, which only the node's serve leg
             // (a separate, future task) can advance. On the client path
-            // (`served_paid == None`) there is no downstream leg, so this
+            // (`downstream == None`) there is no downstream leg, so this
             // collapses to the inert local `paid_frontier`: harmless, because
             // `BudgetPacer` never reads `served_paid_frontier`. The NODE pull leg
             // MUST pass `Some(reader)` here, reading the shared downstream
@@ -659,18 +697,20 @@ where
             // upstream paid frontier, which would be category-wrong (it would
             // make the window track the node's own credit-window lag instead of
             // the client it is serving).
-            served_paid_frontier: served_paid.map_or(paid_frontier, |f| f()),
+            served_paid_frontier: downstream_now.served_paid,
+            // Inert `0` on the client path, which never waits on a serve leg.
+            serve_demand_frontier: downstream_now.serve_demand,
         };
 
         match pacer.decide(&state) {
             PaceDecision::Done => return Ok(()),
             PaceDecision::Wait => {
                 if let Some(hook) = pacing_wait {
-                    // Hand the hook the frontier value THIS decision read, so it can
+                    // Hand the hook the frontiers THIS decision read, so it can
                     // register its wakeup then re-check for an advance that raced the
                     // decision — closing the lost-wakeup that wedged the window-paused
                     // pull under CI scheduling gaps (#1673).
-                    hook.wait(state.served_paid_frontier).await;
+                    hook.wait(downstream_now).await;
                     continue;
                 }
                 anyhow::bail!(
@@ -909,8 +949,11 @@ where
                 }
 
                 // The leg landed: a fresh, healthy open resets the per-open state.
-                awaiting_settle = false;
-                settle_waits = 0;
+                // The settle allowance stays armed, with whatever budget is left: a
+                // landed leg proves only that the upstream admitted ONE stream, maybe
+                // on headroom it computed before its watcher saw the top-up, so a
+                // later re-open can still meet the same stale refusal. The next
+                // top-up re-arms the budget; a stale refusal past it is terminal.
                 exhaustion_confirmed = false;
             }
         }
@@ -1014,6 +1057,7 @@ mod tests {
     fn config() -> DriveConfig {
         DriveConfig {
             working_deposit: U256::from(u128::MAX),
+            seller_reserve: U256::ZERO,
             max_settle_waits: 2,
             settle_backoff: std::time::Duration::from_millis(0),
         }
@@ -1564,6 +1608,7 @@ mod tests {
 
         let drive_config = DriveConfig {
             working_deposit: U256::from(10_000u64),
+            seller_reserve: U256::ZERO,
             max_settle_waits: 2,
             settle_backoff: std::time::Duration::from_secs(2),
         };
@@ -1616,6 +1661,110 @@ mod tests {
         assert_eq!(got.as_ref(), plaintext.as_slice());
     }
 
+    /// A [`BlobSource`] that fails its first open with a genuine exhaustion (like
+    /// [`FailFirstOpen`]), serves the next open, refuses the THIRD open as a stale
+    /// resume ([`ResumeOffsetPastEnd`]), and serves every open after that. It
+    /// models an upstream that admits one stream on headroom it computed before its
+    /// watcher saw the top-up, then refuses the next.
+    struct StaleRefusalAfterOneLeg {
+        inner: FailFirstOpen,
+    }
+
+    impl BlobSource for StaleRefusalAfterOneLeg {
+        type Reader = MaybeFaultReader;
+
+        fn open(
+            &self,
+            hash: [u8; 32],
+            range: AlignedRange,
+        ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
+            let n = self.inner.opens.load(std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 2 {
+                    self.inner
+                        .opens
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(anyhow::Error::new(crate::ResumeOffsetPastEnd {
+                        total_bytes: self.inner.inner.total_bytes(),
+                        byte_offset: range.fetch_start(),
+                    }));
+                }
+                self.inner.open(hash, range).await
+            })
+        }
+
+        fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            self.inner.finish(reader)
+        }
+    }
+
+    /// The settle allowance a top-up arms outlives the first landed leg: a stale
+    /// refusal on a LATER re-open still settle-waits and retries instead of ending
+    /// the fetch. One group per leg (a [`WindowPacer`] with a one-group window and
+    /// the downstream always paid up) forces several opens after the top-up.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_refusal_after_a_landed_post_top_up_leg_still_settle_waits() {
+        let total = 3 * GROUP;
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let inner = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        let root = inner.root();
+        let source = StaleRefusalAfterOneLeg {
+            inner: FailFirstOpen {
+                inner,
+                opens: std::sync::atomic::AtomicUsize::new(0),
+            },
+        };
+
+        let pacer = crate::pacer::WindowPacer::new(GROUP);
+        let funder = FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)));
+        let mut ctx = healthy_ctx();
+        ctx.deposit = U256::ZERO; // under-deposited: the first refusal is genuine
+        let ctx = Arc::new(Mutex::new(ctx));
+        let drive_config = DriveConfig {
+            working_deposit: U256::from(10_000u64),
+            seller_reserve: U256::ZERO,
+            max_settle_waits: 2,
+            settle_backoff: std::time::Duration::from_secs(2),
+        };
+        let downstream = || super::DownstreamFrontier {
+            served_paid: u64::MAX,
+            serve_demand: 0,
+        };
+
+        drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &drive_config,
+            None,
+            None,
+            Some(&downstream),
+            None,
+        )
+        .await
+        .expect("a stale refusal inside the settle budget must retry, not end the fetch");
+
+        assert_eq!(funder.calls().len(), 1, "one top-up funded the fetch");
+        assert!(
+            source.inner.opens.load(std::sync::atomic::Ordering::SeqCst) >= 5,
+            "fault + leg + stale refusal + retried legs"
+        );
+        assert!(store.is_complete().await.expect("is_complete"));
+        let got = store.read(0, 0).await.expect("read whole blob");
+        assert_eq!(got.as_ref(), plaintext.as_slice());
+    }
+
     /// A mid-fetch `topUp` that mines but cannot be credited locally is
     /// terminal: the USDC is escrowed against a row that will not account for
     /// it, so continuing would spend against a deposit the driver cannot track.
@@ -1650,6 +1799,7 @@ mod tests {
 
             let drive_config = DriveConfig {
                 working_deposit: U256::from(10_000u64),
+                seller_reserve: U256::ZERO,
                 max_settle_waits: 2,
                 settle_backoff: std::time::Duration::from_secs(2),
             };
@@ -1766,7 +1916,7 @@ mod tests {
     impl super::PacingWait for CountingWait {
         fn wait(
             &self,
-            _observed: u64,
+            _observed: super::DownstreamFrontier,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async {})
@@ -1853,7 +2003,7 @@ mod tests {
     impl super::PacingWait for BumpServedPaidWait {
         fn wait(
             &self,
-            _observed: u64,
+            _observed: super::DownstreamFrontier,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             self.served_paid
                 .fetch_add(self.bump_bytes, std::sync::atomic::Ordering::SeqCst);
@@ -1889,7 +2039,10 @@ mod tests {
         };
         let served_paid_reader = {
             let counter = Arc::clone(&served_paid_counter);
-            move || counter.load(std::sync::atomic::Ordering::SeqCst)
+            move || super::DownstreamFrontier {
+                served_paid: counter.load(std::sync::atomic::Ordering::SeqCst),
+                serve_demand: 0,
+            }
         };
 
         drive(

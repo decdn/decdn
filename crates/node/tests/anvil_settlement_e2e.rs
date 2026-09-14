@@ -1133,13 +1133,15 @@ async fn run_e2e() -> anyhow::Result<()> {
         "buyer suffix delivery mismatch"
     );
 
-    // Top-up: raise the pool toward the working deposit + a margin and assert the
-    // on-chain deposit reflects it.
-    let target_deposit = U256::from(DEPOSIT_MICRO_USDC) + U256::from(TOPUP_MICRO_USDC);
-    buyer_service.top_up_pool(target_deposit).await?;
+    // Top-up: add a margin to the pool and assert the on-chain deposit reflects it.
+    let deposit_before = U256::from(buyer_pool.getPool(buyer_pool_id).call().await?.deposit);
+    buyer_service
+        .top_up_pool(U256::from(TOPUP_MICRO_USDC))
+        .await?;
     anyhow::ensure!(
-        U256::from(buyer_pool.getPool(buyer_pool_id).call().await?.deposit) >= target_deposit,
-        "topUp must raise the on-chain deposit"
+        U256::from(buyer_pool.getPool(buyer_pool_id).call().await?.deposit)
+            == deposit_before + U256::from(TOPUP_MICRO_USDC),
+        "topUp must raise the on-chain deposit by exactly the requested amount"
     );
 
     // Reclaim: the buyer closes its own pool, the chain is warped past the grace

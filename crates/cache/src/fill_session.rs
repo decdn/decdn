@@ -289,12 +289,24 @@ pub struct FillSession {
     ended: StdMutex<Option<Result<(), FillError>>>,
     /// The client's PAID content frontier: the serve leg stores it after each
     /// voucher batch commits, the pull leg's `WindowPacer` reads it to bound
-    /// `pulled − served_paid ≤ window`. An `Arc` so a pull leg on its own runtime
+    /// `pulled − served_paid ≤ window`, plus one floor to serve `serve_demand`. An
+    /// `Arc` so a pull leg on its own runtime
     /// can hold an owned handle.
     served_paid: Arc<AtomicU64>,
-    /// Notified after each `served_paid` advance so a parked pull re-decides
-    /// exactly when a downstream voucher clears.
+    /// Notified after each `served_paid` or `serve_demand` advance, so a parked pull
+    /// re-decides exactly when a downstream voucher clears or a serve leg starts
+    /// waiting on bytes.
     served_paid_advanced: Arc<Notify>,
+    /// The content end of the furthest span a serve leg has been stuck on (a
+    /// high-water mark, never lowered): the serve leg's frame consumer raises it
+    /// when it has no encoded bytes left and its encode is parked on a leaf or a
+    /// proof node no pull has produced ([`SessionOutboardReader::parked_on`]). A park
+    /// with encoded bytes still buffered is look-ahead and raises nothing, so a
+    /// client that stops paying cannot drag a pull past its window. When it lies within one chunk group past a
+    /// pull's frontier, that pull's pacer draws one window floor even with its window
+    /// full. Without it, a pull window that closes before the serve leg's credit
+    /// window leaves both legs waiting on each other.
+    serve_demand: Arc<AtomicU64>,
     /// The chunk ranges THIS fill will produce — exactly the bytes this pull
     /// fetches (its `missing_ranges ∩ R`). [`FillRegistry::range_still_live`]
     /// intersects a reader's node range against the union of all live sessions'
@@ -339,6 +351,7 @@ impl FillSession {
             ended: StdMutex::new(None),
             served_paid: Arc::new(AtomicU64::new(0)),
             served_paid_advanced: Arc::new(Notify::new()),
+            serve_demand: Arc::new(AtomicU64::new(0)),
             covered: StdMutex::new(ChunkRanges::all()),
             observers: AtomicUsize::new(0),
             cancel: CancellationToken::new(),
@@ -463,6 +476,7 @@ impl FillSession {
         SessionOutboardReader {
             session: Arc::clone(self),
             outboard: self.outboard(),
+            parked_on: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -472,10 +486,42 @@ impl FillSession {
         &self.served_paid
     }
 
-    /// Notified after each [`Self::served_frontier`] advance.
+    /// Notified after each [`Self::served_frontier`] or [`Self::serve_demand`]
+    /// advance.
     #[must_use]
     pub const fn served_advanced(&self) -> &Arc<Notify> {
         &self.served_paid_advanced
+    }
+
+    /// The content end of the furthest span a serve leg awaits. The pull leg's pacer
+    /// may always draw up to it.
+    #[must_use]
+    pub const fn serve_demand(&self) -> &Arc<AtomicU64> {
+        &self.serve_demand
+    }
+
+    /// Record that a serve leg awaits content up to `end`, and wake each parked pull
+    /// whose demand frontier this raises. The demand goes to every live fill of the
+    /// hash, not only this one: under coalescing a sibling pull may be the one that
+    /// produces the awaited span. A pull acts on it only when `end` lies within one
+    /// chunk group past its own frontier, so a demand far from a pull costs nothing.
+    pub fn demand_up_to(&self, end: u64) {
+        let registry = self
+            .registry
+            .get()
+            .and_then(|(weak, hash)| weak.upgrade().map(|registry| (registry, *hash)));
+        match registry {
+            Some((registry, hash)) => registry.raise_demand(hash, end),
+            None => self.raise_own_demand(end),
+        }
+    }
+
+    /// Raise this session's own demand frontier to `end`, waking its parked pull if
+    /// the frontier moved.
+    fn raise_own_demand(&self, end: u64) {
+        if self.serve_demand.fetch_max(end, Ordering::AcqRel) < end {
+            self.served_paid_advanced.notify_waiters();
+        }
     }
 
     /// The per-hash liveness signal, notified whenever any session for this hash
@@ -559,9 +605,24 @@ pub struct SessionOutboardReader {
     /// The shared per-hash outboard, snapshot at mint (after the session adopted the
     /// canonical one), so every `load` reads whatever any pull for the hash captured.
     outboard: Arc<HashOutboard>,
+    /// The content end this reader waits on, written before each park: one byte
+    /// into the node whose pair no pull has captured. The reader does NOT raise
+    /// serve demand itself — an encoder reads ahead of what its consumer needs, so
+    /// a park here alone does not mean the serve leg is stuck. The frame consumer
+    /// publishes this value via [`FillSession::demand_up_to`] only once it is
+    /// starved of encoded bytes ([`Self::parked_on`]).
+    parked_on: Arc<AtomicU64>,
 }
 
 impl SessionOutboardReader {
+    /// The cell this reader writes the content end it waits on into. A frame
+    /// consumer shares it with its data reader and publishes it as serve demand
+    /// once it has no encoded bytes left to take.
+    #[must_use]
+    pub fn parked_on(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.parked_on)
+    }
+
     /// The terminal error for a node no live fill will supply: a precise message
     /// when this session's own pull ended (the standalone / single-fill case), a
     /// generic one when the covering fills were siblings.
@@ -619,6 +680,15 @@ impl Outboard for SessionOutboardReader {
                 }
                 return Err(self.dead_range_error(node));
             }
+
+            // A pull captures this pair only once it fetches into the node's range.
+            // Record the first byte of that range as what this encode waits on; the
+            // frame consumer turns it into serve demand if it starves on this park.
+            let node_start = node.chunk_range().start.to_bytes();
+            self.parked_on.store(
+                node_start.saturating_add(1).min(self.outboard.tree.size()),
+                Ordering::Relaxed,
+            );
 
             // Await the next capture or a liveness change, then re-check.
             tokio::select! {
@@ -901,6 +971,17 @@ impl FillRegistry {
             .iter()
             .find(|session| !session.is_dead())
             .map(|session| session.total_bytes())
+    }
+
+    /// Raise the serve-demand frontier of every live fill of `hash` to `end`
+    /// ([`FillSession::demand_up_to`]).
+    fn raise_demand(&self, hash: Hash, end: u64) {
+        let map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = map.get(&hash) {
+            for session in entry.sessions.iter().filter(|s| !s.is_dead()) {
+                session.raise_own_demand(end);
+            }
+        }
     }
 
     /// Whether any LIVE fill of `hash` still covers `range`. A parked reader calls
@@ -1223,6 +1304,7 @@ mod tests {
 )] // tests
 mod fill_registry_tests {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use bao_tree::io::fsm::Outboard;
     use bao_tree::{BaoTree, ChunkRanges, blake3};
@@ -1294,6 +1376,77 @@ mod fill_registry_tests {
         s.set_covered(cov);
         let lease = reg.register_fill(hash, &s);
         (s, lease)
+    }
+
+    /// A proof read parked on an uncaptured node records the first byte of that
+    /// node's range as what it waits on, so a starved frame consumer can demand it
+    /// from a pull whose window has closed (#1893). The park alone raises no serve
+    /// demand: an encoder reads ahead of its consumer, and only the consumer knows
+    /// when it is stuck.
+    #[tokio::test]
+    async fn a_parked_proof_read_records_the_first_byte_of_its_node() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x4A);
+        let (owner, _ol) = register(&reg, hash, hb(0x4A), total, ranges(0, 0, total));
+
+        let node = interior_node_in(total, 4, 8);
+        let node_start = node.chunk_range().start.to_bytes();
+        assert!(node_start >= 4 * G, "the node lies past the first half");
+        let mut reader = owner.outboard_reader();
+        let parked_on = reader.parked_on();
+
+        let load = tokio::spawn(async move { reader.load(node).await });
+        tokio::task::yield_now().await;
+        assert!(!load.is_finished(), "load parks until the node is captured");
+        assert_eq!(
+            parked_on.load(Ordering::Acquire),
+            node_start + 1,
+            "the parked read records one byte into the node's range"
+        );
+        assert_eq!(
+            owner.serve_demand().load(Ordering::Acquire),
+            0,
+            "the park alone raises no serve demand"
+        );
+
+        let pair = (hb(3), hb(4));
+        owner.capture(node, pair);
+        assert_eq!(load.await.unwrap().unwrap(), Some(pair));
+    }
+
+    /// Serve demand reaches every LIVE fill of the hash, never regresses, and skips a
+    /// dead fill: under coalescing the pull that produces the awaited span may be a
+    /// sibling of the reader's own session.
+    #[test]
+    fn demand_reaches_every_live_fill_and_never_regresses() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x4B);
+        let (a, _al) = register(&reg, hash, hb(0x4B), total, ranges(0, 4 * G, total));
+        let (b, _bl) = register(&reg, hash, hb(0x4B), total, ranges(4 * G, 4 * G, total));
+        let (dead, _dl) = register(&reg, hash, hb(0x4B), total, ranges(2 * G, 2 * G, total));
+        dead.mark_ended(Err(FillError::new("ended before the demand")));
+
+        a.demand_up_to(5 * G);
+        assert_eq!(a.serve_demand().load(Ordering::Acquire), 5 * G);
+        assert_eq!(
+            b.serve_demand().load(Ordering::Acquire),
+            5 * G,
+            "a live sibling receives the demand"
+        );
+        assert_eq!(
+            dead.serve_demand().load(Ordering::Acquire),
+            0,
+            "a dead fill is skipped"
+        );
+
+        b.demand_up_to(3 * G);
+        assert_eq!(
+            a.serve_demand().load(Ordering::Acquire),
+            5 * G,
+            "a lower demand never regresses the frontier"
+        );
     }
 
     /// Two sessions for one hash share the ONE per-hash outboard: a node captured via
