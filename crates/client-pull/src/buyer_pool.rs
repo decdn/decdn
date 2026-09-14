@@ -443,6 +443,14 @@ impl std::fmt::Display for AllowanceShortfall {
 
 impl std::error::Error for AllowanceShortfall {}
 
+/// How many times [`top_up`] re-sends a submit rejected as a nonce collision.
+const TOPUP_NONCE_RETRIES: u32 = 3;
+
+/// How long [`top_up`] waits before re-sending after a nonce collision: long
+/// enough for the colliding transaction to reach the pending pool, so the next
+/// pending-nonce read skips past it.
+const TOPUP_NONCE_BACKOFF: Duration = Duration::from_millis(250);
+
 /// Add `additional` USDC to the buyer pool `pool_id` on-chain and return the
 /// credited amount and the mining transaction as a [`ToppedUpPool`] — the shared
 /// mechanism behind the node's cache-miss buyer (#744) and the CLI fetch buyer's
@@ -458,6 +466,12 @@ impl std::error::Error for AllowanceShortfall {}
 /// fallback is logged — an over-stated local row is the mirror of the hazard
 /// [`escrowed_but_untracked`] guards, so it must not be reached silently.
 ///
+/// A submit rejected as a same-account nonce collision
+/// ([`decdn_incentive::tx::is_nonce_collision`]) broadcast nothing, so it is
+/// re-sent up to three more times, a quarter second apart.
+/// A node signs its sellers' redemptions and its buyer top-ups with one key, so a
+/// top-up can lose its nonce to a redemption sent at the same moment.
+///
 /// # Errors
 ///
 /// Errors if the `topUp` transaction fails (submit, revert, or receipt).
@@ -466,27 +480,34 @@ pub async fn top_up<P: Provider + Clone>(
     pool_id: B256,
     additional: U256,
 ) -> Result<ToppedUpPool> {
-    let pending = match contract
-        .topUp(pool_id, to_pool_u64(additional, "top-up")?)
-        .send()
-        .await
-    {
-        Ok(pending) => pending,
-        Err(err) => {
-            // A deterministic allowance shortfall is caught at gas estimation
-            // and surfaces here with ABI revert data attached. Match it so the
-            // node can re-`approve` and retry once; every other revert stays
-            // terminal (an `approve` cannot fix a balance shortfall or a paused
-            // pool).
-            let allowance_short =
-                decdn_incentive::is_erc20_allowance_shortfall(err.as_revert_data().as_ref());
-            let submit_err = anyhow::Error::new(err).context("submit topUp");
-            return Err(if allowance_short {
-                submit_err.context(AllowanceShortfall)
-            } else {
-                submit_err
-            });
+    let amount = to_pool_u64(additional, "top-up")?;
+    let mut nonce_retries = 0u32;
+    let pending = loop {
+        let err = match contract.topUp(pool_id, amount).send().await {
+            Ok(pending) => break pending,
+            Err(err) => err,
+        };
+        if nonce_retries < TOPUP_NONCE_RETRIES && decdn_incentive::tx::is_nonce_collision(&err) {
+            nonce_retries = nonce_retries.saturating_add(1);
+            debug!(
+                %pool_id, nonce_retries,
+                "topUp lost its nonce to a concurrent transaction; re-sending"
+            );
+            tokio::time::sleep(TOPUP_NONCE_BACKOFF).await;
+            continue;
         }
+        // A deterministic allowance shortfall is caught at gas estimation and
+        // surfaces here with ABI revert data attached. Match it so the node can
+        // re-`approve` and retry once; every other revert stays terminal (an
+        // `approve` cannot fix a balance shortfall or a paused pool).
+        let allowance_short =
+            decdn_incentive::is_erc20_allowance_shortfall(err.as_revert_data().as_ref());
+        let submit_err = anyhow::Error::new(err).context("submit topUp");
+        return Err(if allowance_short {
+            submit_err.context(AllowanceShortfall)
+        } else {
+            submit_err
+        });
     };
     let receipt = pending.get_receipt().await.context("await topUp receipt")?;
     if !receipt.status() {

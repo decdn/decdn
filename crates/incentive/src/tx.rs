@@ -150,6 +150,23 @@ const fn send_broadcast_unknown(err: &ContractError) -> bool {
     }
 }
 
+/// Whether a send failed because another transaction from the same account took
+/// its nonce: the node answered with a JSON-RPC rejection (`nonce too low`, or a
+/// same-nonce `replacement transaction underpriced`). Nothing was broadcast, so
+/// re-sending is safe, and a provider that reads the pending nonce on every send
+/// picks the next free nonce on the retry. A node's seller and buyer services
+/// sign with one operator key, so their transactions can collide this way.
+#[must_use]
+pub fn is_nonce_collision(err: &ContractError) -> bool {
+    use alloy::transports::RpcError;
+
+    let ContractError::TransportError(RpcError::ErrorResp(resp)) = err else {
+        return false;
+    };
+    let message = resp.message.to_ascii_lowercase();
+    message.contains("nonce too low") || message.contains("replacement transaction underpriced")
+}
+
 /// Send one call, await its receipt, and fail on a revert.
 ///
 /// `landed` is the caller's record of whether this step may have taken effect,
@@ -301,6 +318,36 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "code": code, "message": message }))
                 .unwrap(),
         ))
+    }
+
+    /// A same-account nonce collision is a JSON-RPC rejection with one of the two
+    /// collision messages (any case); an unrelated rejection, a revert, or a
+    /// transport failure is not.
+    #[test]
+    fn only_a_nonce_rejection_is_a_nonce_collision() {
+        assert!(super::is_nonce_collision(&error_resp(
+            -32003,
+            "nonce too low"
+        )));
+        assert!(super::is_nonce_collision(&error_resp(
+            -32000,
+            "Nonce too low: next nonce 7, tx nonce 6"
+        )));
+        assert!(super::is_nonce_collision(&error_resp(
+            -32000,
+            "replacement transaction underpriced"
+        )));
+        assert!(!super::is_nonce_collision(&error_resp(
+            3,
+            "execution reverted"
+        )));
+        assert!(!super::is_nonce_collision(&error_resp(
+            -32000,
+            "insufficient funds for gas"
+        )));
+        assert!(!super::is_nonce_collision(&ContractError::TransportError(
+            alloy::transports::TransportErrorKind::custom_str("nonce too low")
+        )));
     }
 
     /// The tx hash reaches the receipt on every arm that has one, and only
