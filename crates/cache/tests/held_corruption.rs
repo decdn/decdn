@@ -1,36 +1,37 @@
 //! A held blob whose stored bytes change after admission (#1984).
 //!
-//! Every serve export validates the held bytes against the content root. A
-//! mismatch must quarantine the hash: the engine stops serving and announcing
-//! it, releases the entry to GC, and lifts the quarantine once the sweep
-//! reclaims it, so a later pull-through admits a verified copy.
+//! Every serve export validates the exported chunk groups against the content
+//! root. A mismatch or short read over held content must quarantine the hash:
+//! the engine stops serving and announcing it, releases the entry to GC, and
+//! lifts the quarantine once the sweep reclaims it, so a later pull-through
+//! admits a verified copy.
 
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use decdn_cache::{CacheEngine, CacheMetrics, Hash, HttpOrigin, Origin, PinnedHashes, RetryPolicy};
+use bao_tree::io::outboard::PreOrderMemOutboard;
+use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
+use decdn_cache::{
+    CacheEngine, CacheMetrics, Hash, HttpOrigin, Origin, PinnedHashes, RetryPolicy, ServeAudit,
+};
 use futures_util::StreamExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+mod util;
 
 /// Large enough that the store keeps the data in `data/{hex}.data` rather than
 /// inline in its database (the inline threshold is 16 KiB).
 const BLOB_LEN: usize = 200 * 1024 + 1234;
 
-fn payload() -> Vec<u8> {
-    let mut payload = vec![0u8; BLOB_LEN];
-    let mut x: u32 = 0x9e37_79b9;
-    for b in &mut payload {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        *b = x.to_le_bytes().first().copied().unwrap_or(0);
-    }
-    payload
-}
+/// Large enough that the outboard (64 bytes per internal node) also passes the
+/// 16 KiB inline threshold and lands in `data/{hex}.obao4`.
+const LARGE_BLOB_LEN: usize = 4 * 1024 * 1024 + 512 * 1024;
+
+const GC_INTERVAL: Duration = Duration::from_millis(200);
 
 async fn serve(payload: &[u8]) -> (MockServer, Hash) {
     let server = MockServer::start().await;
@@ -64,14 +65,28 @@ async fn open(
     .await?)
 }
 
-/// Flip one byte inside the stored data file of `hash`, behind the live store.
-fn tamper(dir: &Path, hash: Hash) -> anyhow::Result<()> {
-    let file = dir.join("data").join(format!("{}.data", hash.to_hex()));
+fn pin(hash: Hash) -> PinnedHashes {
+    PinnedHashes::new(HashSet::from([decdn_config_types::Hash::from_bytes(
+        *hash.as_bytes(),
+    )]))
+}
+
+fn store_file(dir: &Path, hash: Hash, ext: &str) -> anyhow::Result<PathBuf> {
+    let file = dir.join("data").join(format!("{}.{ext}", hash.to_hex()));
+    anyhow::ensure!(
+        file.exists(),
+        "store layout changed: {} is missing",
+        file.display()
+    );
+    Ok(file)
+}
+
+/// Flip one byte of a stored file of `hash`, behind the live store.
+fn flip(dir: &Path, hash: Hash, ext: &str, offset: u64) -> anyhow::Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&file)?;
-    let offset = 100 * 1024;
+        .open(store_file(dir, hash, ext)?)?;
     f.seek(SeekFrom::Start(offset))?;
     let mut byte = [0u8; 1];
     f.read_exact(&mut byte)?;
@@ -82,21 +97,58 @@ fn tamper(dir: &Path, hash: Hash) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Drain a whole-blob serve export. Returns whether it ended in an `Err` item.
-async fn serve_fails(engine: &CacheEngine, hash: Hash) -> anyhow::Result<bool> {
-    let len = u64::try_from(BLOB_LEN)?;
-    let mut stream = engine.export_bao_range_stream(hash, 0, 0, len).await?;
+fn tamper(dir: &Path, hash: Hash) -> anyhow::Result<()> {
+    flip(dir, hash, "data", 100 * 1024)
+}
+
+/// Drain a serve export of `[offset, offset + len)`. Returns the error text of
+/// the terminal `Err` item, or `None` when the export completed.
+async fn serve_error(
+    engine: &CacheEngine,
+    hash: Hash,
+    offset: u64,
+    len: u64,
+    blob_len: usize,
+) -> anyhow::Result<Option<String>> {
+    let blob_size = u64::try_from(blob_len)?;
+    let mut stream = engine
+        .export_bao_range_stream(hash, offset, len, blob_size)
+        .await?;
     while let Some(item) = stream.next().await {
-        if item.is_err() {
-            return Ok(true);
+        if let Err(err) = item {
+            let mut text = err.to_string();
+            let mut source = std::error::Error::source(&err);
+            while let Some(cause) = source {
+                text.push_str(": ");
+                text.push_str(&cause.to_string());
+                source = cause.source();
+            }
+            return Ok(Some(text));
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+async fn serve_fails(engine: &CacheEngine, hash: Hash) -> anyhow::Result<bool> {
+    Ok(serve_error(engine, hash, 0, 0, BLOB_LEN).await?.is_some())
+}
+
+/// Wait until GC has reclaimed `hash`, observed through `inspect`, which never
+/// lifts a quarantine.
+async fn await_reclaim(engine: &CacheEngine, hash: Hash) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + GC_INTERVAL * 64;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(GC_INTERVAL).await;
+        if engine.inspect(hash).await?.size_bytes.is_none() {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("GC did not reclaim the quarantined entry")
 }
 
 #[tokio::test]
 async fn a_serve_that_trips_stored_corruption_quarantines_the_hash() -> anyhow::Result<()> {
-    let payload = payload();
+    let payload = util::make_blob(BLOB_LEN);
     let (server, hash) = serve(&payload).await;
     let tmp = tempfile::tempdir()?;
     let metrics = Arc::new(CacheMetrics::default());
@@ -112,9 +164,11 @@ async fn a_serve_that_trips_stored_corruption_quarantines_the_hash() -> anyhow::
     anyhow::ensure!(!serve_fails(&engine, hash).await?, "the intact blob serves");
 
     tamper(tmp.path(), hash)?;
+    let err = serve_error(&engine, hash, 0, 0, BLOB_LEN).await?;
     anyhow::ensure!(
-        serve_fails(&engine, hash).await?,
-        "the export must fail validation on the tampered group"
+        err.as_deref()
+            .is_some_and(|e| e.to_lowercase().contains("leaf")),
+        "the export must fail leaf validation on the tampered group; got {err:?}"
     );
     anyhow::ensure!(
         engine.is_quarantined(hash),
@@ -124,6 +178,10 @@ async fn a_serve_that_trips_stored_corruption_quarantines_the_hash() -> anyhow::
     anyhow::ensure!(
         !engine.has(hash).await?,
         "a quarantined hash reports absent"
+    );
+    anyhow::ensure!(
+        engine.serve_audit(hash).await? == ServeAudit::Unavailable { withdrawn: true },
+        "the delivery gate reports a quarantined hash as withdrawn, so dispatch never fills it"
     );
     anyhow::ensure!(
         !engine.iter_hashes().await?.contains(&hash),
@@ -152,7 +210,7 @@ async fn a_serve_that_trips_stored_corruption_quarantines_the_hash() -> anyhow::
 
 #[tokio::test]
 async fn outboard_pairs_over_stored_corruption_quarantines_the_hash() -> anyhow::Result<()> {
-    let payload = payload();
+    let payload = util::make_blob(BLOB_LEN);
     let (server, hash) = serve(&payload).await;
     let tmp = tempfile::tempdir()?;
     let metrics = Arc::new(CacheMetrics::default());
@@ -183,8 +241,74 @@ async fn outboard_pairs_over_stored_corruption_quarantines_the_hash() -> anyhow:
 }
 
 #[tokio::test]
-async fn an_export_fault_that_is_not_a_mismatch_does_not_quarantine() -> anyhow::Result<()> {
-    let payload = payload();
+async fn a_tampered_outboard_quarantines_on_a_parent_mismatch() -> anyhow::Result<()> {
+    let payload = util::make_blob(LARGE_BLOB_LEN);
+    let (server, hash) = serve(&payload).await;
+    let tmp = tempfile::tempdir()?;
+    let metrics = Arc::new(CacheMetrics::default());
+    let engine = open(
+        tmp.path(),
+        &server.uri(),
+        PinnedHashes::empty(),
+        &metrics,
+        Duration::ZERO,
+    )
+    .await?;
+    engine.get(hash).await?;
+
+    // The first pre-order pair is the root's children, so every export checks it.
+    flip(tmp.path(), hash, "obao4", 0)?;
+    let err = serve_error(&engine, hash, 0, 0, LARGE_BLOB_LEN).await?;
+    anyhow::ensure!(
+        err.as_deref()
+            .is_some_and(|e| e.to_lowercase().contains("parent")),
+        "the export must fail parent validation on the tampered outboard; got {err:?}"
+    );
+    anyhow::ensure!(
+        engine.is_quarantined(hash),
+        "a parent mismatch quarantines the hash"
+    );
+    anyhow::ensure!(metrics.held_corruption_quarantined.get() == 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_truncated_data_file_quarantines_the_hash() -> anyhow::Result<()> {
+    let payload = util::make_blob(BLOB_LEN);
+    let (server, hash) = serve(&payload).await;
+    let tmp = tempfile::tempdir()?;
+    let metrics = Arc::new(CacheMetrics::default());
+    let engine = open(
+        tmp.path(),
+        &server.uri(),
+        PinnedHashes::empty(),
+        &metrics,
+        Duration::ZERO,
+    )
+    .await?;
+    engine.get(hash).await?;
+
+    let file =
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(store_file(tmp.path(), hash, "data")?)?;
+    file.set_len(64 * 1024)?;
+    file.sync_all()?;
+
+    anyhow::ensure!(
+        serve_fails(&engine, hash).await?,
+        "the export must fail on the short read"
+    );
+    anyhow::ensure!(
+        engine.is_quarantined(hash),
+        "a complete blob whose data file is short is corrupt"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_absent_blob_export_fault_does_not_quarantine() -> anyhow::Result<()> {
+    let payload = util::make_blob(BLOB_LEN);
     let (server, hash) = serve(&payload).await;
     let tmp = tempfile::tempdir()?;
     let metrics = Arc::new(CacheMetrics::default());
@@ -198,8 +322,10 @@ async fn an_export_fault_that_is_not_a_mismatch_does_not_quarantine() -> anyhow:
     .await?;
 
     // Never fetched: the export faults on an absent blob.
-    let failed = serve_fails(&engine, hash).await.unwrap_or(true);
-    anyhow::ensure!(failed, "exporting an absent blob must fail");
+    anyhow::ensure!(
+        serve_error(&engine, hash, 0, 0, BLOB_LEN).await?.is_some(),
+        "exporting an absent blob must end in an error item"
+    );
     anyhow::ensure!(
         !engine.is_quarantined(hash),
         "an absent blob is not stored corruption"
@@ -208,26 +334,79 @@ async fn an_export_fault_that_is_not_a_mismatch_does_not_quarantine() -> anyhow:
     Ok(())
 }
 
+/// A partial blob's data file is sparse, so exporting an absent range reads
+/// zeros that fail validation like corruption. That must not withdraw a healthy
+/// partial. Corruption inside a present range still quarantines it.
+#[tokio::test]
+async fn a_partial_blob_quarantines_only_for_corruption_in_a_present_range() -> anyhow::Result<()> {
+    let payload = util::make_blob(BLOB_LEN);
+    let blob_size = u64::try_from(payload.len())?;
+    let ob = PreOrderMemOutboard::create(&payload, IROH_BLOCK_SIZE);
+    let root: [u8; 32] = *ob.root.as_bytes();
+    let hash = Hash::from(root);
+    let first_group = align_range(0, 16 * 1024, blob_size)?;
+    let bao = encode_verified_range(
+        root,
+        &first_group,
+        payload.get(..16 * 1024).unwrap_or_default(),
+        bytes::Bytes::from(ob.data),
+    )?;
+
+    let tmp = tempfile::tempdir()?;
+    let metrics = Arc::new(CacheMetrics::default());
+    let engine = open(
+        tmp.path(),
+        "http://127.0.0.1:9",
+        PinnedHashes::empty(),
+        &metrics,
+        Duration::ZERO,
+    )
+    .await?;
+    engine
+        .admit_bao(hash, first_group.chunk_ranges().clone(), bao)
+        .await?;
+    anyhow::ensure!(!engine.present_ranges(hash).await?.is_complete());
+
+    let absent = serve_error(&engine, hash, 64 * 1024, 16 * 1024, BLOB_LEN).await?;
+    anyhow::ensure!(
+        absent.is_some(),
+        "exporting an absent range of a partial must fail"
+    );
+    anyhow::ensure!(
+        !engine.is_quarantined(hash),
+        "an absent range is not corruption; got {absent:?}"
+    );
+    anyhow::ensure!(
+        serve_error(&engine, hash, 0, 16 * 1024, BLOB_LEN)
+            .await?
+            .is_none(),
+        "the present range still serves"
+    );
+
+    flip(tmp.path(), hash, "data", 100)?;
+    anyhow::ensure!(
+        serve_error(&engine, hash, 0, 16 * 1024, BLOB_LEN)
+            .await?
+            .is_some(),
+        "the tampered present range must fail validation"
+    );
+    anyhow::ensure!(
+        engine.is_quarantined(hash),
+        "corruption inside a present range quarantines the partial"
+    );
+    Ok(())
+}
+
 /// GC reclaims the quarantined entry, the quarantine lifts, and a pull-through
 /// admits a verified copy that serves. Pinned, so the test also proves the
 /// quarantine releases a pinned hash to GC.
 #[tokio::test]
 async fn gc_reclaim_lifts_the_quarantine_and_a_pinned_hash_re_admits() -> anyhow::Result<()> {
-    let payload = payload();
+    let payload = util::make_blob(BLOB_LEN);
     let (server, hash) = serve(&payload).await;
     let tmp = tempfile::tempdir()?;
     let metrics = Arc::new(CacheMetrics::default());
-    let gc_interval = Duration::from_millis(200);
-    let engine = open(
-        tmp.path(),
-        &server.uri(),
-        PinnedHashes::new(HashSet::from([decdn_config_types::Hash::from_bytes(
-            *hash.as_bytes(),
-        )])),
-        &metrics,
-        gc_interval,
-    )
-    .await?;
+    let engine = open(tmp.path(), &server.uri(), pin(hash), &metrics, GC_INTERVAL).await?;
     engine.get(hash).await?;
 
     tamper(tmp.path(), hash)?;
@@ -237,18 +416,19 @@ async fn gc_reclaim_lifts_the_quarantine_and_a_pinned_hash_re_admits() -> anyhow
     );
     anyhow::ensure!(engine.is_quarantined(hash));
 
-    let deadline = std::time::Instant::now() + gc_interval * 32;
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(gc_interval).await;
-        // `has` lifts a reclaimed quarantine as a side effect.
-        let _ = engine.has(hash).await?;
-        if !engine.is_quarantined(hash) {
-            break;
-        }
-    }
+    await_reclaim(&engine, hash).await?;
+    anyhow::ensure!(
+        engine.is_quarantined(hash),
+        "inspect observes the reclaim without lifting"
+    );
+    // `serve_audit` lifts a reclaimed quarantine, then reports a plain miss.
+    anyhow::ensure!(
+        engine.serve_audit(hash).await? == ServeAudit::Unavailable { withdrawn: false },
+        "a reclaimed hash is a plain miss that dispatch may fill"
+    );
     anyhow::ensure!(
         !engine.is_quarantined(hash),
-        "GC must reclaim the released entry and the quarantine must lift"
+        "serve_audit lifts the quarantine"
     );
 
     let got = engine.get(hash).await?;
@@ -260,6 +440,37 @@ async fn gc_reclaim_lifts_the_quarantine_and_a_pinned_hash_re_admits() -> anyhow
         !serve_fails(&engine, hash).await?,
         "the re-admitted copy serves"
     );
-    anyhow::ensure!(engine.has(hash).await?, "the re-admitted copy is held");
+    anyhow::ensure!(
+        matches!(
+            engine.serve_audit(hash).await?,
+            ServeAudit::Serveable { .. }
+        ),
+        "the re-admitted copy is serveable"
+    );
+    Ok(())
+}
+
+/// The origin rescan lifts a reclaimed quarantine with no request touching
+/// the hash, so a reclaimed hash can rejoin the announce set on its own.
+#[tokio::test]
+async fn an_origin_rescan_lifts_a_reclaimed_quarantine() -> anyhow::Result<()> {
+    let payload = util::make_blob(BLOB_LEN);
+    let (server, hash) = serve(&payload).await;
+    let tmp = tempfile::tempdir()?;
+    let metrics = Arc::new(CacheMetrics::default());
+    let engine = open(tmp.path(), &server.uri(), pin(hash), &metrics, GC_INTERVAL).await?;
+    engine.get(hash).await?;
+
+    tamper(tmp.path(), hash)?;
+    anyhow::ensure!(serve_fails(&engine, hash).await?);
+    anyhow::ensure!(engine.is_quarantined(hash));
+
+    await_reclaim(&engine, hash).await?;
+    anyhow::ensure!(engine.is_quarantined(hash), "nothing has lifted it yet");
+    engine.rescan_origins().await;
+    anyhow::ensure!(
+        !engine.is_quarantined(hash),
+        "the rescan lifts a quarantine whose entry GC reclaimed"
+    );
     Ok(())
 }

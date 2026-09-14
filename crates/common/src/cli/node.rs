@@ -63,8 +63,8 @@ pub enum NodeCommand {
     /// timeout semantics as `decdn node health`.
     Slashes(SlashesArgs),
     /// Forcibly remove a single blob from the local cache (issue #279).
-    /// Useful for DMCA takedown, corruption recovery, and storage
-    /// reclamation.
+    /// The removal is permanent: the node never serves or re-fetches the hash
+    /// again. Useful for DMCA takedown and storage reclamation.
     Evict(EvictArgs),
     /// Re-read the running node's config file and apply hot-reloadable
     /// fields (issue #373). Equivalent to `kill -HUP <pid>` but goes

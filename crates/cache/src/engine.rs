@@ -330,7 +330,7 @@ struct Inner {
     ///
     /// Persisted alongside the iroh-blobs store at `<cache_dir>/evicted.log`
     /// on every successful [`CacheEngine::evict`] call so DMCA takedowns and
-    /// corruption-recovery evicts survive a process restart — an
+    /// other operator evicts survive a process restart — an
     /// in-memory-only set would silently let evicted content resume serving
     /// after `decdn run` is restarted, which is exactly the failure mode
     /// #279 needs to prevent.
@@ -348,9 +348,10 @@ struct Inner {
     /// (disk rot or tampering). [`CacheEngine::refuses`] honors membership, so
     /// the node stops serving, announcing, and re-acquiring the hash while the
     /// corrupt entry is on disk. The quarantine drops the protecting tags, so
-    /// the next GC sweep reclaims the entry, and the membership lifts once the
-    /// store no longer holds the hash. A later pull-through then admits a
-    /// freshly verified copy.
+    /// the next GC sweep reclaims the entry. The membership lifts on the next
+    /// lookup or origin rescan that finds the store no longer holds the hash
+    /// (see [`CacheEngine::is_quarantined`]). A later pull-through then admits
+    /// a freshly verified copy.
     ///
     /// In memory only. A restart before the sweep forgets the entry, and the
     /// next serve of the corrupt bytes trips the validation and quarantines it
@@ -616,10 +617,13 @@ pub enum ServeAudit {
     /// Nothing serveable from the local store: the blob is absent, partial, or
     /// refused by a gate.
     Unavailable {
-        /// Whether the hash is logically evicted (#279). Mirrors
-        /// [`CacheEngine::is_evicted`], so the miss path tells an eviction
-        /// from a plain miss without a second call.
-        evicted: bool,
+        /// Whether this node withdrew the hash on its own authority: an
+        /// operator eviction ([`CacheEngine::is_evicted`], #279) or a
+        /// stored-corruption quarantine ([`CacheEngine::is_quarantined`]). The
+        /// miss path must not fill a withdrawn hash. A fill of an evicted hash
+        /// undoes the takedown. A fill of a quarantined hash lands on the
+        /// corrupt entry and pays for bytes it can never serve.
+        withdrawn: bool,
     },
 }
 
@@ -640,18 +644,17 @@ impl ServeAudit {
         matches!(self, Self::Serveable { .. })
     }
 
-    /// Whether the hash is logically evicted (#279). `false` for a serveable
-    /// hash, since eviction is one of the gates that refuses a serve.
+    /// Whether this node withdrew the hash: evicted or quarantined. `false`
+    /// for a serveable hash, since both are gates that refuse a serve.
     #[must_use]
-    pub const fn is_evicted(&self) -> bool {
-        matches!(self, Self::Unavailable { evicted: true })
+    pub const fn is_withdrawn(&self) -> bool {
+        matches!(self, Self::Unavailable { withdrawn: true })
     }
 }
 
 /// Read-only snapshot of a hash's local-cache state, returned by
 /// [`CacheEngine::inspect`]. Backs `decdn node evict --dry-run`
-/// (issue #379): operators running DMCA takedowns or
-/// corruption-recovery want to confirm the blob's size, last-access
+/// (issue #379): operators running DMCA takedowns want to confirm the blob's size, last-access
 /// time, pin status, and already-evicted flag before mutating state.
 ///
 /// All fields reflect the *underlying* cache state — `size_bytes` reads
@@ -2112,7 +2115,7 @@ impl CacheEngine {
     /// is not that.
     pub async fn serve_audit(&self, hash: Hash) -> CacheResult<ServeAudit> {
         self.lift_reclaimed_quarantine(hash).await;
-        let evicted = self.is_evicted(hash);
+        let withdrawn = self.is_evicted(hash) || self.is_quarantined(hash);
         let refused = self.refuses(hash);
         let status = self
             .inner
@@ -2128,7 +2131,7 @@ impl CacheEngine {
             iroh_blobs::api::blobs::BlobStatus::Complete { .. }
             | iroh_blobs::api::blobs::BlobStatus::NotFound
             | iroh_blobs::api::blobs::BlobStatus::Partial { .. } => {
-                Ok(ServeAudit::Unavailable { evicted })
+                Ok(ServeAudit::Unavailable { withdrawn })
             }
         }
     }
@@ -2463,8 +2466,14 @@ impl CacheEngine {
     /// through this tag (see `evict`). Its only cost is that such a partial may go
     /// unprotected and be GC-reclaimed, which self-corrects on the next pull.
     /// Concurrent first-admits merely repeat one idempotent `set`.
+    ///
+    /// A [quarantined](Self::is_quarantined) hash gets no tag: the tag would
+    /// protect the corrupt entry from the GC sweep that ends the quarantine. A
+    /// fill already past this check when the quarantine starts can still write
+    /// the tag. The origin rescan drops it again
+    /// ([`Self::lift_reclaimed_quarantines`]).
     async fn protect_partial(&self, hash: Hash) -> CacheResult<()> {
-        if self.inner.partial_protected.contains_key(&hash) {
+        if self.is_quarantined(hash) || self.inner.partial_protected.contains_key(&hash) {
             return Ok(());
         }
         let name = format!("decdn-partial-{hash}");
@@ -2607,11 +2616,13 @@ impl CacheEngine {
     /// Is this hash quarantined because its stored bytes failed validation on
     /// a serve export?
     ///
-    /// A `LeafHashMismatch` or `ParentHashMismatch` from
+    /// A hash mismatch or a short read over held content in
     /// [`Self::export_bao_range_stream`] or [`Self::outboard_pairs`] quarantines
     /// the hash. [`Self::refuses`] then withholds it from serving, announcing,
-    /// and re-acquisition. The engine drops its protecting tags, pin included,
-    /// so GC reclaims the entry, and the quarantine lifts once the store no
+    /// and re-acquisition. The engine drops its protecting tags, even when the
+    /// hash is pinned: the pin does not keep corrupt bytes from GC. The
+    /// quarantine lifts on the next [`Self::has`], [`Self::serve_audit`],
+    /// [`Self::pull_through_range`], or origin rescan that finds the store no
     /// longer holds the hash. The quarantine is in memory only.
     pub fn is_quarantined(&self, hash: Hash) -> bool {
         self.inner.quarantined.contains_key(&hash)
@@ -2631,8 +2642,9 @@ impl CacheEngine {
     ///
     /// Idempotent: only the first trip per hash counts
     /// `held_corruption_quarantined` and walks the tag store. A tag-drop
-    /// failure counts `tag_drop_failures` and leaves the bytes GC-protected.
-    /// The hash stays refused regardless.
+    /// failure counts `tag_drop_failures` and leaves the bytes GC-protected
+    /// until [`Self::lift_reclaimed_quarantines`] retries the drop on the next
+    /// origin rescan. The hash stays refused regardless.
     async fn quarantine_corrupt(&self, hash: Hash) {
         if self.inner.quarantined.insert(hash, ()).is_some() {
             return;
@@ -2640,69 +2652,148 @@ impl CacheEngine {
         if let Some(m) = &self.inner.metrics {
             m.held_corruption_quarantined.inc();
         }
-        tracing::warn!(
-            %hash,
-            "held blob failed bao validation on export; quarantined it and released it to GC"
-        );
+        if self.inner.gc_store_handle.is_some() {
+            tracing::warn!(
+                %hash,
+                "held blob failed bao validation on export; quarantined it and released it to GC"
+            );
+        } else {
+            tracing::warn!(
+                %hash,
+                "held blob failed bao validation on export; quarantined it. GC is disabled \
+                 (cache.gc_interval_sec = 0), so the corrupt bytes stay on disk and the hash \
+                 stays withdrawn until a restart"
+            );
+        }
         self.inner.access_times.remove(&hash);
         self.inner
             .segments
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&hash);
-        if let Err(err) = self.drop_named_tags_for(hash).await {
-            if let Some(m) = &self.inner.metrics {
-                m.tag_drop_failures.inc();
+        self.drop_quarantined_tags(hash).await;
+    }
+
+    /// Drop the protecting tags of quarantined `hash`. Returns how many tags
+    /// were dropped; a failure counts `tag_drop_failures`, logs, and returns 0.
+    async fn drop_quarantined_tags(&self, hash: Hash) -> u64 {
+        match self.drop_named_tags_for(hash).await {
+            Ok(dropped) => dropped,
+            Err(err) => {
+                if let Some(m) = &self.inner.metrics {
+                    m.tag_drop_failures.inc();
+                }
+                tracing::warn!(
+                    %hash,
+                    error = %err,
+                    "quarantine: dropping the protecting tags failed; the corrupt bytes stay on \
+                     disk until the next origin rescan retries"
+                );
+                0
             }
-            tracing::warn!(
-                %hash,
-                error = %err,
-                "quarantine: dropping the protecting tags failed; the corrupt bytes stay on disk"
-            );
         }
     }
 
-    /// End the quarantine on `hash` when the store no longer holds it.
+    /// End the quarantine on `hash` when the store no longer holds it. Returns
+    /// `true` when `hash` is not quarantined after the call.
     ///
     /// GC reclaims a quarantined entry because [`Self::quarantine_corrupt`]
     /// dropped its tags. After the sweep nothing corrupt remains, so a
     /// pull-through may admit a freshly verified copy. A store fault keeps the
-    /// quarantine, and a later call retries. No-op for a hash that is not
-    /// quarantined.
-    async fn lift_reclaimed_quarantine(&self, hash: Hash) {
+    /// quarantine, and a later call retries.
+    async fn lift_reclaimed_quarantine(&self, hash: Hash) -> bool {
         if !self.is_quarantined(hash) {
-            return;
+            return true;
         }
-        if let Ok(iroh_blobs::api::blobs::BlobStatus::NotFound) =
-            self.inner.store.blobs().status(hash).await
-        {
-            self.inner.quarantined.remove(&hash);
-            tracing::info!(%hash, "quarantined blob reclaimed; lifted the quarantine");
+        match self.inner.store.blobs().status(hash).await {
+            Ok(iroh_blobs::api::blobs::BlobStatus::NotFound) => {
+                self.inner.quarantined.remove(&hash);
+                tracing::info!(%hash, "quarantined blob reclaimed; lifted the quarantine");
+                true
+            }
+            Ok(_) => false,
+            Err(err) => {
+                tracing::debug!(
+                    %hash,
+                    error = %err,
+                    "quarantine: store status failed; the quarantine stays"
+                );
+                false
+            }
         }
     }
 
-    /// Lift every quarantine whose entry GC has reclaimed. The periodic origin
-    /// rescan calls this, so a reclaimed hash rejoins the origin-held announce
-    /// set even when no request touches it.
+    /// Lift every quarantine whose entry GC has reclaimed, and drop the tags
+    /// again for every quarantined entry the store still holds.
+    ///
+    /// The periodic origin rescan calls this, so a reclaimed hash rejoins the
+    /// origin-held announce set even when no request touches it. The second
+    /// tag drop covers a fill or pull-through that was already past its
+    /// quarantine check when the quarantine started and then protected the
+    /// corrupt entry. Without it, that tag would keep the entry from GC and the
+    /// quarantine would never lift.
     async fn lift_reclaimed_quarantines(&self) {
         let quarantined: Vec<Hash> = self.inner.quarantined.iter().map(|e| *e.key()).collect();
         for hash in quarantined {
-            self.lift_reclaimed_quarantine(hash).await;
+            if self.lift_reclaimed_quarantine(hash).await {
+                continue;
+            }
+            let dropped = self.drop_quarantined_tags(hash).await;
+            if dropped > 0 {
+                tracing::warn!(
+                    %hash,
+                    dropped,
+                    "quarantine: a fill re-protected the corrupt entry; dropped its tags again"
+                );
+            }
         }
     }
 
-    /// Quarantine `hash` when the export error `cause` is a stored-content
-    /// hash mismatch.
+    /// Quarantine `hash` when the export error `cause` proves that held content
+    /// diverged from the root.
     ///
-    /// Only `LeafHashMismatch` and `ParentHashMismatch` prove that the stored
-    /// bytes or outboard diverged from the root. An `Io` or `SizeMismatch`
-    /// error is a store fault or an absent range, not corruption.
+    /// Three errors can prove it:
+    /// - `LeafHashMismatch` and `ParentHashMismatch` fail the hash check.
+    /// - `Io` with `UnexpectedEof` means a data or outboard file is shorter
+    ///   than the size the store recorded.
+    ///
+    /// Each counts only over content the store holds. A partial blob's data
+    /// file is sparse, so an absent range reads back as zeros and fails the
+    /// hash check exactly like corruption. A complete blob holds every range,
+    /// so any of the three errors quarantines it. A partial blob is
+    /// quarantined only when the failing chunk groups lie inside its present
+    /// ranges; a short read never quarantines a partial blob. Every other
+    /// error is a store fault or an absent blob, not corruption.
     async fn quarantine_on_mismatch(&self, hash: Hash, cause: &bao_tree::io::EncodeError) {
-        if matches!(
-            cause,
-            bao_tree::io::EncodeError::LeafHashMismatch(_)
-                | bao_tree::io::EncodeError::ParentHashMismatch(_)
-        ) {
+        use bao_tree::ChunkNum;
+        use bao_tree::io::EncodeError;
+
+        let chunk_log = decdn_bao_range::IROH_BLOCK_SIZE.chunk_log();
+        let failing = match cause {
+            EncodeError::LeafHashMismatch(start) => {
+                ChunkRanges::from(*start..ChunkNum(start.0.saturating_add(1 << chunk_log)))
+            }
+            // A tree node's range is in chunk groups; shift it to chunks.
+            EncodeError::ParentHashMismatch(node) => {
+                let groups = node.chunk_range();
+                ChunkRanges::from(
+                    ChunkNum(groups.start.0 << chunk_log)..ChunkNum(groups.end.0 << chunk_log),
+                )
+            }
+            EncodeError::Io(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                ChunkRanges::all()
+            }
+            _ => return,
+        };
+        let Ok(present) = self.present_ranges(hash).await else {
+            return;
+        };
+        let held = present.is_complete() || {
+            // Clip the failing groups to the blob end: the last group is short.
+            let failing = failing & ChunkRanges::from(..ChunkNum::chunks(present.size()));
+            !failing.is_empty() && (failing - present.chunk_ranges()).is_empty()
+        };
+        if held {
             self.quarantine_corrupt(hash).await;
         }
     }
@@ -4358,7 +4449,10 @@ impl CacheEngine {
     ///
     /// `chunk_ranges` must be PRESENT (a just-admitted or held range): the proof
     /// nodes for absent siblings are emitted from the outboard regardless, but a
-    /// range whose own leaves are absent faults `export_bao`.
+    /// range whose own leaves are absent faults `export_bao`. On a partial blob
+    /// that fault can be a hash mismatch, because an absent range reads back as
+    /// zeros. The quarantine ignores a mismatch outside the present ranges, so
+    /// a precondition breach returns `Err` without withdrawing the hash.
     pub async fn outboard_pairs(
         &self,
         hash: Hash,
@@ -4985,6 +5079,13 @@ impl CacheEngine {
         // Tag-create failure is store-side, not origin-side: surface as `Store`
         // so retry-class taxonomy doesn't pick it up.
         let haf = temp_tag.hash_and_format();
+        // A pull that started before a quarantine must not protect the corrupt
+        // entry the quarantine released to GC. The import landed on that entry,
+        // so nothing verified is lost.
+        if self.is_quarantined(hash) {
+            drop(temp_tag);
+            return Ok(StreamCommitOutcome::Committed);
+        }
         if let Err(err) = self.inner.store.tags().create(haf).await {
             return Ok(StreamCommitOutcome::Store(anyhow::Error::from(err)));
         }
@@ -7685,7 +7786,7 @@ mod tests {
     /// `evict` must take a previously-cached hash off the served set. After
     /// evict, `has` reports false and `get` returns `NotFound` rather than
     /// silently re-pulling from the origin (which would defeat the point of
-    /// the takedown / corruption-recovery use case behind issue #279).
+    /// the takedown use case behind issue #279).
     #[tokio::test]
     async fn evict_blocks_subsequent_serve() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
@@ -7788,7 +7889,7 @@ mod tests {
     /// (#1789 item 7 part B) and matches the `has`/`inspect` pairing the
     /// delivery path would otherwise make: a complete blob is `Serveable` with
     /// its size, an absent hash is `Unavailable`, and an evicted hash is
-    /// `Unavailable` with `evicted` set so the serve path tells an eviction
+    /// `Unavailable` with `withdrawn` set so the serve path tells an eviction
     /// from a plain miss without a second call.
     #[tokio::test]
     async fn serve_audit_reports_presence_size_and_eviction() -> anyhow::Result<()> {
@@ -7801,7 +7902,7 @@ mod tests {
         let unseen = Hash::new(b"never cached");
 
         anyhow::ensure!(
-            engine.serve_audit(unseen).await? == ServeAudit::Unavailable { evicted: false },
+            engine.serve_audit(unseen).await? == ServeAudit::Unavailable { withdrawn: false },
             "an absent hash is unavailable and not evicted"
         );
 
@@ -7816,7 +7917,7 @@ mod tests {
 
         engine.evict(hash).await?;
         anyhow::ensure!(
-            engine.serve_audit(hash).await? == ServeAudit::Unavailable { evicted: true },
+            engine.serve_audit(hash).await? == ServeAudit::Unavailable { withdrawn: true },
             "evicted content is unavailable with the eviction surfaced"
         );
         Ok(())
@@ -7840,7 +7941,7 @@ mod tests {
         engine.set_chain_denied_one(hash, true);
         let audit = engine.serve_audit(hash).await?;
         anyhow::ensure!(
-            audit == ServeAudit::Unavailable { evicted: false },
+            audit == ServeAudit::Unavailable { withdrawn: false },
             "a chain-denied blob is unavailable, un-evicted, and sizeless"
         );
         anyhow::ensure!(

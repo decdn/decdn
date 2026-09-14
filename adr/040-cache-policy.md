@@ -334,17 +334,22 @@ protects a hash against eviction-policy pressure but not against
 `CacheEngine::evict`: a durable operator directive always wins.
 
 **A serve that detects stored corruption quarantines the hash.** Every serve
-export validates the held bytes and outboard against the content root. A hash
-mismatch means that the stored copy changed after admission, from disk rot or
-tampering. The engine then quarantines the hash. It stops serving,
-announcing, and re-acquiring the hash, and it drops the protecting tags, pin
-included. The next GC sweep reclaims the entry. When the store no longer holds
-the hash, the quarantine lifts, and a later pull-through admits a verified
-copy. The quarantine is in memory only. After a restart, the next serve of the
-corrupt bytes quarantines the hash again. `CacheEngine::evict` is not the
-recovery path, because a durable takedown would withhold legitimate content
-permanently. Reclaim needs periodic GC. When GC is off, the hash stays
-quarantined and the bytes stay on disk.
+export validates the exported chunk groups and their proof nodes against the
+content root. A hash mismatch or a short read over held content means that the
+stored copy changed after admission, from disk rot or tampering. The engine
+then quarantines the hash. The node stops serving, announcing, and
+re-acquiring the hash. A stream request for it answers `EvictedSinceProbe`.
+The engine drops the protecting tags, also for a pinned hash. The pin does not
+keep corrupt bytes from GC. The next GC sweep reclaims the entry. The next
+lookup or origin rescan that finds the store no longer holds the hash lifts
+the quarantine. A later pull-through then admits a verified copy. A fill that
+protects the entry during the quarantine does not block this: each origin
+rescan drops the tags of a quarantined entry again. The quarantine is in
+memory only. After a restart, the next serve of the corrupt bytes quarantines
+the hash again. `CacheEngine::evict` is not the recovery path, because a
+durable takedown withholds legitimate content permanently. Reclaim needs
+periodic GC. When GC is off, the hash stays quarantined and the bytes stay on
+disk.
 
 **The probe-triggered hold composes above policy.** A hash a node has just
 advertised as present, per [ADR 005 § Probe-Triggered Eviction
