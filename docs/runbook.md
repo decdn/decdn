@@ -647,6 +647,12 @@ that do not hash to the requested root.
 None of the three has an alert or a panel in `monitoring/`. That is the
 actionable gap.
 
+**Attribute:** `decdn_node_pull_{success,unreachable,corruption}_total` carry no
+peer label. To find the peer behind a rise, run with
+`RUST_LOG=info,decdn::reputation=debug`. Every local reputation change then logs
+one `decdn::reputation` event with the peer's `NodeId`, the outcome, and the
+peer's new local score.
+
 **The real blind spot is the serve leg.** `HashMismatch` is deliberately *not*
 classified as a `HardFault` (`crates/node/src/handlers/client/mod.rs`) — it is
 deterministic, and reporting it as "this node is broken" would steer clients off
