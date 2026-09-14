@@ -10,8 +10,8 @@ deCDN builds with a native toolchain and works with any editor. Install the prer
 |---|---|---|
 | [rustup](https://rustup.rs) | `rust-toolchain.toml` pins Rust `1.95.0` with `rustfmt` and `clippy`; a rustup-managed `cargo` installs and selects that pin on first invocation | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
 | `cargo-nextest` | the test runner this repo and CI use instead of `cargo test` | `cargo install --locked cargo-nextest` |
-| `cargo-deny` | license + advisory audit; both a pre-commit hook and a CI check; findings warn and never block | `cargo install --locked cargo-deny` |
-| [pre-commit](https://pre-commit.com/) | runs the commit- and push-stage gates | `pipx install pre-commit` |
+| `cargo-deny` | license + advisory audit; both a pre-commit hook and a CI check; findings warn and never block, but a run that checked nothing fails | `cargo install --locked cargo-deny` |
+| [pre-commit](https://pre-commit.com/) | runs the commit- and push-stage hooks | `pipx install pre-commit` |
 | [Foundry](https://book.getfoundry.sh) (`forge`, `anvil`) | contract build/test/fmt hooks and the Anvil e2e journeys; CI pins `v1.7.1` | `curl -L https://foundry.paradigm.xyz \| bash` then `foundryup -i v1.7.1` |
 | A C compiler (`cc`) + `make` | `ring` and `aws-lc-sys` compile C sources during `cargo build`, and rustc needs `cc` to link; `make` also drives the `adr-book-list` and `adr-ref-hygiene` hooks via `make -C adr` | system package manager (`build-essential` on Debian/Ubuntu); `cmake` is optional but lets `aws-lc-sys` skip its slower cc-only fallback |
 | [`gh`](https://cli.github.com/) | issue and PR workflow | system package manager |
@@ -48,7 +48,7 @@ anvil --version            # the e2e journeys need it
 
 ## Pre-commit Hooks
 
-The repo uses [pre-commit](https://pre-commit.com/) to enforce formatting, linting, and supply chain checks before each commit.
+The repo uses [pre-commit](https://pre-commit.com/) to enforce formatting and linting, and to report supply chain findings, before each commit.
 
 ```bash
 pre-commit install --hook-type pre-commit --hook-type pre-push   # one-time setup

@@ -103,21 +103,16 @@ jobs:
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v7
-      # Pinned to a concrete patch (v2.1.1) rather than the bare major `v2`
-      # so a future v2 release can't silently change the check's behavior
-      # (the major tag already excludes v3). Dependabot's github-actions
-      # ecosystem still bumps it. The action caches the cargo registry and
-      # its own check cache internally, so no Swatinem/rust-cache partition
-      # is needed here.
-      #
-      # Advisory, not a gate: a finding fails this step but the job still
-      # succeeds, so `ci-success` stays green. The next step turns the
-      # failure into a warning annotation on the run summary.
-      - id: deny
-        uses: EmbarkStudios/cargo-deny-action@v2.1.1
-        continue-on-error: true
-      - if: steps.deny.outcome == 'failure'
-        run: echo "::warning title=cargo deny::cargo deny check reported findings; see the step log above"
+      - uses: dtolnay/rust-toolchain@1.95.0
+      # cargo-deny pinned to an exact version so a release can't silently
+      # change the check's behavior.
+      - uses: taiki-e/install-action@v2.87.8
+        with:
+          tool: cargo-deny@0.20.2
+      # Findings warn (annotations on the run summary) and the job succeeds.
+      # A run that checked nothing — deny.toml error, advisory-db fetch
+      # failure — fails the job. See cargo_deny_warn.py.
+      - run: .github/scripts/cargo-deny-warn.sh
 
   doc:
     name: cargo doc
@@ -248,6 +243,8 @@ jobs:
               - 'rust-toolchain.toml'
               - 'rustfmt.toml'
               - 'deny.toml'
+              - '.github/scripts/cargo_deny_warn.py'
+              - '.github/scripts/cargo-deny-warn.sh'
               - '.cargo/**'
               # insta snapshot baselines (e.g. the public-API surface snapshot,
               # issue #304). Without this, a PR that hand-edits only a committed
