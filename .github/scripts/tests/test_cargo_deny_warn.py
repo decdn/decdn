@@ -42,6 +42,12 @@ def test_zero_exit_is_clean():
     assert cdw.classify(0, CLEAN_OUT) == cdw.CLEAN
 
 
+def test_zero_exit_without_summary_is_not_run():
+    # A zero exit alone is not proof of an audit; the summary is.
+    assert cdw.classify(0, "") == cdw.NOT_RUN
+    assert cdw.classify(0, FETCH_ERROR_OUT) == cdw.NOT_RUN
+
+
 def test_nonzero_exit_with_summary_is_findings():
     assert cdw.classify(1, FINDINGS_OUT) == cdw.FINDINGS
     assert cdw.classify(5, FINDINGS_OUT) == cdw.FINDINGS
@@ -100,6 +106,7 @@ def test_main_exit_codes(monkeypatch, capsys):
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     cases = [
         (fake_run(0, 0, CLEAN_OUT), 0),
+        (fake_run(0, 0, ""), 1),
         (fake_run(0, 1, FINDINGS_OUT), 0),
         (fake_run(0, 1, CONFIG_ERROR_OUT), 1),
         (fake_run(0, 1, FETCH_ERROR_OUT), 1),
@@ -117,7 +124,7 @@ def test_main_missing_cargo_fails(monkeypatch, capsys):
 
     monkeypatch.setattr(cdw.subprocess, "run", run)
     assert cdw.main() == 1
-    assert "not installed" in capsys.readouterr().err
+    assert "cargo is not on PATH" in capsys.readouterr().err
 
 
 def test_main_emits_annotations_only_under_actions(monkeypatch, capsys):

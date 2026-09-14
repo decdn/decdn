@@ -48,12 +48,14 @@ NOT_RUN = "not-run"
 
 
 def classify(returncode: int, output: str) -> str:
-    """Name the outcome of one `cargo deny check` run."""
-    if returncode == 0:
-        return CLEAN
-    if SUMMARY_RE.search(output):
-        return FINDINGS
-    return NOT_RUN
+    """Name the outcome of one `cargo deny check` run.
+
+    The summary line decides whether the checks ran, whatever the exit code;
+    only then does the exit code separate clean from findings.
+    """
+    if not SUMMARY_RE.search(output):
+        return NOT_RUN
+    return CLEAN if returncode == 0 else FINDINGS
 
 
 def escape_annotation(message: str) -> str:
@@ -82,8 +84,9 @@ def main() -> int:
             ["cargo", "deny", "--version"], capture_output=True, text=True, check=False
         )
     except FileNotFoundError:
-        probe = None
-    if probe is None or probe.returncode != 0:
+        print("error: cargo is not on PATH; install Rust via rustup first", file=sys.stderr)
+        return 1
+    if probe.returncode != 0:
         print(
             "error: cargo-deny is not installed; run `cargo install --locked cargo-deny`",
             file=sys.stderr,
