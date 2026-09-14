@@ -6726,8 +6726,8 @@ async fn leaf_paced_pull(
 
 /// [`leaf_paced_pull`] with an explicit [`LeafMode`]. In
 /// [`LeafMode::StopPayingAfter`] the leaf keeps reading after its last voucher
-/// until `hold` elapses or B ends the stream, then closes and reports the WIRE
-/// bytes it received.
+/// until `hold` elapses, then closes and reports the WIRE bytes it received. A
+/// stream error or read failure during the hold is an error.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn leaf_paced_pull_mode(
     leaf_ep: &iroh::Endpoint,
@@ -6797,7 +6797,14 @@ async fn leaf_paced_pull_mode(
             None => read_client(&mut recv).await?,
             Some(deadline) => match tokio::time::timeout_at(deadline, read_client(&mut recv)).await
             {
-                Ok(Ok(ClientMessage::StreamError(_)) | Err(_)) | Err(_) => {
+                // Only the hold elapsing ends the pull as planned. An early
+                // stream error or read failure means B did not keep the
+                // connection open, which is the case this mode exists to test.
+                Ok(Err(e)) => anyhow::bail!("leaf read failed during the unpaid hold: {e}"),
+                Ok(Ok(ClientMessage::StreamError(e))) => {
+                    anyhow::bail!("B ended the stream during the unpaid hold: {e:?}")
+                }
+                Err(_) => {
                     conn.close(0u32.into(), b"leaf-hold");
                     return Ok(LeafOutcome {
                         received: cumulative,
@@ -8283,6 +8290,7 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_spend() -> Result<()>
 {
     // A leaf pays three vouchers, so both of B's windows ramp past their floors,
@@ -8350,6 +8358,13 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
         "leaf should have paid exactly three vouchers, got {}",
         outcome.acks
     );
+    anyhow::ensure!(
+        outcome.received > outcome.paid_wire,
+        "B must keep serving inside its credit window after the last voucher \
+         ({} received, {} paid)",
+        outcome.received,
+        outcome.paid_wire
+    );
 
     // B records its upstream watermark when the pull leg ends, which the leaf's
     // close triggers.
@@ -8383,13 +8398,25 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
     // ADR 037 bounds the unrecouped frontier as bytes pulled minus bytes paid.
     // Measuring against the paid wire, not the larger wire the leaf received
     // inside B's serve credit window, keeps the bound tight.
-    let bound_wire = support::bao_wire_len(payload_len, 0, ramped + pull_floor);
+    //
+    // The upstream watermark sums the wire of every pull-leg open, and each open
+    // re-sends the proof path to its start, which one range encoding counts once.
+    // A single-group range carries a full root-to-leaf path, so its wire minus its
+    // content is the most one extra open adds. B opens once per served-paid
+    // advance (one per voucher) and once per serve-demand floor, so 32 opens is
+    // generous; the allowance stays far below the one floor a breach would add.
+    let group = decdn_cache::CHUNK_GROUP_BYTES;
+    let proof_path = support::bao_wire_len(payload_len, 0, group).saturating_sub(group);
+    let max_opens = 32;
+    let bound_wire =
+        support::bao_wire_len(payload_len, 0, ramped + pull_floor) + max_opens * proof_path;
     let lead = upstream_wire.saturating_sub(paid);
     anyhow::ensure!(
         lead <= bound_wire,
         "B's unrecouped upstream lead ({upstream_wire} upstream - {paid} paid = {lead}) must \
-         stay within the ramped window ({ramped}) plus one pull-window floor ({pull_floor}) = \
-         {bound_wire} wire bytes; leaf received {}",
+         stay within the ramped window ({ramped}) plus one pull-window floor ({pull_floor}) \
+         plus {max_opens} proof paths of {proof_path} = {bound_wire} wire bytes; leaf \
+         received {}",
         outcome.received
     );
     let whole_wire = support::bao_wire_len_whole(payload_len);
