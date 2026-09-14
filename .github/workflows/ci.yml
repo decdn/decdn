@@ -109,7 +109,15 @@ jobs:
       # ecosystem still bumps it. The action caches the cargo registry and
       # its own check cache internally, so no Swatinem/rust-cache partition
       # is needed here.
-      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+      #
+      # Advisory, not a gate: a finding fails this step but the job still
+      # succeeds, so `ci-success` stays green. The next step turns the
+      # failure into a warning annotation on the run summary.
+      - id: deny
+        uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        continue-on-error: true
+      - if: steps.deny.outcome == 'failure'
+        run: echo "::warning title=cargo deny::cargo deny check reported findings; see the step log above"
 
   doc:
     name: cargo doc

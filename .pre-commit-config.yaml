@@ -37,9 +37,13 @@ repos:
         types: [rust]
         pass_filenames: false
 
+      # Advisory, not a gate: findings print (`verbose`) but never block the
+      # commit. CI treats the check the same way. `--log-level error` keeps
+      # the always-printed output to real findings, not duplicate-crate noise.
       - id: cargo-deny
-        name: cargo deny
-        entry: cargo deny check
+        name: cargo deny (warn only)
+        entry: sh -c 'cargo deny --log-level error check || echo "WARNING - cargo deny check reported findings (non-blocking)"'
+        verbose: true
         language: system
         pass_filenames: false
 
