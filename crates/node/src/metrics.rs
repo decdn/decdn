@@ -3084,6 +3084,9 @@ mod tests {
             "decdn_cache_evictions_starved_total",
             "decdn_cache_size_measure_failures_total",
             "decdn_cache_evicted_operator_total",
+            // Serve-detected stored corruption. The struct field is
+            // `held_corruption_quarantined`.
+            "decdn_cache_held_corruption_quarantined_total",
             // Best-effort tag-deletion failures. The array is hand-maintained, so
             // a new `CacheMetrics` field is covered only if someone adds it.
             "decdn_cache_tag_drop_failures_total",

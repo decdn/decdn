@@ -914,7 +914,9 @@ fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
 /// blob. Side effects: a failed probe scores the provider [`Outcome::Unreachable`],
 /// except a probe the provider shed with `APP_ERR_RATE_LIMITED`, which suppresses
 /// the pair for [`REFUSAL_SUPPRESSION_TTL`] and scores nothing (#1986); a
-/// reachable-but-absent provider is recorded in the negative-probe cache.
+/// same-region claim answered slower than [`REGION_LATENCY_MAX_MS`] scores
+/// [`Outcome::RegionLatencyMismatch`] (ADR 030); a reachable-but-absent provider
+/// is recorded in the negative-probe cache.
 // Straight-line probe → classify → build; the tracing macros and the three
 // sequential drop-conditions inflate the cognitive-complexity metric past the
 // threshold (same inflation noted in `chain_staker_set`), and splitting the
@@ -960,7 +962,12 @@ async fn probe_candidate(
             }
             // A failed probe is a reachability signal: the upstream could not be
             // reached for this interaction (ADR 008 §Local Score).
-            debug!(%err, "node-origin: probe failed; scoring provider unreachable");
+            debug!(
+                peer = %pk,
+                provider_addr = ?deps.addr_resolver.address_of(&peer),
+                %err,
+                "node-origin: probe failed; scoring provider unreachable"
+            );
             record_outcome(deps, pk, &Outcome::Unreachable);
             return None;
         }
@@ -1026,7 +1033,7 @@ async fn probe_candidate(
         // spoofer from a mis-set local `identity.region`): peer, both regions,
         // and the observed latency vs ceiling.
         debug!(
-            %pk,
+            peer = %pk,
             own_region = deps.config.own_region.as_deref().unwrap_or(""),
             claimed_region = %region,
             rtt_ms = rtt,
@@ -1035,7 +1042,7 @@ async fn probe_candidate(
              applying ADR 030 latency penalty"
         );
         deps.metrics.node_region_latency_penalty();
-        deps.local_rep.record(pk, Outcome::RegionLatencyMismatch);
+        record_outcome(deps, pk, &Outcome::RegionLatencyMismatch);
     }
     // The holder's reported blob size (`ProbeResponseExt.total_bytes`), read
     // before `coverage` is moved into the candidate. The coverage-union gather
@@ -2518,7 +2525,7 @@ fn classify_pull_failure(
             deps.metrics.node_pull_refused();
             match verdict {
                 RefusalVerdict::NodeFault => {
-                    debug!(%provider_addr, %err, "node-origin: upstream reports itself degraded; scoring unreachable");
+                    debug!(peer = %pk, %provider_addr, %err, "node-origin: upstream reports itself degraded; scoring unreachable");
                     record_outcome(deps, pk, &Outcome::Unreachable);
                 }
                 RefusalVerdict::DurableMiss(cause) => {
@@ -2582,11 +2589,11 @@ fn classify_pull_failure(
             );
         }
         PullVerdict::Corruption => {
-            debug!(%provider_addr, %err, "node-origin: upstream served corrupt bytes; scoring corruption");
+            debug!(peer = %pk, %provider_addr, %err, "node-origin: upstream served corrupt bytes; scoring corruption");
             record_outcome(deps, pk, &Outcome::Corruption);
         }
         PullVerdict::Unreachable => {
-            debug!(%provider_addr, %err, "node-origin: upstream pull failed; scoring unreachable");
+            debug!(peer = %pk, %provider_addr, %err, "node-origin: upstream pull failed; scoring unreachable");
             record_outcome(deps, pk, &Outcome::Unreachable);
         }
     }
@@ -2603,14 +2610,37 @@ fn peer_reputation(deps: &NodeOriginDeps, pk: PublicKey) -> f32 {
     deps.local_rep.score(pk) as f32
 }
 
+/// Tracing target of the per-peer reputation event [`record_outcome`] emits on
+/// every recorded outcome. The `decdn_node_pull_{success,unreachable,corruption}_total`
+/// counters are aggregates; this event names the peer and outcome behind each fold,
+/// including ADR 030 region penalties, which have no counter, and the score the peer
+/// now holds. Idle decay moves scores without an event. It logs at `debug!`, because
+/// a dead peer is re-probed on every cache miss. Enable it alone with
+/// `RUST_LOG=info,decdn::reputation=debug`. `RUST_LOG` applies at startup only: a
+/// config reload replaces the filter with `observability.log_level` and drops the
+/// per-target setting.
+const REPUTATION_LOG_TARGET: &str = "decdn::reputation";
+
 /// Fold a pull/probe outcome into the local EWMA reputation score (ADR 008
 /// §Local Score Calculation) and bump the matching delivery metric.
 fn record_outcome(deps: &NodeOriginDeps, pk: PublicKey, outcome: &Outcome) {
-    deps.local_rep.record(pk, *outcome);
+    fold_outcome(&deps.local_rep, &deps.metrics, pk, outcome);
+}
+
+/// The body of [`record_outcome`], taking the reputation table and the metrics
+/// directly so the fold, the metric, and the attribution event are testable
+/// without a full [`NodeOriginDeps`].
+fn fold_outcome(local_rep: &LocalReputation, metrics: &Metrics, pk: PublicKey, outcome: &Outcome) {
+    let score = local_rep.record(pk, *outcome);
+    debug!(
+        target: REPUTATION_LOG_TARGET,
+        peer = %pk, ?outcome, score,
+        "node-origin: reputation outcome recorded"
+    );
     match *outcome {
-        Outcome::Delivered { .. } => deps.metrics.node_pull_success(),
-        Outcome::Corruption => deps.metrics.node_pull_corruption(),
-        Outcome::Unreachable => deps.metrics.node_pull_unreachable(),
+        Outcome::Delivered { .. } => metrics.node_pull_success(),
+        Outcome::Corruption => metrics.node_pull_corruption(),
+        Outcome::Unreachable => metrics.node_pull_unreachable(),
         // Region-latency mismatch (ADR 030) folds into the local score above but
         // has no delivery metric; `Outcome` is `#[non_exhaustive]`, so any future
         // variant likewise records into the score without a metric until an
@@ -3267,5 +3297,76 @@ mod tests {
             "a peer shedding load says nothing about THIS node, so the client gets an \
              honest miss"
         );
+    }
+
+    /// Shared in-memory sink for the captured tracing output.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Every recorded outcome names its peer and the score it leaves. The
+    /// `node_pull_*` counters are unlabeled aggregates, so without this event an
+    /// `Unreachable` penalty is a counter tick that no operator can attribute.
+    #[test]
+    fn a_reputation_penalty_names_the_peer_and_its_new_score() -> anyhow::Result<()> {
+        // `docs/runbook.md` names this filter string verbatim.
+        assert_eq!(REPUTATION_LOG_TARGET, "decdn::reputation");
+        let local_rep = LocalReputation::new(decdn_reputation::LocalReputationConfig::default())?;
+        let metrics = Metrics::new();
+        let pk = iroh::SecretKey::generate().public();
+
+        let log = CapturedLog::default();
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            fold_outcome(&local_rep, &metrics, pk, &Outcome::Unreachable);
+        });
+
+        let text = String::from_utf8(
+            log.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )?;
+        let line = text
+            .lines()
+            .find(|l| l.contains(REPUTATION_LOG_TARGET))
+            .ok_or_else(|| anyhow::anyhow!("no `{REPUTATION_LOG_TARGET}` event; got:\n{text}"))?;
+        assert!(line.contains(&format!("peer={pk}")), "{line}");
+        assert!(line.contains("outcome=Unreachable"), "{line}");
+        let logged: f64 = line
+            .split_once("score=")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .ok_or_else(|| anyhow::anyhow!("no score field: {line}"))?
+            .parse()?;
+        assert!(
+            (logged - local_rep.score(pk)).abs() < 1e-3,
+            "the event carries the post-fold score: {line}"
+        );
+        let scrape = metrics.encode()?;
+        assert!(
+            scrape
+                .lines()
+                .any(|l| l == "decdn_node_pull_unreachable_total 1"),
+            "the aggregate still counts the penalty:\n{scrape}"
+        );
+        Ok(())
     }
 }

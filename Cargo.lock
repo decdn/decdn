@@ -2789,6 +2789,7 @@ dependencies = [
  "futures-util",
  "iroh",
  "iroh-io",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "tempfile",

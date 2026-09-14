@@ -696,7 +696,7 @@ fn failover_order(
 }
 
 /// Auto-discover the failover order to fetch `hash` from (#936): read the
-/// active set from `CapacityBond`, take the region-nearest
+/// active set from `CapacityBond`, take a random, region-first sample of
 /// [`discovery::SELECT_K`] candidates, and [`probe_and_order`] them. Returns the
 /// ordered candidate list `fetch` tries in turn (#1174).
 /// Callers must have already unwrapped `chain.capacity_bond` into the
@@ -1234,8 +1234,8 @@ fn persist_watermark(
 /// coordinates.
 ///
 /// With `--node-id` the node is dialed explicitly. Without it, `fetch`
-/// auto-discovers (#936): read the active set from `CapacityBond`, probe the
-/// region-nearest candidates, and derive `--provider-address` from each
+/// auto-discovers (#936): read the active set from `CapacityBond`, probe a
+/// random, region-first sample of candidates, and derive `--provider-address` from each
 /// candidate's registry entry, failing over across them (#1174).
 // Linear provider-failover loop over the resolved candidates plus the one-time
 // provider-independent setup: long, and its branch count is the fallback ladder
@@ -2817,8 +2817,10 @@ fn ranged_store_location(output: &Path) -> anyhow::Result<(PathBuf, String)> {
 /// slowdown for long.
 const RATE_SMOOTHING_TAU_SECS: f64 = 3.0;
 
-/// Rolling delivery-rate estimate behind the progress bar's `{msg}`, and the
-/// running totals the end-of-fetch summary reads back.
+/// Rolling delivery-rate estimate behind a progress bar's `{msg}`, and the
+/// running totals the end-of-fetch summary reads back. Single-blob `fetch` feeds
+/// it from the delivery bar; `bundle pull` feeds it from its bottom total bar, so
+/// the rate there is whole-download throughput rather than one file's.
 ///
 /// The bar's positions are cumulative verified **content** bytes — what the
 /// [`decdn_client_pull::ProgressCallback`] reports — so the rate is content
@@ -2831,7 +2833,7 @@ const RATE_SMOOTHING_TAU_SECS: f64 = 3.0;
 /// in with weight `1 - exp(-dt / tau)`, so the estimate is stable regardless of
 /// how unevenly callbacks are spaced.
 #[derive(Default)]
-struct SpeedState {
+pub(crate) struct SpeedState {
     /// Instant and cumulative-byte position at the first observed sample. The
     /// summary measures elapsed and bytes-moved from here, so a resumed fetch
     /// (which starts at a non-zero `base_present`) reports only what this run
@@ -2842,6 +2844,46 @@ struct SpeedState {
     last: Option<(Instant, u64)>,
     /// Smoothed rate in bytes/sec. `None` until the second sample gives a `dt`.
     ewma_bps: Option<f64>,
+}
+
+impl SpeedState {
+    /// Fold one sample — cumulative content bytes `received` as of `now` — into
+    /// the estimate and return the current smoothed rate in bytes/sec (`0.0`
+    /// until a second sample gives a `dt`).
+    pub(crate) fn observe(&mut self, now: Instant, received: u64) -> f64 {
+        self.started.get_or_insert((now, received));
+        if let Some((prev_at, prev_bytes)) = self.last {
+            let dt = now.saturating_duration_since(prev_at).as_secs_f64();
+            // Skip same-instant callbacks (a burst): they carry no usable `dt`
+            // and would divide by ~zero into a spike.
+            if dt > 0.0 {
+                let inst = bytes_as_f64(received.saturating_sub(prev_bytes)) / dt;
+                let alpha = 1.0 - (-dt / RATE_SMOOTHING_TAU_SECS).exp();
+                // Seed from 0, not `inst`: on the first sample a tiny `dt` makes
+                // `inst` huge, but `alpha * inst = (1 - exp(-dt/tau)) * (delta/dt)
+                // -> delta/tau` as `dt -> 0`, so the estimate stays bounded
+                // instead of spiking, then converges upward.
+                let prev_bps = self.ewma_bps.unwrap_or(0.0);
+                self.ewma_bps = Some(prev_bps + alpha * (inst - prev_bps));
+            }
+        }
+        self.last = Some((now, received));
+        self.ewma_bps.unwrap_or(0.0)
+    }
+
+    /// Move the cumulative baseline forward by `bytes` that were not transferred
+    /// (already on disk), so the next sample's delta excludes them and the rate
+    /// stays a transfer rate. A no-op before the first sample: the first
+    /// [`observe`](Self::observe) then seeds from whatever position it sees and
+    /// computes no rate from it.
+    pub(crate) const fn shift(&mut self, bytes: u64) {
+        if let Some((at, pos)) = self.last {
+            self.last = Some((at, pos.saturating_add(bytes)));
+        }
+        if let Some((at, pos)) = self.started {
+            self.started = Some((at, pos.saturating_add(bytes)));
+        }
+    }
 }
 
 /// Widen a byte count to `f64` for rate arithmetic. A single transfer never
@@ -2857,7 +2899,7 @@ const fn bytes_as_f64(n: u64) -> f64 {
 
 /// Format a non-negative bytes/sec rate as e.g. `12.3 MiB/s`. A rate at or
 /// below zero (no data yet, or a stall) renders as `--`.
-fn fmt_rate(bps: f64) -> String {
+pub(crate) fn fmt_rate(bps: f64) -> String {
     if bps.is_finite() && bps >= 1.0 {
         // The rate is a small non-negative value; clamp before the cast so the
         // `HumanBytes` argument can never wrap or lose sign.
@@ -2875,7 +2917,7 @@ fn fmt_rate(bps: f64) -> String {
 
 /// Estimate remaining time from the smoothed rate, formatted like `ETA 8s`.
 /// Below a usable rate it reports `ETA --` rather than a divide-by-tiny blowup.
-fn fmt_eta(remaining_bytes: u64, bps: f64) -> String {
+pub(crate) fn fmt_eta(remaining_bytes: u64, bps: f64) -> String {
     if bps >= 1.0 {
         // Clamp the projection so `from_secs_f64` never overflows `Duration`.
         let secs = (bytes_as_f64(remaining_bytes) / bps).clamp(0.0, 8.64e7);
@@ -2923,7 +2965,7 @@ fn delivery_progress() -> (
     let bar = new_progress_bar();
     // `ProgressBar` is `Arc`-backed, so the clone the callback owns drives the
     // same bar the caller clears.
-    let (on_progress, meter) = bar_callback(bar.clone(), None);
+    let (on_progress, meter) = bar_callback(bar.clone());
     (bar, on_progress, meter)
 }
 
@@ -2933,15 +2975,20 @@ fn delivery_progress() -> (
 /// stays last); single-blob `fetch` uses [`new_progress_bar`] instead, which
 /// self-attaches and needs no prefix.
 ///
+/// Unlike the single-blob bar this one carries no rate/ETA `{msg}`: a per-file
+/// rate in a concurrent pull is one lane's share of the link and its ETA reads as
+/// stuck whenever another file has the bandwidth. `bundle pull` shows one rate
+/// and ETA on its total bar instead, where they describe the whole download.
+///
 /// The steady tick is intentionally not enabled here: the caller enables it only
 /// after inserting the bar into its `MultiProgress`, because a detached bar draws
 /// straight to stderr and a pre-insert tick paints an orphan line the container
 /// never accounts for, tearing every later redraw.
 pub(crate) fn labeled_delivery_bar() -> indicatif::ProgressBar {
     let style = indicatif::ProgressStyle::with_template(
-        // Same rate/ETA-in-`{msg}` layout as `new_progress_bar`, with the
-        // leading spinner replaced by the file label.
-        "{prefix:.bold} {bytes}/{total_bytes} {msg}[{wide_bar:.cyan/blue}]",
+        // The `new_progress_bar` layout with the leading spinner replaced by the
+        // file label and no rate/ETA slot.
+        "{prefix:.bold} {bytes}/{total_bytes} [{wide_bar:.cyan/blue}]",
     )
     .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
     .progress_chars("=>-");
@@ -2960,27 +3007,10 @@ pub(crate) fn labeled_delivery_bar() -> indicatif::ProgressBar {
 /// [`decdn_client_pull::ProgressCallback`]. Both the bar length and its position
 /// are therefore in the same unit, so the bar fills to exactly 100% and never
 /// overshoots.
-///
-/// `on_progress`, when set, receives each update's `(received_delta,
-/// expected_delta)` — the increases in cumulative received and expected content
-/// bytes since the previous callback. `bundle pull` folds every file bar's deltas
-/// into one bottom total bar through it (position by `received_delta`, length by
-/// `expected_delta`), keeping the total unit-consistent too; single-blob `fetch`
-/// passes `None`. `received` is cumulative and non-decreasing across an entry's
-/// fail-over resumes (each attempt continues from `base_present`), so the deltas
-/// are true increments and a folded total never double-counts.
-pub(crate) fn bar_callback(
-    bar: indicatif::ProgressBar,
-    on_progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
-) -> (impl Fn(u64, u64) + 'static, DeliveryMeter) {
+fn bar_callback(bar: indicatif::ProgressBar) -> (impl Fn(u64, u64) + 'static, DeliveryMeter) {
     // `expected` is constant across the pull, so set the bar length once (it
     // takes a write lock) rather than on every chunk in the hot receive loop.
     let length_set = std::sync::atomic::AtomicBool::new(false);
-    // Cumulative received and expected content bytes at the previous callback, so
-    // the forwarded deltas are true per-update increments (`expected` is constant,
-    // so its delta is the full `total_bytes` on the first call and zero after).
-    let prev = std::sync::atomic::AtomicU64::new(0);
-    let prev_expected = std::sync::atomic::AtomicU64::new(0);
     let state = Arc::new(Mutex::new(SpeedState::default()));
     let cb_state = Arc::clone(&state);
     let on_progress = move |received: u64, expected: u64| {
@@ -2989,37 +3019,9 @@ pub(crate) fn bar_callback(
         }
         bar.set_position(received);
 
-        if let Some(sink) = &on_progress {
-            let previous = prev.swap(received, std::sync::atomic::Ordering::Relaxed);
-            let previous_expected =
-                prev_expected.swap(expected, std::sync::atomic::Ordering::Relaxed);
-            sink(
-                received.saturating_sub(previous),
-                expected.saturating_sub(previous_expected),
-            );
-        }
-
-        let now = Instant::now();
         // A poisoned lock only costs this one rate update; the bar still advances.
         if let Ok(mut s) = cb_state.lock() {
-            s.started.get_or_insert((now, received));
-            if let Some((prev_at, prev_bytes)) = s.last {
-                let dt = now.saturating_duration_since(prev_at).as_secs_f64();
-                // Skip same-instant callbacks (a burst): they carry no usable
-                // `dt` and would divide by ~zero into a spike.
-                if dt > 0.0 {
-                    let inst = bytes_as_f64(received.saturating_sub(prev_bytes)) / dt;
-                    let alpha = 1.0 - (-dt / RATE_SMOOTHING_TAU_SECS).exp();
-                    // Seed from 0, not `inst`: on the first sample a tiny `dt`
-                    // makes `inst` huge, but `alpha * inst = (1 - exp(-dt/tau)) *
-                    // (delta/dt) -> delta/tau` as `dt -> 0`, so the estimate
-                    // stays bounded instead of spiking, then converges upward.
-                    let prev_bps = s.ewma_bps.unwrap_or(0.0);
-                    s.ewma_bps = Some(prev_bps + alpha * (inst - prev_bps));
-                }
-            }
-            s.last = Some((now, received));
-            let bps = s.ewma_bps.unwrap_or(0.0);
+            let bps = s.observe(Instant::now(), received);
             bar.set_message(format!(
                 "({}, {}) ",
                 fmt_rate(bps),

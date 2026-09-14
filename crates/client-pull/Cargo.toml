@@ -49,6 +49,8 @@ anyhow = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 iroh = { workspace = true }
+# `discovery::select_candidates` shuffles the probe sample (#1988).
+rand = { workspace = true }
 # Peer store (one JSON file per peer under `<data_dir>/peers`) persistence for
 # the ADR 012 bootstrap fallback.
 serde = { workspace = true }

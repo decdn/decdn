@@ -90,7 +90,7 @@ impl AwaitingDataReader {
 
     /// Does the local present-range snapshot already cover chunk `range`, and is the
     /// hash not refused? Pure in-memory: the coverage test is a `ChunkRanges`
-    /// subtraction and [`NodeRangedStore::refuses`] reads only lock-free sets, so
+    /// subtraction and [`NodeRangedStore::refuses`] reads only in-memory sets, so
     /// this is the zero-store-hop fast path a served leaf takes once the pull has
     /// filled it. Refusing an evicted/blacklisted hash here mirrors the guard the
     /// store's own `present_ranges` applies, so a mid-fill takedown reads as

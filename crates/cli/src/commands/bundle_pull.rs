@@ -1190,8 +1190,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// into `staging`'s `.partial`, returning the ranged store. The ranged twin of
     /// [`Self::fetch_to_staging_from`]: builds the same context and target, then calls
     /// [`fetch::drive_ranges`] (which bao-verifies each range against `hash`,
-    /// leaves the `.partial` unfinalized for the caller's splice-and-promote, and
-    /// persists the lane's voucher watermark so a resume never re-pays).
+    /// finalizing `staging` if these ranges complete the whole blob (otherwise
+    /// leaving `.partial` for the caller's splice-and-promote), and persists the
+    /// lane's voucher watermark so a resume never re-pays).
     async fn drive_ranges_from(
         &self,
         hash: [u8; 32],

@@ -61,6 +61,43 @@ pub(crate) fn bao_wire_len_whole(total: u64) -> u64 {
     bao_wire_len(total, 0, 0)
 }
 
+/// The honest bao verified-stream WIRE bytes (content plus proof, ADR 038) an
+/// upstream emits on `cdn/client/v1` for `payload` from `byte_offset`, bounded to
+/// `byte_len` bytes (`byte_len == 0` means "to the end", matching
+/// [`decdn_cache::range_pull::align_range`]), with the 8-byte LE size header
+/// stripped. The proof is anchored to whole chunk groups, so a resumed range's
+/// encoding is a NEW range encoding with its own root->offset proof path — not a
+/// suffix of the offset-0 one — which is why a resumed leg's wire cost cannot be
+/// derived by subtracting from the whole-blob cost.
+pub(crate) fn honest_bao_wire_range(
+    payload: &[u8],
+    byte_offset: u64,
+    byte_len: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let hash = Hash::new(payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
+        payload,
+        decdn_cache::range_pull::IROH_BLOCK_SIZE,
+    );
+    let aligned = decdn_cache::range_pull::align_range(byte_offset, byte_len, total_bytes)?;
+    let start = usize::try_from(aligned.fetch_start()).unwrap_or(usize::MAX);
+    let end = usize::try_from(aligned.fetch_end()).unwrap_or(usize::MAX);
+    let window = payload
+        .get(start..end)
+        .ok_or_else(|| anyhow::anyhow!("aligned window {start}..{end} outside the payload"))?;
+    let combined = decdn_cache::range_pull::encode_verified_range(
+        *hash.as_bytes(),
+        &aligned,
+        window,
+        bytes::Bytes::from(ob.data),
+    )?;
+    Ok(combined
+        .get(8..)
+        .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its header"))?
+        .to_vec())
+}
+
 /// Open an empty cache (no origins) in a fresh temp dir.
 pub(crate) async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;

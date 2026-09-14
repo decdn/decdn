@@ -1091,11 +1091,12 @@ pub enum StreamError {
     BlobTooLarge,
     /// Unexpected failure; do not retry this node.
     InternalError,
-    /// Blob was evicted between probe and stream request. WARNING: still
+    /// The node withdrew the blob between probe and stream request. WARNING: still
     /// slashable after a signed `has_blob: true` probe (ADR 005).
     ///
-    /// An eviction with no blacklist entry behind it — corruption recovery, a
-    /// manual `decdn node evict`. A takedown answers [`Self::HashBlacklisted`]
+    /// A withdrawal with no blacklist entry behind it — a manual
+    /// `decdn node evict`, or a quarantine after a serve found the stored copy
+    /// corrupt. A takedown answers [`Self::HashBlacklisted`]
     /// whichever list it came from; routing governance takedowns here instead
     /// would leave `HashBlacklisted` uniquely identifying an operator's *private*
     /// denylist (ADR 011 §`StreamRequest` Response).

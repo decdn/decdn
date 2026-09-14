@@ -325,13 +325,36 @@ re-enters the eviction pool at whatever segment and frequency it already
 carries.
 
 **Durable operator-evict is orthogonal to eviction policy.**
-`CacheEngine::evict` is the DMCA and corruption-recovery path. It records the
+`CacheEngine::evict` is the operator takedown path. It records the
 hash in a durable, `fsync`-backed log and makes the engine treat the hash as
 absent for every subsequent lookup, independent of any cache-pressure
 eviction. Disk reclaim for an evicted hash follows on the next GC sweep, when
 periodic GC is enabled and the protecting tag deletion succeeds. Pinning
 protects a hash against eviction-policy pressure but not against
 `CacheEngine::evict`: a durable operator directive always wins.
+
+**A serve that detects stored corruption quarantines the hash.** Every serve
+export validates the exported chunk groups and their proof nodes against the
+content root. A hash mismatch or a short read over held content means that the
+stored copy changed after admission, from disk rot or tampering. The engine
+then quarantines the hash. A complete blob holds all content, so every such
+error quarantines it. A partial blob holds only its present ranges. An absent
+range of a partial blob reads back as zeros or ends early, and that is not
+corruption. So a partial blob is quarantined only when the mismatching leaf or
+node lies inside its present ranges, or when a short read occurs in an export
+whose whole range is present. The node stops serving, announcing, and
+re-acquiring the hash. A stream request for it answers `EvictedSinceProbe`.
+The engine drops the protecting tags, also for a pinned hash. The pin does not
+keep corrupt bytes from GC. The next GC sweep reclaims the entry. The next
+lookup or origin rescan that finds the store no longer holds the hash lifts
+the quarantine. A later pull-through then admits a verified copy. A fill that
+protects the entry during the quarantine does not block this: each origin
+rescan drops the tags of a quarantined entry again. The quarantine is in
+memory only. After a restart, the next serve of the corrupt bytes quarantines
+the hash again. `CacheEngine::evict` is not the recovery path, because a
+durable takedown withholds legitimate content permanently. Reclaim needs
+periodic GC. When GC is off, the hash stays quarantined and the bytes stay on
+disk.
 
 **The probe-triggered hold composes above policy.** A hash a node has just
 advertised as present, per [ADR 005 § Probe-Triggered Eviction
