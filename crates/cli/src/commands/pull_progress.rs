@@ -54,10 +54,15 @@ pub(crate) fn file_label(paths: &[String]) -> String {
     }
 }
 
-/// Steady-tick cadence shared by every bar. Enabled only after a bar joins the
-/// [`indicatif::MultiProgress`]: a detached bar draws straight to stderr, so
-/// ticking first paints an orphan line the container never accounts for, and every
-/// later redraw scrolls instead of overwriting it.
+/// Steady-tick cadence shared by every bar.
+///
+/// Every bar here is born inside the [`indicatif::MultiProgress`] — `mp.add(..)`
+/// or `mp.insert_before(.., ProgressBar::new(..))` as one call — and is styled,
+/// labeled, sized, and ticked only afterwards. A `ProgressBar` outside a container
+/// draws itself straight to stderr on `set_prefix`, `set_length`, and every tick;
+/// the container has no record of that orphan line, so each later redraw moves the
+/// cursor up too few rows and the stale line scrolls into history instead of being
+/// overwritten. Nothing touches a bar before the container owns it.
 const TICK: Duration = Duration::from_millis(120);
 
 /// The multi-bar renderer for one `bundle pull` run. Disabled variants (no inner
@@ -90,20 +95,15 @@ pub(crate) struct TotalBar {
 }
 
 impl TotalBar {
-    /// A styled total bar of fixed content length `len`, not yet attached to any
-    /// [`indicatif::MultiProgress`].
-    fn new(len: u64) -> Self {
-        let style = indicatif::ProgressStyle::with_template(
+    /// The total bar's style: byte counts, the rate/ETA `{msg}`, and a green bar.
+    fn style() -> indicatif::ProgressStyle {
+        indicatif::ProgressStyle::with_template(
             // Rate/ETA come from `{msg}` (see `refresh_rate`), not the built-in
             // `{bytes_per_sec}`/`{eta}` — those swing wildly on bursty arrival.
             "{prefix:.bold} {bytes}/{total_bytes} {msg}[{wide_bar:.green}]",
         )
         .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
-        .progress_chars("=>-");
-        let bar = indicatif::ProgressBar::new(len);
-        bar.set_style(style);
-        bar.set_prefix("total");
-        Self::wrap(bar)
+        .progress_chars("=>-")
     }
 
     /// Wrap an existing bar with a fresh meter.
@@ -183,13 +183,15 @@ impl PullProgress {
         }
     }
 
-    /// Build the bottom total bar with a fixed content-byte length and add it to
-    /// the container. Its steady tick is enabled after the add, never before.
+    /// Build the bottom total bar with a fixed content-byte length inside the
+    /// container, then style, label, and tick it (see [`TICK`] for why the add
+    /// comes first).
     fn add_total_bar(mp: &indicatif::MultiProgress, len: u64) -> TotalBar {
-        let total = TotalBar::new(len);
-        let bar = mp.add(total.bar.clone());
+        let bar = mp.add(indicatif::ProgressBar::new(len));
+        bar.set_style(TotalBar::style());
+        bar.set_prefix("total");
         bar.enable_steady_tick(TICK);
-        total
+        TotalBar::wrap(bar)
     }
 
     /// A renderer that draws nothing and hands out silent bar handles.
@@ -197,14 +199,22 @@ impl PullProgress {
         Self { inner: None }
     }
 
-    /// Insert a per-file bar above the total bar (or at the bottom when there is no
-    /// total bar) and start its steady tick.
-    fn insert_file_bar(&self, bar: indicatif::ProgressBar) -> indicatif::ProgressBar {
-        let Some(i) = &self.inner else { return bar };
+    /// Insert a new per-file bar above the total bar (or at the bottom when there
+    /// is no total bar), then style it, label it `label`, preset its length to
+    /// `size` when declared, and start its steady tick — all after the insert (see
+    /// [`TICK`] for why nothing touches the bar before the container owns it).
+    fn insert_file_bar(i: &Inner, label: String, size: Option<u64>) -> indicatif::ProgressBar {
         let bar = match &i.total {
-            Some(total) => i.mp.insert_before(&total.bar, bar),
-            None => i.mp.add(bar),
+            Some(total) => {
+                i.mp.insert_before(&total.bar, indicatif::ProgressBar::new(0))
+            }
+            None => i.mp.add(indicatif::ProgressBar::new(0)),
         };
+        bar.set_style(fetch::labeled_delivery_style());
+        bar.set_prefix(label);
+        if let Some(n) = size {
+            bar.set_length(n);
+        }
         bar.enable_steady_tick(TICK);
         bar
     }
@@ -223,12 +233,7 @@ impl PullProgress {
         let Some(i) = &self.inner else {
             return FileBar::disabled();
         };
-        let bar = fetch::labeled_delivery_bar();
-        bar.set_prefix(label);
-        if let Some(n) = size {
-            bar.set_length(n);
-        }
-        let bar = self.insert_file_bar(bar);
+        let bar = Self::insert_file_bar(i, label, size);
         // The file bar tracks the pull's own progress; the total bar gets that
         // progress scaled to the manifest's declared `size`. A pull with no
         // declared size still shows its own bar but adds nothing to the total.
@@ -264,12 +269,7 @@ impl PullProgress {
         let Some(i) = &self.inner else {
             return ChunkedFile::disabled();
         };
-        let bar = fetch::labeled_delivery_bar();
-        bar.set_prefix(label);
-        if let Some(n) = size {
-            bar.set_length(n);
-        }
-        let bar = self.insert_file_bar(bar);
+        let bar = Self::insert_file_bar(i, label, size);
         ChunkedFile {
             bar: Some(bar),
             total: i.total.clone(),
