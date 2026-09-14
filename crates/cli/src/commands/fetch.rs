@@ -1558,7 +1558,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         // persisted on disk and keyed by content, so the second pass resumes the
         // partial and re-pays nothing already delivered (ADR 003) — it is a
         // continuation, not a fresh from-zero fetch. A terminal failure is never
-        // retried this way; it returns exactly as before.
+        // retried this way; it returns unchanged.
         if skipped_registry_read
             && !rediscovered
             && retry_disposition(&exhausted_err) != RetryDisposition::Terminal
@@ -2015,7 +2015,7 @@ where
     // must read and write EVERY lane the registry holds — this fetch's
     // concurrent siblings on the same deposit included — not just this one
     // lane, so a solo `decdn fetch` (`ledgers: None`) keeps `pool = None`
-    // exactly as before (one lane IS the whole pool).
+    // unchanged (one lane IS the whole pool).
     let (spent, credit): (Option<SpentFn<'a>>, Option<CreditFn<'a>>) = match ledgers {
         Some(reg) => (
             Some(Box::new(move || reg.total_committed())),
@@ -2132,18 +2132,22 @@ where
 
 /// Fetch the given byte ranges of blob `hash` into the entry's `.partial`
 /// beside `staging`, opening the pool + store once. Each range is bao-verified
-/// against `hash`; the `.partial` is left unfinalized (the caller assembles and
-/// promotes — `drive` only finalizes once the WHOLE blob is present, and
-/// `ranges` here is expected to be a proper subset the donated ranges cover).
-/// Returns the store so the caller can `read` verified ranges.
+/// against `hash`. Like [`drive`], this finalizes the blob — renaming
+/// `.partial` to `staging` — as soon as
+/// these ranges, together with whatever the store already held, cover the
+/// whole blob; otherwise `.partial` is left in place for the caller to keep
+/// splicing or to drive further. Returns the ranged store either way: the
+/// caller checks whether `staging` now exists to tell a finalized blob from
+/// one still open at `.partial`, and reads verified ranges from the returned
+/// store only in the latter case.
 ///
 /// Reuses the same prelude [`drive_fetch`] opens (handshake, ranged store,
 /// source/pacer/funder/ledger/ctx) rather than re-deriving it. Like
 /// `drive_fetch`, it persists the lane's voucher watermark once, after its
 /// ranges are driven: on success at the committed cumulative, and on an
-/// ambiguous failure HIGH (`settlement`), so a failed or resumed chunked pull
-/// never re-pays a byte already bought. The `.partial` and its sidecars are left
-/// in place on error — the resume prefix a retry inherits.
+/// ambiguous failure HIGH (`settlement`), so a failed or resumed range-dedup
+/// pull never re-pays a byte already bought. The `.partial` and its sidecars
+/// are left in place on error — the resume prefix a retry inherits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_ranges<P>(
     deps: &DriveFetchDeps<'_, P>,

@@ -1,18 +1,16 @@
-//! Live anvil-backed e2e for `decdn bundle pull`'s **range-dedup** path
-//! (bundle-chunk-hints plan, task 7): an optimized bundle whose two files
-//! share a large byte run dedups the shared range — splices it locally from
-//! the first file's already-materialized blob — instead of re-downloading
-//! (and re-paying for) it from the node.
+//! Live anvil-backed e2e for `decdn bundle pull`'s **range-dedup** path: an
+//! optimized bundle whose two files share a large byte run dedups the shared
+//! range — splices it locally from the first file's already-materialized
+//! blob — instead of re-downloading (and re-paying for) it from the node.
 //!
 //! Shape: two files share their first 4 MiB, chunk-group-aligned, and differ
 //! only in a distinct tail. Each file is stored as ONE whole-file blob (the
-//! current `origin import --optimize` model: chunks are manifest-only dedup
+//! `origin import --optimize` model: chunks are manifest-only dedup
 //! hints, never separately stored blobs), so the node here is seeded with the
 //! two whole files directly via [`NodeFixture::launch_with_blobs`] — exactly
 //! what an `--optimize` import would have produced on disk. The manifest is
-//! hand-built (mirrors the deleted `cli_bundle_pull_shared_chunk.rs`'s
-//! approach) with each entry's `chunks` hints naming the shared run and each
-//! file's distinct tail as separate BLAKE3-addressed spans.
+//! hand-built, with each entry's `chunks` hints naming the shared run and
+//! each file's distinct tail as separate BLAKE3-addressed spans.
 //!
 //! What this test proves:
 //! 1. **Correct assembly** — both output files are byte-exact and whole-file
@@ -279,20 +277,21 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Self-heal regression (bundle-chunk-hints range-dedup, final review Finding
-/// #1). A *lying recipient hint* names a real donor chunk (a chunk the donor
-/// genuinely holds, so the donor splice VERIFIES) at an offset where the
-/// recipient's actual bytes differ, so the reassembled whole-file BLAKE3
-/// mismatches. `pull_entry` must then re-drive the whole blob, let `drive`
-/// finalize+promote it, and SUCCEED — the recovered file byte- and BLAKE3-exact.
+/// Self-heal regression. A *lying recipient hint* names a real donor chunk (a
+/// chunk the donor genuinely holds, so the donor splice VERIFIES) at an offset
+/// where the recipient's actual bytes differ, so the reassembled whole-file
+/// BLAKE3 mismatches. `pull_entry` must then re-drive the whole blob, let
+/// `drive` finalize+promote it, and SUCCEED — the recovered file byte- and
+/// BLAKE3-exact.
 ///
-/// This exercises the previously-uncovered self-heal path. Before the
-/// finalize-aware guard, the whole-file re-drive completed the blob (so `drive`
-/// renamed `<hex>.partial` -> `<hex>`), and the very next line called
-/// `hash_partial` on the now-absent `.partial` — an `Err(open: No such file)`
-/// that failed the entry spuriously. With the guard the pull succeeds; without
-/// it, `bundle pull` exits non-zero and `run_bundle_pull_until_ready` never
-/// succeeds (the test times out).
+/// This exercises the finalize-aware guard on that self-heal path: the
+/// whole-file re-drive completes the blob (`drive` renames `<hex>.partial` to
+/// `<hex>`), so the guard must recognize completion and skip calling
+/// `hash_partial` on the now-absent `.partial` file, rather than surfacing an
+/// `Err(open: No such file)` that would fail the entry spuriously. With the
+/// guard the pull succeeds; a regression here makes `bundle pull` exit
+/// non-zero and `run_bundle_pull_until_ready` never succeed (the test times
+/// out).
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_bundle_pull_self_heals_a_lying_recipient_hint() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_self_heal()))

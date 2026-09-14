@@ -2376,8 +2376,8 @@ mod tests {
     /// fetch's lane sharing the same deposit. Lane C is registered but never
     /// passed to `multi_source_fetch` in `lanes`; it carries the same prior
     /// spend as the single-fetch `pool_exhaustion_aborts_the_scheduler_and_is_not_reassigned`
-    /// test's lane B. Summed the OLD way (fold over just this fetch's `lanes`,
-    /// both fresh), the pool looks fully solvent and the fetch draws past the
+    /// test's lane B. Summed over just this fetch's own `lanes` (both fresh),
+    /// the pool looks fully solvent and the fetch draws past the
     /// true remaining deposit; summed the pool-wide way (`Some(&reg)`), C's
     /// spend already claims most of the deposit, so the second leg's voucher is
     /// `Refuse`d exactly as it is when the spend sits on an in-fetch lane.

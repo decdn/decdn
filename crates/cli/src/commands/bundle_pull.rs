@@ -1371,9 +1371,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // Disk cost: `materialize` copies rather than hard-links, so every
         // hint-carrying entry keeps its finalized staging blob here until this
         // sweep, on top of the materialized output. Peak disk for an optimized
-        // bundle is therefore about output + staging (~2× the bundle size) — parity
-        // with the prior chunked path. A follow-up can hard-link the first
-        // materialize so the staging blob shares storage with its output.
+        // bundle is therefore about output + staging (~2× the bundle size). A
+        // follow-up can hard-link the first materialize so the staging blob
+        // shares storage with its output.
         sweep_donor_sources(&index);
         (outcomes, transfer)
     }

@@ -163,9 +163,7 @@ impl PullProgress {
         }
     }
 
-    /// A chunked file's bar (summed across its chunk pulls), inserted above the
-    /// total bar. `size` (the manifest's whole-file content size) serves two roles.
-    /// Credit an already-present unit's content `size` straight to the total bar.
+    /// Credit an already-present file's content `size` straight to the total bar.
     /// A skipped file (every destination on disk) does no fetch and drives no
     /// delivery callback, but its content is part of the whole-download total
     /// (`total_content_bytes` counts it), so without this credit the total could

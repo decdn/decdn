@@ -685,11 +685,10 @@ fn optimize_single_file_emits_one_entry_manifest() {
     }
 }
 
-// `--optimize` never touches the source file (it writes the derived
-// whole-file blob into the origin store, source untouched), so pairing it
-// with `--move` would silently leave every source on disk while the report
-// claims a move. The combo is rejected up front, before any filesystem work
-// happens.
+// `--optimize` streams the source file twice: once to write the whole-file
+// blob, once to compute chunk hints. `--move` renames the source away after
+// the first pass, leaving nothing for the second pass to re-open, so the
+// combo is rejected up front, before any filesystem work happens.
 #[test]
 fn optimize_and_move_are_rejected_together() {
     let src = TempDir::new().unwrap();

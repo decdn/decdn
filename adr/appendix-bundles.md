@@ -204,8 +204,9 @@ pull` can recognize the same bytes in another file (see
 
 A single-file `--optimize` import produces one manifest entry with a
 `chunks` hint list; a directory import produces one entry per file, each
-with its own hints computed over the whole directory's files so a shared
-range between two files is recognized either way.
+with hints computed over that file alone. A shared range between two
+files is recognized at pull time, by hash equality between their hint
+lists, not at import time.
 
 `bundle pull` consumes a chunked manifest exactly as it consumes an
 unchunked one — see [Chunked entries](#chunked-entries) under Pull.
@@ -239,11 +240,15 @@ as `decdn fetch`):
   evaluated **per destination**, so an already-present duplicate path
   triggers no fetch of its own (the group still fetches once if any
   sibling path needs bytes).
-- **Concurrency** is bounded by `--jobs` (over distinct blobs). A payment pool's vouchers
-  use a strictly increasing cumulative amount, so fetches that share one provider's
-  lane are serialized by a per-provider lock; distinct providers proceed
-  in parallel. A blob that clears the multi-source gate fans out to its
-  admitted holders per [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1).
+- **Concurrency** is bounded by `--jobs` (over distinct blobs). Fetches share a
+  `LaneLedger` per `(pool, signer, provider)` lane, and `--max-lane-streams`
+  (default 1) caps how many of them run at once on one lane: the shared
+  ledger keeps voucher issuance monotonic across concurrent streams on a
+  lane, but a fast stream still advances the lane's one cumulative
+  watermark ahead of a slow co-stream and starves it, so the default keeps
+  one stream per lane. Distinct lanes proceed in parallel. A blob that
+  clears the multi-source gate fans out to its admitted holders per
+  [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1).
 - **Output** files are written under `-o <dir>` at each entry's relative
   path, resolved with the § Path-safety rules above (`..`, absolute, and
   escaping paths rejected). Writes are atomic (temp-then-rename after the
@@ -284,10 +289,11 @@ range-addressed cache and is a follow-up.
 
 At the end of a pull the report states the distinct content bytes fetched
 and the bytes written to disk — `downloaded X → reconstructed Y` — whenever
-dedup made them differ (a shared chunk, or a blob at several paths, served
-more than one file from one fetch). When the two are equal the report shows
-a single `downloaded X`. `downloaded` sums content lengths, not exact
-on-wire bytes.
+dedup made them differ, which happens only when one blob is materialized
+to several paths. Range-dedup savings from spliced chunk hints do not
+show up in `downloaded`; they are reported separately as `spliced_bytes`.
+When `downloaded` equals `reconstructed` the report shows a single
+`downloaded X`. `downloaded` sums content lengths, not exact on-wire bytes.
 
 ### Deferred
 

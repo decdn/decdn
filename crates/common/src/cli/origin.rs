@@ -103,13 +103,14 @@ pub struct OriginImportArgs {
     /// carries the canonical manifest bytes. `origin` is the `--to` target, or
     /// the literal `(dry-run)` when a dry run runs without `--to`.
     /// Shape:
-    /// `{"imported":<n>,"bytes":<total>,"origin":"<target>","files":{"<path>":"b3:<hex>",...},"bundle_hash":"b3:<hex>"|null,"moved":<bool>,"optimized":<bool>,"chunks_total":<n>,"chunks_written":<n>,"skipped_symlinks":<n>}`.
+    /// `{"imported":<n>,"bytes":<total>,"origin":"<target>","files":{"<path>":"b3:<hex>",...},"bundle_hash":"b3:<hex>"|null,"moved":<bool>,"optimized":<bool>,"chunks_total":<n>,"skipped_symlinks":<n>}`.
     #[arg(long)]
     pub json: bool,
 
-    /// Content-defined-chunk each file and write each chunk as its own blob, so
-    /// a chunk shared across files is stored once. Emits chunked manifest
-    /// entries. Off by default (whole-file blobs).
+    /// Content-defined-chunk each file and record the chunk boundaries as
+    /// `{hash,size}` hints in the manifest entry; each file is still stored
+    /// as one whole-file blob. A pull uses the hints to splice ranges it
+    /// already holds instead of re-fetching them. Off by default (no hints).
     #[arg(long)]
     pub optimize: bool,
 

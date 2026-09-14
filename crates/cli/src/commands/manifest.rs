@@ -42,7 +42,7 @@ struct Bundle<'a> {
 /// against bytes a client already holds. `hash` is the authoritative
 /// end-to-end validator regardless of whether hints are present. A plain
 /// (unhinted) entry omits `chunks` entirely and serializes byte-identically
-/// to a bundle that predates chunk hints.
+/// to a bundle with no chunk hints.
 #[derive(Serialize)]
 pub(crate) struct BundleEntry {
     /// Relative POSIX path within the bundle root (`a/b.txt`, never absolute).

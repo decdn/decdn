@@ -53,7 +53,7 @@ When a source finishes its segment, it does not idle: the scheduler finds the so
 
 **Concurrency invariants:**
 
-- **Exactly one outstanding segment per source (`per_source_inflight = 1`, fixed, not configurable).** This is a correctness constraint, not a simplification: two concurrent segments to the same node would share one `(signer, provider)` payment lane and reintroduce the concurrent-same-lane voucher hazard that bundle pull serializes with a `provider_lock` — nondeterministic node-side voucher ordering causes `BadSignature`. Parallelism comes from the number of sources, never from stacking requests on one source.
+- **Exactly one outstanding segment per source (`per_source_inflight = 1`, fixed, not configurable).** This is a correctness constraint, not a simplification: two concurrent segments to one node share its `(signer, provider)` payment lane and its single cumulative voucher watermark. A fast segment advances that watermark ahead of a slow co-segment, so the node cannot attribute the slow segment's payment and stalls it. The scheduler keeps one segment per source to avoid this; bundle pull bounds same-lane concurrency with `--max-lane-streams` (default 1). Parallelism comes from the number of sources, not from stacking requests on one source.
 - Global in-flight equals the count of active sources, bounded by `max_sources`; no separate global concurrency cap exists or is needed.
 - At most one source owns any given byte range at a time.
 
