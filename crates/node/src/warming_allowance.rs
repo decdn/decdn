@@ -212,16 +212,18 @@ impl WarmingAllowance {
     /// buys overshoot, the source needs at most `budget + 1` units of credit or
     /// refill to warm again. The floor bounds that recovery debt, not the spend.
     ///
-    /// The tag lands before the debit. The tag map and the bucket ledger are
-    /// separate locks, so the two writes are not one atomic step; ordering them
-    /// this way makes the only observable interleaving the harmless one. A
-    /// serve that resolves the tag between the two sees the source and credits
-    /// it, which is what the accounting wants. The reverse order would let a
-    /// serve see a committed debit with no tag yet and silently drop its
-    /// credit.
+    /// The tag is published while the bucket lock is held, before the debit.
+    /// The serve path reads the tag map without that lock, but every credit
+    /// reaches the ledger through `credit_source`, which takes it. So a
+    /// serve that sees the tag has its credit applied only after this debit, and
+    /// a serve that misses the tag also precedes the debit. Publishing the tag
+    /// outside the lock would let a credit land on a bucket this debit is about
+    /// to create full, where the `+budget` cap discards it; publishing it after
+    /// the debit would let a serve see a committed debit with no tag and drop
+    /// its credit.
     pub fn debit_speculative(&self, source: SourceId, hash: Hash, units: u64) {
-        self.source_of.insert(hash, source);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.source_of.insert(hash, source);
         let bucket = state
             .buckets
             .entry(source)
@@ -607,6 +609,39 @@ mod tests {
             eventually(|| allowance.available(S1)).await,
             "the aggregator must apply the enqueued credits"
         );
+    }
+
+    /// A speculative buy's tag is invisible to the serve path until its debit
+    /// can land.
+    ///
+    /// A credit resolved from a tag published ahead of the debit could reach a
+    /// bucket the debit then creates full, where the `+budget` cap discards the
+    /// credit before the debit subtracts from it. Publishing the tag under the
+    /// ledger lock closes that: a debit blocked on the lock has not published
+    /// its tag, so no serve can resolve it yet.
+    #[test]
+    fn a_blocked_debit_has_not_published_its_tag() {
+        let allowance = Arc::new(WarmingAllowance::new(1000, 0));
+        let held = allowance
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
+        let buyer = Arc::clone(&allowance);
+        let debit = std::thread::spawn(move || buyer.debit_speculative(S1, H1, 1000));
+        // Give the debit time to run up to the lock it blocks on.
+        std::thread::sleep(Duration::from_millis(100));
+        let tag_while_blocked = allowance.source_for(H1);
+
+        drop(held);
+        let joined = debit.join().is_ok();
+        assert!(joined, "the debiting thread panicked");
+        assert_eq!(
+            tag_while_blocked, None,
+            "a debit blocked on the ledger lock must not have published its tag"
+        );
+        assert_eq!(allowance.source_for(H1), Some(S1));
+        assert!(!allowance.available(S1), "the debit landed");
     }
 
     /// A serve completion's credit must not wait on the ledger lock.
