@@ -72,6 +72,18 @@ enum RangeTargets {
     Discovered(Vec<NodeCandidate>),
 }
 
+impl RangeTargets {
+    /// The distinct provider addresses this entry's range drives may stream from —
+    /// the pinned target's one provider, or every discovered candidate's. Used to
+    /// acquire the entry's lane-stream permit set before its drives.
+    fn providers(&self) -> Vec<Address> {
+        match self {
+            RangeTargets::Pinned((_, provider)) => vec![*provider],
+            RangeTargets::Discovered(order) => order.iter().map(|c| c.eth_address).collect(),
+        }
+    }
+}
+
 /// Group manifest entries by their blob `hash`, preserving first-seen order both
 /// across groups and within each group. Entries that name the same blob (one
 /// file published at two paths) land in one group so it is fetched once (#1306).
@@ -629,6 +641,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         open_lock: tokio::sync::Mutex::new(()),
         jobs: args.jobs.max(1),
         gate: tokio::sync::Semaphore::new(args.jobs.max(1)),
+        lane_cap: LaneStreamCap::new(args.max_lane_streams),
         // Silent during the manifest fetch below (a single blob); replaced once
         // the kept entries are known and their sizes decide the total-bar mode.
         progress: PullProgress::disabled(),
@@ -694,6 +707,72 @@ async fn obtain_manifest<P: Provider + Clone>(
     Ok(Some(m))
 }
 
+/// Per-provider cap on concurrent streams to one `(pool, signer, provider)`
+/// lane. A lane has one shared [`LaneLedgers`] voucher watermark; two concurrent
+/// streams on the same lane race that watermark — a fast stream advances it and
+/// a slow co-stream's vouchers fall behind — so this bounds how many streams
+/// touch a given provider at once. `--max-lane-streams` sets the cap (default 1):
+/// at 1 a `Semaphore(1)` runs a single ordered voucher sequence per lane, and a
+/// higher value admits that many concurrent same-lane streams. Cross-lane
+/// parallelism (distinct providers) is never bounded here — only by `--jobs`.
+struct LaneStreamCap {
+    /// Per-provider semaphores, created on first use. The `tokio::sync::Mutex`
+    /// guards the map so the cap is `Sync` and shareable across the entry futures.
+    map: tokio::sync::Mutex<HashMap<Address, Arc<tokio::sync::Semaphore>>>,
+    /// Concurrent-stream permits per provider (at least 1). At 1 a `Semaphore(1)`
+    /// serializes same-lane streams exactly like a mutex.
+    n: usize,
+}
+
+impl LaneStreamCap {
+    /// A cap admitting `n` concurrent streams per provider (clamped to at least 1).
+    fn new(n: usize) -> Self {
+        Self {
+            map: tokio::sync::Mutex::new(HashMap::new()),
+            n: n.max(1),
+        }
+    }
+
+    /// The per-provider semaphore, created on first use.
+    async fn semaphore(&self, provider: Address) -> Arc<tokio::sync::Semaphore> {
+        let mut map = self.map.lock().await;
+        Arc::clone(
+            map.entry(provider)
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.n))),
+        )
+    }
+
+    /// Acquire one stream permit for `provider`, held until the returned permit
+    /// drops. At `n == 1` a second concurrent caller for the same provider waits
+    /// here until the first releases.
+    async fn permit(&self, provider: Address) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+        self.semaphore(provider)
+            .await
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("bundle pull lane-stream cap closed"))
+    }
+
+    /// Acquire one stream permit for every distinct provider in `providers`, in
+    /// one global order (sorted, deduped `Address`), and return them held for the
+    /// caller's whole fetch. Acquiring every multi-provider set in the same order
+    /// makes the cap deadlock-free: a task never waits on a lower-address permit
+    /// while holding a higher one.
+    async fn permit_set(
+        &self,
+        providers: &[Address],
+    ) -> anyhow::Result<Vec<tokio::sync::OwnedSemaphorePermit>> {
+        let mut ordered = providers.to_vec();
+        ordered.sort_unstable();
+        ordered.dedup();
+        let mut permits = Vec::with_capacity(ordered.len());
+        for provider in ordered {
+            permits.push(self.permit(provider).await?);
+        }
+        Ok(permits)
+    }
+}
+
 /// Shared, by-reference state for the entry fetch loop. Borrowed by every
 /// in-flight entry future. `LaneLedgers` is `Sync`, so `PullCtx` is `Sync` and
 /// safe to share across `tokio::spawn` if needed; `buffer_unordered` currently
@@ -752,6 +831,11 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// byte range a sibling entry already holds is spliced from disk instead of
     /// fetched, so it never takes a permit of its own.
     gate: tokio::sync::Semaphore,
+    /// Per-provider cap on concurrent same-lane streams (`--max-lane-streams`,
+    /// default 1). Acquired around every stream: one permit for a single-provider
+    /// stream, a sorted permit set for a multi-source fan-out. Bounds only
+    /// per-provider concurrency; `--jobs` still bounds cross-lane parallelism.
+    lane_cap: LaneStreamCap,
     /// The run's multi-bar progress renderer: one per-file bar per active pull
     /// above a bottom total bar (silent off a terminal or under `--json`). Set
     /// once the kept manifest is known — its entries decide the total-bar mode —
@@ -832,6 +916,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         ) {
             return Ok(None);
         }
+        // Hold one lane-stream permit per admitted provider across the whole
+        // fan-out: every admitted lane opens a stream at once, so the cap must
+        // admit the set together. Acquired in sorted `Address` order (deadlock
+        // free) and only after the gate accepts, so a declined fetch takes none.
+        let providers: Vec<Address> = admitted.iter().map(|c| c.eth_address).collect();
+        let _lane_permits = self.lane_cap.permit_set(&providers).await?;
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
         // The entry's per-file bar callback (ADR 039 fan-out reports one monotonic
@@ -883,6 +973,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         if let Some(pinned) = self.explicit {
             // A `--node-id`-pinned target takes its direct address from `--addr`,
             // not the registry, so no on-chain dial hints apply.
+            let _lane_permit = self.lane_cap.permit(pinned.1).await?;
             return self
                 .fetch_to_staging_from(hash, pinned, &[], staging, progress)
                 .await;
@@ -948,6 +1039,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // Registry multiaddrs as direct-address hints for a relay-free dial
             // to a reachable node (ADR 001 § Node Discovery).
             let dial_addrs = cand.dial_addrs();
+            // The failover walk streams from one provider per attempt, so it holds
+            // just that provider's lane-stream permit for the attempt, released
+            // before the next candidate.
+            let _lane_permit = self.lane_cap.permit(cand.eth_address).await?;
             let err = match self
                 .fetch_to_staging_from(hash, target, &dial_addrs, staging, progress)
                 .await
@@ -1402,6 +1497,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // across every sub-drive below (complement, donor re-fetch, whole-blob
         // re-drive) — the happy path (complement only) still probes exactly once.
         let targets = self.resolve_range_targets(hash).await?;
+        // Hold one lane-stream permit per provider this entry may drive from across
+        // every sub-drive (complement, donor re-fetch, whole-blob re-drive) and the
+        // splice between them — one logical fetch unit — so a co-entry never opens a
+        // concurrent stream to a shared lane mid-reassembly. Sorted `Address` order
+        // keeps it deadlock-free against a fan-out entry's permit set.
+        let _lane_permits = self.lane_cap.permit_set(&targets.providers()).await?;
         let driver = CtxRangeDriver {
             ctx: self,
             targets: &targets,
@@ -3736,5 +3837,65 @@ mod tests {
             format!("{err:#}").contains("--provider-address requires --node-id"),
             "expected the validate() guard error, got: {err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn lane_stream_cap_serializes_one_provider_and_frees_the_rest() {
+        use std::time::Duration;
+
+        let p1 = Address::repeat_byte(1);
+        let p2 = Address::repeat_byte(2);
+
+        // n == 1: the first permit for P1 is held; a second acquire for the same
+        // provider must not resolve until the first drops.
+        let cap = LaneStreamCap::new(1);
+        let held = cap.permit(p1).await.unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(100), cap.permit(p1)).await;
+        assert!(
+            second.is_err(),
+            "a second same-provider permit must block while the first is held"
+        );
+        // A different provider never contends.
+        let other = tokio::time::timeout(Duration::from_millis(100), cap.permit(p2)).await;
+        assert!(
+            other.is_ok(),
+            "a distinct provider must not wait on P1's permit"
+        );
+        // Dropping the first lets the waiter through.
+        drop(held);
+        let reacquired = tokio::time::timeout(Duration::from_millis(100), cap.permit(p1))
+            .await
+            .expect("the second permit must resolve once the first is dropped")
+            .unwrap();
+        drop(reacquired);
+
+        // n == 2: two permits for the same provider coexist.
+        let cap2 = LaneStreamCap::new(2);
+        let a = cap2.permit(p1).await.unwrap();
+        let b = tokio::time::timeout(Duration::from_millis(100), cap2.permit(p1))
+            .await
+            .expect("two same-provider permits must coexist at n == 2")
+            .unwrap();
+        drop((a, b));
+
+        // permit_set over an out-of-order, duplicated set acquires every distinct
+        // provider (in sorted order internally) and returns one permit each.
+        let cap3 = LaneStreamCap::new(1);
+        let permits = cap3.permit_set(&[p2, p1, p2]).await.unwrap();
+        assert_eq!(permits.len(), 2, "duplicates collapse to one permit each");
+        // With both lanes held, a fresh single acquire for either must block.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), cap3.permit(p1))
+                .await
+                .is_err(),
+            "P1 is held by the set"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), cap3.permit(p2))
+                .await
+                .is_err(),
+            "P2 is held by the set"
+        );
+        drop(permits);
     }
 }

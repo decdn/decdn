@@ -74,6 +74,13 @@ pub struct BundlePullArgs {
     #[arg(long, value_name = "N", default_value_t = 4)]
     pub jobs: usize,
 
+    /// Maximum concurrent streams to one `(pool, signer, provider)` lane. 1 keeps
+    /// a single ordered voucher sequence per lane (the safe default); a higher
+    /// value allows N concurrent same-lane streams. Cross-lane parallelism is
+    /// bounded by `--jobs` regardless.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub max_lane_streams: usize,
+
     /// Only pull entries whose POSIX relative path matches one of these globs
     /// (`models/*.bin`), matched against the manifest's `path` field, never the
     /// on-disk absolute path. Repeatable — an entry passes the include gate if it
