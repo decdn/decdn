@@ -1135,13 +1135,42 @@ async fn run_e2e() -> anyhow::Result<()> {
 
     // Top-up: add a margin to the pool and assert the on-chain deposit reflects it.
     let deposit_before = U256::from(buyer_pool.getPool(buyer_pool_id).call().await?.deposit);
-    buyer_service
+    let landed = buyer_service
         .top_up_pool(U256::from(TOPUP_MICRO_USDC))
         .await?;
     anyhow::ensure!(
         U256::from(buyer_pool.getPool(buyer_pool_id).call().await?.deposit)
             == deposit_before + U256::from(TOPUP_MICRO_USDC),
         "topUp must raise the on-chain deposit by exactly the requested amount"
+    );
+    anyhow::ensure!(
+        landed.added == U256::from(TOPUP_MICRO_USDC),
+        "top_up_pool must report the requested amount as added, got {}",
+        landed.added
+    );
+
+    // Two concurrent reactive top-ups (#2012): the second joins the first's
+    // in-flight `topUp`, claims none of it, and funds its own amount after. The
+    // chain must hold BOTH escrows — one shared escrow counted by two pulls is the
+    // under-fund this guards — and never more than both.
+    let deposit_before = U256::from(buyer_pool.getPool(buyer_pool_id).call().await?.deposit);
+    let (first, second) = tokio::join!(
+        buyer_service.top_up_pool(U256::from(TOPUP_MICRO_USDC)),
+        buyer_service.top_up_pool(U256::from(TOPUP_MICRO_USDC / 2)),
+    );
+    let (first, second) = (first?, second?);
+    anyhow::ensure!(
+        first.added == U256::from(TOPUP_MICRO_USDC)
+            && second.added == U256::from(TOPUP_MICRO_USDC / 2),
+        "each concurrent reactive top-up must report its own amount as added: \
+         first {}, second {}",
+        first.added,
+        second.added
+    );
+    anyhow::ensure!(
+        U256::from(buyer_pool.getPool(buyer_pool_id).call().await?.deposit)
+            == deposit_before + U256::from(TOPUP_MICRO_USDC + TOPUP_MICRO_USDC / 2),
+        "concurrent reactive top-ups must escrow both amounts exactly once"
     );
 
     // Reclaim: the buyer closes its own pool, the chain is warped past the grace

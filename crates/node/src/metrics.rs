@@ -994,7 +994,7 @@ pub struct DecdnMetrics {
     /// routine traffic cannot hide it.
     pub node_pull_reactive_topup: Counter,
     /// `decdn_node_pull_reactive_topup_refused_total` (#1530): a mid-pull top-up was
-    /// NOT performed, or was performed and added nothing.
+    /// NOT performed, or was performed and added less than the pull asked for.
     ///
     /// Three causes, one adversarial and two operational:
     ///
@@ -1004,13 +1004,16 @@ pub struct DecdnMetrics {
     ///   accounting and we decline to fund an uncorroborated one; this counter is the
     ///   only place that becomes visible, so a sustained rate against one provider is
     ///   worth alerting on;
-    /// - a funding transaction that failed (allowance, revert, RPC);
-    /// - a top-up that landed but added no headroom.
+    /// - a funding transaction that failed (allowance, revert, RPC, or a mined
+    ///   `topUp` the local pool row could not credit);
+    /// - a top-up that landed less than the requested amount, or nothing (#2012).
     ///
-    /// The three share a counter because the pull's outcome is identical — it ends on
-    /// the original exhaustion — but only the first says anything about the peer. Read
-    /// it alongside `decdn_buyer_topup_failure_total`, which the latter two also tick
-    /// and the first does not.
+    /// The three share a counter because the pull runs short of what it asked for,
+    /// but only the first says anything about the peer. A failed funding transaction
+    /// also ticks `decdn_buyer_topup_failure_total`. A short landing ticks neither
+    /// that nor this counter's success sibling, and logs a `warn!` with the requested
+    /// and landed amounts; the pull keeps what landed and continues until that
+    /// headroom runs out.
     pub node_pull_reactive_topup_refused: Counter,
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
@@ -2140,9 +2143,9 @@ recorders! {
     /// frontier (#1530).
     node_pull_reactive_topup => node_pull_reactive_topup.inc();
 
-    /// A mid-pull top-up was declined or added no headroom: an upstream claiming
-    /// exhaustion our own ledger contradicts, a failed funding tx, or a top-up that
-    /// credited nothing (#1530).
+    /// A mid-pull top-up was declined or added less than requested: an upstream
+    /// claiming exhaustion our own ledger contradicts, a failed funding tx, or a
+    /// top-up that landed short (#1530, #2012).
     node_pull_reactive_topup_refused => node_pull_reactive_topup_refused.inc();
 
     /// The delivery handler abandoned a pull-through at its deadline (#831).
