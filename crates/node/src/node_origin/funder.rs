@@ -10,13 +10,10 @@
 //! — the same contract the CLI's `CliFunder` honours by calling `topUp` with
 //! `additional` directly. A `topUp` leaves the pool's committed spend untouched,
 //! so adding `additional` to the deposit adds exactly `additional` to the
-//! spendable headroom too. [`PoolOpener::top_up_pool`], though, takes a SPENDABLE
-//! target (post-top-up spendable == its argument), so `NodeFunder` converts:
-//! it reads the pool's current spendable — `deposit - committed`, off the shared
-//! [`PoolContext`] the driver mutates and the shared [`PoolLedger`] the pull
-//! commits through — and asks `top_up_pool` for `current_spendable + additional`.
-//! That drives spendable up by exactly `additional`, which is what raises a pool's
-//! spendable headroom to a target directly.
+//! spendable headroom too. [`PoolOpener::top_up_pool`] takes the same amount, so
+//! `NodeFunder` passes `additional` through. The driver sizes it from the pull's
+//! live ledger; the buyer service's persisted lane progress lags a running pull
+//! and cannot size it.
 //!
 //! The pool has no expiry, so a `topUp` strands nothing time-bound — the node
 //! funds its own pool freely, and there is no near-expiry refusal to derive.
@@ -28,7 +25,7 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use async_trait::async_trait;
 use decdn_client_pull::source::SourceFuture;
-use decdn_client_pull::{Funder, PoolContext, PoolLedger};
+use decdn_client_pull::{Funder, PoolContext};
 use decdn_incentive::DepositOutcome;
 
 use crate::buyer_channel::PoolOpener;
@@ -105,16 +102,12 @@ const MAX_SETTLE_WAITS: u32 = 60;
 /// - `opener`: where the top-up lands. `Arc<dyn PoolOpener>` because the node
 ///   origin already stores its buyer service behind that same object-safe seam.
 /// - `ctx`: the driver's live [`PoolContext`], shared (not copied) because its
-///   `deposit` field grows across the fetch as earlier top-ups land — reading a
-///   stale copy would under-shoot the target on a pool that already got topped up
-///   once this fetch by a DIFFERENT path (the proactive low-water refill can fire
-///   concurrently; see `top_up_pool`'s own join-or-spawn dedup for why that race
-///   is expected). Locked only to copy `deposit` out; the guard is never held
-///   across `.await` (`top_up_pool` is a network+chain round trip).
-/// - `ledger`: the pull's shared [`PoolLedger`], read for the committed spend that
-///   turns `deposit` into spendable headroom. It is the same ledger the driver
-///   subtracts to compute the `additional` it passes here, so the two agree on
-///   what "current spendable" is.
+///   `deposit` field grows across the fetch as earlier top-ups land. `top_up`
+///   reads it as the baseline that tells a headroom-adding landing from a no-op
+///   one (the proactive low-water refill can fire concurrently; see
+///   `top_up_pool`'s own join-or-spawn dedup for why that race is expected).
+///   Locked only to copy `deposit` out; the guard is never held across `.await`
+///   (`top_up_pool` is a network+chain round trip).
 /// - `metrics`: the node's metrics handle. `top_up` records
 ///   `node_pull_reactive_topup` on a headroom-adding success and
 ///   `node_pull_reactive_topup_refused` on a no-headroom landing or a
@@ -123,7 +116,6 @@ const MAX_SETTLE_WAITS: u32 = 60;
 pub(crate) struct NodeFunder {
     opener: Arc<dyn PoolOpener>,
     ctx: Arc<Mutex<PoolContext>>,
-    ledger: Arc<PoolLedger>,
     metrics: Arc<crate::metrics::Metrics>,
     /// Set the first time a top-up ADDS headroom, so the caller can tell a pull
     /// that never funded itself (an extortion refusal to meter) from one that
@@ -142,14 +134,12 @@ impl NodeFunder {
     pub(crate) fn new(
         opener: Arc<dyn PoolOpener>,
         ctx: Arc<Mutex<PoolContext>>,
-        ledger: Arc<PoolLedger>,
         metrics: Arc<crate::metrics::Metrics>,
         funded: Arc<AtomicBool>,
     ) -> Self {
         Self {
             opener,
             ctx,
-            ledger,
             metrics,
             funded,
         }
@@ -164,8 +154,8 @@ impl Funder for NodeFunder {
 
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
         Box::pin(async move {
-            // Read the raw deposit once; derive spendable locally so the target
-            // computation and the headroom classification share one baseline.
+            // The raw deposit before the call: the baseline that tells a landing that
+            // added headroom from one that joined a refill already in flight.
             let current_deposit = {
                 let guard = self
                     .ctx
@@ -173,12 +163,7 @@ impl Funder for NodeFunder {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.deposit
             };
-            let current_spendable = current_deposit.saturating_sub(self.ledger.committed().amount);
-            // `top_up_pool` targets spendable, so raise the target by exactly
-            // `additional` above the current spendable — that is what adds
-            // `additional` to the deposit (a `topUp` never touches committed spend).
-            let spendable_target = current_spendable.saturating_add(additional);
-            match self.opener.top_up_pool(spendable_target).await {
+            match self.opener.top_up_pool(additional).await {
                 Ok(new_deposit) if new_deposit > current_deposit => {
                     self.metrics.node_pull_reactive_topup();
                     // Record the headroom-adding success so a later terminal
@@ -225,14 +210,14 @@ mod tests {
     use crate::buyer_channel::PoolOpener;
 
     /// A configurable [`PoolOpener`] double: `top_up_pool` records the
-    /// `target_deposit` it was called with (and how many times) and returns a
+    /// `additional` it was called with (and how many times) and returns a
     /// fixed outcome. Only `top_up_pool` is exercised by `NodeFunder`; the rest of
     /// the trait is required by its signature but unreachable from these tests.
     #[derive(Debug)]
     struct MockOpener {
         top_up_result: Result<U256, String>,
         top_up_calls: AtomicU32,
-        last_target: StdMutex<Option<U256>>,
+        last_additional: StdMutex<Option<U256>>,
     }
 
     impl MockOpener {
@@ -240,7 +225,7 @@ mod tests {
             Self {
                 top_up_result,
                 top_up_calls: AtomicU32::new(0),
-                last_target: StdMutex::new(None),
+                last_additional: StdMutex::new(None),
             }
         }
 
@@ -248,9 +233,9 @@ mod tests {
             self.top_up_calls.load(Ordering::SeqCst)
         }
 
-        fn last_target(&self) -> Option<U256> {
+        fn last_additional(&self) -> Option<U256> {
             *self
-                .last_target
+                .last_additional
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
@@ -276,12 +261,12 @@ mod tests {
             unreachable!("not exercised by NodeFunder tests")
         }
 
-        async fn top_up_pool(&self, target_deposit: U256) -> Result<U256> {
+        async fn top_up_pool(&self, additional: U256) -> Result<U256> {
             self.top_up_calls.fetch_add(1, Ordering::SeqCst);
             *self
-                .last_target
+                .last_additional
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(target_deposit);
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(additional);
             self.top_up_result.clone().map_err(|e| anyhow::anyhow!(e))
         }
     }
@@ -301,65 +286,26 @@ mod tests {
         }))
     }
 
-    /// A lane ledger whose committed spend is `committed` — the amount already
-    /// vouchered, which `deposit - committed` is the spendable headroom over.
-    fn test_ledger(committed: U256) -> Arc<PoolLedger> {
-        Arc::new(PoolLedger::new(decdn_client_pull::Cumulative {
-            bytes: U256::ZERO,
-            amount: committed,
-        }))
-    }
-
     fn test_funded() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
     }
 
-    /// With nothing committed, spendable == deposit, so the target `top_up_pool`
-    /// receives is `deposit + additional`.
+    /// The driver path's contract: `top_up(additional)` asks the opener to add
+    /// exactly `additional`. The driver sizes it from the pull's live ledger; the
+    /// funder never re-sizes it from a deposit or committed-spend view of its own,
+    /// which would drift from what the driver saw (#1893).
     #[tokio::test]
-    async fn top_up_targets_current_spendable_plus_additional() {
+    async fn top_up_asks_the_opener_for_exactly_additional() {
         let deposit = U256::from(1_000u64);
         let additional = U256::from(250u64);
         let opener = Arc::new(MockOpener::new(Ok(U256::from(1_250u64))));
         let metrics = Arc::new(crate::metrics::Metrics::new());
-        let f = NodeFunder::new(
-            opener.clone(),
-            test_ctx(deposit),
-            test_ledger(U256::ZERO),
-            metrics,
-            test_funded(),
-        );
+        let f = NodeFunder::new(opener.clone(), test_ctx(deposit), metrics, test_funded());
 
         let outcome = f.top_up(additional).await.expect("top-up should succeed");
 
-        assert_eq!(opener.last_target(), Some(deposit + additional));
+        assert_eq!(opener.last_additional(), Some(additional));
         assert_eq!(outcome, DepositOutcome::Added(U256::from(1_250u64)));
-    }
-
-    /// The driver path's contract: `top_up(additional)` adds exactly `additional`
-    /// to spendable, never over-escrowing by the committed spend. With `committed`
-    /// already vouchered, spendable is `deposit - committed`, so the target must be
-    /// `(deposit - committed) + additional` — NOT `deposit + additional`, which
-    /// would over-target by `committed` and drive spendable to `working + committed`.
-    #[tokio::test]
-    async fn top_up_adds_exactly_additional_to_spendable() {
-        let deposit = U256::from(1_000u64);
-        let committed = U256::from(600u64);
-        let additional = U256::from(250u64);
-        let opener = Arc::new(MockOpener::new(Ok(U256::from(1_250u64))));
-        let metrics = Arc::new(crate::metrics::Metrics::new());
-        let f = NodeFunder::new(
-            opener.clone(),
-            test_ctx(deposit),
-            test_ledger(committed),
-            metrics,
-            test_funded(),
-        );
-
-        let _ = f.top_up(additional).await.expect("top-up should succeed");
-
-        // current spendable = 1000 - 600 = 400; target = 400 + 250 = 650.
-        assert_eq!(opener.last_target(), Some(U256::from(650u64)));
     }
 
     #[tokio::test]
@@ -369,7 +315,6 @@ mod tests {
         let f = NodeFunder::new(
             opener.clone(),
             test_ctx(U256::from(100u64)),
-            test_ledger(U256::ZERO),
             metrics,
             test_funded(),
         );
@@ -384,13 +329,7 @@ mod tests {
     fn max_topups_reports_the_reactive_budget() {
         let opener = Arc::new(MockOpener::new(Ok(U256::ZERO)));
         let metrics = Arc::new(crate::metrics::Metrics::new());
-        let f = NodeFunder::new(
-            opener,
-            test_ctx(U256::ZERO),
-            test_ledger(U256::ZERO),
-            metrics,
-            test_funded(),
-        );
+        let f = NodeFunder::new(opener, test_ctx(U256::ZERO), metrics, test_funded());
 
         assert_eq!(f.max_topups(), MAX_REACTIVE_TOPUPS);
         assert_eq!(f.max_topups(), 1);
@@ -408,7 +347,6 @@ mod tests {
         let f = NodeFunder::new(
             ok_opener,
             test_ctx(U256::from(1_000u64)),
-            test_ledger(U256::ZERO),
             Arc::clone(&metrics),
             test_funded(),
         );
@@ -426,7 +364,6 @@ mod tests {
         let f = NodeFunder::new(
             err_opener,
             test_ctx(U256::from(1_000u64)),
-            test_ledger(U256::ZERO),
             Arc::clone(&metrics),
             test_funded(),
         );
@@ -438,23 +375,18 @@ mod tests {
         );
     }
 
-    /// Regression for the raw-deposit-vs-spendable baseline bug: with `committed`
-    /// nonzero, `top_up_pool`'s no-op path returns the deposit UNCHANGED (a
-    /// concurrent proactive refill already grabbed the slot). Classifying against
-    /// the spendable baseline (`deposit - committed`) would wrongly read the
-    /// unchanged raw deposit as `> current_spendable` and count it as a success;
-    /// classifying against the raw deposit — the fix — correctly calls it refused.
+    /// `top_up_pool`'s no-op path returns the deposit UNCHANGED (a concurrent
+    /// proactive refill already grabbed the slot). The funder classifies against the
+    /// raw pre-call deposit, so an unchanged deposit is a refusal, not a success.
     #[tokio::test]
-    async fn top_up_no_headroom_landing_with_committed_spend_is_refused() {
+    async fn top_up_no_headroom_landing_is_refused() {
         let deposit = U256::from(1_000u64);
-        let committed = U256::from(600u64);
         // The no-op path: `top_up_pool` returns the pre-call raw deposit unchanged.
         let opener = Arc::new(MockOpener::new(Ok(deposit)));
         let metrics = Arc::new(crate::metrics::Metrics::new());
         let f = NodeFunder::new(
             opener,
             test_ctx(deposit),
-            test_ledger(committed),
             Arc::clone(&metrics),
             test_funded(),
         );

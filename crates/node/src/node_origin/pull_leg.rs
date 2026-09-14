@@ -775,7 +775,6 @@ impl RunSink for PeerRunSink<'_> {
         let node_funder = NodeFunder::new(
             Arc::clone(&self.deps.buyer),
             Arc::clone(&ctx),
-            Arc::clone(&ledger),
             Arc::clone(&self.deps.metrics),
             // The window-paced serve-miss leg does not derive a refuse-metering
             // signal from this flag; `NodeFunder` records its own metrics.

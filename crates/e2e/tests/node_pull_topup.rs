@@ -143,32 +143,16 @@ async fn server_upstream_pool_id(
         .with_context(|| format!("seeder lane pool_id is not a B256: {pool_hex}"))
 }
 
-/// IGNORED — the journey's sizing and assertions are correct, but a multi-MB
-/// node-to-node pull on the fused serve-miss path stalls partway through, so the
-/// deposit-exhausting fetch never completes. Un-ignore once that stall is fixed.
+/// A client fetch whose node-to-node pull costs more than the SERVER's working
+/// deposit completes byte-exact, after exactly one on-chain reactive top-up.
 ///
-/// # The blocker: the fused serve-miss pull stalls on a multi-MB blob
-///
-/// The SERVER admits the fetch, signs `ok: true`, and streams. Its upstream pull
-/// from the seeder and its downstream serve to the client both advance, and then
-/// both stop: the client fails `upstream stalled: no progress for 30s`. At the
-/// stall the SERVER's `decdn_node_pull_through_window_paused_total` is non-zero,
-/// it holds no outbound stream, and no reactive top-up, stall, refusal, or
-/// voucher rejection counter moved on either node. The upstream paid frontier
-/// sits about one ramped credit window (`served_paid / credit_ramp_divisor`)
-/// ahead of the client's, so the pull leg is parked on `RampPacer` returning
-/// `PaceDecision::Wait` for a served-paid advance that never arrives.
-///
-/// The stall is independent of the rate and of the top-up: the same journey at
-/// the default rate, with the default working deposit, is observed to stall at
-/// the same point.
-/// A small blob (the warm-up) completes, because it fits inside the pull
-/// window's floor and never waits on a served-paid advance.
+/// The blob is large enough that the fused serve-miss runs well past the ramped
+/// credit window's floor, so the journey also rides the serve-demand path: the
+/// SERVER's pull fetches the span its serve encoder waits on even when its own
+/// window has closed.
 ///
 /// Run the daemons with `DECDN_NODE_LOG="warn,decdn_node=debug"` to see their
 /// debug logs through the harness.
-#[ignore = "#1893: blocked on a fused serve-miss pull stall on multi-MB node-to-node \
-            blobs; see the doc comment"]
 #[tokio::test(flavor = "multi_thread")]
 async fn node_pull_larger_than_working_deposit_tops_up_once_and_completes() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))

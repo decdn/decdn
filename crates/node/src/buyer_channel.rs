@@ -724,16 +724,15 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         }
     }
 
-    /// Raise the node's pool toward `target_deposit` and return the pool's NEW
-    /// total deposit (#1530). The reactive counterpart of the proactive low-water
-    /// refill: the node-to-node pull loop calls this when an upstream rejects a
-    /// voucher `SpendingCapExhausted` AND the buyer's own ledger corroborates it,
-    /// then resumes on the larger deposit.
+    /// Add `additional` to the node's pool deposit and return the pool's NEW total
+    /// deposit (#1530). The reactive counterpart of the proactive low-water refill:
+    /// the node-to-node pull loop calls this when its own deposit can no longer
+    /// cover the next voucher, then resumes on the larger deposit.
     ///
-    /// `target_deposit` targets **spendable headroom**: the shortfall is computed
-    /// against `deposit - committed_amount` (the amount already vouchered across
-    /// every lane), so a pool whose deposit equals the target but is fully spent
-    /// still gets the full amount.
+    /// The caller sizes `additional` from its live pull ledger. This method does
+    /// not re-derive a shortfall from the persisted lane progress: that progress is
+    /// recorded when a pull ends, so mid-pull it omits the spend of the pull that
+    /// asks, and a shortfall computed from it tops up too little.
     ///
     /// Routes through the detached, join-or-spawn funding task (never an inline
     /// `.await`): `topUp` waits on an unbounded `get_receipt`, and this runs inside
@@ -746,16 +745,10 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// Errors if no pool is tracked, if the allowance/`topUp` fails, or if the
     /// `topUp` mined but the local row could not be credited (terminal — the
     /// deposit is escrowed-and-untracked; a retry would escrow again).
-    pub async fn top_up_pool(&self, target_deposit: U256) -> Result<U256> {
+    pub async fn top_up_pool(&self, additional: U256) -> Result<U256> {
         let state = self
             .reuse_or_report()?
             .with_context(|| "no buyer pool tracked to top up")?;
-        let additional = refill_amount(
-            state.deposit,
-            committed_amount(&state),
-            target_deposit,
-            target_deposit,
-        );
         if additional.is_zero() {
             return Ok(state.deposit);
         }
@@ -825,15 +818,15 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
         amount: U256,
     ) -> Result<()>;
 
-    /// Raise the node's pool toward `target_deposit`, returning its NEW total
-    /// deposit. Defaults to "funding not supported" (`U256::ZERO`) so a read-only
-    /// or test double need not override it.
+    /// Add `additional` to the node's pool deposit, returning its NEW total
+    /// deposit. See [`BuyerPoolService::top_up_pool`]. Defaults to "funding not
+    /// supported" (`U256::ZERO`) so a read-only or test double need not override it.
     ///
     /// # Errors
     ///
     /// Implementations error when no pool is tracked, when the allowance or `topUp`
     /// fails, or when the tx lands but the local row can no longer be credited.
-    async fn top_up_pool(&self, _target_deposit: U256) -> Result<U256> {
+    async fn top_up_pool(&self, _additional: U256) -> Result<U256> {
         Ok(U256::ZERO)
     }
 }
@@ -858,8 +851,8 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
         BuyerPoolService::record_progress(self, provider_addr, pool_id, bytes_delivered, amount)
     }
 
-    async fn top_up_pool(&self, target_deposit: U256) -> Result<U256> {
-        BuyerPoolService::top_up_pool(self, target_deposit).await
+    async fn top_up_pool(&self, additional: U256) -> Result<U256> {
+        BuyerPoolService::top_up_pool(self, additional).await
     }
 }
 

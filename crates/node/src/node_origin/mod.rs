@@ -1743,7 +1743,6 @@ async fn pull_from_candidate(
             let funder = NodeFunder::new(
                 buyer,
                 Arc::clone(&ctx),
-                Arc::clone(&ledger_for_drive),
                 Arc::clone(&metrics),
                 reactive_funded_for_thread,
             );

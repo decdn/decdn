@@ -11069,8 +11069,8 @@ struct FundingOpener {
     signer: Arc<PrivateKeySigner>,
     voucher_domain: Eip712Domain,
     recorded: Arc<Mutex<Vec<ProgressEntry>>>,
-    /// Every `top_up_channel(provider, target)` in order — the test's view of what
-    /// the pull tried to fund.
+    /// Every `top_up_pool(additional)` in order — the test's view of what the pull
+    /// tried to fund.
     topups: Arc<Mutex<Vec<(Address, U256)>>>,
     /// Whether a top-up actually adds headroom. `false` models a refusal.
     funds: bool,
@@ -11125,31 +11125,18 @@ impl PoolOpener for FundingOpener {
         Ok(())
     }
 
-    async fn top_up_pool(&self, target_deposit: U256) -> Result<U256> {
+    async fn top_up_pool(&self, additional: U256) -> Result<U256> {
         self.topups
             .lock()
             .map_err(|_| anyhow::anyhow!("topups lock poisoned"))?
-            .push((Address::ZERO, target_deposit));
+            .push((Address::ZERO, additional));
         let mut deposit = self
             .deposit
             .lock()
             .map_err(|_| anyhow::anyhow!("deposit lock poisoned"))?;
-        // Restore SPENDABLE HEADROOM to the target, the same semantics the real
-        // `BuyerPoolService::top_up_pool` implements via `refill_amount(deposit,
-        // committed_amount, target, target)`. A double that read the raw deposit instead
-        // would refuse to fund a pool sitting AT the target and fully spent —
-        // which is precisely the state this leg exists to rescue (#1600 review).
-        let spent = self
-            .recorded
-            .lock()
-            .map_err(|_| anyhow::anyhow!("recorded lock poisoned"))?
-            .iter()
-            .map(|(_, _, amount)| *amount)
-            .max()
-            .unwrap_or(U256::ZERO);
-        let remaining = deposit.saturating_sub(spent);
-        if self.funds && target_deposit > remaining {
-            *deposit = deposit.saturating_add(target_deposit.saturating_sub(remaining));
+        // Add exactly `additional`, as the real `BuyerPoolService::top_up_pool` does.
+        if self.funds && !additional.is_zero() {
+            *deposit = deposit.saturating_add(additional);
             // The escrow the upstream can see rises with it — a real `topUp` raises one
             // number, and the buyer's belief and the seller's gate are both views of it.
             *self
@@ -11616,10 +11603,15 @@ async fn a_pull_larger_than_the_working_deposit_tops_up_once_and_completes() -> 
         log.len() == 1,
         "exactly one reactive top-up should have funded this pull, got {log:?}"
     );
+    // The top-up restores spendable headroom to the WORKING deposit: it adds the
+    // working deposit less what the pool still had, and the pool never had more
+    // than its initial deposit.
     anyhow::ensure!(
-        log.first()
-            .is_some_and(|(_, target)| *target == U256::from(200 * RATE)),
-        "the top-up must target the WORKING deposit, got {log:?}"
+        log.first().is_some_and(|(_, additional)| {
+            *additional >= U256::from(200 * RATE - 2 * RATE)
+                && *additional <= U256::from(200 * RATE)
+        }),
+        "the top-up must raise spendable to the WORKING deposit, got {log:?}"
     );
     assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 1)?;
     assert_counter(
