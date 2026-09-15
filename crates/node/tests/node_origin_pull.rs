@@ -12542,9 +12542,13 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
     // round(0.5 * 128) == 64 == N_MAX: pins N_hat exactly at the clamp ceiling.
     const HEAT: u32 = 128;
     const OP_BPS: u16 = 6000;
-    const SELL: u64 = 1000;
+    // P_sell per MB. Kept well under `MAX_RATE_PER_MB` (1000) so the amortized
+    // ceiling below stays a quotable wire rate: the attack quotes AT that
+    // ceiling, so it must be <= the wire cap or the quote could never be signed.
+    const SELL: u64 = 25;
     // amortized = op_bps * n_max * sell / 10_000 — the ceiling a malicious
     // upstream can quote AT without ever tripping the speculative flag.
+    // = 6000 * 64 * 25 / 10_000 = 960, under the 1000 wire cap.
     const QUOTE_A: u64 = (OP_BPS as u64) * (N_MAX as u64) * SELL / 10_000;
     const LEDGER_DEPOSIT: u64 = 1_000_000_000;
 

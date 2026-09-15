@@ -335,24 +335,32 @@ fn topup_fetch_argv_with_deposits(
 //
 //   * The node's pre-serve floor-M reserve (`pool_remaining_covers_window`,
 //     #1516) refuses to open a stream unless the pool's remaining minus the
-//     refundable floor `M` (default 1 USDC) covers the reserved CREDIT WINDOW.
-//     The gate prices a cold, unbounded request at `paid = 0` (ADR 003
+//     refundable floor `M` (set to `MULTI_POOL_MIN_REMAINING_MICRO_USDC` here via
+//     [`NodeFixture::set_pool_min_remaining_deposit`]) covers the reserved CREDIT
+//     WINDOW. The gate prices a cold, unbounded request at `paid = 0` (ADR 003
 //     §Credit window, #1669), which the ramp collapses to its floor — exactly
 //     ONE chunk (`decdn_protocol::client::CHUNK_BYTES`, 1 MiB); at
-//     `MULTI_RATE_PER_MB` that floor costs 1 * 2_000_000 = 2 USDC, so the
-//     deposit must clear 2 USDC + M = 3 USDC just to open. 18 USDC clears this
-//     with room to spare.
-//   * Yet it must stay below the whole ~9 MiB blob's cost (~19 USDC) so a later
+//     `MULTI_RATE_PER_MB` that floor costs 1 * 1000 = 1000 µUSDC, so the
+//     deposit must clear 1000 + M = 1500 µUSDC just to open. 9000 µUSDC clears
+//     this with room to spare.
+//   * Yet it must stay below the whole ~9 MiB blob's cost (~9500 µUSDC) so a later
 //     voucher exhausts it mid-stream and the reactive top-up fires.
 //
-// 18 USDC threads both: the stream opens (18 − 1 = 17 ≥ 2), nine whole chunks
-// are delivered and metered (cumulative 18 USDC), and the partial tail — the
-// blob is just over nine chunks — is the one that genuinely exhausts the
+// 9000 µUSDC threads both: the stream opens (9000 − 500 = 8500 ≥ 1000), nine whole
+// chunks are delivered and metered (cumulative 9000 µUSDC), and the partial tail —
+// the blob is just over nine chunks — is the one that genuinely exhausts the
 // deposit. It also stays clear of the reuse-time
 // low-water auto-refill (#1103): this test pre-opens and pre-records the pool,
-// and on the CLI's one invocation the pool's full 18 USDC remaining sits above
-// the low-water trigger (working / LOW_WATER_DIVISOR = 3.6 USDC), so no
+// and on the CLI's one invocation the pool's full 9000 µUSDC remaining sits above
+// the low-water trigger (working / LOW_WATER_DIVISOR = 1800 µUSDC), so no
 // proactive refill pre-empts the REACTIVE (mid-stream) top-up under test.
+//
+// The rate, the refundable floor `M`, and the working deposit are all a factor of
+// 2000 below the pre-#2036 sizing (rate 2_000_000, M 1_000_000, deposit 18_000_000)
+// so this whole economic scenario is preserved unchanged under the lowered
+// `MAX_RATE_PER_MB` (1000): every µUSDC quantity in the open-gate and
+// exhaust-mid-blob inequalities scales by the same factor, and the blob is byte-
+// identical, so the same nine-chunks-then-exhaust structure holds.
 //
 // A daemon restart between the pool's on-chain open and this test's later
 // on-chain `topUp` was observed to make the daemon's settlement watcher stop
@@ -361,8 +369,12 @@ fn topup_fetch_argv_with_deposits(
 // interval, causing the resumed voucher to be rejected forever. That looks
 // like a real, separate bug in the watcher/restart interaction, out of scope
 // for this fix; avoiding any daemon restart in this test sidesteps it entirely.
-const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 18_000_000;
-const MULTI_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB
+const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 9000;
+const MULTI_RATE_PER_MB: u64 = 1000; // 0.001 USDC/MB — at the wire cap MAX_RATE_PER_MB
+/// The node's refundable floor `M` for this journey, scaled down by the same 2000x
+/// factor as the rate and deposit so the open-gate headroom (`working − M ≥ one
+/// chunk`) is preserved: 9000 − 500 = 8500 ≥ 1000.
+const MULTI_POOL_MIN_REMAINING_MICRO_USDC: u64 = 500;
 
 // A single-invocation reactive MID-STREAM top-up extends a fetch past its
 // opening deposit: `cli/src/commands/fetch.rs::open_or_reuse_pool` signs the
@@ -420,6 +432,11 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
         "seeded blob hash mismatch: {hash} vs {blob_hash}"
     );
     node.set_rate_per_mb(MULTI_RATE_PER_MB).await?;
+    // Scale the node's refundable floor `M` down by the same factor as the rate so
+    // the deposit-exhaustion structure survives the lowered `MAX_RATE_PER_MB`: at
+    // the default `M` (1 USDC) a 9000 µUSDC deposit could never clear the open gate.
+    node.set_pool_min_remaining_deposit(MULTI_POOL_MIN_REMAINING_MICRO_USDC)
+        .await?;
 
     let client_dir = tempfile::tempdir().context("client tempdir")?;
     #[cfg(unix)]
@@ -669,13 +686,19 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 // summed spend — is unit-tested directly in `client-pull`'s `sink.rs`
 // (`summed_multi_leg_wire_over_maps_which_is_why_baselines_are_per_leg`).
 
-const DEPOSIT_SHORT_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB
+const DEPOSIT_SHORT_RATE_PER_MB: u64 = 1000; // 0.001 USDC/MB — at the wire cap MAX_RATE_PER_MB
 // Clears the pre-serve credit-window gate to OPEN the pool: a cold request's ramp
-// floor is one chunk, `1 * 2_000_000` µUSDC at the rate above, and the deposit must
-// cover that floor plus the refundable floor `M`. 16 USDC clears it with headroom,
-// and stays far below the blob's ~40 USDC wire cost so the fetch runs deposit-short.
-const DEPOSIT_SHORT_WORKING_MICRO_USDC: u64 = 16_000_000;
-/// Just over 20 MiB: its whole-blob wire cost (~40 USDC) is ~2.5x the opening
+// floor is one chunk, `1 * 1000` µUSDC at the rate above, and the deposit must
+// cover that floor plus the refundable floor `M`. 8000 µUSDC clears it with headroom,
+// and stays far below the blob's ~20000 µUSDC wire cost so the fetch runs
+// deposit-short. Rate, `M`, and deposit are all a factor of 2000 below the pre-#2036
+// sizing (rate 2_000_000, M 1_000_000, deposit 16_000_000), so the same ~2.5x
+// deposit-short scenario holds byte-identically under the lowered `MAX_RATE_PER_MB`.
+const DEPOSIT_SHORT_WORKING_MICRO_USDC: u64 = 8000;
+/// The node's refundable floor `M`, scaled down by the same 2000x factor as the
+/// rate and deposit so the open-gate headroom is preserved: 8000 − 500 = 7500 ≥ 1000.
+const DEPOSIT_SHORT_POOL_MIN_REMAINING_MICRO_USDC: u64 = 500;
+/// Just over 20 MiB: its whole-blob wire cost (~0.02 USDC) is ~2.5x the opening
 /// deposit, so the fetch spends well past the deposit in one leg.
 const DEPOSIT_SHORT_BLOB_BYTES: usize = 20 * 1024 * 1024 + 4113;
 
@@ -721,6 +744,11 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
         "seeded blob hash mismatch: {hash} vs {blob_hash}"
     );
     node.set_rate_per_mb(DEPOSIT_SHORT_RATE_PER_MB).await?;
+    // Scale the node's refundable floor `M` down by the same factor as the rate so
+    // the deposit-short structure survives the lowered `MAX_RATE_PER_MB`: at the
+    // default `M` (1 USDC) an 8000 µUSDC deposit could never clear the open gate.
+    node.set_pool_min_remaining_deposit(DEPOSIT_SHORT_POOL_MIN_REMAINING_MICRO_USDC)
+        .await?;
 
     let client_dir = tempfile::tempdir().context("client tempdir")?;
     #[cfg(unix)]
@@ -871,7 +899,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     // groups of headroom absorbs those roundings and — should a slower host let the
     // re-check trip and drive a group-snapped reactive resume — each resumed leg's
     // sub-group re-fetch and left-boundary proof path, while staying far below the
-    // 2_000_000 a genuine re-paid chunk would add.
+    // 1000 a genuine re-paid chunk would add.
     let one_group_cost = ceil_cost(decdn_bao_range::CHUNK_GROUP_BYTES);
     let ceiling = wire_floor.saturating_add(one_group_cost.saturating_mul(U256::from(4u64)));
 
@@ -894,7 +922,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     anyhow::ensure!(
         settled_amount <= ceiling,
         "double-pay: settled {settled_amount} µUSDC against a whole-blob WIRE cost of \
-         {wire_floor} µUSDC (ceiling {ceiling}); a re-paid chunk would add 2000000"
+         {wire_floor} µUSDC (ceiling {ceiling}); a re-paid chunk would add 1000"
     );
 
     // The buyer's local record mirrors the chain: whatever the escrow ended at —
