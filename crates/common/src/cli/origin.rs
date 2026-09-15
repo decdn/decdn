@@ -98,6 +98,15 @@ pub struct OriginImportArgs {
     #[arg(long = "exclude", value_name = "GLOB", action = clap::ArgAction::Append)]
     pub exclude: Vec<String>,
 
+    /// Prefix every manifest entry's path with this folder, so a `bundle pull`
+    /// materializes the whole bundle under one directory (`<out>/<subfolder>/…`)
+    /// rather than spilling its files directly into the output root. Must be a
+    /// relative POSIX path — `..`, absolute paths, and root prefixes are
+    /// rejected; nesting (`a/b`) is allowed. Applies to a single-file import too
+    /// (the one entry becomes `<subfolder>/<name>`).
+    #[arg(long, value_name = "DIR")]
+    pub subfolder: Option<String>,
+
     /// Emit a one-line JSON status report instead of a human summary. Written to
     /// stdout normally; under `--dry-run` it goes to stderr, because stdout then
     /// carries the canonical manifest bytes. `origin` is the `--to` target, or
@@ -166,6 +175,19 @@ mod tests {
         let w = Wrap::try_parse_from(["x", "-i", "d", "--dry-run"]).unwrap();
         assert!(w.args.to.is_none());
         assert!(w.args.dry_run);
+    }
+
+    #[test]
+    fn subfolder_is_none_by_default() {
+        let w = Wrap::try_parse_from(["x", "-i", "d", "--to", "fs:/o"]).unwrap();
+        assert_eq!(w.args.subfolder, None);
+    }
+
+    #[test]
+    fn parses_subfolder() {
+        let w = Wrap::try_parse_from(["x", "-i", "d", "--to", "fs:/o", "--subfolder", "assets/v1"])
+            .unwrap();
+        assert_eq!(w.args.subfolder.as_deref(), Some("assets/v1"));
     }
 
     #[test]
