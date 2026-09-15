@@ -1933,6 +1933,49 @@ contract CapacityBondTest is Test {
         assertEq(bond.bondFloorAtActivation(opAddr), MIN_BOND); // floor unchanged
     }
 
+    /// @notice `registerNode` is an activation path distinct from `bond()`: an
+    ///         operator can satisfy `activeBond >= minBond` without a `bond()`
+    ///         up-crossing when governance lowered `minBond` after they bonded.
+    ///         registerNode must still capture a non-zero grandfathered floor —
+    ///         otherwise a later `minBond` raise would wrongly keep an
+    ///         under-floor operator active (`activeBond >= 0`). PR #2038 review.
+    function test_minBond_registerAfterDecrease_capturesFloor() public {
+        // Raise minBond above the operator's future bond so `bond()` records no floor.
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+
+        uint256 opPk = 0xF10099;
+        address opAddr = vm.addr(opPk);
+        bytes32 nodeId = bytes32(uint256(0xF10099));
+        vm.prank(admin);
+        token.transfer(opAddr, 60_000e18);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(60_000e18); // 60k < 100k minBond → no up-crossing, floor stays 0
+        vm.stopPrank();
+        assertEq(bond.bondFloorAtActivation(opAddr), 0, "bond() below minBond captures no floor");
+        assertFalse(bond.isActive(opAddr), "not active: unregistered");
+
+        // Governance lowers minBond below the operator's existing bond.
+        vm.prank(admin);
+        bond.setMinBond(50_000e18);
+
+        // Activate via registerNode (no further bond()).
+        vm.startPrank(opAddr);
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        vm.stopPrank();
+
+        assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registerNode captures live minBond as floor");
+        assertTrue(bond.isActive(opAddr), "active after registration");
+
+        // A later raise must not de-activate the grandfathered operator.
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+        assertTrue(bond.isActive(opAddr), "grandfathered at 50k floor, stays active");
+        assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "floor unchanged by later raise");
+    }
+
     /// @notice A NEW operator bonding below the raised `minBond` cannot activate:
     ///         entry is gated on the live `minBond`, and no floor is recorded.
     function test_minBond_raise_barsNewEntrantBelowFloor() public {

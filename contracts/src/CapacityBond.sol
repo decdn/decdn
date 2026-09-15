@@ -847,6 +847,16 @@ contract CapacityBond is
         nodeIdToAddress[nodeId] = msg.sender;
         addressToNodeId[msg.sender] = nodeId;
         bindingNonce[msg.sender] = usedBindingNonce + 1;
+        // Capture the grandfathered entry floor if `bond()` did not. An operator
+        // can satisfy the `activeBond >= minBond` precondition without a `bond()`
+        // up-crossing — when governance lowered `minBond` after the operator
+        // bonded — which would otherwise leave the floor at 0 and let `isActive`
+        // treat them as always above it (`activeBond >= 0`). registerNode is an
+        // activation transition gated on `activeBond >= minBond`, so the live
+        // `minBond` is the correct entry floor.
+        if (bondFloorAtActivation[msg.sender] == 0) {
+            bondFloorAtActivation[msg.sender] = minBond;
+        }
         _writeNodeInfo(nodeId, multiaddrs, regionHint);
         _addToRegisteredSet(msg.sender);
 
