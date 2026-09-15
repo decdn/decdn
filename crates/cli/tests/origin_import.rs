@@ -45,6 +45,7 @@ fn import_args(input: &Path, origin: &Path) -> OriginImportArgs {
         chunk_avg: None,
         chunk_min: None,
         chunk_max: None,
+        subfolder: None,
         dry_run: false,
     }
 }
@@ -317,6 +318,44 @@ fn directory_import_matches_dry_run_and_imports_manifest() {
             }
         }
     });
+}
+
+// A directory import with `--subfolder` writes a manifest whose every entry
+// path is prefixed with that folder, and imports the manifest blob under the
+// hash it reports — so a pull materializes the whole tree under one directory.
+#[test]
+fn directory_import_subfolder_prefixes_manifest_entries() {
+    let src = TempDir::new().unwrap();
+    let origin = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+
+    fs::create_dir_all(src.path().join("sub")).unwrap();
+    fs::write(src.path().join("a.txt"), b"alpha").unwrap();
+    fs::write(src.path().join("sub/b.txt"), b"beta").unwrap();
+
+    let out_bundle = out.path().join("out.json");
+    let mut args = import_args(src.path(), origin.path());
+    args.bundle = Some(out_bundle.clone());
+    args.subfolder = Some("release/v2".to_string());
+    rt().block_on(origin_import(&args)).unwrap();
+
+    // The written manifest carries prefixed, sorted paths.
+    let out_bytes = fs::read(&out_bundle).unwrap();
+    let out_json: serde_json::Value = serde_json::from_slice(&out_bytes).unwrap();
+    let paths: Vec<&str> = out_json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["release/v2/a.txt", "release/v2/sub/b.txt"]);
+
+    // The manifest blob is imported under its own hash (of the prefixed bytes).
+    let manifest_hash = blake3::hash(&out_bytes).to_hex().to_string();
+    assert!(
+        data_object_path(origin.path(), &manifest_hash).is_file(),
+        "prefixed manifest blob must be imported into the origin"
+    );
 }
 
 fn hash_from_hex(hex: &str) -> (Hash, String) {

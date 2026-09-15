@@ -219,6 +219,17 @@ a publisher who only wants the manifest, without seeding an origin
 store yet, runs this and nothing else. `--bundle FILE` additionally
 writes the manifest to a file, with or without `--dry-run`.
 
+`--subfolder DIR` prefixes every manifest entry's `path` with `DIR`, so a
+pull writes the whole bundle under one directory rather than into the
+output root. `DIR` is a relative POSIX path and obeys the same path-safety
+rules as an entry path — `..`, absolute paths, and root prefixes are
+rejected; nesting (`a/b`) is allowed. A backslash is rejected too: `\` is
+not a POSIX separator, so it would produce a manifest path that a pull
+reads differently across platforms. The prefix is uniform, so it keeps
+the entries in their by-path-bytes order. The prefix is part of the
+manifest bytes, so it changes the bundle hash and every downstream pull
+sees the folder.
+
 ## Pull
 
 `decdn bundle pull` reads a manifest — from a local file (`-i`) or by

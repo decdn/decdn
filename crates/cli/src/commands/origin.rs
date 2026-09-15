@@ -135,6 +135,47 @@ struct ImportCtx {
     optimize: bool,
     /// The validated chunk-size triple, `Some` iff `optimize`.
     sizes: Option<ChunkSizes>,
+    /// The validated `--subfolder` prefix (a relative POSIX path, no trailing
+    /// slash), prepended to every manifest entry's path so a pull lands the
+    /// whole bundle under one directory. `None` when the flag is absent.
+    subfolder: Option<String>,
+}
+
+/// Validate `--subfolder` into the normalized prefix stored in [`ImportCtx`].
+/// Reuses the manifest path-safety rules ([`validate_relpath`]): a relative
+/// POSIX path with only `Normal` components — `..`, absolute paths, and root
+/// prefixes are rejected — and normalizes a trailing slash away, so `assets/`
+/// and `assets` both yield the `assets` prefix.
+///
+/// A backslash is rejected before that check. `\` is not a POSIX separator, so
+/// on Unix `a\..\evil` collapses to one `Normal` component and slips past the
+/// `..` check — yet a Windows `bundle pull` parses `\` as a separator in
+/// `safe_join`, turning that same manifest path into a parent-dir escape.
+/// Requiring `/` keeps the published manifest identical and safe on every
+/// platform.
+fn resolve_subfolder(raw: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(raw) = raw else { return Ok(None) };
+    if raw.contains('\\') {
+        bail!(
+            "invalid --subfolder {raw:?}: use '/' as the path separator; \
+             '\\' is not allowed (a POSIX-relative subfolder keeps the \
+             manifest identical and safe across platforms)"
+        );
+    }
+    let normalized = validate_relpath(Path::new(raw))
+        .map_err(|e| anyhow!("invalid --subfolder {raw:?}: {e}"))?;
+    Ok(Some(normalized))
+}
+
+/// Place a bundle-relative path under the `--subfolder` prefix when one is set,
+/// so a pull writes the file to `<out>/<subfolder>/<rel>`. `prefix` is already
+/// validated to a relative POSIX path, and `rel` is a validated relative POSIX
+/// path, so the join stays all-`Normal`-component and re-validatable.
+fn place_under(prefix: Option<&str>, rel: &str) -> String {
+    match prefix {
+        Some(sub) => format!("{sub}/{rel}"),
+        None => rel.to_string(),
+    }
 }
 
 /// Entry point. Resolves the target and chunk options, dispatches file vs
@@ -175,6 +216,8 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
         None
     };
 
+    let subfolder = resolve_subfolder(args.subfolder.as_deref())?;
+
     let write = !args.dry_run;
     let origin_label = args.to.clone().unwrap_or_else(|| "(dry-run)".to_string());
 
@@ -194,6 +237,7 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
         origin_label,
         optimize: args.optimize,
         sizes,
+        subfolder,
     };
 
     let report = tokio::task::spawn_blocking(move || -> anyhow::Result<ImportReport> {
@@ -419,7 +463,10 @@ fn import_single_plain(ctx: &ImportCtx, input: &Path) -> anyhow::Result<ImportRe
         || input.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
-    let files = BTreeMap::from([(name, b3_hex_str_from_hex(&hash_hex))]);
+    let files = BTreeMap::from([(
+        place_under(ctx.subfolder.as_deref(), &name),
+        b3_hex_str_from_hex(&hash_hex),
+    )]);
     Ok(ImportReport {
         imported: 1,
         bytes: size,
@@ -444,12 +491,21 @@ fn import_single_plain(ctx: &ImportCtx, input: &Path) -> anyhow::Result<ImportRe
 /// manifest's own content address whether or not the blob was written.
 fn emit_manifest(
     ctx: &ImportCtx,
-    entries: Vec<BundleEntry>,
+    mut entries: Vec<BundleEntry>,
     total_size: u64,
     optimized: bool,
     chunks_total: u64,
     skipped_symlinks: u64,
 ) -> anyhow::Result<ImportReport> {
+    // Prefix every entry's path with `--subfolder` before serializing, so the
+    // bundle hash and every downstream pull place the tree under that folder.
+    // The prefix is uniform, so it preserves the by-path-bytes order the walk
+    // already imposed — no re-sort needed.
+    if let Some(sub) = ctx.subfolder.as_deref() {
+        for entry in &mut entries {
+            entry.path = place_under(Some(sub), &entry.path);
+        }
+    }
     let bundle_bytes = serialize_canonical(&entries)?;
 
     if ctx.write
@@ -803,6 +859,42 @@ fn write_import_report(
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_subfolder_none_is_none() {
+        assert_eq!(resolve_subfolder(None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_subfolder_normalizes_trailing_slash() {
+        assert_eq!(
+            resolve_subfolder(Some("a/b/")).unwrap(),
+            Some("a/b".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_subfolder_rejects_parent_dir() {
+        let err = resolve_subfolder(Some("../evil")).unwrap_err();
+        assert!(format!("{err:#}").contains("parent-dir"));
+    }
+
+    #[test]
+    fn resolve_subfolder_rejects_backslash() {
+        let err = resolve_subfolder(Some("a\\..\\evil")).unwrap_err();
+        assert!(format!("{err:#}").contains("separator"));
+    }
+
+    #[test]
+    fn place_under_prefixes_when_set() {
+        assert_eq!(place_under(Some("assets"), "a/b.txt"), "assets/a/b.txt");
+        assert_eq!(place_under(Some("a/b"), "c.txt"), "a/b/c.txt");
+    }
+
+    #[test]
+    fn place_under_is_identity_when_absent() {
+        assert_eq!(place_under(None, "a/b.txt"), "a/b.txt");
+    }
 
     #[test]
     fn parse_target_accepts_fs() {
