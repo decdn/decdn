@@ -31,12 +31,9 @@ import { ICapacityBondActivity } from "./interfaces/ICapacityBondActivity.sol";
 ///         `AccessControl` (governance-gated setters + emergency pause role,
 ///         handed to the `TimelockController` post-deploy), `ReentrancyGuard`
 ///         + `Pausable` (fund custody), `EIP712` (capability and voucher
-///         signing domain per ADR 024). The
-///         USDC address is immutable; the `FeeRouter` target is
-///         governance-re-pointable per ADR 016 § No proxy deployment
-///         patterns (the capability/voucher domain separator hashes this
-///         contract's address, never the router, so re-pointing invalidates
-///         no signatures).
+///         signing domain per ADR 024). The USDC address and the `FeeRouter`
+///         target are both immutable, fixed at deployment per ADR 016 § No
+///         proxy deployment patterns.
 contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP712 {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
@@ -140,8 +137,13 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ICapacityBondActivity public immutable capacityBond;
 
-    /// @notice Settlement router target; governance-re-pointable via `setFeeRouter`.
-    address public feeRouter;
+    /// @notice Settlement router target, fixed at deployment. It records the
+    ///         `bytesPerEpoch` vote-weight feed that `DecdnGovernor` reads, and
+    ///         the Governor binds its `feeRouter` immutable too; binding both
+    ///         ends at construction keeps the feed and its consumer pinned to
+    ///         one router for the contract's life.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    address public immutable feeRouter;
 
     /// @notice Grace window in seconds (default 48h; bounded [48h, 72h]).
     uint256 public disputeWindow;
@@ -250,7 +252,6 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ///         to `owner` and the pool is now `Closed`.
     event PoolReclaimed(bytes32 indexed poolId, address indexed owner, uint256 ownerRefund);
 
-    event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
     event DisputeWindowUpdated(uint256 oldValue, uint256 newValue);
     event RateBoundsUpdated(uint256 newDeliveryFloor);
     event MinDepositUpdated(uint64 oldValue, uint64 newValue);
@@ -275,7 +276,6 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     error PoolClosed();
     error PoolNotClosing();
     error GraceWindowActive();
-    error RouterUnchanged();
     error LengthMismatch();
     /// @dev A submitted hash-chain preimage does not reach `chainRoot` in
     ///      `chainIndex` steps. Caller error, not transient pool state, so it
@@ -693,30 +693,6 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     // Governance setters (GOVERNANCE_ROLE — Timelock post-deploy)
     // -----------------------------------------------------------------
 
-    /// @notice Re-point the settlement router. Open pools keep their
-    ///         capabilities and vouchers valid — the EIP-712 domain hashes
-    ///         this contract, not the router (ADR 003 § Governance setter:
-    ///         setFeeRouter).
-    /// @dev    `_route` reads `feeRouter` live, so a redemption right after a
-    ///         re-point credits the new router. Intentional: a re-point is
-    ///         the recovery path out of a paused/broken router, and the new
-    ///         one is conformance-probed here.
-    function setFeeRouter(address newRouter) external onlyRole(GOVERNANCE_ROLE) {
-        if (newRouter == address(0)) revert ZeroAddress();
-        // Same invariant the constructor enforces: routing to an EOA would
-        // let `_route` advance pool state while `routeSettlement` no-ops,
-        // desyncing settlement accounting and stranding claimed USDC here.
-        if (newRouter.code.length == 0) revert FeeRouterHasNoCode(newRouter);
-        _requireRouterExposesPausedView(newRouter);
-        if (newRouter == feeRouter) revert RouterUnchanged();
-        address old = feeRouter;
-        // Drop any standing allowance to the outgoing router so a re-point
-        // can never leave it able to pull this contract's USDC afterward.
-        usdc.forceApprove(old, 0);
-        feeRouter = newRouter;
-        emit FeeRouterUpdated(old, newRouter);
-    }
-
     function setDisputeWindow(uint256 newWindow) external onlyRole(GOVERNANCE_ROLE) {
         if (newWindow < DISPUTE_WINDOW_FLOOR || newWindow > DISPUTE_WINDOW_CEILING) {
             revert ParamOutOfBounds(newWindow, DISPUTE_WINDOW_FLOOR, DISPUTE_WINDOW_CEILING);
@@ -1031,12 +1007,10 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     /// @dev Approve then route a strictly-positive delta to `FeeRouter` in the
     ///      same transaction; the router pulls the USDC via `safeTransferFrom`,
     ///      performs the three-bucket split, and stamps `bytesDelta` into the
-    ///      operator's epoch. Reads `feeRouter` live so a governance re-point
-    ///      credits the new router. Resets the allowance to zero afterward: an
-    ///      honest router pulls exactly `amountDelta`, but a re-pointed or buggy
-    ///      one pulling less would otherwise leave a standing allowance over
-    ///      this contract's USDC. Callers MUST have committed the watermark
-    ///      first.
+    ///      operator's epoch. Resets the allowance to zero afterward: an
+    ///      honest router pulls exactly `amountDelta`, but a buggy one pulling
+    ///      less would otherwise leave a standing allowance over this
+    ///      contract's USDC. Callers MUST have committed the watermark first.
     function _route(address operator, uint256 bytesDelta, uint256 amountDelta) internal {
         usdc.forceApprove(feeRouter, amountDelta);
         IFeeRouterSettlement(feeRouter).routeSettlement(operator, bytesDelta, amountDelta);

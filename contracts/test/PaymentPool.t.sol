@@ -212,7 +212,6 @@ contract PaymentPoolTest is Test {
     /// @dev Mirrors for `vm.expectEmit` — close/reclaim + governance setters.
     event PoolCloseInitiated(bytes32 indexed poolId, address indexed owner, uint256 disputeDeadline);
     event PoolReclaimed(bytes32 indexed poolId, address indexed owner, uint256 ownerRefund);
-    event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
     event DisputeWindowUpdated(uint256 oldValue, uint256 newValue);
     event RateBoundsUpdated(uint256 newDeliveryFloor);
     event MinDepositUpdated(uint64 oldValue, uint64 newValue);
@@ -2762,69 +2761,6 @@ contract PaymentPoolTest is Test {
     // Governance setters
     // -----------------------------------------------------------------
 
-    function test_setFeeRouter_updatesTarget() public {
-        MockSettlementRouter newRouter = new MockSettlementRouter(usdc);
-
-        vm.expectEmit(true, true, false, true, address(pool));
-        emit FeeRouterUpdated(address(router), address(newRouter));
-        vm.prank(admin);
-        pool.setFeeRouter(address(newRouter));
-
-        assertEq(pool.feeRouter(), address(newRouter));
-    }
-
-    function test_setFeeRouter_revertsOnZero() public {
-        vm.prank(admin);
-        vm.expectRevert(PaymentPool.ZeroAddress.selector);
-        pool.setFeeRouter(address(0));
-    }
-
-    function test_setFeeRouter_revertsOnUnchanged() public {
-        vm.prank(admin);
-        vm.expectRevert(PaymentPool.RouterUnchanged.selector);
-        pool.setFeeRouter(address(router));
-    }
-
-    function test_setFeeRouter_revertsOnEoa() public {
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(PaymentPool.FeeRouterHasNoCode.selector, stranger));
-        pool.setFeeRouter(stranger);
-    }
-
-    function test_setFeeRouter_revertsOnMissingPausedView() public {
-        NoPauseRouter bad = new NoPauseRouter();
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(PaymentPool.FeeRouterMissingPausedView.selector, address(bad)));
-        pool.setFeeRouter(address(bad));
-    }
-
-    function test_setFeeRouter_onlyGovernance() public {
-        MockSettlementRouter newRouter = new MockSettlementRouter(usdc);
-        vm.prank(stranger);
-        vm.expectRevert(
-            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
-        );
-        pool.setFeeRouter(address(newRouter));
-    }
-
-    function test_setFeeRouter_openPoolsUnaffected() public {
-        // The domain separator hashes this contract's address, never the
-        // router, so a re-point invalidates no already-signed capability or
-        // voucher.
-        bytes32 id = _open();
-        bytes memory cap = _cap(id, SPENDING_CAP, expiry);
-        Sig memory voucher = _voucher(id, 300e6, 30_000_000);
-
-        MockSettlementRouter newRouter = new MockSettlementRouter(usdc);
-        vm.prank(admin);
-        pool.setFeeRouter(address(newRouter));
-
-        vm.prank(provider);
-        _redeemOne(id, signer, provider, 300e6, 30_000_000, voucher, cap);
-        assertEq(pool.getPool(id).totalRedeemed, 300e6, "pre-signed voucher still redeems after re-point");
-        assertEq(newRouter.callCount(), 1, "the NEW router receives the routed settlement");
-    }
-
     function test_setDisputeWindow_enforcesBounds() public {
         vm.prank(admin);
         vm.expectRevert(
@@ -2940,11 +2876,6 @@ contract PaymentPoolTest is Test {
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
         );
         pool.setDisputeWindow(60 hours);
-
-        vm.expectRevert(
-            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
-        );
-        pool.setFeeRouter(address(router));
 
         vm.expectRevert(
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)

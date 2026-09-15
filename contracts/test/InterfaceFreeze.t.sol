@@ -46,7 +46,6 @@ contract PaymentPoolInterfaceFreezeTest is Test {
             "ownerPoolNonce"
         );
         assertEq(PaymentPool.getRateBounds.selector, bytes4(keccak256("getRateBounds()")), "getRateBounds");
-        assertEq(PaymentPool.setFeeRouter.selector, bytes4(keccak256("setFeeRouter(address)")), "setFeeRouter");
         assertEq(
             PaymentPool.setDisputeWindow.selector, bytes4(keccak256("setDisputeWindow(uint256)")), "setDisputeWindow"
         );
