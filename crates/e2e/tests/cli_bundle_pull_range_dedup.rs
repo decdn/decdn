@@ -71,6 +71,11 @@ const SHARED_BYTES: u64 = 4 * 1024 * 1024;
 const TAIL_BYTES: u64 = 200_000 + 123;
 /// The lone no-overlap file used for the parity assertion.
 const LONE_BYTES: u64 = 300_000;
+/// The cross-bundle shared file's size (whole-file dedup journey). Large
+/// enough that a download would bill clearly-nonzero wire bytes, and
+/// deliberately NOT chunk-group-aligned — this is whole-file dedup (no
+/// `chunks` hints on either entry), so alignment is irrelevant to it.
+const CROSS_BUNDLE_DUP_BYTES: u64 = 3 * 1024 * 1024 + 12_345;
 
 /// The fixed chunk size the real-import journey (below) pins
 /// `--chunk-avg`/`--chunk-min`/`--chunk-max` to. This is `fastcdc` v2020's own
@@ -1151,6 +1156,212 @@ async fn run_delta_update() -> anyhow::Result<()> {
     anyhow::ensure!(
         Hash::new(&got_b2) == whole_b_v2,
         "b.bin must hash to the NEW manifest hash after the second pull"
+    );
+
+    drop(node);
+    Ok(())
+}
+
+/// End-to-end proof of whole-root content dedup across two SEPARATE bundles:
+/// bundle 1 places a file at `game1/lib/dup.bin`; bundle 2 places the SAME
+/// bytes at `game2/lib/dup.bin` (identical whole-file BLAKE3, different path,
+/// no `chunks` hints on either entry — this is whole-file dedup, not
+/// range-dedup). Both are pulled into the SAME `out_dir`, one bundle per
+/// invocation, mirroring [`run_delta_update`]'s two-pull-same-root shape.
+///
+/// The first pull actually downloads and pays for `dup.bin`'s bytes at
+/// `game1/lib/dup.bin`, and its outcome is recorded in
+/// `out_dir/.decdn-manifest.json` (task 1's skip-cache). The second pull's
+/// pre-pass ([`resolve_disk_state`] in `bundle_pull.rs`) indexes that saved
+/// record as a whole-file donor keyed by hash — even though `game2/lib/dup.bin`
+/// never appeared in any prior bundle — re-hashes the on-disk `game1` copy to
+/// confirm it, and materializes `game2/lib/dup.bin` by link/copy: no fetch, no
+/// payment, matching the `resolve_disk_state_indexes_whole_file_donor_from_other_path`
+/// unit test's `game1`/`game2` shape end to end over the real paid wire path.
+///
+/// Asserts: `game2/lib/dup.bin` lands byte-identical to the source and hashes
+/// to the manifest hash; the second `PullReport` shows `deduped == 1`,
+/// `reused_bytes >= dup.bin`'s size, and `downloaded == 0`; and the lane bills
+/// EXACTLY zero bytes for the second pull — the shared file is materialized
+/// from the on-disk `game1` copy, never downloaded or paid for.
+#[tokio::test(flavor = "multi_thread")]
+async fn bundle_pull_reuses_a_byte_identical_file_across_bundles() -> anyhow::Result<()> {
+    tokio::time::timeout(
+        OVERALL_TIMEOUT,
+        Box::pin(run_cross_bundle_whole_file_dedup()),
+    )
+    .await
+    .context("cross-bundle whole-file dedup e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey mirroring the sibling dedup tests' shape"
+)]
+async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    ensure_decdn_cli_built()?;
+    let chain = ChainFixture::launch().await?;
+
+    let dup = deterministic_bytes(CROSS_BUNDLE_DUP_BYTES, 0xD0D0_5EED);
+    let whole_dup = Hash::new(&dup);
+
+    // The node holds `dup`'s bytes as ONE whole-file blob. Only the first
+    // pull ever needs to fetch it; the second pull must never touch the node
+    // for this content.
+    let (node, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[dup.as_slice()]).await?;
+    anyhow::ensure!(
+        hashes == vec![whole_dup],
+        "seeded blob hash mismatch: {hashes:?}"
+    );
+    let provider_addr = node.operator_addr();
+
+    // Funded buyer with an on-disk keystore under a `0o700` client data dir.
+    let client_dir = tempfile::tempdir().context("client tempdir")?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        client_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .context("chmod client dir 0o700")?;
+    eth_identity::generate_and_persist(client_dir.path(), KEYSTORE_PASSWORD, false)
+        .context("generate buyer keystore")?;
+    let keystore = eth_identity::keystore_path(client_dir.path());
+    let buyer = eth_identity::load_signer(&keystore, KEYSTORE_PASSWORD).context("load buyer")?;
+    let buyer_addr = buyer.address();
+    chain.fund_eth(buyer_addr, 100).await?;
+    chain
+        .mint_usdc(
+            buyer_addr,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(6u64),
+        )
+        .await
+        .context("mint buyer USDC")?;
+
+    let out_dir = client_dir.path().join("out");
+
+    // --- Bundle 1: game1/lib/dup.bin, fresh out_dir -------------------------
+    let manifest1_path = client_dir.path().join("bundle1.json");
+    std::fs::write(
+        &manifest1_path,
+        format!(
+            r#"{{"version":1,"entries":[{{"path":"game1/lib/dup.bin","hash":"b3:{}","size":{}}}]}}"#,
+            whole_dup.to_hex(),
+            dup.len(),
+        ),
+    )
+    .context("write bundle 1 manifest")?;
+    let mut args1 = bundle_pull_argv(
+        &chain,
+        &node,
+        &manifest1_path,
+        &out_dir,
+        client_dir.path(),
+        &keystore,
+        1,
+    );
+    args1.push("--json".into());
+
+    let before1 = billed_bytes(client_dir.path(), provider_addr)?;
+    anyhow::ensure!(before1 == 0, "lane must be unbilled before the first pull");
+    let report1 = run_bundle_pull_json_until_ready(client_dir.path(), &args1).await?;
+    let paid1 = billed_bytes(client_dir.path(), provider_addr)?.saturating_sub(before1);
+
+    // Sanity: the first pull actually downloaded and paid for the blob, so the
+    // second pull's zero-payment result below is a real dedup, not an
+    // accidental no-op.
+    let wire_dup = whole_blob_wire_bytes(dup.len() as u64);
+    anyhow::ensure!(
+        paid1 == wire_dup,
+        "first pull must bill exactly dup.bin's whole-file wire size: got {paid1}, expected \
+         {wire_dup}"
+    );
+    anyhow::ensure!(
+        report1["fetched"].as_u64() == Some(1),
+        "first pull must fetch game1/lib/dup.bin fresh: {report1}"
+    );
+    anyhow::ensure!(
+        report1["failed"].as_u64() == Some(0),
+        "first pull must have no failures: {report1}"
+    );
+    let got1 =
+        std::fs::read(out_dir.join("game1/lib/dup.bin")).context("read game1/lib/dup.bin")?;
+    anyhow::ensure!(got1 == dup, "game1/lib/dup.bin mismatch on first pull");
+    let saved_manifest_path = out_dir.join(".decdn-manifest.json");
+    anyhow::ensure!(
+        saved_manifest_path.is_file(),
+        "first pull must write {}",
+        saved_manifest_path.display()
+    );
+
+    // --- Bundle 2: game2/lib/dup.bin (SAME hash, different path), same out_dir
+    let manifest2_path = client_dir.path().join("bundle2.json");
+    std::fs::write(
+        &manifest2_path,
+        format!(
+            r#"{{"version":1,"entries":[{{"path":"game2/lib/dup.bin","hash":"b3:{}","size":{}}}]}}"#,
+            whole_dup.to_hex(),
+            dup.len(),
+        ),
+    )
+    .context("write bundle 2 manifest")?;
+    let mut args2 = bundle_pull_argv(
+        &chain,
+        &node,
+        &manifest2_path,
+        &out_dir,
+        client_dir.path(),
+        &keystore,
+        1,
+    );
+    args2.push("--json".into());
+
+    let before2 = billed_bytes(client_dir.path(), provider_addr)?;
+    let report2 = run_bundle_pull_json_until_ready(client_dir.path(), &args2).await?;
+    let paid2 = billed_bytes(client_dir.path(), provider_addr)?.saturating_sub(before2);
+
+    // (1) game2/lib/dup.bin lands byte-identical and hashes to the manifest hash.
+    let got2 =
+        std::fs::read(out_dir.join("game2/lib/dup.bin")).context("read game2/lib/dup.bin")?;
+    anyhow::ensure!(got2 == dup, "game2/lib/dup.bin mismatch on second pull");
+    anyhow::ensure!(
+        Hash::new(&got2) == whole_dup,
+        "game2/lib/dup.bin must hash to the manifest hash"
+    );
+
+    // (2) The report shows a whole-file dedup, not a download.
+    anyhow::ensure!(
+        report2["deduped"].as_u64() == Some(1),
+        "second pull must dedup exactly one destination from the on-disk game1 copy: {report2}"
+    );
+    anyhow::ensure!(
+        report2["reused_bytes"].as_u64().unwrap_or(0) >= dup.len() as u64,
+        "second pull must report reused_bytes covering dup.bin's full size: {report2}"
+    );
+    anyhow::ensure!(
+        report2["downloaded"].as_u64() == Some(0),
+        "second pull must download nothing — the file is materialized from the on-disk game1 \
+         copy: {report2}"
+    );
+    anyhow::ensure!(
+        report2["fetched"].as_u64() == Some(0),
+        "second pull must fetch nothing: {report2}"
+    );
+    anyhow::ensure!(
+        report2["failed"].as_u64() == Some(0),
+        "second pull must have no failures: {report2}"
+    );
+
+    // (3) Zero bytes billed on the lane for the second pull: the shared file
+    // is materialized from disk, never fetched or paid for.
+    anyhow::ensure!(
+        paid2 == 0,
+        "second pull must bill ZERO bytes — dup.bin is deduped from the on-disk game1 copy, not \
+         downloaded: got {paid2}"
     );
 
     drop(node);

@@ -104,11 +104,15 @@ pub struct BundlePullArgs {
     /// `.decdn-manifest.json` record still matches the file's hash, size, and
     /// mtime — the fast path, which trusts that gate without re-hashing — or,
     /// failing that, when re-hashing its on-disk bytes matches the new manifest.
-    /// Use `--overwrite` to force a full re-fetch of every entry, for example
-    /// when the output directory may have been modified outside `decdn` (an
-    /// in-place edit that keeps a file's size and mtime is otherwise trusted by
-    /// the fast path). It skips consulting `.decdn-manifest.json` for skip
-    /// decisions; the file is still read and rewritten with the run's results.
+    /// A file byte-identical to one already anywhere else in the output root is
+    /// likewise reused with no download: it is linked (or copied) from that
+    /// on-disk file once its hash is confirmed by a re-hash. Use `--overwrite`
+    /// to force a full re-fetch of every entry, for example when the output
+    /// directory may have been modified outside `decdn` (an in-place edit that
+    /// keeps a file's size and mtime is otherwise trusted by the fast path). It
+    /// skips consulting `.decdn-manifest.json` for skip decisions, so it
+    /// disables both the skip-existing path and the whole-root reuse above; the
+    /// file is still read and rewritten with the run's results.
     #[arg(long)]
     pub overwrite: bool,
 
