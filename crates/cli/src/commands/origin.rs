@@ -141,6 +141,32 @@ struct ImportCtx {
     subfolder: Option<String>,
 }
 
+/// Validate `--subfolder` into the normalized prefix stored in [`ImportCtx`].
+/// Reuses the manifest path-safety rules ([`validate_relpath`]): a relative
+/// POSIX path with only `Normal` components — `..`, absolute paths, and root
+/// prefixes are rejected — and normalizes a trailing slash away, so `assets/`
+/// and `assets` both yield the `assets` prefix.
+///
+/// A backslash is rejected before that check. `\` is not a POSIX separator, so
+/// on Unix `a\..\evil` collapses to one `Normal` component and slips past the
+/// `..` check — yet a Windows `bundle pull` parses `\` as a separator in
+/// `safe_join`, turning that same manifest path into a parent-dir escape.
+/// Requiring `/` keeps the published manifest identical and safe on every
+/// platform.
+fn resolve_subfolder(raw: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(raw) = raw else { return Ok(None) };
+    if raw.contains('\\') {
+        bail!(
+            "invalid --subfolder {raw:?}: use '/' as the path separator; \
+             '\\' is not allowed (a POSIX-relative subfolder keeps the \
+             manifest identical and safe across platforms)"
+        );
+    }
+    let normalized = validate_relpath(Path::new(raw))
+        .map_err(|e| anyhow!("invalid --subfolder {raw:?}: {e}"))?;
+    Ok(Some(normalized))
+}
+
 /// Place a bundle-relative path under the `--subfolder` prefix when one is set,
 /// so a pull writes the file to `<out>/<subfolder>/<rel>`. `prefix` is already
 /// validated to a relative POSIX path, and `rel` is a validated relative POSIX
@@ -190,17 +216,7 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
         None
     };
 
-    // Validate `--subfolder` up front, reusing the manifest path-safety rules:
-    // a relative POSIX path with only `Normal` components (`..`, absolute paths,
-    // and root prefixes are rejected). The normalized string is what prefixes
-    // every entry — so `assets/` and `assets` both yield the `assets` prefix.
-    let subfolder = match args.subfolder.as_deref() {
-        Some(raw) => Some(
-            validate_relpath(Path::new(raw))
-                .map_err(|e| anyhow!("invalid --subfolder {raw:?}: {e}"))?,
-        ),
-        None => None,
-    };
+    let subfolder = resolve_subfolder(args.subfolder.as_deref())?;
 
     let write = !args.dry_run;
     let origin_label = args.to.clone().unwrap_or_else(|| "(dry-run)".to_string());
@@ -843,6 +859,31 @@ fn write_import_report(
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_subfolder_none_is_none() {
+        assert_eq!(resolve_subfolder(None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_subfolder_normalizes_trailing_slash() {
+        assert_eq!(
+            resolve_subfolder(Some("a/b/")).unwrap(),
+            Some("a/b".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_subfolder_rejects_parent_dir() {
+        let err = resolve_subfolder(Some("../evil")).unwrap_err();
+        assert!(format!("{err:#}").contains("parent-dir"));
+    }
+
+    #[test]
+    fn resolve_subfolder_rejects_backslash() {
+        let err = resolve_subfolder(Some("a\\..\\evil")).unwrap_err();
+        assert!(format!("{err:#}").contains("separator"));
+    }
 
     #[test]
     fn place_under_prefixes_when_set() {

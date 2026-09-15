@@ -335,6 +335,26 @@ fn subfolder_parent_dir_component_rejected() {
     );
 }
 
+// A backslash in the subfolder is rejected regardless of platform: `\` is not
+// a POSIX separator, so on Unix `a\..\evil` would collapse to one component and
+// slip past the `..` check, yet a Windows pull would read it as an escaping
+// path. Requiring `/` keeps the published manifest identical everywhere.
+#[test]
+fn subfolder_backslash_rejected() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    write_files(&src, &[("f.txt", b"x")]);
+
+    let out = dry_run_with_subfolder(&src, &[], false, Some("a\\..\\evil"));
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--subfolder") && stderr.contains("separator"),
+        "expected backslash rejection, got: {stderr}"
+    );
+}
+
 #[test]
 fn exclude_root_and_nested_via_recursive_glob() {
     let dir = TempDir::new().unwrap();

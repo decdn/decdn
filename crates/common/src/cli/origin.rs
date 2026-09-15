@@ -101,9 +101,10 @@ pub struct OriginImportArgs {
     /// Prefix every manifest entry's path with this folder, so a `bundle pull`
     /// materializes the whole bundle under one directory (`<out>/<subfolder>/…`)
     /// rather than spilling its files directly into the output root. Must be a
-    /// relative POSIX path — `..`, absolute paths, and root prefixes are
-    /// rejected; nesting (`a/b`) is allowed. Applies to a single-file import too
-    /// (the one entry becomes `<subfolder>/<name>`).
+    /// relative POSIX path with `/` separators — `..`, absolute paths, root
+    /// prefixes, and backslashes are rejected; nesting (`a/b`) is allowed.
+    /// Applies to a single-file import too (the one entry becomes
+    /// `<subfolder>/<name>`).
     #[arg(long, value_name = "DIR")]
     pub subfolder: Option<String>,
 
