@@ -250,20 +250,12 @@ impl ClientHandler {
 
         let hash = Hash::from_bytes(req.hash);
 
-        // The request's price, resolved ONCE and threaded to every refusal and to
-        // the window tier. `clamped_rate` is side-effecting — it bumps
-        // `rate_bounds_clamped` and warns when the configured rate sits below the
-        // on-chain delivery floor — so calling it twice double-counts one request
-        // (#1518). `respond_error` takes the rate as a required argument precisely
-        // so that cannot happen: there is no way to sign a refusal without the
-        // caller having priced the request exactly once.
-        //
-        // Deliberately BELOW the binding block. Every exit above this point — a
-        // first-message read error, the stream-cap shed, a malformed binding —
-        // returns without signing a `StreamResponse`, so none of them ever quotes
-        // a rate, and pricing them would meter a clamp for a request that never
-        // had a price.
-        let rate_per_mb = self.clamped_rate();
+        // The request's price: the node's configured `rate_per_mb`, quoted
+        // verbatim and threaded to every refusal and to the window tier. The
+        // delivery floor never rewrites it — a sub-floor rate still sells, and
+        // settlement clamps only the vote-weight byte credit (ADR 003
+        // § Rate-floor enforcement).
+        let rate_per_mb = self.rate_per_mb;
 
         // Chain-staleness gate (ADR 011 §Serving while chain-stale). Every gate
         // below this point — the local/governance deny-set, the funder

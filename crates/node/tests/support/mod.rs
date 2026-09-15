@@ -623,7 +623,6 @@ fn client_handler_deps(
         store,
         receipt_sink,
         rate,
-        decdn_node::rate_bounds::RateBounds::new(0),
         max_concurrent_streams,
         // Empty by default; a test needing a populated deny-set overwrites the
         // `content_deny` field via the `configure` closure of `build_handler_with`.

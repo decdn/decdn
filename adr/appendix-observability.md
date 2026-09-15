@@ -77,14 +77,12 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | `decdn_probe_hold_unavailable_total{reason}` | Counter | M | live | A probe for a present blob that got **no** eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). Holds are best-effort, so this is not the same as answering `has_blob: false` — see the per-reason split. Never a safety fault: no offense pairs a probe with a later miss ([ADR 014](014-on-chain-verification.md#rate-manipulation)), and an unheld advertisement that loses the eviction race costs one wasted round trip. The `reason` label carries the cause, because each has a different operator remedy: **`exhausted`** — blob present but **all** hold slots were live (`max_probe_holds` reached); the node still advertises `has_blob: true` and forgoes only the hold, so the blob may be LRU-evicted before the pull. Genuine budget pressure and the only value the "raise `max_probe_holds`" alert fires on. **`disabled`** — blob present but the hold path is **off by config** (`max_probe_holds == 0`); the one reason that also suppresses the advertisement (`has_blob: false` for store-backed content; origin-held content takes no hold and is unaffected). An intentional operator choice, so alerting on it would be nonsensical. **`stake_lane_reserved`** — an end-client probe hit the stake-lane-reserved end-client ceiling (`max_probe_holds − cache.stake_lane_reserved_holds`), keeping hold headroom for registered node-to-node cache-miss probes ([ADR 003 § Admission and Priority](003-payments.md#admission-and-priority)). The reservation is a content-independent admission decision taken before any hold attempt, but the handler still consults the cache to answer honestly and advertises a present blob. Stays zero unless `cache.stake_lane_reserved_holds > 0`. All three children are exported at zero from startup, so a missing series means a broken exporter, not an idle node. |
 | `decdn_probe_hold_slots_used` | Gauge | M | live | Eviction-hold slots in use out of `max_probe_holds`. Saturation means new probes are advertised without a hold, not answered `has_blob: false`. |
 | `decdn_probe_hold_slots_max` | Gauge | M | live | Configured `max_probe_holds`. Paired with `decdn_probe_hold_slots_used` for a saturation ratio. |
-| `decdn_rate_bounds_clamp_events_total` | Counter | M | live | Times `rate_per_mb` was raised to the governance `deliveryFloor` before signing a `ProbeResponse` / `StreamResponse` — the configured rate sits below the current floor ([ADR 003](003-payments.md#adr-003-payment-model), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
 
 **Recommended alert thresholds:**
 
 | Metric | Warning | Critical | Action |
 |--------|---------|----------|--------|
 | `decdn_probe_hold_unavailable_total{reason="exhausted"}` (rate) | > 0 | > 0 sustained | Reduce load or increase `max_probe_holds`; check for OOM. Filter on `reason="exhausted"` — the `disabled` and `stake_lane_reserved` values are deliberate operator decisions and must not trip this alert. |
-| `decdn_rate_bounds_clamp_events_total` (rate) | > 0 | — | Raise the `rate_per_mb` config to at least the governance `deliveryFloor`. |
 
 #### Delivery Metrics (`cdn/client/v1`)
 
@@ -253,7 +251,6 @@ The origin directory is not a watcher — it is a lazy, on-demand TTL cache with
   "node_id": "<hex iroh NodeId>",
   "registry_active": true,
   "blacklist_synced": true,
-  "rate_bounds_loaded": true,
   "staker_set_active_count": 27,
   "lanes_open": 3,
   "pool_deposit_usdc": "15.23",
@@ -309,7 +306,6 @@ Each metric series has one canonical `decdn_`-prefixed name; informal short name
 | `probe_holds_disabled` | `decdn_probe_hold_unavailable_total{reason="disabled"}` | [ADR 005](005-protocol.md#adr-005-wire-protocol) |
 | `probe_stake_lane_reserved` | `decdn_probe_hold_unavailable_total{reason="stake_lane_reserved"}` | [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority) |
 | `probe_hold_slots_used` | `decdn_probe_hold_slots_used` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
-| `rate_bounds_clamp_events` | `decdn_rate_bounds_clamp_events_total` | architecture.md |
 | `probe_collection_latency_seconds` | `decdn_probe_collection_latency_seconds` | [ADR 001 § Probe response collection](001-network.md#probe-response-collection) |
 | `streams_active` | `decdn_streams_active` | architecture.md |
 | `streams_completed` | `decdn_streams_completed_total` | architecture.md |

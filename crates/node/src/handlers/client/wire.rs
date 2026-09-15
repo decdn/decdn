@@ -49,25 +49,6 @@ impl ClientHandler {
         self.receipt_sink.record(receipt);
     }
 
-    /// Load the configured rate and raise it to the delivery floor before
-    /// signing a `StreamResponse`, logging a warning and incrementing
-    /// `rate_bounds_clamp_events` on any clamp (ADR 005 §Rate bounds — the same
-    /// clamp-and-warn the probe handler applies before signing a `ProbeResponse`).
-    pub(super) fn clamped_rate(&self) -> u64 {
-        let raw_rate = self.rate_per_mb;
-        let (rate_per_mb, floor) = self.rate_bounds.raise_to_floor(raw_rate);
-        if rate_per_mb != raw_rate {
-            self.metrics.rate_bounds_clamped();
-            tracing::warn!(
-                raw_rate,
-                clamped = rate_per_mb,
-                floor,
-                "rate_per_mb raised to the delivery floor before signing StreamResponse"
-            );
-        }
-        rate_per_mb
-    }
-
     /// Sign a `StreamResponse` body and assemble the frozen base plus its
     /// unsigned extension (ADR 013 §Tier 1). `error` rides in the extension, so
     /// the pair must be written together — see [`Self::write_stream_response`].
@@ -113,17 +94,11 @@ impl ClientHandler {
     /// is bumped before the network write so a refusal is counted even if the
     /// client has already gone and the write fails.
     ///
-    /// `rate_per_mb` is a required argument rather than something this function
-    /// computes, and that is the whole point: [`Self::clamped_rate`] is
-    /// side-effecting — it bumps `rate_bounds_clamped` and warns when the
-    /// configured rate sits below the on-chain delivery floor — so a caller that
-    /// priced the request and then refused would double-count it (#1518). Taking
-    /// the price as a parameter is what stops this function recomputing it
-    /// implicitly — which is the shape the bug took. It does not make the invariant
-    /// fully type-checked: a caller can still pass `self.clamped_rate()` inline, or
-    /// `0`, or another request's rate. What holds it today is that `serve_stream`
-    /// has the crate's only production `clamped_rate()` call and threads that one
-    /// value everywhere, which is a grep-verified property, not a typed one.
+    /// `rate_per_mb` is the node's quoted price, echoed into the signed refusal
+    /// so a requester sees the same rate whether it is admitted or declined. It
+    /// is a required argument rather than something this function reads from
+    /// `self`, so a refusal always carries the exact price the caller quoted for
+    /// this request and cannot silently diverge from it.
     pub(super) async fn respond_error(
         &self,
         send: &mut SendStream,

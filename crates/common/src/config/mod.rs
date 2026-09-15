@@ -350,15 +350,10 @@ pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 600;
 /// slashable territory, while short RPC blips never take the node dark.
 pub const DEFAULT_CHAIN_STALENESS_GRACE_SEC: u64 = 1800;
 
-/// Default seconds between authoritative `PaymentPool.getRateBounds()`
-/// re-reads by the rate-bounds watcher (#1172, ADR 019 §3.1) — the safety-net
-/// cadence alongside the `RateBoundsUpdated` event subscription. One hour.
-pub const DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC: u64 = 3600;
-
 /// Default seconds between authoritative `FeeRouter.getShares()` re-reads by
 /// the fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics) — the
-/// safety-net cadence alongside the `SharesUpdated` event subscription.
-/// Mirrors [`DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`]'s one-hour cadence.
+/// safety-net cadence alongside the `SharesUpdated` event subscription. One
+/// hour.
 pub const DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC: u64 = 3600;
 
 /// Default maximum concurrently held (eviction-exempt) blobs for the
@@ -1461,27 +1456,13 @@ fn resolve_blockchain_into(
          default (1800s)",
     );
 
-    let rate_bounds_poll_interval_sec = file
-        .and_then(|b| b.rate_bounds_poll_interval_sec)
-        .unwrap_or(DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC);
-    // `0` would make the authoritative re-read run every tick (no throttle),
-    // hammering the RPC — the event subscription is already the prompt path, so
-    // the re-read is a slow safety net. Reject rather than silently over-poll.
-    bag.check(
-        rate_bounds_poll_interval_sec != 0,
-        "blockchain.rate_bounds_poll_interval_sec",
-        "blockchain.rate_bounds_poll_interval_sec must not be 0 — the \
-         authoritative getRateBounds() re-read is a slow safety net; omit it \
-         for the default (3600s)",
-    );
-
     let fee_shares_poll_interval_sec = file
         .and_then(|b| b.fee_shares_poll_interval_sec)
         .unwrap_or(DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC);
-    // Mirrors `rate_bounds_poll_interval_sec`: `0` would make the authoritative
-    // re-read run every tick (no throttle), hammering the RPC — the
-    // `SharesUpdated` event subscription is already the prompt path, so the
-    // re-read is a slow safety net. Reject rather than silently over-poll.
+    // `0` would make the authoritative re-read run every tick (no throttle),
+    // hammering the RPC — the `SharesUpdated` event subscription is already the
+    // prompt path, so the re-read is a slow safety net. Reject rather than
+    // silently over-poll.
     bag.check(
         fee_shares_poll_interval_sec != 0,
         "blockchain.fee_shares_poll_interval_sec",
@@ -1676,7 +1657,6 @@ fn resolve_blockchain_into(
         chain_id,
         rpc_watchdog_interval_sec,
         event_poll_interval_ms,
-        rate_bounds_poll_interval_sec,
         fee_shares_poll_interval_sec,
         redeem_threshold_micro_usdc,
         redeem_max_vouchers_per_tx,
@@ -2810,30 +2790,6 @@ pub fn resolve_payment_into(
             )
         },
     );
-    // Pre-chain seed for the on-chain `getRateBounds()` clamp (ADR 005 §Rate
-    // bounds validation). Since #1172 the runtime overwrites it from chain
-    // before serving, so this default (`0`) only shapes the pre-read window;
-    // the live floor is governance-owned on-chain.
-    let delivery_floor = cli
-        .delivery_floor
-        .or_else(|| file.and_then(|p| p.delivery_floor))
-        .unwrap_or(0);
-    // The clamp only ever raises `rate_per_mb`, so a floor above the wire cap
-    // would make the node sign a rate honest clients reject outright (#378).
-    // There is no lower guard to write: with `rate_per_mb >= 1` validated above
-    // and a raise-only clamp, the signed rate can never collapse to 0.
-    bag.check_with(
-        delivery_floor <= decdn_protocol::MAX_RATE_PER_MB,
-        "payment.delivery_floor",
-        || {
-            format!(
-                "payment.delivery_floor {delivery_floor} exceeds protocol \
-             MAX_RATE_PER_MB ({}); raising a quote to it would emit a rate honest \
-             clients reject",
-                decdn_protocol::MAX_RATE_PER_MB,
-            )
-        },
-    );
     // Downstream credit-window ceiling (ADR 003 §Credit window). Default 64 MiB;
     // no upper bound beyond the runtime deposit guard — a larger ceiling is more
     // unbilled egress the node fronts once a stream has ramped up, which the
@@ -2889,7 +2845,6 @@ pub fn resolve_payment_into(
     );
     ResolvedPayment {
         rate_per_mb,
-        delivery_floor,
         credit_max,
         credit_ramp_divisor,
         frame_target_bytes,
@@ -5262,7 +5217,6 @@ usdc_address = \"0xUsdc\"
     fn resolve_payment_rejects_zero_from_cli() -> anyhow::Result<()> {
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(0),
-            delivery_floor: None,
         };
         let err = resolve_payment(&cli, None)
             .err()
@@ -5336,40 +5290,6 @@ usdc_address = \"0xUsdc\"
         );
     }
 
-    #[test]
-    fn resolve_payment_rejects_floor_above_protocol_max() -> anyhow::Result<()> {
-        // The clamp only raises, so a floor above the wire cap makes the node
-        // sign a `ProbeResponse` honest clients reject outright (#378).
-        let cli = crate::cli::run::PaymentArgs {
-            rate_per_mb: Some(10),
-            delivery_floor: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
-        };
-        let err = resolve_payment(&cli, None)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for floor>MAX"))?
-            .to_string();
-        anyhow::ensure!(
-            err.contains("delivery_floor") && err.contains("MAX_RATE_PER_MB"),
-            "error lacked context: {err}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_payment_accepts_and_threads_explicit_floor() -> anyhow::Result<()> {
-        let cli = crate::cli::run::PaymentArgs {
-            rate_per_mb: Some(10),
-            delivery_floor: Some(5),
-        };
-        let resolved = resolve_payment(&cli, None)?;
-        anyhow::ensure!(
-            resolved.delivery_floor == 5,
-            "floor not threaded: {}",
-            resolved.delivery_floor
-        );
-        Ok(())
-    }
-
     // Origin variant from TOML resolves into a typed `ResolvedOrigin::Http`
     // that round-trips the parsed URL (#437). The origin has no CLI flag, so
     // there is no CLI-vs-TOML precedence to test; this is a smoke test that
@@ -5398,13 +5318,9 @@ usdc_address = \"0xUsdc\"
 
     #[test]
     fn resolve_payment_rejects_zero_from_file() -> anyhow::Result<()> {
-        let cli = crate::cli::run::PaymentArgs {
-            rate_per_mb: None,
-            delivery_floor: None,
-        };
+        let cli = crate::cli::run::PaymentArgs { rate_per_mb: None };
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
-            delivery_floor: None,
             credit_max: None,
             credit_ramp_divisor: None,
             frame_target_bytes: None,
@@ -5449,11 +5365,9 @@ usdc_address = \"0xUsdc\"
         // short-circuit the CLI override that would otherwise be valid.
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(42),
-            delivery_floor: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
-            delivery_floor: None,
             credit_max: None,
             credit_ramp_divisor: None,
             frame_target_bytes: None,
@@ -5466,10 +5380,7 @@ usdc_address = \"0xUsdc\"
 
     #[test]
     fn resolve_payment_defaults_when_unset() -> anyhow::Result<()> {
-        let cli = crate::cli::run::PaymentArgs {
-            rate_per_mb: None,
-            delivery_floor: None,
-        };
+        let cli = crate::cli::run::PaymentArgs { rate_per_mb: None };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
             resolved.rate_per_mb == DEFAULT_RATE_PER_MB,
@@ -5501,7 +5412,6 @@ usdc_address = \"0xUsdc\"
         for set in [Some(20u64), Some(1_000)] {
             let file = types::PaymentConfig {
                 rate_per_mb: Some(10),
-                delivery_floor: None,
                 credit_max: None,
                 credit_ramp_divisor: None,
                 frame_target_bytes: None,
@@ -5549,7 +5459,6 @@ usdc_address = \"0xUsdc\"
     fn resolve_payment_threads_explicit_credit_max_and_ramp_divisor() -> anyhow::Result<()> {
         let file = types::PaymentConfig {
             rate_per_mb: Some(10),
-            delivery_floor: None,
             credit_max: Some(decdn_config_types::Bytes::new(32 * 1024 * 1024)),
             credit_ramp_divisor: Some(5),
             frame_target_bytes: None,
@@ -5577,7 +5486,6 @@ usdc_address = \"0xUsdc\"
     fn resolve_payment_rejects_rate_above_protocol_max() -> anyhow::Result<()> {
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
-            delivery_floor: None,
         };
         let err = resolve_payment(&cli, None)
             .err()
@@ -5594,7 +5502,6 @@ usdc_address = \"0xUsdc\"
     fn resolve_payment_accepts_rate_at_protocol_max() -> anyhow::Result<()> {
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(decdn_protocol::MAX_RATE_PER_MB),
-            delivery_floor: None,
         };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
@@ -7747,7 +7654,6 @@ usdc_address = \"0xUsdc\"
                 "DECDN_STAKE_LANE_RESERVED_HOLDS",
             ),
             ("rate_per_mb", "DECDN_RATE_PER_MB"),
-            ("delivery_floor", "DECDN_DELIVERY_FLOOR"),
             ("log_level", "DECDN_LOG_LEVEL"),
             ("log_format", "DECDN_LOG_FORMAT"),
             ("metrics_port", "DECDN_METRICS_PORT"),
@@ -8192,10 +8098,7 @@ usdc_address = \"0xUsdc\"
     }
 
     fn empty_payment_args() -> crate::cli::run::PaymentArgs {
-        crate::cli::run::PaymentArgs {
-            rate_per_mb: None,
-            delivery_floor: None,
-        }
+        crate::cli::run::PaymentArgs { rate_per_mb: None }
     }
 
     fn empty_observability_args() -> crate::cli::run::ObservabilityArgs {
@@ -8837,7 +8740,6 @@ usdc_address = \"0xUsdc\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
-            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             redeem_interval_secs: None,
             buyer_working_deposit_micro_usdc: None,
@@ -8874,7 +8776,6 @@ usdc_address = \"0xUsdc\"
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
-            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             redeem_interval_secs: None,
             buyer_working_deposit_micro_usdc: None,
@@ -9306,7 +9207,6 @@ usdc_address = \"0xUsdc\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(1),
             event_poll_interval_ms: None,
-            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             redeem_interval_secs: None,
             buyer_working_deposit_micro_usdc: None,
@@ -9354,7 +9254,6 @@ usdc_address = \"0xUsdc\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
-            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: Some(0),
             redeem_interval_secs: None,
             buyer_working_deposit_micro_usdc: None,
@@ -9613,7 +9512,6 @@ usdc_address = \"0xUsdc\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(0),
             event_poll_interval_ms: None,
-            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             redeem_interval_secs: None,
             buyer_working_deposit_micro_usdc: None,
@@ -9654,7 +9552,6 @@ usdc_address = \"0xUsdc\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
             event_poll_interval_ms: None,
-            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             redeem_interval_secs: None,
             buyer_working_deposit_micro_usdc: None,
@@ -9724,7 +9621,6 @@ usdc_address = \"0xUsdc\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
-            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             redeem_interval_secs: None,
             buyer_working_deposit_micro_usdc: Some(0),
@@ -9822,7 +9718,6 @@ usdc_address = \"0xUsdc\"
         };
         let file = types::BlockchainConfig {
             event_poll_interval_ms: Some(MIN_EVENT_POLL_INTERVAL_MS - 1),
-            rate_bounds_poll_interval_sec: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
             content_blacklist_address: None,
@@ -9887,7 +9782,6 @@ usdc_address = \"0xUsdc\"
         };
         let at_min = types::BlockchainConfig {
             event_poll_interval_ms: Some(MIN_EVENT_POLL_INTERVAL_MS),
-            rate_bounds_poll_interval_sec: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
             content_blacklist_address: None,
@@ -9898,7 +9792,6 @@ usdc_address = \"0xUsdc\"
 
         let in_range = types::BlockchainConfig {
             event_poll_interval_ms: Some(1000),
-            rate_bounds_poll_interval_sec: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
             content_blacklist_address: None,
@@ -10035,11 +9928,9 @@ usdc_address = \"0xUsdc\"
     fn resolve_payment_cli_rate_overrides_file_rate() -> anyhow::Result<()> {
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(99),
-            delivery_floor: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(1),
-            delivery_floor: None,
             credit_max: None,
             credit_ramp_divisor: None,
             frame_target_bytes: None,
@@ -10055,7 +9946,6 @@ usdc_address = \"0xUsdc\"
         let cli = empty_payment_args();
         let file = types::PaymentConfig {
             rate_per_mb: Some(50),
-            delivery_floor: None,
             credit_max: None,
             credit_ramp_divisor: None,
             frame_target_bytes: None,

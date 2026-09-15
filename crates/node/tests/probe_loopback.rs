@@ -260,11 +260,10 @@ fn build_handler_bounds(
     metrics: &Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
-    floor: u64,
 ) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
     // Most tests don't exercise the ADR 005 probe rate limiter — wire a
     // permissive one so only the layer under test (the `ConnectionLimiter`,
-    // hold budget, rate clamp, etc.) can fire.
+    // hold budget, etc.) can fire.
     build_handler_with_probe_limiter(
         server_id,
         rate,
@@ -272,7 +271,6 @@ fn build_handler_bounds(
         limiter,
         permissive_probe_rate_limiter(metrics),
         cache,
-        floor,
     )
 }
 
@@ -287,7 +285,6 @@ fn build_handler_with_probe_limiter(
     limiter: Arc<ConnectionLimiter>,
     probe_limiter: Arc<ProbeRateLimiter>,
     cache: CacheEngine,
-    floor: u64,
 ) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
     let signer = Arc::new(PrivateKeySigner::random());
     let domain = test_slash_domain();
@@ -300,7 +297,6 @@ fn build_handler_with_probe_limiter(
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        decdn_node::rate_bounds::RateBounds::new(floor),
         // No stake-lane reservation for the general-purpose builder; the
         // dedicated reservation tests use `build_handler_with_lane` (#757).
         None,
@@ -340,7 +336,6 @@ fn build_handler_with_lane(
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        decdn_node::rate_bounds::RateBounds::new(0),
         Some(policy),
         true,
         None,
@@ -370,7 +365,6 @@ fn build_handler_origin_only(
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        decdn_node::rate_bounds::RateBounds::new(0),
         None,
         false,
         None,
@@ -386,7 +380,7 @@ fn build_handler(
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
 ) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
-    build_handler_bounds(server_id, rate, metrics, limiter, cache, 0)
+    build_handler_bounds(server_id, rate, metrics, limiter, cache)
 }
 
 /// Build a permissive `ConnectionLimiter` suitable for tests that don't
@@ -1178,7 +1172,6 @@ async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
         conn_limiter,
         Arc::clone(&probe_limiter),
         cache,
-        0,
     );
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
@@ -1367,7 +1360,6 @@ async fn probe_has_blob_false_when_chain_stale() -> anyhow::Result<()> {
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        decdn_node::rate_bounds::RateBounds::new(0),
         None,
         true,
         Some(stale),
@@ -1866,37 +1858,6 @@ async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<
         "a stake-lane requester must NOT trip the reservation counter, and the \
          series must be present at zero rather than absent:\n{text}"
     );
-    Ok(())
-}
-
-/// `rate_per_mb` is raised to the governance delivery floor before signing,
-/// and the `slash_sig` covers the clamped value (ADR 005 §Rate bounds
-/// validation, #318). The clamp is raise-only — there is no governance
-/// ceiling to clamp down to.
-#[tokio::test(flavor = "multi_thread")]
-async fn probe_rate_raised_to_floor_before_signing() -> anyhow::Result<()> {
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    let (cache, _cache_tmp) = empty_cache().await?;
-    // Configured rate 5 but a floor of 42 → response must quote 42.
-    let (handler, signer, domain) =
-        build_handler_bounds(server_id, 5, &metrics, limiter, cache, 42);
-
-    let req = ProbeRequest {
-        hash: [9u8; 32],
-        timestamp_us: 99,
-    };
-    let (resp, _resp_ext) = run_one_probe(server_sk, handler, req).await?;
-
-    anyhow::ensure!(
-        resp.body.rate_per_mb == 42,
-        "rate must be raised to floor 42, got {}",
-        resp.body.rate_per_mb
-    );
-    // slash_sig must verify over the clamped rate, not the raw 5.
-    assert_slash_sig_valid(&resp, &signer, &domain)?;
     Ok(())
 }
 

@@ -604,12 +604,10 @@ impl ClientHandler {
                 // No cumulative-rate floor check here. The delivery floor is a
                 // soft floor: `PaymentPool.redeem` settles a sub-floor voucher's
                 // `cumulative` and clamps only the byte count it credits toward
-                // vote weight (ADR 003 § Rate-floor enforcement). So a voucher
-                // whose cumulative dips below the floor — the mid-stream
-                // floor-raise race, since every quote is already raised to the
-                // floor before signing (`wire.rs::clamped_rate`) — is not a
-                // reason to stop the stream. The advertised-rate check above
-                // still protects this node's per-delta revenue at its own quote.
+                // vote weight (ADR 003 § Rate-floor enforcement). The node never
+                // gates a voucher on the floor — it is redemption-time contract
+                // state, not a wire check. The advertised-rate check above still
+                // protects this node's per-delta revenue at its own quote.
                 // The byte watermark this voucher settles is the CHAIN-EXTENDED
                 // one: a rollover voucher's own `bytes_delivered` already folds
                 // the retired chain in, but a voucher that merely re-asserts the

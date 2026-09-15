@@ -118,19 +118,13 @@ Both signing operations are supported by the `decdn` CLI (`decdn node register` 
 
 The node process MUST complete all of the following steps before opening any QUIC listener or accepting incoming connections.
 
-#### Step 3.1 — Fetch the rate floor
-
-Call `PaymentPool.getRateBounds()`. Verify that `deliveryFloor` fits in `u64` (see [ADR 003 § Startup](003-payments.md#rate-bounds-refresh)). If it exceeds `u64::MAX`, the node MUST refuse to start and log an error.
-
-The node SHOULD subscribe to on-chain `RateBoundsUpdated` events for real-time updates. Periodic polling (`rate_bounds_poll_interval`, default 1 hour) is the fallback ([ADR 003](003-payments.md#adr-003-payment-model)).
-
-#### Step 3.2 — Sync content blacklist
+#### Step 3.1 — Sync content blacklist
 
 Enumerate the full current deny-set from the `ContentBlacklist` contract at a single pinned block — the blacklisted address union (`blacklistedAddresses`, kept to the live members of `isOriginBlacklisted || isOperatorBlacklisted`) and the node's in-scope hashes (`getScopeRegions` then `blacklistedHashes` per region, liveness-filtered by `isHashBlacklistedForOperator`). The node MUST NOT accept connections until this enumeration completes successfully ([ADR 011](011-content-takedown.md#enumerating-the-deny-set)).
 
 After the initial enumeration, the node follows the contract's blacklist events for live updates and periodically re-enumerates as the backstop. There is no version checkpoint to record: every boot rebuilds the complete deny-set, so a node returning from any downtime is immediately current.
 
-#### Step 3.3 — Build initial node view from on-chain registry
+#### Step 3.2 — Build initial node view from on-chain registry
 
 Query `CapacityBond.getRegisteredNodes(offset=0, limit=100)` to bootstrap the local node view. For PoC (tens of nodes) a single call suffices; for larger networks, paginate until all active nodes are fetched.
 
@@ -138,9 +132,9 @@ This registry snapshot is the initial node view. The node subscribes to `NodeReg
 
 If the RPC endpoint is unavailable, retry with exponential backoff (3 attempts at 1s, 5s, 30s). If all retries fail, the node cannot start (no node view = cannot participate in DHT lookups or probing).
 
-#### Step 3.4 — Configure local rate
+#### Step 3.3 — Configure local rate
 
-Set the node's `rate_per_mb` at or above the floor fetched in Step 3.1, satisfying `deliveryFloor ≤ rate_per_mb ≤ MAX_RATE_PER_MB`. This rate is advertised in `ProbeResponse` messages. Probes are the canonical rate-discovery channel; rate changes propagate through fresh probe responses ([ADR 005](005-protocol.md#adr-005-wire-protocol)).
+Set the node's `rate_per_mb`, satisfying `rate_per_mb ≤ MAX_RATE_PER_MB`. This rate is advertised verbatim in `ProbeResponse` messages; the node never raises it to the delivery floor. The floor is a redemption-time credit clamp, not a quote gate ([ADR 003 § Rate-floor enforcement](003-payments.md#rate-floor-enforcement)): a rate below the floor still sells and settles, and only its vote-weight byte credit is clamped. An operator that wants full vote-weight credit sets `rate_per_mb` at or above the current `deliveryFloor`, but this is a revenue choice, not a protocol requirement. Probes are the canonical rate-discovery channel; rate changes propagate through fresh probe responses ([ADR 005](005-protocol.md#adr-005-wire-protocol)).
 
 ### Phase 4 — Accepting Paid Delivery
 

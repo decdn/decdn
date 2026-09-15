@@ -226,14 +226,6 @@ pub struct BlockchainConfig {
     /// cadence so live-RPC load is unchanged). Values below
     /// `MIN_EVENT_POLL_INTERVAL_MS` are rejected at config resolution.
     pub event_poll_interval_ms: Option<u64>,
-    /// Seconds between authoritative `PaymentPool.getRateBounds()` re-reads
-    /// by the rate-bounds watcher (#1172, ADR 019 §3.1). This is the safety-net
-    /// cadence *in addition to* the `RateBoundsUpdated` event subscription
-    /// (which follows [`Self::event_poll_interval_ms`]); it reconciles any log
-    /// the event tail missed. Absent =>
-    /// [`super::DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`] (3600s / 1h). Must not
-    /// be `0` (that would poll every tick); rejected at config resolution.
-    pub rate_bounds_poll_interval_sec: Option<u64>,
     /// Seconds between authoritative `FeeRouter.getShares()` re-reads by the
     /// fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics). This is the
     /// safety-net cadence *in addition to* the `SharesUpdated` event
@@ -362,8 +354,9 @@ pub struct CacheConfig {
     /// per-MB units as the wire `StreamResponse.rate_per_mb`. Absent / `0` =
     /// unlimited. Bounds what this node, as a BUYER on a cache-miss pull, will
     /// accept a provider to quote — on top of the always-applied probe-relative
-    /// bound. Distinct from the seller-side `delivery_floor` clamp, which raises
-    /// this node's own quote rather than bounding what it will pay.
+    /// bound. This is a buyer-side ceiling; the node never bounds its own
+    /// sell rate (a rate below the on-chain delivery floor still sells and
+    /// settles, with only its vote-weight byte credit clamped at redemption).
     pub max_rate_per_mb: Option<u64>,
     /// Single origin backend for cache pull-through (#437). Absent =>
     /// no pull-through (unless [`Self::origins`] is set); cache misses
@@ -898,16 +891,6 @@ pub enum S3Credentials {
 pub struct PaymentConfig {
     /// Rate per MB in USDC base units.
     pub rate_per_mb: Option<u64>,
-    /// Pre-chain **seed** for the lower bound the node clamps `rate_per_mb` to
-    /// before signing a `ProbeResponse` (ADR 005 §Rate bounds validation).
-    ///
-    /// This does not govern the live clamp: the node reads
-    /// `PaymentPool.getRateBounds()` at startup and overwrites this value
-    /// before it serves anything, then tracks `RateBoundsUpdated`. Setting it
-    /// only affects the window before that read completes (and a failed read
-    /// refuses startup outright), so treat the on-chain value as authoritative.
-    /// Absent => `0`.
-    pub delivery_floor: Option<u64>,
     /// Downstream credit-window ceiling in bytes (ADR 003 §Credit window). The
     /// per-stream window ramps toward this cap as the stream pays, bounding the
     /// node's credit exposure (unbilled egress already on the wire) to
