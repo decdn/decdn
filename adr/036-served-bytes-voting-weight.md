@@ -131,7 +131,7 @@ The shipped `CapacityBond` exposes no `totalVotingWeightAt(ts)` aggregate getter
 | Parameter           | Default | Min | Max  | Rationale |
 | ------------------- | ------: | --: | ---: | --------- |
 | `windowEpochs` (N)  |      13 |   4 |   26 | <4 (1 month) too reactive to single-burst wash-trading and statistically thin for small operators; >26 (6 months) lags actual operator-set composition and pushes `_getVotes` toward ~55K gas of cold SLOADs per voter per `castVote` on L2 |
-| `voteCapBps`        |    500  | 100 | 2500 | Carry forward from [ADR 009](009-governance.md#governable-parameters-with-safety-bounds); cap now applied against bytes-weighted total |
+| `voteCapBps`        |   1000  | 100 | 1000 | Launches at the 10% ceiling and is decrease-only: governance can lower it toward the 1% floor but never raise it, so the cap only ever decentralizes vote weight. A higher launch value keeps quorum reachable while the operator set is thin. Cap applied against bytes-weighted total |
 | `age_ramp_months`   |      6  |   1 |   24 | Carry forward from [ADR 009](009-governance.md#governable-parameters-with-safety-bounds) and [ADR 026 § Governable parameters](026-tokenomics.md#governable-parameters-with-safety-bounds) |
 
 Cross-parameter invariant (informational, not enforced at the contract layer): `windowEpochs ≤ age_ramp_months × 4.33` keeps the age-ramp horizon ≥ the bytes window. Enforcement at the contract layer would over-constrain governance flexibility and is not warranted; document the invariant and let governance honor it.
@@ -144,13 +144,13 @@ Bytes-weighted voting is gameable by operators self-paying for delivery. An atta
 
 This argument **depends on a minimum price-per-byte being enforced** — otherwise the attacker pays ~0 USDC per byte and the 40% non-refunded cost vanishes. That floor is the `PaymentPool.deliveryFloor` settlement clamp ([ADR 003 § Rate-floor enforcement](003-payments.md#rate-floor-enforcement)): redemption credits at most `amount × BYTES_PER_MB / deliveryFloor` bytes for a voucher's cumulative `amount`, so each *credited* byte costs `>= deliveryFloor` real USDC. A voucher priced below the floor still settles its `amount`, but its excess bytes earn no vote weight — only floor-priced bytes reach the counter. Without that ceiling the attack is near-free (`amount = 1` wei stamping `bytesDelivered = 2^200`), which the cost estimate below assumes away.
 
-**Attack cost to reach the 5% cap from zero.** Let `R` be the network-wide USDC revenue per epoch. An attacker holding `cap` share of the trailing-window bytes generates `R × cap × N` revenue across the window (assuming the attacker pays the *market* per-byte rate). Wash-trading cost is `0.40 × R × cap × N` in attacker-paid USDC across the window. At `R = $25K/week`, `cap = 5%`, `N = 13`: the attacker burns `0.40 × $25K × 0.05 × 13 ≈ $6,500` per quarter to hold full 5% vote.
+**Attack cost to reach the 10% cap from zero.** Let `R` be the network-wide USDC revenue per epoch. An attacker holding `cap` share of the trailing-window bytes generates `R × cap × N` revenue across the window (assuming the attacker pays the *market* per-byte rate). Wash-trading cost is `0.40 × R × cap × N` in attacker-paid USDC across the window. At `R = $25K/week`, `cap = 10%`, `N = 13`: the attacker burns `0.40 × $25K × 0.10 × 13 ≈ $13,000` per quarter to hold full 10% vote.
 
-This figure is an **upper bound on a naive attacker**. A cost-minimizing attacker pays at `deliveryFloor`, not the market rate — and the default floor sits 10× below market ([ADR 003 § Rate-floor enforcement](003-payments.md#rate-floor-enforcement)), so the floor-rate cost is ~10× lower (order `$650/quarter` at the same parameters). The enforcement converts the attack from *near-free* to *proportional to bytes at ≥ floor rate*; the remaining lever is the floor-to-market gap. Narrowing it (raising `deliveryFloor` toward the market rate via governance) raises the attack cost toward `$6,500`, at the price of constraining legitimate low-rate pricing — a governance trade-off, not a fixed guarantee.
+This figure is an **upper bound on a naive attacker**. A cost-minimizing attacker pays at `deliveryFloor`, not the market rate — and the default floor sits 10× below market ([ADR 003 § Rate-floor enforcement](003-payments.md#rate-floor-enforcement)), so the floor-rate cost is ~10× lower (order `$1,300/quarter` at the same parameters). The enforcement converts the attack from *near-free* to *proportional to bytes at ≥ floor rate*; the remaining lever is the floor-to-market gap. Narrowing it (raising `deliveryFloor` toward the market rate via governance) raises the attack cost toward `$13,000`, at the price of constraining legitimate low-rate pricing — a governance trade-off, not a fixed guarantee.
 
 Cost scales linearly with network revenue and with the cap. Defenses:
 
-1. **5% per-operator cap (`voteCapBps`).** Bounds the maximum vote any single attacker can buy. Cap is governable `[1%, 25%]`; lowering it to 1% is the first tightening lever if attacks materialize.
+1. **10% per-operator cap (`voteCapBps`).** Bounds the maximum vote any single attacker can buy. The cap launches at 10% and is decrease-only within `[1%, 10%]`; lowering it toward 1% is the first tightening lever if attacks materialize.
 2. **`age_ramp` floor.** A brand-new bonded operator who wash-trades heavily still votes at a fraction of their bytes-weighted share for the first `age_ramp_months` months. Combined with the cap, this limits the speed-to-influence of a fresh attacker.
 3. **Rolling-window decay.** Sustained wash trading is required across the full window to maintain the cap; a stopping attacker decays out over N epochs.
 
@@ -166,7 +166,7 @@ Defended by the slashing zero-out. Without zero-out, a slashed operator continue
 
 ### Concentration
 
-The per-operator cap (`voteCapBps`, default 5%) is the primary concentration defense. Real delivery skews power-law in CDN markets, so bytes-weighting concentrates more readily than capacity-weighting. The cap is governable `[1%, 25%]`; governance can tighten if observed concentration warrants. Lowering the cap is preferable to lowering `windowEpochs`, because window-shortening would make governance more vulnerable to burst-traffic manipulation.
+The per-operator cap (`voteCapBps`, launch 10%) is the primary concentration defense. Real delivery skews power-law in CDN markets, so bytes-weighting concentrates more readily than capacity-weighting. The cap launches at its 10% ceiling and is decrease-only within `[1%, 10%]`; governance can tighten it if observed concentration warrants but can never re-concentrate weight. Lowering the cap is preferable to lowering `windowEpochs`, because window-shortening would make governance more vulnerable to burst-traffic manipulation.
 
 ## Consequences
 
@@ -187,8 +187,8 @@ The per-operator cap (`voteCapBps`, default 5%) is the primary concentration def
 
 ### Risks
 
-- **Network in low-revenue phase has cheap attack economics.** At `R = $5K/week`, wash-trading 5% cap costs only ~$1,300 / quarter. Governance should be prepared to tighten `voteCapBps` toward 1% during the bootstrap-multisig phase if observed.
-- **Operator with one large publisher could naturally exceed cap.** A legitimate edge-tier operator serving a single high-volume publisher hits the 5% cap easily. They are capped at 5% vote weight — same as a wash trader — which is the design intent (concentration defense applies uniformly). The cap should not be confused with a punishment for honest top carriers.
+- **Network in low-revenue phase has cheap attack economics.** At `R = $5K/week`, wash-trading the 10% cap costs only ~$2,600 / quarter. Governance should be prepared to tighten `voteCapBps` toward 1% during the bootstrap-multisig phase if observed.
+- **Operator with one large publisher could naturally exceed cap.** A legitimate edge-tier operator serving a single high-volume publisher hits the 10% cap easily. They are capped at 10% vote weight — same as a wash trader — which is the design intent (concentration defense applies uniformly). The cap should not be confused with a punishment for honest top carriers.
 - **`age_ramp` and `windowEpochs` interaction window.** A new operator who serves heavily in their first month builds a saturated bytes window before their age-ramp completes. The multiplicative combination still gates them under both axes, but the per-axis behavior diverges from intuition. Document for governance proposers.
 
 ## Cross-ADR Impact

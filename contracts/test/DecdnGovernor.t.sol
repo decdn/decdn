@@ -19,8 +19,9 @@ import { MockCapacityBond } from "./mocks/MockCapacityBond.sol";
 ///         execute dance. The production `setVoteCapBps` is timelock-gated;
 ///         testing the read path (`voteCapBpsAt(historicalTp)` returns the
 ///         prior value after a later push) only requires that we can push
-///         from two distinct timepoints — the gate itself is verified
-///         independently by `test_setVoteCapBps_enforcesBounds`.
+///         from two distinct timepoints — the gate and decrease-only bounds
+///         are verified independently by the `GovernanceLifecycle` timelock
+///         tests.
 contract TestableDecdnGovernor is DecdnGovernor {
     using Checkpoints for Checkpoints.Trace208;
 
@@ -103,15 +104,15 @@ contract DecdnGovernorTest is Test {
         vm.warp(BASE + 2);
         bond.setFirstBondedAt(operator, uint64(BASE - 180 days));
         _setBytesAtTimepoint(operator, 100_000, 1_000_000);
-        // 100k served vs 1M total → 10% raw. Cap = 5% → 50k. Full ramp → 50k.
-        assertEq(gov.getVotes(operator, tp), 50_000);
+        // 100k served vs 1M total → 10% raw. Cap = 10% → 100k. Full ramp → 100k.
+        assertEq(gov.getVotes(operator, tp), 100_000);
     }
 
     function test_getVotes_uncappedWhenBelowCap() public {
         vm.warp(BASE + 2);
         bond.setFirstBondedAt(operator, uint64(BASE - 180 days));
         _setBytesAtTimepoint(operator, 10_000, 1_000_000);
-        // 10k / 1M = 1% raw < 5% cap → 10k. Full ramp → 10k.
+        // 10k / 1M = 1% raw < 10% cap → 10k. Full ramp → 10k.
         assertEq(gov.getVotes(operator, tp), 10_000);
     }
 
@@ -163,14 +164,20 @@ contract DecdnGovernorTest is Test {
         assertEq(gov.proposalThreshold(), 1000);
     }
 
+    /// @notice The vote cap launches at its 10% ceiling (1000 bps). A
+    ///         decrease-only setter starts at the ceiling so governance can
+    ///         only ever move it down.
+    function test_voteCapBps_launchesAtCeiling() public view {
+        assertEq(gov.voteCapBps(), 1000);
+    }
+
     /// @notice `setVoteCapBps` is gated on `onlyGovernance` (timelock
     ///         executor). A direct call from the test contract must revert
     ///         with the explicit `GovernorOnlyExecutor` selector. The arg
-    ///         `500` is intentionally inside the `[VOTE_CAP_BPS_FLOOR=100,
-    ///         VOTE_CAP_BPS_CEILING=2500]` range so the only reachable
-    ///         revert path is the role guard; bounds enforcement on the
-    ///         executor path is out of scope for this test (would require
-    ///         a full timelock propose/queue/execute dance).
+    ///         `500` is a strict decrease from the 1000 bps launch value, so
+    ///         the only reachable revert path is the role guard; decrease-only
+    ///         and bounds enforcement on the executor path are covered by the
+    ///         timelock propose/queue/execute tests in `GovernanceLifecycle`.
     function test_setVoteCapBps_revertsWithoutTimelockCaller() public {
         vm.expectRevert(abi.encodeWithSelector(IGovernor.GovernorOnlyExecutor.selector, address(this)));
         gov.setVoteCapBps(500);
@@ -180,7 +187,7 @@ contract DecdnGovernorTest is Test {
     ///         on `onlyGovernance` (timelock executor). A direct call from
     ///         the test contract must revert with the explicit
     ///         `GovernorOnlyExecutor` selector; see the rationale on
-    ///         `test_setVoteCapBps_enforcesBounds`.
+    ///         `test_setVoteCapBps_revertsWithoutTimelockCaller`.
     function test_setAgeRampMonths_revertsWithoutTimelockCaller() public {
         vm.expectRevert(abi.encodeWithSelector(IGovernor.GovernorOnlyExecutor.selector, address(this)));
         gov.setAgeRampMonths(6);
@@ -239,26 +246,26 @@ contract DecdnGovernorTest is Test {
         _setBytesAtTimepoint(operator, 100_000, 1_000_000);
 
         // Capture the historical timepoint and the weight at the seeded
-        // cap (500 bps = 5% of 1_000_000 = 50_000).
+        // cap (1000 bps = 10% of 1_000_000 = 100_000).
         uint48 historicalTp = uint48(block.timestamp);
         uint256 historicalWeight = t.getVotes(operator, historicalTp);
-        assertEq(historicalWeight, 50_000);
-        assertEq(t.voteCapBpsAt(historicalTp), 500);
+        assertEq(historicalWeight, 100_000);
+        assertEq(t.voteCapBpsAt(historicalTp), 1000);
 
         // Warp forward and push a tighter cap (200 bps). Any reader that
         // looked at `voteCapBps()` live would now see 200; the I4 invariant
-        // says historical reads MUST stay at 500.
+        // says historical reads MUST stay at 1000.
         vm.warp(block.timestamp + 30 days);
         t.pushVoteCapBpsForTest(200);
 
-        // Latest is 200, but the snapshot read returns the prior 500.
+        // Latest is 200, but the snapshot read returns the prior 1000.
         assertEq(t.voteCapBps(), 200);
-        assertEq(t.voteCapBpsAt(historicalTp), 500);
+        assertEq(t.voteCapBpsAt(historicalTp), 1000);
 
         // And the actual weight at the historical timepoint is unchanged —
         // proves `_cappedServed` consults `voteCapBpsAt(tp)`, not `voteCapBps()`.
         // This is the core I4 invariant: an in-flight proposal whose
-        // snapshot is `historicalTp` sees the old 500 bps cap even after
+        // snapshot is `historicalTp` sees the old 1000 bps cap even after
         // governance pushed the new 200 bps.
         assertEq(t.getVotes(operator, historicalTp), historicalWeight);
     }
@@ -298,7 +305,7 @@ contract DecdnGovernorTest is Test {
         _setBytesAtTimepoint(operator, 100_000, 1_000_000);
 
         uint256 w0 = gov.getVotes(operator, tp);
-        assertEq(w0, 50_000); // 5% cap of 1M, full ramp.
+        assertEq(w0, 100_000); // 10% cap of 1M, full ramp.
 
         // Simulate a mid-vote settlement: the node settles a large byte count
         // into the CURRENT (in-progress) epoch bucket — the mock analogue of
@@ -426,10 +433,10 @@ contract DecdnGovernorTest is Test {
         cb.setFirstBondedAt(operator, 1); // non-zero sentinel → ramp not auto-zeroed
 
         fr.setBytes(operator, e, 300_000); // served above the capacity cap
-        fr.setTotalBytes(e, 1_000_000_000); // 5% share cap = 50_000_000 ≫ served
+        fr.setTotalBytes(e, 1_000_000_000); // 10% share cap = 100_000_000 ≫ served
         cb.setDeclaredMbpsAtEpoch(operator, e, 1); // cap = 1 × 1 × 125_000 = 125_000
 
-        // min(served 300_000, capacityCap 125_000, shareCap 50_000_000) = 125_000.
+        // min(served 300_000, capacityCap 125_000, shareCap 100_000_000) = 125_000.
         assertEq(g.getVotes(operator, tp2), 125_000);
     }
 

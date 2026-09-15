@@ -45,8 +45,8 @@ contract LifecycleUSDC is ERC20 {
 ///         then we walk forward 60 epochs (≈ 420 days, past the default 6-month
 ///         age ramp so `age_ramp == 1`). Across the trailing 13 epochs we
 ///         call `FeeRouter.routeSettlement` to populate `bytesPerEpoch` for
-///         each operator. With `voteCapBps` at its 500 bps default, each
-///         operator's vote weight saturates at 5% of total — three operators
+///         each operator. With `voteCapBps` at its 1000 bps launch value, each
+///         operator's vote weight saturates at 10% of total — three operators
 ///         voting `For` clear the 4% quorum, and `proposer` alone clears the
 ///         0.1% proposal threshold by a wide margin.
 contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
@@ -555,15 +555,35 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     // =================================================================
 
     function test_lifecycle_DecdnGovernor_setVoteCapBps_happy() public {
-        _runLifecycle(address(gov), abi.encodeCall(DecdnGovernor.setVoteCapBps, (uint256(1500))));
-        assertEq(gov.voteCapBps(), 1500);
+        // Cap launches at the 1000 bps ceiling; a strict decrease to 500 succeeds.
+        assertEq(gov.voteCapBps(), 1000);
+        _runLifecycle(address(gov), abi.encodeCall(DecdnGovernor.setVoteCapBps, (uint256(500))));
+        assertEq(gov.voteCapBps(), 500);
     }
 
-    function test_lifecycle_DecdnGovernor_setVoteCapBps_outOfBounds() public {
+    function test_lifecycle_DecdnGovernor_setVoteCapBps_belowFloor() public {
         _runLifecycleExpectExecuteRevert(
             address(gov),
-            abi.encodeCall(DecdnGovernor.setVoteCapBps, (uint256(2501))),
-            abi.encodeWithSelector(DecdnGovernor.ParamOutOfBounds.selector, uint256(2501), uint256(100), uint256(2500))
+            abi.encodeCall(DecdnGovernor.setVoteCapBps, (uint256(50))),
+            abi.encodeWithSelector(DecdnGovernor.ParamOutOfBounds.selector, uint256(50), uint256(100), uint256(1000))
+        );
+    }
+
+    function test_lifecycle_DecdnGovernor_setVoteCapBps_increaseReverts() public {
+        // Cap is decrease-only: raising it above the current 1000 reverts.
+        _runLifecycleExpectExecuteRevert(
+            address(gov),
+            abi.encodeCall(DecdnGovernor.setVoteCapBps, (uint256(1500))),
+            abi.encodeWithSelector(DecdnGovernor.VoteCapNotDecreasing.selector, uint256(1500), uint256(1000))
+        );
+    }
+
+    function test_lifecycle_DecdnGovernor_setVoteCapBps_noOpReverts() public {
+        // Setting the cap to its current value is not a decrease and reverts.
+        _runLifecycleExpectExecuteRevert(
+            address(gov),
+            abi.encodeCall(DecdnGovernor.setVoteCapBps, (uint256(1000))),
+            abi.encodeWithSelector(DecdnGovernor.VoteCapNotDecreasing.selector, uint256(1000), uint256(1000))
         );
     }
 

@@ -72,8 +72,13 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     Checkpoints.Trace208 internal _voteCapBpsHistory;
     Checkpoints.Trace208 internal _ageRampMonthsHistory;
 
+    /// @dev Per-operator vote-weight share cap, in bps. Bounded to 1–10%
+    ///      (`VOTE_CAP_BPS_FLOOR`–`VOTE_CAP_BPS_CEILING`). The cap launches at
+    ///      the 10% ceiling and only ever decreases (see `setVoteCapBps`): a
+    ///      higher launch cap keeps quorum reachable while the operator set is
+    ///      thin, and every later move decentralizes weight further.
     uint256 internal constant VOTE_CAP_BPS_FLOOR = 100;
-    uint256 internal constant VOTE_CAP_BPS_CEILING = 2500;
+    uint256 internal constant VOTE_CAP_BPS_CEILING = 1000;
     uint256 internal constant AGE_RAMP_MONTHS_FLOOR = 1;
     uint256 internal constant AGE_RAMP_MONTHS_CEILING = 24;
     uint256 internal constant SECONDS_PER_MONTH = 30 days;
@@ -96,6 +101,9 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     error ZeroFeeRouter();
     error ZeroCapacityBond();
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
+    /// @notice `setVoteCapBps` rejects any value that does not strictly
+    ///         decrease the current cap. The cap is decrease-only.
+    error VoteCapNotDecreasing(uint256 newValue, uint256 current);
 
     event VoteCapBpsUpdated(uint256 oldValue, uint256 newValue);
     event AgeRampMonthsUpdated(uint256 oldValue, uint256 newValue);
@@ -117,7 +125,7 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         // (prevValue, newValue); we discard both — initial seeding has no
         // prior value worth recording.
         // slither-disable-start unused-return
-        _voteCapBpsHistory.push(clock(), 500);
+        _voteCapBpsHistory.push(clock(), VOTE_CAP_BPS_CEILING.toUint208());
         _ageRampMonthsHistory.push(clock(), 6);
         // slither-disable-end unused-return
     }
@@ -307,15 +315,21 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     // Governance-tunable parameters (carry timelock per OZ default flow)
     // -----------------------------------------------------------------
 
-    /// @notice Set the per-operator vote cap in bps. Must be called through
-    ///         the timelock (the governor's executor is itself). The new
-    ///         value is checkpointed at `clock()`; in-flight proposals whose
-    ///         snapshot timepoint is earlier read the prior value.
+    /// @notice Lower the per-operator vote cap in bps. Must be called through
+    ///         the timelock (the governor's executor is itself). The cap is
+    ///         decrease-only: it launches at the 10% ceiling and governance can
+    ///         move it only down, to the 1% floor. Each move decentralizes vote
+    ///         weight; the cap never re-concentrates it. `newValue` must be at
+    ///         least `VOTE_CAP_BPS_FLOOR` and strictly below the current cap;
+    ///         any increase or no-op reverts. The new value is checkpointed at
+    ///         `clock()`; in-flight proposals whose snapshot timepoint is
+    ///         earlier read the prior value.
     function setVoteCapBps(uint256 newValue) external onlyGovernance {
-        if (newValue < VOTE_CAP_BPS_FLOOR || newValue > VOTE_CAP_BPS_CEILING) {
+        if (newValue < VOTE_CAP_BPS_FLOOR) {
             revert ParamOutOfBounds({ value: newValue, floor: VOTE_CAP_BPS_FLOOR, ceiling: VOTE_CAP_BPS_CEILING });
         }
         uint256 old = voteCapBps();
+        if (newValue >= old) revert VoteCapNotDecreasing(newValue, old);
         // slither-disable-next-line unused-return
         _voteCapBpsHistory.push(clock(), newValue.toUint208());
         emit VoteCapBpsUpdated(old, newValue);

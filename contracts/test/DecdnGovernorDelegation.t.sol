@@ -89,7 +89,7 @@ contract DecdnGovernorDelegationTest is Test {
 
         vm.warp(T);
 
-        // Each operator gets 10% raw byte share (capped to the 5% default) at
+        // Each operator gets 10% raw byte share (at the 10% launch cap) at
         // full age ramp, so all three carry identical, non-zero vote weight.
         _seedOperator(proposer, 100_000);
         _seedOperator(opA, 100_000);

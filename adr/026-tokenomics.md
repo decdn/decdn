@@ -296,7 +296,7 @@ Each epoch's counted bytes are capped at what the operator's declared capacity t
 - Fresh bonds vote at zero (no served bytes); full weight requires both `age_ramp_months` of tenure and sustained delivery across the `windowEpochs` trailing window.
 - Defends against "buy your way to instant governance" attacks on both axes: `age_ramp` gates speed-to-influence by tenure, and the rolling bytes window requires sustained activity.
 - Vote weight scales with demonstrated served bytes, capped per epoch by declared capacity, not by bond size — see [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) for the full derivation.
-- **Per-operator voting cap = 5% of total bytes-weighted weight** (governable `[1%, 25%]`). Single biggest carrier still capped at 5%; cap is the primary defense against bytes-weighted concentration in a power-law-skewed CDN traffic distribution.
+- **Per-operator voting cap = 10% of total bytes-weighted weight** (launches at the 10% ceiling, decrease-only within `[1%, 10%]`). Single biggest carrier still capped at 10%; cap is the primary defense against bytes-weighted concentration in a power-law-skewed CDN traffic distribution. Launching at the ceiling keeps quorum reachable while the operator set is thin, and every later move only decentralizes.
 - **Slashing zero-out.** Any slash stamps `CapacityBond.slashedAtEpoch[op]`; vote weight is zero for the operator while `slashedAtEpoch[op]` falls inside the trailing window. A granted slash appeal via [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)'s `grantAppeal` (→ `settleAppealGranted`) clears the field. See [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out).
 
 **Non-operator TOKEN holders have ZERO voting weight.** No allocation category in the [§ Allocation](#allocation) categorical rollup — none of the 100% of supply — can vote unless it also bonds TOKEN to operate. Served-bytes voting weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) further ties weight to delivered bytes, so a TOKEN holder who bonds without actually delivering bytes still accrues zero vote weight.
@@ -323,7 +323,7 @@ Each epoch's counted bytes are capped at what the operator's declared capacity t
 | Timelock | 48 hours | matches [ADR 009](009-governance.md#adr-009-governance-model) |
 | Total governance latency | ≈10 days | matches [ADR 009](009-governance.md#adr-009-governance-model) |
 | Delegation | EIP-712 (Governor Bravo pattern) — voting power delegable, bond itself non-delegable | this ADR |
-| Per-operator voting cap | 5% of total bytes-weighted weight | this ADR ([ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) for full formula) |
+| Per-operator voting cap | 10% of total bytes-weighted weight (launch value; decrease-only) | this ADR ([ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) for full formula) |
 | `windowEpochs` (served-bytes trailing window) | 13 (~1 quarter) | [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) |
 
 **Bootstrap governance — temporary multisig phase.**
@@ -390,7 +390,7 @@ Router shares and capacity-curve parameters are governable, gated by 48-hour tim
 | `MAX_CAPACITY_PER_OPERATOR` | 200 Gbps | 50 Gbps | 1000 Gbps |
 | `MIN_CAPACITY_PER_OPERATOR` | 10 Mbps | 10 Mbps | 1000 Mbps |
 | `age_ramp_months` | 6 | 1 | 24 |
-| Per-operator voting cap | 5% | 1% | 25% |
+| Per-operator voting cap | 10% | 1% | 10% |
 | `windowEpochs` (served-bytes voting window, on `FeeRouter`) | 13 | 4 | 26 |
 | Unbonding window | 14 days | 7 days | 60 days |
 
