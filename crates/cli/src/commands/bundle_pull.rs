@@ -24,8 +24,19 @@
 //! run concurrently; and a single global mutex serializes every open-or-reuse
 //! call — the pool's on-chain state (deposit, allowance) is one shared resource,
 //! regardless of which provider an entry is bound for.
+//!
+//! **Incremental re-runs.** A run reads `<out_root>/.decdn-manifest.json`
+//! before fetching and writes a merged copy back after. An in-scope path is
+//! skipped when the saved record's hash, size, and mtime match the new
+//! manifest. A path with no matching saved record is still skipped when
+//! re-hashing its on-disk bytes matches the new manifest hash. A path whose
+//! on-disk content no longer matches the new manifest hash is re-fetched, not
+//! silently kept. Every skipped or freshly written path also seeds its
+//! on-disk byte ranges as chunk donors, so a later run's or bundle's
+//! complement-range fetch can splice an unchanged range from disk instead of
+//! paying for it again.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,6 +58,7 @@ use futures_util::StreamExt as _;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 
+use super::bundle_manifest::{self, SavedManifest, SavedMtime};
 use super::chain_ctx;
 use super::fetch;
 use super::manifest::build_glob_set;
@@ -109,8 +121,8 @@ fn group_by_hash<'a>(entries: &[&'a ManifestEntry]) -> Vec<HashGroup<'a>> {
 /// a hard link where the filesystem allows it, else a full copy (cross-device
 /// `EXDEV`, or a filesystem that can't link). Staged in `dest`'s parent and
 /// renamed into place so `dest` is only ever absent or complete — the same
-/// atomic-replace invariant [`materialize`] upholds, which bundle pull's
-/// skip-existing relies on ("a present final file is verified-good").
+/// atomic-replace invariant [`materialize`] upholds, which [`resolve_disk_state`]
+/// and [`plan_slots`] rely on when deciding a path is skip-safe.
 fn link_or_copy_atomic(src: &Path, dest: &Path) -> anyhow::Result<()> {
     let parent = dest
         .parent()
@@ -143,16 +155,143 @@ fn link_or_copy_atomic(src: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A disk-seeded chunk donor: a byte range already on disk whose bytes back a
+/// chunk `hash`. Fed into [`ChunkIndex`] before fetching so a splice can reuse
+/// on-disk bytes across runs. The source is an OUTPUT path (not a staging blob),
+/// verified by the existing per-chunk re-hash before any splice trusts it.
+struct SeedDonor {
+    /// The chunk's BLAKE3 hash — the [`ChunkIndex`] key.
+    hash: [u8; 32],
+    /// The on-disk output file that holds the chunk's bytes.
+    source: PathBuf,
+    /// Byte offset of the chunk within `source`.
+    offset: u64,
+    /// Chunk length in bytes.
+    len: u64,
+}
+
+/// The result of inspecting the output tree against the new manifest and the
+/// saved skip-cache before fetching: which in-scope paths to skip, and the
+/// on-disk chunk donors to seed.
+#[derive(Default)]
+struct DiskState {
+    /// In-scope manifest paths whose on-disk file already matches the new
+    /// manifest hash (fast-skip or re-hash-confirmed) — not fetched.
+    skip: HashSet<String>,
+    /// On-disk chunk donors to seed into the run's [`ChunkIndex`].
+    seed: Vec<SeedDonor>,
+}
+
+/// Classify every in-scope entry against the output tree and the saved
+/// skip-cache: fast-skip on a matching saved record (hash + size + mtime), else
+/// re-hash the on-disk bytes against the new manifest hash, else fetch. With
+/// `overwrite` nothing is skipped. The whole-file `hash` is authoritative, so a
+/// stale or absent saved record only costs a re-hash, never correctness.
+async fn resolve_disk_state(
+    entries: &[ManifestEntry],
+    saved: &SavedManifest,
+    out_root: &Path,
+    overwrite: bool,
+) -> DiskState {
+    let mut state = DiskState::default();
+    if overwrite {
+        return state;
+    }
+    for en in entries {
+        let Ok(dest) = safe_join(out_root, &en.path) else {
+            continue; // a bad path fails later in plan_slots; not skippable
+        };
+        if dest.starts_with(out_root.join(STAGING_DIR)) {
+            continue;
+        }
+        // `symlink_metadata` does not follow links: a symlink or any
+        // non-regular file is never skipped, re-hashed, or seeded as a donor —
+        // it is left to the fetch path, whose atomic materialize replaces it
+        // with the manifest's regular file. This avoids hashing a symlink target
+        // and avoids keeping a non-regular file in place on a fast-skip.
+        let Ok(meta) = std::fs::symlink_metadata(&dest) else {
+            continue; // absent/unreadable → fetch
+        };
+        if !meta.is_file() {
+            continue; // symlink / dir / non-regular → not skippable, not a donor
+        }
+        // Fast-skip: saved record agrees on hash, size, and mtime.
+        let fast = saved.get(&en.path).is_some_and(|rec| {
+            rec.hash == en.hash
+                && rec.size == meta.len()
+                && en.size.is_none_or(|s| s == rec.size)
+                && SavedMtime::of(&meta).as_ref() == Some(&rec.mtime)
+        });
+        if fast {
+            state.skip.insert(en.path.clone());
+            seed_new_chunks(&mut state, en, &dest);
+            continue;
+        }
+        // Re-hash gate: confirm the on-disk bytes against the new manifest hash.
+        let Ok(want) = fetch::parse_hash(&en.hash) else {
+            continue;
+        };
+        let dest_buf = dest.clone();
+        let got = tokio::task::spawn_blocking(move || hash_partial(&dest_buf)).await;
+        if let Ok(Ok(got)) = got
+            && got == want
+        {
+            state.skip.insert(en.path.clone());
+            seed_new_chunks(&mut state, en, &dest);
+            continue;
+        }
+        // Present but mismatched: this path will be fetched. Its current bytes
+        // are the OLD file and survive on disk until this entry's own group
+        // atomically materializes (temp + rename), so they are a safe donor for
+        // any other entry that shares an old chunk in the meantime.
+        if let Some(rec) = saved.get(&en.path)
+            && let Some(old) = bundle_manifest::saved_hints(rec)
+        {
+            for (chash, offset, len) in old {
+                if let Ok(h) = fetch::parse_hash(&chash) {
+                    state.seed.push(SeedDonor {
+                        hash: h,
+                        source: dest.clone(),
+                        offset,
+                        len,
+                    });
+                }
+            }
+        }
+    }
+    state
+}
+
+/// Seed `state.seed` with the NEW manifest entry's chunk donors, sourced from
+/// `dest` — the entry's own output file, confirmed unchanged (skipped) this
+/// run. Seeding never gates skip/fetch; it only supplies optional splice
+/// donors for other entries.
+fn seed_new_chunks(state: &mut DiskState, en: &ManifestEntry, dest: &Path) {
+    if let Some(hints) = hints_of(en) {
+        for h in hints {
+            state.seed.push(SeedDonor {
+                hash: h.hash,
+                source: dest.to_path_buf(),
+                offset: h.offset,
+                len: h.len,
+            });
+        }
+    }
+}
+
 /// Resolve each entry's on-disk destination and classify it — a resolve failure,
-/// an already-present file to skip, or a path to write — before any fetch.
-/// Skip-existing (default): a present final file is verified-good (renamed into
-/// place only after a BLAKE3 check), so re-runs resume. Evaluated **per
-/// destination**, so one path of a duplicated blob can be skipped while another
-/// is written.
+/// a path to skip, or a path to write — before any fetch. `skip` is the
+/// [`resolve_disk_state`] pre-pass result: a path lands in it on a matching
+/// saved-manifest record (fast-skip) or, failing that, on a re-hash of the
+/// on-disk bytes against the new manifest hash. A path whose content changed
+/// is written, not silently kept. Evaluated **per destination**, so one path
+/// of a duplicated blob can be skipped while another is written. With
+/// `overwrite` set, `skip` is empty and every destination is written.
 fn plan_slots<'a>(
     entries: &[&'a ManifestEntry],
     out_root: &Path,
     overwrite: bool,
+    skip: &HashSet<String>,
 ) -> Vec<Slot<'a>> {
     entries
         .iter()
@@ -170,7 +309,7 @@ fn plan_slots<'a>(
                     ),
                 ))
             }
-            Ok(dest) if !overwrite && dest.try_exists().unwrap_or(false) => Slot::Skip,
+            Ok(_) if !overwrite && skip.contains(en.path.as_str()) => Slot::Skip,
             Ok(dest) => Slot::Write {
                 label: en.path.as_str(),
                 dest,
@@ -661,10 +800,23 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // content size, fixed now from the manifest's declared sizes.
     ctx.progress = PullProgress::new(args.json, total_content_bytes(&manifest.entries));
 
+    // Loaded once for the whole run: the pre-pass skip decisions above consult it,
+    // and a later write reuses this same binding (never a second load).
+    let saved = bundle_manifest::load(&args.output);
     let (outcomes, transfer) = ctx
-        .pull_all(&manifest.entries, &args.output, args.overwrite)
+        .pull_all(&manifest.entries, &args.output, args.overwrite, &saved)
         .await;
     ctx.progress.finish();
+
+    // Persist the skip-cache: prior state merged with what this run landed. A
+    // write failure is non-fatal (the cache is advisory) — log and continue.
+    let updates = build_saved_updates(&manifest.entries, &outcomes, &args.output);
+    if let Err(e) = bundle_manifest::merge_and_write(&args.output, saved, updates) {
+        tracing::warn!(
+            "failed to write {}: {e}",
+            bundle_manifest::SAVED_MANIFEST_NAME
+        );
+    }
 
     // Every entry has joined, so the shared dedup counters are now stable.
     let dedup = DedupSummary {
@@ -1356,6 +1508,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         entries: &[ManifestEntry],
         out_root: &Path,
         overwrite: bool,
+        saved: &SavedManifest,
     ) -> (Vec<EntryOutcome>, Transfer) {
         // Every entry declares an authoritative whole-file `hash`, so the by-hash
         // grouping path (fetch-once + link-duplicates, #1306) covers plain and
@@ -1363,7 +1516,16 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // one blob is assembled, never that it is one paid unit per distinct hash.
         let index = ChunkIndex::default();
         let refs: Vec<&ManifestEntry> = entries.iter().collect();
-        let (outcomes, transfer) = self.pull_plain(&refs, out_root, overwrite, &index).await;
+        // Pre-pass: classify every entry against the output tree and the saved
+        // skip-cache before any fetch, so an updated file at an already-present
+        // path is written rather than silently skipped.
+        let disk = resolve_disk_state(entries, saved, out_root, overwrite).await;
+        for d in &disk.seed {
+            index.seed_disk(d.hash, &d.source, d.offset, d.len);
+        }
+        let (outcomes, transfer) = self
+            .pull_plain(&refs, out_root, overwrite, &index, &disk.skip)
+            .await;
 
         // A donor entry's finalized staging blob is the source a recipient splices
         // from, so it is kept past its own group's cleanup. With the run over,
@@ -1393,11 +1555,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         overwrite: bool,
         index: &ChunkIndex,
+        skip: &HashSet<String>,
     ) -> (Vec<EntryOutcome>, Transfer) {
         let groups_by_hash = group_by_hash(entries);
         let group_count = groups_by_hash.len().max(1);
         let groups: Vec<Vec<EntryOutcome>> = futures_util::stream::iter(groups_by_hash)
-            .map(|group| self.fetch_group(group, out_root, overwrite, index))
+            .map(|group| self.fetch_group(group, out_root, overwrite, index, skip))
             // Live-bar fan-out bounded by --jobs; the global gate is the real in-flight-fetch cap.
             .buffer_unordered(self.jobs.min(group_count))
             .collect::<Vec<Vec<EntryOutcome>>>()
@@ -1549,6 +1712,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         overwrite: bool,
         index: &ChunkIndex,
+        skip: &HashSet<String>,
     ) -> Vec<EntryOutcome> {
         // The group's shared hash is carried explicitly; parse it once, and a bad
         // hash fails every path in the group.
@@ -1588,7 +1752,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // `pull_all` removes it once every recipient has had its chance.
         let is_donor = hints.as_ref().is_some_and(|h| !h.is_empty());
 
-        let slots = plan_slots(&group.entries, out_root, overwrite);
+        let slots = plan_slots(&group.entries, out_root, overwrite, skip);
 
         // Every destination already present (or failed to resolve) → no fetch, no
         // payment. This is the whole point of the group: a duplicate path that is
@@ -1969,6 +2133,10 @@ struct ChunkIndex {
     /// finalized `<hex>` is the resume prefix a rerun needs — deleting it would
     /// force a full re-fetch and re-payment of an unrefunded blob.
     retain: std::sync::Mutex<HashSet<PathBuf>>,
+    /// Output-file donor sources seeded from disk before the run. Excluded from
+    /// [`Self::sources`] so the run-end staging sweep never deletes a
+    /// materialized output.
+    seeded: std::sync::Mutex<HashSet<PathBuf>>,
 }
 
 impl ChunkIndex {
@@ -1991,17 +2159,38 @@ impl ChunkIndex {
     }
 
     /// The distinct donor staging blobs registered this run, for the run-end
-    /// sweep in [`PullCtx::pull_all`].
+    /// sweep in [`PullCtx::pull_all`]. Excludes any [`Self::seed_disk`] source —
+    /// an on-disk OUTPUT file the sweep must never delete.
     fn sources(&self) -> Vec<PathBuf> {
+        let seeded = self.seeded.lock().unwrap_or_else(PoisonError::into_inner);
         let map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
         let mut seen: HashSet<&Path> = HashSet::new();
         let mut out = Vec::new();
         for m in map.values() {
-            if seen.insert(m.source.as_path()) {
+            if !seeded.contains(&m.source) && seen.insert(m.source.as_path()) {
                 out.push(m.source.clone());
             }
         }
         out
+    }
+
+    /// Seed a donor whose bytes live in an on-disk OUTPUT file (a skipped
+    /// entry's current file, or a changed entry's old copy still present until
+    /// its atomic materialize). First-writer-wins, like [`Self::register`]; the
+    /// source is recorded as seeded so the sweep never removes it. The existing
+    /// per-chunk re-hash guard verifies the bytes before any splice trusts them,
+    /// so a stale offset or edited/removed file simply falls back to a fetch.
+    fn seed_disk(&self, hash: [u8; 32], source: &Path, offset: u64, len: u64) {
+        {
+            let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+            map.entry(hash).or_insert_with(|| MaterializedRange {
+                source: source.to_path_buf(),
+                offset,
+                len,
+            });
+        }
+        let mut seeded = self.seeded.lock().unwrap_or_else(PoisonError::into_inner);
+        seeded.insert(source.to_path_buf());
     }
 
     /// Mark a donor `source` as a resume prefix the run-end sweep must keep: its
@@ -2470,6 +2659,72 @@ fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     Ok(out)
 }
 
+/// Build the saved-manifest updates for this run from the FINAL on-disk state:
+/// every in-scope entry whose output file is present AND whose fetch this run
+/// did not fail contributes a record built from the new manifest entry plus the
+/// file's observed size and mtime. Presence alone is not proof of freshness — a
+/// FAILED fetch leaves the file exactly as it was before this run (materialize
+/// only renames the new content into place on success), so a present-but-failed
+/// entry is skipped rather than recorded: recording it would pair the *new*
+/// manifest hash with the *old* file's bytes, and a later run's mtime/hash fast
+/// path would then wrongly treat that stale file as up to date and never
+/// re-fetch it. Omitting it instead leaves any prior record (or no record) in
+/// place, which always forces a re-check next run. Excluded paths are not in
+/// `entries`, so they are never recorded.
+fn build_saved_updates(
+    entries: &[ManifestEntry],
+    outcomes: &[EntryOutcome],
+    out_root: &Path,
+) -> BTreeMap<String, bundle_manifest::SavedFile> {
+    let failed: HashSet<&str> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            EntryOutcome::Failed { path, .. } => Some(path.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut updates = BTreeMap::new();
+    for en in entries {
+        if failed.contains(en.path.as_str()) {
+            continue; // this run left the old bytes in place — never record
+        }
+        let Ok(dest) = safe_join(out_root, &en.path) else {
+            continue;
+        };
+        // `symlink_metadata` does not follow links: only a regular file this run
+        // landed is recorded, so a symlink or non-regular file at `dest` is never
+        // written into the skip-cache (its later fast-skip would trust a target
+        // this run never verified).
+        let Ok(meta) = std::fs::symlink_metadata(&dest) else {
+            continue; // absent → this run did not land it
+        };
+        if !meta.is_file() {
+            continue; // only record regular files
+        }
+        let Some(mtime) = SavedMtime::of(&meta) else {
+            continue; // no usable mtime → omit rather than record an unverifiable gate
+        };
+        let chunks = en.chunks.as_ref().map(|cs| {
+            cs.iter()
+                .map(|c| bundle_manifest::SavedChunk {
+                    hash: c.hash.clone(),
+                    size: c.size,
+                })
+                .collect()
+        });
+        updates.insert(
+            en.path.clone(),
+            bundle_manifest::SavedFile {
+                hash: en.hash.clone(),
+                size: meta.len(),
+                mtime,
+                chunks,
+            },
+        );
+    }
+    updates
+}
+
 /// Report an empty would-fetch set. `by_filter` is true only when a non-empty
 /// bundle was emptied by `--include`/`--exclude`, so the operator learns their
 /// globs matched nothing rather than mistaking it for an empty bundle.
@@ -2685,6 +2940,47 @@ fn group_transfer(outcomes: &[EntryOutcome]) -> Transfer {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_saved_updates_records_present_omits_failed() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        std::fs::write(tmp.path().join("ok.txt"), b"data").expect("write");
+        // "bad.txt" has an OLD file present on disk (this run's fetch failed and
+        // left it untouched) — it must never be recorded with the NEW hash.
+        std::fs::write(tmp.path().join("bad.txt"), b"old-bytes").expect("write");
+        let entries = vec![
+            ManifestEntry {
+                path: "ok.txt".into(),
+                hash: "b3:aa".into(),
+                size: Some(4),
+                chunks: Some(vec![ManifestChunk {
+                    hash: "b3:bb".into(),
+                    size: 4,
+                }]),
+            },
+            ManifestEntry {
+                path: "bad.txt".into(),
+                hash: "b3:cc".into(),
+                size: Some(9),
+                chunks: None,
+            },
+        ];
+        let outcomes = vec![
+            EntryOutcome::Fetched(4),
+            EntryOutcome::Failed {
+                path: "bad.txt".into(),
+                err: "nope".into(),
+            },
+        ];
+        let upd = build_saved_updates(&entries, &outcomes, tmp.path());
+        assert!(upd.contains_key("ok.txt"));
+        let rec = upd.get("ok.txt").expect("rec");
+        assert_eq!(rec.hash, "b3:aa");
+        assert_eq!(rec.size, 4);
+        assert!(rec.chunks.is_some());
+        // Failed → omitted even though the (stale) file is present on disk.
+        assert!(!upd.contains_key("bad.txt"));
+    }
 
     #[test]
     fn safe_join_builds_nested_path_under_root() {
@@ -3118,6 +3414,24 @@ mod tests {
             retained.exists(),
             "a retained (materialize-failed) donor source survives the sweep"
         );
+    }
+
+    /// A [`ChunkIndex::seed_disk`] source is an on-disk OUTPUT file, not a
+    /// staging blob: [`ChunkIndex::sources`] (the run-end sweep's deletion list)
+    /// must exclude it, or a materialized output would be deleted. It is still
+    /// resolvable as a splice donor for planning.
+    #[test]
+    fn chunk_index_seeded_source_survives_sweep() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let out = tmp.path().join("kept.bin");
+        std::fs::write(&out, b"donorbytes").expect("write");
+        let idx = ChunkIndex::default();
+        idx.seed_disk([7u8; 32], &out, 0, 10);
+        // A seeded output path is NOT a sweepable staging source.
+        assert!(idx.sources().is_empty());
+        // But it IS resolvable as a donor for planning.
+        let guard = idx.map.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(guard.contains_key(&[7u8; 32]));
     }
 
     /// `splice_donors` happy path: a donor file holds a verified chunk at some
@@ -3606,9 +3920,10 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
     }
 
-    /// Skip-existing / `--overwrite` are decided **per destination**: one path of a
-    /// duplicated blob can be already-present (Skip) while its twin is absent
-    /// (Write), and `--overwrite` forces both to Write.
+    /// Skip-existing / `--overwrite` are decided **per destination** from the
+    /// [`resolve_disk_state`] pre-pass's skip set (not a raw existence check): one
+    /// path of a duplicated blob can be in the skip set (Skip) while its twin is
+    /// not (Write), and `--overwrite` forces both to Write regardless of `skip`.
     #[test]
     fn plan_slots_classifies_each_destination_independently() {
         let dir = tempfile::tempdir().unwrap();
@@ -3616,12 +3931,13 @@ mod tests {
         std::fs::write(out.join("present.txt"), b"x").unwrap();
         let entries = [entry("present.txt", "b3:h"), entry("absent.txt", "b3:h")];
         let refs: Vec<&ManifestEntry> = entries.iter().collect();
+        let skip = HashSet::from(["present.txt".to_string()]);
 
-        let slots = plan_slots(&refs, out, false);
+        let slots = plan_slots(&refs, out, false, &skip);
         assert!(matches!(slots[0], Slot::Skip));
         assert!(matches!(slots[1], Slot::Write { .. }));
 
-        let slots = plan_slots(&refs, out, true);
+        let slots = plan_slots(&refs, out, true, &skip);
         assert!(matches!(slots[0], Slot::Write { .. }));
         assert!(matches!(slots[1], Slot::Write { .. }));
     }
@@ -3632,7 +3948,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let entries = [entry("../escape", "b3:h")];
         let refs: Vec<&ManifestEntry> = entries.iter().collect();
-        let slots = plan_slots(&refs, dir.path(), false);
+        let slots = plan_slots(&refs, dir.path(), false, &HashSet::new());
         assert!(matches!(slots[0], Slot::Failed(_)));
     }
 
@@ -3644,8 +3960,178 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let entries = [entry(&format!("{STAGING_DIR}/deadbeef.partial"), "b3:h")];
         let refs: Vec<&ManifestEntry> = entries.iter().collect();
-        let slots = plan_slots(&refs, dir.path(), false);
+        let slots = plan_slots(&refs, dir.path(), false, &HashSet::new());
         assert!(matches!(slots[0], Slot::Failed(_)));
+    }
+
+    /// An unrecorded (empty saved manifest) file still skips via the re-hash gate
+    /// when its on-disk bytes already match the new manifest hash.
+    #[tokio::test]
+    async fn resolve_disk_state_skips_matching_file_by_rehash() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let body = b"hello world";
+        std::fs::write(tmp.path().join("a.txt"), body).expect("write");
+        let h = format!("b3:{}", blake3::hash(body).to_hex());
+        let entries = vec![ManifestEntry {
+            path: "a.txt".into(),
+            hash: h,
+            size: Some(u64::try_from(body.len()).expect("len")),
+            chunks: None,
+        }];
+        // Empty saved manifest → falls to the re-hash gate, still skips (content matches).
+        let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
+        assert!(st.skip.contains("a.txt"));
+    }
+
+    /// A changed file (content no longer matches the new manifest hash) is never
+    /// skipped, whether or not a saved record exists for it.
+    #[tokio::test]
+    async fn resolve_disk_state_fetches_changed_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        std::fs::write(tmp.path().join("a.txt"), b"OLD CONTENT").expect("write");
+        let new = format!("b3:{}", blake3::hash(b"NEW CONTENT").to_hex());
+        let entries = vec![ManifestEntry {
+            path: "a.txt".into(),
+            hash: new,
+            size: Some(11),
+            chunks: None,
+        }];
+        let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
+        assert!(!st.skip.contains("a.txt")); // hash mismatch → fetch
+    }
+
+    /// An absent file always fetches — nothing to re-hash, no fast-skip possible.
+    #[tokio::test]
+    async fn resolve_disk_state_absent_file_fetches() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let entries = vec![ManifestEntry {
+            path: "missing.txt".into(),
+            hash: "b3:00".into(),
+            size: Some(1),
+            chunks: None,
+        }];
+        let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
+        assert!(!st.skip.contains("missing.txt"));
+    }
+
+    /// `--overwrite` bypasses the pre-pass entirely: nothing is ever skipped.
+    #[tokio::test]
+    async fn resolve_disk_state_overwrite_skips_nothing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let body = b"hello world";
+        std::fs::write(tmp.path().join("a.txt"), body).expect("write");
+        let h = format!("b3:{}", blake3::hash(body).to_hex());
+        let entries = vec![ManifestEntry {
+            path: "a.txt".into(),
+            hash: h,
+            size: Some(u64::try_from(body.len()).expect("len")),
+            chunks: None,
+        }];
+        let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), true).await;
+        assert!(st.skip.is_empty());
+    }
+
+    /// A symlink at a destination path is never fast-skipped, even when it
+    /// points at content whose bytes match the manifest hash: the pre-pass uses
+    /// `symlink_metadata` and requires a regular file, so the symlink is left to
+    /// the fetch path (which materializes a regular file over it) rather than
+    /// hashing the link target or keeping the link in place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_disk_state_does_not_skip_a_symlink() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let body = b"hello world";
+        // The real bytes live outside the manifest path; the manifest path is a
+        // symlink to them, so following it would hash a match.
+        std::fs::write(tmp.path().join("target.bin"), body).expect("write target");
+        std::os::unix::fs::symlink(tmp.path().join("target.bin"), tmp.path().join("link.txt"))
+            .expect("symlink");
+        let h = format!("b3:{}", blake3::hash(body).to_hex());
+        let entries = vec![ManifestEntry {
+            path: "link.txt".into(),
+            hash: h,
+            size: Some(u64::try_from(body.len()).expect("len")),
+            chunks: None,
+        }];
+        let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
+        assert!(!st.skip.contains("link.txt"));
+        assert!(st.seed.is_empty());
+    }
+
+    /// A skipped (unchanged) path seeds the NEW manifest entry's chunks, sourced
+    /// from its own output file — a donor future entries can splice from without
+    /// paying, spanning cross-run and cross-bundle reuse.
+    #[tokio::test]
+    async fn resolve_disk_state_seeds_unchanged_and_old_chunks() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // unchanged file present, matches new manifest, has chunks → seed NEW chunks
+        let body = vec![9u8; 20];
+        std::fs::write(tmp.path().join("u.bin"), &body).expect("write");
+        let uh = format!("b3:{}", blake3::hash(&body).to_hex());
+        let ch = format!("b3:{}", blake3::hash(&body).to_hex()); // single-chunk == whole file
+        let entries = vec![ManifestEntry {
+            path: "u.bin".into(),
+            hash: uh,
+            size: Some(20),
+            chunks: Some(vec![ManifestChunk { hash: ch, size: 20 }]),
+        }];
+        let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
+        assert!(st.skip.contains("u.bin"));
+        assert_eq!(st.seed.len(), 1);
+        assert_eq!(st.seed[0].offset, 0);
+        assert_eq!(st.seed[0].len, 20);
+    }
+
+    /// A changed path (present but hash-mismatched against the new manifest)
+    /// with a prior saved record carrying chunks seeds the OLD chunks, sourced
+    /// from the still-present old file — it survives on disk until this entry's
+    /// own group atomically materializes.
+    #[tokio::test]
+    async fn resolve_disk_state_seeds_old_chunks_of_a_changed_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_body = vec![1u8; 20];
+        let path = tmp.path().join("c.bin");
+        std::fs::write(&path, &old_body).expect("write old");
+
+        // Build a saved record (as a prior run would have) carrying chunk hints
+        // for the OLD content, then persist and reload it via the real
+        // merge_and_write / load round trip.
+        let old_hash = format!("b3:{}", blake3::hash(&old_body).to_hex());
+        let old_chunk_hash = old_hash.clone(); // single-chunk == whole file
+        let old_entries = vec![ManifestEntry {
+            path: "c.bin".into(),
+            hash: old_hash,
+            size: Some(20),
+            chunks: Some(vec![ManifestChunk {
+                hash: old_chunk_hash.clone(),
+                size: 20,
+            }]),
+        }];
+        let old_outcomes = vec![EntryOutcome::Fetched(20)];
+        let updates = build_saved_updates(&old_entries, &old_outcomes, tmp.path());
+        bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
+            .expect("write saved manifest");
+        let saved = bundle_manifest::load(tmp.path());
+
+        // The new manifest declares different content, but the OLD file is
+        // still on disk (not yet overwritten) — a fetch, not a skip, and the
+        // old bytes remain a valid donor until this entry's own materialize.
+        let new_hash = format!("b3:{}", blake3::hash(&[2u8; 20]).to_hex());
+        let new_entries = vec![ManifestEntry {
+            path: "c.bin".into(),
+            hash: new_hash,
+            size: Some(20),
+            chunks: None,
+        }];
+
+        let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
+        assert!(!st.skip.contains("c.bin"), "changed content must fetch");
+        assert_eq!(st.seed.len(), 1);
+        let want_hash = fetch::parse_hash(&old_chunk_hash).expect("parse old chunk hash");
+        assert_eq!(st.seed[0].hash, want_hash);
+        assert_eq!(st.seed[0].source, path);
+        assert_eq!(st.seed[0].offset, 0);
+        assert_eq!(st.seed[0].len, 20);
     }
 
     /// `materialize` (the paid-path writer) atomically replaces an existing

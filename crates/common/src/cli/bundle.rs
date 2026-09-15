@@ -100,8 +100,15 @@ pub struct BundlePullArgs {
     pub exclude: Vec<String>,
 
     /// Re-fetch and overwrite entries whose destination file already exists.
-    /// Default is skip-existing (resume-friendly: a completed file is only
-    /// renamed into place after BLAKE3 verification, so a present file is good).
+    /// Default is skip-existing (resume-friendly): a path skips when its saved
+    /// `.decdn-manifest.json` record still matches the file's hash, size, and
+    /// mtime — the fast path, which trusts that gate without re-hashing — or,
+    /// failing that, when re-hashing its on-disk bytes matches the new manifest.
+    /// Use `--overwrite` to force a full re-fetch of every entry, for example
+    /// when the output directory may have been modified outside `decdn` (an
+    /// in-place edit that keeps a file's size and mtime is otherwise trusted by
+    /// the fast path). It skips consulting `.decdn-manifest.json` for skip
+    /// decisions; the file is still read and rewritten with the run's results.
     #[arg(long)]
     pub overwrite: bool,
 
