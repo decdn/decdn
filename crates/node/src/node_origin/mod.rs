@@ -343,14 +343,9 @@ pub struct NodeOriginConfig {
     /// == `"margin"`). Feeds the `margin` policy's heat-estimate ceiling input;
     /// `None` when no consumer needs it.
     pub frequency_estimator: Option<Arc<dyn decdn_cache::FrequencyEstimator>>,
-    /// This node's live delivery-rate floor clamp — the same handle the probe
-    /// and client handlers hold. Combined with `sell_rate_base` to derive the
-    /// node's current sell rate `P_sell`, the serve-economics policy's other
-    /// input.
-    pub sell_rate_bounds: crate::rate_bounds::RateBounds,
-    /// This node's configured base served rate per MB (`payment.rate_per_mb`),
-    /// BEFORE the on-chain floor clamp — the same base value the probe handler
-    /// is constructed with.
+    /// This node's configured served rate per MB (`payment.rate_per_mb`) — the
+    /// sell rate `P_sell`, the serve-economics policy's other input. The same
+    /// base value the probe handler is constructed with.
     pub sell_rate_base: u64,
     /// ADR 041 per-source warming allowance: bounds the loss from speculative
     /// above-floor buys per upstream source node. The buy loop reads
@@ -1364,10 +1359,7 @@ fn economic_ceiling(
     heat: u32,
     candidate_rate: u64,
 ) -> EconGate {
-    let (sell, _floor) = deps
-        .config
-        .sell_rate_bounds
-        .raise_to_floor(deps.config.sell_rate_base);
+    let sell = deps.config.sell_rate_base;
     let operator_bps = deps.config.operator_shares.bps();
     let warm = deps.config.warming.available(source);
     let mk = |warming_available| crate::serve_economics::ServeEconomicsCtx {

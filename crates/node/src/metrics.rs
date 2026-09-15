@@ -257,11 +257,6 @@ pub struct DecdnMetrics {
     /// `probe_hold_slots_used` so dashboards can alert on a saturation
     /// ratio rather than an absolute count.
     pub probe_hold_slots_max: Gauge,
-    /// Times the node clamped `rate_per_mb` to the configured delivery
-    /// bounds before signing a `ProbeResponse` (ADR 005 §Rate bounds
-    /// validation). Operator-visible name:
-    /// `decdn_rate_bounds_clamp_events_total`.
-    pub rate_bounds_clamp_events: Counter,
     /// `cdn/dht/v1` requests rejected by the per-peer (`NodeId`) token
     /// bucket (ADR 022 §DHT Rate Limiting). One Counter per layer to match
     /// the existing `dispatch_rejected_*` convention: a plain counter field
@@ -1321,17 +1316,8 @@ pub struct DecdnMetrics {
     /// `decdn_settlement_watcher_last_tick_timestamp_seconds` (#1316): Unix time
     /// of the payment-settlement watcher's last successful poll tick.
     pub settlement_watcher_last_tick_timestamp_seconds: Gauge,
-    /// `decdn_rate_bounds_watcher_last_tick_timestamp_seconds` (#1172): Unix time
-    /// of the rate-bounds watcher's last successful poll tick. Load-bearing: the
-    /// watcher's `getRateBounds()` poll failure and undecodable-log paths both
-    /// return `Ok` by design (an `Err` would stall the cursor), so a watcher stuck
-    /// in RPC backoff — or dead — is otherwise indistinguishable from a healthy
-    /// one while the node keeps signing quotes against stale, economically
-    /// load-bearing bounds. Alert on this gauge going stale.
-    pub rate_bounds_watcher_last_tick_timestamp_seconds: Gauge,
     /// `decdn_fee_shares_watcher_last_tick_timestamp_seconds`: Unix time of the
-    /// fee-shares watcher's last successful poll tick. Load-bearing for the
-    /// same reason as `rate_bounds_watcher_last_tick_timestamp_seconds`: the
+    /// fee-shares watcher's last successful poll tick. Load-bearing: the
     /// watcher's `getShares()` poll failure and undecodable-log paths both
     /// return `Ok` by design, so a watcher stuck in RPC backoff — or dead — is
     /// otherwise indistinguishable from a healthy one while the node keeps
@@ -1349,9 +1335,6 @@ pub struct DecdnMetrics {
     /// `decdn_blacklist_watcher_task_panicked_total` (#1316, #1283): the
     /// blacklist watcher task unwound on a panic.
     pub blacklist_watcher_task_panicked: Counter,
-    /// `decdn_rate_bounds_watcher_task_panicked_total` (#1172): the rate-bounds
-    /// watcher task unwound on a panic. Any non-zero value is a bug in this node.
-    pub rate_bounds_watcher_task_panicked: Counter,
     /// `decdn_fee_shares_watcher_task_panicked_total`: the fee-shares watcher
     /// task unwound on a panic. Any non-zero value is a bug in this node.
     pub fee_shares_watcher_task_panicked: Counter,
@@ -1817,10 +1800,6 @@ recorders! {
     /// Publish the configured `max_probe_holds` budget (registry-mandatory
     /// `decdn_probe_hold_slots_max`). Called once at runtime bring-up.
     probe_hold_slots_max(max: usize) => probe_hold_slots_max.set(sat(max));
-
-    /// The node clamped `rate_per_mb` to the configured delivery bounds
-    /// before signing (ADR 005 §Rate bounds validation).
-    rate_bounds_clamped => rate_bounds_clamp_events.inc();
 
     /// An accepted voucher skipped one or more nonce values past
     /// `last_nonce + 1` (#747). Counted once per gapped voucher; the precise
@@ -2327,11 +2306,6 @@ recorders! {
     blacklist_watcher_tick => blacklist_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// Stamp the payment-settlement watcher's liveness gauge (#1316).
     settlement_watcher_tick => settlement_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
-    /// Stamp the rate-bounds watcher's liveness gauge (#1172). See
-    /// `slash_watcher_tick`; this one matters because the rate-bounds watcher's
-    /// failure paths deliberately return `Ok`, so this gauge is the only signal
-    /// that it is still polling.
-    rate_bounds_watcher_tick => rate_bounds_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// Stamp the fee-shares watcher's liveness gauge. See `slash_watcher_tick`;
     /// this one matters because the fee-shares watcher's failure paths
     /// deliberately return `Ok`, so this gauge is the only signal that it is
@@ -2345,8 +2319,6 @@ recorders! {
     staker_set_watcher_task_panicked => staker_set_watcher_task_panicked.inc();
     /// Record that the blacklist watcher task unwound on a panic (#1316, #1283).
     blacklist_watcher_task_panicked => blacklist_watcher_task_panicked.inc();
-    /// Record that the rate-bounds watcher task unwound on a panic (#1172).
-    rate_bounds_watcher_task_panicked => rate_bounds_watcher_task_panicked.inc();
     /// Record that the fee-shares watcher task unwound on a panic.
     fee_shares_watcher_task_panicked => fee_shares_watcher_task_panicked.inc();
     /// Record that the payment-settlement watcher task unwound on a panic (#1316).

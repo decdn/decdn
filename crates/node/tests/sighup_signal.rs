@@ -70,7 +70,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
             rpc_watchdog_interval_sec: 30,
             event_poll_interval_ms: 7000,
-            rate_bounds_poll_interval_sec: 3600,
             fee_shares_poll_interval_sec: 3600,
             redeem_threshold_micro_usdc: 1_000_000,
             redeem_max_vouchers_per_tx: 300,
@@ -136,7 +135,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         payment: ResolvedPayment {
             frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
             rate_per_mb: rate,
-            delivery_floor: 0,
             credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
             credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
             voucher_commit_interval_ms: decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,

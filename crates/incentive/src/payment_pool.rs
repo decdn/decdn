@@ -40,8 +40,8 @@
 //!   filters on its own `provider` topic as the single write path for the
 //!   paid side), `PoolCloseInitiated` (the owner started the grace-window
 //!   close), `PoolReclaimed` (the residual was refunded and the pool is now
-//!   closed), and `RateBoundsUpdated` (the rate-bounds watcher decodes the
-//!   new floor and clamps the node's advertised `rate_per_mb`).
+//!   closed), and `RateBoundsUpdated` (governance changed the redemption-time
+//!   delivery-rate floor).
 //!
 //! The capability/voucher EIP-712 domain (name `"PaymentPool"`, version
 //! `"1"`) lives in [`crate::voucher`]; the `capability` argument to `redeem`
@@ -208,10 +208,11 @@ mod sol_types {
                 view
                 returns (Lane memory);
 
-            /// Governable per-megabyte delivery-rate floor (ADR 005 / ADR
-            /// 003) — the settlement-enforced minimum rate a voucher may pay
-            /// per MB. The node reads it at startup and on every
-            /// `RateBoundsUpdated` to clamp its advertised `rate_per_mb`.
+            /// Governable per-megabyte delivery-rate floor (ADR 003). A soft
+            /// floor: `redeem` settles a sub-floor voucher in full and clamps
+            /// only the byte count it credits toward governance vote weight. It
+            /// is not a quote gate — nodes never read it to bound their own
+            /// rate — so this getter is governance-observability only.
             function getRateBounds() external view returns (uint256 floor);
 
             /// Per-owner monotonic pool counter (public mapping getter). The
@@ -309,11 +310,10 @@ mod sol_types {
             /// to `owner` and the pool is now `Closed`.
             event PoolReclaimed(bytes32 indexed poolId, address indexed owner, uint256 ownerRefund);
 
-            /// Governance changed the per-MB delivery-rate floor. The
-            /// rate-bounds watcher decodes the new floor and stores it into
-            /// the node's live clamp so a governance retune reaches running
-            /// nodes without a restart. No `indexed` params — matches
-            /// `setRateBounds`.
+            /// Governance changed the per-MB delivery-rate floor. The floor is
+            /// redemption-time contract state (the soft vote-weight credit
+            /// clamp); this event announces the change to on-chain observers. No
+            /// `indexed` params — matches `setRateBounds`.
             event RateBoundsUpdated(uint256 newDeliveryFloor);
         }
     }

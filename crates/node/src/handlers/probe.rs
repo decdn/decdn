@@ -138,12 +138,6 @@ pub struct ProbeHandler {
     /// `SlashJudge` EIP-712 domain, built once from
     /// `blockchain.{slash_judge_address,chain_id}`.
     slash_domain: Eip712Domain,
-    /// Live per-MB delivery-rate bounds clamping `rate_per_mb` before signing
-    /// (ADR 005 §Rate bounds validation). Seeded from the on-chain
-    /// `getRateBounds()` at startup and updated in place by the
-    /// `RateBoundsUpdated` watcher (#1172), so a governance retune takes effect
-    /// without a restart.
-    rate_bounds: crate::rate_bounds::RateBounds,
     /// Optional stake-lane probe-acceptance reservation (#757). `None` (the
     /// single-lane default) makes the hold-admission path identical to
     /// pre-#757 behaviour; `Some` reserves hold headroom for registered
@@ -168,7 +162,6 @@ impl std::fmt::Debug for ProbeHandler {
         f.debug_struct("ProbeHandler")
             .field("node_id", &self.node_id)
             .field("rate_per_mb", &self.rate_per_mb)
-            .field("rate_bounds", &self.rate_bounds)
             .finish_non_exhaustive()
     }
 }
@@ -192,7 +185,6 @@ impl ProbeHandler {
         cache: CacheEngine,
         eth_signer: Arc<PrivateKeySigner>,
         slash_domain: Eip712Domain,
-        rate_bounds: crate::rate_bounds::RateBounds,
         stake_lane: Option<StakeLanePolicy>,
         relay_foreign_namespaces: bool,
         chain_freshness: Option<crate::chain_freshness::ChainFreshness>,
@@ -206,7 +198,6 @@ impl ProbeHandler {
             cache,
             eth_signer,
             slash_domain,
-            rate_bounds,
             stake_lane,
             relay_foreign_namespaces,
             chain_freshness,
@@ -620,21 +611,11 @@ impl ProbeHandler {
             self.cache.probe_hold_slots_used()
         });
 
-        // Raise the quoted rate to the governance delivery floor before signing
-        // (ADR 005 §Rate bounds validation): clamp-and-warn keeps the node
-        // operational across governance transitions.
-        let raw_rate = self.rate_per_mb;
-        let (rate_per_mb, floor) = self.rate_bounds.raise_to_floor(raw_rate);
-        if rate_per_mb != raw_rate {
-            self.metrics.rate_bounds_clamped();
-            tracing::warn!(
-                raw_rate,
-                clamped = rate_per_mb,
-                floor,
-                "rate_per_mb raised to the delivery floor before signing ProbeResponse"
-            );
-        }
-
+        // The node advertises its configured rate verbatim. The delivery floor
+        // is not a quote gate: a rate below the floor still sells and settles,
+        // and `PaymentPool.redeem` clamps only the vote-weight byte credit for
+        // sub-floor bytes (ADR 003 § Rate-floor enforcement).
+        let rate_per_mb = self.rate_per_mb;
         let body = ProbeResponseBody {
             hash: req.hash,
             has_blob,

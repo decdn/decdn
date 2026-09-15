@@ -184,11 +184,6 @@ pub struct PaymentArgs {
     /// Rate per MB in USDC base units (6 decimals; 10 = $0.00001/MB) [default: 10].
     #[arg(long, value_name = "UNITS", env = "DECDN_RATE_PER_MB")]
     pub rate_per_mb: Option<u64>,
-
-    /// Lower bound `rate_per_mb` is clamped to before signing a
-    /// `ProbeResponse` (ADR 005 §Rate bounds validation) [default: 0].
-    #[arg(long, value_name = "UNITS", env = "DECDN_DELIVERY_FLOOR")]
-    pub delivery_floor: Option<u64>,
 }
 
 /// Observability settings (logging, metrics).

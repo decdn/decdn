@@ -743,7 +743,7 @@ An owner reconciling its pools after a restart reads its own `ownerPoolNonce` an
 
 `PaymentPool` does not hold a fee-percentage parameter. Bucket-share bounds (60/30/10 with per-share bounds 40–90 / 5–50 / 0–30) are owned by `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
 
-**The rate floor is in USDC base units (6 decimals) per MB.** The contract stores `deliveryFloor`, the per-byte price floor **enforced at redemption** (see [Rate-floor enforcement](#rate-floor-enforcement) below). There is no governance ceiling: a seller self-clamping its own advertised rate downward buys no on-chain safety — a seller never wants to charge less — and the buyer's protection is seeing the signed rate in `StreamResponse` before it pays. The absolute upper bound is the wire constant `MAX_RATE_PER_MB` = 1000 base units per MB (~$1/GB, ~100× the expected market rate; [ADR 005](005-protocol.md#adr-005-wire-protocol)), which honest requesters reject above. The ceiling sits near real prices on purpose: a floor set close to it clamps credited bytes toward zero, so a far-above-market ceiling would let governance suppress ADR-036 vote-weight accrual, while a realistic one still catches below-market bytes and can never zero out the electorate's weight.
+**The rate floor is in USDC base units (6 decimals) per MB.** The contract stores `deliveryFloor`, the per-byte price floor **enforced at redemption** (see [Rate-floor enforcement](#rate-floor-enforcement) below). It is a soft floor and never a quote gate: a node advertises whatever rate it configures, and a sub-floor rate still settles. There is no governance ceiling either — the buyer sees the signed rate in `StreamResponse` before it pays, so it protects itself by rejecting a rate it finds too expensive. The absolute upper bound is the wire constant `MAX_RATE_PER_MB` = 1000 base units per MB (~$1/GB, ~100× the expected market rate; [ADR 005](005-protocol.md#adr-005-wire-protocol)), which honest requesters reject above. The ceiling sits near real prices on purpose: a floor set close to it clamps credited bytes toward zero, so a far-above-market ceiling would let governance suppress ADR-036 vote-weight accrual, while a realistic one still catches below-market bytes and can never zero out the electorate's weight.
 
 **Initial rate floor:**
 
@@ -769,29 +769,7 @@ This binds credited bytes to real USDC: crediting `B` bytes requires cumulativel
 
 The cumulative `amount` needs no separate bound. Credit is proportional to the USDC actually routed (`bytesPaid = mulDiv(bytesDelta, paid, desired)`), so a partial-drain payment credits only the bytes its money buys at the floor price. Overpaying for few bytes credits the honest, sub-ceiling byte count and moves only the payer's own USDC through the fee split; it inflates nothing. The floor is a price on vote weight, not a gate.
 
-A node protects its own revenue off-chain without mirroring the floor at voucher acceptance. It raises its advertised rate to the floor before signing a quote, so it never sells below the floor, and it checks each voucher pays that advertised rate for the bytes the voucher covers. It does **not** reject a voucher whose cumulative dips below the live floor — the mid-stream floor-raise race, since the quote was already raised to the floor before signing. Such a voucher still settles its cumulative, and redemption clamps only its byte credit, rather than stranding the node for bytes it already served.
-
-### Rate Bounds Refresh
-
-Nodes must keep their local copy of `deliveryFloor` current so an advertised `rate_per_mb` never falls below it. Staleness is a revenue risk rather than a safety one — a node quoting under a raised floor still collects each voucher's `amount`, but redemption clamps the byte credit for those vouchers, so the node loses vote-weight credit on bytes it served. So the refresh strategy is lighter-touch than the content blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)), where serving blacklisted content is a slashable offense.
-
-**Primary mechanism: event listening.** Nodes SHOULD subscribe to `RateBoundsUpdated` events on the `PaymentPool` contract and update the local cache immediately. Governance actions are infrequent (days to weeks), so high-frequency polling would be wasteful.
-
-**Fallback mechanism: periodic polling.** Nodes MUST poll `getRateBounds()` at a configurable interval (`rate_bounds_poll_interval`, default **1 hour**), guarding against missed events from RPC provider issues, WebSocket disconnections, or chain reorganizations. The 1-hour default is deliberately longer than the 10-minute registry ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) / blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)) intervals: registry freshness is connectivity-critical and blacklist freshness slashing-critical, but a stale rate floor only risks the node quoting below it and having those vouchers' byte credit clamped at settlement.
-
-#### Startup
-
-Nodes MUST call `getRateBounds()` before accepting connections, never operating without a floor (same pattern as the content blacklist initial sync, [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). Because `getRateBounds()` returns `uint256` but the wire protocol represents `rate_per_mb` as `u64` ([ADR 005](005-protocol.md#adr-005-wire-protocol)), nodes MUST verify `deliveryFloor` fits within `u64` on every refresh (startup and subsequent polls/events). If it exceeds `u64::MAX`, the node MUST refuse to start (or, on a mid-operation refresh, continue with its last valid floor and log an error). Unreachable against a correctly-deployed contract — `setRateBounds` caps the floor at `MAX_RATE_PER_MB` (1000), far below `u64::MAX` — but the check guards against a contract deployed without that cap.
-
-#### Stale bounds
-
-If the event subscription is lost and RPC polling fails, the node SHOULD continue operating with its last-known floor and log a warning. No service interruption is required. The worst-case consequence of a stale floor is that the node quotes below a raised floor and redemption clamps the byte credit on those vouchers — a revenue and vote-weight impact, not a safety violation.
-
-#### No version-based delta pattern
-
-The rate floor is a single `uint256`, readable in one `eth_call` with negligible overhead, so it carries no version counter and no delta-fetch path. This matches the content blacklist, which likewise keeps no version cursor and reads full current state by enumeration ([ADR 011 § Node Behavior](011-content-takedown.md#node-behavior)).
-
-For how nodes validate `rate_per_mb` against the cached floor before signing protocol messages, see [ADR 005 — Rate Bounds Validation](005-protocol.md#rate-bounds-validation).
+The node never mirrors the floor on the wire. It advertises its configured `rate_per_mb` verbatim and never raises its own quote to the floor. It checks each voucher pays that advertised rate for the bytes the voucher covers, which protects its own per-delta revenue. It does **not** gate a voucher on the floor. The floor is redemption-time contract state; the node reads it for no wire decision. A voucher whose cumulative dips below the floor still settles its cumulative, and redemption clamps only its byte credit. So a node that quotes below the floor keeps serving and keeps its money; it loses only vote-weight credit on the sub-floor bytes. Raising the floor never obliges a node to raise its price.
 
 ### BuybackBurner
 

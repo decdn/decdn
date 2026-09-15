@@ -868,7 +868,6 @@ impl RuntimeReloadState {
                 capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
                 event_poll_interval_ms: 7000,
-                rate_bounds_poll_interval_sec: 3600,
                 fee_shares_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
                 redeem_max_vouchers_per_tx: 300,
@@ -938,7 +937,6 @@ impl RuntimeReloadState {
             // Placeholder rate — `payment.*` is restart-required.
             payment: ResolvedPayment {
                 rate_per_mb: 1,
-                delivery_floor: 0,
                 credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
                 frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
                 credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
@@ -1192,11 +1190,10 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
     if file.payment.is_some() {
         // The whole `[payment]` section is restart-required. `rate_per_mb` is
         // the served price — an economic commitment on the wire — so it takes
-        // effect only at startup; reprice by draining and restarting.
-        // `delivery_floor` is governed on-chain via `getRateBounds()`; the
-        // other serve knobs are read once at handler construction.
+        // effect only at startup; reprice by draining and restarting. The other
+        // serve knobs are read once at handler construction.
         warn_ignored(
-            "payment.* (rate_per_mb, delivery_floor, credit_max, \
+            "payment.* (rate_per_mb, credit_max, \
              credit_ramp_divisor, frame_target_bytes, voucher_commit_interval_ms)",
         );
     }
@@ -1401,7 +1398,6 @@ mod tests {
                 capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
                 event_poll_interval_ms: 7000,
-                rate_bounds_poll_interval_sec: 3600,
                 fee_shares_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
                 redeem_max_vouchers_per_tx: 300,
@@ -1470,7 +1466,6 @@ mod tests {
             },
             payment: ResolvedPayment {
                 rate_per_mb: rate,
-                delivery_floor: 0,
                 credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
                 frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
                 credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,

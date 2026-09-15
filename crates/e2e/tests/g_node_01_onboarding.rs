@@ -256,9 +256,9 @@ async fn run_journey() -> anyhow::Result<()> {
 
     // ---- 6. ADR 019 Phase 3 state sync, now that the node is servable.
     //
-    // Rate floor (Step 3.1): the signed probe quote must be at or above the
-    // on-chain `getRateBounds()` floor. `g_gov_02` owns the retune case; here it
-    // is enough that the startup read produced a live clamp at all.
+    // The node advertises its configured rate verbatim — the delivery floor is
+    // a redemption-time credit clamp, not a quote gate — so it is enough here
+    // that a servable node signs a probe response carrying a real rate.
     let probe = client.probe(&node, hash).await?;
     assert!(probe.body.has_blob, "the node holds the blob");
     assert!(

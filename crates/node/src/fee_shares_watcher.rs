@@ -44,11 +44,10 @@ struct FeeSharesSink<P: Provider + Clone> {
 impl<P: Provider + Clone> FeeSharesSink<P> {
     /// Narrow the on-chain `[operator, buyback, treasury]` split to the
     /// operator's bps and store it. Fail-closed at the narrowing step
-    /// (`operator_bps_from_shares` rejects an out-of-range split), so unlike
-    /// `rate_bounds_watcher`'s clamp-and-keep, a bad split here simply never
-    /// overwrites the current cell: it is logged and the previous share is
-    /// kept, because signing quotes against a value we cannot validate is
-    /// worse than signing against the last-known-good one.
+    /// (`operator_bps_from_shares` rejects an out-of-range split), so a bad
+    /// split here simply never overwrites the current cell: it is logged and the
+    /// previous share is kept, because signing quotes against a value we cannot
+    /// validate is worse than signing against the last-known-good one.
     fn store_shares(&self, raw_shares: [U256; 3], source: &str) {
         match operator_bps_from_shares(raw_shares, source) {
             Ok(bps) => {
@@ -94,10 +93,9 @@ impl<P: Provider + Clone + 'static> LogSink for FeeSharesSink<P> {
         if !due {
             return Ok(());
         }
-        // Stamp BEFORE the call, not only on success — see
-        // `rate_bounds_watcher::RateBoundsSink::on_tick_complete` for why: a
-        // persistently failing `getShares()` must retry on the slow cadence,
-        // not on every watcher tick.
+        // Stamp BEFORE the call, not only on success: a persistently failing
+        // `getShares()` must retry on the slow cadence, not on every watcher
+        // tick, which would hammer the RPC.
         self.last_poll = Some(now);
         match self.contract.getShares().call().await {
             Ok(shares) => {

@@ -843,7 +843,6 @@ async fn build_origin_with_probe_caches(
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
             operator_shares: decdn_node::fee_shares::OperatorShares::new(6000),
             frequency_estimator: None,
-            sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
             sell_rate_base: 0,
             // A budget far larger than any test's buy cost, so these fixtures warm
             // freely and the ADR 041 gate never changes their behaviour.
@@ -1000,7 +999,6 @@ async fn build_origin_multi_hash(
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
             operator_shares: decdn_node::fee_shares::OperatorShares::new(6000),
             frequency_estimator: None,
-            sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
             sell_rate_base: 0,
             // A budget far larger than any test's buy cost, so these fixtures warm
             // freely and the ADR 041 gate never changes their behaviour.
@@ -1554,7 +1552,6 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
             operator_shares: decdn_node::fee_shares::OperatorShares::new(6000),
             frequency_estimator: None,
-            sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
             sell_rate_base: 0,
             // A budget far larger than any test's buy cost, so these fixtures warm
             // freely and the ADR 041 gate never changes their behaviour.
@@ -9468,7 +9465,6 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
             operator_shares: decdn_node::fee_shares::OperatorShares::new(6000),
             frequency_estimator: None,
-            sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
             sell_rate_base: 0,
             // A budget far larger than any test's buy cost, so these fixtures warm
             // freely and the ADR 041 gate never changes their behaviour.
@@ -11180,7 +11176,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
             operator_shares: decdn_node::fee_shares::OperatorShares::new(6000),
             frequency_estimator: None,
-            sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
             sell_rate_base: 0,
             // A budget far larger than any test's buy cost, so these fixtures warm
             // freely and the ADR 041 gate never changes their behaviour.
@@ -12493,7 +12488,6 @@ async fn build_origin_economics(
             serve_economics,
             operator_shares: decdn_node::fee_shares::OperatorShares::new(operator_bps),
             frequency_estimator,
-            sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
             sell_rate_base,
             warming,
         },

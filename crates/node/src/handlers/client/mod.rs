@@ -893,10 +893,6 @@ pub struct ClientHandlerDeps {
     /// The served per-MB price, fixed at startup. Reprice by restarting the
     /// daemon (see `runtime::reload::warn_restart_required_sections`).
     pub rate_per_mb: u64,
-    /// Live per-MB delivery-rate bounds (#1172). Seeded from on-chain
-    /// `getRateBounds()` and updated by the `RateBoundsUpdated` watcher,
-    /// replacing the by-value config stand-in.
-    pub rate_bounds: crate::rate_bounds::RateBounds,
     /// Cap on concurrently served streams within one connection — the
     /// semaphore is built per accepted connection, not per node.
     pub max_concurrent_streams: usize,
@@ -1027,7 +1023,6 @@ impl ClientHandlerDeps {
         channel_state_store: Arc<dyn PoolStateStore>,
         receipt_sink: Arc<dyn ReceiptSink>,
         rate_per_mb: u64,
-        rate_bounds: crate::rate_bounds::RateBounds,
         max_concurrent_streams: usize,
         content_deny: Arc<crate::content_deny::ContentDenylist>,
         pool_min_remaining_deposit: U256,
@@ -1048,7 +1043,6 @@ impl ClientHandlerDeps {
             pool_view: None,
             pool_min_remaining_deposit,
             rate_per_mb,
-            rate_bounds,
             max_concurrent_streams,
             content_deny,
             chain_freshness: None,
@@ -1321,7 +1315,6 @@ pub struct ClientHandler {
     /// Served per-MB price, fixed at startup (see
     /// [`ClientHandlerDeps::rate_per_mb`]).
     rate_per_mb: u64,
-    rate_bounds: crate::rate_bounds::RateBounds,
     max_concurrent_streams: usize,
     /// Throttle state for the insufficient-deposit refusal log (#1520): the
     /// millisecond timestamp of the last emitted `warn!`, and how many refusals
@@ -1455,7 +1448,6 @@ impl ClientHandler {
             frame_target_bytes: deps.frame_target_bytes,
             content_deny: deps.content_deny,
             rate_per_mb: deps.rate_per_mb,
-            rate_bounds: deps.rate_bounds,
             max_concurrent_streams: deps.max_concurrent_streams,
             deposit_refusal_last_warn_ms: AtomicU64::new(0),
             deposit_refusal_suppressed: AtomicU64::new(0),
@@ -1487,7 +1479,7 @@ impl ClientHandler {
     /// `try_send`, and never waits on the bucket lock the buy loop takes, which
     /// is what the sink contract requires of anything on this path.
     fn credit_warming_serve(&self, hash: Hash, served_bytes: u64) {
-        let (sell_rate, _floor) = self.rate_bounds.raise_to_floor(self.rate_per_mb);
+        let sell_rate = self.rate_per_mb;
         let margin_per_mb = sell_rate
             .saturating_mul(u64::from(self.operator_shares.bps()))
             .saturating_div(10_000);
@@ -2706,7 +2698,6 @@ pub(super) async fn handler_over_store(
             crate::receipt_log::NoopReceiptLog,
         ))) as Arc<dyn ReceiptSink>,
         1,
-        crate::rate_bounds::RateBounds::new(0),
         16,
         Arc::new(crate::content_deny::ContentDenylist::empty()),
         U256::ZERO,
@@ -2930,7 +2921,6 @@ mod tests {
                 crate::receipt_log::NoopReceiptLog,
             ))) as Arc<dyn ReceiptSink>,
             1,
-            crate::rate_bounds::RateBounds::new(0),
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
             pool_min_remaining_deposit,
@@ -3472,7 +3462,6 @@ mod tests {
                 crate::receipt_log::NoopReceiptLog,
             ))) as Arc<dyn ReceiptSink>,
             1,
-            crate::rate_bounds::RateBounds::new(0),
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
             U256::ZERO,
@@ -3522,7 +3511,6 @@ mod tests {
                 crate::receipt_log::NoopReceiptLog,
             ))) as Arc<dyn ReceiptSink>,
             1,
-            crate::rate_bounds::RateBounds::new(0),
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
             U256::ZERO,

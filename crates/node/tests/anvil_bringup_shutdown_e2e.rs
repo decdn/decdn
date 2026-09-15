@@ -342,7 +342,6 @@ fn build_config(
             capacity_bond_address: addrs.capacity_bond.to_string(),
             rpc_watchdog_interval_sec: 30,
             event_poll_interval_ms: 250,
-            rate_bounds_poll_interval_sec: 3600,
             fee_shares_poll_interval_sec: 3600,
             redeem_threshold_micro_usdc: 1_000_000,
             redeem_max_vouchers_per_tx: 300,
@@ -410,7 +409,6 @@ fn build_config(
         payment: ResolvedPayment {
             frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
             rate_per_mb: 10,
-            delivery_floor: 0,
             credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
             credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
             voucher_commit_interval_ms: decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,

@@ -101,22 +101,6 @@ groups:
             panic. Never expected under the anti-panic policy. Capture the
             error! log line naming the watcher label and file a bug.
 
-      - alert: DecdnRateBoundsClamp
-        expr: rate(decdn_rate_bounds_clamp_events_total[5m]) > 0
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "rate_per_mb being raised to the delivery floor on {{ $labels.instance }}"
-          description: |
-            The configured rate_per_mb sits BELOW the governance deliveryFloor,
-            so every quote is being raised to the floor before signing a
-            ProbeResponse or StreamResponse. The clamp is raise-only — there is
-            no governance ceiling — so this never lowers your rate; it means you
-            are not charging what you configured. Raise payment.rate_per_mb to
-            at least the on-chain floor (hot-reloadable via SIGHUP).
-            See adr/003-payments.md#rate-bounds-refresh.
-
       # A latent-bug report, not a degradation (#1517). The engine recovers the
       # guard and clears the poison, so coalescing never stops and no restart is
       # needed — but the workspace anti-panic policy means no production path is

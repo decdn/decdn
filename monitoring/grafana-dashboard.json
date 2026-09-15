@@ -185,15 +185,9 @@
           "expr": "rate(decdn_probe_hold_unavailable_total{reason=\"exhausted\",instance=~\"$instance\"}[5m])",
           "legendFormat": "probe_hold_unavailable{reason=exhausted} / s — {{instance}}",
           "refId": "A"
-        },
-        {
-          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "rate(decdn_rate_bounds_clamp_events_total{instance=~\"$instance\"}[5m])",
-          "legendFormat": "rate_bounds_clamp / s — {{instance}}",
-          "refId": "B"
         }
       ],
-      "title": "Probe-hold & rate-clamp event rates",
+      "title": "Probe-hold event rate",
       "type": "timeseries"
     },
     {

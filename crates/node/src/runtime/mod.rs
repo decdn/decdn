@@ -774,10 +774,6 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// handle: the binding only moves by an explicit operator transaction, so
     /// there is nothing live to keep.
     binding_report: crate::binding_check::BindingReport,
-    /// Live per-MB delivery-rate floor clamp — the same handle the probe and
-    /// client handlers hold. Threaded to [`crate::node_origin::NodeOriginConfig`]
-    /// (ADR 041) so the buy-side gate can derive this node's current sell rate.
-    rate_bounds: crate::rate_bounds::RateBounds,
     /// ADR 041 buy-side profitability gate policy, selected from
     /// `cache.serve_economics.policy`.
     serve_economics: Arc<dyn crate::serve_economics::ServeEconomicsPolicy>,
@@ -974,15 +970,6 @@ async fn build_chain_and_handlers(
         Arc::clone(&infra.node_metrics),
     ));
 
-    // Live per-MB delivery-rate floor (#1172, ADR 019 §3.1). Seed from the
-    // config stand-in (`payment.delivery_floor`) so the handlers hold the shared
-    // clamp from construction; the authoritative on-chain `getRateBounds()` read
-    // below (once `payment_pool_addr` is parsed) overwrites it before serving
-    // begins, and the `RateBoundsUpdated` watcher keeps it live thereafter. The
-    // same handle is cloned into the probe handler, the client handler, and the
-    // watcher.
-    let rate_bounds = crate::rate_bounds::RateBounds::new(cfg.payment.delivery_floor);
-
     // Chain-read liveness (ADR 011 §Serving while chain-stale). One handle,
     // stamped by the blacklist watcher (boot enumeration + every successful poll
     // tick) and read by the probe and serve paths, which refuse once the node
@@ -1004,7 +991,6 @@ async fn build_chain_and_handlers(
         infra.cache.clone(),
         Arc::clone(&infra.eth_signer),
         slash_domain.clone(),
-        rate_bounds.clone(),
         stake_lane_policy,
         cfg.cache.relay_foreign_namespaces,
         Some(chain_freshness.clone()),
@@ -1080,38 +1066,8 @@ async fn build_chain_and_handlers(
         "blockchain.payment_pool_address",
     )?;
 
-    // Authoritative on-chain delivery-rate floor (#1172, ADR 019 §3.1 / ADR
-    // 003). Read once at startup — a fail-fast self-check in the same spirit as
-    // `PaymentPool.usdc()` — and seed the shared clamp created above,
-    // replacing the config stand-in. The on-chain floor is `uint256`; the node
-    // clamps in `u64`, so an out-of-range value must refuse startup rather than
-    // silently truncate. The `RateBoundsUpdated` watcher spawned below keeps the
-    // clamp live for governance retunes without a restart.
-    {
-        let contract = decdn_incentive::payment_pool::PaymentPool::new(
-            payment_pool_addr,
-            ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
-        );
-        let on_chain_floor = contract.getRateBounds().call().await.with_context(|| {
-            format!("PaymentPool.getRateBounds() startup read at {payment_pool_addr}")
-        })?;
-        // Both rejection arms live in `rate_bounds::on_chain_floor_to_u64` so a
-        // unit test can reach them; inline here they sat behind an async chain
-        // read no fixture could drive to a bad value.
-        let floor = crate::rate_bounds::on_chain_floor_to_u64(
-            on_chain_floor,
-            &payment_pool_addr.to_string(),
-        )?;
-        rate_bounds.store(floor);
-        tracing::info!(
-            floor,
-            %payment_pool_addr,
-            "seeded live delivery-rate floor from on-chain getRateBounds()"
-        );
-    }
-
     // Live operator fee-share seed (ADR 041 / ADR 016 § Tunable Economics).
-    // Mirrors the delivery-rate-floor startup read above — `PaymentPool.feeRouter()`
+    // A fail-fast on-chain self-check at startup — `PaymentPool.feeRouter()`
     // resolves the router address, then `FeeRouter.getShares()` reads the current
     // 3-way split, narrowed to the operator's bps. Unlike the rate-bounds read,
     // NO leg of this chain is fatal to boot: an RPC failure or an unnarrowable
@@ -1353,7 +1309,6 @@ async fn build_chain_and_handlers(
             cfg.blockchain.pool_min_remaining_deposit_micro_usdc,
         ),
         rate_per_mb: cfg.payment.rate_per_mb,
-        rate_bounds: rate_bounds.clone(),
         max_concurrent_streams: MAX_CLIENT_STREAMS,
         content_deny: Arc::clone(&content_denylist),
         chain_freshness: Some(chain_freshness.clone()),
@@ -1449,20 +1404,6 @@ async fn build_chain_and_handlers(
     .context("blacklist compliance watcher boot enumeration")?;
     poller_routes.push(blacklist_route);
 
-    // Rate-bounds route (#1172, ADR 019 §3.1): follows `RateBoundsUpdated` on the
-    // shared poller and re-reads `getRateBounds()` authoritatively every
-    // `rate_bounds_poll_interval_sec` as a safety net, storing into the same
-    // shared `rate_bounds` clamp the handlers hold (seeded by the startup read
-    // above). Read-only, no durable cursor.
-    let rate_bounds_route = crate::rate_bounds_watcher::route(
-        ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
-        payment_pool_addr,
-        rate_bounds.clone(),
-        Duration::from_secs(cfg.blockchain.rate_bounds_poll_interval_sec),
-        &infra.node_metrics,
-    );
-    poller_routes.push(rate_bounds_route);
-
     // Fee-shares route (ADR 041 / ADR 016 § Tunable Economics): follows
     // `SharesUpdated` on the shared poller and re-reads `getShares()`
     // authoritatively every `fee_shares_poll_interval_sec` as a safety net,
@@ -1544,7 +1485,6 @@ async fn build_chain_and_handlers(
         payment_service,
         blacklist_ready_rx,
         binding_report,
-        rate_bounds,
         serve_economics,
         operator_shares,
         warming,
@@ -2072,12 +2012,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         own_region: cfg.identity.region.clone(),
         // ADR 041 buy-side profitability gate + its inputs: the policy object
         // itself, the live operator fee-share cell, the shared ADR 040
-        // frequency estimator (when built), and the handles the buy loop reads
-        // to derive this node's current sell rate `P_sell`.
+        // frequency estimator (when built), and this node's configured sell rate
+        // `P_sell` (`payment.rate_per_mb`).
         serve_economics: ch.serve_economics.clone(),
         operator_shares: ch.operator_shares.clone(),
         frequency_estimator: infra.frequency_estimator.clone(),
-        sell_rate_bounds: ch.rate_bounds.clone(),
         sell_rate_base: cfg.payment.rate_per_mb,
         warming: Arc::clone(&ch.warming),
     };
@@ -3976,7 +3915,6 @@ mod tests {
                 capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
                 event_poll_interval_ms: 7000,
-                rate_bounds_poll_interval_sec: 3600,
                 fee_shares_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
                 redeem_max_vouchers_per_tx: 300,
@@ -4045,7 +3983,6 @@ mod tests {
             },
             payment: ResolvedPayment {
                 rate_per_mb: 10,
-                delivery_floor: 0,
                 credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
                 frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
                 credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
