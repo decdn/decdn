@@ -1584,6 +1584,16 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                         let outcomes = self
                             .fetch_group(group, out_root, overwrite, index, skip)
                             .await;
+                        // `fetch_group` returns one outcome per entry, in order;
+                        // `build_completed_updates` relies on that to correlate a
+                        // path to its outcome by position. Assert the invariant for
+                        // completed groups so a future divergence is caught in
+                        // debug builds rather than silently truncating the zip.
+                        debug_assert_eq!(
+                            group_entries.len(),
+                            outcomes.len(),
+                            "fetch_group must return one outcome per entry"
+                        );
                         let updates = build_completed_updates(&group_entries, &outcomes, out_root);
                         (outcomes, updates)
                     }
@@ -2823,24 +2833,30 @@ async fn flush_task(
         bytes_since = bytes_since.saturating_add(batch.fetched_bytes);
         bundle_manifest::merge(&mut acc, batch.updates);
         dirty = true;
-        if files_since >= FLUSH_FILES || bytes_since >= FLUSH_BYTES {
-            flush_now(out_root, &acc).await;
+        if (files_since >= FLUSH_FILES || bytes_since >= FLUSH_BYTES)
+            && flush_now(out_root, &acc).await
+        {
+            // Only clear on a successful write. A failed cadence flush keeps
+            // `dirty` set and the counters over threshold, so the next batch
+            // retries and the final write below still runs at close — the last
+            // accumulated updates are never dropped by a transient write error.
             files_since = 0;
             bytes_since = 0;
             dirty = false;
         }
     }
-    // Persist whatever landed since the last cadence flush (or the only batch of a
-    // small run). `dirty` stays false when the last cadence flush already covered
-    // everything, so a clean run adds no redundant final write.
+    // Persist whatever landed since the last successful flush (or the only batch of
+    // a small run). `dirty` stays false only when the last cadence flush already
+    // wrote everything, so a clean run adds no redundant final write.
     if dirty {
         flush_now(out_root, &acc).await;
     }
 }
 
 /// Serialize `acc` (fast, in-memory) and write it atomically on a blocking task.
-/// Advisory: every failure is logged, never returned.
-async fn flush_now(out_root: &Path, acc: &SavedManifest) {
+/// Returns whether the write succeeded so the caller can retry a failed cadence
+/// flush at close. Advisory: every failure is logged, never returned as an error.
+async fn flush_now(out_root: &Path, acc: &SavedManifest) -> bool {
     let bytes = match bundle_manifest::serialize(acc) {
         Ok(b) => b,
         Err(e) => {
@@ -2848,17 +2864,23 @@ async fn flush_now(out_root: &Path, acc: &SavedManifest) {
                 "failed to serialize {}: {e}",
                 bundle_manifest::SAVED_MANIFEST_NAME
             );
-            return;
+            return false;
         }
     };
     let root = out_root.to_path_buf();
     match tokio::task::spawn_blocking(move || bundle_manifest::write_bytes(&root, &bytes)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(
-            "failed to write {}: {e}",
-            bundle_manifest::SAVED_MANIFEST_NAME
-        ),
-        Err(e) => tracing::warn!("skip-cache flush task panicked: {e}"),
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "failed to write {}: {e}",
+                bundle_manifest::SAVED_MANIFEST_NAME
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("skip-cache flush task panicked: {e}");
+            false
+        }
     }
 }
 
@@ -3262,14 +3284,18 @@ mod tests {
         })
         .expect("send");
         // Poll for the mid-stream write while the task is still alive (sender held).
-        let mut seen = false;
-        for _ in 0..200 {
-            if bundle_manifest::load(tmp.path()).get("big.bin").is_some() {
-                seen = true;
-                break;
+        // A generous deadline absorbs fsync + scheduling latency on slow CI, while
+        // still failing quickly if the write never happens.
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if bundle_manifest::load(tmp.path()).get("big.bin").is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        })
+        .await
+        .is_ok();
         assert!(
             seen,
             "byte-cadence flush should write before the channel closes"
