@@ -402,6 +402,33 @@ where
     outcomes
 }
 
+/// Materialize every write slot from an on-disk whole-file `donor` (a byte-
+/// identical file already in the root), by link/copy — no fetch, no payment.
+/// The first write is [`EntryOutcome::Deduped`] (the reused blob, counted once);
+/// each further duplicate path is [`EntryOutcome::Linked`], mirroring the
+/// fetch-once/link-rest accounting of #1306. The donor is verified by the
+/// caller (a re-hash against the target hash) before this is called.
+async fn materialize_from_donor(
+    slots: Vec<Slot<'_>>,
+    donor: &Path,
+    size: u64,
+) -> Vec<EntryOutcome> {
+    materialize_group(
+        slots,
+        |dest| std::future::ready(link_or_copy_atomic(donor, &dest).map(|()| size)),
+        link_or_copy_atomic,
+    )
+    .await
+    .into_iter()
+    .map(|o| match o {
+        // materialize_group tags the first materialize Fetched(n); relabel it
+        // Deduped since no payment or download occurred.
+        EntryOutcome::Fetched(n) => EntryOutcome::Deduped(n),
+        other => other,
+    })
+    .collect()
+}
+
 /// Read-side bundle manifest (the write-side lives in [`super::bundle`]). `size`
 /// is optional on the wire (per `appendix-bundles.md`); it is informational for
 /// the dry-run plan and not required to fetch.
@@ -537,7 +564,15 @@ enum EntryOutcome {
     Fetched(u64),
     Linked,
     Skipped,
-    Failed { path: String, err: String },
+    /// A destination materialized from an on-disk whole-file donor (a byte-
+    /// identical file already in the root, verified by re-hash) — no download,
+    /// no payment. The `u64` is the file's size, counted as reused, never
+    /// downloaded.
+    Deduped(u64),
+    Failed {
+        path: String,
+        err: String,
+    },
 }
 
 /// One-line `--json` summary. `fetched`/`linked`/`skipped`/`failed` are entry
@@ -549,6 +584,11 @@ enum EntryOutcome {
 /// a chunk served from an existing staging file on a resumed run, and counts a
 /// blob's whole size even when range-dedup paid for only its complement — so it
 /// equals `reconstructed` per single-path blob and does not report chunk savings.
+///
+/// `deduped` and `reused_bytes` report the whole-file dedup outcome: `deduped` is
+/// the count of destinations materialized from an on-disk whole-file donor
+/// (verified by re-hash before use), and `reused_bytes` is the bytes those
+/// destinations contributed to `reconstructed` with no download and no payment.
 ///
 /// `spliced_bytes` and `hints_ignored` report the range-dedup outcome so a run
 /// whose hints saved bytes is distinguishable from one whose hints did not:
@@ -569,6 +609,10 @@ struct PullReport {
     reconstructed: u64,
     spliced_bytes: u64,
     hints_ignored: u64,
+    /// Count of destinations materialized from an on-disk whole-file donor.
+    deduped: u64,
+    /// Bytes materialized from a whole-file donor with no download.
+    reused_bytes: u64,
 }
 
 /// The run's range-dedup outcome, read off [`PullCtx::dedup_stats`] once the pull
@@ -1563,7 +1607,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             index.seed_disk(d.hash, &d.source, d.offset, d.len);
         }
         let (outcomes, transfer) = self
-            .pull_plain(&refs, out_root, overwrite, &index, &disk.skip)
+            .pull_plain(&refs, out_root, overwrite, &index, &disk)
             .await;
 
         // A donor entry's finalized staging blob is the source a recipient splices
@@ -1594,12 +1638,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         overwrite: bool,
         index: &ChunkIndex,
-        skip: &HashSet<String>,
+        disk: &DiskState,
     ) -> (Vec<EntryOutcome>, Transfer) {
         let groups_by_hash = group_by_hash(entries);
         let group_count = groups_by_hash.len().max(1);
         let groups: Vec<Vec<EntryOutcome>> = futures_util::stream::iter(groups_by_hash)
-            .map(|group| self.fetch_group(group, out_root, overwrite, index, skip))
+            .map(|group| self.fetch_group(group, out_root, overwrite, index, disk))
             // Live-bar fan-out bounded by --jobs; the global gate is the real in-flight-fetch cap.
             .buffer_unordered(self.jobs.min(group_count))
             .collect::<Vec<Vec<EntryOutcome>>>()
@@ -1751,7 +1795,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         overwrite: bool,
         index: &ChunkIndex,
-        skip: &HashSet<String>,
+        disk: &DiskState,
     ) -> Vec<EntryOutcome> {
         // The group's shared hash is carried explicitly; parse it once, and a bad
         // hash fails every path in the group.
@@ -1791,7 +1835,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // `pull_all` removes it once every recipient has had its chance.
         let is_donor = hints.as_ref().is_some_and(|h| !h.is_empty());
 
-        let slots = plan_slots(&group.entries, out_root, overwrite, skip);
+        let slots = plan_slots(&group.entries, out_root, overwrite, &disk.skip);
 
         // Every destination already present (or failed to resolve) → no fetch, no
         // payment. This is the whole point of the group: a duplicate path that is
@@ -1808,6 +1852,30 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                     _ => EntryOutcome::Skipped,
                 })
                 .collect();
+        }
+
+        // Whole-file dedup: an identical file already sits somewhere in the root
+        // (recorded by a prior bundle). Verify that candidate by re-hashing it,
+        // then materialize every destination by link/copy — no fetch, no payment.
+        // A failed re-hash (stale/edited/removed donor) falls through to the
+        // normal fetch path below; `slots` is untouched until this decision is
+        // made, so falling through loses nothing. `materialize_group` (inside
+        // `materialize_from_donor`) already passes a `Slot::Failed` through as its
+        // own failure and a `Slot::Skip` through as `Skipped`, so handing it the
+        // whole `slots` vector — not just the `Write` entries — is correct.
+        if let Some(candidate) = disk.whole_file.get(&hash) {
+            let donor = candidate.clone();
+            let verify_target = donor.clone();
+            let verified = tokio::task::spawn_blocking(move || {
+                hash_partial(&verify_target).is_ok_and(|got| got == hash)
+            })
+            .await
+            .unwrap_or(false);
+            if verified {
+                self.progress
+                    .credit_skipped(group.entries.iter().find_map(|e| e.size));
+                return materialize_from_donor(slots, &donor, total.unwrap_or(0)).await;
+            }
         }
 
         // Staged once per group: `drive_fetch` finalizes to
@@ -2849,11 +2917,17 @@ fn report(
     let mut linked = 0u64;
     let mut skipped = 0u64;
     let mut failed = 0u64;
+    let mut deduped = 0u64;
+    let mut reused_bytes = 0u64;
     for o in outcomes {
         match o {
             EntryOutcome::Fetched(_) => fetched += 1,
             EntryOutcome::Linked => linked += 1,
             EntryOutcome::Skipped => skipped += 1,
+            EntryOutcome::Deduped(n) => {
+                deduped += 1;
+                reused_bytes = reused_bytes.saturating_add(*n);
+            }
             EntryOutcome::Failed { path, err } => {
                 failed += 1;
                 // A per-entry failure is a command result the user needs, not
@@ -2874,6 +2948,8 @@ fn report(
         reconstructed: transfer.reconstructed,
         spliced_bytes: dedup.spliced_bytes,
         hints_ignored: dedup.hints_ignored,
+        deduped,
+        reused_bytes,
     };
     if json {
         let line = serde_json::to_string(&rep).map_err(|e| anyhow!("serialize report: {e}"))?;
@@ -2881,12 +2957,20 @@ fn report(
     } else {
         println!(
             "pulled into {} ({fetched} fetched, {linked} linked, {skipped} skipped, \
-             {failed} failed)",
+             {deduped} deduped, {failed} failed)",
             output.display()
         );
         // `downloaded X → reconstructed Y` only when dedup made them differ;
         // otherwise a single `downloaded X`.
         println!("{}", transfer_line(transfer));
+        // The whole-file dedup outcome, shown only when it mattered: a run that
+        // materialized any destination from an on-disk donor instead of fetching.
+        if deduped > 0 {
+            println!(
+                "whole-file dedup: reused {} from disk ({deduped} destination(s))",
+                human_bytes(reused_bytes)
+            );
+        }
         // The range-dedup outcome, shown only when a hint mattered: a run that
         // spliced bytes from disk, or one whose hints were dropped by a fault. A
         // plain pull with no usable hints stays silent (both are zero), so a
@@ -2944,25 +3028,37 @@ fn transfer_line(t: Transfer) -> String {
     }
 }
 
-/// The [`Transfer`] for one whole-file hash-group: the blob is pulled once
-/// (`downloaded` = its size, taken from the single `Fetched`), and every
-/// materialized copy — the `Fetched` plus each `Linked` duplicate path — is a
-/// full file on disk (`reconstructed` = size × copies). A group with nothing
-/// written (all skipped or failed) contributes nothing.
+/// The [`Transfer`] for one whole-file hash-group: the blob is either paid for
+/// once (`downloaded` = its size, taken from the single `Fetched`) or reused
+/// from an on-disk donor with no download (`Deduped`, contributing 0 to
+/// `downloaded`) — a group never mixes the two, since [`fetch_group`] takes one
+/// path or the other. Every materialized copy — the canonical (`Fetched` or
+/// `Deduped`) plus each `Linked` duplicate path — is a full file on disk
+/// (`reconstructed` = size × copies). A group with nothing written (all skipped
+/// or failed) contributes nothing.
 fn group_transfer(outcomes: &[EntryOutcome]) -> Transfer {
-    let file_size = outcomes.iter().find_map(|o| match o {
+    let paid_size = outcomes.iter().find_map(|o| match o {
         EntryOutcome::Fetched(n) => Some(*n),
         _ => None,
     });
-    match file_size {
+    let reused_size = outcomes.iter().find_map(|o| match o {
+        EntryOutcome::Deduped(n) => Some(*n),
+        _ => None,
+    });
+    match paid_size.or(reused_size) {
         Some(n) => {
             let copies = outcomes
                 .iter()
-                .filter(|o| matches!(o, EntryOutcome::Fetched(_) | EntryOutcome::Linked))
+                .filter(|o| {
+                    matches!(
+                        o,
+                        EntryOutcome::Fetched(_) | EntryOutcome::Linked | EntryOutcome::Deduped(_)
+                    )
+                })
                 .count();
             let copies = u64::try_from(copies).unwrap_or(u64::MAX);
             Transfer {
-                downloaded: n,
+                downloaded: paid_size.unwrap_or(0),
                 reconstructed: n.saturating_mul(copies),
             }
         }
@@ -4442,6 +4538,72 @@ mod tests {
         );
         assert!(matches!(outcomes[0], EntryOutcome::Failed { .. }));
         assert!(matches!(outcomes[1], EntryOutcome::Fetched(5)));
+    }
+
+    /// `materialize_from_donor` links every write slot from an on-disk donor —
+    /// no fetch, no payment — and tags the reused blob `Deduped`, mirroring
+    /// `materialize_group`'s fetch-once/link-rest accounting.
+    #[tokio::test]
+    async fn materialize_from_donor_links_every_destination() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let donor = tmp.path().join("game1/lib/dup.dll");
+        std::fs::create_dir_all(donor.parent().expect("parent")).expect("mkdir");
+        let body = vec![3u8; 2048];
+        std::fs::write(&donor, &body).expect("write donor");
+        let dest = tmp.path().join("game2/lib/dup.dll");
+        let slots = vec![Slot::Write {
+            label: "game2/lib/dup.dll",
+            dest: dest.clone(),
+        }];
+        let outcomes = materialize_from_donor(slots, &donor, 2048).await;
+        assert!(matches!(outcomes.as_slice(), [EntryOutcome::Deduped(2048)]));
+        assert_eq!(std::fs::read(&dest).expect("read"), body);
+    }
+
+    /// A second duplicate destination is a free `Linked`, not a second
+    /// `Deduped` — the whole point of routing this through `materialize_group`.
+    #[tokio::test]
+    async fn materialize_from_donor_links_second_destination_as_linked() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let donor = tmp.path().join("donor.bin");
+        std::fs::write(&donor, b"same-bytes").expect("write donor");
+        let dest_a = tmp.path().join("a/out.bin");
+        let dest_b = tmp.path().join("b/out.bin");
+        let slots = vec![
+            Slot::Write {
+                label: "a/out.bin",
+                dest: dest_a.clone(),
+            },
+            Slot::Write {
+                label: "b/out.bin",
+                dest: dest_b.clone(),
+            },
+        ];
+        let outcomes = materialize_from_donor(slots, &donor, 10).await;
+        assert!(matches!(outcomes[0], EntryOutcome::Deduped(10)));
+        assert!(matches!(outcomes[1], EntryOutcome::Linked));
+        assert_eq!(std::fs::read(&dest_a).expect("read a"), b"same-bytes");
+        assert_eq!(std::fs::read(&dest_b).expect("read b"), b"same-bytes");
+    }
+
+    /// A `Slot::Failed` slot passes through as its own failure, never touched
+    /// by the donor materialize path.
+    #[tokio::test]
+    async fn materialize_from_donor_preserves_failed_slot() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let donor = tmp.path().join("donor.bin");
+        std::fs::write(&donor, b"bytes").expect("write donor");
+        let dest = tmp.path().join("out.bin");
+        let slots = vec![
+            Slot::Failed(EntryOutcome::failed("bad", &anyhow!("resolve failed"))),
+            Slot::Write {
+                label: "out.bin",
+                dest: dest.clone(),
+            },
+        ];
+        let outcomes = materialize_from_donor(slots, &donor, 5).await;
+        assert!(matches!(outcomes[0], EntryOutcome::Failed { .. }));
+        assert!(matches!(outcomes[1], EntryOutcome::Deduped(5)));
     }
 
     /// A linked duplicate is counted separately and never fails the pull.
