@@ -2963,8 +2963,17 @@ fn validate_otlp_endpoint(endpoint: &str) -> anyhow::Result<()> {
         parsed.host().is_some(),
         "observability.otlp_endpoint has no host"
     );
+    // Authority = text after `://` up to the first `/`, `?`, or `#`. Read raw:
+    // the parsed URL reports an empty userinfo (`http://@host`) as absent and
+    // hides an explicit default port.
+    let authority = endpoint
+        .split_once("://")
+        .map_or("", |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
     anyhow::ensure!(
-        parsed.username().is_empty() && parsed.password().is_none(),
+        !authority.contains('@') && parsed.username().is_empty() && parsed.password().is_none(),
         "observability.otlp_endpoint must not carry userinfo; pass collector \
          credentials through the collector, not the URL"
     );
@@ -2973,14 +2982,7 @@ fn validate_otlp_endpoint(endpoint: &str) -> anyhow::Result<()> {
         "observability.otlp_endpoint must be http://host:port with no path, query, or \
          fragment; an OTLP/HTTP URL (port 4318, /v1/traces) is the wrong protocol"
     );
-    // Authority = text after `://` up to the first `/`, `?`, or `#`. IPv6 hosts
-    // are bracketed, so a trailing `:<digits>` is always a port.
-    let authority = endpoint
-        .split_once("://")
-        .map_or("", |(_, rest)| rest)
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
+    // IPv6 hosts are bracketed, so a trailing `:<digits>` is always a port.
     let has_port = authority.rsplit_once(':').is_some_and(|(host, port)| {
         !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && !host.is_empty()
     });
@@ -7673,6 +7675,8 @@ usdc_address = \"0xUsdc\"
             ("http://collector:4317?x=1", "no path"),
             ("http://collector:4317#frag", "no path"),
             ("http://user:pw@collector:4317", "userinfo"),
+            ("http://@collector:4317", "userinfo"),
+            ("http://:@collector:4317", "userinfo"),
             ("http://coll ector:4317", "not a valid URL"),
             ("not a url", "must start with http://"),
             ("http:collector:4317", "must start with http://"),

@@ -36,7 +36,7 @@ since project inception and will roll into the first tagged release.
   - The endpoint must be `http://host:port`: config resolution rejects
     `https://` (the exporter has no TLS), a missing port, a path, query or
     fragment (an OTLP/HTTP `…:4318/v1/traces` URL is the wrong protocol),
-    userinfo, and surrounding whitespace. Rejections never echo any part of the
+    userinfo (including an empty `@`), and surrounding whitespace. Rejections never echo any part of the
     endpoint. An exporter that fails to build aborts start-up.
   - New counter `decdn_otlp_export_failures_total` and warning alert
     `DecdnOtlpExportFailing` surface a dead or wrong collector. The counter
@@ -50,8 +50,8 @@ since project inception and will roll into the first tagged release.
     `otlp_endpoint`) now logs one `warn` per changed field, comparing the
     resolved value (CLI/env > file) with startup. An unchanged field stays
     silent, where it previously logged an `info` notice on every reload.
-  - Queued spans flush on exit (bounded at 5 s), on both the clean and the
-    failed-run path.
+  - Queued spans flush on exit, on both the clean and the failed-run path. The
+    flush runs on its own thread and the exit path waits at most 6 s for it.
   - The OTel layer drops `h2`/`hyper`/`hyper_util`/`tonic`/`tower` spans, so
     `trace` level cannot feed the export connection back into itself.
 

@@ -16,6 +16,10 @@ use crate::metrics::Metrics;
 /// cannot hold the process open after the runtime has drained.
 const OTLP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Slack past [`OTLP_SHUTDOWN_TIMEOUT`] for the shutdown thread to report
+/// back before the exit path stops waiting for it.
+const OTLP_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
 /// Crates whose spans make up the OTLP export connection itself. The
 /// OpenTelemetry layer drops them: at `trace` level each export would
 /// otherwise emit h2/tonic spans that become the next export's payload.
@@ -120,40 +124,78 @@ pub(super) fn init_otlp_provider(
 ///
 /// The error is recorded before the flush, so it is exported with the
 /// run's last spans instead of waiting behind the flush for `main`'s stderr
-/// line. It takes `main`'s redaction, because the chain can carry `rpc_url`.
+/// line.
 pub(super) async fn finish_run(provider: SdkTracerProvider, result: &anyhow::Result<()>) {
     if let Err(err) = result {
+        record_run_failure(err);
+    }
+    shutdown_tracer_provider(provider).await;
+}
+
+/// Log a failed run's error inside its own short span. The OpenTelemetry
+/// layer exports an event only as part of a span, and nothing guarantees a
+/// span is open when `runtime::run` returns. The error takes `main`'s
+/// redaction, because the chain can carry `rpc_url`.
+fn record_run_failure(err: &anyhow::Error) {
+    tracing::error_span!("node_run_failed").in_scope(|| {
         tracing::error!(
             error = %decdn_common::redact::sanitize_err_chain(err),
             "node run failed"
         );
-    }
-    shutdown_tracer_provider(provider).await;
+    });
 }
 
 /// Flush queued spans and shut the OTLP tracer provider down.
 ///
 /// The `opentelemetry` global is a static that is never dropped, so without
 /// this call the batch processor's queue is discarded at exit. Shutdown waits
-/// synchronously on the batch worker, so it runs on a blocking thread; it runs
+/// synchronously on the batch worker, so it runs off the async workers, and
 /// before `main` returns because this runtime drives the tonic channel.
+///
+/// It runs on a dedicated thread, not the blocking pool: long-running blocking
+/// work can saturate the pool and queue the shutdown past its bound. The wait
+/// is bounded too, so the exit path never waits longer than
+/// [`OTLP_SHUTDOWN_TIMEOUT`] plus [`OTLP_SHUTDOWN_GRACE`].
 async fn shutdown_tracer_provider(provider: SdkTracerProvider) {
-    let joined =
-        tokio::task::spawn_blocking(move || provider.shutdown_with_timeout(OTLP_SHUTDOWN_TIMEOUT))
-            .await;
-    match joined {
-        Ok(Ok(())) => {}
-        Ok(Err(OTelSdkError::Timeout(after))) => {
-            tracing::warn!(
-                ?after,
-                "OTLP collector did not answer the exit-time flush in time; the in-flight batch is abandoned"
-            );
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "OTLP exit-time flush failed; its spans are lost");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "OTLP tracer provider shutdown task did not complete");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("otlp-shutdown".into())
+        .spawn(move || {
+            // The receiver is gone only if the exit path stopped waiting.
+            let _ = tx.send(provider.shutdown_with_timeout(OTLP_SHUTDOWN_TIMEOUT));
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "could not start the OTLP shutdown thread; queued spans are lost");
+        return;
+    }
+    let outcome = tokio::time::timeout(OTLP_SHUTDOWN_TIMEOUT + OTLP_SHUTDOWN_GRACE, rx).await;
+    if let Some(problem) = shutdown_problem(outcome) {
+        tracing::warn!("{problem}");
+    }
+}
+
+/// Operator-facing description of a shutdown that did not flush cleanly, or
+/// `None` when it did.
+fn shutdown_problem(
+    outcome: Result<
+        Result<OTelSdkResult, tokio::sync::oneshot::error::RecvError>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Option<String> {
+    match outcome {
+        Ok(Ok(Ok(()))) => None,
+        Ok(Ok(Err(OTelSdkError::Timeout(after)))) => Some(format!(
+            "OTLP collector did not answer the exit-time flush within {after:?}; \
+             the in-flight batch is abandoned"
+        )),
+        Ok(Ok(Err(e))) => Some(format!(
+            "OTLP exit-time flush failed; its spans are lost: {e}"
+        )),
+        Ok(Err(_)) => Some(
+            "OTLP shutdown thread ended without reporting; queued spans may be lost".to_string(),
+        ),
+        Err(_) => {
+            Some("OTLP shutdown did not finish within its bound; exiting without it".to_string())
         }
     }
 }
@@ -167,7 +209,7 @@ mod tests {
 
     use super::{
         CountingSpanExporter, init_otlp_provider, is_otlp_transport_target, otel_layer,
-        shutdown_tracer_provider,
+        record_run_failure, shutdown_tracer_provider,
     };
     use crate::metrics::Metrics;
 
@@ -176,6 +218,8 @@ mod tests {
     #[derive(Debug, Clone)]
     struct StubExporter {
         names: Arc<Mutex<Vec<String>>>,
+        /// Event count of each exported span, in export order.
+        events: Arc<Mutex<Vec<usize>>>,
         fail: bool,
     }
 
@@ -183,6 +227,7 @@ mod tests {
         fn new(fail: bool) -> Self {
             Self {
                 names: Arc::new(Mutex::new(Vec::new())),
+                events: Arc::new(Mutex::new(Vec::new())),
                 fail,
             }
         }
@@ -190,6 +235,9 @@ mod tests {
 
     impl SpanExporter for StubExporter {
         async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            if let Ok(mut events) = self.events.lock() {
+                events.extend(batch.iter().map(|s| s.events.len()));
+            }
             if let Ok(mut names) = self.names.lock() {
                 names.extend(batch.into_iter().map(|s| s.name.into_owned()));
             }
@@ -228,6 +276,38 @@ mod tests {
             "failure must pass through"
         );
         anyhow::ensure!(failures_line(&metrics, 1)?, "failed export was not counted");
+        Ok(())
+    }
+
+    /// A failed run's error reaches the exporter even with no span open:
+    /// `record_run_failure` wraps its event in a span of its own.
+    #[test]
+    fn run_failure_is_exported_without_an_open_span() -> anyhow::Result<()> {
+        use tracing_subscriber::prelude::*;
+
+        let stub = StubExporter::new(false);
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(stub.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(otel_layer(&provider));
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            record_run_failure(&anyhow::anyhow!("rpc unreachable"));
+        }
+        provider.force_flush()?;
+
+        let names = stub
+            .names
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stub mutex poisoned"))?
+            .clone();
+        let events = stub
+            .events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stub mutex poisoned"))?
+            .clone();
+        anyhow::ensure!(names == ["node_run_failed"], "exported spans: {names:?}");
+        anyhow::ensure!(events == [1], "event counts: {events:?}");
         Ok(())
     }
 

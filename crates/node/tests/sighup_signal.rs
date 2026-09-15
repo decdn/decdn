@@ -476,11 +476,15 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
             .filter(|l| l.contains(&prefix) && l.contains("(requires restart)"))
             .count()
     };
-    // `[observability]` notices name the changed field, never its value.
+    // `[observability]` notices name the changed field, never its value, and
+    // are `warn`-level: an `info` regression would hide them at
+    // `log_level = warn`.
     let observability_notice_count = |logs: &str, field: &str| -> usize {
         let prefix = format!("ignoring change to observability.{field}");
         logs.lines()
-            .filter(|l| l.contains(&prefix) && l.contains("(requires restart)"))
+            .filter(|l| {
+                l.contains(" WARN ") && l.contains(&prefix) && l.contains("(requires restart)")
+            })
             .count()
     };
 
@@ -824,11 +828,13 @@ async fn a_failed_commit_reports_no_notices() {
 
     // Both sections resolve clean. `log_level` differs from the seeded value
     // so the setter is actually called — and fails, taking the whole reload
-    // down with the security values still unapplied.
+    // down with the security values still unapplied. `metrics_port` differs
+    // from startup, so a restart notice emitted before phase 2 would show.
     write_config(
         &path,
         "[observability]\n\
          log_level = \"debug\"\n\
+         metrics_port = 9999\n\
          [security]\n\
          max_tracked_sources = 0\n",
     );
@@ -845,6 +851,10 @@ async fn a_failed_commit_reports_no_notices() {
         !logs.contains("unbounded"),
         "a reload that aborted in phase 2 applied no security values, so it \
          must not report their notices, got:\n{logs}"
+    );
+    assert!(
+        !logs.contains("(requires restart)"),
+        "a reload that aborted in phase 2 must not report restart notices, got:\n{logs}"
     );
 }
 

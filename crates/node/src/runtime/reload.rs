@@ -352,7 +352,8 @@ impl LogLevelSection {
     /// On each reload, warn for each restart-required observability field whose
     /// resolved value (CLI/env > file > default) differs from the startup value.
     /// A field that stays changed warns again on every reload. Reads
-    /// the buffer `resolve` filled, so it runs between resolve and commit.
+    /// the buffer `resolve` filled, so it runs after the commits and before the
+    /// swap drains it.
     /// Names fields only: `otlp_endpoint` can carry credentials.
     fn warn_restart_required_changes(&self) {
         let Ok(guard) = self.buf.lock() else {
@@ -1178,14 +1179,6 @@ impl RuntimeReloadState {
             return Err(err);
         }
 
-        // Emit a "requires restart" notice for each non-reloadable section the
-        // file carries, and for each restart-required observability field whose
-        // resolved value differs from startup. Read-only, so do it before the
-        // commit step; it runs after the gate above, so an aborted reload
-        // reports none.
-        warn_restart_required_sections(&file);
-        self.log_level.warn_restart_required_changes();
-
         // Phase 2: fallible commits. The log-level section is the only
         // one that can fail here today; future sections may add more.
         // Rollback boundary: a section that already returned `Ok`
@@ -1214,6 +1207,13 @@ impl RuntimeReloadState {
         // that path returns before any `infallible_swap`, which is where the
         // notice-bearing sections put their values.
         emit_config_notices(&notices);
+        // The same holds for the "requires restart" notices: one for each
+        // non-reloadable section the file carries, and one for each
+        // restart-required observability field whose resolved value differs
+        // from startup. `warn_restart_required_changes` reads the observability
+        // buffer, so it runs before phase 3 drains it.
+        warn_restart_required_sections(&file);
+        self.log_level.warn_restart_required_changes();
 
         // Phase 3: infallible swaps. None can fail.
         for section in &self.sections {
