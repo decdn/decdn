@@ -180,6 +180,11 @@ struct DiskState {
     skip: HashSet<String>,
     /// On-disk chunk donors to seed into the run's [`ChunkIndex`].
     seed: Vec<SeedDonor>,
+    /// Whole-file donors already on disk anywhere in the root: target blob hash
+    /// → an on-disk regular file the saved manifest records with that hash. A hit
+    /// lets a group materialize by link/copy instead of fetching — but only after
+    /// the candidate is re-hashed and confirmed (done at the use site).
+    whole_file: HashMap<[u8; 32], PathBuf>,
 }
 
 /// Classify every in-scope entry against the output tree and the saved
@@ -252,6 +257,40 @@ async fn resolve_disk_state(
                     state.seed.push(SeedDonor {
                         hash: h,
                         source: dest.clone(),
+                        offset,
+                        len,
+                    });
+                }
+            }
+        }
+    }
+    // Widen reuse to the whole root: every saved record whose file still exists
+    // as a regular file is a donor keyed by content — a whole-file donor (for a
+    // no-download link, verified by re-hash at the use site) and a chunk donor
+    // (spliced under the existing per-chunk re-hash guard). This is what lets a
+    // file shared across bundles at different paths be reused.
+    for (path, rec) in saved.records() {
+        let Ok(src) = safe_join(out_root, path) else {
+            continue;
+        };
+        if src.starts_with(out_root.join(STAGING_DIR)) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&src) else {
+            continue; // gone / unreadable
+        };
+        if !meta.is_file() {
+            continue; // symlink / non-regular → never a donor
+        }
+        if let Ok(h) = fetch::parse_hash(&rec.hash) {
+            state.whole_file.entry(h).or_insert_with(|| src.clone());
+        }
+        if let Some(hints) = bundle_manifest::saved_hints(rec) {
+            for (chash, offset, len) in hints {
+                if let Ok(h) = fetch::parse_hash(&chash) {
+                    state.seed.push(SeedDonor {
+                        hash: h,
+                        source: src.clone(),
                         offset,
                         len,
                     });
@@ -4125,6 +4164,62 @@ mod tests {
         assert!(st.skip.is_empty());
     }
 
+    /// A saved record for a file that still exists on disk becomes a whole-file
+    /// donor keyed by its hash — even when its path is NOT in the current bundle
+    /// (the cross-bundle / shared-file case).
+    #[tokio::test]
+    async fn resolve_disk_state_indexes_whole_file_donor_from_other_path() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let body = vec![7u8; 4096];
+        std::fs::create_dir_all(tmp.path().join("game1/lib")).expect("mkdir");
+        std::fs::write(tmp.path().join("game1/lib/dup.dll"), &body).expect("write");
+        let h = format!("b3:{}", blake3::hash(&body).to_hex());
+        // Prior run recorded game1/lib/dup.dll.
+        let old_entries = vec![ManifestEntry {
+            path: "game1/lib/dup.dll".into(),
+            hash: h.clone(),
+            size: Some(4096),
+            chunks: None,
+        }];
+        let updates = build_saved_updates(&old_entries, &[EntryOutcome::Fetched(4096)], tmp.path());
+        bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
+            .expect("write saved");
+        let saved = bundle_manifest::load(tmp.path());
+        // The NEW bundle wants the same content at a different path.
+        let new_entries = vec![ManifestEntry {
+            path: "game2/lib/dup.dll".into(),
+            hash: h.clone(),
+            size: Some(4096),
+            chunks: None,
+        }];
+        let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
+        let want = fetch::parse_hash(&h).expect("hash");
+        assert_eq!(
+            st.whole_file.get(&want),
+            Some(&tmp.path().join("game1/lib/dup.dll"))
+        );
+    }
+
+    /// `overwrite` builds no index (nothing is reused).
+    #[tokio::test]
+    async fn resolve_disk_state_overwrite_builds_no_whole_file_index() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let body = vec![7u8; 16];
+        std::fs::write(tmp.path().join("a.bin"), &body).expect("write");
+        let h = format!("b3:{}", blake3::hash(&body).to_hex());
+        let old = vec![ManifestEntry {
+            path: "a.bin".into(),
+            hash: h.clone(),
+            size: Some(16),
+            chunks: None,
+        }];
+        let updates = build_saved_updates(&old, &[EntryOutcome::Fetched(16)], tmp.path());
+        bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates).expect("w");
+        let saved = bundle_manifest::load(tmp.path());
+        let st = resolve_disk_state(&old, &saved, tmp.path(), true).await;
+        assert!(st.whole_file.is_empty());
+    }
+
     /// A symlink at a destination path is never fast-skipped, even when it
     /// points at content whose bytes match the manifest hash: the pre-pass uses
     /// `symlink_metadata` and requires a regular file, so the symlink is left to
@@ -4220,12 +4315,18 @@ mod tests {
 
         let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
         assert!(!st.skip.contains("c.bin"), "changed content must fetch");
-        assert_eq!(st.seed.len(), 1);
+        // The per-entry "changed" branch and the whole-root records pass both
+        // seed this same donor (harmless duplication, see resolve_disk_state's
+        // doc comment) — assert every seed entry present matches, rather than
+        // pinning an exact count.
+        assert!(!st.seed.is_empty());
         let want_hash = fetch::parse_hash(&old_chunk_hash).expect("parse old chunk hash");
-        assert_eq!(st.seed[0].hash, want_hash);
-        assert_eq!(st.seed[0].source, path);
-        assert_eq!(st.seed[0].offset, 0);
-        assert_eq!(st.seed[0].len, 20);
+        for donor in &st.seed {
+            assert_eq!(donor.hash, want_hash);
+            assert_eq!(donor.source, path);
+            assert_eq!(donor.offset, 0);
+            assert_eq!(donor.len, 20);
+        }
     }
 
     /// `materialize` (the paid-path writer) atomically replaces an existing
