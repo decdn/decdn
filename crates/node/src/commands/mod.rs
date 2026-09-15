@@ -7,9 +7,21 @@
 //! out into a separate file mostly avoids churn in
 //! `crates/node/src/main.rs`, which stays a thin clap shell.
 
+use std::time::Duration;
+
 use decdn_common::{cli, config};
+use opentelemetry_sdk::trace::SdkTracerProvider;
 
 use crate::runtime;
+
+/// Upper bound on the exit-time OTLP flush, so an unreachable collector
+/// cannot hold the process open after the runtime has drained.
+const OTLP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Crates whose spans make up the OTLP export connection itself. The
+/// OpenTelemetry layer drops them: at `trace` level each export would otherwise emit
+/// h2/tonic spans that become the next export's payload.
+const OTLP_TRANSPORT_TARGETS: &[&str] = &["h2", "hyper", "hyper_util", "tonic", "tower"];
 
 /// Run the deCDN node with resolved configuration.
 #[expect(
@@ -34,7 +46,7 @@ pub async fn run(
         }
     };
 
-    let log_level_setter = init_tracing(filter, &resolved)?;
+    let (log_level_setter, tracer_provider) = init_tracing(filter, &resolved)?;
 
     // Replay what `resolve_config` recorded. It runs before `init_tracing`
     // (the fallback filter above is built from the resolved log level), so a
@@ -60,26 +72,37 @@ pub async fn run(
         log_level_setter,
     ));
 
-    runtime::run(
+    let result = runtime::run(
         resolved,
         config_path.map(std::path::Path::to_path_buf),
         reload_state,
     )
-    .await
+    .await;
+
+    // On both exit paths: the spans around a failed run are the ones an
+    // operator most wants exported.
+    if let Some(provider) = tracer_provider {
+        shutdown_tracer_provider(provider).await;
+    }
+
+    result
 }
 
-/// Initialize the tracing subscriber with fmt layer and optional OTLP layer.
+/// Initialize the tracing subscriber with a fmt layer, plus an OTLP span
+/// export layer when `observability.otlp_endpoint` is set.
 ///
 /// Returns a [`runtime::LogLevelSetter`] closure that swaps the live
 /// `EnvFilter` to one matching a new `LogLevel` — used by the SIGHUP
 /// hot-reload path (#236). The closure captures a `reload::Handle` to the
 /// `EnvFilter` layer; calls to `modify` must respect any errors from the
 /// handle (e.g. the registry was dropped) by surfacing them.
-#[allow(clippy::unnecessary_wraps)] // Returns Result only when otlp feature is enabled.
+///
+/// Also returns the OTLP tracer provider when export is on; the caller
+/// passes it to [`shutdown_tracer_provider`] before the process exits.
 fn init_tracing(
     filter: tracing_subscriber::EnvFilter,
     resolved: &config::ResolvedConfig,
-) -> anyhow::Result<runtime::LogLevelSetter> {
+) -> anyhow::Result<(runtime::LogLevelSetter, Option<SdkTracerProvider>)> {
     use tracing_subscriber::prelude::*;
 
     let fmt_layer = match resolved.observability.log_format {
@@ -95,30 +118,20 @@ fn init_tracing(
         .with(reload_filter)
         .with(fmt_layer);
 
-    #[cfg(feature = "otlp")]
-    {
-        if let Some(ref endpoint) = resolved.observability.otlp_endpoint {
-            let tracer = init_otlp_tracer(endpoint)?;
-            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-            registry.with(otel_layer).init();
-        } else {
-            registry.init();
-        }
-    }
-
-    #[cfg(not(feature = "otlp"))]
-    {
-        // `allow`, not `expect`: this `eprintln!` is itself cfg-gated, so an
-        // `--all-features` build would find the expectation unfulfilled. Scoped
-        // to this block rather than the function so the `LogLevelSetter` closure
-        // below — which runs on SIGHUP, long after `registry.init()` — stays
-        // covered by the workspace deny.
-        #[allow(clippy::print_stderr)]
-        if resolved.observability.otlp_endpoint.is_some() {
-            eprintln!("warning: --otlp-endpoint ignored (binary not built with 'otlp' feature)");
-        }
+    let tracer_provider = if let Some(ref endpoint) = resolved.observability.otlp_endpoint {
+        let provider = init_otlp_provider(endpoint)?;
+        let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "decdn");
+        let otel_layer = tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                !is_otlp_transport_target(meta.target())
+            }));
+        registry.with(otel_layer).init();
+        Some(provider)
+    } else {
         registry.init();
-    }
+        None
+    };
 
     let setter: runtime::LogLevelSetter = Box::new(move |lvl| {
         // Build a fresh EnvFilter from the level's lowercase name. This
@@ -133,20 +146,29 @@ fn init_tracing(
         Ok(())
     });
 
-    Ok(setter)
+    Ok((setter, tracer_provider))
 }
 
-/// Build an OTLP span exporter and tracer provider.
+/// Whether a span/event target belongs to the OTLP export transport
+/// ([`OTLP_TRANSPORT_TARGETS`]), matched on the crate-path boundary.
+fn is_otlp_transport_target(target: &str) -> bool {
+    OTLP_TRANSPORT_TARGETS.iter().any(|krate| {
+        target
+            .strip_prefix(krate)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    })
+}
+
+/// Build an OTLP span exporter and register its tracer provider as the
+/// `opentelemetry` global. The returned handle shares state with the global.
 ///
 /// Note: the metric prefix and OTLP `service.name` stay `decdn` (not
 /// `decdn-node`) for dashboard/alert continuity across the binary
 /// split — see ADR appendix-binaries.
-#[cfg(feature = "otlp")]
-fn init_otlp_tracer(endpoint: &str) -> anyhow::Result<opentelemetry_sdk::trace::SdkTracer> {
+fn init_otlp_provider(endpoint: &str) -> anyhow::Result<SdkTracerProvider> {
     use opentelemetry::KeyValue;
     use opentelemetry_otlp::{SpanExporter, WithExportConfig};
     use opentelemetry_sdk::Resource;
-    use opentelemetry_sdk::trace::SdkTracerProvider;
 
     let exporter = SpanExporter::builder()
         .with_tonic()
@@ -163,8 +185,75 @@ fn init_otlp_tracer(endpoint: &str) -> anyhow::Result<opentelemetry_sdk::trace::
         )
         .build();
 
-    let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "decdn");
-    opentelemetry::global::set_tracer_provider(provider);
+    opentelemetry::global::set_tracer_provider(provider.clone());
 
-    Ok(tracer)
+    Ok(provider)
+}
+
+/// Flush queued spans and shut the OTLP tracer provider down.
+///
+/// The `opentelemetry` global is a static that is never dropped, so without
+/// this call the batch processor's queue is discarded at exit. Shutdown waits
+/// synchronously on the batch worker, so it runs on a blocking thread; it runs
+/// before `main` returns because this runtime drives the tonic channel.
+async fn shutdown_tracer_provider(provider: SdkTracerProvider) {
+    let joined =
+        tokio::task::spawn_blocking(move || provider.shutdown_with_timeout(OTLP_SHUTDOWN_TIMEOUT))
+            .await;
+    match joined {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "OTLP tracer provider shutdown failed; queued spans may be lost");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "OTLP tracer provider shutdown task did not complete");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{init_otlp_provider, is_otlp_transport_target, shutdown_tracer_provider};
+
+    /// A span still in the batch queue reaches the collector at shutdown.
+    /// The batch delay (5 s) outlasts this test, so only the shutdown flush
+    /// can open the connection. The listener never speaks gRPC, so the export
+    /// itself fails; the accepted connection is the proof of the attempt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_flushes_queued_spans() -> anyhow::Result<()> {
+        use opentelemetry::trace::{Tracer, TracerProvider};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let accept = tokio::spawn(async move { listener.accept().await });
+
+        let provider = init_otlp_provider(&endpoint)?;
+        provider.tracer("test").in_span("queued", |_| {});
+        shutdown_tracer_provider(provider).await;
+
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(1), accept).await;
+        anyhow::ensure!(
+            matches!(accepted, Ok(Ok(Ok(_)))),
+            "shutdown did not attempt an export: {accepted:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_transport_targets_match_on_crate_boundary() {
+        for target in [
+            "h2",
+            "h2::codec::framed_write",
+            "tonic::transport",
+            "hyper_util::client",
+        ] {
+            assert!(
+                is_otlp_transport_target(target),
+                "{target} should be filtered"
+            );
+        }
+        for target in ["decdn_node::runtime", "h2o", "towering", "hyperion::x"] {
+            assert!(!is_otlp_transport_target(target), "{target} should pass");
+        }
+    }
 }

@@ -2911,15 +2911,17 @@ pub fn resolve_observability_into(
         .or_else(|| file.and_then(|o| o.otlp_endpoint.clone()))
         .filter(|s| !s.is_empty());
 
+    // `http://` only: the node's OTLP gRPC exporter is built without TLS, so an
+    // `https://` endpoint would pass here and then abort daemon start-up.
     if let Some(ref ep) = otlp_endpoint {
-        let lower = ep.to_ascii_lowercase();
         bag.check_with(
-            lower.starts_with("http://") || lower.starts_with("https://"),
+            ep.to_ascii_lowercase().starts_with("http://"),
             "observability.otlp_endpoint",
             || {
                 format!(
-                    "observability.otlp_endpoint must start with http:// or https:// \
-                 (got {ep:?}); gRPC/OTLP collectors require an HTTP-scheme URL"
+                    "observability.otlp_endpoint must start with http:// (got {ep:?}); \
+                 the OTLP gRPC exporter has no TLS, so point it at a local collector \
+                 and terminate TLS there"
                 )
             },
         );
@@ -7568,8 +7570,21 @@ usdc_address = \"0xUsdc\"
             resolve_observability(&cli, None).expect_err("non-http scheme should be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("http://") && msg.contains("https://"),
-            "error should mention valid schemes: {msg}"
+            msg.contains("http://"),
+            "error should mention the valid scheme: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_observability_rejects_https_otlp_endpoint() {
+        let mut cli = obs_cli(None, None);
+        cli.otlp_endpoint = Some("HTTPS://collector:4317".to_string());
+        let err = resolve_observability(&cli, None)
+            .expect_err("https endpoint should be rejected: the exporter has no TLS");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no TLS"),
+            "error should explain the TLS gap: {msg}"
         );
     }
 
