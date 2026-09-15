@@ -206,10 +206,13 @@ pub(crate) fn format_rate_bytes(per_sec: f64) -> String {
 }
 
 /// Render a raw micro-USDC amount (6 decimals, the on-chain base unit) as a
-/// dollar figure with full precision, e.g. `12_345_678` → `$12.345678`. Full
-/// six-decimal precision rather than rounding so the displayed figure matches
-/// the raw counter exactly when multiplied by 1e6 — an operator reconciling
-/// against on-chain redemptions must not see a rounded value.
+/// dollar figure, e.g. `12_345_678` → `$12.345678`. Emits all six fractional
+/// digits rather than rounding, so the operator reads back the exact base-unit
+/// value this formatter is handed. That value is itself exact only below 2^53
+/// micro-USDC (~$9e9, far past any realistic per-node total): the `/metrics`
+/// scrape parses series as `f64` in [`parse_openmetrics`], which cannot
+/// represent every larger `u64` — an upstream limit of the text exposition,
+/// not of this formatter.
 fn format_usdc(micro: u64) -> String {
     let dollars = micro / 1_000_000;
     let frac = micro % 1_000_000;
