@@ -1046,6 +1046,7 @@ async fn build_chain_and_handlers(
                 origin_assignment_addr,
                 Arc::clone(&operator_to_node),
                 Arc::clone(&staker_set),
+                reload_state.content_denylist(),
                 cfg.blockchain.origin_directory_cache_capacity,
                 Duration::from_secs(cfg.blockchain.origin_directory_positive_ttl_sec),
                 Duration::from_secs(cfg.blockchain.origin_directory_negative_ttl_sec),

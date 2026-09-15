@@ -182,7 +182,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             "paymentPool holds ROUTER_CALLER_ROLE on router"
         );
         assertTrue(d.bond.hasRole(d.bond.SLASH_ROLE(), address(d.slashJudge)), "slashJudge holds SLASH_ROLE on bond");
-        assertEq(d.originAssignment.contentBlacklist(), address(d.blacklist), "originAssignment blacklist binding");
         assertEq(address(d.bond.slashJudge()), address(d.slashJudge), "bond slashJudge binding");
         assertEq(
             address(d.originAssignment.vettingPolicy()),

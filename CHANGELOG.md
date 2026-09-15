@@ -28,6 +28,30 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Contracts: `OriginAssignment` drops its `ContentBlacklist` coupling; the
+  routing consumer filters instead (#2032).** The seat set is a routing hint, so
+  blacklist filtering moves to the party that acts on it. Removed from
+  `OriginAssignment`: the `contentBlacklist` pointer and `setContentBlacklist`
+  setter, the `ContentBlacklistUpdated` event, the `addOrigin` blacklist guard,
+  and the `ContentBlacklistNotSet` / `OperatorBlacklisted` / `OperatorNotBlacklisted`
+  errors. The `contentBlacklist_` constructor argument is gone, which erases the
+  post-deploy `setContentBlacklist` wiring step (ADR 016 § Post-Deployment
+  Initialization renumbers 1–6) and the deployment-window bootstrap. The
+  `IContentBlacklistOriginView` interface is deleted (`OriginAssignment` was its
+  only user; `SlashJudge`'s `IContentBlacklistHashView` is unrelated and
+  unchanged).
+  - **Renamed** (an indexer should map these rather than treat them as removed):
+    `pruneBlacklistedOrigin(uint256,address)` → `pruneInactiveOrigin(uint256,address)`,
+    now keyed on `CapacityBond.isActive(operator) == false` (reverts
+    `OperatorStillActive`) rather than on blacklist membership — it reaches every
+    exit from the active set, including an operator-level blacklist, which ejects
+    from `CapacityBond`. Event `BlacklistedOriginPruned` → `InactiveOriginPruned`
+    (same topic shape: `(uint256 indexed, address indexed, address indexed)`).
+  - The node's chain-backed origin directory now drops any `getOrigins` operator
+    on its live blacklist deny-set (the origin ∪ operator union already synced
+    for the delivery gate), applied at resolve time so a governance blacklist
+    takes effect without waiting out the `getOrigins` cache TTL. ADR 011
+    § Interaction with ContentBlacklist and ADR 016 are rewritten to match.
 - **CLI/runtime: a keystore password source is chosen by PRESENCE, not by being
   non-empty, so an empty password is a password.** `DECDN_KEYSTORE_PASSWORD` set
   to the empty string, and a `--keystore-password-file` that is empty after the

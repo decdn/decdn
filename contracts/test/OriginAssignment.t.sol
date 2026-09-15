@@ -8,7 +8,6 @@ import { OriginAssignment } from "../src/OriginAssignment.sol";
 import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
 import { ICapacityBondActivity } from "../src/interfaces/ICapacityBondActivity.sol";
 import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistryOwnership.sol";
-import { IContentBlacklistOriginView } from "../src/interfaces/IContentBlacklistOriginView.sol";
 import { IVettingPolicy } from "../src/interfaces/IVettingPolicy.sol";
 
 /// A policy that vets nobody — used to prove `setVettingPolicy` changes the
@@ -52,31 +51,9 @@ contract MockPublisherRegistry is IPublisherRegistryOwnership {
     }
 }
 
-contract MockBlacklistOrigin is IContentBlacklistOriginView {
-    mapping(address => bool) internal _bl;
-    mapping(address => bool) internal _opBl;
-
-    function setBlacklisted(address op, bool b) external {
-        _bl[op] = b;
-    }
-
-    function setOperatorBlacklisted(address op, bool b) external {
-        _opBl[op] = b;
-    }
-
-    function isOriginBlacklisted(address op) external view override returns (bool) {
-        return _bl[op];
-    }
-
-    function isOperatorBlacklisted(address op) external view override returns (bool) {
-        return _opBl[op];
-    }
-}
-
 contract OriginAssignmentTest is Test {
     MockBondActivity internal bond;
     MockPublisherRegistry internal registry;
-    MockBlacklistOrigin internal blacklist;
     ManualVettingPolicy internal policy;
     OriginAssignment internal oa;
 
@@ -93,12 +70,11 @@ contract OriginAssignmentTest is Test {
     function setUp() public {
         bond = new MockBondActivity();
         registry = new MockPublisherRegistry();
-        blacklist = new MockBlacklistOrigin();
         // admin holds GOVERNANCE_ROLE and, as `initialVetter`, VETTER_ROLE — so it
         // can vet directly in these origin-plane tests.
         policy = new ManualVettingPolicy(admin, admin);
 
-        oa = new OriginAssignment(bond, registry, address(blacklist), IVettingPolicy(address(policy)), admin);
+        oa = new OriginAssignment(bond, registry, IVettingPolicy(address(policy)), admin);
 
         registry.setOwner(NS, publisher);
         registry.setNamespaceCount(publisher, 1);
@@ -197,7 +173,7 @@ contract OriginAssignmentTest is Test {
     function test_constructor_rejectsNonContractPolicy() public {
         address eoa = address(0xE0A);
         vm.expectRevert(abi.encodeWithSelector(OriginAssignment.VettingPolicyNotAContract.selector, eoa));
-        new OriginAssignment(bond, registry, address(blacklist), IVettingPolicy(eoa), admin);
+        new OriginAssignment(bond, registry, IVettingPolicy(eoa), admin);
     }
 
     function test_setVettingPolicy_onlyGovernance() public {
@@ -246,24 +222,6 @@ contract OriginAssignmentTest is Test {
         oa.addOrigin(NS, opA);
     }
 
-    function test_addOrigin_revertsBlacklistedOperator() public {
-        _vet(publisher);
-        blacklist.setBlacklisted(opA, true);
-        vm.prank(publisher);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorBlacklisted.selector, opA));
-        oa.addOrigin(NS, opA);
-    }
-
-    /// @notice M-2 — seating must also reject an operator blacklisted via the
-    ///         operator mapping (`addOperator`), not only the origin mapping.
-    function test_addOrigin_revertsOperatorBlacklistedViaOperatorMapping() public {
-        _vet(publisher);
-        blacklist.setOperatorBlacklisted(opA, true);
-        vm.prank(publisher);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorBlacklisted.selector, opA));
-        oa.addOrigin(NS, opA);
-    }
-
     function test_addOrigin_revertsAlreadySeated() public {
         _vet(publisher);
         _seat(opA);
@@ -297,55 +255,14 @@ contract OriginAssignmentTest is Test {
         oa.addOrigin(NS, opB);
     }
 
-    /// Deployment window: with no `ContentBlacklist` bound, seating validates
-    /// against `CapacityBond.isActive` alone.
-    function test_addOrigin_blacklistSkippedWhenUnset() public {
-        OriginAssignment oaNoBl =
-            new OriginAssignment(bond, registry, address(0), IVettingPolicy(address(policy)), admin);
-        _vet(publisher);
-        // opA "blacklisted" in the standalone mock, but oaNoBl has no binding → check skipped.
-        blacklist.setBlacklisted(opA, true);
-
-        vm.prank(publisher);
-        oaNoBl.addOrigin(NS, opA);
-        assertTrue(oaNoBl.isAuthorizedOrigin(NS, opA));
-    }
-
-    /// ADR 016 post-deploy step 2: binding the blacklist turns the guard on.
-    /// Nothing else proves the setter writes the slot the guards read — every
-    /// other blacklist test gets its binding from the constructor, so a setter
-    /// that wrote the wrong slot would ship a permanently unenforced blacklist
-    /// with a green suite.
-    function test_setContentBlacklist_turnsTheGuardOn() public {
-        OriginAssignment oaNoBl =
-            new OriginAssignment(bond, registry, address(0), IVettingPolicy(address(policy)), admin);
-        _vet(publisher);
-        vm.prank(publisher);
-        oaNoBl.addOrigin(NS, opA);
-
-        vm.prank(admin);
-        oaNoBl.setContentBlacklist(address(blacklist));
-
-        blacklist.setBlacklisted(opB, true);
-        vm.prank(publisher);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorBlacklisted.selector, opB));
-        oaNoBl.addOrigin(NS, opB);
-
-        // And the prune path, which reverted `ContentBlacklistNotSet` before.
-        blacklist.setBlacklisted(opA, true);
-        oaNoBl.pruneBlacklistedOrigin(NS, opA);
-        assertFalse(oaNoBl.isAuthorizedOrigin(NS, opA));
-    }
-
     /// The #1107 regression, stated as an invariant: seating B validates B and
-    /// nothing else. A live origin A that has gone inactive AND been blacklisted
-    /// cannot block the publisher from adding a redundant origin.
+    /// nothing else. A live origin A that has gone inactive cannot block the
+    /// publisher from adding a redundant origin.
     function test_addOrigin_deltaSeatIsIndependentOfLiveOriginState() public {
         _vet(publisher);
         _seat(opA);
 
         bond.setActive(opA, false);
-        blacklist.setBlacklisted(opA, true);
 
         _seat(opB);
 
@@ -397,7 +314,7 @@ contract OriginAssignmentTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // removeOrigin / pruneBlacklistedOrigin
+    // removeOrigin / pruneInactiveOrigin
     // -----------------------------------------------------------------
 
     function test_removeOrigin_byPublisherAndGovernance() public {
@@ -429,53 +346,41 @@ contract OriginAssignmentTest is Test {
         oa.removeOrigin(NS, opC);
     }
 
-    function test_prune_removesBlacklistedOperator() public {
+    function test_prune_removesInactiveOperator() public {
         _vetAndSeatBoth();
 
-        blacklist.setBlacklisted(opA, true);
+        // A seated operator leaves the active set (unbonded / deregistered /
+        // ejected — including an operator-level blacklist, which ejects from
+        // CapacityBond and so reads inactive here).
+        bond.setActive(opA, false);
         // Permissionless — any caller.
         vm.expectEmit(true, true, true, true);
-        emit OriginAssignment.BlacklistedOriginPruned(NS, opA, stranger);
+        emit OriginAssignment.InactiveOriginPruned(NS, opA, stranger);
         vm.prank(stranger);
-        oa.pruneBlacklistedOrigin(NS, opA);
+        oa.pruneInactiveOrigin(NS, opA);
         assertFalse(oa.isAuthorizedOrigin(NS, opA));
     }
 
-    /// @notice M-2 — prune must also work for an operator blacklisted via the
-    ///         operator mapping (`addOperator`), not only the origin mapping.
-    function test_prune_removesOperatorBlacklistedViaOperatorMapping() public {
+    function test_prune_revertsWhenStillActive() public {
         _vetAndSeatBoth();
-
-        blacklist.setOperatorBlacklisted(opA, true);
+        // opA is still active, so a caller cannot grief by pruning it.
         vm.prank(stranger);
-        oa.pruneBlacklistedOrigin(NS, opA);
-        assertFalse(oa.isAuthorizedOrigin(NS, opA));
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorStillActive.selector, opA));
+        oa.pruneInactiveOrigin(NS, opA);
     }
 
-    function test_prune_revertsWhenNotBlacklisted() public {
+    function test_prune_revertsForUnseatedInactiveOperator() public {
         _vetAndSeatBoth();
+        // opC was never seated; even inactive, prune has nothing to remove.
+        bond.setActive(opC, false);
         vm.prank(stranger);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorNotBlacklisted.selector, opA));
-        oa.pruneBlacklistedOrigin(NS, opA);
-    }
-
-    function test_prune_revertsWhenBlacklistUnset() public {
-        OriginAssignment oaNoBl =
-            new OriginAssignment(bond, registry, address(0), IVettingPolicy(address(policy)), admin);
-        vm.prank(stranger);
-        vm.expectRevert(OriginAssignment.ContentBlacklistNotSet.selector);
-        oaNoBl.pruneBlacklistedOrigin(NS, opA);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NotAuthorizedOrigin.selector, NS, opC));
+        oa.pruneInactiveOrigin(NS, opC);
     }
 
     // -----------------------------------------------------------------
     // Governance setters
     // -----------------------------------------------------------------
-
-    function test_setContentBlacklist_rejectsZero() public {
-        vm.prank(admin);
-        vm.expectRevert(OriginAssignment.ZeroAddress.selector);
-        oa.setContentBlacklist(address(0));
-    }
 
     /// ADR 011 § Contract promises each governance setter emits its own update
     /// event, and the CHANGELOG tells indexers to map those topics. Nothing
@@ -492,13 +397,6 @@ contract OriginAssignmentTest is Test {
         emit OriginAssignment.MaxOriginsPerNamespaceUpdated(10, 5);
         vm.prank(admin);
         oa.setMaxOriginsPerNamespace(5);
-
-        OriginAssignment oaNoBl =
-            new OriginAssignment(bond, registry, address(0), IVettingPolicy(address(policy)), admin);
-        vm.expectEmit(true, true, true, true);
-        emit OriginAssignment.ContentBlacklistUpdated(address(0), address(blacklist));
-        vm.prank(admin);
-        oaNoBl.setContentBlacklist(address(blacklist));
     }
 
     function test_setMaxOrigins_enforcesBounds() public {
@@ -514,16 +412,14 @@ contract OriginAssignmentTest is Test {
         oa.setMaxOriginsPerNamespace(51);
     }
 
-    /// The three remaining governance setters share one role gate; a missing
-    /// `onlyRole` on `setContentBlacklist` would hand anyone the power to
-    /// re-point the blacklist read and disable the operator-blacklist guard.
+    /// Both governance setters share one role gate; a missing `onlyRole` on
+    /// either would hand anyone the power to swap the vetting policy or move the
+    /// per-namespace origin cap.
     function test_governanceSetters_rejectNonGovernance() public {
         bytes memory denied =
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE);
         RejectAllVettingPolicy rejectAll = new RejectAllVettingPolicy();
         vm.startPrank(stranger);
-        vm.expectRevert(denied);
-        oa.setContentBlacklist(address(blacklist));
         vm.expectRevert(denied);
         oa.setVettingPolicy(IVettingPolicy(address(rejectAll)));
         vm.expectRevert(denied);
@@ -568,9 +464,9 @@ contract OriginAssignmentTest is Test {
             "OriginRemoved"
         );
         assertEq(
-            OriginAssignment.BlacklistedOriginPruned.selector,
-            keccak256("BlacklistedOriginPruned(uint256,address,address)"),
-            "BlacklistedOriginPruned"
+            OriginAssignment.InactiveOriginPruned.selector,
+            keccak256("InactiveOriginPruned(uint256,address,address)"),
+            "InactiveOriginPruned"
         );
         assertEq(
             OriginAssignment.VettingPolicyUpdated.selector,
@@ -629,12 +525,12 @@ contract OriginAssignmentTest is Test {
     /// pruned namespace would linger in the enumeration forever.
     function test_assignedNamespaces_prunePathWithdrawsWhenEmptied() public {
         _vetAndSeatBoth();
-        blacklist.setBlacklisted(opA, true);
-        blacklist.setBlacklisted(opB, true);
+        bond.setActive(opA, false);
+        bond.setActive(opB, false);
 
-        oa.pruneBlacklistedOrigin(NS, opA);
+        oa.pruneInactiveOrigin(NS, opA);
         assertEq(oa.assignedNamespaceCount(), 1);
-        oa.pruneBlacklistedOrigin(NS, opB);
+        oa.pruneInactiveOrigin(NS, opB);
         assertEq(oa.assignedNamespaceCount(), 0);
     }
 

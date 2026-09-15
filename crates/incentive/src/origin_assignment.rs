@@ -14,7 +14,7 @@
 //! `setVettingPolicy`); a vetted publisher then seats and unseats origins for
 //! its own namespaces instantly, one operator at a time. So every event here is
 //! a single-operator delta — `OriginAdded` seats one, `OriginRemoved` /
-//! `BlacklistedOriginPruned` remove one — and the directory treats each as a
+//! `InactiveOriginPruned` remove one — and the directory treats each as a
 //! signal to re-read `getOrigins`, not as history. Namespace 0 has no publisher
 //! and no authorized origins, so `getOrigins(0)` is always empty.
 //!
@@ -86,8 +86,8 @@ mod sol_types {
             /// Vetted namespace owner seats one more authorized origin. Instant:
             /// there is no pending state and no governance step. Reverts if the
             /// caller does not own the namespace, is not vetted, or the operator
-            /// is not an active bonded node, is blacklisted, is already seated,
-            /// or would exceed `maxOriginsPerNamespace`.
+            /// is not an active bonded node, is already seated, or would exceed
+            /// `maxOriginsPerNamespace`.
             function addOrigin(uint256 namespaceId, address operator) external;
 
             /// Namespace owner (own namespace) or governance (any) unseats one
@@ -115,9 +115,10 @@ mod sol_types {
                 address indexed by
             );
 
-            /// A blacklisted `operator` was pruned from `namespaceId`'s
+            /// An `operator` that left the active set (unbonded, deregistered,
+            /// or ejected) was permissionlessly pruned from `namespaceId`'s
             /// authorized set. Same cache effect as a removal (remove one).
-            event BlacklistedOriginPruned(
+            event InactiveOriginPruned(
                 uint256 indexed namespaceId,
                 address indexed operator,
                 address indexed pruner
