@@ -74,21 +74,49 @@ const OVERALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// chunk-log 4 == 16 KiB chunk groups).
 const CHUNK_GROUP: usize = 16 * 1024;
 
-/// 0.5 USDC/MB, priced identically on BOTH hops. The ADR 041 buy-margin gate
+/// 0.001 USDC/MB (1000 µUSDC/MB, at the wire cap `MAX_RATE_PER_MB`), priced
+/// identically on BOTH hops. The ADR 041 buy-margin gate
 /// (`serve_economics.policy = "margin"`, the default) caps the SERVER's upstream
 /// buy at its own sell rate, so an equal seeder rate clears the gate in the
 /// market regime while a higher one would be refused as below-margin.
-const RATE_PER_MB: u64 = 500_000;
+///
+/// The rate, the seeder's refundable floor `M` ([`SEEDER_MIN_REMAINING`]), and
+/// the SERVER's working deposit ([`SERVER_WORKING_DEPOSIT`]) are all a factor of
+/// 500 below the pre-#2036 sizing (rate `500_000`, M `1_000_000`, deposit
+/// `4_000_000`) so this whole node-to-node exhaust-mid-pull scenario is preserved
+/// unchanged under the lowered `MAX_RATE_PER_MB` (1000): every `µUSDC` quantity in
+/// the open-gate and exhaust-mid-blob inequalities scales by the same factor, and
+/// the blob is byte-identical.
+const RATE_PER_MB: u64 = 1000;
 
-/// The SERVER's node-to-node buyer working deposit, shrunk to 4 USDC — far below
-/// the blob's ~4.5 USDC wire cost, so the upstream pull exhausts it mid-stream
-/// and the reactive top-up fires exactly once (the node's `MAX_REACTIVE_TOPUPS`
-/// is 1). Sized above the seeder's pre-serve floor with room to spare: the
-/// seeder admits the SERVER's pool only while `remaining − M` covers the reserved
-/// credit window (#1518), and `M` defaults to 1 USDC, so the 3 USDC of headroom
-/// here also absorbs the several concurrent one-chunk floor reservations the
-/// gap-driven pull holds on the seeder side at once.
-const SERVER_WORKING_DEPOSIT: u64 = 4_000_000;
+/// The SERVER's node-to-node buyer working deposit, shrunk to 8000 `µUSDC` — far
+/// below the blob's ~9040 `µUSDC` wire cost, so the upstream pull exhausts it
+/// mid-stream and the reactive top-up fires exactly once (the node's
+/// `MAX_REACTIVE_TOPUPS` is 1). Sized above the seeder's pre-serve floor with room
+/// to spare: the seeder admits the SERVER's pool only while `remaining − M` covers
+/// the reserved credit window (#1518), and this journey sets `M` to
+/// [`POOL_MIN_REMAINING`] (2000 `µUSDC`), so the 6000 `µUSDC` of headroom
+/// (8000 − 2000) here also absorbs the several concurrent one-chunk floor
+/// reservations the gap-driven pull holds on the seeder side at once.
+const SERVER_WORKING_DEPOSIT: u64 = 8_000;
+
+/// The refundable floor `M` for this journey, scaled down by the same factor of
+/// 500 as the rate and deposit so the open-gate headroom (`working − M ≥ one
+/// chunk`) is preserved: 8000 − 2000 = 6000 ≥ 1000. It is set on BOTH nodes,
+/// because `M` has two roles here that must agree at the same value:
+///
+///   * On the SEEDER it is the seller-side pre-serve floor: the seeder admits the
+///     SERVER's buyer pool only while `remaining − M` covers the reserved credit
+///     window (#1518).
+///   * On the SERVER it is the buyer-side `seller_reserve` estimate: the SERVER's
+///     pull pacer holds back its estimate of the upstream's `M` (taken from its
+///     own `pool_min_remaining_deposit`, since an upstream running this software
+///     keeps the same floor) before funding a voucher.
+///
+/// At the default `M` (1 USDC) the SERVER's pacer would reserve `1_000_000` `µUSDC`
+/// out of the scaled 8000 `µUSDC` deposit and could never fund the first voucher, so both
+/// nodes are scaled together.
+const POOL_MIN_REMAINING: u64 = 2_000;
 
 /// USDC (base units) minted to the SERVER operator so its buyer pool to the
 /// seeder can open at [`SERVER_WORKING_DEPOSIT`] and fund a full reactive top-up
@@ -96,12 +124,12 @@ const SERVER_WORKING_DEPOSIT: u64 = 4_000_000;
 const SERVER_BUYER_USDC: u64 = 1_000_000_000;
 
 /// The blob under test: 9 MiB of content. At [`RATE_PER_MB`] its whole-blob wire
-/// cost (content + interleaved bao proof, ADR 038) is ~4.52 USDC — strictly above
-/// the 4 USDC working deposit, so the pull must top up. The buy clears the ADR 041
-/// margin gate in the market regime: the SERVER checks the seeder's warming
+/// cost (content + interleaved bao proof, ADR 038) is ~9040 `µUSDC` — strictly above
+/// the 8000 `µUSDC` working deposit, so the pull must top up. The buy clears the ADR
+/// 041 margin gate in the market regime: the SERVER checks the seeder's warming
 /// allowance (`serve_economics.warming_budget`, 5 USDC, starting full) before each
 /// pull run and debits it only after the run, and the warm-up's 1 MB debit
-/// (0.5 USDC) leaves it positive when the blob's pull starts.
+/// (1000 `µUSDC`) leaves it positive when the blob's pull starts.
 const BLOB_BYTES: usize = 9 * 1024 * 1024;
 
 /// Deterministic pseudo-random blob spanning many chunk groups, so a delivery
@@ -191,6 +219,15 @@ async fn run() -> anyhow::Result<()> {
         (warm_hash, blob_hash)
     };
     seeder.set_rate_per_mb(RATE_PER_MB).await?;
+    // The seeder admits the SERVER's buyer pull pool only while its remaining
+    // deposit minus the refundable floor `M` covers the reserved credit window
+    // (#1518). Scale `M` down by the same factor as the rate and deposit so the
+    // scaled 8000 µUSDC deposit still clears the open gate. (The SERVER's own `M`
+    // is scaled to match below, since its pacer uses it as the upstream-reserve
+    // estimate it must not spend into.)
+    seeder
+        .set_pool_min_remaining_deposit(POOL_MIN_REMAINING)
+        .await?;
 
     // Seat the seeder as an authorized origin for a fresh namespace so the
     // SERVER's on-chain `OriginAssignment` directory fallback resolves it on a
@@ -213,6 +250,14 @@ async fn run() -> anyhow::Result<()> {
     server.set_rate_per_mb(RATE_PER_MB).await?;
     server
         .set_buyer_working_deposit(SERVER_WORKING_DEPOSIT)
+        .await?;
+    // The SERVER's pull pacer holds back its estimate of the upstream's refundable
+    // floor `M` before funding each voucher, and takes that estimate from its own
+    // `pool_min_remaining_deposit`. Scale it to match the seeder's `M`: at the
+    // default (1 USDC) the pacer would reserve 1_000_000 µUSDC out of the 8000 µUSDC
+    // deposit and never fund the first voucher.
+    server
+        .set_pool_min_remaining_deposit(POOL_MIN_REMAINING)
         .await?;
     chain
         .fund_node_as_buyer(server.operator_addr(), U256::from(SERVER_BUYER_USDC))
