@@ -35,6 +35,17 @@
 //! on-disk byte ranges as chunk donors, so a later run's or bundle's
 //! complement-range fetch can splice an unchanged range from disk instead of
 //! paying for it again.
+//!
+//! **Whole-root content reuse.** A run also reuses a byte-identical file
+//! already anywhere in the output root, not only at its own manifest path. It
+//! consults a whole-root content index built from `.decdn-manifest.json`'s
+//! saved records: target blob hash → an on-disk regular file the manifest
+//! records with that hash. When a blob's hash hits that index, the candidate
+//! is confirmed by a whole-file re-hash, then the destination is materialized
+//! by hard link (or copy) with no download and no payment. A file that only
+//! partially matches an on-disk candidate still splices its common byte
+//! ranges from disk the same way, through the donor mechanism described
+//! above.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -3039,7 +3050,7 @@ fn transfer_line(t: Transfer) -> String {
 /// The [`Transfer`] for one whole-file hash-group: the blob is either paid for
 /// once (`downloaded` = its size, taken from the single `Fetched`) or reused
 /// from an on-disk donor with no download (`Deduped`, contributing 0 to
-/// `downloaded`) — a group never mixes the two, since [`fetch_group`] takes one
+/// `downloaded`) — a group never mixes the two, since [`PullCtx::fetch_group`] takes one
 /// path or the other. Every materialized copy — the canonical (`Fetched` or
 /// `Deduped`) plus each `Linked` duplicate path — is a full file on disk
 /// (`reconstructed` = size × copies). A group with nothing written (all skipped
