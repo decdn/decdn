@@ -68,7 +68,7 @@ contract BuybackBurnerBalancerV3ForkTest is Test {
         // The constructor runs `_validatePoolWiring()` against the LIVE Vault and
         // pool: if any `IBalancerV3*` ABI disagrees with deployed bytecode, or
         // the pool is mis-read, this reverts. That is the core fork coverage.
-        bb = new BuybackBurnerBalancerV3(IERC20(USDC), ERC20Burnable(WETH), address(this), cfg);
+        bb = new BuybackBurnerBalancerV3(IERC20(USDC), ERC20Burnable(WETH), address(this), address(this), cfg);
     }
 
     modifier requiresFork() {

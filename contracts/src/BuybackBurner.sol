@@ -60,12 +60,22 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, SunsettingPau
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ERC20Burnable public immutable token;
 
+    /// @notice Fixed sink for `rescueUSDC`. Snapshotted at construction from the
+    ///         same treasury that `FeeRouter` pays, so a rescue can only ever
+    ///         return the buyback bucket here — never to a caller-chosen
+    ///         address. A live `FeeRouter.treasury()` read is a circular deploy
+    ///         dependency (the router's constructor already needs this burner),
+    ///         and the immutable snapshot is stricter still: it cannot be
+    ///         redirected even by `FeeRouter.setTreasury`.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    address public immutable treasury;
+
     // -----------------------------------------------------------------
     // Events / Errors
     // -----------------------------------------------------------------
 
     event BuybackExecuted(uint256 usdcIn, uint256 tokenOut);
-    event UsdcRescued(address indexed to, uint256 amount);
+    event UsdcRescued(uint256 amount);
 
     error ZeroAddress();
     error ZeroAmount();
@@ -79,12 +89,16 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, SunsettingPau
     // Constructor
     // -----------------------------------------------------------------
 
-    constructor(IERC20 usdc_, ERC20Burnable token_, address admin) {
-        if (address(usdc_) == address(0) || address(token_) == address(0) || admin == address(0)) {
+    constructor(IERC20 usdc_, ERC20Burnable token_, address admin, address treasury_) {
+        if (
+            address(usdc_) == address(0) || address(token_) == address(0) || admin == address(0)
+                || treasury_ == address(0)
+        ) {
             revert ZeroAddress();
         }
         usdc = usdc_;
         token = token_;
+        treasury = treasury_;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
     }
@@ -156,18 +170,20 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, SunsettingPau
     // USDC rescue + pausing
     // -----------------------------------------------------------------
 
-    /// @notice Recover USDC stranded in this contract — e.g. inflow that
-    ///         accumulated while the pool was unwired, residue left by a keeper
-    ///         under-swap, or the full balance before a `setBuybackBurner`
-    ///         replacement on `FeeRouter`. Without this, replacing the burner
-    ///         would permanently strand the old contract's USDC.
+    /// @notice Return USDC stranded in this contract to the fixed `treasury` —
+    ///         e.g. inflow that accumulated while the pool was unwired, residue
+    ///         left by a keeper under-swap, or the full balance before a
+    ///         `setBuybackBurner` replacement on `FeeRouter`. Without this,
+    ///         replacing the burner would permanently strand the old contract's
+    ///         USDC. This is a misconfiguration hatch, not a payout path: it can
+    ///         only ever move USDC to the immutable `treasury`, never to a
+    ///         caller-supplied address.
     /// @dev Governance-gated; only moves the externally-held USDC bucket, never
     ///      TOKEN (which is always burned, never transferred out).
-    function rescueUSDC(address to, uint256 amount) external onlyRole(GOVERNANCE_ROLE) {
-        if (to == address(0)) revert ZeroAddress();
+    function rescueUSDC(uint256 amount) external onlyRole(GOVERNANCE_ROLE) {
         if (amount == 0) revert ZeroAmount();
-        emit UsdcRescued(to, amount);
-        usdc.safeTransfer(to, amount);
+        emit UsdcRescued(amount);
+        usdc.safeTransfer(treasury, amount);
     }
 
     function pause() external onlyRole(PAUSER_ROLE) {

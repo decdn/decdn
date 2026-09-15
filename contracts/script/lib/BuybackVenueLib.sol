@@ -167,6 +167,7 @@ library BuybackVenueLib {
         IERC20 usdc,
         ERC20Burnable token,
         address admin,
+        address treasury,
         address swapRouter,
         address pool,
         GuardedBuybackBurner.GuardParams memory guard
@@ -176,6 +177,7 @@ library BuybackVenueLib {
             usdc,
             token,
             admin,
+            treasury,
             BuybackBurnerUniswapV3.Config({
                 swapRouter_: IUniswapV3SwapRouter(swapRouter),
                 pool_: pool,
@@ -199,6 +201,7 @@ library BuybackVenueLib {
         IERC20 usdc,
         ERC20Burnable token,
         address admin,
+        address treasury,
         BalancerWiring memory wiring,
         GuardedBuybackBurner.GuardParams memory guard
     ) internal returns (GuardedBuybackBurner) {
@@ -207,6 +210,7 @@ library BuybackVenueLib {
             usdc,
             token,
             admin,
+            treasury,
             BuybackBurnerBalancerV3.Config({
                 swapRouter_: IBalancerV3Router(wiring.swapRouter),
                 pool_: wiring.pool,

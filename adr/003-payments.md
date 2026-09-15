@@ -644,31 +644,18 @@ There is no pinned per-channel `voucherSigner`. Signers are authorized off-chain
 | View | `getAuthorization(poolId, signer) → Authorization` | Read a signer's `{cap, expiry, spent}`, so a later node confirms a signer and its cap without holding the capability. |
 | View | `getRateBounds() → floor` | Current `deliveryFloor` in payment-token base units. |
 | View | `minDeposit() → uint64` | Current minimum credited `openPool` deposit in payment-token base units; `0` = dormant ([Minimum deposit](#minimum-deposit)). |
-| View | `feeRouter() → address` | Configured `FeeRouter` target ([ADR 026](026-tokenomics.md#adr-026-tokenomics)). |
-| Governance | `setFeeRouter(addr)` | Replace router target. `GOVERNANCE_ROLE`-gated; routed through the standard 48h `TimelockController` delay; emits `FeeRouterUpdated(address oldRouter, address newRouter)`. See [§ Governance setter: setFeeRouter](#governance-setter-setfeerouter) below. |
+| View | `feeRouter() → address` | The `FeeRouter` target, `immutable` and fixed at construction ([ADR 026](026-tokenomics.md#adr-026-tokenomics)). |
 | Governance | `setDisputeWindow(seconds)` | Grace window (bounded 172800–259200 — 48h–72h). |
 | Governance | `setRateBounds(floor)` | Per-MB delivery-rate floor in payment-token base units. Capped at `MAX_RATE_PER_MB`. |
 | Governance | `setMinDeposit(newMin)` | Minimum credited `openPool` deposit; bounded [0, 100_000_000] ($100 ceiling); `0` returns the knob to dormant. Emits `MinDepositUpdated`. |
 
 Bucket shares (60/30/10) are governed on `FeeRouter`, not on `PaymentPool`; the treasury share (10%) is configured on `FeeRouter`.
 
-#### Governance setter: setFeeRouter
+#### Immutable settlement router
 
-```solidity
-function setFeeRouter(address newRouter) external onlyRole(GOVERNANCE_ROLE);
+`feeRouter` is `immutable`. The constructor takes the router address and fixes it for the contract's life. `PaymentPool` has no setter for it. `FeeRouter` records the `bytesPerEpoch` vote-weight feed that `DecdnGovernor` reads, and `DecdnGovernor.feeRouter` is `immutable` too. A re-pointable pool router could sever that feed and permanently brick governance, so both ends bind to one router at construction.
 
-event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
-```
-
-`setFeeRouter` re-points the configured `FeeRouter` for future redemptions. Required because the audited contract surface is fixed at deploy time, yet the `FeeRouter` may need replacing (bug fix, structural upgrade) without redeploying `PaymentPool` and forcing every open pool to re-issue vouchers.
-
-**Authority and timelock.** Only callable by `GOVERNANCE_ROLE` (held by the `TimelockController` post-deploy per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)). `DecdnGovernor` proposals to replace the router execute through the standard 48h timelock per [ADR 009](009-governance.md#adr-009-governance-model). Calls outside that path revert.
-
-**Validation.** Reverts on `address(0)`, on the same address as the current `feeRouter`, and on a `newRouter` whose code size is zero (EOA / undeployed address) — the same `code.length` invariant the constructor enforces, because `_route` would otherwise advance pool state while `routeSettlement` silently no-ops, desyncing accounting and stranding paid USDC. Beyond that code-size check the new router is not further interrogated — the deeper cross-validation invariants in [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) live on `FeeRouter` itself, so re-pointing at a wrong-but-deployed contract still surfaces at the next redemption rather than at the setter.
-
-**Open pools are unaffected.** Vouchers signed against this `PaymentPool` remain valid because the EIP-712 domain separator hashes the contract's own address, not the configured `FeeRouter`. Carve-out documented in [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns): helper-contract addresses are not domain-separator inputs and may be re-pointed via governance without invalidating signatures.
-
-**Routing during the swap.** Redemptions beginning before the timelock executes use the previous router; those beginning after use the new one. Redemption reads `feeRouter()` at call time, and `routeSettlement` is a single transaction, so no in-flight redemption splits across routers.
+The constructor validates the router. It reverts on `address(0)`, on a router whose code size is zero (EOA or undeployed address), and on a router that does not expose the `paused()` view. A code-present router that later proves wrong surfaces at the next redemption, not at deploy. A router bug now needs a `PaymentPool` redeploy, which the immutable-Governor design already assumes.
 
 > **Reentrancy protection:** All state-mutating functions that perform external calls (ERC-20 transfers) — `openPool`, `topUp`, `redeemMany`, `reclaim` — MUST use `nonReentrant` guards and follow checks-effects-interactions. `redeemMany` additionally crosses the `FeeRouter` boundary, so the effects (lane watermark, `spent`, and `totalRedeemed` advances) MUST be committed before the `safeTransfer` + `routeSettlement` interaction — a batch commits *every* entry's effects before its one settlement call.
 
@@ -751,12 +738,12 @@ An owner reconciling its pools after a restart reads its own `ownerPoolNonce` an
 | Parameter | Minimum | Maximum |
 | --- | --- | --- |
 | Grace window (`disputeWindow`) | 172800 seconds (48 hours) | 259200 seconds (3 days) |
-| Rate floor | 1 base unit | `MAX_RATE_PER_MB` (10^12) |
+| Rate floor | 1 base unit | `MAX_RATE_PER_MB` (1000) |
 | Minimum deposit (`minDeposit`) | 0 (dormant) | 100_000_000 base units ($100) |
 
 `PaymentPool` does not hold a fee-percentage parameter. Bucket-share bounds (60/30/10 with per-share bounds 40–90 / 5–50 / 0–30) are owned by `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
 
-**The rate floor is in USDC base units (6 decimals) per MB.** The contract stores `deliveryFloor`, the per-byte price floor **enforced at redemption** (see [Rate-floor enforcement](#rate-floor-enforcement) below). It is a soft floor and never a quote gate: a node advertises whatever rate it configures, and a sub-floor rate still settles. There is no governance ceiling either — the buyer sees the signed rate in `StreamResponse` before it pays, so it protects itself by rejecting a rate it finds too expensive. The absolute upper bound is the wire constant `MAX_RATE_PER_MB` ([ADR 005](005-protocol.md#adr-005-wire-protocol)), which honest requesters reject above.
+**The rate floor is in USDC base units (6 decimals) per MB.** The contract stores `deliveryFloor`, the per-byte price floor **enforced at redemption** (see [Rate-floor enforcement](#rate-floor-enforcement) below). It is a soft floor and never a quote gate: a node advertises whatever rate it configures, and a sub-floor rate still settles. There is no governance ceiling either — the buyer sees the signed rate in `StreamResponse` before it pays, so it protects itself by rejecting a rate it finds too expensive. The absolute upper bound is the wire constant `MAX_RATE_PER_MB` = 1000 base units per MB (~$1/GB, ~100× the expected market rate; [ADR 005](005-protocol.md#adr-005-wire-protocol)), which honest requesters reject above. The ceiling sits near real prices on purpose: a floor set close to it clamps credited bytes toward zero, so a far-above-market ceiling would let governance suppress ADR-036 vote-weight accrual, while a realistic one still catches below-market bytes and can never zero out the electorate's weight.
 
 **Initial rate floor:**
 

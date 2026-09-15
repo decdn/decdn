@@ -37,7 +37,13 @@ contract CapacityBondTest is Test {
     address internal challenger = address(0xC4A11);
 
     uint256 internal constant MIN_BOND = 50_000e18;
+    // Governance `minBond` ceiling, mirroring `CapacityBond.MIN_BOND_CEILING`
+    // (internal), used by the non-retroactive-minBond tests.
+    uint256 internal constant MIN_BOND_CEILING_TEST = 1_000_000e18;
     uint256 internal constant UNBONDING = 7 days;
+    // First-offense slash tier (bps), mirroring `CapacityBond.SLASH_BPS_TIER_1`
+    // (internal), used by the exit slash-safety test.
+    uint256 internal constant SLASH_BPS_TIER_1_TEST = 500;
     // ADR 019 § Terms Acceptance — genesis operator-terms hash the fixture
     // registers against (stand-in for `keccak256(TERMS.md)`).
     bytes32 internal constant TERMS_HASH = keccak256("decdn operator terms v1");
@@ -1008,6 +1014,76 @@ contract CapacityBondTest is Test {
         assertEq(token.balanceOf(opAddr), balanceBefore + bonded, "the full bond comes back");
     }
 
+    // ── Exits are never pausable (issue #2030) ───────────────────────────────
+
+    /// @notice A pause must not trap an operator's bond. With the contract
+    ///         paused, an operator can still `requestUnbond` and, after the
+    ///         unbonding period, `unbond` the principal back. Pause halts intake
+    ///         and serving only; a captured PAUSER cannot freeze the exit.
+    function test_exit_notPausable_requestUnbondAndUnbondWhilePaused() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        uint256 balBefore = token.balanceOf(operator);
+
+        vm.startPrank(admin);
+        bond.grantRole(bond.PAUSER_ROLE(), admin);
+        bond.pause();
+        vm.stopPrank();
+
+        // No capacity is declared, so the curve floor is 0 and the whole bond is
+        // releasable — the exit runs entirely while the contract is paused.
+        vm.startPrank(operator);
+        bond.requestUnbond(MIN_BOND);
+        vm.warp(block.timestamp + UNBONDING);
+        bond.unbond();
+        vm.stopPrank();
+
+        assertEq(bond.activeBond(operator), 0, "bond fully released despite the pause");
+        assertEq(token.balanceOf(operator), balBefore + MIN_BOND, "principal returned while paused");
+    }
+
+    /// @notice Un-gating the exit does not weaken slash safety. An operator with
+    ///         an OPEN slash record cannot recover the at-risk amount by exiting,
+    ///         even while unbonding and even while the contract is paused. The
+    ///         protection is the slash escrow and the unbonding period, never the
+    ///         pause: `slash` reaches bond already sitting in the unbonding queue,
+    ///         and the escrowed portion is not withdrawable by `unbond`.
+    function test_exit_openSlashUnwithdrawable_evenWhileUnbondingAndPaused() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        uint256 balBefore = token.balanceOf(operator);
+
+        // Queue the entire bond, THEN slash — proving the slash reaches bond in
+        // the unbonding queue, not only active bond.
+        vm.prank(operator);
+        bond.requestUnbond(MIN_BOND);
+
+        // Tier-1 slash = 5% of the at-risk bond. Active is 0, so it taps the
+        // queue: 50k → 2.5k escrowed, 47.5k left queued.
+        uint256 expectedSlash = (MIN_BOND * SLASH_BPS_TIER_1_TEST) / 10_000;
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1, bytes32(0));
+        assertEq(bond.escrowedTotal(), expectedSlash, "slash escrowed the at-risk portion of the queued bond");
+        assertGt(bond.slashedAtEpoch(operator), 0, "slash record is open");
+
+        // Pause after the slash — the exit must still complete, but only for the
+        // un-slashed remainder.
+        vm.startPrank(admin);
+        bond.grantRole(bond.PAUSER_ROLE(), admin);
+        bond.pause();
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + UNBONDING);
+        vm.prank(operator);
+        bond.unbond();
+
+        uint256 recovered = token.balanceOf(operator) - balBefore;
+        assertEq(recovered, MIN_BOND - expectedSlash, "only the un-slashed remainder is withdrawn");
+        assertEq(bond.escrowedTotal(), expectedSlash, "the slashed amount stays escrowed, unreachable by exit");
+    }
+
     function test_reRegisterAfterDeregister_keepsBondAndNeedsFreshDeclare() public {
         uint256 opPk = 0x8EE8;
         bytes32 nodeId = bytes32(uint256(0x8EE8));
@@ -1819,6 +1895,153 @@ contract CapacityBondTest is Test {
         bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig2, hex"01");
     }
 
+    // -----------------------------------------------------------------
+    // minBond is non-retroactive (issue #2033)
+    // -----------------------------------------------------------------
+
+    /// @dev Bond exactly `amount` from a fresh operator and register a node with
+    ///      no Mbps declared, so only `minBond` gates entry. Returns the address.
+    function _bondAndRegister(uint256 opPk, uint256 amount) internal returns (address opAddr) {
+        opAddr = vm.addr(opPk);
+        vm.prank(admin);
+        token.transfer(opAddr, amount);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(amount);
+        vm.stopPrank();
+        bytes32 nodeId = bytes32(uint256(opPk));
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+    }
+
+    /// @notice Core: an operator active at the launch `minBond` (50k) stays
+    ///         active — retaining vote-weight eligibility — after governance
+    ///         raises `minBond` to 100k. The raise is non-retroactive: it never
+    ///         de-activates the grandfathered operator.
+    function test_minBond_raise_grandfathersActiveOperator() public {
+        address opAddr = _bondAndRegister(0xF10021, MIN_BOND);
+        assertTrue(bond.isActive(opAddr));
+        assertEq(bond.bondFloorAtActivation(opAddr), MIN_BOND);
+
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+
+        // Still active though active bond (50k) sits below the new minBond.
+        assertTrue(bond.isActive(opAddr));
+        assertEq(bond.activeBond(opAddr), MIN_BOND);
+        assertEq(bond.bondFloorAtActivation(opAddr), MIN_BOND); // floor unchanged
+    }
+
+    /// @notice `registerNode` is an activation path distinct from `bond()`: an
+    ///         operator can satisfy `activeBond >= minBond` without a `bond()`
+    ///         up-crossing when governance lowered `minBond` after they bonded.
+    ///         registerNode must still capture a non-zero grandfathered floor —
+    ///         otherwise a later `minBond` raise would wrongly keep an
+    ///         under-floor operator active (`activeBond >= 0`). PR #2038 review.
+    function test_minBond_registerAfterDecrease_capturesFloor() public {
+        // Raise minBond above the operator's future bond so `bond()` records no floor.
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+
+        uint256 opPk = 0xF10099;
+        address opAddr = vm.addr(opPk);
+        bytes32 nodeId = bytes32(uint256(0xF10099));
+        vm.prank(admin);
+        token.transfer(opAddr, 60_000e18);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(60_000e18); // 60k < 100k minBond → no up-crossing, floor stays 0
+        vm.stopPrank();
+        assertEq(bond.bondFloorAtActivation(opAddr), 0, "bond() below minBond captures no floor");
+        assertFalse(bond.isActive(opAddr), "not active: unregistered");
+
+        // Governance lowers minBond below the operator's existing bond.
+        vm.prank(admin);
+        bond.setMinBond(50_000e18);
+
+        // Activate via registerNode (no further bond()).
+        vm.startPrank(opAddr);
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        vm.stopPrank();
+
+        assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registerNode captures live minBond as floor");
+        assertTrue(bond.isActive(opAddr), "active after registration");
+
+        // A later raise must not de-activate the grandfathered operator.
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+        assertTrue(bond.isActive(opAddr), "grandfathered at 50k floor, stays active");
+        assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "floor unchanged by later raise");
+    }
+
+    /// @notice A NEW operator bonding below the raised `minBond` cannot activate:
+    ///         entry is gated on the live `minBond`, and no floor is recorded.
+    function test_minBond_raise_barsNewEntrantBelowFloor() public {
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+
+        uint256 opPk = 0xF10022;
+        address opAddr = vm.addr(opPk);
+        vm.prank(admin);
+        token.transfer(opAddr, MIN_BOND); // 50k, under the new 100k floor
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(MIN_BOND);
+        vm.stopPrank();
+        // Never crossed the live minBond, so no grandfathered floor was set.
+        assertEq(bond.bondFloorAtActivation(opAddr), 0);
+
+        bytes32 nodeId = bytes32(uint256(opPk));
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        vm.prank(opAddr);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowMinimum.selector, MIN_BOND, 100_000e18));
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+    }
+
+    /// @notice A `minBond` raise alone never ejects; only a real slash below the
+    ///         grandfathered `bondFloorAtActivation / 2` does.
+    function test_minBond_raiseNeverEjects_slashStillEjects() public {
+        address opAddr = _bondAndRegister(0xF10023, MIN_BOND); // floor 50k
+        vm.prank(admin);
+        bond.setMinBond(MIN_BOND_CEILING_TEST); // 1M — a 20× raise
+        assertTrue(bond.isActive(opAddr)); // raise alone: still active
+        assertFalse(bond.ejected(opAddr)); // raise alone: not ejected
+
+        // Escalating slashes drop active bond below the 25k floor/2 threshold:
+        // 50k → 47.5k (5%) → 40.375k (15%) → 20.1875k (50%) < 25k → eject.
+        vm.startPrank(admin);
+        bond.slash(opAddr, challenger, 1, bytes32(0));
+        assertFalse(bond.ejected(opAddr)); // 47.5k ≥ 25k floor/2
+        bond.slash(opAddr, challenger, 1, bytes32(0));
+        assertFalse(bond.ejected(opAddr)); // 40.375k ≥ 25k floor/2
+        bond.slash(opAddr, challenger, 1, bytes32(0));
+        vm.stopPrank();
+        assertTrue(bond.ejected(opAddr)); // 20.1875k < 25k floor/2 → ejected
+        assertFalse(bond.isActive(opAddr));
+    }
+
+    /// @notice A grandfathered operator's own partial unbond below its
+    ///         activation floor de-activates it (mirrors the below-floor
+    ///         behavior, keyed to the grandfathered floor).
+    function test_minBond_partialUnbondBelowFloor_deactivates() public {
+        address opAddr = _bondAndRegister(0xF10024, 60_000e18); // crosses 50k → floor 50k
+        assertTrue(bond.isActive(opAddr));
+        assertEq(bond.bondFloorAtActivation(opAddr), MIN_BOND);
+
+        // Unbond 15k → active 45k, under the 50k grandfathered floor.
+        vm.prank(opAddr);
+        bond.requestUnbond(15_000e18);
+        assertEq(bond.activeBond(opAddr), 45_000e18);
+
+        vm.warp(block.timestamp + UNBONDING + 1);
+        vm.prank(opAddr);
+        bond.unbond();
+        assertEq(bond.activeBond(opAddr), 45_000e18);
+        assertFalse(bond.isActive(opAddr)); // 45k < 50k floor: own action de-activates
+    }
+
     function test_updateMultiaddrs_revertsWhenNodeNotActive() public {
         // Operator never registered a node — `_nodes[op].active` is false.
         vm.prank(operator);
@@ -2034,8 +2257,8 @@ contract CapacityBondTest is Test {
         // unbondingPeriod*1e6 (7 days*1e6), so the wire-time invariant guard passes.
         MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(uint256(5 days) * 1_000_000);
         vm.prank(admin);
-        vm.expectEmit(true, true, false, false, address(bond));
-        emit CapacityBond.SlashJudgeUpdated(address(0), address(judge));
+        vm.expectEmit(true, false, false, false, address(bond));
+        emit CapacityBond.SlashJudgeWired(address(judge));
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
         assertEq(address(bond.slashJudge()), address(judge));
     }
@@ -2063,19 +2286,20 @@ contract CapacityBondTest is Test {
         assertEq(address(bond.slashJudge()), address(okJudge));
     }
 
-    function test_setSlashJudge_rewireEmitsPreviousJudgeAsOld() public {
-        // Re-wiring a second judge must emit the FIRST judge as `old` (not address(0)).
-        // Both maxEvidenceAgeUs values (4d, 5d *1e6) are strictly below the bond's
-        // unbondingPeriod*1e6 (7 days*1e6), so both wires satisfy the invariant.
+    function test_setSlashJudge_revertsOnSecondWire() public {
+        // The judge is set once at deploy wiring, then fixed. A second call must
+        // revert, so a captured governance cannot swap in a malicious judge. Both
+        // maxEvidenceAgeUs values (4d, 5d *1e6) are strictly below the bond's
+        // unbondingPeriod*1e6 (7 days*1e6), so the first wire satisfies the invariant.
         MockSlashJudgeEvidence first = new MockSlashJudgeEvidence(uint256(4 days) * 1_000_000);
         MockSlashJudgeEvidence second = new MockSlashJudgeEvidence(uint256(5 days) * 1_000_000);
         vm.startPrank(admin);
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(first)));
-        vm.expectEmit(true, true, false, false, address(bond));
-        emit CapacityBond.SlashJudgeUpdated(address(first), address(second));
+        vm.expectRevert(CapacityBond.SlashJudgeAlreadySet.selector);
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(second)));
         vm.stopPrank();
-        assertEq(address(bond.slashJudge()), address(second));
+        // The first judge stays wired.
+        assertEq(address(bond.slashJudge()), address(first));
     }
 
     // -----------------------------------------------------------------

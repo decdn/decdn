@@ -241,7 +241,7 @@ contract CapacityBond is
     ///         at the operator-initiated mutation sites (`declareMbps`,
     ///         `requestUnbond`, `registerNode`). Slash paths intentionally do
     ///         not re-enforce it — a penalized operator may fall under the
-    ///         curve and is auto-ejected below `minBond / 2`.
+    ///         curve and is auto-ejected below `bondFloorAtActivation / 2`.
     /// @dev    Invariant: every write to this mapping emits `MbpsDeclared`.
     ///         There are exactly two routes back to 0, split by whether the
     ///         operator is active: `deregisterNode` (active — it reverts
@@ -261,14 +261,34 @@ contract CapacityBond is
     ///         `declaredMbps` mapping remains the value the curve gates read.
     mapping(address operator => Checkpoints.Trace208 history) internal _declaredMbpsHistory;
 
+    /// @notice Global minimum active bond that gates ENTRY into the active set
+    ///         (ADR 026 § Operator bond). `minBond` is non-retroactive: it is
+    ///         read live only at the entry transitions (`bond` reinstatement,
+    ///         `registerNode`), never for ongoing active status. Governance may
+    ///         tighten it as the network matures without purging the electorate
+    ///         — a raise applies to new entrants only. See
+    ///         `bondFloorAtActivation`.
     uint256 public minBond;
+
+    /// @notice Per-operator entry floor: the live `minBond` captured each time
+    ///         the operator's `activeBond` crosses UP through it in `bond`
+    ///         (ADR 026 § Minimum bond is non-retroactive). Ongoing active status
+    ///         (`isActive`) and slash auto-ejection (`_maybeAutoEject`) test the
+    ///         active bond against THIS floor, not the live `minBond`, so a later
+    ///         `minBond` raise never de-activates or eases the ejection threshold
+    ///         of an already-active operator. A re-crossing after a full ejection
+    ///         re-grandfathers at the then-current `minBond`. Zero until the
+    ///         operator first reaches `minBond`.
+    mapping(address operator => uint256) public bondFloorAtActivation;
+
     uint256 public unbondingPeriod;
 
     /// @notice SlashJudge view used to enforce the paired
     ///         `maxEvidenceAgeUs < unbondingPeriod * 1e6` invariant on
     ///         `setUnbondingPeriod` (ADR 014 § Interaction with unbonding period).
-    ///         Wired post-deploy via `setSlashJudge` because SlashJudge is deployed
-    ///         after CapacityBond (deploy-order circular dependency). While unset
+    ///         Wired once post-deploy via `setSlashJudge` because SlashJudge is
+    ///         deployed after CapacityBond (deploy-order circular dependency), then
+    ///         fixed: the judge is not re-pointable. While unset
     ///         (`address(0)`), `setUnbondingPeriod` applies only the live
     ///         `[UNBONDING_PERIOD_FLOOR, UNBONDING_PERIOD_CEILING]` bound — the
     ///         `[7d,60d]` window from ADR 014/009 (see the bounds' declaration
@@ -341,7 +361,7 @@ contract CapacityBond is
     ///         the watermark back to an older slash that still stands rather
     ///         than wrongly clearing it (ADR 036 § Slashing zero-out —
     ///         multi-slash). Expected to stay small in practice — a slash drops
-    ///         active bond (auto-ejecting below `minBond / 2`), so re-slashing
+    ///         active bond (auto-ejecting below `bondFloorAtActivation / 2`), so re-slashing
     ///         costs the operator a fresh re-bond each cycle — but this is an
     ///         economic deterrent, not a hard cap; the recompute scan reads from
     ///         the tail and breaks at the first standing slash, so it is cheap
@@ -428,7 +448,9 @@ contract CapacityBond is
     event KUpdated(uint256 oldValue, uint256 newValue);
     event AlphaUpdated(uint256 oldValue, uint256 newValue);
     event UnbondingPeriodUpdated(uint256 oldValue, uint256 newValue);
-    event SlashJudgeUpdated(address indexed oldJudge, address indexed newJudge);
+    /// @notice The SlashJudge was wired. Fires exactly once, at initial deploy
+    ///         wiring; the judge is fixed thereafter.
+    event SlashJudgeWired(address indexed judge);
     event MultiaddrUpdateCooldownUpdated(uint256 oldValue, uint256 newValue);
     event MaxMultiaddrSizeUpdated(uint256 oldValue, uint256 newValue);
     event RegionStabilityWindowUpdated(uint256 oldValue, uint256 newValue);
@@ -513,6 +535,9 @@ contract CapacityBond is
     ///      invariant.
     ///      Paired with `SlashJudge.EvidenceAgeExceedsUnbonding` (the other half).
     error UnbondingBelowEvidenceAge(uint256 unbondingUs, uint256 maxEvidenceAgeUs);
+    /// @notice `setSlashJudge` was called after the judge was already wired. The
+    ///         judge is set once at deploy and then fixed; it is not re-pointable.
+    error SlashJudgeAlreadySet();
 
     // ADR 030
     error RegionCooldownActive(uint64 readyAt);
@@ -606,6 +631,19 @@ contract CapacityBond is
             _firstBondedAt[msg.sender] = uint64(block.timestamp);
         }
 
+        // Grandfather the entry floor: capture the live `minBond` each time the
+        // operator crosses UP through it (ADR 026 § Minimum bond is
+        // non-retroactive). This is the entry transition — `registerNode` and
+        // the reinstatement gate below both require `activeBond >= minBond`, so
+        // any operator that can activate has crossed here and holds a floor.
+        // Ongoing active status (`isActive`) and slash auto-ejection read this
+        // floor, never the live `minBond`, so a later `minBond` raise is
+        // non-retroactive. Re-crossing after a full ejection re-grandfathers at
+        // the then-current `minBond`.
+        if (oldBalance < minBond && newBalance >= minBond) {
+            bondFloorAtActivation[msg.sender] = minBond;
+        }
+
         // Slash auto-ejection (ADR 026) is recoverable by re-bonding, but a
         // governance blacklist latch (ADR 011) is not — re-entry after a
         // blacklist must go through `unEjectNode` first.
@@ -617,7 +655,15 @@ contract CapacityBond is
         emit Bonded(msg.sender, amount, newBalance);
     }
 
-    function requestUnbond(uint256 amount) external nonReentrant whenNotPaused {
+    /// @notice Start the unbonding timer on part of the active bond. This is a
+    ///         principal-exit path and is never pausable: pause halts intake and
+    ///         serving, never an operator's exit (the client-side twin
+    ///         `PaymentPool.reclaim` is un-pausable for the same reason). Slash
+    ///         safety does not come from pause — the unbonding period keeps the
+    ///         queued amount exposed, and `slash` reaches bond sitting in the
+    ///         queue via `_reduceBondAtTier`, so a captured PAUSER cannot trap an
+    ///         honest operator's bond and pause buys a dishonest one no shelter.
+    function requestUnbond(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
         if (amount > activeBond[msg.sender]) {
             revert InsufficientBond({ requested: amount, available: activeBond[msg.sender] });
@@ -641,7 +687,14 @@ contract CapacityBond is
         emit UnbondingRequested(msg.sender, amount, unlockAt, activeBond[msg.sender]);
     }
 
-    function unbond() external nonReentrant whenNotPaused {
+    /// @notice Withdraw bond whose unbonding period has elapsed. This is a
+    ///         principal-exit path and is never pausable, matching
+    ///         `requestUnbond`: pause covers intake and serving only. The elapsed
+    ///         unbonding period is the sole gate on the released amount — the bond
+    ///         stayed slashable for the whole window, and any at-risk portion was
+    ///         already moved to escrow by `slash`, so what remains here is the
+    ///         operator's to withdraw whether the contract is paused or not.
+    function unbond() external nonReentrant {
         UnbondingRequest memory req = unbondingOf[msg.sender];
         if (req.amount == 0) revert NoUnbondingRequest();
         // forge-lint: disable-next-line(block-timestamp)
@@ -794,6 +847,16 @@ contract CapacityBond is
         nodeIdToAddress[nodeId] = msg.sender;
         addressToNodeId[msg.sender] = nodeId;
         bindingNonce[msg.sender] = usedBindingNonce + 1;
+        // Capture the grandfathered entry floor if `bond()` did not. An operator
+        // can satisfy the `activeBond >= minBond` precondition without a `bond()`
+        // up-crossing — when governance lowered `minBond` after the operator
+        // bonded — which would otherwise leave the floor at 0 and let `isActive`
+        // treat them as always above it (`activeBond >= 0`). registerNode is an
+        // activation transition gated on `activeBond >= minBond`, so the live
+        // `minBond` is the correct entry floor.
+        if (bondFloorAtActivation[msg.sender] == 0) {
+            bondFloorAtActivation[msg.sender] = minBond;
+        }
         _writeNodeInfo(nodeId, multiaddrs, regionHint);
         _addToRegisteredSet(msg.sender);
 
@@ -900,7 +963,13 @@ contract CapacityBond is
     ///         a registered node by definition is not. The bond itself
     ///         stays put and fully slashable; re-registering needs only
     ///         `minBond` again, but the tier must be re-declared.
-    function deregisterNode() external nonReentrant whenNotPaused {
+    ///
+    ///         Not pausable: clearing `declaredMbps` is the step a registered
+    ///         operator takes to drop the `bondRequired(declaredMbps)` floor and
+    ///         fully unbond, so gating it on pause would trap that floor of
+    ///         principal. Leaving the active set is an exit and a de-escalation of
+    ///         serving; pause halts intake and serving, never an operator's exit.
+    function deregisterNode() external nonReentrant {
         NodeInfo storage info = _nodes[msg.sender];
         if (!info.active) revert NodeNotActive();
 
@@ -1065,7 +1134,7 @@ contract CapacityBond is
     }
 
     /// @dev Stamp `slashedAtEpoch`, fire auto-eject if post-slash active bond
-    ///      falls below `minBond / 2`, and emit `Slashed`. Under escrow-on-
+    ///      falls below `bondFloorAtActivation / 2`, and emit `Slashed`. Under escrow-on-
     ///      slash no TOKEN moves here — distribution happens at finality.
     function _stampSlash(address operator, address challenger, uint8 offenseType, uint256 totalSlash, uint32 newCount)
         internal
@@ -1080,9 +1149,18 @@ contract CapacityBond is
         emit Slashed(operator, challenger, offenseType, newCount, totalSlash);
     }
 
-    /// @dev Auto-eject if post-slash active bond fell below minBond/2.
+    /// @dev Auto-eject if post-slash active bond fell below half the operator's
+    ///      grandfathered `bondFloorAtActivation`. Keyed to the entry floor, not
+    ///      the live `minBond`, so a `minBond` raise alone never ejects — only a
+    ///      real slash below `bondFloorAtActivation / 2` does. An operator that
+    ///      never crossed `minBond` holds no floor (`0`); it falls back to the
+    ///      live `minBond`, preserving the pre-entry eject threshold for that
+    ///      degenerate case (a zero-bond phantom slash) with nothing to
+    ///      grandfather.
     function _maybeAutoEject(address operator) internal {
-        if (activeBond[operator] >= (minBond / 2) || ejected[operator]) return;
+        uint256 floor = bondFloorAtActivation[operator];
+        if (floor == 0) floor = minBond;
+        if (activeBond[operator] >= (floor / 2) || ejected[operator]) return;
         ejected[operator] = true;
         bytes32 nodeId = _ejectNodeEffects(operator);
         emit AutoEjected(operator, activeBond[operator]);
@@ -1205,6 +1283,15 @@ contract CapacityBond is
     // Governance setters
     // -----------------------------------------------------------------
 
+    /// @notice Set the global entry minimum bond, within the fixed
+    ///         `[MIN_BOND_FLOOR, MIN_BOND_CEILING]` (10K–1M TOKEN) rail
+    ///         (ADR 026 § Operator bond). Non-retroactive in both directions:
+    ///         `minBond` gates only entry (`bond` reinstatement, `registerNode`),
+    ///         so a change applies to new entrants alone. Active operators keep
+    ///         the `bondFloorAtActivation` they entered under — governance may
+    ///         tighten the entry bar as the network matures without purging the
+    ///         electorate, and a raise alone neither de-activates nor eases the
+    ///         slash-ejection threshold of any active operator.
     function setMinBond(uint256 newMinBond) external onlyRole(GOVERNANCE_ROLE) {
         _enforceMinBondBounds(newMinBond);
         uint256 oldMinBond = minBond;
@@ -1288,11 +1375,13 @@ contract CapacityBond is
 
     /// @notice Wire the SlashJudge whose `maxEvidenceAgeUs` bounds how low
     ///         `unbondingPeriod` may be set (ADR 014 § Interaction with unbonding
-    ///         period). Set post-deploy (SlashJudge is deployed after this
-    ///         contract). Re-settable by governance so a redeployed SlashJudge can
-    ///         be repointed; the zero address is rejected so the invariant cannot
-    ///         be silently disabled once wired.
+    ///         period). Set once post-deploy (SlashJudge is deployed after this
+    ///         contract), then fixed: the judge is not re-pointable. A captured
+    ///         governance therefore cannot swap in a malicious judge to fabricate
+    ///         slashes. The zero address is rejected, and the paired invariant is
+    ///         re-checked at wiring.
     function setSlashJudge(ISlashJudgeEvidenceView newSlashJudge) external onlyRole(GOVERNANCE_ROLE) {
+        if (address(slashJudge) != address(0)) revert SlashJudgeAlreadySet();
         if (address(newSlashJudge) == address(0)) revert ZeroAddress();
         // Reject a judge that would violate the paired invariant against the CURRENT
         // unbonding period (ADR 014): maxEvidenceAgeUs MUST stay strictly below
@@ -1305,9 +1394,8 @@ contract CapacityBond is
         // aderyn-ignore-next-line(reentrancy-state-change)
         uint256 maxAgeUs = newSlashJudge.maxEvidenceAgeUs();
         if (unbondingUs <= maxAgeUs) revert UnbondingBelowEvidenceAge(unbondingUs, maxAgeUs);
-        address old = address(slashJudge);
         slashJudge = newSlashJudge;
-        emit SlashJudgeUpdated(old, address(newSlashJudge));
+        emit SlashJudgeWired(address(newSlashJudge));
     }
 
     function setUnbondingPeriod(uint256 newPeriod) external onlyRole(GOVERNANCE_ROLE) {
@@ -1392,9 +1480,14 @@ contract CapacityBond is
     }
 
     function isActive(address operator) public view returns (bool) {
+        // Ongoing active status tests the grandfathered `bondFloorAtActivation`,
+        // not the live `minBond`: a `minBond` raise never de-activates an
+        // already-active operator (ADR 026 § Operator bond). A partial unbond
+        // below the operator's own floor still de-activates once the unbonding
+        // request clears — the floor binds the operator's own bond reductions.
         // slither-disable-next-line incorrect-equality
-        return _nodes[operator].active && activeBond[operator] >= minBond && unbondingOf[operator].amount == 0
-            && !ejected[operator];
+        return _nodes[operator].active && activeBond[operator] >= bondFloorAtActivation[operator]
+            && unbondingOf[operator].amount == 0 && !ejected[operator];
     }
 
     /// @inheritdoc ICapacityBond
@@ -1440,7 +1533,7 @@ contract CapacityBond is
     ///         `uint256[]` return: a dynamic-array getter costs several hundred
     ///         bytes of ABI-encoding bytecode, and this contract sits close to
     ///         the EIP-170 runtime ceiling. Lists are short in practice — a slash
-    ///         auto-ejects below `minBond / 2`, so re-slashing an operator
+    ///         auto-ejects below `bondFloorAtActivation / 2`, so re-slashing an operator
     ///         requires a fresh re-bond first.
     function operatorSlashCount(address operator) external view returns (uint256) {
         return _operatorSlashIds[operator].length;

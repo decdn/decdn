@@ -17,10 +17,8 @@ import { FeeRouter } from "../src/FeeRouter.sol";
 import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
-import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceView.sol";
 
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
-import { MockSlashJudgeEvidence } from "./mocks/MockSlashJudgeEvidence.sol";
 
 /// @dev Stand-in for the ADR 009 5-of-9 bootstrap-governance multisig. It must hold
 ///      code: `_deployGovernor` rejects an EOA with `BootstrapMultisigNotAContract`,
@@ -276,21 +274,32 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     // BindingNotWired guard for the ADR-014 paired-invariant view is real, not a
     // no-op. Routed through an external wrapper because `vm.expectRevert` only
     // catches reverts at external-call boundaries.
-
-    function test_assertPeerRolesWired_revertsWhenSlashJudgeMisbound() public {
+    //
+    // `setSlashJudge` is set-once, so a mismatch cannot be forged by re-pointing a
+    // wired judge. Instead we grant every other peer role but leave the judge
+    // unwired (`address(0)`), which is the exact gap the guard exists to catch.
+    function test_assertPeerRolesWired_revertsWhenSlashJudgeUnwired() public {
         DeployConfig memory cfg2 = _testConfig();
         Deployment memory d2 = _deployTargets(cfg2, _deployTimelock(cfg2));
         _deployGovernor(cfg2, d2);
-        _wireCrossContractRoles(cfg2, d2);
-        // Re-point slashJudge to a different (valid) judge so the binding no longer
-        // matches d2.slashJudge. Deployer still holds GOVERNANCE_ROLE (handoff skipped),
-        // and a 1-day judge satisfies the wire-time invariant (14d*1e6 > 1d*1e6).
-        MockSlashJudgeEvidence wrong = new MockSlashJudgeEvidence(uint256(1 days) * 1_000_000);
-        vm.prank(cfg2.deployer);
-        d2.bond.setSlashJudge(ISlashJudgeEvidenceView(address(wrong)));
+        // Grant the peer roles `_assertPeerRolesWired` checks, but skip the one-time
+        // `setSlashJudge` wiring so `d2.bond.slashJudge()` stays `address(0)`. Deployer
+        // still holds the admin roles (handoff skipped).
+        vm.startPrank(cfg2.deployer);
+        d2.bond.grantRole(d2.bond.SLASH_APPEAL_ROLE(), address(d2.slashAppeal));
+        d2.bond.grantRole(d2.bond.BLACKLIST_ROLE(), address(d2.blacklist));
+        d2.blacklist.grantRole(d2.blacklist.EMERGENCY_MULTISIG_ROLE(), cfg2.emergencyMultisig);
+        d2.bond.grantRole(d2.bond.PAUSER_ROLE(), cfg2.emergencyMultisig);
+        d2.router.grantRole(d2.router.PAUSER_ROLE(), cfg2.emergencyMultisig);
+        d2.slashAppeal.grantRole(d2.slashAppeal.PAUSER_ROLE(), cfg2.emergencyMultisig);
+        d2.paymentPool.grantRole(d2.paymentPool.PAUSER_ROLE(), cfg2.emergencyMultisig);
+        d2.slashJudge.grantRole(d2.slashJudge.PAUSER_ROLE(), cfg2.emergencyMultisig);
+        d2.router.grantRole(d2.router.ROUTER_CALLER_ROLE(), address(d2.paymentPool));
+        d2.bond.grantRole(d2.bond.SLASH_ROLE(), address(d2.slashJudge));
+        vm.stopPrank();
         vm.expectRevert(
             abi.encodeWithSelector(
-                BaseProtocolDeploy.BindingNotWired.selector, address(d2.bond), address(d2.slashJudge), address(wrong)
+                BaseProtocolDeploy.BindingNotWired.selector, address(d2.bond), address(d2.slashJudge), address(0)
             )
         );
         this.externalAssertPeerRolesWired(cfg2, d2);

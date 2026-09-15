@@ -158,6 +158,8 @@ All challenge types MUST validate evidence age using a skew-safe comparison. Let
 
 The check applies at initialization too — neither contract may be deployed with an initial pair that violates the invariant. This matches the cross-parameter setter pattern used elsewhere (see [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds): the FeeRouter sum-to-100% invariant) — invariants between parameters with a genuine ordering relationship are contract-enforced, not implementation-enforced.
 
+`CapacityBond` reads `SlashJudge.maxEvidenceAgeUs` through the view wired by `CapacityBond.setSlashJudge`. `SlashJudge`'s constructor takes the `CapacityBond` address, so the bond cannot hold the judge as a constructor immutable; the deploy wires the judge post-deploy. `setSlashJudge` is set-once: it wires the judge on the single `address(0)` → judge transition, re-checks the paired invariant at that moment, and reverts on any later call. The judge is fixed after wiring. A captured governance therefore cannot swap in a malicious `SlashJudge` to fabricate slashes against honest operators.
+
 ##### Rate manipulation
 
 1. Challenger provides `challengedNode` address (the node's Ethereum address or Safe address)

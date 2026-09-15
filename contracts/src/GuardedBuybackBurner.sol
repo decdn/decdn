@@ -166,8 +166,8 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
         uint256 epochLiquidityCapFraction_;
     }
 
-    constructor(IERC20 usdc_, ERC20Burnable token_, address admin, GuardParams memory g)
-        BuybackBurner(usdc_, token_, admin)
+    constructor(IERC20 usdc_, ERC20Burnable token_, address admin, address treasury_, GuardParams memory g)
+        BuybackBurner(usdc_, token_, admin, treasury_)
     {
         if (g.slippageBps_ > SLIPPAGE_CEILING) revert SlippageOutOfBounds(g.slippageBps_, SLIPPAGE_CEILING);
         if (g.epochLiquidityCapFraction_ < CAP_FRACTION_FLOOR || g.epochLiquidityCapFraction_ > CAP_FRACTION_CEILING) {

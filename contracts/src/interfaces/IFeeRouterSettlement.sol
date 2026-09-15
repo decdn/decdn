@@ -20,8 +20,8 @@ interface IFeeRouterSettlement {
     function routeSettlement(address operator, uint256 bytesDelivered, uint256 amount) external;
 
     /// @notice True when the router is paused and `routeSettlement` would revert.
-    /// @dev    `PaymentPool` probes this once at config time (`setFeeRouter`)
-    ///         to reject a router that does not expose the view, rather than
-    ///         discovering the gap on a later redemption.
+    /// @dev    `PaymentPool` probes this once in its constructor to reject a
+    ///         router that does not expose the view, rather than discovering
+    ///         the gap on a later redemption.
     function paused() external view returns (bool);
 }
