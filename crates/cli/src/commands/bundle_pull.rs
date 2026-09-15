@@ -1866,15 +1866,23 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         if let Some(candidate) = disk.whole_file.get(&hash) {
             let donor = candidate.clone();
             let verify_target = donor.clone();
-            let verified = tokio::task::spawn_blocking(move || {
-                hash_partial(&verify_target).is_ok_and(|got| got == hash)
+            // On a hash match, return the donor's actual on-disk length — the
+            // authoritative size of what is about to be linked — rather than the
+            // manifest's optional `size` (absent on the wire for some bundles).
+            // `None` covers both a hash mismatch and a metadata-read failure.
+            let verified_len: Option<u64> = tokio::task::spawn_blocking(move || {
+                let got = hash_partial(&verify_target).ok()?;
+                (got == hash)
+                    .then(|| std::fs::metadata(&verify_target).ok())
+                    .flatten()
+                    .map(|m| m.len())
             })
             .await
-            .unwrap_or(false);
-            if verified {
+            .unwrap_or(None);
+            if let Some(len) = verified_len {
                 self.progress
                     .credit_skipped(group.entries.iter().find_map(|e| e.size));
-                return materialize_from_donor(slots, &donor, total.unwrap_or(0)).await;
+                return materialize_from_donor(slots, &donor, len).await;
             }
         }
 
