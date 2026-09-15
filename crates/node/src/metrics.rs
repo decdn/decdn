@@ -179,6 +179,11 @@ pub struct DecdnMetrics {
     /// invisible in `active_connections` alone. Operator-visible name:
     /// `decdn_client_idle_close_total`.
     pub client_idle_close: Counter,
+    /// OTLP span-export batches the collector did not accept (unreachable,
+    /// rejected, or timed out), counted at the batch exporter. Stays `0` when
+    /// `observability.otlp_endpoint` is unset. Operator-visible name:
+    /// `decdn_otlp_export_failures_total`.
+    pub otlp_export_failures: Counter,
     /// Seconds since node start.
     pub node_uptime_seconds: Gauge,
     /// JSON-RPC endpoint reachability per the watchdog task. `1` =
@@ -2164,6 +2169,9 @@ recorders! {
     /// A `cdn/client/v1` connection was reaped by the application-layer idle
     /// closer (ADR 005 §Connection lifetime).
     client_idle_close => client_idle_close.inc();
+
+    /// An OTLP span-export batch failed (`commands::otlp`'s counting exporter).
+    otlp_export_failure => otlp_export_failures.inc();
 
     /// Set the RPC health gauge. `true` -> 1 (reachable), `false` -> 0
     /// (unreachable). Driven by the watchdog task spawned in

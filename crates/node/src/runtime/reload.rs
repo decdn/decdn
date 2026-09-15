@@ -70,7 +70,7 @@ use std::sync::Arc;
 
 use crate::dispatch::ConnectionLimiter;
 use anyhow::Context;
-use decdn_common::cli::common::LogLevel;
+use decdn_common::cli::common::{LogFormat, LogLevel};
 use decdn_common::cli::run::ObservabilityArgs;
 use decdn_common::config::{
     ConfigDiagnostics, ConfigNotice, ConfigNoticeLevel, FileConfig, ResolvedLoadShed,
@@ -254,10 +254,13 @@ fn drain_or_log<T>(slot: &std::sync::Mutex<Option<T>>, section: &'static str) ->
 /// Reloadable observability log level. The full `[observability]`
 /// section isn't reloadable (`metrics_port`, `log_format`, etc. all
 /// need a restart), but the level is. The other sub-fields get a
-/// "requires restart" notice from `warn_restart_required_sections`.
+/// "requires restart" warning from [`Self::warn_restart_required_changes`]
+/// when their resolved value differs from the one the node started with.
 struct LogLevelSection {
     cli: ObservabilityArgs,
     setter: LogLevelSetter,
+    /// Restart-required observability values the node started with.
+    startup: StartupObservability,
     /// Cached log level last applied. `None` until the first successful
     /// reload — the live `EnvFilter` at startup may be a `RUST_LOG`
     /// directive we cannot reflect back into a `LogLevel`, so we force
@@ -343,6 +346,76 @@ impl ReloadableSection for LogLevelSection {
             "config reload section applied"
         );
     }
+}
+
+impl LogLevelSection {
+    /// Warn once for each restart-required observability field whose resolved
+    /// value (CLI/env > file > default) differs from the startup value. Reads
+    /// the buffer `resolve` filled, so it runs between resolve and commit.
+    /// Names fields only: `otlp_endpoint` can carry credentials.
+    fn warn_restart_required_changes(&self) {
+        let Ok(guard) = self.buf.lock() else {
+            return;
+        };
+        let Some(resolved) = guard.as_ref() else {
+            return;
+        };
+        for field in observability_restart_required_changes(&self.startup, resolved) {
+            tracing::warn!(
+                field,
+                "config reload: ignoring change to observability.{field} (requires restart)"
+            );
+        }
+    }
+}
+
+/// The restart-required `[observability]` values a node started with.
+#[derive(Debug)]
+struct StartupObservability {
+    log_format: LogFormat,
+    metrics_port: u16,
+    metrics_bind: std::net::IpAddr,
+    admin_port: Option<u16>,
+    otlp_endpoint: Option<String>,
+}
+
+impl StartupObservability {
+    fn from_resolved(o: &ResolvedObservability) -> Self {
+        Self {
+            log_format: o.log_format,
+            metrics_port: o.metrics_port,
+            metrics_bind: o.metrics_bind,
+            admin_port: o.admin_port,
+            otlp_endpoint: o.otlp_endpoint.clone(),
+        }
+    }
+}
+
+/// Names of the restart-required observability fields whose reloaded value
+/// differs from startup. `log_level` is hot-reloadable and never listed.
+/// Exhaustively destructured so a new field must be classified here.
+fn observability_restart_required_changes(
+    startup: &StartupObservability,
+    reloaded: &ResolvedObservability,
+) -> Vec<&'static str> {
+    let ResolvedObservability {
+        log_level: _, // hot-reloadable
+        log_format,
+        metrics_port,
+        metrics_bind,
+        admin_port,
+        otlp_endpoint,
+    } = reloaded;
+    [
+        ("log_format", startup.log_format != *log_format),
+        ("metrics_port", startup.metrics_port != *metrics_port),
+        ("metrics_bind", startup.metrics_bind != *metrics_bind),
+        ("admin_port", startup.admin_port != *admin_port),
+        ("otlp_endpoint", startup.otlp_endpoint != *otlp_endpoint),
+    ]
+    .into_iter()
+    .filter_map(|(field, changed)| changed.then_some(field))
+    .collect()
 }
 
 // ----- pinned_hashes ------------------------------------------------------
@@ -712,6 +785,7 @@ impl RuntimeReloadState {
         let log_level = Arc::new(LogLevelSection {
             cli: observability_cli,
             setter: log_level_setter,
+            startup: StartupObservability::from_resolved(&initial.observability),
             current: std::sync::Mutex::new(None),
             buf: std::sync::Mutex::new(None),
             swap_applied: std::sync::Mutex::new(false),
@@ -1106,6 +1180,7 @@ impl RuntimeReloadState {
         // Emit a "requires restart" notice for each non-reloadable field the
         // file carries. Read-only, so do it before the commit step.
         warn_restart_required_sections(&file);
+        self.log_level.warn_restart_required_changes();
 
         // Phase 2: fallible commits. The log-level section is the only
         // one that can fail here today; future sections may add more.
@@ -1160,13 +1235,15 @@ fn warn_ignored(field: &'static str) {
 
 /// Emit a "requires restart" notice for each non-reloadable field the
 /// operator can't hot-apply. Fully non-reloadable sections (including
-/// `payment`) warn whenever they are *present*; the partially-reloadable
-/// sections (`cache`, `observability`) warn only when they set a field
-/// *outside* their reloadable subset, so the common `cache.pinned_hashes`-only
-/// or `observability.log_level`-only reload stays quiet. `security` is fully
-/// reloadable and never warns. Best-effort operator guidance, not a correctness
-/// gate — this does not diff against the previous file, so a present-but-unchanged
-/// non-reloadable field still warns on every reload.
+/// `payment`) warn whenever they are *present*; `cache` warns only when it
+/// sets a field *outside* its reloadable subset, so the common
+/// `cache.pinned_hashes`-only reload stays quiet. `security` is fully
+/// reloadable and never warns. `observability` is not handled here: its
+/// resolved values are diffed against startup by
+/// [`LogLevelSection::warn_restart_required_changes`]. Best-effort operator
+/// guidance, not a correctness gate — this does not diff against the previous
+/// file, so a present-but-unchanged non-reloadable field still warns on every
+/// reload.
 fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
     if file.identity.is_some() {
         warn_ignored("identity.* (data_dir, region)");
@@ -1195,16 +1272,6 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         warn_ignored(
             "payment.* (rate_per_mb, credit_max, \
              credit_ramp_divisor, frame_target_bytes, voucher_commit_interval_ms)",
-        );
-    }
-    if file
-        .observability
-        .as_ref()
-        .is_some_and(observability_has_restart_required_field)
-    {
-        warn_ignored(
-            "observability.* (log_format, metrics_port, metrics_bind, otlp_endpoint, \
-             admin_port)",
         );
     }
     if file.dht.is_some() {
@@ -1319,28 +1386,6 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         // alongside the admission/eviction policy objects; changing it
         // requires a restart.
         || serve_economics.is_some()
-}
-
-/// Whether the file's `[observability]` section sets any field that a
-/// restart is required to apply — i.e. anything other than the
-/// hot-reloadable `log_level`. Exhaustively destructured for the same
-/// compile-time-classification reason as [`cache_has_restart_required_field`].
-const fn observability_has_restart_required_field(
-    o: &decdn_common::config::types::ObservabilityConfig,
-) -> bool {
-    let decdn_common::config::types::ObservabilityConfig {
-        log_level: _, // the only hot-reloadable observability field
-        log_format,
-        metrics_port,
-        metrics_bind,
-        admin_port,
-        otlp_endpoint,
-    } = o;
-    log_format.is_some()
-        || metrics_port.is_some()
-        || metrics_bind.is_some()
-        || admin_port.is_some()
-        || otlp_endpoint.is_some()
 }
 
 #[cfg(test)]
@@ -2536,26 +2581,24 @@ mod tests {
         assert!(cache_has_restart_required_field(&with_dir));
     }
 
-    /// The `[observability]` restart notice is gated on a *non-reloadable*
-    /// field being set: a `log_level`-only edit (hot-reloadable) must not
-    /// trip it, while e.g. `metrics_port` must.
+    /// The `[observability]` restart notice diffs resolved values against
+    /// startup: an unchanged value or a `log_level`-only edit (hot-reloadable)
+    /// stays silent, and each changed restart-required field is named.
     #[test]
-    fn observability_notice_gate_ignores_log_level_only() {
-        use decdn_common::config::types::ObservabilityConfig;
+    fn observability_restart_notice_names_only_changed_fields() {
+        let startup_resolved = seed_resolved(10, LogLevel::Info).observability;
+        let startup = StartupObservability::from_resolved(&startup_resolved);
 
-        let level_only = ObservabilityConfig {
-            log_level: Some(LogLevel::Debug),
-            ..ObservabilityConfig::default()
-        };
-        assert!(!observability_has_restart_required_field(&level_only));
-        assert!(!observability_has_restart_required_field(
-            &ObservabilityConfig::default()
-        ));
-        let with_metrics = ObservabilityConfig {
-            metrics_port: Some(9090),
-            ..ObservabilityConfig::default()
-        };
-        assert!(observability_has_restart_required_field(&with_metrics));
+        let unchanged = seed_resolved(10, LogLevel::Debug).observability;
+        assert!(observability_restart_required_changes(&startup, &unchanged).is_empty());
+
+        let mut reloaded = seed_resolved(10, LogLevel::Info).observability;
+        reloaded.otlp_endpoint = Some("http://collector:4317".to_string());
+        reloaded.metrics_port = 9999;
+        assert_eq!(
+            observability_restart_required_changes(&startup, &reloaded),
+            ["metrics_port", "otlp_endpoint"]
+        );
     }
 
     /// SIGHUP with a `[load_shed]` block swaps the live controller's policy:

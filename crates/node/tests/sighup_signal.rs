@@ -394,16 +394,20 @@ async fn sighup_applies_security_changes() {
 /// A regression that wrongly classified a restart-required section as
 /// reloadable (applying it silently) would go uncaught.
 ///
-/// The notice is unconditional (`warn_restart_required_sections`): it fires
-/// once per restart-required section *present* in the reloaded file,
-/// whether or not the section changed. The two reloads assert that:
+/// For every section but `[observability]` the notice is unconditional
+/// (`warn_restart_required_sections`): it fires once per restart-required
+/// section *present* in the reloaded file, whether or not the section changed.
+/// `[observability]` instead warns once per restart-required field whose
+/// resolved value differs from startup. The two reloads assert that:
 ///   - **Reload #1** carries `[network]` and `[payment]` → one notice each;
-///     `[blockchain]` / `[cache]` (absent from the file) stay silent.
+///     `[blockchain]` / `[cache]` (absent from the file) stay silent, and a
+///     `log_level`-only `[observability]` stays silent.
 ///   - **Reload #2** carries `[network]` and `[payment]` again plus new
 ///     `[blockchain]` / `[cache]` / `[identity]` → each present
-///     restart-required section emits one notice (no cross-reload suppression),
-///     all alongside the mutable `observability.log_level` change that must
-///     still apply.
+///     restart-required section emits one notice (no cross-reload suppression);
+///     `[observability]` changes `metrics_port` and `otlp_endpoint` → one
+///     notice per changed field; all alongside the mutable
+///     `observability.log_level` change that must still apply.
 ///
 /// Runs on a single-thread runtime so the buffer-capturing subscriber
 /// installed via `set_default` (thread-local) observes the reload, which
@@ -470,6 +474,13 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
             .filter(|l| l.contains(&prefix) && l.contains("(requires restart)"))
             .count()
     };
+    // `[observability]` notices name the changed field, never its value.
+    let observability_notice_count = |logs: &str, field: &str| -> usize {
+        let prefix = format!("ignoring change to observability.{field}");
+        logs.lines()
+            .filter(|l| l.contains(&prefix) && l.contains("(requires restart)"))
+            .count()
+    };
 
     // --- Reload #1: a mutable `log_level` + restart-required `[payment]`
     //     and `[network]` sections. The log_level change applies; `[payment]`
@@ -516,11 +527,11 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         0,
         "cache absent from the file must not warn, got:\n{after_first}"
     );
-    // `[observability]` is present but sets only the hot-reloadable
-    // `log_level`, so it does not warn (field-gated notice, not
+    // `[observability]` is present but changes only the hot-reloadable
+    // `log_level`, so it does not warn (diffed against startup, not
     // section-presence).
     assert_eq!(
-        notice_count(&after_first, "observability"),
+        observability_notice_count(&after_first, ""),
         0,
         "observability with only log_level set (reloadable) must not warn, got:\n{after_first}"
     );
@@ -535,8 +546,9 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     //     restart-required ones. payment/network/blockchain/identity/
     //     dht/probe/receipts warn on presence; `[cache]`
     //     warns because it sets the non-reloadable `cache_dir` (a
-    //     pinned_hashes-only edit would not); `[observability]` does NOT warn
-    //     because it sets only the reloadable `log_level`; `[security]` is
+    //     pinned_hashes-only edit would not); `[observability]` warns once for
+    //     each of `metrics_port` and `otlp_endpoint`, which differ from
+    //     startup, and not for the reloadable `log_level`; `[security]` is
     //     fully reloadable, so it stays silent. Empty `[dht]`/`[probe]`/
     //     `[receipts]`/`[security]` tables are "present" so they exercise
     //     those emitter branches.
@@ -545,7 +557,9 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         "[payment]\n\
          rate_per_mb = 22\n\n\
          [observability]\n\
-         log_level = \"debug\"\n\n\
+         log_level = \"debug\"\n\
+         metrics_port = 9999\n\
+         otlp_endpoint = \"http://collector:4317\"\n\n\
          [network]\n\
          bind_port = 5555\n\n\
          [blockchain]\n\
@@ -594,15 +608,31 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         );
     }
 
-    // Fully-reloadable `[security]`, and `[observability]` which set only the
-    // reloadable `log_level`, stay silent.
-    for section in ["security", "observability"] {
+    // Fully-reloadable `[security]` stays silent.
+    assert_eq!(
+        notice_count(&logs, "security"),
+        0,
+        "[security] must not warn (no non-reloadable field set), got:\n{logs}"
+    );
+
+    // `[observability]` names each changed restart-required field once, never
+    // the reloadable `log_level`, and never echoes the endpoint.
+    for field in ["metrics_port", "otlp_endpoint"] {
         assert_eq!(
-            notice_count(&logs, section),
-            0,
-            "[{section}] must not warn (no non-reloadable field set), got:\n{logs}"
+            observability_notice_count(&logs, field),
+            1,
+            "expected one notice for changed observability.{field}, got:\n{logs}"
         );
     }
+    assert_eq!(
+        observability_notice_count(&logs, ""),
+        2,
+        "only the two changed observability fields may warn, got:\n{logs}"
+    );
+    assert!(
+        !logs.contains("collector:4317"),
+        "the otlp_endpoint value must not be logged, got:\n{logs}"
+    );
 }
 
 /// A resolve-time notice must reach the operator's structured log stream on

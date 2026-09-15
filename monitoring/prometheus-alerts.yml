@@ -263,6 +263,22 @@ groups:
             failures degrade origin discovery silently. Check the RPC provider and
             the OriginAssignment contract address.
 
+      # Only meaningful when observability.otlp_endpoint is set; the counter
+      # stays 0 otherwise. Warning: lost traces do not affect delivery.
+      - alert: DecdnOtlpExportFailing
+        expr: increase(decdn_otlp_export_failures_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTLP span export failing on {{ $labels.instance }}"
+          description: |
+            The node's OTLP exporter has failed span-export batches for 15
+            minutes, so traces are being lost. Check that the collector at
+            observability.otlp_endpoint is up and speaks OTLP/gRPC (usually port
+            4317). Export errors are also logged at error level under the
+            opentelemetry_sdk target.
+
       # NOTE: /health 503 detection requires an external prober (e.g.
       # blackbox_exporter) — it is not surfaced as a decdn_* metric. Add
       # an alert in your blackbox rules file along the lines of

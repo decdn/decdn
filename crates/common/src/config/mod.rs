@@ -2911,20 +2911,8 @@ pub fn resolve_observability_into(
         .or_else(|| file.and_then(|o| o.otlp_endpoint.clone()))
         .filter(|s| !s.is_empty());
 
-    // `http://` only: the node's OTLP gRPC exporter is built without TLS, so an
-    // `https://` endpoint would pass here and then abort daemon start-up.
     if let Some(ref ep) = otlp_endpoint {
-        bag.check_with(
-            ep.to_ascii_lowercase().starts_with("http://"),
-            "observability.otlp_endpoint",
-            || {
-                format!(
-                    "observability.otlp_endpoint must start with http:// (got {ep:?}); \
-                 the OTLP gRPC exporter has no TLS, so point it at a local collector \
-                 and terminate TLS there"
-                )
-            },
-        );
+        bag.try_with("observability.otlp_endpoint", validate_otlp_endpoint(ep));
     }
 
     ResolvedObservability {
@@ -2935,6 +2923,60 @@ pub fn resolve_observability_into(
         admin_port,
         otlp_endpoint,
     }
+}
+
+/// Check that `endpoint` is a URL the node's OTLP gRPC exporter can use:
+/// `http://host:port` with nothing after the authority.
+///
+/// - `http` only: the exporter is built without TLS, so an `https://`
+///   endpoint would pass resolution and then abort daemon start-up.
+/// - An explicit port: without one the exporter dials port 80, which is
+///   almost never an OTLP/gRPC collector. The port is read from the raw
+///   authority because `Url::port` hides an explicit default port (`:80`).
+/// - No path, query, fragment, or userinfo: gRPC uses none of them, and an
+///   OTLP/HTTP URL (`…:4318/v1/traces`) there means the wrong protocol.
+///
+/// Errors never echo the endpoint: it can carry credentials, so it is
+/// redacted like `rpc_url`.
+fn validate_otlp_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    let parsed = url::Url::parse(endpoint)
+        .map_err(|e| anyhow::anyhow!("observability.otlp_endpoint is not a valid URL: {e}"))?;
+    anyhow::ensure!(
+        parsed.scheme() == "http",
+        "observability.otlp_endpoint must use http:// (got scheme {:?}); the OTLP gRPC \
+         exporter has no TLS, so point it at a local collector and terminate TLS there",
+        parsed.scheme()
+    );
+    anyhow::ensure!(
+        parsed.host().is_some(),
+        "observability.otlp_endpoint has no host"
+    );
+    anyhow::ensure!(
+        parsed.username().is_empty() && parsed.password().is_none(),
+        "observability.otlp_endpoint must not carry userinfo; pass collector \
+         credentials through the collector, not the URL"
+    );
+    anyhow::ensure!(
+        parsed.path() == "/" && parsed.query().is_none() && parsed.fragment().is_none(),
+        "observability.otlp_endpoint must be http://host:port with no path, query, or \
+         fragment; an OTLP/HTTP URL (port 4318, /v1/traces) is the wrong protocol"
+    );
+    // Authority = text after `://` up to the first `/`, `?`, or `#`. IPv6 hosts
+    // are bracketed, so a trailing `:<digits>` is always a port.
+    let authority = endpoint
+        .split_once("://")
+        .map_or("", |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let has_port = authority.rsplit_once(':').is_some_and(|(host, port)| {
+        !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && !host.is_empty()
+    });
+    anyhow::ensure!(
+        has_port,
+        "observability.otlp_endpoint must name the collector port (e.g. http://localhost:4317)"
+    );
+    Ok(())
 }
 
 /// Resolve download-receipt audit-log retention fields (#802).
@@ -7595,6 +7637,58 @@ usdc_address = \"0xUsdc\"
         let obs = resolve_observability(&cli, None)?;
         assert_eq!(obs.otlp_endpoint.as_deref(), Some("http://collector:4317"));
         Ok(())
+    }
+
+    #[test]
+    fn otlp_endpoint_accepts_ipv6_default_port_and_trailing_slash() -> anyhow::Result<()> {
+        for ep in [
+            "http://[::1]:4317",
+            "http://collector:80",
+            "http://10.0.0.5:4317/",
+        ] {
+            validate_otlp_endpoint(ep).with_context(|| format!("{ep} should be accepted"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_endpoint_rejects_unusable_shapes() {
+        for (ep, expect) in [
+            ("http://collector", "port"),
+            ("http://[::1]", "port"),
+            ("http://collector:4318/v1/traces", "no path"),
+            ("http://collector:4317?x=1", "no path"),
+            ("http://collector:4317#frag", "no path"),
+            ("http://user:pw@collector:4317", "userinfo"),
+            ("http://coll ector:4317", "not a valid URL"),
+            ("not a url", "not a valid URL"),
+        ] {
+            let err = validate_otlp_endpoint(ep).expect_err(ep);
+            assert!(
+                err.to_string().contains(expect),
+                "{ep}: expected {expect:?} in {err}"
+            );
+        }
+    }
+
+    /// The endpoint can carry credentials, so no rejection may echo it.
+    #[test]
+    fn otlp_endpoint_errors_never_echo_the_value() {
+        let secret = "s3cr3t-token";
+        for ep in [
+            format!("http://collector:4317/?api_key={secret}"),
+            format!("http://{secret}:pw@collector:4317"),
+            format!("https://collector:4317/{secret}"),
+            format!("http://collector/{secret}"),
+        ] {
+            let mut cli = obs_cli(None, None);
+            cli.otlp_endpoint = Some(ep.clone());
+            let msg = format!(
+                "{:#}",
+                resolve_observability(&cli, None).expect_err("endpoint should be rejected")
+            );
+            assert!(!msg.contains(secret), "{ep} leaked into: {msg}");
+        }
     }
 
     // Closes #268. The three-layer merge is CLI/env > TOML file > default;
