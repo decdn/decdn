@@ -39,19 +39,22 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum permitted value for [`ProbeResponseBody::rate_per_mb`] (issue #378).
 ///
-/// 1 trillion (10^12) base units. The value participates in the client
-/// selection score `rate_per_mb × rtt_ms × scale / reputation²` (issue #322,
-/// ADR 001 §Node Selection Algorithm); a peer-controlled `u64::MAX` would
-/// cause the multiplication to overflow and could silently let a malicious
-/// node win the selection — exactly the inverse of what an honestly-priced
-/// rate would do.
+/// 1000 µUSDC/MB (USDC at 6 decimals: ~$1/GB), a realistic ceiling about 100×
+/// market price (~10 µUSDC/MB ≈ $0.01/GB). It bounds two things at once. It is
+/// the largest `rate_per_mb` the wire decodes, and it caps the governance
+/// `deliveryFloor` on-chain (ADR 003 §Rate-floor enforcement); the floor can
+/// never exceed the wire price. A cap far above market lets a governance floor
+/// near the ceiling drive credited bytes toward zero and suppress ADR-036
+/// vote-weight accrual, so the cap stays close to real prices.
 ///
-/// The bound sits above any plausible CDN rate (USDC at 6 decimals: $1M per
-/// MB) while leaving 7+ orders of magnitude of headroom from `u64::MAX`
-/// (~1.8 × 10^19) for the downstream selection arithmetic. Selection-formula
-/// callers SHOULD still use saturating arithmetic as defense-in-depth — the
-/// bound is the protocol-boundary check, not a substitute for safe math.
-pub const MAX_RATE_PER_MB: u64 = 1_000_000_000_000;
+/// The value also participates in the client selection score
+/// `rate_per_mb × rtt_ms × scale / reputation²` (issue #322, ADR 001 §Node
+/// Selection Algorithm); a peer-controlled `u64::MAX` would overflow the
+/// multiplication and could silently let a malicious node win the selection.
+/// Selection-formula callers SHOULD still use saturating arithmetic as
+/// defense-in-depth — the bound is the protocol-boundary check, not a
+/// substitute for safe math.
+pub const MAX_RATE_PER_MB: u64 = 1000;
 
 /// Length in bytes of an EOA secp256k1 EIP-712 signature (`r‖s‖v`, 32+32+1).
 ///

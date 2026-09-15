@@ -122,7 +122,7 @@ The α range upper-bounds at 1.8 to prevent a concentration penalty so steep tha
 | Multiaddr update cooldown | CapacityBond | 0 (disabled) | 86400 seconds (1 day) |
 | Max multiaddr size | CapacityBond | 64 bytes | 1024 bytes |
 | Dispute window (default: 48h) | PaymentPool | 48 hours | 72 hours (3 days) |
-| Rate floor | PaymentPool | 1 base unit | `MAX_RATE_PER_MB` (10^12, the [ADR 005](005-protocol.md#adr-005-wire-protocol) wire cap) |
+| Rate floor | PaymentPool | 1 base unit | `MAX_RATE_PER_MB` (1000, the [ADR 005](005-protocol.md#adr-005-wire-protocol) wire cap) |
 | Challenge bond | SlashJudge | 1 TOKEN | 1,000 TOKEN |
 | Base slash reset period | CapacityBond | 30 days | 365 days |
 | Compliance window | ContentBlacklist | 1 hour | 7 days |

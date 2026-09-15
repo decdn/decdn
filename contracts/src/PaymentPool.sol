@@ -67,10 +67,16 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     uint256 internal constant DISPUTE_WINDOW_CEILING = 72 hours;
 
     /// @dev Mirrors `decdn_protocol::MAX_RATE_PER_MB` (ADR 005 §Wire protocol),
-    ///      the largest `rate_per_mb` the wire schema will decode. A floor
-    ///      above it is network-isolating: no advertised delivery rate could
-    ///      ever clear it, so redemption would always revert.
-    uint256 internal constant MAX_RATE_PER_MB = 1_000_000_000_000;
+    ///      the largest `rate_per_mb` the wire schema will decode: 1000
+    ///      µUSDC/MB (~$1/GB), a realistic ceiling ~100× market price. It caps
+    ///      the governance `deliveryFloor` so the floor can never exceed the
+    ///      wire price. A floor above the market clears no advertised rate, so
+    ///      every voucher settles below it; `_applyVoucher` does not revert but
+    ///      clamps, crediting only `claimed * BYTES_PER_MB / deliveryFloor`
+    ///      bytes toward ADR-036 vote weight. A cap far above market would let
+    ///      a floor near the ceiling drive that byte credit toward zero and
+    ///      suppress vote-weight accrual, so the cap stays close to real prices.
+    uint256 internal constant MAX_RATE_PER_MB = 1000;
 
     /// @dev Lower bound of the governable per-MB delivery-rate floor.
     uint256 internal constant MIN_RATE_FLOOR = 1;
@@ -704,9 +710,9 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
 
     function setRateBounds(uint256 newFloor) external onlyRole(GOVERNANCE_ROLE) {
         // Cap at MAX_RATE_PER_MB, not `type(uint64).max`: the daemon decodes
-        // the floor as `u64` (#1383), but `u64` is ~18M× the wire cap, and
-        // every value in that gap is quietly network-isolating (see the
-        // constant).
+        // the floor as `u64` (#1383), but the wire cap is far below `u64::MAX`,
+        // and every value in that gap is above market and would clamp credited
+        // bytes toward zero (see the constant).
         if (newFloor < MIN_RATE_FLOOR || newFloor > MAX_RATE_PER_MB) {
             revert RateBoundsInvalid(newFloor);
         }

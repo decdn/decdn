@@ -172,7 +172,7 @@ contract PaymentPoolTest is Test {
     uint64 internal constant MIN_DEPOSIT = 0;
     uint64 internal constant ARMED_MIN = 5e6;
     uint64 internal constant MIN_DEPOSIT_CEILING = 100e6;
-    uint256 internal constant MAX_RATE_PER_MB = 1_000_000_000_000;
+    uint256 internal constant MAX_RATE_PER_MB = 1000;
     uint64 internal constant DEPOSIT = 1000e6;
     uint256 internal constant BYTES_PER_MB = 1_048_576;
     uint64 internal constant SPENDING_CAP = 500e6;

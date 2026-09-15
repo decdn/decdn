@@ -738,12 +738,12 @@ An owner reconciling its pools after a restart reads its own `ownerPoolNonce` an
 | Parameter | Minimum | Maximum |
 | --- | --- | --- |
 | Grace window (`disputeWindow`) | 172800 seconds (48 hours) | 259200 seconds (3 days) |
-| Rate floor | 1 base unit | `MAX_RATE_PER_MB` (10^12) |
+| Rate floor | 1 base unit | `MAX_RATE_PER_MB` (1000) |
 | Minimum deposit (`minDeposit`) | 0 (dormant) | 100_000_000 base units ($100) |
 
 `PaymentPool` does not hold a fee-percentage parameter. Bucket-share bounds (60/30/10 with per-share bounds 40–90 / 5–50 / 0–30) are owned by `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
 
-**The rate floor is in USDC base units (6 decimals) per MB.** The contract stores `deliveryFloor`, the per-byte price floor **enforced at redemption** (see [Rate-floor enforcement](#rate-floor-enforcement) below). There is no governance ceiling: a seller self-clamping its own advertised rate downward buys no on-chain safety — a seller never wants to charge less — and the buyer's protection is seeing the signed rate in `StreamResponse` before it pays. The absolute upper bound is the wire constant `MAX_RATE_PER_MB` ([ADR 005](005-protocol.md#adr-005-wire-protocol)), which honest requesters reject above.
+**The rate floor is in USDC base units (6 decimals) per MB.** The contract stores `deliveryFloor`, the per-byte price floor **enforced at redemption** (see [Rate-floor enforcement](#rate-floor-enforcement) below). There is no governance ceiling: a seller self-clamping its own advertised rate downward buys no on-chain safety — a seller never wants to charge less — and the buyer's protection is seeing the signed rate in `StreamResponse` before it pays. The absolute upper bound is the wire constant `MAX_RATE_PER_MB` = 1000 base units per MB (~$1/GB, ~100× the expected market rate; [ADR 005](005-protocol.md#adr-005-wire-protocol)), which honest requesters reject above. The ceiling sits near real prices on purpose: a floor set close to it clamps credited bytes toward zero, so a far-above-market ceiling would let governance suppress ADR-036 vote-weight accrual, while a realistic one still catches below-market bytes and can never zero out the electorate's weight.
 
 **Initial rate floor:**
 
@@ -781,7 +781,7 @@ Nodes must keep their local copy of `deliveryFloor` current so an advertised `ra
 
 #### Startup
 
-Nodes MUST call `getRateBounds()` before accepting connections, never operating without a floor (same pattern as the content blacklist initial sync, [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). Because `getRateBounds()` returns `uint256` but the wire protocol represents `rate_per_mb` as `u64` ([ADR 005](005-protocol.md#adr-005-wire-protocol)), nodes MUST verify `deliveryFloor` fits within `u64` on every refresh (startup and subsequent polls/events). If it exceeds `u64::MAX`, the node MUST refuse to start (or, on a mid-operation refresh, continue with its last valid floor and log an error). Unreachable against a correctly-deployed contract — `setRateBounds` caps the floor at `MAX_RATE_PER_MB` (10^12), far below `u64::MAX` — but the check guards against a contract deployed without that cap.
+Nodes MUST call `getRateBounds()` before accepting connections, never operating without a floor (same pattern as the content blacklist initial sync, [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). Because `getRateBounds()` returns `uint256` but the wire protocol represents `rate_per_mb` as `u64` ([ADR 005](005-protocol.md#adr-005-wire-protocol)), nodes MUST verify `deliveryFloor` fits within `u64` on every refresh (startup and subsequent polls/events). If it exceeds `u64::MAX`, the node MUST refuse to start (or, on a mid-operation refresh, continue with its last valid floor and log an error). Unreachable against a correctly-deployed contract — `setRateBounds` caps the floor at `MAX_RATE_PER_MB` (1000), far below `u64::MAX` — but the check guards against a contract deployed without that cap.
 
 #### Stale bounds
 
