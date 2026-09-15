@@ -623,7 +623,15 @@ contract CapacityBond is
         emit Bonded(msg.sender, amount, newBalance);
     }
 
-    function requestUnbond(uint256 amount) external nonReentrant whenNotPaused {
+    /// @notice Start the unbonding timer on part of the active bond. This is a
+    ///         principal-exit path and is never pausable: pause halts intake and
+    ///         serving, never an operator's exit (the client-side twin
+    ///         `PaymentPool.reclaim` is un-pausable for the same reason). Slash
+    ///         safety does not come from pause — the unbonding period keeps the
+    ///         queued amount exposed, and `slash` reaches bond sitting in the
+    ///         queue via `_reduceBondAtTier`, so a captured PAUSER cannot trap an
+    ///         honest operator's bond and pause buys a dishonest one no shelter.
+    function requestUnbond(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
         if (amount > activeBond[msg.sender]) {
             revert InsufficientBond({ requested: amount, available: activeBond[msg.sender] });
@@ -647,7 +655,14 @@ contract CapacityBond is
         emit UnbondingRequested(msg.sender, amount, unlockAt, activeBond[msg.sender]);
     }
 
-    function unbond() external nonReentrant whenNotPaused {
+    /// @notice Withdraw bond whose unbonding period has elapsed. This is a
+    ///         principal-exit path and is never pausable, matching
+    ///         `requestUnbond`: pause covers intake and serving only. The elapsed
+    ///         unbonding period is the sole gate on the released amount — the bond
+    ///         stayed slashable for the whole window, and any at-risk portion was
+    ///         already moved to escrow by `slash`, so what remains here is the
+    ///         operator's to withdraw whether the contract is paused or not.
+    function unbond() external nonReentrant {
         UnbondingRequest memory req = unbondingOf[msg.sender];
         if (req.amount == 0) revert NoUnbondingRequest();
         // forge-lint: disable-next-line(block-timestamp)
@@ -906,7 +921,13 @@ contract CapacityBond is
     ///         a registered node by definition is not. The bond itself
     ///         stays put and fully slashable; re-registering needs only
     ///         `minBond` again, but the tier must be re-declared.
-    function deregisterNode() external nonReentrant whenNotPaused {
+    ///
+    ///         Not pausable: clearing `declaredMbps` is the step a registered
+    ///         operator takes to drop the `bondRequired(declaredMbps)` floor and
+    ///         fully unbond, so gating it on pause would trap that floor of
+    ///         principal. Leaving the active set is an exit and a de-escalation of
+    ///         serving; pause halts intake and serving, never an operator's exit.
+    function deregisterNode() external nonReentrant {
         NodeInfo storage info = _nodes[msg.sender];
         if (!info.active) revert NodeNotActive();
 

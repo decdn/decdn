@@ -38,6 +38,9 @@ contract CapacityBondTest is Test {
 
     uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant UNBONDING = 7 days;
+    // First-offense slash tier (bps), mirroring `CapacityBond.SLASH_BPS_TIER_1`
+    // (internal), used by the exit slash-safety test.
+    uint256 internal constant SLASH_BPS_TIER_1_TEST = 500;
     // ADR 019 § Terms Acceptance — genesis operator-terms hash the fixture
     // registers against (stand-in for `keccak256(TERMS.md)`).
     bytes32 internal constant TERMS_HASH = keccak256("decdn operator terms v1");
@@ -1006,6 +1009,76 @@ contract CapacityBondTest is Test {
 
         assertEq(bond.activeBond(opAddr), 0, "the last TOKEN is withdrawable once the tier is cleared");
         assertEq(token.balanceOf(opAddr), balanceBefore + bonded, "the full bond comes back");
+    }
+
+    // ── Exits are never pausable (issue #2030) ───────────────────────────────
+
+    /// @notice A pause must not trap an operator's bond. With the contract
+    ///         paused, an operator can still `requestUnbond` and, after the
+    ///         unbonding period, `unbond` the principal back. Pause halts intake
+    ///         and serving only; a captured PAUSER cannot freeze the exit.
+    function test_exit_notPausable_requestUnbondAndUnbondWhilePaused() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        uint256 balBefore = token.balanceOf(operator);
+
+        vm.startPrank(admin);
+        bond.grantRole(bond.PAUSER_ROLE(), admin);
+        bond.pause();
+        vm.stopPrank();
+
+        // No capacity is declared, so the curve floor is 0 and the whole bond is
+        // releasable — the exit runs entirely while the contract is paused.
+        vm.startPrank(operator);
+        bond.requestUnbond(MIN_BOND);
+        vm.warp(block.timestamp + UNBONDING);
+        bond.unbond();
+        vm.stopPrank();
+
+        assertEq(bond.activeBond(operator), 0, "bond fully released despite the pause");
+        assertEq(token.balanceOf(operator), balBefore + MIN_BOND, "principal returned while paused");
+    }
+
+    /// @notice Un-gating the exit does not weaken slash safety. An operator with
+    ///         an OPEN slash record cannot recover the at-risk amount by exiting,
+    ///         even while unbonding and even while the contract is paused. The
+    ///         protection is the slash escrow and the unbonding period, never the
+    ///         pause: `slash` reaches bond already sitting in the unbonding queue,
+    ///         and the escrowed portion is not withdrawable by `unbond`.
+    function test_exit_openSlashUnwithdrawable_evenWhileUnbondingAndPaused() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        uint256 balBefore = token.balanceOf(operator);
+
+        // Queue the entire bond, THEN slash — proving the slash reaches bond in
+        // the unbonding queue, not only active bond.
+        vm.prank(operator);
+        bond.requestUnbond(MIN_BOND);
+
+        // Tier-1 slash = 5% of the at-risk bond. Active is 0, so it taps the
+        // queue: 50k → 2.5k escrowed, 47.5k left queued.
+        uint256 expectedSlash = (MIN_BOND * SLASH_BPS_TIER_1_TEST) / 10_000;
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1, bytes32(0));
+        assertEq(bond.escrowedTotal(), expectedSlash, "slash escrowed the at-risk portion of the queued bond");
+        assertGt(bond.slashedAtEpoch(operator), 0, "slash record is open");
+
+        // Pause after the slash — the exit must still complete, but only for the
+        // un-slashed remainder.
+        vm.startPrank(admin);
+        bond.grantRole(bond.PAUSER_ROLE(), admin);
+        bond.pause();
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + UNBONDING);
+        vm.prank(operator);
+        bond.unbond();
+
+        uint256 recovered = token.balanceOf(operator) - balBefore;
+        assertEq(recovered, MIN_BOND - expectedSlash, "only the un-slashed remainder is withdrawn");
+        assertEq(bond.escrowedTotal(), expectedSlash, "the slashed amount stays escrowed, unreachable by exit");
     }
 
     function test_reRegisterAfterDeregister_keepsBondAndNeedsFreshDeclare() public {
