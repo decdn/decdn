@@ -147,11 +147,6 @@ pub struct ResolvedBlockchain {
     /// Defaults to 7000 ms (`DEFAULT_EVENT_POLL_INTERVAL_MS`); the resolver
     /// enforces a minimum (see `MIN_EVENT_POLL_INTERVAL_MS`).
     pub event_poll_interval_ms: u64,
-    /// Seconds between authoritative `getRateBounds()` re-reads by the
-    /// rate-bounds watcher (#1172). Safety-net cadence alongside the
-    /// `RateBoundsUpdated` event subscription. Defaults to 3600s
-    /// (`DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`); the resolver rejects `0`.
-    pub rate_bounds_poll_interval_sec: u64,
     /// Seconds between authoritative `FeeRouter.getShares()` re-reads by the
     /// fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics). Safety-net
     /// cadence alongside the `SharesUpdated` event subscription. Defaults to
@@ -216,12 +211,11 @@ pub struct ResolvedCache {
     pub max_blob_size_mb: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling for paid pulls (#1375), in the same
     /// per-MB units as the wire `StreamResponse.rate_per_mb`; `0` = unlimited
-    /// (the default). Distinct from the seller-side `delivery_floor` clamp, which
-    /// raises this node's own quote: this bounds what this node, acting as a BUYER
-    /// on a cache-miss pull, will accept a provider to quote. The node also always
-    /// applies a probe-relative bound (a
-    /// quote may not exceed the rate the chosen candidate advertised at probe), so
-    /// this is the additional absolute backstop.
+    /// (the default). A buyer-side ceiling: it bounds what this node, acting as a
+    /// BUYER on a cache-miss pull, will accept a provider to quote. The node also
+    /// always applies a probe-relative bound (a quote may not exceed the rate the
+    /// chosen candidate advertised at probe), so this is the additional absolute
+    /// backstop. The node never bounds its own sell rate.
     pub max_rate_per_mb: u64,
     /// Resolved ordered list of origin backends (#437, #284). Empty
     /// vec => no pull-through; cache misses return `NoOrigin`. A
@@ -533,11 +527,6 @@ pub enum ResolvedS3Credentials {
 pub struct ResolvedPayment {
     /// Rate per MB in USDC base units (6 decimals).
     pub rate_per_mb: u64,
-    /// Pre-chain seed for the lower clamp bound on `rate_per_mb` (ADR 005
-    /// §Rate bounds validation). **Not the live bound since #1172** — the
-    /// runtime overwrites it from on-chain `getRateBounds()` before serving and
-    /// the rate-bounds watcher keeps it current. Default `0`.
-    pub delivery_floor: u64,
     /// Credit-window ceiling in bytes (ADR 003 §Credit window). The per-stream
     /// window ramps toward this cap as the stream pays; floored at one chunk
     /// ([`decdn_protocol::client::CHUNK_BYTES`], the payment quantum).

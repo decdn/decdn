@@ -194,11 +194,6 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
-        "  rate_bounds_poll_interval_sec: {}",
-        resolved.blockchain.rate_bounds_poll_interval_sec
-    )?;
-    writeln!(
-        w,
         "  fee_shares_poll_interval_sec: {}",
         resolved.blockchain.fee_shares_poll_interval_sec
     )?;
@@ -939,7 +934,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
 # event_poll_interval_ms = 7000      # eth_getLogs tick cadence for chain watchers + pending-tx receipt polling (#1011/#1106); default 7000ms, min 250ms (lower for a local anvil)
-# rate_bounds_poll_interval_sec = 3600 # authoritative getRateBounds() re-read cadence, safety net beside the RateBoundsUpdated subscription (#1172); default 3600s, must be > 0
 # fee_shares_poll_interval_sec = 3600  # authoritative getShares() re-read cadence, safety net beside the SharesUpdated subscription (ADR 041); default 3600s, must be > 0
 # redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
 # redeem_max_vouchers_per_tx = 300  # max vouchers per redeemMany tx; the redeemer chunks a sweep to stay under the block gas limit (default 300)
@@ -959,7 +953,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # cache_size_mb = 102400                  # UPPER bound on the cache; the eviction driver clamps it down to keep disk_headroom_mb free on the volume (#1930). Set it large to let free disk size the cache.
 # disk_headroom_mb = 8192                  # free disk (MiB) the eviction driver keeps unused on the cache_dir volume, defended against ANY process (#1930); default 8 GiB. 0 opts out (only cache_size_mb binds)
 # max_blob_size_mb = 51200             # largest single blob admitted; unset => 50 GB capped to cache_size_mb. Must be <= cache_size_mb; 0 = unlimited
-# max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the candidate's probe rate, before paying. Distinct from the seller-side [payment] delivery_floor clamp, which raises this node's own quote
+# max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the candidate's probe rate, before paying. A buyer-side ceiling only; the node never bounds its own sell rate
 # pinned_hashes = []                       # blob hashes (hex) exempted from LRU eviction (#276)
 # user_agent = "decdn-node/<version>"      # User-Agent on HTTP origin pull-through (#435); default embeds the crate version
 # Pull-through origin (singular). Mutually exclusive with the plural [[cache.origins]] form below.
@@ -1037,7 +1031,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [payment]
 # rate_per_mb = 10
-# delivery_floor = 0                       # PRE-CHAIN SEED ONLY (#1172): overwritten from on-chain getRateBounds() before serving; governance owns the live floor
 # credit_max = 67108864                    # downstream credit-window ceiling in bytes (ADR 003 §Credit window); the window ramps toward this cap as the stream pays; default 64 MiB; floored at one chunk (1 MiB)
 # credit_ramp_divisor = 2                  # ramp divisor (ADR 003 §Credit window); window is paid/credit_ramp_divisor, capped at credit_max; 0 opens the full ceiling immediately
 # frame_target_bytes = 1048576              # serve-path wire-frame target in bytes (ADR 005 §cdn/client/v1); node-local, never negotiated; clamped down to the credit window's remaining room; must be in 1..=1048576 (one payment chunk); default 1 MiB
@@ -1205,7 +1198,6 @@ mod tests {
             chain_id,
             rpc_watchdog_interval_sec,
             event_poll_interval_ms,
-            rate_bounds_poll_interval_sec,
             fee_shares_poll_interval_sec,
             redeem_threshold_micro_usdc,
             redeem_max_vouchers_per_tx,
@@ -1261,10 +1253,6 @@ mod tests {
                 rpc_watchdog_interval_sec.is_none(),
             ),
             ("event_poll_interval_ms =", event_poll_interval_ms.is_none()),
-            (
-                "rate_bounds_poll_interval_sec =",
-                rate_bounds_poll_interval_sec.is_none(),
-            ),
             (
                 "fee_shares_poll_interval_sec =",
                 fee_shares_poll_interval_sec.is_none(),
@@ -1402,7 +1390,6 @@ mod tests {
 
         let config::types::PaymentConfig {
             rate_per_mb,
-            delivery_floor,
             credit_max,
             credit_ramp_divisor,
             frame_target_bytes,
@@ -1410,7 +1397,6 @@ mod tests {
         } = &config::types::PaymentConfig::default();
         let payment = [
             ("rate_per_mb =", rate_per_mb.is_none()),
-            ("delivery_floor =", delivery_floor.is_none()),
             ("credit_max =", credit_max.is_none()),
             ("frame_target_bytes =", frame_target_bytes.is_none()),
             ("credit_ramp_divisor =", credit_ramp_divisor.is_none()),

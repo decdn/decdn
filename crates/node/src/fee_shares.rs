@@ -1,7 +1,7 @@
 //! Live operator fee-share (basis points), read from `FeeRouter.getShares()[0]`.
-//! Mirrors `rate_bounds.rs`: a single `Arc<AtomicU16>` shared by all clones,
-//! seeded at startup and refreshed by the multiplexed log poller (see
-//! `fee_shares_watcher.rs`). `(1 - f)` numerator for the serve-economics margin.
+//! A single `Arc<AtomicU16>` shared by all clones, seeded at startup and
+//! refreshed by the multiplexed log poller (see `fee_shares_watcher.rs`).
+//! `(1 - f)` numerator for the serve-economics margin.
 
 use std::sync::{
     Arc,

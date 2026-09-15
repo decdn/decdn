@@ -1526,8 +1526,8 @@ impl StalledDelivery {
             provider: operator_addr(),
             // Exactly the advertised-rate minimum for the bytes served, which
             // clears the handler's per-delta `verify_rate` (1% tolerance). The
-            // cumulative rate-floor check is inert here: the fixture builds the
-            // handler with `delivery_floor = 0`.
+            // node applies no cumulative rate-floor check — the delivery floor
+            // is a redemption-time credit clamp only.
             amount: settled.amount,
             bytes_delivered: U256::from(settled.wire_bytes),
             chain_root: B256::ZERO,
@@ -7369,146 +7369,6 @@ async fn spent_out_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
             "decdn_serve_stream_rejected_insufficient_deposit_total 1"
         ),
         "the refusal must be attributed to the deposit floor, not to the fill missing"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// #1518's invariant, which nothing asserted until now: one request clamps the
-/// rate exactly once.
-///
-/// `clamped_rate()` bumps `rate_bounds_clamped` and warns, so a path that priced a
-/// request and then let `respond_error` price it again double-counted a single
-/// request. The fix made the rate a required argument of `respond_error`, which
-/// stops the *implicit* recomputation — but a grep is what holds "exactly one
-/// production call site", and greps do not run in CI. This does.
-///
-/// Driven through the #1519 floor specifically, because that is the path the
-/// collapse was performed for: it prices the request and then falls through into
-/// the fill ladder, whose miss arms also refuse.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_refused_request_clamps_the_rate_exactly_once() -> anyhow::Result<()> {
-    let signer = Arc::new(PrivateKeySigner::random());
-    let store = Arc::new(MemoryPoolStateStore::new());
-    store.record(&LaneState::hydrate(
-        pool_id(),
-        signer.address(),
-        operator_addr(),
-        U256::from(1u64),
-        0,
-        U256::ZERO,
-        U256::ZERO,
-        None,
-        decdn_incentive::LaneChain::NONE,
-    ))?;
-
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = operator_signer();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    // An on-chain floor above the advertised rate, so every `clamped_rate()` call
-    // bumps the counter. With `RateBounds::new(0)` (the harness default) it never
-    // fires and this test would be vacuous.
-    let handler = build_handler_configured(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        empty_cache().await?.0,
-        store_dyn,
-        RATE_PER_MB,
-        |deps| {
-            deps.rate_bounds = decdn_node::rate_bounds::RateBounds::new(RATE_PER_MB * 50);
-            deps.pull_through = Some(std::time::Duration::from_secs(5));
-        },
-    )?;
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let ext = binding_ext(&signer, client_node_id)?;
-    let req = StreamRequest {
-        hash: [0x18u8; 32],
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        pool_id: pool_id().into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: 0x1518,
-    };
-    let _ = raw_request(&client_ep, target, &req, Some(&ext)).await?;
-
-    anyhow::ensure!(
-        metric_line_present(&metrics.encode()?, "decdn_rate_bounds_clamp_events_total 1"),
-        "one refused request must clamp exactly once; got:\n{}",
-        metrics.encode()?
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// The other half of #1518's invariant: a request that never quotes a rate must
-/// not clamp at all. This is what pins the *placement* of `clamped_rate()` below
-/// the binding block — hoisting it to the top of `serve_stream` would meter a clamp
-/// for a request that is reset without a signed `StreamResponse`, which is the same
-/// double-count bug in a different direction and is otherwise guarded only by prose.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_request_rejected_before_pricing_does_not_clamp_the_rate() -> anyhow::Result<()> {
-    let (store, _signer, _deposit) = seeded_store()?;
-
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = operator_signer();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    let handler = build_handler_configured(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        empty_cache().await?.0,
-        store,
-        RATE_PER_MB,
-        |deps| {
-            deps.rate_bounds = decdn_node::rate_bounds::RateBounds::new(RATE_PER_MB * 50);
-        },
-    )?;
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    // A binding whose signature recovers a different address: the handler resets the
-    // stream in the binding block, above the pricing point, signing nothing.
-    let client_sk = fresh_key();
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let mut ext = binding_ext(
-        &Arc::new(PrivateKeySigner::random()),
-        B256::repeat_byte(0x77),
-    )?;
-    if let Some(binding) = ext.binding.as_mut() {
-        binding.ethereum_address = [0xAB; 20];
-    }
-    let req = StreamRequest {
-        hash: [0x19u8; 32],
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        pool_id: pool_id().into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: 0x1519,
-    };
-    // The stream is reset, so there is no reply to read — that IS the expected shape.
-    let _ = raw_request(&client_ep, target, &req, Some(&ext)).await;
-
-    anyhow::ensure!(
-        metric_line_present(&metrics.encode()?, "decdn_rate_bounds_clamp_events_total 0"),
-        "a request reset above the pricing point must never clamp; got:\n{}",
-        metrics.encode()?
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;

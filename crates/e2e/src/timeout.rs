@@ -45,7 +45,7 @@
 //! - [`HEAVY`] (600s) — journeys whose *internal* poll ladder is long enough
 //!   that a slow poll under contention could crowd the deploy ladder inside
 //!   300s: a sequential poll budget above ~150s, i.e. more than half the
-//!   standard tier. Today that is `g_gov_02` (a 120+60+120+60s repricing walk),
+//!   standard tier. Today that is
 //!   `origin_blacklist_compliance` (repeated 180s catch-up polls), `slash_appeal`
 //!   (120+30+30s), the `g_node_04` removal-reversal journey (60s evict + 30s
 //!   blacklist + 180s removal convergence), and the `g_node_07` Ethereum leg
