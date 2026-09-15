@@ -3999,6 +3999,14 @@ mod tests {
         // A hash the on-disk bytes provably do not produce.
         let claimed =
             "b3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        // Document the assumption the skip proof rests on: the planted bytes do
+        // not hash to `claimed`, so a re-hash would fetch and only a
+        // record-trusting fast-skip can pass.
+        assert_ne!(
+            claimed,
+            format!("b3:{}", blake3::hash(body).to_hex()),
+            "planted bytes must not match the claimed hash"
+        );
         let mut updates = BTreeMap::new();
         updates.insert(
             "a.txt".to_string(),
@@ -4036,6 +4044,15 @@ mod tests {
         let size = u64::try_from(body.len()).expect("len");
         // Right hash + size, but a stale (1970) mtime → the fast path misses.
         let stale = SavedMtime { secs: 1, nanos: 0 };
+        // Document the precondition: the stale mtime differs from the file's
+        // actual mtime, so the fast path is genuinely bypassed and the skip can
+        // only come from the re-hash gate.
+        let meta = std::fs::metadata(tmp.path().join("a.txt")).expect("meta");
+        assert_ne!(
+            stale,
+            SavedMtime::of(&meta).expect("mtime"),
+            "stale mtime must differ from the file's real mtime"
+        );
         let mut updates = BTreeMap::new();
         updates.insert(
             "a.txt".to_string(),
