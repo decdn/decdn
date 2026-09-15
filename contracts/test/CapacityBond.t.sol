@@ -37,6 +37,9 @@ contract CapacityBondTest is Test {
     address internal challenger = address(0xC4A11);
 
     uint256 internal constant MIN_BOND = 50_000e18;
+    // Governance `minBond` ceiling, mirroring `CapacityBond.MIN_BOND_CEILING`
+    // (internal), used by the non-retroactive-minBond tests.
+    uint256 internal constant MIN_BOND_CEILING_TEST = 1_000_000e18;
     uint256 internal constant UNBONDING = 7 days;
     // First-offense slash tier (bps), mirroring `CapacityBond.SLASH_BPS_TIER_1`
     // (internal), used by the exit slash-safety test.
@@ -1890,6 +1893,110 @@ contract CapacityBondTest is Test {
         vm.prank(opAddr);
         vm.expectRevert(CapacityBond.NodeAlreadyRegistered.selector);
         bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig2, hex"01");
+    }
+
+    // -----------------------------------------------------------------
+    // minBond is non-retroactive (issue #2033)
+    // -----------------------------------------------------------------
+
+    /// @dev Bond exactly `amount` from a fresh operator and register a node with
+    ///      no Mbps declared, so only `minBond` gates entry. Returns the address.
+    function _bondAndRegister(uint256 opPk, uint256 amount) internal returns (address opAddr) {
+        opAddr = vm.addr(opPk);
+        vm.prank(admin);
+        token.transfer(opAddr, amount);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(amount);
+        vm.stopPrank();
+        bytes32 nodeId = bytes32(uint256(opPk));
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+    }
+
+    /// @notice Core: an operator active at the launch `minBond` (50k) stays
+    ///         active — retaining vote-weight eligibility — after governance
+    ///         raises `minBond` to 100k. The raise is non-retroactive: it never
+    ///         de-activates the grandfathered operator.
+    function test_minBond_raise_grandfathersActiveOperator() public {
+        address opAddr = _bondAndRegister(0xF10021, MIN_BOND);
+        assertTrue(bond.isActive(opAddr));
+        assertEq(bond.bondFloorAtActivation(opAddr), MIN_BOND);
+
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+
+        // Still active though active bond (50k) sits below the new minBond.
+        assertTrue(bond.isActive(opAddr));
+        assertEq(bond.activeBond(opAddr), MIN_BOND);
+        assertEq(bond.bondFloorAtActivation(opAddr), MIN_BOND); // floor unchanged
+    }
+
+    /// @notice A NEW operator bonding below the raised `minBond` cannot activate:
+    ///         entry is gated on the live `minBond`, and no floor is recorded.
+    function test_minBond_raise_barsNewEntrantBelowFloor() public {
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+
+        uint256 opPk = 0xF10022;
+        address opAddr = vm.addr(opPk);
+        vm.prank(admin);
+        token.transfer(opAddr, MIN_BOND); // 50k, under the new 100k floor
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(MIN_BOND);
+        vm.stopPrank();
+        // Never crossed the live minBond, so no grandfathered floor was set.
+        assertEq(bond.bondFloorAtActivation(opAddr), 0);
+
+        bytes32 nodeId = bytes32(uint256(opPk));
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        vm.prank(opAddr);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowMinimum.selector, MIN_BOND, 100_000e18));
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+    }
+
+    /// @notice A `minBond` raise alone never ejects; only a real slash below the
+    ///         grandfathered `bondFloorAtActivation / 2` does.
+    function test_minBond_raiseNeverEjects_slashStillEjects() public {
+        address opAddr = _bondAndRegister(0xF10023, MIN_BOND); // floor 50k
+        vm.prank(admin);
+        bond.setMinBond(MIN_BOND_CEILING_TEST); // 1M — a 20× raise
+        assertTrue(bond.isActive(opAddr)); // raise alone: still active
+        assertFalse(bond.ejected(opAddr)); // raise alone: not ejected
+
+        // Escalating slashes drop active bond below the 25k floor/2 threshold:
+        // 50k → 47.5k (5%) → 40.375k (15%) → 20.1875k (50%) < 25k → eject.
+        vm.startPrank(admin);
+        bond.slash(opAddr, challenger, 1, bytes32(0));
+        assertFalse(bond.ejected(opAddr)); // 47.5k ≥ 25k floor/2
+        bond.slash(opAddr, challenger, 1, bytes32(0));
+        assertFalse(bond.ejected(opAddr)); // 40.375k ≥ 25k floor/2
+        bond.slash(opAddr, challenger, 1, bytes32(0));
+        vm.stopPrank();
+        assertTrue(bond.ejected(opAddr)); // 20.1875k < 25k floor/2 → ejected
+        assertFalse(bond.isActive(opAddr));
+    }
+
+    /// @notice A grandfathered operator's own partial unbond below its
+    ///         activation floor de-activates it (mirrors the below-floor
+    ///         behavior, keyed to the grandfathered floor).
+    function test_minBond_partialUnbondBelowFloor_deactivates() public {
+        address opAddr = _bondAndRegister(0xF10024, 60_000e18); // crosses 50k → floor 50k
+        assertTrue(bond.isActive(opAddr));
+        assertEq(bond.bondFloorAtActivation(opAddr), MIN_BOND);
+
+        // Unbond 15k → active 45k, under the 50k grandfathered floor.
+        vm.prank(opAddr);
+        bond.requestUnbond(15_000e18);
+        assertEq(bond.activeBond(opAddr), 45_000e18);
+
+        vm.warp(block.timestamp + UNBONDING + 1);
+        vm.prank(opAddr);
+        bond.unbond();
+        assertEq(bond.activeBond(opAddr), 45_000e18);
+        assertFalse(bond.isActive(opAddr)); // 45k < 50k floor: own action de-activates
     }
 
     function test_updateMultiaddrs_revertsWhenNodeNotActive() public {
