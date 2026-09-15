@@ -1030,7 +1030,13 @@ abstract contract BaseProtocolDeploy is Script {
         if (cfg.usdc.balanceOf(pool) == 0) revert PoolNotSeeded(pool);
 
         return BuybackVenueLib.deployUniswapBurner(
-            cfg.usdc, ERC20Burnable(address(d.token)), cfg.deployer, act.uni.swapRouter, pool, act.guard
+            cfg.usdc,
+            ERC20Burnable(address(d.token)),
+            cfg.deployer,
+            address(d.timelock),
+            act.uni.swapRouter,
+            pool,
+            act.guard
         );
     }
 
@@ -1056,7 +1062,7 @@ abstract contract BaseProtocolDeploy is Script {
         BuybackVenueLib.BalancerWiring memory wiring = act.bal.wiring;
         wiring.pool = pool;
         return BuybackVenueLib.deployBalancerBurner(
-            cfg.usdc, ERC20Burnable(address(d.token)), cfg.deployer, wiring, act.guard
+            cfg.usdc, ERC20Burnable(address(d.token)), cfg.deployer, address(d.timelock), wiring, act.guard
         );
     }
 

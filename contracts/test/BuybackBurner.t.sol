@@ -60,8 +60,8 @@ contract TestableBuybackBurner is BuybackBurner {
     uint256 public reportedReturn;
     bool public wired;
 
-    constructor(IERC20 usdc_, ERC20Burnable token_, address admin, TokenSource source_)
-        BuybackBurner(usdc_, token_, admin)
+    constructor(IERC20 usdc_, ERC20Burnable token_, address admin, address treasury_, TokenSource source_)
+        BuybackBurner(usdc_, token_, admin, treasury_)
     {
         source = source_;
     }
@@ -102,6 +102,7 @@ contract BuybackBurnerTest is Test {
     address internal admin = address(0xA11CE);
     address internal keeper = address(0xCAFE);
     address internal pauser = address(0xBAD);
+    address internal treasury = address(0x7EA);
 
     uint256 internal constant USDC_AMOUNT = 1000e6;
     uint256 internal constant TOKEN_OUT = 500e18;
@@ -111,7 +112,7 @@ contract BuybackBurnerTest is Test {
         token = new Token(admin);
         source = new TokenSource(IERC20(address(token)));
 
-        bb = new TestableBuybackBurner(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, source);
+        bb = new TestableBuybackBurner(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, source);
 
         vm.startPrank(admin);
         bb.grantRole(bb.KEEPER_ROLE(), keeper);
@@ -136,17 +137,26 @@ contract BuybackBurnerTest is Test {
 
     function test_constructor_revertsOnZeroUsdc() public {
         vm.expectRevert(BuybackBurner.ZeroAddress.selector);
-        new TestableBuybackBurner(IERC20(address(0)), ERC20Burnable(address(token)), admin, source);
+        new TestableBuybackBurner(IERC20(address(0)), ERC20Burnable(address(token)), admin, treasury, source);
     }
 
     function test_constructor_revertsOnZeroToken() public {
         vm.expectRevert(BuybackBurner.ZeroAddress.selector);
-        new TestableBuybackBurner(IERC20(address(usdc)), ERC20Burnable(address(0)), admin, source);
+        new TestableBuybackBurner(IERC20(address(usdc)), ERC20Burnable(address(0)), admin, treasury, source);
     }
 
     function test_constructor_revertsOnZeroAdmin() public {
         vm.expectRevert(BuybackBurner.ZeroAddress.selector);
-        new TestableBuybackBurner(IERC20(address(usdc)), ERC20Burnable(address(token)), address(0), source);
+        new TestableBuybackBurner(IERC20(address(usdc)), ERC20Burnable(address(token)), address(0), treasury, source);
+    }
+
+    function test_constructor_revertsOnZeroTreasury() public {
+        vm.expectRevert(BuybackBurner.ZeroAddress.selector);
+        new TestableBuybackBurner(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, address(0), source);
+    }
+
+    function test_constructor_snapshotsTreasury() public view {
+        assertEq(bb.treasury(), treasury);
     }
 
     // -----------------------------------------------------------------
@@ -178,7 +188,7 @@ contract BuybackBurnerTest is Test {
     function test_executeBuyback_revertsPoolNotWiredWhenUnwired() public {
         // Fresh deployment left unwired (`wired` defaults false).
         TestableBuybackBurner fresh =
-            new TestableBuybackBurner(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, source);
+            new TestableBuybackBurner(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, source);
         vm.startPrank(admin);
         fresh.grantRole(fresh.KEEPER_ROLE(), keeper);
         vm.stopPrank();
@@ -291,18 +301,19 @@ contract BuybackBurnerTest is Test {
     // rescueUSDC — recover stranded USDC
     // -----------------------------------------------------------------
 
-    function test_rescueUSDC_transfersToRecipient() public {
-        address recipient = address(0xBEEF);
+    function test_rescueUSDC_transfersToTreasury() public {
         uint256 amount = 1234e6;
-        uint256 recipientBefore = usdc.balanceOf(recipient);
+        uint256 treasuryBefore = usdc.balanceOf(treasury);
         uint256 bbBefore = usdc.balanceOf(address(bb));
 
-        vm.expectEmit(true, false, false, true, address(bb));
-        emit BuybackBurner.UsdcRescued(recipient, amount);
+        vm.expectEmit(false, false, false, true, address(bb));
+        emit BuybackBurner.UsdcRescued(amount);
         vm.prank(admin);
-        bb.rescueUSDC(recipient, amount);
+        bb.rescueUSDC(amount);
 
-        assertEq(usdc.balanceOf(recipient), recipientBefore + amount);
+        // Funds land at the fixed treasury; there is no caller-chosen sink.
+        assertEq(bb.treasury(), treasury);
+        assertEq(usdc.balanceOf(treasury), treasuryBefore + amount);
         assertEq(usdc.balanceOf(address(bb)), bbBefore - amount);
     }
 
@@ -312,18 +323,12 @@ contract BuybackBurnerTest is Test {
                 IAccessControl.AccessControlUnauthorizedAccount.selector, address(this), bb.GOVERNANCE_ROLE()
             )
         );
-        bb.rescueUSDC(address(0xBEEF), 1e6);
-    }
-
-    function test_rescueUSDC_revertsOnZeroRecipient() public {
-        vm.prank(admin);
-        vm.expectRevert(BuybackBurner.ZeroAddress.selector);
-        bb.rescueUSDC(address(0), 1e6);
+        bb.rescueUSDC(1e6);
     }
 
     function test_rescueUSDC_revertsOnZeroAmount() public {
         vm.prank(admin);
         vm.expectRevert(BuybackBurner.ZeroAmount.selector);
-        bb.rescueUSDC(address(0xBEEF), 0);
+        bb.rescueUSDC(0);
     }
 }

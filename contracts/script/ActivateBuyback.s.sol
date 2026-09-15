@@ -122,6 +122,7 @@ contract ActivateBuyback is Script {
             usdc,
             token,
             timelock,
+            timelock,
             BuybackVenueLib.BalancerWiring({
                 swapRouter: vm.envAddress("BALANCER_ROUTER"),
                 pool: vm.envAddress("BALANCER_POOL"),
@@ -139,6 +140,7 @@ contract ActivateBuyback is Script {
         return BuybackVenueLib.deployUniswapBurner(
             usdc,
             token,
+            timelock,
             timelock,
             vm.envAddress("UNISWAP_SWAP_ROUTER"),
             vm.envAddress("UNISWAP_POOL"),

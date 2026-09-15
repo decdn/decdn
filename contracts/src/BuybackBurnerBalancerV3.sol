@@ -97,11 +97,12 @@ contract BuybackBurnerBalancerV3 is GuardedBuybackBurner {
         uint256 epochLiquidityCapFraction_;
     }
 
-    constructor(IERC20 usdc_, ERC20Burnable token_, address admin, Config memory cfg)
+    constructor(IERC20 usdc_, ERC20Burnable token_, address admin, address treasury_, Config memory cfg)
         GuardedBuybackBurner(
             usdc_,
             token_,
             admin,
+            treasury_,
             GuardParams({
                 twapMinWindow_: cfg.twapMinWindow_,
                 maxBuybackAmount_: cfg.maxBuybackAmount_,

@@ -109,6 +109,7 @@ contract BuybackBurnerUniswapV3Test is Test {
 
     address internal admin = address(0xA11CE);
     address internal keeper = address(0xCAFE);
+    address internal treasury = address(0x7EA);
 
     uint24 internal constant FEE = 3000; // 0.30%
     uint256 internal constant FEE_E18 = 3e15;
@@ -149,6 +150,7 @@ contract BuybackBurnerUniswapV3Test is Test {
             IERC20(address(usdc)),
             ERC20Burnable(address(token)),
             admin,
+            treasury,
             BuybackBurnerUniswapV3.Config({
                 swapRouter_: IUniswapV3SwapRouter(address(router)),
                 pool_: pool_,
@@ -186,6 +188,7 @@ contract BuybackBurnerUniswapV3Test is Test {
             IERC20(address(usdc)),
             ERC20Burnable(address(token)),
             admin,
+            treasury,
             BuybackBurnerUniswapV3.Config({
                 swapRouter_: IUniswapV3SwapRouter(address(0)),
                 pool_: address(pool),

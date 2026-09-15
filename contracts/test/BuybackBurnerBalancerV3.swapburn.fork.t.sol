@@ -125,7 +125,9 @@ contract BuybackBurnerBalancerV3SwapBurnForkTest is Test {
             slippageBps_: SLIPPAGE_BPS,
             epochLiquidityCapFraction_: EPOCH_CAP_FRACTION
         });
-        bb = new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), address(this), cfg);
+        bb = new BuybackBurnerBalancerV3(
+            IERC20(address(usdc)), ERC20Burnable(address(token)), address(this), address(this), cfg
+        );
         bb.setKeeper(address(this)); // grants KEEPER_ROLE to the test (GOVERNANCE_ROLE held via admin).
     }
 

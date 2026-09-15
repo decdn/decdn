@@ -205,6 +205,7 @@ contract BuybackBurnerBalancerV3Test is Test {
     address internal admin = address(0xA11CE);
     address internal keeper = address(0xCAFE);
     address internal pauser = address(0xBAD);
+    address internal treasury = address(0x7EA);
     address internal gov = address(0x60F);
 
     // 80/20 TOKEN/USDC weighted pool seeded with 1,000,000 USDC + 100,000,000
@@ -276,7 +277,7 @@ contract BuybackBurnerBalancerV3Test is Test {
             slippageBps_: SLIPPAGE_BPS,
             epochLiquidityCapFraction_: capFraction
         });
-        newBb = new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        newBb = new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
 
         vm.startPrank(admin);
         newBb.grantRole(newBb.KEEPER_ROLE(), keeper);
@@ -589,21 +590,21 @@ contract BuybackBurnerBalancerV3Test is Test {
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
         cfg.swapRouter_ = IBalancerV3Router(address(0));
         vm.expectRevert(BuybackBurner.ZeroAddress.selector);
-        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
     }
 
     function test_constructor_revertsOnZeroPermit2() public {
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
         cfg.permit2_ = address(0);
         vm.expectRevert(BuybackBurner.ZeroAddress.selector);
-        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
     }
 
     function test_constructor_revertsOnCapFractionOutOfBounds() public {
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
         cfg.epochLiquidityCapFraction_ = 3001;
         vm.expectRevert(abi.encodeWithSelector(GuardedBuybackBurner.CapFractionOutOfBounds.selector, 3001, 100, 3000));
-        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
     }
 
     function test_constructor_revertsOnTwapWindowTooShort() public {
@@ -612,7 +613,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         vm.expectRevert(
             abi.encodeWithSelector(GuardedBuybackBurner.TwapWindowTooShort.selector, 30 minutes - 1, 30 minutes)
         );
-        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
     }
 
     function test_constructor_revertsOnSlippageAboveCeiling() public {
@@ -623,14 +624,14 @@ contract BuybackBurnerBalancerV3Test is Test {
                 GuardedBuybackBurner.SlippageOutOfBounds.selector, SLIPPAGE_CEILING + 1, SLIPPAGE_CEILING
             )
         );
-        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
     }
 
     function test_constructor_acceptsSlippageAtCeiling() public {
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
         cfg.slippageBps_ = SLIPPAGE_CEILING;
         BuybackBurnerBalancerV3 atCeiling =
-            new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+            new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
         assertEq(atCeiling.slippageBps(), SLIPPAGE_CEILING, "ceiling is inclusive");
     }
 
@@ -641,7 +642,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         cfg.minBuybackAmount_ = 0;
         cfg.maxBuybackAmount_ = 0;
         vm.expectRevert(GuardedBuybackBurner.BuybackBandDead.selector);
-        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
     }
 
     function test_constructor_revertsOnInvertedBand() public {
@@ -650,7 +651,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         vm.expectRevert(
             abi.encodeWithSelector(GuardedBuybackBurner.BuybackBandInverted.selector, MAX_BUYBACK + 1, MAX_BUYBACK)
         );
-        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
     }
 
     function test_setMaxBuybackAmount_revertsBelowMin() public {
@@ -665,7 +666,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         MockHighDecimalsToken bad = new MockHighDecimalsToken();
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
         vm.expectRevert(abi.encodeWithSelector(GuardedBuybackBurner.UnsupportedTokenDecimals.selector, uint8(19)));
-        new BuybackBurnerBalancerV3(IERC20(address(bad)), ERC20Burnable(address(token)), admin, cfg);
+        new BuybackBurnerBalancerV3(IERC20(address(bad)), ERC20Burnable(address(token)), admin, treasury, cfg);
     }
 
     function test_poke_revertsWhenPoolUnwired() public {
@@ -673,7 +674,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         cfg.pool_ = address(0);
         cfg.vault_ = address(0);
         BuybackBurnerBalancerV3 bb2 =
-            new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+            new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
         vm.expectRevert(BuybackBurner.PoolNotWired.selector);
         bb2.poke();
     }
@@ -741,7 +742,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         vm.expectRevert(
             abi.encodeWithSelector(BuybackBurnerBalancerV3.PoolNotRegistered.selector, address(p2), address(v2))
         );
-        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
     }
 
     function test_constructor_revertsOnMissingTokenLeg() public {
@@ -756,7 +757,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         cfg.vault_ = address(v2);
         cfg.pool_ = address(p2);
         vm.expectRevert(BuybackBurnerBalancerV3.PoolStateInvalid.selector);
-        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
     }
 
     function test_constructor_skipsValidationWhenWiringDeferred() public {
@@ -765,7 +766,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         cfg.pool_ = address(0);
         cfg.vault_ = address(0);
         BuybackBurnerBalancerV3 bb2 =
-            new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+            new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
         assertEq(bb2.balancerPool(), address(0), "pool unwired");
         assertEq(bb2.balancerVault(), address(0), "vault unwired");
     }
@@ -910,7 +911,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
         cfg.pool_ = address(0);
         cfg.vault_ = address(0);
-        a = new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        a = new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
         bytes32 govRole = a.GOVERNANCE_ROLE();
         vm.prank(admin);
         a.grantRole(govRole, gov);
@@ -942,7 +943,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
         cfg.vault_ = address(v2);
         cfg.pool_ = address(p2);
-        bb2 = new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        bb2 = new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, treasury, cfg);
     }
 
     function _orderedTokens(bool usdcFirst) internal view returns (IERC20[] memory t) {
