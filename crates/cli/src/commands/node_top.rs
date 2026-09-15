@@ -61,6 +61,9 @@ pub(crate) struct Snapshot {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub cache_bytes_returned: u64,
+    /// Raw USDC held in accepted vouchers not yet redeemed on-chain, refreshed
+    /// once per redeemer self-tick (`decdn_unredeemed_usdc`).
+    pub unredeemed_usdc: u64,
     pub rpc_healthy: bool,
 }
 
@@ -95,6 +98,7 @@ impl Snapshot {
             cache_hits: u("decdn_cache_hits_total"),
             cache_misses: u("decdn_cache_misses_total"),
             cache_bytes_returned: u("decdn_cache_bytes_returned_total"),
+            unredeemed_usdc: u("decdn_unredeemed_usdc"),
             rpc_healthy: m.get("decdn_rpc_healthy").copied().unwrap_or(0.0) >= 0.5,
         }
     }
@@ -201,6 +205,20 @@ pub(crate) fn format_rate_bytes(per_sec: f64) -> String {
     format!("{s}/s")
 }
 
+/// Render a raw micro-USDC amount (6 decimals, the on-chain base unit) as a
+/// dollar figure, e.g. `12_345_678` → `$12.345678`. Emits all six fractional
+/// digits rather than rounding, so the operator reads back the exact base-unit
+/// value this formatter is handed. That value is itself exact only below 2^53
+/// micro-USDC (~$9e9, far past any realistic per-node total): the `/metrics`
+/// scrape parses series as `f64` in [`parse_openmetrics`], which cannot
+/// represent every larger `u64` — an upstream limit of the text exposition,
+/// not of this formatter.
+fn format_usdc(micro: u64) -> String {
+    let dollars = micro / 1_000_000;
+    let frac = micro % 1_000_000;
+    format!("${dollars}.{frac:06}")
+}
+
 fn format_uptime(secs: u64) -> String {
     if secs < 60 {
         return format!("{secs}s");
@@ -288,6 +306,15 @@ pub(crate) fn write_top_table(
         format_bytes(now.cache_bytes_returned),
         bytes_rate,
     )?;
+    // Pending redemption: refreshed once per redeemer self-tick, so no
+    // meaningful /sec rate — the `-` placeholder matches the other gauges.
+    writeln!(
+        w,
+        "{:<35} {:>14} {:>12}",
+        "unredeemed_usdc",
+        format_usdc(now.unredeemed_usdc),
+        "-",
+    )?;
     writeln!(w)?;
     writeln!(
         w,
@@ -310,6 +337,9 @@ pub(crate) fn render_json_snapshot(s: &Snapshot) -> anyhow::Result<String> {
         "cache_misses_total": s.cache_misses,
         "cache_bytes_returned_total": s.cache_bytes_returned,
         "cache_hit_rate": hit_rate(s.cache_hits, s.cache_misses),
+        // Raw micro-USDC (6 decimals) so downstream tooling gets the exact
+        // integer the gauge exports; the human table renders it as dollars.
+        "unredeemed_usdc_micro": s.unredeemed_usdc,
         "rpc_healthy": s.rpc_healthy,
     });
     serde_json::to_string_pretty(&value).context("encode top snapshot as JSON")
@@ -829,6 +859,7 @@ mod render_tests {
             cache_hits: hits,
             cache_misses: misses,
             cache_bytes_returned: bytes,
+            unredeemed_usdc: 0,
             rpc_healthy: healthy,
         }
     }
@@ -840,6 +871,15 @@ mod render_tests {
         assert_eq!(format_bytes(2048), "2.0 KiB");
         assert_eq!(format_bytes(15 * 1024 * 1024), "15.0 MiB");
         assert_eq!(format_bytes(3 * 1024_u64.pow(3)), "3.0 GiB");
+    }
+
+    #[test]
+    fn format_usdc_renders_six_decimals() {
+        assert_eq!(format_usdc(0), "$0.000000");
+        assert_eq!(format_usdc(1), "$0.000001");
+        assert_eq!(format_usdc(12_345_678), "$12.345678");
+        // Whole dollars keep the trailing zeros so 1e6 × display == raw.
+        assert_eq!(format_usdc(5_000_000), "$5.000000");
     }
 
     #[test]
@@ -931,6 +971,38 @@ mod render_tests {
     }
 
     #[test]
+    fn write_top_table_renders_unredeemed_usdc_row() {
+        let s = Snapshot {
+            uptime_seconds: 312,
+            active_connections: 4,
+            dispatch_in_flight: 2,
+            cache_hits: 812,
+            cache_misses: 94,
+            cache_bytes_returned: 14_900_000,
+            unredeemed_usdc: 12_345_678,
+            rpc_healthy: true,
+        };
+        let mut buf = Vec::<u8>::new();
+        write_top_table(
+            &mut buf,
+            "http://127.0.0.1:9090",
+            &s,
+            None,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("unredeemed_usdc"),
+            "unredeemed row missing: {out}"
+        );
+        assert!(
+            out.contains("$12.345678"),
+            "unredeemed dollar value missing: {out}"
+        );
+    }
+
+    #[test]
     fn write_top_table_hit_rate_na_on_empty_cache() {
         let s = snap(0, 0, 0, 0, 0, 0, true);
         let mut buf = Vec::<u8>::new();
@@ -985,6 +1057,7 @@ mod json_tests {
             cache_hits: 812,
             cache_misses: 94,
             cache_bytes_returned: 14_900_000,
+            unredeemed_usdc: 12_345_678,
             rpc_healthy: true,
         };
         let json = render_json_snapshot(&s).unwrap();
@@ -995,6 +1068,8 @@ mod json_tests {
         assert_eq!(v["cache_bytes_returned_total"], 14_900_000);
         assert_eq!(v["dispatch_in_flight"], 2);
         assert_eq!(v["active_connections"], 4);
+        // Raw micro-USDC integer, not the dollar-formatted table value.
+        assert_eq!(v["unredeemed_usdc_micro"], 12_345_678u64);
         assert_eq!(v["rpc_healthy"], true);
         // Cumulative hit_rate emitted as a fraction in [0,1] so
         // downstream tooling does its own formatting.
@@ -1011,6 +1086,7 @@ mod json_tests {
             cache_hits: 0,
             cache_misses: 0,
             cache_bytes_returned: 0,
+            unredeemed_usdc: 0,
             rpc_healthy: false,
         };
         let json = render_json_snapshot(&s).unwrap();

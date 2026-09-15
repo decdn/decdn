@@ -166,6 +166,12 @@ pub struct DecdnMetrics {
     pub lanes_open: Gauge,
     /// Total raw USDC deposits across the pools currently paying this node.
     pub pool_deposit_usdc: Gauge,
+    /// Total raw USDC this node holds in accepted vouchers that it has not yet
+    /// redeemed on-chain — the sum of `owed − paid` across every inbound lane
+    /// the redeemer plans to collect. Refreshed once per redeemer self-tick
+    /// (`redeem_interval_secs`), not on every voucher, so it lags live accrual
+    /// by up to one interval. Operator-visible name: `decdn_unredeemed_usdc`.
+    pub unredeemed_usdc: Gauge,
     /// `cdn/client/v1` connections closed by the application-layer idle reaper
     /// (ADR 005 §Connection lifetime): no stream for `APP_IDLE_TIMEOUT` after the
     /// last one closed. A sustained rate flags peers parking streamless
@@ -1526,6 +1532,13 @@ impl Metrics {
         self.decdn.pool_deposit_usdc.set(sat_u256(deposit));
     }
 
+    /// Publish the total raw USDC held in accepted-but-unredeemed vouchers.
+    /// Called once per redeemer self-tick from the settlement sweep, so the
+    /// gauge tracks what the node plans to redeem as of the last interval.
+    pub(crate) fn set_unredeemed_usdc(&self, total: U256) {
+        self.decdn.unredeemed_usdc.set(sat_u256(total));
+    }
+
     /// Register iroh's transport metrics under the `decdn_iroh_` prefix so
     /// `magicsock_*`, `net_report_*`, etc. come out as
     /// `decdn_iroh_magicsock_*`, matching `adr/appendix-observability.md`'s naming convention.
@@ -2641,6 +2654,7 @@ mod tests {
             "decdn_streams_active{direction=\"outbound\"}",
             "decdn_lanes_open",
             "decdn_pool_deposit_usdc",
+            "decdn_unredeemed_usdc",
             "decdn_node_uptime_seconds",
         ] {
             assert!(
@@ -2653,6 +2667,28 @@ mod tests {
                 .lines()
                 .any(|line| line.starts_with("decdn_uptime_seconds ")),
             "retired uptime name must not be exported:\n{text}"
+        );
+    }
+
+    #[test]
+    fn set_unredeemed_usdc_publishes_the_total() {
+        // The redeemer sweep hands this setter the summed `owed − paid` across
+        // the node's lanes; the gauge must reflect exactly that raw value so
+        // `decdn node top` and dashboards report the pending redemption.
+        let metrics = Metrics::new();
+        metrics.set_unredeemed_usdc(U256::from(12_345u64));
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_unredeemed_usdc", 12_345),
+            "gauge must publish the set total:\n{text}"
+        );
+        // A later, smaller sweep result replaces (not accumulates) the value —
+        // a gauge, so a redemption that draws the total down is visible.
+        metrics.set_unredeemed_usdc(U256::from(42u64));
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_unredeemed_usdc", 42),
+            "gauge must overwrite on the next sweep:\n{text}"
         );
     }
 

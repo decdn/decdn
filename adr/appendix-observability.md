@@ -151,6 +151,7 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | `decdn_lanes_open` | Gauge | M | live | Currently open inbound serve lanes — distinct `(pool, signer, provider)` keys with unredeemed vouchers. |
 | `decdn_pool_redemptions_total` | Counter | M | planned | On-chain redemptions by this node. |
 | `decdn_pool_deposit_usdc` | Gauge | M | live | Total USDC deposited in pools currently paying this node. Represents maximum on-chain recoverable value. |
+| `decdn_unredeemed_usdc` | Gauge | M | live | Raw USDC in accepted vouchers this node has not redeemed on-chain. The value sums `owed − paid` over the lanes the redeemer plans to collect. The redeemer refreshes it once per self-tick, so it lags live accrual by up to one `redeem_interval_secs`. |
 | `decdn_buyer_pool_store_skipped_undecodable_records_total` | Counter | M | live | Buyer-pool rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy pools from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
 | `decdn_vouchers_signed_total` | Counter | M | planned | Vouchers signed by this node as the payee. |
 | `decdn_vouchers_received_total` | Counter | R | planned | Vouchers received by this node as the payer (node-to-node pulls). |

@@ -43,6 +43,12 @@ impl SavedManifest {
     pub(crate) fn get(&self, path: &str) -> Option<&SavedFile> {
         self.files.get(path)
     }
+
+    /// Every recorded file as `(path, record)`, in sorted path order. Lets the
+    /// pull pre-pass index the whole root's content, not just one bundle's paths.
+    pub(crate) fn records(&self) -> impl Iterator<Item = (&str, &SavedFile)> {
+        self.files.iter().map(|(p, r)| (p.as_str(), r))
+    }
 }
 
 /// One recorded file: the whole-file content address and size last materialized
@@ -269,6 +275,18 @@ mod tests {
         };
         let got = saved_hints(&rec).expect("hints");
         assert_eq!(got, vec![("b3:c0".into(), 0, 10), ("b3:c1".into(), 10, 20)]);
+    }
+
+    #[test]
+    fn records_iterates_all_saved_files() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut updates = BTreeMap::new();
+        updates.insert("g1/a.dll".to_string(), sample());
+        updates.insert("g2/a.dll".to_string(), sample());
+        merge_and_write(tmp.path(), SavedManifest::default(), updates).expect("write");
+        let loaded = load(tmp.path());
+        let paths: Vec<&str> = loaded.records().map(|(p, _)| p).collect();
+        assert_eq!(paths, vec!["g1/a.dll", "g2/a.dll"]);
     }
 
     #[test]

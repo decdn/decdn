@@ -19,6 +19,15 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 fn dry_run(input: &Path, exclude: &[&str], follow_symlinks: bool) -> Output {
+    dry_run_with_subfolder(input, exclude, follow_symlinks, None)
+}
+
+fn dry_run_with_subfolder(
+    input: &Path,
+    exclude: &[&str],
+    follow_symlinks: bool,
+    subfolder: Option<&str>,
+) -> Output {
     let mut args: Vec<String> = vec![
         "origin".into(),
         "import".into(),
@@ -32,6 +41,10 @@ fn dry_run(input: &Path, exclude: &[&str], follow_symlinks: bool) -> Output {
     }
     if follow_symlinks {
         args.push("--follow-symlinks".into());
+    }
+    if let Some(sub) = subfolder {
+        args.push("--subfolder".into());
+        args.push(sub.into());
     }
     Command::new(env!("CARGO_BIN_EXE_decdn"))
         .args(&args)
@@ -247,6 +260,99 @@ fn entries_are_sorted_by_posix_path_bytes() {
         .map(|e| e["path"].as_str().unwrap())
         .collect();
     assert_eq!(paths, vec!["a/b.txt", "a/c.txt", "b.txt"]);
+}
+
+// `--subfolder` prefixes every manifest entry's path (and keeps them sorted),
+// so a bundle pull lands the whole tree under that one directory.
+#[test]
+fn subfolder_prefixes_every_entry_path() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    write_files(
+        &src,
+        &[("index.html", b"x"), ("a/b.txt", b"y"), ("a/c.txt", b"z")],
+    );
+
+    let out = dry_run_with_subfolder(&src, &[], false, Some("release"));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let manifest = read_manifest(&out.stdout);
+    let paths: Vec<&str> = manifest["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["release/a/b.txt", "release/a/c.txt", "release/index.html"]
+    );
+}
+
+// A trailing slash and a nested subfolder both normalize to a clean relative
+// POSIX prefix (`a/b`), matching the manifest path-safety rules.
+#[test]
+fn subfolder_nested_and_trailing_slash_normalize() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    write_files(&src, &[("f.txt", b"x")]);
+
+    let out = dry_run_with_subfolder(&src, &[], false, Some("a/b/"));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let manifest = read_manifest(&out.stdout);
+    assert_eq!(
+        manifest["entries"][0]["path"].as_str().unwrap(),
+        "a/b/f.txt"
+    );
+}
+
+// A `..` subfolder is rejected before any walk — the prefix must be a relative
+// POSIX path so the manifest stays re-validatable and a pull cannot escape its
+// output root.
+#[test]
+fn subfolder_parent_dir_component_rejected() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    write_files(&src, &[("f.txt", b"x")]);
+
+    let out = dry_run_with_subfolder(&src, &[], false, Some("../evil"));
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--subfolder") && stderr.contains("parent-dir"),
+        "expected subfolder rejection, got: {stderr}"
+    );
+}
+
+// A backslash in the subfolder is rejected regardless of platform: `\` is not
+// a POSIX separator, so on Unix `a\..\evil` would collapse to one component and
+// slip past the `..` check, yet a Windows pull would read it as an escaping
+// path. Requiring `/` keeps the published manifest identical everywhere.
+#[test]
+fn subfolder_backslash_rejected() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    write_files(&src, &[("f.txt", b"x")]);
+
+    let out = dry_run_with_subfolder(&src, &[], false, Some("a\\..\\evil"));
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--subfolder") && stderr.contains("separator"),
+        "expected backslash rejection, got: {stderr}"
+    );
 }
 
 #[test]
