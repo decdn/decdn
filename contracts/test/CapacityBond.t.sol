@@ -2034,8 +2034,8 @@ contract CapacityBondTest is Test {
         // unbondingPeriod*1e6 (7 days*1e6), so the wire-time invariant guard passes.
         MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(uint256(5 days) * 1_000_000);
         vm.prank(admin);
-        vm.expectEmit(true, true, false, false, address(bond));
-        emit CapacityBond.SlashJudgeUpdated(address(0), address(judge));
+        vm.expectEmit(true, false, false, false, address(bond));
+        emit CapacityBond.SlashJudgeWired(address(judge));
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
         assertEq(address(bond.slashJudge()), address(judge));
     }
@@ -2063,19 +2063,20 @@ contract CapacityBondTest is Test {
         assertEq(address(bond.slashJudge()), address(okJudge));
     }
 
-    function test_setSlashJudge_rewireEmitsPreviousJudgeAsOld() public {
-        // Re-wiring a second judge must emit the FIRST judge as `old` (not address(0)).
-        // Both maxEvidenceAgeUs values (4d, 5d *1e6) are strictly below the bond's
-        // unbondingPeriod*1e6 (7 days*1e6), so both wires satisfy the invariant.
+    function test_setSlashJudge_revertsOnSecondWire() public {
+        // The judge is set once at deploy wiring, then fixed. A second call must
+        // revert, so a captured governance cannot swap in a malicious judge. Both
+        // maxEvidenceAgeUs values (4d, 5d *1e6) are strictly below the bond's
+        // unbondingPeriod*1e6 (7 days*1e6), so the first wire satisfies the invariant.
         MockSlashJudgeEvidence first = new MockSlashJudgeEvidence(uint256(4 days) * 1_000_000);
         MockSlashJudgeEvidence second = new MockSlashJudgeEvidence(uint256(5 days) * 1_000_000);
         vm.startPrank(admin);
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(first)));
-        vm.expectEmit(true, true, false, false, address(bond));
-        emit CapacityBond.SlashJudgeUpdated(address(first), address(second));
+        vm.expectRevert(CapacityBond.SlashJudgeAlreadySet.selector);
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(second)));
         vm.stopPrank();
-        assertEq(address(bond.slashJudge()), address(second));
+        // The first judge stays wired.
+        assertEq(address(bond.slashJudge()), address(first));
     }
 
     // -----------------------------------------------------------------
