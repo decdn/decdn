@@ -280,6 +280,20 @@ async fn resolve_disk_state(
     // no-download link, verified by re-hash at the use site) and a chunk donor
     // (spliced under the existing per-chunk re-hash guard). This is what lets a
     // file shared across bundles at different paths be reused.
+    //
+    // A path this run will overwrite (an in-scope entry not already in
+    // `state.skip`) is excluded from `whole_file` only: its bytes can be
+    // atomically replaced by its own group between the whole-file link's
+    // re-hash and its link/copy (TOCTOU), which would silently corrupt the
+    // link's destination with no post-link verification to catch it. Chunk
+    // donors from the same record stay in `state.seed` — a spliced range is
+    // always covered by the final whole-file re-verification, so the race
+    // there is harmless.
+    let will_write: HashSet<&str> = entries
+        .iter()
+        .map(|e| e.path.as_str())
+        .filter(|p| !state.skip.contains(*p))
+        .collect();
     for (path, rec) in saved.records() {
         let Ok(src) = safe_join(out_root, path) else {
             continue;
@@ -293,7 +307,9 @@ async fn resolve_disk_state(
         if !meta.is_file() {
             continue; // symlink / non-regular → never a donor
         }
-        if let Ok(h) = fetch::parse_hash(&rec.hash) {
+        if !will_write.contains(path)
+            && let Ok(h) = fetch::parse_hash(&rec.hash)
+        {
             state.whole_file.entry(h).or_insert_with(|| src.clone());
         }
         if let Some(hints) = bundle_manifest::saved_hints(rec) {
@@ -598,8 +614,10 @@ enum EntryOutcome {
 ///
 /// `deduped` and `reused_bytes` report the whole-file dedup outcome: `deduped` is
 /// the count of destinations materialized from an on-disk whole-file donor
-/// (verified by re-hash before use), and `reused_bytes` is the bytes those
-/// destinations contributed to `reconstructed` with no download and no payment.
+/// (verified by re-hash before use), and `reused_bytes` sums, once per such
+/// destination, the reused blob's size — bytes served from disk with no
+/// download and no payment — so unlike `downloaded` it is not deduped per
+/// distinct blob.
 ///
 /// `spliced_bytes` and `hints_ignored` report the range-dedup outcome so a run
 /// whose hints saved bytes is distinguishable from one whose hints did not:
@@ -4312,6 +4330,54 @@ mod tests {
         assert_eq!(
             st.whole_file.get(&want),
             Some(&tmp.path().join("game1/lib/dup.dll"))
+        );
+    }
+
+    /// A saved record whose path IS an in-scope current-bundle entry that will be
+    /// WRITTEN this run (its content changed, so it is not in `state.skip`) is
+    /// excluded from `whole_file`: another entry's group could atomically replace
+    /// its bytes between the whole-file link's re-hash and its link/copy (TOCTOU),
+    /// so it must never be indexed as a whole-file donor — even though its bytes
+    /// are still a valid CHUNK donor (covered by the final whole-file
+    /// re-verification) and stay seeded.
+    #[tokio::test]
+    async fn resolve_disk_state_excludes_will_write_path_from_whole_file_index() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_body = vec![9u8; 32];
+        std::fs::write(tmp.path().join("changed.bin"), &old_body).expect("write old");
+        let old_hash = format!("b3:{}", blake3::hash(&old_body).to_hex());
+        let old_entries = vec![ManifestEntry {
+            path: "changed.bin".into(),
+            hash: old_hash.clone(),
+            size: Some(32),
+            chunks: None,
+        }];
+        let updates = build_saved_updates(&old_entries, &[EntryOutcome::Fetched(32)], tmp.path());
+        bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
+            .expect("write saved");
+        let saved = bundle_manifest::load(tmp.path());
+
+        // The new manifest wants DIFFERENT content at the SAME path: this entry
+        // is in scope and will be written (not skipped), so its saved record's
+        // hash must not become a whole-file donor.
+        let new_hash = format!("b3:{}", blake3::hash(&[1u8; 32]).to_hex());
+        let new_entries = vec![ManifestEntry {
+            path: "changed.bin".into(),
+            hash: new_hash,
+            size: Some(32),
+            chunks: None,
+        }];
+
+        let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
+        assert!(
+            !st.skip.contains("changed.bin"),
+            "changed content must fetch"
+        );
+        let old_want = fetch::parse_hash(&old_hash).expect("hash");
+        assert_eq!(
+            st.whole_file.get(&old_want),
+            None,
+            "a will-write path must never be indexed as a whole-file donor"
         );
     }
 
