@@ -77,11 +77,13 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                          Pausable target,
 ///                                          router-caller → PaymentPool,
 ///                                          SLASH_ROLE → SlashJudge) plus the
-///                                          deployer-only
+///                                          `GOVERNANCE_ROLE`-gated
 ///                                          `CapacityBond.setSlashJudge`
-///                                          setter that MUST run before the
-///                                          GOVERNANCE_ROLE handoff because it
-///                                          becomes Timelock-gated post-handoff.
+///                                          setter, run here while the deployer
+///                                          still holds `GOVERNANCE_ROLE` so it
+///                                          skips the Timelock delay it would
+///                                          otherwise incur post-handoff (it
+///                                          stays callable by governance then).
 ///           5. `_handOffGovernance`      — grant-before-revoke loop over every
 ///                                          target for both GOVERNANCE_ROLE and
 ///                                          DEFAULT_ADMIN_ROLE, then renounce the
