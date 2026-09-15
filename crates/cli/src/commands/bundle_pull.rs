@@ -612,12 +612,12 @@ enum EntryOutcome {
 /// blob's whole size even when range-dedup paid for only its complement — so it
 /// equals `reconstructed` per single-path blob and does not report chunk savings.
 ///
-/// `deduped` and `reused_bytes` report the whole-file dedup outcome: `deduped` is
-/// the count of destinations materialized from an on-disk whole-file donor
-/// (verified by re-hash before use), and `reused_bytes` sums, once per such
-/// destination, the reused blob's size — bytes served from disk with no
-/// download and no payment — so unlike `downloaded` it is not deduped per
-/// distinct blob.
+/// `deduped` and `reused_bytes` report the whole-file dedup outcome, counted per
+/// distinct blob exactly as `fetched`/`downloaded` are (a blob reused at several
+/// paths counts once here; its extra destinations are `linked`): `deduped` is the
+/// count of distinct blobs materialized from an on-disk whole-file donor (verified
+/// by re-hash before use), and `reused_bytes` sums those blobs' sizes once each —
+/// bytes served from disk with no download and no payment.
 ///
 /// `spliced_bytes` and `hints_ignored` report the range-dedup outcome so a run
 /// whose hints saved bytes is distinguishable from one whose hints did not:
@@ -638,9 +638,11 @@ struct PullReport {
     reconstructed: u64,
     spliced_bytes: u64,
     hints_ignored: u64,
-    /// Count of destinations materialized from an on-disk whole-file donor.
+    /// Count of distinct blobs materialized from an on-disk whole-file donor;
+    /// extra destinations of the same blob are counted in `linked`.
     deduped: u64,
-    /// Bytes materialized from a whole-file donor with no download.
+    /// Sum of those blobs' sizes (once per blob) — bytes materialized from a
+    /// whole-file donor with no download or payment.
     reused_bytes: u64,
 }
 
@@ -3004,7 +3006,7 @@ fn report(
         // materialized any destination from an on-disk donor instead of fetching.
         if deduped > 0 {
             println!(
-                "whole-file dedup: reused {} from disk ({deduped} destination(s))",
+                "whole-file dedup: reused {} from disk ({deduped} file(s))",
                 human_bytes(reused_bytes)
             );
         }
