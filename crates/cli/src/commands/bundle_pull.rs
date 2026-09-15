@@ -3983,6 +3983,83 @@ mod tests {
         assert!(st.skip.contains("a.txt"));
     }
 
+    /// The fast path skips WITHOUT re-hashing when a saved record's hash, size,
+    /// and mtime all match the on-disk file — the file's bytes are never read.
+    /// Proven by planting bytes that do NOT hash to the recorded hash: a re-hash
+    /// would mismatch and fetch, so a skip can only mean the record was trusted.
+    #[tokio::test]
+    async fn resolve_disk_state_fast_skips_on_matching_record_without_rehash() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // On-disk bytes deliberately do not hash to the claimed hash below.
+        let body = b"actual on-disk bytes";
+        std::fs::write(tmp.path().join("a.txt"), body).expect("write");
+        let meta = std::fs::metadata(tmp.path().join("a.txt")).expect("meta");
+        let size = u64::try_from(body.len()).expect("len");
+        let mtime = SavedMtime::of(&meta).expect("mtime");
+        // A hash the on-disk bytes provably do not produce.
+        let claimed =
+            "b3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "a.txt".to_string(),
+            bundle_manifest::SavedFile {
+                hash: claimed.clone(),
+                size,
+                mtime,
+                chunks: None,
+            },
+        );
+        bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
+            .expect("write saved manifest");
+        let saved = bundle_manifest::load(tmp.path());
+        let entries = vec![ManifestEntry {
+            path: "a.txt".into(),
+            hash: claimed, // equals the saved record's hash → fast-skip candidate
+            size: Some(size),
+            chunks: None,
+        }];
+        let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
+        // Skipped on the record alone; a re-hash of the (non-matching) bytes would fetch.
+        assert!(st.skip.contains("a.txt"));
+    }
+
+    /// A file whose mtime drifted but whose content is unchanged is NOT
+    /// re-fetched: the fast path misses (recorded mtime differs), and the re-hash
+    /// gate then confirms the on-disk bytes against the new manifest hash and
+    /// skips. This is the "touched but identical" case.
+    #[tokio::test]
+    async fn resolve_disk_state_rehash_confirms_touched_but_identical_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let body = b"unchanged content";
+        std::fs::write(tmp.path().join("a.txt"), body).expect("write");
+        let real = format!("b3:{}", blake3::hash(body).to_hex());
+        let size = u64::try_from(body.len()).expect("len");
+        // Right hash + size, but a stale (1970) mtime → the fast path misses.
+        let stale = SavedMtime { secs: 1, nanos: 0 };
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "a.txt".to_string(),
+            bundle_manifest::SavedFile {
+                hash: real.clone(),
+                size,
+                mtime: stale,
+                chunks: None,
+            },
+        );
+        bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
+            .expect("write saved manifest");
+        let saved = bundle_manifest::load(tmp.path());
+        let entries = vec![ManifestEntry {
+            path: "a.txt".into(),
+            hash: real,
+            size: Some(size),
+            chunks: None,
+        }];
+        let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
+        // Re-hash confirmed the content is identical → skip, no re-fetch.
+        assert!(st.skip.contains("a.txt"));
+    }
+
     /// A changed file (content no longer matches the new manifest hash) is never
     /// skipped, whether or not a saved record exists for it.
     #[tokio::test]
