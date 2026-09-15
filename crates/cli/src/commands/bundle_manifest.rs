@@ -30,7 +30,7 @@ const SAVED_MANIFEST_VERSION: u32 = 1;
 /// The local skip-cache: an index of the bundle files known to live under one
 /// output root, keyed by bundle-relative POSIX path. Ordered (`BTreeMap`) so the
 /// serialized form is deterministic across runs.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct SavedManifest {
     /// On-disk schema version; see [`SAVED_MANIFEST_VERSION`].
     version: u32,
@@ -128,26 +128,53 @@ pub(crate) fn load(out_root: &Path) -> SavedManifest {
     }
 }
 
-/// Overlay `updates` onto `prior` (insert-or-replace per path, untouched paths
-/// kept) and write the result atomically to `out_root`'s skip-cache.
-pub(crate) fn merge_and_write(
-    out_root: &Path,
-    mut prior: SavedManifest,
-    updates: BTreeMap<String, SavedFile>,
-) -> anyhow::Result<()> {
-    prior.version = SAVED_MANIFEST_VERSION;
+/// Overlay `updates` onto `manifest` in place: insert-or-replace per path, keep
+/// untouched paths, and stamp the current schema version. Pairs with
+/// [`serialize`] + [`write_bytes`] so a long pull can fold each batch of landed
+/// files into one in-memory manifest and flush it repeatedly.
+pub(crate) fn merge(manifest: &mut SavedManifest, updates: BTreeMap<String, SavedFile>) {
+    manifest.version = SAVED_MANIFEST_VERSION;
     for (path, rec) in updates {
-        prior.files.insert(path, rec);
+        manifest.files.insert(path, rec);
     }
-    let bytes = serde_json::to_vec_pretty(&prior).context("serialize saved manifest")?;
+}
+
+/// Serialize `manifest` to the on-disk JSON bytes. Split from [`write_bytes`] so
+/// the (fast, in-memory) serialize runs on the async caller and the blocking
+/// filesystem write can be handed to a blocking task with the owned bytes.
+pub(crate) fn serialize(manifest: &SavedManifest) -> anyhow::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(manifest).context("serialize saved manifest")
+}
+
+/// Write pre-serialized skip-cache `bytes` atomically to `out_root`'s cache file
+/// (temp file in the same directory, `sync_all`, then rename). Blocking I/O: call
+/// it from a blocking context. Owning `bytes` (not a borrowed manifest) is what
+/// lets an incremental flush move the write off the async executor.
+pub(crate) fn write_bytes(out_root: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let dest = out_root.join(SAVED_MANIFEST_NAME);
     let mut tmp = super::fetch::temp_in_parent(&dest).context("stage saved manifest")?;
-    std::io::Write::write_all(tmp.as_file_mut(), &bytes).context("write saved manifest")?;
+    std::io::Write::write_all(tmp.as_file_mut(), bytes).context("write saved manifest")?;
     tmp.as_file().sync_all().context("sync saved manifest")?;
     tmp.persist(&dest)
         .map_err(|e| e.error)
         .context("persist saved manifest")?;
     Ok(())
+}
+
+/// Overlay `updates` onto `prior` (insert-or-replace per path, untouched paths
+/// kept) and write the result atomically to `out_root`'s skip-cache — the
+/// one-shot convenience over [`merge`] + [`serialize`] + [`write_bytes`]. A test
+/// helper: the pull path folds and flushes incrementally through the granular
+/// functions instead.
+#[cfg(test)]
+pub(crate) fn merge_and_write(
+    out_root: &Path,
+    mut prior: SavedManifest,
+    updates: BTreeMap<String, SavedFile>,
+) -> anyhow::Result<()> {
+    merge(&mut prior, updates);
+    let bytes = serialize(&prior)?;
+    write_bytes(out_root, &bytes)
 }
 
 #[cfg(test)]

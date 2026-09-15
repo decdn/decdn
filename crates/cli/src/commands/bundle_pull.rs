@@ -26,7 +26,14 @@
 //! regardless of which provider an entry is bound for.
 //!
 //! **Incremental re-runs.** A run reads `<out_root>/.decdn-manifest.json`
-//! before fetching and writes a merged copy back after. An in-scope path is
+//! before fetching and folds each completed file's record back into it as the
+//! pull progresses — rewriting the merged cache atomically whenever a batch of
+//! files or a gigabyte of new bytes has landed, and once more when the pull
+//! ends. An interrupted pull therefore leaves the files it already landed
+//! recorded, so the next run skips them rather than re-hashing the whole tree.
+//! Only a file that completed successfully this run is recorded; a still-in-flight
+//! or not-yet-fetched entry is never written from bytes this run has not landed.
+//! An in-scope path is
 //! skipped when the saved record's hash, size, and mtime match the new
 //! manifest. A path with no matching saved record is still skipped when
 //! re-hashing its on-disk bytes matches the new manifest hash. A path whose
@@ -915,22 +922,16 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     ctx.progress = PullProgress::new(args.json, total_content_bytes(&manifest.entries));
 
     // Loaded once for the whole run: the pre-pass skip decisions above consult it,
-    // and a later write reuses this same binding (never a second load).
+    // and it seeds the incremental skip-cache flush inside `pull_all` — a run's
+    // completed files are folded onto this prior and rewritten as the pull
+    // progresses, so an interrupted pull leaves the files it landed recorded
+    // rather than losing the whole index. The skip-cache is advisory, so a flush
+    // failure is logged (inside the flush) and never fails the pull.
     let saved = bundle_manifest::load(&args.output);
     let (outcomes, transfer) = ctx
-        .pull_all(&manifest.entries, &args.output, args.overwrite, &saved)
+        .pull_all(&manifest.entries, &args.output, args.overwrite, saved)
         .await;
     ctx.progress.finish();
-
-    // Persist the skip-cache: prior state merged with what this run landed. A
-    // write failure is non-fatal (the cache is advisory) — log and continue.
-    let updates = build_saved_updates(&manifest.entries, &outcomes, &args.output);
-    if let Err(e) = bundle_manifest::merge_and_write(&args.output, saved, updates) {
-        tracing::warn!(
-            "failed to write {}: {e}",
-            bundle_manifest::SAVED_MANIFEST_NAME
-        );
-    }
 
     // Every entry has joined, so the shared dedup counters are now stable.
     let dedup = DedupSummary {
@@ -1622,7 +1623,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         entries: &[ManifestEntry],
         out_root: &Path,
         overwrite: bool,
-        saved: &SavedManifest,
+        saved: SavedManifest,
     ) -> (Vec<EntryOutcome>, Transfer) {
         // Every entry declares an authoritative whole-file `hash`, so the by-hash
         // grouping path (fetch-once + link-duplicates, #1306) covers plain and
@@ -1633,12 +1634,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // Pre-pass: classify every entry against the output tree and the saved
         // skip-cache before any fetch, so an updated file at an already-present
         // path is written rather than silently skipped.
-        let disk = resolve_disk_state(entries, saved, out_root, overwrite).await;
+        let disk = resolve_disk_state(entries, &saved, out_root, overwrite).await;
         for d in &disk.seed {
             index.seed_disk(d.hash, &d.source, d.offset, d.len);
         }
+        // `saved` moves on to seed the incremental skip-cache flush: each
+        // completed group's records fold onto it and rewrite the cache as the
+        // pull progresses.
         let (outcomes, transfer) = self
-            .pull_plain(&refs, out_root, overwrite, &index, &disk)
+            .pull_plain(&refs, out_root, overwrite, &index, &disk, saved)
             .await;
 
         // A donor entry's finalized staging blob is the source a recipient splices
@@ -1670,15 +1674,80 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         overwrite: bool,
         index: &ChunkIndex,
         disk: &DiskState,
+        saved: SavedManifest,
     ) -> (Vec<EntryOutcome>, Transfer) {
         let groups_by_hash = group_by_hash(entries);
         let group_count = groups_by_hash.len().max(1);
-        let groups: Vec<Vec<EntryOutcome>> = futures_util::stream::iter(groups_by_hash)
-            .map(|group| self.fetch_group(group, out_root, overwrite, index, disk))
-            // Live-bar fan-out bounded by --jobs; the global gate is the real in-flight-fetch cap.
-            .buffer_unordered(self.jobs.min(group_count))
-            .collect::<Vec<Vec<EntryOutcome>>>()
-            .await;
+        // Completed groups' skip-cache records flow to the flush task over this
+        // channel. Unbounded so a `send` from the fetch-driving side never blocks
+        // (the flush write must never stall a fetch); the messages are one small
+        // batch per completed group, so the channel stays shallow.
+        let (flush_tx, flush_rx) = tokio::sync::mpsc::unbounded_channel::<FlushBatch>();
+
+        // The fetch-driving side: run every group through `fetch_group` bounded by
+        // `--jobs`, and as each completes, forward its recordable files (built here
+        // while the group's entries are in scope) to the flush task and keep the
+        // outcomes for the run summary.
+        let drive = async {
+            let mut stream = futures_util::stream::iter(groups_by_hash)
+                .map(|group| {
+                    // Cheap clone of the group's entry refs so `fetch_group` can
+                    // consume `group` while we still correlate outcomes to entries.
+                    let group_entries: Vec<&ManifestEntry> = group.entries.clone();
+                    async move {
+                        let outcomes = self
+                            .fetch_group(group, out_root, overwrite, index, disk)
+                            .await;
+                        // `fetch_group` returns one outcome per entry, in order;
+                        // `build_completed_updates` relies on that to correlate a
+                        // path to its outcome by position. Assert the invariant for
+                        // completed groups so a future divergence is caught in
+                        // debug builds rather than silently truncating the zip.
+                        debug_assert_eq!(
+                            group_entries.len(),
+                            outcomes.len(),
+                            "fetch_group must return one outcome per entry"
+                        );
+                        let updates = build_completed_updates(&group_entries, &outcomes, out_root);
+                        (outcomes, updates)
+                    }
+                })
+                // Live-bar fan-out bounded by --jobs; the global gate is the real in-flight-fetch cap.
+                .buffer_unordered(self.jobs.min(group_count));
+            let mut groups: Vec<Vec<EntryOutcome>> = Vec::new();
+            while let Some((outcomes, updates)) = stream.next().await {
+                if !updates.is_empty() {
+                    // Newly-fetched content bytes drive the byte-cadence flush; a
+                    // link/skip records a file but lands no new bytes.
+                    let fetched_bytes = outcomes
+                        .iter()
+                        .map(|o| match o {
+                            EntryOutcome::Fetched(n) => *n,
+                            _ => 0,
+                        })
+                        .sum();
+                    // Unbounded send: fails only if the flush task is gone, which
+                    // never happens before `drive` drops `flush_tx` below.
+                    let _ = flush_tx.send(FlushBatch {
+                        updates,
+                        fetched_bytes,
+                    });
+                }
+                groups.push(outcomes);
+            }
+            // Closing the channel tells the flush task to do its final write.
+            drop(flush_tx);
+            groups
+        };
+
+        // The flush task: fold each batch onto the prior skip-cache and rewrite it
+        // atomically at the cadence, plus a final write when the channel closes.
+        // Running here (joined, not awaited inside `drive`) keeps the blocking
+        // write off the fetch-driving path — `join!` keeps polling `drive` while
+        // this side awaits its write.
+        let flush = flush_task(out_root, saved, flush_rx);
+
+        let (groups, ()) = tokio::join!(drive, flush);
         // Byte tally is per-group (a blob pulled once, materialized to N paths),
         // so sum it before flattening away the group boundaries.
         let transfer = groups
@@ -2805,70 +2874,160 @@ fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     Ok(out)
 }
 
-/// Build the saved-manifest updates for this run from the FINAL on-disk state:
-/// every in-scope entry whose output file is present AND whose fetch this run
-/// did not fail contributes a record built from the new manifest entry plus the
-/// file's observed size and mtime. Presence alone is not proof of freshness — a
-/// FAILED fetch leaves the file exactly as it was before this run (materialize
-/// only renames the new content into place on success), so a present-but-failed
-/// entry is skipped rather than recorded: recording it would pair the *new*
-/// manifest hash with the *old* file's bytes, and a later run's mtime/hash fast
-/// path would then wrongly treat that stale file as up to date and never
-/// re-fetch it. Omitting it instead leaves any prior record (or no record) in
-/// place, which always forces a re-check next run. Excluded paths are not in
-/// `entries`, so they are never recorded.
-fn build_saved_updates(
-    entries: &[ManifestEntry],
+/// The skip-cache record for one entry, built from its FINAL on-disk state, or
+/// `None` when this run has nothing safe to record for it. A record is produced
+/// only when a regular file is present at the entry's path with a usable mtime —
+/// the gates that keep a symlink, a non-regular file, a missing file, or an
+/// unreadable mtime out of the later fast-skip path. `materialize` renames new
+/// content into place only on success, so a present regular file at the path is
+/// this run's landed bytes; pairing the entry's hash with them is sound.
+fn record_one(out_root: &Path, en: &ManifestEntry) -> Option<bundle_manifest::SavedFile> {
+    let dest = safe_join(out_root, &en.path).ok()?;
+    // `symlink_metadata` does not follow links: only a regular file this run
+    // landed is recorded, so a symlink or non-regular file at `dest` is never
+    // written into the skip-cache (its later fast-skip would trust a target
+    // this run never verified).
+    let meta = std::fs::symlink_metadata(&dest).ok()?;
+    if !meta.is_file() {
+        return None; // only record regular files
+    }
+    let mtime = SavedMtime::of(&meta)?; // no usable mtime → omit the unverifiable gate
+    let chunks = en.chunks.as_ref().map(|cs| {
+        cs.iter()
+            .map(|c| bundle_manifest::SavedChunk {
+                hash: c.hash.clone(),
+                size: c.size,
+            })
+            .collect()
+    });
+    Some(bundle_manifest::SavedFile {
+        hash: en.hash.clone(),
+        size: meta.len(),
+        mtime,
+        chunks,
+    })
+}
+
+/// Build the skip-cache updates for a batch of `entries` paired with THIS run's
+/// `outcomes` for them, in order — `fetch_group` returns one outcome per entry,
+/// in order, so position correlates a path to its outcome. Only an entry whose
+/// outcome is a success this run (`Fetched`, `Linked`, or `Skipped`) is
+/// eligible; a `Failed` entry is omitted, because its fetch left the OLD bytes in
+/// place (materialize renames new content only on success) and pairing the *new*
+/// manifest hash with them would let a later mtime/hash fast path wrongly treat
+/// the stale file as up to date and never re-fetch it.
+///
+/// Correlating by position — rather than "every entry not in the failed set" —
+/// is what makes this safe to call MID-RUN: an entry whose group has not
+/// completed yet is simply absent from `outcomes`, so it is never recorded from
+/// bytes this run has not landed. A batch may be one completed group or the whole
+/// run's outcomes; the result is the same records either way.
+fn build_completed_updates(
+    entries: &[&ManifestEntry],
     outcomes: &[EntryOutcome],
     out_root: &Path,
 ) -> BTreeMap<String, bundle_manifest::SavedFile> {
-    let failed: HashSet<&str> = outcomes
-        .iter()
-        .filter_map(|o| match o {
-            EntryOutcome::Failed { path, .. } => Some(path.as_str()),
-            _ => None,
-        })
-        .collect();
     let mut updates = BTreeMap::new();
-    for en in entries {
-        if failed.contains(en.path.as_str()) {
-            continue; // this run left the old bytes in place — never record
-        }
-        let Ok(dest) = safe_join(out_root, &en.path) else {
-            continue;
-        };
-        // `symlink_metadata` does not follow links: only a regular file this run
-        // landed is recorded, so a symlink or non-regular file at `dest` is never
-        // written into the skip-cache (its later fast-skip would trust a target
-        // this run never verified).
-        let Ok(meta) = std::fs::symlink_metadata(&dest) else {
-            continue; // absent → this run did not land it
-        };
-        if !meta.is_file() {
-            continue; // only record regular files
-        }
-        let Some(mtime) = SavedMtime::of(&meta) else {
-            continue; // no usable mtime → omit rather than record an unverifiable gate
-        };
-        let chunks = en.chunks.as_ref().map(|cs| {
-            cs.iter()
-                .map(|c| bundle_manifest::SavedChunk {
-                    hash: c.hash.clone(),
-                    size: c.size,
-                })
-                .collect()
-        });
-        updates.insert(
-            en.path.clone(),
-            bundle_manifest::SavedFile {
-                hash: en.hash.clone(),
-                size: meta.len(),
-                mtime,
-                chunks,
-            },
+    for (en, outcome) in entries.iter().zip(outcomes) {
+        let recordable = matches!(
+            outcome,
+            EntryOutcome::Fetched(_) | EntryOutcome::Linked | EntryOutcome::Skipped
         );
+        if recordable && let Some(rec) = record_one(out_root, en) {
+            updates.insert(en.path.clone(), rec);
+        }
     }
     updates
+}
+
+/// Completed files may accumulate up to this many before the skip-cache is
+/// rewritten, bounding how much a later run re-hashes to recover after an
+/// interruption (and how often a many-file pull rewrites the cache).
+const FLUSH_FILES: usize = 64;
+/// Newly-fetched bytes may land up to this many before the skip-cache is
+/// rewritten, so a long single-file transfer still checkpoints its completed
+/// siblings without waiting for [`FLUSH_FILES`].
+const FLUSH_BYTES: u64 = 1 << 30; // 1 GiB
+
+/// One completed group's contribution to the skip-cache flush: the records to
+/// fold in, and the new content bytes it fetched (which drive the byte cadence —
+/// a link or skip records a file but lands no new bytes).
+struct FlushBatch {
+    updates: BTreeMap<String, bundle_manifest::SavedFile>,
+    fetched_bytes: u64,
+}
+
+/// Fold each completed-group [`FlushBatch`] onto `acc` and rewrite the skip-cache
+/// atomically whenever ≥[`FLUSH_FILES`] files or ≥[`FLUSH_BYTES`] new bytes have
+/// accumulated since the last write, plus one final write when the channel closes
+/// so the last partial batch is always persisted. This is the sole writer of the
+/// skip-cache for the run: a single consumer, so its rewrites never race.
+///
+/// The skip-cache is advisory — a flush failure is logged and never propagated.
+/// The blocking filesystem write runs on a blocking task with owned bytes, so the
+/// caller's `join!` keeps driving fetches while a flush is in flight.
+async fn flush_task(
+    out_root: &Path,
+    mut acc: SavedManifest,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<FlushBatch>,
+) {
+    let mut files_since = 0usize;
+    let mut bytes_since = 0u64;
+    let mut dirty = false;
+    while let Some(batch) = rx.recv().await {
+        files_since += batch.updates.len();
+        bytes_since = bytes_since.saturating_add(batch.fetched_bytes);
+        bundle_manifest::merge(&mut acc, batch.updates);
+        dirty = true;
+        if (files_since >= FLUSH_FILES || bytes_since >= FLUSH_BYTES)
+            && flush_now(out_root, &acc).await
+        {
+            // Only clear on a successful write. A failed cadence flush keeps
+            // `dirty` set and the counters over threshold, so the next batch
+            // retries and the final write below still runs at close — the last
+            // accumulated updates are never dropped by a transient write error.
+            files_since = 0;
+            bytes_since = 0;
+            dirty = false;
+        }
+    }
+    // Persist whatever landed since the last successful flush (or the only batch of
+    // a small run). `dirty` stays false only when the last cadence flush already
+    // wrote everything, so a clean run adds no redundant final write.
+    if dirty {
+        flush_now(out_root, &acc).await;
+    }
+}
+
+/// Serialize `acc` (fast, in-memory) and write it atomically on a blocking task.
+/// Returns whether the write succeeded so the caller can retry a failed cadence
+/// flush at close. Advisory: every failure is logged, never returned as an error.
+async fn flush_now(out_root: &Path, acc: &SavedManifest) -> bool {
+    let bytes = match bundle_manifest::serialize(acc) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                "failed to serialize {}: {e}",
+                bundle_manifest::SAVED_MANIFEST_NAME
+            );
+            return false;
+        }
+    };
+    let root = out_root.to_path_buf();
+    match tokio::task::spawn_blocking(move || bundle_manifest::write_bytes(&root, &bytes)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "failed to write {}: {e}",
+                bundle_manifest::SAVED_MANIFEST_NAME
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("skip-cache flush task panicked: {e}");
+            false
+        }
+    }
 }
 
 /// Report an empty would-fetch set. `by_filter` is true only when a non-empty
@@ -3116,13 +3275,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_saved_updates_records_present_omits_failed() {
+    fn build_completed_updates_records_present_omits_failed() {
         let tmp = tempfile::tempdir().expect("tmp");
         std::fs::write(tmp.path().join("ok.txt"), b"data").expect("write");
         // "bad.txt" has an OLD file present on disk (this run's fetch failed and
         // left it untouched) — it must never be recorded with the NEW hash.
         std::fs::write(tmp.path().join("bad.txt"), b"old-bytes").expect("write");
-        let entries = vec![
+        let entries = [
             ManifestEntry {
                 path: "ok.txt".into(),
                 hash: "b3:aa".into(),
@@ -3146,7 +3305,8 @@ mod tests {
                 err: "nope".into(),
             },
         ];
-        let upd = build_saved_updates(&entries, &outcomes, tmp.path());
+        let refs: Vec<&ManifestEntry> = entries.iter().collect();
+        let upd = build_completed_updates(&refs, &outcomes, tmp.path());
         assert!(upd.contains_key("ok.txt"));
         let rec = upd.get("ok.txt").expect("rec");
         assert_eq!(rec.hash, "b3:aa");
@@ -3154,6 +3314,168 @@ mod tests {
         assert!(rec.chunks.is_some());
         // Failed → omitted even though the (stale) file is present on disk.
         assert!(!upd.contains_key("bad.txt"));
+    }
+
+    #[test]
+    fn build_completed_updates_records_linked_and_skipped() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        std::fs::write(tmp.path().join("linked.txt"), b"aa").expect("write");
+        std::fs::write(tmp.path().join("skipped.txt"), b"bbbb").expect("write");
+        let entries = [
+            ManifestEntry {
+                path: "linked.txt".into(),
+                hash: "b3:l".into(),
+                size: Some(2),
+                chunks: None,
+            },
+            ManifestEntry {
+                path: "skipped.txt".into(),
+                hash: "b3:s".into(),
+                size: Some(4),
+                chunks: None,
+            },
+        ];
+        let outcomes = vec![EntryOutcome::Linked, EntryOutcome::Skipped];
+        let refs: Vec<&ManifestEntry> = entries.iter().collect();
+        let upd = build_completed_updates(&refs, &outcomes, tmp.path());
+        // Both are successes this run and present on disk → both recorded.
+        assert_eq!(upd.get("linked.txt").expect("linked").hash, "b3:l");
+        assert_eq!(upd.get("skipped.txt").expect("skipped").hash, "b3:s");
+    }
+
+    #[test]
+    fn build_completed_updates_omits_entry_absent_from_outcomes() {
+        // The mid-run trap: an entry whose group has NOT completed yet is simply
+        // not in `outcomes`. Even with a stale file already on disk under the new
+        // hash, `zip` never reaches it, so it is never recorded from bytes this
+        // run has not landed. (Here only the first entry has an outcome.)
+        let tmp = tempfile::tempdir().expect("tmp");
+        std::fs::write(tmp.path().join("done.txt"), b"new").expect("write");
+        std::fs::write(tmp.path().join("pending.txt"), b"stale-old-bytes").expect("write");
+        let entries = [
+            ManifestEntry {
+                path: "done.txt".into(),
+                hash: "b3:done".into(),
+                size: Some(3),
+                chunks: None,
+            },
+            ManifestEntry {
+                path: "pending.txt".into(),
+                hash: "b3:new".into(), // new hash, not yet fetched
+                size: Some(3),
+                chunks: None,
+            },
+        ];
+        let outcomes = vec![EntryOutcome::Fetched(3)]; // only "done.txt" has completed
+        let refs: Vec<&ManifestEntry> = entries.iter().collect();
+        let upd = build_completed_updates(&refs, &outcomes, tmp.path());
+        assert!(upd.contains_key("done.txt"));
+        assert!(
+            !upd.contains_key("pending.txt"),
+            "an entry not yet in outcomes must never be recorded"
+        );
+    }
+
+    fn saved_file(hash: &str, size: u64) -> bundle_manifest::SavedFile {
+        bundle_manifest::SavedFile {
+            hash: hash.into(),
+            size,
+            mtime: SavedMtime { secs: 1, nanos: 0 },
+            chunks: None,
+        }
+    }
+
+    fn one_update(
+        path: &str,
+        hash: &str,
+        size: u64,
+    ) -> BTreeMap<String, bundle_manifest::SavedFile> {
+        let mut m = BTreeMap::new();
+        m.insert(path.to_string(), saved_file(hash, size));
+        m
+    }
+
+    // Several sub-cadence batches, then the channel closes: the final write must
+    // persist every batch — an interrupted pull keeps all completed files.
+    #[tokio::test]
+    async fn flush_task_final_write_persists_all_batches() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(FlushBatch {
+            updates: one_update("a.bin", "b3:a", 1),
+            fetched_bytes: 1,
+        })
+        .expect("send a");
+        tx.send(FlushBatch {
+            updates: one_update("b.bin", "b3:b", 1),
+            fetched_bytes: 1,
+        })
+        .expect("send b");
+        drop(tx);
+        flush_task(tmp.path(), SavedManifest::default(), rx).await;
+
+        let saved = bundle_manifest::load(tmp.path());
+        assert_eq!(saved.get("a.bin").expect("a").hash, "b3:a");
+        assert_eq!(saved.get("b.bin").expect("b").hash, "b3:b");
+    }
+
+    // The flush folds onto the prior skip-cache: entries a prior run recorded but
+    // this run never touched survive, alongside this run's new records.
+    #[tokio::test]
+    async fn flush_task_keeps_prior_untouched_entries() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut prior = SavedManifest::default();
+        bundle_manifest::merge(&mut prior, one_update("old.bin", "b3:old", 9));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(FlushBatch {
+            updates: one_update("new.bin", "b3:new", 2),
+            fetched_bytes: 2,
+        })
+        .expect("send");
+        drop(tx);
+        flush_task(tmp.path(), prior, rx).await;
+
+        let saved = bundle_manifest::load(tmp.path());
+        assert_eq!(saved.get("old.bin").expect("old kept").hash, "b3:old");
+        assert_eq!(saved.get("new.bin").expect("new recorded").hash, "b3:new");
+    }
+
+    // A byte-cadence flush mid-stream must persist before the channel closes: a
+    // single batch over FLUSH_BYTES is written while the task still runs. Proven
+    // by observing the file after that batch, before dropping the sender.
+    #[tokio::test]
+    async fn flush_task_byte_cadence_writes_mid_stream() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn({
+            let root = tmp.path().to_path_buf();
+            async move { flush_task(&root, SavedManifest::default(), rx).await }
+        });
+        tx.send(FlushBatch {
+            updates: one_update("big.bin", "b3:big", FLUSH_BYTES),
+            fetched_bytes: FLUSH_BYTES,
+        })
+        .expect("send");
+        // Poll for the mid-stream write while the task is still alive (sender held).
+        // A generous deadline absorbs fsync + scheduling latency on slow CI, while
+        // still failing quickly if the write never happens.
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if bundle_manifest::load(tmp.path()).get("big.bin").is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            seen,
+            "byte-cadence flush should write before the channel closes"
+        );
+        drop(tx);
+        handle.await.expect("flush task join");
     }
 
     #[test]
@@ -4146,7 +4468,7 @@ mod tests {
         let body = b"hello world";
         std::fs::write(tmp.path().join("a.txt"), body).expect("write");
         let h = format!("b3:{}", blake3::hash(body).to_hex());
-        let entries = vec![ManifestEntry {
+        let entries = [ManifestEntry {
             path: "a.txt".into(),
             hash: h,
             size: Some(u64::try_from(body.len()).expect("len")),
@@ -4194,7 +4516,7 @@ mod tests {
         bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
             .expect("write saved manifest");
         let saved = bundle_manifest::load(tmp.path());
-        let entries = vec![ManifestEntry {
+        let entries = [ManifestEntry {
             path: "a.txt".into(),
             hash: claimed, // equals the saved record's hash → fast-skip candidate
             size: Some(size),
@@ -4240,7 +4562,7 @@ mod tests {
         bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
             .expect("write saved manifest");
         let saved = bundle_manifest::load(tmp.path());
-        let entries = vec![ManifestEntry {
+        let entries = [ManifestEntry {
             path: "a.txt".into(),
             hash: real,
             size: Some(size),
@@ -4258,7 +4580,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         std::fs::write(tmp.path().join("a.txt"), b"OLD CONTENT").expect("write");
         let new = format!("b3:{}", blake3::hash(b"NEW CONTENT").to_hex());
-        let entries = vec![ManifestEntry {
+        let entries = [ManifestEntry {
             path: "a.txt".into(),
             hash: new,
             size: Some(11),
@@ -4272,7 +4594,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_disk_state_absent_file_fetches() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let entries = vec![ManifestEntry {
+        let entries = [ManifestEntry {
             path: "missing.txt".into(),
             hash: "b3:00".into(),
             size: Some(1),
@@ -4289,7 +4611,7 @@ mod tests {
         let body = b"hello world";
         std::fs::write(tmp.path().join("a.txt"), body).expect("write");
         let h = format!("b3:{}", blake3::hash(body).to_hex());
-        let entries = vec![ManifestEntry {
+        let entries = [ManifestEntry {
             path: "a.txt".into(),
             hash: h,
             size: Some(u64::try_from(body.len()).expect("len")),
@@ -4310,13 +4632,17 @@ mod tests {
         std::fs::write(tmp.path().join("game1/lib/dup.dll"), &body).expect("write");
         let h = format!("b3:{}", blake3::hash(&body).to_hex());
         // Prior run recorded game1/lib/dup.dll.
-        let old_entries = vec![ManifestEntry {
+        let old_entries = [ManifestEntry {
             path: "game1/lib/dup.dll".into(),
             hash: h.clone(),
             size: Some(4096),
             chunks: None,
         }];
-        let updates = build_saved_updates(&old_entries, &[EntryOutcome::Fetched(4096)], tmp.path());
+        let updates = build_completed_updates(
+            &old_entries.iter().collect::<Vec<_>>(),
+            &[EntryOutcome::Fetched(4096)],
+            tmp.path(),
+        );
         bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
             .expect("write saved");
         let saved = bundle_manifest::load(tmp.path());
@@ -4348,13 +4674,17 @@ mod tests {
         let old_body = vec![9u8; 32];
         std::fs::write(tmp.path().join("changed.bin"), &old_body).expect("write old");
         let old_hash = format!("b3:{}", blake3::hash(&old_body).to_hex());
-        let old_entries = vec![ManifestEntry {
+        let old_entries = [ManifestEntry {
             path: "changed.bin".into(),
             hash: old_hash.clone(),
             size: Some(32),
             chunks: None,
         }];
-        let updates = build_saved_updates(&old_entries, &[EntryOutcome::Fetched(32)], tmp.path());
+        let updates = build_completed_updates(
+            &old_entries.iter().collect::<Vec<_>>(),
+            &[EntryOutcome::Fetched(32)],
+            tmp.path(),
+        );
         bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
             .expect("write saved");
         let saved = bundle_manifest::load(tmp.path());
@@ -4390,13 +4720,17 @@ mod tests {
         let body = vec![7u8; 16];
         std::fs::write(tmp.path().join("a.bin"), &body).expect("write");
         let h = format!("b3:{}", blake3::hash(&body).to_hex());
-        let old = vec![ManifestEntry {
+        let old = [ManifestEntry {
             path: "a.bin".into(),
             hash: h.clone(),
             size: Some(16),
             chunks: None,
         }];
-        let updates = build_saved_updates(&old, &[EntryOutcome::Fetched(16)], tmp.path());
+        let updates = build_completed_updates(
+            &old.iter().collect::<Vec<_>>(),
+            &[EntryOutcome::Fetched(16)],
+            tmp.path(),
+        );
         bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates).expect("w");
         let saved = bundle_manifest::load(tmp.path());
         let st = resolve_disk_state(&old, &saved, tmp.path(), true).await;
@@ -4419,7 +4753,7 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path().join("target.bin"), tmp.path().join("link.txt"))
             .expect("symlink");
         let h = format!("b3:{}", blake3::hash(body).to_hex());
-        let entries = vec![ManifestEntry {
+        let entries = [ManifestEntry {
             path: "link.txt".into(),
             hash: h,
             size: Some(u64::try_from(body.len()).expect("len")),
@@ -4441,7 +4775,7 @@ mod tests {
         std::fs::write(tmp.path().join("u.bin"), &body).expect("write");
         let uh = format!("b3:{}", blake3::hash(&body).to_hex());
         let ch = format!("b3:{}", blake3::hash(&body).to_hex()); // single-chunk == whole file
-        let entries = vec![ManifestEntry {
+        let entries = [ManifestEntry {
             path: "u.bin".into(),
             hash: uh,
             size: Some(20),
@@ -4470,7 +4804,7 @@ mod tests {
         // merge_and_write / load round trip.
         let old_hash = format!("b3:{}", blake3::hash(&old_body).to_hex());
         let old_chunk_hash = old_hash.clone(); // single-chunk == whole file
-        let old_entries = vec![ManifestEntry {
+        let old_entries = [ManifestEntry {
             path: "c.bin".into(),
             hash: old_hash,
             size: Some(20),
@@ -4480,7 +4814,8 @@ mod tests {
             }]),
         }];
         let old_outcomes = vec![EntryOutcome::Fetched(20)];
-        let updates = build_saved_updates(&old_entries, &old_outcomes, tmp.path());
+        let old_refs: Vec<&ManifestEntry> = old_entries.iter().collect();
+        let updates = build_completed_updates(&old_refs, &old_outcomes, tmp.path());
         bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
             .expect("write saved manifest");
         let saved = bundle_manifest::load(tmp.path());
