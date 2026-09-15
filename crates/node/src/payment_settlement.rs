@@ -989,6 +989,16 @@ struct PlannedLane {
     register: Option<PaymentPool::CapabilityReg>,
 }
 
+/// Sum the unredeemed value across planned lanes — the raw USDC the node holds
+/// in accepted vouchers it has not yet cashed on-chain. Saturating so a
+/// pathological total can never wrap; in practice pool deposits bound it far
+/// below `U256::MAX`. Feeds the `decdn_unredeemed_usdc` gauge once per sweep.
+fn sum_unredeemed(plans: &[PlannedLane]) -> U256 {
+    plans
+        .iter()
+        .fold(U256::ZERO, |acc, plan| acc.saturating_add(plan.unredeemed))
+}
+
 /// Group planned lanes into one `PoolBatch` per distinct pool, in first-seen
 /// order, so the contract amortizes each pool's status read and `totalRedeemed`
 /// write across its lanes. A lane's capability registration (present only on a
@@ -1340,6 +1350,11 @@ async fn redeem_sweep<P: Provider + Clone>(
         }
     };
     let plans = plan_lanes(paid, self_address, states, metrics, pool_view);
+    // Publish the pending-redemption total once per sweep. This is the whole
+    // planned set, before the per-chunk floor defers any dust — a lane below the
+    // floor is still owed and rides a later sweep, so counting it here is what
+    // makes the gauge "USDC waiting to be redeemed" rather than "redeeming now".
+    metrics.set_unredeemed_usdc(sum_unredeemed(&plans));
     redeem_planned_lanes(
         contract,
         store,
@@ -2239,12 +2254,23 @@ mod tests {
         assert_eq!(batch1.map(|b| b.capabilities.len()), Some(0)); // register == false
     }
 
-    /// Sum a chunk's unredeemed values, for `chunk_redemptions` tests.
+    /// Sum a chunk's unredeemed values, for `chunk_redemptions` tests. Delegates
+    /// to the production [`sum_unredeemed`] so the tests exercise the same
+    /// summation that feeds the `decdn_unredeemed_usdc` gauge.
     fn total_unredeemed(chunk: &[PlannedLane]) -> U256 {
-        chunk
-            .iter()
-            .map(|l| l.unredeemed)
-            .fold(U256::ZERO, |a, b| a + b)
+        sum_unredeemed(chunk)
+    }
+
+    #[test]
+    fn sum_unredeemed_totals_planned_lanes() {
+        // Empty set is zero — the gauge reads 0 when nothing is owed.
+        assert_eq!(sum_unredeemed(&[]), U256::ZERO);
+        let plans = vec![
+            planned(1, 10, 100, false),
+            planned(1, 11, 250, false),
+            planned(2, 12, 1_000_000, true),
+        ];
+        assert_eq!(sum_unredeemed(&plans), U256::from(1_000_350u64));
     }
 
     #[test]
