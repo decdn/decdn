@@ -522,11 +522,11 @@ impl WatcherState {
     }
 
     /// Apply an origin/operator blacklist state change to the live deny-set the
-    /// delivery path reads. Both on-chain lists (`OriginBlacklistUpdated` and
-    /// `OperatorBlacklisted`) feed this one set, mirroring `OriginAssignment`'s
-    /// `isOriginBlacklisted(op) || isOperatorBlacklisted(op)` — the node does not
-    /// need to know which list an address came from, only that governance put it on
-    /// one.
+    /// delivery path and the origin-routing filter both read. Both on-chain lists
+    /// (`OriginBlacklistUpdated` and `OperatorBlacklisted`) feed this one set as a
+    /// union `isOriginBlacklisted(op) || isOperatorBlacklisted(op)` — the node does
+    /// not need to know which list an address came from, only that governance put
+    /// it on one.
     fn set_origin(&self, origin: Address, blacklisted: bool) {
         self.denylist.apply_chain_origin(origin, blacklisted);
     }

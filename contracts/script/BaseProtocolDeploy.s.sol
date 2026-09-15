@@ -78,7 +78,7 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                          router-caller → PaymentPool,
 ///                                          SLASH_ROLE → SlashJudge) plus the
 ///                                          deployer-only
-///                                          `OriginAssignment.setContentBlacklist`
+///                                          `CapacityBond.setSlashJudge`
 ///                                          setter that MUST run before the
 ///                                          GOVERNANCE_ROLE handoff because it
 ///                                          becomes Timelock-gated post-handoff.
@@ -371,10 +371,10 @@ abstract contract BaseProtocolDeploy is Script {
     ///         payment path, or no live pauser.
     error PeerRoleNotWired(address target, bytes32 role, address grantee);
     /// @notice Post-deploy invariant — an address binding (such as
-    ///         `CapacityBond.slashJudge` or
-    ///         `OriginAssignment.contentBlacklist`) does not match the intended
-    ///         deployment target. Catches a setter or constructor binding error
-    ///         that would silently leave a security check unwired.
+    ///         `CapacityBond.slashJudge` or `OriginAssignment.vettingPolicy`)
+    ///         does not match the intended deployment target. Catches a setter or
+    ///         constructor binding error that would silently leave a security
+    ///         check unwired.
     error BindingNotWired(address target, address expected, address actual);
 
     /// @notice Genesis buyback activation was requested without a keeper — the
@@ -572,15 +572,14 @@ abstract contract BaseProtocolDeploy is Script {
         // so governance re-points it post-handoff.
         d.vettingPolicy = new ManualVettingPolicy({ admin: cfg.deployer, initialVetter: cfg.initialVetter });
 
-        // OriginAssignment (ADR 011): deployed with a zero ContentBlacklist binding;
-        // `_wireCrossContractRoles` calls `setContentBlacklist` post-deploy (ADR 016
-        // § Post-Deployment Initialization step 2). The vetting policy is a
-        // constructor immutable-shaped binding (governance swaps it via
-        // `setVettingPolicy`), non-zero from genesis.
+        // OriginAssignment (ADR 011): the seat set is a routing hint, so it takes
+        // no ContentBlacklist binding — consumers of `getOrigins` filter against
+        // the blacklist themselves. The vetting policy is a constructor
+        // immutable-shaped binding (governance swaps it via `setVettingPolicy`),
+        // non-zero from genesis.
         d.originAssignment = new OriginAssignment({
             capacityBond_: ICapacityBondActivity(address(d.bond)),
             publisherRegistry_: IPublisherRegistryOwnership(address(d.registry)),
-            contentBlacklist_: address(0),
             vettingPolicy_: IVettingPolicy(address(d.vettingPolicy)),
             admin: cfg.deployer
         });
@@ -718,9 +717,6 @@ abstract contract BaseProtocolDeploy is Script {
         // the other half against the bond's current unbondingPeriod, and
         // `setSlashJudge` re-checks it at wire time, so this cannot revert here.
         d.bond.setSlashJudge(ISlashJudgeEvidenceView(address(d.slashJudge)));
-        // Wire the OriginAssignment → ContentBlacklist read direction (step 2);
-        // deployer still holds GOVERNANCE_ROLE on OriginAssignment here.
-        d.originAssignment.setContentBlacklist(address(d.blacklist));
 
         _postWiringHook(cfg, d);
     }
@@ -867,10 +863,6 @@ abstract contract BaseProtocolDeploy is Script {
         address boundSlashJudge = address(d.bond.slashJudge());
         if (boundSlashJudge != address(d.slashJudge)) {
             revert BindingNotWired(address(d.bond), address(d.slashJudge), boundSlashJudge);
-        }
-        address boundBlacklist = d.originAssignment.contentBlacklist();
-        if (boundBlacklist != address(d.blacklist)) {
-            revert BindingNotWired(address(d.originAssignment), address(d.blacklist), boundBlacklist);
         }
         // OriginAssignment.vettingPolicy is a constructor binding, but re-read it
         // so a wrong-wired genesis policy fails the deploy loudly like every other

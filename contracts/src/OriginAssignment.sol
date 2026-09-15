@@ -7,7 +7,6 @@ import { EnumerableSet } from "@openzeppelin/contracts/utils/structs/EnumerableS
 
 import { ICapacityBondActivity } from "./interfaces/ICapacityBondActivity.sol";
 import { IPublisherRegistryOwnership } from "./interfaces/IPublisherRegistryOwnership.sol";
-import { IContentBlacklistOriginView } from "./interfaces/IContentBlacklistOriginView.sol";
 import { IVettingPolicy } from "./interfaces/IVettingPolicy.sol";
 
 /// @title OriginAssignment
@@ -29,9 +28,12 @@ import { IVettingPolicy } from "./interfaces/IVettingPolicy.sol";
 /// @dev    OZ bases per ADR 016 § Contract Inventory: `AccessControl` (governance
 ///         gating) + `ReentrancyGuard` (all cross-contract reads are views, but
 ///         the guard matches the inventory and the repo's external-call-then-write
-///         convention). Holds no funds. The `ContentBlacklist` binding is wired
-///         once post-deploy via `setContentBlacklist`; until then `addOrigin`
-///         validates against `CapacityBond.isActive` only and `prune` reverts.
+///         convention). Holds no funds. Blacklist filtering is not a concern of
+///         this contract: the seat set is a routing hint, and consumers of
+///         `getOrigins` filter each operator against `ContentBlacklist` and
+///         `CapacityBond.isActive` themselves (ADR 011 § Interaction with
+///         ContentBlacklist). `pruneInactiveOrigin` keeps the set from
+///         accumulating operators that have left the active set.
 contract OriginAssignment is AccessControl, ReentrancyGuard {
     using EnumerableSet for EnumerableSet.AddressSet;
     using EnumerableSet for EnumerableSet.UintSet;
@@ -60,11 +62,6 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
 
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IPublisherRegistryOwnership public immutable publisherRegistry;
-
-    /// @notice Read-direction binding for `pruneBlacklistedOrigin` and the
-    ///         `addOrigin` blacklist guard. `address(0)` until
-    ///         `setContentBlacklist`.
-    address public contentBlacklist;
 
     uint256 public maxOriginsPerNamespace;
 
@@ -98,8 +95,7 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
 
     event OriginAdded(uint256 indexed namespaceId, address indexed operator, address indexed by);
     event OriginRemoved(uint256 indexed namespaceId, address indexed operator, address indexed by);
-    event BlacklistedOriginPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
-    event ContentBlacklistUpdated(address indexed oldAddr, address indexed newAddr);
+    event InactiveOriginPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
     event MaxOriginsPerNamespaceUpdated(uint256 oldValue, uint256 newValue);
     event VettingPolicyUpdated(address indexed oldPolicy, address indexed newPolicy);
 
@@ -112,10 +108,8 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     error TooManyOrigins(uint256 count, uint256 cap);
     error DuplicateOperator(address operator);
     error OperatorNotActive(address operator);
-    error OperatorBlacklisted(address operator);
     error NotAuthorizedOrigin(uint256 namespaceId, address operator);
-    error ContentBlacklistNotSet();
-    error OperatorNotBlacklisted(address operator);
+    error OperatorStillActive(address operator);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
     error PublisherNotVetted(address publisher);
     /// @notice The vetting policy address holds no code. `addOrigin` would revert
@@ -129,15 +123,12 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
 
     /// @param capacityBond_       Operator activity source.
     /// @param publisherRegistry_  Namespace ownership source.
-    /// @param contentBlacklist_   May be `address(0)` at deploy; bound later via
-    ///                            `setContentBlacklist` (ADR 016 post-deploy step 2).
     /// @param vettingPolicy_      Installed vetting authority. A concrete policy
     ///                            exists from genesis — no `address(0)` phase.
     /// @param admin               `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` holder.
     constructor(
         ICapacityBondActivity capacityBond_,
         IPublisherRegistryOwnership publisherRegistry_,
-        address contentBlacklist_,
         IVettingPolicy vettingPolicy_,
         address admin
     ) {
@@ -154,7 +145,6 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         if (address(vettingPolicy_).code.length == 0) revert VettingPolicyNotAContract(address(vettingPolicy_));
         capacityBond = capacityBond_;
         publisherRegistry = publisherRegistry_;
-        contentBlacklist = contentBlacklist_; // may be zero at deploy
         vettingPolicy = vettingPolicy_;
 
         maxOriginsPerNamespace = DEFAULT_MAX_ORIGINS;
@@ -172,8 +162,13 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     /// @dev Validation covers ONLY `operator`. Operators already in the set are
     ///      never re-checked, so a transient failure on a live origin cannot
     ///      block seating a new one (issue #1107). External `ownerOf` /
-    ///      `isActive` / blacklist reads precede the set write; safe under
-    ///      `nonReentrant` (the reads are views).
+    ///      `isActive` reads precede the set write; safe under `nonReentrant`
+    ///      (the reads are views). Blacklist status is deliberately NOT checked
+    ///      here — the seat set is a routing hint and consumers of `getOrigins`
+    ///      filter against `ContentBlacklist` themselves (ADR 011 § Interaction
+    ///      with ContentBlacklist); an operator blacklisted at the operator
+    ///      level is already ejected from `CapacityBond`, so `isActive` above
+    ///      rejects it regardless.
     // slither-disable-next-line reentrancy-no-eth
     function addOrigin(uint256 namespaceId, address operator) external nonReentrant {
         // Vetting first: it is the blocking prerequisite an unvetted caller must
@@ -186,12 +181,6 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         if (publisherRegistry.ownerOf(namespaceId) != msg.sender) revert NotNamespaceOwner(namespaceId, msg.sender);
         // aderyn-ignore-next-line(reentrancy-state-change)
         if (!capacityBond.isActive(operator)) revert OperatorNotActive(operator);
-
-        address blacklist = contentBlacklist;
-        // aderyn-ignore-next-line(reentrancy-state-change)
-        if (blacklist != address(0) && _isBlacklisted(blacklist, operator)) {
-            revert OperatorBlacklisted(operator);
-        }
 
         // Duplicate BEFORE cap: re-adding an operator that is already seated is a
         // caller error whatever the set size, and reporting `TooManyOrigins` for
@@ -232,45 +221,28 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         emit OriginRemoved(namespaceId, operator, msg.sender);
     }
 
-    /// @notice Permissionless: remove a blacklisted operator from a namespace's set.
-    ///         The contract checks the blacklist itself, so a caller cannot grief by
-    ///         naming a non-blacklisted operator.
+    /// @notice Permissionless: remove an operator that has left the active set
+    ///         (unbonded, deregistered, slash-ejected, or blacklist-ejected —
+    ///         every operator blacklisted at the operator level is ejected from
+    ///         `CapacityBond`, so this reaches them too) from a namespace's set.
+    ///         The contract checks `CapacityBond.isActive` itself, so a caller
+    ///         cannot grief by naming a still-active operator. Storage hygiene,
+    ///         not enforcement: consumers already skip an inactive or blacklisted
+    ///         operator at routing time (ADR 011 § Interaction with
+    ///         ContentBlacklist), so this only keeps the on-chain set from
+    ///         accumulating dead entries against the per-namespace cap.
     // slither-disable-next-line reentrancy-no-eth
-    function pruneBlacklistedOrigin(uint256 namespaceId, address operator) external nonReentrant {
-        address blacklist = contentBlacklist;
-        if (blacklist == address(0)) revert ContentBlacklistNotSet();
+    function pruneInactiveOrigin(uint256 namespaceId, address operator) external nonReentrant {
         // aderyn-ignore-next-line(reentrancy-state-change)
-        if (!_isBlacklisted(blacklist, operator)) {
-            revert OperatorNotBlacklisted(operator);
-        }
+        if (capacityBond.isActive(operator)) revert OperatorStillActive(operator);
         if (!_origins[namespaceId].remove(operator)) revert NotAuthorizedOrigin(namespaceId, operator);
         _pruneEmptyNamespace(namespaceId);
-        emit BlacklistedOriginPruned(namespaceId, operator, msg.sender);
-    }
-
-    /// @dev True if `operator` is blacklisted via EITHER the origin or the
-    ///      operator mapping on `ContentBlacklist` (M-2). An operator can be
-    ///      ejected via the operator mapping (`addOperator`) without the origin
-    ///      mapping being set, and vice versa; authorization must reject — and
-    ///      pruning must succeed on — either.
-    function _isBlacklisted(address blacklist, address operator) internal view returns (bool) {
-        IContentBlacklistOriginView bl = IContentBlacklistOriginView(blacklist);
-        return bl.isOriginBlacklisted(operator) || bl.isOperatorBlacklisted(operator);
+        emit InactiveOriginPruned(namespaceId, operator, msg.sender);
     }
 
     // -----------------------------------------------------------------
     // Governance setters
     // -----------------------------------------------------------------
-
-    /// @notice Wire (or re-point) the ContentBlacklist read direction. Rejecting
-    ///         `address(0)` prevents regressing into the deployment-window state
-    ///         where `addOrigin` skips the blacklist check (ADR 011 § Edge cases).
-    function setContentBlacklist(address newContentBlacklist) external onlyRole(GOVERNANCE_ROLE) {
-        if (newContentBlacklist == address(0)) revert ZeroAddress();
-        address old = contentBlacklist;
-        contentBlacklist = newContentBlacklist;
-        emit ContentBlacklistUpdated(old, newContentBlacklist);
-    }
 
     function setMaxOriginsPerNamespace(uint256 cap) external onlyRole(GOVERNANCE_ROLE) {
         if (cap < MAX_ORIGINS_FLOOR || cap > MAX_ORIGINS_CEILING) {

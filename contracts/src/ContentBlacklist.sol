@@ -160,8 +160,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         Blacklisting). Internal because an emergency-added origin expires
     ///         and a raw mapping getter cannot express that — read through
     ///         `isOriginBlacklisted(address)`, which keeps the same selector the
-    ///         auto-getter had, so `IContentBlacklistOriginView` and
-    ///         `OriginAssignment` are unaffected.
+    ///         auto-getter had, so off-chain consumers binding it are unaffected.
     mapping(address origin => bool) internal _isOriginBlacklisted;
 
     /// @notice Auto-expiry metadata for origins added via `emergencyAddOrigin`.
@@ -210,9 +209,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     /// @notice Membership index for the union of the two address-level deny
     ///         lists: `_isOriginBlacklisted` ∪ `isOperatorBlacklisted`.
     /// @dev    A union rather than two sets because that is the only question
-    ///         any consumer asks — `OriginAssignment._isBlacklisted` already
-    ///         computes exactly this disjunction on-chain, and a node's delivery
-    ///         gate refuses on either. Reconciled through `_syncAddr`, which
+    ///         any consumer asks — a node's delivery gate refuses on either, and
+    ///         its routing filter skips an origin blacklisted through either.
+    ///         Reconciled through `_syncAddr`, which
     ///         re-derives membership from both sources so clearing one list while
     ///         the other still holds cannot drop the address from the index.
     EnumerableSet.AddressSet internal _blacklistedAddrs;
@@ -429,7 +428,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         emits `HashRemoved`, so the raw `blacklistedHashes` membership a
     ///         node enumerates (ADR 011 § Node Behavior) no longer carries the
     ///         lapsed entry. Mirrors the permissionless-cleanup model of
-    ///         `OriginAssignment.pruneBlacklistedOrigin`.
+    ///         `OriginAssignment.pruneInactiveOrigin`.
     function expireEmergencyEntry(bytes32 region, bytes32 hash) external {
         HashEntry storage e = _hashEntries[region][hash];
         if (e.addedAt == 0) revert EntryNotBlacklisted(region, hash);
@@ -499,10 +498,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     }
 
     /// @notice True while `origin` is blacklisted at the origin level. Same
-    ///         selector as the former public-mapping auto-getter, so
-    ///         `IContentBlacklistOriginView` and `OriginAssignment` are
-    ///         unaffected — but this form also honours emergency auto-expiry,
-    ///         which a raw mapping read could not.
+    ///         selector as the former public-mapping auto-getter, so off-chain
+    ///         consumers binding it are unaffected — but this form also honours
+    ///         emergency auto-expiry, which a raw mapping read could not.
     function isOriginBlacklisted(address origin) public view returns (bool) {
         if (!_isOriginBlacklisted[origin]) return false;
         EmergencyOrigin storage eo = _emergencyOrigins[origin];

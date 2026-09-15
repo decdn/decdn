@@ -219,7 +219,7 @@ Hash-based blacklisting covers only exact copies of a blob. A one-byte change pr
 **The protocol's primary response is origin blacklisting.** If an origin-backed node repeatedly sources blacklisted content — whether the same blob or trivially re-encoded variants — governance can blacklist the operator's Ethereum address. `ContentBlacklist.addOperator()` calls `CapacityBond.ejectNode(operatorAddress)` via a cross-contract call; the `CapacityBond` grants the `ContentBlacklist` contract address the `BLACKLIST_ROLE`, permitting this call. A blacklisted origin:
 
 - **Ejected from `CapacityBond`** — emits `EjectedByBlacklist`, sets the permanent `blacklistEjected` latch, and (when the operator had a registered node) sets `active = false` and emits `NodeAutoEjected` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)). The node-deactivation effects follow the same code path as bond-shortfall auto-ejection ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn))
-- **Effectively removed from every namespace's authorized origin set** at runtime; storage cleanup is lazy and permissionless via `pruneBlacklistedOrigin` — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist)
+- **Effectively removed from every namespace's authorized origin set** at runtime; consumers of `getOrigins` drop a blacklisted operator, and storage cleanup is lazy and permissionless via `pruneInactiveOrigin` once the operator-level blacklist ejects it from `CapacityBond` — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist)
 - **Remaining bond enters forced unbonding** — the standard unbonding window applies (14 days default per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve), governable [7, 60] days). Bond remains slashable during unbonding
 - **Address banned while blacklisted** — cannot register new nodes under the same Ethereum address unless governance removes the blacklist entry via `removeOperator(operatorAddress)`. Re-entry otherwise requires a new identity funded with a fresh capacity bond (`bond = k × Mbps^α`; ≈50,000 TOKEN for a 1 Gbps entry tier at default `k=12.6`, `α=1.2` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve))
 - **The operator's registered NodeId leaves the registry active set** — the `NodeAutoEjected` event removes it, so peers stop discovering and dialing it, and the `cdn/dht/v1` STORE path rejects its records ([ADR 022 § STORE Flow](022-content-discovery.md#store-flow-cache-event--dht-publish))
@@ -304,11 +304,13 @@ interface IOriginAssignment {
     // Vetted namespace owner seats one more authorized origin. Effective
     // immediately. Reverts if msg.sender does not own the namespace, is not
     // vetted (per the installed policy), or if the operator is not active in
-    // CapacityBond, is blacklisted through EITHER ContentBlacklist mapping, is
-    // already seated, or would exceed maxOriginsPerNamespace. Validation covers
-    // ONLY the operator being added: operators already in the set are never
-    // re-checked, so a transient failure on a live origin cannot block seating a
-    // new one.
+    // CapacityBond, is already seated, or would exceed maxOriginsPerNamespace.
+    // Validation covers ONLY the operator being added: operators already in the
+    // set are never re-checked, so a transient failure on a live origin cannot
+    // block seating a new one. Blacklist status is not checked here — the seat
+    // set is a routing hint that consumers filter themselves (see § Interaction
+    // with ContentBlacklist), and an operator-level blacklist ejects from
+    // CapacityBond, so the isActive check already rejects it.
     function addOrigin(uint256 namespaceId, address operator) external;
 
     // Removal paths:
@@ -320,23 +322,17 @@ interface IOriginAssignment {
     // unassigned state until the publisher seats another origin.
     function removeOrigin(uint256 namespaceId, address operator) external;
 
-    // Permissionless storage cleanup for blacklisted operators.
-    // Reverts unless the operator is currently blacklisted in ContentBlacklist,
-    // read as the UNION of isOriginBlacklisted and isOperatorBlacklisted: an
-    // operator can be ejected through either mapping alone, and both seating and
-    // pruning must honour either. Callable by anyone — the
-    // contract performs the lookup itself rather than trusting the caller. This
-    // pattern avoids the unbounded gas cost of removing a blacklisted operator
-    // from every namespace in one transaction; runtime authorization checks
-    // (probe, registry-derived node view) consult ContentBlacklist directly so
-    // cleanup latency does not affect security.
-    function pruneBlacklistedOrigin(uint256 namespaceId, address operator) external;
-
-    // Wires the read-direction integration with ContentBlacklist for
-    // pruneBlacklistedOrigin and the addOrigin blacklist guard. Called once
-    // during post-deploy initialization (see ADR 016) and not expected to change
-    // thereafter; GOVERNANCE_ROLE only.
-    function setContentBlacklist(address contentBlacklist) external;
+    // Permissionless storage cleanup for operators that have left the active
+    // set. Reverts unless CapacityBond.isActive(operator) is false — so a caller
+    // cannot grief by naming a still-active operator. This reaches every exit:
+    // unbond, deregister, slash-ejection, and operator-level blacklist (which
+    // ejects from CapacityBond). Callable by anyone — the contract performs the
+    // isActive lookup itself rather than trusting the caller. Storage hygiene,
+    // not security: consumers already skip an inactive or blacklisted operator
+    // at routing time (see § Interaction with ContentBlacklist), so cleanup
+    // latency does not affect delivery; this only keeps the on-chain set from
+    // accumulating dead entries against maxOriginsPerNamespace.
+    function pruneInactiveOrigin(uint256 namespaceId, address operator) external;
 
     // Governable parameter with safety bounds (see ADR 009). Emits its own
     // update event: MaxOriginsPerNamespaceUpdated. Vetting-related parameters, if
@@ -361,7 +357,7 @@ interface IOriginAssignment {
     event VettingPolicyUpdated(address indexed oldPolicy, address indexed newPolicy);
     event OriginAdded(uint256 indexed namespaceId, address indexed operator, address indexed by);
     event OriginRemoved(uint256 indexed namespaceId, address indexed operator, address indexed by);
-    event BlacklistedOriginPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
+    event InactiveOriginPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
 }
 ```
 
@@ -376,7 +372,7 @@ interface IOriginAssignment {
 - **`addOrigin` for an operator that is already seated** — reverts `DuplicateOperator`, whatever the current set size. The duplicate check precedes the cap check, so a re-add never reports `TooManyOrigins`.
 - **`maxOriginsPerNamespace` lowered below a live set** — nothing is evicted. The cap binds `addOrigin` only, so an existing set may exceed it until the publisher removes operators.
 - **A reverting or misconfigured policy** — `addOrigin` reverts, failing closed. Governance owns the policy address, so a loud failure is preferable to silently denying every publisher.
-- **`ContentBlacklist` unbound during the deployment window** — until `setContentBlacklist` is called post-deploy (see [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)), `addOrigin` skips the blacklist check and validates only against `CapacityBond.isActive`. Once set the check is mandatory thereafter; `setContentBlacklist(address(0))` reverts to prevent regressing into the deployment-window state. `pruneBlacklistedOrigin` reverts until the binding is set.
+- **A seated origin is blacklisted** — nothing on `OriginAssignment` reacts; the seat set is a routing hint, and consumers of `getOrigins` already drop a blacklisted operator (see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist)). `pruneInactiveOrigin` clears the stale entry once the operator leaves the active set, which an operator-level blacklist forces by ejecting it from `CapacityBond`.
 - **`removeOrigin` of a non-member operator** — reverts. Typo protection; the explicit error surfaces accidental address mismatches that would otherwise pass silently.
 
 ### Lifecycle
@@ -406,17 +402,19 @@ The contract rejects an `addOrigin` for an operator already seated in the namesp
 
 - `OriginAssignment` reads `PublisherRegistry.ownerOf(namespaceId)` to validate that the caller owns the namespace it seats or unseats an origin for.
 - `OriginAssignment` makes no `PublisherRegistry.namespaceCount` read — vetting is the installed policy's concern; `OriginAssignment` only asks it `isVetted(publisher)`. A policy that gates its own application on namespace ownership would read `namespaceCount` itself.
-- `OriginAssignment` reads `CapacityBond.isActive(operator)` to validate an origin candidate at seating time. The check is opportunistic, not enforced at probe time — an operator who unbonds while seated is filtered by clients via the standard bond-active check, not by `OriginAssignment` (avoiding expensive cross-contract checks on every assignment lookup).
-- `OriginAssignment` reads `ContentBlacklist.isOriginBlacklisted(operator)` (and the operator mapping) both to reject a blacklisted candidate at seating time and to decide whether `pruneBlacklistedOrigin` may remove an entry. Permissionless callers can clean up storage one (`namespaceId`, operator) pair at a time.
+- `OriginAssignment` reads `CapacityBond.isActive(operator)` to validate an origin candidate at seating time. The check is opportunistic, not enforced at probe time — an operator who unbonds while seated is filtered by clients via the standard bond-active check, not by `OriginAssignment` (avoiding expensive cross-contract checks on every assignment lookup). `pruneInactiveOrigin` reads the same `isActive` to permissionlessly clean up an entry once the operator leaves the active set, one (`namespaceId`, operator) pair at a time.
+- `OriginAssignment` holds no `ContentBlacklist` binding. The seat set is a routing hint, and blacklist filtering is the consumer's job (see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist)) — pushing it there keeps the seat set free of a governance-settable pointer and a deployment-window bootstrap.
 - `ContentBlacklist.addOperator(operator)` does not call into `OriginAssignment` — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist) below for the rationale and the runtime-check pattern.
 
 ### Interaction with ContentBlacklist
 
-`ContentBlacklist.addOperator(operator)` does **not** call `OriginAssignment` to evict the operator from every namespace. The naïve approach — iterate every namespace the operator is assigned to and remove them in one transaction — is unbounded: an operator in N namespaces costs O(N) storage writes, and a prolific operator could exceed the block gas limit, blocking the blacklist transaction entirely.
+`ContentBlacklist.addOperator(operator)` does **not** call `OriginAssignment` to evict the operator from every namespace. The naïve approach — iterate every namespace the operator is assigned to and remove them in one transaction — is unbounded: an operator in N namespaces costs O(N) storage writes, and a prolific operator could exceed the block gas limit, blocking the blacklist transaction entirely. Nor does `OriginAssignment` hold a `ContentBlacklist` binding: the seat set is a routing hint, so enforcement lives with the party that acts on it.
 
-Off-chain consumers of `OriginAssignment.getOrigins(namespaceId)` (clients selecting peers for first-fetch, off-chain monitors checking publisher availability commitments) cross-reference each returned operator against **both** `ContentBlacklist.isOriginBlacklisted` and `isOperatorBlacklisted`, and treat an entry blacklisted through either as unauthorized regardless of stale `OriginAssignment` state. Storage cleanup happens lazily and permissionlessly via `OriginAssignment.pruneBlacklistedOrigin(namespaceId, operator)`: each call removes one entry; anyone may call it (the contract evaluates that same union itself, so the caller cannot grief by claiming a non-blacklisted operator is blacklisted). Reputation services and other public-good infrastructure will likely run pruning jobs.
+Consumers of `OriginAssignment.getOrigins(namespaceId)` protect themselves. A node's origin-routing filter and off-chain monitors cross-reference each returned operator against **both** `ContentBlacklist.isOriginBlacklisted` and `isOperatorBlacklisted` (the same union its delivery gate consults) and drop an operator blacklisted through either, regardless of stale `OriginAssignment` state — so a blacklisted operator left in the seat set is never routed to. This is the trustless shape: the seat check would be opportunistic anyway (it never re-runs after seating), and every consumer must re-filter, so filtering belongs at the consumer and the on-chain guard adds nothing but a governance surface. An operator-level blacklist additionally ejects the operator from `CapacityBond`, so `isActive` returns false and the standard bond-active filter drops it too.
 
-Net: blacklisting an operator is O(1) on-chain (one ejection call) and storage cleanup is O(1) per call with no transaction-size limit — no design path requires iterating an operator's full namespace set.
+Storage cleanup happens lazily and permissionlessly via `OriginAssignment.pruneInactiveOrigin(namespaceId, operator)`: each call removes one entry whose operator has left the active set (`CapacityBond.isActive(operator) == false`); anyone may call it (the contract evaluates `isActive` itself, so the caller cannot grief by naming a still-active operator). An operator-level blacklist reaches this path via its ejection; a purely origin-level blacklist (which does not eject) leaves an active operator in the set, but the consumer filter already skips it, so the residual entry is harmless storage. Reputation services and other public-good infrastructure will likely run pruning jobs.
+
+Net: blacklisting an operator is O(1) on-chain (one ejection call), consumers enforce it at routing time, and storage cleanup is O(1) per call with no transaction-size limit — no design path requires iterating an operator's full namespace set.
 
 ### Permissionless property
 

@@ -6,8 +6,16 @@
 //! Authority) is:
 //!
 //!   `OriginAssignment.getOrigins(namespaceId)` → `[operator...]`
+//!     → drop operators the local [`ContentDenylist`] denies (the origin ∪
+//!       operator blacklist union the watcher syncs from `ContentBlacklist`,
+//!       plus the operator's own `[content] denied_origins`)
 //!     → capacity-bond reverse projection (`operator → NodeId`, binding only)
 //!     → keep operators the shared [`StakerSet`] reports `active`
+//!
+//! The blacklist drop is this node protecting itself: `getOrigins` is a routing
+//! hint the contract does not filter (ADR 011 § Interaction with
+//! `ContentBlacklist`), so the consumer applies the same deny-set its delivery
+//! gate already holds rather than trusting the seat set to be blacklist-clean.
 //!
 //! The bare hash carries no origin information (ADR 002 § Retrieval by
 //! namespace): the request supplies the namespace its content is published
@@ -44,6 +52,7 @@ use anyhow::{Context, Result};
 use tracing::warn;
 
 use crate::chain_events::timed;
+use crate::content_deny::ContentDenylist;
 use crate::dht::lazy_origin_cache::{LazyOriginCache, resolve_active};
 use crate::dht::origin::OriginDirectory;
 use crate::dht::routing::NodeId;
@@ -96,6 +105,12 @@ pub struct ChainOriginDirectory {
     cache: LazyOriginCache,
     operator_to_node: Arc<RwLock<HashMap<Address, NodeId>>>,
     staker_set: Arc<dyn StakerSet>,
+    /// The node's live origin deny-set — the same union the delivery gate
+    /// consults. A blacklisted operator is dropped from every resolved origin
+    /// set, so this node never routes an origin-pull to one. Read live (never
+    /// cached), so a governance blacklist takes effect without waiting out the
+    /// `getOrigins` TTL.
+    content_deny: Arc<ContentDenylist>,
     metrics: Arc<Metrics>,
 }
 
@@ -116,6 +131,7 @@ impl ChainOriginDirectory {
         origin_assignment_addr: Address,
         operator_to_node: Arc<RwLock<HashMap<Address, NodeId>>>,
         staker_set: Arc<dyn StakerSet>,
+        content_deny: Arc<ContentDenylist>,
         cache_capacity: usize,
         positive_ttl: Duration,
         negative_ttl: Duration,
@@ -132,8 +148,23 @@ impl ChainOriginDirectory {
             cache: LazyOriginCache::new(cache_capacity, positive_ttl, negative_ttl),
             operator_to_node,
             staker_set,
+            content_deny,
             metrics,
         }
+    }
+
+    /// Resolve a cached/fetched operator address set to active origin
+    /// `NodeId`s, first dropping any operator the local deny-set blacklists.
+    /// Both the blacklist filter and liveness are applied live at read time, so
+    /// a TTL-anchored cache entry never keeps routing to an operator that has
+    /// since been blacklisted or gone inactive.
+    fn resolve(&self, operators: &[Address]) -> Vec<NodeId> {
+        let allowed: Vec<Address> = operators
+            .iter()
+            .copied()
+            .filter(|op| !self.content_deny.is_origin_denied(op))
+            .collect();
+        resolve_active(&allowed, &self.operator_to_node, self.staker_set.as_ref())
     }
 }
 
@@ -148,7 +179,7 @@ impl OriginDirectory for ChainOriginDirectory {
         // Live TTL hit (positive OR negative) → resolve from the cached operator
         // set with no RPC.
         if let Some(operators) = self.cache.get(&namespace_id) {
-            return resolve_active(&operators, &self.operator_to_node, self.staker_set.as_ref());
+            return self.resolve(&operators);
         }
         // Cold miss: one on-demand getOrigins. On RPC error, fail closed
         // (resolve nothing) and DO NOT cache — a transient failure must not be
@@ -168,7 +199,7 @@ impl OriginDirectory for ChainOriginDirectory {
         // Cache the authoritative set (empty → negative entry, short TTL).
         self.cache.insert(namespace_id, operators.clone());
         self.metrics.origin_directory_cache_size(self.cache.len());
-        resolve_active(&operators, &self.operator_to_node, self.staker_set.as_ref())
+        self.resolve(&operators)
     }
 }
 
@@ -290,11 +321,30 @@ mod tests {
         positive_ttl: Duration,
         negative_ttl: Duration,
     ) -> ChainOriginDirectory {
+        directory_with_deny(
+            reads,
+            operator_to_node,
+            staker_set,
+            Arc::new(ContentDenylist::empty()),
+            positive_ttl,
+            negative_ttl,
+        )
+    }
+
+    fn directory_with_deny(
+        reads: Arc<StubReads>,
+        operator_to_node: HashMap<Address, NodeId>,
+        staker_set: Arc<StubStakers>,
+        content_deny: Arc<ContentDenylist>,
+        positive_ttl: Duration,
+        negative_ttl: Duration,
+    ) -> ChainOriginDirectory {
         ChainOriginDirectory {
             reads,
             cache: LazyOriginCache::new(8, positive_ttl, negative_ttl),
             operator_to_node: Arc::new(RwLock::new(operator_to_node)),
             staker_set,
+            content_deny,
             metrics: Arc::new(Metrics::new()),
         }
     }
@@ -466,6 +516,38 @@ mod tests {
         );
         let got = dir.lookup_origins(ns(7)).await;
         assert_eq!(got, vec![nid(0xA)]);
+    }
+
+    #[tokio::test]
+    async fn blacklisted_operator_is_dropped_from_the_resolved_set() {
+        // Both A and B are bonded, active, and authorized in getOrigins, but B is
+        // on the deny-set (a governance origin/operator blacklist the watcher
+        // synced). The node must not route an origin-pull to B even though the
+        // seat set still lists it — the contract does not filter getOrigins.
+        let reads = Arc::new(StubReads::new().origins(&[(7, &[addr(0xA), addr(0xB)])]));
+        let stakers = Arc::new(StubStakers::new(&[nid(0xA), nid(0xB)]));
+        let deny = Arc::new(ContentDenylist::empty());
+        deny.apply_chain_origin(addr(0xB), true);
+        let dir = directory_with_deny(
+            Arc::clone(&reads),
+            HashMap::from([(addr(0xA), nid(0xA)), (addr(0xB), nid(0xB))]),
+            stakers,
+            Arc::clone(&deny),
+            LONG,
+            LONG,
+        );
+
+        assert_eq!(dir.lookup_origins(ns(7)).await, vec![nid(0xA)]);
+
+        // The filter is applied live: lifting the blacklist restores B with no
+        // re-fetch, proving the deny-set is not baked into the cached set.
+        deny.apply_chain_origin(addr(0xB), false);
+        assert_eq!(dir.lookup_origins(ns(7)).await, vec![nid(0xA), nid(0xB)]);
+        assert_eq!(
+            reads.call_count(),
+            1,
+            "a blacklist change must not trigger a re-fetch"
+        );
     }
 
     /// `getOrigins` is bounded, so a stalled provider fails this lookup rather

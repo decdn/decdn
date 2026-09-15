@@ -16,10 +16,10 @@
 //!   orders makes this the only mechanism sized to a sub-day statutory deadline,
 //!   because it is the only one entirely within the order recipient's control.
 //! - **On-chain**, from `ContentBlacklist`'s `OriginBlacklistUpdated` AND
-//!   `OperatorBlacklisted` — two separate on-chain mappings that
-//!   `OriginAssignment` itself unions, so the node does too. Watching only the
-//!   first would leave the primary governance path (`addOperator`, which also
-//!   ejects from `CapacityBond`) unenforced at the delivery gate.
+//!   `OperatorBlacklisted` — two separate on-chain mappings the node unions.
+//!   Watching only the first would leave the primary governance path
+//!   (`addOperator`, which also ejects from `CapacityBond`) unenforced at the
+//!   delivery gate.
 //!
 //! Separate slots because their lifecycles are independent — a config reload
 //! must not clobber what the chain watcher learned, and vice versa — but
@@ -47,8 +47,7 @@ pub struct ContentDenylist {
     /// `[content] denied_origins`.
     local_origins: ArcSwap<HashSet<Address>>,
     /// Addresses governance has blacklisted at the origin OR operator level —
-    /// the union of `ContentBlacklist`'s two mappings, matching
-    /// `OriginAssignment.sol`'s own predicate.
+    /// the union of `ContentBlacklist`'s two mappings.
     chain_origins: ArcSwap<HashSet<Address>>,
 }
 
