@@ -383,7 +383,8 @@ async fn sighup_applies_security_changes() {
 /// SIGHUP must apply changes to the mutable `observability.log_level` while
 /// restart-required sections (`payment`, `network`, `blockchain`, `cache`,
 /// `identity`) surface an `info`-level "ignoring change to X
-/// (requires restart)" notice — never a silently-applied or silently-dropped
+/// (requires restart)" notice, and a changed restart-required `[observability]`
+/// field surfaces a `warn`-level one — never a silently-applied or silently-dropped
 /// value (#499). `payment.rate_per_mb` is restart-required, so a `[payment]`
 /// change earns the notice like any other non-reloadable section.
 ///
@@ -429,9 +430,10 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     // thread-local guard, the `current_thread` runtime, and `reload`
     // being awaited inline (not spawned) — see the doc comment above.
     // It also relies on no test in this binary installing a *global*
-    // subscriber (none does). The asserted lines are `info`-level
-    // (`warn_ignored` → `tracing::info!`), so `INFO` is the minimum
-    // capture level; broader would only add noise to failure dumps.
+    // subscriber (none does). The asserted section lines are `info`-level
+    // (`warn_ignored` → `tracing::info!`) and the observability lines are
+    // `warn`-level, so `INFO` is the minimum capture level; broader would
+    // only add noise to failure dumps.
     let _log_guard = tracing_subscriber::fmt()
         .with_writer(move || sink.clone())
         .with_ansi(false)
@@ -843,5 +845,116 @@ async fn a_failed_commit_reports_no_notices() {
         !logs.contains("unbounded"),
         "a reload that aborted in phase 2 applied no security values, so it \
          must not report their notices, got:\n{logs}"
+    );
+}
+
+/// The `[observability]` restart notice diffs *resolved* values, so CLI/env
+/// precedence holds on reload: a node started with `--otlp-endpoint` and
+/// `--metrics-port` whose file later sets different values is still running
+/// the CLI values, and must not warn that a restart would change them.
+#[tokio::test(flavor = "current_thread")]
+async fn observability_restart_notice_follows_cli_precedence() {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let log_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = BufferWriter(Arc::clone(&log_buf));
+    let _log_guard = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .with_max_level(LevelFilter::INFO)
+        .finish()
+        .set_default();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+
+    let mut initial = seed_resolved(10, LogLevel::Info);
+    initial.observability.otlp_endpoint = Some("http://cli-collector:4317".to_string());
+    initial.observability.metrics_port = 9100;
+    let (setter, _levels) = recording_setter();
+    let state = RuntimeReloadState::new(
+        ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port: Some(9100),
+            metrics_bind: None,
+            admin_port: None,
+            otlp_endpoint: Some("http://cli-collector:4317".to_string()),
+        },
+        &initial,
+        setter,
+    );
+
+    write_config(
+        &path,
+        "[observability]\n\
+         log_level = \"debug\"\n\
+         metrics_port = 9999\n\
+         otlp_endpoint = \"http://file-collector:4317\"\n",
+    );
+    state.reload(&path).await.expect("reload");
+
+    let logs = captured_logs(&log_buf);
+    assert!(
+        !logs.contains("ignoring change to observability."),
+        "CLI values win over the file, so nothing restart-required changed, got:\n{logs}"
+    );
+}
+
+/// A reload that fails resolution applies nothing, so it must not tell the
+/// operator that a restart would apply its observability values — least of
+/// all an endpoint that start-up would reject.
+#[tokio::test(flavor = "current_thread")]
+async fn an_aborted_reload_reports_no_observability_notice() {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let log_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = BufferWriter(Arc::clone(&log_buf));
+    let _log_guard = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .with_max_level(LevelFilter::INFO)
+        .finish()
+        .set_default();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+
+    let initial = seed_resolved(10, LogLevel::Info);
+    let (setter, _levels) = recording_setter();
+    let state = RuntimeReloadState::new(
+        ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port: None,
+            metrics_bind: None,
+            admin_port: None,
+            otlp_endpoint: None,
+        },
+        &initial,
+        setter,
+    );
+
+    write_config(
+        &path,
+        "[observability]\n\
+         metrics_port = 9999\n\
+         otlp_endpoint = \"https://collector:4317\"\n",
+    );
+    state
+        .reload(&path)
+        .await
+        .expect_err("an https otlp_endpoint must fail resolution");
+
+    let logs = captured_logs(&log_buf);
+    assert!(
+        !logs.contains("ignoring change to observability."),
+        "an aborted reload must not report restart notices, got:\n{logs}"
+    );
+    assert!(
+        !logs.contains("collector:4317"),
+        "the otlp_endpoint value must not be logged, got:\n{logs}"
     );
 }

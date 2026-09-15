@@ -5,8 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+use tracing_subscriber::Layer;
+use tracing_subscriber::registry::LookupSpan;
 
 use crate::metrics::Metrics;
 
@@ -21,12 +23,26 @@ const OTLP_TRANSPORT_TARGETS: &[&str] = &["h2", "hyper", "hyper_util", "tonic", 
 
 /// Whether a span/event target belongs to the OTLP export transport
 /// ([`OTLP_TRANSPORT_TARGETS`]), matched on the crate-path boundary.
-pub(super) fn is_otlp_transport_target(target: &str) -> bool {
+fn is_otlp_transport_target(target: &str) -> bool {
     OTLP_TRANSPORT_TARGETS.iter().any(|krate| {
         target
             .strip_prefix(krate)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
     })
+}
+
+/// The tracing layer that exports spans through `provider`, with the OTLP
+/// transport's own spans filtered out.
+pub(super) fn otel_layer<S>(provider: &SdkTracerProvider) -> impl Layer<S> + use<S>
+where
+    S: tracing::Subscriber + for<'span> LookupSpan<'span>,
+{
+    let tracer = opentelemetry::trace::TracerProvider::tracer(provider, "decdn");
+    tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+            !is_otlp_transport_target(meta.target())
+        }))
 }
 
 /// Span exporter that counts failed export batches into
@@ -48,6 +64,10 @@ impl<E: SpanExporter> SpanExporter for CountingSpanExporter<E> {
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
         self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn shutdown(&self) -> OTelSdkResult {
+        self.inner.shutdown()
     }
 
     fn force_flush(&self) -> OTelSdkResult {
@@ -95,20 +115,42 @@ pub(super) fn init_otlp_provider(
     Ok(provider)
 }
 
+/// Record a failed run's error, then flush and shut the OTLP tracer provider
+/// down.
+///
+/// The error is recorded before the flush, so it is exported with the
+/// run's last spans instead of waiting behind the flush for `main`'s stderr
+/// line. It takes `main`'s redaction, because the chain can carry `rpc_url`.
+pub(super) async fn finish_run(provider: SdkTracerProvider, result: &anyhow::Result<()>) {
+    if let Err(err) = result {
+        tracing::error!(
+            error = %decdn_common::redact::sanitize_err_chain(err),
+            "node run failed"
+        );
+    }
+    shutdown_tracer_provider(provider).await;
+}
+
 /// Flush queued spans and shut the OTLP tracer provider down.
 ///
 /// The `opentelemetry` global is a static that is never dropped, so without
 /// this call the batch processor's queue is discarded at exit. Shutdown waits
 /// synchronously on the batch worker, so it runs on a blocking thread; it runs
 /// before `main` returns because this runtime drives the tonic channel.
-pub(super) async fn shutdown_tracer_provider(provider: SdkTracerProvider) {
+async fn shutdown_tracer_provider(provider: SdkTracerProvider) {
     let joined =
         tokio::task::spawn_blocking(move || provider.shutdown_with_timeout(OTLP_SHUTDOWN_TIMEOUT))
             .await;
     match joined {
         Ok(Ok(())) => {}
+        Ok(Err(OTelSdkError::Timeout(after))) => {
+            tracing::warn!(
+                ?after,
+                "OTLP collector did not answer the exit-time flush in time; the in-flight batch is abandoned"
+            );
+        }
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "OTLP tracer provider shutdown failed; queued spans may be lost");
+            tracing::warn!(error = %e, "OTLP exit-time flush failed; its spans are lost");
         }
         Err(e) => {
             tracing::warn!(error = %e, "OTLP tracer provider shutdown task did not complete");
@@ -118,17 +160,112 @@ pub(super) async fn shutdown_tracer_provider(provider: SdkTracerProvider) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    use super::{init_otlp_provider, is_otlp_transport_target, shutdown_tracer_provider};
+    use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
+    use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+
+    use super::{
+        CountingSpanExporter, init_otlp_provider, is_otlp_transport_target, otel_layer,
+        shutdown_tracer_provider,
+    };
     use crate::metrics::Metrics;
 
+    /// In-memory exporter that records exported span names and returns a
+    /// fixed result.
+    #[derive(Debug, Clone)]
+    struct StubExporter {
+        names: Arc<Mutex<Vec<String>>>,
+        fail: bool,
+    }
+
+    impl StubExporter {
+        fn new(fail: bool) -> Self {
+            Self {
+                names: Arc::new(Mutex::new(Vec::new())),
+                fail,
+            }
+        }
+    }
+
+    impl SpanExporter for StubExporter {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            if let Ok(mut names) = self.names.lock() {
+                names.extend(batch.into_iter().map(|s| s.name.into_owned()));
+            }
+            if self.fail {
+                Err(OTelSdkError::InternalFailure("stub failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn failures_line(metrics: &Metrics, count: u64) -> anyhow::Result<bool> {
+        let expected = format!("decdn_otlp_export_failures_total {count}");
+        Ok(metrics.encode()?.lines().any(|l| l == expected))
+    }
+
+    /// Only a failed export counts: a regression that drops or inverts the
+    /// `is_err` check fires the alert on healthy nodes or never at all.
+    #[tokio::test]
+    async fn counting_exporter_counts_failures_only() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+
+        let ok = CountingSpanExporter {
+            inner: StubExporter::new(false),
+            metrics: Arc::clone(&metrics),
+        };
+        ok.export(Vec::new()).await?;
+        anyhow::ensure!(failures_line(&metrics, 0)?, "successful export was counted");
+
+        let failing = CountingSpanExporter {
+            inner: StubExporter::new(true),
+            metrics: Arc::clone(&metrics),
+        };
+        anyhow::ensure!(
+            failing.export(Vec::new()).await.is_err(),
+            "failure must pass through"
+        );
+        anyhow::ensure!(failures_line(&metrics, 1)?, "failed export was not counted");
+        Ok(())
+    }
+
+    /// The layer `init_tracing` installs exports application spans and drops
+    /// the OTLP transport's own.
+    #[test]
+    fn otel_layer_drops_transport_spans() -> anyhow::Result<()> {
+        use tracing_subscriber::prelude::*;
+
+        let stub = StubExporter::new(false);
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(stub.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(otel_layer(&provider));
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::info_span!(target: "h2::codec", "h2_span").in_scope(|| {});
+            tracing::info_span!(target: "tonic::transport", "tonic_span").in_scope(|| {});
+            tracing::info_span!(target: "decdn_node::runtime", "app_span").in_scope(|| {});
+        }
+        provider.force_flush()?;
+
+        let names = stub
+            .names
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stub mutex poisoned"))?
+            .clone();
+        anyhow::ensure!(names == ["app_span"], "exported spans: {names:?}");
+        Ok(())
+    }
+
     /// A span still in the batch queue reaches the collector at shutdown, and
-    /// the failed export is counted. The batch delay (5 s) outlasts this test,
-    /// so only the shutdown flush can open the connection. The listener closes
-    /// each connection on accept, so the export fails fast (a silent listener
-    /// would hang it past the shutdown bound); the accepted connection is the
-    /// proof of the attempt.
+    /// the failed export is counted. The SDK's default batch delay (5 s,
+    /// `OTEL_BSP_SCHEDULE_DELAY`) outlasts this test, so only the shutdown
+    /// flush can open the connection. The listener closes each connection on
+    /// accept, so the export fails fast (a silent listener would hang it past
+    /// the shutdown bound); the accepted connection is the proof of the
+    /// attempt.
     #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_flushes_queued_spans_and_counts_the_failed_export() -> anyhow::Result<()> {
         use opentelemetry::trace::{Tracer, TracerProvider};
@@ -151,12 +288,7 @@ mod tests {
             matches!(accepted, Ok(Ok(Ok(_)))),
             "shutdown did not attempt an export: {accepted:?}"
         );
-        let body = metrics.encode()?;
-        anyhow::ensure!(
-            body.lines()
-                .any(|l| l == "decdn_otlp_export_failures_total 1"),
-            "failed export not counted"
-        );
+        anyhow::ensure!(failures_line(&metrics, 1)?, "failed export not counted");
         Ok(())
     }
 

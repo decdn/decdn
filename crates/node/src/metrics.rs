@@ -179,9 +179,12 @@ pub struct DecdnMetrics {
     /// invisible in `active_connections` alone. Operator-visible name:
     /// `decdn_client_idle_close_total`.
     pub client_idle_close: Counter,
-    /// OTLP span-export batches the collector did not accept (unreachable,
-    /// rejected, or timed out), counted at the batch exporter. Stays `0` when
-    /// `observability.otlp_endpoint` is unset. Operator-visible name:
+    /// OTLP span-export batches whose export call failed (connect error,
+    /// non-OK gRPC status, or timeout), counted at the batch exporter. Spans
+    /// the batch queue drops when full, and spans a collector rejects inside
+    /// an OK partial-success reply, are not counted: `0` does not mean no
+    /// traces were lost. Stays `0` when `observability.otlp_endpoint` is unset
+    /// or the node emits no spans. Operator-visible name:
     /// `decdn_otlp_export_failures_total`.
     pub otlp_export_failures: Counter,
     /// Seconds since node start.

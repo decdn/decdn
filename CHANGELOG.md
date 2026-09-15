@@ -35,11 +35,16 @@ since project inception and will roll into the first tagged release.
   layer is installed. Building with `--features otlp` is now an error.
   - The endpoint must be `http://host:port`: config resolution rejects
     `https://` (the exporter has no TLS), a missing port, a path, query or
-    fragment (an OTLP/HTTP `…:4318/v1/traces` URL is the wrong protocol), and
-    userinfo. Rejections never echo the endpoint. An exporter that fails to
-    build aborts start-up.
+    fragment (an OTLP/HTTP `…:4318/v1/traces` URL is the wrong protocol),
+    userinfo, and surrounding whitespace. Rejections never echo any part of the
+    endpoint. An exporter that fails to build aborts start-up.
   - New counter `decdn_otlp_export_failures_total` and warning alert
-    `DecdnOtlpExportFailing` surface a dead or wrong collector.
+    `DecdnOtlpExportFailing` surface a dead or wrong collector. The counter
+    counts failed export batches only: queue-full drops and partial-success
+    rejections are not counted. While a collector is down, the SDK also logs
+    each failed batch at `error` under the `opentelemetry_sdk` target.
+  - A failed run logs its (redacted) error before the exit-time flush, so the
+    error is exported with the run's last spans.
   - A SIGHUP that changes a restart-required `[observability]` field
     (`log_format`, `metrics_port`, `metrics_bind`, `admin_port`,
     `otlp_endpoint`) now logs one `warn` per changed field, comparing the

@@ -273,11 +273,14 @@ groups:
         annotations:
           summary: "OTLP span export failing on {{ $labels.instance }}"
           description: |
-            The node's OTLP exporter has failed span-export batches for 15
-            minutes, so traces are being lost. Check that the collector at
-            observability.otlp_endpoint is up and speaks OTLP/gRPC (usually port
-            4317). Export errors are also logged at error level under the
-            opentelemetry_sdk target.
+            The node's OTLP exporter kept failing span-export batches through
+            the last 15 minutes, so traces are being lost. Check that the
+            collector at observability.otlp_endpoint is up and speaks OTLP/gRPC
+            (usually port 4317). The SDK also logs each failed batch at error
+            level under the opentelemetry_sdk target. An idle node exports no
+            batches, so a dead collector does not fire this until spans flow.
+            Queue-full drops are not counted; watch for the SDK's
+            BatchSpanProcessor.SpanDroppingStarted warning.
 
       # NOTE: /health 503 detection requires an external prober (e.g.
       # blackbox_exporter) — it is not surfaced as a decdn_* metric. Add

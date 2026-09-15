@@ -81,7 +81,7 @@ pub async fn run(
     // On both exit paths: the spans around a failed run are the ones an
     // operator most wants exported.
     if let Some(provider) = tracer_provider {
-        otlp::shutdown_tracer_provider(provider).await;
+        otlp::finish_run(provider, &result).await;
     }
 
     result
@@ -97,7 +97,7 @@ pub async fn run(
 /// handle (e.g. the registry was dropped) by surfacing them.
 ///
 /// Also returns the OTLP tracer provider when export is on; the caller
-/// passes it to [`otlp::shutdown_tracer_provider`] before the process exits.
+/// passes it to [`otlp::finish_run`] before the process exits.
 fn init_tracing(
     filter: tracing_subscriber::EnvFilter,
     resolved: &config::ResolvedConfig,
@@ -120,13 +120,7 @@ fn init_tracing(
 
     let tracer_provider = if let Some(ref endpoint) = resolved.observability.otlp_endpoint {
         let provider = otlp::init_otlp_provider(endpoint, node_metrics)?;
-        let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "decdn");
-        let otel_layer = tracing_opentelemetry::layer()
-            .with_tracer(tracer)
-            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
-                !otlp::is_otlp_transport_target(meta.target())
-            }));
-        registry.with(otel_layer).init();
+        registry.with(otlp::otel_layer(&provider)).init();
         Some(provider)
     } else {
         registry.init();

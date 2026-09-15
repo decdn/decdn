@@ -349,8 +349,9 @@ impl ReloadableSection for LogLevelSection {
 }
 
 impl LogLevelSection {
-    /// Warn once for each restart-required observability field whose resolved
-    /// value (CLI/env > file > default) differs from the startup value. Reads
+    /// On each reload, warn for each restart-required observability field whose
+    /// resolved value (CLI/env > file > default) differs from the startup value.
+    /// A field that stays changed warns again on every reload. Reads
     /// the buffer `resolve` filled, so it runs between resolve and commit.
     /// Names fields only: `otlp_endpoint` can carry credentials.
     fn warn_restart_required_changes(&self) {
@@ -1177,8 +1178,11 @@ impl RuntimeReloadState {
             return Err(err);
         }
 
-        // Emit a "requires restart" notice for each non-reloadable field the
-        // file carries. Read-only, so do it before the commit step.
+        // Emit a "requires restart" notice for each non-reloadable section the
+        // file carries, and for each restart-required observability field whose
+        // resolved value differs from startup. Read-only, so do it before the
+        // commit step; it runs after the gate above, so an aborted reload
+        // reports none.
         warn_restart_required_sections(&file);
         self.log_level.warn_restart_required_changes();
 
@@ -2599,6 +2603,31 @@ mod tests {
             observability_restart_required_changes(&startup, &reloaded),
             ["metrics_port", "otlp_endpoint"]
         );
+
+        // One field at a time, so a name paired with the wrong comparison fails.
+        for field in [
+            "log_format",
+            "metrics_port",
+            "metrics_bind",
+            "admin_port",
+            "otlp_endpoint",
+        ] {
+            let mut reloaded = seed_resolved(10, LogLevel::Info).observability;
+            match field {
+                "log_format" => reloaded.log_format = decdn_common::cli::common::LogFormat::Json,
+                "metrics_port" => reloaded.metrics_port = 9999,
+                "metrics_bind" => {
+                    reloaded.metrics_bind = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+                }
+                "admin_port" => reloaded.admin_port = None,
+                _ => reloaded.otlp_endpoint = Some("http://collector:4317".to_string()),
+            }
+            assert_eq!(
+                observability_restart_required_changes(&startup, &reloaded),
+                [field],
+                "changing only {field}"
+            );
+        }
     }
 
     /// SIGHUP with a `[load_shed]` block swaps the live controller's policy:

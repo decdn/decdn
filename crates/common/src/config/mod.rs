@@ -2936,17 +2936,29 @@ pub fn resolve_observability_into(
 /// - No path, query, fragment, or userinfo: gRPC uses none of them, and an
 ///   OTLP/HTTP URL (`…:4318/v1/traces`) there means the wrong protocol.
 ///
-/// Errors never echo the endpoint: it can carry credentials, so it is
-/// redacted like `rpc_url`.
+/// - No surrounding whitespace, tab, or newline: the URL parser strips them
+///   but the exporter does not, so such a value would pass here and fail at
+///   start-up.
+///
+/// Errors never echo any part of the endpoint: it can carry credentials, so
+/// it is redacted like `rpc_url`.
 fn validate_otlp_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        endpoint.trim() == endpoint && !endpoint.contains(['\t', '\n', '\r']),
+        "observability.otlp_endpoint must not contain whitespace, tabs, or newlines"
+    );
+    // Checked on the raw text, before parsing: `http:host:4317` parses as a URL
+    // but is not `http://…`, and a scheme-less value would parse its first
+    // segment (possibly a username) as the scheme.
+    anyhow::ensure!(
+        endpoint
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://")),
+        "observability.otlp_endpoint must start with http://; the OTLP gRPC exporter has \
+         no TLS, so point it at a local collector and terminate TLS there"
+    );
     let parsed = url::Url::parse(endpoint)
         .map_err(|e| anyhow::anyhow!("observability.otlp_endpoint is not a valid URL: {e}"))?;
-    anyhow::ensure!(
-        parsed.scheme() == "http",
-        "observability.otlp_endpoint must use http:// (got scheme {:?}); the OTLP gRPC \
-         exporter has no TLS, so point it at a local collector and terminate TLS there",
-        parsed.scheme()
-    );
     anyhow::ensure!(
         parsed.host().is_some(),
         "observability.otlp_endpoint has no host"
@@ -7645,6 +7657,7 @@ usdc_address = \"0xUsdc\"
             "http://[::1]:4317",
             "http://collector:80",
             "http://10.0.0.5:4317/",
+            "HTTP://collector:4317",
         ] {
             validate_otlp_endpoint(ep).with_context(|| format!("{ep} should be accepted"))?;
         }
@@ -7661,7 +7674,10 @@ usdc_address = \"0xUsdc\"
             ("http://collector:4317#frag", "no path"),
             ("http://user:pw@collector:4317", "userinfo"),
             ("http://coll ector:4317", "not a valid URL"),
-            ("not a url", "not a valid URL"),
+            ("not a url", "must start with http://"),
+            ("http:collector:4317", "must start with http://"),
+            (" http://collector:4317", "whitespace"),
+            ("http://coll\tector:4317", "whitespace"),
         ] {
             let err = validate_otlp_endpoint(ep).expect_err(ep);
             assert!(
@@ -7680,6 +7696,8 @@ usdc_address = \"0xUsdc\"
             format!("http://{secret}:pw@collector:4317"),
             format!("https://collector:4317/{secret}"),
             format!("http://collector/{secret}"),
+            format!("{secret}:pw@collector:4317"),
+            format!("{secret}.example:4317"),
         ] {
             let mut cli = obs_cli(None, None);
             cli.otlp_endpoint = Some(ep.clone());

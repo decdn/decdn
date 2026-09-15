@@ -80,8 +80,8 @@ cargo clippy -p decdn-incentive --no-default-features \
 ```
 
 The `--all-features` run is the only one that reaches anything behind an off-by-default feature —
-the `anvil-e2e` targets (journeys and the two `decdn-node` anvil tests), `public-api-test`. Run it before pushing a change that touches
-gated code, or the first thing that tells you is a red CI.
+the `anvil-e2e` targets (journeys and the two `decdn-node` anvil tests), `public-api-test`. Run it
+before pushing a change that touches gated code, or the first thing that tells you is a red CI.
 
 ### Public API snapshot
 

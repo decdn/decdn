@@ -168,7 +168,7 @@ Reputation is local-only per [ADR 008](008-reputation.md#adr-008-reputation-syst
 | Metric | Type | Tier | Status | Description |
 |--------|------|------|--------|-------------|
 | `decdn_node_uptime_seconds` | Gauge | R | live | Seconds since the node process started. Used by the `/health` endpoint and operator dashboards to correlate events with restarts. |
-| `decdn_otlp_export_failures_total` | Counter | R | live | OTLP span-export batches that the collector did not accept: unreachable, rejected, or timed out. Stays 0 when `observability.otlp_endpoint` is unset. A sustained rate means traces are lost. |
+| `decdn_otlp_export_failures_total` | Counter | R | live | OTLP span-export batches whose export call failed: connect error, non-OK gRPC status, or timeout. A sustained rate means traces are lost. The counter does not count spans that the batch queue drops when full, or spans that a collector rejects inside an OK partial-success reply, so 0 does not prove that no traces were lost. The SDK logs queue drops as `BatchSpanProcessor.SpanDroppingStarted` and `BatchSpanProcessor.SpansDropped` under the `opentelemetry_sdk` target. Stays 0 when `observability.otlp_endpoint` is unset or the node emits no spans. |
 
 #### DHT / Content-Discovery Metrics
 
