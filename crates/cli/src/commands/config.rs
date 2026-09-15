@@ -1042,7 +1042,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # metrics_port = 9090
 # metrics_bind = "127.0.0.1"               # IP the metrics HTTP server binds; default loopback only
 # admin_port = 9191                        # loopback-only; 0 disables (appendix-local-admin-http.md)
-# otlp_endpoint = "http://localhost:4317"  # requires --features otlp
+# otlp_endpoint = "http://localhost:4317"  # OTLP gRPC collector (http:// only); enables span export
 
 [security]
 # max_concurrent_handlers = 256             # global cap on in-flight QUIC handler tasks; 0 disables the cap

@@ -557,7 +557,8 @@ pub struct ResolvedObservability {
     /// Loopback admin HTTP port (`appendix-local-admin-http.md`). `None` disables the admin
     /// server entirely; `Some(port)` binds on `127.0.0.1:<port>`.
     pub admin_port: Option<u16>,
-    /// OTLP collector endpoint URL (if set, span export is enabled).
+    /// OTLP gRPC collector endpoint (if set, span export is enabled). Resolution
+    /// guarantees the `http://host:port` shape; see `validate_otlp_endpoint`.
     pub otlp_endpoint: Option<String>,
 }
 

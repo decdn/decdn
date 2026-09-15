@@ -580,11 +580,11 @@ fn summary_redacts_rpc_url_value() -> anyhow::Result<()> {
 #[test]
 fn summary_redacts_otlp_endpoint_value() -> anyhow::Result<()> {
     let cfg = sample_resolved(|c| {
-        c.observability.otlp_endpoint = Some("https://otel.example/?token=OTEL_SECRET_xyz".into());
+        c.observability.otlp_endpoint = Some("http://otel-secret-xyz.example:4317".into());
     });
     let out = render(None, &cfg)?;
     anyhow::ensure!(
-        !out.contains("OTEL_SECRET_xyz"),
+        !out.contains("otel-secret-xyz"),
         "otlp_endpoint value must never appear in summary: {out}"
     );
     anyhow::ensure!(
@@ -612,7 +612,7 @@ fn summary_prints_optional_fields_when_set() -> anyhow::Result<()> {
     let cfg = sample_resolved(|c| {
         c.identity.region = Some("US".into());
         c.network.relay_urls = vec!["https://relay.iroh.network".into()];
-        c.observability.otlp_endpoint = Some("https://otel.example".into());
+        c.observability.otlp_endpoint = Some("http://otel.example:4317".into());
     });
     let out = render(None, &cfg)?;
     anyhow::ensure!(out.contains("region:                   US"), "{out}");

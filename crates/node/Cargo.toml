@@ -17,12 +17,6 @@ path = "src/main.rs"
 
 [features]
 default = []
-otlp = [
-    "dep:opentelemetry",
-    "dep:opentelemetry_sdk",
-    "dep:opentelemetry-otlp",
-    "dep:tracing-opentelemetry",
-]
 # Opt-in gate for the live anvil-backed on-chain settlement e2e
 # (`tests/anvil_settlement_e2e.rs`, issue #745). Off by default so `cargo
 # nextest run` stays fast and needs no `anvil`/`forge` binaries. The e2e
@@ -100,10 +94,10 @@ url = { workspace = true }
 governor = { workspace = true }
 arc-swap = { workspace = true }
 redb = { workspace = true }
-opentelemetry = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
-tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
 # Self dev-dependency that turns on `test-support` for the `decdn-node` library

@@ -75,7 +75,7 @@ CLI links no blob store.
 ### Why the metric prefix and OTLP `service.name` stay `decdn`
 
 The Prometheus metric prefix in `crates/node/src/metrics.rs` and the
-OTLP `service.name` in `crates/node/src/commands/mod.rs` both read
+OTLP `service.name` in `crates/node/src/commands/otlp.rs` both read
 `decdn` (not `decdn-node`) for dashboard and alert continuity. A
 reviewer asking "shouldn't `decdn_*` be `decdn_node_*`?" should
 consult this appendix and `monitoring/prometheus-alerts.yml` /

@@ -28,6 +28,33 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Runtime: OTLP span export is always compiled into `decdn-node`; the `otlp`
+  cargo feature is gone (#2039).** Release archives and the Docker image now honour
+  `observability.otlp_endpoint` / `--otlp-endpoint` / `DECDN_OTLP_ENDPOINT`
+  instead of ignoring it with a stderr warning. With no endpoint set, no OTel
+  layer is installed. Building with `--features otlp` is now an error.
+  - The endpoint must be `http://host:port`: config resolution rejects
+    `https://` (the exporter has no TLS), a missing port, a path, query or
+    fragment (an OTLP/HTTP `…:4318/v1/traces` URL is the wrong protocol),
+    userinfo (including an empty `@`), and surrounding whitespace. Rejections never echo any part of the
+    endpoint. An exporter that fails to build aborts start-up.
+  - New counter `decdn_otlp_export_failures_total` and warning alert
+    `DecdnOtlpExportFailing` surface a dead or wrong collector. The counter
+    counts failed export batches only: queue-full drops and partial-success
+    rejections are not counted. While a collector is down, the SDK also logs
+    each failed batch at `error` under the `opentelemetry_sdk` target.
+  - A failed run logs its (redacted) error before the exit-time flush, so the
+    error is exported with the run's last spans.
+  - A SIGHUP that changes a restart-required `[observability]` field
+    (`log_format`, `metrics_port`, `metrics_bind`, `admin_port`,
+    `otlp_endpoint`) now logs one `warn` per changed field, comparing the
+    resolved value (CLI/env > file) with startup. An unchanged field stays
+    silent, where it previously logged an `info` notice on every reload.
+  - Queued spans flush on exit, on both the clean and the failed-run path. The
+    flush runs on its own thread and the exit path waits at most 6 s for it.
+  - The OTel layer drops `h2`/`hyper`/`hyper_util`/`tonic`/`tower` spans, so
+    `trace` level cannot feed the export connection back into itself.
+
 - **Contracts: `OriginAssignment` drops its `ContentBlacklist` coupling; the
   routing consumer filters instead (#2032).** The seat set is a routing hint, so
   blacklist filtering moves to the party that acts on it. Removed from
@@ -1885,7 +1912,7 @@ since project inception and will roll into the first tagged release.
 
 - Prometheus metrics over loopback HTTP at `observability.metrics_port`
   (ADR 020).
-- Optional OTLP span export behind the `otlp` feature flag.
+- OTLP span export to `observability.otlp_endpoint` (`--otlp-endpoint`).
 - `pretty` and `json` log formats (`--log-format`).
 
 #### Identity

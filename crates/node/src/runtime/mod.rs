@@ -390,13 +390,13 @@ struct Infra {
 async fn build_infra(
     cfg: &ResolvedConfig,
     reload_state: &RuntimeReloadState,
+    node_metrics: Arc<metrics::Metrics>,
 ) -> anyhow::Result<Infra> {
     // Preflight: verify RPC endpoint is reachable before committing to
     // port binding. A 5-second timeout keeps startup responsive on flaky
     // networks while still catching typos and dead endpoints early.
     check_rpc_reachability(&cfg.blockchain.rpc_url).await?;
 
-    let node_metrics = Arc::new(metrics::Metrics::new());
     // Registry-mandatory `decdn_probe_hold_slots_max` (ADR
     // appendix-observability.md) — static, set once from config.
     node_metrics.probe_hold_slots_max(cfg.cache.max_probe_holds);
@@ -2281,10 +2281,15 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
 /// persistent stream queues the signal until the next `recv()` call
 /// (kernel-managed, with coalescing) so concurrent or rapidly-repeated
 /// signals are observed deterministically.
+///
+/// `node_metrics` is the registry `/metrics` serves. The caller builds it
+/// so that pre-runtime components (the OTLP exporter) count into the same
+/// registry.
 pub async fn run(
     cfg: ResolvedConfig,
     config_path: Option<PathBuf>,
     reload_state: Arc<RuntimeReloadState>,
+    node_metrics: Arc<metrics::Metrics>,
 ) -> anyhow::Result<()> {
     // Captured at the very top of `run()`, before any `await` or I/O,
     // so `admin_v1_health.uptime_s` reflects the entire process lifetime
@@ -2294,7 +2299,7 @@ pub async fn run(
     // run` was invoked, not just everything after the admin server bound.
     let started_at = std::time::Instant::now();
 
-    let infra = build_infra(&cfg, &reload_state).await?;
+    let infra = build_infra(&cfg, &reload_state, node_metrics).await?;
 
     let ch = build_chain_and_handlers(&cfg, &reload_state, &infra).await?;
 

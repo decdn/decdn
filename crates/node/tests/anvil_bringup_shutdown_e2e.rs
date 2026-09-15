@@ -19,7 +19,7 @@
 //! 2. Generate a node Ethereum keystore, build a `ResolvedConfig` pointed at the
 //!    anvil RPC and the deployed contract addresses, with data dirs under
 //!    `TempDir`s and explicit free TCP ports for the admin + metrics listeners.
-//! 3. `tokio::spawn(decdn_node::runtime::run(cfg, None, reload_state))`.
+//! 3. `tokio::spawn(decdn_node::runtime::run(cfg, None, reload_state, metrics))`.
 //! 4. Poll `admin_v1_health` on the configured admin port until the runtime is
 //!    up (bounded retry loop), reusing the same jsonrpsee `AdminRpcClient` the
 //!    `decdn node …` CLI uses.
@@ -568,7 +568,12 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
     ));
 
     // ---- 5. Boot the real runtime.
-    let handle = tokio::spawn(decdn_node::runtime::run(cfg, None, reload_state));
+    let handle = tokio::spawn(decdn_node::runtime::run(
+        cfg,
+        None,
+        reload_state,
+        Arc::new(decdn_node::metrics::Metrics::new()),
+    ));
 
     // ---- 6. Poll the admin health endpoint until the runtime answers — the
     // readiness signal (the admin server binds and serves once bring-up has

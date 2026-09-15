@@ -7,9 +7,14 @@
 //! out into a separate file mostly avoids churn in
 //! `crates/node/src/main.rs`, which stays a thin clap shell.
 
-use decdn_common::{cli, config};
+mod otlp;
 
-use crate::runtime;
+use std::sync::Arc;
+
+use decdn_common::{cli, config};
+use opentelemetry_sdk::trace::SdkTracerProvider;
+
+use crate::{metrics, runtime};
 
 /// Run the deCDN node with resolved configuration.
 #[expect(
@@ -34,7 +39,12 @@ pub async fn run(
         }
     };
 
-    let log_level_setter = init_tracing(filter, &resolved)?;
+    // Built before tracing so the OTLP exporter counts into the registry
+    // `/metrics` serves.
+    let node_metrics = Arc::new(metrics::Metrics::new());
+
+    let (log_level_setter, tracer_provider) =
+        init_tracing(filter, &resolved, Arc::clone(&node_metrics))?;
 
     // Replay what `resolve_config` recorded. It runs before `init_tracing`
     // (the fallback filter above is built from the resolved log level), so a
@@ -54,32 +64,45 @@ pub async fn run(
         "resolved configuration"
     );
 
-    let reload_state = std::sync::Arc::new(runtime::RuntimeReloadState::new(
+    let reload_state = Arc::new(runtime::RuntimeReloadState::new(
         run_args.observability.clone(),
         &resolved,
         log_level_setter,
     ));
 
-    runtime::run(
+    let result = runtime::run(
         resolved,
         config_path.map(std::path::Path::to_path_buf),
         reload_state,
+        node_metrics,
     )
-    .await
+    .await;
+
+    // On both exit paths: the spans around a failed run are the ones an
+    // operator most wants exported.
+    if let Some(provider) = tracer_provider {
+        otlp::finish_run(provider, &result).await;
+    }
+
+    result
 }
 
-/// Initialize the tracing subscriber with fmt layer and optional OTLP layer.
+/// Initialize the tracing subscriber with a fmt layer, plus an OTLP span
+/// export layer when `observability.otlp_endpoint` is set.
 ///
 /// Returns a [`runtime::LogLevelSetter`] closure that swaps the live
 /// `EnvFilter` to one matching a new `LogLevel` — used by the SIGHUP
 /// hot-reload path (#236). The closure captures a `reload::Handle` to the
 /// `EnvFilter` layer; calls to `modify` must respect any errors from the
 /// handle (e.g. the registry was dropped) by surfacing them.
-#[allow(clippy::unnecessary_wraps)] // Returns Result only when otlp feature is enabled.
+///
+/// Also returns the OTLP tracer provider when export is on; the caller
+/// passes it to [`otlp::finish_run`] before the process exits.
 fn init_tracing(
     filter: tracing_subscriber::EnvFilter,
     resolved: &config::ResolvedConfig,
-) -> anyhow::Result<runtime::LogLevelSetter> {
+    node_metrics: Arc<metrics::Metrics>,
+) -> anyhow::Result<(runtime::LogLevelSetter, Option<SdkTracerProvider>)> {
     use tracing_subscriber::prelude::*;
 
     let fmt_layer = match resolved.observability.log_format {
@@ -95,30 +118,14 @@ fn init_tracing(
         .with(reload_filter)
         .with(fmt_layer);
 
-    #[cfg(feature = "otlp")]
-    {
-        if let Some(ref endpoint) = resolved.observability.otlp_endpoint {
-            let tracer = init_otlp_tracer(endpoint)?;
-            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-            registry.with(otel_layer).init();
-        } else {
-            registry.init();
-        }
-    }
-
-    #[cfg(not(feature = "otlp"))]
-    {
-        // `allow`, not `expect`: this `eprintln!` is itself cfg-gated, so an
-        // `--all-features` build would find the expectation unfulfilled. Scoped
-        // to this block rather than the function so the `LogLevelSetter` closure
-        // below — which runs on SIGHUP, long after `registry.init()` — stays
-        // covered by the workspace deny.
-        #[allow(clippy::print_stderr)]
-        if resolved.observability.otlp_endpoint.is_some() {
-            eprintln!("warning: --otlp-endpoint ignored (binary not built with 'otlp' feature)");
-        }
+    let tracer_provider = if let Some(ref endpoint) = resolved.observability.otlp_endpoint {
+        let provider = otlp::init_otlp_provider(endpoint, node_metrics)?;
+        registry.with(otlp::otel_layer(&provider)).init();
+        Some(provider)
+    } else {
         registry.init();
-    }
+        None
+    };
 
     let setter: runtime::LogLevelSetter = Box::new(move |lvl| {
         // Build a fresh EnvFilter from the level's lowercase name. This
@@ -133,38 +140,5 @@ fn init_tracing(
         Ok(())
     });
 
-    Ok(setter)
-}
-
-/// Build an OTLP span exporter and tracer provider.
-///
-/// Note: the metric prefix and OTLP `service.name` stay `decdn` (not
-/// `decdn-node`) for dashboard/alert continuity across the binary
-/// split — see ADR appendix-binaries.
-#[cfg(feature = "otlp")]
-fn init_otlp_tracer(endpoint: &str) -> anyhow::Result<opentelemetry_sdk::trace::SdkTracer> {
-    use opentelemetry::KeyValue;
-    use opentelemetry_otlp::{SpanExporter, WithExportConfig};
-    use opentelemetry_sdk::Resource;
-    use opentelemetry_sdk::trace::SdkTracerProvider;
-
-    let exporter = SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint)
-        .build()
-        .map_err(|e| anyhow::anyhow!("failed to build OTLP exporter: {e}"))?;
-
-    let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(
-            Resource::builder()
-                .with_attributes([KeyValue::new("service.name", "decdn")])
-                .build(),
-        )
-        .build();
-
-    let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "decdn");
-    opentelemetry::global::set_tracer_provider(provider);
-
-    Ok(tracer)
+    Ok((setter, tracer_provider))
 }

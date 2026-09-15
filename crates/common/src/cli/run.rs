@@ -212,7 +212,7 @@ pub struct ObservabilityArgs {
     #[arg(long, value_name = "PORT", env = "DECDN_ADMIN_PORT")]
     pub admin_port: Option<u16>,
 
-    /// OTLP collector endpoint URL (enables span export; requires `--features otlp`).
+    /// OTLP gRPC collector endpoint URL (`http://` only); setting it enables span export.
     #[arg(long, value_name = "URL", env = "DECDN_OTLP_ENDPOINT")]
     pub otlp_endpoint: Option<String>,
 }
