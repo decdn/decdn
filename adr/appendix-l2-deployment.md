@@ -8,8 +8,8 @@
 > appendix still weighs are a forced-inclusion delay ≤ 24h (so the redemption
 > grace window covers censorship per
 > [ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship))
-> and Balancer V3 Router availability
-> ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)).
+> and Uniswap V3 Router availability
+> ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)).
 > This appendix records the canonical selection (Arbitrum One) and the comparison
 > against alternatives; a future Base, OP Mainnet, or other deployment would
 > require re-validating these property constraints.
@@ -21,10 +21,11 @@ The PoC runs on **Arbitrum Sepolia**. TOKEN is canonical on one L2 — all staki
 The choice affects the criteria enumerated below. Dependent ADRs: **[ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)** gas estimates assume Arbitrum-class L2 fee markets; [ADR 003 § L2 sequencer
 censorship](003-payments.md#l2-sequencer-censorship) assumes
 forced-inclusion delay ≤ 24 hours (Arbitrum value), which lower-bounds the redemption grace
-window; **[ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)**'s Balancer V3 Router address (canonical: see
-[ADR 018 §"Buyback execution via Balancer V3"](018-liquidity-strategy.md#buyback-execution-via-balancer-v3))
-is labelled the Arbitrum mainnet address. Because pool opens are rare and off the
-fetch path, per-open gas cost is not a first-order selection criterion.
+window; **[ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)**'s Uniswap V3 `SwapRouter02` (see
+[ADR 018 §"Buyback execution via Uniswap V3"](018-liquidity-strategy.md#buyback-execution-via-uniswap-v3))
+must be deployed on the target chain; the Arbitrum One address is in the
+[§ Chain-Specific Constants](#chain-specific-constants) table below. Because pool opens
+are rare and off the fetch path, per-open gas cost is not a first-order selection criterion.
 
 ## Candidate Chains
 
@@ -37,8 +38,8 @@ Three OP-Stack / Nitro L2s evaluated: **Arbitrum One**, **Base**, **OP Mainnet**
 | Gas costs at current fee market | Affects redemption and slash-evidence gas; pool opens are rare and off the fetch path, so per-open cost is second-order ([ADR 003 § Deposit Economics](003-payments.md#deposit-economics)) |
 | Sequencer forced-inclusion delay | Hard lower-bound on the redemption grace window; must exceed this value ([ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)) |
 | Native USDC availability | Eliminates Circle bridge counterparty risk for the payment pool |
-| Balancer V3 deployment | [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) requires a Balancer V3 Weighted Pool for TOKEN/USDC POL |
-| Aggregator routing density | Affects buyback execution quality and CoW Swap solver availability ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) |
+| Uniswap V3 deployment | [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol) requires a Uniswap V3 pool for TOKEN/USDC POL |
+| Aggregator routing density | Affects buyback execution quality and CoW Swap solver availability ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)) |
 | DeFi ecosystem depth | Thin overall liquidity amplifies TOKEN/USDC pool slippage |
 | Arbitrum Sepolia continuity | Sepolia → mainnet same-family migration avoids contract redesign |
 | OpenZeppelin Governor compatibility | Governor + TimelockController deployment must be straightforward |
@@ -54,8 +55,8 @@ Three OP-Stack / Nitro L2s evaluated: **Arbitrum One**, **Base**, **OP Mainnet**
 | **Sequencer forced-inclusion delay** | ~24 h (Arbitrum delayed inbox) | ~24 h (OP inbox) | ~24 h (OP inbox) |
 | **L1 finality window** | ~7 days (Nitro fraud-proof window) | ~7 days (fault-proof window) | ~7 days (fault-proof window) |
 | **Native USDC (Circle CCTP)** | ✅ Yes | ✅ Yes | ✅ Yes |
-| **Balancer V3 deployment** | ✅ Deployed | ✅ Deployed | ✅ Deployed |
-| **Balancer V3 aggregator coverage** | High (1inch, Paraswap, CoW) | Medium (maturing) | Medium (maturing) |
+| **Uniswap V3 deployment** | ✅ Deployed | ✅ Deployed | ✅ Deployed |
+| **Uniswap V3 aggregator coverage** | High (1inch, Paraswap, CoW) | High | High |
 | **Arbitrum Sepolia → mainnet migration** | ✅ Same chain family | ❌ Cross-family re-deploy | ❌ Cross-family re-deploy |
 | **DeFi TVL / liquidity depth (early 2026)** | Highest among the three | Second; growing fast | Third |
 | **OpenZeppelin Governor + Timelock** | Battle-tested, widely deployed | Battle-tested | Battle-tested |
@@ -94,15 +95,15 @@ a concrete benefit of fast finality. `Δ` is a sizing input to node policy, not 
 parameter, and it does **not** bind the chain choice: the payment model is chain-agnostic
 and this appendix's selection turns on the criteria above, not on `Δ`.
 
-### Balancer V3 and Liquidity
+### Uniswap V3 and Liquidity
 
-Balancer V3 is deployed on all three; Arbitrum is preferred because [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) already
-embedded the Arbitrum mainnet Balancer V3 Router address (canonical:
-[ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3)), CoW Swap
-solver coverage of Balancer V3 pools is most mature on Arbitrum One ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)
-requires operator CoW-routing verification pre-production, most likely to succeed on
-Arbitrum), and Arbitrum's largest-of-three DeFi TVL reduces TOKEN/USDC pool slippage
-for buybacks on thin early-production liquidity.
+Uniswap V3 is deployed on all three at the deterministic canonical addresses. Arbitrum
+is preferred because its largest-of-three DeFi TVL reduces TOKEN/USDC pool slippage for
+buybacks on thin early-production liquidity, and CoW Swap solver coverage is deep on
+Arbitrum One ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)
+requires operator CoW-routing verification pre-production). The Arbitrum One
+`SwapRouter02` and `NonfungiblePositionManager` addresses are in the
+[§ Chain-Specific Constants](#chain-specific-constants) table.
 
 ### Migration Continuity
 
@@ -117,8 +118,8 @@ Deploy deCDN production contracts on Arbitrum One (chain ID 42161).
 
 Rationale:
 
-1. **Cross-ADR calibration** — Balancer V3 Router address, CoW Swap routing
-   assumptions, and aggregator density ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)), gas estimates ([ADR 003](003-payments.md#adr-003-payment-model)), and the
+1. **Cross-ADR calibration** — Uniswap V3 addresses, CoW Swap routing
+   assumptions, and aggregator density ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)), gas estimates ([ADR 003](003-payments.md#adr-003-payment-model)), and the
    forced-inclusion window ([ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)) are all calibrated
    for Arbitrum One; changing chains would require re-validating all of them.
 2. **Highest DeFi liquidity depth** — thinner competition for TOKEN/USDC pool depth
@@ -131,7 +132,7 @@ Rationale:
 
 **Base** — strongest alternative (rapidly growing DeFi TVL, Coinbase retail
 onboarding). Re-evaluate if: Arbitrum One gas rises significantly vs Base; Base's
-Balancer V3 CoW routing reaches Arbitrum parity; regulatory pressure shifts the
+Uniswap V3 CoW routing reaches Arbitrum parity; regulatory pressure shifts the
 token's liquidity centre to Base. **OP Mainnet** — not selected; DeFi ecosystem and
 aggregator coverage smaller than both for this protocol's needs.
 
@@ -154,7 +155,7 @@ Canonical reference for Arbitrum-specific assumptions elsewhere in the ADR set:
 |-----|------------|
 | [ADR 003 § Deposit Economics](003-payments.md#deposit-economics) | Recurring gas is per-redemption; pool opens rare and off the fetch path |
 | [ADR 003 § L2 Sequencer Censorship](003-payments.md#l2-sequencer-censorship) | Forced-inclusion delay ≤ 24 h (Arbitrum value) |
-| [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) | Balancer V3 Router address is the Arbitrum One deployment |
+| [ADR 018 § Buyback execution via Uniswap V3](018-liquidity-strategy.md#buyback-execution-via-uniswap-v3) | Uniswap V3 `SwapRouter02` address is the Arbitrum One deployment |
 | [ADR 016 § Deployment Order](016-contract-interactions.md#deployment-order-and-initialization-dependencies) | "Arbitrum mainnet" in the BuybackBurner row |
 
 ### Chain-Specific Constants
@@ -164,9 +165,9 @@ Canonical reference for Arbitrum-specific assumptions elsewhere in the ADR set:
 | Chain ID | **42161** | Arbitrum One |
 | Native token (gas) | ETH | — |
 | Native USDC (CCTP) address | `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` | Circle CCTP on Arbitrum One |
-| Balancer V3 Vault | `0xbA1333333333a1BA1108E8412f11850A5C319bA9` | Balancer deployments registry |
-| Balancer V3 Router | `0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E` | Balancer deployments registry (`Router v2`) |
-| Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` | Canonical Permit2 (same address on every chain deCDN targets) |
+| Uniswap V3 `SwapRouter02` | `0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45` | Uniswap V3 deployment |
+| Uniswap V3 `NonfungiblePositionManager` | `0xC36442b4a4522E871399CD717aBDD847Ab11FE88` | Uniswap V3 deployment (pool create + seed) |
+| Uniswap V3 Factory | `0x1F98431c8aD98523631AE4a59f267346ea31F984` | Uniswap V3 deployment |
 | Sequencer forced-inclusion delay | ~24 h | Arbitrum delayed inbox |
 | L1 finality window | ~7 days | Nitro fraud-proof window |
 | Block time | ~250 ms | Arbitrum Nitro |
@@ -175,21 +176,20 @@ Canonical reference for Arbitrum-specific assumptions elsewhere in the ADR set:
 | Reference gas price (early 2026) | ~$0.50 per 1M gas | Underlying rate behind the per-operation costs cited in [ADR 003](003-payments.md#adr-003-payment-model) and [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) |
 
 > **Address verification.** Addresses MUST be re-confirmed against the Arbitrum One
-> deployment registry and Arbiscan at deployment time. Balancer V3 addresses correct
-> as of 2026-04-08 (Balancer may add router versions). USDC is native Circle Arbitrum
-> USDC — do not substitute USDC.e (bridged).
+> deployment registry and Arbiscan at deployment time. The Uniswap V3 addresses are the
+> deterministic canonical deployment. USDC is native Circle Arbitrum USDC — do not
+> substitute USDC.e (bridged).
 
 ### Deployment Runbook Impact
 
 The production deployment runbook ([ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model)) substitutes Arbitrum Sepolia addresses
 for Arbitrum One mainnet equivalents at each step. No contract logic changes.
 
-**Buyback approvals.** The Balancer V3 buyback path approves **Permit2**, never the
-Vault: `BuybackBurnerBalancerV3` issues a scoped per-swap Permit2 allowance to the
-Router and resets it to `0` after each swap, so no standing USDC allowance is
-required or expected. Granting a standing allowance to the Vault buys nothing and is
-never consumed. [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3)
-is authoritative for the mechanism; the canonical Permit2 address is in the
+**Buyback approvals.** The Uniswap V3 buyback path approves the `SwapRouter02` directly:
+`BuybackBurnerUniswapV3` issues a scoped per-swap ERC20 allowance to the Router and
+resets it to `0` after each swap, so no standing USDC allowance is required or expected.
+[ADR 018 § Buyback execution via Uniswap V3](018-liquidity-strategy.md#buyback-execution-via-uniswap-v3)
+is authoritative for the mechanism; the `SwapRouter02` address is in the
 [§ Chain-Specific Constants](#chain-specific-constants) table above.
 
 ### Tokenomics Validation Requirements
@@ -214,8 +214,8 @@ Arbitrum One fee markets at deployment. Three MUST gates:
 2. **Per-epoch keeper-call gas economics.** One TWAP-protected USDC→TOKEN swap
    keeper call per epoch via `BuybackBurner` (30% buyback-and-burn flow per
    [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) and
-   [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) —
-   at a 1-week epoch, **52+ swaps/year minimum**, via the Balancer V3 80/20
+   [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)) —
+   at a 1-week epoch, **52+ swaps/year minimum**, via the Uniswap V3 50/50
    TOKEN/USDC pool with TWAP windows, `minOut`, mandatory private-RPC routing, and
    a per-epoch liquidity cap that binds under sustained network revenue at the
    25% burn share. Per-epoch keeper costs MUST be not cost-prohibitive at S2/S3
@@ -223,7 +223,7 @@ Arbitrum One fee markets at deployment. Three MUST gates:
 
 3. **Private-RPC gate.** The L2 MUST support private-RPC routing (Flashbots-style
    bundles) for the hardened MEV-protection requirement in
-   [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) (private RPC and per-epoch liquidity caps
+   [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol) (private RPC and per-epoch liquidity caps
    both mandatory); without a viable private-RPC route the swap path's MEV defense
    is not deployable as designed.
 

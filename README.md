@@ -172,7 +172,7 @@ living overview. Highlights:
 - **Client architecture:** lightweight QUIC endpoints; registry bootstrap with fallback; per-connection ephemeral identity binding ([ADR 012](adr/012-client.md))
 - **Schema evolution:** varint-length framing, protocol enums, three-tier evolution model ([ADR 013](adr/013-schema-evolution.md))
 - **On-chain verification:** single secp256k1 EIP-712 slash signature (`slash_sig`) per message with optimistic challenge-response; the Ed25519 NodeId is connection identity only, authenticated separately by the QUIC handshake ([ADR 014](adr/014-on-chain-verification.md))
-- **Liquidity:** protocol-owned liquidity via a Balancer V3 80/20 TOKEN/USDC weighted pool ([ADR 018](adr/018-liquidity-strategy.md))
+- **Liquidity:** protocol-owned liquidity via a Uniswap V3 50/50 TOKEN/USDC pool ([ADR 018](adr/018-liquidity-strategy.md))
 - **Production L2:** Arbitrum One for all on-chain contracts ([appendix](adr/appendix-l2-deployment.md))
 
 ## Development

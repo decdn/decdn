@@ -4,7 +4,6 @@ pragma solidity 0.8.28;
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BaseProtocolDeploy } from "./BaseProtocolDeploy.s.sol";
-import { BuybackVenueLib } from "./lib/BuybackVenueLib.sol";
 import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 
@@ -26,11 +25,11 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///
 ///         `ACTIVATE_BUYBACK=true` opts into an OFF-by-default deploy-time genesis
 ///         activation instead (a testnet / genesis convenience): the script seeds
-///         the venue pool, deploys the concrete burner, and flips the FeeRouter to
-///         the steady-state `[6000, 3000, 1000]` split in-script — before the
-///         governance handoff, because at genesis the served-bytes voting weight
-///         that gates the governance path is zero (ADR 036). Venue is selected via
-///         `BUYBACK_VENUE`; see `_readBuybackActivation`.
+///         the Uniswap V3 TOKEN/USDC pool, deploys the concrete burner, and flips
+///         the FeeRouter to the steady-state `[6000, 3000, 1000]` split in-script —
+///         before the governance handoff, because at genesis the served-bytes voting
+///         weight that gates the governance path is zero (ADR 036). See
+///         `_readBuybackActivation`.
 ///
 /// @dev    The production `Ed25519Verifier` (issue #669) is deployed in-script
 ///         as the first broadcast step — no operator-supplied address. It wraps
@@ -233,37 +232,28 @@ contract DeployProtocol is BaseProtocolDeploy {
     //
     //   Required when ON:
     //     - `BUYBACK_KEEPER`             — EOA/bot granted KEEPER_ROLE
+    //     - `UNISWAP_SWAP_ROUTER`        — SwapRouter02
+    //     - `UNISWAP_POSITION_MANAGER`   — NonfungiblePositionManager
     //   Optional (defaults from ADR 018 § Parameter Table):
-    //     - `BUYBACK_VENUE`              — uniswap|balancer (default uniswap; the
-    //                                      only venue live on Arbitrum Sepolia)
     //     - `TWAP_MIN_WINDOW_SECS`       (default 1800)
     //     - `MAX_BUYBACK_AMOUNT`         (default 10_000e6 USDC; must be non-zero)
     //     - `MIN_BUYBACK_AMOUNT`         (default 100e6 USDC)
     //     - `SLIPPAGE_BPS`               (default 200; ceiling 1000 = 10%)
     //     - `EPOCH_CAP_FRACTION_BPS`     (default 1000 = 10%)
-    //   Pool seed (both venues create + seed the pool in-script; the deployer must
-    //   hold the seed TOKEN + USDC — set `INITIAL_TOKEN_HOLDER` to the deployer or
-    //   fund it). Pick a USDC amount you hold and a target price; the paired TOKEN
-    //   seed is derived so the pool initializes at that price (venue weights applied):
+    //     - `UNISWAP_POOL_FEE`           (default 10000 = 1%)
+    //   Pool seed (the script creates + seeds the Uniswap V3 pool in-script; the
+    //   deployer must hold the seed TOKEN + USDC — set `INITIAL_TOKEN_HOLDER` to the
+    //   deployer or fund it). Pick a USDC amount you hold and a target price; the
+    //   paired TOKEN seed is derived so the 50/50 pool initializes at that price:
     //     - `BUYBACK_USDC_SEED`          (default 100e6 = 100 USDC)
     //     - `BUYBACK_TARGET_PRICE`       (default 10_000 — the price of one TOKEN in
     //                                      USDC base units; 6-dec USDC → $0.01/TOKEN)
-    //   Uniswap venue:
-    //     - `UNISWAP_SWAP_ROUTER`        — SwapRouter02 (required)
-    //     - `UNISWAP_POSITION_MANAGER`   — NonfungiblePositionManager (required)
-    //     - `UNISWAP_POOL_FEE`           (default 10000 = 1%)
-    //   Balancer venue (80/20 TOKEN/USDC weighted pool):
-    //     - `BALANCER_WEIGHTED_POOL_FACTORY` — WeightedPoolFactory (required)
-    //     - `BALANCER_ROUTER`, `BALANCER_VAULT` (required)
-    //     - `PERMIT2_ADDRESS`            (default canonical Permit2)
-    //     - `BALANCER_SWAP_FEE`          (default 1e16 = 1%)
     error PoolFeeOutOfRange(uint256 fee);
 
     function _readBuybackActivation() internal view returns (BuybackActivation memory act) {
         act.activate = vm.envOr("ACTIVATE_BUYBACK", false);
         if (!act.activate) return act; // all-off; every other field is ignored.
 
-        act.venue = BuybackVenueLib.parseVenue(vm.envOr("BUYBACK_VENUE", string("uniswap")));
         act.keeper = vm.envAddress("BUYBACK_KEEPER"); // required — enforced in _activateBuyback too
         act.guard = GuardedBuybackBurner.GuardParams({
             twapMinWindow_: vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800)),
@@ -274,38 +264,24 @@ contract DeployProtocol is BaseProtocolDeploy {
         });
 
         // Pool seed: pick a USDC amount you actually hold and a target TOKEN price;
-        // the paired TOKEN seed is derived so the pool initializes at that price
-        // (no need to hand-compute the ratio, and it differs per venue's weights).
-        // `BUYBACK_TARGET_PRICE` is the price of one whole TOKEN in USDC base units
-        // (6-dec USDC → `$0.01/TOKEN` is `10_000`).
+        // the paired TOKEN seed is derived so the 50/50 pool initializes at that
+        // price (no need to hand-compute the ratio). `BUYBACK_TARGET_PRICE` is the
+        // price of one whole TOKEN in USDC base units (6-dec USDC → `$0.01/TOKEN`
+        // is `10_000`).
         uint256 usdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(100e6));
         uint256 targetPrice = vm.envOr("BUYBACK_TARGET_PRICE", uint256(10_000)); // $0.01/TOKEN
-        // Built through the derivation helper so the seed records the venue it was
-        // sized for; pairing it with the other venue mis-anchors the pool silently.
-        act.seed = _derivePoolSeed(act.venue, usdcSeed, targetPrice);
+        // Built through the derivation helper so the seed records the price it was
+        // sized for; `_assertPoolSeedDerived` re-derives to prove `tokenSeed`.
+        act.seed = _derivePoolSeed(usdcSeed, targetPrice);
 
-        // Exactly one venue sub-struct is populated; the other stays zero, which is
-        // what `_assertVenueFieldsScoped` enforces before the burner is deployed.
-        if (act.venue == BuybackVenueLib.Venue.UNISWAP) {
-            act.uni.swapRouter = vm.envAddress("UNISWAP_SWAP_ROUTER");
-            act.uni.positionManager = vm.envAddress("UNISWAP_POSITION_MANAGER");
-            // Validate the fee against the supported Uniswap V3 tiers here, before
-            // `vm.startBroadcast`, so an unsupported tier aborts with no gas spent
-            // rather than reverting `UnsupportedFeeTier` mid-deploy.
-            uint256 fee = vm.envOr("UNISWAP_POOL_FEE", uint256(10_000));
-            if (fee != 100 && fee != 500 && fee != 3000 && fee != 10_000) revert PoolFeeOutOfRange(fee);
-            act.uni.poolFee = uint24(fee);
-        } else {
-            act.bal.factory = vm.envAddress("BALANCER_WEIGHTED_POOL_FACTORY");
-            act.bal.swapFee = vm.envOr("BALANCER_SWAP_FEE", uint256(1e16)); // 1% (ADR 018 pool fee)
-            // `pool` stays zero: it does not exist until `_activateBalancer` creates it.
-            act.bal.wiring = BuybackVenueLib.BalancerWiring({
-                swapRouter: vm.envAddress("BALANCER_ROUTER"),
-                pool: address(0),
-                vault: vm.envAddress("BALANCER_VAULT"),
-                permit2: vm.envOr("PERMIT2_ADDRESS", BuybackVenueLib.CANONICAL_PERMIT2)
-            });
-        }
+        act.uni.swapRouter = vm.envAddress("UNISWAP_SWAP_ROUTER");
+        act.uni.positionManager = vm.envAddress("UNISWAP_POSITION_MANAGER");
+        // Validate the fee against the supported Uniswap V3 tiers here, before
+        // `vm.startBroadcast`, so an unsupported tier aborts with no gas spent
+        // rather than reverting `UnsupportedFeeTier` mid-deploy.
+        uint256 fee = vm.envOr("UNISWAP_POOL_FEE", uint256(10_000));
+        if (fee != 100 && fee != 500 && fee != 3000 && fee != 10_000) revert PoolFeeOutOfRange(fee);
+        act.uni.poolFee = uint24(fee);
     }
 
     // -----------------------------------------------------------------

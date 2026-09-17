@@ -55,27 +55,19 @@ invariant = { runs = 1024, depth = 100 }
 optimizer = false
 via_ir = false
 
-# Balancer V3 fork tests (test/*.fork.t.sol) run against live Balancer V3
-# deployments. Each self-skips unless its RPC env var is set, so this profile
-# only matters in CI's `solidity fork test` job, which runs them with the secret.
-# No fuzz/invariant amplification — fork tests are read-only and network-bound,
-# not property tests.
+# Fork tests (test/*.fork.t.sol) run against a live network deployment. Each
+# self-skips unless its RPC env var is set, so this profile only matters in CI's
+# `solidity fork test` job, which runs them with the secret. No fuzz/invariant
+# amplification — fork tests are read-only and network-bound, not property tests.
 [profile.fork]
 fuzz = { runs = 0 }
 verbosity = 2
 
 # Consumed by the fork tests via vm.rpcUrl(<alias>).
-#   arbitrum — read/validation suite, pins a historical block, needs an ARCHIVE
-#     endpoint (public RPCs prune state and answer a pinned block with
-#     "metadata is not found").
-#   sepolia — swap+burn suite (#995), forks at LATEST and creates its own pool,
-#     so a plain public (non-archive) endpoint suffices.
 #   arbitrum_sepolia — genesis buyback-activation deploy suite, forks at LATEST
 #     and creates + seeds its own Uniswap V3 pool, so a plain public (non-archive)
 #     endpoint suffices.
 [rpc_endpoints]
-arbitrum = "${ARBITRUM_RPC_URL}"
-sepolia = "${SEPOLIA_RPC_URL}"
 arbitrum_sepolia = "${ARBITRUM_SEPOLIA_RPC_URL}"
 
 [fmt]

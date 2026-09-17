@@ -5,7 +5,6 @@ import { Test } from "forge-std/Test.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
-import { BuybackVenueLib } from "../script/lib/BuybackVenueLib.sol";
 import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { IUniswapV3Factory } from "../script/interfaces/IUniswapV3PoolCreation.sol";
 import { BuybackBurnerUniswapV3 } from "../src/BuybackBurnerUniswapV3.sol";
@@ -14,8 +13,8 @@ import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 /// @title GenesisBuybackActivationForkTest — Arbitrum Sepolia acceptance for the
 ///        OFF-by-default deploy-time genesis buyback activation.
 /// @notice Runs the real `_runFullDeploy(cfg, act)` pipeline against the LIVE
-///         Uniswap V3 deployment on Arbitrum Sepolia (the initial network, where
-///         Balancer V3 is not deployed): the script creates + seeds a real
+///         Uniswap V3 deployment on Arbitrum Sepolia (the initial network): the
+///         script creates + seeds a real
 ///         TOKEN/USDC V3 pool via the live `NonfungiblePositionManager`, deploys
 ///         `BuybackBurnerUniswapV3` bound to it and the live `SwapRouter02`, flips
 ///         the FeeRouter to the steady-state `[6000, 3000, 1000]` split, and hands
@@ -89,7 +88,6 @@ contract GenesisBuybackActivationForkTest is Test, BaseProtocolDeploy {
 
     function _activation() internal view returns (BuybackActivation memory act) {
         act.activate = true;
-        act.venue = BuybackVenueLib.Venue.UNISWAP;
         act.keeper = keeper;
         act.guard = GuardedBuybackBurner.GuardParams({
             twapMinWindow_: 1800,
@@ -99,7 +97,7 @@ contract GenesisBuybackActivationForkTest is Test, BaseProtocolDeploy {
             epochLiquidityCapFraction_: 1000
         });
         act.uni = UniswapVenueParams({ swapRouter: SWAP_ROUTER, positionManager: POSITION_MANAGER, poolFee: FEE });
-        act.seed = _derivePoolSeed(BuybackVenueLib.Venue.UNISWAP, USDC_SEED, TARGET_PRICE);
+        act.seed = _derivePoolSeed(USDC_SEED, TARGET_PRICE);
     }
 
     /// @notice The headline acceptance: flag ON + Uniswap venue lands the

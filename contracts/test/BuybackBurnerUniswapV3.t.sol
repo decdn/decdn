@@ -96,10 +96,10 @@ contract MockV3Router {
 
 /// @title BuybackBurnerUniswapV3 unit tests
 /// @notice Mock-backed coverage for the Uniswap V3 venue hooks: the `slot0`
-///         spot-price math (both token orderings), the inherited TWAP floor /
-///         band / cap firing through the V3 swap, wiring validation, and the
-///         scoped router approval. The shared MEV stack itself is covered by the
-///         Balancer suite; here we verify the venue-specific reads/swap.
+///         spot-price math (both token orderings), wiring validation, and the
+///         scoped router approval. As the sole venue subclass it also exercises the
+///         inherited MEV stack — the TWAP floor, the min/max band, and the
+///         per-epoch cap — firing through the V3 swap.
 contract BuybackBurnerUniswapV3Test is Test {
     MockUSDC internal usdc;
     Token internal token;
@@ -209,7 +209,7 @@ contract BuybackBurnerUniswapV3Test is Test {
 
     function test_constructor_revertsOnMisWiredPool() public {
         // A non-zero pool supplied at deploy must fail-fast if it is not a
-        // USDC/TOKEN pair (mirrors `setPool` and the Balancer constructor).
+        // USDC/TOKEN pair (mirrors `setPool`).
         MockV3Pool bad = new MockV3Pool(SQRTP_ONE_DOLLAR, address(0xDEAD), address(0xBEEF), FEE);
         vm.expectRevert(BuybackBurnerUniswapV3.PoolStateInvalid.selector);
         _deploy(address(bad));
