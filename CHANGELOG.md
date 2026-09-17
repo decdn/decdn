@@ -28,6 +28,38 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Contracts: the Balancer V3 buyback venue is deleted; Uniswap V3 is the sole
+  canonical TOKEN/USDC POL and buyback venue (#2043).** `BuybackBurnerBalancerV3`, the
+  three `IBalancerV3*` interfaces, `IBalancerV3PoolCreation`, `IPermit2` (Permit2 was
+  Balancer-only — Uniswap V3 pulls `tokenIn` through a direct ERC20 allowance), and the
+  four Balancer test/fork suites are gone. The abstract `GuardedBuybackBurner` base and
+  the single concrete `BuybackBurnerUniswapV3` subclass stay, so a second venue is a
+  subclass-and-deploy change rather than a dispatch layer.
+  - `BuybackVenueLib` loses the venue enum, the venue-string parser and the seed/venue
+    drift machinery; it holds `steadyShares()`, `requireUniswapWiring` and
+    `deployUniswapBurner`. `BuybackActivation` carries one unconditional
+    `UniswapVenueParams uni` field in place of the `uni`/`bal` pair, so
+    `VenueFieldsCrossWired`, `VenueFieldsUnwired` and `PoolSeedVenueMismatch` go with
+    the choice they guarded. `_assertVenueSeedMatches` is now `_assertPoolSeedDerived`.
+  - Deploy and activation drop the `BUYBACK_VENUE` and `BALANCER_POOL` env vars along
+    with the Balancer Vault/Permit2 ones. `contracts/foundry.toml` drops the `arbitrum`
+    and `sepolia` `[rpc_endpoints]` aliases, and the `solidity fork test` job drops the
+    matching `ARBITRUM_RPC_URL` and `SEPOLIA_RPC_URL` secrets: one fork suite remains,
+    `GenesisBuybackActivation.fork` on `ARBITRUM_SEPOLIA_RPC_URL`, superseding the
+    four-suite counts in the fork-RPC and #1090 entries below.
+  - [ADR 018](adr/018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)
+    is rewritten around a full-range 50/50 Uniswap V3 TOKEN/USDC pool, dropping the
+    80/20-weighted decision and the Balancer-specific Vault/Permit2/Router indirection.
+    The venue-neutral MEV stack (TWAP floor, `minTokenOut`, private-RPC routing,
+    per-epoch cap) is unchanged.
+  - POL keeps its 10% allocation, but the pool is not seeded at genesis: the DAO funds
+    the USDC side from its 10% `FeeRouter` revenue share and creates the pool at its own
+    discretion, then deepens it from a Timelock reserve and the buyback glidepath (each
+    swap adds USDC to the pool, so seed depth is a floor that glides up). The
+    [ADR 026](adr/026-tokenomics.md#bootstrap-mechanism--pre-seed-usdc) pre-seed table
+    therefore drops the POL-seed earmark into operator infrastructure subsidies —
+    ~85% subsidies, ~10% incident contingency, ~5% audits and legal.
+
 - **Runtime: OTLP span export is always compiled into `decdn-node`; the `otlp`
   cargo feature is gone (#2039).** Release archives and the Docker image now honour
   `observability.otlp_endpoint` / `--otlp-endpoint` / `DECDN_OTLP_ENDPOINT`

@@ -1065,24 +1065,15 @@ jobs:
         working-directory: contracts
     env:
       FOUNDRY_PROFILE: fork
-      # Live RPC endpoints for the fork suites. All are absent on fork PRs (secrets
-      # are withheld) and in forks that never configured them — the run step below
-      # no-ops when none is set, and each fork suite additionally self-skips on
-      # its own missing RPC, so this job never blocks a PR for a missing secret.
-      # Each name matches an `[rpc_endpoints]` alias in `contracts/foundry.toml`.
-      #   ARBITRUM_RPC_URL — read/validation suite (BuybackBurnerBalancerV3.fork);
-      #     verifies our IBalancerV3* ABIs against live Arbitrum One bytecode. Pins
-      #     a historical block, so it needs an ARCHIVE endpoint.
-      #   SEPOLIA_RPC_URL — swap+burn suite (BuybackBurnerBalancerV3.swapburn.fork,
-      #     issue #995) and the Balancer genesis-activation suite
-      #     (GenesisBuybackActivationBalancer.fork); each creates+seeds its own pool.
-      #     Forks at LATEST, so a plain public (non-archive) endpoint suffices.
-      #   ARBITRUM_SEPOLIA_RPC_URL — Uniswap genesis-activation suite
-      #     (GenesisBuybackActivation.fork, issue #1090); the initial network's only
-      #     runnable buyback venue, so this is the deploy path #1083 actually takes.
-      #     Forks at LATEST and creates its own pool — a plain public endpoint suffices.
-      ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
-      SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
+      # Live RPC endpoint for the one fork suite, `GenesisBuybackActivation.fork`
+      # (issue #1090), which exercises the Arbitrum Sepolia deploy path #1083 takes.
+      # `contracts/foundry.toml`'s `arbitrum_sepolia` `[rpc_endpoints]` alias
+      # interpolates this var, so the two names change together. That suite forks at
+      # LATEST and creates + seeds its own pool, so a plain public (non-archive)
+      # endpoint suffices. The secret is absent on fork PRs (secrets are withheld)
+      # and in forks that never configured it — the run step below no-ops when it is
+      # unset and the suite self-skips on its own, so this job never blocks a PR for
+      # a missing secret.
       ARBITRUM_SEPOLIA_RPC_URL: ${{ secrets.ARBITRUM_SEPOLIA_RPC_URL }}
     steps:
       # submodules: recursive — forge-std + openzeppelin-contracts are submodules.
@@ -1093,33 +1084,28 @@ jobs:
         with:
           version: v1.7.1
       # A skipped step yields a SUCCESSFUL job, and the checks UI renders
-      # "solidity fork test ✓" identically whether every fork suite passed or none
-      # ran at all. Distinguishing them meant opening the log and noticing an
-      # absence — which is why nobody spotted that no fork RPC secret has ever been
-      # configured, leaving all four suites permanently unexecuted behind a green
-      # check. This step always runs and puts the state in the job summary.
+      # "solidity fork test ✓" identically whether the fork suite passed or never
+      # ran at all — telling them apart otherwise means opening the log and noticing
+      # an absence. This step always runs and puts the state in the job summary.
       # Deliberately not a failure: fork PRs cannot have secrets by policy, and a
-      # hard gate here would turn main red until the secrets are provisioned.
+      # hard gate here would turn main red whenever the secret is unavailable.
       - name: Fork RPC configuration
         if: always()
         run: |
-          for v in ARBITRUM_RPC_URL SEPOLIA_RPC_URL ARBITRUM_SEPOLIA_RPC_URL; do
-            if [ -z "${!v}" ]; then
-              echo "::warning::$v is not configured — its fork suite did not run"
-              echo "- ⚠️ \`$v\` unset — suite skipped" >> "$GITHUB_STEP_SUMMARY"
-            else
-              echo "- ✅ \`$v\` configured" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
-      # Runs every fork suite; each self-skips unless its own RPC is set, so a run
-      # with only one secret configured exercises just that suite.
-      # Reports how many suites the glob matched, not just which secrets exist.
+          if [ -z "$ARBITRUM_SEPOLIA_RPC_URL" ]; then
+            echo "::warning::ARBITRUM_SEPOLIA_RPC_URL is not configured — the fork suite did not run"
+            echo "- ⚠️ \`ARBITRUM_SEPOLIA_RPC_URL\` unset — suite skipped" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- ✅ \`ARBITRUM_SEPOLIA_RPC_URL\` configured" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # The suite self-skips when the var is unset, which is what keeps an offline
+      # `forge test` green; the `if:` below only avoids burning a runner.
       # `forge test --match-path` exits 0 on a glob that matches nothing, so a rename
       # or a typo would otherwise go green — and, with the summary above, green next
-      # to three configured-secret checkmarks. Counting the files is what turns
-      # "configured" into "actually ran".
+      # to a configured-secret checkmark. The count catches that rename; proving a
+      # test body ran is the `-vv` output's job.
       - name: Fork tests (no-op when no fork RPC is set)
-        if: env.ARBITRUM_RPC_URL != '' || env.SEPOLIA_RPC_URL != '' || env.ARBITRUM_SEPOLIA_RPC_URL != ''
+        if: env.ARBITRUM_SEPOLIA_RPC_URL != ''
         run: |
           matched=$(ls -1 test/*.fork.t.sol 2>/dev/null | wc -l)
           echo "- fork suites matched by the glob: $matched" >> "$GITHUB_STEP_SUMMARY"
