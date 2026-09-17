@@ -271,7 +271,7 @@ contract DeployProtocol is BaseProtocolDeploy {
         uint256 usdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(100e6));
         uint256 targetPrice = vm.envOr("BUYBACK_TARGET_PRICE", uint256(10_000)); // $0.01/TOKEN
         // Built through the derivation helper so the seed records the price it was
-        // sized for; `_assertVenueSeedMatches` re-derives to prove `tokenSeed`.
+        // sized for; `_assertPoolSeedDerived` re-derives to prove `tokenSeed`.
         act.seed = _derivePoolSeed(usdcSeed, targetPrice);
 
         act.uni.swapRouter = vm.envAddress("UNISWAP_SWAP_ROUTER");
