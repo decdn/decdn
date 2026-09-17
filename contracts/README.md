@@ -27,18 +27,22 @@ Libraries:
 
 - `BondMath` — pure arithmetic for the ADR 026 capacity-bond curve and tier-based slash reduction.
 - `SlashEscrowLib` — shared slash-escrow lifecycle types (status enum + record struct).
+- `RegionScopeLib` — region string packing and the ADR 030 region-stability scope test,
+  inlined into `SlashJudge` and `ContentBlacklist`.
+- `DeclaredMbpsHistoryLib` — per-operator `declaredMbps` checkpoint history for
+  `CapacityBond`, read back per epoch for the ADR 036 vote-weight cap.
 
 ## Layout
 
 ```
 contracts/
-  src/            — 16 contracts + BondMath/SlashEscrowLib/RegionScopeLib libraries
-    interfaces/   — 23 frozen external surfaces (I*.sol)
-  test/           — Foundry suite (31 *.t.sol + mocks/ + ed25519-vectors/)
+  src/            — 17 contracts (3 abstract) + 4 libraries
+    interfaces/   — 19 frozen external surfaces (I*.sol)
+  test/           — Foundry suite (29 *.t.sol + mocks/ + ed25519-vectors/)
   script/         — DeployProtocol, BaseProtocolDeploy, ActivateBuyback,
                     TransitionToGovernor, TestnetFaucet
     interfaces/   — pool-creation surfaces used only by the deploy scripts
-    lib/          — BuybackVenueLib (shared venue dispatch + burner construction)
+    lib/          — BuybackVenueLib (shared burner construction + steady-state split)
   lib/            — submodules: openzeppelin-contracts, forge-std, solady, crypto-lib
 ```
 

@@ -81,8 +81,7 @@ reviews:
         external calls moving value), access control on privileged functions,
         unchecked external call return values, and unsafe delegatecall. For the
         OZ Governor integration verify quorum/threshold/timelock wiring and that
-        proposal state transitions can't be griefed. For Permit2 paths scrutinize
-        the signature/allowance assumptions. Flag any use of tx.origin for auth
+        proposal state transitions can't be griefed. Flag any use of tx.origin for auth
         and any arithmetic that bypasses checked math. Confirm events are emitted
         for state-changing ops. Style is handled by solhint — focus on
         exploitable bugs.
