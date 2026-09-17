@@ -84,17 +84,21 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                          skips the Timelock delay it would
 ///                                          otherwise incur post-handoff (it
 ///                                          stays callable by governance then).
-///           5. `_handOffGovernance`      — grant-before-revoke loop over every
-///                                          target for both GOVERNANCE_ROLE and
-///                                          DEFAULT_ADMIN_ROLE, then renounce the
-///                                          deployer's admin on the Timelock
-///                                          itself. Grant-before-revoke ordering
-///                                          is mandatory; reversing it strands
+///           5. `_handOffGovernance`      — hand GOVERNANCE_ROLE to the Timelock
+///                                          (grant-before-revoke), then renounce
+///                                          DEFAULT_ADMIN_ROLE to no one (#2028) so
+///                                          the role table freezes, and finally
+///                                          renounce the deployer's admin on the
+///                                          Timelock itself. Ordering is mandatory:
+///                                          the DEFAULT_ADMIN_ROLE renounce is the
+///                                          last role op per target, and reversing
+///                                          the GOVERNANCE_ROLE grant/revoke strands
 ///                                          the contract ungoverned mid-tx.
-///           6. `_assertNoBackDoors`      — reverts if deployer still holds
-///                                          GOVERNANCE_ROLE or DEFAULT_ADMIN_ROLE
-///                                          on any target, if the Timelock does not
-///                                          hold both, or if the Timelock's sole
+///           6. `_assertNoBackDoors`      — reverts if the deployer still holds
+///                                          GOVERNANCE_ROLE on any target, if the
+///                                          Timelock does not hold GOVERNANCE_ROLE,
+///                                          if anyone still holds DEFAULT_ADMIN_ROLE
+///                                          (#2028), or if the Timelock's sole
 ///                                          proposer is not the one this deploy
 ///                                          mode seats. Runs in-script (not
 ///                                          just in tests) so a mainnet deploy
@@ -334,6 +338,17 @@ abstract contract BaseProtocolDeploy is Script {
     ///         contract ungoverned. Asserting both directions makes the in-script
     ///         guard symmetric with the test role matrix.
     error GovernanceNotHandedOff(address target, bytes32 role);
+    /// @notice Post-deploy invariant (#2028) — `DEFAULT_ADMIN_ROLE` still has a
+    ///         holder on `target`. The handoff renounces it to no one so the role
+    ///         table freezes; a lingering holder is a master key that could mint a
+    ///         fresh `GOVERNANCE_ROLE` and defeat every other hardening.
+    error AdminRoleNotRenounced(address target, address holder);
+    /// @notice Post-deploy invariant (#2028) — `role`'s admin on `target` is not
+    ///         the expected value. The rotatable off-chain-key roles must be
+    ///         `GOVERNANCE_ROLE`-administered (so a compromised key can be rotated
+    ///         out post-freeze), and the check fails loudly if a constructor
+    ///         `_setRoleAdmin` was dropped and the role silently froze instead.
+    error RoleAdminNotScoped(address target, bytes32 role, bytes32 wantAdmin, bytes32 gotAdmin);
     /// @notice Post-deploy invariant — `account` was meant to hold a Timelock
     ///         scheduling role and does not. `role` decides the consequence: a missing
     ///         `PROPOSER_ROLE` means nobody can schedule and the protocol ships
@@ -695,11 +710,13 @@ abstract contract BaseProtocolDeploy is Script {
         // § Role Inventory: `EMERGENCY_ROLE` holds `pause()` on fund-holding /
         // Pausable contracts, a 3-of-5 multisig). No constructor grants
         // PAUSER_ROLE, so without this wiring the system comes up with no live
-        // pauser: post-handoff the only PAUSER_ROLE admin is the Timelock, so the
-        // first emergency pause would need a 48h-delayed governance proposal —
-        // defeating the emergency path. Granted here, before the handoff, so the
-        // multisig can pause from block one. (BuybackBurner is also Pausable but
-        // is not deployed by this script — see the contract header.)
+        // pauser: post-handoff PAUSER_ROLE is GOVERNANCE_ROLE-administered (#2028),
+        // so a first grant would then need a 48h-delayed governance proposal —
+        // defeating the emergency path. Granted here, before the handoff (the
+        // deployer still holds GOVERNANCE_ROLE, PAUSER_ROLE's admin), so the
+        // multisig can pause from block one. Post-freeze a compromised pauser is
+        // still rotatable through that same GOVERNANCE_ROLE admin. (BuybackBurner
+        // is also Pausable but is not deployed by this script — see the header.)
         d.bond.grantRole(d.bond.PAUSER_ROLE(), cfg.emergencyMultisig);
         d.router.grantRole(d.router.PAUSER_ROLE(), cfg.emergencyMultisig);
         d.slashAppeal.grantRole(d.slashAppeal.PAUSER_ROLE(), cfg.emergencyMultisig);
@@ -728,17 +745,29 @@ abstract contract BaseProtocolDeploy is Script {
     ///      the role-grant surface behind the Timelock. No-op in production.
     function _postWiringHook(DeployConfig memory cfg, Deployment memory d) internal virtual { }
 
-    // Phase 5 — atomic role handoff to Timelock.
+    // Phase 5 — role handoff to Timelock, then DEFAULT_ADMIN_ROLE renounced (#2028).
     //
-    // Identical in both ADR 009 phases: the Timelock is always the GOVERNANCE_ROLE
-    // and DEFAULT_ADMIN_ROLE holder, so every parameter change carries the standard
-    // 48-hour delay whoever proposes it. The bootstrap phase differs only in who may
-    // schedule through the Timelock, which `_deployGovernor` decides.
+    // The Timelock becomes the sole GOVERNANCE_ROLE holder, so every parameter
+    // change carries the standard 48-hour delay whoever proposes it. The bootstrap
+    // phase differs only in who may schedule through the Timelock, which
+    // `_deployGovernor` decides.
     //
-    // Grant-before-revoke ordering is mandatory: revoking GOVERNANCE_ROLE or
-    // DEFAULT_ADMIN_ROLE from the deployer before granting it to the Timelock
-    // strands the contract (no holder of either role) and locks out every
-    // governance setter until a recovery deploy.
+    // DEFAULT_ADMIN_ROLE is then renounced to NO ONE (#2028). It is the master key
+    // over the role table — a holder could `grantRole(GOVERNANCE_ROLE, anyEOA)` and
+    // hand that EOA the whole governance surface with no vote and no Timelock delay,
+    // bypassing every other hardening. Renouncing it freezes the table: GOVERNANCE_ROLE
+    // and the contract-held peer roles (their admin is the now-unheld DEFAULT_ADMIN_ROLE)
+    // can no longer be granted or rotated. The narrow, genuinely-rotatable off-chain-key
+    // roles (PAUSER / EMERGENCY_MULTISIG / KEEPER) were re-homed to GOVERNANCE_ROLE
+    // admin in each constructor, so governance keeps exactly that minimal rotation
+    // power and nothing more. Migrating governance to a successor Governor is a
+    // redeploy, consistent with the no-proxy philosophy.
+    //
+    // Ordering is mandatory per target: grant GOVERNANCE_ROLE to the Timelock and
+    // revoke it from the deployer BEFORE renouncing DEFAULT_ADMIN_ROLE. Revoking
+    // GOVERNANCE_ROLE needs the deployer's still-held admin, and once DEFAULT_ADMIN_ROLE
+    // is renounced no admin-gated grant/revoke can succeed — so the renounce is the
+    // last role op on each target.
     function _handOffGovernance(DeployConfig memory cfg, Deployment memory d) internal {
         address[] memory targets = _allGovernedTargets(d);
         address tl = address(d.timelock);
@@ -748,9 +777,10 @@ abstract contract BaseProtocolDeploy is Script {
         for (uint256 i = 0; i < targets.length; i++) {
             IAccessControl target = IAccessControl(targets[i]);
             target.grantRole(GOVERNANCE_ROLE, tl);
-            target.grantRole(DEFAULT_ADMIN_ROLE, tl);
             target.revokeRole(GOVERNANCE_ROLE, cfg.deployer);
-            target.revokeRole(DEFAULT_ADMIN_ROLE, cfg.deployer);
+            // Last op on this target — freezes the role table. renounceRole drops
+            // the deployer's own DEFAULT_ADMIN_ROLE with no onward grant.
+            target.renounceRole(DEFAULT_ADMIN_ROLE, cfg.deployer);
         }
 
         // Final step: deployer no longer admins the Timelock itself.
@@ -779,11 +809,13 @@ abstract contract BaseProtocolDeploy is Script {
         return targets;
     }
 
-    // Phase 6 — post-deploy invariant. Symmetric check: the deployer holds
-    // neither privileged role on any target (no back door), AND the Timelock
-    // holds both on every target plus self-administers (governance is live, not
-    // stranded). A handoff that revoked the deployer but skipped a Timelock grant
-    // would pass the back-door half yet leave a contract ungoverned.
+    // Phase 6 — post-deploy invariant. Three checks per target: GOVERNANCE_ROLE
+    // is off the deployer (no back door) and on the Timelock (governance is live,
+    // not stranded), and DEFAULT_ADMIN_ROLE is held by no one (#2028 — the role
+    // table is frozen, no master key survives). A handoff that revoked the deployer
+    // but skipped the Timelock grant would pass the back-door half yet leave a
+    // contract ungoverned; one that left DEFAULT_ADMIN_ROLE on the Timelock would
+    // leave the capture master key in place.
     function _assertNoBackDoors(DeployConfig memory cfg, Deployment memory d) internal view {
         address[] memory targets = _allGovernedTargets(d);
         address tl = address(d.timelock);
@@ -793,14 +825,23 @@ abstract contract BaseProtocolDeploy is Script {
             if (target.hasRole(GOVERNANCE_ROLE, cfg.deployer)) {
                 revert DeployerStillHoldsRole(targets[i], GOVERNANCE_ROLE);
             }
-            if (target.hasRole(DEFAULT_ADMIN_ROLE, cfg.deployer)) {
-                revert DeployerStillHoldsRole(targets[i], DEFAULT_ADMIN_ROLE);
-            }
             if (!target.hasRole(GOVERNANCE_ROLE, tl)) {
                 revert GovernanceNotHandedOff(targets[i], GOVERNANCE_ROLE);
             }
-            if (!target.hasRole(DEFAULT_ADMIN_ROLE, tl)) {
-                revert GovernanceNotHandedOff(targets[i], DEFAULT_ADMIN_ROLE);
+            // DEFAULT_ADMIN_ROLE is renounced to no one (#2028), so neither the
+            // deployer nor the Timelock may hold it — a Timelock holder would still
+            // be a master key reachable by a captured governance. OZ AccessControl
+            // is not enumerable, so this asserts the only two addresses that could
+            // plausibly hold it: the deployer (which held it transiently before the
+            // renounce) and the Timelock (never granted it here, checked in case a
+            // future handoff edit grants it by mistake). The constructor
+            // `_setRoleAdmin` moves live-key roles off it and `_assertPeerRolesWired`
+            // confirms those admins landed.
+            if (target.hasRole(DEFAULT_ADMIN_ROLE, cfg.deployer)) {
+                revert AdminRoleNotRenounced(targets[i], cfg.deployer);
+            }
+            if (target.hasRole(DEFAULT_ADMIN_ROLE, tl)) {
+                revert AdminRoleNotRenounced(targets[i], tl);
             }
         }
 
@@ -859,6 +900,20 @@ abstract contract BaseProtocolDeploy is Script {
         _requireRole(d.paymentPool, d.paymentPool.PAUSER_ROLE(), cfg.emergencyMultisig);
         _requireRole(d.slashJudge, d.slashJudge.PAUSER_ROLE(), cfg.emergencyMultisig);
 
+        // #2028 — the rotatable off-chain-key roles must be GOVERNANCE_ROLE-administered
+        // so a compromised key can be rotated out after DEFAULT_ADMIN_ROLE is renounced.
+        // A dropped constructor `_setRoleAdmin` would silently leave the role admined by
+        // the now-unheld DEFAULT_ADMIN_ROLE — permanently frozen, unrotatable — and only
+        // this read surfaces it. Checked on every deployed Pausable target; the burner's
+        // own admins are asserted in `_assertBuybackActivated`.
+        _requireRoleAdmin(d.bond, d.bond.PAUSER_ROLE(), GOVERNANCE_ROLE);
+        _requireRoleAdmin(d.router, d.router.PAUSER_ROLE(), GOVERNANCE_ROLE);
+        _requireRoleAdmin(d.slashJudge, d.slashJudge.PAUSER_ROLE(), GOVERNANCE_ROLE);
+        _requireRoleAdmin(d.paymentPool, d.paymentPool.PAUSER_ROLE(), GOVERNANCE_ROLE);
+        _requireRoleAdmin(d.slashAppeal, d.slashAppeal.PAUSER_ROLE(), GOVERNANCE_ROLE);
+        _requireRoleAdmin(d.slashAppeal, d.slashAppeal.EMERGENCY_MULTISIG_ROLE(), GOVERNANCE_ROLE);
+        _requireRoleAdmin(d.blacklist, d.blacklist.EMERGENCY_MULTISIG_ROLE(), GOVERNANCE_ROLE);
+
         // Address bindings from deployer-only setters.
         // CapacityBond.slashJudge wires the ADR-014 paired-invariant view used by
         // `setUnbondingPeriod`; an unwired binding leaves the invariant unenforced.
@@ -879,9 +934,19 @@ abstract contract BaseProtocolDeploy is Script {
         if (!target.hasRole(role, grantee)) revert PeerRoleNotWired(address(target), role, grantee);
     }
 
-    /// @dev The nine GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE-bearing targets handed
-    ///      off to the Timelock (router, bond, blacklist, slashAppeal, registry,
-    ///      paymentPool, slashJudge, originAssignment, vettingPolicy) — single
+    /// @dev #2028 — assert `role`'s admin on `target` equals `wantAdmin`, so a
+    ///      dropped constructor `_setRoleAdmin` (which would leave the role admined
+    ///      by the renounced DEFAULT_ADMIN_ROLE, i.e. permanently frozen) fails the
+    ///      deploy loudly.
+    function _requireRoleAdmin(IAccessControl target, bytes32 role, bytes32 wantAdmin) private view {
+        bytes32 got = target.getRoleAdmin(role);
+        if (got != wantAdmin) revert RoleAdminNotScoped(address(target), role, wantAdmin, got);
+    }
+
+    /// @dev The nine role-bearing targets whose handoff grants GOVERNANCE_ROLE to
+    ///      the Timelock and renounces DEFAULT_ADMIN_ROLE to no one (router, bond,
+    ///      blacklist, slashAppeal, registry, paymentPool, slashJudge,
+    ///      originAssignment, vettingPolicy) — single
     ///      source of truth for `_handOffGovernance` and `_assertNoBackDoors` so
     ///      the governed set can't drift between them. The array width MUST equal
     ///      the number of role-bearing `Deployment` members; adding a target
@@ -1340,5 +1405,8 @@ abstract contract BaseProtocolDeploy is Script {
         }
         _requireRole(burner, burner.KEEPER_ROLE(), act.keeper);
         _requireRole(burner, burner.PAUSER_ROLE(), cfg.emergencyMultisig);
+        // #2028 — both stay rotatable under GOVERNANCE_ROLE after the admin renounce.
+        _requireRoleAdmin(burner, burner.PAUSER_ROLE(), GOVERNANCE_ROLE);
+        _requireRoleAdmin(burner, burner.KEEPER_ROLE(), GOVERNANCE_ROLE);
     }
 }

@@ -222,14 +222,15 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         assertTrue(slashAppeal.hasRole(GOVERNANCE_ROLE, tl), "slashAppeal gov");
         assertTrue(registry.hasRole(GOVERNANCE_ROLE, tl), "registry gov");
 
-        // Timelock holds DEFAULT_ADMIN_ROLE on every target (the meta-admin
-        // that can re-grant any role). Without this, the deployer would still
-        // be able to bypass the Timelock by re-granting itself GOVERNANCE_ROLE.
-        assertTrue(router.hasRole(defaultAdmin, tl), "router admin");
-        assertTrue(bond.hasRole(defaultAdmin, tl), "bond admin");
-        assertTrue(blacklist.hasRole(defaultAdmin, tl), "blacklist admin");
-        assertTrue(slashAppeal.hasRole(defaultAdmin, tl), "slashAppeal admin");
-        assertTrue(registry.hasRole(defaultAdmin, tl), "registry admin");
+        // DEFAULT_ADMIN_ROLE is renounced to no one at deploy end (#2028): it is
+        // the meta-admin that can re-grant any role, so leaving it live — even on
+        // the Timelock — would let a captured governance grantRole(GOVERNANCE_ROLE,
+        // anyEOA) and bypass the vote+timelock envelope entirely. Nobody holds it.
+        assertFalse(router.hasRole(defaultAdmin, tl), "router admin master key");
+        assertFalse(bond.hasRole(defaultAdmin, tl), "bond admin master key");
+        assertFalse(blacklist.hasRole(defaultAdmin, tl), "blacklist admin master key");
+        assertFalse(slashAppeal.hasRole(defaultAdmin, tl), "slashAppeal admin master key");
+        assertFalse(registry.hasRole(defaultAdmin, tl), "registry admin master key");
 
         // Test contract must NOT retain either role on any target — closes the
         // "deployer keeps a back door" failure mode in #694's deploy script.

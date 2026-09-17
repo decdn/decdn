@@ -99,13 +99,78 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(d.registry.hasRole(GOVERNANCE_ROLE, tl), "registry gov");
     }
 
-    function test_roleMatrix_timelockHoldsDefaultAdminOnEveryTarget() public view {
+    // #2028 — DEFAULT_ADMIN_ROLE is renounced to no one at deploy end, so the role
+    // table is frozen and no master key survives. The Timelock governs via
+    // GOVERNANCE_ROLE (asserted above); it must NOT hold DEFAULT_ADMIN_ROLE, or a
+    // captured governance could grantRole(GOVERNANCE_ROLE, anyEOA) and bypass the
+    // whole vote+timelock envelope.
+    function test_roleMatrix_defaultAdminRenouncedOnEveryTarget() public view {
         address tl = address(d.timelock);
-        assertTrue(d.router.hasRole(DEFAULT_ADMIN_ROLE, tl), "router admin");
-        assertTrue(d.bond.hasRole(DEFAULT_ADMIN_ROLE, tl), "bond admin");
-        assertTrue(d.blacklist.hasRole(DEFAULT_ADMIN_ROLE, tl), "blacklist admin");
-        assertTrue(d.slashAppeal.hasRole(DEFAULT_ADMIN_ROLE, tl), "slashAppeal admin");
-        assertTrue(d.registry.hasRole(DEFAULT_ADMIN_ROLE, tl), "registry admin");
+        assertFalse(d.router.hasRole(DEFAULT_ADMIN_ROLE, tl), "router admin master key");
+        assertFalse(d.bond.hasRole(DEFAULT_ADMIN_ROLE, tl), "bond admin master key");
+        assertFalse(d.blacklist.hasRole(DEFAULT_ADMIN_ROLE, tl), "blacklist admin master key");
+        assertFalse(d.slashAppeal.hasRole(DEFAULT_ADMIN_ROLE, tl), "slashAppeal admin master key");
+        assertFalse(d.registry.hasRole(DEFAULT_ADMIN_ROLE, tl), "registry admin master key");
+        assertFalse(d.paymentPool.hasRole(DEFAULT_ADMIN_ROLE, tl), "paymentPool admin master key");
+        assertFalse(d.slashJudge.hasRole(DEFAULT_ADMIN_ROLE, tl), "slashJudge admin master key");
+        assertFalse(d.originAssignment.hasRole(DEFAULT_ADMIN_ROLE, tl), "originAssignment admin master key");
+        assertFalse(d.vettingPolicy.hasRole(DEFAULT_ADMIN_ROLE, tl), "vettingPolicy admin master key");
+    }
+
+    // #2028 — the rotatable off-chain-key roles are re-homed to GOVERNANCE_ROLE
+    // admin so a compromised key can be rotated out via a timelocked proposal even
+    // after DEFAULT_ADMIN_ROLE is renounced. GOVERNANCE_ROLE itself stays under the
+    // now-unheld DEFAULT_ADMIN_ROLE — frozen, so no new governance key can be minted.
+    function test_roleMatrix_rotatableRolesAdminedByGovernance() public view {
+        assertEq(d.bond.getRoleAdmin(d.bond.PAUSER_ROLE()), GOVERNANCE_ROLE, "bond pauser admin");
+        assertEq(d.router.getRoleAdmin(d.router.PAUSER_ROLE()), GOVERNANCE_ROLE, "router pauser admin");
+        assertEq(d.paymentPool.getRoleAdmin(d.paymentPool.PAUSER_ROLE()), GOVERNANCE_ROLE, "pool pauser admin");
+        assertEq(d.slashJudge.getRoleAdmin(d.slashJudge.PAUSER_ROLE()), GOVERNANCE_ROLE, "judge pauser admin");
+        assertEq(d.slashAppeal.getRoleAdmin(d.slashAppeal.PAUSER_ROLE()), GOVERNANCE_ROLE, "appeal pauser admin");
+        assertEq(
+            d.slashAppeal.getRoleAdmin(d.slashAppeal.EMERGENCY_MULTISIG_ROLE()),
+            GOVERNANCE_ROLE,
+            "appeal emergency admin"
+        );
+        assertEq(
+            d.blacklist.getRoleAdmin(d.blacklist.EMERGENCY_MULTISIG_ROLE()),
+            GOVERNANCE_ROLE,
+            "blacklist emergency admin"
+        );
+        // GOVERNANCE_ROLE is frozen: its admin is the renounced DEFAULT_ADMIN_ROLE.
+        assertEq(d.router.getRoleAdmin(GOVERNANCE_ROLE), DEFAULT_ADMIN_ROLE, "governance role frozen");
+    }
+
+    // #2028 acceptance — no new GOVERNANCE_ROLE holder can be minted post-handoff.
+    // Its admin is the renounced DEFAULT_ADMIN_ROLE, so even the Timelock's own
+    // grantRole reverts. This is the lever that turns a transient, vote-gated,
+    // timelock-delayed capture into a permanent one, and it is now closed: a captor
+    // cannot hand itself a standing key that bypasses the vote+delay envelope.
+    function test_2028_governanceRoleCannotBeGrantedAfterHandoff() public {
+        address attacker = address(0xA11CE);
+        vm.prank(address(d.timelock));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, address(d.timelock), DEFAULT_ADMIN_ROLE
+            )
+        );
+        d.router.grantRole(GOVERNANCE_ROLE, attacker);
+    }
+
+    // #2028 acceptance — a compromised emergency pauser stays rotatable. The
+    // Timelock holds GOVERNANCE_ROLE, which admins PAUSER_ROLE, so governance can
+    // seat a new pauser and evict the old one (here direct-from-Timelock; in
+    // production the same calls run through a 48h proposal). This is why option A
+    // (freeze everything) was rejected: it would strand a rogue pauser in place.
+    function test_2028_pauserRotatableByGovernance() public {
+        address newPauser = address(0xBEEF);
+        bytes32 pauser = d.paymentPool.PAUSER_ROLE();
+        vm.startPrank(address(d.timelock));
+        d.paymentPool.grantRole(pauser, newPauser);
+        d.paymentPool.revokeRole(pauser, emergencyMultisig);
+        vm.stopPrank();
+        assertTrue(d.paymentPool.hasRole(pauser, newPauser), "new pauser seated");
+        assertFalse(d.paymentPool.hasRole(pauser, emergencyMultisig), "old pauser evicted");
     }
 
     function test_roleMatrix_deployerHoldsNoRoleAnywhere() public view {
@@ -315,9 +380,13 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     // the Timelock's GOVERNANCE_ROLE on the router to simulate that gap. The
     // deployer holds nothing, so the back-door checks pass and `GovernanceNotHandedOff`
     // must fire — proving the positive assertion is real, not a no-op.
+    //
+    // The Timelock RENOUNCES its own GOVERNANCE_ROLE (not a revoke): after #2028
+    // renounces DEFAULT_ADMIN_ROLE there is no admin left to authorize a revoke, but
+    // renounceRole never needs one, so it is the only way to reach the stripped state.
     function test_assertNoBackDoors_revertsWhenTimelockMissingRole() public {
         vm.prank(address(d.timelock));
-        d.router.revokeRole(GOVERNANCE_ROLE, address(d.timelock));
+        d.router.renounceRole(GOVERNANCE_ROLE, address(d.timelock));
 
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -366,7 +435,9 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         address tl = address(bd.timelock);
         assertTrue(bd.router.hasRole(GOVERNANCE_ROLE, tl), "router gov");
         assertTrue(bd.bond.hasRole(GOVERNANCE_ROLE, tl), "bond gov");
-        assertTrue(bd.slashJudge.hasRole(DEFAULT_ADMIN_ROLE, tl), "slashJudge admin");
+        assertTrue(bd.slashJudge.hasRole(GOVERNANCE_ROLE, tl), "slashJudge gov");
+        // DEFAULT_ADMIN_ROLE is renounced in both modes (#2028) — no master key.
+        assertFalse(bd.slashJudge.hasRole(DEFAULT_ADMIN_ROLE, tl), "slashJudge admin master key");
         // And the multisig holds nothing directly, so it cannot bypass the delay.
         assertFalse(bd.router.hasRole(GOVERNANCE_ROLE, bootstrapMultisig), "multisig has no direct gov");
         assertFalse(bd.bond.hasRole(DEFAULT_ADMIN_ROLE, bootstrapMultisig), "multisig has no direct admin");

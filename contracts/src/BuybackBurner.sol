@@ -101,6 +101,12 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, SunsettingPau
         treasury = treasury_;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
+        // Deploy renounces DEFAULT_ADMIN_ROLE, freezing the role table (#2028).
+        // PAUSER_ROLE and KEEPER_ROLE stay rotatable under GOVERNANCE_ROLE so a
+        // timelocked proposal can rotate a compromised emergency pauser or an
+        // operational keeper key without a redeploy.
+        _setRoleAdmin(PAUSER_ROLE, GOVERNANCE_ROLE);
+        _setRoleAdmin(KEEPER_ROLE, GOVERNANCE_ROLE);
     }
 
     // -----------------------------------------------------------------

@@ -168,6 +168,12 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
+        // Deploy renounces DEFAULT_ADMIN_ROLE, freezing the role table (#2028).
+        // PAUSER_ROLE and EMERGENCY_MULTISIG_ROLE stay rotatable under
+        // GOVERNANCE_ROLE so a timelocked proposal can evict a compromised
+        // off-chain key without a redeploy.
+        _setRoleAdmin(PAUSER_ROLE, GOVERNANCE_ROLE);
+        _setRoleAdmin(EMERGENCY_MULTISIG_ROLE, GOVERNANCE_ROLE);
         if (emergencyMultisig != address(0)) {
             _grantRole(EMERGENCY_MULTISIG_ROLE, emergencyMultisig);
         }
