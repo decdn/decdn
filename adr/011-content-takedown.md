@@ -164,7 +164,7 @@ A regional body is an address (multisig or governance contract) registered by gl
 
 **Registration binds a body to exactly one region, and that binding is the authority.** Holding `REGIONAL_BODY_ROLE` is necessary but not sufficient: `addHashRegional` / `removeHashRegional` additionally require the caller to be the body registered for the region named in the call. Without that, any one registered body could write entries for every other jurisdiction, which would make the whole regional split decorative. The one-region-per-body rule is enforced in both directions (a region has at most one body; a body serves at most one region) so a suspension in one jurisdiction cannot be routed around by the same body acting in another.
 
-**At launch:** No regional bodies are registered. The `DEFAULT_ADMIN_ROLE` holder (deployer pre-handover, `TimelockController` post-handover) acts as sole governance. The contract surface supports regional bodies from day one so they can be added by governance vote without a contract redeploy.
+**At launch:** No regional bodies are registered. The `GOVERNANCE_ROLE` holder (deployer pre-handover, `TimelockController` post-handover) acts as sole governance. The contract surface supports regional bodies from day one so they can be added by governance vote without a contract redeploy.
 
 **Production-scale operation:** Regional bodies are expected for at minimum EU (DSA compliance) and US (DMCA). Each body is a 3-of-5 multisig constituted with signers who have legal presence in the relevant jurisdiction.
 
@@ -556,7 +556,7 @@ A slash requires an active challenger submitting evidence of a post-window deliv
 The minimum viable process at launch:
 
 1. A `takedown@` contact address is published alongside the node registry
-2. Notices are triaged by the `DEFAULT_ADMIN_ROLE` holder (deployer pre-handover, then global governance multisig once `TimelockController` is wired)
+2. Notices are triaged by the `GOVERNANCE_ROLE` holder (deployer pre-handover, then global governance multisig once `TimelockController` is wired)
 3. Clearly illegal content (CSAM, actively-exploited material) → emergency multisig path
 4. DMCA / DSA notices → appropriate governance body (global or regional) with the notice ID in the `reason` field
 5. Repeat-offender origin nodes → global governance vote for origin blacklisting

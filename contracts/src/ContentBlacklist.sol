@@ -316,6 +316,14 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         emergencyComplianceWindow = EMERGENCY_COMPLIANCE_WINDOW_DEFAULT;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
+        // Deploy renounces DEFAULT_ADMIN_ROLE, freezing the role table (#2028).
+        // EMERGENCY_MULTISIG_ROLE stays rotatable under GOVERNANCE_ROLE so a
+        // timelocked proposal can evict a compromised emergency multisig without
+        // a redeploy. REGIONAL_BODY_ROLE needs no admin rescope: it is granted
+        // and revoked by governance through registerRegionalBody /
+        // deregisterRegionalBody, which use internal _grantRole and never the
+        // admin-gated public grantRole.
+        _setRoleAdmin(EMERGENCY_MULTISIG_ROLE, GOVERNANCE_ROLE);
     }
 
     // -----------------------------------------------------------------

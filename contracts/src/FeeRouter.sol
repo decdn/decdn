@@ -182,6 +182,10 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
+        // Deploy renounces DEFAULT_ADMIN_ROLE, freezing the role table (#2028).
+        // PAUSER_ROLE stays rotatable under GOVERNANCE_ROLE so a timelocked
+        // proposal can evict a compromised emergency pauser without a redeploy.
+        _setRoleAdmin(PAUSER_ROLE, GOVERNANCE_ROLE);
     }
 
     // -----------------------------------------------------------------

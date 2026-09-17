@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import { Script, console2 } from "forge-std/Script.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
@@ -23,11 +24,19 @@ import { BuybackVenueLib } from "./lib/BuybackVenueLib.sol";
 ///         cap (ADR 018 § Activation Criteria 1–7). This script performs the one
 ///         broadcast step that is safe to run ahead of time — deploying the
 ///         concrete `GuardedBuybackBurner` with `GOVERNANCE_ROLE`/`DEFAULT_ADMIN_ROLE`
-///         held by the Timelock — then PRINTS (does not execute) the two
+///         held by the Timelock — then PRINTS (does not execute) the three
 ///         calldata blobs governance schedules through the 48h Timelock:
 ///           1. `FeeRouter.setSharesAndDestinations([6000, 3000, 1000], …)`
 ///              (steady-state split, ADR 016 § Deployment Order).
 ///           2. `GuardedBuybackBurner.setKeeper(keeper)`.
+///           3. `GuardedBuybackBurner.renounceRole(DEFAULT_ADMIN_ROLE, timelock)`
+///              (#2028 — freeze the burner's role table to match every other
+///              contract; without it the Timelock keeps a master key on the burner
+///              that a captured governance could use to mint a fresh GOVERNANCE_ROLE).
+///              `setKeeper` is GOVERNANCE_ROLE-gated and PAUSER_ROLE is
+///              GOVERNANCE_ROLE-administered, so both stay reachable after this
+///              renounce; schedule it last. Genesis activation via `DeployProtocol`
+///              renounces the same admin automatically in its handoff loop.
 ///         The script holds no privileged role and never touches FeeRouter, so
 ///         it cannot itself activate the bucket — the Timelock proposal does.
 ///
@@ -94,6 +103,7 @@ contract ActivateBuyback is Script {
         console2.log("Venue:", venue);
         console2.log("BuybackBurner deployed at:", address(burner));
         console2.log("Roles (DEFAULT_ADMIN, GOVERNANCE) held by Timelock:", timelock);
+        console2.log("DEFAULT_ADMIN is renounced by step 3 below (#2028).");
         console2.log("");
         console2.log("== Schedule the following through the 48h Timelock ==");
 
@@ -112,6 +122,16 @@ contract ActivateBuyback is Script {
         console2.log("2) target:", address(burner));
         console2.log("   GuardedBuybackBurner.setKeeper(keeper)");
         console2.logBytes(keeperCalldata);
+
+        // #2028 — the Timelock renounces its own DEFAULT_ADMIN_ROLE on the burner,
+        // freezing the role table so no master key survives on this contract either.
+        // renounceRole requires callerConfirmation == the caller, and the Timelock is
+        // the executor, so the account argument is the Timelock itself.
+        bytes memory renounceCalldata =
+            abi.encodeCall(IAccessControl.renounceRole, (burner.DEFAULT_ADMIN_ROLE(), timelock));
+        console2.log("3) target:", address(burner));
+        console2.log("   GuardedBuybackBurner.renounceRole(DEFAULT_ADMIN_ROLE, timelock)  [#2028, schedule last]");
+        console2.logBytes(renounceCalldata);
     }
 
     function _deployBalancer(IERC20 usdc, ERC20Burnable token, address timelock)

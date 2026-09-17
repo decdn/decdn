@@ -261,7 +261,11 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         address tl = address(d.timelock);
 
         assertTrue(d.buybackBurner.hasRole(GOVERNANCE_ROLE, tl), "timelock gov");
-        assertTrue(d.buybackBurner.hasRole(DEFAULT_ADMIN_ROLE, tl), "timelock admin");
+        // #2028 — the genesis handoff renounces the burner's DEFAULT_ADMIN_ROLE too,
+        // so no master key survives on it; PAUSER/KEEPER stay GOVERNANCE-administered.
+        assertFalse(d.buybackBurner.hasRole(DEFAULT_ADMIN_ROLE, tl), "timelock admin master key");
+        assertEq(d.buybackBurner.getRoleAdmin(d.buybackBurner.PAUSER_ROLE()), GOVERNANCE_ROLE, "burner pauser admin");
+        assertEq(d.buybackBurner.getRoleAdmin(d.buybackBurner.KEEPER_ROLE()), GOVERNANCE_ROLE, "burner keeper admin");
         assertFalse(d.buybackBurner.hasRole(GOVERNANCE_ROLE, address(this)), "no deployer gov back door");
         assertFalse(d.buybackBurner.hasRole(DEFAULT_ADMIN_ROLE, address(this)), "no deployer admin back door");
     }
@@ -357,7 +361,8 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         // the rest, not be skipped because the handoff sized its array off a literal.
         assertTrue(address(bd.buybackBurner) != address(0), "burner deployed");
         assertTrue(bd.buybackBurner.hasRole(GOVERNANCE_ROLE, address(bd.timelock)), "burner gov to timelock");
-        assertTrue(bd.buybackBurner.hasRole(DEFAULT_ADMIN_ROLE, address(bd.timelock)), "burner admin to timelock");
+        // #2028 — the burner's DEFAULT_ADMIN_ROLE is renounced in the same handoff loop.
+        assertFalse(bd.buybackBurner.hasRole(DEFAULT_ADMIN_ROLE, address(bd.timelock)), "burner admin master key");
         assertFalse(bd.buybackBurner.hasRole(GOVERNANCE_ROLE, address(this)), "no deployer back door on burner");
 
         // And the bootstrap phase still holds: only the multisig may schedule.

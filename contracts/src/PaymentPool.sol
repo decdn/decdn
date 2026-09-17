@@ -350,6 +350,12 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
+        // Deploy renounces DEFAULT_ADMIN_ROLE, freezing the role table (#2028).
+        // PAUSER_ROLE stays rotatable: its admin is GOVERNANCE_ROLE, so a
+        // timelocked governance proposal can evict a compromised emergency
+        // pauser without a redeploy. GOVERNANCE_ROLE itself keeps the frozen
+        // DEFAULT_ADMIN admin, so no new governance key can ever be minted.
+        _setRoleAdmin(PAUSER_ROLE, GOVERNANCE_ROLE);
 
         DOMAIN_SEPARATOR = _domainSeparatorV4();
     }
