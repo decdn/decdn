@@ -125,8 +125,9 @@ contract ActivateBuyback is Script {
 
         // #2028 — the Timelock renounces its own DEFAULT_ADMIN_ROLE on the burner,
         // freezing the role table so no master key survives on this contract either.
-        // renounceRole requires callerConfirmation == the caller, and the Timelock is
-        // the executor, so the account argument is the Timelock itself.
+        // OZ `renounceRole(bytes32 role, address callerConfirmation)` requires its
+        // second argument to equal `msg.sender`. The Timelock executes this batch,
+        // so the argument is the Timelock's own address — it renounces its own role.
         bytes memory renounceCalldata =
             abi.encodeCall(IAccessControl.renounceRole, (burner.DEFAULT_ADMIN_ROLE(), timelock));
         console2.log("3) target:", address(burner));

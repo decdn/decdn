@@ -831,9 +831,12 @@ abstract contract BaseProtocolDeploy is Script {
             // DEFAULT_ADMIN_ROLE is renounced to no one (#2028), so neither the
             // deployer nor the Timelock may hold it — a Timelock holder would still
             // be a master key reachable by a captured governance. OZ AccessControl
-            // is not enumerable, so this asserts the two addresses that ever held
-            // it; the constructor `_setRoleAdmin` moves live-key roles off it and
-            // `_assertPeerRolesWired` confirms those admins landed.
+            // is not enumerable, so this asserts the only two addresses that could
+            // plausibly hold it: the deployer (which held it transiently before the
+            // renounce) and the Timelock (never granted it here, checked in case a
+            // future handoff edit grants it by mistake). The constructor
+            // `_setRoleAdmin` moves live-key roles off it and `_assertPeerRolesWired`
+            // confirms those admins landed.
             if (target.hasRole(DEFAULT_ADMIN_ROLE, cfg.deployer)) {
                 revert AdminRoleNotRenounced(targets[i], cfg.deployer);
             }
@@ -940,9 +943,10 @@ abstract contract BaseProtocolDeploy is Script {
         if (got != wantAdmin) revert RoleAdminNotScoped(address(target), role, wantAdmin, got);
     }
 
-    /// @dev The nine GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE-bearing targets handed
-    ///      off to the Timelock (router, bond, blacklist, slashAppeal, registry,
-    ///      paymentPool, slashJudge, originAssignment, vettingPolicy) — single
+    /// @dev The nine role-bearing targets whose handoff grants GOVERNANCE_ROLE to
+    ///      the Timelock and renounces DEFAULT_ADMIN_ROLE to no one (router, bond,
+    ///      blacklist, slashAppeal, registry, paymentPool, slashJudge,
+    ///      originAssignment, vettingPolicy) — single
     ///      source of truth for `_handOffGovernance` and `_assertNoBackDoors` so
     ///      the governed set can't drift between them. The array width MUST equal
     ///      the number of role-bearing `Deployment` members; adding a target
