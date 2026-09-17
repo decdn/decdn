@@ -369,8 +369,7 @@ Approximate use of pre-seed USDC:
 
 | Use | Approx allocation | Notes |
 |---|---:|---|
-| Operator infrastructure subsidies (direct USDC) | ~65% | Covers VPS/bandwidth for first 12 months for early operators; the primary lever making first-year operator unit economics positive (there is no on-chain TOKEN credit). Absorbs the ~10pp of pre-seed USDC freed by the lower POL seed |
-| Genesis POL seed (USDC side of the 50/50 pool) | ~20% | Pairs with the 10pp treasury-owned TOKEN POL position; sized to support the 10pp POL allocation. `TODO(pol-resize)`: the USDC side of a 50/50 pool scales 1:1 by value with the TOKEN side, following the POL allocation resize |
+| Operator infrastructure subsidies (direct USDC) | ~85% | Covers VPS/bandwidth for first 12 months for early operators; the primary lever making first-year operator unit economics positive (there is no on-chain TOKEN credit). Absorbs the whole POL-seed budget: POL is not seeded from pre-seed USDC — the DAO funds it from its 10% `FeeRouter` revenue share and creates the pool itself ([ADR 018 § Protocol-Owned Liquidity mechanics](018-liquidity-strategy.md#protocol-owned-liquidity-mechanics)) |
 | Treasury incident-contingency buffer (USDC) | ~10% | Discretionary buffer for governance-approved incident restitution before fee inflows reach steady state (no dedicated reserve contract — held by the DAO Treasury) |
 | Audits, legal, contingency | ~5% | Operational, not protocol-bound |
 
