@@ -5,8 +5,8 @@ pragma solidity 0.8.28;
 /// @notice Minimal vendored interfaces used by the genesis buyback-activation
 ///         path in `BaseProtocolDeploy.s.sol` to stand up and seed a TOKEN/USDC
 ///         Uniswap V3 pool in-script. Uniswap V3 is live on Arbitrum Sepolia (the
-///         initial-network testnet), where Balancer V3 is not, so this is the only
-///         venue whose pool the genesis flag creates on-chain.
+///         initial-network testnet); this is the venue whose pool the genesis flag
+///         creates on-chain.
 /// @dev    Deliberately NOT under `src/interfaces/` — the deployed contract surface
 ///         never creates or seeds pools; only the deploy script does. Signatures
 ///         are vendored verbatim from the Uniswap V3 periphery

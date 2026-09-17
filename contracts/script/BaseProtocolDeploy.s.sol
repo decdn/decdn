@@ -22,10 +22,8 @@ import { OriginAssignment } from "../src/OriginAssignment.sol";
 import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
 import { IVettingPolicy } from "../src/interfaces/IVettingPolicy.sol";
 import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
-import { IPermit2 } from "../src/interfaces/IPermit2.sol";
 import { BuybackVenueLib } from "./lib/BuybackVenueLib.sol";
 import { INonfungiblePositionManager } from "./interfaces/IUniswapV3PoolCreation.sol";
-import { IBalancerV3RouterInit, IBalancerV3WeightedPoolFactory } from "./interfaces/IBalancerV3PoolCreation.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceView.sol";
 import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
@@ -167,78 +165,38 @@ abstract contract BaseProtocolDeploy is Script {
     uint160 internal constant UNIV3_MIN_SQRT_RATIO = 4_295_128_739;
     uint160 internal constant UNIV3_MAX_SQRT_RATIO = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342;
 
-    /// @dev Balancer 80/20 TOKEN/USDC normalized weights (WAD). Single source of
-    ///      truth for both the pool creation and the price-implied TOKEN seed sizing.
-    uint256 internal constant BAL_TOKEN_WEIGHT = 0.8e18;
-    uint256 internal constant BAL_USDC_WEIGHT = 0.2e18;
-
-    /// @notice Pool seed amounts (raw). Both venues create + seed the pool
-    ///         in-script; the venue-appropriate ratio differs (the 80/20 Balancer
-    ///         pool needs a different TOKEN:USDC ratio than the constant-product
-    ///         Uniswap pool to hit the same anchor price), so `_deriveTokenSeed`
-    ///         computes `tokenSeed` per venue.
+    /// @notice Pool seed amounts (raw). The script creates + seeds the 50/50
+    ///         Uniswap V3 pool in-script, so `_deriveTokenSeed` pairs `usdcSeed`
+    ///         1:1 by value at `targetPrice`.
     struct PoolSeed {
         uint256 usdcSeed; // USDC seed (raw, 6-dec)
         uint256 tokenSeed; // TOKEN seed (raw, 18-dec)
-        // The inputs `tokenSeed` was derived from. Carried so `_assertVenueSeedMatches`
-        // can RE-DERIVE and compare rather than trust a label: a `venue` tag alone is
-        // an unverifiable claim by the caller, and `Venue.UNISWAP == 0` makes it
-        // vacuous on a default-constructed struct. With `targetPrice` recorded the
-        // seed is self-checking, and an unset one dies on `TargetPriceZero`.
+        // The input `tokenSeed` was derived from. Carried so `_assertPoolSeedDerived`
+        // can RE-DERIVE and compare rather than trust it: a caller-supplied
+        // `tokenSeed` is an unverifiable claim. With `targetPrice` recorded the seed
+        // is self-checking, and an unset one dies on `TargetPriceZero`.
         uint256 targetPrice;
-        BuybackVenueLib.Venue venue;
     }
 
     /// @notice Uniswap-venue inputs — the pool is created + seeded in-script.
-    ///         Must be entirely zero when `venue != UNISWAP` (see
-    ///         `_assertVenueFieldsScoped`).
+    ///         Every field is required when `activate` (see
+    ///         `_assertUniswapFieldsWired`).
     struct UniswapVenueParams {
         address swapRouter; // SwapRouter02 (swap + token-pull target)
         address positionManager; // NonfungiblePositionManager (create + seed)
         uint24 poolFee; // fee tier (e.g. 10000 = 1%)
     }
 
-    /// @notice Balancer-venue inputs — the 80/20 pool is created + seeded
-    ///         in-script. Must be entirely zero when `venue != BALANCER` (see
-    ///         `_assertVenueFieldsScoped`).
-    /// @dev Only `factory` and `swapFee` are pool-*creation* inputs; everything the
-    ///      burner's constructor needs is nested rather than restated. The gain is one
-    ///      owner per concept — the wiring cannot drift from what the burner actually
-    ///      takes, and five fields stop being copied. It is NOT extra compile-time
-    ///      safety: the code this replaced was a named-args literal, which solc already
-    ///      rejects when a member is missing, so both shapes catch an added field at
-    ///      their construction sites. What nesting does not help is the `unwired`
-    ///      disjunction below and in `BuybackVenueLib` — those are hand-enumerated, so
-    ///      a new required field must be added there by hand.
-    ///      `wiring.pool` is the one deliberate hole: it does not exist at env-read
-    ///      time and is filled by `_activateBalancer` once the pool is created — which
-    ///      is why a caller-supplied value is rejected rather than overwritten.
-    struct BalancerVenueParams {
-        address factory; // WeightedPoolFactory (create the 80/20 pool)
-        uint256 swapFee; // pool swap fee (WAD; 1e16 = 1%)
-        BuybackVenueLib.BalancerWiring wiring;
-    }
-
     /// @notice Genesis buyback-activation inputs. `activate == false` reproduces
     ///         the dormant launch exactly; all other fields are then ignored.
-    ///
-    /// @dev    The two venues' inputs live in their own sub-structs rather than
-    ///         flattened side by side (issue #1090): a flat struct made
-    ///         `balVault`-while-`venue == UNISWAP` a silently-ignored field.
-    ///         Solidity has no tagged union, so grouping alone cannot make that
-    ///         unrepresentable — `_assertVenueFieldsScoped` supplies the
-    ///         enforcement by rejecting any non-zero field on the unselected
-    ///         venue's sub-struct.
     struct BuybackActivation {
         bool activate;
-        BuybackVenueLib.Venue venue;
         // Keeper granted KEEPER_ROLE in-script (required when `activate`).
         address keeper;
-        // Shared MEV-stack guard band (ADR 018 § Parameter Table).
+        // MEV-stack guard band (ADR 018 § Parameter Table).
         GuardedBuybackBurner.GuardParams guard;
         PoolSeed seed;
         UniswapVenueParams uni;
-        BalancerVenueParams bal;
     }
 
     // PaymentPool launch params (ADR 003 § Initial deployment values). All
@@ -399,36 +357,16 @@ abstract contract BaseProtocolDeploy is Script {
     ///         `KEEPER_ROLE` holder can never `executeBuyback`, silently queueing
     ///         USDC in the burner forever.
     error MissingBuybackKeeper();
-    /// @notice Genesis activation carried a non-zero field on the venue it did NOT
-    ///         select — e.g. a `bal.vault` under `venue == UNISWAP`. Under the old
-    ///         flat `BuybackActivation` that field was silently dropped, so a
-    ///         caller could believe it had wired a Balancer pool and ship a Uniswap
-    ///         burner. `venue` is the selected venue; the offending fields are the
-    ///         other one's.
-    error VenueFieldsCrossWired(BuybackVenueLib.Venue venue);
-    /// @notice Genesis activation left a required field zero on the venue it DID
-    ///         select. `venue` is that venue. Catches the mirror of
-    ///         `VenueFieldsCrossWired`: a Balancer activation missing its Vault ships
-    ///         a burner that can never swap while already receiving the buyback
-    ///         bucket's 30% of revenue.
-    error VenueFieldsUnwired(BuybackVenueLib.Venue venue);
-    /// @notice A Balancer activation supplied `bal.wiring.pool`. That field is filled
-    ///         by `_activateBalancer` from the pool it creates; a caller-supplied value
-    ///         would be silently overwritten and a second pool created and seeded with
-    ///         real protocol-owned liquidity. Natural mistake — `ActivateBuyback` reads
-    ///         `BALANCER_POOL` from env and does exactly that, because it wires an
-    ///         already-live pool rather than creating one.
-    error PoolPrefilled(address pool);
-    /// @notice The `PoolSeed` was derived for `seedVenue` but the activation selects
-    ///         `venue`. The two weight the TOKEN leg differently (80/20 vs 1:1), so
-    ///         proceeding would initialize the genesis pool at 4x or 1/4 the intended
-    ///         anchor price — silently, since nothing downstream re-checks.
-    error PoolSeedVenueMismatch(BuybackVenueLib.Venue venue, BuybackVenueLib.Venue seedVenue);
-    /// @notice `PoolSeed.tokenSeed` is not what `usdcSeed` + `targetPrice` derive for
-    ///         the selected venue. The seed sizes the genesis pool, so a wrong value
-    ///         anchors protocol-owned liquidity at the wrong price with nothing
-    ///         downstream to notice — the tag check alone cannot catch it, because the
-    ///         tag is written by whoever built the struct.
+    /// @notice Genesis activation left a required Uniswap field zero. A missing
+    ///         swap router, position manager, or fee tier ships a burner that can
+    ///         never swap while already receiving the buyback bucket's 30% of
+    ///         revenue, or fails the seed with an opaque `extcodesize` revert.
+    error UniswapFieldsUnwired();
+    /// @notice `PoolSeed.tokenSeed` is not what `usdcSeed` + `targetPrice` derive.
+    ///         The seed sizes the genesis pool, so a wrong value anchors
+    ///         protocol-owned liquidity at the wrong price with nothing downstream
+    ///         to notice — a caller-supplied `tokenSeed` cannot be trusted, so the
+    ///         guard re-derives.
     error PoolSeedNotDerived(uint256 tokenSeed, uint256 expected);
     /// @notice The venue seed left the pool with no USDC depth — the per-epoch
     ///         cap denominator (`usdc.balanceOf(pool)`) would be zero, so the
@@ -972,28 +910,17 @@ abstract contract BaseProtocolDeploy is Script {
     // -----------------------------------------------------------------
 
     /// @dev Runs the full activation bundle between `_wireCrossContractRoles` and
-    ///      `_handOffGovernance`: deploy (and for Uniswap, seed) the venue pool +
-    ///      concrete burner (deployer as admin), grant the burner's pauser + keeper,
-    ///      then flip the FeeRouter to the steady-state `[6000, 3000, 1000]` split.
-    ///      Stores the burner on `d` so the handoff and the post-deploy asserts
-    ///      treat it as a governed target.
+    ///      `_handOffGovernance`: create + seed the Uniswap V3 pool + concrete burner
+    ///      (deployer as admin), grant the burner's pauser + keeper, then flip the
+    ///      FeeRouter to the steady-state `[6000, 3000, 1000]` split. Stores the
+    ///      burner on `d` so the handoff and the post-deploy asserts treat it as a
+    ///      governed target.
     function _activateBuyback(DeployConfig memory cfg, BuybackActivation memory act, Deployment memory d) internal {
         if (act.keeper == address(0)) revert MissingBuybackKeeper();
-        _assertVenueFieldsScoped(act);
-        _assertVenueSeedMatches(act);
+        _assertUniswapFieldsWired(act);
+        _assertPoolSeedDerived(act);
 
-        // Explicit else-revert rather than a two-way ternary: Solidity has no
-        // exhaustiveness check, so a third `Venue` variant would otherwise be silently
-        // deployed as Balancer here while `_deriveTokenSeed` sized its pool with
-        // Uniswap's 1:1 weights — a mis-anchored pool with no revert anywhere.
-        GuardedBuybackBurner burner;
-        if (act.venue == BuybackVenueLib.Venue.UNISWAP) {
-            burner = _activateUniswap(cfg, act, d);
-        } else if (act.venue == BuybackVenueLib.Venue.BALANCER) {
-            burner = _activateBalancer(cfg, act, d);
-        } else {
-            revert BuybackVenueLib.UnknownVenueVariant(uint8(act.venue));
-        }
+        GuardedBuybackBurner burner = _activateUniswap(cfg, act, d);
 
         // The burner is Pausable: grant the emergency multisig PAUSER_ROLE while the
         // deployer still admins it, so it ships with a live pauser like every other
@@ -1017,69 +944,19 @@ abstract contract BaseProtocolDeploy is Script {
         d.buybackBurner = burner;
     }
 
-    /// @dev Two halves, both needed.
-    ///
-    ///      **Cross-wired** — any non-zero field on the venue `act` did NOT select.
-    ///      Compared as an `abi.encode` digest against a zero-valued struct rather
-    ///      than a hand-written disjunction, so the check cannot fall behind the
-    ///      type: a field added later is covered by construction, where an
-    ///      enumeration would compile clean, pass every test, and silently
-    ///      under-check.
-    ///
-    ///      **Under-wired** — a required field missing on the venue it DID select.
-    ///      Without this, `bal.wiring.vault == 0` is entirely silent: the pool seeds
-    ///      (that path never reads the vault), `BuybackBurnerBalancerV3`'s
-    ///      constructor treats a zero vault as the documented deferred-wiring case
-    ///      and skips validation, and `_assertBuybackActivated` only checks the
-    ///      FeeRouter binding, the shares, and two roles — never liveness. The
-    ///      deploy exits 0 having routed 30% of protocol revenue to a burner whose
-    ///      every `executeBuyback` reverts `PoolNotWired`, forever, post-handoff.
-    ///      That is the outcome `MissingBuybackKeeper` exists to prevent, reached
-    ///      through a different door. The Uniswap side fails less quietly (an
-    ///      `extcodesize` revert with no reason string, mid-broadcast) but earns the
-    ///      same guard.
-    ///
-    ///      Reachability differs between the halves. Cross-wiring is unreachable from
-    ///      `DeployProtocol._readBuybackActivation` — it is an `if/else` — so that half
-    ///      fires only on a hand-constructed activation. Under-wiring is NOT:
-    ///      `vm.envAddress` rejects an *unset* variable but happily parses an explicit
-    ///      `0x0`, and `BALANCER_SWAP_FEE=0` is an ordinary `envOr`. So the motivating
-    ///      scenario — a Balancer activation without its Vault — is an env-configured
-    ///      deploy, not just a fixture.
-    ///
-    ///      Of every term across both venues, `bal.wiring.vault` is the only one with
-    ///      no downstream backstop, which is why the guard exists: a zero `swapRouter`
-    ///      or `permit2` hits `ZeroAddress` in the burner constructor, a zero
-    ///      `uni.poolFee` is rejected pre-broadcast by `PoolFeeOutOfRange`, and a zero
-    ///      `uni.positionManager` at least fails loudly (an `extcodesize` revert with
-    ///      no reason string, mid-broadcast). The rest of the list converts opaque
-    ///      reverts into named ones; the vault term converts silence into a revert.
-    function _assertVenueFieldsScoped(BuybackActivation memory act) internal pure {
-        if (act.venue == BuybackVenueLib.Venue.UNISWAP) {
-            BalancerVenueParams memory emptyBal;
-            if (keccak256(abi.encode(act.bal)) != keccak256(abi.encode(emptyBal))) {
-                revert VenueFieldsCrossWired(act.venue);
-            }
-            UniswapVenueParams memory u = act.uni;
-            if (u.swapRouter == address(0) || u.positionManager == address(0) || u.poolFee == 0) {
-                revert VenueFieldsUnwired(act.venue);
-            }
-        } else {
-            UniswapVenueParams memory emptyUni;
-            if (keccak256(abi.encode(act.uni)) != keccak256(abi.encode(emptyUni))) {
-                revert VenueFieldsCrossWired(act.venue);
-            }
-            BalancerVenueParams memory b = act.bal;
-            // Only the pool-*creation* inputs are checked here. Everything the burner
-            // itself needs is validated by `BuybackVenueLib` at construction, so the
-            // runbook entry point (`ActivateBuyback`) gets the same protection rather
-            // than none — see `BuybackVenueLib.WiringIncomplete`.
-            if (b.factory == address(0) || b.swapFee == 0) revert VenueFieldsUnwired(act.venue);
-            // The pool cannot exist yet: `_activateBalancer` creates it and overwrites
-            // this field. A caller who supplies an existing pool would have it silently
-            // discarded and a NEW one created and seeded with real protocol-owned
-            // liquidity, so reject rather than overwrite.
-            if (b.wiring.pool != address(0)) revert PoolPrefilled(b.wiring.pool);
+    /// @dev Reject an activation missing any required Uniswap input. `vm.envAddress`
+    ///      rejects an *unset* variable but happily parses an explicit `0x0`, so a
+    ///      `UNISWAP_SWAP_ROUTER=0x0` deploy is reachable from env, not just a fixture.
+    ///      A zero `poolFee` is already rejected pre-broadcast by `PoolFeeOutOfRange`,
+    ///      and a zero `swapRouter` hits `ZeroAddress` in the burner constructor; a
+    ///      zero `positionManager` would otherwise fail with an opaque `extcodesize`
+    ///      revert mid-broadcast. This converts all three into one named revert before
+    ///      any gas is spent, and gives the runbook entry point (`ActivateBuyback`)
+    ///      the same protection via `BuybackVenueLib.WiringIncomplete`.
+    function _assertUniswapFieldsWired(BuybackActivation memory act) internal pure {
+        UniswapVenueParams memory u = act.uni;
+        if (u.swapRouter == address(0) || u.positionManager == address(0) || u.poolFee == 0) {
+            revert UniswapFieldsUnwired();
         }
     }
 
@@ -1103,132 +980,6 @@ abstract contract BaseProtocolDeploy is Script {
             pool,
             act.guard
         );
-    }
-
-    /// @dev Balancer venue: create + seed the 80/20 TOKEN/USDC weighted pool
-    ///      in-script via the `WeightedPoolFactory` + Router (Permit2), then deploy
-    ///      the concrete burner bound to it, the Vault, and the Router. The burner
-    ///      constructor fail-fasts if the pool is not a live, registered USDC/TOKEN
-    ///      pair (the seed above makes it one), which is the "seed before wire"
-    ///      guard for this venue — the Vault custodies reserves, so there is no
-    ///      pool-held USDC balance to check as there is for Uniswap.
-    function _activateBalancer(DeployConfig memory cfg, BuybackActivation memory act, Deployment memory d)
-        internal
-        returns (GuardedBuybackBurner)
-    {
-        address pool = _createAndSeedBalancerPool(cfg, act, d);
-        // The Router minted the pool BPT (protocol-owned liquidity) to the
-        // broadcasting deployer; hand it to the Timelock and clear the Permit2
-        // approvals so the deployer keeps no custody — mirroring the Uniswap path.
-        _finalizeBalancerSeed(
-            cfg.usdc, IERC20(address(d.token)), pool, act.bal.wiring.permit2, cfg.deployer, address(d.timelock)
-        );
-        // The only field the env reader could not fill: the pool did not exist yet.
-        BuybackVenueLib.BalancerWiring memory wiring = act.bal.wiring;
-        wiring.pool = pool;
-        return BuybackVenueLib.deployBalancerBurner(
-            cfg.usdc, ERC20Burnable(address(d.token)), cfg.deployer, address(d.timelock), wiring, act.guard
-        );
-    }
-
-    /// @dev Create the 80/20 TOKEN/USDC weighted pool through the live
-    ///      `WeightedPoolFactory` and seed it through the Router (Permit2). Tokens
-    ///      are sorted ascending (Vault `registerPool` invariant); the weights and
-    ///      seed amounts track the sorted order so TOKEN keeps 80% and USDC 20%.
-    ///      Pulls both legs from the deployer, so the deployer MUST hold the seed
-    ///      TOKEN + USDC (set `INITIAL_TOKEN_HOLDER` to the deployer, or fund it).
-    function _createAndSeedBalancerPool(DeployConfig memory cfg, BuybackActivation memory act, Deployment memory d)
-        internal
-        returns (address pool)
-    {
-        IERC20 usdc = cfg.usdc;
-        IERC20 token = IERC20(address(d.token));
-        _requireSeedBalance(usdc, cfg.deployer, act.seed.usdcSeed);
-        _requireSeedBalance(token, cfg.deployer, act.seed.tokenSeed);
-
-        bool usdcFirst = address(usdc) < address(token);
-        // Split the declaration from the allocation: `forge fmt` treats
-        // `new T[](n)` as atomic and won't wrap the combined line, which trips
-        // solhint's 120-char rule for this long factory type.
-        IBalancerV3WeightedPoolFactory.TokenConfig[] memory tokens;
-        tokens = new IBalancerV3WeightedPoolFactory.TokenConfig[](2);
-        uint256[] memory weights = new uint256[](2);
-        {
-            IBalancerV3WeightedPoolFactory.TokenConfig memory usdcCfg = IBalancerV3WeightedPoolFactory.TokenConfig({
-                token: usdc,
-                tokenType: IBalancerV3WeightedPoolFactory.TokenType.STANDARD,
-                rateProvider: address(0),
-                paysYieldFees: false
-            });
-            IBalancerV3WeightedPoolFactory.TokenConfig memory tokenCfg = IBalancerV3WeightedPoolFactory.TokenConfig({
-                token: token,
-                tokenType: IBalancerV3WeightedPoolFactory.TokenType.STANDARD,
-                rateProvider: address(0),
-                paysYieldFees: false
-            });
-            tokens[0] = usdcFirst ? usdcCfg : tokenCfg;
-            tokens[1] = usdcFirst ? tokenCfg : usdcCfg;
-            weights[0] = usdcFirst ? BAL_USDC_WEIGHT : BAL_TOKEN_WEIGHT;
-            weights[1] = usdcFirst ? BAL_TOKEN_WEIGHT : BAL_USDC_WEIGHT;
-        }
-
-        IBalancerV3WeightedPoolFactory.PoolRoleAccounts memory roles = IBalancerV3WeightedPoolFactory.PoolRoleAccounts({
-            pauseManager: address(0), swapFeeManager: address(0), poolCreator: address(0)
-        });
-
-        pool = IBalancerV3WeightedPoolFactory(act.bal.factory)
-            .create(
-                "deCDN 80TOKEN-20USDC",
-                "dcdn-8020",
-                tokens,
-                weights,
-                roles,
-                act.bal.swapFee,
-                address(0), // no hooks
-                false, // enableDonation
-                false, // disableUnbalancedLiquidity
-                keccak256(abi.encodePacked(address(token), address(usdc))) // salt (unique per fresh TOKEN)
-            );
-
-        IERC20[] memory initTokens = new IERC20[](2);
-        uint256[] memory initAmounts = new uint256[](2);
-        initTokens[0] = tokens[0].token;
-        initTokens[1] = tokens[1].token;
-        initAmounts[0] = usdcFirst ? act.seed.usdcSeed : act.seed.tokenSeed;
-        initAmounts[1] = usdcFirst ? act.seed.tokenSeed : act.seed.usdcSeed;
-
-        _permit2Approve(usdc, act, act.seed.usdcSeed);
-        _permit2Approve(token, act, act.seed.tokenSeed);
-
-        // slither-disable-next-line unused-return
-        IBalancerV3RouterInit(act.bal.wiring.swapRouter).initialize(pool, initTokens, initAmounts, 0, false, "");
-    }
-
-    /// @dev Post-seed cleanup for the Balancer venue: move the freshly-minted
-    ///      pool BPT (protocol-owned liquidity) to the Timelock and drop the
-    ///      standing Permit2 ERC20 allowances, so the deployer retains no
-    ///      custody or approval. Extracted to keep `_createAndSeedBalancerPool`
-    ///      under the stack-depth limit.
-    function _finalizeBalancerSeed(
-        IERC20 usdc,
-        IERC20 token,
-        address pool,
-        address permit2,
-        address deployer,
-        address timelock
-    ) internal {
-        IERC20(pool).safeTransfer(timelock, IERC20(pool).balanceOf(deployer));
-        usdc.forceApprove(permit2, 0);
-        token.forceApprove(permit2, 0);
-    }
-
-    /// @dev The two-step Permit2 grant the V3 Router requires to pull `amount` of
-    ///      `erc20` from the deployer: ERC20-approve Permit2, then set the Permit2
-    ///      allowance for the Router.
-    function _permit2Approve(IERC20 erc20, BuybackActivation memory act, uint256 amount) internal {
-        erc20.forceApprove(act.bal.wiring.permit2, type(uint256).max);
-        IPermit2(act.bal.wiring.permit2)
-            .approve(address(erc20), act.bal.wiring.swapRouter, uint160(amount), uint48(block.timestamp + 1 days));
     }
 
     /// @dev Create the TOKEN/USDC Uniswap V3 pool (idempotent) at the seed-implied
@@ -1296,40 +1047,26 @@ abstract contract BaseProtocolDeploy is Script {
         if (have < need) revert InsufficientSeedBalance(address(t), have, need);
     }
 
-    /// @notice Build a `PoolSeed`. `tokenSeed` is venue-derived (80/20 weights for
-    ///         Balancer, 1:1 for Uniswap), so a seed and a venue chosen independently
-    ///         can disagree — and that disagreement is **silent**: the pool initializes
-    ///         at 4x or 1/4 the intended anchor price, seeding real protocol-owned
-    ///         liquidity at the wrong value.
-    ///
-    ///         Solidity cannot make this the only way to build one — a struct literal
-    ///         or per-field assignment always compiles. What makes the invariant hold
-    ///         is that the inputs are recorded, so `_assertVenueSeedMatches` re-derives
-    ///         and compares rather than trusting the caller.
-    function _derivePoolSeed(BuybackVenueLib.Venue venue, uint256 usdcSeed, uint256 targetPrice)
-        internal
-        pure
-        returns (PoolSeed memory)
-    {
-        // Split rather than inlined: `forge fmt` collapses the one-line form to 121
-        // chars, one over solhint's 120 limit, and the two tools then disagree
-        // forever (`forge fmt --check` passes, `solhint` fails).
-        uint256 tokenSeed = _deriveTokenSeed(venue, usdcSeed, targetPrice);
-        return PoolSeed({ usdcSeed: usdcSeed, tokenSeed: tokenSeed, targetPrice: targetPrice, venue: venue });
+    /// @notice Build a `PoolSeed` for the 50/50 Uniswap V3 pool. Solidity cannot
+    ///         make this the only way to build one — a struct literal or per-field
+    ///         assignment always compiles. What makes the invariant hold is that the
+    ///         inputs are recorded, so `_assertPoolSeedDerived` re-derives and compares
+    ///         rather than trusting a caller-supplied `tokenSeed`.
+    function _derivePoolSeed(uint256 usdcSeed, uint256 targetPrice) internal pure returns (PoolSeed memory) {
+        return
+            PoolSeed({
+                usdcSeed: usdcSeed, tokenSeed: _deriveTokenSeed(usdcSeed, targetPrice), targetPrice: targetPrice
+            });
     }
 
-    /// @dev Reject a `PoolSeed` that was not derived for the venue this activation
-    ///      selects. Two checks, and the second is what makes the first meaningful:
-    ///      the tag says which venue the caller *claims* the seed was sized for, and
-    ///      the re-derivation proves it. Without it a hand-built seed could carry a
-    ///      correct tag and an arbitrary `tokenSeed` — the mis-anchored pool the error
-    ///      text describes, sailing through the guard named after it.
+    /// @dev Reject a `PoolSeed` whose `tokenSeed` is not what `usdcSeed` +
+    ///      `targetPrice` derive. Without it a hand-built seed could carry an
+    ///      arbitrary `tokenSeed` — the mis-anchored pool `PoolSeedNotDerived`
+    ///      describes, seeding real protocol-owned liquidity at the wrong price.
     ///      `_deriveTokenSeed` reverts `TargetPriceZero` on a default-constructed
-    ///      seed, so "never set" fails here too rather than masquerading as Uniswap
-    ///      (whose ordinal is 0).
-    function _assertVenueSeedMatches(BuybackActivation memory act) internal pure {
-        if (act.seed.venue != act.venue) revert PoolSeedVenueMismatch(act.venue, act.seed.venue);
-        uint256 expected = _deriveTokenSeed(act.venue, act.seed.usdcSeed, act.seed.targetPrice);
+    ///      seed, so "never set" fails here too.
+    function _assertPoolSeedDerived(BuybackActivation memory act) internal pure {
+        uint256 expected = _deriveTokenSeed(act.seed.usdcSeed, act.seed.targetPrice);
         if (act.seed.tokenSeed != expected) revert PoolSeedNotDerived(act.seed.tokenSeed, expected);
     }
 
@@ -1337,22 +1074,12 @@ abstract contract BaseProtocolDeploy is Script {
     ///      whole TOKEN in USDC base units (USDC is 6-dec, so `$0.01/TOKEN` is
     ///      `10_000`). The USDC decimals cancel (`usdcSeed` and `targetPrice` share
     ///      them), so the result is only scaled by TOKEN's 18 decimals:
-    ///        tokenSeed = (wTOKEN / wUSDC) · usdcSeed · 1e18 / targetPrice
-    ///      where the value-weight ratio is 1:1 for the 50/50 constant-product
-    ///      Uniswap pool and 4:1 (80/20) for the Balancer weighted pool. Feeding the
+    ///        tokenSeed = usdcSeed · 1e18 / targetPrice
+    ///      The 50/50 constant-product Uniswap pool pairs value 1:1, so feeding the
     ///      seeds in this proportion makes the pool initialize at exactly `targetPrice`.
-    function _deriveTokenSeed(BuybackVenueLib.Venue venue, uint256 usdcSeed, uint256 targetPrice)
-        internal
-        pure
-        returns (uint256)
-    {
+    function _deriveTokenSeed(uint256 usdcSeed, uint256 targetPrice) internal pure returns (uint256) {
         if (targetPrice == 0) revert TargetPriceZero();
-        if (venue != BuybackVenueLib.Venue.BALANCER && venue != BuybackVenueLib.Venue.UNISWAP) {
-            revert BuybackVenueLib.UnknownVenueVariant(uint8(venue));
-        }
-        (uint256 wToken, uint256 wUsdc) =
-            venue == BuybackVenueLib.Venue.BALANCER ? (BAL_TOKEN_WEIGHT, BAL_USDC_WEIGHT) : (uint256(1), uint256(1));
-        return Math.mulDiv(Math.mulDiv(usdcSeed, wToken, wUsdc), 1e18, targetPrice);
+        return Math.mulDiv(usdcSeed, 1e18, targetPrice);
     }
 
     /// @dev `sqrtPriceX96 = sqrt(amount1 / amount0) * 2**96`, computed with

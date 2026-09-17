@@ -19,7 +19,7 @@ import { BuybackBurner } from "./BuybackBurner.sol";
 ///         (checks-effects-interactions).
 /// @dev    The venue is abstracted behind five hooks a concrete subclass binds:
 ///         `_requireWired` (base), `_spotPrice`, `_usdcDepthRaw`, `_swapFeeE18`,
-///         and `_swap`. Nothing here references Balancer or Uniswap; the
+///         and `_swap`. Nothing here references a specific venue; the
 ///         spot-price source and the swap call are entirely the subclass's.
 ///
 ///         TWAP source: a self-maintained cumulative-price accumulator
@@ -331,7 +331,7 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
     /// @dev Clear the venue-derived guard state — the TWAP accumulator and the
     ///      per-epoch cap snapshot — so both re-derive from scratch against a
     ///      freshly wired venue. A concrete burner MUST call this whenever it
-    ///      rotates a price/depth source (the pool, or the Balancer Vault): the
+    ///      rotates a price/depth source (the pool): the
     ///      accumulator returns to its fail-closed lazy-init state
     ///      (`twapLastUpdate == 0` ⇒ `_twapPrice` reverts `TwapNotReady` until
     ///      `twapMinWindow` re-matures against the new venue), and zeroing

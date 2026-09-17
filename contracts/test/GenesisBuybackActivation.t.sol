@@ -165,7 +165,6 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
 
     function _uniswapActivation(address positionManager) internal view returns (BuybackActivation memory act) {
         act.activate = true;
-        act.venue = BuybackVenueLib.Venue.UNISWAP;
         act.keeper = keeper;
         act.guard = GuardedBuybackBurner.GuardParams({
             twapMinWindow_: 1800,
@@ -175,7 +174,7 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
             epochLiquidityCapFraction_: 1000
         });
         act.uni = UniswapVenueParams({ swapRouter: swapRouter, positionManager: positionManager, poolFee: 10_000 });
-        act.seed = _derivePoolSeed(BuybackVenueLib.Venue.UNISWAP, USDC_SEED, TARGET_PRICE);
+        act.seed = _derivePoolSeed(USDC_SEED, TARGET_PRICE);
     }
 
     // External wrapper so `vm.expectRevert` catches reverts at the call boundary.
@@ -281,33 +280,19 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         this.externalRunFullDeploy(_config(), act);
     }
 
-    /// @notice Venue-scoped sub-structs plus this guard reject a Balancer field
-    ///         wired under `venue == UNISWAP`, so a caller cannot believe it
-    ///         pointed at a Balancer pool and ship a Uniswap burner.
-    function test_revertsWhenBalancerFieldsSetUnderUniswapVenue() public {
+    /// @notice A required Uniswap field left zero ships a burner that can never
+    ///         swap while already receiving 30% of protocol revenue, so the deploy
+    ///         must fail fast.
+    function test_revertsWhenUniswapFieldsUnwired() public {
         BuybackActivation memory act = _uniswapActivation(address(0xdead));
-        act.bal.wiring.vault = address(0xBA1);
-        vm.expectRevert(
-            abi.encodeWithSelector(BaseProtocolDeploy.VenueFieldsCrossWired.selector, BuybackVenueLib.Venue.UNISWAP)
-        );
+        act.uni.positionManager = address(0);
+        vm.expectRevert(BaseProtocolDeploy.UniswapFieldsUnwired.selector);
         this.externalRunFullDeploy(_config(), act);
     }
 
-    /// @notice The mirror direction. Fires before any venue-specific work, so the
-    ///         zero `bal.factory` that would otherwise revert deeper never matters.
-    function test_revertsWhenUniswapFieldsSetUnderBalancerVenue() public {
-        BuybackActivation memory act = _uniswapActivation(address(0xdead));
-        act.venue = BuybackVenueLib.Venue.BALANCER;
-        // `act.uni` is still populated from the Uniswap helper — the cross-wiring.
-        vm.expectRevert(
-            abi.encodeWithSelector(BaseProtocolDeploy.VenueFieldsCrossWired.selector, BuybackVenueLib.Venue.BALANCER)
-        );
-        this.externalRunFullDeploy(_config(), act);
-    }
-
-    /// @notice Doubles as proof that `_assertVenueFieldsScoped` is venue-scoped
-    ///         rather than blanket: a correctly-wired Uniswap activation runs THROUGH
-    ///         both halves of the guard and only fails later, here.
+    /// @notice A correctly-wired Uniswap activation runs THROUGH the wiring and seed
+    ///         guards and only fails later, here — proof they do not blanket-reject a
+    ///         live configuration.
     function test_revertsWhenPoolNotSeeded() public {
         // A manager that creates the pool but seeds no liquidity must fail the
         // "seed before wire" guard.
@@ -329,13 +314,6 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         vm.expectPartialRevert(BaseProtocolDeploy.InsufficientSeedBalance.selector);
         this.externalRunFullDeploy(cfg, _uniswapActivation(address(npm)));
     }
-
-    // The Balancer venue creates + seeds its pool through the live Balancer V3
-    // factory/router (Permit2), so its full-bundle coverage is the gated Ethereum
-    // Sepolia fork suite `GenesisBuybackActivationBalancer.fork.t.sol` — the
-    // factory/vault/router stack is impractical to mock in-process. The keeper
-    // guard here (`test_revertsWhenKeeperMissing`) is venue-agnostic and fires
-    // before any venue-specific work, so it covers the Balancer path too.
 
     // -----------------------------------------------------------------
     // Bootstrap phase x genesis activation (ADR 009 + ADR 018)
@@ -372,60 +350,8 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     }
 
     // -----------------------------------------------------------------
-    // Venue/seed scoping guards
+    // Seed guards
     // -----------------------------------------------------------------
-
-    /// @dev A Balancer activation wired well enough to clear the cross-wire half,
-    ///      so the under-wire and seed guards are what a test actually exercises.
-    ///      Needs no live contracts: every guard it targets runs inside
-    ///      `_assertVenueFieldsScoped` / `_assertVenueSeedMatches`, the first two
-    ///      statements of `_activateBuyback`, before any external call.
-    function _balancerActivation() internal view returns (BuybackActivation memory act) {
-        act.activate = true;
-        act.venue = BuybackVenueLib.Venue.BALANCER;
-        act.keeper = keeper;
-        act.guard = GuardedBuybackBurner.GuardParams({
-            twapMinWindow_: 1800,
-            maxBuybackAmount_: 10_000e6,
-            minBuybackAmount_: 100e6,
-            slippageBps_: 200,
-            epochLiquidityCapFraction_: 1000
-        });
-        act.bal = BalancerVenueParams({
-            factory: address(0xFAC),
-            swapFee: 1e16,
-            wiring: BuybackVenueLib.BalancerWiring({
-                swapRouter: address(0x8081),
-                pool: address(0), // created by `_activateBalancer`; prefilling is rejected
-                vault: address(0xA017),
-                permit2: BuybackVenueLib.CANONICAL_PERMIT2
-            })
-        });
-        act.seed = _derivePoolSeed(BuybackVenueLib.Venue.BALANCER, USDC_SEED, TARGET_PRICE);
-    }
-
-    /// @notice The pool-creation inputs, which the deploy script still owns because
-    ///         the library never sees them.
-    function test_revertsWhenBalancerFactoryIsUnwired() public {
-        BuybackActivation memory act = _balancerActivation();
-        act.bal.factory = address(0);
-        vm.expectRevert(
-            abi.encodeWithSelector(BaseProtocolDeploy.VenueFieldsUnwired.selector, BuybackVenueLib.Venue.BALANCER)
-        );
-        this.externalRunFullDeploy(_config(), act);
-    }
-
-    /// @notice `_activateBalancer` overwrites `wiring.pool` with the pool it creates,
-    ///         so a caller-supplied value would be silently discarded and a second
-    ///         pool created and seeded with real protocol-owned liquidity. The natural
-    ///         mistake: `ActivateBuyback` reads `BALANCER_POOL` from env because it
-    ///         wires a live pool instead of creating one.
-    function test_revertsWhenBalancerPoolIsPrefilled() public {
-        BuybackActivation memory act = _balancerActivation();
-        act.bal.wiring.pool = address(0xB001);
-        vm.expectRevert(abi.encodeWithSelector(BaseProtocolDeploy.PoolPrefilled.selector, address(0xB001)));
-        this.externalRunFullDeploy(_config(), act);
-    }
 
     /// @notice A guard band of `min == max == 0` reverts `AboveMaxBuyback` on
     ///         every non-zero buyback until governance raises the ceiling.
@@ -443,19 +369,16 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         this.externalRunFullDeploy(_config(), act);
     }
 
-    /// @notice A seed sized for one venue paired with the other. `_deriveTokenSeed`
-    ///         weights the TOKEN leg 80/20 for Balancer and 1:1 for Uniswap, so this
-    ///         would initialize the genesis pool at 4x or 1/4 the intended anchor —
-    ///         silently, with no revert anywhere downstream.
-    function test_revertsWhenSeedWasDerivedForTheOtherVenue() public {
+    /// @notice A `PoolSeed` whose `tokenSeed` does not match what `usdcSeed` +
+    ///         `targetPrice` derive would initialize the genesis pool at the wrong
+    ///         anchor — silently, with no revert anywhere downstream. The guard
+    ///         re-derives rather than trusting the caller-supplied value.
+    function test_revertsWhenSeedNotDerived() public {
         BuybackActivation memory act = _uniswapActivation(address(0xdead));
-        act.seed = _derivePoolSeed(BuybackVenueLib.Venue.BALANCER, USDC_SEED, TARGET_PRICE);
+        // 1M TOKEN is correct for 10k USDC at $0.01; halve it to mis-anchor the pool.
+        act.seed.tokenSeed = TOKEN_SEED / 2;
         vm.expectRevert(
-            abi.encodeWithSelector(
-                BaseProtocolDeploy.PoolSeedVenueMismatch.selector,
-                BuybackVenueLib.Venue.UNISWAP,
-                BuybackVenueLib.Venue.BALANCER
-            )
+            abi.encodeWithSelector(BaseProtocolDeploy.PoolSeedNotDerived.selector, TOKEN_SEED / 2, TOKEN_SEED)
         );
         this.externalRunFullDeploy(_config(), act);
     }
@@ -466,35 +389,26 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
 
     function test_deriveTokenSeed_uniswapAnchor() public pure {
         // 10k USDC at $0.01/TOKEN -> 1M TOKEN (50/50 value split).
-        assertEq(_deriveTokenSeed(BuybackVenueLib.Venue.UNISWAP, 10_000e6, 10_000), 1_000_000e18);
-    }
-
-    function test_deriveTokenSeed_balancerAnchor() public pure {
-        // 250k USDC at $0.01/TOKEN, 80/20 -> 100M TOKEN (TOKEN side is 4x by value).
-        assertEq(_deriveTokenSeed(BuybackVenueLib.Venue.BALANCER, 250_000e6, 10_000), 100_000_000e18);
+        assertEq(_deriveTokenSeed(10_000e6, 10_000), 1_000_000e18);
     }
 
     function test_deriveTokenSeed_scalesInverselyWithPrice() public pure {
         // At $0.02/TOKEN the same USDC buys half the TOKEN.
-        assertEq(_deriveTokenSeed(BuybackVenueLib.Venue.UNISWAP, 10_000e6, 20_000), 500_000e18);
+        assertEq(_deriveTokenSeed(10_000e6, 20_000), 500_000e18);
     }
 
     function test_deriveTokenSeed_smallSeed() public pure {
         // The point of the price knob: 100 USDC at $0.01 seeds 10k TOKEN, no
         // hand-computed ratio and no large USDC balance required.
-        assertEq(_deriveTokenSeed(BuybackVenueLib.Venue.UNISWAP, 100e6, 10_000), 10_000e18);
+        assertEq(_deriveTokenSeed(100e6, 10_000), 10_000e18);
     }
 
     function test_deriveTokenSeed_revertsOnZeroPrice() public {
         vm.expectRevert(BaseProtocolDeploy.TargetPriceZero.selector);
-        this.externalDeriveTokenSeed(BuybackVenueLib.Venue.UNISWAP, 100e6, 0);
+        this.externalDeriveTokenSeed(100e6, 0);
     }
 
-    function externalDeriveTokenSeed(BuybackVenueLib.Venue venue, uint256 usdcSeed, uint256 targetPrice)
-        external
-        pure
-        returns (uint256)
-    {
-        return _deriveTokenSeed(venue, usdcSeed, targetPrice);
+    function externalDeriveTokenSeed(uint256 usdcSeed, uint256 targetPrice) external pure returns (uint256) {
+        return _deriveTokenSeed(usdcSeed, targetPrice);
     }
 }

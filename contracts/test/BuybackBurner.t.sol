@@ -91,8 +91,8 @@ contract TestableBuybackBurner is BuybackBurner {
 ///         paths (including the I1 trust-boundary check on the subclass's
 ///         reported `tokenOut` and the `_requireWired` gate), `pause`/`unpause`
 ///         and `rescueUSDC` role guards, and constructor zero-address
-///         validation. Venue-specific wiring (pool/vault/router) is covered in
-///         the per-venue suites.
+///         validation. Venue-specific wiring (pool/router) is covered in
+///         the `BuybackBurnerUniswapV3` suite.
 contract BuybackBurnerTest is Test {
     MockUSDC internal usdc;
     Token internal token;

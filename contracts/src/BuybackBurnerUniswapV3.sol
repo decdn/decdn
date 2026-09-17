@@ -19,17 +19,16 @@ import { IUniswapV3Pool } from "./interfaces/IUniswapV3Pool.sol";
 ///         approval, the pool's `slot0` marginal spot feeding the inherited TWAP
 ///         floor, the fee-tier-derived swap fee, and the in-pool USDC balance
 ///         feeding the inherited per-epoch cap.
-/// @dev    Initial-network venue on Arbitrum Sepolia, where Uniswap V3 is live
-///         but Balancer V3 is not. The `FeeRouter.buybackBurner` is swappable in
-///         one governance call, so this can be replaced by
-///         `BuybackBurnerBalancerV3` later with no FeeRouter change.
+/// @dev    The canonical buyback venue (ADR 018): Uniswap V3 is live on the
+///         Arbitrum Sepolia initial network. The `FeeRouter.buybackBurner` is
+///         swappable in one governance call, so a future venue subclass can replace
+///         this with no FeeRouter change.
 ///
-///         TWAP source: like the Balancer burner this uses the inherited
-///         hand-rolled accumulator (NOT the pool's native `observe()` oracle) —
-///         it samples `_spotPrice` from `slot0.sqrtPriceX96`, advanceable
-///         permissionlessly via `poke()`, fail-closed until `twapMinWindow`
-///         matures. This keeps both burners on one TWAP implementation and works
-///         on a freshly-seeded pool whose observation cardinality is still 1.
+///         TWAP source: the inherited hand-rolled accumulator (NOT the pool's
+///         native `observe()` oracle) — it samples `_spotPrice` from
+///         `slot0.sqrtPriceX96`, advanceable permissionlessly via `poke()`,
+///         fail-closed until `twapMinWindow` matures. This works on a
+///         freshly-seeded pool whose observation cardinality is still 1.
 ///
 ///         Token-pull: `SwapRouter02` pulls `tokenIn` via a direct ERC20
 ///         allowance (no Permit2 leg), so the swap scopes `forceApprove(router,
@@ -101,9 +100,8 @@ contract BuybackBurnerUniswapV3 is GuardedBuybackBurner {
         swapRouter = cfg.swapRouter_;
         pool = cfg.pool_;
         // Fail-fast on a mis-wired pool supplied at deploy, symmetric with
-        // `setPool` and the Balancer burner's constructor validation: a non-zero
-        // pool must read as a USDC/TOKEN pair with a live price (`_spotPrice`
-        // reverts otherwise). Zero stays the deferred-wiring path.
+        // `setPool`: a non-zero pool must read as a USDC/TOKEN pair with a live
+        // price (`_spotPrice` reverts otherwise). Zero stays the deferred-wiring path.
         if (cfg.pool_ != address(0)) _spotPrice();
     }
 
@@ -190,8 +188,7 @@ contract BuybackBurnerUniswapV3 is GuardedBuybackBurner {
     /// @inheritdoc GuardedBuybackBurner
     /// @dev In-pool USDC depth proxied by the pool's USDC token balance — the V3
     ///      pool custodies its reserves directly, so `balanceOf(pool)` is the
-    ///      per-epoch cap denominator (analogous to the Vault live balance the
-    ///      Balancer burner reads). Like that read it is an instantaneous balance
+    ///      per-epoch cap denominator. It is an instantaneous balance
     ///      (flash-loan-shrinkable — a throughput-griefing, not fund-loss, risk;
     ///      see `_accruePerEpochCap`).
     function _usdcDepthRaw() internal view override returns (uint256) {

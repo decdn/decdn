@@ -16,8 +16,8 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 ///         keeper entry point, the actual-TOKEN-delta verification, the burn,
 ///         USDC rescue, and pausing. The concrete swap, the pool/router wiring,
 ///         and any MEV-defense stack live in subclasses (`GuardedBuybackBurner`
-///         adds the shared TWAP/band/cap stack; `BuybackBurnerBalancerV3` and
-///         `BuybackBurnerUniswapV3` bind a live venue).
+///         adds the shared TWAP/band/cap stack; `BuybackBurnerUniswapV3` binds a
+///         live venue).
 /// @dev    `executeBuyback` reverts `PoolNotWired` (via the subclass
 ///         `_requireWired` hook) until governance wires the venue, and
 ///         `SwapNotImplemented` if `_performSwap` transfers no TOKEN. Once a
@@ -33,9 +33,9 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 ///              `amountIn` by the contract's USDC balance.
 ///           2. Scope the input-token approval to exactly `amountIn` and reset
 ///              it to `0` after the swap, so no standing USDC allowance survives
-///              the call. The mechanism is venue-specific (a Balancer/Uniswap V3
-///              Router pulls via Permit2; another venue may take a direct
-///              allowance).
+///              the call. The mechanism is venue-specific (a Uniswap V3
+///              SwapRouter02 pulls via a direct ERC20 allowance; another venue
+///              may pull through a Permit2-style intermediary).
 ///           3. Optionally cap `amountIn` against a governed per-epoch
 ///              liquidity budget to limit sandwich exposure on thin pools.
 ///         `GuardedBuybackBurner` implements all three once for every venue.
@@ -168,7 +168,7 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, SunsettingPau
     function _performSwap(uint256 amountIn, uint256 minOut) internal virtual returns (uint256);
 
     /// @dev Abstract wiring-readiness guard. Subclasses revert `PoolNotWired`
-    ///      while their venue (pool/router/vault) is not fully configured, so
+    ///      while their venue (pool/router) is not fully configured, so
     ///      `executeBuyback` never reaches a swap against an unwired venue.
     function _requireWired() internal view virtual;
 
