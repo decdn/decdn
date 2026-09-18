@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use alloy::primitives::B256;
+use alloy::primitives::{B256, U256};
 
 use crate::lane::{LaneKey, LaneState, PoolId};
 
@@ -113,6 +113,22 @@ pub trait PoolStateStore: Send + Sync {
     /// Returns a [`StoreError`] if the backing store is unwritable.
     fn set_registered_until(&self, key: LaneKey, registered_until: u64) -> Result<(), StoreError> {
         let _ = (key, registered_until);
+        Ok(())
+    }
+
+    /// Raise this lane's paid cumulative (`LaneState::paid_cumulative`) to
+    /// `paid_cumulative`, monotonically — a lower or equal value is a no-op.
+    /// Touches ONLY that field, never the replay-critical `last_*` tuple, so the
+    /// seller `PoolRedeemed` watcher can record an observed redemption without
+    /// racing a concurrent voucher advance into a lost update. A no-op for a lane
+    /// with no record. Buffered like `record`; durability is the next `flush`'s
+    /// job. Persisting it is what stops a restarted node from forgetting prior
+    /// redemptions and re-submitting already-redeemed lanes (#2052).
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if the backing store is unwritable.
+    fn set_paid_cumulative(&self, key: LaneKey, paid_cumulative: U256) -> Result<(), StoreError> {
+        let _ = (key, paid_cumulative);
         Ok(())
     }
 }
@@ -365,6 +381,12 @@ impl PoolStateStore for MemoryPoolStateStore {
         let mut next = state.clone();
         if let Some(existing) = guard.get(&next.key()) {
             next.registered_until = next.registered_until.max(existing.registered_until);
+            // The voucher-record path carries `paid_cumulative` from the live
+            // in-memory lane, which never learns the redeemed watermark (that
+            // rides the `PoolRedeemed` watcher). Preserve the persisted value so a
+            // voucher advance cannot clobber it back to zero, mirroring
+            // `registered_until`/`owner_sig` (#2052).
+            next.paid_cumulative = next.paid_cumulative.max(existing.paid_cumulative);
         }
         guard.insert(next.key(), next);
         Ok(())
@@ -377,6 +399,17 @@ impl PoolStateStore for MemoryPoolStateStore {
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
         if let Some(state) = guard.get_mut(&key) {
             state.registered_until = state.registered_until.max(registered_until);
+        }
+        Ok(())
+    }
+
+    fn set_paid_cumulative(&self, key: LaneKey, paid_cumulative: U256) -> Result<(), StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        if let Some(state) = guard.get_mut(&key) {
+            state.paid_cumulative = state.paid_cumulative.max(paid_cumulative);
         }
         Ok(())
     }

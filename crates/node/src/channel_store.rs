@@ -51,11 +51,13 @@
 //! The record persists the latest voucher's signature (so the seller
 //! redemption path can submit it to the on-chain `PaymentPool.redeem` after a
 //! restart without forfeiting the claim), the capability's spending cap, its
-//! expiry (so the node stops serving once the grant lapses), and the owner's
+//! expiry (so the node stops serving once the grant lapses), the owner's
 //! signature over the capability (`owner_sig`, the `ownerSig` the redeemer
-//! submits to register the signer on-chain). All of these are plain fields of
-//! the one `StoredLaneState` record — there is a single on-disk format and no
-//! older shape to decode.
+//! submits to register the signer on-chain), and the lane's paid cumulative
+//! (`paid_cumulative`, the on-chain redeemed watermark the redeemer subtracts
+//! from owed — persisting it stops a restart from re-submitting already-redeemed
+//! lanes, #2052). All of these are plain fields of the one `StoredLaneState`
+//! record — there is a single on-disk format and no older shape to decode.
 //!
 //! The seller table above is defined here. The **buyer** pool table (#744) is
 //! not: its record codec and every one of its operations live in
@@ -287,6 +289,17 @@ struct StoredLaneState {
     /// defaulted. That break is deliberate and unversioned: deCDN is pre-launch
     /// with no deployed store to stay compatible with.
     owner_sig: Vec<u8>,
+    /// The lane's paid cumulative — the on-chain `newPaidCumulative` of the most
+    /// recent `PoolRedeemed` this node observed for it — as a fixed-width
+    /// big-endian `[u8; 32]`, like `last_amount`/`cap`. The seller redeemer
+    /// subtracts it from the lane's owed value to get what it still has to cash;
+    /// persisting it here (in the same fsynced row as the frontier) is what stops
+    /// a restarted node from forgetting redemptions behind its log-poller cursor
+    /// and re-submitting already-redeemed lanes for silent on-chain no-ops
+    /// (#2052). A required field like `registered_until`/`owner_sig`: adding it is
+    /// a breaking on-disk change (a record written before it fails to decode), not
+    /// silently defaulted — deliberate and unversioned, as deCDN is pre-launch.
+    paid_cumulative: [u8; 32],
 }
 
 impl From<&LaneState> for StoredLaneState {
@@ -300,6 +313,7 @@ impl From<&LaneState> for StoredLaneState {
             expiry: state.expiry,
             registered_until: state.registered_until,
             owner_sig: state.owner_sig.map_or_else(Vec::new, |s| s.to_vec()),
+            paid_cumulative: state.paid_cumulative.to_be_bytes(),
             chain_root: state.chain().chain_root.into(),
             chunk_price: state.chain().chunk_price.to_be_bytes(),
             verified_index: state.chain().verified_index,
@@ -369,6 +383,7 @@ impl StoredLaneState {
         );
         state.registered_until = self.registered_until;
         state.owner_sig = owner_sig;
+        state.paid_cumulative = U256::from_be_bytes(self.paid_cumulative);
         Ok(state)
     }
 }
@@ -839,6 +854,12 @@ impl PoolStateStore for PersistentPoolStateStore {
                     if next.owner_sig.is_none() {
                         next.owner_sig = existing.owner_sig;
                     }
+                    // Same rule for the paid watermark: the voucher-record path
+                    // carries it from the live in-memory lane, which never learns
+                    // the redeemed cumulative (that rides the `PoolRedeemed`
+                    // watcher via `set_paid_cumulative`). Keep the persisted value
+                    // so a frontier advance cannot regress it to zero (#2052).
+                    next.paid_cumulative = next.paid_cumulative.max(existing.paid_cumulative);
                 }
                 occ.insert(LaneSlot::Live(next));
             }
@@ -864,6 +885,26 @@ impl PoolStateStore for PersistentPoolStateStore {
         };
         if registered_until > state.registered_until {
             state.registered_until = registered_until;
+            self.dirty.push(key);
+        }
+        Ok(())
+    }
+
+    /// Raise this lane's paid cumulative, monotonically — touches ONLY
+    /// `paid_cumulative`, never the replay-critical `last_*` tuple, so a
+    /// `PoolRedeemed` write cannot race a concurrent voucher `record` into a lost
+    /// update. A no-op for a lane with no live record (a redemption observed after
+    /// the lane was forgotten has nothing to advance). Buffered like `record`;
+    /// durability is the next `flush`'s job (#2052).
+    fn set_paid_cumulative(&self, key: LaneKey, paid_cumulative: U256) -> Result<(), StoreError> {
+        let Some(mut slot) = self.lanes.get_mut(&key) else {
+            return Ok(());
+        };
+        let LaneSlot::Live(state) = slot.value_mut() else {
+            return Ok(());
+        };
+        if paid_cumulative > state.paid_cumulative {
+            state.paid_cumulative = paid_cumulative;
             self.dirty.push(key);
         }
         Ok(())

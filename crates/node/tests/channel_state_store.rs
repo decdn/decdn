@@ -293,6 +293,74 @@ fn set_registered_until_survives_restart_and_resists_regression() -> anyhow::Res
     Ok(())
 }
 
+/// `set_paid_cumulative` writes must survive a `flush` → reopen round trip, and
+/// once persisted a later voucher-path `record` carrying `paid_cumulative: 0`
+/// (the shape the serve path produces, since the live lane never learns the
+/// redeemed watermark) must NOT regress the persisted value after reopen. This is
+/// the durability the redeemer relies on so a restart does not re-submit an
+/// already-redeemed lane (#2052).
+#[test]
+fn set_paid_cumulative_survives_restart_and_resists_regression() -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let signer = PrivateKeySigner::random();
+
+    {
+        let store = PersistentPoolStateStore::open(dir.path())?;
+        let state = make_state(POOL_ID, &signer);
+        store.record(&state)?;
+        store.set_paid_cumulative(state.key(), U256::from(6_307u64))?;
+        store.flush()?;
+    }
+
+    let key = LaneKey {
+        pool_id: POOL_ID,
+        signer: signer.address(),
+        provider: PROVIDER,
+    };
+
+    {
+        let store = PersistentPoolStateStore::open(dir.path())?;
+        let found = store
+            .get(key)?
+            .ok_or_else(|| anyhow::anyhow!("lane not found after reopen"))?;
+        anyhow::ensure!(
+            found.paid_cumulative == U256::from(6_307u64),
+            "set_paid_cumulative did not survive persistence round trip, got {}",
+            found.paid_cumulative,
+        );
+
+        // A later voucher-path `record` carries paid_cumulative back at zero.
+        let mut regressed = found.clone();
+        regressed.paid_cumulative = U256::ZERO;
+        store.record(&regressed)?;
+        store.flush()?;
+    }
+
+    let store = PersistentPoolStateStore::open(dir.path())?;
+    let found = store
+        .get(key)?
+        .ok_or_else(|| anyhow::anyhow!("lane not found after second reopen"))?;
+    anyhow::ensure!(
+        found.paid_cumulative == U256::from(6_307u64),
+        "a later record with paid_cumulative=0 regressed the persisted value after restart, got {}",
+        found.paid_cumulative,
+    );
+
+    // A lower `set_paid_cumulative` is a no-op (monotone, like the on-chain
+    // watermark), while a higher one advances it.
+    store.set_paid_cumulative(key, U256::from(1u64))?;
+    store.set_paid_cumulative(key, U256::from(9_000u64))?;
+    let found = store
+        .get(key)?
+        .ok_or_else(|| anyhow::anyhow!("lane not found"))?;
+    anyhow::ensure!(
+        found.paid_cumulative == U256::from(9_000u64),
+        "set_paid_cumulative must be monotone, got {}",
+        found.paid_cumulative,
+    );
+    Ok(())
+}
+
 /// Two distinct lanes with interleaved monotonic voucher progressions must both
 /// reach their expected terminal state — verifies the store does not
 /// cross-contaminate entries across lane keys. Same-lane concurrent acceptance

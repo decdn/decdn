@@ -99,6 +99,23 @@ pub struct LaneState {
     /// intake path and the on-disk decoder) like `cap`/`expiry`/`registered_until`,
     /// not replay-critical, so it is `pub` rather than a private `last_*` field.
     pub owner_sig: Option<[u8; 65]>,
+    /// The lane's paid cumulative: the on-chain `newPaidCumulative` of the most
+    /// recent `PoolRedeemed` this node observed for it (`U256::ZERO` until the
+    /// first redemption lands). The seller redeemer subtracts it from
+    /// [`Self::owed`] to get the unredeemed value it still has to cash, so a lane
+    /// already redeemed to its owed amount drops out of the plan instead of being
+    /// re-submitted for a silent on-chain no-op (#2052). Monotone on-chain, so it
+    /// only ever advances.
+    ///
+    /// Kept ON the lane record — not a side table or a volatile cache — so it is
+    /// written in the same durable transaction as the voucher frontier it settles
+    /// against and survives a restart: without it a rebooted node forgets every
+    /// redemption behind its log-poller cursor and re-batches those lanes forever.
+    /// Set by the trusted node-side watcher (`PoolRedeemed`) and the on-disk
+    /// decoder, like `owner_sig`/`registered_until`; not replay-critical (it gates
+    /// redemption planning, not voucher acceptance), so it is `pub` rather than a
+    /// private `last_*` field.
+    pub paid_cumulative: U256,
     /// Cumulative amount of the most-recently-accepted voucher (token base
     /// units). `U256::ZERO` until the first voucher is applied. Private
     /// (#527/#751) — read via [`Self::last_amount`].
@@ -247,11 +264,12 @@ impl LaneState {
     /// not add callers without round-trip coverage that pins a signer distinct
     /// from the provider.
     ///
-    /// Hydration seeds `registered_until` to `0` (unknown) and `owner_sig` to
-    /// `None` regardless of caller-supplied `expiry`; the trusted on-disk decoder
-    /// (`StoredLaneState::into_state`) assigns the persisted values on the
-    /// returned `Self` after construction, and the seller intake path sets
-    /// `owner_sig` on the lane it registers.
+    /// Hydration seeds `registered_until` to `0` (unknown), `owner_sig` to
+    /// `None`, and `paid_cumulative` to `U256::ZERO` regardless of caller-supplied
+    /// `expiry`; the trusted on-disk decoder (`StoredLaneState::into_state`)
+    /// assigns the persisted values on the returned `Self` after construction, the
+    /// seller intake path sets `owner_sig` on the lane it registers, and the
+    /// `PoolRedeemed` watcher advances `paid_cumulative`.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn hydrate(
@@ -273,6 +291,7 @@ impl LaneState {
             expiry,
             registered_until: 0,
             owner_sig: None,
+            paid_cumulative: U256::ZERO,
             last_amount,
             last_bytes_delivered,
             last_signature,
