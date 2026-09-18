@@ -1013,12 +1013,18 @@ async fn redeemer_loop<P: Provider + Clone>(
 }
 
 /// One lane planned for redemption: its pool, its persistence key (so a landed
-/// registration can be written back to `registered_until`), its unredeemed
-/// value (for the per-chunk floor), the highest voucher to submit, and — on
-/// the signer's first redemption — the owner-signed capability to register.
+/// registration can be written back to `registered_until`), its full claim value
+/// and its unredeemed value (for the per-chunk floor), the highest voucher to
+/// submit, and — on the signer's first redemption — the owner-signed capability
+/// to register.
 struct PlannedLane {
     pool_id: PoolId,
     key: LaneKey,
+    /// The claim's full on-chain-comparable value (`amount + verified frontier`).
+    /// The contract pays `owed − w.amount`, so the pre-submit reconciliation
+    /// ([`reconcile_onchain_watermarks`]) drops a lane whose on-chain watermark
+    /// already reaches this, and recomputes `unredeemed` from the fresh read.
+    owed: U256,
     unredeemed: U256,
     voucher: PaymentPool::LaneVoucher,
     register: Option<PaymentPool::CapabilityReg>,
@@ -1306,6 +1312,7 @@ fn plan_lane(
     Ok(Some(PlannedLane {
         pool_id: key.pool_id,
         key,
+        owed,
         unredeemed,
         voucher,
         register,
@@ -1562,6 +1569,107 @@ async fn flush_store_durable(
 /// skip their submit on a failed flush (`strict_flush`); the forced
 /// close/shutdown paths redeem regardless, since forfeiting the whole claim at the
 /// deadline is worse than a bounded re-serve risk.
+/// Read the on-chain paid watermark for every planned lane in one Multicall3
+/// round-trip and drop any lane the chain already shows settled to its claim
+/// value — the last check before spending gas on a `redeemMany` the contract
+/// would silently no-op (its own `claimed <= w.amount` guard,
+/// `PaymentPool.redeem`). A surviving lane's `unredeemed` is recomputed from the
+/// fresh on-chain paid, so the per-chunk floor gates on the true delta.
+///
+/// This is the freshest possible signal and complements the durable paid cache:
+/// the event-fed cache can lag the chain between poll ticks, and another actor
+/// could have redeemed the same lane. The read is `getWatermark` against the
+/// deployed contract via alloy's canonical Multicall3 aggregate — no new
+/// contract surface, no per-lane `eth_call` fan-out.
+///
+/// **Fail-open.** A multicall/RPC error (or a chain without Multicall3) returns
+/// the plans unchanged and submits: the contract's own no-op guard is the
+/// backstop, and the only cost of a stale read is the gas this check saves. It
+/// never holds up a redemption on a read it could not make.
+async fn reconcile_onchain_watermarks<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    plans: Vec<PlannedLane>,
+    metrics: &Arc<Metrics>,
+) -> Vec<PlannedLane> {
+    if plans.is_empty() {
+        return plans;
+    }
+    let mut call = contract
+        .provider()
+        .multicall()
+        .dynamic::<PaymentPool::getWatermarkCall>();
+    for plan in &plans {
+        call = call.add_dynamic(contract.getWatermark(
+            plan.pool_id,
+            plan.key.signer,
+            plan.key.provider,
+        ));
+    }
+    let lanes = match call.aggregate().await {
+        Ok(lanes) => lanes,
+        Err(err) => {
+            warn!(
+                err = %sanitize_rpc_display(err),
+                lanes = plans.len(),
+                "pre-redeem watermark reconciliation failed; submitting on the contract's own no-op guard"
+            );
+            return plans;
+        }
+    };
+    // The aggregate returns one `Lane` per call in input order. A mismatch is a
+    // provider/Multicall3 fault — fail open rather than mis-pair a watermark with
+    // the wrong lane.
+    if lanes.len() != plans.len() {
+        warn!(
+            expected = plans.len(),
+            got = lanes.len(),
+            "watermark reconciliation returned a mismatched count; submitting unchanged"
+        );
+        return plans;
+    }
+    let onchain_paid: Vec<U256> = lanes.iter().map(|lane| U256::from(lane.amount)).collect();
+    let (kept, skipped) = reconcile_plans(plans, &onchain_paid);
+    if skipped > 0 {
+        metrics.redemption_reconciled_skip_by(skipped);
+    }
+    kept
+}
+
+/// Pure core of [`reconcile_onchain_watermarks`]: given each plan's freshly-read
+/// on-chain paid watermark (parallel to `plans`, same order), drop every lane the
+/// chain already shows settled to its claim value and recompute `unredeemed` for
+/// the survivors from that fresh paid. Returns the kept lanes and the count
+/// dropped. `onchain_paid` MUST be the same length as `plans` (the caller checks
+/// the multicall parity); a shorter slice conservatively keeps the untouched tail.
+fn reconcile_plans(plans: Vec<PlannedLane>, onchain_paid: &[U256]) -> (Vec<PlannedLane>, u64) {
+    let mut kept = Vec::with_capacity(plans.len());
+    let mut skipped = 0u64;
+    for (idx, mut plan) in plans.into_iter().enumerate() {
+        let Some(&onchain) = onchain_paid.get(idx) else {
+            // No reading for this lane (short slice): keep it unchanged — the
+            // contract's own no-op guard remains the backstop.
+            kept.push(plan);
+            continue;
+        };
+        if onchain >= plan.owed {
+            skipped += 1;
+            debug!(
+                pool_id = %plan.pool_id,
+                signer = %plan.key.signer,
+                onchain_paid = %onchain,
+                owed = %plan.owed,
+                "reconciliation: lane already settled on-chain, dropping from redeem batch"
+            );
+            continue;
+        }
+        // Recompute against the fresh on-chain paid so a lagging cache cannot push
+        // this lane over the per-chunk floor on value the chain has already paid.
+        plan.unredeemed = plan.owed.saturating_sub(onchain);
+        kept.push(plan);
+    }
+    (kept, skipped)
+}
+
 async fn redeem_planned_lanes<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
@@ -1571,6 +1679,10 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
     strict_flush: bool,
     metrics: &Arc<Metrics>,
 ) {
+    // Last check before spending gas: reconcile against the on-chain watermark
+    // and drop lanes the chain already shows settled, so a lagging cache or a
+    // concurrent redeemer can never cost a no-op `redeemMany`.
+    let plans = reconcile_onchain_watermarks(contract, plans, metrics).await;
     let chunks = chunk_redemptions(plans, floor, max_vouchers);
     if chunks.is_empty() {
         return;
@@ -2288,6 +2400,7 @@ mod tests {
                 signer: signer_addr,
                 provider: Address::from([0xEE; 20]),
             },
+            owed: U256::from(unredeemed),
             unredeemed: U256::from(unredeemed),
             voucher: PaymentPool::LaneVoucher {
                 signer: signer_addr,
@@ -2343,6 +2456,58 @@ mod tests {
             planned(2, 12, 1_000_000, true),
         ];
         assert_eq!(sum_unredeemed(&plans), U256::from(1_000_350u64));
+    }
+
+    #[test]
+    fn reconcile_plans_drops_fully_settled_and_keeps_remainder() {
+        // Three lanes, all owed 1000. On-chain: lane 0 already settled to 1000
+        // (drop), lane 1 partially at 600 (keep, remainder 400), lane 2 never
+        // redeemed at 0 (keep, remainder 1000).
+        let mut plans = vec![
+            planned(1, 0, 1_000, false),
+            planned(1, 1, 1_000, false),
+            planned(1, 2, 1_000, false),
+        ];
+        for p in &mut plans {
+            p.owed = U256::from(1_000u64);
+        }
+        let onchain = [U256::from(1_000u64), U256::from(600u64), U256::from(0u64)];
+        let (kept, skipped) = reconcile_plans(plans, &onchain);
+        assert_eq!(skipped, 1, "the fully-settled lane is dropped");
+        assert_eq!(kept.len(), 2);
+        // Survivors carry the recomputed remainder, not the stale full owed.
+        assert_eq!(kept.first().map(|p| p.unredeemed), Some(U256::from(400u64)));
+        assert_eq!(
+            kept.get(1).map(|p| p.unredeemed),
+            Some(U256::from(1_000u64))
+        );
+    }
+
+    #[test]
+    fn reconcile_plans_drops_when_onchain_exceeds_owed() {
+        // A watermark strictly above owed (a fresher voucher already redeemed
+        // elsewhere) still settles this claim to zero — drop it.
+        let mut plans = vec![planned(1, 0, 1_000, false)];
+        if let Some(p) = plans.first_mut() {
+            p.owed = U256::from(1_000u64);
+        }
+        let (kept, skipped) = reconcile_plans(plans, &[U256::from(5_000u64)]);
+        assert_eq!(skipped, 1);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn reconcile_plans_short_slice_keeps_untouched_tail() {
+        // Fail-open parity guard: a slice shorter than the plans keeps the
+        // unread tail unchanged rather than mis-pairing.
+        let plans = vec![planned(1, 0, 1_000, false), planned(1, 1, 1_000, false)];
+        let (kept, skipped) = reconcile_plans(plans, &[U256::from(1_000u64)]);
+        assert_eq!(skipped, 1, "the read lane (settled) is dropped");
+        assert_eq!(kept.len(), 1, "the unread lane is kept unchanged");
+        assert_eq!(
+            kept.first().map(|p| p.unredeemed),
+            Some(U256::from(1_000u64))
+        );
     }
 
     #[test]

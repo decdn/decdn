@@ -517,6 +517,15 @@ pub struct DecdnMetrics {
     /// which pools are dry. Operator-visible name:
     /// `decdn_redemption_skipped_insolvent_total`.
     pub redemption_skipped_insolvent: Counter,
+    /// Lanes dropped from a redeem batch by the pre-submit on-chain watermark
+    /// reconciliation because the chain already shows them settled to their
+    /// claim value — a `redeemMany` the contract would silently no-op, caught
+    /// before it costs gas. Counted once per dropped lane. A sustained non-zero
+    /// rate means the event-fed paid cache is lagging the chain (or a second
+    /// actor is redeeming the same lanes); a burst right after a restart is the
+    /// expected catch-up. Operator-visible name:
+    /// `decdn_redemption_reconciled_skip_total`.
+    pub redemption_reconciled_skip: Counter,
     /// Buyer-side reclaim-sweep attempts (`try_reclaim`) that failed — a failed
     /// `getChannel`/`reclaimExpired` RPC, a receipt wait, an on-chain revert, or
     /// a failed store write when clearing the local record after a reclaim/drop
@@ -1863,6 +1872,12 @@ recorders! {
     /// `n` lanes were held or dropped by `pool_is_redeemable` in one planning
     /// pass (ADR 003); the batched form of `redemption_skipped_insolvent`.
     redemption_skipped_insolvent_by(n: u64) => redemption_skipped_insolvent.inc_by(n);
+
+    /// `n` lanes were dropped from a redeem batch by the pre-submit on-chain
+    /// watermark reconciliation because the chain already shows them settled to
+    /// their claim value (the `redeemMany` no-op guard, avoided before it costs
+    /// gas).
+    redemption_reconciled_skip_by(n: u64) => redemption_reconciled_skip.inc_by(n);
 
     /// A buyer-side reclaim-sweep attempt (`try_reclaim`) failed — an RPC/receipt
     /// error, an on-chain revert, or a failed store write when clearing the local
