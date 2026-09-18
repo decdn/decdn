@@ -79,9 +79,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::chain_events::REORG_MARGIN_BLOCKS;
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{Checkpoint, ColdStart, CursorStart, LogSink};
+use crate::chain_events::{REORG_MARGIN_BLOCKS, timed};
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
@@ -1605,7 +1605,11 @@ async fn reconcile_onchain_watermarks<P: Provider + Clone>(
             plan.key.provider,
         ));
     }
-    let lanes = match call.aggregate().await {
+    // Bound the read: the alloy HTTP provider has no request timeout, so a hung
+    // RPC would wedge the redeemer loop forever — the opposite of fail-open. A
+    // timeout folds into the error arm and submits unchanged (degrade-and-continue,
+    // per `timed`); the default bound (`DEFAULT_RPC_CALL_TIMEOUT`) applies.
+    let lanes = match timed(None, "pre-redeem getWatermark multicall", call.aggregate()).await {
         Ok(lanes) => lanes,
         Err(err) => {
             warn!(
