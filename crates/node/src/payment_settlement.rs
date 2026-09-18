@@ -11,11 +11,16 @@
 //! - **Paid-watermark watcher.** The paid side of every lane is driven by
 //!   consuming `PoolRedeemed` events filtered on this node's own `provider`
 //!   address (ADR 003 § Tracking owed vs. paid): each event sets the lane's paid
-//!   cumulative to `newPaidCumulative`. `PoolToppedUp` re-drives a pool's lanes
+//!   cumulative to `newPaidCumulative` and mirrors it onto the durable
+//!   `LaneState::paid_cumulative` row. `PoolToppedUp` re-drives a pool's lanes
 //!   (a dry pool may have left `owed > paid`), and `PoolReclaimed` forgets the
 //!   pool's lanes. The watcher reconciles like every other chain watcher —
 //!   enumerate `PoolRedeemed` from a pinned block, then tail live, resyncing on a
-//!   missed range — so paid is rebuilt from the event log, never guessed. The same
+//!   missed range — so paid is rebuilt from the event log, never guessed. That
+//!   forward rebuild starts at the poller's persisted cursor, so bootstrap first
+//!   rehydrates the paid cache from the durable lane rows: a restart carries
+//!   forward every redemption behind the cursor instead of re-submitting those
+//!   lanes for silent on-chain no-ops (#2052). The same
 //!   scan also folds the serve path's pool solvency/funder projection
 //!   ([`crate::pool_view::PoolProjection`]): `PoolOpened`/`PoolToppedUp` set a
 //!   pool's `{owner, deposit}`, `PoolRedeemed` for every provider draws down its
@@ -159,11 +164,18 @@ const CHECKPOINT_FLUSH_BLOCKS: u64 = 512;
 /// re-scans when block-cadence alone would defer the write indefinitely.
 const CHECKPOINT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The paid-cumulative watermark of every lane, keyed by [`LaneKey`]. Written
-/// solely by the `PoolRedeemed` watcher (the single write path for the paid
-/// side, ADR 003 § Tracking owed vs. paid) and read by the redeemer to compute
-/// `unredeemed = owed − paid`. A `std::sync::Mutex`: the guard is only ever held
-/// to read/insert a single entry, never across an `.await`.
+/// In-memory index of every lane's paid-cumulative watermark, keyed by
+/// [`LaneKey`], read by the redeemer to compute `unredeemed = owed − paid`
+/// (ADR 003 § Tracking owed vs. paid). Written by the `PoolRedeemed` watcher,
+/// which mirrors every update onto the durable `LaneState::paid_cumulative` row
+/// in the same breath. The durable field is the source of truth; this cache is
+/// rehydrated from it at bootstrap ([`PoolSettlementService::bootstrap`]) so a
+/// restart carries forward redemptions that landed before the log-poller's
+/// persisted cursor, instead of re-submitting those lanes for silent on-chain
+/// no-ops (#2052).
+///
+/// A `std::sync::Mutex`: the guard is only ever held to read/insert a single
+/// entry, never across an `.await`.
 #[derive(Clone, Default)]
 pub struct PaidWatermarks {
     inner: Arc<Mutex<HashMap<LaneKey, U256>>>,
@@ -191,9 +203,11 @@ impl PaidWatermarks {
             .insert(key, paid);
     }
 
-    /// A lane's paid cumulative, or `U256::ZERO` if no `PoolRedeemed` has landed
-    /// for it yet (the safe over-estimate of `unredeemed` — the on-chain redeem
-    /// caps the increment and the event then corrects the cache).
+    /// A lane's paid cumulative, or `U256::ZERO` if none is cached — no
+    /// `PoolRedeemed` has landed for it this run and the bootstrap rehydration
+    /// found no durable watermark (a never-redeemed lane). `ZERO` is the safe
+    /// over-estimate of `unredeemed`: the on-chain redeem caps the increment and
+    /// the event then corrects both the cache and the durable row.
     fn get(&self, key: &LaneKey) -> U256 {
         self.inner
             .lock()
@@ -273,7 +287,10 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             "PaymentPool settlement service bootstrap complete"
         );
 
-        let paid = PaidWatermarks::default();
+        // Rehydrate the cache from the durable lane records BEFORE the redeemer
+        // starts, so a restart does not forget redemptions that landed before the
+        // log-poller's persisted cursor (#2052).
+        let paid = rehydrate_paid_watermarks(store.as_ref(), self_address);
 
         // Paid-watermark watcher on the resumable `eth_getLogs` poller. The
         // backfill floor and downtime-gap resume are the cursor start's job: a
@@ -585,7 +602,25 @@ impl LogSink for PoolSettlementSink {
                         signer: lane.signer,
                         provider: event.provider,
                     };
-                    self.paid.set(key, U256::from(lane.newPaidCumulative));
+                    let paid_cumulative = U256::from(lane.newPaidCumulative);
+                    self.paid.set(key, paid_cumulative);
+                    // Mirror the watermark onto the durable lane record so it
+                    // survives a restart (#2052). Buffered like `record`; the
+                    // periodic lane flush fsyncs it. A no-op for a lane already
+                    // forgotten, and the in-memory cache above stays authoritative
+                    // for this run even if the durable write is refused, so a
+                    // failure only lags durability — log it rather than fail the
+                    // poller apply (whose failure policy is in-memory + always Ok).
+                    if let Err(err) = self.store.set_paid_cumulative(key, paid_cumulative) {
+                        self.metrics.watcher_persist_failure();
+                        warn!(
+                            %err,
+                            pool_id = %event.poolId,
+                            signer = %lane.signer,
+                            "failed to persist lane paid watermark; in-memory cache updated, \
+                             durable value lags until the next redemption"
+                        );
+                    }
                     debug!(
                         pool_id = %event.poolId,
                         signer = %lane.signer,
@@ -1129,6 +1164,43 @@ enum RegistrationStatus {
     /// when another provider already registered the signer; the first landed
     /// redemption persists `registered_until` and every later one skips the reg.
     Unregistered,
+}
+
+/// Seed a fresh paid-watermark cache from the durable lane rows this node
+/// provides. Bootstrap calls this before the redeemer starts so a restart carries
+/// forward redemptions that landed before the log-poller's persisted cursor,
+/// instead of re-planning those already-redeemed lanes into a `redeemMany` the
+/// contract silently no-ops (#2052).
+///
+/// A `load_all` failure is not fatal: the `PoolRedeemed` watcher still rebuilds
+/// `paid` forward from the cursor. It only re-opens the restart-amnesia window for
+/// pre-cursor lanes, so the failure is surfaced loudly rather than aborting
+/// bring-up.
+fn rehydrate_paid_watermarks(store: &dyn PoolStateStore, self_address: Address) -> PaidWatermarks {
+    let paid = PaidWatermarks::default();
+    match store.load_all() {
+        Ok(states) => {
+            let mut restored = 0usize;
+            for st in &states {
+                if st.provider == self_address && !st.paid_cumulative.is_zero() {
+                    paid.set(st.key(), st.paid_cumulative);
+                    restored += 1;
+                }
+            }
+            if restored > 0 {
+                info!(
+                    restored,
+                    "rehydrated paid-watermark cache from durable lane store"
+                );
+            }
+        }
+        Err(err) => warn!(
+            %err,
+            "failed to rehydrate paid-watermark cache from lane store; pre-cursor \
+             redemptions may be re-submitted until re-observed on-chain"
+        ),
+    }
+    paid
 }
 
 /// Plan one lane for redemption from its already-loaded state and a resolved
@@ -2640,6 +2712,93 @@ mod tests {
         assert!(
             plan.is_none(),
             "an unregistered lane with no owner_sig is a durability fault and is skipped"
+        );
+        Ok(())
+    }
+
+    /// #2052 acceptance: a lane redeemed to its owed value before a restart — the
+    /// durable row carries `paid_cumulative == owed` — must NOT be re-planned once
+    /// the in-memory cache is rebuilt from the store. Exercises the real bootstrap
+    /// rehydration path ([`rehydrate_paid_watermarks`]) over a store, then plans.
+    #[test]
+    fn redeemed_lane_not_replanned_after_restart() -> Result<()> {
+        use decdn_incentive::MemoryPoolStateStore;
+
+        let provider = Address::from([40u8; 20]);
+        let mut st = signed_lane_state(1, 30, 40, None);
+        // On-chain the lane was fully redeemed before the restart; the durable
+        // lane row records that.
+        st.paid_cumulative = st.owed();
+        anyhow::ensure!(!st.paid_cumulative.is_zero(), "fixture must be redeemable");
+
+        let store = MemoryPoolStateStore::new();
+        store.record(&st)?;
+
+        // Restart: the volatile cache is gone. Rebuild it from the store exactly
+        // as `bootstrap` does — this is the fix under test.
+        let paid = rehydrate_paid_watermarks(&store, provider);
+
+        let plan = plan_lane(&st, &paid, provider, &RegistrationStatus::Registered)?;
+        assert!(
+            plan.is_none(),
+            "a lane already redeemed to its owed value must not be re-planned after restart (#2052)"
+        );
+        Ok(())
+    }
+
+    /// #2052: a partially-redeemed lane still owes the remainder after a restart,
+    /// so rehydration must leave exactly that remainder to plan — never the full
+    /// face value (the amnesia bug) and never nothing.
+    #[test]
+    fn partially_redeemed_lane_plans_only_the_remainder_after_restart() -> Result<()> {
+        use decdn_incentive::MemoryPoolStateStore;
+
+        let provider = Address::from([41u8; 20]);
+        let mut st = signed_lane_state(1, 31, 41, None);
+        let remainder = U256::from(250u64);
+        st.paid_cumulative = st.owed() - remainder;
+
+        let store = MemoryPoolStateStore::new();
+        store.record(&st)?;
+        let paid = rehydrate_paid_watermarks(&store, provider);
+
+        let plan =
+            plan_lane(&st, &paid, provider, &RegistrationStatus::Registered)?.ok_or_else(|| {
+                anyhow::anyhow!("a partially-redeemed lane still owes and should plan")
+            })?;
+        assert_eq!(
+            plan.unredeemed, remainder,
+            "only the un-redeemed remainder is planned, not the full owed value"
+        );
+        Ok(())
+    }
+
+    /// The voucher-record path carries `paid_cumulative` from the live in-memory
+    /// lane, which never learns the redeemed watermark. `record` must not let that
+    /// zero clobber a persisted non-zero value, or a later frontier advance would
+    /// silently reopen the #2052 amnesia within a single run.
+    #[test]
+    fn record_does_not_regress_paid_cumulative() -> Result<()> {
+        use decdn_incentive::MemoryPoolStateStore;
+
+        let store = MemoryPoolStateStore::new();
+        let mut st = signed_lane_state(1, 32, 42, None);
+        st.paid_cumulative = U256::from(600u64);
+        store.record(&st)?;
+
+        // A later voucher record for the same lane carries paid_cumulative back at
+        // zero (the shape the serve path produces).
+        let mut advanced = signed_lane_state(1, 32, 42, None);
+        advanced.paid_cumulative = U256::ZERO;
+        store.record(&advanced)?;
+
+        let got = store
+            .get(st.key())?
+            .ok_or_else(|| anyhow::anyhow!("lane must persist"))?;
+        assert_eq!(
+            got.paid_cumulative,
+            U256::from(600u64),
+            "record must not regress the persisted paid watermark to zero"
         );
         Ok(())
     }
