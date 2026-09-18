@@ -209,7 +209,7 @@ S1 and S2 leave essentially all TOKEN liquid; operators bond TOKEN purchased on 
 
 **Node-to-node cache-miss paid pulls route like every other settlement.** No bypass: operator-to-operator `PaymentPool` settlements forward through `FeeRouter.routeSettlement` and take the same 60/30/10 split. Self-routed channels therefore pay the 40% non-base skim every cycle — this per-cycle skim is the wash-trading deterrent (see [§ FeeRouter split](#feerouter-split) and [ADR 036 § Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying)).
 
-**Gross client rate.** $0.01/GB — at parity with Bunny.net's budget tier and 7–20× cheaper than major traditional CDNs. No deCDN-specific premium. The router's 40% non-base skim is absorbed by operator net revenue, recovered through TOKEN-economy exposure (capacity-growth lock demand, deflationary burn) and externally-funded pre-seed USDC subsidies.
+**Gross client rate.** $0.01/GB — at parity with Bunny.net's budget tier and 4–20× cheaper than major traditional CDNs. No deCDN-specific premium. The router's 40% non-base skim is absorbed by operator net revenue, recovered through TOKEN-economy exposure (capacity-growth lock demand, deflationary burn) and externally-funded pre-seed USDC subsidies.
 
 **Operator-aligned share = 90% at the activated target.** 60% direct + 30% burn — a different 90% from the dormant launch's 90% operator base share above. The burn raises TOKEN's mechanical demand and benefits every bond-holder uniformly.
 
