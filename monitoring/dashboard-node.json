@@ -3551,7 +3551,7 @@
             "type": "tempo",
             "uid": "${DS_TEMPO}"
           },
-          "expr": "{resource.service.name=\"decdn-node\" && resource.service.instance.id=\"$node\"} | rate() by (name)",
+          "query": "{resource.service.name=\"decdn-node\" && resource.service.instance.id=\"$node\"} | rate() by (name)",
           "refId": "A",
           "legendFormat": "{{name}}",
           "queryType": "traceql",
@@ -3646,7 +3646,7 @@
             "type": "tempo",
             "uid": "${DS_TEMPO}"
           },
-          "expr": "{resource.service.name=\"decdn-node\" && name=\"run-probe\"} | quantile_over_time(duration, .5, .95, .99)",
+          "query": "{resource.service.name=\"decdn-node\" && name=\"run-probe\"} | quantile_over_time(duration, .5, .95, .99)",
           "refId": "A",
           "legendFormat": "p{{p}}",
           "queryType": "traceql",
@@ -3741,7 +3741,7 @@
             "type": "tempo",
             "uid": "${DS_TEMPO}"
           },
-          "expr": "{resource.service.name=\"decdn-node\" && resource.service.instance.id=\"$node\" && status=error} | rate()",
+          "query": "{resource.service.name=\"decdn-node\" && resource.service.instance.id=\"$node\" && status=error} | rate()",
           "refId": "A",
           "legendFormat": "{{name}}",
           "queryType": "traceql",
@@ -3835,7 +3835,7 @@
             "type": "tempo",
             "uid": "${DS_TEMPO}"
           },
-          "expr": "{resource.service.name=\"decdn-node\" && resource.service.instance.id=\"$node\"}",
+          "query": "{resource.service.name=\"decdn-node\" && resource.service.instance.id=\"$node\"}",
           "refId": "A",
           "queryType": "traceql",
           "limit": 50,

@@ -2044,7 +2044,7 @@
             "type": "tempo",
             "uid": "${DS_TEMPO}"
           },
-          "expr": "{resource.service.name=\"decdn-node\"} | rate() by (name)",
+          "query": "{resource.service.name=\"decdn-node\"} | rate() by (name)",
           "refId": "A",
           "legendFormat": "{{name}}",
           "queryType": "traceql",
