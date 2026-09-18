@@ -29,8 +29,10 @@ groups:
         expr: rate(decdn_probe_hold_unavailable_total{reason="exhausted"}[5m]) > 0
         for: 5m
         labels:
+          component: probe
           severity: critical
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#slashing-risk"
           summary: "Probe-hold budget exhausted on {{ $labels.instance }}"
           description: |
             decdn_probe_hold_unavailable_total{reason="exhausted"} has been
@@ -64,9 +66,11 @@ groups:
         expr: (decdn_blacklist_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_blacklist_watcher_last_tick_timestamp_seconds > 180)
         for: 5m
         labels:
+          component: blacklist
           severity: critical
           slash_risk: blacklist_violation
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#contentblacklist-compliance"
           summary: "Blacklist watcher not ticking on {{ $labels.instance }}"
           description: |
             No successful blacklist poll tick for several intervals — the
@@ -78,9 +82,11 @@ groups:
         expr: rate(decdn_blacklist_enforcement_failures_total[10m]) > 0
         for: 2m
         labels:
+          component: blacklist
           severity: critical
           slash_risk: blacklist_violation
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#contentblacklist-compliance"
           summary: "Blacklist deny-set not fully enforced on {{ $labels.instance }}"
           description: |
             A re-scope could not re-verify or evict every known entry (disk or
@@ -89,17 +95,40 @@ groups:
             disk health and the ContentBlacklist RPC. See adr/011-content-takedown.md.
 
       - alert: DecdnWatcherTaskPanicked
-        # One rule covers all six chain-event watchers via the metric-name match.
-        expr: rate({__name__=~"decdn_.+_task_panicked_total"}[10m]) > 0
+        # One rule covers all five chain-event watchers — slash, staker_set,
+        # blacklist, settlement and fee_shares — via the metric-name match.
+        #
+        # The obvious spelling, `rate({__name__=~"..."}[10m]) > 0`, does not
+        # evaluate: rate() drops __name__, so the five per-watcher series on a
+        # node collapse to five identical label sets and Prometheus refuses the
+        # vector. label_replace lifts the watcher out of the metric name while
+        # the raw selector still has it, and the offset subtraction takes the
+        # place of rate() so nothing ever strips the name mid-expression. A
+        # counter reset reads negative, not positive, so a restart cannot fire
+        # this.
+        #
+        # The extraction regex ends `_watcher_task_panicked_total` so `watcher`
+        # reads `slash`, not `slash_watcher`, and the description does not say
+        # "slash_watcher watcher". The SELECTOR stays broad on purpose: every
+        # panic counter today is a watcher's, but a future one that is not would
+        # still fire this rule, just with an empty `watcher` label. Firing with a
+        # thin message beats not firing at all for a counter whose every non-zero
+        # value is a bug.
+        expr: >-
+          (label_replace({__name__=~"decdn_.+_task_panicked_total"}, "watcher", "$1",
+          "__name__", "decdn_(.+)_watcher_task_panicked_total") - label_replace({__name__=~"decdn_.+_task_panicked_total"}
+          offset 10m, "watcher", "$1", "__name__", "decdn_(.+)_watcher_task_panicked_total")) > 0
         for: 0m
         labels:
+          component: watcher
           severity: critical
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#slashing-risk"
           summary: "A chain-event watcher task panicked on {{ $labels.instance }}"
           description: |
-            {{ $labels.__name__ }} incremented — a watcher task unwound on a
-            panic. Never expected under the anti-panic policy. Capture the
-            error! log line naming the watcher label and file a bug.
+            The {{ $labels.watcher }} watcher task unwound on a panic. Never
+            expected under the anti-panic policy. Capture the error! log line
+            naming the watcher and file a bug.
 
       # A latent-bug report, not a degradation (#1517). The engine recovers the
       # guard and clears the poison, so coalescing never stops and no restart is
@@ -107,15 +136,19 @@ groups:
       # supposed to be able to poison this at all, so any nonzero value is a bug
       # worth filing.
       #
-      # `> 0`, not `rate(...)`: the counter counts poisonings (one per panic,
-      # because the poison is cleared), and the whole point is that a single
-      # occurrence matters. It is process-local, so it resets on restart.
+      # `increase(...[1h]) > 0`, not the bare `> 0` this used to carry: the
+      # counter is monotonic and process-local, and the annotation tells the
+      # operator not to restart, so a bare comparison latches for the life of
+      # the process and can never resolve. A single occurrence still fires —
+      # the window only decides when the alert clears.
       - alert: DecdnCacheInflightMutexPoisoned
-        expr: decdn_cache_inflight_mutex_poisoned_total > 0
+        expr: increase(decdn_cache_inflight_mutex_poisoned_total[1h]) > 0
         for: 0m
         labels:
+          component: cache
           severity: warning
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#cache-coalescing-mutex-poisoned"
           summary: "Cache coalescing mutex poisoned on {{ $labels.instance }}"
           description: |
             A task panicked while holding the in-flight fill-coalescing map.
@@ -135,8 +168,10 @@ groups:
         expr: up{job=~".*decdn.*"} == 0
         for: 1m
         labels:
+          component: node
           severity: critical
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#rpc-unreachable"
           summary: "Node {{ $labels.instance }} unreachable for 1m"
           description: |
             Prometheus has been unable to scrape this node for at least
@@ -146,21 +181,27 @@ groups:
             exported. Adjust the `job=~".*decdn.*"` selector to match
             your scrape-config job name(s).
 
+      # `resets(...)`, not `decdn_node_uptime_seconds < 300`: the comparison
+      # holds true for a full five minutes after every deploy, and a
+      # crash-looping node re-enters it continuously instead of escalating.
+      # `resets` counts the gauge going backwards, so one restart is one event.
       - alert: DecdnNodeRestarted
-        expr: decdn_node_uptime_seconds < 300
+        expr: resets(decdn_node_uptime_seconds[15m]) > 0
         for: 0m
         labels:
+          component: node
           severity: info
         annotations:
           summary: "{{ $labels.instance }} restarted recently"
           description: |
-            decdn_node_uptime_seconds reset within the last 5 minutes —
-            the node process restarted. Correlate with deploy events.
+            decdn_node_uptime_seconds went backwards — the node process
+            restarted. Correlate with deploy events.
 
       - alert: DecdnNoActiveStreams
         expr: sum without (direction) (decdn_streams_active) == 0
         for: 15m
         labels:
+          component: delivery
           severity: warning
         annotations:
           summary: "No active streams on {{ $labels.instance }} for 15m"
@@ -184,8 +225,10 @@ groups:
         expr: (decdn_slash_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_slash_watcher_last_tick_timestamp_seconds > 180)
         for: 5m
         labels:
+          component: watcher
           severity: warning
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#slashing-risk"
           summary: "Slash watcher not ticking on {{ $labels.instance }}"
           description: |
             No successful slash-detection poll tick for several intervals — the
@@ -196,8 +239,10 @@ groups:
         expr: (decdn_staker_set_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_staker_set_watcher_last_tick_timestamp_seconds > 180)
         for: 5m
         labels:
+          component: watcher
           severity: warning
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#active-staker-set-repair-not-running"
           summary: "Staker-set watcher not ticking on {{ $labels.instance }}"
           description: |
             The cached active-staker set / node-address bindings projection is no
@@ -219,8 +264,10 @@ groups:
         expr: increase(decdn_capacity_bond_registry_resync_failures_total[1h]) > 0
         for: 15m
         labels:
+          component: registry
           severity: warning
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#active-staker-set-repair-not-running"
           summary: "Capacity-bond registry re-enumeration failing on {{ $labels.instance }}"
           description: |
             The repair for a drifted active-staker set is itself failing, so a
@@ -235,8 +282,10 @@ groups:
         expr: (decdn_capacity_bond_registry_last_resync_timestamp_seconds > 0) and (time() - decdn_capacity_bond_registry_last_resync_timestamp_seconds > 1800)
         for: 15m
         labels:
+          component: registry
           severity: warning
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#active-staker-set-repair-not-running"
           summary: "Capacity-bond registry not re-enumerating on {{ $labels.instance }}"
           description: |
             No successful getRegisteredNodes re-enumeration in two intervals. The
@@ -254,8 +303,10 @@ groups:
         expr: rate(decdn_origin_directory_get_origins_failures_total[5m]) > 0
         for: 15m
         labels:
+          component: origin
           severity: warning
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#origin-rescan-probes-faulting"
           summary: "Origin directory getOrigins lookups failing on {{ $labels.instance }}"
           description: |
             The lazy origin directory cannot read getOrigins from chain, so a DHT
@@ -269,6 +320,7 @@ groups:
         expr: increase(decdn_otlp_export_failures_total[15m]) > 0
         for: 15m
         labels:
+          component: observability
           severity: warning
         annotations:
           summary: "OTLP span export failing on {{ $labels.instance }}"
@@ -307,6 +359,7 @@ groups:
         expr: sum by (instance) (rate(decdn_serve_stream_rejected_internal_error_total[5m])) > 0
         for: 10m
         labels:
+          component: delivery
           severity: warning
         annotations:
           summary: "Serve path returning internal errors on {{ $labels.instance }}"
@@ -331,8 +384,10 @@ groups:
           (decdn_probe_hold_slots_used / clamp_min(decdn_probe_hold_slots_max, 1)) > 0.9
         for: 5m
         labels:
+          component: probe
           severity: warning
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#slashing-risk"
           summary: "Probe-hold slots >90% used on {{ $labels.instance }}"
           description: |
             Saturation means cached content is advertised without an eviction
@@ -350,8 +405,10 @@ groups:
         expr: (decdn_settlement_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_settlement_watcher_last_tick_timestamp_seconds > 180)
         for: 5m
         labels:
+          component: settlement
           severity: warning
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#refusing-paying-clients-insufficient-deposit"
           summary: "Settlement watcher not ticking on {{ $labels.instance }}"
           description: |
             No successful payment-settlement poll tick for several intervals —
@@ -382,8 +439,10 @@ groups:
         expr: sum by (instance) (rate(decdn_serve_stream_rejected_insufficient_deposit_total[10m])) > 0.1
         for: 15m
         labels:
+          component: payments
           severity: warning
         annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#refusing-paying-clients-insufficient-deposit"
           summary: "Sustained insufficient-deposit refusals on {{ $labels.instance }}"
           description: |
             This node is refusing delivery because the requesting channel's
