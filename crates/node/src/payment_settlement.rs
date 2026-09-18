@@ -1166,12 +1166,6 @@ enum RegistrationStatus {
     Unregistered,
 }
 
-/// Plan one lane for redemption from its already-loaded state and a resolved
-/// registration status. Pure and I/O-free — the caller ([`plan_lanes`]) resolves
-/// the status from the persisted `registered_until` watermark alone, with no chain
-/// read. Returns `Ok(None)` when the lane is not this node's, has no signed
-/// voucher, has nothing unredeemed, or — a node-durability fault that should not
-/// occur — is an unregistered signer whose lane has lost its `owner_sig`.
 /// Seed a fresh paid-watermark cache from the durable lane rows this node
 /// provides. Bootstrap calls this before the redeemer starts so a restart carries
 /// forward redemptions that landed before the log-poller's persisted cursor,
@@ -1209,6 +1203,12 @@ fn rehydrate_paid_watermarks(store: &dyn PoolStateStore, self_address: Address) 
     paid
 }
 
+/// Plan one lane for redemption from its already-loaded state and a resolved
+/// registration status. Pure and I/O-free — the caller ([`plan_lanes`]) resolves
+/// the status from the persisted `registered_until` watermark alone, with no chain
+/// read. Returns `Ok(None)` when the lane is not this node's, has no signed
+/// voucher, has nothing unredeemed, or — a node-durability fault that should not
+/// occur — is an unregistered signer whose lane has lost its `owner_sig`.
 fn plan_lane(
     st: &LaneState,
     paid: &PaidWatermarks,
