@@ -106,10 +106,18 @@ groups:
         # place of rate() so nothing ever strips the name mid-expression. A
         # counter reset reads negative, not positive, so a restart cannot fire
         # this.
+        #
+        # The extraction regex ends `_watcher_task_panicked_total` so `watcher`
+        # reads `slash`, not `slash_watcher`, and the description does not say
+        # "slash_watcher watcher". The SELECTOR stays broad on purpose: every
+        # panic counter today is a watcher's, but a future one that is not would
+        # still fire this rule, just with an empty `watcher` label. Firing with a
+        # thin message beats not firing at all for a counter whose every non-zero
+        # value is a bug.
         expr: >-
           (label_replace({__name__=~"decdn_.+_task_panicked_total"}, "watcher", "$1",
-          "__name__", "decdn_(.+)_task_panicked_total") - label_replace({__name__=~"decdn_.+_task_panicked_total"}
-          offset 10m, "watcher", "$1", "__name__", "decdn_(.+)_task_panicked_total")) > 0
+          "__name__", "decdn_(.+)_watcher_task_panicked_total") - label_replace({__name__=~"decdn_.+_task_panicked_total"}
+          offset 10m, "watcher", "$1", "__name__", "decdn_(.+)_watcher_task_panicked_total")) > 0
         for: 0m
         labels:
           component: watcher

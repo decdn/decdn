@@ -40,7 +40,7 @@
         "hide": false,
         "iconColor": "purple",
         "name": "Node restarts",
-        "expr": "resets(decdn_node_uptime_seconds{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]) > 0",
+        "expr": "resets(decdn_node_uptime_seconds{instance=~\"$node\"}[$__rate_interval]) > 0",
         "titleFormat": "decdn-node restarted",
         "textFormat": "{{instance}}",
         "step": "60s",
