@@ -721,6 +721,33 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **`DecdnWatcherTaskPanicked` could never evaluate.** Its expr was
+  `rate({__name__=~"decdn_.+_task_panicked_total"}[10m]) > 0`, and `rate()` drops
+  `__name__`, so the five per-watcher series on a node collapsed to five identical
+  label sets and Prometheus refused the vector outright
+  (`vector cannot contain metrics with the same labelset`). Wrapping it in
+  `sum by (instance)` does not help — the duplicate exists before the aggregation
+  runs. The rule now lifts the watcher out of the metric name with `label_replace`
+  while the raw selector still has it, and subtracts a 10-minute offset in place of
+  `rate()` so nothing strips the name mid-expression; a counter reset reads negative,
+  so a restart cannot fire it. The annotation reports `{{ $labels.watcher }}`, which
+  a binary operation preserves, rather than `{{ $labels.__name__ }}`, which it does not.
+  Nothing evaluated these rules before, so the breakage was invisible.
+
+- **`DecdnCacheInflightMutexPoisoned` could never resolve.** The counter is
+  monotonic and process-local and the annotation tells the operator not to restart,
+  so a bare `> 0` latched for the life of the process. It now reads
+  `increase(...[1h]) > 0`: a single occurrence still fires, and the window only
+  decides when it clears.
+
+- **`DecdnNodeRestarted` fired for five minutes after every deploy.**
+  `decdn_node_uptime_seconds < 300` holds true for the whole window and a
+  crash-looping node re-entered it continuously instead of escalating. Now
+  `resets(decdn_node_uptime_seconds[15m]) > 0`, so one restart is one event.
+
+- **A stale comment claimed six chain-event watchers.** The exporter has five —
+  `slash`, `staker_set`, `blacklist`, `settlement`, `fee_shares`.
+
 - **Cache: a held blob whose stored bytes change after admission is
   quarantined on the first serve that trips it (#1984).** Every serve export
   already validates the exported chunk groups against the content root, so a
@@ -1696,6 +1723,41 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+- **Observability: the single reference dashboard becomes a four-dashboard suite
+  covering metrics, logs and traces.** `monitoring/` gains
+  `dashboard-delivery.json` (`decdn-delivery`), `dashboard-chain.json`
+  (`decdn-chain`) and `dashboard-node.json` (`decdn-node`) beside the rebuilt
+  `grafana-dashboard.json` (`decdn-poc-overview`, retitled "fleet overview"; uid
+  and filename unchanged so existing links hold). Coverage goes from 25 named
+  series to 207 — every serve-refusal reason, the whole `decdn_node_pull_*`
+  funnel, all five chain-event watchers, the `decdn_iroh_*` transport
+  sub-registry, and `node_exporter` host panels that join on the same `instance`
+  label. Loki panels parse the daemon's tracing JSON (`| json lvl="level"`),
+  since journald stamps every stdout line priority `info` and the Loki `level`
+  label reports that, not the event's real severity. Tempo panels supply the only
+  latency distribution available anywhere: the exporter registers no histograms,
+  so `histogram_quantile` has nothing to read.
+  - `monitoring_selectors_are_exported` now sweeps every `.yml` and `.json` under
+    `monitoring/` instead of two hard-coded filenames, so a new dashboard is gated
+    the day it lands. The exported set it compares against includes the
+    `decdn_iroh_*` sub-registry, which `Metrics::new()` alone does not carry —
+    `register_iroh_endpoint` is split so the test can register an
+    `EndpointMetrics::default()` without standing up a socket. Without that split
+    every iroh panel would read as an unexported name.
+  - Query bugs fixed while rebuilding: the cache hit ratio no longer clamps a
+    per-second *rate* denominator to a floor of 1.0 (which understated every node
+    doing under one lookup per second — all of them); USDC gauges are scaled out
+    of raw 6-decimal base units and carry `currencyUSD`; watcher tick-age
+    thresholds move from 600/1800s to 120/180s so the panel cannot read green
+    while `DecdnBlacklistWatcherStalled` is firing; panels that aggregate
+    `by (instance)` carry `{{instance}}` in the legend instead of emitting one
+    identically-labelled series per node.
+
+- **Alert rules gain `component` labels and `runbook_url` annotations.** All 18
+  rules carry a `component` for routing; the 14 with a matching `docs/runbook.md`
+  section link straight to it, so Alertmanager and Grafana can render a button
+  rather than burying the path in prose.
 
 - **`decdn fetch` fans a large blob out across several holders at once (ADR 039,
   #1164).** A blob above `--multi-source-min-bytes` (64 MiB) with at least two

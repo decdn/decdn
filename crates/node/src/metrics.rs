@@ -17,6 +17,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use iroh::Endpoint;
+use iroh::metrics::EndpointMetrics;
 use iroh_metrics::{
     Counter, EncodeLabelSet, EncodeLabelValue, Family, Gauge, MetricsGroup, MetricsSource, Registry,
 };
@@ -1538,12 +1539,27 @@ impl Metrics {
     ///
     /// Returns an error if the registry lock is poisoned.
     pub fn register_iroh_endpoint(&self, ep: &Endpoint) -> anyhow::Result<()> {
+        self.register_iroh_metrics(ep.metrics())
+    }
+
+    /// Register an [`EndpointMetrics`] set under the `decdn_iroh_` prefix.
+    ///
+    /// Split out from [`Self::register_iroh_endpoint`] so the name gate can
+    /// register the same group from an `EndpointMetrics::default()` and see the
+    /// `decdn_iroh_*` names without standing up a socket. Without it those
+    /// series are absent from `Metrics::new().encode()` and every panel naming
+    /// one reads as a series the exporter does not emit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registry lock is poisoned.
+    fn register_iroh_metrics(&self, metrics: &EndpointMetrics) -> anyhow::Result<()> {
         let mut reg = self
             .registry
             .write()
             .map_err(|_| anyhow::anyhow!("metrics registry lock poisoned"))?;
         reg.sub_registry_with_prefix("decdn_iroh")
-            .register_all(ep.metrics());
+            .register_all(metrics);
         Ok(())
     }
 
@@ -2778,11 +2794,28 @@ mod tests {
         out
     }
 
+    /// The exporter's full surface as a running node presents it: everything
+    /// `Metrics::new()` registers, plus the iroh transport sub-registry that
+    /// `register_iroh_endpoint` only attaches once an `Endpoint` exists.
+    /// `EndpointMetrics` is `Default`, so the gate covers `decdn_iroh_*`
+    /// without a socket — and a typo in one of those names still fails.
+    fn full_scrape() -> String {
+        let metrics = Metrics::new();
+        metrics
+            .register_iroh_metrics(&EndpointMetrics::default())
+            .unwrap();
+        metrics.encode().unwrap()
+    }
+
     /// Every `decdn_*` name in `monitoring/` must resolve to a real exported
     /// series. This is the blanket assertion the single-selector test below
     /// could not carry until #1513: `DecdnHighStreamErrorRate` divided by
     /// `decdn_streams_completed_total`, which no field produces, shipped as a
     /// rule that could never fire.
+    ///
+    /// The scan covers every `.yml` and `.json` in the directory, so a new
+    /// dashboard is gated the day it lands rather than the day someone
+    /// remembers to add it to a list.
     ///
     /// **What this does not prove.** A name that resolves may still sit at a
     /// permanent zero because nothing increments it; the gate is about the
@@ -2805,13 +2838,32 @@ mod tests {
         const NOT_SERIES: [&str; 1] = ["decdn_health"];
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let exported = exported_series(&Metrics::new().encode().unwrap());
+        let exported = exported_series(&full_scrape());
 
-        for file in [
-            "monitoring/prometheus-alerts.yml",
-            "monitoring/grafana-dashboard.json",
-        ] {
-            let text = fs::read_to_string(root.join(file)).unwrap();
+        // Sweep the directory rather than a fixed list: a new dashboard file
+        // that no test reads is the same silent-coverage hole the name floor
+        // below guards against within a file.
+        let mut files: Vec<String> = fs::read_dir(root.join("monitoring"))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                let ext = path.extension()?.to_str()?;
+                matches!(ext, "yml" | "json")
+                    .then(|| path.file_name()?.to_str().map(str::to_owned))
+                    .flatten()
+            })
+            .collect();
+        files.sort();
+        assert!(
+            files.len() >= 5,
+            "monitoring/ yielded only {} scannable files — the directory moved or \
+             the suite shrank",
+            files.len()
+        );
+
+        for name in &files {
+            let file = format!("monitoring/{name}");
+            let text = fs::read_to_string(root.join(&file)).unwrap();
             // Drop whole-line YAML comments before scanning. A retired series
             // has to stay nameable in prose — the comments explaining why
             // `decdn_streams_failed_total` was removed are the record of that
@@ -2826,10 +2878,10 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             let names = decdn_names_in(&live);
-            // Floor sized just under the smaller file's real count (17 in
-            // the alerts, 27 in the dashboard). A loose floor is the same
-            // failure this gate exists to stop: a shape change that silently
-            // drops most of the coverage while the test stays green.
+            // Floor sized just under the smallest file's real count. A loose
+            // floor is the same failure this gate exists to stop: a shape
+            // change that silently drops most of the coverage while the test
+            // stays green.
             assert!(
                 names.len() >= 15,
                 "{file} yielded only {} names — the scanner or the file shape changed",

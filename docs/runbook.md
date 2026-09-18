@@ -7,8 +7,17 @@ follow the ADR cross-references.
 
 Companion assets:
 
-- [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json)
-- [`monitoring/prometheus-alerts.yml`](../monitoring/prometheus-alerts.yml)
+- [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) —
+  fleet overview. Start here.
+- [`monitoring/dashboard-delivery.json`](../monitoring/dashboard-delivery.json) —
+  serve leg, pull leg, cache and origin. Every refusal and failure reason.
+- [`monitoring/dashboard-chain.json`](../monitoring/dashboard-chain.json) —
+  watcher liveness, registries, and both sides of the payment flow.
+- [`monitoring/dashboard-node.json`](../monitoring/dashboard-node.json) —
+  one node at a time: host, transport, DHT, logs and traces.
+- [`monitoring/prometheus-alerts.yml`](../monitoring/prometheus-alerts.yml) —
+  every rule carries a `component` label and, where a section below matches, a
+  `runbook_url` annotation pointing straight at it.
 - [`adr/architecture.md`](../adr/architecture.md)
 - [`adr/appendix-observability.md`](../adr/appendix-observability.md) — full
   metric catalogue and alert rationale.

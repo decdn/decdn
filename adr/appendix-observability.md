@@ -321,24 +321,40 @@ Each metric series has one canonical `decdn_`-prefixed name; informal short name
 
 ### Reference dashboards and alerts
 
-A reference Grafana dashboard and starter Prometheus alerting rules ship in the top-level [`monitoring/`](../monitoring/) directory. They consume only canonical [§ Metric Registry](#metric-registry) metric names — no new metrics — and are an onboarding starting point, not a normative deliverable.
+Four Grafana dashboards and starter Prometheus alerting rules ship in the top-level [`monitoring/`](../monitoring/) directory. They are an operator starting point, not a normative deliverable.
+
+The panels draw on the whole exported surface, not only the [§ Metric Registry](#metric-registry) subset. The registry is a curated view of roughly 180 exported series, so a panel may name a series this appendix does not list. What it may never name is a series the exporter does not emit, and `crates/node/src/metrics.rs` enforces that: `monitoring_selectors_are_exported` sweeps every `.yml` and `.json` in `monitoring/` and fails on any `decdn_*` token absent from a live scrape, including the `decdn_iroh_*` transport sub-registry. Adding a file to the directory therefore gates it; no list needs updating.
 
 | File | Purpose |
 |------|---------|
-| [`monitoring/prometheus-alerts.yml`](../monitoring/prometheus-alerts.yml) | Three rule groups: `decdn-slash-safety` (thresholds copied verbatim from [§ Slash-Safety Metrics (all Mandatory)](#slash-safety-metrics-all-mandatory)), `decdn-liveness`, `decdn-delivery`. |
-| [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) | Single overview dashboard (`uid: decdn-poc-overview`); rows for health, slash safety, delivery, cache, probes, payments. Datasource parameterised via `${DS_PROMETHEUS}`; node selection via the `instance` template variable. |
+| [`monitoring/prometheus-alerts.yml`](../monitoring/prometheus-alerts.yml) | Three rule groups: `decdn-slash-safety` (thresholds copied verbatim from [§ Slash-Safety Metrics (all Mandatory)](#slash-safety-metrics-all-mandatory)), `decdn-liveness`, `decdn-delivery`. Every rule carries a `component` label for routing, and a `runbook_url` annotation where [`docs/runbook.md`](../docs/runbook.md) has a matching section. |
+| [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) | Fleet overview (`uid: decdn-poc-overview`): status, delivery funnel, slash safety, and the logs and traces that explain them. |
+| [`monitoring/dashboard-delivery.json`](../monitoring/dashboard-delivery.json) | Delivery and cache (`uid: decdn-delivery`): the serve leg, the paying pull leg, cache, origin and warming. Every serve-refusal and pull-failure reason gets its own series. |
+| [`monitoring/dashboard-chain.json`](../monitoring/dashboard-chain.json) | Chain, payments and slash safety (`uid: decdn-chain`): watcher liveness for all five watchers, the capacity-bond and active-staker registries, and both sides of the payment flow. |
+| [`monitoring/dashboard-node.json`](../monitoring/dashboard-node.json) | Single-node drilldown (`uid: decdn-node`): host resources, process state, iroh transport, DHT and probe, plus that node's logs and traces. |
 
-#### Importing the dashboard
+All four share a datasource variable per signal — `${DS_PROMETHEUS}`, `${DS_LOKI}`, `${DS_TEMPO}` — and scope every selector with `deployment_environment`, `region` and `instance`. They cross-link through a dashboard link on the `decdn` tag.
 
-In Grafana, *Dashboards → New → Import*; upload or paste the JSON. Select your Prometheus datasource at the prompt; the `instance` variable auto-populates from `decdn_node_uptime_seconds`.
+#### Two query shapes worth knowing
+
+`rate()` and `increase()` drop `__name__`. A family panel written as `sum by (__name__) (rate({__name__=~"decdn_x_.+_total"}[5m]))` does not evaluate at all — the per-reason series collapse to identical label sets and Prometheus refuses the vector. So:
+
+- Rate panels name each series explicitly, one target per metric. This also puts every name under the gate; a `__name__` regex scans as the wildcard token `decdn_x_` and is skipped.
+- Instant panels over a family call `label_replace` on the raw selector, before any operator strips the name. The watcher-liveness table and the `DecdnWatcherTaskPanicked` rule are both built this way.
+
+#### Importing the dashboards
+
+In Grafana, *Dashboards → New → Import*; upload or paste each JSON. The datasource variables carry a saved value but re-resolve on load, so an import into another Grafana falls back to the picker. The `instance` variable auto-populates from `decdn_node_uptime_seconds`.
 
 #### Using the alerts
 
 Add the file via Prometheus `rule_files:` and reload. Validate with `promtool check rules monitoring/prometheus-alerts.yml`. Tune `for:` durations and thresholds for your fleet size before paging.
 
+On Grafana Cloud the hosted ruler does not accept writes through the stack's service-account token, so the rules are translated into Grafana-managed rules instead. The translation is not a literal one: each rule's PromQL already contains its own comparison, so the result set is empty when the rule should not fire but the surviving values are not usable as a threshold — `up == 0` fires at value 0. The condition therefore counts datapoints rather than testing them, with `noDataState: OK` carrying the not-firing case.
+
 #### Scope
 
-Covers M-tier slash-safety metrics and the most common R-tier panels for a first dashboard. Deliberately not exhaustive.
+Covers M-tier slash-safety metrics, the full delivery and pull surface, and the chain and payment paths. Deliberately not exhaustive.
 
 ## Consequences
 
