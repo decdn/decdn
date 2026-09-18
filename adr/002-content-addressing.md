@@ -44,6 +44,8 @@ A `cdn/client/v1` request carries a `namespaceId` alongside the hash (see [ADR 0
 
 Cache-only serving stays permissionless: any staked operator may re-serve bytes it already holds, for any hash, regardless of namespace. Only the **origin** role is namespace-gated.
 
+Whether a node relays a *foreign*-namespace miss — one it neither holds nor serves from its own origin — is a node-local policy, `cache.relay_foreign_namespaces`. The default is role-derived. A node with no origin configured is a pure relay edge and relays by default. A node that configures an origin backend serves only its own namespace by default and declines a foreign miss, because an origin is not a general proxy. The decline is categorical: the node applies it above the cache-hit branch, so it declines a foreign blob even after an earlier relay seeded it into the local cache. An operator sets the field explicitly to override either default. A decline is a serve refusal, not a routing change — it collapses to `NotFound` on the wire, so the client fails over to another candidate. [ADR 037 § Warming is a relay-edge mechanism](037-regional-proxy-warming.md#warming-is-a-relay-edge-mechanism) covers how this composes with proxy warming.
+
 ### Namespace 0
 
 `namespaceId == 0` is the default namespace, for content published without one. It has no publisher and no authorized origins; the DAO authorizes origins only for registered (non-zero) namespaces. Namespace-0 content is served best-effort from cache or DHT-discovered holders (the path above) and carries no availability guarantee. A publisher wanting durable origins, takedown accountability, or a stable origin set creates a non-zero namespace and has the DAO authorize origins for it.
