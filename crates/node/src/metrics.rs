@@ -4,6 +4,7 @@
 //! `decdn_*` counters and iroh's own transport metrics through a single
 //! endpoint. Output is `OpenMetrics` text, which Prometheus scrapers accept.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -12,6 +13,7 @@ use alloy::primitives::U256;
 use bytes::Bytes;
 use decdn_cache::CacheMetrics;
 use decdn_incentive::PoolOpenFailureReason;
+use decdn_protocol::Region;
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -137,6 +139,19 @@ struct ProbeHoldUnavailableLabels {
     reason: ProbeHoldUnavailableReason,
 }
 
+/// The `node_region` label on `decdn_staker_set_active_by_region`.
+///
+/// The label is `node_region`, not `region`: every reference dashboard scopes
+/// its selectors on a scrape-side `region` target label. Under the default
+/// `honor_labels: false`, Prometheus renames a clashing metric label to
+/// `exported_region`, so the metric's own label would be lost.
+#[derive(
+    Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, EncodeLabelSet,
+)]
+struct NodeRegionLabels {
+    node_region: String,
+}
+
 /// Build a [`WatcherHook`] that invokes one `&self` recorder on a shared
 /// `Metrics`, deduping the per-watcher `Box::new(move || metrics.foo())`
 /// closures each watcher site would otherwise define (#1251). All
@@ -236,9 +251,9 @@ pub struct DecdnMetrics {
     /// `_total` suffix because the `OpenMetrics` encoder appends it.
     ///
     /// **This is the documented exception, not the convention** (#1475) — the
-    /// one labeled *reason split*, which is not the same as the crate's only
-    /// `Family` — `streams_active` is another. Every other reason-style split
-    /// in this crate — `dispatch_rejected_*`, `probe_rate_limit_rejected_*`,
+    /// one labeled *reason split*, not the crate's only `Family`:
+    /// `streams_active` and `staker_set_active_by_region` label other axes.
+    /// Every other reason-style split in this crate — `dispatch_rejected_*`, `probe_rate_limit_rejected_*`,
     /// and `pool_open_failures_*` — fans out to sibling unlabeled counters,
     /// and that stays the default for a new split: sibling counters need no
     /// `EncodeLabelSet` type, no pre-materialization to keep a series
@@ -660,6 +675,25 @@ pub struct DecdnMetrics {
     /// e.g. the count holding flat while down-seconds climbs means the cache
     /// is frozen, not that the network genuinely lost operators.
     pub staker_set_active_count: Gauge,
+    /// `decdn_staker_set_active_by_region{node_region}`: active-staker set
+    /// size per operator-declared region (ADR 030), the source of the
+    /// reference network map. Each node's registry holds the whole network, so
+    /// one scrape maps every active node; aggregate across nodes with `max`,
+    /// not `sum`. A region that drops to zero loses its series rather than
+    /// exporting `0`, and the name is absent while no active node has a valid
+    /// region. Label values pass [`Region::parse`], so the ISO
+    /// allowlist bounds cardinality and an unparsable on-chain `regionHint`
+    /// never reaches a label. Like `streams_active{direction}`, this labels a
+    /// dimension, not a reason split, so the sibling-counter convention does
+    /// not apply.
+    staker_set_active_by_region: Family<NodeRegionLabels, Gauge>,
+    /// `decdn_staker_set_active_unknown_region`: active stakers whose
+    /// `regionHint` is empty or not an accepted region code. With the
+    /// per-region family it sums to `decdn_staker_set_active_count` after each
+    /// completed watcher tick. The count moves on each event and the region
+    /// split at the end of the tick, so the two can differ between ticks and
+    /// while the watcher is in backoff.
+    pub staker_set_active_unknown_region: Gauge,
     /// `decdn_node_address_directory_size` (#831): current count of cached
     /// `NodeId → operator address` bindings the node-to-node pull path resolves
     /// against ([`crate::dht::node_address::ChainNodeAddressDirectory`]).
@@ -1407,6 +1441,10 @@ pub struct Metrics {
     probe_hold_exhausted: Arc<Counter>,
     probe_hold_disabled: Arc<Counter>,
     probe_hold_stake_lane_reserved: Arc<Counter>,
+    /// Regions that currently have a `staker_set_active_by_region` child.
+    /// `Family` cannot enumerate its children, so this is what tells
+    /// [`Self::staker_set_active_by_region`] which ones to remove.
+    published_regions: Mutex<BTreeSet<Region>>,
     started_at: Instant,
     /// Monotonic instant at which the staker-set watcher entered its current
     /// error/backoff window (#783, downtime semantics #788). `None` whenever a
@@ -1514,6 +1552,7 @@ impl Metrics {
             probe_hold_exhausted,
             probe_hold_disabled,
             probe_hold_stake_lane_reserved,
+            published_regions: Mutex::new(BTreeSet::new()),
             started_at: Instant::now(),
             staker_set_watcher_down_since: Mutex::new(None),
             slash_watcher_down_since: Mutex::new(None),
@@ -1609,6 +1648,45 @@ impl Metrics {
                 self.probe_hold_stake_lane_reserved.inc()
             }
         };
+    }
+
+    /// Publish the active-staker set size per region: one
+    /// `decdn_staker_set_active_by_region` child per entry in `counts`, plus
+    /// `unknown` on `decdn_staker_set_active_unknown_region`. A region absent
+    /// from `counts` has its child removed, so the map shows no stale country.
+    /// Stale children are removed after the live ones are set, so a concurrent
+    /// scrape never sees the family emptied part-way through an update. It can
+    /// still see some regions at their new value and others at the old one.
+    pub fn staker_set_active_by_region(&self, counts: &BTreeMap<Region, usize>, unknown: usize) {
+        // Held for the whole update so two publishers cannot interleave their
+        // set and remove passes. A poisoned lock still holds a whole set, since
+        // it is only ever replaced in one assignment; at worst it misses a
+        // child the panicking call created.
+        let mut published = match self.published_regions.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("published-regions Mutex poisoned; recovering inner state");
+                self.published_regions.clear_poison();
+                poisoned.into_inner()
+            }
+        };
+        let family = &self.decdn.staker_set_active_by_region;
+        for (region, count) in counts {
+            family
+                .get_or_create(&NodeRegionLabels {
+                    node_region: region.as_str().to_owned(),
+                })
+                .set(sat(*count));
+        }
+        for stale in published.iter().filter(|r| !counts.contains_key(r)) {
+            family.remove(&NodeRegionLabels {
+                node_region: stale.as_str().to_owned(),
+            });
+        }
+        *published = counts.keys().copied().collect();
+        self.decdn
+            .staker_set_active_unknown_region
+            .set(sat(unknown));
     }
 
     /// Current value of the `dispatch_in_flight` gauge as a `u64`. Read
@@ -2814,11 +2892,17 @@ mod tests {
     /// `register_iroh_endpoint` only attaches once an `Endpoint` exists.
     /// `EndpointMetrics` is `Default`, so the gate covers `decdn_iroh_*`
     /// without a socket — and a typo in one of those names still fails.
+    ///
+    /// It also publishes one region: a labelled family with no child emits
+    /// nothing, and a running node has a child once an active staker declares
+    /// a valid region.
     fn full_scrape() -> String {
         let metrics = Metrics::new();
         metrics
             .register_iroh_metrics(&EndpointMetrics::default())
             .unwrap();
+        let de = Region::parse("DE").unwrap();
+        metrics.staker_set_active_by_region(&BTreeMap::from([(de, 1)]), 0);
         metrics.encode().unwrap()
     }
 
@@ -3038,6 +3122,29 @@ mod tests {
                 .any(|line| line.starts_with(SELECTOR)),
             "the exporter no longer produces {SELECTOR}"
         );
+    }
+
+    /// A republish overwrites counts and removes a region that left, rather
+    /// than leaving it exported at its last value.
+    #[test]
+    fn staker_set_active_by_region_replaces_the_previous_map() {
+        let metrics = Metrics::new();
+        let de = Region::parse("DE").unwrap();
+        let us = Region::parse("US").unwrap();
+        metrics.staker_set_active_by_region(&BTreeMap::from([(de, 2), (us, 1)]), 1);
+        metrics.staker_set_active_by_region(&BTreeMap::from([(de, 1)]), 0);
+
+        let text = metrics.encode().unwrap();
+        let has = |line: &str| text.lines().any(|l| l == line);
+        assert!(
+            has(r#"decdn_staker_set_active_by_region{node_region="DE"} 1"#),
+            "{text}"
+        );
+        assert!(
+            !text.contains(r#"node_region="US""#),
+            "a departed region kept its series"
+        );
+        assert!(has("decdn_staker_set_active_unknown_region 0"), "{text}");
     }
 
     #[test]

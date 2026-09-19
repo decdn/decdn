@@ -1724,6 +1724,27 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Monitoring: the chain dashboard shows a world map of active nodes by
+  declared region.** New gauge `decdn_staker_set_active_by_region{node_region}`
+  counts active stakers per region (ADR 030) from the CapacityBond registry.
+  Each node holds the whole network, so a single scrape counts every active node.
+  New gauge `decdn_staker_set_active_unknown_region` counts active stakers with
+  an empty or invalid `regionHint`. `monitoring/dashboard-chain.json` gains an
+  "Active nodes by country" Geomap panel, an "Active nodes per region" table
+  (which also lists codes the map cannot place) and an "Active nodes without a
+  region" stat panel.
+  - The label is `node_region`, not `region`, so it does not collide with the
+    scrape-side `region` target label. Query it with `max by (node_region)`:
+    summing across nodes multiplies the count by fleet size.
+  - The CapacityBond registry now follows `RegionUpdated`, so a region change
+    reaches the region map, the dashboard and the ADR 030 latency penalty on
+    the next watcher tick instead of the next 15-minute re-enumeration.
+  - The registry's region map stores the canonical region code: a raw
+    `" de "` on chain becomes `DE`, and an invalid hint has no entry. The
+    ADR 030 latency penalty compares these codes against the node's own
+    normalized `identity.region`, so a padded or lower-case hint no longer
+    evades it.
+
 - **Observability: the single reference dashboard becomes a four-dashboard suite
   covering metrics, logs and traces.** `monitoring/` gains
   `dashboard-delivery.json` (`decdn-delivery`), `dashboard-chain.json`
