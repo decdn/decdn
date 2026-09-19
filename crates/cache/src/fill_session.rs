@@ -543,6 +543,13 @@ impl FillSession {
         self.served_start
     }
 
+    /// The current PAID content frontier (absolute): how far the observers of
+    /// this fill have paid, and therefore how far past it the pull may run.
+    #[must_use]
+    pub fn served_paid(&self) -> u64 {
+        self.served_paid.get()
+    }
+
     /// The live observer count (pull owner + attached serve legs).
     #[must_use]
     pub fn observer_count(&self) -> usize {
@@ -1164,9 +1171,9 @@ impl FillRegistry {
 
         // R = the chunk ranges the request spans. An align error (out-of-bounds) or
         // an empty R has no coalescable range, so fall straight to the Owner path.
-        let r = match align_range(offset, len, total) {
-            Ok(aligned) => aligned.chunk_ranges().clone(),
-            Err(_) => ChunkRanges::empty(),
+        let (r, fetch_start) = match align_range(offset, len, total) {
+            Ok(aligned) => (aligned.chunk_ranges().clone(), aligned.fetch_start()),
+            Err(_) => (ChunkRanges::empty(), 0),
         };
 
         if !r.is_empty() {
@@ -1180,6 +1187,20 @@ impl FillRegistry {
                     // concurrent last-out lease drop (which fires `cancel()` under
                     // this same lock).
                     if session.is_dead() {
+                        continue;
+                    }
+                    // A live fill advances only as ITS payer pays: the pull runs one
+                    // credit window past `served_paid` and parks. A request that
+                    // starts AHEAD of that frontier would park on it too, and an
+                    // observer's payments extend a fill's paid prefix only once the
+                    // prefix reaches the observer's start (`extend_served_from`).
+                    // With the owner not paying — the CLI's throwaway open, or a
+                    // stalled client — the observer starves until its own stall
+                    // budget expires. So such a request is not coalesced: it OWNS
+                    // its own span, and the two fills coexist under the hash. A
+                    // request at or behind the frontier attaches as before; its
+                    // payments extend the shared prefix at once.
+                    if fetch_start > session.served_paid() {
                         continue;
                     }
                     let covered = session.covered_ranges();
@@ -1499,7 +1520,14 @@ mod fill_registry_tests {
         total: u64,
         cov: ChunkRanges,
     ) -> (Arc<FillSession>, super::ObserverLease) {
-        let s = FillSession::new(root, total);
+        // As the node builds an owner: the paid frontier starts at the request's
+        // own start, so a fill for `[half, total)` is reachable by a claim at
+        // `half` (`FillRegistry::claim` attaches only at or behind the frontier).
+        let start = cov
+            .boundaries()
+            .first()
+            .map_or(0, bao_tree::ChunkNum::to_bytes);
+        let s = FillSession::starting_at(root, total, start);
         s.set_covered(cov);
         let lease = reg.register_fill(hash, &s);
         (s, lease)
@@ -1808,9 +1836,12 @@ mod fill_registry_tests {
         let hash = store_hash(0xC3);
 
         let (sibling, _sl) = register(&reg, hash, hb(0xC3), total, ranges(0, 3 * G, total));
+        // The sibling's payer has paid up to the request's start, so the request
+        // is at (not ahead of) its paid frontier and may share its overlap.
+        sibling.advance_served(2 * G);
 
         let claim = reg.claim(hash, 2 * G, 3 * G, total, || {
-            FillSession::new(hb(0xC3), total)
+            FillSession::starting_at(hb(0xC3), total, 2 * G)
         });
         let FillClaim::Mixed {
             owner,
@@ -1950,6 +1981,55 @@ mod fill_registry_tests {
         );
         assert_eq!(session.observer_count(), 0);
         assert!(!mapped(&reg, hash), "last observer left — session removed");
+    }
+
+    #[test]
+    fn claim_ahead_of_a_live_owners_paid_frontier_owns_its_own_span() {
+        // A whole-blob owner whose client has paid nothing (the CLI's throwaway
+        // open) has its paid frontier at 0. A request that starts at 4 groups is
+        // AHEAD of that frontier: attaching would park it on a pull that only
+        // advances as the owner pays, and the owner never will. It must OWN its
+        // own span instead. Both sessions stay live under the hash.
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0xDB);
+
+        let FillClaim::Owner {
+            session: whole,
+            lease: _whole_lease,
+        } = reg.claim(hash, 0, 0, total, || FillSession::new(root(0xDB), total))
+        else {
+            panic!("owns");
+        };
+        let FillClaim::Owner {
+            session: tail,
+            lease: _tail_lease,
+        } = reg.claim(hash, 4 * G, 0, total, || {
+            FillSession::starting_at(root(0xDB), total, 4 * G)
+        })
+        else {
+            panic!("a request ahead of the owner's paid frontier owns its own span");
+        };
+        assert!(!Arc::ptr_eq(&whole, &tail));
+        assert_eq!(whole.observer_count(), 1, "the tail did not attach");
+        assert_eq!(tail.observer_count(), 1);
+        assert!(mapped(&reg, hash));
+
+        // Once the owner's client has paid past the tail's start, a request at
+        // that start attaches again — its payments can extend the owner's paid
+        // prefix at once.
+        whole.advance_served(5 * G);
+        let FillClaim::Attach {
+            session: attached,
+            lease: _a,
+        } = reg.claim(hash, 5 * G, 0, total, || panic!("attaches"))
+        else {
+            panic!("a request at or behind the paid frontier attaches");
+        };
+        assert!(
+            Arc::ptr_eq(&attached, &whole) || Arc::ptr_eq(&attached, &tail),
+            "attaches to a live session whose paid frontier reaches it"
+        );
     }
 
     #[test]

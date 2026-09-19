@@ -336,6 +336,27 @@ async fn throwaway_open(
     pool_id: B256,
     hash: Hash,
 ) -> anyhow::Result<u64> {
+    let (conn, total) =
+        idle_open(client_ep, target, client_node_id, client_eth, pool_id, hash).await?;
+    // Exactly what `UpstreamPull::abort` / `Drop` do on the CLI: close the
+    // connection; the node's serve leg learns of it on its next write.
+    conn.close(0u32.into(), b"client-abandoned");
+    Ok(total)
+}
+
+/// A bound `(0, 0)` open that reads the signed `StreamResponse` and then does
+/// NOTHING — neither pays nor closes. The node's fill for it parks at the ramp
+/// floor with its paid frontier at 0 for as long as the connection lives: the
+/// stalled-owner shape. Returns the live connection (drop it to end the stream)
+/// and the advertised total.
+async fn idle_open(
+    client_ep: &iroh::Endpoint,
+    target: EndpointAddr,
+    client_node_id: B256,
+    client_eth: &Arc<PrivateKeySigner>,
+    pool_id: B256,
+    hash: Hash,
+) -> anyhow::Result<(iroh::endpoint::Connection, u64)> {
     let conn = client_ep
         .connect(target, ALPN_CLIENT)
         .await
@@ -369,11 +390,12 @@ async fn throwaway_open(
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
     write_frame_to(&mut send, &payload).await?;
     let (resp, resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "throwaway open refused: {:?}", resp_ext.error);
-    // Exactly what `UpstreamPull::abort` / `Drop` do on the CLI: close the
-    // connection; the node's serve leg learns of it on its next write.
-    conn.close(0u32.into(), b"client-abandoned");
-    Ok(resp.body.total_bytes)
+    anyhow::ensure!(resp.body.ok, "idle open refused: {:?}", resp_ext.error);
+    // Keep the streams alive with the connection so the node's serve leg stays
+    // parked on a client that never pays.
+    std::mem::forget(send);
+    std::mem::forget(recv);
+    Ok((conn, resp.body.total_bytes))
 }
 
 async fn write_frame_to(send: &mut SendStream, payload: &[u8]) -> anyhow::Result<()> {
@@ -1413,6 +1435,140 @@ async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::R
         distinct.len() == ranges.len(),
         "a span was fetched twice in full: {ranges:?}"
     );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The `bundle pull` splice shape against a STALLED owner: a `(0, 0)` open whose
+/// client stays connected but never pays (the CLI's throwaway open before the
+/// node notices its close, or any client that stops paying), then the real open
+/// for only the CHANGED TAIL at an offset far past anything that fill will draw
+/// (its pull parks at the ramp floor with a paid frontier of 0). The tail request
+/// must not attach to that fill — `claim_fill` gives a request ahead of a live
+/// fill's paid frontier its own pull — and must be served byte-exact well inside a
+/// client's 30 s stall budget.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn tail_open_ahead_of_a_stalled_owner_does_not_starve() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = large_blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+    // The changed tail starts 2 MiB in — past the floor draw the throwaway's
+    // fill makes from byte 0.
+    let tail_off = 2 * 1024 * 1024u64;
+
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    let blob_for_resp = blob.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header_exists("range"))
+        .respond_with(move |req: &Request| {
+            let span = req
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .and_then(|(s, e)| Some((usize::try_from(s).ok()?, usize::try_from(e).ok()?)))
+                .and_then(|(s, e)| blob_for_resp.get(s..=e));
+            match span {
+                Some(body) => ResponseTemplate::new(206)
+                    .set_body_bytes(body.to_vec())
+                    .set_delay(Duration::from_millis(200)),
+                None => ResponseTemplate::new(416),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x66);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    // Concurrent accept loop: the stalled connection stays open for the whole
+    // test, so the tail open must be served beside it, as the daemon does.
+    let server_task = spawn_server_concurrent(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (stalled_conn, total) = idle_open(
+        &client_ep,
+        target.clone(),
+        client_node_id,
+        &client_eth,
+        pool_id,
+        hash,
+    )
+    .await?;
+    anyhow::ensure!(total == blob_size, "idle open header total mismatch");
+    // Let the stalled owner's fill make its floor draw and park.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let started = std::time::Instant::now();
+    let got = tokio::time::timeout(
+        Duration::from_secs(15),
+        ranged_paid_pull(
+            &client_ep,
+            target,
+            client_node_id,
+            &client_eth,
+            pool_id,
+            provider,
+            hash,
+            tail_off,
+            0,
+            RATE_PER_MB,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the tail open starved behind the throwaway's parked fill"))??;
+    let want = blob
+        .get(usize::try_from(tail_off)?..)
+        .ok_or_else(|| anyhow::anyhow!("tail out of bounds"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "tail delivery mismatch: got {} bytes, want {}",
+        got.len(),
+        want.len()
+    );
+    anyhow::ensure!(
+        started.elapsed() < Duration::from_secs(10),
+        "the tail must not wait on a stalled fill: took {:?}",
+        started.elapsed()
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 2,
+        "both the stalled open and the tail open must enter the two-leg tier"
+    );
+    stalled_conn.close(0u32.into(), b"done");
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
