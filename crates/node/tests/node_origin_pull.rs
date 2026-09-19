@@ -6674,6 +6674,143 @@ enum LeafMode {
     StopPayingAfter { acks: u64, hold: Duration },
 }
 
+/// A leaf client that requests the bounded range `[byte_offset, byte_offset +
+/// byte_len)` (`byte_len == 0` ⇒ to end) through B's fused window path, pays
+/// the vouchers B collects on the bao WIRE it receives, decodes + verifies the
+/// aligned superset against the root, and returns exactly the requested span.
+/// The ranged twin of [`leaf_paced_pull`] — the peer-path counterpart of
+/// `origin_range_pull.rs`'s `ranged_paid_pull`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn leaf_ranged_paid_pull(
+    leaf_ep: &iroh::Endpoint,
+    target: EndpointAddr,
+    leaf_node_id: B256,
+    leaf_eth: &Arc<PrivateKeySigner>,
+    provider: Address,
+    pool_id: B256,
+    hash: Hash,
+    byte_offset: u64,
+    byte_len: u64,
+    rate: u64,
+) -> Result<Vec<u8>> {
+    use alloy::signers::SignerSync;
+
+    let conn = leaf_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf open_bi: {e}"))?;
+
+    let binding_hash = binding_signing_hash(leaf_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec();
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: leaf_eth.address().into(),
+            binding_signature,
+        }),
+        capability: None,
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id.into(),
+        byte_offset,
+        byte_len,
+        timestamp_us: 0x9008,
+    };
+    let payload =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame(&mut send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
+
+    let (resp, resp_ext) = read_client_response(&mut recv).await?;
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
+    let total = resp.body.total_bytes;
+    // The paid/closing boundary is the bao-encoded WIRE size of the aligned
+    // superset (ADR 038), not the requested content length.
+    let aligned = decdn_cache::range_pull::align_range(byte_offset, byte_len, total)
+        .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
+    let expected_wire = decdn_cache::range_pull::bao_encoded_size(total, aligned.chunk_ranges());
+    let interval_bytes = CHUNK_BYTES;
+
+    let mut buf = BytesMut::new();
+    let mut cumulative: u64 = 0;
+    let mut unvouchered: u64 = 0;
+    loop {
+        match read_client(&mut recv).await? {
+            ClientMessage::ChunkData(chunk) => {
+                buf.extend_from_slice(chunk.bytes());
+                let len = u64::try_from(chunk.bytes().len()).unwrap_or(u64::MAX);
+                cumulative = cumulative.saturating_add(len);
+                unvouchered = unvouchered.saturating_add(len);
+                let boundary = interval_bytes > 0 && unvouchered >= interval_bytes;
+                let closing = cumulative >= expected_wire && unvouchered > 0;
+                if boundary || closing {
+                    let amount = U256::from(cumulative)
+                        .saturating_mul(U256::from(rate))
+                        .div_ceil(U256::from(MB_BYTES));
+                    let signed = Voucher {
+                        pool_id,
+                        signer: leaf_eth.address(),
+                        provider,
+                        amount,
+                        bytes_delivered: U256::from(cumulative),
+                        chain_root: B256::ZERO,
+                        chunk_price: U256::ZERO,
+                    }
+                    .sign(leaf_eth.as_ref(), &voucher_dom())
+                    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+                    write_client(
+                        &mut send,
+                        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
+                    )
+                    .await?;
+                    unvouchered = 0;
+                }
+            }
+            ClientMessage::StreamEnd => break,
+            ClientMessage::StreamError(e) => anyhow::bail!("leaf saw stream error: {e:?}"),
+            other => anyhow::bail!("unexpected message mid-delivery: {other:?}"),
+        }
+    }
+    conn.close(0u32.into(), b"done");
+
+    // Decode + verify the aligned superset against the root, trim to the span.
+    let plaintext = {
+        use bao_tree::BaoTree;
+        use bao_tree::io::BaoContentItem;
+        use bao_tree::io::sync::DecodeResponseIter;
+        let tree = BaoTree::new(total, decdn_cache::range_pull::IROH_BLOCK_SIZE);
+        let reader = std::io::Cursor::new(&buf[..]);
+        let mut out = Vec::new();
+        for item in
+            DecodeResponseIter::new(hash.into(), tree, reader, aligned.chunk_ranges().as_ref())
+        {
+            match item.map_err(|e| anyhow::anyhow!("bao decode: {e}"))? {
+                BaoContentItem::Leaf(leaf) => out.extend_from_slice(&leaf.data),
+                BaoContentItem::Parent(_) => {}
+            }
+        }
+        out
+    };
+    let lead = usize::try_from(byte_offset.saturating_sub(aligned.fetch_start()))
+        .map_err(|e| anyhow::anyhow!("lead: {e}"))?;
+    let want = if byte_len == 0 {
+        plaintext.len().saturating_sub(lead)
+    } else {
+        usize::try_from(byte_len).map_err(|e| anyhow::anyhow!("len: {e}"))?
+    };
+    let end = lead.saturating_add(want);
+    plaintext
+        .get(lead..end)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| anyhow::anyhow!("decoded range shorter than requested span"))
+}
+
 async fn read_client(recv: &mut iroh::endpoint::RecvStream) -> Result<ClientMessage> {
     let frame = read_frame(recv)
         .await
@@ -8122,28 +8259,31 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
     Ok(())
 }
 
-/// A resumed cache-miss request (`byte_offset > 0`) IS served by the fused window
-/// path: the serve leg clamps delivery to `[offset, end)`, the pull leg fills only
-/// `missing_ranges(offset, 0)`, and every chunk group verifies against the root
-/// independently (ADR 038), so no tier needs byte 0. The proof is the signed
-/// `ok: true` response carrying the whole-blob `total_bytes` — a buffered fallback
-/// on B's empty cache would have refused.
+/// A BOUNDED, UNALIGNED range (`byte_offset` and end both inside chunk groups)
+/// through the peer fused path: leaf→B (cold miss)→A. The serve leg's paid-wire
+/// mapping starts at the group floor of the offset and the pull leg draws only
+/// the aligned span's missing groups — proven by B's recorded upstream spend
+/// being exactly the aligned span's bao wire, and B's cache holding the span
+/// but not the head. Unlike the own-origin twin, this leg fronts real upstream
+/// payment, so an off-by-one-group here over- or under-draws against a live
+/// counterparty.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
-async fn window_pull_through_resumed_offset_is_served_by_the_fused_path() -> Result<()> {
-    use alloy::signers::SignerSync;
-
-    let payload = vec![0x7Eu8; PAYLOAD_LEN];
+async fn window_pull_through_bounded_unaligned_range_pulls_only_the_span() -> Result<()> {
+    let payload: Vec<u8> = (0..PAYLOAD_LEN)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
     let hash = Hash::new(&payload);
+    let total = u64::try_from(PAYLOAD_LEN)?;
 
-    let ab_channel_id = B256::repeat_byte(0xA7);
+    let ab_channel_id = B256::repeat_byte(0xA9);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
         spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x7F);
-    let (handler_b, b_target, ep_b, _recorded, _cache_b, _b_metrics, _local_rep, _b_operator) =
+    let leaf_channel_id = B256::repeat_byte(0x8F);
+    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
@@ -8163,54 +8303,128 @@ async fn window_pull_through_resumed_offset_is_served_by_the_fused_path() -> Res
     let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
     let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
 
-    // Send a request resuming from one interval in (byte_offset > 0), with a
-    // valid ownership binding so authorization is NOT the reason for refusal —
-    // the offset gate must be.
-    let conn = leaf_ep
-        .connect(b_target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("leaf connect: {e}"))?;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("leaf open_bi: {e}"))?;
-    let binding_hash = binding_signing_hash(leaf_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
-    let binding_signature = leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec();
-    let ext = StreamRequestExt {
-        binding: Some(ClientBinding {
-            ethereum_address: leaf_eth.address().into(),
-            binding_signature,
-        }),
-        capability: None,
-    };
-    let req = StreamRequest {
-        hash: *hash.as_bytes(),
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        pool_id: leaf_channel_id.into(),
-        byte_offset: MB_BYTES,
-        byte_len: 0,
-        timestamp_us: 0x9007,
-    };
-    let payload_bytes =
-        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
-    write_frame(&mut send, &payload_bytes)
-        .await
-        .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
+    // 20 KiB is NOT a 16 KiB group boundary; the 40 KiB length ends mid-group
+    // too. The aligned superset is [16 KiB, 64 KiB).
+    let (req_off, req_len) = (20 * 1024u64, 40 * 1024u64);
+    let aligned = decdn_cache::range_pull::align_range(req_off, req_len, total)
+        .map_err(|e| anyhow::anyhow!("align: {e}"))?;
 
-    let resp = match read_client(&mut recv).await? {
-        ClientMessage::StreamResponse(r) => r,
-        other => anyhow::bail!("expected StreamResponse, got {other:?}"),
-    };
+    let got = leaf_ranged_paid_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        b_operator,
+        leaf_channel_id,
+        hash,
+        req_off,
+        req_len,
+        RATE,
+    )
+    .await?;
+    let want = payload
+        .get(usize::try_from(req_off)?..usize::try_from(req_off + req_len)?)
+        .ok_or_else(|| anyhow::anyhow!("requested range out of bounds"))?;
     anyhow::ensure!(
-        resp.body.ok,
-        "a resumed offset>0 miss must be served by the fused window path"
+        got.as_slice() == want,
+        "unaligned bounded range through the peer path must be byte-exact"
+    );
+
+    // B's upstream spend covered exactly the aligned span's bao wire — the
+    // range-minimized pull, priced against a live counterparty.
+    let span_wire = decdn_cache::range_pull::bao_encoded_size(total, aligned.chunk_ranges());
+    let log = progress_log(&recorded)?;
+    let last = log
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("B must have pulled upstream"))?;
+    anyhow::ensure!(
+        last.1 == U256::from(span_wire),
+        "B's upstream wire must be the aligned span's bao size ({span_wire}), got {}",
+        last.1
+    );
+    // The span is present in B's cache; the head was never pulled.
+    anyhow::ensure!(!cache_b.has(hash).await?, "B holds a partial, not the blob");
+    anyhow::ensure!(
+        cache_b
+            .missing_ranges(hash, req_off, req_len, total)
+            .await?
+            .is_empty(),
+        "the requested span must be present in B's cache"
     );
     anyhow::ensure!(
-        usize::try_from(resp.body.total_bytes)? == PAYLOAD_LEN,
-        "the fused path commits to the whole-blob total, got {}",
-        resp.body.total_bytes
+        !cache_b
+            .missing_ranges(hash, 0, aligned.fetch_start(), total)
+            .await?
+            .is_empty(),
+        "the head before the aligned span must never have been pulled"
     );
-    conn.close(0u32.into(), b"done");
+
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
+/// A resumed cache-miss request (`byte_offset > 0`) IS served by the fused window
+/// path: the serve leg clamps delivery to `[offset, end)`, the pull leg fills only
+/// `missing_ranges(offset, 0)`, and every chunk group verifies against the root
+/// independently (ADR 038), so no tier needs byte 0. The proof is the drained,
+/// byte-exact tail — a fused path serving from byte 0, or a buffered fallback on
+/// B's empty cache (which would refuse), both fail it.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn window_pull_through_resumed_offset_is_served_by_the_fused_path() -> Result<()> {
+    let payload = vec![0x7Eu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA7);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x7F);
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, _b_metrics, _local_rep, b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+
+    // Resume from one interval in (byte_offset > 0) and DRAIN the delivery: the
+    // routing proof is the byte-exact tail, not just the signed `ok: true` — a
+    // fused path that served from byte 0 would fail the comparison.
+    let got = leaf_ranged_paid_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        b_operator,
+        leaf_channel_id,
+        hash,
+        MB_BYTES,
+        0,
+        RATE,
+    )
+    .await?;
+    let want = payload
+        .get(usize::try_from(MB_BYTES)?..)
+        .ok_or_else(|| anyhow::anyhow!("tail out of bounds"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "the fused path must serve the requested tail byte-exact"
+    );
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
