@@ -644,7 +644,7 @@
       },
       "title": "Stream outcomes by direction",
       "type": "timeseries",
-      "description": "Every paid stream ends in exactly one of completed or failed. inbound is this node serving; outbound is one pull from one upstream candidate. failed includes routine refusals (a cache miss, an unfunded channel) — the reason is in the refusal and pull-outcome panels. Mid-stream stops name the funding cause.",
+      "description": "Every ended paid stream counts once as completed or failed. inbound is this node serving; outbound is a stream this node opened to an upstream candidate, or one assembled range on the streaming miss path. failed includes routine outcomes — a cache-miss refusal, a client that closes early, and the free header handshake a downstream node opens and closes — so read the refusal and pull-outcome panels for health. Mid-stream stops name the funding cause.",
       "targets": [
         {
           "datasource": {

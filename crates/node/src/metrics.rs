@@ -1434,41 +1434,54 @@ pub struct DecdnMetrics {
 
     // ---- Stream outcomes and volume ----
     /// `decdn_streams_completed_total{direction}`: paid streams that delivered
-    /// the whole request. `inbound` counts streams this node served; `outbound`
-    /// counts node-to-node pulls this node made from one upstream candidate.
-    /// With `streams_failed`, every stream counts exactly once, so
-    /// `completed / (completed + failed)` is the success ratio. The reason
-    /// split lives in the existing sibling counters (`serve_stream_rejected_*`,
-    /// `node_pull_*`).
+    /// the whole request. `inbound` counts streams this node served. `outbound`
+    /// counts node-to-node pulls this node made: one per upstream candidate it
+    /// opened a stream to on the buffered miss path, one per assembled range on
+    /// the streaming miss path. Every ended stream counts once, in this family
+    /// or in `streams_failed`; a stream cancelled by shutdown counts in
+    /// neither. The reason split lives in the sibling counters
+    /// (`serve_stream_rejected_*`, `node_pull_*`).
     streams_completed: Family<StreamLabels, Counter>,
     /// `decdn_streams_failed_total{direction}`: paid streams that ended without
-    /// delivering the whole request — refused, stopped mid-stream, reset, or
-    /// ended on an error. See `streams_completed`.
+    /// delivering the whole request — refused, stopped mid-stream, reset,
+    /// panicked, or ended on an error. Routine outcomes count here too: a cache
+    /// miss refusal, a client that closes early, and the free header handshake a
+    /// downstream node's miss pull opens and closes after the response. So read
+    /// the reason siblings, not a raw ratio, for health. See `streams_completed`.
     streams_failed: Family<StreamLabels, Counter>,
     /// `decdn_bytes_served_total`: payload bytes this node wrote to clients and
     /// downstream nodes on `cdn/client/v1`, counted per frame as it is written.
     pub bytes_served: Counter,
     /// `decdn_bytes_received_total`: payload bytes this node admitted from
-    /// upstream nodes in paid node-to-node pulls, counted per verified range.
+    /// upstream nodes in paid node-to-node pulls, counted per verified range
+    /// (chunk-group aligned, so it can exceed the requested bytes).
     pub bytes_received: Counter,
 
     // ---- Settlement and on-chain transactions ----
-    /// `decdn_pool_redemptions_total`: vouchers this node redeemed on-chain in a
-    /// landed `redeemMany`. One `redeemMany` adds its voucher count.
+    /// `decdn_pool_redemptions_total`: lane claims this node redeemed on-chain in
+    /// a landed `redeemMany` — one cumulative voucher per lane, however many
+    /// vouchers the lane accepted.
     pub pool_redemptions: Counter,
-    /// `decdn_vouchers_received_total`: vouchers this node accepted as the
-    /// payee on an inbound stream.
+    /// `decdn_vouchers_received_total`: signed vouchers this node accepted as
+    /// the payee on an inbound stream. `PayWord` preimage reveals are not
+    /// vouchers and do not count; a `PayWord` stream counts its anchor voucher.
     pub vouchers_received: Counter,
     /// `decdn_pool_grace_closes_total`: pools that entered the owner-close grace
-    /// window while this node still held unredeemed vouchers on them. Each one is
-    /// revenue that must redeem before the grace window ends.
+    /// window while this node still held unredeemed vouchers on them, read from
+    /// the flushed lane store when the close event arrives. Each one is revenue
+    /// that must redeem before the grace window ends. A pool already closing at
+    /// startup is not counted.
     pub pool_grace_closes: Counter,
-    /// `decdn_onchain_tx_landed_total`: node transactions mined and succeeded.
+    /// `decdn_onchain_tx_landed_total`: settlement transactions (`redeemMany`)
+    /// mined and succeeded. The `onchain_tx_*` family counts every transaction
+    /// sent through `send_and_await_receipt`; buyer-side pool transactions go
+    /// through client-pull and are not counted here.
     pub onchain_tx_landed: Counter,
     /// `decdn_onchain_tx_reverted_total`: node transactions mined and reverted.
     pub onchain_tx_reverted: Counter,
     /// `decdn_onchain_tx_send_failed_total`: node transactions the RPC refused at
-    /// `send` — none was issued.
+    /// `send` — none was issued. An oversize `redeemMany` the redeemer then
+    /// halves and retries counts here once too.
     pub onchain_tx_send_failed: Counter,
     /// `decdn_onchain_tx_receipt_failed_total`: issued node transactions whose
     /// receipt wait failed. The transaction may still mine.
@@ -1514,7 +1527,8 @@ pub struct DecdnMetrics {
 
     // ---- Operator-path failures ----
     /// `decdn_config_reload_failures_total`: SIGHUP or admin config reloads that
-    /// failed and kept the previous values.
+    /// failed. Sections committed before the failure stay applied; the rest keep
+    /// their previous values.
     pub config_reload_failures: Counter,
     /// `decdn_receipt_write_failures_total`: download-receipt audit records the
     /// writer failed to persist (an I/O error or a panicked write task). Audit

@@ -157,11 +157,14 @@ groups:
             the surrounding ERROR log line (emitted once per process).
             See docs/runbook.md § Cache coalescing mutex poisoned.
 
-      # The slash watcher backfills the appeal window at bring-up, so a restart
-      # inside that window re-counts a past slash from zero and fires this
-      # again. That repeat is intended: the appeal deadline is still open.
+      # The value, not increase(): the slash watcher's bring-up backfill counts
+      # every still-appealable slash before the first scrape, so increase()
+      # would miss a slash found at startup. A non-zero value means this process
+      # has seen a slash; after a restart it re-counts only the slashes whose
+      # appeal window is still open, so the alert clears once the last window
+      # closes and the node restarts.
       - alert: DecdnSlashDetected
-        expr: increase(decdn_slashes_detected_total[1h]) > 0
+        expr: decdn_slashes_detected_total > 0
         for: 0m
         labels:
           component: slashing
@@ -408,9 +411,10 @@ groups:
         annotations:
           summary: "Config reload failed on {{ $labels.instance }}"
           description: |
-            A SIGHUP or admin reload failed and the node kept its previous
-            values for every section. The warn! line beside it names the
-            cause. Fix the config file and reload again.
+            A SIGHUP or admin reload failed. Sections committed before the
+            failure stay applied; the rest keep their previous values. The
+            warn! line beside it names the cause. Fix the config file and
+            reload again.
 
       - alert: DecdnReceiptLogWriteFailing
         expr: increase(decdn_receipt_write_failures_total[1h]) > 0
@@ -459,9 +463,9 @@ groups:
             throttled `error!` names the specific failure.
 
       # Removed in #1513: DecdnHashMismatchAppearing, which read
-      # decdn_streams_failed_total{reason="hash_mismatch"}. Neither that series
-      # nor any outcome-labelled stream family has ever been exported, so the
-      # rule was permanently silent. Delivery hash mismatch is genuinely
+      # decdn_streams_failed_total{reason="hash_mismatch"}. That family carries
+      # `direction` only, never a `reason`, so such a rule is permanently
+      # silent. Delivery hash mismatch is genuinely
       # unmetered today — the cache returns CacheError::HashMismatch and the
       # node logs it, but nothing counts it. This is a real coverage gap, not a
       # naming fix; it is recorded in docs/runbook.md rather than papered over
@@ -554,7 +558,8 @@ groups:
         annotations:
           summary: "Voucher redemptions failing on {{ $labels.instance }}"
           description: |
-            redeemMany keeps failing: reverted, refused at send, or no receipt.
+            redeemMany keeps failing: reverted, refused at send, no receipt, a
+            timed-out receipt, or a lane-store read failure.
             The claims stay and retry, but unredeemed revenue accrues and a
             closing pool's grace window can run out. Read the redeemMany warn!
             lines (each carries the tx hash when one was issued) and check the
@@ -638,3 +643,32 @@ groups:
             A node-to-node pull received bytes that failed bao verification.
             The node rejected them and scored the upstream; a repeat from one
             peer points at a faulty or dishonest node.
+
+      - alert: DecdnPoolGraceCloseWithUnredeemed
+        expr: increase(decdn_pool_grace_closes_total[1h]) > 0
+        for: 0m
+        labels:
+          component: payments
+          severity: warning
+        annotations:
+          summary: "A pool closing on {{ $labels.instance }} holds unredeemed vouchers"
+          description: |
+            A pool owner started a close while this node held unredeemed
+            vouchers on it. The redeemer must land them before the grace window
+            ends or the revenue is lost. Check that redeemMany is landing
+            (decdn_onchain_tx_landed_total, DecdnRedemptionFailing) and that the
+            operator key has gas.
+
+      - alert: DecdnDhtRoutingTableEmpty
+        expr: decdn_dht_routing_table_size == 0
+        for: 30m
+        labels:
+          component: dht
+          severity: warning
+        annotations:
+          summary: "DHT routing table empty on {{ $labels.instance }}"
+          description: |
+            The node knows no DHT peers after bootstrap and refresh, so it
+            cannot discover providers or publish its content. Check network
+            reachability and that the staker set lists live seeds. The gauge is
+            set after bootstrap and on each bucket-refresh tick.

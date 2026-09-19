@@ -2340,7 +2340,7 @@
       },
       "title": "Vouchers, redemptions and grace closes",
       "type": "timeseries",
-      "description": "vouchers accepted is the payee side of every inbound stream; vouchers redeemed is what landed on chain. A grace close is a pool its owner is closing while this node still holds unredeemed vouchers on it.",
+      "description": "vouchers accepted counts signed vouchers on inbound streams (PayWord reveals are not vouchers). vouchers redeemed counts lane claims that landed on chain — one cumulative voucher per lane. A grace close is a pool its owner is closing while this node still holds unredeemed vouchers on it.",
       "targets": [
         {
           "datasource": {

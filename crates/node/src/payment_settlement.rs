@@ -699,11 +699,7 @@ impl PoolSettlementSink {
     /// store read failure answers `false`: the counter this feeds is advisory.
     fn holds_unredeemed_on(&self, pool_id: PoolId) -> bool {
         match self.store.load_all() {
-            Ok(states) => states.iter().any(|st| {
-                st.pool_id == pool_id
-                    && st.provider == self.self_address
-                    && st.owed() > st.paid_cumulative
-            }),
+            Ok(states) => holds_unredeemed(&states, pool_id, self.self_address),
             Err(err) => {
                 warn!(error = %err, %pool_id, "grace-close check: failed to load lane state");
                 false
@@ -1726,6 +1722,14 @@ fn record_tx_failure(span: &tracing::Span, outcome: &'static str, tx: Option<TxH
     }
     span.record("outcome", outcome);
     span.record("otel.status_code", "ERROR");
+}
+
+/// Whether `provider` has a lane of `pool_id` in `states` that is owed more
+/// than it has been paid.
+fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) -> bool {
+    states.iter().any(|st| {
+        st.pool_id == pool_id && st.provider == provider && st.owed() > st.paid_cumulative
+    })
 }
 
 async fn redeem_planned_lanes<P: Provider + Clone>(
@@ -2881,6 +2885,26 @@ mod tests {
         );
         st.owner_sig = owner_sig;
         st
+    }
+
+    /// A grace close counts only for this provider's lane on the closing pool
+    /// that the chain has not fully paid.
+    #[test]
+    fn holds_unredeemed_matches_only_an_unpaid_lane_of_this_pool_and_provider() {
+        let pool = PoolId::from([1; 32]);
+        let me = Address::from([20; 20]);
+        let owed = signed_lane_state(1, 10, 20, None);
+        assert!(holds_unredeemed(std::slice::from_ref(&owed), pool, me));
+
+        let mut paid = owed.clone();
+        paid.paid_cumulative = paid.owed();
+        assert!(!holds_unredeemed(&[paid], pool, me));
+
+        let other_provider = signed_lane_state(1, 10, 21, None);
+        assert!(!holds_unredeemed(&[other_provider], pool, me));
+
+        let other_pool = signed_lane_state(2, 10, 20, None);
+        assert!(!holds_unredeemed(&[other_pool], pool, me));
     }
 
     #[test]

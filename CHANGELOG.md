@@ -1748,7 +1748,7 @@ since project inception and will roll into the first tagged release.
   `decdn_dht_{findvalue_queries,lookup_round_timeouts,store_published,bucket_refresh_failures,bootstrap_find_node_failures}_total`,
   `decdn_dht_routing_table_size`, `decdn_fee_shares_watcher_{poll_failures_total,restarts_total,down_seconds}`,
   `decdn_config_reload_failures_total`, `decdn_receipt_write_failures_total` and
-  `decdn_serve_stream_midstream_pool_exhausted_total`. The eleven registry rows
+  `decdn_serve_stream_midstream_pool_exhausted_total`. The ten registry rows
   that were `planned` for these ship as `live`; `decdn_streams_failed_total`
   carries `direction` only, with the reason split in the existing sibling
   counters. New alerts: `DecdnSlashDetected`, `DecdnRpcUnhealthy`,

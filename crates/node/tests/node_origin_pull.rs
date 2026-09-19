@@ -1046,6 +1046,29 @@ fn assert_counter(metrics: &Arc<Metrics>, name: &str, value: u64) -> Result<()> 
     Ok(())
 }
 
+/// A relay node that pulled a `blob_len`-byte blob from upstream and served it
+/// downstream records one completed outbound stream and counts at least the
+/// blob in both byte directions. The pull thread marks its end just after the
+/// last byte lands, so this waits briefly for it.
+async fn assert_relay_counted(metrics: &Arc<Metrics>, blob_len: u64) -> Result<()> {
+    let outbound_completed = "streams_completed_total{direction=\"outbound\"}";
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while counter_value(metrics, outbound_completed)? == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_counter(metrics, outbound_completed, 1)?;
+    assert_counter(metrics, "streams_failed_total{direction=\"outbound\"}", 0)?;
+    anyhow::ensure!(
+        counter_value(metrics, "bytes_received_total")? >= blob_len,
+        "the relay must count the blob it pulled"
+    );
+    anyhow::ensure!(
+        counter_value(metrics, "bytes_served_total")? >= blob_len,
+        "the relay must count the blob it served"
+    );
+    Ok(())
+}
+
 /// Read a `decdn_<name>` counter's value from the metrics scrape, or `0` if the
 /// line is absent.
 fn counter_value(metrics: &Arc<Metrics>, name: &str) -> Result<u64> {
@@ -7281,6 +7304,8 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
          {expected_amount} paid), got {:?}",
         progress_log(&recorded)?
     );
+
+    assert_relay_counted(&b_metrics, u64::try_from(payload.len())?).await?;
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())

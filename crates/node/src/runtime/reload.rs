@@ -1135,18 +1135,15 @@ impl RuntimeReloadState {
     /// restart". It fires on presence of the field, not on a change to it
     /// (no diff against the previous file) — best-effort operator
     /// guidance, not a correctness gate.
-    #[allow(
-        clippy::cognitive_complexity, // A few short phase loops; reads better as one unit than split apart.
-        clippy::unused_async, // Future-shaped on purpose: see below.
-    )]
+    ///
+    /// A failed reload counts into `decdn_config_reload_failures_total` once
+    /// [`Self::attach_metrics`] has run.
     // `async` is preserved even though no body is currently `.await`ed:
     // the runtime select loop awaits this future inside `tokio::select!`
     // (see `runtime::run`), so the signature is part of the contract
     // with the caller. A future revision adding `tokio::fs::read_to_string`
     // for the config file would also need it.
-    ///
-    /// A failed reload counts into `decdn_config_reload_failures_total` once
-    /// [`Self::attach_metrics`] has run.
+    #[allow(clippy::unused_async)]
     pub async fn reload(&self, path: &Path) -> anyhow::Result<()> {
         let result = self.reload_sections(path);
         if result.is_err()
@@ -1159,7 +1156,7 @@ impl RuntimeReloadState {
 
     /// The body of [`Self::reload`]: load, resolve, validate and commit every
     /// section.
-    #[allow(clippy::cognitive_complexity)] // See `reload`.
+    #[allow(clippy::cognitive_complexity)] // A few short phase loops; reads better as one unit than split apart.
     fn reload_sections(&self, path: &Path) -> anyhow::Result<()> {
         let file = match load_file_config(Some(path)) {
             Ok(f) => f,
@@ -1764,9 +1761,18 @@ mod tests {
             &initial,
             failing_setter,
         );
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        state.attach_metrics(Arc::clone(&metrics));
 
         let err = state.reload(&path).await.unwrap_err();
         assert!(format!("{err:#}").contains("simulated tracing-reload failure"));
+        // The failed reload is counted once.
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_config_reload_failures_total 1"),
+            "{text}"
+        );
     }
 
     /// Transactional contract for the *log-level* mutex: a poisoned

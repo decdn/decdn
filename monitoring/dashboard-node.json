@@ -3434,7 +3434,7 @@
         "y": 85
       },
       "id": 45,
-      "description": "Lookups this node ran and STORE records peers accepted from it. Round timeouts and refresh or bootstrap failures are RPCs to peers that did not answer."
+      "description": "Lookups this node ran and STORE records peers accepted from it. A round timeout is a lookup round whose peers did not all answer in time. A refresh failure is a FindNode error, an invalid peer key or a panicked refresh task; a bootstrap failure is a FindNode against a seed that failed."
     },
     {
       "datasource": {

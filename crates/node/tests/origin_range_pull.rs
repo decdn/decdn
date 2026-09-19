@@ -976,6 +976,16 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
+    // The operator's own origin is not a peer: the fill counts as bytes served,
+    // never as bytes received from another node.
+    anyhow::ensure!(
+        counter_value(&metrics, "bytes_received_total")? == 0,
+        "an own-origin fill must not count as bytes received from peers"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "bytes_served_total")? > 0,
+        "the served blob must count as bytes served"
+    );
     Ok(())
 }
 

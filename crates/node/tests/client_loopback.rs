@@ -392,6 +392,8 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
     }
     shutdown([server_task], [&client_ep, &server_ep]).await?;
 
+    assert_one_completed_inbound_stream(&metrics, 2)?;
+
     let served = spans.matching("serve_stream", "hash", &key);
     let [span] = served.as_slice() else {
         anyhow::bail!("expected one serve_stream span for the hash, got {served:?}");
@@ -407,6 +409,27 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
     anyhow::ensure!(
         span.fields.get("peer").map(String::as_str) == Some(client_ep.id().to_string().as_str()),
         "peer: {span:?}"
+    );
+    Ok(())
+}
+
+/// The stream-outcome family counts one completed inbound stream and no failed
+/// one, with the `vouchers` it accepted and a non-zero byte count.
+fn assert_one_completed_inbound_stream(metrics: &Metrics, vouchers: u64) -> anyhow::Result<()> {
+    let encoded = metrics.encode()?;
+    for line in [
+        "decdn_streams_completed_total{direction=\"inbound\"} 1".to_string(),
+        "decdn_streams_failed_total{direction=\"inbound\"} 0".to_string(),
+        format!("decdn_vouchers_received_total {vouchers}"),
+    ] {
+        anyhow::ensure!(
+            metric_line_present(&encoded, &line),
+            "missing `{line}`:\n{encoded}"
+        );
+    }
+    anyhow::ensure!(
+        !metric_line_present(&encoded, "decdn_bytes_served_total 0"),
+        "bytes served must count the delivered frames:\n{encoded}"
     );
     Ok(())
 }

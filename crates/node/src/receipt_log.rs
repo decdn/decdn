@@ -1015,7 +1015,10 @@ mod tests {
             ..RecordingLog::default()
         });
         let metrics = Arc::new(Metrics::new());
-        let (sink, handle) = spawn_receipt_writer(Arc::clone(&log) as Arc<dyn ReceiptLog>, metrics);
+        let (sink, handle) = spawn_receipt_writer(
+            Arc::clone(&log) as Arc<dyn ReceiptLog>,
+            Arc::clone(&metrics),
+        );
         for tag in 0..5u8 {
             sink.record(raw_sample(tag));
         }
@@ -1025,6 +1028,13 @@ mod tests {
         anyhow::ensure!(
             sizes == vec![0, 1024, 3 * 1024, 4 * 1024],
             "the failing append should be skipped but the rest recorded: {sizes:?}"
+        );
+        // The one failed append is counted.
+        let text = metrics.encode()?;
+        anyhow::ensure!(
+            text.lines()
+                .any(|l| l == "decdn_receipt_write_failures_total 1"),
+            "{text}"
         );
         Ok(())
     }
