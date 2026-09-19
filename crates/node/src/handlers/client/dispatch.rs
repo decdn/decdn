@@ -1224,25 +1224,17 @@ impl ClientHandler {
         // `deliver`'s `export_range` then aborts mid-stream. A whole-blob request
         // (`byte_offset == 0 && byte_len == 0`) is always in bounds for a present
         // blob; `byte_len == 0` on a non-zero offset is the in-bounds whole-tail
-        // read. Mirrors `range_pull::align_range`'s bound check on the origin
-        // tier so the serve tier rejects the same ranges.
-        if req.byte_offset > 0 || req.byte_len > 0 {
-            let out_of_bounds = req.byte_offset >= total_bytes
-                || (req.byte_len > 0
-                    && req
-                        .byte_offset
-                        .checked_add(req.byte_len)
-                        .is_none_or(|end| end > total_bytes));
-            if out_of_bounds {
-                return self
-                    .respond_error(
-                        &mut send,
-                        &req,
-                        ServeRejectReason::RangeNotSatisfiable,
-                        rate_per_mb,
-                    )
-                    .await;
-            }
+        // read. Mirrors `align_range`'s bound check, shared with the two-leg
+        // spine via `range_out_of_bounds`.
+        if range_out_of_bounds(req.byte_offset, req.byte_len, total_bytes) {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::RangeNotSatisfiable,
+                    rate_per_mb,
+                )
+                .await;
         }
 
         // Resolve the lane (must be pre-persisted — see module docs / #327).
@@ -1427,7 +1419,7 @@ impl ClientHandler {
 /// is also 0). Total-saturating throughout: the caller's range bounds check has
 /// already rejected an out-of-bounds request, and a zero-length blob correctly
 /// yields 0.
-fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) -> u64 {
+pub(super) fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) -> u64 {
     let end = if byte_len > 0 {
         byte_offset.saturating_add(byte_len).min(total_bytes)
     } else {
@@ -1441,9 +1433,50 @@ fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) -> u64 {
     aligned_end.saturating_sub(start)
 }
 
+/// Whether `[byte_offset, byte_offset + byte_len)` (`byte_len == 0` = to the
+/// blob end) lies outside a `total_bytes`-byte blob. Mirrors
+/// [`decdn_bao_range::align_range`]'s bound check so every serve tier — the
+/// direct-serve gate and the two-leg spine — refuses the same ranges with
+/// `RangeNotSatisfiable` BEFORE it signs a response. A whole-blob request
+/// (`0, 0`) is always in bounds, including for the empty blob.
+pub(super) const fn range_out_of_bounds(byte_offset: u64, byte_len: u64, total_bytes: u64) -> bool {
+    if byte_offset == 0 && byte_len == 0 {
+        return false;
+    }
+    if byte_offset >= total_bytes {
+        return true;
+    }
+    if byte_len == 0 {
+        return false;
+    }
+    match byte_offset.checked_add(byte_len) {
+        Some(end) => end > total_bytes,
+        None => true,
+    }
+}
+
 #[cfg(test)]
-mod aligned_span_tests {
-    use super::{CHUNK_GROUP_BYTES, aligned_span};
+mod range_helper_tests {
+    use super::{CHUNK_GROUP_BYTES, aligned_span, range_out_of_bounds};
+
+    #[test]
+    fn range_out_of_bounds_mirrors_align_range() {
+        let total = 100 * 1024;
+        // Whole blob and in-bounds tails / bounds are satisfiable.
+        assert!(!range_out_of_bounds(0, 0, total));
+        assert!(!range_out_of_bounds(16 * 1024, 0, total));
+        assert!(!range_out_of_bounds(16 * 1024, 32 * 1024, total));
+        assert!(!range_out_of_bounds(0, total, total));
+        // Offset at/past the end, an end past the blob, or an overflowing end.
+        assert!(range_out_of_bounds(total, 0, total));
+        assert!(range_out_of_bounds(total + 1, 0, total));
+        assert!(range_out_of_bounds(16 * 1024, total, total));
+        assert!(range_out_of_bounds(u64::MAX, 1, total));
+        assert!(range_out_of_bounds(1, u64::MAX, total));
+        // The empty blob is addressable only as (0, 0).
+        assert!(!range_out_of_bounds(0, 0, 0));
+        assert!(range_out_of_bounds(0, 1, 0));
+    }
 
     const G: u64 = CHUNK_GROUP_BYTES;
 
