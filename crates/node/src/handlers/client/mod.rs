@@ -60,6 +60,7 @@ use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
 use crate::node_origin::NodeOrigin;
 use crate::receipt_log::{RawReceipt, ReceiptSink};
+use crate::warn_throttle::WarnThrottle;
 
 // The paid-delivery methods are split across concern-focused submodules, each
 // a bare `impl ClientHandler` block over the fields defined here. Support
@@ -541,23 +542,6 @@ impl Drop for FloorReservation {
         // the pool ceiling and the per-signer live cap (ADR 003 §Pool solvency).
         self.release_live_repaid();
     }
-}
-
-/// Whether an insufficient-deposit `warn!` is due: `interval` has elapsed since
-/// `last_warn_ms`, or nothing has ever been warned (`last_warn_ms == 0`).
-///
-/// Pure and millisecond-based so the throttle is testable without sleeping. A
-/// clock that steps behind `last_warn_ms` yields `false` (via the saturating
-/// subtraction), suppressing rather than spamming. Note the asymmetry that leaves:
-/// a clock that jumps FORWARD parks `last_warn_ms` in the future, so the gate stays
-/// shut for the size of the jump rather than for `interval` — see
-/// [`ClientHandler::note_deposit_refusal`] for why that is tolerated.
-fn should_warn_now(now_ms: u64, last_warn_ms: u64, interval: Duration) -> bool {
-    if last_warn_ms == 0 {
-        return true;
-    }
-    let elapsed = now_ms.saturating_sub(last_warn_ms);
-    elapsed >= u64::try_from(interval.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Which floor gate refused an admission
@@ -1316,25 +1300,24 @@ pub struct ClientHandler {
     /// [`ClientHandlerDeps::rate_per_mb`]).
     rate_per_mb: u64,
     max_concurrent_streams: usize,
-    /// Throttle state for the insufficient-deposit refusal log (#1520): the
-    /// millisecond timestamp of the last emitted `warn!`, and how many refusals
-    /// have been swallowed since. See [`ClientHandler::note_deposit_refusal`].
-    ///
-    /// Unkeyed on purpose. A per-channel `governor` limiter was the obvious reach —
-    /// it is already a dependency and the vocabulary the three request limiters
-    /// speak — but keying it means an unboundedly growing map, and the in-tree cost
-    /// of owning one is `retain_recent` sweeps, split single-flight prune guards,
-    /// and two metrics per map (`crate::rate_limit`). That is a lot of machinery to
-    /// rate-limit a log line, and the aggregate is what answers the triage
-    /// question anyway: "one client ran dry" versus "I am refusing everyone". The
-    /// per-channel detail lives in the `debug!` beside it and in the counter.
-    deposit_refusal_last_warn_ms: AtomicU64,
-    deposit_refusal_suppressed: AtomicU64,
-    /// The same window for the per-signer LIVE-cap arm, kept separate from the pool
-    /// arm so neither can starve the other's `warn!` or pollute its `suppressed`
-    /// count ([`ClientHandler::note_refusal`]).
-    signer_cap_refusal_last_warn_ms: AtomicU64,
-    signer_cap_refusal_suppressed: AtomicU64,
+    /// Throttle for the insufficient-deposit refusal `warn!` (#1520). Unkeyed:
+    /// the aggregate answers the triage question — "one client ran dry" versus
+    /// "I am refusing everyone" — and the per-channel detail lives in the
+    /// `debug!` beside it and in the counter.
+    deposit_refusal_warn: WarnThrottle,
+    /// The same window for the per-signer LIVE-cap arm, kept separate from the
+    /// pool arm because the two carry different remedies: a pool-wide shortfall
+    /// clears with a top-up, a signer at its share does not.
+    signer_cap_refusal_warn: WarnThrottle,
+    /// Throttle for the `warn!` on a client binding whose signature is invalid
+    /// or recovers a different address. A remote peer triggers it at will.
+    binding_warn: WarnThrottle,
+    /// Throttle for the `warn!` on a stream request that carries no verified
+    /// binding. A remote peer triggers it at will.
+    unbound_request_warn: WarnThrottle,
+    /// Throttle for the `warn!` on a stream request that names no known lane. A
+    /// remote peer triggers it at will.
+    unknown_lane_warn: WarnThrottle,
     /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime).
     /// `None` (the default and production path) reads as [`APP_IDLE_TIMEOUT`]
     /// (30s); a shorter value is set at construction via [`ClientHandlerDeps`]
@@ -1449,10 +1432,11 @@ impl ClientHandler {
             content_deny: deps.content_deny,
             rate_per_mb: deps.rate_per_mb,
             max_concurrent_streams: deps.max_concurrent_streams,
-            deposit_refusal_last_warn_ms: AtomicU64::new(0),
-            deposit_refusal_suppressed: AtomicU64::new(0),
-            signer_cap_refusal_last_warn_ms: AtomicU64::new(0),
-            signer_cap_refusal_suppressed: AtomicU64::new(0),
+            deposit_refusal_warn: WarnThrottle::new(Self::DEPOSIT_REFUSAL_WARN_INTERVAL),
+            signer_cap_refusal_warn: WarnThrottle::new(Self::DEPOSIT_REFUSAL_WARN_INTERVAL),
+            binding_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
+            unbound_request_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
+            unknown_lane_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             idle_timeout: deps.idle_timeout,
             pool_recheck_interval: deps.pool_recheck_interval,
             warming_credit: deps.warming_credit,
@@ -1829,67 +1813,10 @@ impl ClientHandler {
     /// `[payment]` knob costs, and no operator needs to tune it.
     pub(super) const DEPOSIT_REFUSAL_WARN_INTERVAL: Duration = Duration::from_mins(5);
 
-    /// Record a refusal against one throttle window and decide whether this one
-    /// gets a `warn!`. Returns `Some(suppressed_since_last)` when the caller
-    /// should warn.
-    ///
-    /// The refusal is routine — a client running dry is not a fault — so warning
-    /// per occurrence is farmable into log spam by exactly the abuse this guards
-    /// against. But a one-shot latch (the only existing precedent, `log_per_source_poison`
-    /// in `crate::dispatch`) is wrong in the other direction: this fires
-    /// legitimately and repeatedly, so a permanently-latched warning is as
-    /// invisible as none. Hence a window, with the swallowed count carried on the
-    /// line so a reader can tell one dry client from a node refusing everyone.
-    ///
-    /// The caller passes its OWN window, because the two floor caps carry
-    /// different remedies: a pool-wide shortfall clears with a top-up, a signer at
-    /// its share does not. Sharing one window would let whichever cap fires more
-    /// often hold it open and silence the other entirely, and would mix both
-    /// causes into the `suppressed` count each line reports.
-    ///
-    /// The window arithmetic lives in [`should_warn_now`] so it is testable
-    /// without sleeping.
-    fn note_refusal(last_warn_ms: &AtomicU64, suppressed: &AtomicU64) -> Option<u64> {
-        suppressed.fetch_add(1, Ordering::Relaxed);
-        let now_ms = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX);
-        let last = last_warn_ms.load(Ordering::Relaxed);
-        if !should_warn_now(now_ms, last, Self::DEPOSIT_REFUSAL_WARN_INTERVAL) {
-            return None;
-        }
-        // Lost the race: another task is emitting this window's line. Its count
-        // already includes ours, because we bumped before checking.
-        if last_warn_ms
-            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return None;
-        }
-        Some(suppressed.swap(0, Ordering::Relaxed).saturating_sub(1))
-    }
-
-    /// Throttle window for the pool-wide arm: `remaining − M` cannot cover the
-    /// reserved cost.
-    pub(super) fn note_deposit_refusal(&self) -> Option<u64> {
-        Self::note_refusal(
-            &self.deposit_refusal_last_warn_ms,
-            &self.deposit_refusal_suppressed,
-        )
-    }
-
-    /// Throttle window for the per-signer LIVE-cap arm: the pool is solvent and one
-    /// signer holds its whole live concurrency cap.
-    pub(super) fn note_signer_cap_refusal(&self) -> Option<u64> {
-        Self::note_refusal(
-            &self.signer_cap_refusal_last_warn_ms,
-            &self.signer_cap_refusal_suppressed,
-        )
-    }
+    /// Minimum gap between `warn!` lines a remote peer can trigger at will: a bad
+    /// binding, a request with no binding, a request on an unknown lane. Each
+    /// line carries the offending `peer` and the `suppressed` count.
+    pub(super) const PEER_FAULT_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
     /// Emit the observable side of a floor-admission refusal, picking the message
     /// the refusing gate actually justifies.
@@ -1937,10 +1864,10 @@ impl ClientHandler {
             "refusing delivery: this capability signer already holds its live concurrency cap \
              of un-vouchered floor reservation; the pool itself can still pay"
         );
-        if let Some(suppressed) = self.note_signer_cap_refusal() {
+        if let Some(suppressed) = self.signer_cap_refusal_warn.admit() {
             tracing::warn!(
                 %pool_id, %signer, %signer_cap, %headroom, suppressed,
-                interval = ?Self::DEPOSIT_REFUSAL_WARN_INTERVAL,
+                interval = ?self.signer_cap_refusal_warn.interval(),
                 "refusing a paying client: one capability signer is running its whole live \
                  concurrency cap of un-vouchered streams at once while the pool is solvent. This \
                  clears as those streams pay; a sustained rate means that signer runs more \
@@ -1954,7 +1881,7 @@ impl ClientHandler {
     /// Emit the observable side of an insufficient-deposit refusal (#1520).
     ///
     /// Unconditional `debug!` so a support ticket is answerable at all, plus a
-    /// throttled `warn!` (see [`Self::note_deposit_refusal`]). The wire code is
+    /// throttled `warn!` ([`WarnThrottle`]). The wire code is
     /// deliberately lossy — `InsufficientDeposit` collapses to `NotFound` with the
     /// other miss reasons so a prober cannot map channel balances — so without these the
     /// only trace of a refusal is a counter that, at the time this was written, no
@@ -1972,10 +1899,10 @@ impl ClientHandler {
             %pool_id, %hash, %headroom, %ceiling,
             "refusing delivery: pool's refundable remaining deposit cannot cover the reserved cost"
         );
-        if let Some(suppressed) = self.note_deposit_refusal() {
+        if let Some(suppressed) = self.deposit_refusal_warn.admit() {
             tracing::warn!(
                 %pool_id, %headroom, %ceiling, suppressed,
-                interval = ?Self::DEPOSIT_REFUSAL_WARN_INTERVAL,
+                interval = ?self.signer_cap_refusal_warn.interval(),
                 "refusing paying clients: pool's refundable remaining deposit below the reserved cost. \
                  A sustained rate here is either a client running dry (no action) or this \
                  node's chain watcher lagging behind an on-chain top-up (check RPC health) \
@@ -3230,65 +3157,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deposit_refusal_warn_fires_on_the_first_refusal_then_waits_out_the_window() {
-        let interval = Duration::from_mins(5);
-        // Nothing warned yet: the very first refusal must be visible, not swallowed
-        // until a window elapses from process start.
-        assert!(should_warn_now(0, 0, interval));
-        assert!(should_warn_now(1_000_000, 0, interval));
-
-        let last = 1_000_000;
-        // Inside the window — suppressed.
-        assert!(!should_warn_now(last, last, interval));
-        assert!(!should_warn_now(last + 299_999, last, interval));
-        // Exactly at the boundary, and past it — due.
-        assert!(should_warn_now(last + 300_000, last, interval));
-        assert!(should_warn_now(last + 600_000, last, interval));
-    }
-
-    /// The atomic path, which `should_warn_now`'s two tests do not touch. The
-    /// suppressed count IS the feature — it is what distinguishes one dry client
-    /// from a node refusing everyone — and every part of producing it was
-    /// unverified: the `fetch_add` before the gate, the `swap(0)`, and the
-    /// `saturating_sub(1)` that removes the winner's own event from its own report.
-    ///
-    /// Mutants this kills: dropping the `-1` (every line off by one); moving the
-    /// `fetch_add` after the gate (the first warn reports 0 forever and nothing
-    /// accumulates); `swap` → `load` (the count grows monotonically and "suppressed
-    /// since the last line" becomes meaningless).
-    ///
-    /// No sleeping and no clock injection: the window is forced open by writing
-    /// `last_warn_ms` back to 1, which is what a test in the same module can do.
-    #[tokio::test]
-    async fn deposit_refusal_warn_reports_exactly_what_it_swallowed() {
-        let metrics = Arc::new(Metrics::new());
-        let (handler, _dir) = handler_for_tests(&metrics).await;
-
-        // First refusal is always visible, and has swallowed nothing.
-        assert_eq!(handler.note_deposit_refusal(), Some(0));
-        // Inside the window: silent, but counting.
-        assert_eq!(handler.note_deposit_refusal(), None);
-        assert_eq!(handler.note_deposit_refusal(), None);
-
-        // Force the window open. `1`, not `0` — `0` is the never-warned sentinel.
-        handler
-            .deposit_refusal_last_warn_ms
-            .store(1, Ordering::Relaxed);
-        assert_eq!(
-            handler.note_deposit_refusal(),
-            Some(2),
-            "the line must report the two it swallowed, not counting itself"
-        );
-
-        // And the counter reset, so the next window starts from zero.
-        assert_eq!(handler.note_deposit_refusal(), None);
-        handler
-            .deposit_refusal_last_warn_ms
-            .store(1, Ordering::Relaxed);
-        assert_eq!(handler.note_deposit_refusal(), Some(1));
-    }
-
     /// Floor-`M` serving policy: the pool serves a full credit window while
     /// `remaining − M` covers it and stops the instant it cannot. `M` is the
     /// refundable minimum the pool owner is guaranteed to keep.
@@ -3320,16 +3188,6 @@ mod tests {
         // Draining to the floor must stop serving: remaining − M underflows to 0.
         let at_floor = floor;
         assert!(at_floor.saturating_sub(floor).is_zero());
-    }
-
-    #[test]
-    fn deposit_refusal_warn_suppresses_rather_than_spams_on_a_backwards_clock() {
-        // A clock that steps backwards (NTP correction, VM migration) makes
-        // `now < last`. The saturating subtraction yields 0 elapsed, so the gate
-        // stays shut until the clock catches up. Suppressing is the safe direction
-        // for a log gate: the alternative is every refusal warning until then.
-        let interval = Duration::from_mins(5);
-        assert!(!should_warn_now(500, 1_000_000, interval));
     }
 
     /// ADR 011 §`StreamRequest` Response names distinct refusal codes for the two

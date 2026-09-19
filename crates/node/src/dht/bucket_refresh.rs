@@ -175,7 +175,7 @@ async fn refresh_one_bucket(
         Ok(k) => k,
         Err(e) => {
             tracing::warn!(
-                peer = ?peer,
+                peer = %peer,
                 error = %e,
                 "dht bucket-refresh: routing-table peer not a valid public key"
             );

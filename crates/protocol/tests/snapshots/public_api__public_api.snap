@@ -241,6 +241,8 @@ impl core::convert::From<[u8; 32]> for decdn_protocol::identity::ContentHash
 pub fn decdn_protocol::identity::ContentHash::from([u8; 32]) -> Self
 impl core::convert::From<decdn_protocol::identity::ContentHash> for [u8; 32]
 pub fn [u8; 32]::from(decdn_protocol::identity::ContentHash) -> Self
+impl core::fmt::Display for decdn_protocol::identity::ContentHash
+pub fn decdn_protocol::identity::ContentHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[repr(transparent)] pub struct decdn_protocol::identity::NodeId(_)
 impl decdn_protocol::identity::NodeId
 pub const fn decdn_protocol::identity::NodeId::as_bytes(&self) -> &[u8; 32]
@@ -250,6 +252,8 @@ impl core::convert::From<[u8; 32]> for decdn_protocol::identity::NodeId
 pub fn decdn_protocol::identity::NodeId::from([u8; 32]) -> Self
 impl core::convert::From<decdn_protocol::identity::NodeId> for [u8; 32]
 pub fn [u8; 32]::from(decdn_protocol::identity::NodeId) -> Self
+impl core::fmt::Display for decdn_protocol::identity::NodeId
+pub fn decdn_protocol::identity::NodeId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub const decdn_protocol::identity::ID_LEN: usize
 pub mod decdn_protocol::message
 pub enum decdn_protocol::message::MessageValidationError
@@ -445,6 +449,8 @@ impl core::convert::From<[u8; 32]> for decdn_protocol::identity::ContentHash
 pub fn decdn_protocol::identity::ContentHash::from([u8; 32]) -> Self
 impl core::convert::From<decdn_protocol::identity::ContentHash> for [u8; 32]
 pub fn [u8; 32]::from(decdn_protocol::identity::ContentHash) -> Self
+impl core::fmt::Display for decdn_protocol::identity::ContentHash
+pub fn decdn_protocol::identity::ContentHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_protocol::Coverage
 impl decdn_protocol::coverage::Coverage
 pub fn decdn_protocol::coverage::Coverage::covered_blocks(&self) -> impl core::iter::traits::iterator::Iterator<Item = u32> + '_
@@ -480,6 +486,8 @@ impl core::convert::From<[u8; 32]> for decdn_protocol::identity::NodeId
 pub fn decdn_protocol::identity::NodeId::from([u8; 32]) -> Self
 impl core::convert::From<decdn_protocol::identity::NodeId> for [u8; 32]
 pub fn [u8; 32]::from(decdn_protocol::identity::NodeId) -> Self
+impl core::fmt::Display for decdn_protocol::identity::NodeId
+pub fn decdn_protocol::identity::NodeId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_protocol::ProbeRequest
 pub decdn_protocol::ProbeRequest::hash: [u8; 32]
 pub decdn_protocol::ProbeRequest::timestamp_us: u64

@@ -82,6 +82,15 @@ macro_rules! id_newtype_impls {
                 value.0
             }
         }
+
+        /// Lowercase hex with no prefix — the same rendering as
+        /// `iroh::PublicKey` and `iroh_blobs::Hash`, so a log or span field
+        /// written from this type matches one written from the iroh type.
+        impl std::fmt::Display for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+            }
+        }
     };
 }
 
@@ -92,6 +101,16 @@ id_newtype_impls!(ContentHash);
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_is_lowercase_hex_without_prefix() {
+        let mut raw = [0u8; ID_LEN];
+        raw[0] = 0xAB;
+        raw[ID_LEN - 1] = 0x0F;
+        let expected = format!("ab{}0f", "00".repeat(ID_LEN - 2));
+        assert_eq!(NodeId::from_bytes(raw).to_string(), expected);
+        assert_eq!(ContentHash::from_bytes(raw).to_string(), expected);
+    }
 
     #[test]
     fn nodeid_postcard_identical_to_array() -> Result<(), postcard::Error> {
