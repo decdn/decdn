@@ -410,9 +410,10 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// the `{H}.obao4` outboard alone only pins the size to within one chunk
     /// group (`IROH_BLOCK_SIZE`, 16 KiB — the final group's true length isn't in
     /// the tree). The
-    /// `cdn/client/v1` serving handler calls this on a cold ranged cache miss
-    /// — via [`crate::CacheEngine::origin_size`] — before
-    /// [`crate::CacheEngine::pull_through_range`].
+    /// `cdn/client/v1` serving handler calls this on a cold cache miss — via
+    /// [`crate::CacheEngine::origin_size`] — before it signs a response and
+    /// runs the two-leg serve-miss spine over
+    /// [`crate::CacheEngine::origin_encode_range`].
     ///
     /// The probe is cheap (HTTP `HEAD` / S3 `HeadObject` / `fs` metadata), and
     /// `Ok(None)` is an **authoritative** "this origin does not hold the

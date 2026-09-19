@@ -1,8 +1,8 @@
 //! Bao verified-range helpers — re-exported from the iroh-blobs-free
 //! [`decdn_bao_range`] leaf crate (#578) so `decdn-client-pull` can share the
 //! exact same alignment / encoded-size / verify logic without linking
-//! iroh-blobs. The serve (`engine::export_bao_range`), origin-import
-//! (`engine::pull_through_range`), and client-receive paths therefore all agree
+//! iroh-blobs. The serve (`engine::export_bao_range`), origin range encode
+//! (`engine::origin_encode_range`), and client-receive paths therefore all agree
 //! by construction. See [ADR 038 §Wire format](../../../adr/038-bao-verified-range-streaming.md).
 //!
 //! The block size [`IROH_BLOCK_SIZE`] is declared in the leaf crate from the

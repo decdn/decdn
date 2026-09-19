@@ -4,8 +4,9 @@
 //! points ([`engine::CacheEngine::get`] / `populate`) fetch from a configured
 //! [`Origin`] backend on a cache miss, verify the BLAKE3 hash, and insert the
 //! bytes before returning them to the caller. The streaming entry points do
-//! not buffer whole-blob first: [`engine::CacheEngine::pull_through_range`]
-//! (#823) pulls only a verified sub-range. Node-to-node pull-through is one
+//! not buffer whole-blob first: [`engine::CacheEngine::origin_encode_range`]
+//! encodes one verified sub-range per draw for the node's two-leg serve-miss
+//! spine. Node-to-node pull-through is one
 //! such backend — the
 //! `node` crate supplies an [`Origin`] (`NodeOrigin`, #831) that pays a peer
 //! over `cdn/client/v1` — so this crate needs no knowledge of the paid path.
@@ -40,7 +41,7 @@ pub use circuit_breaker::{
 pub use decdn_bao_range::CHUNK_GROUP_BYTES;
 pub use engine::{
     CacheEngine, EvictionCandidates, EvictionPreview, OriginHeldReport, OriginPresence,
-    PresentRanges, RangePullOutcome, ServeAudit,
+    PresentRanges, ServeAudit,
 };
 pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
 pub use fill_session::{
