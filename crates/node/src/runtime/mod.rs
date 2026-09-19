@@ -620,6 +620,7 @@ async fn build_infra(
     // (#235). Done immediately after construction so a SIGHUP delivered
     // during the rest of startup still finds a target.
     reload_state.attach_limiter(Some(Arc::clone(&limiter)));
+    reload_state.attach_metrics(Arc::clone(&node_metrics));
 
     Ok(Infra {
         node_metrics,
@@ -1460,6 +1461,16 @@ async fn build_chain_and_handlers(
         closer_added = bootstrap_outcome.closer_peers_inserted,
         "dht bootstrap complete"
     );
+    infra.node_metrics.dht_bootstrap_find_node_failures(
+        u64::try_from(bootstrap_outcome.find_node_err).unwrap_or(u64::MAX),
+    );
+    infra
+        .node_metrics
+        .dht_routing_table_size(crate::dht::chain_projection::with_lock(
+            &dht_routing,
+            "dht routing table",
+            |table| table.len(),
+        ));
 
     Ok(ChainHandlers {
         rpc_url,
@@ -1879,6 +1890,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         bucket_refresh_stop_rx,
         crate::dht::bucket_refresh::BUCKET_REFRESH_TICK,
         Arc::clone(&bucket_refresh_clock),
+        Arc::clone(&infra.node_metrics),
     ));
 
     // RPC connectivity watchdog (issue #283). Updates `decdn_rpc_healthy`

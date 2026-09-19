@@ -158,9 +158,16 @@ impl ClientHandler {
                                 let ended = AssertUnwindSafe(serve).catch_unwind().await;
                                 unended.0 = None;
                                 match ended {
-                                    Ok(Ok(end)) => end.record(&span),
+                                    Ok(Ok(end)) => {
+                                        end.record(&span);
+                                        this.metrics.inbound_stream_ended(matches!(
+                                            end,
+                                            ServeEnd::Completed { .. }
+                                        ));
+                                    }
                                     Ok(Err(e)) => {
                                         span.record("outcome", "failed");
+                                        this.metrics.inbound_stream_ended(false);
                                         span.record(
                                             "error",
                                             tracing::field::display(format_args!("{e:#}")),
@@ -169,6 +176,7 @@ impl ClientHandler {
                                     }
                                     Err(panic) => {
                                         span.record("outcome", "panicked");
+                                        this.metrics.inbound_stream_ended(false);
                                         span.record("otel.status_code", "ERROR");
                                         std::panic::resume_unwind(panic);
                                     }

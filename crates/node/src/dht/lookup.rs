@@ -156,6 +156,9 @@ pub async fn find_providers(
     cfg: LookupConfig,
     metrics: Option<&crate::metrics::Metrics>,
 ) -> Vec<(NodeId, Coverage)> {
+    if let Some(metrics) = metrics {
+        metrics.dht_findvalue_query();
+    }
     let ctx = LookupCtx {
         endpoint,
         staker_set: staker_set.as_ref(),
@@ -163,6 +166,7 @@ pub async fn find_providers(
         requester_id,
         target,
         cfg,
+        metrics,
     };
     let mut state = LookupState::new(routing_table, &target, requester_id, cfg);
 
@@ -238,6 +242,7 @@ struct LookupCtx<'a> {
     requester_id: NodeId,
     target: Hash,
     cfg: LookupConfig,
+    metrics: Option<&'a crate::metrics::Metrics>,
 }
 
 /// Run one round of α parallel `find_value` RPCs against `batch`,
@@ -308,6 +313,9 @@ async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupStat
         // dashboard distinguish "round drained cleanly" from "round
         // timed out with N peers in flight."
         let aborted = tasks.len();
+        if let Some(metrics) = ctx.metrics {
+            metrics.dht_lookup_round_timeout();
+        }
         warn!(
             aborted_peers = aborted,
             timeout_ms = u64::try_from(ctx.cfg.round_timeout.as_millis()).unwrap_or(u64::MAX),

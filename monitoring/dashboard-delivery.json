@@ -193,7 +193,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "title": "Bytes served vs pulled through",
+      "title": "Bytes served, received and pulled through",
       "type": "timeseries",
       "targets": [
         {
@@ -213,6 +213,24 @@
           "expr": "sum(rate(decdn_cache_pull_through_bytes_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "B",
           "legendFormat": "pulled from origin"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_bytes_served_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "served on the wire"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_bytes_received_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "D",
+          "legendFormat": "received from peers"
         }
       ],
       "fieldConfig": {
@@ -286,7 +304,8 @@
         "x": 8,
         "y": 1
       },
-      "id": 3
+      "id": 3,
+      "description": "served on the wire and received from peers count cdn/client/v1 payload bytes; served to callers and pulled from origin are the cache engine's own view."
     },
     {
       "datasource": {
@@ -623,6 +642,125 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
+      "title": "Stream outcomes by direction",
+      "type": "timeseries",
+      "description": "Every paid stream ends in exactly one of completed or failed. inbound is this node serving; outbound is one pull from one upstream candidate. failed includes routine refusals (a cache miss, an unfunded channel) — the reason is in the refusal and pull-outcome panels. Mid-stream stops name the funding cause.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (direction) (rate(decdn_streams_completed_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "completed {{direction}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (direction) (rate(decdn_streams_failed_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "failed {{direction}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_serve_stream_midstream_pool_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "stopped mid-stream: pool exhausted"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_serve_stream_midstream_signer_cap_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "D",
+          "legendFormat": "stopped mid-stream: signer cap exhausted"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "id": 27
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "title": "Node-side faults — every one of these costs a delivery",
       "type": "timeseries",
       "description": "The first two are latent-bug reports, not degradation: the node's own byte accounting or encoder refused to proceed. Alert on > 0 and file it. Takedown terminations are correct behaviour, shown here so they are not mistaken for faults.",
@@ -744,7 +882,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 17
+        "y": 25
       },
       "id": 6
     },
@@ -866,7 +1004,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 17
+        "y": 25
       },
       "id": 7
     },
@@ -876,7 +1014,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 25
+        "y": 33
       },
       "id": 8,
       "panels": [],
@@ -981,7 +1119,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 26
+        "y": 34
       },
       "id": 9
     },
@@ -1174,7 +1312,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 26
+        "y": 34
       },
       "id": 10
     },
@@ -1303,7 +1441,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 34
+        "y": 42
       },
       "id": 11
     },
@@ -1432,7 +1570,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 34
+        "y": 42
       },
       "id": 12
     },
@@ -1561,7 +1699,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 34
+        "y": 42
       },
       "id": 13
     },
@@ -1571,7 +1709,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 41
+        "y": 49
       },
       "id": 14,
       "panels": [],
@@ -1654,7 +1792,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 42
+        "y": 50
       },
       "id": 15
     },
@@ -1756,7 +1894,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 42
+        "y": 50
       },
       "id": 16
     },
@@ -1858,7 +1996,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 42
+        "y": 50
       },
       "id": 17
     },
@@ -1978,7 +2116,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 49
+        "y": 57
       },
       "id": 18
     },
@@ -2078,7 +2216,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 49
+        "y": 57
       },
       "id": 19
     },
@@ -2208,7 +2346,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 49
+        "y": 57
       },
       "id": 20
     },
@@ -2218,7 +2356,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 56
+        "y": 64
       },
       "id": 21,
       "panels": [],
@@ -2350,7 +2488,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 57
+        "y": 65
       },
       "id": 22
     },
@@ -2461,7 +2599,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 57
+        "y": 65
       },
       "id": 23
     },
@@ -2573,7 +2711,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 57
+        "y": 65
       },
       "id": 24
     },
@@ -2684,7 +2822,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 64
+        "y": 72
       },
       "id": 25
     },
@@ -2726,7 +2864,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 64
+        "y": 72
       },
       "id": 26
     }

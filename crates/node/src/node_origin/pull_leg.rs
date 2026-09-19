@@ -528,7 +528,8 @@ pub(crate) async fn run_pull_leg(
         }
     };
 
-    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(Arc::clone(&session)));
+    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(Arc::clone(&session)))
+        .counting_received(Arc::clone(&deps.metrics));
     // The ramped credit-window pacer (ADR 003 §Credit window / ADR 037), SHARED
     // across every run so the pull never runs further ahead of the downstream
     // served-paid frontier than the window allows, in lockstep with the serve leg.

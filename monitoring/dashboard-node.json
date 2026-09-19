@@ -1528,12 +1528,123 @@
       "id": 18
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Operator-path failures",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_config_reload_failures_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "config reload failures"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_receipt_write_failures_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "receipt write failures"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 75
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          },
+          "unit": "short",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "id": 47,
+      "description": "A failed config reload kept the previous values; a failed receipt write is a lost audit-log row. Neither affects settlement."
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 34
+        "y": 41
       },
       "id": 19,
       "panels": [],
@@ -1649,7 +1760,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 35
+        "y": 42
       },
       "id": 20
     },
@@ -1770,7 +1881,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 35
+        "y": 42
       },
       "id": 21
     },
@@ -1870,7 +1981,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 42
+        "y": 49
       },
       "id": 22
     },
@@ -1990,7 +2101,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 42
+        "y": 49
       },
       "id": 23
     },
@@ -2119,7 +2230,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 42
+        "y": 49
       },
       "id": 24
     },
@@ -2239,7 +2350,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 49
+        "y": 56
       },
       "id": 25
     },
@@ -2386,7 +2497,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 49
+        "y": 56
       },
       "id": 26
     },
@@ -2396,7 +2507,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 56
+        "y": 63
       },
       "id": 27,
       "panels": [],
@@ -2537,7 +2648,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 57
+        "y": 64
       },
       "id": 28
     },
@@ -2693,7 +2804,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 57
+        "y": 64
       },
       "id": 29
     },
@@ -2832,7 +2943,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 64
+        "y": 71
       },
       "id": 30
     },
@@ -2972,7 +3083,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 64
+        "y": 71
       },
       "id": 31
     },
@@ -3083,7 +3194,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 71
+        "y": 78
       },
       "id": 32
     },
@@ -3185,9 +3296,249 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 71
+        "y": 78
       },
       "id": 33
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "DHT discovery and publishing",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_dht_findvalue_queries_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "find_value lookups"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_dht_store_published_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "stores accepted by peers"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_dht_lookup_round_timeouts_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "lookup round timeouts"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_dht_bucket_refresh_failures_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "D",
+          "legendFormat": "bucket refresh failures"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_dht_bootstrap_find_node_failures_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "E",
+          "legendFormat": "bootstrap failures"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 75
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          },
+          "unit": "short",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 85
+      },
+      "id": 45,
+      "description": "Lookups this node ran and STORE records peers accepted from it. Round timeouts and refresh or bootstrap failures are RPCs to peers that did not answer."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Routing table size",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max(decdn_dht_routing_table_size{instance=~\"$node\"})",
+          "refId": "A",
+          "legendFormat": "entries"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 75
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          },
+          "unit": "short",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 85
+      },
+      "id": 46,
+      "description": "Distinct peers in the local Kademlia routing table, set after bootstrap and on every bucket-refresh tick."
     },
     {
       "collapsed": false,
@@ -3195,7 +3546,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 92
       },
       "id": 34,
       "panels": [],
@@ -3293,7 +3644,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 79
+        "y": 93
       },
       "id": 35
     },
@@ -3387,7 +3738,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 79
+        "y": 93
       },
       "id": 36
     },
@@ -3479,7 +3830,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 79
+        "y": 93
       },
       "id": 37
     },
@@ -3520,7 +3871,7 @@
         "h": 11,
         "w": 24,
         "x": 0,
-        "y": 86
+        "y": 100
       },
       "id": 38
     },
@@ -3530,7 +3881,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 97
+        "y": 111
       },
       "id": 39,
       "panels": [],
@@ -3628,7 +3979,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 98
+        "y": 112
       },
       "id": 40
     },
@@ -3723,7 +4074,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 106
+        "y": 120
       },
       "id": 42
     },
@@ -3756,7 +4107,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 106
+        "y": 120
       },
       "id": 43
     },
@@ -3851,7 +4202,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 114
+        "y": 128
       },
       "id": 44
     }

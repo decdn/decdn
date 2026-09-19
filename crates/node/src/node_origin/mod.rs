@@ -1554,6 +1554,7 @@ async fn pull_from_candidate(
     let result = pull_from_candidate_in_span(deps_lock, deps, candidate, hash_bytes)
         .instrument(span.clone())
         .await;
+    deps.metrics.outbound_stream_ended(result.is_ok());
     span.record(
         "outcome",
         match result {
@@ -1779,7 +1780,8 @@ async fn pull_from_candidate_in_span(
             .build()?;
         let _entered = pull_span.enter();
         Ok::<_, std::io::Error>(rt.block_on(async move {
-            let store = NodeAdmitStore::new(engine, hash, total_bytes, None);
+            let store = NodeAdmitStore::new(engine, hash, total_bytes, None)
+                .counting_received(Arc::clone(&metrics));
             // Capture the lane seed before `ctx` moves behind the mutex, so the
             // on-thread settle can tell whether this stream advanced the watermark.
             let pool_id = ctx.pool_id;

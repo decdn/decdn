@@ -1431,6 +1431,99 @@ pub struct DecdnMetrics {
     /// a different question than the down-family, which tracks chain-read outages
     /// only. Pairs with the aggregate `warn!` in `rescan`.
     pub blacklist_enforcement_failures: Counter,
+
+    // ---- Stream outcomes and volume ----
+    /// `decdn_streams_completed_total{direction}`: paid streams that delivered
+    /// the whole request. `inbound` counts streams this node served; `outbound`
+    /// counts node-to-node pulls this node made from one upstream candidate.
+    /// With `streams_failed`, every stream counts exactly once, so
+    /// `completed / (completed + failed)` is the success ratio. The reason
+    /// split lives in the existing sibling counters (`serve_stream_rejected_*`,
+    /// `node_pull_*`).
+    streams_completed: Family<StreamLabels, Counter>,
+    /// `decdn_streams_failed_total{direction}`: paid streams that ended without
+    /// delivering the whole request — refused, stopped mid-stream, reset, or
+    /// ended on an error. See `streams_completed`.
+    streams_failed: Family<StreamLabels, Counter>,
+    /// `decdn_bytes_served_total`: payload bytes this node wrote to clients and
+    /// downstream nodes on `cdn/client/v1`, counted per frame as it is written.
+    pub bytes_served: Counter,
+    /// `decdn_bytes_received_total`: payload bytes this node admitted from
+    /// upstream nodes in paid node-to-node pulls, counted per verified range.
+    pub bytes_received: Counter,
+
+    // ---- Settlement and on-chain transactions ----
+    /// `decdn_pool_redemptions_total`: vouchers this node redeemed on-chain in a
+    /// landed `redeemMany`. One `redeemMany` adds its voucher count.
+    pub pool_redemptions: Counter,
+    /// `decdn_vouchers_received_total`: vouchers this node accepted as the
+    /// payee on an inbound stream.
+    pub vouchers_received: Counter,
+    /// `decdn_pool_grace_closes_total`: pools that entered the owner-close grace
+    /// window while this node still held unredeemed vouchers on them. Each one is
+    /// revenue that must redeem before the grace window ends.
+    pub pool_grace_closes: Counter,
+    /// `decdn_onchain_tx_landed_total`: node transactions mined and succeeded.
+    pub onchain_tx_landed: Counter,
+    /// `decdn_onchain_tx_reverted_total`: node transactions mined and reverted.
+    pub onchain_tx_reverted: Counter,
+    /// `decdn_onchain_tx_send_failed_total`: node transactions the RPC refused at
+    /// `send` — none was issued.
+    pub onchain_tx_send_failed: Counter,
+    /// `decdn_onchain_tx_receipt_failed_total`: issued node transactions whose
+    /// receipt wait failed. The transaction may still mine.
+    pub onchain_tx_receipt_failed: Counter,
+    /// `decdn_onchain_tx_timeout_total`: issued node transactions whose receipt
+    /// did not arrive inside the caller's bound. The transaction may still mine.
+    pub onchain_tx_timeout: Counter,
+
+    // ---- DHT ----
+    /// `decdn_dht_findvalue_queries_total`: `FIND_VALUE` lookups this node ran
+    /// to discover providers.
+    pub dht_findvalue_queries: Counter,
+    /// `decdn_dht_lookup_round_timeouts_total`: lookup rounds that hit the round
+    /// timeout and aborted their in-flight RPCs.
+    pub dht_lookup_round_timeouts: Counter,
+    /// `decdn_dht_store_published_total`: DHT `STORE` records a peer accepted
+    /// from this node.
+    pub dht_store_published: Counter,
+    /// `decdn_dht_routing_table_size`: distinct entries in the local Kademlia
+    /// routing table, set after bootstrap and on every bucket-refresh tick.
+    pub dht_routing_table_size: Gauge,
+    /// `decdn_dht_bucket_refresh_failures_total`: bucket-refresh `FIND_NODE`
+    /// RPCs that failed.
+    pub dht_bucket_refresh_failures: Counter,
+    /// `decdn_dht_bootstrap_find_node_failures_total`: bootstrap `FIND_NODE`
+    /// RPCs against a seed that failed.
+    pub dht_bootstrap_find_node_failures: Counter,
+
+    // ---- Fee-shares watcher parity ----
+    /// `decdn_fee_shares_watcher_poll_failures_total`: authoritative
+    /// `getShares()` re-reads that failed. The watcher keeps the current share and
+    /// its tick still succeeds, so this is the only signal that the safety-net
+    /// re-read is not landing.
+    pub fee_shares_watcher_poll_failures: Counter,
+    /// `decdn_fee_shares_watcher_restarts_total`: distinct drift windows the
+    /// fee-shares watcher entered. Mirrors `slash_watcher_restarts`.
+    pub fee_shares_watcher_restarts: Counter,
+    /// `decdn_fee_shares_watcher_down_seconds`: seconds the fee-shares watcher
+    /// has been failing its chain read, recomputed at scrape from
+    /// `fee_shares_watcher_down_since`.
+    pub fee_shares_watcher_down_seconds: Gauge,
+
+    // ---- Operator-path failures ----
+    /// `decdn_config_reload_failures_total`: SIGHUP or admin config reloads that
+    /// failed and kept the previous values.
+    pub config_reload_failures: Counter,
+    /// `decdn_receipt_write_failures_total`: download-receipt audit records the
+    /// writer failed to persist (an I/O error or a panicked write task). Audit
+    /// only; settlement is unaffected.
+    pub receipt_write_failures: Counter,
+    /// `decdn_serve_stream_midstream_pool_exhausted_total`: paying streams this
+    /// node stopped mid-delivery because the pool could no longer fund the
+    /// floor credit committed across its signers. The pool-level sibling of
+    /// `serve_stream_midstream_signer_cap_exhausted`.
+    pub serve_stream_midstream_pool_exhausted: Counter,
 }
 
 /// Aggregated deCDN node metrics.
@@ -1441,6 +1534,10 @@ pub struct Metrics {
     cache: Arc<CacheMetrics>,
     inbound_streams: Arc<Gauge>,
     outbound_streams: Arc<Gauge>,
+    inbound_completed: Arc<Counter>,
+    inbound_failed: Arc<Counter>,
+    outbound_completed: Arc<Counter>,
+    outbound_failed: Arc<Counter>,
     /// Materialized `probe_hold_unavailable` children, one per
     /// [`ProbeHoldUnavailableReason`]. Held here for the same reason as the
     /// stream gauges: `Family` creates a child series lazily on first
@@ -1482,6 +1579,11 @@ pub struct Metrics {
     /// `settlement_watcher_down_seconds` gauge. Mirrors
     /// `staker_set_watcher_down_since`.
     settlement_watcher_down_since: Mutex<Option<Instant>>,
+    /// `Instant` the fee-shares watcher entered its current error/backoff
+    /// window. `None` whenever a cycle is established. Backs the
+    /// `fee_shares_watcher_down_seconds` gauge. Mirrors
+    /// `staker_set_watcher_down_since`.
+    fee_shares_watcher_down_since: Mutex<Option<Instant>>,
 }
 
 impl Default for Metrics {
@@ -1532,6 +1634,18 @@ impl Metrics {
         let outbound_streams = decdn.streams_active.get_or_create(&StreamLabels {
             direction: StreamDirection::Outbound,
         });
+        // Both directions of both outcome families export at zero from a fresh
+        // registry, so a rate over them never starts absent.
+        let inbound = StreamLabels {
+            direction: StreamDirection::Inbound,
+        };
+        let outbound = StreamLabels {
+            direction: StreamDirection::Outbound,
+        };
+        let inbound_completed = decdn.streams_completed.get_or_create(&inbound);
+        let inbound_failed = decdn.streams_failed.get_or_create(&inbound);
+        let outbound_completed = decdn.streams_completed.get_or_create(&outbound);
+        let outbound_failed = decdn.streams_failed.get_or_create(&outbound);
         // Materialize every `reason` child up front so all three series export
         // at zero from a fresh registry (see the field docs on `Metrics`).
         // Driven off `ALL` and destructured positionally so a new variant
@@ -1559,6 +1673,10 @@ impl Metrics {
             cache,
             inbound_streams,
             outbound_streams,
+            inbound_completed,
+            inbound_failed,
+            outbound_completed,
+            outbound_failed,
             probe_hold_exhausted,
             probe_hold_disabled,
             probe_hold_stake_lane_reserved,
@@ -1568,6 +1686,7 @@ impl Metrics {
             slash_watcher_down_since: Mutex::new(None),
             blacklist_watcher_down_since: Mutex::new(None),
             settlement_watcher_down_since: Mutex::new(None),
+            fee_shares_watcher_down_since: Mutex::new(None),
         }
     }
 
@@ -1755,6 +1874,26 @@ impl Metrics {
     /// Count one outbound paid-delivery stream until the returned guard drops.
     pub(crate) fn outbound_stream_guard(&self) -> StreamGuard {
         StreamGuard::new(Arc::clone(&self.outbound_streams))
+    }
+
+    /// An inbound serve stream ended: `completed` when it delivered the whole
+    /// request, otherwise failed (`decdn_streams_{completed,failed}_total`).
+    pub(crate) fn inbound_stream_ended(&self, completed: bool) {
+        if completed {
+            self.inbound_completed.inc();
+        } else {
+            self.inbound_failed.inc();
+        }
+    }
+
+    /// An outbound node-to-node pull from one candidate ended: `completed` when
+    /// it filled the blob, otherwise failed.
+    pub(crate) fn outbound_stream_ended(&self, completed: bool) {
+        if completed {
+            self.outbound_completed.inc();
+        } else {
+            self.outbound_failed.inc();
+        }
     }
 
     /// Render the registry as `OpenMetrics` text — exactly the body the
@@ -2461,6 +2600,52 @@ recorders! {
     /// Record `count` hashes a blacklist re-scope could not enforce this pass
     /// (#1319 — `Recheck::Failed`). One aggregated bump per pass, not per hash.
     blacklist_enforcement_failure(count: u64) => blacklist_enforcement_failures.inc_by(count);
+
+    /// Count `bytes` of payload written to a client on `cdn/client/v1`.
+    bytes_served(bytes: u64) => bytes_served.inc_by(bytes);
+    /// Count `bytes` of payload admitted from an upstream node in a paid pull.
+    bytes_received(bytes: u64) => bytes_received.inc_by(bytes);
+
+    /// A landed `redeemMany` redeemed `vouchers` vouchers on-chain.
+    pool_redemptions(vouchers: u64) => pool_redemptions.inc_by(vouchers);
+    /// An inbound stream accepted a voucher as the payee.
+    voucher_received => vouchers_received.inc();
+    /// A pool entered the owner-close grace window while this node held
+    /// unredeemed vouchers on it.
+    pool_grace_close => pool_grace_closes.inc();
+    /// A node transaction mined and succeeded.
+    onchain_tx_landed => onchain_tx_landed.inc();
+    /// A node transaction mined and reverted.
+    onchain_tx_reverted => onchain_tx_reverted.inc();
+    /// The RPC refused a node transaction at `send`.
+    onchain_tx_send_failed => onchain_tx_send_failed.inc();
+    /// An issued node transaction's receipt wait failed.
+    onchain_tx_receipt_failed => onchain_tx_receipt_failed.inc();
+    /// An issued node transaction's receipt did not arrive in time.
+    onchain_tx_timeout => onchain_tx_timeout.inc();
+
+    /// A `FIND_VALUE` provider lookup started.
+    dht_findvalue_query => dht_findvalue_queries.inc();
+    /// A lookup round hit its timeout and aborted its in-flight RPCs.
+    dht_lookup_round_timeout => dht_lookup_round_timeouts.inc();
+    /// `count` peers accepted a `STORE` record from this node.
+    dht_store_published(count: u64) => dht_store_published.inc_by(count);
+    /// Publish the routing table's entry count.
+    dht_routing_table_size(entries: usize) => dht_routing_table_size.set(sat(entries));
+    /// A bucket-refresh `FIND_NODE` RPC failed.
+    dht_bucket_refresh_failure => dht_bucket_refresh_failures.inc();
+    /// `count` bootstrap `FIND_NODE` RPCs against seeds failed.
+    dht_bootstrap_find_node_failures(count: u64) => dht_bootstrap_find_node_failures.inc_by(count);
+
+    /// The fee-shares watcher's authoritative `getShares()` re-read failed.
+    fee_shares_watcher_poll_failure => fee_shares_watcher_poll_failures.inc();
+
+    /// A config reload failed and kept the previous values.
+    config_reload_failure => config_reload_failures.inc();
+    /// The receipt writer failed to persist one audit record.
+    receipt_write_failure => receipt_write_failures.inc();
+    /// A paying stream stopped mid-delivery on `PoolExhausted`.
+    serve_stream_midstream_pool_exhausted => serve_stream_midstream_pool_exhausted.inc();
 }
 
 watcher_downtime_recorders! {
@@ -2530,6 +2715,17 @@ watcher_downtime_recorders! {
     down_since: settlement_watcher_down_since,
     restarts: settlement_watcher_restarts,
     down_seconds: settlement_watcher_down_seconds;
+
+    /// The fee-shares watcher's poll tick errored and the loop is about to back
+    /// off. Stamps `fee_shares_watcher_down_since` once per drift window.
+    /// Mirrors [`Self::slash_watcher_backoff_started`].
+    fee_shares_watcher_backoff_started,
+    /// Mark the fee-shares watcher cycle established: clear
+    /// `fee_shares_watcher_down_since`. Mirrors [`Self::slash_watcher_cycle_established`].
+    fee_shares_watcher_cycle_established,
+    down_since: fee_shares_watcher_down_since,
+    restarts: fee_shares_watcher_restarts,
+    down_seconds: fee_shares_watcher_down_seconds;
 }
 
 /// Bind the `/metrics` HTTP listener synchronously so startup can fail fast
@@ -3505,6 +3701,74 @@ mod tests {
         assert!(text.contains("decdn_load_shed_pressure_active 1"), "{text}");
     }
 
+    /// Every counter and gauge this node exposes for stream outcomes, byte
+    /// volume, on-chain transactions, DHT health and operator-path failures
+    /// exports at zero from a fresh registry, so an alert or a rate over it
+    /// never starts absent.
+    #[test]
+    fn observability_counters_export_at_zero() {
+        let text = Metrics::new().encode().unwrap();
+        for name in [
+            "decdn_bytes_served_total",
+            "decdn_bytes_received_total",
+            "decdn_pool_redemptions_total",
+            "decdn_vouchers_received_total",
+            "decdn_pool_grace_closes_total",
+            "decdn_onchain_tx_landed_total",
+            "decdn_onchain_tx_reverted_total",
+            "decdn_onchain_tx_send_failed_total",
+            "decdn_onchain_tx_receipt_failed_total",
+            "decdn_onchain_tx_timeout_total",
+            "decdn_dht_findvalue_queries_total",
+            "decdn_dht_lookup_round_timeouts_total",
+            "decdn_dht_store_published_total",
+            "decdn_dht_routing_table_size",
+            "decdn_dht_bucket_refresh_failures_total",
+            "decdn_dht_bootstrap_find_node_failures_total",
+            "decdn_fee_shares_watcher_poll_failures_total",
+            "decdn_fee_shares_watcher_restarts_total",
+            "decdn_fee_shares_watcher_down_seconds",
+            "decdn_config_reload_failures_total",
+            "decdn_receipt_write_failures_total",
+            "decdn_serve_stream_midstream_pool_exhausted_total",
+        ] {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "{name} should export at zero on a fresh registry:\n{text}"
+            );
+        }
+    }
+
+    /// Both directions of both stream-outcome families export at zero, and
+    /// each end lands in exactly one family.
+    #[test]
+    fn stream_outcomes_split_by_direction() {
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        for family in [
+            "decdn_streams_completed_total",
+            "decdn_streams_failed_total",
+        ] {
+            for direction in ["inbound", "outbound"] {
+                let line = format!("{family}{{direction=\"{direction}\"}} 0");
+                assert!(text.lines().any(|l| l == line), "missing {line}:\n{text}");
+            }
+        }
+        metrics.inbound_stream_ended(true);
+        metrics.inbound_stream_ended(false);
+        metrics.inbound_stream_ended(false);
+        metrics.outbound_stream_ended(true);
+        let text = metrics.encode().unwrap();
+        for line in [
+            "decdn_streams_completed_total{direction=\"inbound\"} 1",
+            "decdn_streams_failed_total{direction=\"inbound\"} 2",
+            "decdn_streams_completed_total{direction=\"outbound\"} 1",
+            "decdn_streams_failed_total{direction=\"outbound\"} 0",
+        ] {
+            assert!(text.lines().any(|l| l == line), "missing {line}:\n{text}");
+        }
+    }
+
     #[test]
     fn receipt_writes_dropped_metric_starts_at_zero_and_increments() {
         // #803. The struct field is `receipt_writes_dropped`; the OpenMetrics
@@ -3800,7 +4064,7 @@ mod tests {
         // the `watcher_downtime_recorders!` template, so one compact pass per
         // watcher confirms the wiring: healthy reads 0, backoff climbs, one
         // restart per drift window, re-establish clears.
-        let cases: [(fn(&Metrics), fn(&Metrics), &str, &str); 2] = [
+        let cases: [(fn(&Metrics), fn(&Metrics), &str, &str); 3] = [
             (
                 Metrics::blacklist_watcher_cycle_established,
                 Metrics::blacklist_watcher_backoff_started,
@@ -3812,6 +4076,12 @@ mod tests {
                 Metrics::settlement_watcher_backoff_started,
                 "decdn_settlement_watcher_down_seconds",
                 "decdn_settlement_watcher_restarts_total",
+            ),
+            (
+                Metrics::fee_shares_watcher_cycle_established,
+                Metrics::fee_shares_watcher_backoff_started,
+                "decdn_fee_shares_watcher_down_seconds",
+                "decdn_fee_shares_watcher_restarts_total",
             ),
         ];
         for (established, backoff, down_seconds, restarts) in cases {

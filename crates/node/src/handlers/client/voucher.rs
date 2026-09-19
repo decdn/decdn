@@ -318,6 +318,7 @@ impl ClientHandler {
             .last_voucher_at
             .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
         drop(guard);
+        self.metrics.voucher_received();
 
         // (3) Post-acceptance bookkeeping (best-effort, off the durability path).
         //

@@ -824,7 +824,10 @@ pub async fn run_republish(
                         // discoverable for up to 50 minutes — the
                         // exact failure mode the eager publish
                         // closes.
-                        publish_hash(&endpoint, self_node_id, &routing, &cache, hash_bytes).await;
+                        let accepted =
+                            publish_hash(&endpoint, self_node_id, &routing, &cache, hash_bytes)
+                                .await;
+                        metrics.dht_store_published(accepted);
                         scheduler.schedule_steady(hash_bytes);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -916,8 +919,11 @@ pub async fn run_republish(
                     let ep = endpoint.clone();
                     let routing = Arc::clone(&routing);
                     let cache_cloned = cache.clone();
+                    let metrics = Arc::clone(&metrics);
                     tokio::spawn(async move {
-                        publish_batch(&ep, self_node_id, &routing, &cache_cloned, &held).await;
+                        let accepted =
+                            publish_batch(&ep, self_node_id, &routing, &cache_cloned, &held).await;
+                        metrics.dht_store_published(accepted);
                     });
                 }
             }
@@ -985,13 +991,15 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash)
 /// `coverage` is derived once, up front — every receiver gets the same
 /// snapshot of what this node can currently serve for `hash` rather than a
 /// per-RPC re-derivation that could drift mid-fan-out.
+///
+/// Returns how many peers accepted the record.
 async fn publish_hash(
     endpoint: &Endpoint,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
     cache: &decdn_cache::CacheEngine,
     hash: ContentHash,
-) {
+) -> u64 {
     let coverage = fetch_coverage(cache, hash).await;
     let targets: Vec<NodeId> = with_lock(routing, "dht routing table", |table| {
         // ADR 022 §STORE Flow line 128 specifies K+3 (= 23) closest
@@ -1006,7 +1014,7 @@ async fn publish_hash(
     if targets.is_empty() {
         // No routing-table entries yet (e.g. boot before bootstrap).
         // Nothing to do this cycle; the scheduler will retry.
-        return;
+        return 0;
     }
     let mut handles = Vec::with_capacity(targets.len());
     for peer in targets {
@@ -1021,18 +1029,19 @@ async fn publish_hash(
                         error = %e,
                         "dht republish: routing-table peer not a valid public key"
                     );
-                    return;
+                    return 0;
                 }
             };
             let addr = EndpointAddr::new(target_pk);
             match client::store(&endpoint_cloned, addr, hash, self_node_id, coverage_cloned).await {
-                Ok(ack) if ack.accepted => {}
+                Ok(ack) if ack.accepted => 1,
                 Ok(_) => {
                     tracing::debug!(
                         peer = %peer,
                         hash = ?hash,
                         "dht republish: peer rejected Store (not staked, over quota, etc)"
                     );
+                    0
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -1041,13 +1050,16 @@ async fn publish_hash(
                         error = %e,
                         "dht republish: Store request failed"
                     );
+                    0
                 }
             }
         }));
     }
+    let mut accepted = 0;
     for h in handles {
-        let _ = h.await;
+        accepted += h.await.unwrap_or(0);
     }
+    accepted
 }
 
 /// Derive `hash`'s current [`Coverage`] from the cache, folding any store
@@ -1096,20 +1108,22 @@ fn group_by_receiver(
 /// not staked, over quota) or a failed exchange is logged at debug — the
 /// record retries on the next cycle. Every DHT node implements
 /// `BatchStore`, so there is no per-hash fallback.
+///
+/// Returns how many `(peer, hash)` records the peers accepted.
 async fn publish_batch(
     endpoint: &Endpoint,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
     cache: &decdn_cache::CacheEngine,
     hashes: &[ContentHash],
-) {
+) -> u64 {
     let groups = with_lock(routing, "dht routing table", |table| {
         group_by_receiver(table, hashes)
     });
     if groups.is_empty() {
         // No routing-table entries yet (e.g. boot before bootstrap).
         // Nothing to do this cycle; the scheduler will retry.
-        return;
+        return 0;
     }
     // Derive each hash's coverage once, up front, and share it across every
     // receiver's batch — the same rationale as `publish_hash`'s single
@@ -1133,10 +1147,11 @@ async fn publish_batch(
                         error = %e,
                         "dht republish: routing-table peer not a valid public key"
                     );
-                    return;
+                    return 0;
                 }
             };
             let addr = EndpointAddr::new(target_pk);
+            let mut accepted: u64 = 0;
             for chunk in peer_hashes.chunks(MAX_BATCH_STORE_HASHES) {
                 let entries: Vec<(ContentHash, Coverage)> = chunk
                     .iter()
@@ -1149,6 +1164,8 @@ async fn publish_batch(
                     .await
                 {
                     Ok(ack) => {
+                        let ok = ack.results.iter().filter(|accepted| **accepted).count();
+                        accepted += u64::try_from(ok).unwrap_or(u64::MAX);
                         let rejected = ack.results.iter().filter(|accepted| !**accepted).count();
                         if rejected > 0 {
                             tracing::debug!(
@@ -1169,11 +1186,14 @@ async fn publish_batch(
                     }
                 }
             }
+            accepted
         }));
     }
+    let mut accepted = 0;
     for h in handles {
-        let _ = h.await;
+        accepted += h.await.unwrap_or(0);
     }
+    accepted
 }
 
 #[cfg(test)]

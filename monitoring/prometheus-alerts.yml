@@ -157,6 +157,25 @@ groups:
             the surrounding ERROR log line (emitted once per process).
             See docs/runbook.md § Cache coalescing mutex poisoned.
 
+      # The slash watcher backfills the appeal window at bring-up, so a restart
+      # inside that window re-counts a past slash from zero and fires this
+      # again. That repeat is intended: the appeal deadline is still open.
+      - alert: DecdnSlashDetected
+        expr: increase(decdn_slashes_detected_total[1h]) > 0
+        for: 0m
+        labels:
+          component: slashing
+          severity: critical
+          slash_risk: "true"
+        annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#slashing-risk"
+          summary: "Operator slashed on {{ $labels.instance }}"
+          description: |
+            The slash watcher saw a SlashJudge.Slashed event against this
+            operator. The bond lost stake. Read the slash reason from the
+            watcher's log line and consider `decdn appeal slash` inside the
+            30-day appeal window.
+
   # ---------------------------------------------------------------
   # Liveness / capacity — operator-onboarding defaults.
   # Tune `for:` and thresholds for your fleet size before paging.
@@ -334,6 +353,78 @@ groups:
             Queue-full drops are not counted; watch for the SDK's
             BatchSpanProcessor.SpanDroppingStarted warning.
 
+      - alert: DecdnFeeSharesWatcherStalled
+        expr: (decdn_fee_shares_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_fee_shares_watcher_last_tick_timestamp_seconds > 180)
+        for: 5m
+        labels:
+          component: watcher
+          severity: warning
+        annotations:
+          summary: "Fee-shares watcher not ticking on {{ $labels.instance }}"
+          description: |
+            No successful fee-shares poll tick for several intervals — the
+            watcher may have panicked, wedged, or exited. The node keeps
+            pricing its settlement share off the last split it read, which the
+            chain may have moved. Restart and check the RPC provider.
+
+      # getShares() is the safety-net re-read behind the SharesUpdated event
+      # tail. Its failure keeps the current share and the tick still succeeds,
+      # so the stall alert above cannot see it. The re-read runs on a slow
+      # cadence (hours), hence the long window.
+      - alert: DecdnFeeSharesPollFailing
+        expr: increase(decdn_fee_shares_watcher_poll_failures_total[6h]) > 0
+        for: 0m
+        labels:
+          component: watcher
+          severity: warning
+        annotations:
+          summary: "Fee-shares getShares() re-read failing on {{ $labels.instance }}"
+          description: |
+            The authoritative FeeRouter.getShares() re-read failed. The node
+            keeps the last share it read and relies on the event tail alone
+            until a re-read lands. Check the RPC provider.
+
+      - alert: DecdnRpcUnhealthy
+        expr: decdn_rpc_healthy == 0
+        for: 2m
+        labels:
+          component: chain
+          severity: critical
+        annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#rpc-unreachable"
+          summary: "Chain RPC unreachable from {{ $labels.instance }}"
+          description: |
+            The RPC watchdog cannot reach blockchain.rpc_url. While it is down
+            the node cannot read blacklist updates (slash exposure), follow
+            pool events, or redeem vouchers. See docs/runbook.md § RPC
+            unreachable.
+
+      - alert: DecdnConfigReloadFailed
+        expr: increase(decdn_config_reload_failures_total[15m]) > 0
+        for: 0m
+        labels:
+          component: config
+          severity: warning
+        annotations:
+          summary: "Config reload failed on {{ $labels.instance }}"
+          description: |
+            A SIGHUP or admin reload failed and the node kept its previous
+            values for every section. The warn! line beside it names the
+            cause. Fix the config file and reload again.
+
+      - alert: DecdnReceiptLogWriteFailing
+        expr: increase(decdn_receipt_write_failures_total[1h]) > 0
+        for: 0m
+        labels:
+          component: receipts
+          severity: warning
+        annotations:
+          summary: "Download-receipt log writes failing on {{ $labels.instance }}"
+          description: |
+            The receipt writer could not persist audit records. Settlement is
+            unaffected, but the audit log has gaps. Check disk space and
+            permissions under identity.data_dir.
+
       # NOTE: /health 503 detection requires an external prober (e.g.
       # blackbox_exporter) — it is not surfaced as a decdn_* metric. Add
       # an alert in your blackbox rules file along the lines of
@@ -346,15 +437,12 @@ groups:
   - name: decdn-delivery
     interval: 30s
     rules:
-      # Replaces DecdnHighStreamErrorRate (#1513), which divided
-      # decdn_streams_failed_total by decdn_streams_{failed,completed}_total —
-      # none of which the exporter emits, so it could never fire. There is no
-      # outcome-labelled stream family to rebuild the ratio from, and no
-      # serve-ATTEMPT counter to divide by, so this is an absolute rate on the
-      # one refusal reason that means "the node is at fault": every other
+      # An absolute rate on the one refusal reason that means "the node is at
+      # fault", not a ratio over decdn_streams_{failed,completed}_total: the
+      # failed family counts every refusal, and every other
       # decdn_serve_stream_rejected_* value is a client-side or policy outcome
       # (unfunded channel, unknown channel, denied hash) that a healthy node
-      # produces on purpose.
+      # produces on purpose, so a failure ratio would page on normal traffic.
       - alert: DecdnServeInternalErrorRate
         expr: sum by (instance) (rate(decdn_serve_stream_rejected_internal_error_total[5m])) > 0
         for: 10m
@@ -456,3 +544,97 @@ groups:
             `decdn_settlement_watcher_last_tick_timestamp_seconds`.
             Long `for:` because a burst of dry clients is normal.
             See adr/003-payments.md and docs/runbook.md.
+
+      - alert: DecdnRedemptionFailing
+        expr: increase(decdn_redemption_failures_total[30m]) > 2
+        for: 30m
+        labels:
+          component: payments
+          severity: warning
+        annotations:
+          summary: "Voucher redemptions failing on {{ $labels.instance }}"
+          description: |
+            redeemMany keeps failing: reverted, refused at send, or no receipt.
+            The claims stay and retry, but unredeemed revenue accrues and a
+            closing pool's grace window can run out. Read the redeemMany warn!
+            lines (each carries the tx hash when one was issued) and check the
+            RPC provider and the operator key's gas balance.
+
+      - alert: DecdnOnchainTxTimeouts
+        expr: increase(decdn_onchain_tx_timeout_total[1h]) > 0
+        for: 0m
+        labels:
+          component: payments
+          severity: warning
+        annotations:
+          summary: "On-chain transaction receipts timing out on {{ $labels.instance }}"
+          description: |
+            A node transaction was issued but its receipt did not arrive in
+            time. It can still mine; look it up by the tx hash in the warn!
+            line. A repeat points at a congested chain or a low gas price.
+
+      # The next four are latent-bug reports, not degradations: each non-zero
+      # increase is a node-side fault worth filing. increase(...[1h]) rather
+      # than a bare > 0, so the alert resolves an hour after the last event.
+      - alert: DecdnServeNodeFault
+        expr: increase(decdn_serve_stream_node_fault_total[1h]) > 0
+        for: 0m
+        labels:
+          component: delivery
+          severity: warning
+        annotations:
+          summary: "Delivery abandoned on a node-side fault on {{ $labels.instance }}"
+          description: |
+            A cdn/client/v1 delivery ended on a fault this node caused (encode,
+            alignment, store or framing). The client saw only a short stream.
+            File the error! line beside it.
+
+      - alert: DecdnFrameAccountingFault
+        expr: increase(decdn_serve_frame_accounting_fault_total[1h]) > 0
+        for: 0m
+        labels:
+          component: delivery
+          severity: warning
+        annotations:
+          summary: "Serve frame accounting fault on {{ $labels.instance }}"
+          description: |
+            A serve leg refused to frame a chunk because its own byte
+            accounting did not add up. The delivery aborted cleanly; file it.
+
+      - alert: DecdnWatcherPersistFailures
+        expr: increase(decdn_watcher_persist_failures_total[1h]) > 0
+        for: 0m
+        labels:
+          component: watcher
+          severity: warning
+        annotations:
+          summary: "Chain watcher could not persist state on {{ $labels.instance }}"
+          description: |
+            A chain watcher failed to write its projection or lane state. Check
+            disk health under identity.data_dir.
+
+      - alert: DecdnLaneFlushFailures
+        expr: increase(decdn_lane_flush_failures_total[1h]) > 0
+        for: 15m
+        labels:
+          component: payments
+          severity: warning
+        annotations:
+          summary: "Lane store cannot flush on {{ $labels.instance }}"
+          description: |
+            Background lane-store flushes keep failing; the dirty set retries
+            each tick, but the frontier a crash would replay keeps growing.
+            Check disk health and space under identity.data_dir.
+
+      - alert: DecdnNodePullCorruption
+        expr: increase(decdn_node_pull_corruption_total[1h]) > 0
+        for: 0m
+        labels:
+          component: delivery
+          severity: warning
+        annotations:
+          summary: "Upstream node served corrupt bytes to {{ $labels.instance }}"
+          description: |
+            A node-to-node pull received bytes that failed bao verification.
+            The node rejected them and scored the upstream; a repeat from one
+            peer points at a faulty or dishonest node.

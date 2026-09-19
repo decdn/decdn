@@ -780,6 +780,9 @@ pub struct RuntimeReloadState {
     /// lock is recovered in place rather than surfaced: a prior
     /// panic-mid-reload must not wedge every future reload.
     reload_lock: std::sync::Mutex<()>,
+    /// Counts failed reloads into `decdn_config_reload_failures_total`. Set
+    /// once by [`Self::attach_metrics`]; a reload before that is not counted.
+    metrics: std::sync::OnceLock<Arc<crate::metrics::Metrics>>,
 }
 
 impl std::fmt::Debug for RuntimeReloadState {
@@ -853,7 +856,14 @@ impl RuntimeReloadState {
             load_shed,
             sections,
             reload_lock: std::sync::Mutex::new(()),
+            metrics: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach the node metrics so failed reloads are counted. Call once, before
+    /// the SIGHUP select loop runs; a second call keeps the first handle.
+    pub fn attach_metrics(&self, metrics: Arc<crate::metrics::Metrics>) {
+        let _already_attached = self.metrics.set(metrics);
     }
 
     /// Attach the live cache engine after it's been built. Must be called
@@ -1134,7 +1144,23 @@ impl RuntimeReloadState {
     // (see `runtime::run`), so the signature is part of the contract
     // with the caller. A future revision adding `tokio::fs::read_to_string`
     // for the config file would also need it.
+    ///
+    /// A failed reload counts into `decdn_config_reload_failures_total` once
+    /// [`Self::attach_metrics`] has run.
     pub async fn reload(&self, path: &Path) -> anyhow::Result<()> {
+        let result = self.reload_sections(path);
+        if result.is_err()
+            && let Some(metrics) = self.metrics.get()
+        {
+            metrics.config_reload_failure();
+        }
+        result
+    }
+
+    /// The body of [`Self::reload`]: load, resolve, validate and commit every
+    /// section.
+    #[allow(clippy::cognitive_complexity)] // See `reload`.
+    fn reload_sections(&self, path: &Path) -> anyhow::Result<()> {
         let file = match load_file_config(Some(path)) {
             Ok(f) => f,
             Err(err) => {
