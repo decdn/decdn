@@ -312,26 +312,38 @@ Metrics cover aggregates; structured logs cover per-event detail. Logs complemen
 
 ### Trace Spans
 
-The node exports spans over OTLP when `observability.otlp_endpoint` is set. The export filter is separate from the log filter. It admits `INFO` spans from the deCDN crates only, so a change to `log_level` does not change the traces. A span covers one stream, pull, lookup, or transaction. No span covers a single frame.
+The node exports spans over OTLP when `observability.otlp_endpoint` is set. The export filter is separate from the log filter, so a change to `log_level` does not change the traces. The filter admits `INFO` spans and events from the deCDN crates. From other crates it admits `WARN` and `ERROR` events only, so a dependency failure lands on the deCDN span it happened in. The OTLP transport crates are always off. A span covers one stream, pull, lookup, or transaction. No span covers a single frame.
 
 | Span | Covers | Fields |
 |------|--------|--------|
-| `serve_stream` | One inbound `cdn/client/v1` stream | `peer`, `local_node_id`, `hash`, `pool_id`, `byte_offset`, `byte_len`, `direction`, `outcome`, `reason`, `bytes` |
-| `pull_through` | One cache-fill tier for a serve miss | `tier`, `hash`, `outcome` |
-| `origin_pull` | One walk of the origin chain | `hash`, `local_only` |
-| `origin_range_pull` | One ranged pull from the origin chain | `hash`, `byte_offset`, `byte_len` |
+| `serve_stream` | One inbound `cdn/client/v1` stream | `peer`, `local_node_id`, `hash`, `pool_id`, `byte_offset`, `byte_len`, `direction`, `outcome`, `reason`, `bytes`, `error` |
+| `pull_through` | One buffered cache-fill tier for a serve miss | `tier`, `hash`, `outcome` |
+| `serve_miss_pull` | The streaming pull thread for a serve miss | `tier`, `hash` |
+| `origin_pull` | One walk of the origin chain | `hash`, `local_only`, `outcome`, `error` |
+| `origin_range_pull` | One ranged pull from the origin chain | `hash`, `byte_offset`, `byte_len`, `outcome`, `error` |
 | `node_pull` | One node-to-node pull, over every candidate | `hash`, `outcome` |
 | `upstream_stream` | One paid pull from one candidate | `peer`, `local_node_id`, `hash`, `pool_id`, `direction`, `outcome` |
-| `open_progressive_pull` | The dial and handshake of one pulled range | `peer`, `local_node_id`, `hash`, `pool_id`, `byte_offset`, `byte_len` |
+| `open_progressive_pull` | The dial and handshake of one pulled range | `peer`, `local_node_id`, `hash`, `pool_id`, `byte_offset`, `byte_len`, `error` |
 | `dht_lookup` | One `FIND_VALUE` lookup | `hash`, `rounds`, `providers` |
 | `redeem_cycle` | One submission pass of the redeemer | `chunks`, `strict_flush` |
 | `onchain_tx` | One `redeemMany` from send to receipt | `op`, `depth`, `voucher_count`, `tx`, `outcome` |
 
-A miss nests as `serve_stream` → `pull_through` → `origin_pull` → `node_pull` → `upstream_stream` → `open_progressive_pull`.
+`serve_stream` records one `outcome`:
+
+- `completed`: the whole request is delivered and paid.
+- `refused`: a signed refusal. `reason` names it, for example `cache_miss`.
+- `stopped`: delivery stops mid-stream. `reason` names the stop, for example `pool_exhausted`.
+- `reset`: a reset with no signed response. `reason` is `stream_cap_full` or `bad_binding`.
+- `failed`: the stream ends on an error. `error` holds the error text.
+- `panicked` or `cancelled`: the task panics, or it stops before the stream ends.
+
+A failed request read, a full stream cap, and a bad binding end before the node reads the request fields, so those spans have no `hash`.
+
+A buffered miss nests as `serve_stream` → `pull_through` → `origin_pull` → `node_pull` → `upstream_stream` → `open_progressive_pull`. A streaming miss nests as `serve_stream` → `serve_miss_pull` → `open_progressive_pull`.
 
 **Correlation across nodes.** No trace context crosses the wire. A peer controls what it sends, so a remote trace parent would let it set this node's sampling decision. Instead, both ends of a transfer record the same fields in the same format. The requester's `open_progressive_pull` and the server's `serve_stream` share `hash`, `pool_id` and `byte_offset`, and each side's `local_node_id` is the other side's `peer`. One TraceQL query finds both spans.
 
-The span-metrics generator derives latency from span durations, so the exporter has no histograms. Use the span name and `outcome` as its dimensions. Do not use `hash` or `peer`, because each value makes a new series.
+**Latency.** The exporter has no histograms. Tempo derives latency from span durations. Group by span name and `outcome`. Do not group by `hash` or `peer`, because each value makes a new series.
 
 ### Canonical Metric Name Cross-Reference
 

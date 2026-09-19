@@ -757,3 +757,119 @@ pub(crate) fn spawn_server(
         }
     })
 }
+
+/// One closed span, as [`capture_spans`] saw it.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedSpan {
+    /// The span's name.
+    pub(crate) name: &'static str,
+    /// Every field recorded on the span, as its `Display`/`Debug` string.
+    pub(crate) fields: std::collections::HashMap<String, String>,
+    /// The name of the span's parent, if it had one.
+    pub(crate) parent: Option<&'static str>,
+}
+
+/// Collects closed spans into a shared list.
+#[derive(Clone, Default)]
+pub(crate) struct SpanCapture(Arc<std::sync::Mutex<Vec<CapturedSpan>>>);
+
+impl SpanCapture {
+    /// Every closed span named `name` whose `field` reads `value`.
+    pub(crate) fn matching(&self, name: &str, field: &str, value: &str) -> Vec<CapturedSpan> {
+        self.0.lock().map_or_else(
+            |_| Vec::new(),
+            |spans| {
+                spans
+                    .iter()
+                    .filter(|s| s.name == name && s.fields.get(field).is_some_and(|v| v == value))
+                    .cloned()
+                    .collect()
+            },
+        )
+    }
+}
+
+/// Field values of an open span, kept in the span's extensions.
+struct OpenFields(std::collections::HashMap<String, String>);
+
+struct FieldVisitor<'a>(&'a mut std::collections::HashMap<String, String>);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for SpanCapture
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = std::collections::HashMap::new();
+        attrs.record(&mut FieldVisitor(&mut fields));
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(OpenFields(fields));
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if let Some(span) = ctx.span(id)
+            && let Some(open) = span.extensions_mut().get_mut::<OpenFields>()
+        {
+            values.record(&mut FieldVisitor(&mut open.0));
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let Some(span) = ctx.span(&id) else {
+            return;
+        };
+        let fields = span
+            .extensions_mut()
+            .remove::<OpenFields>()
+            .map(|open| open.0)
+            .unwrap_or_default();
+        let captured = CapturedSpan {
+            name: span.name(),
+            fields,
+            parent: span.parent().map(|p| p.name()),
+        };
+        if let Ok(mut spans) = self.0.lock() {
+            spans.push(captured);
+        }
+    }
+}
+
+/// Install a process-wide span capture once and return it. Global, not
+/// thread-local, because the serve and pull tasks run on runtime worker and
+/// pull threads. Shared across the tests of one binary, so each test filters
+/// by a field unique to it (such as its `hash`).
+pub(crate) fn capture_spans() -> SpanCapture {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    static CAPTURE: std::sync::OnceLock<SpanCapture> = std::sync::OnceLock::new();
+    CAPTURE
+        .get_or_init(|| {
+            let capture = SpanCapture::default();
+            let installed = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(capture.clone()),
+            );
+            assert!(installed.is_ok(), "a global subscriber was already set");
+            capture
+        })
+        .clone()
+}

@@ -25,9 +25,53 @@ pub(super) enum ServeEnd {
         /// Payload bytes written to the client before the stop.
         bytes: u64,
     },
-    /// Reset with no signed response: the stream cap was full, or the client
-    /// binding failed to verify.
-    Reset,
+    /// Reset with no signed response.
+    Reset(ResetCause),
+}
+
+/// Why a serve stream was reset with no signed response. The two causes call
+/// for opposite responses: a full stream cap is this node's capacity, a bad
+/// binding is the client's fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResetCause {
+    /// The per-connection stream cap was full (`RATE_LIMITED`).
+    StreamCapFull,
+    /// The client binding failed to verify (`MALFORMED_MESSAGE`).
+    BadBinding,
+}
+
+impl ResetCause {
+    /// The `reason` value a span records for this reset.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::StreamCapFull => "stream_cap_full",
+            Self::BadBinding => "bad_binding",
+        }
+    }
+}
+
+/// The `reason` value a span records for a refusal: snake case, like every
+/// other `reason` and `outcome` value, so one attribute reads one way.
+const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
+    match reason {
+        ServeRejectReason::EvictedSinceProbe => "evicted_since_probe",
+        ServeRejectReason::CacheMiss => "cache_miss",
+        ServeRejectReason::InternalError => "internal_error",
+        ServeRejectReason::UnknownChannel => "unknown_lane",
+        ServeRejectReason::OwnerMismatch => "owner_mismatch",
+        ServeRejectReason::InsufficientDeposit => "insufficient_deposit",
+        ServeRejectReason::PoolUnconfirmed => "pool_unconfirmed",
+        ServeRejectReason::SignerCapExhausted => "signer_cap_exhausted",
+        ServeRejectReason::SignerFloorAtCap => "signer_floor_at_cap",
+        ServeRejectReason::LoadShedHit => "load_shed_hit",
+        ServeRejectReason::LoadShedMiss => "load_shed_miss",
+        ServeRejectReason::RangeNotSatisfiable => "range_not_satisfiable",
+        ServeRejectReason::HashDenied => "hash_denied",
+        ServeRejectReason::ChainHashDenied => "chain_hash_denied",
+        ServeRejectReason::OriginDenied => "origin_denied",
+        ServeRejectReason::ForeignNamespaceDeclined => "foreign_declined",
+        ServeRejectReason::ChainStale => "chain_stale",
+    }
 }
 
 /// Why a serve stopped after delivery began.
@@ -60,12 +104,12 @@ impl ServeStop {
 
 impl ServeEnd {
     /// The `outcome` value a span records for this end.
-    pub(super) const fn outcome(self) -> &'static str {
+    const fn outcome(self) -> &'static str {
         match self {
             Self::Completed { .. } => "completed",
             Self::Refused(_) => "refused",
             Self::Stopped { .. } => "stopped",
-            Self::Reset => "reset",
+            Self::Reset(_) => "reset",
         }
     }
 
@@ -77,13 +121,15 @@ impl ServeEnd {
                 span.record("bytes", bytes);
             }
             Self::Refused(reason) => {
-                span.record("reason", tracing::field::debug(reason));
+                span.record("reason", refusal_reason(reason));
             }
             Self::Stopped { stop, bytes } => {
                 span.record("reason", stop.as_str());
                 span.record("bytes", bytes);
             }
-            Self::Reset => {}
+            Self::Reset(cause) => {
+                span.record("reason", cause.as_str());
+            }
         }
     }
 }
@@ -99,7 +145,7 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::super::dispatch::{record_request, serve_stream_span};
-    use super::{ServeEnd, ServeStop};
+    use super::{ResetCause, ServeEnd, ServeStop};
     use crate::handlers::client::StreamRequest;
 
     /// One exported span: its name and its attributes as strings.
@@ -157,10 +203,10 @@ mod tests {
         attrs
     }
 
-    /// The join keys a requester's `upstream_stream` / `open_progressive_pull`
-    /// span matches on reach the exporter in the same renderings: lowercase-hex
-    /// `hash` (as `iroh_blobs::Hash` and `ContentHash` print), `0x` `pool_id`
-    /// (as `B256` prints), and the numeric range.
+    /// The join keys a requester's `open_progressive_pull` span matches on
+    /// reach the exporter in the same renderings: lowercase-hex `hash` (as
+    /// `iroh_blobs::Hash` and `ContentHash` print), `0x` `pool_id` (as `B256`
+    /// prints), and the numeric range.
     #[test]
     fn serve_stream_span_exports_the_join_keys_and_outcome() {
         let attrs = export_one(ServeEnd::Completed { bytes: 8192 });
@@ -185,7 +231,11 @@ mod tests {
 
         let refused = export_one(ServeEnd::Refused(super::ServeRejectReason::CacheMiss));
         assert_eq!(refused["outcome"], "refused");
-        assert_eq!(refused["reason"], "CacheMiss");
+        assert_eq!(refused["reason"], "cache_miss");
         assert!(!refused.contains_key("bytes"));
+
+        let reset = export_one(ServeEnd::Reset(ResetCause::BadBinding));
+        assert_eq!(reset["outcome"], "reset");
+        assert_eq!(reset["reason"], "bad_binding");
     }
 }

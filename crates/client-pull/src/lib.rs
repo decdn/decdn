@@ -2347,15 +2347,16 @@ impl std::fmt::Debug for UpstreamPull {
 #[tracing::instrument(
     name = "open_progressive_pull",
     skip_all,
-    err(Display, level = "debug"),
     fields(
+        error = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
         otel.kind = "client",
         peer = %target.id,
         local_node_id = %endpoint.id(),
         hash = %decdn_protocol::ContentHash::from_bytes(hash),
         pool_id = %ctx.pool_id,
-        byte_offset,
-        byte_len,
+        byte_offset = byte_offset,
+        byte_len = byte_len,
     )
 )]
 pub async fn open_progressive_pull(
@@ -2384,122 +2385,127 @@ pub async fn open_progressive_pull(
     // connection already live. `None` for a caller with no such hazard.
     on_connect: Option<&DialObserver<'_>>,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-    let window = deadlines.window;
-    let floor_bps = deadlines.floor_bps;
-    // TTFB boundary (#1906-series peer store): measured from immediately before
-    // dial to the moment the signed `StreamResponse` verifies inside
-    // `open_stream`, so it captures the real send-to-first-byte round trip a
-    // probe cannot — a probe measures only its own tiny response, not the
-    // paid-stream handshake this fetch actually pays for.
-    let started = std::time::Instant::now();
-    let (conn, send, recv, resp, resp_ext) = open_stream(
-        endpoint,
-        target,
-        ctx,
-        slash_domain,
-        expected_signer,
-        hash,
-        // Node-to-node pull. `NO_NAMESPACE` (0) for a DHT-discovered *holder* — it
-        // already holds the bytes, so the downstream node needs no namespace (ADR
-        // 002 §Retrieval by namespace). But a directory-discovered *cold origin* is
-        // reached with the served request's namespace: it must fill from its own
-        // backend, and its pull-through authorized-origin gate resolves on that
-        // namespace (ADR 005 §Namespace routing). The caller passes whichever
-        // applies.
-        namespace_id,
-        byte_offset,
-        byte_len,
-        timestamp_us,
-        deadlines.open,
-        on_connect,
-    )
-    .await?;
-    if !resp.body.ok {
-        return Err(UpstreamRefused::open(resp, &resp_ext));
-    }
-    // The peer's signed `total_bytes` never drives a refusal (#1895): it is
-    // peer-controlled and unverified (`StreamResponse::validate()` does not bound
-    // it), so the `max_blob_size_bytes` ceiling is enforced on the bytes that
-    // ACTUALLY arrive, inside `UpstreamPull::next_chunk`, not on the claim. Refusing
-    // on an inflated claim would let a holder centralise a small blob's traffic
-    // across every finite-ceiling relay; a lie cannot produce bytes that verify
-    // against the true root, and an honest giant is streamed and paid for only up
-    // to one ceiling.
-    // Buyer-side rate ceiling (#1375): refuse an over-ceiling quote before the
-    // first paid interval, carrying the signed quote out as rate-manipulation
-    // evidence. `0` = unbounded.
-    if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
-        return Err(RateAboveCeiling::over_ceiling(resp, max_rate_per_mb));
-    }
-    // A resume offset the blob cannot satisfy. `<=` rather than `<`: an offset
-    // exactly AT the end has no chunk group to anchor either, and `align_range`
-    // would reject it a few lines later with an untyped fault — this way both
-    // land on the same typed sentinel. Guarded on `byte_offset > 0` so a 0-byte
-    // blob fetched from 0 (#1054) is untouched.
-    if resp.body.total_bytes <= byte_offset && byte_offset > 0 {
-        return Err(anyhow::Error::new(ResumeOffsetPastEnd {
-            total_bytes: resp.body.total_bytes,
+    let result: anyhow::Result<(UpstreamPullHeader, UpstreamPull)> = async {
+        let window = deadlines.window;
+        let floor_bps = deadlines.floor_bps;
+        // TTFB boundary (#1906-series peer store): measured from immediately before
+        // dial to the moment the signed `StreamResponse` verifies inside
+        // `open_stream`, so it captures the real send-to-first-byte round trip a
+        // probe cannot — a probe measures only its own tiny response, not the
+        // paid-stream handshake this fetch actually pays for.
+        let started = std::time::Instant::now();
+        let (conn, send, recv, resp, resp_ext) = open_stream(
+            endpoint,
+            target,
+            ctx,
+            slash_domain,
+            expected_signer,
+            hash,
+            // Node-to-node pull. `NO_NAMESPACE` (0) for a DHT-discovered *holder* — it
+            // already holds the bytes, so the downstream node needs no namespace (ADR
+            // 002 §Retrieval by namespace). But a directory-discovered *cold origin* is
+            // reached with the served request's namespace: it must fill from its own
+            // backend, and its pull-through authorized-origin gate resolves on that
+            // namespace (ADR 005 §Namespace routing). The caller passes whichever
+            // applies.
+            namespace_id,
             byte_offset,
-        }));
-    }
+            byte_len,
+            timestamp_us,
+            deadlines.open,
+            on_connect,
+        )
+        .await?;
+        if !resp.body.ok {
+            return Err(UpstreamRefused::open(resp, &resp_ext));
+        }
+        // The peer's signed `total_bytes` never drives a refusal (#1895): it is
+        // peer-controlled and unverified (`StreamResponse::validate()` does not bound
+        // it), so the `max_blob_size_bytes` ceiling is enforced on the bytes that
+        // ACTUALLY arrive, inside `UpstreamPull::next_chunk`, not on the claim. Refusing
+        // on an inflated claim would let a holder centralise a small blob's traffic
+        // across every finite-ceiling relay; a lie cannot produce bytes that verify
+        // against the true root, and an honest giant is streamed and paid for only up
+        // to one ceiling.
+        // Buyer-side rate ceiling (#1375): refuse an over-ceiling quote before the
+        // first paid interval, carrying the signed quote out as rate-manipulation
+        // evidence. `0` = unbounded.
+        if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
+            return Err(RateAboveCeiling::over_ceiling(resp, max_rate_per_mb));
+        }
+        // A resume offset the blob cannot satisfy. `<=` rather than `<`: an offset
+        // exactly AT the end has no chunk group to anchor either, and `align_range`
+        // would reject it a few lines later with an untyped fault — this way both
+        // land on the same typed sentinel. Guarded on `byte_offset > 0` so a 0-byte
+        // blob fetched from 0 (#1054) is untouched.
+        if resp.body.total_bytes <= byte_offset && byte_offset > 0 {
+            return Err(anyhow::Error::new(ResumeOffsetPastEnd {
+                total_bytes: resp.body.total_bytes,
+                byte_offset,
+            }));
+        }
 
-    let rate_per_mb = resp.body.rate_per_mb;
-    // Wire-byte bound (bao-encoded size of the aligned range), not content bytes —
-    // the window path forwards this stream verbatim and pays the upstream in wire
-    // bytes (ADR 038 §Payment metering).
-    let total_bytes = resp.body.total_bytes;
-    let expected_wire_bytes = aligned_wire_len(byte_offset, byte_len, total_bytes)?;
-    // Received-byte ceiling (#1895), expressed as a WIRE bound so `next_chunk` can
-    // enforce it without decoding: the wire size of a ceiling-sized blob's content
-    // from this offset. Enforced on the bytes that ACTUALLY arrive, never on the
-    // peer's unverified `total_bytes` claim. A resume offset already at/past the
-    // ceiling means the blob is genuinely oversized — abort before the first chunk.
-    // `0` = unlimited.
-    let max_received_wire = if max_blob_size_bytes == 0 {
-        0
-    } else if byte_offset >= max_blob_size_bytes {
-        return Err(anyhow::Error::new(BlobTooLarge {
-            received: byte_offset,
-            ceiling: max_blob_size_bytes,
-        }));
-    } else {
-        aligned_wire_len(byte_offset, 0, max_blob_size_bytes)?
-    };
-    let ttfb_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let header = UpstreamPullHeader {
-        total_bytes,
-        rate_per_mb,
-        interval_bytes: CHUNK_BYTES,
-        ttfb_ms,
-    };
-    let progress_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let floor = progress::ThroughputFloor::new(
-        progress::FloorConfig { window, floor_bps },
-        Arc::clone(&progress_counter),
-        tokio::time::Instant::now(),
-    );
-    let mut sampler = tokio::time::interval(stall_sample_period(window));
-    sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let pull = UpstreamPull {
-        window,
-        progress_counter,
-        floor,
-        sampler,
-        conn,
-        send,
-        recv,
-        ctx: ctx.clone(),
-        ledger,
-        hash,
-        rate_per_mb,
-        meter: StreamMeter::default(),
-        expected_wire_bytes,
-        max_received_wire,
-        cumulative: 0,
-        unproved: 0,
-        ended: false,
-    };
-    Ok((header, pull))
+        let rate_per_mb = resp.body.rate_per_mb;
+        // Wire-byte bound (bao-encoded size of the aligned range), not content bytes —
+        // the window path forwards this stream verbatim and pays the upstream in wire
+        // bytes (ADR 038 §Payment metering).
+        let total_bytes = resp.body.total_bytes;
+        let expected_wire_bytes = aligned_wire_len(byte_offset, byte_len, total_bytes)?;
+        // Received-byte ceiling (#1895), expressed as a WIRE bound so `next_chunk` can
+        // enforce it without decoding: the wire size of a ceiling-sized blob's content
+        // from this offset. Enforced on the bytes that ACTUALLY arrive, never on the
+        // peer's unverified `total_bytes` claim. A resume offset already at/past the
+        // ceiling means the blob is genuinely oversized — abort before the first chunk.
+        // `0` = unlimited.
+        let max_received_wire = if max_blob_size_bytes == 0 {
+            0
+        } else if byte_offset >= max_blob_size_bytes {
+            return Err(anyhow::Error::new(BlobTooLarge {
+                received: byte_offset,
+                ceiling: max_blob_size_bytes,
+            }));
+        } else {
+            aligned_wire_len(byte_offset, 0, max_blob_size_bytes)?
+        };
+        let ttfb_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let header = UpstreamPullHeader {
+            total_bytes,
+            rate_per_mb,
+            interval_bytes: CHUNK_BYTES,
+            ttfb_ms,
+        };
+        let progress_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let floor = progress::ThroughputFloor::new(
+            progress::FloorConfig { window, floor_bps },
+            Arc::clone(&progress_counter),
+            tokio::time::Instant::now(),
+        );
+        let mut sampler = tokio::time::interval(stall_sample_period(window));
+        sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let pull = UpstreamPull {
+            window,
+            progress_counter,
+            floor,
+            sampler,
+            conn,
+            send,
+            recv,
+            ctx: ctx.clone(),
+            ledger,
+            hash,
+            rate_per_mb,
+            meter: StreamMeter::default(),
+            expected_wire_bytes,
+            max_received_wire,
+            cumulative: 0,
+            unproved: 0,
+            ended: false,
+        };
+        Ok((header, pull))
+    }
+    .await;
+    record_open_result(&tracing::Span::current(), &result);
+    result
 }
 
 impl UpstreamPull {
@@ -3316,6 +3322,16 @@ const fn variant_name(msg: &ClientMessage) -> &'static str {
         ClientMessage::ChunkPreimage(_) => "ChunkPreimage",
         ClientMessage::StreamEnd => "StreamEnd",
         ClientMessage::StreamError(_) => "StreamError",
+    }
+}
+
+/// Record a failed [`open_progressive_pull`] on its span once: the error text
+/// and an error status, so a failed dial or handshake is not exported as a
+/// slow success.
+fn record_open_result<T>(span: &tracing::Span, result: &anyhow::Result<T>) {
+    if let Err(e) = result {
+        span.record("error", tracing::field::display(format_args!("{e:#}")));
+        span.record("otel.status_code", "ERROR");
     }
 }
 

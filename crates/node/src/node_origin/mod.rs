@@ -1528,16 +1528,13 @@ fn lane_ledger(
 /// held in RAM (#1682). Returns the [`PullMiss`] this failure is on a miss (try
 /// the next candidate either way — a local fault latches, it does not abort the
 /// walk, #1560).
-// Sequential resolve → open → fetch → classify pipeline; the tracing macros and
-// the success/failure classification inflate the cognitive-complexity + line
-// metrics past threshold (same inflation noted in `chain_staker_set`). Splitting
-// it would scatter a single linear flow across helpers.
 ///
 /// Runs inside an `upstream_stream` span. Its `hash`, `pool_id`, `peer` and
 /// `local_node_id` fields match the upstream's `serve_stream` span field for
 /// field (with `peer` and `local_node_id` swapped), so one trace query joins
 /// the two sides of the transfer across nodes. Each gap the pull opens is a
-/// child `open_progressive_pull` span that adds the gap's `byte_offset`.
+/// child `open_progressive_pull` span that adds the gap's `byte_offset` and
+/// `byte_len`.
 async fn pull_from_candidate(
     deps_lock: &Arc<OnceLock<NodeOriginDeps>>,
     deps: &NodeOriginDeps,
@@ -1568,6 +1565,10 @@ async fn pull_from_candidate(
 }
 
 /// The body of [`pull_from_candidate`], run inside its span.
+// Sequential resolve → open → fetch → classify pipeline; the tracing macros and
+// the success/failure classification inflate the cognitive-complexity + line
+// metrics past threshold (same inflation noted in `chain_staker_set`). Splitting
+// it would scatter a single linear flow across helpers.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn pull_from_candidate_in_span(
     deps_lock: &Arc<OnceLock<NodeOriginDeps>>,

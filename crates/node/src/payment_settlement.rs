@@ -1461,7 +1461,7 @@ async fn redeem_sweep<P: Provider + Clone>(
     skip_all,
     fields(
         op = "redeemMany",
-        depth,
+        depth = depth,
         voucher_count = lanes.len(),
         tx = tracing::field::Empty,
         outcome = tracing::field::Empty,

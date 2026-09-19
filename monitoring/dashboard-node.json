@@ -3544,7 +3544,7 @@
       },
       "title": "Span rate by operation",
       "type": "timeseries",
-      "description": "Spans per second by name. The deCDN operations are serve_stream (one per inbound client stream), pull_through, origin_pull, node_pull, upstream_stream and open_progressive_pull (the miss path, nested in that order under serve_stream), origin_range_pull, dht_lookup, redeem_cycle and onchain_tx. Every other name belongs to a dependency crate.",
+      "description": "Spans per second by name. Only deCDN spans are exported; dependency crates' spans are filtered at the node. serve_stream is one inbound client stream. A buffered miss nests pull_through, origin_pull, node_pull, upstream_stream and open_progressive_pull under it; a streaming miss nests serve_miss_pull and open_progressive_pull. origin_range_pull is a ranged origin fetch; dht_lookup, redeem_cycle and onchain_tx cover discovery and settlement.",
       "targets": [
         {
           "datasource": {
@@ -3626,106 +3626,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
         "y": 98
       },
       "id": 40
-    },
-    {
-      "datasource": {
-        "type": "tempo",
-        "uid": "${DS_TEMPO}"
-      },
-      "title": "Probe duration",
-      "type": "timeseries",
-      "description": "The probe's round-trip distribution. Exemplars link straight to the trace. The deCDN operation latency panel below covers the serve, pull, DHT and settlement spans.",
-      "targets": [
-        {
-          "datasource": {
-            "type": "tempo",
-            "uid": "${DS_TEMPO}"
-          },
-          "query": "{resource.service.name=\"decdn-node\" && name=\"run-probe\"} | quantile_over_time(duration, .5, .95, .99)",
-          "refId": "A",
-          "legendFormat": "p{{p}}",
-          "queryType": "traceql",
-          "limit": 50,
-          "tableType": "spans"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "table",
-          "placement": "right",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 98
-      },
-      "id": 41
     },
     {
       "datasource": {
@@ -3869,7 +3774,7 @@
             "type": "tempo",
             "uid": "${DS_TEMPO}"
           },
-          "query": "{resource.service.name=\"decdn-node\" && resource.service.instance.id=\"$node\" && name=~\"serve_stream|pull_through|origin_pull|origin_range_pull|node_pull|upstream_stream|open_progressive_pull|dht_lookup|redeem_cycle|onchain_tx\"} | quantile_over_time(duration, .5, .95) by (name)",
+          "query": "{resource.service.name=\"decdn-node\" && resource.service.instance.id=\"$node\" && name=~\"serve_stream|pull_through|serve_miss_pull|origin_pull|origin_range_pull|node_pull|upstream_stream|open_progressive_pull|dht_lookup|redeem_cycle|onchain_tx\"} | quantile_over_time(duration, .5, .95) by (name)",
           "refId": "A",
           "legendFormat": "{{name}} p{{p}}",
           "queryType": "traceql",

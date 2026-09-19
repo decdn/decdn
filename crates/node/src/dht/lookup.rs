@@ -130,12 +130,12 @@ impl Default for LookupConfig {
 /// `metrics` is optional so the DHT test suite can drive a lookup without standing one up;
 /// the production caller always passes `Some`, and it is the only way the round ceiling
 /// below becomes observable.
-// One argument over the threshold, and every one of them is a distinct collaborator the
-// lookup genuinely needs. Bundling them into a struct would move the same list one level out
-// without making any call site clearer.
 ///
 /// Runs inside a `dht_lookup` span that records the `rounds` run and the
 /// `providers` found; each round's per-peer RPCs run inside it too.
+// One argument over the threshold, and every one of them is a distinct collaborator the
+// lookup genuinely needs. Bundling them into a struct would move the same list one level out
+// without making any call site clearer.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "dht_lookup",

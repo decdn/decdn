@@ -10,20 +10,25 @@ use super::{
     VarInt, read_first_message, reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
 use tokio::task::{JoinError, JoinSet};
+
+use futures_util::FutureExt as _;
 use tracing::Instrument as _;
 
-use super::outcome::ServeEnd;
+use super::outcome::{ResetCause, ServeEnd};
 
 /// The root span for one inbound serve stream.
 ///
 /// The request fields (`hash`, `pool_id`, `byte_offset`, `byte_len`) are
-/// recorded once the request is read, and `outcome` / `reason` / `bytes` once
-/// the stream ends ([`ServeEnd::record`]). `peer` and `local_node_id` render as
-/// lowercase-hex iroh ids, the same as the requester's `upstream_stream` span
-/// records them, so one trace query joins the two sides of a transfer on
-/// `hash`, `byte_offset` and the swapped ids.
+/// recorded once the client binding verifies, so a stream reset before that has
+/// none. `outcome` / `reason` / `bytes` are recorded once the stream ends
+/// ([`ServeEnd::record`]), or `outcome` / `error` when it ends on an error.
+/// `peer` and `local_node_id` render as lowercase-hex iroh ids, the same as the
+/// requester's `open_progressive_pull` span records them, so one trace query
+/// joins the two sides of a transfer on `hash`, `pool_id`, `byte_offset` and
+/// the swapped ids.
 pub(super) fn serve_stream_span(peer: PublicKey, local_node_id: PublicKey) -> tracing::Span {
     tracing::info_span!(
         "serve_stream",
@@ -38,8 +43,23 @@ pub(super) fn serve_stream_span(peer: PublicKey, local_node_id: PublicKey) -> tr
         byte_len = tracing::field::Empty,
         outcome = tracing::field::Empty,
         reason = tracing::field::Empty,
+        error = tracing::field::Empty,
         bytes = tracing::field::Empty,
     )
+}
+
+/// Records `outcome = "cancelled"` on a serve stream's span when its task is
+/// dropped before the stream ends — an abort on shutdown, while the task waits
+/// on the client. Disarmed (set to `None`) once the stream ends, so the span's
+/// outcome is still recorded exactly once.
+struct CancelledMark(Option<tracing::Span>);
+
+impl Drop for CancelledMark {
+    fn drop(&mut self) {
+        if let Some(span) = self.0.take() {
+            span.record("outcome", "cancelled");
+        }
+    }
 }
 
 /// Record the request fields of a [`serve_stream_span`].
@@ -132,11 +152,25 @@ impl ClientHandler {
                         inflight.spawn(
                             async move {
                                 let span = tracing::Span::current();
-                                match serve.await {
-                                    Ok(end) => end.record(&span),
-                                    Err(e) => {
+                                let mut unended = CancelledMark(Some(span.clone()));
+                                // Caught only to mark the span, then resumed, so the
+                                // `JoinSet` still sees the panic and meters it.
+                                let ended = AssertUnwindSafe(serve).catch_unwind().await;
+                                unended.0 = None;
+                                match ended {
+                                    Ok(Ok(end)) => end.record(&span),
+                                    Ok(Err(e)) => {
                                         span.record("outcome", "failed");
+                                        span.record(
+                                            "error",
+                                            tracing::field::display(format_args!("{e:#}")),
+                                        );
                                         this.log_stream_end(&e, &span);
+                                    }
+                                    Err(panic) => {
+                                        span.record("outcome", "panicked");
+                                        span.record("otel.status_code", "ERROR");
+                                        std::panic::resume_unwind(panic);
                                     }
                                 }
                             }
@@ -227,7 +261,8 @@ impl ClientHandler {
         }
     }
 
-    /// Serve one delivery stream end to end.
+    /// Serve one delivery stream end to end. Returns how the stream ended
+    /// ([`ServeEnd`]); an `Err` is recorded on the span as `outcome = failed`.
     ///
     /// Kept as one linear, ADR-ordered sequence (read → bind → blob gate →
     /// channel → sign → deliver); splitting it would scatter the ADR-005
@@ -261,7 +296,7 @@ impl ClientHandler {
         // cap exists to shed load, not to add work to the reject path.
         if permit.is_none() {
             reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
-            return Ok(ServeEnd::Reset);
+            return Ok(ServeEnd::Reset(ResetCause::StreamCapFull));
         }
 
         let FirstMessage::Delivery(req, ext) = first;
@@ -297,7 +332,7 @@ impl ClientHandler {
                     }
                     self.metrics.serve_stream_rejected_bad_binding();
                     reset_stream(&mut send, &mut recv, APP_ERR_MALFORMED_MESSAGE);
-                    return Ok(ServeEnd::Reset);
+                    return Ok(ServeEnd::Reset(ResetCause::BadBinding));
                 }
                 Err(e) => {
                     if let Some(suppressed) = self.binding_warn.admit() {
@@ -311,7 +346,7 @@ impl ClientHandler {
                     }
                     self.metrics.serve_stream_rejected_bad_binding();
                     reset_stream(&mut send, &mut recv, APP_ERR_MALFORMED_MESSAGE);
-                    return Ok(ServeEnd::Reset);
+                    return Ok(ServeEnd::Reset(ResetCause::BadBinding));
                 }
             }
         }
