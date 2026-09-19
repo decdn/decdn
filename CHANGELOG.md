@@ -721,6 +721,20 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Cache: origin range pulls held the whole requested span in memory — twice
+  (#2065).** A few multi-GB range requests against a partially held blob OOM-killed
+  the node. `CacheEngine::pull_through_range` now reads the `{H}.obao4` outboard once
+  and fetches, verifies, and imports the span in `RANGE_PULL_WINDOW_BYTES` (4 MiB)
+  windows, so a pull holds `O(window + outboard)` bytes whatever `byte_len` is. The
+  own-origin serve-miss (Flow A) streams its wire the same way:
+  `CacheEngine::origin_range_wire` replaces `origin_encode_range` and runs one
+  coherent encode over on-demand windows behind a bounded channel; a window that
+  fails verification against `H` still ends the leg on a hard `VerifyFailed`, now
+  surfaced through the reader's parked fault. At most `MAX_CONCURRENT_RANGE_PULLS`
+  (4) origin range pulls run at once across both paths; a pull past the bound waits
+  rather than degrading to a whole-blob pull. The `Origin` trait's `fetch_range`
+  becomes the data-only `fetch_range_data` — the outboard comes from
+  `fetch_outboard` — so a custom `Origin` implementation must rename it.
 - **`DecdnWatcherTaskPanicked` could never evaluate.** Its expr was
   `rate({__name__=~"decdn_.+_task_panicked_total"}[10m]) > 0`, and `rate()` drops
   `__name__`, so the five per-watcher series on a node collapsed to five identical

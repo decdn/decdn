@@ -16,9 +16,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use decdn_cache::range_pull::{align_range, encode_verified_range};
 use decdn_cache::{
     CHUNK_GROUP_BYTES, FilesystemOrigin, Hash, Origin, OriginFetch, OriginRangeFetch,
-    OriginRangeRequest,
+    OriginRangeRequest, OutboardFetch,
 };
 use decdn_cli::commands::origin::origin_import;
 use decdn_common::cli::OriginImportArgs;
@@ -106,10 +107,17 @@ fn single_file_import_is_readable_and_range_serves() {
         };
         let start = usize::try_from(CHUNK_GROUP_BYTES).unwrap();
         let end = usize::try_from(3 * CHUNK_GROUP_BYTES).unwrap();
-        match reader.fetch_range(hash, req, 1 << 30).await.unwrap() {
-            OriginRangeFetch::Ranged { data, outboard } => {
+        let outboard = match reader.fetch_outboard(hash, 1 << 30).await.unwrap() {
+            OutboardFetch::Found(outboard) => outboard,
+            other => panic!("expected the outboard, got {other:?}"),
+        };
+        match reader.fetch_range_data(hash, req).await.unwrap() {
+            OriginRangeFetch::Ranged { data } => {
                 assert_eq!(data.as_ref(), &payload[start..end]);
-                assert!(!outboard.is_empty(), "outboard must be served for a range");
+                let total = u64::try_from(payload.len()).unwrap();
+                let aligned = align_range(CHUNK_GROUP_BYTES, 2 * CHUNK_GROUP_BYTES, total).unwrap();
+                encode_verified_range(*hash.as_bytes(), &aligned, &data, outboard)
+                    .expect("the range must verify against the written outboard");
             }
             other => panic!("expected Ranged, got {other:?}"),
         }

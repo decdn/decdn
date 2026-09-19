@@ -1000,7 +1000,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// # What drops out relative to the paid [`run_pull_leg`]
 ///
 /// This leg pulls from THIS node's own configured origin, reached through
-/// [`CacheEngine::origin_encode_range`] behind the [`BackendSource`]. There is no
+/// [`CacheEngine::origin_range_wire`] behind the [`BackendSource`]. There is no
 /// counterparty, so every paid-path axis is absent — and each absence is load-bearing,
 /// not an omission:
 ///
@@ -1177,7 +1177,7 @@ mod local_pull_leg_tests {
     enum Mode {
         /// Serve the genuine bytes for `H` — a healthy own origin.
         Serve,
-        /// Return a transport error from `fetch_range` — an origin the node cannot
+        /// Return a transport error from `fetch_range_data` — an origin the node cannot
         /// reach (the no-hang-on-fault case).
         Fault,
         /// Serve length-matching bytes that do NOT hash to `H` — a
@@ -1265,11 +1265,10 @@ mod local_pull_leg_tests {
             Box::pin(async move { Ok(result) })
         }
 
-        fn fetch_range(
+        fn fetch_range_data(
             &self,
             hash: Hash,
             req: OriginRangeRequest,
-            _outboard_max_bytes: u64,
         ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>>
         {
             if matches!(self.mode, FakeMode::Fault) {
@@ -1285,7 +1284,6 @@ mod local_pull_leg_tests {
                 match self.data.get(s..e) {
                     Some(span) => OriginRangeFetch::Ranged {
                         data: Bytes::copy_from_slice(span),
-                        outboard: self.outboard.clone(),
                     },
                     None => OriginRangeFetch::NotFound,
                 }

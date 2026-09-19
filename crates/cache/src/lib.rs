@@ -21,6 +21,7 @@ pub mod fill_session;
 pub mod metrics;
 pub mod origin;
 pub mod origin_probe;
+pub mod origin_range;
 pub mod policy;
 pub mod probe_hold;
 pub mod range_pull;
@@ -60,6 +61,7 @@ pub use origin::{
     FilesystemOrigin, HttpOrigin, Origin, OriginFetch, OriginRangeFetch, OriginRangeRequest,
     OutboardFetch, S3Credentials, S3Origin, S3OriginConfig,
 };
+pub use origin_range::{MAX_CONCURRENT_RANGE_PULLS, OriginRangeWire, RANGE_PULL_WINDOW_BYTES};
 pub use policy::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AlwaysAdmit, EvictionContext,
     EvictionPlan, EvictionPolicy, FrequencyEstimator, LruEviction, Segment,

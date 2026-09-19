@@ -7,21 +7,23 @@
 //! node's own origin, so
 //! there is no counterparty, no channel, and no payment — but the driver, sink,
 //! and serve leg are reused verbatim. This source is what lets that happen: it
-//! produces the header-less interleaved bao wire for one [`AlignedRange`] straight
-//! out of [`CacheEngine::origin_encode_range`], so the existing `NodeAdmitStore`
+//! streams the header-less interleaved bao wire for one [`AlignedRange`] straight
+//! out of [`CacheEngine::origin_range_wire`], so the existing `NodeAdmitStore`
 //! sink verifies-and-stores it against the root `H` exactly as it does a peer
-//! pull's wire.
+//! pull's wire. The wire is produced window by window, so a leg holds
+//! `O(window + outboard)` bytes whatever its range (#2065).
 //!
 //! # Why the origin bytes are a LOCAL fault, not upstream corruption
 //!
 //! By the time this source runs, the node has already signed a `StreamResponse`
 //! committing to serve the blob under `H` to a paying client.
-//! [`CacheEngine::origin_encode_range`] therefore treats a range that fails bao
+//! [`CacheEngine::origin_range_wire`] therefore treats a range that fails bao
 //! verification as a HARD [`decdn_cache::CacheError::VerifyFailed`] — a
 //! corrupt/misconfigured OWN origin — rather than degrading it (there is no
 //! upstream to blame and no fallback that still honours `H`). This source
-//! propagates that fault out of [`BlobSource::open`]; nothing here scores a
-//! provider, because there is no provider.
+//! propagates that fault out of [`BlobSource::open`] when it is found up front,
+//! and parks it on the reader ([`StashedFault`]) when it is found mid-stream;
+//! nothing here scores a provider, because there is no provider.
 //!
 //! # The self-payment counter (THE CRUX)
 //!
@@ -42,7 +44,7 @@ use std::sync::Arc;
 use alloy::primitives::U256;
 use bytes::Bytes;
 use decdn_bao_range::AlignedRange;
-use decdn_cache::{CacheEngine, Hash};
+use decdn_cache::{CacheEngine, Hash, OriginRangeWire};
 use decdn_client_pull::sink::StashedFault;
 use decdn_client_pull::source::SourceFuture;
 use decdn_client_pull::{BlobSource, PoolLedger, UpstreamPullHeader, VoucherProgress};
@@ -112,12 +114,12 @@ impl BlobSource for BackendSource {
                     Hash::from(hash),
                 );
             }
-            // Fetch + verify + encode the range out of our own origin. A verify
-            // failure surfaces here as `CacheError::VerifyFailed` (a local-origin
-            // fault) via `?`; a decline (no origin serves it any more) is `None`.
-            let Some(combined) = self
+            // Stream + verify + encode the range out of our own origin. A fault
+            // found up front (a wrong-length outboard, a transport fault) surfaces
+            // here via `?`; a decline (no origin serves it any more) is `None`.
+            let Some(wire) = self
                 .engine
-                .origin_encode_range(Hash::from(hash), &range)
+                .origin_range_wire(Hash::from(hash), &range)
                 .await?
             else {
                 anyhow::bail!(
@@ -125,20 +127,6 @@ impl BlobSource for BackendSource {
                     Hash::from(hash)
                 );
             };
-            // `origin_encode_range` returns the header-full wire (leading 8-byte LE
-            // size header); the driver's sink wants the header-less body (ADR 038,
-            // the size comes from the signed `total_bytes` instead). Guard the
-            // length with `get` — never index — then take the zero-copy slice.
-            let wire_len = combined
-                .get(8..)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "backend origin wire for {} is shorter than its 8-byte size header",
-                        Hash::from(hash),
-                    )
-                })?
-                .len();
-            let wire = combined.slice(8..);
             let header = UpstreamPullHeader {
                 total_bytes: self.total_bytes,
                 rate_per_mb: 0,
@@ -150,7 +138,8 @@ impl BlobSource for BackendSource {
                 header,
                 BackendReader {
                     wire,
-                    wire_len: wire_len as u64,
+                    pending: Bytes::new(),
+                    wire_len: range.wire_len(),
                 },
             ))
         })
@@ -183,42 +172,68 @@ impl BlobSource for BackendSource {
     }
 }
 
-/// The reader a [`BackendSource`] yields: a fixed header-less bao wire buffer over
-/// [`Bytes`] with a no-op [`StashedFault`] (an own-origin leg parks no typed
-/// upstream fault — a bad origin already failed the encode in
-/// [`BlobSource::open`]). Mirrors the shape of `client-pull`'s `ScriptedReader` /
-/// the node's `admit_store` test `MemReader`, but as a real (non-test) type.
+/// The reader a [`BackendSource`] yields: the header-less bao wire streamed out
+/// of an [`OriginRangeWire`]. A fault the encode stopped on — a window that fails
+/// verification against `H`, or an origin that stops serving mid-stream — is
+/// parked for [`StashedFault::take_fault`], so the sink reports that typed
+/// [`decdn_cache::CacheError`] rather than a bare truncation.
 #[allow(dead_code, reason = "wired by FA.2/FA.3 orchestration")]
 pub(crate) struct BackendReader {
-    wire: Bytes,
-    /// Wire byte count handed to this reader (before consumption), used by
+    wire: OriginRangeWire,
+    /// The unread rest of the last chunk the wire yielded.
+    pending: Bytes,
+    /// The range's exact header-less wire byte count, used by
     /// [`BlobSource::finish`] to advance the local completion counter.
     wire_len: u64,
 }
 
+impl BackendReader {
+    /// Refill `pending` from the wire when it is empty. Returns `false` at the
+    /// wire's end.
+    async fn refill(&mut self) -> bool {
+        while self.pending.is_empty() {
+            match self.wire.next_chunk().await {
+                Some(chunk) => self.pending = chunk,
+                None => return false,
+            }
+        }
+        true
+    }
+}
+
 impl AsyncStreamReader for BackendReader {
     async fn read_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
-        let take = self.wire.len().min(len);
-        Ok(self.wire.split_to(take))
+        if len == 0 || !self.refill().await {
+            return Ok(Bytes::new());
+        }
+        let take = self.pending.len().min(len);
+        Ok(self.pending.split_to(take))
     }
 
     async fn read<const L: usize>(&mut self) -> std::io::Result<[u8; L]> {
-        if self.wire.len() < L {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "backend reader exhausted before a fixed-size bao read",
-            ));
-        }
-        let got = self.wire.split_to(L);
         let mut out = [0u8; L];
-        out.copy_from_slice(&got);
+        let mut filled = 0;
+        while filled < L {
+            if !self.refill().await {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "backend reader exhausted before a fixed-size bao read",
+                ));
+            }
+            let take = self.pending.len().min(L - filled);
+            let got = self.pending.split_to(take);
+            if let Some(dst) = out.get_mut(filled..filled + take) {
+                dst.copy_from_slice(&got);
+            }
+            filled += take;
+        }
         Ok(out)
     }
 }
 
 impl StashedFault for BackendReader {
     fn take_fault(&mut self) -> Option<anyhow::Error> {
-        None
+        self.wire.take_fault().map(anyhow::Error::from)
     }
 }
 
@@ -313,11 +328,10 @@ mod tests {
             Box::pin(async move { Ok(result) })
         }
 
-        fn fetch_range(
+        fn fetch_range_data(
             &self,
             hash: Hash,
             req: OriginRangeRequest,
-            _outboard_max_bytes: u64,
         ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>>
         {
             let result = if hash == self.hash {
@@ -326,7 +340,6 @@ mod tests {
                 match self.data.get(s..e) {
                     Some(span) => OriginRangeFetch::Ranged {
                         data: Bytes::copy_from_slice(span),
-                        outboard: self.outboard.clone(),
                     },
                     None => OriginRangeFetch::NotFound,
                 }
@@ -395,9 +408,9 @@ mod tests {
         Ok(())
     }
 
-    /// (b) Mismatched origin blob: `open` fails with a LOCAL-origin
-    /// `VerifyFailed` — no provider/upstream scoring is reachable from this
-    /// source.
+    /// (b) Mismatched origin blob: the wire ends on a LOCAL-origin
+    /// `VerifyFailed`, and the driver's sink reports that parked fault — no
+    /// provider/upstream scoring is reachable from this source.
     #[tokio::test]
     async fn backend_source_mismatch_is_local_verify_fault() -> anyhow::Result<()> {
         let genuine = test_blob();
@@ -417,8 +430,12 @@ mod tests {
 
         let source = BackendSource::new(engine, root, total, fresh_ledger());
         let aligned = align_range(0, 0, total).map_err(|e| anyhow::anyhow!("align: {e}"))?;
-        let err = source
-            .open(root, aligned)
+        let (_header, reader) = source.open(root, aligned.clone()).await?;
+
+        let tmp2 = tempfile::tempdir()?;
+        let engine2 = CacheEngine::open(tmp2.path(), vec![], 64).await?;
+        let store = NodeAdmitStore::new(engine2, hash, total, None);
+        let err = IngestStore::ingest_stream(&store, &aligned, reader, None)
             .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?;
