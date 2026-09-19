@@ -1089,6 +1089,13 @@ pub struct DecdnMetrics {
     /// doing its job pacing speculation); a flat zero under real pull-through
     /// traffic means the window never binds.
     pub node_pull_through_window_paused: Counter,
+    /// `decdn_node_pull_min_draw_waits_total` (#2061): pull-leg pauses because
+    /// open room is below the minimum draw (half the ramped window) — healthy
+    /// batching that trades one pause per half-window for large origin reads.
+    /// Kept apart from [`Self::node_pull_through_window_paused`] so that
+    /// counter still means "the ADR 037 window binds": a flat zero there under
+    /// real pull-through traffic still says payment never gated the pull.
+    pub node_pull_min_draw_waits: Counter,
     /// `decdn_node_pull_through_client_abandoned_total` (#856): window-paced
     /// serves the requesting client dropped or underpaid mid-pull, so the node
     /// aborted the upstream pull and abandoned the partial fill. The per-request
@@ -2345,6 +2352,9 @@ recorders! {
     /// The window-paced serve loop paused the upstream pull at the ramped credit
     /// window to wait for the downstream voucher to clear (#856, #1669).
     node_pull_through_window_paused => node_pull_through_window_paused.inc();
+
+    /// Record a pull-leg minimum-draw batching pause (#2061).
+    node_pull_min_draw_wait => node_pull_min_draw_waits.inc();
 
     /// A window-paced serve was abandoned because the requesting client dropped
     /// or underpaid mid-pull (#856).

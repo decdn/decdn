@@ -9382,11 +9382,27 @@ mod tests {
 
         let serving = RangeStubOrigin::serving(hash, &data, outboard.clone());
         let tmp = tempfile::tempdir()?;
-        let engine =
-            CacheEngine::open(tmp.path(), vec![Arc::new(serving) as Arc<dyn Origin>], 64).await?;
+        let metrics = Arc::new(crate::metrics::CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            vec![Arc::new(serving) as Arc<dyn Origin>],
+            64,
+            PinnedHashes::default(),
+            RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
+            Some(Arc::clone(&metrics)),
+            std::time::Duration::ZERO,
+        )
+        .await?;
         anyhow::ensure!(
-            engine.origin_fetch_outboard_bytes(hash, total).await? == Some(outboard),
+            engine.origin_fetch_outboard_bytes(hash, total).await? == Some(outboard.clone()),
             "a publishing origin must return its outboard bytes"
+        );
+        // The outboard is origin egress, metered once per fill (#2061) — the
+        // per-draw metering moved to `origin_range_wire`'s data spans.
+        anyhow::ensure!(
+            metrics.pull_through_bytes.get() == u64::try_from(outboard.len()).unwrap_or(u64::MAX),
+            "outboard bytes must land in pull_through_bytes"
         );
 
         let bare = OutboardStubOrigin::new(&data, None);

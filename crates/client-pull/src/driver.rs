@@ -163,6 +163,11 @@ pub trait PacingWait: Send + Sync {
     /// Resolve once the caller judges it worth re-deciding (e.g. a downstream
     /// frontier advanced, or a bounded poll interval elapsed).
     ///
+    /// `batching` is the [`crate::PaceDecision::Wait`] cause: `false` for
+    /// genuine window backpressure, `true` for a minimum-draw batching pause
+    /// (#2061) — implementors metering "the window binds" must count only the
+    /// former.
+    ///
     /// `observed` holds the downstream frontiers the caller's `Wait` decision was
     /// computed from. An implementor backed by an edge-triggered wakeup (a
     /// [`tokio::sync::Notify`], which stores no permit across `notify_waiters`) MUST
@@ -170,7 +175,11 @@ pub trait PacingWait: Send + Sync {
     /// immediately if either already moved past `observed` — otherwise an advance
     /// that races between the decision and the park is lost and the caller wedges
     /// forever (#1673).
-    fn wait(&self, observed: DownstreamFrontier) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    fn wait(
+        &self,
+        observed: DownstreamFrontier,
+        batching: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Read the channel context's current deposit through the shared handle. A tiny
@@ -680,13 +689,14 @@ where
 
         match pacer.decide(&state) {
             PaceDecision::Done => return Ok(()),
-            PaceDecision::Wait => {
+            PaceDecision::Wait { batching } => {
                 if let Some(hook) = pacing_wait {
                     // Hand the hook the frontiers THIS decision read, so it can
                     // register its wakeup then re-check for an advance that raced the
                     // decision — closing the lost-wakeup that wedged the window-paused
-                    // pull under CI scheduling gaps (#1673).
-                    hook.wait(downstream_now).await;
+                    // pull under CI scheduling gaps (#1673). The cause rides along so
+                    // the hook meters backpressure and batching apart (#2061).
+                    hook.wait(downstream_now, batching).await;
                     continue;
                 }
                 anyhow::bail!(
@@ -1893,6 +1903,7 @@ mod tests {
         fn wait(
             &self,
             _observed: super::DownstreamFrontier,
+            _batching: bool,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async {})
@@ -1911,7 +1922,7 @@ mod tests {
             if self.waited.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 BudgetPacer::new().decide(state)
             } else {
-                PaceDecision::Wait
+                PaceDecision::Wait { batching: false }
             }
         }
     }
@@ -1980,6 +1991,7 @@ mod tests {
         fn wait(
             &self,
             _observed: super::DownstreamFrontier,
+            _batching: bool,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             self.served_paid
                 .fetch_add(self.bump_bytes, std::sync::atomic::Ordering::SeqCst);
@@ -2119,6 +2131,7 @@ mod tests {
         fn wait(
             &self,
             _observed: super::DownstreamFrontier,
+            _batching: bool,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(std::future::pending())
