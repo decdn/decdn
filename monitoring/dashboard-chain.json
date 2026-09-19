@@ -1027,12 +1027,276 @@
       "id": 10
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Active nodes by country",
+      "type": "geomap",
+      "description": "Active stakers per declared region (ADR 030), from each selected node's CapacityBond registry. Every node holds the whole network, so the query takes the max across nodes, not the sum. A node with a frozen watcher keeps its last view, and max can hold a departed region on the map: check watcher downtime above. A code absent from Grafana's country gazetteer has no location and is not drawn. In current Grafana these are the user-assigned codes (AA, QM–QZ, XA–XZ, ZZ) plus XK and SS. The table to the right lists every region, including these.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max by (node_region) (decdn_staker_set_active_by_region{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"})",
+          "refId": "A",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "legendFormat": "{{node_region}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "continuous-BlYlRd"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "view": {
+          "id": "zero",
+          "lat": 20,
+          "lon": 0,
+          "zoom": 1,
+          "allLayers": true
+        },
+        "controls": {
+          "showZoom": true,
+          "mouseWheelZoom": false,
+          "showAttribution": true
+        },
+        "basemap": {
+          "type": "default",
+          "name": "Basemap",
+          "config": {}
+        },
+        "layers": [
+          {
+            "type": "markers",
+            "name": "Active nodes",
+            "tooltip": true,
+            "location": {
+              "mode": "lookup",
+              "lookup": "node_region",
+              "gazetteer": "public/gazetteer/countries.json"
+            },
+            "config": {
+              "showLegend": true,
+              "style": {
+                "size": {
+                  "field": "Value",
+                  "fixed": 5,
+                  "min": 6,
+                  "max": 30
+                },
+                "color": {
+                  "field": "Value"
+                },
+                "opacity": 0.6,
+                "symbol": {
+                  "mode": "fixed",
+                  "fixed": "img/icons/marker/circle.svg"
+                },
+                "text": {
+                  "mode": "field",
+                  "field": "Value",
+                  "fixed": ""
+                },
+                "textConfig": {
+                  "fontSize": 11,
+                  "offsetX": 0,
+                  "offsetY": 0,
+                  "textAlign": "center",
+                  "textBaseline": "middle"
+                }
+              }
+            }
+          }
+        ],
+        "tooltip": {
+          "mode": "details"
+        }
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 14,
+        "x": 0,
+        "y": 25
+      },
+      "id": 27
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Active nodes per region",
+      "type": "table",
+      "description": "Every region the map reads, including codes the map cannot place.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max by (node_region) (decdn_staker_set_active_by_region{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"})",
+          "refId": "A",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "node_region": "Region",
+              "Value": "Active nodes"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Active nodes",
+            "desc": true
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 5,
+        "x": 14,
+        "y": 25
+      },
+      "id": 29
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Active nodes without a region",
+      "type": "stat",
+      "description": "Active stakers whose on-chain regionHint is empty or not an accepted region code. These nodes are absent from the map and the table. Non-zero means an operator should run `decdn node update-region`; the panel follows on the next watcher tick.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max(decdn_staker_set_active_unknown_region{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short",
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto",
+        "wideLayout": true,
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 5,
+        "x": 19,
+        "y": 25
+      },
+      "id": 28
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 25
+        "y": 37
       },
       "id": 11,
       "panels": [],
@@ -1126,7 +1390,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 26
+        "y": 38
       },
       "id": 12
     },
@@ -1218,7 +1482,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 26
+        "y": 38
       },
       "id": 13
     },
@@ -1315,7 +1579,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 26
+        "y": 38
       },
       "id": 14
     },
@@ -1325,7 +1589,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 33
+        "y": 45
       },
       "id": 15,
       "panels": [],
@@ -1420,7 +1684,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 34
+        "y": 46
       },
       "id": 16
     },
@@ -1512,7 +1776,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 34
+        "y": 46
       },
       "id": 17
     },
@@ -1603,7 +1867,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 34
+        "y": 46
       },
       "id": 18
     },
@@ -1715,7 +1979,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 41
+        "y": 53
       },
       "id": 19
     },
@@ -1827,7 +2091,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 41
+        "y": 53
       },
       "id": 20
     },
@@ -1926,7 +2190,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 41
+        "y": 53
       },
       "id": 21
     },
@@ -1936,7 +2200,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 48
+        "y": 60
       },
       "id": 22,
       "panels": [],
@@ -2041,7 +2305,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 49
+        "y": 61
       },
       "id": 23
     },
@@ -2153,7 +2417,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 49
+        "y": 61
       },
       "id": 24
     },
@@ -2256,7 +2520,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 49
+        "y": 61
       },
       "id": 25
     },
@@ -2298,7 +2562,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 56
+        "y": 68
       },
       "id": 26
     }
