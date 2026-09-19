@@ -95,8 +95,9 @@ pub struct RegistryHandles {
     pub staker_set: Arc<dyn StakerSet>,
     /// `NodeId` → dial address, present only where pull-through is on.
     pub node_addresses: Option<Arc<dyn NodeAddressResolver>>,
-    /// `NodeId → regionHint` (non-empty only). Read by the ADR-030 region-latency
-    /// penalty on the selection/pull path. Always present, unlike `node_addresses`.
+    /// `NodeId → regionHint`, as the canonical [`decdn_protocol::Region`] code;
+    /// an empty or invalid hint has no entry. Read by the ADR-030 region-latency penalty on the selection/pull path.
+    /// Always present, unlike `node_addresses`.
     pub regions: Arc<RwLock<HashMap<NodeId, String>>>,
     /// `operator address → bound NodeId`, always built (like `regions`, unlike
     /// the pull-through-gated `bindings`) so the chain-backed origin directory
@@ -193,7 +194,8 @@ pub(crate) struct RegistrySink<R> {
     pub(crate) active: Arc<RwLock<HashSet<NodeId>>>,
     /// `None` when pull-through is off — see [`RegistryHandles::node_addresses`].
     pub(crate) bindings: Option<Arc<RwLock<HashMap<NodeId, Address>>>>,
-    /// `NodeId → regionHint`. Non-empty only; empty `regionHint` is absence.
+    /// `NodeId → regionHint`, canonical codes only; an empty or invalid
+    /// `regionHint` is absence (see [`canonical_region`]).
     /// Always built (not gated on pull-through): the ADR-030 selection penalty
     /// reads it whether or not node-to-node pull is on.
     pub(crate) regions: Arc<RwLock<HashMap<NodeId, String>>>,
@@ -216,7 +218,7 @@ pub(crate) struct RegistrySink<R> {
 impl<R: RegistryChainReads> RegistrySink<R> {
     /// `NodeRegistered`: active insert (unfiltered — see the module doc) AND a
     /// binding insert.
-    fn on_registered(&self, node_id: NodeId, eth_address: Address, region: String) {
+    fn on_registered(&self, node_id: NodeId, eth_address: Address, region: &str) {
         apply_change(&self.active, &self.metrics, StakerChange::Active(node_id));
         if let Some(bindings) = &self.bindings {
             set_binding(bindings, &self.metrics, node_id, eth_address);
@@ -224,7 +226,7 @@ impl<R: RegistryChainReads> RegistrySink<R> {
         with_write(&self.operator_to_node, "chain operator reverse map", |m| {
             m.insert(eth_address, node_id);
         });
-        if !region.is_empty() {
+        if let Some(region) = canonical_region(region) {
             with_write(&self.regions, "chain region directory", |m| {
                 m.insert(node_id, region);
             });
@@ -254,13 +256,16 @@ impl<R: RegistryChainReads> RegistrySink<R> {
 
     /// `RegionUpdated`: the region map follows the operator's new
     /// `regionHint` on the tick it lands. Membership and bindings are
-    /// untouched. An empty region is absence, as in [`Self::on_registered`].
-    fn on_region_updated(&self, node_id: NodeId, new_region: String) {
-        with_write(&self.regions, "chain region directory", |m| {
-            if new_region.is_empty() {
+    /// untouched. An empty or invalid region is absence, as in
+    /// [`Self::on_registered`].
+    fn on_region_updated(&self, node_id: NodeId, new_region: &str) {
+        let region = canonical_region(new_region);
+        with_write(&self.regions, "chain region directory", |m| match region {
+            Some(region) => {
+                m.insert(node_id, region);
+            }
+            None => {
                 m.remove(&node_id);
-            } else {
-                m.insert(node_id, new_region);
             }
         });
     }
@@ -323,7 +328,7 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                         self.on_registered(
                             NodeId::from_bytes(event.nodeId.0),
                             event.ethAddress,
-                            event.regionHint,
+                            &event.regionHint,
                         );
                     }
                     Err(err) => warn!(%err, "skipping undecodable NodeRegistered log"),
@@ -377,7 +382,10 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
             Some(sig) if sig == CapacityBond::RegionUpdated::SIGNATURE_HASH => {
                 match CapacityBond::RegionUpdated::decode_log_data(&log.inner.data) {
                     Ok(event) => {
-                        self.on_region_updated(NodeId::from_bytes(event.nodeId.0), event.newRegion);
+                        self.on_region_updated(
+                            NodeId::from_bytes(event.nodeId.0),
+                            &event.newRegion,
+                        );
                     }
                     Err(err) => warn!(%err, "skipping undecodable RegionUpdated log"),
                 }
@@ -541,8 +549,8 @@ where
             let node_id = NodeId::from_bytes(node.nodeId.0);
             bindings.insert(node_id, node.ethAddress);
             operator_to_node.insert(node.ethAddress, node_id);
-            if !node.regionHint.is_empty() {
-                regions.insert(node_id, node.regionHint.clone());
+            if let Some(region) = canonical_region(&node.regionHint) {
+                regions.insert(node_id, region);
             }
             if is_active {
                 active.insert(node_id);
@@ -663,13 +671,24 @@ where
     })
 }
 
+/// The canonical form of an on-chain `regionHint`, or `None` when it is empty
+/// or not an accepted code.
+///
+/// The contract only length-checks `regionHint`, so `" de "` can land on
+/// chain. Every region-map consumer compares codes as strings — the ADR-030
+/// penalty against the node's own normalized `identity.region` — so the map
+/// stores the [`Region::parse`] form and nothing else.
+fn canonical_region(raw: &str) -> Option<String> {
+    Region::parse(raw).map(|r| r.as_str().to_owned())
+}
+
 /// Publish the active-staker set size per declared region (ADR 030) to
 /// `decdn_staker_set_active_by_region`.
 ///
 /// `regions` is unfiltered, so the count walks `active` and looks each node up.
-/// A region that fails [`Region::parse`] counts as unknown: the on-chain
-/// `regionHint` is only length-checked, and an unparsed string must not become
-/// a metric label.
+/// An active node with no region-map entry counts as unknown. The map holds
+/// canonical codes only ([`canonical_region`]); parsing again yields the typed
+/// key, and keeps an unparsed string from ever becoming a metric label.
 fn publish_region_counts(
     active: &RwLock<HashSet<NodeId>>,
     regions: &RwLock<HashMap<NodeId, String>>,
@@ -1163,6 +1182,31 @@ mod tests {
         assert!(
             !text.contains("decdn_staker_set_active_by_region{"),
             "an emptied region kept its series: {text}"
+        );
+    }
+
+    /// Every write path stores the canonical code: a raw `" de "` must compare
+    /// equal to the node's own normalized `DE` in the ADR-030 penalty, and an
+    /// invalid code is absence.
+    #[tokio::test]
+    async fn region_map_stores_canonical_codes_only() {
+        let (mut s, _active, _bindings, _op, regions, _m) = sink(ok_reads(), true);
+        let _ = s
+            .apply(registered_log_region(nid(1), addr(1), " de "))
+            .await;
+        let _ = s
+            .apply(registered_log_region(nid(2), addr(2), "Germany"))
+            .await;
+        assert_eq!(region_of(&regions, nid(1)), Some("DE".to_string()));
+        assert_eq!(region_of(&regions, nid(2)), None, "invalid code is absence");
+
+        let _ = s.apply(region_updated_log(nid(1), "DE", "us ")).await;
+        assert_eq!(region_of(&regions, nid(1)), Some("US".to_string()));
+        let _ = s.apply(region_updated_log(nid(1), "US", "Germany")).await;
+        assert_eq!(
+            region_of(&regions, nid(1)),
+            None,
+            "invalid update is absence"
         );
     }
 

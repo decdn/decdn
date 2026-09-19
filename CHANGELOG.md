@@ -1739,6 +1739,11 @@ since project inception and will roll into the first tagged release.
   - The CapacityBond registry now follows `RegionUpdated`, so a region change
     reaches the region map, the dashboard and the ADR 030 latency penalty on
     the next watcher tick instead of the next 15-minute re-enumeration.
+  - The registry's region map stores the canonical region code: a raw
+    `" de "` on chain becomes `DE`, and an invalid hint has no entry. The
+    ADR 030 latency penalty compares these codes against the node's own
+    normalized `identity.region`, so a padded or lower-case hint no longer
+    evades it.
 
 - **Observability: the single reference dashboard becomes a four-dashboard suite
   covering metrics, logs and traces.** `monitoring/` gains
