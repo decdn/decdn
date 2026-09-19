@@ -4158,6 +4158,112 @@ async fn http_size_compressed_object_is_unknown() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An origin whose `size` probe faults with a transport error; `fetch` is the
+/// trait default (never called here).
+#[derive(Debug)]
+struct FaultingSizeOrigin;
+
+impl Origin for FaultingSizeOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        Box::pin(async {
+            Err(OriginPullError::Transient(anyhow::anyhow!(
+                "unreachable in this test"
+            )))
+        })
+    }
+
+    fn size(
+        &self,
+        _hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
+        Box::pin(async {
+            Err(OriginPullError::Transient(anyhow::anyhow!(
+                "synthetic size-probe transport fault"
+            )))
+        })
+    }
+}
+
+#[tokio::test]
+async fn origin_size_surfaces_a_transport_fault_when_no_origin_answers() -> anyhow::Result<()> {
+    // #1129: a transport fault on the size probe is a degraded node, not an
+    // empty one. When NO origin answers and at least one faulted, the fault is
+    // the answer — swallowing it into `Ok(None)` would let the serve path
+    // terminally report `NotFound` for a node whose own origin is broken.
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(
+        tmp.path(),
+        vec![Arc::new(FaultingSizeOrigin) as Arc<dyn Origin>],
+        16,
+    )
+    .await?;
+    let err = err_of(engine.origin_size(Hash::new(b"x")).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected the transport fault to surface, got {err:?}"
+    );
+    Ok(())
+}
+
+/// An origin whose `size` probe answers a fixed value.
+#[derive(Debug)]
+struct FixedSizeOrigin(u64);
+
+impl Origin for FixedSizeOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        Box::pin(async {
+            Err(OriginPullError::Transient(anyhow::anyhow!(
+                "unreachable in this test"
+            )))
+        })
+    }
+
+    fn size(
+        &self,
+        _hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
+        let size = self.0;
+        Box::pin(async move { Ok(Some(size)) })
+    }
+}
+
+#[tokio::test]
+async fn origin_size_fault_then_answer_advances_the_chain() -> anyhow::Result<()> {
+    // A faulting origin must not deny the probe when a later origin answers.
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(
+        tmp.path(),
+        vec![
+            Arc::new(FaultingSizeOrigin) as Arc<dyn Origin>,
+            Arc::new(FixedSizeOrigin(5)) as Arc<dyn Origin>,
+        ],
+        16,
+    )
+    .await?;
+    let size = engine.origin_size(Hash::new(b"sized")).await?;
+    anyhow::ensure!(
+        size == Some(5),
+        "the healthy origin's answer wins, got {size:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn origin_size_no_origin_configured_errors() -> anyhow::Result<()> {
     // `CacheEngine::origin_size` with no origins returns `NoOrigin` (a coherent

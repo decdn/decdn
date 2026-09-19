@@ -442,11 +442,11 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// origin-only serve gate and the DHT announce set read `Ok(None)` as an
     /// absence they may memoise, sign as `NotFound` to a paying client, and
     /// unschedule from republish — an outage folded into `None` does all
-    /// three. Callers that only want the best-effort range scope
-    /// (`CacheEngine::origin_size`) swallow the error themselves and fall back
-    /// to a whole-blob [`Self::fetch`], which re-surfaces a persistent fault
-    /// at its proper severity. The default returns `Ok(None)`, so a custom
-    /// [`Origin`] needs no change and simply never range-pulls.
+    /// three. `CacheEngine::origin_size` advances the origin chain past a
+    /// per-origin fault, but a probe that ends on faults surfaces the last one
+    /// (#1129): the serve path must report a degraded node, not an empty one.
+    /// The default returns `Ok(None)`, so a custom [`Origin`] needs no change
+    /// and simply never range-pulls.
     fn size(
         &self,
         _hash: Hash,

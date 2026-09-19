@@ -1005,20 +1005,22 @@ impl ClientHandler {
                                 // reports InternalError not NotFound, then fall
                                 // through — another source may still serve.
                                 Err(e) => {
-                                    tracing::debug!(%hash, error = %e, "own-origin outboard probe faulted; falling through");
+                                    self.metrics.node_pull_through_error();
+                                    tracing::warn!(%hash, error = %e, "own-origin outboard probe faulted; falling through");
                                     fault_seen = true;
                                 }
                             }
                         }
                         // No origin knows the size, or no origin is configured at
                         // all — both a clean fall-through (degrade). `origin_size`
-                        // already returns Ok(None) for most declines, so only
-                        // NoOrigin and transport faults reach the Err arms.
+                        // returns Ok(None) only for clean declines; a probe that
+                        // ends on a transport fault reaches the Err arm below.
                         Ok(None) | Err(CacheError::NoOrigin { .. }) => {}
                         // Any other origin fault latches `fault_seen` (#1129) so a
                         // later-tier miss reports InternalError not NotFound.
                         Err(e) => {
-                            tracing::debug!(%hash, error = %e, "own-origin size probe faulted; falling through");
+                            self.metrics.node_pull_through_error();
+                            tracing::warn!(%hash, error = %e, "own-origin size probe faulted; falling through");
                             fault_seen = true;
                         }
                     }

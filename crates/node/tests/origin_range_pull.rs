@@ -1699,6 +1699,99 @@ async fn throwaway_open_torn_down_before_real_open_still_serves() -> anyhow::Res
     Ok(())
 }
 
+/// #1129 through the spine's serviceability probe: a TRANSPORT fault on the own
+/// origin's size probe (HEAD → 500) with no other fill tier configured must
+/// terminally refuse as `InternalError` (a degraded node), never `NotFound` (an
+/// empty one). Guards the dispatch fault latch against `origin_size` swallowing
+/// the fault into a clean decline.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_origin_size_probe_fault_refuses_internal_error_not_cache_miss() -> anyhow::Result<()> {
+    let (blob, _outboard, hash) = blob_with_outboard();
+    let hex = hash.to_hex();
+    drop(blob);
+
+    let server = MockServer::start().await;
+    // The size probe faults (5xx is a transport-class fault for `size`, unlike
+    // a 404's clean decline). Nothing else is mounted: no fill tier can serve.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x67);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // A bound whole-blob open, read the refusal, close.
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let binding_hash =
+        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = client_eth
+        .sign_hash_sync(&binding_hash)?
+        .as_bytes()
+        .to_vec();
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: client_eth.address().into(),
+            binding_signature,
+        }),
+        capability: None,
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id.into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x9003,
+    };
+    let payload =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame_to(&mut send, &payload).await?;
+    let (resp, _resp_ext) = read_stream_response(&mut recv).await?;
+    anyhow::ensure!(!resp.body.ok, "a faulted node must refuse");
+    conn.close(0u32.into(), b"done");
+
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_internal_error_total")? == 1,
+        "a size-probe transport fault must refuse as InternalError (degraded node)"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_cache_miss_total")? == 0,
+        "a degraded node must not be reported as an empty one"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// A distinctive 3 MiB payload plus its outboard: larger than `PULL_WINDOW_FLOOR`,
 /// so a whole-blob own-origin miss takes several pull-leg draws.
 fn large_blob_with_outboard() -> (Vec<u8>, Vec<u8>, Hash) {

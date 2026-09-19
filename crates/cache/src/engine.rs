@@ -3592,20 +3592,28 @@ impl CacheEngine {
     /// per-origin `Ok(None)` (no object / compressed / unsupported) or a
     /// transport error advances the chain.
     ///
-    /// Returns `Ok(None)` when no origin can answer — the caller MUST then
-    /// degrade to a whole-blob [`Self::populate`] / [`Self::get`]. This is a
-    /// metadata probe only: it never fetches or caches bytes, so it carries no
+    /// Returns `Ok(None)` when every origin cleanly declines — the caller MUST
+    /// then degrade to a whole-blob [`Self::populate`] / [`Self::get`]. This is
+    /// a metadata probe only: it never fetches or caches bytes, so it carries no
     /// logical-eviction guard (the caller's serve path and whole-blob fallback
     /// both enforce it).
     ///
     /// # Errors
     ///
-    /// [`CacheError::NoOrigin`] when no origin is configured, so the caller sees
-    /// a coherent "can't range-pull" signal rather than a silent `None`.
+    /// - [`CacheError::NoOrigin`] when no origin is configured, so the caller
+    ///   sees a coherent "can't range-pull" signal rather than a silent `None`.
+    /// - [`CacheError::OriginError`] when NO origin answers and at least one
+    ///   failed with a transport fault (the last such fault). A per-origin
+    ///   fault still advances the chain — a later origin's answer wins — but a
+    ///   probe that ends on faults reports a degraded node, not an empty one,
+    ///   so the serve path's #1129 latch can turn the terminal miss into
+    ///   `InternalError` instead of `NotFound`. Mirrors
+    ///   [`Self::origin_fetch_outboard_bytes`].
     pub async fn origin_size(&self, hash: Hash) -> CacheResult<Option<u64>> {
         if self.inner.origins.is_empty() {
             return Err(CacheError::NoOrigin { hash });
         }
+        let mut last_err: Option<CacheError> = None;
         for origin in &self.inner.origins {
             match origin.size(hash).await {
                 Ok(Some(size)) => return Ok(Some(size)),
@@ -3617,10 +3625,17 @@ impl CacheEngine {
                         error = %e,
                         "origin size probe failed; trying next origin",
                     );
+                    last_err = Some(CacheError::OriginError {
+                        hash,
+                        source: e.into_inner(),
+                    });
                 }
             }
         }
-        Ok(None)
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(None),
+        }
     }
 
     /// Flush ephemeral state to disk. The iroh-blobs store does its own
