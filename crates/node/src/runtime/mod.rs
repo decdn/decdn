@@ -2805,10 +2805,10 @@ async fn build_endpoint(
         // excluded; their per-relay "skipping" warning already fired.
         if tally.reachable == 0 && tally.unprobeable < relays.len() {
             tracing::warn!(
-                "none of the {} probeable network.relay_urls were reachable at bring-up; \
+                probeable = relays.len().saturating_sub(tally.unprobeable),
+                "none of the probeable network.relay_urls were reachable at bring-up; \
                  proceeding and letting iroh retry in the background — check the URLs and \
-                 that a relay is up, or clear network.relay_urls to fall back to the n0 relays",
-                relays.len().saturating_sub(tally.unprobeable)
+                 that a relay is up, or clear network.relay_urls to fall back to the n0 relays"
             );
         }
         builder = builder.relay_mode(RelayMode::Custom(RelayMap::from_iter(relays)));
@@ -2945,7 +2945,7 @@ async fn probe_relays(relays: &[RelayUrl]) -> RelayProbeTally {
             // let that internal error hard-fail bring-up — treat it as
             // "couldn't probe" so it's excluded from the reachability gate.
             Err(e) => {
-                tracing::warn!("relay probe task failed to join: {e}");
+                tracing::warn!(error = %e, "relay probe task failed to join");
                 tally.unprobeable = tally.unprobeable.saturating_add(1);
             }
         }
@@ -2977,7 +2977,14 @@ async fn relay_host_reachable(host: &str, port: u16) -> bool {
         match relay_connect_once(host, port, ATTEMPT_TIMEOUT).await {
             Ok(()) => return true,
             Err(reason) => {
-                tracing::debug!("relay {host}:{port} probe attempt {attempt}/{ATTEMPTS}: {reason}");
+                tracing::debug!(
+                    relay = %host,
+                    port,
+                    attempt,
+                    attempts = ATTEMPTS,
+                    %reason,
+                    "relay probe attempt failed"
+                );
             }
         }
         if attempt < ATTEMPTS {
@@ -2985,7 +2992,10 @@ async fn relay_host_reachable(host: &str, port: u16) -> bool {
         }
     }
     tracing::warn!(
-        "relay {host}:{port} unreachable after {ATTEMPTS} attempts; iroh will keep retrying it in the background"
+        relay = %host,
+        port,
+        attempts = ATTEMPTS,
+        "relay unreachable at bring-up; iroh will keep retrying it in the background"
     );
     false
 }
@@ -3047,7 +3057,7 @@ async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigne
     // password file). The daemon has a `tracing` subscriber, so unlike the CLI
     // it logs rather than printing.
     for warning in resolved.warnings() {
-        tracing::warn!("keystore password: {warning}");
+        tracing::warn!(%warning, "keystore password source ignored");
     }
     let password = resolved.into_secret();
 

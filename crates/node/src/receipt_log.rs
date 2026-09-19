@@ -490,7 +490,14 @@ impl JsonlReceiptLog {
             Err(open_err) => {
                 // Restore the canonical path so the still-open `state.file`
                 // handle keeps appending to a correctly-named live log.
-                let _ = std::fs::rename(self.backup_path(1), &self.path);
+                if let Err(error) = std::fs::rename(self.backup_path(1), &self.path) {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        %error,
+                        "download receipt log: restoring the live path after a failed rotation \
+                         failed; receipts append to the `.1` backup until the next rotation"
+                    );
+                }
                 Err(open_err)
             }
         }

@@ -27,15 +27,19 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let (resolved, notices) = config::resolve_config(config_path, run_args)?;
 
-    // Initialize tracing — RUST_LOG env var takes precedence over resolved log level.
-    let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
-        Ok(f) => f,
+    // Initialize tracing — RUST_LOG env var takes precedence over resolved log level,
+    // for the whole life of the process (see `reload_directive`).
+    let (filter, rust_log_pinned) = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(f) => (f, true),
         Err(e) => {
             // Only warn if RUST_LOG was actually set (not just absent).
             if std::env::var_os("RUST_LOG").is_some() {
                 eprintln!("warning: ignoring malformed RUST_LOG: {e}");
             }
-            tracing_subscriber::EnvFilter::new(resolved.observability.log_level.to_string())
+            (
+                tracing_subscriber::EnvFilter::new(resolved.observability.log_level.to_string()),
+                false,
+            )
         }
     };
 
@@ -43,8 +47,12 @@ pub async fn run(
     // `/metrics` serves.
     let node_metrics = Arc::new(metrics::Metrics::new());
 
-    let (log_level_setter, tracer_provider) =
-        init_tracing(filter, &resolved, Arc::clone(&node_metrics))?;
+    let (log_level_setter, tracer_provider) = init_tracing(
+        filter,
+        rust_log_pinned,
+        &resolved,
+        Arc::clone(&node_metrics),
+    )?;
 
     // Replay what `resolve_config` recorded. It runs before `init_tracing`
     // (the fallback filter above is built from the resolved log level), so a
@@ -92,7 +100,8 @@ pub async fn run(
 ///
 /// Returns a [`runtime::LogLevelSetter`] closure that swaps the live
 /// `EnvFilter` to one matching a new `LogLevel` — used by the SIGHUP
-/// hot-reload path (#236). The closure captures a `reload::Handle` to the
+/// hot-reload path (#236). When `rust_log_pinned` is set, the filter came from
+/// `RUST_LOG` and the closure leaves it in place (see [`reload_directive`]). The closure captures a `reload::Handle` to the
 /// `EnvFilter` layer; calls to `modify` must respect any errors from the
 /// handle (e.g. the registry was dropped) by surfacing them.
 ///
@@ -100,6 +109,7 @@ pub async fn run(
 /// passes it to [`otlp::finish_run`] before the process exits.
 fn init_tracing(
     filter: tracing_subscriber::EnvFilter,
+    rust_log_pinned: bool,
     resolved: &config::ResolvedConfig,
     node_metrics: Arc<metrics::Metrics>,
 ) -> anyhow::Result<(runtime::LogLevelSetter, Option<SdkTracerProvider>)> {
@@ -128,11 +138,14 @@ fn init_tracing(
     };
 
     let setter: runtime::LogLevelSetter = Box::new(move |lvl| {
-        // Build a fresh EnvFilter from the level's lowercase name. This
-        // matches the startup default-filter construction above; we don't
-        // attempt to honour `RUST_LOG` here because reload is driven by
-        // the file, not the launching shell.
-        let new_filter = tracing_subscriber::EnvFilter::try_new(lvl.to_string())
+        let Some(directive) = reload_directive(rust_log_pinned, lvl) else {
+            tracing::info!(
+                log_level = %lvl,
+                "RUST_LOG is set; the config file log_level change is not applied"
+            );
+            return Ok(());
+        };
+        let new_filter = tracing_subscriber::EnvFilter::try_new(directive)
             .map_err(|e| anyhow::anyhow!("invalid log_level {lvl}: {e}"))?;
         reload_handle
             .modify(|f| *f = new_filter)
@@ -141,4 +154,39 @@ fn init_tracing(
     });
 
     Ok((setter, tracer_provider))
+}
+
+/// The filter directive a config-file `log_level` reload installs, or `None`
+/// when the live filter must stay as it is.
+///
+/// `RUST_LOG` wins over the file `log_level` at startup, so it wins on every
+/// reload too: a reload that replaced a `RUST_LOG` filter with a bare level
+/// would silently drop its per-target directives. Without `RUST_LOG`, the
+/// directive is the level's lowercase name, the same construction as the
+/// startup fallback.
+fn reload_directive(rust_log_pinned: bool, lvl: cli::common::LogLevel) -> Option<String> {
+    (!rust_log_pinned).then(|| lvl.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reload_directive_keeps_a_rust_log_filter_and_applies_the_file_level_otherwise() {
+        for lvl in [
+            cli::common::LogLevel::Error,
+            cli::common::LogLevel::Warn,
+            cli::common::LogLevel::Info,
+            cli::common::LogLevel::Debug,
+            cli::common::LogLevel::Trace,
+        ] {
+            assert_eq!(
+                reload_directive(true, lvl),
+                None,
+                "RUST_LOG pins the filter"
+            );
+            assert_eq!(reload_directive(false, lvl), Some(lvl.to_string()));
+        }
+    }
 }

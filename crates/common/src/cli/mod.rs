@@ -85,6 +85,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "LEVEL")]
     pub log_level: Option<common::LogLevel>,
 
+    /// Enable client-side logging by count: `-v` is `info`, `-vv` is `debug`,
+    /// `-vvv` is `trace`. Shorthand for `--log-level`, which wins when both are
+    /// given; `RUST_LOG` wins over both.
+    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
     /// Subcommand to execute.
     #[command(subcommand)]
     pub command: Command,

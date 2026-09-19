@@ -46,10 +46,13 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Opt-in only: with neither `--log-level` nor `RUST_LOG` this is a no-op and
+    // Opt-in only: with no `-v`, `--log-level` or `RUST_LOG` this is a no-op and
     // the CLI stays a clean terminal UI. Installed before dispatch so it covers
     // every subcommand.
-    decdn_cli::logging::init(cli.log_level);
+    decdn_cli::logging::init(decdn_cli::logging::requested_level(
+        cli.log_level,
+        cli.verbose,
+    ));
 
     let config_path = cli.config.map(|p| cli::common::expand_tilde(&p));
 

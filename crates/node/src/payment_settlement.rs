@@ -1508,13 +1508,13 @@ async fn submit_chunk<P: Provider + Clone>(
             metrics.redemption_failure();
             warn!(error = %sanitize_rpc_display(&err), voucher_count, "redeemMany send failed; leaving claims for retry");
         }
-        TxOutcome::ReceiptErr(err) => {
+        TxOutcome::ReceiptErr { error, tx_hash } => {
             metrics.redemption_failure();
-            warn!(error = %sanitize_rpc_display(&err), voucher_count, "redeemMany receipt failed; leaving claims for retry");
+            warn!(error = %sanitize_rpc_display(&error), voucher_count, tx = %tx_hash, "redeemMany receipt failed; leaving claims for retry");
         }
-        TxOutcome::Timeout => {
+        TxOutcome::Timeout { tx_hash } => {
             metrics.redemption_failure();
-            warn!(voucher_count, timeout = ?REDEEM_RECEIPT_TIMEOUT, "redeemMany receipt timed out; leaving claims for retry");
+            warn!(voucher_count, tx = %tx_hash, timeout = ?REDEEM_RECEIPT_TIMEOUT, "redeemMany receipt timed out; leaving claims for retry");
         }
     }
 }

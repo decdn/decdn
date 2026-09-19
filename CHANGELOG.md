@@ -1362,6 +1362,21 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **Logging: one field name per concept, and peer-triggered warnings are
+  throttled.** Every tracing event names its error field `error` (was a mix of
+  `err`, `%err` and `error`); a `tracing-field-names` pre-commit hook keeps it
+  that way. Update any log query or alert that matched `err=`. DHT logs name the
+  remote id `peer` (was `responder` / `seed`) and print it as lowercase hex, the
+  same as the transport's `peer`. The client-binding, unbound-request,
+  unknown-lane and probe read-fault `warn!` lines — all of which a remote peer
+  can trigger at will — now fire at most once a minute per cause and carry
+  `peer` and a `suppressed` count. A failed `redeemMany` receipt wait or timeout
+  logs the transaction hash, since the transaction may still mine.
+- **A config reload no longer replaces a `RUST_LOG` filter.** `RUST_LOG` wins
+  over the config file `log_level` at startup; a SIGHUP or admin reload used to
+  swap it for the bare file level, dropping its per-target directives. The
+  reload now leaves a `RUST_LOG` filter in place and logs that it did.
+
 - **The workspace reads `0.0.0` until the first release is cut, and the
   versioning invariants are enforced rather than described.** `decdn
   --version` and the default user agent report `0.0.0`; the first `cargo
@@ -1723,6 +1738,10 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+- **CLI: `-v` / `-vv` / `-vvv` turn on client-side logging** at `info` /
+  `debug` / `trace`. `--log-level` wins over the count, and `RUST_LOG` wins over
+  both.
 
 - **Monitoring: the chain dashboard shows a world map of active nodes by
   declared region.** New gauge `decdn_staker_set_active_by_region{node_region}`

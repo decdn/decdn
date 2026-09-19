@@ -43,7 +43,7 @@ pub(crate) fn with_read<T, R>(state: &RwLock<T>, label: &str, f: impl FnOnce(&T)
     match state.read() {
         Ok(guard) => f(&guard),
         Err(poisoned) => {
-            warn!("{label} RwLock poisoned; recovering inner state");
+            warn!(lock = label, "RwLock poisoned; recovering inner state");
             state.clear_poison();
             f(&poisoned.into_inner())
         }
@@ -55,7 +55,7 @@ pub(super) fn with_write<T, R>(state: &RwLock<T>, label: &str, f: impl FnOnce(&m
     match state.write() {
         Ok(mut guard) => f(&mut guard),
         Err(poisoned) => {
-            warn!("{label} RwLock poisoned; recovering inner state");
+            warn!(lock = label, "RwLock poisoned; recovering inner state");
             state.clear_poison();
             f(&mut poisoned.into_inner())
         }
@@ -75,7 +75,7 @@ pub(crate) fn with_lock<T, R>(lock: &Mutex<T>, label: &str, f: impl FnOnce(&mut 
     match lock.lock() {
         Ok(mut guard) => f(&mut guard),
         Err(poisoned) => {
-            warn!("{label} Mutex poisoned; recovering inner state");
+            warn!(lock = label, "Mutex poisoned; recovering inner state");
             lock.clear_poison();
             f(&mut poisoned.into_inner())
         }
