@@ -240,7 +240,9 @@ impl Pacer for BudgetPacer {
 /// `window_bytes` ahead of the downstream serve leg's paid frontier — plus one
 /// [`PULL_WINDOW_FLOOR`] when [`DownstreamFrontier::serve_demand`] shows a serve leg parked
 /// at the pull's frontier. When the window is already full and no serve leg is
-/// parked there, wait instead of drawing zero bytes.
+/// parked there, wait instead of drawing zero bytes. Once the window has ramped
+/// past [`PULL_WINDOW_FLOOR`] it also waits while less than half the window is
+/// free, so draws stay large (#2061).
 ///
 /// Composition, not reimplementation: `WindowPacer::decide` calls
 /// `BudgetPacer::decide` and only touches the `Draw` arm. `Done` / `TopUp` /
@@ -298,6 +300,27 @@ impl Pacer for WindowPacer {
                 } else {
                     0
                 };
+                // Minimum draw (#2061). A voucher opens about one chunk of room and
+                // wakes the pull, so without a floor a fast origin is driven in
+                // one-chunk draws — one origin round trip per chunk for the whole
+                // blob. Once the window has ramped, wait until at least half of it
+                // is free, so the draw count is bounded by `2 · total / window`
+                // instead of `total / CHUNK_BYTES`. The bound
+                // `pulled − served_paid ≤ window` is untouched: waiting only ever
+                // draws LESS. Three exceptions keep liveness: the minimum never
+                // exceeds the room above [`PULL_WINDOW_FLOOR`] (at the floor it is
+                // zero, so the floor's rounding slack stays drawable — the
+                // invariant that constant exists for), the serve-demand floor above
+                // (a parked serve leg gets its one floor regardless), and the final
+                // draw (a gap remainder smaller than the minimum is drawn as soon as
+                // it fits).
+                let min_draw = (self.window_bytes / 2)
+                    .min(self.window_bytes.saturating_sub(PULL_WINDOW_FLOOR))
+                    .min(up_to_bytes);
+                let min_draw = min_draw - min_draw % CHUNK_GROUP_BYTES;
+                if demanded == 0 && room < min_draw {
+                    return PaceDecision::Wait;
+                }
                 let room = room.max(demanded);
                 if room == 0 {
                     PaceDecision::Wait
@@ -684,6 +707,84 @@ mod tests {
         s.downstream.served_paid = 0;
         assert_eq!(WindowPacer::new(10).decide(&s), PaceDecision::Refuse);
         assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Refuse);
+    }
+
+    #[test]
+    fn window_pacer_waits_until_half_the_window_is_free() {
+        // A ramped window of 256 groups (4 MiB, well past the 67-group floor).
+        // The pull is 250 groups ahead: 6 groups of room, less than the
+        // 128-group minimum draw, and no serve leg is parked → Wait.
+        let window = 256 * CHUNK_GROUP_BYTES;
+        let pacer = WindowPacer::new(window);
+        let mut s = healthy();
+        s.requested_bytes = 1_000 * CHUNK_GROUP_BYTES;
+        s.cleared_bytes = 0;
+        s.downstream.served_paid = 0;
+        s.pulled_frontier = 250 * CHUNK_GROUP_BYTES;
+        assert_eq!(pacer.decide(&s), PaceDecision::Wait);
+
+        // 128 groups of room (exactly the minimum) → Draw, capped to the room.
+        s.pulled_frontier = 128 * CHUNK_GROUP_BYTES;
+        assert_eq!(
+            pacer.decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: 128 * CHUNK_GROUP_BYTES
+            }
+        );
+    }
+
+    #[test]
+    fn window_pacer_minimum_is_zero_at_the_floor() {
+        // At the ramp floor the window carries only its rounding slack; every
+        // group of room must stay drawable or the loop deadlocks (see
+        // `PULL_WINDOW_FLOOR`). Three groups of room → Draw three groups.
+        let pacer = WindowPacer::new(PULL_WINDOW_FLOOR);
+        let mut s = healthy();
+        s.requested_bytes = 1_000 * CHUNK_GROUP_BYTES;
+        s.cleared_bytes = 0;
+        s.downstream.served_paid = 0;
+        s.pulled_frontier = PULL_WINDOW_FLOOR - 3 * CHUNK_GROUP_BYTES;
+        assert_eq!(
+            pacer.decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: 3 * CHUNK_GROUP_BYTES
+            }
+        );
+    }
+
+    #[test]
+    fn window_pacer_final_draw_ignores_the_minimum() {
+        // Only 3 groups remain in the gap (`up_to_bytes` from the budget pacer is
+        // the gap remainder). 6 groups of room is enough for the last draw even
+        // though it is below half the window.
+        let window = 256 * CHUNK_GROUP_BYTES;
+        let pacer = WindowPacer::new(window);
+        let mut s = healthy();
+        s.requested_bytes = 253 * CHUNK_GROUP_BYTES;
+        s.cleared_bytes = 250 * CHUNK_GROUP_BYTES;
+        s.downstream.served_paid = 0;
+        s.pulled_frontier = 250 * CHUNK_GROUP_BYTES;
+        assert!(matches!(pacer.decide(&s), PaceDecision::Draw { .. }));
+    }
+
+    #[test]
+    fn window_pacer_serve_demand_overrides_the_minimum() {
+        // A serve leg parked at the frontier still gets one floor even when the
+        // room is below the minimum draw.
+        let window = 256 * CHUNK_GROUP_BYTES;
+        let pacer = WindowPacer::new(window);
+        let mut s = healthy();
+        s.requested_bytes = 1_000 * CHUNK_GROUP_BYTES;
+        s.cleared_bytes = 0;
+        s.downstream.served_paid = 0;
+        s.pulled_frontier = 250 * CHUNK_GROUP_BYTES;
+        s.downstream.serve_demand = 250 * CHUNK_GROUP_BYTES + 1;
+        assert_eq!(
+            pacer.decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: PULL_WINDOW_FLOOR
+            }
+        );
     }
 
     #[test]
