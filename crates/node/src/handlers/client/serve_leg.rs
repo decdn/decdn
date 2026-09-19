@@ -52,9 +52,9 @@ use super::outcome::{ServeEnd, ServeStop};
 use super::voucher::StreamAnchor;
 use super::wire::chunk_frame_bufs;
 use super::{
-    Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, FloorReservation,
-    Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VecDeque,
-    VoucherRejectReason, VoucherStop,
+    Arc, B256, BufferedProofReader, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, ClientMessage,
+    FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256,
+    VecDeque, VoucherRejectReason, VoucherStop,
 };
 
 impl ClientHandler {
@@ -136,6 +136,11 @@ impl ClientHandler {
             offset.saturating_add(len).min(total_bytes)
         };
         let offset = offset.min(end);
+        // The wire this leg delivers starts at the chunk-group floor of `offset`
+        // (`align_range` snaps the fetch start down), so paid wire maps back to
+        // content from THAT boundary — `content_paid_frontier` requires a
+        // group-aligned fetch start. Equal to `offset` for an aligned request.
+        let fetch_start = (offset / CHUNK_GROUP_BYTES).saturating_mul(CHUNK_GROUP_BYTES);
 
         let chunk_bytes = CHUNK_BYTES;
 
@@ -324,26 +329,24 @@ impl ClientHandler {
                             // `WindowPacer`, mapping paid WIRE back into content space (the
                             // largest chunk-group boundary provably inside the paid wire
                             // prefix — conservative, so the pull never overshoots its
-                            // window). One contiguous delivery from `offset`, so `offset`
-                            // is the single fetch-start.
-                            let served = content_paid_frontier(offset, total_bytes, paid);
-                            // Forward-only: N observers advance the SHARED frontier and
-                            // the pull's `WindowPacer` binds on the MAX-over-observers
-                            // paid frontier (DECISION-B), so a slower observer never
-                            // regresses a faster one. With one observer `served` never
-                            // decreases, so forward-only discards nothing. A batch that
-                            // stays inside one chunk group leaves `served` unchanged and
-                            // wakes nothing.
-                            session.advance_served(served);
+                            // window). One contiguous delivery from `fetch_start`, so it is
+                            // the single fetch-start.
+                            let served = content_paid_frontier(fetch_start, total_bytes, paid);
+                            // Forward-only, and guarded on THIS leg's start: an owning
+                            // session starts AT `fetch_start`, so the guard is a no-op and
+                            // N whole-range observers advance the SHARED frontier with the
+                            // pull's `WindowPacer` binding on the MAX-over-observers paid
+                            // frontier (DECISION-B). An observer ATTACHED at an offset the
+                            // owner's paid prefix has not reached yet must not lift that
+                            // prefix past bytes nobody paid for; its payment extends the
+                            // frontier once the prefix reaches it
+                            // (`FillSession::extend_served_from`).
+                            session.extend_served_from(fetch_start, served);
                             // Under partial-overlap coalescing each attached sibling pull
-                            // produces the OVERLAP this leg also consumes and bills. This
-                            // leg's payment extends a sibling's paid prefix only once that
-                            // prefix reaches `offset` (`FillSession::extend_served_from`):
-                            // each overlap byte is fetched once and recouped by the
-                            // fastest of its shared observers (DECISION-B). Empty in the
-                            // common N=1 case.
+                            // produces the OVERLAP this leg also consumes and bills; the
+                            // same guard applies to every sibling.
                             for extra in also_pace {
-                                extra.extend_served_from(offset, served);
+                                extra.extend_served_from(fetch_start, served);
                             }
                             continue 'chunk;
                         }
