@@ -1145,7 +1145,7 @@ async fn run_open<P: Provider + Clone>(
         }
         Ok(None) => {}
         Err(err) => {
-            error!(%err, "buyer pool store read failed under the open slot; cannot open a pool");
+            error!(error = %err, "buyer pool store read failed under the open slot; cannot open a pool");
             metrics.node_pull_pool_open_failure();
             return Err(anyhow::Error::new(err))
                 .context("look up the node's buyer pool under the open slot")
@@ -1168,7 +1168,7 @@ async fn run_open<P: Provider + Clone>(
         error!(
             tx = %opened.tx,
             pool_id = %opened.state.pool_id,
-            %err,
+            error = %err,
             "buyer pool opened on-chain but its row could not be persisted; the deposit is \
              escrowed but UNTRACKED — reconcile against the tx"
         );
@@ -1228,7 +1228,7 @@ async fn reclaim_once<P: Provider + Clone>(
     let Some(state) = (match store.get_by_owner(owner) {
         Ok(state) => state,
         Err(err) => {
-            warn!(%err, "reclaim sweep: buyer pool store read failed");
+            warn!(error = %err, "reclaim sweep: buyer pool store read failed");
             metrics.buyer_reclaim_failure();
             return;
         }
@@ -1274,7 +1274,7 @@ async fn reclaim_once<P: Provider + Clone>(
                 // still reads healthy, so meter it like the sibling arms
                 // instead of dropping out of the sweep silently.
                 if let Err(err) = store.forget_if_pool(owner, state.pool_id) {
-                    warn!(pool_id = %state.pool_id, %err, "reclaim sweep: forget after reclaim failed");
+                    warn!(pool_id = %state.pool_id, error = %err, "reclaim sweep: forget after reclaim failed");
                     metrics.buyer_reclaim_failure();
                     return;
                 }

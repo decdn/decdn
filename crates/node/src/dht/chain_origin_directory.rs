@@ -189,7 +189,7 @@ impl OriginDirectory for ChainOriginDirectory {
             Err(err) => {
                 self.metrics.origin_directory_get_origins_failure();
                 warn!(
-                    err = %sanitize_err_chain(&err),
+                    error = %sanitize_err_chain(&err),
                     %namespace_id,
                     "getOrigins lookup failed; resolving no origins for this request"
                 );

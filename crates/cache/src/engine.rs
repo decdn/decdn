@@ -986,7 +986,7 @@ async fn gc_protect_callback(
         // The spawned task panicked or was dropped before sending.
         // Surface it: a panic in `gc_protect_inner` would otherwise be
         // invisible (this cb just returns `Continue` either way).
-        tracing::warn!(%err, "gc protect spawn dropped without completing; metrics may have skipped a cycle");
+        tracing::warn!(error = %err, "gc protect spawn dropped without completing; metrics may have skipped a cycle");
     }
 }
 
@@ -1016,7 +1016,7 @@ async fn gc_protect_inner(
     let current = match snapshot_blob_sizes(store).await {
         Ok(snap) => snap,
         Err(err) => {
-            tracing::warn!(%err, "gc snapshot failed; skipping reclaim attribution this cycle");
+            tracing::warn!(error = %err, "gc snapshot failed; skipping reclaim attribution this cycle");
             return;
         }
     };
@@ -2430,7 +2430,7 @@ impl CacheEngine {
                 }
                 tracing::warn!(
                     %hash,
-                    %err,
+                    error = %err,
                     "evict: failed to drop protecting tags; bytes stay GC-protected (not auto-retried)",
                 );
             }
@@ -5149,7 +5149,7 @@ impl CacheEngine {
                 tracing::warn!(
                     expected = %hash,
                     %actual,
-                    %err,
+                    error = %err,
                     "hash-mismatch tag delete failed (drain path); wrong-hash bytes stay GC-protected (not auto-retried)",
                 );
             }

@@ -268,10 +268,10 @@ async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupStat
                     );
                 }
                 Ok((responder, Err(RoundRpcError::Transport(err)))) => {
-                    debug!(?responder, %err, "dht lookup: find_value RPC failed");
+                    debug!(?responder, error = %err, "dht lookup: find_value RPC failed");
                 }
                 Err(err) => {
-                    warn!(%err, "dht lookup: round task panicked");
+                    warn!(error = %err, "dht lookup: round task panicked");
                 }
             }
         }

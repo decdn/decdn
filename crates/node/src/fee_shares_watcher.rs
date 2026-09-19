@@ -56,7 +56,7 @@ impl<P: Provider + Clone> FeeSharesSink<P> {
             }
             Err(err) => {
                 tracing::error!(
-                    %err,
+                    error = %err,
                     source,
                     "fee-shares watcher: on-chain FeeRouter split could not be narrowed to \
                      operator bps; keeping the current share — governance must fix the split"
@@ -78,7 +78,7 @@ impl<P: Provider + Clone + 'static> LogSink for FeeSharesSink<P> {
                 Err(err) => {
                     // Undecodable log: log-and-skip (never Err — a deterministic
                     // re-scan would hot-loop the cursor).
-                    tracing::warn!(%err, "fee-shares watcher: undecodable SharesUpdated log; skipping");
+                    tracing::warn!(error = %err, "fee-shares watcher: undecodable SharesUpdated log; skipping");
                 }
             }
         }
@@ -106,7 +106,7 @@ impl<P: Provider + Clone + 'static> LogSink for FeeSharesSink<P> {
                 // re-read logs and keeps the current share rather than backing
                 // off the whole watcher (which would also stall event pickup).
                 // Returning Ok keeps the cursor advancing.
-                tracing::warn!(%err, "fee-shares watcher: authoritative getShares() poll failed; keeping current share");
+                tracing::warn!(error = %err, "fee-shares watcher: authoritative getShares() poll failed; keeping current share");
             }
         }
         Ok(())

@@ -323,7 +323,7 @@ impl ReloadableSection for LogLevelSection {
             Some(prev) => prev != new_level,
         };
         if log_level_changed && let Err(err) = (self.setter)(new_level) {
-            tracing::warn!(%err, ?new_level, "failed to apply new log level; previous level retained");
+            tracing::warn!(error = %err, ?new_level, "failed to apply new log level; previous level retained");
             return Err(err);
         }
         if log_level_changed {
@@ -1116,7 +1116,7 @@ impl RuntimeReloadState {
         let file = match load_file_config(Some(path)) {
             Ok(f) => f,
             Err(err) => {
-                tracing::warn!(%err, path = %path.display(), "config reload aborted (file load failed); previous values retained for every section");
+                tracing::warn!(error = %err, path = %path.display(), "config reload aborted (file load failed); previous values retained for every section");
                 return Err(err);
             }
         };
@@ -1170,7 +1170,7 @@ impl RuntimeReloadState {
         let problem_count = bag.problem_count();
         if let Err(err) = bag.into_result() {
             tracing::warn!(
-                %err,
+                error = %err,
                 problem_count,
                 "config reload aborted; entire reload rolled back \
                  (all-or-nothing) — all reloadable sections retained at \
@@ -1193,7 +1193,7 @@ impl RuntimeReloadState {
                 // monolithic body's behaviour where a setter failure
                 // returned before the rate atomic swap.
                 tracing::warn!(
-                    %err,
+                    error = %err,
                     section = section.name(),
                     "config reload fallible_commit failed; later sections skipped"
                 );

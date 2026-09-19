@@ -180,7 +180,7 @@ fn record_pool_open_failure(
     // inert for this symptom.
     if err.downcast_ref::<PoolOpenPending>().is_some() {
         deps.metrics.node_pull_pool_open_pending();
-        debug!(%provider_addr, %err, "node-origin: pool open still in flight; trying the next candidate");
+        debug!(%provider_addr, error = %err, "node-origin: pool open still in flight; trying the next candidate");
         return PullMiss::Clean;
     }
     // Ahead of `OpenReported`, deliberately, and this ordering is load-bearing (#1560). The
@@ -202,7 +202,7 @@ fn record_pool_open_failure(
     if err.downcast_ref::<LocalPullFault>().is_some() {
         deps.metrics.node_pull_local_fault();
         warn!(
-            %provider_addr, %err,
+            %provider_addr, error = %err,
             "node-origin: LOCAL buyer-side fault opening a channel — this node cannot pay \
              any provider; exonerating the upstream and refusing rather than reporting a miss"
         );
@@ -214,7 +214,7 @@ fn record_pool_open_failure(
     // unobserved exactly when it is least affordable. This arm keeps the caller that
     // DID happen to still be waiting from double-counting it.
     if err.downcast_ref::<OpenReported>().is_some() {
-        debug!(%provider_addr, %err, "node-origin: buyer channel open failed (reported by the open task)");
+        debug!(%provider_addr, error = %err, "node-origin: buyer channel open failed (reported by the open task)");
         // Reported by the open path and NOT typed as ours there, so it is one of the legs
         // that leaves this node able to pay somebody else: a `ContractRevert`, an `RpcError`,
         // or an expired channel that could not be reclaimed. Another candidate may still
@@ -239,7 +239,7 @@ fn record_pool_open_failure(
     warn!(
         %provider_addr,
         reason = reason.map_or("unclassified", PoolOpenFailureReason::as_label),
-        %err,
+        error = %err,
         "node-origin: buyer channel open/reuse failed (raised outside the open task — \
          suspect this node's store or lock state, not the peer)"
     );
@@ -954,7 +954,7 @@ async fn probe_candidate(
             // outcome is recorded. A `global-full` shed skips the node's close ack-wait
             // and can still arrive as a bare drop; that residue scores below.
             if err.downcast_ref::<UpstreamRateLimited>().is_some() {
-                debug!(%err, "node-origin: probe shed by the upstream's rate limiter; suppressing briefly, not scoring");
+                debug!(error = %err, "node-origin: probe shed by the upstream's rate limiter; suppressing briefly, not scoring");
                 deps.metrics.node_upstream_rate_limited();
                 deps.negative_cache.record_failure_with_ttl(
                     peer,
@@ -968,7 +968,7 @@ async fn probe_candidate(
             debug!(
                 peer = %pk,
                 provider_addr = ?deps.addr_resolver.address_of(&peer),
-                %err,
+                error = %err,
                 "node-origin: probe failed; scoring provider unreachable"
             );
             record_outcome(deps, pk, &Outcome::Unreachable);
@@ -995,7 +995,7 @@ async fn probe_candidate(
         hash_bytes,
         probe_ts,
     ) {
-        debug!(%err, "node-origin: dropping an unverifiable probe response");
+        debug!(error = %err, "node-origin: dropping an unverifiable probe response");
         return None;
     }
     // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
@@ -1803,7 +1803,7 @@ async fn pull_from_candidate(
     let (result, pool_id, cancelled) = match join {
         Ok(Ok(triple)) => triple,
         Ok(Err(err)) => {
-            warn!(%err, "node-origin: pull-thread runtime build failed; local fault");
+            warn!(error = %err, "node-origin: pull-thread runtime build failed; local fault");
             return Err(PullMiss::LocalFault);
         }
         Err(join_err) => {
@@ -1953,7 +1953,7 @@ fn persist_buyer_progress(
                 .record_progress(provider_addr, pool_id, bytes_delivered, amount)
     {
         deps.metrics.node_pull_progress_persist_failure();
-        warn!(%provider_addr, %err, "node-origin: failed to persist buyer voucher progress");
+        warn!(%provider_addr, error = %err, "node-origin: failed to persist buyer voucher progress");
     }
 }
 
@@ -2422,7 +2422,7 @@ fn classify_pull_failure(
         // the prefix we took (bounded to roughly one ceiling), never for the peer's claim.
         PullVerdict::Oversize => {
             deps.metrics.node_pull_too_large();
-            debug!(%provider_addr, %err, "node-origin: upstream blob crossed our size ceiling on received bytes; pull aborted");
+            debug!(%provider_addr, error = %err, "node-origin: upstream blob crossed our size ceiling on received bytes; pull aborted");
         }
         // The provider quoted above our effective rate ceiling (#1375). We refused before
         // paying; the signed over-quote is retained ON the `RateAboveCeiling` error for a
@@ -2436,7 +2436,7 @@ fn classify_pull_failure(
         PullVerdict::RateCeiling => {
             deps.metrics.node_pull_rate_above_ceiling();
             suppress(Some(REFUSAL_SUPPRESSION_TTL));
-            debug!(%provider_addr, %err, "node-origin: upstream quoted above our rate ceiling; refused before paying, suppressing the pair");
+            debug!(%provider_addr, error = %err, "node-origin: upstream quoted above our rate ceiling; refused before paying, suppressing the pair");
         }
         // A possibly mis-sized local budget, not evidence the provider is unreachable
         // (#857). Unscored — but NOT ignored (#1145 review).
@@ -2460,7 +2460,7 @@ fn classify_pull_failure(
         PullVerdict::OurDeadline => {
             deps.metrics.node_pull_timeout();
             suppress(Some(REFUSAL_SUPPRESSION_TTL));
-            debug!(%provider_addr, %err, "node-origin: pull hit our local deadline; suppressing briefly, not tarring upstream reputation");
+            debug!(%provider_addr, error = %err, "node-origin: pull hit our local deadline; suppressing briefly, not tarring upstream reputation");
         }
         // A throughput-floor abort is non-attributable (#1797), the same class as
         // `OurDeadline`: a stream that falls below the floor may be slow because of the link,
@@ -2474,7 +2474,7 @@ fn classify_pull_failure(
         PullVerdict::Stalled => {
             deps.metrics.node_pull_stalled();
             suppress(Some(REFUSAL_SUPPRESSION_TTL));
-            debug!(%provider_addr, %err, "node-origin: upstream fell below the throughput floor; suppressing briefly, not tarring upstream reputation");
+            debug!(%provider_addr, error = %err, "node-origin: upstream fell below the throughput floor; suppressing briefly, not tarring upstream reputation");
         }
         // The peer shed us at the transport with `APP_ERR_RATE_LIMITED` (#1986): the same
         // event as a handler-level `Overloaded` refusal, one layer down, and it earns the
@@ -2485,7 +2485,7 @@ fn classify_pull_failure(
         PullVerdict::RateLimited => {
             deps.metrics.node_upstream_rate_limited();
             suppress(Some(REFUSAL_SUPPRESSION_TTL));
-            debug!(%provider_addr, %err, ttl = ?REFUSAL_SUPPRESSION_TTL, "node-origin: upstream shed the pull at the transport (rate-limited); suppressing briefly, not tarring upstream reputation");
+            debug!(%provider_addr, error = %err, ttl = ?REFUSAL_SUPPRESSION_TTL, "node-origin: upstream shed the pull at the transport (rate-limited); suppressing briefly, not tarring upstream reputation");
         }
         // Our payment-side fault — the provider is not scored (#857). What separates this arm
         // from the retryable one below is what it costs the LANE.
@@ -2507,7 +2507,7 @@ fn classify_pull_failure(
         PullVerdict::OurVoucherRetryable(reason) => {
             deps.metrics.node_pull_voucher_rejected();
             debug!(
-                %provider_addr, ?reason, %err,
+                %provider_addr, ?reason, error = %err,
                 "node-origin: upstream rejected the voucher but the channel is healthy; \
                  left intact for a retry"
             );
@@ -2528,7 +2528,7 @@ fn classify_pull_failure(
             deps.metrics.node_pull_refused();
             match verdict {
                 RefusalVerdict::NodeFault => {
-                    debug!(peer = %pk, %provider_addr, %err, "node-origin: upstream reports itself degraded; scoring unreachable");
+                    debug!(peer = %pk, %provider_addr, error = %err, "node-origin: upstream reports itself degraded; scoring unreachable");
                     record_outcome(deps, pk, &Outcome::Unreachable);
                 }
                 RefusalVerdict::DurableMiss(cause) => {
@@ -2559,7 +2559,7 @@ fn classify_pull_failure(
                         DurableMissCause::HashBlacklisted => {}
                     }
                     suppress(None);
-                    debug!(%provider_addr, ?cause, %err, "node-origin: upstream does not have this blob; negative-caching this (peer, hash) for the full TTL without tarring reputation");
+                    debug!(%provider_addr, ?cause, error = %err, "node-origin: upstream does not have this blob; negative-caching this (peer, hash) for the full TTL without tarring reputation");
                 }
                 RefusalVerdict::Transient => {
                     // Metered (#1520). This arm is where a *buyer-side* problem
@@ -2570,10 +2570,10 @@ fn classify_pull_failure(
                     // nothing in its telemetry saying why.
                     deps.metrics.node_pull_refused_unattributable();
                     suppress(Some(REFUSAL_SUPPRESSION_TTL));
-                    debug!(%provider_addr, %err, ttl = ?REFUSAL_SUPPRESSION_TTL, "node-origin: upstream refused for a reason we cannot attribute to it; briefly suppressing this (peer, hash) without tarring reputation");
+                    debug!(%provider_addr, error = %err, ttl = ?REFUSAL_SUPPRESSION_TTL, "node-origin: upstream refused for a reason we cannot attribute to it; briefly suppressing this (peer, hash) without tarring reputation");
                 }
                 RefusalVerdict::OurFault => {
-                    debug!(%provider_addr, %err, "node-origin: upstream refused on OUR payment fault; exonerating and leaving it selectable");
+                    debug!(%provider_addr, error = %err, "node-origin: upstream refused on OUR payment fault; exonerating and leaving it selectable");
                 }
             }
         }
@@ -2586,17 +2586,17 @@ fn classify_pull_failure(
         PullVerdict::OurLocalFault => {
             deps.metrics.node_pull_local_fault();
             warn!(
-                %provider_addr, %err,
+                %provider_addr, error = %err,
                 "node-origin: LOCAL buyer-side fault during a pull (signer/encode/range) — this node \
                  cannot pay; exonerating the upstream"
             );
         }
         PullVerdict::Corruption => {
-            debug!(peer = %pk, %provider_addr, %err, "node-origin: upstream served corrupt bytes; scoring corruption");
+            debug!(peer = %pk, %provider_addr, error = %err, "node-origin: upstream served corrupt bytes; scoring corruption");
             record_outcome(deps, pk, &Outcome::Corruption);
         }
         PullVerdict::Unreachable => {
-            debug!(peer = %pk, %provider_addr, %err, "node-origin: upstream pull failed; scoring unreachable");
+            debug!(peer = %pk, %provider_addr, error = %err, "node-origin: upstream pull failed; scoring unreachable");
             record_outcome(deps, pk, &Outcome::Unreachable);
         }
     }

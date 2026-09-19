@@ -382,7 +382,7 @@ impl<R: SlashChainReads> LogSink for SlashSink<R> {
             Ok(fresh) => fresh,
             Err(err) => {
                 warn!(
-                    err = %sanitize_err_chain(&err),
+                    error = %sanitize_err_chain(&err),
                     "slash resync failed; keeping the current detected-slash set"
                 );
                 return Ok(());
@@ -461,7 +461,7 @@ async fn record_recorded_log<R: SlashChainReads>(
         Ok(record) => record,
         Err(err) => {
             warn!(
-                err = %sanitize_err_chain(&err),
+                error = %sanitize_err_chain(&err),
                 slash_id = %slash_id,
                 "failed to read slash record for a live SlashRecorded log; the resync will recover it"
             );
@@ -472,7 +472,7 @@ async fn record_recorded_log<R: SlashChainReads>(
         Ok(paused_total) => paused_total,
         Err(err) => {
             warn!(
-                err = %sanitize_err_chain(&err),
+                error = %sanitize_err_chain(&err),
                 slash_id = %slash_id,
                 "failed to read pausedTotal for a live SlashRecorded log; the resync will recover it"
             );

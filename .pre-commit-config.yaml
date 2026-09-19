@@ -116,6 +116,15 @@ repos:
         files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml|\.github/scripts/check[-_]workspace[-_]manifests\.(py|sh))$'
         pass_filenames: false
 
+      # One field name per concept in tracing events: an error value is
+      # `error = %e`, never the `%err` shorthand or an `err =` field, so a
+      # log query or a span attribute filter matches every site.
+      - id: tracing-field-names
+        name: tracing events name error fields `error`
+        entry: '^(?!\s*//).*((?<!= )[%?](err|e)\b\s*[,)]|\berr = [%?])'
+        language: pygrep
+        types: [rust]
+
       # Cargo enforces acyclicity only. The dependency flow in CLAUDE.md
       # § Crate Structure (three leaves, cli/e2e as sinks, an iroh-blobs-free
       # CLI) is held by the table in check_crate_edges.py. Needs cargo. The

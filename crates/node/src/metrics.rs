@@ -2600,7 +2600,7 @@ pub async fn serve(
             res = listener.accept() => match res {
                 Ok(pair) => pair,
                 Err(err) => {
-                    tracing::warn!(%err, "metrics accept failed");
+                    tracing::warn!(error = %err, "metrics accept failed");
                     continue;
                 }
             },
@@ -2628,7 +2628,7 @@ pub async fn serve(
                 .serve_connection(io, svc)
                 .await
             {
-                tracing::debug!(%err, "metrics connection ended");
+                tracing::debug!(error = %err, "metrics connection ended");
             }
         });
     }
@@ -2656,7 +2656,7 @@ fn handle(
             .body(Full::new(Bytes::from(body)))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))),
         Err(err) => {
-            tracing::warn!(%err, "metrics encode error");
+            tracing::warn!(error = %err, "metrics encode error");
             Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Full::new(Bytes::from_static(b"encode error\n")))

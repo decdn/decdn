@@ -103,7 +103,7 @@ pub async fn check<P: Provider>(
         Ok(bound) => bound,
         Err(err) => {
             tracing::warn!(
-                %err,
+                error = %err,
                 %operator,
                 %capacity_bond,
                 "could not read the on-chain node-id binding at startup; slashability of this \
