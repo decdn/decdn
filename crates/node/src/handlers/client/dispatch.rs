@@ -243,6 +243,7 @@ impl ClientHandler {
                             "client binding signature recovered a different address"
                         );
                     }
+                    self.metrics.serve_stream_rejected_bad_binding();
                     reset_stream(&mut send, &mut recv, APP_ERR_MALFORMED_MESSAGE);
                     return Ok(());
                 }
@@ -256,6 +257,7 @@ impl ClientHandler {
                             "client binding signature invalid"
                         );
                     }
+                    self.metrics.serve_stream_rejected_bad_binding();
                     reset_stream(&mut send, &mut recv, APP_ERR_MALFORMED_MESSAGE);
                     return Ok(());
                 }

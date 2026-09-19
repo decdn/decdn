@@ -462,6 +462,17 @@ impl JsonlReceiptLog {
             return Ok(());
         }
 
+        // A missing live path means an earlier rotation moved it to `.1` and
+        // could not move it back: `state.file` already writes into `.1`. The
+        // shift below would then push that inode up the chain on every retry
+        // until it fell off the end, so re-create the live file instead — that
+        // completes the earlier rotation.
+        if !self.path.exists() {
+            state.file = open_append(&self.path)?;
+            state.written = 0;
+            return Ok(());
+        }
+
         // Drop the oldest retained backup (NotFound is fine before the chain
         // fills) to make room for the shift below.
         match std::fs::remove_file(self.backup_path(retained)) {
@@ -495,7 +506,8 @@ impl JsonlReceiptLog {
                         path = %self.path.display(),
                         %error,
                         "download receipt log: restoring the live path after a failed rotation \
-                         failed; receipts append to the `.1` backup until the next rotation"
+                         failed; receipts append to the `.1` backup until the next rotation \
+                         re-creates the live file"
                     );
                 }
                 Err(open_err)

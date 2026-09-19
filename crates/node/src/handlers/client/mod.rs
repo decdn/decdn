@@ -1305,12 +1305,16 @@ pub struct ClientHandler {
     /// "I am refusing everyone" — and the per-channel detail lives in the
     /// `debug!` beside it and in the counter.
     deposit_refusal_warn: WarnThrottle,
-    /// The same window for the per-signer LIVE-cap arm, kept separate from the
-    /// pool arm because the two carry different remedies: a pool-wide shortfall
-    /// clears with a top-up, a signer at its share does not.
+    /// The same window for the per-signer LIVE-cap arm. Kept separate from the
+    /// pool arm because the two carry different remedies — a pool-wide shortfall
+    /// clears with a top-up, a signer at its share does not — so one must not
+    /// starve the other's line or pollute its `suppressed` count.
     signer_cap_refusal_warn: WarnThrottle,
     /// Throttle for the `warn!` on a client binding whose signature is invalid
-    /// or recovers a different address. A remote peer triggers it at will.
+    /// or recovers a different address. A remote peer triggers it at will. The
+    /// two causes share one window on purpose: both are the same client fault
+    /// with the same remedy (the client signs its binding wrongly), and each
+    /// event also counts into `decdn_serve_stream_rejected_bad_binding_total`.
     binding_warn: WarnThrottle,
     /// Throttle for the `warn!` on a stream request that carries no verified
     /// binding. A remote peer triggers it at will.

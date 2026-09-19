@@ -10,8 +10,8 @@
 //! [`init`] turns logging on only when the operator asks for it, through
 //! `-v`/`-vv`/`-vvv`, `--log-level`, or the `RUST_LOG` environment variable.
 //! `RUST_LOG` wins (the same precedence the daemon uses), then `--log-level`,
-//! then the `-v` count ([`requested_level`]). When neither is set the CLI stays silent
-//! and behaves exactly as before.
+//! then the `-v` count ([`requested_level`]). With none of them set the CLI
+//! installs no subscriber and stays silent.
 //!
 //! # Progress-bar coexistence
 //!
@@ -47,11 +47,12 @@ pub const fn requested_level(log_level: Option<LogLevel>, verbose: u8) -> Option
     }
 }
 
-/// Decide the tracing filter directive from the two opt-in sources, or `None`
-/// to stay silent.
+/// Decide the tracing filter directive from `RUST_LOG` and the command-line
+/// level (`--log-level` or `-v`, see [`requested_level`]), or `None` to stay
+/// silent.
 ///
-/// `RUST_LOG` (when present and not blank) takes precedence over `--log-level`,
-/// matching the daemon. With neither source set the CLI installs no subscriber
+/// `RUST_LOG` (when present and not blank) takes precedence over the
+/// command-line level, matching the daemon. With neither source set the CLI installs no subscriber
 /// and its output is identical to a build without this module.
 fn filter_directive(rust_log: Option<&str>, log_level: Option<LogLevel>) -> Option<String> {
     match rust_log {

@@ -84,13 +84,12 @@ use decdn_common::config::{
 /// values their RPC just applied without having to scrape logs.
 ///
 /// `log_level` is `Option` for the same reason `current_log_level` is on
-/// the parent state: the startup `EnvFilter` may have been built from
-/// `RUST_LOG`, in which case there is no `LogLevel` to report until the
-/// first reload commits one.
+/// the parent state: no `LogLevel` is running before the first reload
+/// commits one, and none ever runs while `RUST_LOG` drives the live filter.
 #[derive(Debug, Clone, Copy)]
 pub struct ReloadSnapshot {
-    /// The live log level, or `None` while the startup `EnvFilter` came from
-    /// `RUST_LOG` and no reload has committed one.
+    /// The live log level. `None` before the first reload commits one, and
+    /// for the life of the process while `RUST_LOG` drives the live filter.
     pub log_level: Option<decdn_common::cli::common::LogLevel>,
 }
 
@@ -273,11 +272,13 @@ struct LogLevelSection {
     setter: LogLevelSetter,
     /// Restart-required observability values the node started with.
     startup: StartupObservability,
-    /// Cached log level last applied. `None` until the first successful
-    /// reload — the live `EnvFilter` at startup may be a `RUST_LOG`
-    /// directive we cannot reflect back into a `LogLevel`, so we force
-    /// the first reload to apply unconditionally and only thereafter
-    /// suppress no-op writes.
+    /// Cached log level last applied. `None` until a reload installs one —
+    /// the live `EnvFilter` at startup may be a `RUST_LOG` directive we
+    /// cannot reflect back into a `LogLevel`, so a `None` forces the setter
+    /// to run and only a cached level suppresses no-op writes. While
+    /// `RUST_LOG` drives the filter the setter keeps it
+    /// ([`LogLevelApply::KeptRustLog`]) and this stays `None`, so every
+    /// reload asks the setter again.
     current: std::sync::Mutex<Option<LogLevel>>,
     buf: std::sync::Mutex<Option<ResolvedObservability>>,
     /// Set by `fallible_commit` so `infallible_swap` knows whether the
@@ -1639,12 +1640,6 @@ mod tests {
         assert!(captured.lock().unwrap().is_none());
     }
 
-    /// First-reload-applies guarantee: `current_log_level` initialises
-    /// to `None`, so the first reload after startup always invokes the
-    /// setter even when the file's `log_level` matches
-    /// `initial.observability.log_level`. The setter, not this section,
-    /// decides whether a `RUST_LOG` filter stays in place
-    /// ([`LogLevelApply::KeptRustLog`]).
     /// A setter that keeps a `RUST_LOG` filter must not make the reload report
     /// the file level as live: the snapshot stays `None`, and the next reload
     /// asks the setter again rather than skipping it as unchanged.
@@ -1682,6 +1677,12 @@ mod tests {
         );
     }
 
+    /// First-reload-applies guarantee: `current_log_level` initialises
+    /// to `None`, so the first reload after startup always invokes the
+    /// setter even when the file's `log_level` matches
+    /// `initial.observability.log_level`. The setter, not this section,
+    /// decides whether a `RUST_LOG` filter stays in place
+    /// ([`LogLevelApply::KeptRustLog`]).
     #[tokio::test]
     async fn first_reload_applies_log_level_even_when_matching_initial() {
         let dir = tempfile::tempdir().unwrap();

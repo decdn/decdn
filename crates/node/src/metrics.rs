@@ -1157,6 +1157,16 @@ pub struct DecdnMetrics {
     /// not authorize the named channel (#327). Visible name:
     /// `decdn_serve_stream_rejected_owner_mismatch_total`.
     pub serve_stream_rejected_owner_mismatch: Counter,
+    /// `serve_stream` requests reset because the client binding failed to
+    /// verify: the signature is invalid, or it recovers a different address
+    /// than the one claimed. No signed response is sent. Visible name:
+    /// `decdn_serve_stream_rejected_bad_binding_total`.
+    pub serve_stream_rejected_bad_binding: Counter,
+    /// Probe requests this node could not read: the read timed out, the frame
+    /// or the message failed to decode, or the peer sent a response on the
+    /// server stream. The connection closes with the matching ADR 013 code.
+    /// Visible name: `decdn_probe_read_faults_total`.
+    pub probe_read_faults: Counter,
     /// `serve_stream` requests refused before any bytes are served because the
     /// requesting channel's remaining deposit could not cover what the node
     /// would front at its rate. (The refusal itself is signed — as an `ok: false`
@@ -2093,6 +2103,10 @@ recorders! {
     /// Record a `serve_stream` request refused because the client binding did
     /// not authorize the named channel (#876).
     serve_stream_rejected_owner_mismatch => serve_stream_rejected_owner_mismatch.inc();
+    /// A client binding failed to verify and the stream was reset.
+    serve_stream_rejected_bad_binding => serve_stream_rejected_bad_binding.inc();
+    /// A probe request could not be read.
+    probe_read_fault => probe_read_faults.inc();
 
     /// Record a `serve_stream` cache-miss refused by the pre-flight deposit guard
     /// (#856): the requesting channel could not cover the worst-case blob cost,

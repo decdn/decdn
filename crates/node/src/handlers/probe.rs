@@ -30,10 +30,6 @@ use crate::warn_throttle::WarnThrottle;
 // steps.
 const ACCEPT_BI_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Minimum gap between probe request read-fault `warn!` lines. Each line
-/// carries the offending `peer` and the `suppressed` count.
-const PROBE_READ_FAULT_WARN_INTERVAL: Duration = Duration::from_mins(1);
 const PROBE_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bound on the post-rejection close-frame flush. The QUIC `CONNECTION_CLOSE`
 /// frame is best-effort; we wait briefly for the peer to acknowledge so the
@@ -41,6 +37,10 @@ const PROBE_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// the wait so a malicious flooder can't keep the handler alive by refusing
 /// to acknowledge.
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Minimum gap between probe request read-fault `warn!` lines. Each line
+/// carries the offending `peer` and the `suppressed` count.
+const PROBE_READ_FAULT_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
 // QUIC application error codes defined by ADR 013 §Application Error Codes.
 //
@@ -326,6 +326,7 @@ impl ProbeHandler {
         let req = match read_probe_request(&mut send, &mut recv).await {
             Ok(req) => req,
             Err(ProbeReadError { err, app_code }) => {
+                self.metrics.probe_read_fault();
                 if let Some(suppressed) = self.read_fault_warn.admit() {
                     tracing::warn!(
                         peer = %conn.remote_id(),
@@ -341,7 +342,10 @@ impl ProbeHandler {
                 // code so the peer observes it deterministically even if the
                 // stream RESET racing with connection teardown gets clobbered.
                 conn.close(VarInt::from_u32(app_code), b"probe-error");
-                return Err(err);
+                // Handled: the peer has its close code and the fault is counted
+                // and logged above. An `Err` here would make iroh's router log
+                // it again, unthrottled, once per bad probe from any peer.
+                return Ok(());
             }
         };
 

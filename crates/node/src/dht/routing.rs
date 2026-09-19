@@ -327,6 +327,18 @@ mod tests {
         NodeId::from_bytes([byte; 32])
     }
 
+    /// A DHT `peer` field and a transport `peer` field render the same
+    /// string, so a log or span query joins them. Pinned against iroh, whose
+    /// encoding an upgrade could change.
+    #[test]
+    fn node_id_display_matches_iroh_public_key() {
+        let pk = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        assert_eq!(
+            NodeId::from_bytes(*pk.as_bytes()).to_string(),
+            pk.to_string()
+        );
+    }
+
     #[test]
     fn xor_distance_to_self_is_zero() {
         let a = id(42);

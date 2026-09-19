@@ -117,7 +117,7 @@ repos:
         pass_filenames: false
 
       # One field name per concept in tracing events: an error value is
-      # `error = %e`, never the `%err` shorthand or an `err =` field, so a
+      # `error = %e`, never the `%err`/`%e` shorthand or an `err =` field, so a
       # log query or a span attribute filter matches every site.
       - id: tracing-field-names
         name: tracing events name error fields `error`

@@ -101,9 +101,10 @@ pub async fn run(
 /// Returns a [`runtime::LogLevelSetter`] closure that swaps the live
 /// `EnvFilter` to one matching a new `LogLevel` — used by the SIGHUP
 /// hot-reload path (#236). When `rust_log_pinned` is set, the filter came from
-/// `RUST_LOG` and the closure leaves it in place (see [`reload_directive`]). The closure captures a `reload::Handle` to the
-/// `EnvFilter` layer; calls to `modify` must respect any errors from the
-/// handle (e.g. the registry was dropped) by surfacing them.
+/// `RUST_LOG` and the closure leaves it in place (see [`reload_directive`]).
+/// The closure captures a `reload::Handle` to the `EnvFilter` layer; calls to
+/// `modify` must respect any errors from the handle (e.g. the registry was
+/// dropped) by surfacing them.
 ///
 /// Also returns the OTLP tracer provider when export is on; the caller
 /// passes it to [`otlp::finish_run`] before the process exits.
@@ -141,7 +142,7 @@ fn init_tracing(
         let Some(directive) = reload_directive(rust_log_pinned, lvl) else {
             tracing::info!(
                 log_level = %lvl,
-                "RUST_LOG is set; the config file log_level change is not applied"
+                "RUST_LOG is set; the config file log_level is not applied"
             );
             return Ok(runtime::LogLevelApply::KeptRustLog);
         };
@@ -161,7 +162,7 @@ fn init_tracing(
 ///
 /// `RUST_LOG` wins over the file `log_level` at startup, so it wins on every
 /// reload too: a reload that replaced a `RUST_LOG` filter with a bare level
-/// would silently drop its per-target directives. Without `RUST_LOG`, the
+/// would silently drop its per-target directives. Without a valid `RUST_LOG`, the
 /// directive is the level's lowercase name, the same construction as the
 /// startup fallback.
 fn reload_directive(rust_log_pinned: bool, lvl: cli::common::LogLevel) -> Option<String> {
