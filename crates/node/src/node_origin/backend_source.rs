@@ -44,7 +44,7 @@ use std::sync::Arc;
 use alloy::primitives::U256;
 use bytes::Bytes;
 use decdn_bao_range::AlignedRange;
-use decdn_cache::{CacheEngine, Hash, OriginRangeWire};
+use decdn_cache::{CacheEngine, CacheError, CacheResult, Hash, OriginRangeWire};
 use decdn_client_pull::sink::StashedFault;
 use decdn_client_pull::source::SourceFuture;
 use decdn_client_pull::{BlobSource, PoolLedger, UpstreamPullHeader, VoucherProgress};
@@ -115,8 +115,9 @@ impl BlobSource for BackendSource {
                 );
             }
             // Stream + verify + encode the range out of our own origin. A fault
-            // found up front (a wrong-length outboard, a transport fault) surfaces
-            // here via `?`; a decline (no origin serves it any more) is `None`.
+            // found up front (a wrong-length outboard or first window, a transport
+            // fault) surfaces here via `?`; a decline (no origin serves it any
+            // more) is `None`.
             let Some(wire) = self
                 .engine
                 .origin_range_wire(Hash::from(hash), &range)
@@ -134,28 +135,27 @@ impl BlobSource for BackendSource {
                 // A local origin re-encode, not a network round trip.
                 ttfb_ms: 0.0,
             };
-            Ok((
-                header,
-                BackendReader {
-                    wire,
-                    pending: Bytes::new(),
-                    wire_len: range.wire_len(),
-                },
-            ))
+            Ok((header, BackendReader::new(wire, range.wire_len())))
         })
     }
 
     fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
         Box::pin(async move {
-            // Advance the LOCAL completion counter by this leg's drained wire bytes
-            // at rate 0, so `committed.bytes` reaches the gap end (the driver's
+            // Advance the LOCAL completion counter by this leg's wire length at
+            // rate 0, so `committed.bytes` reaches the gap end (the driver's
             // paid-frontier completion) while `committed.amount` stays 0 — the
             // `ScriptedSource::finish` paying arm, with a zero rate. This is not
-            // payment; see the module docs.
-            if reader.wire_len > 0 {
+            // payment; see the module docs. The driver calls `finish` only after
+            // the sink decoded the whole range, so the reader drained exactly
+            // `expected_wire_len` bytes.
+            debug_assert!(
+                reader.pending.is_empty(),
+                "finish on a backend reader with undrained wire"
+            );
+            if reader.expected_wire_len > 0 {
                 self.self_pay
                     .issue(
-                        reader.wire_len,
+                        reader.expected_wire_len,
                         0,
                         // No chain on the unpaid leg: `Keep` on a lane that has
                         // opened none commits a sealed section and opens nothing.
@@ -172,49 +172,99 @@ impl BlobSource for BackendSource {
     }
 }
 
-/// The reader a [`BackendSource`] yields: the header-less bao wire streamed out
-/// of an [`OriginRangeWire`]. A fault the encode stopped on — a window that fails
-/// verification against `H`, or an origin that stops serving mid-stream — is
-/// parked for [`StashedFault::take_fault`], so the sink reports that typed
-/// [`decdn_cache::CacheError`] rather than a bare truncation.
-#[allow(dead_code, reason = "wired by FA.2/FA.3 orchestration")]
-pub(crate) struct BackendReader {
-    wire: OriginRangeWire,
-    /// The unread rest of the last chunk the wire yielded.
-    pending: Bytes,
-    /// The range's exact header-less wire byte count, used by
-    /// [`BlobSource::finish`] to advance the local completion counter.
-    wire_len: u64,
+/// The chunk source a [`BackendReader`] drains: in production the
+/// [`OriginRangeWire`], whose chunks end in one terminal `Err` on a fault.
+pub(crate) trait WireChunks: Send {
+    /// The next chunk, a terminal `Err`, or `None` at a clean end.
+    fn next_chunk(&mut self) -> impl Future<Output = Option<CacheResult<Bytes>>> + Send;
 }
 
-impl BackendReader {
-    /// Refill `pending` from the wire when it is empty. Returns `false` at the
-    /// wire's end.
-    async fn refill(&mut self) -> bool {
-        while self.pending.is_empty() {
-            match self.wire.next_chunk().await {
-                Some(chunk) => self.pending = chunk,
-                None => return false,
-            }
-        }
-        true
+impl WireChunks for OriginRangeWire {
+    fn next_chunk(&mut self) -> impl Future<Output = Option<CacheResult<Bytes>>> + Send {
+        Self::next_chunk(self)
     }
 }
 
-impl AsyncStreamReader for BackendReader {
+/// The reader a [`BackendSource`] yields: the header-less bao wire streamed out
+/// of an [`OriginRangeWire`]. A fault the encode stopped on — a window that fails
+/// verification against `H`, or an origin that stops serving mid-stream — fails
+/// the read and is kept for [`StashedFault::take_fault`], so the sink reports
+/// that typed [`CacheError`] rather than a bare truncation.
+#[allow(dead_code, reason = "wired by FA.2/FA.3 orchestration")]
+pub(crate) struct BackendReader<W = OriginRangeWire> {
+    wire: W,
+    /// The unread rest of the last chunk the wire yielded.
+    pending: Bytes,
+    /// The terminal fault the wire ended on, until the sink takes it.
+    fault: Option<CacheError>,
+    /// The range's exact header-less wire byte count
+    /// ([`AlignedRange::wire_len`]), used by [`BlobSource::finish`] to advance
+    /// the local completion counter.
+    expected_wire_len: u64,
+}
+
+impl<W: WireChunks> BackendReader<W> {
+    const fn new(wire: W, expected_wire_len: u64) -> Self {
+        Self {
+            wire,
+            pending: Bytes::new(),
+            fault: None,
+            expected_wire_len,
+        }
+    }
+
+    /// Refill `pending` from the wire when it is empty. `Ok(false)` at a clean
+    /// end; `Err` once the wire has ended on a fault (kept for `take_fault`).
+    async fn refill(&mut self) -> std::io::Result<bool> {
+        while self.pending.is_empty() {
+            match self.wire.next_chunk().await {
+                Some(Ok(chunk)) => self.pending = chunk,
+                Some(Err(fault)) => {
+                    let msg = fault.to_string();
+                    self.fault = Some(fault);
+                    return Err(std::io::Error::other(msg));
+                }
+                None if self.fault.is_some() => {
+                    return Err(std::io::Error::other(
+                        "own origin range wire ended on a fault",
+                    ));
+                }
+                None => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl<W: WireChunks> AsyncStreamReader for BackendReader<W> {
+    /// Reads `len` bytes, or fewer only at the wire's end: the bao decoder
+    /// reads each leaf with one `read_bytes_exact`, so a short read here would
+    /// fail it even though the rest of the leaf is in the next chunk. A read
+    /// inside one chunk is a zero-copy slice; only a read that spans chunks is
+    /// copied.
     async fn read_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
-        if len == 0 || !self.refill().await {
+        if len == 0 || !self.refill().await? {
             return Ok(Bytes::new());
         }
-        let take = self.pending.len().min(len);
-        Ok(self.pending.split_to(take))
+        if self.pending.len() >= len {
+            return Ok(self.pending.split_to(len));
+        }
+        let mut out = bytes::BytesMut::new();
+        while out.len() < len {
+            if !self.refill().await? {
+                break;
+            }
+            let take = self.pending.len().min(len - out.len());
+            out.extend_from_slice(&self.pending.split_to(take));
+        }
+        Ok(out.freeze())
     }
 
     async fn read<const L: usize>(&mut self) -> std::io::Result<[u8; L]> {
         let mut out = [0u8; L];
-        let mut filled = 0;
+        let mut filled = 0usize;
         while filled < L {
-            if !self.refill().await {
+            if !self.refill().await? {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "backend reader exhausted before a fixed-size bao read",
@@ -222,18 +272,19 @@ impl AsyncStreamReader for BackendReader {
             }
             let take = self.pending.len().min(L - filled);
             let got = self.pending.split_to(take);
-            if let Some(dst) = out.get_mut(filled..filled + take) {
-                dst.copy_from_slice(&got);
-            }
-            filled += take;
+            let dst = out
+                .get_mut(filled..filled.saturating_add(take))
+                .ok_or_else(|| std::io::Error::other("backend reader fixed-size read overran"))?;
+            dst.copy_from_slice(&got);
+            filled = filled.saturating_add(take);
         }
         Ok(out)
     }
 }
 
-impl StashedFault for BackendReader {
+impl<W: WireChunks> StashedFault for BackendReader<W> {
     fn take_fault(&mut self) -> Option<anyhow::Error> {
-        self.wire.take_fault().map(anyhow::Error::from)
+        self.fault.take().map(anyhow::Error::from)
     }
 }
 
@@ -261,7 +312,7 @@ mod tests {
     use decdn_client_pull::{BlobSource, Cumulative, IngestStore, PoolLedger, VoucherProgress};
     use iroh_io::AsyncStreamReader;
 
-    use super::BackendSource;
+    use super::{BackendReader, BackendSource, WireChunks};
     use crate::node_origin::NodeAdmitStore;
 
     /// A minimal own-origin double: serves one blob's aligned ranges plus its
@@ -408,20 +459,28 @@ mod tests {
         Ok(())
     }
 
-    /// (b) Mismatched origin blob: the wire ends on a LOCAL-origin
-    /// `VerifyFailed`, and the driver's sink reports that parked fault — no
-    /// provider/upstream scoring is reachable from this source.
+    /// (b) Mismatched origin blob, corrupt past the first window: the wire ends
+    /// mid-stream on a LOCAL-origin `VerifyFailed`, and the driver's sink
+    /// reports that parked fault — no provider/upstream scoring is reachable
+    /// from this source.
     #[tokio::test]
     async fn backend_source_mismatch_is_local_verify_fault() -> anyhow::Result<()> {
-        let genuine = test_blob();
+        let window = decdn_cache::RANGE_PULL_WINDOW_BYTES as usize;
+        let genuine: Vec<u8> = (0..window + 5 * decdn_cache::CHUNK_GROUP_BYTES as usize + 123)
+            .map(|i| (i % 251) as u8)
+            .collect();
         let ob = PreOrderMemOutboard::create(&genuine, IROH_BLOCK_SIZE);
         let root: [u8; 32] = *ob.root.as_bytes();
         let outboard = Bytes::from(ob.data.clone());
         let hash = Hash::from(root);
         let total = genuine.len() as u64;
 
-        // Same length, different bytes: the served span will not verify against H.
-        let corrupt: Vec<u8> = genuine.iter().map(|b| b ^ 0xFF).collect();
+        // Same length; the second window's bytes differ, so it will not verify
+        // against H after the first window has already streamed.
+        let mut corrupt = genuine.clone();
+        for b in &mut corrupt[window..window + 1024] {
+            *b ^= 0xFF;
+        }
         assert_ne!(Hash::new(&corrupt), hash, "fixtures must differ");
         let origin = FakeOrigin::new(hash, &corrupt, outboard);
         let tmp = tempfile::tempdir()?;
@@ -473,7 +532,7 @@ mod tests {
         let source = BackendSource::new(engine, root, total, Arc::clone(&ledger));
         let aligned = align_range(0, 0, total).map_err(|e| anyhow::anyhow!("align: {e}"))?;
         let (_header, reader) = source.open(root, aligned).await?;
-        let expected_wire = reader.wire_len;
+        let expected_wire = reader.expected_wire_len;
         assert!(expected_wire > 0, "a non-empty blob has non-zero wire");
 
         let progress: VoucherProgress = source.finish(reader).await?;
@@ -488,5 +547,95 @@ mod tests {
         assert_eq!(ledger.committed().bytes, U256::from(expected_wire));
         assert_eq!(ledger.committed().amount, U256::ZERO);
         Ok(())
+    }
+
+    /// A scripted chunk source: yields `items` in order, then `None`.
+    struct VecWire(std::collections::VecDeque<decdn_cache::CacheResult<Bytes>>);
+
+    impl WireChunks for VecWire {
+        fn next_chunk(
+            &mut self,
+        ) -> impl Future<Output = Option<decdn_cache::CacheResult<Bytes>>> + Send {
+            let next = self.0.pop_front();
+            async move { next }
+        }
+    }
+
+    fn reader_over(items: Vec<decdn_cache::CacheResult<Bytes>>) -> BackendReader<VecWire> {
+        BackendReader::new(VecWire(items.into()), 0)
+    }
+
+    /// Fixed-size reads fill across chunk boundaries: a wire cut into 1- and
+    /// 7-byte chunks still ingests to the complete, byte-exact blob.
+    #[tokio::test]
+    async fn backend_reader_reassembles_a_finely_chunked_wire() -> anyhow::Result<()> {
+        let data = test_blob();
+        let ob = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
+        let root: [u8; 32] = *ob.root.as_bytes();
+        let hash = Hash::from(root);
+        let total = data.len() as u64;
+        let aligned = align_range(0, 0, total).map_err(|e| anyhow::anyhow!("align: {e}"))?;
+        let wire = decdn_bao_range::encode_verified_range(
+            root,
+            &aligned,
+            &data,
+            Bytes::from(ob.data.clone()),
+        )?
+        .slice(8..);
+
+        let mut items = Vec::new();
+        let mut rest = wire;
+        let mut step = 1;
+        while !rest.is_empty() {
+            let take = step.min(rest.len());
+            items.push(Ok(rest.split_to(take)));
+            step = if step == 1 { 7 } else { 1 };
+        }
+
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await?;
+        let store = NodeAdmitStore::new(engine.clone(), hash, total, None);
+        IngestStore::ingest_stream(&store, &aligned, reader_over(items), None).await?;
+        assert!(RangedStore::is_complete(&store).await?);
+        assert_eq!(engine.get(hash).await?.as_ref(), data.as_slice());
+        Ok(())
+    }
+
+    /// A zero-length read consumes nothing, and a fixed-size read past a clean
+    /// end is `UnexpectedEof`.
+    #[tokio::test]
+    async fn backend_reader_zero_read_and_short_fixed_read() {
+        let mut reader = reader_over(vec![Ok(Bytes::from_static(b"abc"))]);
+        assert!(reader.read_bytes(0).await.unwrap().is_empty());
+        let err = reader.read::<8>().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A terminal fault fails the read and is handed to the sink once through
+    /// `take_fault`.
+    #[tokio::test]
+    async fn backend_reader_keeps_the_terminal_fault() {
+        use decdn_client_pull::sink::StashedFault;
+
+        let hash = Hash::new(b"fault");
+        let mut reader = reader_over(vec![
+            Ok(Bytes::from_static(b"ab")),
+            Err(decdn_cache::CacheError::VerifyFailed { expected: hash }),
+        ]);
+        assert_eq!(reader.read_bytes(2).await.unwrap().as_ref(), b"ab");
+        assert!(
+            reader.read_bytes(16).await.is_err(),
+            "the fault fails the read"
+        );
+        assert!(
+            reader.read_bytes(16).await.is_err(),
+            "and every read after it"
+        );
+        let fault = reader.take_fault().expect("the fault is kept");
+        assert!(matches!(
+            fault.downcast_ref::<decdn_cache::CacheError>(),
+            Some(decdn_cache::CacheError::VerifyFailed { .. })
+        ));
+        assert!(reader.take_fault().is_none(), "taken once");
     }
 }

@@ -625,8 +625,8 @@ impl HttpOrigin {
     /// bounds a slow-trickle origin. Transport errors mid-body surface as
     /// `Transient`. The range path buffers (rather than streams) because the
     /// payloads are bounded: the outboard is `O(blob/256)` and the data span
-    /// is the requested range, both far below the whole-blob streaming
-    /// threshold that motivated #271.
+    /// is at most one [`crate::RANGE_PULL_WINDOW_BYTES`] window, both far
+    /// below the whole-blob streaming threshold that motivated #271.
     async fn collect_capped(
         &self,
         mut resp: reqwest::Response,

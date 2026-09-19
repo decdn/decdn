@@ -1180,6 +1180,9 @@ mod local_pull_leg_tests {
         /// Return a transport error from `fetch_range_data` — an origin the node cannot
         /// reach (the no-hang-on-fault case).
         Fault,
+        /// Serve a multi-window blob's first window, then return a transport error
+        /// — an origin that fails after the wire has started streaming.
+        FaultMidStream,
         /// Serve length-matching bytes that do NOT hash to `H` — a
         /// corrupt/misconfigured own origin (the local-verify case).
         Corrupt,
@@ -1203,6 +1206,8 @@ mod local_pull_leg_tests {
     enum FakeMode {
         Serve,
         Fault,
+        /// Windows starting at or past this offset fail.
+        FaultFrom(u64),
     }
 
     impl FakeOrigin {
@@ -1212,6 +1217,7 @@ mod local_pull_leg_tests {
             let fake_mode = match mode {
                 Mode::Serve | Mode::Corrupt => FakeMode::Serve,
                 Mode::Fault => FakeMode::Fault,
+                Mode::FaultMidStream => FakeMode::FaultFrom(decdn_cache::RANGE_PULL_WINDOW_BYTES),
             };
             Self {
                 hash,
@@ -1271,7 +1277,12 @@ mod local_pull_leg_tests {
             req: OriginRangeRequest,
         ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>>
         {
-            if matches!(self.mode, FakeMode::Fault) {
+            let faults = match self.mode {
+                FakeMode::Serve => false,
+                FakeMode::Fault => true,
+                FakeMode::FaultFrom(from) => req.fetch_start >= from,
+            };
+            if faults {
                 return Box::pin(async {
                     Err(OriginPullError::Permanent(anyhow::anyhow!(
                         "simulated own-origin transport fault"
@@ -1311,7 +1322,16 @@ mod local_pull_leg_tests {
     async fn engine_with_origin(
         mode: Mode,
     ) -> anyhow::Result<(CacheEngine, [u8; 32], u64, tempfile::TempDir)> {
-        let data = test_blob();
+        let data = match mode {
+            // Past one window, so the fault lands after the wire has started.
+            Mode::FaultMidStream => {
+                let size = decdn_cache::RANGE_PULL_WINDOW_BYTES as usize
+                    + 5 * decdn_cache::CHUNK_GROUP_BYTES as usize
+                    + 123;
+                (0..size).map(|i| (i % 251) as u8).collect()
+            }
+            Mode::Serve | Mode::Fault | Mode::Corrupt => test_blob(),
+        };
         let ob = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
         let root: [u8; 32] = *ob.root.as_bytes();
         let outboard = Bytes::from(ob.data.clone());
@@ -1319,7 +1339,7 @@ mod local_pull_leg_tests {
         let total = data.len() as u64;
 
         let served: Vec<u8> = match mode {
-            Mode::Serve | Mode::Fault => data,
+            Mode::Serve | Mode::Fault | Mode::FaultMidStream => data,
             Mode::Corrupt => data.iter().map(|b| b ^ 0xFF).collect(),
         };
         let origin = FakeOrigin::new(hash, &served, outboard, mode);
@@ -1420,6 +1440,22 @@ mod local_pull_leg_tests {
         assert!(
             result.is_err(),
             "an origin transport fault must terminate the leg with Err"
+        );
+        Ok(())
+    }
+
+    /// (b2) A transport fault AFTER the wire has started streaming also records
+    /// `pull_result == Some(Err(_))` and does NOT hang.
+    #[tokio::test]
+    async fn local_pull_leg_mid_stream_origin_fault_fails_without_hang() -> anyhow::Result<()> {
+        let (engine, root, total, _tmp) = engine_with_origin(Mode::FaultMidStream).await?;
+
+        let result = run_to_termination(&engine, root, total)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("pull_result must be recorded even on fault"))?;
+        assert!(
+            result.is_err(),
+            "a mid-stream origin transport fault must terminate the leg with Err"
         );
         Ok(())
     }

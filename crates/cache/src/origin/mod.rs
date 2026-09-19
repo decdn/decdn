@@ -220,10 +220,14 @@ impl OriginFetch {
 ///
 /// A range-scoped origin pull fetches the small sibling `{H}.obao4` outboard
 /// once ([`Origin::fetch_outboard`]), then fetches the requested byte span in
-/// bounded windows, verifying each against the root `H` via
-/// [`crate::range_pull::encode_verified_range`] before importing it as a
-/// partial blob — avoiding whole-blob origin egress to serve a byte range on a
-/// cache miss, with memory bounded by the window rather than the span (#2065).
+/// windows of at most [`crate::RANGE_PULL_WINDOW_BYTES`], verifying them
+/// against the root `H` before any byte is imported or served — avoiding
+/// whole-blob origin egress to serve a byte range on a cache miss, with memory
+/// bounded by the window rather than the span (#2065). The verifier is
+/// the engine: [`crate::range_pull::encode_verified_range`] per window on the
+/// [`crate::CacheEngine::pull_through_range`] path, one
+/// [`bao_tree::io::fsm::encode_ranges_validated`] pass on the
+/// [`crate::CacheEngine::origin_range_wire`] path.
 ///
 /// The optimization is **best-effort**: when the origin does not honor
 /// `Range`, or the object is absent or shorter than the span, the adapter
@@ -234,8 +238,8 @@ impl OriginFetch {
 pub enum OriginRangeFetch {
     /// The origin served the requested byte span. `data` covers exactly
     /// `[req.fetch_start, req.fetch_end)` (the chunk-group-aligned span the
-    /// engine asked for) and is untrusted until
-    /// [`crate::range_pull::encode_verified_range`] verifies it against `H`.
+    /// engine asked for) and is untrusted until the engine verifies it against
+    /// `H`.
     Ranged {
         /// The aligned data bytes, exactly `req.len()` long.
         data: Bytes,
@@ -243,10 +247,10 @@ pub enum OriginRangeFetch {
     /// The origin reported the object (data key) does not exist.
     NotFound,
     /// The range optimization is not available for this fetch — no
-    /// `Range`/`206` support, or a span the object does not hold. The engine
-    /// degrades to a whole-blob [`Origin::fetch`] pull. This is the
-    /// *expected* path for origins that don't publish `{H}.obao4`, not an
-    /// error.
+    /// `Range`/`206` support, or a span the object does not hold (a stale or
+    /// short copy). The engine degrades to a whole-blob [`Origin::fetch`]
+    /// pull. This is an expected answer, not an error. A missing `{H}.obao4` is
+    /// reported by [`Origin::fetch_outboard`], not here.
     Unsupported,
 }
 
@@ -264,8 +268,9 @@ impl std::fmt::Debug for OriginRangeFetch {
 }
 
 /// The chunk-group-aligned span a [`Origin::fetch_range_data`] call must
-/// fetch, passed from the engine to the adapter. This is the produced-by-engine half of the range
-/// pull; the verify-against-root half lives in [`crate::range_pull`].
+/// fetch, passed from the engine to the adapter. This is the
+/// produced-by-engine half of the range pull; the verify-against-root half
+/// lives in [`crate::range_pull`] and [`crate::origin_range`].
 #[derive(Debug, Clone, Copy)]
 pub struct OriginRangeRequest {
     /// First byte of the chunk-group-aligned data span to fetch (inclusive).
@@ -358,9 +363,9 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// Fetch the chunk-group-aligned byte span `req` of the blob `hash`, for a
     /// range-scoped pull
     /// ([ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md),
-    /// #823). The engine calls this once per bounded window of the requested
-    /// span, never for the whole span at once, and fetches the sibling
-    /// `{H}.obao4` outboard separately through [`Self::fetch_outboard`].
+    /// #823). Each call covers at most [`crate::RANGE_PULL_WINDOW_BYTES`]; a
+    /// longer span takes several calls, in order. The engine fetches the
+    /// sibling `{H}.obao4` outboard separately through [`Self::fetch_outboard`].
     ///
     /// The default implementation returns [`OriginRangeFetch::Unsupported`],
     /// so the engine degrades to a whole-blob [`Self::fetch`] pull. A range
@@ -373,9 +378,12 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// serve-miss path reports [`crate::CacheError::VerifyFailed`].
     ///
     /// Like [`Self::fetch`], the origin is a dumb byte store: the returned
-    /// `data` is **untrusted** and verified against the root `H` by the engine
-    /// via [`crate::range_pull::encode_verified_range`] before any byte is
-    /// imported.
+    /// `data` is **untrusted** and verified against the root `H` by
+    /// the engine: [`crate::range_pull::encode_verified_range`] per window on the
+    /// [`crate::CacheEngine::pull_through_range`] path, one
+    /// [`bao_tree::io::fsm::encode_ranges_validated`] pass on the
+    /// [`crate::CacheEngine::origin_range_wire`] path — before any byte is
+    /// imported or served.
     ///
     /// Returning [`OriginRangeFetch::Unsupported`] is the correct, expected
     /// answer whenever the optimization can't apply (no `Range`/`206`, a short
