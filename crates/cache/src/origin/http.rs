@@ -386,25 +386,9 @@ impl Origin for HttpOrigin {
         &self,
         hash: Hash,
         req: OriginRangeRequest,
-        outboard_max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
             let hex = hash.to_hex();
-            // Outboard first: an origin that doesn't publish `{H}.obao4` can't
-            // be range-pulled, and the outboard read is the cheaper request.
-            // A 404 (or any non-success) on the sibling → degrade to
-            // whole-blob (`Unsupported`), never an error. The data `Range`
-            // request is skipped entirely in that case.
-            let obao4_url = self
-                .base_url
-                .as_url()
-                .join(&format!("{hex}{OBAO4_SUFFIX}"))
-                .with_context(|| format!("failed to build outboard URL for {hash}"))
-                .map_err(OriginPullError::Permanent)?;
-            let Some(outboard) = self.get_bounded(&obao4_url, outboard_max_bytes).await? else {
-                return Ok(OriginRangeFetch::Unsupported);
-            };
-
             // Ranged data read. `Range: bytes=a-(b-1)` is inclusive-end. A
             // compliant origin answers `206 Partial Content` with exactly the
             // requested span. A `200` means the origin ignored `Range` and
@@ -418,10 +402,7 @@ impl Origin for HttpOrigin {
                 .map_err(OriginPullError::Permanent)?;
             // Empty span only for a zero-length blob — nothing to range.
             if req.is_empty() {
-                return Ok(OriginRangeFetch::Ranged {
-                    data: Bytes::new(),
-                    outboard,
-                });
+                return Ok(OriginRangeFetch::Ranged { data: Bytes::new() });
             }
             // Inclusive end: HTTP byte ranges are `[a, b]`, our span is
             // `[fetch_start, fetch_end)`. `fetch_end > fetch_start` here (the
@@ -431,7 +412,7 @@ impl Origin for HttpOrigin {
             let Some(data) = self.get_range_bytes(&data_url, &range_val, want).await? else {
                 return Ok(OriginRangeFetch::Unsupported);
             };
-            Ok(OriginRangeFetch::Ranged { data, outboard })
+            Ok(OriginRangeFetch::Ranged { data })
         })
     }
 
@@ -539,50 +520,9 @@ impl Origin for HttpOrigin {
 }
 
 impl HttpOrigin {
-    /// GET `url` and buffer the whole body, capped at `max_bytes`. Returns
-    /// `Ok(None)` when the origin answers any non-2xx (a missing
-    /// `{H}.obao4` → 404 → degrade to whole-blob). Used for the small sibling
-    /// outboard read on the range-pull path. Redirects stay disabled (SSRF,
-    /// #579): a 3xx is treated as `None` (degrade) rather than followed.
-    async fn get_bounded(
-        &self,
-        url: &reqwest::Url,
-        max_bytes: u64,
-    ) -> Result<Option<Bytes>, OriginPullError> {
-        let url_log = redact_for_log(url);
-        let send_fut = self.client.get(url.clone()).send();
-        let resp = match tokio::time::timeout(self.response_headers_timeout, send_fut).await {
-            Err(_elapsed) => {
-                return Err(OriginPullError::Transient(anyhow::anyhow!(
-                    "origin GET {url_log} headers timed out"
-                )));
-            }
-            Ok(Err(reqwest_err)) => {
-                return Err(classify_reqwest_error(reqwest_err)
-                    .map_inner(|e| e.context(format!("origin GET {url_log} failed"))));
-            }
-            Ok(Ok(resp)) => resp,
-        };
-        // Any non-success (404 missing sibling, 3xx redirect, 5xx) → degrade.
-        // The optimization is best-effort; only transport faults on the send
-        // above are surfaced as errors.
-        if !resp.status().is_success() {
-            return Ok(None);
-        }
-        if let Some(len) = resp.content_length()
-            && len > max_bytes
-        {
-            return Ok(None);
-        }
-        self.collect_capped(resp, max_bytes, url_log).await
-    }
-
-    /// GET `url` and buffer the whole body, capped at `max_bytes`, returning
-    /// an [`OutboardFetch`] rather than an `Option<Bytes>` — unlike
-    /// [`Self::get_bounded`] (used by the range-pull's outboard sub-fetch,
-    /// where any non-success collapses to a single "degrade" signal), a
-    /// standalone [`Origin::fetch_outboard`] call distinguishes a genuine
-    /// 404 ([`OutboardFetch::NotFound`]) from every other non-success status
+    /// GET `url` and buffer the whole body, capped at `max_bytes`, as an
+    /// [`OutboardFetch`]: an [`Origin::fetch_outboard`] call distinguishes a
+    /// genuine 404 ([`OutboardFetch::NotFound`]) from every other non-success status
     /// — redirect (disabled per #579), permission decline, 5xx —
     /// ([`OutboardFetch::Unsupported`]). Neither is an error; only a
     /// transport-level fault on the `.send()` surfaces as [`OriginPullError`].

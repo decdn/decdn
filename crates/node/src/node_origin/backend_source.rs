@@ -10,7 +10,9 @@
 //! produces the header-less interleaved bao wire for one [`AlignedRange`] straight
 //! out of [`CacheEngine::origin_encode_range`], so the existing `NodeAdmitStore`
 //! sink verifies-and-stores it against the root `H` exactly as it does a peer
-//! pull's wire.
+//! pull's wire. The `{H}.obao4` outboard every draw verifies against is fetched
+//! ONCE per fill (by dispatch's serviceability probe) and carried by the source;
+//! a draw fetches only its data span (#2061).
 //!
 //! # Why the origin bytes are a LOCAL fault, not upstream corruption
 //!
@@ -59,6 +61,10 @@ pub(crate) struct BackendSource {
     engine: CacheEngine,
     root: [u8; 32],
     total_bytes: u64,
+    /// The untrusted `{H}.obao4` the serviceability probe fetched, reused for
+    /// every draw's `origin_encode_range` (#2061): one outboard read per fill,
+    /// not one per draw.
+    outboard: Bytes,
     /// Local completion bookkeeping ONLY — no channel, no chain, no counterparty.
     self_pay: Arc<PoolLedger>,
 }
@@ -69,16 +75,20 @@ impl BackendSource {
     /// over `engine`, whose `self_pay` ledger the caller also drives the
     /// completion frontier off (the SAME `Arc` the driver is handed). See the
     /// module docs for why the ledger is local bookkeeping, not payment.
+    /// `outboard` is the `{H}.obao4` fetched once for this fill; every draw
+    /// verifies against it.
     pub(crate) const fn new(
         engine: CacheEngine,
         root: [u8; 32],
         total_bytes: u64,
+        outboard: Bytes,
         self_pay: Arc<PoolLedger>,
     ) -> Self {
         Self {
             engine,
             root,
             total_bytes,
+            outboard,
             self_pay,
         }
     }
@@ -117,7 +127,7 @@ impl BlobSource for BackendSource {
             // fault) via `?`; a decline (no origin serves it any more) is `None`.
             let Some(combined) = self
                 .engine
-                .origin_encode_range(Hash::from(hash), &range)
+                .origin_encode_range(Hash::from(hash), &range, self.outboard.clone())
                 .await?
             else {
                 anyhow::bail!(
@@ -317,7 +327,6 @@ mod tests {
             &self,
             hash: Hash,
             req: OriginRangeRequest,
-            _outboard_max_bytes: u64,
         ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>>
         {
             let result = if hash == self.hash {
@@ -326,7 +335,6 @@ mod tests {
                 match self.data.get(s..e) {
                     Some(span) => OriginRangeFetch::Ranged {
                         data: Bytes::copy_from_slice(span),
-                        outboard: self.outboard.clone(),
                     },
                     None => OriginRangeFetch::NotFound,
                 }
@@ -342,6 +350,19 @@ mod tests {
     fn test_blob() -> Vec<u8> {
         let size = 5 * decdn_cache::CHUNK_GROUP_BYTES as usize + 123;
         (0..size).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// The outboard the way dispatch obtains it: one `origin_fetch_outboard_bytes`
+    /// per fill, handed to the source for every draw.
+    async fn probed_outboard(
+        engine: &CacheEngine,
+        hash: Hash,
+        total: u64,
+    ) -> anyhow::Result<Bytes> {
+        engine
+            .origin_fetch_outboard_bytes(hash, total)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("fixture origin must publish the outboard"))
     }
 
     fn fresh_ledger() -> Arc<PoolLedger> {
@@ -364,7 +385,8 @@ mod tests {
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
 
-        let source = BackendSource::new(engine, root, total, fresh_ledger());
+        let outboard = probed_outboard(&engine, hash, total).await?;
+        let source = BackendSource::new(engine, root, total, outboard, fresh_ledger());
         let aligned = align_range(0, 0, total).map_err(|e| anyhow::anyhow!("align: {e}"))?;
         let (header, reader) = source.open(root, aligned.clone()).await?;
         assert_eq!(header.total_bytes, total);
@@ -415,7 +437,8 @@ mod tests {
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
 
-        let source = BackendSource::new(engine, root, total, fresh_ledger());
+        let outboard = probed_outboard(&engine, hash, total).await?;
+        let source = BackendSource::new(engine, root, total, outboard, fresh_ledger());
         let aligned = align_range(0, 0, total).map_err(|e| anyhow::anyhow!("align: {e}"))?;
         let err = source
             .open(root, aligned)
@@ -453,7 +476,8 @@ mod tests {
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
 
         let ledger = fresh_ledger();
-        let source = BackendSource::new(engine, root, total, Arc::clone(&ledger));
+        let outboard = probed_outboard(&engine, hash, total).await?;
+        let source = BackendSource::new(engine, root, total, outboard, Arc::clone(&ledger));
         let aligned = align_range(0, 0, total).map_err(|e| anyhow::anyhow!("align: {e}"))?;
         let (_header, reader) = source.open(root, aligned).await?;
         let expected_wire = reader.wire_len;

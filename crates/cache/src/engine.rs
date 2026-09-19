@@ -3486,15 +3486,25 @@ impl CacheEngine {
         req: OriginRangeRequest,
     ) -> CacheResult<Option<(Bytes, Bytes)>> {
         let outboard_max = expected_outboard_len(blob_size).saturating_add(64);
-        let (data, outboard) =
+        let outboard = match origin
+            .fetch_outboard(hash, outboard_max)
+            .await
+            .map_err(|e| CacheError::OriginError {
+                hash,
+                source: e.into_inner(),
+            })? {
+            OutboardFetch::Found(bytes) => bytes,
+            OutboardFetch::NotFound | OutboardFetch::Unsupported => return Ok(None),
+        };
+        let data =
             match origin
-                .fetch_range(hash, req, outboard_max)
+                .fetch_range(hash, req)
                 .await
                 .map_err(|e| CacheError::OriginError {
                     hash,
                     source: e.into_inner(),
                 })? {
-                OriginRangeFetch::Ranged { data, outboard } => (data, outboard),
+                OriginRangeFetch::Ranged { data } => data,
                 OriginRangeFetch::Unsupported | OriginRangeFetch::NotFound => return Ok(None),
             };
 
@@ -3543,7 +3553,15 @@ impl CacheEngine {
         let mut last_err: Option<CacheError> = None;
         for origin in &self.inner.origins {
             match origin.fetch_outboard(hash, outboard_max).await {
-                Ok(OutboardFetch::Found(ob)) => return Ok(Some(ob)),
+                Ok(OutboardFetch::Found(ob)) => {
+                    // The outboard is origin egress too; metered here, once per
+                    // fill, since every draw of the fill reuses it (#2061).
+                    if let Some(m) = &self.inner.metrics {
+                        m.pull_through_bytes
+                            .inc_by(u64::try_from(ob.len()).unwrap_or(u64::MAX));
+                    }
+                    return Ok(Some(ob));
+                }
                 Ok(OutboardFetch::NotFound | OutboardFetch::Unsupported) => {}
                 Err(e) => {
                     tracing::debug!(
@@ -3570,10 +3588,12 @@ impl CacheEngine {
 
     /// Fetch `aligned`'s span from the configured origins and return the
     /// header-full interleaved bao **wire** for it, verified against the root `H`
-    /// — the raw-fetch half of a range pull WITHOUT the import
-    /// (`range_pull_attempt` imports; here the node's `NodeAdmitStore` sink
-    /// does). The returned bytes keep their leading 8-byte little-endian size
-    /// header (the shape [`encode_verified_range`] produces); the node-side
+    /// with `outboard` — the untrusted `{H}.obao4` the caller fetched ONCE
+    /// ([`Self::origin_fetch_outboard_bytes`]) and reuses for every draw of the
+    /// fill (#2061). This is the raw-fetch half of a range pull WITHOUT the import
+    /// (the node's `NodeAdmitStore` sink admits). The returned bytes keep their
+    /// leading 8-byte little-endian size header (the shape
+    /// [`encode_verified_range`] produces); the node-side
     /// `decdn_client_pull::BlobSource` caller strips it before feeding the
     /// header-less wire (ADR 038) to the driver.
     ///
@@ -3581,46 +3601,51 @@ impl CacheEngine {
     /// ([`OriginRangeFetch::Unsupported`] / [`OriginRangeFetch::NotFound`])
     /// advances the chain; all origins exhausted → `Ok(None)`.
     ///
-    /// # The load-bearing difference from `range_pull_attempt`
-    ///
     /// A verify failure here is a HARD fault ([`CacheError::VerifyFailed`]), NOT a
-    /// degrade. `range_pull_attempt` can degrade a range that fails bao
-    /// verification to a whole-blob pull because it is only OPTIMIZING a cold miss
-    /// — the whole-blob path re-verifies against `H` and still serves correct
-    /// bytes. Flow A cannot: by the time this runs the node has signed a
-    /// `StreamResponse` committing to serve under `H`, so a corrupt or
-    /// misconfigured OWN origin is a local-origin fault to surface, not upstream
-    /// corruption to route around (there is no upstream, and no fallback still
-    /// honours `H`).
+    /// degrade: by the time this runs the node has signed a `StreamResponse`
+    /// committing to serve under `H`, so a corrupt or misconfigured OWN origin is
+    /// a local-origin fault to surface, not upstream corruption to route around
+    /// (there is no upstream, and no fallback still honours `H`).
     ///
     /// # Errors
     ///
-    /// - [`CacheError::VerifyFailed`] — the winning origin's range/outboard did
-    ///   not verify against the root `H` (a bad `{H}.obao4`, a corrupt span, a
-    ///   wrong-length body). Mapped from [`encode_verified_range`]'s
+    /// - [`CacheError::VerifyFailed`] — the winning origin's range did not verify
+    ///   against the root `H` with `outboard` (a bad `{H}.obao4`, a corrupt span,
+    ///   a wrong-length body). Mapped from [`encode_verified_range`]'s
     ///   [`RangeVerifyError`](decdn_bao_range::RangeVerifyError) — the same shape
     ///   [`Self::admit_bao_stream`] reports on a mid-stream group mismatch.
     /// - [`CacheError::OriginError`] — an origin transport fault while fetching the
-    ///   range (propagated from `origin_fetch_range_bytes`).
+    ///   range.
     pub async fn origin_encode_range(
         &self,
         hash: Hash,
         aligned: &AlignedRange,
+        outboard: Bytes,
     ) -> CacheResult<Option<Bytes>> {
         let root = *hash.as_bytes();
         let req = OriginRangeRequest {
             fetch_start: aligned.fetch_start(),
             fetch_end: aligned.fetch_end(),
         };
-        let blob_size = aligned.blob_size();
         for origin in &self.inner.origins {
-            let Some((data, outboard)) = self
-                .origin_fetch_range_bytes(origin, hash, blob_size, req)
-                .await?
-            else {
-                continue;
-            };
-            return match encode_verified_range(root, aligned, &data, outboard) {
+            let data =
+                match origin
+                    .fetch_range(hash, req)
+                    .await
+                    .map_err(|e| CacheError::OriginError {
+                        hash,
+                        source: e.into_inner(),
+                    })? {
+                    OriginRangeFetch::Ranged { data } => data,
+                    OriginRangeFetch::Unsupported | OriginRangeFetch::NotFound => continue,
+                };
+            // Meter the pulled span as origin egress; the outboard was metered
+            // once when it was fetched.
+            if let Some(m) = &self.inner.metrics {
+                m.pull_through_bytes
+                    .inc_by(u64::try_from(data.len()).unwrap_or(u64::MAX));
+            }
+            return match encode_verified_range(root, aligned, &data, outboard.clone()) {
                 Ok(wire) => Ok(Some(wire)),
                 Err(err) => {
                     tracing::warn!(
@@ -9096,23 +9121,20 @@ mod tests {
             &self,
             hash: Hash,
             req: OriginRangeRequest,
-            _outboard_max_bytes: u64,
         ) -> Pin<
             Box<dyn Future<Output = Result<OriginRangeFetch, crate::OriginPullError>> + Send + '_>,
         > {
-            let result = match (&self.outboard, hash == self.hash && self.support_range) {
-                (Some(ob), true) => {
-                    let s = usize::try_from(req.fetch_start).unwrap_or(usize::MAX);
-                    let e = usize::try_from(req.fetch_end).unwrap_or(usize::MAX);
-                    match self.data.get(s..e) {
-                        Some(span) => OriginRangeFetch::Ranged {
-                            data: Bytes::copy_from_slice(span),
-                            outboard: ob.clone(),
-                        },
-                        None => OriginRangeFetch::NotFound,
-                    }
+            let result = if hash == self.hash && self.support_range {
+                let s = usize::try_from(req.fetch_start).unwrap_or(usize::MAX);
+                let e = usize::try_from(req.fetch_end).unwrap_or(usize::MAX);
+                match self.data.get(s..e) {
+                    Some(span) => OriginRangeFetch::Ranged {
+                        data: Bytes::copy_from_slice(span),
+                    },
+                    None => OriginRangeFetch::NotFound,
                 }
-                _ => OriginRangeFetch::Unsupported,
+            } else {
+                OriginRangeFetch::Unsupported
             };
             Box::pin(async move { Ok(result) })
         }
@@ -9131,14 +9153,14 @@ mod tests {
         let hash = Hash::from(root);
         let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
 
-        let origin = RangeStubOrigin::serving(hash, &data, outboard);
+        let origin = RangeStubOrigin::serving(hash, &data, outboard.clone());
         let tmp = tempfile::tempdir()?;
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
 
         let aligned = crate::range_pull::align_range(0, 0, total)
             .map_err(|e| anyhow::anyhow!("align: {e}"))?;
-        let Some(combined) = engine.origin_encode_range(hash, &aligned).await? else {
+        let Some(combined) = engine.origin_encode_range(hash, &aligned, outboard).await? else {
             anyhow::bail!("expected Some(wire) — the origin serves the range + outboard");
         };
         anyhow::ensure!(
@@ -9192,7 +9214,7 @@ mod tests {
         let origin = RangeStubOrigin {
             hash,
             data: Bytes::from(corrupt),
-            outboard: Some(outboard),
+            outboard: Some(outboard.clone()),
             size: total,
             support_range: true,
             fault_outboard: false,
@@ -9204,7 +9226,7 @@ mod tests {
         let aligned = crate::range_pull::align_range(0, 0, total)
             .map_err(|e| anyhow::anyhow!("align: {e}"))?;
         let err = engine
-            .origin_encode_range(hash, &aligned)
+            .origin_encode_range(hash, &aligned, outboard)
             .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?;
@@ -9237,7 +9259,10 @@ mod tests {
         let aligned = crate::range_pull::align_range(0, 0, total)
             .map_err(|e| anyhow::anyhow!("align: {e}"))?;
         anyhow::ensure!(
-            engine.origin_encode_range(hash, &aligned).await?.is_none(),
+            engine
+                .origin_encode_range(hash, &aligned, Bytes::new())
+                .await?
+                .is_none(),
             "an unsupported origin must degrade origin_encode_range to Ok(None)"
         );
         Ok(())

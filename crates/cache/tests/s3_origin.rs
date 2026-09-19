@@ -986,10 +986,10 @@ async fn cache_engine_surfaces_not_found_for_no_such_key() -> anyhow::Result<()>
 // ----------------------------------------------------------------------------
 // Origin range pull-through (#962, ADR 037 §Origin-tier pull-through).
 //
-// `S3Origin::fetch_range` issues a sibling `{key}.obao4` GET plus a ranged
-// data GET. The mock dispatcher keys on the requested key (data vs. outboard)
-// and on the presence of a `Range` so we can assert the range-scoped behavior
-// and the always-correct degrade when the outboard is absent.
+// `S3Origin::fetch_range` issues a ranged data GET; the sibling `{key}.obao4`
+// is a separate `fetch_outboard` (covered below). The mock dispatcher keys on
+// the requested key and on the presence of a `Range` so we can assert the
+// range-scoped behavior and the always-correct degrade on a wrong-length body.
 // ----------------------------------------------------------------------------
 
 use bao_tree::io::outboard::PreOrderMemOutboard;
@@ -1009,27 +1009,16 @@ fn make_blob(len: usize) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn fetch_range_returns_span_and_outboard() -> anyhow::Result<()> {
+async fn fetch_range_returns_the_span() -> anyhow::Result<()> {
     let blob = make_blob(200 * 1024);
     let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
     let hash = Hash::from_bytes(*ob.root.as_bytes());
     let data_key = expected_key("", hash);
-    let obao4_key = format!("{data_key}.obao4");
 
     // Aligned span [16 KiB, 48 KiB).
     let (start, end) = (16 * 1024usize, 48 * 1024usize);
     let span = blob.get(start..end).unwrap_or_default().to_vec();
-    let outboard_bytes = ob.data.clone();
 
-    // Outboard rule: plain GET on `{key}.obao4`.
-    let obao4_match = obao4_key.clone();
-    let obao4_rule = mock!(Client::get_object)
-        .match_requests(move |req| req.key() == Some(&obao4_match) && req.range().is_none())
-        .then_output(move || {
-            GetObjectOutput::builder()
-                .body(ByteStream::from(outboard_bytes.clone()))
-                .build()
-        });
     // Ranged data rule: GET on `{key}` with a Range header.
     let data_match = data_key.clone();
     let data_rule = mock!(Client::get_object)
@@ -1039,122 +1028,36 @@ async fn fetch_range_returns_span_and_outboard() -> anyhow::Result<()> {
                 .body(ByteStream::from(span.clone()))
                 .build()
         });
-    let client = mock_s3_client_match_any(&[&obao4_rule, &data_rule]);
+    let client = mock_s3_client_match_any(&[&data_rule]);
     let origin = s3_origin(client, "");
 
     let req = OriginRangeRequest {
         fetch_start: start as u64,
         fetch_end: end as u64,
     };
-    match origin.fetch_range(hash, req, 1 << 20).await? {
-        OriginRangeFetch::Ranged { data, outboard } => {
+    match origin.fetch_range(hash, req).await? {
+        OriginRangeFetch::Ranged { data } => {
             anyhow::ensure!(
                 data.as_ref() == blob.get(start..end).unwrap_or_default(),
                 "span mismatch",
             );
-            anyhow::ensure!(!outboard.is_empty(), "outboard must be served");
         }
         other => anyhow::bail!("expected Ranged, got {other:?}"),
     }
-    anyhow::ensure!(obao4_rule.num_calls() == 1, "one outboard GET");
     anyhow::ensure!(data_rule.num_calls() == 1, "one ranged data GET");
     Ok(())
 }
 
 #[tokio::test]
-async fn fetch_range_missing_outboard_is_unsupported() -> anyhow::Result<()> {
-    // The sibling `{key}.obao4` is absent (`NoSuchKey`) → degrade, no data GET.
-    let blob = make_blob(64 * 1024);
-    let hash = Hash::new(&blob);
-    let obao4_key = format!("{}.obao4", expected_key("", hash));
-
-    let obao4_match = obao4_key.clone();
-    let obao4_rule = mock!(Client::get_object)
-        .match_requests(move |req| req.key() == Some(&obao4_match))
-        .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
-    let client = mock_s3_client_match_any(&[&obao4_rule]);
-    let origin = s3_origin(client, "");
-
-    let req = OriginRangeRequest {
-        fetch_start: 0,
-        fetch_end: 16 * 1024,
-    };
-    anyhow::ensure!(
-        matches!(
-            origin.fetch_range(hash, req, 1 << 20).await?,
-            OriginRangeFetch::Unsupported
-        ),
-        "missing outboard must degrade to Unsupported",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn fetch_range_oversized_outboard_degrades_without_buffering() -> anyhow::Result<()> {
-    // OOM guard: a hostile/oversized `{H}.obao4` (origin ignoring the bound, or
-    // a foreign object served under the outboard key) must degrade to
-    // `Unsupported` WITHOUT buffering the whole body. The mock omits
-    // Content-Length (matching real chunked responses), so the
-    // `content_length()` pre-check can't short-circuit — this exercises the
-    // streaming abort in `collect_bounded`, which stops at the first over-cap
-    // chunk instead of draining the body via `ByteStream::collect()`.
-    let blob = make_blob(64 * 1024);
-    let hash = Hash::new(&blob);
-    let obao4_key = format!("{}.obao4", expected_key("", hash));
-
-    // 8 MiB outboard against a 4 KiB cap. Pre-fix this 8 MiB would be fully
-    // aggregated before the cap check; post-fix it aborts after ~4 KiB.
-    let huge_outboard = vec![0x5Au8; 8 * 1024 * 1024];
-    let obao4_match = obao4_key.clone();
-    let obao4_rule = mock!(Client::get_object)
-        .match_requests(move |req| req.key() == Some(&obao4_match))
-        .then_output(move || {
-            GetObjectOutput::builder()
-                .body(ByteStream::from(huge_outboard.clone()))
-                .build()
-        });
-    let client = mock_s3_client_match_any(&[&obao4_rule]);
-    let origin = s3_origin(client, "");
-
-    let req = OriginRangeRequest {
-        fetch_start: 0,
-        fetch_end: 16 * 1024,
-    };
-    // Tiny outboard cap forces the over-cap abort path.
-    anyhow::ensure!(
-        matches!(
-            origin.fetch_range(hash, req, 4 * 1024).await?,
-            OriginRangeFetch::Unsupported
-        ),
-        "oversized outboard must degrade to Unsupported",
-    );
-    anyhow::ensure!(
-        obao4_rule.num_calls() == 1,
-        "outboard GET issued exactly once",
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn fetch_range_wrong_length_span_degrades() -> anyhow::Result<()> {
-    // Outboard present, but the ranged GET returns a *shorter* body than the
+    // The ranged GET returns a *shorter* body than the
     // requested span (origin ignored Range / truncated). Must degrade, not
     // import a wrong-length span.
     let blob = make_blob(200 * 1024);
     let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
     let hash = Hash::from_bytes(*ob.root.as_bytes());
     let data_key = expected_key("", hash);
-    let obao4_key = format!("{data_key}.obao4");
-    let outboard_bytes = ob.data.clone();
 
-    let obao4_match = obao4_key.clone();
-    let obao4_rule = mock!(Client::get_object)
-        .match_requests(move |req| req.key() == Some(&obao4_match) && req.range().is_none())
-        .then_output(move || {
-            GetObjectOutput::builder()
-                .body(ByteStream::from(outboard_bytes.clone()))
-                .build()
-        });
     // Returns only 8 bytes regardless of the 32 KiB requested span.
     let data_match = data_key.clone();
     let data_rule = mock!(Client::get_object)
@@ -1164,7 +1067,7 @@ async fn fetch_range_wrong_length_span_degrades() -> anyhow::Result<()> {
                 .body(ByteStream::from_static(b"short!!!"))
                 .build()
         });
-    let client = mock_s3_client_match_any(&[&obao4_rule, &data_rule]);
+    let client = mock_s3_client_match_any(&[&data_rule]);
     let origin = s3_origin(client, "");
 
     let req = OriginRangeRequest {
@@ -1173,7 +1076,7 @@ async fn fetch_range_wrong_length_span_degrades() -> anyhow::Result<()> {
     };
     anyhow::ensure!(
         matches!(
-            origin.fetch_range(hash, req, 1 << 20).await?,
+            origin.fetch_range(hash, req).await?,
             OriginRangeFetch::Unsupported
         ),
         "wrong-length span must degrade",

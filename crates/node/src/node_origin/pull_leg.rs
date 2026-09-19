@@ -1271,7 +1271,6 @@ mod local_pull_leg_tests {
             &self,
             hash: Hash,
             req: OriginRangeRequest,
-            _outboard_max_bytes: u64,
         ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>>
         {
             if matches!(self.mode, FakeMode::Fault) {
@@ -1287,7 +1286,6 @@ mod local_pull_leg_tests {
                 match self.data.get(s..e) {
                     Some(span) => OriginRangeFetch::Ranged {
                         data: Bytes::copy_from_slice(span),
-                        outboard: self.outboard.clone(),
                     },
                     None => OriginRangeFetch::NotFound,
                 }
@@ -1351,7 +1349,11 @@ mod local_pull_leg_tests {
         total: u64,
     ) -> anyhow::Result<Option<Result<(), FillError>>> {
         let hash = Hash::from(root);
-        let source = BackendSource::new(engine.clone(), root, total, fresh_ledger());
+        let outboard = engine
+            .origin_fetch_outboard_bytes(hash, total)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("fixture origin must publish the outboard"))?;
+        let source = BackendSource::new(engine.clone(), root, total, outboard, fresh_ledger());
         // Start the served frontier at `total` so the downstream `RampPacer` never
         // gates the pull (this test exercises the completion path, not the window).
         let session = FillSession::starting_at(bao_tree::blake3::Hash::from(root), total, total);

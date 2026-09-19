@@ -989,6 +989,131 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
     Ok(())
 }
 
+/// A distinctive 3 MiB payload plus its outboard: larger than `PULL_WINDOW_FLOOR`,
+/// so a whole-blob own-origin miss takes several pull-leg draws.
+fn large_blob_with_outboard() -> (Vec<u8>, Vec<u8>, Hash) {
+    let blob: Vec<u8> = (0..3 * 1024 * 1024u32)
+        .map(|i| u8::try_from(i.wrapping_mul(2_654_435_761) >> 24).unwrap_or(0))
+        .collect();
+    let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
+    let hash = Hash::from_bytes(*ob.root.as_bytes());
+    (blob, ob.data, hash)
+}
+
+/// #2061 §1: the pull leg fetches `{H}.obao4` ONCE per fill, not once per draw.
+/// A 3 MiB blob is several draws at the ramp floor; the origin must see exactly
+/// one outboard GET (the serviceability probe's, handed to the pull leg) and at
+/// least two ranged data GETs (proof the pull really was multi-draw).
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn own_origin_miss_fetches_the_outboard_once_across_draws() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = large_blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    // Dynamic 206 responder: whatever aligned span a draw asks for.
+    let blob_for_resp = blob.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header_exists("range"))
+        .respond_with(move |req: &Request| {
+            let span = req
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .and_then(|(s, e)| Some((usize::try_from(s).ok()?, usize::try_from(e).ok()?)))
+                .and_then(|(s, e)| blob_for_resp.get(s..=e));
+            match span {
+                Some(body) => ResponseTemplate::new(206).set_body_bytes(body.to_vec()),
+                None => ResponseTemplate::new(416),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x61);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        pool_id,
+        provider,
+        hash,
+        0,
+        0,
+        RATE_PER_MB,
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_slice() == blob.as_slice(),
+        "multi-draw delivery mismatch"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "the own-origin two-leg tier must serve this miss"
+    );
+
+    let outboard_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET" && r.url.path() == format!("/{hex}.obao4")
+    })
+    .await?;
+    let ranged_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers.contains_key("range")
+    })
+    .await?;
+    anyhow::ensure!(
+        ranged_gets >= 2,
+        "test premise: a 3 MiB blob must take several draws, saw {ranged_gets}"
+    );
+    anyhow::ensure!(
+        outboard_gets == 1,
+        "the outboard must be fetched once per fill, saw {outboard_gets} GET(s) across {ranged_gets} draws"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// INTERIOR-HOLD own-origin serve-miss (Flow A). The node already holds an aligned
 /// INTERIOR range of the blob before the whole-blob request arrives; the local pull
 /// leg must draw ONLY the surrounding gaps from origin (never the held interior),

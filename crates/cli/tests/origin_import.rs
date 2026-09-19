@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use decdn_cache::{
     CHUNK_GROUP_BYTES, FilesystemOrigin, Hash, Origin, OriginFetch, OriginRangeFetch,
-    OriginRangeRequest,
+    OriginRangeRequest, OutboardFetch,
 };
 use decdn_cli::commands::origin::origin_import;
 use decdn_common::cli::OriginImportArgs;
@@ -106,12 +106,17 @@ fn single_file_import_is_readable_and_range_serves() {
         };
         let start = usize::try_from(CHUNK_GROUP_BYTES).unwrap();
         let end = usize::try_from(3 * CHUNK_GROUP_BYTES).unwrap();
-        match reader.fetch_range(hash, req, 1 << 30).await.unwrap() {
-            OriginRangeFetch::Ranged { data, outboard } => {
+        match reader.fetch_range(hash, req).await.unwrap() {
+            OriginRangeFetch::Ranged { data } => {
                 assert_eq!(data.as_ref(), &payload[start..end]);
-                assert!(!outboard.is_empty(), "outboard must be served for a range");
             }
             other => panic!("expected Ranged, got {other:?}"),
+        }
+        match reader.fetch_outboard(hash, 1 << 30).await.unwrap() {
+            OutboardFetch::Found(outboard) => {
+                assert!(!outboard.is_empty(), "outboard must be served for a range");
+            }
+            other => panic!("expected Found, got {other:?}"),
         }
     });
 }

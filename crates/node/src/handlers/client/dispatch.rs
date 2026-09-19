@@ -1002,8 +1002,10 @@ impl ClientHandler {
                                 // Serviceable: size known and an origin publishes the
                                 // outboard. Enter the orchestration directly — it claims
                                 // the fill (owner-or-attach) internally after signing the
-                                // response, so no coalescing decision happens here.
-                                Ok(Some(_)) => {
+                                // response, so no coalescing decision happens here. The
+                                // outboard fetched here is the one the pull leg reuses
+                                // for every draw (#2061).
+                                Ok(Some(outboard)) => {
                                     // Boxed: the serve future is large
                                     // (clippy::large_futures). `pull_authorized`
                                     // (checked in the `if` above) guarantees a
@@ -1018,6 +1020,7 @@ impl ClientHandler {
                                             lk,
                                             ln,
                                             total,
+                                            outboard,
                                             pool_status.map(|s| s.remaining),
                                             rate_per_mb,
                                             floor_reservation,

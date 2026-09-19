@@ -231,35 +231,29 @@ impl OriginFetch {
 /// correctness or availability failure — it only forgoes the cost reduction
 /// (ADR 037 §"Fallback is always correct").
 pub enum OriginRangeFetch {
-    /// The origin served both the requested byte span and the sibling
-    /// `{H}.obao4` outboard. `data` covers exactly
+    /// The origin served the requested byte span. `data` covers exactly
     /// `[aligned.fetch_start(), aligned.fetch_end())` (the chunk-group-aligned
-    /// span the engine asked for); `outboard` is the untrusted pre-order
-    /// outboard. Neither is trusted until
-    /// [`crate::range_pull::encode_verified_range`] verifies them against `H`.
+    /// span the engine asked for) and is untrusted until
+    /// [`crate::range_pull::encode_verified_range`] verifies it against `H`
+    /// with the outboard from [`Origin::fetch_outboard`].
     Ranged {
         /// The aligned data bytes, exactly `aligned.fetch_len()` long.
         data: Bytes,
-        /// The raw, untrusted `{H}.obao4` outboard bytes.
-        outboard: Bytes,
     },
     /// The origin reported the object (data key) does not exist.
     NotFound,
-    /// The range optimization is not available for this fetch — no published
-    /// outboard, no `Range`/`206` support, or a short/absent outboard. The
-    /// engine degrades to a whole-blob [`Origin::fetch`] pull. This is the
-    /// *expected* path for origins that don't publish `{H}.obao4`, not an
-    /// error.
+    /// The range read is not available for this fetch — no `Range`/`206`
+    /// support, or a body of the wrong length. The engine degrades to a
+    /// whole-blob pull.
     Unsupported,
 }
 
 impl std::fmt::Debug for OriginRangeFetch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Ranged { data, outboard } => f
+            Self::Ranged { data } => f
                 .debug_struct("Ranged")
                 .field("data_len", &data.len())
-                .field("outboard_len", &outboard.len())
                 .finish(),
             Self::NotFound => f.write_str("NotFound"),
             Self::Unsupported => f.write_str("Unsupported"),
@@ -361,31 +355,28 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
         max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>>;
 
-    /// Fetch the chunk-group-aligned byte span `req` of the blob `hash`
-    /// **plus** its sibling `{H}.obao4` outboard, for a range-scoped pull
-    /// ([ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md),
-    /// #823). `outboard_max_bytes` caps the outboard read (the engine derives
-    /// it from the blob size — an outboard is `O(blob/256)` and an oversize
-    /// one is malformed/foreign).
+    /// Fetch the chunk-group-aligned byte span `req` of the blob `hash`. The
+    /// sibling `{H}.obao4` outboard is a separate, one-time
+    /// [`Self::fetch_outboard`]; a fill that draws many spans reuses that one
+    /// outboard for every draw ([ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md)).
     ///
     /// The default implementation returns [`OriginRangeFetch::Unsupported`],
     /// so a custom [`Origin`] needs no change and the engine degrades to a
     /// whole-blob [`Self::fetch`] pull. The three shipped adapters override it.
     ///
     /// Like [`Self::fetch`], the origin is a dumb byte store: the returned
-    /// `data` and `outboard` are **untrusted** and verified against the root
-    /// `H` by the engine via [`crate::range_pull::encode_verified_range`]
-    /// before any byte is imported.
+    /// `data` is **untrusted** and verified against the root `H` by the
+    /// engine via [`crate::range_pull::encode_verified_range`] before any byte
+    /// is imported.
     ///
     /// Returning [`OriginRangeFetch::Unsupported`] is the correct, expected
-    /// answer whenever the optimization can't apply (no `{H}.obao4`, no
-    /// `Range`/`206`, short outboard) — it is not an error. Only genuine
-    /// transport / permission failures surface as [`OriginPullError`].
+    /// answer whenever the range read can't apply (no `Range`/`206`, wrong
+    /// body length) — it is not an error. Only genuine transport / permission
+    /// failures surface as [`OriginPullError`].
     fn fetch_range(
         &self,
         _hash: Hash,
         _req: OriginRangeRequest,
-        _outboard_max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async { Ok(OriginRangeFetch::Unsupported) })
     }

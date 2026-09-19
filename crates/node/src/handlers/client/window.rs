@@ -1,6 +1,7 @@
 //! Window-paced pull-through serve path (#856, ADR 037).
 
 use alloy::primitives::U256;
+use bytes::Bytes;
 
 use crate::node_origin::PullLegTarget;
 
@@ -495,6 +496,7 @@ impl ClientHandler {
         lane_key: LaneKey,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         total_bytes: u64,
+        outboard: Bytes,
         pool_remaining: Option<U256>,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
@@ -649,6 +651,7 @@ impl ClientHandler {
                 engine.clone(),
                 *hash.as_bytes(),
                 total_bytes,
+                outboard,
                 ledger,
             );
             // The pull runs on its own thread and runtime, which starts with no
