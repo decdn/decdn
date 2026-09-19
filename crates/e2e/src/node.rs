@@ -365,11 +365,11 @@ impl NodeFixture {
     }
 
     /// Like [`Self::seed_origin_blob`], but also writes the sibling `{H}.obao4`
-    /// pre-order outboard so a ranged origin fetch reaches the **range tier**.
+    /// pre-order outboard so a ranged origin fetch reaches the **own-origin streaming spine**.
     ///
     /// A range pull treats a missing outboard (`FilesystemOrigin::fetch_outboard`
     /// `NotFound`) as unsupported by design, so a blob seeded by `seed_origin_blob` alone declines the range
-    /// path and falls through to a whole-blob fill — the origin range tier and
+    /// path and falls through to a whole-blob fill — the ranged spine path and
     /// `bao-range`'s chunk-group handling are then never exercised (#1372). Seed
     /// with this variant when a journey asserts on the range path itself.
     pub fn seed_origin_blob_with_outboard(&self, blob: &[u8]) -> anyhow::Result<Hash> {

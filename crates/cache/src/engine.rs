@@ -3238,6 +3238,9 @@ impl CacheEngine {
         Ok(())
     }
 
+    /// A permit from the own-origin draw pool ([`MAX_CONCURRENT_RANGE_PULLS`]);
+    /// waits (with a debug line) when the pool is full rather than degrading,
+    /// because the degrade is a whole-blob origin pull — more egress, not less.
     async fn range_pull_permit(
         pool: &Arc<tokio::sync::Semaphore>,
     ) -> CacheResult<tokio::sync::OwnedSemaphorePermit> {
@@ -3343,10 +3346,10 @@ impl CacheEngine {
     /// import (the node's `NodeAdmitStore` sink admits, fed by
     /// `decdn_client_pull::BlobSource`).
     ///
-    /// The first origin that serves the outboard and the first window wins. A
-    /// per-origin decline or transport fault advances the chain. The wire is
-    /// produced window by window ([`crate::RANGE_PULL_WINDOW_BYTES`]) by a
-    /// background encode that holds a permit from its own pool of
+    /// The first origin that serves the first window wins; a per-origin
+    /// decline or transport fault advances the chain. The wire is produced
+    /// window by window ([`crate::RANGE_PULL_WINDOW_BYTES`]) by a background
+    /// encode that holds a permit from the engine-wide pool of
     /// [`crate::MAX_CONCURRENT_RANGE_PULLS`], so memory stays
     /// `O(window + outboard)` whatever the span (#2065).
     ///

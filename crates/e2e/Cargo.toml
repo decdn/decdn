@@ -51,7 +51,7 @@ decdn-client-pull = { workspace = true, features = ["test-util"] }
 decdn-protocol = { workspace = true }
 decdn-config-types = { workspace = true }
 # Outboard construction for `seed_origin_blob_with_outboard`: seeds the sibling
-# `{H}.obao4` so a ranged origin fetch reaches the real range tier instead of
+# `{H}.obao4` so a ranged origin fetch reaches the real own-origin streaming spine instead of
 # degrading to a whole-blob fill (#1372). `IROH_BLOCK_SIZE` comes from the leaf
 # `decdn-bao-range` so the fixture can't diverge from the canonical block size.
 decdn-bao-range = { workspace = true }

@@ -333,7 +333,8 @@ impl ClientHandler {
                             // the single fetch-start.
                             let served = content_paid_frontier(fetch_start, total_bytes, paid);
                             // Forward-only, and guarded on THIS leg's start: an owning
-                            // session starts AT `fetch_start`, so the guard is a no-op and
+                            // session's frontier starts at the raw `byte_offset`, at or
+                            // above its group floor `fetch_start`, so the guard is a no-op and
                             // N whole-range observers advance the SHARED frontier with the
                             // pull's `WindowPacer` binding on the MAX-over-observers paid
                             // frontier (DECISION-B). An observer ATTACHED at an offset the

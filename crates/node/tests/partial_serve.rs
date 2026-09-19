@@ -11,9 +11,9 @@
 //!    and NO pull-through configured (nothing else *could* fill it), succeeds
 //!    and is paid — proving the new branch serves straight from cache.
 //! 2. A request that spans a cached range AND a missing range does not
-//!    short-circuit: it takes the existing origin-tier range pull-through leg
-//!    (asserted via the mock origin actually being hit), exactly as an
-//!    ordinary cache-miss range request does today.
+//!    short-circuit: it takes the own-origin two-leg spine, whose pull leg
+//!    fetches only the missing group (asserted via the mock origin actually
+//!    being hit), exactly as an ordinary cache-miss range request does.
 
 use std::sync::Arc;
 

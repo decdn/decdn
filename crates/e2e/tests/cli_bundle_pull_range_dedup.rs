@@ -918,7 +918,7 @@ async fn run_from_optimize_import() -> anyhow::Result<()> {
 /// re-downloading and re-paying for it — paying only for the changed tail.
 ///
 /// `b.bin`'s v2 bytes are seeded into the SAME node's filesystem origin
-/// (`seed_origin_blob_with_outboard`, ADR-038 range tier) after the mutation,
+/// (`seed_origin_blob_with_outboard`, ADR-038 own-origin streaming spine) after the mutation,
 /// mirroring a real operator re-importing updated content: the client-visible
 /// picture is a single node whose held content changed between the two pulls.
 #[tokio::test(flavor = "multi_thread")]
@@ -1066,7 +1066,7 @@ async fn run_delta_update() -> anyhow::Result<()> {
     // Seed the node with `b.bin` v2's bytes via its filesystem origin, WITH the
     // sibling `.obao4` outboard so the reactive pull-through can serve the
     // ranged complement fetch below (a missing outboard falls back to a
-    // whole-blob fill and would never exercise the range tier, #1372).
+    // whole-blob fill and would never exercise the ranged spine path, #1372).
     node.seed_origin_blob_with_outboard(&file_b_v2)
         .context("seed b.bin v2 into node origin")?;
 

@@ -812,11 +812,13 @@ impl ClientHandler {
                 // On a successful fill, fall through to the normal size-gate +
                 // delivery path; otherwise it stays a `NotFound`.
                 //
-                // Every fill tier below is range-aware: a bounded or resumed request
-                // (`byte_offset > 0 || byte_len > 0`) takes the same two-leg spine as a
-                // whole-blob request, and the spine's pull leg fetches only the requested
-                // span's missing chunk groups (ADR 037 §Origin-tier pull-through). No tier
-                // buffers a requested span before it signs the response.
+                // Every request shape — whole blob, bounded, resumed — takes the same
+                // two-leg spine on its preferred tiers: the spine signs first and its
+                // pull leg fetches only the requested span's missing chunk groups
+                // (ADR 037 §Origin-tier pull-through). The FALLBACK tiers below it
+                // (`try_local_populate`, the buffered pull-through) still import the
+                // whole blob before the size gate answers; they serve exactly the
+                // requested span at delivery.
                 // The fault latch (#1129): declared before the first tier so every
                 // tier's `CacheError::Store` lands in it.
                 // Pre-spend deposit floor (#1519). Every fill tier below spends:
@@ -935,7 +937,7 @@ impl ClientHandler {
                 // Own-origin serve-miss via the two decoupled legs.
                 // When the node's OWN configured fs/http/s3 origin can prove it
                 // serves `hash` — it knows the size AND publishes the {H}.obao4
-                // outboard — serve the whole blob by running the local pull leg (fill
+                // outboard — serve the request by running the local pull leg (fill
                 // the cache from origin) beside the serve leg (stream the filling
                 // cache to the paying client), exactly like the node→node window path
                 // but with NO upstream, NO channel, and NO payment on the ingest side.
@@ -963,7 +965,7 @@ impl ClientHandler {
                 // streams the same filling cache to its own client (no double origin
                 // egress). The registry is range-aware, so this coalescing is not
                 // limited to the whole-blob case.
-                if !locally_filled && self.pull_authorized(&req, verified_client) {
+                if self.pull_authorized(&req, verified_client) {
                     match self.cache.origin_size(hash).await {
                         Ok(Some(total)) => {
                             match self.cache.origin_fetch_outboard_bytes(hash, total).await {
