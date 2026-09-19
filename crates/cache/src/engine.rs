@@ -33,8 +33,11 @@ use crate::circuit_breaker::{
 use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::fill_session::{FillClaim, FillRegistry, FillSession};
 use crate::metrics::CacheMetrics;
-use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
+use crate::origin::{Origin, OriginKind, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, OriginProbePolicy, Presence};
+use crate::origin_range::{
+    MAX_CONCURRENT_RANGE_PULLS, OriginRangeCursor, OriginRangeWire, WindowFetch,
+};
 use crate::probe_hold::ProbeHoldOutcome;
 use crate::range_pull::{AlignedRange, align_range, encode_verified_range};
 use crate::retry::{
@@ -470,6 +473,14 @@ struct Inner {
     /// per-hash captured outboard every serve leg reads. Purely synchronous range
     /// math; holds no blob bytes. Driven through [`CacheEngine::claim_fill`].
     fill_registry: Arc<FillRegistry>,
+    /// Bounds the [`CacheEngine::pull_through_range`] pulls that run at once
+    /// (#2065); each holds a permit for its whole span. Each pull holds
+    /// `O(window + outboard)` bytes, so the bound caps their sum.
+    range_pulls: Arc<tokio::sync::Semaphore>,
+    /// Bounds the [`CacheEngine::origin_range_wire`] encodes that run at once.
+    /// A separate pool from `range_pulls`, so a long cold-miss range pull never
+    /// stalls an own-origin serve that has already committed to a client.
+    own_origin_range_pulls: Arc<tokio::sync::Semaphore>,
 }
 
 impl Inner {
@@ -1371,6 +1382,10 @@ impl CacheEngine {
                 inserts_tx: broadcast::channel(1024).0,
                 gc_store_handle,
                 fill_registry: Arc::new(FillRegistry::new()),
+                range_pulls: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RANGE_PULLS)),
+                own_origin_range_pulls: Arc::new(tokio::sync::Semaphore::new(
+                    MAX_CONCURRENT_RANGE_PULLS,
+                )),
             }),
         })
     }
@@ -3264,19 +3279,28 @@ impl CacheEngine {
     /// fetched bytes + the untrusted `{H}.obao4` outboard are verified against
     /// the root `H` ([`crate::range_pull::encode_verified_range`]), and the
     /// verified span is imported as a **partial** blob via iroh-blobs
-    /// `import_bao_bytes` — no whole-blob origin egress. The node then serves
-    /// the range via `export_ranges` ([ADR 038 §Serve side](../../../adr/038-bao-verified-range-streaming.md)).
-    /// Only the actually-pulled bytes leave the origin — the range span the ramped
-    /// credit window paces, plus the small `{H}.obao4` outboard as additional
-    /// origin egress beyond that content window — not the whole blob, tightening
-    /// the node's exposure (ADR 037 §"Origin-tier pull-through").
+    /// `import_bao_bytes` — no whole-blob origin egress. The outboard is read
+    /// once; the span is fetched, verified, and imported in windows of
+    /// [`crate::RANGE_PULL_WINDOW_BYTES`], so the pull holds `O(window +
+    /// outboard)` bytes whatever `byte_len` is (#2065). At most
+    /// [`crate::MAX_CONCURRENT_RANGE_PULLS`] of these pulls run at once; a
+    /// caller past the bound waits for a permit. The node then serves the range
+    /// via `export_ranges` ([ADR 038 §Serve side](../../../adr/038-bao-verified-range-streaming.md)).
+    /// On success only the pulled bytes leave the origin — the range span the
+    /// ramped credit window paces, plus the small `{H}.obao4` outboard as
+    /// additional origin egress beyond that content window — not the whole
+    /// blob, tightening the node's exposure (ADR 037 §"Origin-tier
+    /// pull-through").
     ///
     /// Returns [`RangePullOutcome::Served`] when the partial range is present,
-    /// or [`RangePullOutcome::Unsupported`] when no origin could range-pull
-    /// (no `{H}.obao4`, no `Range`, short outboard) — in which case the caller
-    /// MUST fall back to a whole-blob [`Self::populate`] / [`Self::get`]. The
-    /// fallback is always correct; the optimization only reduces the origin
-    /// hop's cost.
+    /// or [`RangePullOutcome::Unsupported`] when no origin could range-pull —
+    /// in which case the caller MUST fall back to a whole-blob
+    /// [`Self::populate`] / [`Self::get`]. An origin declines when it has no
+    /// `{H}.obao4` or no `Range`, or when a window fails verification or stops
+    /// being served mid-span. In the mid-span case the windows imported before
+    /// it stay as verified partial data, and the whole-blob fallback completes
+    /// the blob. The fallback is always correct; the optimization only reduces
+    /// the origin hop's cost.
     ///
     /// This is **partial**-blob population. It installs a deterministic
     /// `decdn-partial-<hash>` named tag so the imported range survives GC
@@ -3300,12 +3324,13 @@ impl CacheEngine {
     ///   pull-through path, a store fault fails fast rather than masking a
     ///   misbehaving local store behind the next origin.
     ///
-    /// A genuine origin *transport / verify* fault is NOT surfaced as an error:
-    /// it is recorded in `last_err`, logged, and the chain advances; if every
-    /// origin declines or errors the call returns [`RangePullOutcome::Unsupported`]
-    /// so the caller falls back to a whole-blob pull (which re-surfaces the real
-    /// fault if the blob is genuinely unreachable). A *missing-outboard* /
-    /// *no-range* origin likewise returns [`RangePullOutcome::Unsupported`].
+    /// A genuine origin *transport* fault — at open or on any window — is NOT
+    /// surfaced as an error: it is logged per origin, and the chain advances to
+    /// the next origin, which starts again from the first window. If every
+    /// origin declines or errors the call returns
+    /// [`RangePullOutcome::Unsupported`] so the caller falls back to a
+    /// whole-blob pull (which re-surfaces the real fault if the blob is
+    /// genuinely unreachable).
     #[tracing::instrument(
         name = "origin_range_pull",
         skip_all,
@@ -3346,24 +3371,23 @@ impl CacheEngine {
             // check; map its typed error onto the engine's origin-error surface so
             // the caller sees a coherent `CacheError` rather than a cache-internal
             // type.
-            let aligned =
-                align_range(byte_offset, byte_len, blob_size).map_err(|e| CacheError::OriginError {
+            let aligned = align_range(byte_offset, byte_len, blob_size).map_err(|e| {
+                CacheError::OriginError {
                     hash,
                     source: anyhow::Error::new(e).context("range pull-through: invalid byte range"),
-                })?;
+                }
+            })?;
 
+            let _permit = Self::range_pull_permit(&self.inner.range_pulls).await?;
             if let Some(m) = &self.inner.metrics {
                 m.origin_fetches.inc();
             }
             let root = *hash.as_bytes();
-            let req = OriginRangeRequest {
-                fetch_start: aligned.fetch_start(),
-                fetch_end: aligned.fetch_end(),
-            };
 
             // Walk the origin fallback chain (#284). A per-origin `Unsupported`
-            // (no outboard / no range) advances to the next origin; a genuine
-            // origin transport / verify fault is recorded and the chain advances.
+            // (no outboard / no range / a window that fails verification) advances
+            // to the next origin; a genuine origin transport fault is logged and
+            // the chain advances.
             // A local-store fault (`CacheError::Store`: disk full / IO) fails fast
             // and is NOT masked by trying another origin — consistent with
             // whole-blob `pull_through`, where `Store` short-circuits the chain
@@ -3372,25 +3396,31 @@ impl CacheEngine {
             let mut last_err: Option<CacheError> = None;
             for origin in &self.inner.origins {
                 match self
-                    .range_pull_attempt(Arc::clone(origin), hash, root, blob_size, &aligned, req)
+                    .range_pull_attempt(Arc::clone(origin), hash, root, &aligned)
                     .await
                 {
                     Ok(RangePullOutcome::Served) => return Ok(RangePullOutcome::Served),
                     Ok(RangePullOutcome::Unsupported) => {}
                     // Local store fault: fail fast, do not advance the chain.
                     Err(e @ CacheError::Store(_)) => return Err(e),
-                    Err(e) => last_err = Some(e),
+                    Err(e) => {
+                        tracing::warn!(
+                            %hash,
+                            kind = ?origin.kind(),
+                            error = %e,
+                            "origin range pull failed; trying next origin",
+                        );
+                        last_err = Some(e);
+                    }
                 }
             }
-            // Every origin declined the optimization. If any errored, the caller
-            // still falls back to a whole-blob pull (which will surface the real
-            // error if the blob is genuinely unreachable), so prefer the degrade
-            // signal — but log a genuine fault so it isn't silently swallowed.
-            if let Some(e) = last_err {
-                tracing::warn!(
+            // Every origin declined the optimization. The caller falls back to a
+            // whole-blob pull, which surfaces the real error if the blob is
+            // genuinely unreachable; each origin's fault is already logged above.
+            if last_err.is_some() {
+                tracing::debug!(
                     %hash,
-                    error = %e,
-                    "range pull-through attempt errored on every origin; degrading to whole-blob pull",
+                    "range pull-through errored on every origin; degrading to whole-blob pull",
                 );
             }
             Ok(RangePullOutcome::Unsupported)
@@ -3400,116 +3430,110 @@ impl CacheEngine {
         result
     }
 
-    /// One range-pull attempt against a single origin: fetch the aligned span
-    /// plus outboard, verify against `root`, then import the verified partial
-    /// blob. Returns [`RangePullOutcome::Unsupported`] (degrade) for any
-    /// non-error decline; `Err` only for genuine transport / store / verify
-    /// faults.
+    /// One range-pull attempt against a single origin: read the outboard once,
+    /// then fetch, verify against `root`, and import the aligned span window by
+    /// window. Returns [`RangePullOutcome::Unsupported`] (degrade) for any
+    /// non-error decline; `Err` only for genuine transport / store faults.
+    ///
+    /// A window that fails verification, or that the origin stops serving
+    /// mid-span, degrades the whole pull. The windows imported before it stay
+    /// as verified partial data under the `protect_partial` tag.
     async fn range_pull_attempt(
         &self,
         origin: Arc<dyn Origin>,
         hash: Hash,
         root: [u8; 32],
-        blob_size: u64,
         aligned: &AlignedRange,
-        req: OriginRangeRequest,
     ) -> CacheResult<RangePullOutcome> {
-        let Some((data, outboard)) = self
-            .origin_fetch_range_bytes(&origin, hash, blob_size, req)
-            .await?
+        let blob_size = aligned.blob_size();
+        let outboard_max = expected_outboard_len(blob_size).saturating_add(64);
+        let Some(mut cursor) = OriginRangeCursor::open(
+            origin,
+            hash,
+            aligned,
+            outboard_max,
+            self.inner.metrics.clone(),
+        )
+        .await?
         else {
-            // Missing outboard / no range support / object absent → degrade.
+            // Missing outboard / no range support / object absent → next origin.
             return Ok(RangePullOutcome::Unsupported);
         };
 
-        // Verify the untrusted range + outboard against the root `H` and
-        // produce the bao interleaved encoding for `import_bao_bytes`. A
-        // verification failure (tampered range/outboard, wrong root) is a
-        // deterministic protocol violation — degrade to a whole-blob pull
-        // (which re-verifies whole-blob against `H`) rather than erroring, so
-        // a single misbehaving origin can't deny the range entirely. A
-        // wrong-length outboard is the same degrade.
-        let encoded = match encode_verified_range(root, aligned, &data, outboard) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                tracing::warn!(
-                    %hash,
-                    kind = ?origin.kind(),
-                    error = %err,
-                    "origin range failed bao verification; degrading to whole-blob pull",
-                );
+        let mut protected = false;
+        while let Some(fetch) = cursor.next_window().await? {
+            let Some(w) = accept_range_window(fetch, hash, cursor.origin_kind()) else {
                 return Ok(RangePullOutcome::Unsupported);
-            }
-        };
-
-        // Import the verified span as a partial blob. The chunk ranges scope
-        // exactly what was verified; iroh-blobs writes them as a partial blob
-        // anchored at `hash`. A store fault here is a real error (local disk /
-        // actor problem), surfaced as `Store`.
-        self.inner
-            .store
-            .blobs()
-            .import_bao_bytes(hash, aligned.chunk_ranges().clone(), encoded)
-            .await
-            .map_err(|e| {
-                CacheError::Store(
-                    anyhow::Error::from(e).context("import_bao_bytes failed for verified range"),
-                )
+            };
+            let window = align_range(w.start, w.end - w.start, blob_size).map_err(|e| {
+                CacheError::OriginError {
+                    hash,
+                    source: anyhow::Error::new(e).context("range pull-through: invalid window"),
+                }
             })?;
 
-        self.protect_partial(hash).await?;
+            // Verify the untrusted window + outboard against the root `H` and
+            // produce the bao interleaved encoding for `import_bao_bytes`. A
+            // verification failure (tampered range/outboard, wrong root) is a
+            // deterministic protocol violation — decline this origin (the chain
+            // ends in a whole-blob pull that re-verifies against `H`) rather than
+            // erroring, so a single misbehaving origin can't deny the range
+            // entirely. A wrong-length outboard is the same decline.
+            let encoded = match encode_verified_range(root, &window, &w.data, cursor.outboard()) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!(
+                        %hash,
+                        kind = ?cursor.origin_kind(),
+                        error = %err,
+                        "origin range failed bao verification; trying next origin",
+                    );
+                    return Ok(RangePullOutcome::Unsupported);
+                }
+            };
+            drop(w);
+
+            // Import the verified window as a partial blob. The chunk ranges
+            // scope exactly what was verified; iroh-blobs writes them as a
+            // partial blob anchored at `hash`. A store fault here is a real
+            // error (local disk / actor problem), surfaced as `Store`.
+            self.inner
+                .store
+                .blobs()
+                .import_bao_bytes(hash, window.chunk_ranges().clone(), encoded)
+                .await
+                .map_err(|e| {
+                    CacheError::Store(
+                        anyhow::Error::from(e)
+                            .context("import_bao_bytes failed for verified range"),
+                    )
+                })?;
+
+            if !protected {
+                self.protect_partial(hash).await?;
+                protected = true;
+            }
+        }
 
         Ok(RangePullOutcome::Served)
     }
 
-    /// Fetch one origin's chunk-group-aligned range span (`req`) plus its
-    /// sibling `{H}.obao4` outboard, and meter the pulled bytes as
-    /// `pull_through_bytes`. Returns the raw, still-UNVERIFIED `(data, outboard)`
-    /// on a hit, or `Ok(None)` for a per-origin decline
-    /// ([`OriginRangeFetch::Unsupported`] / [`OriginRangeFetch::NotFound`]) so the
-    /// caller can advance the fallback chain.
-    ///
-    /// Deliberately stops at the fetch+meter boundary and does NOT verify against
-    /// the root: the two callers apply OPPOSITE verify-failure policies over the
-    /// same fetched bytes, so the verify cannot be shared. [`Self::range_pull_attempt`]
-    /// DEGRADES a range that fails bao verification to a whole-blob pull (a single
-    /// misbehaving origin must not deny the range), while [`Self::origin_encode_range`]
-    /// treats the same failure as a HARD local-origin fault (Flow A has already
-    /// committed to serving under `H`, so there is no safe degrade). Sharing the
-    /// fetch keeps the origin transport / metering path DRY without forcing one
-    /// policy on both.
-    async fn origin_fetch_range_bytes(
-        &self,
-        origin: &Arc<dyn Origin>,
-        hash: Hash,
-        blob_size: u64,
-        req: OriginRangeRequest,
-    ) -> CacheResult<Option<(Bytes, Bytes)>> {
-        let outboard_max = expected_outboard_len(blob_size).saturating_add(64);
-        let (data, outboard) =
-            match origin
-                .fetch_range(hash, req, outboard_max)
-                .await
-                .map_err(|e| CacheError::OriginError {
-                    hash,
-                    source: e.into_inner(),
-                })? {
-                OriginRangeFetch::Ranged { data, outboard } => (data, outboard),
-                OriginRangeFetch::Unsupported | OriginRangeFetch::NotFound => return Ok(None),
-            };
-
-        // Meter the actually-pulled bytes (span + outboard) as origin egress —
-        // the bytes really did leave an origin. The ramped credit window paces the
-        // content span; the outboard is additional origin egress beyond it. Either
-        // way this is the pulled side, not the whole blob.
-        if let Some(m) = &self.inner.metrics {
-            let pulled = u64::try_from(data.len())
-                .unwrap_or(u64::MAX)
-                .saturating_add(u64::try_from(outboard.len()).unwrap_or(u64::MAX));
-            m.pull_through_bytes.inc_by(pulled);
+    /// A permit from one of the origin range-pull pools (#2065). Waits while
+    /// [`crate::MAX_CONCURRENT_RANGE_PULLS`] pulls already hold that pool, and
+    /// logs the wait so a pool held by stuck pulls is visible.
+    async fn range_pull_permit(
+        pool: &Arc<tokio::sync::Semaphore>,
+    ) -> CacheResult<tokio::sync::OwnedSemaphorePermit> {
+        if let Ok(permit) = Arc::clone(pool).try_acquire_owned() {
+            return Ok(permit);
         }
-
-        Ok(Some((data, outboard)))
+        tracing::debug!(
+            bound = MAX_CONCURRENT_RANGE_PULLS,
+            "origin range-pull pool is full; waiting for a permit",
+        );
+        Arc::clone(pool).acquire_owned().await.map_err(|e| {
+            CacheError::Store(anyhow::Error::new(e).context("range-pull bound closed"))
+        })
     }
 
     /// Fetch the sibling `{H}.obao4` outboard for `hash` (a `total_bytes`-byte
@@ -3526,7 +3550,7 @@ impl CacheEngine {
     /// for the final partial group), same "a per-origin decline or transport fault
     /// advances the chain" discipline. The returned outboard is UNTRUSTED until it
     /// verifies against the root `H` (the range encode in
-    /// [`Self::origin_encode_range`] is where that happens).
+    /// [`Self::origin_range_wire`] is where that happens).
     pub async fn origin_fetch_outboard_bytes(
         &self,
         hash: Hash,
@@ -3568,18 +3592,18 @@ impl CacheEngine {
         }
     }
 
-    /// Fetch `aligned`'s span from the configured origins and return the
-    /// header-full interleaved bao **wire** for it, verified against the root `H`
-    /// — the raw-fetch half of a range pull WITHOUT the import
+    /// Stream the header-less interleaved bao **wire** (ADR 038) for
+    /// `aligned`'s span out of the configured origins, verified against the
+    /// root `H` — the raw-fetch half of a range pull WITHOUT the import
     /// (`range_pull_attempt` imports; here the node's `NodeAdmitStore` sink
-    /// does). The returned bytes keep their leading 8-byte little-endian size
-    /// header (the shape [`encode_verified_range`] produces); the node-side
-    /// `decdn_client_pull::BlobSource` caller strips it before feeding the
-    /// header-less wire (ADR 038) to the driver.
+    /// does, fed by `decdn_client_pull::BlobSource`).
     ///
-    /// The first origin that SERVES the range wins. A per-origin decline
-    /// ([`OriginRangeFetch::Unsupported`] / [`OriginRangeFetch::NotFound`])
-    /// advances the chain; all origins exhausted → `Ok(None)`.
+    /// The first origin that serves the outboard and the first window wins. A
+    /// per-origin decline or transport fault advances the chain. The wire is
+    /// produced window by window ([`crate::RANGE_PULL_WINDOW_BYTES`]) by a
+    /// background encode that holds a permit from its own pool of
+    /// [`crate::MAX_CONCURRENT_RANGE_PULLS`], so memory stays
+    /// `O(window + outboard)` whatever the span (#2065).
     ///
     /// # The load-bearing difference from `range_pull_attempt`
     ///
@@ -3591,55 +3615,56 @@ impl CacheEngine {
     /// `StreamResponse` committing to serve under `H`, so a corrupt or
     /// misconfigured OWN origin is a local-origin fault to surface, not upstream
     /// corruption to route around (there is no upstream, and no fallback still
-    /// honours `H`).
+    /// honours `H`). A fault after the wire has started ends it with a terminal
+    /// `Err` from [`OriginRangeWire::next_chunk`].
     ///
     /// # Errors
     ///
-    /// - [`CacheError::VerifyFailed`] — the winning origin's range/outboard did
-    ///   not verify against the root `H` (a bad `{H}.obao4`, a corrupt span, a
-    ///   wrong-length body). Mapped from [`encode_verified_range`]'s
-    ///   [`RangeVerifyError`](decdn_bao_range::RangeVerifyError) — the same shape
-    ///   [`Self::admit_bao_stream`] reports on a mid-stream group mismatch.
-    /// - [`CacheError::OriginError`] — an origin transport fault while fetching the
-    ///   range (propagated from `origin_fetch_range_bytes`).
-    pub async fn origin_encode_range(
+    /// - [`CacheError::VerifyFailed`] — the winning origin served a wrong-length
+    ///   outboard or a wrong-length first window; neither can verify against `H`.
+    /// - [`CacheError::OriginError`] — no origin opened the range and at least
+    ///   one failed with a transport fault (the last such fault).
+    ///
+    /// `Ok(None)` when every origin cleanly declines.
+    pub async fn origin_range_wire(
         &self,
         hash: Hash,
         aligned: &AlignedRange,
-    ) -> CacheResult<Option<Bytes>> {
-        let root = *hash.as_bytes();
-        let req = OriginRangeRequest {
-            fetch_start: aligned.fetch_start(),
-            fetch_end: aligned.fetch_end(),
-        };
-        let blob_size = aligned.blob_size();
+    ) -> CacheResult<Option<OriginRangeWire>> {
+        let permit = Self::range_pull_permit(&self.inner.own_origin_range_pulls).await?;
+        let outboard_max = expected_outboard_len(aligned.blob_size()).saturating_add(64);
+        let mut last_err: Option<CacheError> = None;
         for origin in &self.inner.origins {
-            let Some((data, outboard)) = self
-                .origin_fetch_range_bytes(origin, hash, blob_size, req)
-                .await?
-            else {
-                continue;
-            };
-            return match encode_verified_range(root, aligned, &data, outboard) {
-                Ok(wire) => Ok(Some(wire)),
-                Err(err) => {
+            let opened = OriginRangeCursor::open(
+                Arc::clone(origin),
+                hash,
+                aligned,
+                outboard_max,
+                self.inner.metrics.clone(),
+            )
+            .await;
+            match opened {
+                Ok(Some(cursor)) => {
+                    return OriginRangeWire::spawn(cursor, aligned, permit).map(Some);
+                }
+                Ok(None) => {}
+                Err(e) => {
                     tracing::warn!(
                         %hash,
                         kind = ?origin.kind(),
-                        error = %err,
-                        "own origin served a range that failed bao verification against H; \
-                         hard local-origin fault (no degrade — committed to serving under H)",
+                        error = %e,
+                        "own origin range open failed; trying next origin",
                     );
-                    Err(CacheError::VerifyFailed { expected: hash })
+                    last_err = Some(e);
                 }
-            };
+            }
         }
-        Ok(None)
+        last_err.map_or(Ok(None), Err)
     }
 
     /// Import an already-encoded interleaved bao range for `hash`, verified
     /// against the root on import (iroh-blobs `import_bao_bytes`). Thin
-    /// wrapper over the same store call `pull_through_range` makes, exposed so
+    /// wrapper over the same store call `pull_through_range` makes per window, exposed so
     /// `NodeRangedStore::admit` need not reach into the private store handle.
     pub async fn admit_bao(
         &self,
@@ -5295,13 +5320,46 @@ fn is_blob_too_large_marker(e: &std::io::Error) -> bool {
         .is_some_and(<dyn std::error::Error + Send + Sync>::is::<BlobTooLargeMarker>)
 }
 
+/// The window a range pull imports, or `None` when the origin declined it or
+/// served the wrong length — logged, and the pull moves to the next origin.
+fn accept_range_window(
+    fetch: WindowFetch,
+    hash: Hash,
+    kind: OriginKind,
+) -> Option<crate::origin_range::OriginWindow> {
+    match fetch {
+        WindowFetch::Window(w) => Some(w),
+        WindowFetch::Declined { start, end } => {
+            tracing::warn!(
+                %hash,
+                ?kind,
+                window_start = start,
+                window_end = end,
+                "origin stopped serving the range mid-span; trying next origin",
+            );
+            None
+        }
+        WindowFetch::WrongLength { start, end, got } => {
+            tracing::warn!(
+                %hash,
+                ?kind,
+                window_start = start,
+                window_end = end,
+                got,
+                "origin served a wrong-length range window; trying next origin",
+            );
+            None
+        }
+    }
+}
+
 /// Exact byte length a correct pre-order bao outboard for a `blob_size`-byte
 /// blob has, under iroh-blobs' canonical `IROH_BLOCK_SIZE` (#823). Used to
 /// bound the untrusted `{H}.obao4` read on the range-pull path before
 /// `encode_verified_range`'s authoritative length check rejects a malformed
 /// one. Saturates to `u64::MAX` only if the upstream `outboard_size` ever
 /// exceeds `u64` (it cannot for any real blob).
-fn expected_outboard_len(blob_size: u64) -> u64 {
+pub(crate) fn expected_outboard_len(blob_size: u64) -> u64 {
     bao_tree::BaoTree::new(blob_size, crate::range_pull::IROH_BLOCK_SIZE).outboard_size()
 }
 
@@ -8994,7 +9052,7 @@ mod tests {
         (0..size).map(|i| (i % 251) as u8).collect()
     }
 
-    // -- FA.1a: origin_encode_range / origin_fetch_outboard_bytes (Flow A) --
+    // -- FA.1a: origin_range_wire / origin_fetch_outboard_bytes (Flow A) --
 
     /// A test origin that serves chunk-group-aligned ranges plus a configurable
     /// `{H}.obao4` outboard, so the Flow A raw fetch+encode surface can be
@@ -9002,7 +9060,8 @@ mod tests {
     /// independently so a test can serve bytes that do NOT hash to `hash` (a
     /// corrupt / misconfigured OWN origin, the local-origin-fault case).
     /// `support_range == false` models an origin with no `206`/outboard support,
-    /// i.e. the [`OriginRangeFetch::Unsupported`] degrade.
+    /// i.e. the [`crate::OriginRangeFetch::Unsupported`] degrade. `max_req`
+    /// records the largest data span any single range fetch asked for.
     #[derive(Debug)]
     struct RangeStubOrigin {
         hash: Hash,
@@ -9010,6 +9069,18 @@ mod tests {
         outboard: Option<Bytes>,
         size: u64,
         support_range: bool,
+        max_req: AtomicU64,
+        /// Windows starting at or past this offset come back one byte short.
+        short_from: u64,
+        /// Windows starting at or past this offset are declined.
+        decline_from: u64,
+        /// Windows starting at or past this offset fail with a transport error.
+        fail_from: u64,
+        /// A window starting at or past this offset panics the fetch.
+        panic_from: u64,
+        /// Windows starting at or past this offset wait on `gate`.
+        gate_from: u64,
+        gate: Arc<tokio::sync::Semaphore>,
         /// When true, [`Origin::fetch_outboard`] returns a transport
         /// [`OriginPullError`] instead of a clean decline — the degraded-origin
         /// case the serviceability probe must surface as a fault (#1129), not as a
@@ -9026,6 +9097,13 @@ mod tests {
                 outboard: Some(outboard),
                 size: u64::try_from(payload.len()).unwrap_or(u64::MAX),
                 support_range: true,
+                max_req: AtomicU64::new(0),
+                short_from: u64::MAX,
+                decline_from: u64::MAX,
+                fail_from: u64::MAX,
+                panic_from: u64::MAX,
+                gate_from: u64::MAX,
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
                 fault_outboard: false,
             }
         }
@@ -9039,6 +9117,13 @@ mod tests {
                 outboard: None,
                 size,
                 support_range: false,
+                max_req: AtomicU64::new(0),
+                short_from: u64::MAX,
+                decline_from: u64::MAX,
+                fail_from: u64::MAX,
+                panic_from: u64::MAX,
+                gate_from: u64::MAX,
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
                 fault_outboard: true,
             }
         }
@@ -9092,63 +9177,327 @@ mod tests {
             Box::pin(async move { Ok(result) })
         }
 
-        fn fetch_range(
+        fn fetch_range_data(
             &self,
             hash: Hash,
-            req: OriginRangeRequest,
-            _outboard_max_bytes: u64,
+            req: crate::OriginRangeRequest,
         ) -> Pin<
-            Box<dyn Future<Output = Result<OriginRangeFetch, crate::OriginPullError>> + Send + '_>,
+            Box<
+                dyn Future<Output = Result<crate::OriginRangeFetch, crate::OriginPullError>>
+                    + Send
+                    + '_,
+            >,
         > {
-            let result = match (&self.outboard, hash == self.hash && self.support_range) {
-                (Some(ob), true) => {
-                    let s = usize::try_from(req.fetch_start).unwrap_or(usize::MAX);
-                    let e = usize::try_from(req.fetch_end).unwrap_or(usize::MAX);
-                    match self.data.get(s..e) {
-                        Some(span) => OriginRangeFetch::Ranged {
-                            data: Bytes::copy_from_slice(span),
-                            outboard: ob.clone(),
-                        },
-                        None => OriginRangeFetch::NotFound,
-                    }
+            self.max_req.fetch_max(req.len(), Ordering::SeqCst);
+            assert!(
+                req.fetch_start < self.panic_from,
+                "stub origin panics on request"
+            );
+            if req.fetch_start >= self.fail_from {
+                return Box::pin(async {
+                    Err(crate::OriginPullError::Transient(anyhow::anyhow!(
+                        "stub range transport fault"
+                    )))
+                });
+            }
+            let gated = req.fetch_start >= self.gate_from;
+            let result = if req.fetch_start >= self.decline_from {
+                crate::OriginRangeFetch::Unsupported
+            } else if hash == self.hash && self.support_range {
+                let s = usize::try_from(req.fetch_start).unwrap_or(usize::MAX);
+                let mut e = usize::try_from(req.fetch_end).unwrap_or(usize::MAX);
+                if req.fetch_start >= self.short_from {
+                    e = e.saturating_sub(1);
                 }
-                _ => OriginRangeFetch::Unsupported,
+                match self.data.get(s..e) {
+                    Some(span) => crate::OriginRangeFetch::Ranged {
+                        data: Bytes::copy_from_slice(span),
+                    },
+                    None => crate::OriginRangeFetch::NotFound,
+                }
+            } else {
+                crate::OriginRangeFetch::Unsupported
             };
-            Box::pin(async move { Ok(result) })
+            Box::pin(async move {
+                if gated {
+                    let _held = self.gate.acquire().await;
+                }
+                Ok(result)
+            })
         }
     }
 
-    /// A correct origin: `origin_encode_range` yields header-full wire whose
-    /// header-less body `admit_bao_stream` accepts and stores under `H`.
-    #[tokio::test]
-    async fn origin_encode_range_yields_admittable_wire() -> anyhow::Result<()> {
+    /// A blob of a little over two range-pull windows, so a whole-blob range
+    /// crosses window boundaries.
+    fn multi_window_test_blob() -> Vec<u8> {
+        let size = 2 * crate::RANGE_PULL_WINDOW_BYTES + 5 * crate::CHUNK_GROUP_BYTES + 123;
+        (0..size).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Drain a Flow A wire to its end: the bytes, and the fault it ended on.
+    async fn drain_wire(mut wire: OriginRangeWire) -> (Vec<u8>, Option<CacheError>) {
+        let mut out = Vec::new();
+        while let Some(item) = wire.next_chunk().await {
+            match item {
+                Ok(chunk) => out.extend_from_slice(&chunk),
+                Err(fault) => {
+                    assert!(wire.next_chunk().await.is_none(), "a fault is terminal");
+                    return (out, Some(fault));
+                }
+            }
+        }
+        (out, None)
+    }
+
+    /// A blob of a little over two windows, its hash, and a stub origin
+    /// serving it with its genuine outboard, plus the whole-blob aligned range.
+    fn multi_window_stub() -> (Vec<u8>, Hash, RangeStubOrigin, AlignedRange) {
         use bao_tree::io::outboard::PreOrderMemOutboard;
 
-        let data = local_outboard_pull_test_blob();
+        let data = multi_window_test_blob();
+        let ob = PreOrderMemOutboard::create(&data, crate::range_pull::IROH_BLOCK_SIZE);
+        let hash = Hash::from(*ob.root.as_bytes());
+        let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let origin = RangeStubOrigin::serving(hash, &data, Bytes::from(ob.data));
+        let aligned = crate::range_pull::align_range(0, 0, total).expect("aligns");
+        (data, hash, origin, aligned)
+    }
+
+    async fn stub_engine(
+        origins: Vec<RangeStubOrigin>,
+    ) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
+        let tmp = tempfile::tempdir()?;
+        let origins = origins
+            .into_iter()
+            .map(|o| Arc::new(o) as Arc<dyn Origin>)
+            .collect();
+        let engine = CacheEngine::open(tmp.path(), origins, 64).await?;
+        Ok((engine, tmp))
+    }
+
+    /// An origin that stops serving (declines) a later window ends the wire on
+    /// an `OriginError`, not a `VerifyFailed` and not a clean end.
+    #[tokio::test]
+    async fn origin_range_wire_mid_stream_decline_is_origin_error() -> anyhow::Result<()> {
+        let (_, hash, mut origin, aligned) = multi_window_stub();
+        origin.decline_from = crate::RANGE_PULL_WINDOW_BYTES;
+        let (engine, _tmp) = stub_engine(vec![origin]).await?;
+        let wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .expect("opens");
+        let (_, fault) = drain_wire(wire).await;
+        anyhow::ensure!(
+            matches!(fault, Some(CacheError::OriginError { .. })),
+            "a mid-stream decline must be an OriginError, got {fault:?}"
+        );
+        Ok(())
+    }
+
+    /// A transport fault on a later window ends the wire on an `OriginError`.
+    #[tokio::test]
+    async fn origin_range_wire_mid_stream_transport_fault_is_origin_error() -> anyhow::Result<()> {
+        let (_, hash, mut origin, aligned) = multi_window_stub();
+        origin.fail_from = crate::RANGE_PULL_WINDOW_BYTES;
+        let (engine, _tmp) = stub_engine(vec![origin]).await?;
+        let wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .expect("opens");
+        let (_, fault) = drain_wire(wire).await;
+        anyhow::ensure!(
+            matches!(fault, Some(CacheError::OriginError { .. })),
+            "a mid-stream transport fault must be an OriginError, got {fault:?}"
+        );
+        Ok(())
+    }
+
+    /// A panic inside the encode task never reads as a clean end: the wire ends
+    /// on an `OriginError`.
+    #[tokio::test]
+    async fn origin_range_wire_panicking_encode_ends_on_a_fault() -> anyhow::Result<()> {
+        let (_, hash, mut origin, aligned) = multi_window_stub();
+        origin.panic_from = crate::RANGE_PULL_WINDOW_BYTES;
+        let (engine, _tmp) = stub_engine(vec![origin]).await?;
+        let wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .expect("opens");
+        let (_, fault) = drain_wire(wire).await;
+        anyhow::ensure!(
+            matches!(fault, Some(CacheError::OriginError { .. })),
+            "a panicked encode must end on an OriginError, got {fault:?}"
+        );
+        Ok(())
+    }
+
+    /// Dropping a wire releases its permit, and the own-origin pool is separate
+    /// from the range-pull pool: a full own-origin pool does not stall a range
+    /// pull.
+    #[tokio::test]
+    async fn origin_range_wire_releases_its_permit_on_drop() -> anyhow::Result<()> {
+        use std::time::Duration;
+
+        let (_, hash, mut origin, aligned) = multi_window_stub();
+        // Every wire stalls in its second window, holding its permit.
+        origin.gate_from = crate::RANGE_PULL_WINDOW_BYTES;
+        let total = aligned.blob_size();
+        let (engine, _tmp) = stub_engine(vec![origin]).await?;
+
+        let mut wires = Vec::new();
+        for _ in 0..crate::MAX_CONCURRENT_RANGE_PULLS {
+            let mut wire = engine
+                .origin_range_wire(hash, &aligned)
+                .await?
+                .expect("opens");
+            anyhow::ensure!(matches!(wire.next_chunk().await, Some(Ok(_))));
+            wires.push(wire);
+        }
+        anyhow::ensure!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                engine.origin_range_wire(hash, &aligned)
+            )
+            .await
+            .is_err(),
+            "a full own-origin pool must make the next open wait",
+        );
+        // A range pull inside the first window draws from its own pool.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.pull_through_range(hash, 0, 1000, total),
+        )
+        .await??;
+        anyhow::ensure!(
+            matches!(outcome, RangePullOutcome::Served),
+            "got {outcome:?}"
+        );
+
+        drop(wires);
+        let reopened = tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.origin_range_wire(hash, &aligned),
+        )
+        .await??;
+        anyhow::ensure!(
+            reopened.is_some(),
+            "dropped wires must release their permits"
+        );
+        Ok(())
+    }
+
+    /// The 0-byte blob streams its (empty) wire and ends cleanly.
+    #[tokio::test]
+    async fn origin_range_wire_empty_blob_ends_cleanly() -> anyhow::Result<()> {
+        use bao_tree::io::outboard::PreOrderMemOutboard;
+
+        let ob = PreOrderMemOutboard::create([], crate::range_pull::IROH_BLOCK_SIZE);
+        let root: [u8; 32] = *ob.root.as_bytes();
+        let hash = Hash::from(root);
+        let outboard = Bytes::from(ob.data.clone());
+        let origin = RangeStubOrigin::serving(hash, &[], outboard.clone());
+        let (engine, _tmp) = stub_engine(vec![origin]).await?;
+        let aligned = crate::range_pull::align_range(0, 0, 0)?;
+        let wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .expect("opens");
+        let (wire, fault) = drain_wire(wire).await;
+        anyhow::ensure!(fault.is_none(), "the empty blob must not fault: {fault:?}");
+        let reference = encode_verified_range(root, &aligned, &[], outboard)?;
+        anyhow::ensure!(wire.as_slice() == &reference[8..]);
+        Ok(())
+    }
+
+    /// The origin chain advances past an origin that declines the first window
+    /// and past one whose outboard read faults, to one that serves.
+    #[tokio::test]
+    async fn origin_range_wire_falls_back_to_a_serving_origin() -> anyhow::Result<()> {
+        let (data, hash, serving, aligned) = multi_window_stub();
+        let (_, _, mut declining, _) = multi_window_stub();
+        declining.support_range = false;
+        let faulting = RangeStubOrigin::outboard_faulting(hash, aligned.blob_size());
+        let (engine, _tmp) = stub_engine(vec![faulting, declining, serving]).await?;
+        let wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .expect("opens");
+        let (wire, fault) = drain_wire(wire).await;
+        anyhow::ensure!(
+            fault.is_none(),
+            "the serving origin must not fault: {fault:?}"
+        );
+
+        let root = *hash.as_bytes();
+        let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
+            &data,
+            crate::range_pull::IROH_BLOCK_SIZE,
+        );
+        let reference = encode_verified_range(root, &aligned, &data, Bytes::from(ob.data))?;
+        anyhow::ensure!(wire.as_slice() == &reference[8..], "the wire is byte-exact");
+        Ok(())
+    }
+
+    /// Only transport faults and no serving origin: the last fault is the error.
+    #[tokio::test]
+    async fn origin_range_wire_reports_a_transport_fault_when_no_origin_serves()
+    -> anyhow::Result<()> {
+        let (_, hash, _, aligned) = multi_window_stub();
+        let faulting = RangeStubOrigin::outboard_faulting(hash, aligned.blob_size());
+        let (engine, _tmp) = stub_engine(vec![faulting]).await?;
+        let err = engine
+            .origin_range_wire(hash, &aligned)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected an OriginError"))?;
+        anyhow::ensure!(matches!(err, CacheError::OriginError { .. }), "got {err:?}");
+        Ok(())
+    }
+
+    /// A correct origin: `origin_range_wire` streams a multi-window range as
+    /// the same header-less wire a whole-span encode produces, asks the origin
+    /// for at most one window per fetch (#2065), and the wire admits under `H`.
+    #[tokio::test]
+    async fn origin_range_wire_streams_admittable_wire_in_windows() -> anyhow::Result<()> {
+        use bao_tree::io::outboard::PreOrderMemOutboard;
+
+        let data = multi_window_test_blob();
         let ob = PreOrderMemOutboard::create(&data, crate::range_pull::IROH_BLOCK_SIZE);
         let root: [u8; 32] = *ob.root.as_bytes();
         let outboard = Bytes::from(ob.data.clone());
         let hash = Hash::from(root);
         let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
 
-        let origin = RangeStubOrigin::serving(hash, &data, outboard);
+        let origin = Arc::new(RangeStubOrigin::serving(hash, &data, outboard.clone()));
         let tmp = tempfile::tempdir()?;
         let engine =
-            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
+            CacheEngine::open(tmp.path(), vec![Arc::clone(&origin) as Arc<dyn Origin>], 64).await?;
 
-        let aligned = crate::range_pull::align_range(0, 0, total)
+        // Start mid-blob so the range is not window-aligned to the blob start.
+        let aligned = crate::range_pull::align_range(3 * crate::CHUNK_GROUP_BYTES, 0, total)
             .map_err(|e| anyhow::anyhow!("align: {e}"))?;
-        let Some(combined) = engine.origin_encode_range(hash, &aligned).await? else {
+        let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
             anyhow::bail!("expected Some(wire) — the origin serves the range + outboard");
         };
+        let (wire, fault) = drain_wire(wire).await;
         anyhow::ensure!(
-            combined.len() > 8,
-            "origin_encode_range must return the header-full wire (8-byte size header intact)"
+            fault.is_none(),
+            "a correct origin must not fault: {fault:?}"
         );
 
-        // Round-trip: strip the header (the node-side caller's job) and admit the
-        // header-less wire into a FRESH engine, which verifies it against `H`.
-        let header_less = combined.slice(8..);
+        let start = usize::try_from(aligned.fetch_start())?;
+        let reference = encode_verified_range(root, &aligned, &data[start..], outboard)?;
+        anyhow::ensure!(
+            wire.as_slice() == &reference[8..],
+            "the streamed wire must equal the header-less whole-span encode"
+        );
+        anyhow::ensure!(
+            origin.max_req.load(Ordering::SeqCst) <= crate::RANGE_PULL_WINDOW_BYTES,
+            "each origin read must be at most one window"
+        );
+
+        // Round-trip: admit the header-less wire into a FRESH engine, which
+        // verifies it against `H`.
         let tmp2 = tempfile::tempdir()?;
         let engine2 = CacheEngine::open(tmp2.path(), vec![], 64).await?;
         let drained = engine2
@@ -9156,47 +9505,121 @@ mod tests {
                 hash,
                 aligned.chunk_ranges().clone(),
                 total,
-                header_less,
+                Bytes::from(wire),
                 None,
             )
             .await
             .map_err(|(_reader, e)| e)?;
         anyhow::ensure!(drained.is_empty(), "the wire is fully drained by admit");
-        anyhow::ensure!(
-            engine2.present_ranges(hash).await?.is_complete(),
-            "the whole-blob wire must reconstruct a complete blob under H"
-        );
-        anyhow::ensure!(
-            engine2.get(hash).await?.as_ref() == data.as_slice(),
-            "the reconstructed content must be byte-exact"
-        );
         Ok(())
     }
 
-    /// A corrupt own origin (bytes that do NOT hash to `H`, served with the
-    /// genuine outboard) is a HARD [`CacheError::VerifyFailed`] — never degraded.
+    /// A corrupt own origin (a window that does NOT hash to `H`, served with the
+    /// genuine outboard) ends the wire on a HARD [`CacheError::VerifyFailed`] —
+    /// never a degrade — even when the corruption is past the first window.
     #[tokio::test]
-    async fn origin_encode_range_hard_faults_on_mismatch() -> anyhow::Result<()> {
+    async fn origin_range_wire_hard_faults_on_mismatch() -> anyhow::Result<()> {
         use bao_tree::io::outboard::PreOrderMemOutboard;
 
-        let genuine = local_outboard_pull_test_blob();
+        let genuine = multi_window_test_blob();
         let ob = PreOrderMemOutboard::create(&genuine, crate::range_pull::IROH_BLOCK_SIZE);
         let root: [u8; 32] = *ob.root.as_bytes();
         let outboard = Bytes::from(ob.data.clone());
         let hash = Hash::from(root);
         let total = u64::try_from(genuine.len()).unwrap_or(u64::MAX);
 
-        // Same length, different bytes: the served span will not verify against H.
-        let corrupt: Vec<u8> = genuine.iter().map(|b| b ^ 0xFF).collect();
-        anyhow::ensure!(Hash::new(&corrupt) != hash, "fixtures must differ");
-        let origin = RangeStubOrigin {
-            hash,
-            data: Bytes::from(corrupt),
-            outboard: Some(outboard),
-            size: total,
-            support_range: true,
-            fault_outboard: false,
+        // Same length; the second window's bytes differ, so it will not verify.
+        let window = usize::try_from(crate::RANGE_PULL_WINDOW_BYTES)?;
+        let mut corrupt = genuine.clone();
+        for b in &mut corrupt[window..window + 1024] {
+            *b ^= 0xFF;
+        }
+        let mut origin = RangeStubOrigin::serving(hash, &genuine, outboard);
+        origin.data = Bytes::from(corrupt);
+        let tmp = tempfile::tempdir()?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
+
+        let aligned = crate::range_pull::align_range(0, 0, total)
+            .map_err(|e| anyhow::anyhow!("align: {e}"))?;
+        let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
+            anyhow::bail!("expected Some(wire) — the first window serves");
         };
+        let (_, fault) = drain_wire(wire).await;
+        anyhow::ensure!(
+            matches!(fault, Some(CacheError::VerifyFailed { expected }) if expected == hash),
+            "a corrupt own origin must be a hard VerifyFailed, got {fault:?}"
+        );
+        Ok(())
+    }
+
+    /// A later window the origin returns short cannot verify against `H`, so the
+    /// wire ends on a HARD [`CacheError::VerifyFailed`].
+    #[tokio::test]
+    async fn origin_range_wire_hard_faults_on_short_later_window() -> anyhow::Result<()> {
+        use bao_tree::io::outboard::PreOrderMemOutboard;
+
+        let data = multi_window_test_blob();
+        let ob = PreOrderMemOutboard::create(&data, crate::range_pull::IROH_BLOCK_SIZE);
+        let hash = Hash::from(*ob.root.as_bytes());
+        let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let aligned = crate::range_pull::align_range(0, 0, total)
+            .map_err(|e| anyhow::anyhow!("align: {e}"))?;
+
+        let mut origin = RangeStubOrigin::serving(hash, &data, Bytes::from(ob.data.clone()));
+        origin.short_from = crate::RANGE_PULL_WINDOW_BYTES;
+        let tmp = tempfile::tempdir()?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
+        let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
+            anyhow::bail!("expected Some(wire) — the first window serves");
+        };
+        let (_, fault) = drain_wire(wire).await;
+        anyhow::ensure!(
+            matches!(fault, Some(CacheError::VerifyFailed { expected }) if expected == hash),
+            "a short later window must be a hard VerifyFailed, got {fault:?}"
+        );
+        Ok(())
+    }
+
+    /// A short FIRST window is a hard [`CacheError::VerifyFailed`] at open,
+    /// before any wire.
+    #[tokio::test]
+    async fn origin_range_wire_hard_faults_on_short_first_window() -> anyhow::Result<()> {
+        use bao_tree::io::outboard::PreOrderMemOutboard;
+
+        let data = multi_window_test_blob();
+        let ob = PreOrderMemOutboard::create(&data, crate::range_pull::IROH_BLOCK_SIZE);
+        let hash = Hash::from(*ob.root.as_bytes());
+        let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let aligned = crate::range_pull::align_range(0, 0, total)
+            .map_err(|e| anyhow::anyhow!("align: {e}"))?;
+
+        let mut origin = RangeStubOrigin::serving(hash, &data, Bytes::from(ob.data.clone()));
+        origin.short_from = 0;
+        let tmp = tempfile::tempdir()?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
+        let err = engine
+            .origin_range_wire(hash, &aligned)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?;
+        anyhow::ensure!(
+            matches!(err, CacheError::VerifyFailed { expected } if expected == hash),
+            "a short first window must be a hard VerifyFailed, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// A wrong-length outboard cannot verify, so it is a HARD
+    /// [`CacheError::VerifyFailed`] before any wire is produced.
+    #[tokio::test]
+    async fn origin_range_wire_hard_faults_on_wrong_length_outboard() -> anyhow::Result<()> {
+        let data = local_outboard_pull_test_blob();
+        let hash = Hash::new(&data);
+        let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let origin = RangeStubOrigin::serving(hash, &data, Bytes::from_static(&[0u8; 64]));
         let tmp = tempfile::tempdir()?;
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
@@ -9204,13 +9627,13 @@ mod tests {
         let aligned = crate::range_pull::align_range(0, 0, total)
             .map_err(|e| anyhow::anyhow!("align: {e}"))?;
         let err = engine
-            .origin_encode_range(hash, &aligned)
+            .origin_range_wire(hash, &aligned)
             .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?;
         anyhow::ensure!(
             matches!(err, CacheError::VerifyFailed { expected } if expected == hash),
-            "a corrupt own origin must be a hard VerifyFailed, got {err:?}"
+            "a wrong-length outboard must be a hard VerifyFailed, got {err:?}"
         );
         Ok(())
     }
@@ -9218,18 +9641,13 @@ mod tests {
     /// An origin with no range support degrades to `Ok(None)` — the caller then
     /// falls through to a whole-blob path.
     #[tokio::test]
-    async fn origin_encode_range_none_when_unsupported() -> anyhow::Result<()> {
+    async fn origin_range_wire_none_when_unsupported() -> anyhow::Result<()> {
         let data = local_outboard_pull_test_blob();
         let hash = Hash::new(&data);
         let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
-        let origin = RangeStubOrigin {
-            hash,
-            data: Bytes::from(data.clone()),
-            outboard: None,
-            size: total,
-            support_range: false,
-            fault_outboard: false,
-        };
+        let mut origin = RangeStubOrigin::serving(hash, &data, Bytes::new());
+        origin.outboard = None;
+        origin.support_range = false;
         let tmp = tempfile::tempdir()?;
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
@@ -9237,8 +9655,8 @@ mod tests {
         let aligned = crate::range_pull::align_range(0, 0, total)
             .map_err(|e| anyhow::anyhow!("align: {e}"))?;
         anyhow::ensure!(
-            engine.origin_encode_range(hash, &aligned).await?.is_none(),
-            "an unsupported origin must degrade origin_encode_range to Ok(None)"
+            engine.origin_range_wire(hash, &aligned).await?.is_none(),
+            "an unsupported origin must degrade origin_range_wire to Ok(None)"
         );
         Ok(())
     }

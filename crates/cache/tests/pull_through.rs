@@ -4980,3 +4980,416 @@ async fn get_returns_bytes_for_a_small_origin_blob() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ----------------------------------------------------------------------------
+// Windowed origin range pulls (#2065). A range pull reads the outboard once and
+// fetches, verifies, and imports the span in `RANGE_PULL_WINDOW_BYTES` windows,
+// so its memory is bounded by the window, not the span. At most
+// `MAX_CONCURRENT_RANGE_PULLS` range pulls run at once.
+// ----------------------------------------------------------------------------
+
+mod windowed_range_pull {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    use bytes::Bytes;
+    use decdn_cache::{
+        MAX_CONCURRENT_RANGE_PULLS, OriginRangeFetch, OutboardFetch, RANGE_PULL_WINDOW_BYTES,
+    };
+    use tokio::sync::Semaphore;
+
+    use super::*;
+
+    /// An in-memory origin that serves `data` by range plus `outboard`, and
+    /// records every read: the largest data span asked for, the outboard and
+    /// data read counts, and how many data reads are in flight at once. Data
+    /// reads at or past `decline_from` are declined, reads at or past
+    /// `fail_from` fail with a transport error, and a `gate` holds every data
+    /// read until the test releases it. A whole-blob `fetch` serves `whole`.
+    #[derive(Debug)]
+    struct WindowedOrigin {
+        hash: Hash,
+        data: Bytes,
+        outboard: Bytes,
+        whole: Option<Bytes>,
+        decline_from: u64,
+        fail_from: u64,
+        gate: Option<Arc<Semaphore>>,
+        max_req: AtomicU64,
+        outboard_reads: AtomicUsize,
+        data_reads: AtomicUsize,
+        inflight: AtomicUsize,
+        max_inflight: AtomicUsize,
+    }
+
+    impl WindowedOrigin {
+        fn new(hash: Hash, data: Vec<u8>, outboard: Vec<u8>) -> Self {
+            Self {
+                hash,
+                data: Bytes::from(data),
+                outboard: Bytes::from(outboard),
+                whole: None,
+                decline_from: u64::MAX,
+                fail_from: u64::MAX,
+                gate: None,
+                max_req: AtomicU64::new(0),
+                outboard_reads: AtomicUsize::new(0),
+                data_reads: AtomicUsize::new(0),
+                inflight: AtomicUsize::new(0),
+                max_inflight: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Origin for WindowedOrigin {
+        fn kind(&self) -> OriginKind {
+            OriginKind::Http
+        }
+
+        fn fetch(
+            &self,
+            hash: Hash,
+            _max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>>
+        {
+            let out = match &self.whole {
+                Some(whole) if hash == self.hash => OriginFetch::found_one_shot(whole.clone()),
+                _ => OriginFetch::NotFound,
+            };
+            Box::pin(async move { Ok(out) })
+        }
+
+        fn fetch_outboard(
+            &self,
+            hash: Hash,
+            _outboard_max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, OriginPullError>> + Send + '_>>
+        {
+            self.outboard_reads.fetch_add(1, Ordering::SeqCst);
+            let out = if hash == self.hash {
+                OutboardFetch::Found(self.outboard.clone())
+            } else {
+                OutboardFetch::NotFound
+            };
+            Box::pin(async move { Ok(out) })
+        }
+
+        fn fetch_range_data(
+            &self,
+            hash: Hash,
+            req: OriginRangeRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>>
+        {
+            Box::pin(async move {
+                self.data_reads.fetch_add(1, Ordering::SeqCst);
+                self.max_req.fetch_max(req.len(), Ordering::SeqCst);
+                let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_inflight.fetch_max(now, Ordering::SeqCst);
+                if let Some(gate) = &self.gate {
+                    let _held = gate.acquire().await;
+                }
+                self.inflight.fetch_sub(1, Ordering::SeqCst);
+                if req.fetch_start >= self.fail_from {
+                    return Err(OriginPullError::Transient(anyhow::anyhow!(
+                        "windowed origin transport fault"
+                    )));
+                }
+                if hash != self.hash || req.fetch_start >= self.decline_from {
+                    return Ok(OriginRangeFetch::Unsupported);
+                }
+                let s = usize::try_from(req.fetch_start).unwrap_or(usize::MAX);
+                let e = usize::try_from(req.fetch_end).unwrap_or(usize::MAX);
+                Ok(match self.data.get(s..e) {
+                    Some(span) => OriginRangeFetch::Ranged {
+                        data: self.data.slice_ref(span),
+                    },
+                    None => OriginRangeFetch::NotFound,
+                })
+            })
+        }
+    }
+
+    /// A blob of several windows plus a ragged tail, its hash, and its outboard.
+    fn multi_window_blob(windows: u64) -> anyhow::Result<(Vec<u8>, Hash, Vec<u8>)> {
+        let len = usize::try_from(windows * RANGE_PULL_WINDOW_BYTES + 3 * GROUP + 777)?;
+        let blob = make_blob(len);
+        let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
+        let hash = Hash::from_bytes(*ob.root.as_bytes());
+        Ok((blob, hash, ob.data))
+    }
+
+    #[tokio::test]
+    async fn range_pull_reads_one_window_at_a_time() -> anyhow::Result<()> {
+        let (blob, hash, outboard) = multi_window_blob(5)?;
+        let blob_size = u64::try_from(blob.len())?;
+        let outboard_len = u64::try_from(outboard.len())?;
+        let origin = Arc::new(WindowedOrigin::new(hash, blob.clone(), outboard));
+        let metrics = Arc::new(CacheMetrics::default());
+        let (engine, _tmp) = build_engine_with_origins(
+            vec![Arc::clone(&origin) as Arc<dyn Origin>],
+            Arc::clone(&metrics),
+        )
+        .await?;
+
+        // A mid-blob start, to the blob end: a span of more than five windows.
+        let req_start = GROUP + 100;
+        let outcome = engine
+            .pull_through_range(hash, req_start, 0, blob_size)
+            .await?;
+        anyhow::ensure!(
+            matches!(outcome, RangePullOutcome::Served),
+            "got {outcome:?}"
+        );
+
+        let aligned = align_range(req_start, 0, blob_size)?;
+        let windows = usize::try_from(aligned.fetch_len().div_ceil(RANGE_PULL_WINDOW_BYTES))?;
+        anyhow::ensure!(
+            origin.max_req.load(Ordering::SeqCst) <= RANGE_PULL_WINDOW_BYTES,
+            "every data read must be at most one window",
+        );
+        anyhow::ensure!(
+            origin.outboard_reads.load(Ordering::SeqCst) == 1,
+            "the outboard is read exactly once",
+        );
+        anyhow::ensure!(
+            origin.data_reads.load(Ordering::SeqCst) == windows,
+            "one data read per window",
+        );
+        anyhow::ensure!(
+            metrics.pull_through_bytes.get() == outboard_len + aligned.fetch_len(),
+            "origin egress is metered as the outboard once plus the span",
+        );
+        let exported = engine.export_range(hash, req_start, 0).await?;
+        anyhow::ensure!(
+            exported == sub(&blob, req_start, blob_size)?,
+            "the imported span must read back byte-exact",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn range_pull_degrades_on_a_corrupt_later_window() -> anyhow::Result<()> {
+        let (blob, hash, outboard) = multi_window_blob(3)?;
+        let blob_size = u64::try_from(blob.len())?;
+        let window = usize::try_from(RANGE_PULL_WINDOW_BYTES)?;
+        let mut corrupt = blob.clone();
+        for b in corrupt.iter_mut().skip(2 * window).take(1024) {
+            *b ^= 0xFF;
+        }
+        let origin = Arc::new(WindowedOrigin::new(hash, corrupt, outboard));
+        let (engine, _tmp) = build_engine_with_origins(
+            vec![Arc::clone(&origin) as Arc<dyn Origin>],
+            Arc::new(CacheMetrics::default()),
+        )
+        .await?;
+
+        let outcome = engine.pull_through_range(hash, 0, 0, blob_size).await?;
+        anyhow::ensure!(
+            matches!(outcome, RangePullOutcome::Unsupported),
+            "a window that fails verification must degrade, got {outcome:?}",
+        );
+        // The windows before it verified and stay as partial data.
+        let first = engine
+            .export_range(hash, 0, RANGE_PULL_WINDOW_BYTES)
+            .await?;
+        anyhow::ensure!(first == sub(&blob, 0, RANGE_PULL_WINDOW_BYTES)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn range_pull_degrades_when_the_origin_stops_mid_span() -> anyhow::Result<()> {
+        let (blob, hash, outboard) = multi_window_blob(3)?;
+        let blob_size = u64::try_from(blob.len())?;
+        let mut origin = WindowedOrigin::new(hash, blob.clone(), outboard);
+        origin.decline_from = RANGE_PULL_WINDOW_BYTES;
+        let origin = Arc::new(origin);
+        let (engine, _tmp) = build_engine_with_origins(
+            vec![Arc::clone(&origin) as Arc<dyn Origin>],
+            Arc::new(CacheMetrics::default()),
+        )
+        .await?;
+
+        let outcome = engine.pull_through_range(hash, 0, 0, blob_size).await?;
+        anyhow::ensure!(
+            matches!(outcome, RangePullOutcome::Unsupported),
+            "a window the origin declines must degrade, got {outcome:?}",
+        );
+        anyhow::ensure!(
+            origin.data_reads.load(Ordering::SeqCst) == 2,
+            "no window is fetched after the decline",
+        );
+        let first = engine
+            .export_range(hash, 0, RANGE_PULL_WINDOW_BYTES)
+            .await?;
+        anyhow::ensure!(first == sub(&blob, 0, RANGE_PULL_WINDOW_BYTES)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_range_pulls_are_bounded() -> anyhow::Result<()> {
+        let (blob, hash, outboard) = multi_window_blob(0)?;
+        let blob_size = u64::try_from(blob.len())?;
+        let gate = Arc::new(Semaphore::new(0));
+        let mut origin = WindowedOrigin::new(hash, blob, outboard);
+        origin.gate = Some(Arc::clone(&gate));
+        let origin = Arc::new(origin);
+        let (engine, _tmp) = build_engine_with_origins(
+            vec![Arc::clone(&origin) as Arc<dyn Origin>],
+            Arc::new(CacheMetrics::default()),
+        )
+        .await?;
+
+        let pulls: Vec<_> = (0..MAX_CONCURRENT_RANGE_PULLS + 2)
+            .map(|_| {
+                let engine = engine.clone();
+                tokio::spawn(async move { engine.pull_through_range(hash, 0, 0, blob_size).await })
+            })
+            .collect();
+
+        // Wait for the bound to fill, then give the excess pulls time to (not)
+        // start.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while origin.inflight.load(Ordering::SeqCst) < MAX_CONCURRENT_RANGE_PULLS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        anyhow::ensure!(
+            origin.inflight.load(Ordering::SeqCst) == MAX_CONCURRENT_RANGE_PULLS,
+            "only the bounded number of range pulls may reach the origin at once",
+        );
+
+        gate.add_permits(1024);
+        for pull in pulls {
+            let outcome = pull.await??;
+            anyhow::ensure!(
+                matches!(outcome, RangePullOutcome::Served),
+                "got {outcome:?}"
+            );
+        }
+        anyhow::ensure!(
+            origin.max_inflight.load(Ordering::SeqCst) == MAX_CONCURRENT_RANGE_PULLS,
+            "the in-flight peak must equal the bound",
+        );
+        Ok(())
+    }
+
+    /// After a range pull degrades part-way (earlier windows imported), the
+    /// whole-blob fallback the caller runs completes the blob byte-exact.
+    #[tokio::test]
+    async fn whole_blob_fill_completes_after_a_partial_degrade() -> anyhow::Result<()> {
+        let (blob, hash, outboard) = multi_window_blob(3)?;
+        let blob_size = u64::try_from(blob.len())?;
+        let window = usize::try_from(RANGE_PULL_WINDOW_BYTES)?;
+        let mut corrupt = blob.clone();
+        for b in corrupt.iter_mut().skip(2 * window).take(1024) {
+            *b ^= 0xFF;
+        }
+        let mut origin = WindowedOrigin::new(hash, corrupt, outboard);
+        origin.whole = Some(Bytes::from(blob.clone()));
+        let (engine, _tmp) = build_engine_with_origins(
+            vec![Arc::new(origin) as Arc<dyn Origin>],
+            Arc::new(CacheMetrics::default()),
+        )
+        .await?;
+
+        let outcome = engine.pull_through_range(hash, 0, 0, blob_size).await?;
+        anyhow::ensure!(
+            matches!(outcome, RangePullOutcome::Unsupported),
+            "got {outcome:?}"
+        );
+        anyhow::ensure!(
+            !engine.has(hash).await?,
+            "a partial import is not a full holder"
+        );
+
+        let got = engine.get(hash).await?;
+        anyhow::ensure!(
+            got.as_ref() == blob.as_slice(),
+            "the fallback fill is byte-exact"
+        );
+        anyhow::ensure!(engine.has(hash).await?, "the fallback completes the blob");
+        Ok(())
+    }
+
+    /// The chain advances past an origin that declines the first window, and
+    /// past one that fails with a transport fault part-way, to one that serves.
+    #[tokio::test]
+    async fn range_pull_falls_back_past_declining_and_faulting_origins() -> anyhow::Result<()> {
+        let (blob, hash, outboard) = multi_window_blob(3)?;
+        let blob_size = u64::try_from(blob.len())?;
+        let mut declining = WindowedOrigin::new(hash, blob.clone(), outboard.clone());
+        declining.decline_from = 0;
+        let mut faulting = WindowedOrigin::new(hash, blob.clone(), outboard.clone());
+        faulting.fail_from = 2 * RANGE_PULL_WINDOW_BYTES;
+        let serving = Arc::new(WindowedOrigin::new(hash, blob.clone(), outboard));
+        let (engine, _tmp) = build_engine_with_origins(
+            vec![
+                Arc::new(declining) as Arc<dyn Origin>,
+                Arc::new(faulting) as Arc<dyn Origin>,
+                Arc::clone(&serving) as Arc<dyn Origin>,
+            ],
+            Arc::new(CacheMetrics::default()),
+        )
+        .await?;
+
+        let outcome = engine.pull_through_range(hash, 0, 0, blob_size).await?;
+        anyhow::ensure!(
+            matches!(outcome, RangePullOutcome::Served),
+            "got {outcome:?}"
+        );
+        anyhow::ensure!(
+            serving.data_reads.load(Ordering::SeqCst) > 0,
+            "the third origin served the range",
+        );
+        let exported = engine.export_range(hash, 0, 0).await?;
+        anyhow::ensure!(exported == blob, "the served span is byte-exact");
+        Ok(())
+    }
+
+    /// The 0-byte blob range-pulls: one empty window, imported cleanly.
+    #[tokio::test]
+    async fn empty_blob_range_pull_is_served() -> anyhow::Result<()> {
+        let ob = PreOrderMemOutboard::create([], IROH_BLOCK_SIZE);
+        let hash = Hash::from_bytes(*ob.root.as_bytes());
+        let origin = WindowedOrigin::new(hash, Vec::new(), ob.data);
+        let (engine, _tmp) = build_engine_with_origins(
+            vec![Arc::new(origin) as Arc<dyn Origin>],
+            Arc::new(CacheMetrics::default()),
+        )
+        .await?;
+        let outcome = engine.pull_through_range(hash, 0, 0, 0).await?;
+        anyhow::ensure!(
+            matches!(outcome, RangePullOutcome::Served),
+            "got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// Flow A meters the outboard once plus the span, like the range pull.
+    #[tokio::test]
+    async fn origin_range_wire_meters_outboard_once_plus_span() -> anyhow::Result<()> {
+        let (blob, hash, outboard) = multi_window_blob(2)?;
+        let blob_size = u64::try_from(blob.len())?;
+        let outboard_len = u64::try_from(outboard.len())?;
+        let metrics = Arc::new(CacheMetrics::default());
+        let (engine, _tmp) = build_engine_with_origins(
+            vec![Arc::new(WindowedOrigin::new(hash, blob, outboard)) as Arc<dyn Origin>],
+            Arc::clone(&metrics),
+        )
+        .await?;
+        let aligned = align_range(0, 0, blob_size)?;
+        let mut wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("expected a wire"))?;
+        while let Some(item) = wire.next_chunk().await {
+            item?;
+        }
+        anyhow::ensure!(
+            metrics.pull_through_bytes.get() == outboard_len + blob_size,
+            "origin egress is metered as the outboard once plus the span",
+        );
+        Ok(())
+    }
+}

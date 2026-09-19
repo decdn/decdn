@@ -739,31 +739,16 @@ impl Origin for S3Origin {
         })
     }
 
-    fn fetch_range(
+    fn fetch_range_data(
         &self,
         hash: Hash,
         req: OriginRangeRequest,
-        outboard_max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
-            // Sibling outboard key: `{prefix}{hex[0..2]}/{hex}.obao4`, next to
-            // the data object. A missing key (`NoSuchKey`/404) → degrade to
-            // whole-blob (`Unsupported`), never an error.
             let data_key = key_for(&self.prefix, hash);
-            let obao4_key = format!("{data_key}{OBAO4_SUFFIX}");
-            let Some(outboard) = self
-                .get_object_bounded(&obao4_key, outboard_max_bytes)
-                .await?
-            else {
-                return Ok(OriginRangeFetch::Unsupported);
-            };
-
             // Empty span only for a zero-length blob.
             if req.is_empty() {
-                return Ok(OriginRangeFetch::Ranged {
-                    data: Bytes::new(),
-                    outboard,
-                });
+                return Ok(OriginRangeFetch::Ranged { data: Bytes::new() });
             }
 
             // Ranged data read. S3 `Range` is inclusive-end (`bytes=a-b`),
@@ -785,9 +770,8 @@ impl Origin for S3Origin {
             {
                 Ok(r) => r,
                 // Reuse the headers-phase classifier. A `NotFound` here is the
-                // data object disappearing between the outboard read and this
-                // read — degrade rather than error (whole-blob pull surfaces
-                // the real `NotFound`).
+                // data object missing or deleted mid-pull — degrade rather than
+                // error (whole-blob pull surfaces the real `NotFound`).
                 Err(e) => match classify_get_object_error(e, &log_target)? {
                     // `classify_get_object_error` only ever produces
                     // `NotFound` for an `Err` input; `Found` and
@@ -829,7 +813,7 @@ impl Origin for S3Origin {
             if u64::try_from(data.len()).unwrap_or(u64::MAX) != want {
                 return Ok(OriginRangeFetch::Unsupported);
             }
-            Ok(OriginRangeFetch::Ranged { data, outboard })
+            Ok(OriginRangeFetch::Ranged { data })
         })
     }
 
@@ -857,7 +841,7 @@ impl Origin for S3Origin {
                     OriginFetch::NotFound => return Ok(OutboardFetch::NotFound),
                     // `classify_get_object_error` never actually produces
                     // these arms for an `Err` input; only present to satisfy
-                    // exhaustiveness (mirrors `get_object_bounded`).
+                    // exhaustiveness.
                     OriginFetch::Found { .. } | OriginFetch::AlreadyAdmitted => {
                         return Ok(OutboardFetch::Unsupported);
                     }
@@ -899,7 +883,7 @@ impl Origin for S3Origin {
             };
             // A `Content-Encoding` object advertises the *encoded* length here,
             // not the canonical blob size — degrade to unknown, consistent with
-            // `fetch_range` refusing compressed ranges.
+            // `fetch_range_data` refusing compressed ranges.
             if resp
                 .content_encoding()
                 .is_some_and(|e| !e.trim().is_empty())
@@ -912,48 +896,6 @@ impl Origin for S3Origin {
                 .content_length()
                 .and_then(|len| u64::try_from(len).ok()))
         })
-    }
-}
-
-impl S3Origin {
-    /// GET the object at `key` and buffer the whole body, capped at
-    /// `max_bytes`. Returns `Ok(None)` for a missing key (`NoSuchKey`/404) or
-    /// an over-cap body — both degrade the range pull to a whole-blob fetch.
-    /// Used for the small sibling `{H}.obao4` outboard read.
-    async fn get_object_bounded(
-        &self,
-        key: &str,
-        max_bytes: u64,
-    ) -> Result<Option<Bytes>, OriginPullError> {
-        let log_target = format!("s3://{}/{}", self.bucket, key);
-        let resp = match self
-            .client
-            .get_object()
-            .bucket(self.bucket.as_ref())
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => match classify_get_object_error(e, &log_target)? {
-                // Missing outboard → degrade (the expected path for origins
-                // that don't publish `{H}.obao4`). `Found` and
-                // `AlreadyAdmitted` never occur here; present only to
-                // satisfy exhaustiveness.
-                OriginFetch::NotFound
-                | OriginFetch::Found { .. }
-                | OriginFetch::AlreadyAdmitted => {
-                    return Ok(None);
-                }
-            },
-        };
-        if let Some(len) = resp.content_length()
-            && (len < 0 || u64::try_from(len).unwrap_or(u64::MAX) > max_bytes)
-        {
-            return Ok(None);
-        }
-        let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-        collect_bounded(resp.body, cap).await
     }
 }
 

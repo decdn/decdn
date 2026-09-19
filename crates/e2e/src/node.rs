@@ -367,8 +367,8 @@ impl NodeFixture {
     /// Like [`Self::seed_origin_blob`], but also writes the sibling `{H}.obao4`
     /// pre-order outboard so a ranged origin fetch reaches the **range tier**.
     ///
-    /// `FilesystemOrigin::fetch_range` treats a missing outboard as `Unsupported`
-    /// by design, so a blob seeded by `seed_origin_blob` alone declines the range
+    /// A range pull treats a missing outboard (`FilesystemOrigin::fetch_outboard`
+    /// `NotFound`) as unsupported by design, so a blob seeded by `seed_origin_blob` alone declines the range
     /// path and falls through to a whole-blob fill — the origin range tier and
     /// `bao-range`'s chunk-group handling are then never exercised (#1372). Seed
     /// with this variant when a journey asserts on the range path itself.
@@ -920,7 +920,7 @@ fn write_fs_origin_blob(root: &std::path::Path, hash: &Hash, blob: &[u8]) -> any
 
 /// Sibling suffix of a filesystem origin's pre-order outboard. Mirrors the
 /// `pub(super)` `OBAO4_SUFFIX` in `decdn_cache::origin::fs`, kept in sync by the
-/// `FilesystemOrigin::fetch_range` range-tier assertions the e2e journeys run.
+/// `FilesystemOrigin::fetch_outboard` range-tier assertions the e2e journeys run.
 const OBAO4_SUFFIX: &str = ".obao4";
 
 /// Write the sibling `{hex}.obao4` pre-order outboard next to the data object.

@@ -841,7 +841,7 @@ impl ClientHandler {
                 // egress, and the buffered tier's `cache.populate` walks the paid
                 // `Peer` origin and fronts real upstream USDC. (The range tier is
                 // own-egress-only because `NodeOrigin` does not implement
-                // `Origin::fetch_range` — `pull_through_range` iterates every
+                // `Origin::fetch_range_data` — `pull_through_range` iterates every
                 // origin with no `local_only` filter, so the day it does, that tier
                 // starts fronting upstream USDC too. Nothing would fail.) All three are gated
                 // on channel OWNERSHIP (`pull_authorized`) and none on solvency,
@@ -975,7 +975,7 @@ impl ClientHandler {
                 //
                 // Serviceability is confirmed by `origin_size` +
                 // `origin_fetch_outboard_bytes` (an origin publishes the outboard) —
-                // NOT by proving a Range/206 `fetch_range` works. All three shipped
+                // NOT by proving a Range/206 `fetch_range_data` works. All three shipped
                 // adapters (fs/http/s3) support Range whenever they publish an
                 // outboard, so this holds in practice; a custom Origin that publishes
                 // an outboard but refuses Range would sign `ok:true` then fail the
