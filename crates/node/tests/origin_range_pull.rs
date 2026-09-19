@@ -548,6 +548,95 @@ async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result
     Ok(())
 }
 
+/// A TRUNCATED `{H}.obao4` (wrong length for the probed size) must be treated
+/// exactly like a missing one: the serviceability probe declines, no `ok: true`
+/// is signed for the streaming tier, and the buffered whole-blob fallback
+/// serves. Accepting it would sign first and then hard-fail every stream for
+/// this hash on the first draw's verify.
+#[tokio::test(flavor = "multi_thread")]
+async fn truncated_outboard_declines_before_signing_and_falls_back() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let truncated = outboard
+        .get(..outboard.len().saturating_sub(7))
+        .ok_or_else(|| anyhow::anyhow!("outboard too short for the fixture"))?
+        .to_vec();
+
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(truncated))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x68);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    // Enable the buffered whole-blob pull-through the fallback relies on.
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        Some(Duration::from_secs(15)),
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        pool_id,
+        provider,
+        hash,
+        0,
+        0,
+        RATE_PER_MB,
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_slice() == blob.as_slice(),
+        "the buffered fallback must deliver the whole blob byte-exact"
+    );
+    anyhow::ensure!(cache.has(hash).await?, "the fallback caches the blob");
+    // The streaming tier was never entered: a truncated outboard declines at
+    // the probe, before any signature.
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 0,
+        "a truncated outboard must not enter the two-leg tier"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn range_request_without_outboard_falls_back_to_whole_blob() -> anyhow::Result<()> {
     let (blob, _outboard, hash) = blob_with_outboard();

@@ -4264,6 +4264,94 @@ async fn origin_size_fault_then_answer_advances_the_chain() -> anyhow::Result<()
     Ok(())
 }
 
+/// An origin that serves only a fixed `{H}.obao4` via `fetch_outboard`.
+#[derive(Debug)]
+struct OutboardOnlyOrigin(bytes::Bytes);
+
+impl Origin for OutboardOnlyOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        Box::pin(async {
+            Err(OriginPullError::Transient(anyhow::anyhow!(
+                "unreachable in this test"
+            )))
+        })
+    }
+
+    fn fetch_outboard(
+        &self,
+        _hash: Hash,
+        _outboard_max_bytes: u64,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<decdn_cache::OutboardFetch, OriginPullError>> + Send + '_>,
+    > {
+        let ob = self.0.clone();
+        Box::pin(async move { Ok(decdn_cache::OutboardFetch::Found(ob)) })
+    }
+}
+
+#[tokio::test]
+async fn outboard_probe_rejects_a_wrong_length_outboard_and_advances_the_chain()
+-> anyhow::Result<()> {
+    // A truncated `{H}.obao4` (an HTML error body under the cap, a half-written
+    // upload) can never verify against `H`. Accepting it at the serviceability
+    // probe would make the node sign `ok: true` and then hard-fail every stream
+    // for the hash — and a broken origin 1 would permanently shadow a healthy
+    // origin 2. The probe must treat a wrong length as a decline that advances
+    // the origin chain.
+    use bao_tree::io::outboard::PreOrderMemOutboard;
+    let payload: Vec<u8> = (0..200 * 1024u32)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let ob = PreOrderMemOutboard::create(&payload, decdn_cache::range_pull::IROH_BLOCK_SIZE);
+    let hash = Hash::from_bytes(*ob.root.as_bytes());
+    let total = u64::try_from(payload.len())?;
+    let correct = bytes::Bytes::from(ob.data);
+    anyhow::ensure!(correct.len() > 8, "test premise: non-trivial outboard");
+    let short = correct.slice(..correct.len() - 7);
+
+    // Chain: broken origin first, healthy origin second → the healthy one wins.
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(
+        tmp.path(),
+        vec![
+            Arc::new(OutboardOnlyOrigin(short.clone())) as Arc<dyn Origin>,
+            Arc::new(OutboardOnlyOrigin(correct.clone())) as Arc<dyn Origin>,
+        ],
+        16,
+    )
+    .await?;
+    let got = engine
+        .origin_fetch_outboard_bytes(hash, total)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("the healthy origin's outboard must win"))?;
+    anyhow::ensure!(got == correct, "the correct-length outboard wins the chain");
+
+    // Only the broken origin configured → a clean decline, never a poisoned Some.
+    let tmp2 = tempfile::tempdir()?;
+    let engine2 = CacheEngine::open(
+        tmp2.path(),
+        vec![Arc::new(OutboardOnlyOrigin(short)) as Arc<dyn Origin>],
+        16,
+    )
+    .await?;
+    anyhow::ensure!(
+        engine2
+            .origin_fetch_outboard_bytes(hash, total)
+            .await?
+            .is_none(),
+        "a wrong-length outboard must decline, not serve"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn origin_size_no_origin_configured_errors() -> anyhow::Result<()> {
     // `CacheEngine::origin_size` with no origins returns `NoOrigin` (a coherent

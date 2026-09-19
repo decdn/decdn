@@ -3273,7 +3273,8 @@ impl CacheEngine {
         hash: Hash,
         total_bytes: u64,
     ) -> CacheResult<Option<Bytes>> {
-        let outboard_max = expected_outboard_len(total_bytes).saturating_add(64);
+        let expected_len = expected_outboard_len(total_bytes);
+        let outboard_max = expected_len.saturating_add(64);
         // A genuine transport fault on an origin (as opposed to a clean
         // `NotFound`/`Unsupported` decline) is remembered so it can be surfaced when
         // NO origin serves the outboard. The serviceability caller latches this into
@@ -3285,6 +3286,23 @@ impl CacheEngine {
         for origin in &self.inner.origins {
             match origin.fetch_outboard(hash, outboard_max).await {
                 Ok(OutboardFetch::Found(ob)) => {
+                    // Exact-length gate. A wrong-length `{H}.obao4` (a truncated
+                    // upload, an HTML error body under the cap) can never verify
+                    // against `H` — accepting it would make the serviceability
+                    // caller sign `ok: true` and then hard-fail every stream on
+                    // the first draw's verify, and a broken origin here would
+                    // permanently shadow a healthy later one. A mismatch is a
+                    // DECLINE that advances the chain, exactly like `NotFound`.
+                    if u64::try_from(ob.len()).unwrap_or(u64::MAX) != expected_len {
+                        tracing::warn!(
+                            %hash,
+                            kind = ?origin.kind(),
+                            got = ob.len(),
+                            expected = expected_len,
+                            "origin served a wrong-length outboard; trying next origin",
+                        );
+                        continue;
+                    }
                     // The outboard is origin egress too; metered here, once per
                     // fill, since every draw of the fill reuses it (#2061).
                     if let Some(m) = &self.inner.metrics {
