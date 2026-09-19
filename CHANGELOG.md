@@ -1739,6 +1739,25 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Metrics: stream outcomes, byte volume, on-chain transactions and DHT
+  health are exported, and the gaps they expose now alert.** New series:
+  `decdn_streams_{completed,failed}_total{direction}`, `decdn_bytes_served_total`,
+  `decdn_bytes_received_total`, `decdn_pool_redemptions_total`,
+  `decdn_vouchers_received_total`, `decdn_pool_grace_closes_total`,
+  `decdn_onchain_tx_{landed,reverted,send_failed,receipt_failed,timeout}_total`,
+  `decdn_dht_{findvalue_queries,lookup_round_timeouts,store_published,bucket_refresh_failures,bootstrap_find_node_failures}_total`,
+  `decdn_dht_routing_table_size`, `decdn_fee_shares_watcher_{poll_failures_total,restarts_total,down_seconds}`,
+  `decdn_config_reload_failures_total`, `decdn_receipt_write_failures_total` and
+  `decdn_serve_stream_midstream_pool_exhausted_total`. The ten registry rows
+  that were `planned` for these ship as `live`; `decdn_streams_failed_total`
+  carries `direction` only, with the reason split in the existing sibling
+  counters. New alerts: `DecdnSlashDetected`, `DecdnRpcUnhealthy`,
+  `DecdnFeeSharesWatcherStalled`, `DecdnFeeSharesPollFailing`,
+  `DecdnRedemptionFailing`, `DecdnOnchainTxTimeouts`, `DecdnServeNodeFault`,
+  `DecdnFrameAccountingFault`, `DecdnWatcherPersistFailures`,
+  `DecdnLaneFlushFailures`, `DecdnNodePullCorruption`,
+  `DecdnConfigReloadFailed` and `DecdnReceiptLogWriteFailing`. The delivery,
+  chain and node dashboards gain panels for each family.
 - **Tracing: deCDN emits its own spans.** Each inbound client stream is a
   `serve_stream` span with its `outcome` (`completed`, `refused`, `stopped`,
   `reset`, `failed`, `panicked`, `cancelled`), `reason`, `bytes` and `error`. A

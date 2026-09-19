@@ -803,7 +803,9 @@ pub fn spawn_receipt_writer(
     metrics: Arc<Metrics>,
 ) -> (Arc<dyn ReceiptSink>, StopHandle) {
     let (tx, rx) = mpsc::channel::<RawReceipt>(RECEIPT_LOG_CAPACITY);
-    let handle = StopHandle::spawn(move |shutdown| receipt_writer_loop(rx, log, shutdown));
+    let writer_metrics = Arc::clone(&metrics);
+    let handle =
+        StopHandle::spawn(move |shutdown| receipt_writer_loop(rx, log, writer_metrics, shutdown));
     (Arc::new(ChannelReceiptSink { tx, metrics }), handle)
 }
 
@@ -813,13 +815,14 @@ pub fn spawn_receipt_writer(
 async fn receipt_writer_loop(
     mut rx: mpsc::Receiver<RawReceipt>,
     log: Arc<dyn ReceiptLog>,
+    metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) {
     loop {
         tokio::select! {
             biased;
             maybe = rx.recv() => match maybe {
-                Some(receipt) => append_one(&log, receipt).await,
+                Some(receipt) => append_one(&log, receipt, &metrics).await,
                 // All sinks dropped — nothing more can be enqueued.
                 None => break,
             },
@@ -832,7 +835,7 @@ async fn receipt_writer_loop(
     // the buffer is drained (and `Disconnected` if the senders are gone); either
     // ends the drain.
     while let Ok(receipt) = rx.try_recv() {
-        append_one(&log, receipt).await;
+        append_one(&log, receipt, &metrics).await;
     }
     tracing::debug!("download-receipt writer drained and stopped");
 }
@@ -851,8 +854,9 @@ async fn receipt_writer_loop(
 /// disk stall under a full or slow `data_dir`) runs, never on a runtime worker.
 /// The single writer awaits each append before the next, preserving receipt
 /// order. An append error is non-fatal — the payment already advanced the lane
-/// watermark — so it is logged at `warn` and the loop continues.
-async fn append_one(log: &Arc<dyn ReceiptLog>, raw: RawReceipt) {
+/// watermark — so it is logged at `warn`, counted into
+/// `decdn_receipt_write_failures_total`, and the loop continues.
+async fn append_one(log: &Arc<dyn ReceiptLog>, raw: RawReceipt, metrics: &Metrics) {
     // Stamp at dequeue so the timestamp reflects acceptance order; the render
     // that consumes it runs on the blocking pool below.
     let stamped_at = crate::payment_settlement::unix_now();
@@ -871,6 +875,7 @@ async fn append_one(log: &Arc<dyn ReceiptLog>, raw: RawReceipt) {
     let (res, receipt) = match join {
         Ok(pair) => pair,
         Err(join_err) => {
+            metrics.receipt_write_failure();
             tracing::warn!(
                 error = %join_err,
                 event = "download_receipt_writer_join_error",
@@ -881,6 +886,7 @@ async fn append_one(log: &Arc<dyn ReceiptLog>, raw: RawReceipt) {
         }
     };
     if let Err(e) = res {
+        metrics.receipt_write_failure();
         tracing::warn!(
             hash = receipt.hash(),
             client_node_id = receipt.client_node_id(),
@@ -1009,7 +1015,10 @@ mod tests {
             ..RecordingLog::default()
         });
         let metrics = Arc::new(Metrics::new());
-        let (sink, handle) = spawn_receipt_writer(Arc::clone(&log) as Arc<dyn ReceiptLog>, metrics);
+        let (sink, handle) = spawn_receipt_writer(
+            Arc::clone(&log) as Arc<dyn ReceiptLog>,
+            Arc::clone(&metrics),
+        );
         for tag in 0..5u8 {
             sink.record(raw_sample(tag));
         }
@@ -1019,6 +1028,13 @@ mod tests {
         anyhow::ensure!(
             sizes == vec![0, 1024, 3 * 1024, 4 * 1024],
             "the failing append should be skipped but the rest recorded: {sizes:?}"
+        );
+        // The one failed append is counted.
+        let text = metrics.encode()?;
+        anyhow::ensure!(
+            text.lines()
+                .any(|l| l == "decdn_receipt_write_failures_total 1"),
+            "{text}"
         );
         Ok(())
     }

@@ -235,6 +235,7 @@ impl ClientHandler {
                 }
                 delivered = delivered.saturating_add(clen_u64);
                 self.shed.record_egress(clen_u64);
+                self.metrics.bytes_served(clen_u64);
                 unvouchered = unvouchered.saturating_add(clen_u64);
                 if unvouchered >= chunk_bytes {
                     pending.push_back(unvouchered);
@@ -414,6 +415,7 @@ impl ClientHandler {
                 {
                     self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
                         .await?;
+                    self.metrics.serve_stream_midstream_pool_exhausted();
                     // Observable stop (symmetric with the takedown re-check below): this
                     // terminates a paying miss-leg delivery.
                     tracing::warn!(

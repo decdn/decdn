@@ -56,6 +56,10 @@ pub const BUCKET_REFRESH_TICK: Duration = Duration::from_hours(1);
 /// starts at 0 ("never refreshed") and is updated every tick regardless
 /// of whether any bucket was populated, so it tracks "the refresh task is
 /// alive and ran at T" rather than "a bucket received fresh entries".
+///
+/// Each pass also counts its failed bucket refreshes into
+/// `decdn_dht_bucket_refresh_failures_total` and publishes the table's size
+/// as `decdn_dht_routing_table_size`.
 pub async fn run_bucket_refresh(
     endpoint: Endpoint,
     self_id: PublicKey,
@@ -63,6 +67,7 @@ pub async fn run_bucket_refresh(
     mut stop_rx: oneshot::Receiver<()>,
     interval: Duration,
     refresh_clock: Arc<AtomicU64>,
+    metrics: Arc<crate::metrics::Metrics>,
 ) {
     let self_node_id = NodeId::from_bytes(*self_id.as_bytes());
     let mut ticker = tokio::time::interval(interval);
@@ -77,7 +82,14 @@ pub async fn run_bucket_refresh(
                 return;
             }
             _ = ticker.tick() => {
-                refresh_all_non_empty_buckets(&endpoint, self_node_id, &routing).await;
+                let failures =
+                    refresh_all_non_empty_buckets(&endpoint, self_node_id, &routing).await;
+                for _ in 0..failures {
+                    metrics.dht_bucket_refresh_failure();
+                }
+                metrics.dht_routing_table_size(
+                    with_lock(&routing, "dht routing table", |table| table.len()),
+                );
                 // Stamp after the pass completes so `admin_v1_status`
                 // reports the time refresh last *finished*. `Relaxed` is
                 // sufficient: the admin reader only needs the latest value
@@ -114,28 +126,37 @@ fn now_us() -> u64 {
 /// Refresh every non-empty bucket once. Snapshots the (`bucket_index`,
 /// peer, target) tuples under a single short lock acquire, then fans
 /// the network requests out in parallel.
+///
+/// Returns how many bucket refreshes failed: a `FindNode` RPC error, a
+/// routing-table peer that is not a valid public key, or a panicked refresh
+/// task.
 async fn refresh_all_non_empty_buckets(
     endpoint: &Endpoint,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
-) {
+) -> usize {
     let picks: Vec<BucketPick> = with_lock(routing, "dht routing table", |table| {
         all_non_empty_picks(table)
     });
     if picks.is_empty() {
-        return;
+        return 0;
     }
     let mut handles = Vec::with_capacity(picks.len());
     for pick in picks {
         let endpoint_cloned = endpoint.clone();
         let routing_cloned = Arc::clone(routing);
         handles.push(tokio::spawn(async move {
-            refresh_one_bucket(&endpoint_cloned, self_node_id, &routing_cloned, pick).await;
+            refresh_one_bucket(&endpoint_cloned, self_node_id, &routing_cloned, pick).await
         }));
     }
+    let mut failures = 0;
     for h in handles {
-        let _ = h.await;
+        // A panicked refresh task counts as a failed refresh.
+        if !h.await.unwrap_or(false) {
+            failures += 1;
+        }
     }
+    failures
 }
 
 /// Snapshot all non-empty buckets as `BucketPick`s. Returns one pick
@@ -165,7 +186,7 @@ async fn refresh_one_bucket(
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
     pick: BucketPick,
-) {
+) -> bool {
     let BucketPick {
         bucket_index,
         peer,
@@ -179,7 +200,7 @@ async fn refresh_one_bucket(
                 error = %e,
                 "dht bucket-refresh: routing-table peer not a valid public key"
             );
-            return;
+            return false;
         }
     };
     let addr = EndpointAddr::new(target_pk);
@@ -198,6 +219,7 @@ async fn refresh_one_bucket(
                     }
                 }
             });
+            true
         }
         Err(e) => {
             tracing::debug!(
@@ -205,6 +227,7 @@ async fn refresh_one_bucket(
                 error = %e,
                 "dht bucket-refresh: FindNode failed; will retry on next tick"
             );
+            false
         }
     }
 }

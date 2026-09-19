@@ -1551,9 +1551,16 @@ async fn pull_from_candidate(
         pool_id = tracing::field::Empty,
         outcome = tracing::field::Empty,
     );
-    let result = pull_from_candidate_in_span(deps_lock, deps, candidate, hash_bytes)
+    let opened = AtomicBool::new(false);
+    let result = pull_from_candidate_in_span(deps_lock, deps, candidate, hash_bytes, &opened)
         .instrument(span.clone())
         .await;
+    // Only a candidate the pull opened a stream to has a stream outcome; one
+    // skipped before that (no address, above the buy ceiling, a pool-open
+    // failure) is not a failed stream.
+    if opened.load(Ordering::Relaxed) {
+        deps.metrics.outbound_stream_ended(result.is_ok());
+    }
     span.record(
         "outcome",
         match result {
@@ -1575,6 +1582,7 @@ async fn pull_from_candidate_in_span(
     deps: &NodeOriginDeps,
     candidate: &Candidate,
     hash_bytes: [u8; 32],
+    opened: &AtomicBool,
 ) -> Result<(), PullMiss> {
     let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
         return Err(PullMiss::Clean);
@@ -1676,6 +1684,7 @@ async fn pull_from_candidate_in_span(
     // continues (#1610 removed the detached warm). So "no hard cap here" does not mean
     // "a client can wait forever".
     let _stream_guard = deps.metrics.outbound_stream_guard();
+    opened.store(true, Ordering::Relaxed);
 
     // Header handshake: a free whole-tail open to read the committed `total_bytes`,
     // then abort — no bytes pulled, no voucher. `NO_NAMESPACE`, as this hash-only
@@ -1779,7 +1788,8 @@ async fn pull_from_candidate_in_span(
             .build()?;
         let _entered = pull_span.enter();
         Ok::<_, std::io::Error>(rt.block_on(async move {
-            let store = NodeAdmitStore::new(engine, hash, total_bytes, None);
+            let store = NodeAdmitStore::new(engine, hash, total_bytes, None)
+                .counting_received(Arc::clone(&metrics));
             // Capture the lane seed before `ctx` moves behind the mutex, so the
             // on-thread settle can tell whether this stream advanced the watermark.
             let pool_id = ctx.pool_id;

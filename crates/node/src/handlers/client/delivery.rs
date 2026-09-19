@@ -338,6 +338,7 @@ impl ClientHandler {
                 self.write_chunk_payload_multi(send, &frame).await?;
                 delivered = delivered.saturating_add(len);
                 self.shed.record_egress(len);
+                self.metrics.bytes_served(len);
                 unvouchered = unvouchered.saturating_add(len);
                 if unvouchered >= chunk_bytes {
                     pending.push_back(unvouchered);
@@ -482,6 +483,7 @@ impl ClientHandler {
                 {
                     self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
                         .await?;
+                    self.metrics.serve_stream_midstream_pool_exhausted();
                     // A paying in-flight download is being terminated, and the pool solvency bound
                     // only grows — an accumulator bug here is permanent per pool, so make
                     // the stop observable rather than a silent `Ok(())` (symmetric with the

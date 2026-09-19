@@ -664,6 +664,9 @@ impl LogSink for PoolSettlementSink {
                     event.poolId,
                     u64::try_from(event.disputeDeadline).unwrap_or(u64::MAX),
                 );
+                if self.holds_unredeemed_on(event.poolId) {
+                    self.metrics.pool_grace_close();
+                }
             }
             Some(sig) if sig == PaymentPool::PoolReclaimed::SIGNATURE_HASH => {
                 let event = match PaymentPool::PoolReclaimed::decode_log_data(&log.inner.data) {
@@ -691,6 +694,19 @@ impl LogSink for PoolSettlementSink {
 }
 
 impl PoolSettlementSink {
+    /// Whether this node provides a lane of `pool_id` that is owed more than the
+    /// chain has paid it — revenue that must redeem inside the grace window. A
+    /// store read failure answers `false`: the counter this feeds is advisory.
+    fn holds_unredeemed_on(&self, pool_id: PoolId) -> bool {
+        match self.store.load_all() {
+            Ok(states) => holds_unredeemed(&states, pool_id, self.self_address),
+            Err(err) => {
+                warn!(error = %err, %pool_id, "grace-close check: failed to load lane state");
+                false
+            }
+        }
+    }
+
     /// Hint the redeemer for every lane of `pool_id` this node provides, so a
     /// top-up re-drives lanes a dry pool left `owed > paid`. Best-effort: a full
     /// hint channel drops the nudge (the self-tick sweep is the backstop).
@@ -1484,10 +1500,11 @@ async fn submit_chunk<P: Provider + Clone>(
     let voucher_count = lanes.len();
     let pool_count = batches.len();
     let sent = contract.redeemMany(batches).send().await;
-    match send_and_await_receipt(sent, Some(REDEEM_RECEIPT_TIMEOUT)).await {
+    match send_and_await_receipt(sent, Some(REDEEM_RECEIPT_TIMEOUT), metrics).await {
         TxOutcome::Landed(receipt) => {
             span.record("tx", tracing::field::display(receipt.transaction_hash));
             span.record("outcome", "landed");
+            metrics.pool_redemptions(u64::try_from(voucher_count).unwrap_or(u64::MAX));
             info!(
                 pool_count,
                 cap_count,
@@ -1705,6 +1722,14 @@ fn record_tx_failure(span: &tracing::Span, outcome: &'static str, tx: Option<TxH
     }
     span.record("outcome", outcome);
     span.record("otel.status_code", "ERROR");
+}
+
+/// Whether `provider` has a lane of `pool_id` in `states` that is owed more
+/// than it has been paid.
+fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) -> bool {
+    states.iter().any(|st| {
+        st.pool_id == pool_id && st.provider == provider && st.owed() > st.paid_cumulative
+    })
 }
 
 async fn redeem_planned_lanes<P: Provider + Clone>(
@@ -2860,6 +2885,26 @@ mod tests {
         );
         st.owner_sig = owner_sig;
         st
+    }
+
+    /// A grace close counts only for this provider's lane on the closing pool
+    /// that the chain has not fully paid.
+    #[test]
+    fn holds_unredeemed_matches_only_an_unpaid_lane_of_this_pool_and_provider() {
+        let pool = PoolId::from([1; 32]);
+        let me = Address::from([20; 20]);
+        let owed = signed_lane_state(1, 10, 20, None);
+        assert!(holds_unredeemed(std::slice::from_ref(&owed), pool, me));
+
+        let mut paid = owed.clone();
+        paid.paid_cumulative = paid.owed();
+        assert!(!holds_unredeemed(&[paid], pool, me));
+
+        let other_provider = signed_lane_state(1, 10, 21, None);
+        assert!(!holds_unredeemed(&[other_provider], pool, me));
+
+        let other_pool = signed_lane_state(2, 10, 20, None);
+        assert!(!holds_unredeemed(&[other_pool], pool, me));
     }
 
     #[test]

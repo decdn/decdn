@@ -39,6 +39,8 @@ struct FeeSharesSink<P: Provider + Clone> {
     poll_interval: Duration,
     /// When the last authoritative re-read ran; `None` until the first.
     last_poll: Option<Instant>,
+    /// Counts failed re-reads into `decdn_fee_shares_watcher_poll_failures_total`.
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl<P: Provider + Clone> FeeSharesSink<P> {
@@ -106,6 +108,7 @@ impl<P: Provider + Clone + 'static> LogSink for FeeSharesSink<P> {
                 // re-read logs and keeps the current share rather than backing
                 // off the whole watcher (which would also stall event pickup).
                 // Returning Ok keeps the cursor advancing.
+                self.metrics.fee_shares_watcher_poll_failure();
                 tracing::warn!(error = %err, "fee-shares watcher: authoritative getShares() poll failed; keeping current share");
             }
         }
@@ -147,6 +150,7 @@ where
         // would fire a redundant re-read on the very first tick. The first
         // safety-net poll is due one `poll_interval` from now.
         last_poll: Some(Instant::now()),
+        metrics: Arc::clone(metrics),
     };
     Route {
         addresses: vec![fee_router_addr],
@@ -159,8 +163,14 @@ where
         start: CursorStart::HeadMinusWindow { window_blocks: 0 },
         sink: SinkSource::Ready(Box::new(sink)),
         label: "fee-shares",
-        on_established: None,
-        on_backoff: None,
+        on_established: Some(crate::metrics::metric_hook(
+            metrics,
+            crate::metrics::Metrics::fee_shares_watcher_cycle_established,
+        )),
+        on_backoff: Some(crate::metrics::metric_hook(
+            metrics,
+            crate::metrics::Metrics::fee_shares_watcher_backoff_started,
+        )),
         // Liveness + panic signals. Load-bearing here more than for most
         // watchers: this sink's poll-failure and undecodable-log paths both
         // return `Ok` by design, so without these a route wedged in RPC backoff
@@ -202,6 +212,7 @@ mod tests {
             shares,
             poll_interval: Duration::from_secs(u64::MAX),
             last_poll: Some(Instant::now()),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
         }
     }
 

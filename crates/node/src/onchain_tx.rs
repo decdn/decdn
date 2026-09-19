@@ -27,6 +27,8 @@ use alloy::primitives::TxHash;
 use alloy::providers::{PendingTransactionBuilder, PendingTransactionError};
 use alloy::rpc::types::TransactionReceipt;
 
+use crate::metrics::Metrics;
+
 /// Terminal outcome of one on-chain transaction: the `send` → `get_receipt` →
 /// `status` sequence folded to a single value. Every arm past `.send()` carries
 /// the transaction hash (inside the receipt, or beside the error) so callers can
@@ -59,8 +61,26 @@ pub(crate) enum TxOutcome {
 ///
 /// `sent` is the result of `contract.<method>(..).send().await`. When
 /// `receipt_timeout` is `Some`, the receipt wait is bounded and a lapse yields
-/// [`TxOutcome::Timeout`]; when `None`, the wait is unbounded.
+/// [`TxOutcome::Timeout`]; when `None`, the wait is unbounded. Every outcome
+/// counts once into its `decdn_onchain_tx_*_total` sibling.
 pub(crate) async fn send_and_await_receipt(
+    sent: Result<PendingTransactionBuilder<Ethereum>, ContractError>,
+    receipt_timeout: Option<Duration>,
+    metrics: &Metrics,
+) -> TxOutcome {
+    let outcome = await_receipt(sent, receipt_timeout).await;
+    match &outcome {
+        TxOutcome::Landed(_) => metrics.onchain_tx_landed(),
+        TxOutcome::Reverted(_) => metrics.onchain_tx_reverted(),
+        TxOutcome::SendErr(_) => metrics.onchain_tx_send_failed(),
+        TxOutcome::ReceiptErr { .. } => metrics.onchain_tx_receipt_failed(),
+        TxOutcome::Timeout { .. } => metrics.onchain_tx_timeout(),
+    }
+    outcome
+}
+
+/// The classification behind [`send_and_await_receipt`], before it is counted.
+async fn await_receipt(
     sent: Result<PendingTransactionBuilder<Ethereum>, ContractError>,
     receipt_timeout: Option<Duration>,
 ) -> TxOutcome {
@@ -88,6 +108,7 @@ pub(crate) async fn send_and_await_receipt(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -99,7 +120,19 @@ mod tests {
         // outcome. The receipt/status branches are provider-bound and covered by
         // the anvil e2e.
         let send_err = alloy::transports::TransportErrorKind::custom_str("boom");
-        let outcome = send_and_await_receipt(Err(send_err.into()), None).await;
+        let metrics = Metrics::new();
+        let outcome = send_and_await_receipt(Err(send_err.into()), None, &metrics).await;
         assert!(matches!(outcome, TxOutcome::SendErr(_)));
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(
+            encoded
+                .lines()
+                .any(|l| l == "decdn_onchain_tx_send_failed_total 1")
+        );
+        assert!(
+            encoded
+                .lines()
+                .any(|l| l == "decdn_onchain_tx_landed_total 0")
+        );
     }
 }

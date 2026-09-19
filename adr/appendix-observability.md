@@ -89,10 +89,11 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | Metric | Type | Tier | Status | Labels | Description |
 |--------|------|------|--------|--------|-------------|
 | `decdn_streams_active` | Gauge | M | live | `direction={inbound,outbound}` | Currently open delivery streams. |
-| `decdn_streams_completed_total` | Counter | M | planned | `direction={inbound,outbound}` | Successfully completed streams. |
-| `decdn_streams_failed_total` | Counter | M | planned | `direction, reason` | Failed streams. `reason` values: `hash_mismatch`, `channel_insufficient`, `rate_mismatch`, `blob_too_large`, `evicted`, `timeout`, `protocol_error`, `other`. |
-| `decdn_bytes_served_total` | Counter | M | planned | — | Bytes delivered to clients and downstream nodes (inbound streams from the requester's perspective). |
-| `decdn_bytes_received_total` | Counter | M | planned | — | Bytes received as a client in node-to-node cache-miss pulls. |
+| `decdn_streams_completed_total` | Counter | M | live | `direction={inbound,outbound}` | Streams that delivered the whole request. `inbound` counts streams this node served. `outbound` counts node-to-node pulls this node made: one per upstream candidate it opened a stream to on the buffered miss path, and one per assembled range on the streaming miss path. |
+| `decdn_streams_failed_total` | Counter | M | live | `direction={inbound,outbound}` | Streams that ended without the whole request: refused, stopped mid-stream, reset, panicked, or ended on an error. Every ended stream counts once in this counter or in `decdn_streams_completed_total`. A stream that shutdown cancels counts in neither. Routine outcomes count here too: a cache-miss refusal, a client that closes early, and the free header handshake that a downstream node's miss pull opens and closes after the response. So do not read `completed / (completed + failed)` as health. Read the sibling counters `decdn_serve_stream_rejected_*` and `decdn_node_pull_*`, per [§ Reason splits](#reason-splits-sibling-counters-not-labels). |
+| `decdn_bytes_served_total` | Counter | M | live | — | Payload bytes this node wrote to clients and downstream nodes, counted per frame as it is written. |
+| `decdn_bytes_received_total` | Counter | M | live | — | Payload bytes this node admitted from upstream nodes in paid node-to-node pulls, counted per verified range. The range is chunk-group aligned, so the count can exceed the requested bytes. |
+| `decdn_serve_stream_midstream_pool_exhausted_total` | Counter | R | live | — | Paying streams this node stopped mid-delivery with `PoolExhausted`: the pool can no longer fund the floor credit committed across its signers. The pool-level sibling of `decdn_serve_stream_midstream_signer_cap_exhausted_total`. The owner must top up. |
 | `decdn_serve_frame_accounting_fault_total` | Counter | R | live | — | Times a serve leg refused to cut or frame a `ChunkData` because its own byte accounting did not add up: a zero frame target, a `queued`/`queue` desync, a payload whose chunks disagree with the length the header would declare, or a header the encoder refused. Each refusal is correct — the delivery aborts without `StreamEnd`, so the client gets no mislabelled frame and pays no closing voucher — which is exactly why it is otherwise invisible: the stream simply ends, and that reads as a client that hung up. This is a **latent-bug report, not a degradation**. Alert on `> 0` and file it rather than tuning anything. |
 | `decdn_serve_stream_node_fault_total` | Counter | R | live | — | Times a `cdn/client/v1` delivery ended on a fault this node caused: an encode fault, an alignment error, a store fault, or a framing fault. A peer hang-up and a client payment fault are excluded — they are routine. The client sees only a short stream, so this counter and the `error!` line beside it are the operator's sole signal that a delivery was abandoned. This is a **latent-bug report, not a degradation**. Alert on `> 0` and file it. It is a superset of `decdn_serve_frame_accounting_fault_total`, which meters one of the four classes on its own. |
 | `decdn_serve_stream_rejected_bad_binding_total` | Counter | R | live | — | Streams reset because the client binding failed to verify: the signature is invalid, or it recovers a different address than the one claimed. No signed response is sent. Any peer can cause these, so the matching `warn!` line is throttled; this counter records every event. |
@@ -149,13 +150,18 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | Metric | Type | Tier | Status | Description |
 |--------|------|------|--------|-------------|
 | `decdn_lanes_open` | Gauge | M | live | Currently open inbound serve lanes — distinct `(pool, signer, provider)` keys with unredeemed vouchers. |
-| `decdn_pool_redemptions_total` | Counter | M | planned | On-chain redemptions by this node. |
+| `decdn_pool_redemptions_total` | Counter | M | live | Lane claims this node redeemed on-chain in a landed `redeemMany`. Each lane redeems one cumulative voucher, however many vouchers the lane accepted. |
+| `decdn_onchain_tx_landed_total` | Counter | R | live | Settlement transactions (`redeemMany`) that mined and succeeded. The `decdn_onchain_tx_*` family counts every transaction the node sends through its settlement path. Buyer-side pool transactions go through client-pull and do not count. |
+| `decdn_onchain_tx_reverted_total` | Counter | R | live | Node transactions that mined and reverted. |
+| `decdn_onchain_tx_send_failed_total` | Counter | R | live | Node transactions the RPC refused at `send`. No transaction was issued. An oversize `redeemMany` that the redeemer then halves and retries counts here once. |
+| `decdn_onchain_tx_receipt_failed_total` | Counter | R | live | Issued node transactions whose receipt wait failed. The transaction can still mine; its hash is in the `warn!` line. |
+| `decdn_onchain_tx_timeout_total` | Counter | R | live | Issued node transactions whose receipt did not arrive inside the caller's bound. The transaction can still mine; its hash is in the `warn!` line. |
 | `decdn_pool_deposit_usdc` | Gauge | M | live | Total USDC deposited in pools currently paying this node. Represents maximum on-chain recoverable value. |
 | `decdn_unredeemed_usdc` | Gauge | M | live | Raw USDC in accepted vouchers this node has not redeemed on-chain. The value sums `owed − paid` over the lanes the redeemer plans to collect. The redeemer refreshes it once per self-tick, so it lags live accrual by up to one `redeem_interval_secs`. |
 | `decdn_buyer_pool_store_skipped_undecodable_records_total` | Counter | M | live | Buyer-pool rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy pools from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
-| `decdn_vouchers_signed_total` | Counter | M | planned | Vouchers signed by this node as the payee. |
-| `decdn_vouchers_received_total` | Counter | R | planned | Vouchers received by this node as the payer (node-to-node pulls). |
-| `decdn_pool_grace_closes_total` | Counter | R | planned | Pools observed entering the redemption grace window (owner close) while this node holds unredeemed vouchers. |
+| `decdn_vouchers_signed_total` | Counter | M | planned | Vouchers this node signed as the payer (node-to-node pulls). |
+| `decdn_vouchers_received_total` | Counter | R | live | Signed vouchers this node accepted as the payee on an inbound stream. `PayWord` preimage reveals are not vouchers and do not count. A `PayWord` stream counts its anchor voucher. |
+| `decdn_pool_grace_closes_total` | Counter | R | live | Pools that entered the owner-close grace window while this node held unredeemed vouchers on them. The node reads the flushed lane store when the close event arrives. Each one is revenue that must redeem before the grace window ends. A pool that is already closing at startup does not count. |
 
 #### Reputation Metrics
 
@@ -170,6 +176,8 @@ Reputation is local-only per [ADR 008](008-reputation.md#adr-008-reputation-syst
 | Metric | Type | Tier | Status | Description |
 |--------|------|------|--------|-------------|
 | `decdn_node_uptime_seconds` | Gauge | R | live | Seconds since the node process started. Used by the `/health` endpoint and operator dashboards to correlate events with restarts. |
+| `decdn_config_reload_failures_total` | Counter | R | live | SIGHUP or admin config reloads that failed. Sections committed before the failure stay applied. The other sections keep their previous values. |
+| `decdn_receipt_write_failures_total` | Counter | R | live | Download-receipt audit records the writer failed to persist: an I/O error or a panicked write task. Audit only; settlement is unaffected. |
 | `decdn_otlp_export_failures_total` | Counter | R | live | OTLP span-export batches whose export call failed: connect error, non-OK gRPC status, or timeout. A sustained rate means traces are lost. The counter does not count spans that the batch queue drops when full, or spans that a collector rejects inside an OK partial-success reply, so 0 does not prove that no traces were lost. The SDK logs queue drops as `BatchSpanProcessor.SpanDroppingStarted` and `BatchSpanProcessor.SpansDropped` under the `opentelemetry_sdk` target. Stays 0 when `observability.otlp_endpoint` is unset or the node emits no spans. |
 
 #### DHT / Content-Discovery Metrics
@@ -178,9 +186,12 @@ Per [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) (`cd
 
 | Metric | Type | Tier | Status | Labels | Description |
 |--------|------|------|--------|--------|-------------|
-| `decdn_dht_store_published_total` | Counter | R | planned | — | DHT STORE records this node published to the K-closest peers ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)). |
-| `decdn_dht_findvalue_queries_total` | Counter | R | planned | — | DHT FIND_VALUE lookups this node issued to discover providers. |
-| `decdn_dht_routing_table_size` | Gauge | R | planned | — | Distinct entries in the local Kademlia routing table. |
+| `decdn_dht_store_published_total` | Counter | R | live | — | DHT STORE records a peer accepted from this node ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)). A batched STORE adds one per accepted hash. |
+| `decdn_dht_findvalue_queries_total` | Counter | R | live | — | DHT FIND_VALUE lookups this node ran to discover providers. |
+| `decdn_dht_lookup_round_timeouts_total` | Counter | R | live | — | Lookup rounds that hit the round timeout and aborted their in-flight RPCs. |
+| `decdn_dht_routing_table_size` | Gauge | R | live | — | Distinct entries in the local Kademlia routing table, set after bootstrap and on every bucket-refresh tick. |
+| `decdn_dht_bucket_refresh_failures_total` | Counter | R | live | — | Bucket refreshes that failed: a `FIND_NODE` RPC error, a routing-table peer that is not a valid public key, or a panicked refresh task. |
+| `decdn_dht_bootstrap_find_node_failures_total` | Counter | R | live | — | Bootstrap `FIND_NODE` RPCs against a seed that failed. |
 | `decdn_dht_rate_limit_rejected_per_peer_total` | Counter | R | live | — | DHT requests shed by the per-peer token bucket. |
 | `decdn_dht_rate_limit_rejected_per_ip_total` | Counter | R | live | — | DHT requests shed by the per-IP token bucket. |
 | `decdn_dht_rate_limit_rejected_global_total` | Counter | R | live | — | DHT requests shed by the node-wide ceiling. |
@@ -231,6 +242,9 @@ In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **
 |--------|------|------|--------|--------|-------------|
 | `decdn_<watcher>_last_tick_timestamp_seconds` | Gauge | M | live | — | **Positive liveness signal**: Unix wall-clock time of the last *successful* poll tick, stamped every tick (including idle ticks — a successful head read is proof of life). Unlike the error-triggered down-family, a panicked, wedged, or cleanly-exited task stops advancing this, so staleness is detectable. One series per watcher (`slash`, `staker_set`, `blacklist`, `settlement`). Reads `0` until the first successful tick. |
 | `decdn_<watcher>_task_panicked_total` | Counter | M | live | — | The watcher task unwound on a panic. Bumped from a `Drop` guard in `resumable_watcher::run` — the only thing that runs on the unwind, since the detached task is never awaited. **Any non-zero value is a bug in this node.** One series per watcher. |
+| `decdn_fee_shares_watcher_poll_failures_total` | Counter | R | live | — | Authoritative `getShares()` re-reads that failed. The fee-shares watcher keeps the current share and its tick still succeeds, so this counter is the only signal that the safety-net re-read is not landing. |
+| `decdn_fee_shares_watcher_restarts_total` | Counter | R | live | — | Distinct drift windows the fee-shares watcher entered. The same down-family as the `blacklist` and `settlement` rows. |
+| `decdn_fee_shares_watcher_down_seconds` | Gauge | R | live | — | Seconds the fee-shares watcher has been failing its chain read. `0` on a healthy cycle. |
 | `decdn_blacklist_enforcement_failures_total` | Counter | M | live | — | Distinct hashes a batched re-scope could not re-verify or evict this pass (`Recheck::Failed` — a disk error or a scope `eth_call` failure). Non-zero means the deny-set is **not fully enforced** and a blacklisted blob may still be servable and slashable (`SlashJudge.submitBlacklistChallenge`), even while `decdn_blacklist_watcher_down_seconds` reads `0` — the two answer different questions (deny-set enforced vs chain readable). Pairs with the aggregate `warn!` (`"blacklist re-scope could not enforce every entry"`). |
 
 The origin directory is not a watcher — it is a lazy, on-demand TTL cache with no poll loop, so it carries none of the tick/panic/down metrics above. It exposes its own pair instead: `decdn_origin_directory_get_origins_failures_total` (Counter) counts `getOrigins` lookups that failed on a cold-namespace cache miss, and `decdn_origin_directory_cache_size` (Gauge) reports the current namespace count held in the cache (positive and negative entries, bounded by the configured capacity).

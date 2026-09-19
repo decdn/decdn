@@ -528,7 +528,8 @@ pub(crate) async fn run_pull_leg(
         }
     };
 
-    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(Arc::clone(&session)));
+    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(Arc::clone(&session)))
+        .counting_received(Arc::clone(&deps.metrics));
     // The ramped credit-window pacer (ADR 003 §Credit window / ADR 037), SHARED
     // across every run so the pull never runs further ahead of the downstream
     // served-paid frontier than the window allows, in lockstep with the serve leg.
@@ -568,6 +569,15 @@ pub(crate) async fn run_pull_leg(
     };
 
     let outcome = assemble(&sink, &coverages, offset, len, total_bytes).await;
+    // One outbound outcome per assembled range. A cancelled assembly (the serve
+    // leg finished first) is neither.
+    match &outcome {
+        AssembleOutcome::Complete => deps.metrics.outbound_stream_ended(true),
+        AssembleOutcome::Unavailable | AssembleOutcome::Terminal(_) => {
+            deps.metrics.outbound_stream_ended(false);
+        }
+        AssembleOutcome::Cancelled => {}
+    }
     // On cancel the serve leg has already finished and nobody reads this, but set a
     // terminal outcome regardless. A cancelled assembly is not a fault (Ok), matching
     // a single-source pull's own Cancelled outcome; a range no holder covers is the

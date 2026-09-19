@@ -69,6 +69,7 @@ async fn bucket_refresh_stamps_clock_after_first_pass() {
         // later.
         Duration::from_millis(50),
         Arc::clone(&clock),
+        Arc::new(decdn_node::metrics::Metrics::new()),
     ));
 
     // Poll for the stamp (real time; the task uses a real ticker). Bound the

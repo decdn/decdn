@@ -22,6 +22,8 @@ use decdn_bao_range::{AlignedRange, RangedFuture, RangedStore};
 use decdn_cache::{CacheEngine, FillSession, Hash, NodeRangedStore};
 use decdn_client_pull::{BaoRangeReader, IngestStore};
 
+use crate::metrics::Metrics;
+
 /// The node's pull-leg store: [`RangedStore`] queries delegate to a
 /// [`NodeRangedStore`], and [`IngestStore::ingest_stream`] admits each gap via
 /// [`CacheEngine::admit_bao_stream`]. When a [`FillSession`] is present, the cache's
@@ -34,6 +36,10 @@ pub(crate) struct NodeAdmitStore {
     /// the admit-only unit tests). Passed to [`CacheEngine::admit_bao_stream`], which
     /// captures the admitted range's outboard proof nodes into it cache-side.
     session: Option<Arc<FillSession>>,
+    /// Counts each admitted range's payload into `decdn_bytes_received_total`.
+    /// Set only on the paid node-to-node pulls, so an operator's own-origin fill
+    /// through the same store is not counted as bytes received from peers.
+    received: Option<Arc<Metrics>>,
 }
 
 impl NodeAdmitStore {
@@ -49,7 +55,15 @@ impl NodeAdmitStore {
         Self {
             inner: NodeRangedStore::new(engine, hash, total_bytes),
             session,
+            received: None,
         }
+    }
+
+    /// Count every admitted range into `decdn_bytes_received_total`. For the
+    /// paid node-to-node pulls only.
+    pub(crate) fn counting_received(mut self, metrics: Arc<Metrics>) -> Self {
+        self.received = Some(metrics);
+        self
     }
 }
 
@@ -156,6 +170,9 @@ impl IngestStore for NodeAdmitStore {
                     // arm — surface the parked fault over the apparent success.
                     if let Some(fault) = reader.take_fault() {
                         return Err(fault);
+                    }
+                    if let Some(metrics) = &self.received {
+                        metrics.bytes_received(range.fetch_len());
                     }
                     Ok(reader)
                 }
