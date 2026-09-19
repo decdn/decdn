@@ -143,14 +143,14 @@ fn init_tracing(
                 log_level = %lvl,
                 "RUST_LOG is set; the config file log_level change is not applied"
             );
-            return Ok(());
+            return Ok(runtime::LogLevelApply::KeptRustLog);
         };
         let new_filter = tracing_subscriber::EnvFilter::try_new(directive)
             .map_err(|e| anyhow::anyhow!("invalid log_level {lvl}: {e}"))?;
         reload_handle
             .modify(|f| *f = new_filter)
             .map_err(|e| anyhow::anyhow!("failed to swap tracing filter: {e}"))?;
-        Ok(())
+        Ok(runtime::LogLevelApply::Installed)
     });
 
     Ok((setter, tracer_provider))

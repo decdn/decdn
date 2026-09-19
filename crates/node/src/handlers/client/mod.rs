@@ -1902,7 +1902,7 @@ impl ClientHandler {
         if let Some(suppressed) = self.deposit_refusal_warn.admit() {
             tracing::warn!(
                 %pool_id, %headroom, %ceiling, suppressed,
-                interval = ?self.signer_cap_refusal_warn.interval(),
+                interval = ?self.deposit_refusal_warn.interval(),
                 "refusing paying clients: pool's refundable remaining deposit below the reserved cost. \
                  A sustained rate here is either a client running dry (no action) or this \
                  node's chain watcher lagging behind an on-chain top-up (check RPC health) \

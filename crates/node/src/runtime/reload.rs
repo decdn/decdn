@@ -94,13 +94,25 @@ pub struct ReloadSnapshot {
     pub log_level: Option<decdn_common::cli::common::LogLevel>,
 }
 
+/// What a [`LogLevelSetter`] did with a requested level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevelApply {
+    /// The live filter now runs at the requested level.
+    Installed,
+    /// The live filter came from `RUST_LOG` and stays in place: `RUST_LOG`
+    /// wins over the config file for the life of the process.
+    KeptRustLog,
+}
+
 /// Closure that swaps the live `EnvFilter` to one matching `level`.
 ///
 /// Boxed so the runtime can hold it without naming the (large, layered)
 /// concrete subscriber type that `tracing_subscriber::reload::Handle` is
 /// generic over. Returning `anyhow::Result` lets the closure surface
-/// filter-parse failures from the new directive string.
-pub type LogLevelSetter = Box<dyn Fn(LogLevel) -> anyhow::Result<()> + Send + Sync + 'static>;
+/// filter-parse failures from the new directive string; the
+/// [`LogLevelApply`] says whether the level was installed at all.
+pub type LogLevelSetter =
+    Box<dyn Fn(LogLevel) -> anyhow::Result<LogLevelApply> + Send + Sync + 'static>;
 
 // ---------------------------------------------------------------------------
 // Reloadable-section trait + section impls
@@ -322,11 +334,20 @@ impl ReloadableSection for LogLevelSection {
             None => true,
             Some(prev) => prev != new_level,
         };
-        if log_level_changed && let Err(err) = (self.setter)(new_level) {
-            tracing::warn!(error = %err, ?new_level, "failed to apply new log level; previous level retained");
-            return Err(err);
+        if !log_level_changed {
+            return Ok(());
         }
-        if log_level_changed {
+        match (self.setter)(new_level) {
+            Err(err) => {
+                tracing::warn!(error = %err, ?new_level, "failed to apply new log level; previous level retained");
+                return Err(err);
+            }
+            // `RUST_LOG` still drives the live filter, so no file level is
+            // running: leave `current` at `None` and the snapshot reports none.
+            Ok(LogLevelApply::KeptRustLog) => return Ok(()),
+            Ok(LogLevelApply::Installed) => {}
+        }
+        {
             *current = Some(new_level);
             if let Ok(mut g) = self.swap_applied.lock() {
                 *g = true;
@@ -1412,7 +1433,7 @@ mod tests {
         let captured = Arc::clone(&last);
         let setter: LogLevelSetter = Box::new(move |lvl| {
             *captured.lock().unwrap() = Some(lvl);
-            Ok(())
+            Ok(LogLevelApply::Installed)
         });
         (setter, last)
     }
@@ -1621,10 +1642,46 @@ mod tests {
     /// First-reload-applies guarantee: `current_log_level` initialises
     /// to `None`, so the first reload after startup always invokes the
     /// setter even when the file's `log_level` matches
-    /// `initial.observability.log_level`. This is the
-    /// `RUST_LOG=debug` + `config.log_level="info"` case: the live
-    /// filter is `debug`, the resolved value is `info`, and a first
-    /// SIGHUP must push `info` through to the subscriber.
+    /// `initial.observability.log_level`. The setter, not this section,
+    /// decides whether a `RUST_LOG` filter stays in place
+    /// ([`LogLevelApply::KeptRustLog`]).
+    /// A setter that keeps a `RUST_LOG` filter must not make the reload report
+    /// the file level as live: the snapshot stays `None`, and the next reload
+    /// asks the setter again rather than skipping it as unchanged.
+    #[tokio::test]
+    async fn kept_rust_log_filter_is_not_reported_as_the_live_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "[observability]\nlog_level = \"debug\"\n");
+        let calls = Arc::new(Mutex::new(0_u32));
+        let counted = Arc::clone(&calls);
+        let setter: LogLevelSetter = Box::new(move |_| {
+            *counted.lock().unwrap() += 1;
+            Ok(LogLevelApply::KeptRustLog)
+        });
+        let state = RuntimeReloadState::new(
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &seed_resolved(1, LogLevel::Info),
+            setter,
+        );
+
+        state.reload(&path).await.unwrap();
+        assert_eq!(state.current().log_level, None);
+        state.reload(&path).await.unwrap();
+        assert_eq!(state.current().log_level, None);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "each reload asks the setter again"
+        );
+    }
+
     #[tokio::test]
     async fn first_reload_applies_log_level_even_when_matching_initial() {
         let dir = tempfile::tempdir().unwrap();

@@ -616,12 +616,11 @@ impl AdminRpcServer for AdminRpcImpl {
             })?;
         let snap = hook.reload_state.current();
         Ok(ReloadResponse {
-            // After a successful reload `current_log_level` is `Some`;
-            // the `unwrap_or` branch is the (unreachable in practice)
-            // poisoned-mutex case where `current()` returned `None`.
-            // Returning a stable string ("unknown") rather than the
-            // empty string makes operator scripts that parse the
-            // response trivially unambiguous.
+            // `current()` is `None` when `RUST_LOG` drives the live filter
+            // (a reload never replaces it) or on a poisoned mutex; in both
+            // cases no config-file level is running. Returning a stable
+            // string ("unknown") rather than the empty string makes operator
+            // scripts that parse the response trivially unambiguous.
             log_level: snap
                 .log_level
                 .map_or_else(|| "unknown".to_string(), |l| l.to_string()),
@@ -1455,7 +1454,8 @@ mod tests {
         let path = dir.path().join("node.toml");
         std::fs::write(&path, "[observability]\nlog_level = \"debug\"\n").expect("write config");
 
-        let setter: crate::runtime::LogLevelSetter = Box::new(|_| Ok(()));
+        let setter: crate::runtime::LogLevelSetter =
+            Box::new(|_| Ok(crate::runtime::LogLevelApply::Installed));
         let reload_state = Arc::new(RuntimeReloadState::for_test_with_setter(
             LogLevel::Info,
             setter,
@@ -1755,7 +1755,8 @@ mod tests {
         // missing without depending on filesystem state outside the test.
         let path = dir.path().join("does-not-exist.toml");
 
-        let setter: crate::runtime::LogLevelSetter = Box::new(|_| Ok(()));
+        let setter: crate::runtime::LogLevelSetter =
+            Box::new(|_| Ok(crate::runtime::LogLevelApply::Installed));
         let reload_state = Arc::new(RuntimeReloadState::for_test_with_setter(
             LogLevel::Info,
             setter,
