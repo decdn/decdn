@@ -2039,7 +2039,7 @@ git commit --no-verify -m "docs: drop the #2060 implementation plan from the rep
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 git push -u origin feat/2060-stream-bounded-miss
-gh pr create --title "feat(node): stream bounded and resumed cache-miss requests through the two-leg spine" --body "Closes #2060. Fixes #2061 §1 (outboard once per fill) and §2 (minimum draw); §3 (prefetch) and §4 (origin-leg timeout) stay open there.
+gh pr create --title "feat(node): stream bounded and resumed cache-miss requests through the two-leg spine" --body "Closes #2060. Refs #2061 — §1 (outboard once per fill) and §2 (minimum draw) land here; §3 (prefetch) and §4 (origin-leg timeout) stay open there. Follow-ups filed: #2062, #2063.
 
 On a cold miss the CLI's real request is \`byte_len = total_bytes\`, which dispatch routed to \`try_range_pull_through\`: download the whole span + outboard into memory, verify, import, and only then sign \`StreamResponse\`. No timeout, no keepalive — a multi-GiB file trips the client's 30 s stall clock while the node is still buffering.
 
@@ -2063,11 +2063,11 @@ Tests: CLI-shaped \`(0, total)\` and unaligned-offset misses stream via the own-
 
 ---
 
-## Follow-ups to file as issues (out of scope here)
+## Follow-ups (filed; nothing here needs a second PR)
 
-1. **Attached observer ahead of a stalled owner.** With `Attach` at offset `X` and the owner's client no longer paying, `extend_served_from` keeps the pull paced by an unpaid prefix and the observer parks until its own stall budget expires. Registry-level fix: treat a request whose start lies beyond `owner.served_paid + credit_max` as `Owner` of its own span.
-2. **CLI throwaway `(0, 0)` open.** `open_fetch_prelude` claims a fill the CLI immediately abandons (one outboard GET + up to one `PULL_WINDOW_FLOOR` draw per entry, and a duplicate draw in the torn-down-first ordering). Learn `total_bytes` without claiming, or reuse the first open as the real leg.
-3. **#2061 §3 / §4** — prefetch the next draw within the window; per-draw timeout on the origin leg matching `node_pull_timeout_sec`.
+- [#2062](https://github.com/decdn/decdn/issues/2062) — an observer attached ahead of a stalled owner's paid frontier parks until its own stall budget expires (the `extend_served_from` guard Task 4 keeps).
+- [#2063](https://github.com/decdn/decdn/issues/2063) — the CLI's throwaway `(0, 0)` prelude open claims a fill it abandons (one wasted draw per entry; a duplicate draw in Task 6's torn-down ordering).
+- [#2061](https://github.com/decdn/decdn/issues/2061) §3 / §4 — prefetch the next draw; per-draw origin-leg timeout. Recorded there as a comment; this PR references #2061 and does not close it.
 
 ## Verification (end-to-end)
 
