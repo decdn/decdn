@@ -379,6 +379,10 @@ pub struct FillSession {
     /// `serve_demand`. A cloneable handle, so a pull leg on its own runtime can hold
     /// an owned copy.
     served_paid: Frontier,
+    /// The ABSOLUTE content offset the owning request starts at — the value
+    /// `served_paid` is seeded with. A pull leg's `RampPacer` ramps on
+    /// `served_paid − served_start`, so a resumed request ramps from the floor.
+    served_start: u64,
     /// The content end of the furthest span a serve leg has been stuck on (a
     /// high-water mark, never lowered): the serve leg's frame consumer raises it
     /// when it has no encoded bytes left and its encode is parked on a leaf or a
@@ -443,6 +447,7 @@ impl FillSession {
             outboard: StdMutex::new(HashOutboard::new(root, total_bytes)),
             ended: StdMutex::new(None),
             served_paid: Frontier::new(served_start, Arc::clone(&downstream_advanced)),
+            served_start,
             serve_demand: Frontier::new(0, downstream_advanced),
             covered: StdMutex::new(ChunkRanges::all()),
             observers: AtomicUsize::new(0),
@@ -530,6 +535,12 @@ impl FillSession {
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.outboard().tree.size()
+    }
+
+    /// The ABSOLUTE content offset this session's owning request starts at.
+    #[must_use]
+    pub const fn served_start(&self) -> u64 {
+        self.served_start
     }
 
     /// The live observer count (pull owner + attached serve legs).
@@ -1580,6 +1591,17 @@ mod fill_registry_tests {
 
     /// A served-frontier advance is forward-only and wakes a parked watch only when it
     /// moves the frontier: a lower or an equal value wakes nothing.
+    #[test]
+    fn starting_at_records_the_served_start() {
+        let at_zero = FillSession::new(hb(0x60), 8 * G);
+        assert_eq!(at_zero.served_start(), 0);
+        let resumed = FillSession::starting_at(hb(0x61), 8 * G, 3 * G);
+        assert_eq!(resumed.served_start(), 3 * G);
+        // Advancing the paid frontier never moves the start.
+        resumed.advance_served(5 * G);
+        assert_eq!(resumed.served_start(), 3 * G);
+    }
+
     #[test]
     fn advance_served_is_forward_only() {
         use futures_util::FutureExt;

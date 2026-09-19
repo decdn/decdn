@@ -2163,6 +2163,7 @@ mod tests {
             divisor: 0,
             floor: FLOOR,
             credit_max: window,
+            paid_base: 0,
         };
         // The serve leg is parked on the first byte past the closed window: one
         // byte ahead of the pull once the window fills, and so in band.

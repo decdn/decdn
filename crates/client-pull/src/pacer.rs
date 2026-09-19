@@ -332,16 +332,19 @@ pub struct RampPacer {
     pub floor: u64,
     /// Ceiling the ramp climbs toward.
     pub credit_max: u64,
+    /// The ABSOLUTE content offset the downstream stream starts paying from —
+    /// the fill session's served start. `served_paid` is an absolute frontier,
+    /// so the ramp input is `served_paid − paid_base`: what THIS stream has
+    /// paid, not where in the blob it happens to sit. A request resuming at a
+    /// multi-GiB offset therefore ramps from the floor like any other stream.
+    pub paid_base: u64,
 }
 
 impl Pacer for RampPacer {
     fn decide(&self, s: &PaceState) -> PaceDecision {
-        let window = decdn_incentive::ramped_credit_window(
-            self.divisor,
-            self.floor,
-            self.credit_max,
-            s.downstream.served_paid,
-        );
+        let paid = s.downstream.served_paid.saturating_sub(self.paid_base);
+        let window =
+            decdn_incentive::ramped_credit_window(self.divisor, self.floor, self.credit_max, paid);
         WindowPacer::new(window).decide(s)
     }
 }
@@ -692,6 +695,7 @@ mod tests {
             divisor: 2,
             floor,
             credit_max: 64 * CHUNK_GROUP_BYTES,
+            paid_base: 0,
         };
         let mut s = healthy();
         s.downstream.served_paid = 0;
@@ -708,10 +712,35 @@ mod tests {
             divisor: 2,
             floor,
             credit_max: 64 * CHUNK_GROUP_BYTES,
+            paid_base: 0,
         };
         let mut s = healthy();
         s.downstream.served_paid = 32 * CHUNK_GROUP_BYTES;
         s.pulled_frontier = floor;
+        assert!(matches!(pacer.decide(&s), PaceDecision::Draw { .. }));
+    }
+
+    #[test]
+    fn ramp_pacer_measures_paid_from_the_session_start() {
+        // A request resuming at 32 groups has an ABSOLUTE served-paid frontier of
+        // 32 groups before it pays a byte. The ramp must read that as "0 paid",
+        // so the window stays at the floor and a pull already `floor` ahead Waits.
+        let floor = 4 * CHUNK_GROUP_BYTES;
+        let start = 32 * CHUNK_GROUP_BYTES;
+        let pacer = RampPacer {
+            divisor: 2,
+            floor,
+            credit_max: 64 * CHUNK_GROUP_BYTES,
+            paid_base: start,
+        };
+        let mut s = healthy();
+        s.downstream.served_paid = start;
+        s.pulled_frontier = start + floor;
+        assert_eq!(pacer.decide(&s), PaceDecision::Wait);
+
+        // Once the stream has paid 32 groups PAST its start, the window is 16
+        // groups (> floor), so the same pull may Draw again.
+        s.downstream.served_paid = start + 32 * CHUNK_GROUP_BYTES;
         assert!(matches!(pacer.decide(&s), PaceDecision::Draw { .. }));
     }
 
@@ -757,6 +786,7 @@ mod tests {
             divisor: 2,
             floor: PULL_WINDOW_FLOOR,
             credit_max: 64 * CHUNK_BYTES,
+            paid_base: 0,
         };
         let mut s = healthy();
         s.requested_bytes = 64 * CHUNK_BYTES;
