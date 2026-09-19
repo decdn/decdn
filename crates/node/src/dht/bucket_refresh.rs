@@ -57,7 +57,7 @@ pub const BUCKET_REFRESH_TICK: Duration = Duration::from_hours(1);
 /// of whether any bucket was populated, so it tracks "the refresh task is
 /// alive and ran at T" rather than "a bucket received fresh entries".
 ///
-/// Each pass also counts its failed `FindNode` RPCs into
+/// Each pass also counts its failed bucket refreshes into
 /// `decdn_dht_bucket_refresh_failures_total` and publishes the table's size
 /// as `decdn_dht_routing_table_size`.
 pub async fn run_bucket_refresh(
@@ -127,7 +127,9 @@ fn now_us() -> u64 {
 /// peer, target) tuples under a single short lock acquire, then fans
 /// the network requests out in parallel.
 ///
-/// Returns how many `FindNode` RPCs failed.
+/// Returns how many bucket refreshes failed: a `FindNode` RPC error, a
+/// routing-table peer that is not a valid public key, or a panicked refresh
+/// task.
 async fn refresh_all_non_empty_buckets(
     endpoint: &Endpoint,
     self_node_id: NodeId,

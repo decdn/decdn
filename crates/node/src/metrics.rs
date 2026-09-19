@@ -1490,8 +1490,9 @@ pub struct DecdnMetrics {
     /// `decdn_dht_routing_table_size`: distinct entries in the local Kademlia
     /// routing table, set after bootstrap and on every bucket-refresh tick.
     pub dht_routing_table_size: Gauge,
-    /// `decdn_dht_bucket_refresh_failures_total`: bucket-refresh `FIND_NODE`
-    /// RPCs that failed.
+    /// `decdn_dht_bucket_refresh_failures_total`: bucket refreshes that failed:
+    /// a `FIND_NODE` RPC error, a routing-table peer that is not a valid public
+    /// key, or a panicked refresh task.
     pub dht_bucket_refresh_failures: Counter,
     /// `decdn_dht_bootstrap_find_node_failures_total`: bootstrap `FIND_NODE`
     /// RPCs against a seed that failed.
@@ -2632,7 +2633,7 @@ recorders! {
     dht_store_published(count: u64) => dht_store_published.inc_by(count);
     /// Publish the routing table's entry count.
     dht_routing_table_size(entries: usize) => dht_routing_table_size.set(sat(entries));
-    /// A bucket-refresh `FIND_NODE` RPC failed.
+    /// A bucket refresh failed.
     dht_bucket_refresh_failure => dht_bucket_refresh_failures.inc();
     /// `count` bootstrap `FIND_NODE` RPCs against seeds failed.
     dht_bootstrap_find_node_failures(count: u64) => dht_bootstrap_find_node_failures.inc_by(count);

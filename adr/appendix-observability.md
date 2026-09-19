@@ -190,7 +190,7 @@ Per [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) (`cd
 | `decdn_dht_findvalue_queries_total` | Counter | R | live | — | DHT FIND_VALUE lookups this node ran to discover providers. |
 | `decdn_dht_lookup_round_timeouts_total` | Counter | R | live | — | Lookup rounds that hit the round timeout and aborted their in-flight RPCs. |
 | `decdn_dht_routing_table_size` | Gauge | R | live | — | Distinct entries in the local Kademlia routing table, set after bootstrap and on every bucket-refresh tick. |
-| `decdn_dht_bucket_refresh_failures_total` | Counter | R | live | — | Bucket-refresh `FIND_NODE` RPCs that failed. |
+| `decdn_dht_bucket_refresh_failures_total` | Counter | R | live | — | Bucket refreshes that failed: a `FIND_NODE` RPC error, a routing-table peer that is not a valid public key, or a panicked refresh task. |
 | `decdn_dht_bootstrap_find_node_failures_total` | Counter | R | live | — | Bootstrap `FIND_NODE` RPCs against a seed that failed. |
 | `decdn_dht_rate_limit_rejected_per_peer_total` | Counter | R | live | — | DHT requests shed by the per-peer token bucket. |
 | `decdn_dht_rate_limit_rejected_per_ip_total` | Counter | R | live | — | DHT requests shed by the per-IP token bucket. |
