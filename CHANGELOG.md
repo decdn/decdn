@@ -28,6 +28,20 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Cache: `Origin::fetch_range` is now the data-only `Origin::fetch_range_data`
+  (#2065).** The outboard comes from `Origin::fetch_outboard`, read once per fill.
+  A custom `Origin` that overrode `fetch_range` must implement both methods;
+  overriding only one silently disables range pulls. `CacheEngine::origin_encode_range`
+  is now the streaming `CacheEngine::origin_range_wire`, which takes that one
+  outboard.
+- **Node: every authorized `cdn/client/v1` cache miss — whole blob, bounded range,
+  resumed tail — streams through the two-leg serve-miss spine (#2060).** The buffered
+  `try_range_pull_through` tier and `CacheEngine::pull_through_range` /
+  `RangePullOutcome` are deleted: the node signs `StreamResponse` before the first
+  origin draw and never holds a requested span in memory. `FillRegistry::claim`
+  attaches a request to a live fill only when the request starts at or behind that
+  fill's paid frontier (#2062).
+
 - **Contracts: the Balancer V3 buyback venue is deleted; Uniswap V3 is the sole
   canonical TOKEN/USDC POL and buyback venue (#2043).** `BuybackBurnerBalancerV3`, the
   three `IBalancerV3*` interfaces, `IBalancerV3PoolCreation`, `IPermit2` (Permit2 was
@@ -721,6 +735,20 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Cache: origin range pulls held the whole requested span in memory — twice
+  (#2065).** A few multi-GB range requests against a partially held blob OOM-killed
+  the node. `CacheEngine::pull_through_range` now reads the `{H}.obao4` outboard once
+  and fetches, verifies, and imports the span in `RANGE_PULL_WINDOW_BYTES` (4 MiB)
+  windows, so a pull holds `O(window + outboard)` bytes whatever `byte_len` is. The
+  own-origin serve-miss (Flow A) streams its wire the same way:
+  `CacheEngine::origin_range_wire` runs one coherent encode over on-demand windows
+  behind a bounded channel and ends a faulted wire with one terminal `Err` — a window
+  that fails verification against `H` is still a hard `VerifyFailed`, and a panicked
+  or cancelled encode is an `OriginError`, never a clean end. Each path runs at most
+  `MAX_CONCURRENT_RANGE_PULLS` (4) origin range pulls at once, from separate pools so
+  a long range pull never stalls a committed own-origin serve; a pull past the bound
+  waits rather than degrading to a whole-blob pull. See the `Origin::fetch_range_data`
+  entry under Changed (BREAKING).
 - **`DecdnWatcherTaskPanicked` could never evaluate.** Its expr was
   `rate({__name__=~"decdn_.+_task_panicked_total"}[10m]) > 0`, and `rate()` drops
   `__name__`, so the five per-watcher series on a node collapsed to five identical

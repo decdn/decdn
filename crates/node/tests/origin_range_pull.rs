@@ -6,7 +6,7 @@
 //! the requested span's missing chunk groups from origin — not the whole blob —
 //! bao-verify each group against the content address as it lands, and stream
 //! the correct bytes back to the paying client. The engine machinery
-//! (`origin_encode_range` / `export_bao_range_stream`) and the origin adapters
+//! (`origin_range_wire` / `export_bao_range_stream`) and the origin adapters
 //! are unit-tested in `decdn-cache`; these tests exercise the full protocol path
 //! through the [`ClientHandler`].
 //!
@@ -950,7 +950,7 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
 }
 
 /// Parse an inclusive-end HTTP byte-range header (`bytes=START-END`, the shape
-/// `HttpOrigin::fetch_range` emits) into `(start, end_inclusive)`.
+/// `HttpOrigin::fetch_range_data` emits) into `(start, end_inclusive)`.
 fn parse_byte_range(h: &str) -> Option<(u64, u64)> {
     let (a, b) = h.strip_prefix("bytes=")?.split_once('-')?;
     Some((a.parse().ok()?, b.parse().ok()?))
@@ -2034,7 +2034,7 @@ async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<(
 /// SERVE-LEVEL NO-HANG: an origin fetch failure on the own-origin serve-miss path
 /// must FAIL the serve, not hang it. Dispatch confirms serviceability (origin size +
 /// published outboard both succeed) and signs `ok:true`, but the ranged data GET the
-/// local pull leg draws returns `500` — so `origin_encode_range` errors, the pull
+/// local pull leg draws returns `500` — so `origin_range_wire` errors, the pull
 /// leg records a terminal `pull_result`/`pull_ended`, and the serve leg races that
 /// terminal against its present-range watch and FAILS the gap it is waiting on. The
 /// client must see a delivery error / stream reset, never a clean whole blob.
@@ -2067,7 +2067,7 @@ async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Res
         .mount(&server)
         .await;
     // (3) the ranged data GET the local pull leg draws FAILS with a 500. The pull
-    //     leg's `origin_encode_range` errors; this is a local-origin fault, so the
+    //     leg's `origin_range_wire` errors; this is a local-origin fault, so the
     //     serve must terminate with an error rather than wait forever.
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))

@@ -268,7 +268,7 @@ impl Origin for FilesystemOrigin {
         })
     }
 
-    fn fetch_range(
+    fn fetch_range_data(
         &self,
         hash: Hash,
         req: OriginRangeRequest,
@@ -352,10 +352,11 @@ impl Origin for FilesystemOrigin {
     ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
             let obao4_path = self.obao4_path_for(hash);
-            // Check the on-disk length via `metadata()` before reading, same
-            // rationale as `fetch_range`'s outboard sub-fetch: a wildly
+            // Check the on-disk length via `metadata()` before reading: a wildly
             // oversized `.obao4` is malformed/foreign, and reading it first
-            // would buffer the whole thing into memory only to reject it.
+            // would buffer the whole thing into memory only to reject it (an
+            // OOM lever for a hostile sibling). Degrade — never a failure; the
+            // engine's outboard length check is the load-bearing reject.
             match tokio::fs::metadata(&obao4_path).await {
                 Ok(meta) if meta.len() > outboard_max_bytes => {
                     return Ok(OutboardFetch::Unsupported);
@@ -402,7 +403,7 @@ impl Origin for FilesystemOrigin {
             // The local data object's on-disk length IS the canonical blob size
             // (filesystem origins never compress), so a `metadata()` stat is an
             // exact, body-free answer. Resolve + contain the path exactly as
-            // `fetch` / `fetch_range` do so a symlink escape is a permanent
+            // `fetch` / `fetch_range_data` do so a symlink escape is a permanent
             // failure, not a silent read outside `base`.
             let path = self.path_for(hash);
             let canonical = match tokio::fs::canonicalize(&path).await {
@@ -917,10 +918,9 @@ mod tests {
         Ok(())
     }
 
-    /// A blob with a published `{hex}.obao4` range-fetches: the aligned span
-    /// comes back exactly, plus the full outboard.
+    /// A ranged data fetch returns exactly the aligned span.
     #[tokio::test]
-    async fn fetch_range_returns_the_span() -> anyhow::Result<()> {
+    async fn fetch_range_data_returns_span() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let origin = FilesystemOrigin::new(tmp.path()).await?;
         let canonical = tokio::fs::canonicalize(tmp.path()).await?;
@@ -933,7 +933,7 @@ mod tests {
             fetch_start: 16 * 1024,
             fetch_end: 48 * 1024,
         };
-        match origin.fetch_range(hash, req).await? {
+        match origin.fetch_range_data(hash, req).await? {
             OriginRangeFetch::Ranged { data } => {
                 anyhow::ensure!(
                     data.as_ref() == payload.get(16 * 1024..48 * 1024).unwrap_or_default(),
@@ -942,6 +942,42 @@ mod tests {
             }
             other => anyhow::bail!("expected Ranged, got {other:?}"),
         }
+        Ok(())
+    }
+
+    /// A missing data object, or one shorter than the requested span (a stale
+    /// origin copy), degrades to `Unsupported`, never an error.
+    #[tokio::test]
+    async fn fetch_range_data_missing_or_short_object_is_unsupported() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+        let absent = Hash::new(b"no-such-object");
+        let req = OriginRangeRequest {
+            fetch_start: 0,
+            fetch_end: 16 * 1024,
+        };
+        anyhow::ensure!(
+            matches!(
+                origin.fetch_range_data(absent, req).await?,
+                OriginRangeFetch::Unsupported
+            ),
+            "missing object must degrade",
+        );
+
+        let payload = vec![7u8; 32 * 1024];
+        let hash = seed_blob_with_outboard(&canonical, &payload).await?;
+        let past_end = OriginRangeRequest {
+            fetch_start: 16 * 1024,
+            fetch_end: 48 * 1024,
+        };
+        anyhow::ensure!(
+            matches!(
+                origin.fetch_range_data(hash, past_end).await?,
+                OriginRangeFetch::Unsupported
+            ),
+            "a short read must degrade",
+        );
         Ok(())
     }
 
@@ -988,11 +1024,32 @@ mod tests {
         Ok(())
     }
 
+    /// An oversize sibling outboard (beyond `outboard_max_bytes`) degrades
+    /// rather than buffering — a hostile/foreign `{H}.obao4` can't force a huge
+    /// read.
+    #[tokio::test]
+    async fn fetch_outboard_oversize_is_unsupported() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+        let payload = vec![3u8; 64 * 1024];
+        let hash = seed_blob_with_outboard(&canonical, &payload).await?;
+        // Cap the outboard read at 1 byte — the real outboard is larger.
+        anyhow::ensure!(
+            matches!(
+                origin.fetch_outboard(hash, 1).await?,
+                OutboardFetch::Unsupported
+            ),
+            "oversize outboard must degrade",
+        );
+        Ok(())
+    }
+
     /// OOM guard: a multi-megabyte `{H}.obao4` against a tiny cap must degrade
     /// via the `metadata()` length pre-check, BEFORE `tokio::fs::read` buffers
     /// the whole file into memory.
     #[tokio::test]
-    async fn fetch_outboard_oversize_is_rejected_before_read() -> anyhow::Result<()> {
+    async fn fetch_outboard_oversize_rejected_before_read() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let origin = FilesystemOrigin::new(tmp.path()).await?;
         let canonical = tokio::fs::canonicalize(tmp.path()).await?;

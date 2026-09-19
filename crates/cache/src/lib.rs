@@ -4,9 +4,9 @@
 //! points ([`engine::CacheEngine::get`] / `populate`) fetch from a configured
 //! [`Origin`] backend on a cache miss, verify the BLAKE3 hash, and insert the
 //! bytes before returning them to the caller. The streaming entry points do
-//! not buffer whole-blob first: [`engine::CacheEngine::origin_encode_range`]
-//! encodes one verified sub-range per draw for the node's two-leg serve-miss
-//! spine. Node-to-node pull-through is one
+//! not buffer whole-blob first: [`engine::CacheEngine::origin_range_wire`]
+//! streams one verified sub-range per draw, window by window, for the node's
+//! two-leg serve-miss spine. Node-to-node pull-through is one
 //! such backend — the
 //! `node` crate supplies an [`Origin`] (`NodeOrigin`, #831) that pays a peer
 //! over `cdn/client/v1` — so this crate needs no knowledge of the paid path.
@@ -22,6 +22,7 @@ pub mod fill_session;
 pub mod metrics;
 pub mod origin;
 pub mod origin_probe;
+pub mod origin_range;
 pub mod policy;
 pub mod probe_hold;
 pub mod range_pull;
@@ -61,6 +62,7 @@ pub use origin::{
     FilesystemOrigin, HttpOrigin, Origin, OriginFetch, OriginRangeFetch, OriginRangeRequest,
     OutboardFetch, S3Credentials, S3Origin, S3OriginConfig,
 };
+pub use origin_range::{MAX_CONCURRENT_RANGE_PULLS, OriginRangeWire, RANGE_PULL_WINDOW_BYTES};
 pub use policy::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AlwaysAdmit, EvictionContext,
     EvictionPlan, EvictionPolicy, FrequencyEstimator, LruEviction, Segment,

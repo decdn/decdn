@@ -739,7 +739,7 @@ impl Origin for S3Origin {
         })
     }
 
-    fn fetch_range(
+    fn fetch_range_data(
         &self,
         hash: Hash,
         req: OriginRangeRequest,
@@ -770,9 +770,8 @@ impl Origin for S3Origin {
             {
                 Ok(r) => r,
                 // Reuse the headers-phase classifier. A `NotFound` here is the
-                // data object disappearing between the outboard read and this
-                // read — degrade rather than error (whole-blob pull surfaces
-                // the real `NotFound`).
+                // data object missing or deleted mid-pull — degrade rather than
+                // error (whole-blob pull surfaces the real `NotFound`).
                 Err(e) => match classify_get_object_error(e, &log_target)? {
                     // `classify_get_object_error` only ever produces
                     // `NotFound` for an `Err` input; `Found` and
@@ -884,7 +883,7 @@ impl Origin for S3Origin {
             };
             // A `Content-Encoding` object advertises the *encoded* length here,
             // not the canonical blob size — degrade to unknown, consistent with
-            // `fetch_range` refusing compressed ranges.
+            // `fetch_range_data` refusing compressed ranges.
             if resp
                 .content_encoding()
                 .is_some_and(|e| !e.trim().is_empty())

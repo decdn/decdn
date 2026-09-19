@@ -483,7 +483,7 @@ impl ClientHandler {
     /// running the two decoupled serve-miss legs — the LOCAL twin
     /// of [`Self::serve_via_window_pull_through`] with every paid-upstream axis
     /// stripped. The local pull leg fetches + verifies + stores each missing range
-    /// straight out of this node's origin ([`decdn_cache::CacheEngine::origin_encode_range`]
+    /// straight out of this node's origin ([`decdn_cache::CacheEngine::origin_range_wire`]
     /// behind a [`crate::node_origin::BackendSource`]) while the serve leg streams
     /// the filling cache to the paying client; there is no counterparty, no channel,
     /// and no payment on the ingest side, so no discovery, no `PeerSource`, no
