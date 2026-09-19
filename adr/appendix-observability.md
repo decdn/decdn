@@ -301,6 +301,38 @@ Metrics cover aggregates; structured logs cover per-event detail. Logs complemen
 - `level` — log level
 - `target` — Rust module path
 
+**Field names.** One concept has one field name on every event:
+
+- `error` — the error value. A pre-commit hook rejects `err` and the `%err` shorthand.
+- `peer` — a remote iroh NodeId, as lowercase hex. The DHT `NodeId` and `iroh::PublicKey` print the same string.
+- `hash` — a content hash, as lowercase hex.
+- `tx` — a transaction hash.
+
+**Peer-triggered warnings.** A remote peer can fire some `WARN` lines at any rate: a bad client binding, a request with no binding, a request on an unknown lane, a bad probe request. Each of these lines passes a per-cause throttle. The throttle admits one line per window and counts the lines it drops. The admitted line carries `peer` and `suppressed`.
+
+### Trace Spans
+
+The node exports spans over OTLP when `observability.otlp_endpoint` is set. The export filter is separate from the log filter. It admits `INFO` spans from the deCDN crates only, so a change to `log_level` does not change the traces. A span covers one stream, pull, lookup, or transaction. No span covers a single frame.
+
+| Span | Covers | Fields |
+|------|--------|--------|
+| `serve_stream` | One inbound `cdn/client/v1` stream | `peer`, `local_node_id`, `hash`, `pool_id`, `byte_offset`, `byte_len`, `direction`, `outcome`, `reason`, `bytes` |
+| `pull_through` | One cache-fill tier for a serve miss | `tier`, `hash`, `outcome` |
+| `origin_pull` | One walk of the origin chain | `hash`, `local_only` |
+| `origin_range_pull` | One ranged pull from the origin chain | `hash`, `byte_offset`, `byte_len` |
+| `node_pull` | One node-to-node pull, over every candidate | `hash`, `outcome` |
+| `upstream_stream` | One paid pull from one candidate | `peer`, `local_node_id`, `hash`, `pool_id`, `direction`, `outcome` |
+| `open_progressive_pull` | The dial and handshake of one pulled range | `peer`, `local_node_id`, `hash`, `pool_id`, `byte_offset`, `byte_len` |
+| `dht_lookup` | One `FIND_VALUE` lookup | `hash`, `rounds`, `providers` |
+| `redeem_cycle` | One submission pass of the redeemer | `chunks`, `strict_flush` |
+| `onchain_tx` | One `redeemMany` from send to receipt | `op`, `depth`, `voucher_count`, `tx`, `outcome` |
+
+A miss nests as `serve_stream` → `pull_through` → `origin_pull` → `node_pull` → `upstream_stream` → `open_progressive_pull`.
+
+**Correlation across nodes.** No trace context crosses the wire. A peer controls what it sends, so a remote trace parent would let it set this node's sampling decision. Instead, both ends of a transfer record the same fields in the same format. The requester's `open_progressive_pull` and the server's `serve_stream` share `hash`, `pool_id` and `byte_offset`, and each side's `local_node_id` is the other side's `peer`. One TraceQL query finds both spans.
+
+The span-metrics generator derives latency from span durations, so the exporter has no histograms. Use the span name and `outcome` as its dimensions. Do not use `hash` or `peer`, because each value makes a new series.
+
 ### Canonical Metric Name Cross-Reference
 
 Each metric series has one canonical `decdn_`-prefixed name; informal short names map to it below. **Instrumentation names only** — no wire protocol or on-chain surface.

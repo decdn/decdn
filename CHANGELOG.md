@@ -1739,6 +1739,17 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Tracing: deCDN emits its own spans.** Each inbound client stream is a
+  `serve_stream` span with its `outcome` (`completed`, `refused`, `stopped`,
+  `reset`, `failed`), `reason` and `bytes`. A cache miss nests `pull_through`,
+  `origin_pull`, `node_pull`, `upstream_stream` and `open_progressive_pull`
+  under it. `dht_lookup`, `redeem_cycle` and `onchain_tx` cover discovery and
+  settlement. Both ends of a transfer record the same `hash`, `pool_id`,
+  `byte_offset`, `peer` and `local_node_id`, so one TraceQL query finds both
+  sides. No trace context crosses the wire. The span export no longer follows
+  `log_level`; it exports `INFO` spans from the deCDN crates, and the OTLP
+  resource carries `service.version`. The node dashboard gains a deCDN
+  operation latency panel ([appendix-observability](adr/appendix-observability.md#trace-spans)).
 - **CLI: `-v` / `-vv` / `-vvv` turn on client-side logging** at `info` /
   `debug` / `trace`. `--log-level` wins over the count, and `RUST_LOG` wins over
   both.

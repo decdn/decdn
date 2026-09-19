@@ -17,31 +17,13 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use crate::{metrics, runtime};
 
 /// Run the deCDN node with resolved configuration.
-#[expect(
-    clippy::print_stderr,
-    reason = "runs before the tracing subscriber is initialized"
-)]
 pub async fn run(
     config_path: Option<&std::path::Path>,
     run_args: &cli::RunArgs,
 ) -> anyhow::Result<()> {
     let (resolved, notices) = config::resolve_config(config_path, run_args)?;
 
-    // Initialize tracing — RUST_LOG env var takes precedence over resolved log level,
-    // for the whole life of the process (see `reload_directive`).
-    let (filter, rust_log_pinned) = match tracing_subscriber::EnvFilter::try_from_default_env() {
-        Ok(f) => (f, true),
-        Err(e) => {
-            // Only warn if RUST_LOG was actually set (not just absent).
-            if std::env::var_os("RUST_LOG").is_some() {
-                eprintln!("warning: ignoring malformed RUST_LOG: {e}");
-            }
-            (
-                tracing_subscriber::EnvFilter::new(resolved.observability.log_level.to_string()),
-                false,
-            )
-        }
-    };
+    let (filter, rust_log_pinned) = startup_log_filter(&resolved);
 
     // Built before tracing so the OTLP exporter counts into the registry
     // `/metrics` serves.
@@ -95,6 +77,31 @@ pub async fn run(
     result
 }
 
+/// The startup log filter, and whether it came from `RUST_LOG`.
+///
+/// `RUST_LOG` takes precedence over the resolved log level, for the whole life
+/// of the process (see [`reload_directive`]). A malformed `RUST_LOG` falls back
+/// to the resolved level with a warning on stderr.
+#[expect(
+    clippy::print_stderr,
+    reason = "runs before the tracing subscriber is initialized"
+)]
+fn startup_log_filter(resolved: &config::ResolvedConfig) -> (tracing_subscriber::EnvFilter, bool) {
+    match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(f) => (f, true),
+        Err(e) => {
+            // Only warn if RUST_LOG was actually set (not just absent).
+            if std::env::var_os("RUST_LOG").is_some() {
+                eprintln!("warning: ignoring malformed RUST_LOG: {e}");
+            }
+            (
+                tracing_subscriber::EnvFilter::new(resolved.observability.log_level.to_string()),
+                false,
+            )
+        }
+    }
+}
+
 /// Initialize the tracing subscriber with a fmt layer, plus an OTLP span
 /// export layer when `observability.otlp_endpoint` is set.
 ///
@@ -122,12 +129,12 @@ fn init_tracing(
     };
 
     // Wrap the EnvFilter in a `reload::Layer` so the SIGHUP reload path
-    // can swap it without rebuilding the rest of the subscriber stack.
+    // can swap it without rebuilding the rest of the subscriber stack. It
+    // filters the fmt layer only: span export has its own fixed filter
+    // (`otlp::otel_layer`), so lowering the log level never drops traces.
     let (reload_filter, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
 
-    let registry = tracing_subscriber::registry()
-        .with(reload_filter)
-        .with(fmt_layer);
+    let registry = tracing_subscriber::registry().with(fmt_layer.with_filter(reload_filter));
 
     let tracer_provider = if let Some(ref endpoint) = resolved.observability.otlp_endpoint {
         let provider = otlp::init_otlp_provider(endpoint, node_metrics)?;
@@ -189,5 +196,55 @@ mod tests {
             );
             assert_eq!(reload_directive(false, lvl), Some(lvl.to_string()));
         }
+    }
+
+    /// The reload handle still swaps the level when the `EnvFilter` is a
+    /// per-layer filter on the fmt layer (the `init_tracing` shape), not a
+    /// global layer: a debug event is dropped at `info` and written after the
+    /// swap to `debug`.
+    #[test]
+    fn per_layer_reload_filter_applies_a_new_level() -> anyhow::Result<()> {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .map_err(|_| std::io::Error::other("poisoned"))?
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let (filter, handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_filter(filter),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tracing::debug!("before the swap");
+        handle.modify(|f| *f = tracing_subscriber::EnvFilter::new("debug"))?;
+        tracing::debug!("after the swap");
+
+        let logs = String::from_utf8(
+            buf.0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?
+                .clone(),
+        )?;
+        anyhow::ensure!(!logs.contains("before the swap"), "logs: {logs}");
+        anyhow::ensure!(logs.contains("after the swap"), "logs: {logs}");
+        Ok(())
     }
 }

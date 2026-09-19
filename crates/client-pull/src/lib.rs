@@ -2338,7 +2338,26 @@ impl std::fmt::Debug for UpstreamPull {
 /// compute the same next cumulative `amount` independently and collide
 /// (`AmountRegression`, #1145 review). The caller reads what to
 /// persist from it — including after a drop — via [`PoolLedger::settlement`].
+///
+/// Runs inside an `open_progressive_pull` span that covers the dial and the
+/// signed-response handshake — the time to first byte. Its `hash`, `pool_id`,
+/// `byte_offset`, `peer` and `local_node_id` fields match the serving node's
+/// `serve_stream` span, with `peer` and `local_node_id` swapped.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "open_progressive_pull",
+    skip_all,
+    err(Display, level = "debug"),
+    fields(
+        otel.kind = "client",
+        peer = %target.id,
+        local_node_id = %endpoint.id(),
+        hash = %decdn_protocol::ContentHash::from_bytes(hash),
+        pool_id = %ctx.pool_id,
+        byte_offset,
+        byte_len,
+    )
+)]
 pub async fn open_progressive_pull(
     endpoint: &Endpoint,
     target: EndpointAddr,

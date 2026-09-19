@@ -105,7 +105,7 @@ impl ClientHandler {
         req: &StreamRequest,
         reason: ServeRejectReason,
         rate_per_mb: u64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<super::outcome::ServeEnd> {
         match reason {
             ServeRejectReason::EvictedSinceProbe => {
                 self.metrics.serve_stream_rejected_evicted_since_probe();
@@ -157,7 +157,7 @@ impl ClientHandler {
         let (resp, resp_ext) = self.sign_response(body, Some(error))?;
         self.write_stream_response(send, &resp, &resp_ext).await?;
         let _ = send.finish();
-        Ok(())
+        Ok(super::outcome::ServeEnd::Refused(reason))
     }
 
     /// Write a mid-stream `StreamError { VoucherRejected }` and finish the

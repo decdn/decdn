@@ -70,6 +70,7 @@ use crate::warn_throttle::WarnThrottle;
 mod delivery;
 mod dispatch;
 mod fill;
+mod outcome;
 mod serve_encoder;
 mod serve_leg;
 mod voucher;
@@ -799,6 +800,17 @@ enum FillOutcome {
     /// node is broken" would steer clients off a perfectly healthy node forever
     /// over one oversized blob.
     HardFault,
+}
+
+impl FillOutcome {
+    /// The `outcome` value a `pull_through` span records.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Filled => "filled",
+            Self::CleanMiss => "clean_miss",
+            Self::HardFault => "hard_fault",
+        }
+    }
 }
 
 impl FillOutcome {

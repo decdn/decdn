@@ -47,7 +47,7 @@ use indexmap::IndexMap;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use rand::seq::SliceRandom;
 use tokio::task::JoinSet;
-use tracing::{debug, warn};
+use tracing::{Instrument as _, debug, warn};
 
 use crate::dht::client;
 use crate::dht::negative_cache::{Hash, NegativeProbeCache};
@@ -133,7 +133,19 @@ impl Default for LookupConfig {
 // One argument over the threshold, and every one of them is a distinct collaborator the
 // lookup genuinely needs. Bundling them into a struct would move the same list one level out
 // without making any call site clearer.
+///
+/// Runs inside a `dht_lookup` span that records the `rounds` run and the
+/// `providers` found; each round's per-peer RPCs run inside it too.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "dht_lookup",
+    skip_all,
+    fields(
+        hash = %target,
+        rounds = tracing::field::Empty,
+        providers = tracing::field::Empty,
+    )
+)]
 pub async fn find_providers(
     endpoint: &Endpoint,
     routing_table: &Arc<Mutex<RoutingTable>>,
@@ -154,6 +166,7 @@ pub async fn find_providers(
     };
     let mut state = LookupState::new(routing_table, &target, requester_id, cfg);
 
+    let mut rounds_run: u32 = 0;
     for round in 0..MAX_LOOKUP_ROUNDS {
         if state.have_enough_providers() {
             break;
@@ -162,6 +175,7 @@ pub async fn find_providers(
         if batch.is_empty() {
             break;
         }
+        rounds_run = rounds_run.saturating_add(1);
         let observed_closer = run_round(&ctx, &batch, &mut state).await;
         if !observed_closer {
             break;
@@ -190,7 +204,11 @@ pub async fn find_providers(
         }
     }
 
-    state.into_randomised_providers()
+    let providers = state.into_randomised_providers();
+    let span = tracing::Span::current();
+    span.record("rounds", rounds_run);
+    span.record("providers", providers.len());
+    providers
 }
 
 /// Per-peer error category surfaced by a single RPC attempt within a
@@ -237,16 +255,19 @@ async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupStat
         let endpoint = ctx.endpoint.clone();
         let requester_id = ctx.requester_id;
         let target = ctx.target;
-        tasks.spawn(async move {
-            let Ok(pk) = PublicKey::from_bytes(peer.as_bytes()) else {
-                return (peer, Err(RoundRpcError::InvalidPubKey));
-            };
-            let addr = EndpointAddr::new(pk);
-            let result = client::find_value(&endpoint, addr, target, requester_id)
-                .await
-                .map_err(RoundRpcError::Transport);
-            (peer, result)
-        });
+        tasks.spawn(
+            async move {
+                let Ok(pk) = PublicKey::from_bytes(peer.as_bytes()) else {
+                    return (peer, Err(RoundRpcError::InvalidPubKey));
+                };
+                let addr = EndpointAddr::new(pk);
+                let result = client::find_value(&endpoint, addr, target, requester_id)
+                    .await
+                    .map_err(RoundRpcError::Transport);
+                (peer, result)
+            }
+            .in_current_span(),
+        );
     }
 
     let mut observed_closer = false;

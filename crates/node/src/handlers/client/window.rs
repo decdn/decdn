@@ -103,7 +103,7 @@ impl ClientHandler {
         fault_seen: bool,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<super::outcome::ServeEnd> {
         // The ADR 011 OPEN-TIME deny gates are already discharged on the only
         // path that reaches here: `serve_stream` refuses a denylisted hash
         // before the availability check, and this branch is entered only behind
@@ -493,7 +493,7 @@ impl ClientHandler {
         pool_remaining: Option<U256>,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<super::outcome::ServeEnd> {
         // Mark that the own-origin serve-miss tier fired for this request, before
         // any admission guard below — the tier-selection signal (#1130), not a
         // success signal; an early reject still counts as

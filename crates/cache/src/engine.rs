@@ -3306,6 +3306,12 @@ impl CacheEngine {
     /// so the caller falls back to a whole-blob pull (which re-surfaces the real
     /// fault if the blob is genuinely unreachable). A *missing-outboard* /
     /// *no-range* origin likewise returns [`RangePullOutcome::Unsupported`].
+    #[tracing::instrument(
+        name = "origin_range_pull",
+        skip_all,
+        err(Display, level = "debug"),
+        fields(%hash, byte_offset, byte_len)
+    )]
     pub async fn pull_through_range(
         &self,
         hash: Hash,
@@ -4545,7 +4551,18 @@ impl CacheEngine {
     /// [`FillMode::CommitOnly`] always yields `None`. Prefer the
     /// [`Self::pull_through_bytes`] / [`Self::pull_through_fill`] wrappers, which
     /// are total and hide the `Option` entirely.
-    #[allow(clippy::too_many_lines)] // One linear chain walk; each outcome arm carries the rationale for its own fallback/return decision, and splitting the match out would separate those from the loop state (`last_err`, `any_not_found`, `any_short_circuit`) they exist to explain.
+    ///
+    /// Runs inside an `origin_pull` span: one per chain walk, with the paid
+    /// node→node fallback's `node_pull` span nested inside when the walk reaches
+    /// the `Peer` origin.
+    #[allow(clippy::too_many_lines)]
+    // One linear chain walk; each outcome arm carries the rationale for its own fallback/return decision, and splitting the match out would separate those from the loop state (`last_err`, `any_not_found`, `any_short_circuit`) they exist to explain.
+    #[tracing::instrument(
+        name = "origin_pull",
+        skip_all,
+        err(Display, level = "debug"),
+        fields(%hash, local_only)
+    )]
     async fn pull_through(
         &self,
         hash: Hash,
