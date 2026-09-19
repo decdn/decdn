@@ -223,9 +223,8 @@ impl ClientHandler {
     /// serve (#1506 C3).
     ///
     /// Reuses [`CacheEngine::missing_ranges`](super::CacheEngine::missing_ranges)'s
-    /// own size contract — the same `blob_size` source
-    /// [`Self::try_range_pull_through`] resolves via
-    /// [`CacheEngine::origin_size`](super::CacheEngine::origin_size) for the
+    /// own size contract — the same `blob_size` the own-origin spine resolves
+    /// via [`CacheEngine::origin_size`](super::CacheEngine::origin_size) for the
     /// ORIGIN-backed case; here the size comes from the LOCAL store's own
     /// bitfield, since a purely local partial has no origin to probe.
     pub(super) async fn partial_hit_size(

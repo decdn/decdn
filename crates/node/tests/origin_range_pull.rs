@@ -1,20 +1,22 @@
-//! End-to-end test for origin-tier range pull-through on `cdn/client/v1`
-//! (#823, ADR 037 §Origin-tier pull-through; closes the #990 coverage gap).
+//! End-to-end tests for the own-origin two-leg serve-miss on `cdn/client/v1`
+//! (ADR 037 §Origin-tier pull-through).
 //!
-//! A `cdn/client/v1` byte-range request (`StreamRequest` with `byte_offset` /
-//! `byte_len`) against a **cold** cache must fetch only the requested span
-//! from origin — not the whole blob — bao-verify it against the content
-//! address, and assemble the correct bytes back to the paying client. The
-//! engine machinery (`pull_through_range` / `export_range`) and the origin
-//! adapters are unit-tested in `decdn-cache`; this test exercises the full
-//! protocol path through the [`ClientHandler`].
+//! A `cdn/client/v1` request of any shape (`StreamRequest` with `byte_offset` /
+//! `byte_len`) against a **cold** cache must sign its response first, fetch only
+//! the requested span's missing chunk groups from origin — not the whole blob —
+//! bao-verify each group against the content address as it lands, and stream
+//! the correct bytes back to the paying client. The engine machinery
+//! (`origin_encode_range` / `export_bao_range_stream`) and the origin adapters
+//! are unit-tested in `decdn-cache`; these tests exercise the full protocol path
+//! through the [`ClientHandler`].
 //!
-//! Two scenarios:
+//! Two shapes of origin:
 //! 1. The origin publishes the sibling `{H}.obao4` outboard → the handler
-//!    range-pulls (HEAD for the size, outboard GET, one `206` ranged data GET),
-//!    serves the span, and the blob stays **partial** (never a whole-blob GET).
-//! 2. The origin does NOT publish the outboard → the range pull declines and
-//!    the handler falls back to the buffered whole-blob pull, still serving the
+//!    streams (HEAD for the size, one outboard GET, `206` ranged data GETs per
+//!    draw), serves the span, and a partial request leaves the blob **partial**
+//!    (never a whole-blob GET).
+//! 2. The origin does NOT publish the outboard → the spine declines and the
+//!    handler falls back to the buffered whole-blob pull, still serving the
 //!    correct range bytes ("fallback is always correct", ADR 037).
 
 use std::sync::Arc;

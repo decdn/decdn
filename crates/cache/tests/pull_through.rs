@@ -4160,9 +4160,8 @@ async fn http_size_compressed_object_is_unknown() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn origin_size_no_origin_configured_errors() -> anyhow::Result<()> {
-    // `CacheEngine::origin_size` mirrors `pull_through_range`: with no origins
-    // it returns `NoOrigin` (a coherent "can't range-pull" signal) rather than
-    // a silent `None`.
+    // `CacheEngine::origin_size` with no origins returns `NoOrigin` (a coherent
+    // "can't range-pull" signal) rather than a silent `None`.
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open(tmp.path(), vec![], 16).await?;
     let err = err_of(engine.origin_size(Hash::new(b"x")).await)?;
