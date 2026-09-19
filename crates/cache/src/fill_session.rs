@@ -1030,14 +1030,24 @@ struct HashEntry {
 #[derive(Debug, Default)]
 pub struct FillRegistry {
     map: StdMutex<HashMap<Hash, HashEntry>>,
+    /// Cache metrics for the coalescing decisions this registry makes; `None`
+    /// in unit fixtures.
+    metrics: Option<Arc<crate::metrics::CacheMetrics>>,
 }
 
 impl FillRegistry {
-    /// An empty registry.
+    /// An empty registry with no metrics handle (unit fixtures).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_metrics(None)
+    }
+
+    /// An empty registry that reports its coalescing decisions to `metrics`.
+    #[must_use]
+    pub fn with_metrics(metrics: Option<Arc<crate::metrics::CacheMetrics>>) -> Self {
         Self {
             map: StdMutex::new(HashMap::new()),
+            metrics,
         }
     }
 
@@ -1144,7 +1154,11 @@ impl FillRegistry {
     ///
     /// `R = align_range(offset, len, total)`. On an align error or empty `R`, the
     /// caller takes the Owner path (its own fetch surfaces any out-of-bounds error).
-    /// Otherwise, over LIVE sessions, `covered_union = ⋃ covered`,
+    /// Otherwise, over LIVE sessions **whose paid frontier reaches `R`'s aligned
+    /// fetch start** (a session behind that frontier is excluded — attaching to it
+    /// would park this request on a pull that advances only as the OTHER client
+    /// pays, #2062; the exclusion trades duplicate egress for the overlap, counted
+    /// as `fill_not_coalesced`, decdn#2069 §4), `covered_union = ⋃ covered`,
     /// `attach = R ∩ covered_union`, `remainder = R − covered_union`:
     /// - `attach` empty → OWNER of the whole `R`.
     /// - `remainder` empty (a live pull covers all of `R`) → ATTACH to the
@@ -1153,8 +1167,9 @@ impl FillRegistry {
     ///   `R − sibling.covered` is ONE contiguous span → MIXED: own a pull for that
     ///   remainder, attach the sibling for the overlap.
     /// - otherwise (a multi-sibling union, or an interior overlap splitting the
-    ///   remainder in two) → OWNER of the whole `R`, the conservative fallback that
-    ///   never double-pulls or wedges. Range-serving lands the general case later.
+    ///   remainder in two) → OWNER of the whole `R`, the conservative fallback.
+    ///   It never wedges; like the frontier exclusion above it can double-pull
+    ///   an overlap a live sibling also covers.
     ///
     /// `make_session` runs under the lock only on an owning branch (never
     /// built-and-dropped on a pure attach); it does no await (a std lock) and only
@@ -1198,9 +1213,21 @@ impl FillRegistry {
                     // stalled client — the observer starves until its own stall
                     // budget expires. So such a request is not coalesced: it OWNS
                     // its own span, and the two fills coexist under the hash. A
-                    // request at or behind the frontier attaches as before; its
-                    // payments extend the shared prefix at once.
+                    // request at or behind the frontier attaches; its payments
+                    // extend the shared prefix at once.
                     if fetch_start > session.served_paid() {
+                        // The opt-out costs duplicate origin egress for the
+                        // overlap (decdn#2069 §4); count and log it so a
+                        // double-egress bill is diagnosable.
+                        if let Some(m) = &self.metrics {
+                            m.fill_not_coalesced.inc();
+                        }
+                        tracing::debug!(
+                            %hash,
+                            fetch_start,
+                            served_paid = session.served_paid(),
+                            "fill not coalesced: request starts ahead of the live fill's paid frontier",
+                        );
                         continue;
                     }
                     let covered = session.covered_ranges();

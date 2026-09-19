@@ -1343,6 +1343,7 @@ impl CacheEngine {
                 segments: Mutex::new(HashMap::new()),
                 evicted_log_path,
                 retry_policy,
+                fill_registry: Arc::new(FillRegistry::with_metrics(metrics.clone())),
                 metrics,
                 // Bounded channel — slow consumers (e.g. a republish
                 // scheduler under load) lag instead of backpressuring
@@ -1353,7 +1354,6 @@ impl CacheEngine {
                 // the lag to actually fire.
                 inserts_tx: broadcast::channel(1024).0,
                 gc_store_handle,
-                fill_registry: Arc::new(FillRegistry::new()),
                 own_origin_range_pulls: Arc::new(tokio::sync::Semaphore::new(
                     MAX_CONCURRENT_RANGE_PULLS,
                 )),
