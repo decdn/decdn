@@ -564,7 +564,7 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
             otlp_endpoint: None,
         },
         &cfg,
-        Box::new(|_| Ok(())) as LogLevelSetter,
+        Box::new(|_| Ok(decdn_node::runtime::LogLevelApply::Installed)) as LogLevelSetter,
     ));
 
     // ---- 5. Boot the real runtime.

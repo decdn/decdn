@@ -179,7 +179,7 @@ impl CursorStart {
         if let Some(cp) = self.checkpoint()
             && let Err(err) = cp.store.record_checkpoint(cp.key, block)
         {
-            warn!(err = %n(&err), key = cp.key.as_str(), block, "failed to persist watcher checkpoint");
+            warn!(error = %n(&err), key = cp.key.as_str(), block, "failed to persist watcher checkpoint");
         }
     }
 
@@ -188,7 +188,7 @@ impl CursorStart {
         if let Some(cp) = self.checkpoint()
             && let Err(err) = cp.store.flush_checkpoint(cp.key)
         {
-            warn!(err = %n(&err), key = cp.key.as_str(), "failed to flush watcher checkpoint");
+            warn!(error = %n(&err), key = cp.key.as_str(), "failed to flush watcher checkpoint");
         }
     }
 }

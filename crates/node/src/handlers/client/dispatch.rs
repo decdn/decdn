@@ -5,9 +5,9 @@ use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
     FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey, LaneSlot,
-    OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream,
-    ServeRejectReason, StreamReadError, StreamResponseBody, U256, VarInt, read_first_message,
-    reset_stream, verify_binding,
+    OwnedSemaphorePermit, PublicKey, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore,
+    SendStream, ServeRejectReason, StreamReadError, StreamResponseBody, U256, VarInt,
+    read_first_message, reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
 use std::sync::atomic::Ordering;
@@ -69,7 +69,7 @@ impl ClientHandler {
         // the fallback for its own unbound streams — no lane it cannot already
         // sign for.
         let bound_addr: Arc<ArcSwapOption<Address>> = Arc::new(ArcSwapOption::empty());
-        let client_node_id = B256::from(*conn.remote_id().as_bytes());
+        let peer = conn.remote_id();
 
         let idle_timeout = self.idle_timeout.unwrap_or(APP_IDLE_TIMEOUT);
         let mut inflight: JoinSet<anyhow::Result<()>> = JoinSet::new();
@@ -89,7 +89,7 @@ impl ClientHandler {
                             recv,
                             permit,
                             bound,
-                            client_node_id,
+                            peer,
                         )));
                     }
                     // The connection closed (client done) or errored — stop
@@ -188,8 +188,9 @@ impl ClientHandler {
         mut recv: RecvStream,
         permit: Option<OwnedSemaphorePermit>,
         bound_addr: Arc<ArcSwapOption<Address>>,
-        client_node_id: B256,
+        peer: PublicKey,
     ) -> anyhow::Result<()> {
+        let client_node_id = B256::from(*peer.as_bytes());
         let first = match read_first_message(&mut recv).await {
             Ok(first) => first,
             Err(StreamReadError { err, app_code }) => {
@@ -232,16 +233,31 @@ impl ClientHandler {
                     bound_addr.store(Some(Arc::new(recovered)));
                 }
                 Ok(recovered) => {
-                    tracing::warn!(
-                        claimed = %Address::from(addr_bytes),
-                        recovered = %recovered,
-                        "client binding signature recovered a different address"
-                    );
+                    if let Some(suppressed) = self.binding_warn.admit() {
+                        tracing::warn!(
+                            %peer,
+                            claimed = %Address::from(addr_bytes),
+                            recovered = %recovered,
+                            suppressed,
+                            interval = ?self.binding_warn.interval(),
+                            "client binding signature recovered a different address"
+                        );
+                    }
+                    self.metrics.serve_stream_rejected_bad_binding();
                     reset_stream(&mut send, &mut recv, APP_ERR_MALFORMED_MESSAGE);
                     return Ok(());
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "client binding signature invalid");
+                    if let Some(suppressed) = self.binding_warn.admit() {
+                        tracing::warn!(
+                            %peer,
+                            error = %e,
+                            suppressed,
+                            interval = ?self.binding_warn.interval(),
+                            "client binding signature invalid"
+                        );
+                    }
+                    self.metrics.serve_stream_rejected_bad_binding();
                     reset_stream(&mut send, &mut recv, APP_ERR_MALFORMED_MESSAGE);
                     return Ok(());
                 }
@@ -1142,7 +1158,14 @@ impl ClientHandler {
         // the initial `StreamResponse`, so use the delivery-side `NotFound` here
         // (avoids leaking lane existence).
         let Some(lane_key) = lane_key else {
-            tracing::warn!("stream request with no verified binding; refusing pre-serve");
+            if let Some(suppressed) = self.unbound_request_warn.admit() {
+                tracing::warn!(
+                    %peer,
+                    suppressed,
+                    interval = ?self.unbound_request_warn.interval(),
+                    "stream request with no verified binding; refusing pre-serve"
+                );
+            }
             return self
                 .respond_error(
                     &mut send,
@@ -1153,10 +1176,15 @@ impl ClientHandler {
                 .await;
         };
         let Some(lane) = known_lane else {
-            tracing::warn!(
-                ?lane_key,
-                "stream request on unknown lane; refusing pre-serve"
-            );
+            if let Some(suppressed) = self.unknown_lane_warn.admit() {
+                tracing::warn!(
+                    %peer,
+                    ?lane_key,
+                    suppressed,
+                    interval = ?self.unknown_lane_warn.interval(),
+                    "stream request on unknown lane; refusing pre-serve"
+                );
+            }
             return self
                 .respond_error(
                     &mut send,

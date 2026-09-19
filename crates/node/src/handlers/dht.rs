@@ -478,7 +478,7 @@ impl DhtHandler {
             self.metrics.dht_store_rejected_holder_mismatch();
             tracing::debug!(
                 holder = ?req.holder,
-                peer = ?peer.node_id(),
+                peer = %peer.node_id(),
                 "dht BatchStore rejected: holder != authenticated NodeId"
             );
             return Err(APP_ERR_MALFORMED_MESSAGE);
@@ -588,7 +588,7 @@ impl DhtHandler {
             self.metrics.dht_store_rejected_holder_mismatch();
             tracing::debug!(
                 holder = ?req.holder,
-                peer = ?peer.node_id(),
+                peer = %peer.node_id(),
                 "dht Store rejected: holder != authenticated NodeId"
             );
             return wire::StoreAck {

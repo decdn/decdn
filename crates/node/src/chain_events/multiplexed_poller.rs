@@ -487,7 +487,7 @@ async fn demux_window_logs(poller: &mut MultiplexedPoller, logs: Vec<Log>) {
             route.errored = true;
             warn!(
                 label = route.label,
-                err = %sanitize_err_chain(&err),
+                error = %sanitize_err_chain(&err),
                 "route sink error; isolating and re-scanning this route"
             );
         }
@@ -530,7 +530,7 @@ async fn reconcile_routes(poller: &mut MultiplexedPoller) {
         };
         if let Err(err) = reconciled {
             r.errored = true;
-            warn!(label = r.label, err = %sanitize_err_chain(&err), "route reconcile error");
+            warn!(label = r.label, error = %sanitize_err_chain(&err), "route reconcile error");
         }
     }
 }
@@ -727,7 +727,7 @@ where
             }
             Err(err) => {
                 warn!(
-                    err = %sanitize_err_chain(&err),
+                    error = %sanitize_err_chain(&err),
                     backoff_secs = backoff.as_secs(),
                     "multiplexed poller tick error; restarting after backoff"
                 );

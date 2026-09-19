@@ -600,7 +600,7 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
             match bootstrap_snapshot(&self.reads, self.operator).await {
                 Ok(snapshot) => self.state.fold_reenumeration(snapshot),
                 Err(err) => warn!(
-                    err = %sanitize_err_chain(&err),
+                    error = %sanitize_err_chain(&err),
                     "blacklist watcher: periodic re-enumeration failed; keeping the current \
                      deny-set (the live tail is still the primary path)"
                 ),
@@ -831,7 +831,7 @@ where
             recheck(contract, operator, cache, warming, state, hash).await
         }
         Err(err) => {
-            warn!(err = %err, "blacklist watcher: undecodable HashBlacklisted log");
+            warn!(error = %err, "blacklist watcher: undecodable HashBlacklisted log");
             Recheck::NoAction
         }
     }
@@ -867,7 +867,7 @@ async fn on_removed_log<P: Provider + Clone>(
                 "blacklist entry removed on-chain (local eviction stays sticky)"
             );
         }
-        Err(err) => warn!(err = %err, "blacklist watcher: undecodable HashRemoved log"),
+        Err(err) => warn!(error = %err, "blacklist watcher: undecodable HashRemoved log"),
     }
 }
 
@@ -974,7 +974,7 @@ where
         Err(err) => {
             warn!(
                 %hash,
-                err = %sanitize_err_chain(&err),
+                error = %sanitize_err_chain(&err),
                 "blacklist watcher: isHashBlacklistedForOperator failed; keeping for re-scope"
             );
             None
@@ -993,7 +993,7 @@ async fn evict(cache: &CacheEngine, warming: &Arc<WarmingAllowance>, hash: Hash)
             true
         }
         Err(err) => {
-            warn!(%hash, err = %err, "blacklist watcher: evict failed; will retry");
+            warn!(%hash, error = %err, "blacklist watcher: evict failed; will retry");
             false
         }
     }

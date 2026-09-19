@@ -23,13 +23,16 @@ use std::time::Duration;
 
 use alloy::contract::Error as ContractError;
 use alloy::network::Ethereum;
+use alloy::primitives::TxHash;
 use alloy::providers::{PendingTransactionBuilder, PendingTransactionError};
 use alloy::rpc::types::TransactionReceipt;
 
 /// Terminal outcome of one on-chain transaction: the `send` → `get_receipt` →
-/// `status` sequence folded to a single value. The `Landed`/`Reverted` receipts
-/// are carried so callers can log the transaction hash; the two error arms keep
-/// their distinct concrete types rather than being flattened.
+/// `status` sequence folded to a single value. Every arm past `.send()` carries
+/// the transaction hash (inside the receipt, or beside the error) so callers can
+/// log it: a transaction whose receipt wait failed or lapsed may still mine, and
+/// its hash is the only way to find it. The two error arms keep their distinct
+/// concrete types rather than being flattened.
 pub(crate) enum TxOutcome {
     /// Mined and succeeded (`receipt.status() == true`).
     Landed(TransactionReceipt),
@@ -38,10 +41,18 @@ pub(crate) enum TxOutcome {
     /// `.send()` failed (RPC / mempool rejection) — no transaction was issued.
     SendErr(ContractError),
     /// The transaction was issued but awaiting its receipt failed.
-    ReceiptErr(PendingTransactionError),
+    ReceiptErr {
+        /// The receipt-wait failure.
+        error: PendingTransactionError,
+        /// Hash of the issued transaction.
+        tx_hash: TxHash,
+    },
     /// The receipt wait exceeded the caller-supplied timeout. Only reachable
     /// when `receipt_timeout` is `Some`; the transaction may still mine later.
-    Timeout,
+    Timeout {
+        /// Hash of the issued transaction.
+        tx_hash: TxHash,
+    },
 }
 
 /// Drive an already-issued `.send()` to a classified [`TxOutcome`].
@@ -57,15 +68,16 @@ pub(crate) async fn send_and_await_receipt(
         Ok(pending) => pending,
         Err(err) => return TxOutcome::SendErr(err),
     };
+    let tx_hash = *pending.tx_hash();
     let receipt = match receipt_timeout {
         Some(timeout) => match tokio::time::timeout(timeout, pending.get_receipt()).await {
             Ok(Ok(receipt)) => receipt,
-            Ok(Err(err)) => return TxOutcome::ReceiptErr(err),
-            Err(_elapsed) => return TxOutcome::Timeout,
+            Ok(Err(error)) => return TxOutcome::ReceiptErr { error, tx_hash },
+            Err(_elapsed) => return TxOutcome::Timeout { tx_hash },
         },
         None => match pending.get_receipt().await {
             Ok(receipt) => receipt,
-            Err(err) => return TxOutcome::ReceiptErr(err),
+            Err(error) => return TxOutcome::ReceiptErr { error, tx_hash },
         },
     };
     if receipt.status() {

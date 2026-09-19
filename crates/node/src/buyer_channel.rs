@@ -326,7 +326,7 @@ fn retryable_join_error(
     warn!(
         %pool_id,
         %requested,
-        error = %format!("{err:#}"),
+        error = %format_args!("{err:#}"),
         "reactive top-up: the joined topUp failed; funding with our own topUp"
     );
     Ok(err)
@@ -460,7 +460,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
             warn!(
                 %pool_id,
                 %additional,
-                error = %format!("{err:#}"),
+                error = %format_args!("{err:#}"),
                 "buyer top-up: topUp failed; pool not topped up"
             );
             handles.metrics.buyer_topup_failure();
@@ -495,7 +495,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
                 %pool_id,
                 %credited,
                 %tx,
-                error = %format!("{err:#}"),
+                error = %format_args!("{err:#}"),
                 "buyer top-up: topUp landed on-chain but the local pool row could not be \
                  credited; the deposit is ESCROWED AND UNTRACKED — reconcile against the chain"
             );
@@ -683,7 +683,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         self.store.get_by_owner(self.owner).map_err(|err| {
             self.metrics.node_pull_pool_open_failure();
             error!(
-                error = %format!("{err:#}"),
+                error = %format_args!("{err:#}"),
                 "buyer pool store read failed; this node can neither open nor reuse its \
                  payment pool until the store recovers"
             );
@@ -1145,7 +1145,7 @@ async fn run_open<P: Provider + Clone>(
         }
         Ok(None) => {}
         Err(err) => {
-            error!(%err, "buyer pool store read failed under the open slot; cannot open a pool");
+            error!(error = %err, "buyer pool store read failed under the open slot; cannot open a pool");
             metrics.node_pull_pool_open_failure();
             return Err(anyhow::Error::new(err))
                 .context("look up the node's buyer pool under the open slot")
@@ -1157,7 +1157,7 @@ async fn run_open<P: Provider + Clone>(
     let opened = open_pool(contract, signer, voucher_domain, token, owner, deposit)
         .await
         .inspect_err(|err| {
-            error!(error = %format!("{err:#}"), "buyer pool open failed");
+            error!(error = %format_args!("{err:#}"), "buyer pool open failed");
             metrics.node_pull_pool_open_failure();
         })?;
 
@@ -1168,7 +1168,7 @@ async fn run_open<P: Provider + Clone>(
         error!(
             tx = %opened.tx,
             pool_id = %opened.state.pool_id,
-            %err,
+            error = %err,
             "buyer pool opened on-chain but its row could not be persisted; the deposit is \
              escrowed but UNTRACKED — reconcile against the tx"
         );
@@ -1228,7 +1228,7 @@ async fn reclaim_once<P: Provider + Clone>(
     let Some(state) = (match store.get_by_owner(owner) {
         Ok(state) => state,
         Err(err) => {
-            warn!(%err, "reclaim sweep: buyer pool store read failed");
+            warn!(error = %err, "reclaim sweep: buyer pool store read failed");
             metrics.buyer_reclaim_failure();
             return;
         }
@@ -1239,7 +1239,7 @@ async fn reclaim_once<P: Provider + Clone>(
     let pool = match contract.getPool(state.pool_id).call().await {
         Ok(pool) => pool,
         Err(err) => {
-            warn!(pool_id = %state.pool_id, error = %format!("{err:#}"), "reclaim sweep: getPool failed");
+            warn!(pool_id = %state.pool_id, error = %format_args!("{err:#}"), "reclaim sweep: getPool failed");
             metrics.buyer_reclaim_failure();
             return;
         }
@@ -1260,7 +1260,7 @@ async fn reclaim_once<P: Provider + Clone>(
         Ok(now) if now < pool.disputeDeadline => return,
         Ok(_) => {}
         Err(err) => {
-            debug!(pool_id = %state.pool_id, error = %format!("{err:#}"), "reclaim sweep: chain head read failed; attempting reclaim anyway");
+            debug!(pool_id = %state.pool_id, error = %format_args!("{err:#}"), "reclaim sweep: chain head read failed; attempting reclaim anyway");
         }
     }
 
@@ -1274,7 +1274,7 @@ async fn reclaim_once<P: Provider + Clone>(
                 // still reads healthy, so meter it like the sibling arms
                 // instead of dropping out of the sweep silently.
                 if let Err(err) = store.forget_if_pool(owner, state.pool_id) {
-                    warn!(pool_id = %state.pool_id, %err, "reclaim sweep: forget after reclaim failed");
+                    warn!(pool_id = %state.pool_id, error = %err, "reclaim sweep: forget after reclaim failed");
                     metrics.buyer_reclaim_failure();
                     return;
                 }
@@ -1285,12 +1285,12 @@ async fn reclaim_once<P: Provider + Clone>(
                 metrics.buyer_reclaim_failure();
             }
             Err(err) => {
-                warn!(pool_id = %state.pool_id, error = %format!("{err:#}"), "reclaim sweep: reclaim receipt failed");
+                warn!(pool_id = %state.pool_id, error = %format_args!("{err:#}"), "reclaim sweep: reclaim receipt failed");
                 metrics.buyer_reclaim_failure();
             }
         },
         Err(err) => {
-            warn!(pool_id = %state.pool_id, error = %format!("{err:#}"), "reclaim sweep: reclaim submit failed");
+            warn!(pool_id = %state.pool_id, error = %format_args!("{err:#}"), "reclaim sweep: reclaim submit failed");
             metrics.buyer_reclaim_failure();
         }
     }

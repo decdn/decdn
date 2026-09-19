@@ -566,7 +566,7 @@ impl LogSink for PoolSettlementSink {
                 let event = match PaymentPool::PoolOpened::decode_log_data(&log.inner.data) {
                     Ok(event) => event,
                     Err(err) => {
-                        warn!(%err, "skipping undecodable PoolOpened log");
+                        warn!(error = %err, "skipping undecodable PoolOpened log");
                         return Ok(());
                     }
                 };
@@ -578,7 +578,7 @@ impl LogSink for PoolSettlementSink {
                 let event = match PaymentPool::PoolRedeemed::decode_log_data(&log.inner.data) {
                     Ok(event) => event,
                     Err(err) => {
-                        warn!(%err, "skipping undecodable PoolRedeemed log");
+                        warn!(error = %err, "skipping undecodable PoolRedeemed log");
                         return Ok(());
                     }
                 };
@@ -614,7 +614,7 @@ impl LogSink for PoolSettlementSink {
                     if let Err(err) = self.store.set_paid_cumulative(key, paid_cumulative) {
                         self.metrics.watcher_persist_failure();
                         warn!(
-                            %err,
+                            error = %err,
                             pool_id = %event.poolId,
                             signer = %lane.signer,
                             "failed to persist lane paid watermark; in-memory cache updated, \
@@ -633,7 +633,7 @@ impl LogSink for PoolSettlementSink {
                 let event = match PaymentPool::PoolToppedUp::decode_log_data(&log.inner.data) {
                     Ok(event) => event,
                     Err(err) => {
-                        warn!(%err, "skipping undecodable PoolToppedUp log");
+                        warn!(error = %err, "skipping undecodable PoolToppedUp log");
                         return Ok(());
                     }
                 };
@@ -650,7 +650,7 @@ impl LogSink for PoolSettlementSink {
                 {
                     Ok(event) => event,
                     Err(err) => {
-                        warn!(%err, "skipping undecodable PoolCloseInitiated log");
+                        warn!(error = %err, "skipping undecodable PoolCloseInitiated log");
                         return Ok(());
                     }
                 };
@@ -669,7 +669,7 @@ impl LogSink for PoolSettlementSink {
                 let event = match PaymentPool::PoolReclaimed::decode_log_data(&log.inner.data) {
                     Ok(event) => event,
                     Err(err) => {
-                        warn!(%err, "skipping undecodable PoolReclaimed log");
+                        warn!(error = %err, "skipping undecodable PoolReclaimed log");
                         return Ok(());
                     }
                 };
@@ -698,7 +698,7 @@ impl PoolSettlementSink {
         let states = match self.store.load_all() {
             Ok(s) => s,
             Err(err) => {
-                warn!(%err, %pool_id, "top-up re-drive: failed to load lane state");
+                warn!(error = %err, %pool_id, "top-up re-drive: failed to load lane state");
                 return;
             }
         };
@@ -716,7 +716,7 @@ impl PoolSettlementSink {
         let states = match self.store.load_all() {
             Ok(s) => s,
             Err(err) => {
-                warn!(%err, %pool_id, "reclaim cleanup: failed to load lane state");
+                warn!(error = %err, %pool_id, "reclaim cleanup: failed to load lane state");
                 return;
             }
         };
@@ -727,7 +727,7 @@ impl PoolSettlementSink {
             let key = st.key();
             if let Err(err) = self.handler.forget_lane(key).await {
                 self.metrics.watcher_persist_failure();
-                warn!(%err, pool_id = %pool_id, signer = %key.signer, "failed to forget reclaimed lane");
+                warn!(error = %err, pool_id = %pool_id, signer = %key.signer, "failed to forget reclaimed lane");
             } else {
                 self.paid.forget(&key);
                 info!(pool_id = %pool_id, signer = %key.signer, "pool reclaimed; dropped tracked lane");
@@ -822,7 +822,7 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
             Ok(pool) => pool,
             Err(err) => {
                 warn!(
-                    err = %sanitize_rpc_display(&err),
+                    error = %sanitize_rpc_display(&err),
                     %pool_id,
                     "admit getPool failed; refusing this pool"
                 );
@@ -886,7 +886,7 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
             Ok(auth) => auth,
             Err(err) => {
                 warn!(
-                    err = %sanitize_rpc_display(&err),
+                    error = %sanitize_rpc_display(&err),
                     %pool_id,
                     %signer,
                     "admit getAuthorization failed; refusing this signer"
@@ -1201,7 +1201,7 @@ fn rehydrate_paid_watermarks(store: &dyn PoolStateStore, self_address: Address) 
             }
         }
         Err(err) => warn!(
-            %err,
+            error = %err,
             "failed to rehydrate paid-watermark cache from lane store; pre-cursor \
              redemptions may be re-submitted until re-observed on-chain"
         ),
@@ -1367,7 +1367,7 @@ fn plan_lanes(
             Ok(None) => {}
             Err(err) => {
                 metrics.redemption_failure();
-                warn!(err = %sanitize_rpc_display(&err), pool_id = %st.pool_id, "redemption planning failed");
+                warn!(error = %sanitize_rpc_display(&err), pool_id = %st.pool_id, "redemption planning failed");
             }
         }
     }
@@ -1394,7 +1394,7 @@ async fn redeem_one<P: Provider + Clone>(
         Ok(None) => return,
         Err(err) => {
             metrics.redemption_failure();
-            warn!(err = %err, pool_id = %key.pool_id, "redemption planning failed to load lane");
+            warn!(error = %err, pool_id = %key.pool_id, "redemption planning failed to load lane");
             return;
         }
     };
@@ -1424,7 +1424,7 @@ async fn redeem_sweep<P: Provider + Clone>(
     let states = match store.load_all() {
         Ok(s) => s,
         Err(err) => {
-            warn!(%err, "redeemer self-tick: failed to load lane state");
+            warn!(error = %err, "redeemer self-tick: failed to load lane state");
             return;
         }
     };
@@ -1481,7 +1481,7 @@ async fn submit_chunk<P: Provider + Clone>(
                 if let Some(reg) = &lane.register
                     && let Err(err) = store.set_registered_until(lane.key, reg.expiry)
                 {
-                    warn!(%err, pool_id = %lane.pool_id, signer = %reg.signer,
+                    warn!(error = %err, pool_id = %lane.pool_id, signer = %reg.signer,
                         "failed to persist registered_until after a landed registration");
                 }
             }
@@ -1506,15 +1506,15 @@ async fn submit_chunk<P: Provider + Clone>(
         }
         TxOutcome::SendErr(err) => {
             metrics.redemption_failure();
-            warn!(err = %sanitize_rpc_display(&err), voucher_count, "redeemMany send failed; leaving claims for retry");
+            warn!(error = %sanitize_rpc_display(&err), voucher_count, "redeemMany send failed; leaving claims for retry");
         }
-        TxOutcome::ReceiptErr(err) => {
+        TxOutcome::ReceiptErr { error, tx_hash } => {
             metrics.redemption_failure();
-            warn!(err = %sanitize_rpc_display(&err), voucher_count, "redeemMany receipt failed; leaving claims for retry");
+            warn!(error = %sanitize_rpc_display(&error), voucher_count, tx = %tx_hash, "redeemMany receipt failed; leaving claims for retry");
         }
-        TxOutcome::Timeout => {
+        TxOutcome::Timeout { tx_hash } => {
             metrics.redemption_failure();
-            warn!(voucher_count, timeout = ?REDEEM_RECEIPT_TIMEOUT, "redeemMany receipt timed out; leaving claims for retry");
+            warn!(voucher_count, tx = %tx_hash, timeout = ?REDEEM_RECEIPT_TIMEOUT, "redeemMany receipt timed out; leaving claims for retry");
         }
     }
 }
@@ -1540,10 +1540,10 @@ async fn flush_store_durable(
         Ok(Err(err)) => {
             metrics.lane_flush_failure();
             if strict {
-                warn!(%err, "pre-redeem lane store flush failed; deferring redeem");
+                warn!(error = %err, "pre-redeem lane store flush failed; deferring redeem");
             } else {
                 warn!(
-                    %err,
+                    error = %err,
                     "pre-redeem lane store flush failed; proceeding on the forced \
                      close/shutdown path with un-flushed lane and capability state"
                 );
@@ -1613,7 +1613,7 @@ async fn reconcile_onchain_watermarks<P: Provider + Clone>(
         Ok(lanes) => lanes,
         Err(err) => {
             warn!(
-                err = %sanitize_rpc_display(err),
+                error = %sanitize_rpc_display(err),
                 lanes = plans.len(),
                 "pre-redeem watermark reconciliation failed; submitting on the contract's own no-op guard"
             );

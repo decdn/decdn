@@ -307,7 +307,7 @@ impl<'a> BuyerPoolTable<'a> {
                     skipped.push(pool_id);
                     tracing::error!(
                         %pool_id,
-                        %err,
+                        error = %err,
                         event = "buyer_pool_store_skip_undecodable_record",
                         "buyer pool hydration: skipping an undecodable record; its escrowed \
                          deposit is untracked and will not be auto-reclaimed until the record is \

@@ -130,7 +130,7 @@ pub async fn bootstrap(
                     // Ed25519 public key is operator config rot; log
                     // and skip rather than aborting bootstrap.
                     tracing::warn!(
-                        peer = ?target_id,
+                        peer = %target_id,
                         error = %e,
                         "dht bootstrap: staker_set entry is not a valid Ed25519 public key"
                     );
@@ -170,7 +170,7 @@ pub async fn bootstrap(
             Ok((peer, Err(e))) => {
                 outcome.find_node_err += 1;
                 tracing::debug!(
-                    seed = ?peer,
+                    peer = %peer,
                     error = %e,
                     "dht bootstrap: FindNode failed against seed"
                 );

@@ -23,6 +23,7 @@ use crate::dht::staker_set::StakerSet;
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer};
 use crate::metrics::{Metrics, ProbeHoldUnavailableReason};
+use crate::warn_throttle::WarnThrottle;
 
 // Server-side timeouts. Each ceiling exists so a single peer cannot pin a
 // handler task indefinitely by stalling at one of the protocol's ordered
@@ -36,6 +37,10 @@ const PROBE_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// the wait so a malicious flooder can't keep the handler alive by refusing
 /// to acknowledge.
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Minimum gap between probe request read-fault `warn!` lines. Each line
+/// carries the offending `peer` and the `suppressed` count.
+const PROBE_READ_FAULT_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
 // QUIC application error codes defined by ADR 013 §Application Error Codes.
 //
@@ -155,6 +160,10 @@ pub struct ProbeHandler {
     /// `ProbeResponse` advertising content whose takedown status it can no longer
     /// confirm. `None` (dev/test, no chain) leaves the presence answer unchanged.
     chain_freshness: Option<crate::chain_freshness::ChainFreshness>,
+    /// Throttle for the `warn!` on a probe request that times out, fails to
+    /// frame or decode, or arrives as the wrong message. The probe ALPN is
+    /// unauthenticated, so any peer triggers it at will.
+    read_fault_warn: WarnThrottle,
 }
 
 impl std::fmt::Debug for ProbeHandler {
@@ -201,6 +210,7 @@ impl ProbeHandler {
             stake_lane,
             relay_foreign_namespaces,
             chain_freshness,
+            read_fault_warn: WarnThrottle::new(PROBE_READ_FAULT_WARN_INTERVAL),
         }
     }
 
@@ -316,12 +326,26 @@ impl ProbeHandler {
         let req = match read_probe_request(&mut send, &mut recv).await {
             Ok(req) => req,
             Err(ProbeReadError { err, app_code }) => {
+                self.metrics.probe_read_fault();
+                if let Some(suppressed) = self.read_fault_warn.admit() {
+                    tracing::warn!(
+                        peer = %conn.remote_id(),
+                        app_code,
+                        error = %err,
+                        suppressed,
+                        interval = ?self.read_fault_warn.interval(),
+                        "probe request read failed"
+                    );
+                }
                 // ADR 013 scopes app error codes to streams, but probe is 1:1
                 // connection:stream — also close the connection with the same
                 // code so the peer observes it deterministically even if the
                 // stream RESET racing with connection teardown gets clobbered.
                 conn.close(VarInt::from_u32(app_code), b"probe-error");
-                return Err(err);
+                // Handled: the peer has its close code and the fault is counted
+                // and logged above. An `Err` here would make iroh's router log
+                // it again, unthrottled, once per bad probe from any peer.
+                return Ok(());
             }
         };
 
@@ -772,10 +796,6 @@ async fn read_probe_request(
             // `APP_ERR_NO_ERROR` constant (same convention now applied
             // to `FrameError::Io(_)` per #577 M1).
             reset(send, recv, APP_ERR_NO_ERROR);
-            tracing::warn!(
-                timeout_ms = u64::try_from(PROBE_READ_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
-                "probe request read timed out"
-            );
             return Err(ProbeReadError {
                 err: anyhow::anyhow!("probe request timed out after {PROBE_READ_TIMEOUT:?}"),
                 app_code: APP_ERR_NO_ERROR,
@@ -784,7 +804,6 @@ async fn read_probe_request(
         Ok(Err(e)) => {
             let app_code = frame_err_code(&e);
             reset(send, recv, app_code);
-            tracing::warn!(app_code, error = %e, "probe frame read failed");
             return Err(ProbeReadError {
                 err: anyhow::anyhow!("probe frame read failed: {e}"),
                 app_code,
@@ -805,11 +824,6 @@ async fn read_probe_request(
                 APP_ERR_MALFORMED_MESSAGE
             };
             reset(send, recv, app_code);
-            tracing::warn!(
-                app_code,
-                error = %e,
-                "probe message decode failed"
-            );
             Err(ProbeReadError {
                 err: anyhow::anyhow!("probe decode failed: {e}"),
                 app_code,
@@ -818,10 +832,6 @@ async fn read_probe_request(
         Ok((ProbeMessage::Request(req), _rest)) => Ok(req),
         Ok((ProbeMessage::Response(_), _)) => {
             reset(send, recv, APP_ERR_UNSUPPORTED_MESSAGE);
-            tracing::warn!(
-                app_code = APP_ERR_UNSUPPORTED_MESSAGE,
-                "peer sent ProbeMessage::Response on server stream"
-            );
             Err(ProbeReadError {
                 err: anyhow::anyhow!("unexpected ProbeMessage::Response on server stream"),
                 app_code: APP_ERR_UNSUPPORTED_MESSAGE,

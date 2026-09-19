@@ -263,15 +263,15 @@ async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupStat
                     // and/or three response filters; failing Ed25519
                     // decode here points at state corruption upstream.
                     warn!(
-                        ?responder,
+                        peer = %responder,
                         "dht lookup: peer NodeId is not a valid Ed25519 public key"
                     );
                 }
                 Ok((responder, Err(RoundRpcError::Transport(err)))) => {
-                    debug!(?responder, %err, "dht lookup: find_value RPC failed");
+                    debug!(peer = %responder, error = %err, "dht lookup: find_value RPC failed");
                 }
                 Err(err) => {
-                    warn!(%err, "dht lookup: round task panicked");
+                    warn!(error = %err, "dht lookup: round task panicked");
                 }
             }
         }

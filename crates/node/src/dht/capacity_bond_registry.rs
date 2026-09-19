@@ -290,7 +290,7 @@ impl<R: RegistryChainReads> RegistrySink<R> {
                 // without this counter it would move no metric at all.
                 self.metrics.staker_set_watcher_resolve_failure();
                 warn!(
-                    err = %sanitize_err_chain(&err),
+                    error = %sanitize_err_chain(&err),
                     %operator,
                     "nodeIdOf RPC failed; cached active set may diverge from chain state for this operator"
                 );
@@ -331,13 +331,13 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                             &event.regionHint,
                         );
                     }
-                    Err(err) => warn!(%err, "skipping undecodable NodeRegistered log"),
+                    Err(err) => warn!(error = %err, "skipping undecodable NodeRegistered log"),
                 }
             }
             Some(sig) if sig == CapacityBond::NodeDeregistered::SIGNATURE_HASH => {
                 match CapacityBond::NodeDeregistered::decode_log_data(&log.inner.data) {
                     Ok(event) => self.on_deregistered(NodeId::from_bytes(event.nodeId.0)),
-                    Err(err) => warn!(%err, "skipping undecodable NodeDeregistered log"),
+                    Err(err) => warn!(error = %err, "skipping undecodable NodeDeregistered log"),
                 }
             }
             Some(sig) if sig == CapacityBond::NodeAutoEjected::SIGNATURE_HASH => {
@@ -352,19 +352,19 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                             StakerChange::Inactive(event.nodeId.0.into()),
                         );
                     }
-                    Err(err) => warn!(%err, "skipping undecodable NodeAutoEjected log"),
+                    Err(err) => warn!(error = %err, "skipping undecodable NodeAutoEjected log"),
                 }
             }
             Some(sig) if sig == CapacityBond::Reinstated::SIGNATURE_HASH => {
                 match CapacityBond::Reinstated::decode_log_data(&log.inner.data) {
                     Ok(event) => self.on_operator_change(event.operator, true).await,
-                    Err(err) => warn!(%err, "skipping undecodable Reinstated log"),
+                    Err(err) => warn!(error = %err, "skipping undecodable Reinstated log"),
                 }
             }
             Some(sig) if sig == CapacityBond::UnbondingRequested::SIGNATURE_HASH => {
                 match CapacityBond::UnbondingRequested::decode_log_data(&log.inner.data) {
                     Ok(event) => self.on_operator_change(event.operator, false).await,
-                    Err(err) => warn!(%err, "skipping undecodable UnbondingRequested log"),
+                    Err(err) => warn!(error = %err, "skipping undecodable UnbondingRequested log"),
                 }
             }
             // The blacklist-ejection twin of `Reinstated` (#1030). `ejected` is a
@@ -376,7 +376,7 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
             Some(sig) if sig == CapacityBond::EjectedByBlacklist::SIGNATURE_HASH => {
                 match CapacityBond::EjectedByBlacklist::decode_log_data(&log.inner.data) {
                     Ok(event) => self.on_operator_change(event.operator, false).await,
-                    Err(err) => warn!(%err, "skipping undecodable EjectedByBlacklist log"),
+                    Err(err) => warn!(error = %err, "skipping undecodable EjectedByBlacklist log"),
                 }
             }
             Some(sig) if sig == CapacityBond::RegionUpdated::SIGNATURE_HASH => {
@@ -387,7 +387,7 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                             &event.newRegion,
                         );
                     }
-                    Err(err) => warn!(%err, "skipping undecodable RegionUpdated log"),
+                    Err(err) => warn!(error = %err, "skipping undecodable RegionUpdated log"),
                 }
             }
             _ => {
@@ -455,7 +455,7 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                 // `Err` marks the route errored, which stalls event pickup and
                 // also skips the next resync entirely.
                 self.metrics.capacity_bond_registry_resync_failure();
-                warn!(%err, "capacity-bond registry resync failed; keeping current projections");
+                warn!(error = %err, "capacity-bond registry resync failed; keeping current projections");
                 return Ok(());
             }
         };

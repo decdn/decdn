@@ -228,8 +228,30 @@ impl PeerStore {
     /// Read one record by id.
     #[must_use]
     pub fn get(&self, node_id: &PublicKey) -> Option<PeerRecord> {
-        let bytes = std::fs::read(self.path_for(node_id)).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        let path = self.path_for(node_id);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "peer store: ignoring unreadable record"
+                );
+                return None;
+            }
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(rec) => Some(rec),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "peer store: ignoring unreadable record"
+                );
+                None
+            }
+        }
     }
 
     fn write(&self, rec: &PeerRecord) -> anyhow::Result<()> {
@@ -319,7 +341,13 @@ impl PeerStore {
         let mut records = self.load_all();
         records.retain(|r| {
             if r.identity_prunable(now_secs, cfg) {
-                let _ = self.delete(&r.node_id);
+                if let Err(e) = self.delete(&r.node_id) {
+                    tracing::warn!(
+                        peer = %r.node_id,
+                        error = %e,
+                        "peer store: failed to prune a stale record"
+                    );
+                }
                 false
             } else {
                 true

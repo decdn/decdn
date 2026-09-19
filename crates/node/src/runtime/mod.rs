@@ -4,7 +4,7 @@ pub mod eviction;
 pub mod reload;
 
 pub(crate) use reload::emit_config_notices;
-pub use reload::{LogLevelSetter, ReloadSnapshot, RuntimeReloadState};
+pub use reload::{LogLevelApply, LogLevelSetter, ReloadSnapshot, RuntimeReloadState};
 
 use crate::chain_events::shared_head::{HeadSource, SharedHead};
 
@@ -537,7 +537,7 @@ async fn build_infra(
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
                     flush_metrics.lane_flush_failure();
-                    tracing::warn!(%err, "lane store background flush failed; retrying next tick");
+                    tracing::warn!(error = %err, "lane store background flush failed; retrying next tick");
                 }
                 Err(join_err) => {
                     flush_metrics.lane_flush_failure();
@@ -709,7 +709,7 @@ async fn serve_until_shutdown(
                 match config_path {
                     Some(path) => {
                         if let Err(err) = reload_state.reload(path).await {
-                            tracing::warn!(%err, "config reload error");
+                            tracing::warn!(error = %err, "config reload error");
                         }
                     }
                     None => {
@@ -1086,7 +1086,7 @@ async fn build_chain_and_handlers(
     .await
     .inspect_err(|err| {
         tracing::warn!(
-            %err,
+            error = %err,
             fallback_bps = FEE_ROUTER_OPERATOR_BPS_FLOOR,
             "PaymentPool.feeRouter() startup read failed; operator fee share seeded to the \
              FeeRouter OPERATOR_BPS_FLOOR and the fee-shares watcher is not registered"
@@ -1105,7 +1105,7 @@ async fn build_chain_and_handlers(
                         Ok(bps) => bps,
                         Err(err) => {
                             tracing::warn!(
-                                %err,
+                                error = %err,
                                 fallback_bps = FEE_ROUTER_OPERATOR_BPS_FLOOR,
                                 "FeeRouter.getShares() startup read could not be narrowed to \
                                  operator bps; falling back to OPERATOR_BPS_FLOOR"
@@ -1116,7 +1116,7 @@ async fn build_chain_and_handlers(
                 }
                 Err(err) => {
                     tracing::warn!(
-                        %err,
+                        error = %err,
                         fallback_bps = FEE_ROUTER_OPERATOR_BPS_FLOOR,
                         "FeeRouter.getShares() startup read failed; falling back to \
                          OPERATOR_BPS_FLOOR"
@@ -1592,7 +1592,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let mut tasks = JoinSet::new();
     tasks.spawn(async move {
         if let Err(err) = metrics::serve(metrics_listener, metrics_handle, metrics_stop_rx).await {
-            tracing::error!(%err, "metrics server exited with error");
+            tracing::error!(error = %err, "metrics server exited with error");
         }
     });
 
@@ -2054,7 +2054,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                 Ok(service) => Arc::new(service),
                 Err(err) => {
                     tracing::warn!(
-                        err = %sanitize_rpc_display(&err),
+                        error = %sanitize_rpc_display(&err),
                         payment_pool_addr = %payment_pool_addr_for_buyer,
                         "buyer-side PaymentPool bootstrap failed; node→node paid cache-miss \
                          pulls are DISABLED for this process (seller settlement is unaffected). \
@@ -2216,7 +2216,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         .with_denylist(reload_state.content_denylist());
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
-                tracing::error!(%err, "admin server exited with error");
+                tracing::error!(error = %err, "admin server exited with error");
             }
         });
         Some(tx)
@@ -2538,7 +2538,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // Router::shutdown waits for ProtocolHandler::shutdown on each handler,
     // then closes the endpoint.
     if let Err(err) = router.shutdown().await {
-        tracing::warn!(%err, "router shutdown reported an error");
+        tracing::warn!(error = %err, "router shutdown reported an error");
     }
     // The ONE multiplexed poller driving all registered watcher routes stops here,
     // once. It exits cooperatively — cancelling its loop at the next await
@@ -2598,7 +2598,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     };
     if let Err(err) = flush_result {
         node_metrics.lane_flush_failure();
-        tracing::warn!(%err, "final lane store flush on shutdown failed");
+        tracing::warn!(error = %err, "final lane store flush on shutdown failed");
     }
     lane_flush_task.abort();
 
@@ -2636,7 +2636,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // exit to know the store may be inconsistent.
     let cache_shutdown_err = cache.shutdown().await.err();
     if let Some(err) = cache_shutdown_err.as_ref() {
-        tracing::error!(%err, "cache shutdown failed; store state may be inconsistent");
+        tracing::error!(error = %err, "cache shutdown failed; store state may be inconsistent");
     }
 
     // Last-resort abort handle for the RPC watchdog, which lives *outside* the
@@ -2684,7 +2684,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
             && let Err(err) = handle.await
             && !err.is_cancelled()
         {
-            tracing::warn!(%err, "RPC watchdog task panicked during shutdown");
+            tracing::warn!(error = %err, "RPC watchdog task panicked during shutdown");
         }
     };
     if tokio::time::timeout(SHUTDOWN_DEADLINE, drain).await.is_ok() {
@@ -2805,10 +2805,10 @@ async fn build_endpoint(
         // excluded; their per-relay "skipping" warning already fired.
         if tally.reachable == 0 && tally.unprobeable < relays.len() {
             tracing::warn!(
-                "none of the {} probeable network.relay_urls were reachable at bring-up; \
+                probeable = relays.len().saturating_sub(tally.unprobeable),
+                "none of the probeable network.relay_urls were reachable at bring-up; \
                  proceeding and letting iroh retry in the background — check the URLs and \
-                 that a relay is up, or clear network.relay_urls to fall back to the n0 relays",
-                relays.len().saturating_sub(tally.unprobeable)
+                 that a relay is up, or clear network.relay_urls to fall back to the n0 relays"
             );
         }
         builder = builder.relay_mode(RelayMode::Custom(RelayMap::from_iter(relays)));
@@ -2945,7 +2945,7 @@ async fn probe_relays(relays: &[RelayUrl]) -> RelayProbeTally {
             // let that internal error hard-fail bring-up — treat it as
             // "couldn't probe" so it's excluded from the reachability gate.
             Err(e) => {
-                tracing::warn!("relay probe task failed to join: {e}");
+                tracing::warn!(error = %e, "relay probe task failed to join");
                 tally.unprobeable = tally.unprobeable.saturating_add(1);
             }
         }
@@ -2977,7 +2977,14 @@ async fn relay_host_reachable(host: &str, port: u16) -> bool {
         match relay_connect_once(host, port, ATTEMPT_TIMEOUT).await {
             Ok(()) => return true,
             Err(reason) => {
-                tracing::debug!("relay {host}:{port} probe attempt {attempt}/{ATTEMPTS}: {reason}");
+                tracing::debug!(
+                    relay = %host,
+                    port,
+                    attempt,
+                    attempts = ATTEMPTS,
+                    %reason,
+                    "relay probe attempt failed"
+                );
             }
         }
         if attempt < ATTEMPTS {
@@ -2985,7 +2992,10 @@ async fn relay_host_reachable(host: &str, port: u16) -> bool {
         }
     }
     tracing::warn!(
-        "relay {host}:{port} unreachable after {ATTEMPTS} attempts; iroh will keep retrying it in the background"
+        relay = %host,
+        port,
+        attempts = ATTEMPTS,
+        "relay unreachable at bring-up; iroh will keep retrying it in the background"
     );
     false
 }
@@ -3047,7 +3057,7 @@ async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigne
     // password file). The daemon has a `tracing` subscriber, so unlike the CLI
     // it logs rather than printing.
     for warning in resolved.warnings() {
-        tracing::warn!("keystore password: {warning}");
+        tracing::warn!(%warning, "keystore password source ignored");
     }
     let password = resolved.into_secret();
 
@@ -3075,7 +3085,7 @@ fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static s
         if err.is_cancelled() {
             tracing::debug!(phase, "task cancelled during shutdown");
         } else {
-            tracing::warn!(phase, %err, "task failed during shutdown");
+            tracing::warn!(phase, error = %err, "task failed during shutdown");
         }
     }
 }
@@ -3370,7 +3380,7 @@ impl HupStream {
             let hup = match signal(SignalKind::hangup()) {
                 Ok(s) => Some(s),
                 Err(err) => {
-                    tracing::warn!(%err, "failed to install SIGHUP handler; hot-reload disabled");
+                    tracing::warn!(error = %err, "failed to install SIGHUP handler; hot-reload disabled");
                     None
                 }
             };
@@ -3444,7 +3454,7 @@ impl ShutdownStreams {
                 Ok(s) => Some(s),
                 Err(err) => {
                     tracing::warn!(
-                        %err,
+                        error = %err,
                         "failed to install SIGTERM handler; falling back to SIGINT only",
                     );
                     None
@@ -3665,7 +3675,7 @@ fn spawn_rpc_watchdog(
                         // Display embeds the full `rpc_url` (an API key may live
                         // in its path/query, not just userinfo). The transport
                         // failure class survives; the URL does not (issue #954).
-                        tracing::warn!(err = %sanitize_rpc_display(&err), "RPC endpoint unhealthy");
+                        tracing::warn!(error = %sanitize_rpc_display(&err), "RPC endpoint unhealthy");
                     }
                     false
                 }

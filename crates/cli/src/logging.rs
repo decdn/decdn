@@ -8,9 +8,10 @@
 //! side that is actually failing.
 //!
 //! [`init`] turns logging on only when the operator asks for it, through
-//! `--log-level` or the `RUST_LOG` environment variable (`RUST_LOG` wins, the
-//! same precedence the daemon uses). When neither is set the CLI stays silent
-//! and behaves exactly as before.
+//! `-v`/`-vv`/`-vvv`, `--log-level`, or the `RUST_LOG` environment variable.
+//! `RUST_LOG` wins (the same precedence the daemon uses), then `--log-level`,
+//! then the `-v` count ([`requested_level`]). With none of them set the CLI
+//! installs no subscriber and stays silent.
 //!
 //! # Progress-bar coexistence
 //!
@@ -31,11 +32,27 @@ use decdn_common::cli::common::LogLevel;
 /// subscriber is installed. Empty on the default (no-verbosity) path.
 static PROGRESS: OnceLock<indicatif::MultiProgress> = OnceLock::new();
 
-/// Decide the tracing filter directive from the two opt-in sources, or `None`
-/// to stay silent.
+/// The level the command line asks for: an explicit `--log-level` wins over
+/// the `-v` count, and a zero count with no `--log-level` asks for nothing.
+#[must_use]
+pub const fn requested_level(log_level: Option<LogLevel>, verbose: u8) -> Option<LogLevel> {
+    if log_level.is_some() {
+        return log_level;
+    }
+    match verbose {
+        0 => None,
+        1 => Some(LogLevel::Info),
+        2 => Some(LogLevel::Debug),
+        _ => Some(LogLevel::Trace),
+    }
+}
+
+/// Decide the tracing filter directive from `RUST_LOG` and the command-line
+/// level (`--log-level` or `-v`, see [`requested_level`]), or `None` to stay
+/// silent.
 ///
-/// `RUST_LOG` (when present and not blank) takes precedence over `--log-level`,
-/// matching the daemon. With neither source set the CLI installs no subscriber
+/// `RUST_LOG` (when present and not blank) takes precedence over the
+/// command-line level, matching the daemon. With neither source set the CLI installs no subscriber
 /// and its output is identical to a build without this module.
 fn filter_directive(rust_log: Option<&str>, log_level: Option<LogLevel>) -> Option<String> {
     match rust_log {
@@ -203,6 +220,31 @@ mod tests {
         assert_eq!(
             malformed_rust_log_fallback(Some(LogLevel::Debug)),
             LogLevel::Debug
+        );
+    }
+
+    #[test]
+    fn verbose_count_maps_to_levels() {
+        assert_eq!(requested_level(None, 0), None);
+        assert_eq!(requested_level(None, 1), Some(LogLevel::Info));
+        assert_eq!(requested_level(None, 2), Some(LogLevel::Debug));
+        assert_eq!(requested_level(None, 3), Some(LogLevel::Trace));
+        assert_eq!(requested_level(None, 9), Some(LogLevel::Trace));
+    }
+
+    #[test]
+    fn explicit_log_level_wins_over_verbose_count() {
+        assert_eq!(
+            requested_level(Some(LogLevel::Warn), 2),
+            Some(LogLevel::Warn)
+        );
+    }
+
+    #[test]
+    fn rust_log_wins_over_verbose_count() {
+        assert_eq!(
+            filter_directive(Some("iroh=trace"), requested_level(None, 1)),
+            Some("iroh=trace".to_string())
         );
     }
 

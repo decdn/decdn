@@ -38,7 +38,7 @@ use decdn_common::config::{
 };
 use decdn_node::dispatch::{ConnectionLimiter, RejectReason};
 use decdn_node::metrics::Metrics;
-use decdn_node::runtime::{LogLevelSetter, RuntimeReloadState};
+use decdn_node::runtime::{LogLevelApply, LogLevelSetter, RuntimeReloadState};
 use nix::sys::signal::{Signal, raise};
 
 /// Build the same minimal `ResolvedConfig` the unit tests use.
@@ -170,7 +170,7 @@ fn recording_setter() -> (LogLevelSetter, Arc<Mutex<Vec<LogLevel>>>) {
     let captured = Arc::clone(&levels);
     let setter: LogLevelSetter = Box::new(move |lvl| {
         captured.lock().unwrap().push(lvl);
-        Ok(())
+        Ok(LogLevelApply::Installed)
     });
     (setter, levels)
 }

@@ -1017,7 +1017,7 @@ async fn publish_hash(
                 Ok(k) => k,
                 Err(e) => {
                     tracing::warn!(
-                        peer = ?peer,
+                        peer = %peer,
                         error = %e,
                         "dht republish: routing-table peer not a valid public key"
                     );
@@ -1029,14 +1029,14 @@ async fn publish_hash(
                 Ok(ack) if ack.accepted => {}
                 Ok(_) => {
                     tracing::debug!(
-                        peer = ?peer,
+                        peer = %peer,
                         hash = ?hash,
                         "dht republish: peer rejected Store (not staked, over quota, etc)"
                     );
                 }
                 Err(e) => {
                     tracing::debug!(
-                        peer = ?peer,
+                        peer = %peer,
                         hash = ?hash,
                         error = %e,
                         "dht republish: Store request failed"
@@ -1129,7 +1129,7 @@ async fn publish_batch(
                 Ok(k) => k,
                 Err(e) => {
                     tracing::warn!(
-                        peer = ?peer,
+                        peer = %peer,
                         error = %e,
                         "dht republish: routing-table peer not a valid public key"
                     );
@@ -1152,7 +1152,7 @@ async fn publish_batch(
                         let rejected = ack.results.iter().filter(|accepted| !**accepted).count();
                         if rejected > 0 {
                             tracing::debug!(
-                                peer = ?peer,
+                                peer = %peer,
                                 rejected,
                                 batch = chunk.len(),
                                 "dht republish: peer rejected some batched Stores (not staked, over quota, etc)"
@@ -1161,7 +1161,7 @@ async fn publish_batch(
                     }
                     Err(e) => {
                         tracing::debug!(
-                            peer = ?peer,
+                            peer = %peer,
                             batch = chunk.len(),
                             error = %e,
                             "dht republish: BatchStore request failed"
