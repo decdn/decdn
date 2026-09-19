@@ -1881,6 +1881,332 @@ async fn own_origin_size_probe_fault_refuses_internal_error_not_cache_miss() -> 
     Ok(())
 }
 
+/// The spine's own pre-signature bounds gate, on a COLD miss: an out-of-bounds
+/// bounded request against a serviceable own origin must be refused
+/// `RangeNotSatisfiable` before any `ok: true` is signed — and the floor
+/// reservation it releases must not leak, so a follow-up in-bounds request on
+/// the same handler still serves.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let aligned = align_range(0, 0, blob_size)?;
+    let span = blob.clone();
+    let range_val = format!(
+        "bytes={}-{}",
+        aligned.fetch_start(),
+        aligned.fetch_end() - 1
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", range_val.as_str()))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(span))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x69);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Out of bounds: offset at the blob end, on a COLD cache (spine gate, not
+    // the direct-serve gate).
+    let conn = client_ep
+        .connect(target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let binding_hash =
+        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = client_eth
+        .sign_hash_sync(&binding_hash)?
+        .as_bytes()
+        .to_vec();
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: client_eth.address().into(),
+            binding_signature,
+        }),
+        capability: None,
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id.into(),
+        byte_offset: blob_size,
+        byte_len: 16 * 1024,
+        timestamp_us: 0x9004,
+    };
+    let payload =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame_to(&mut send, &payload).await?;
+    let (resp, _resp_ext) = read_stream_response(&mut recv).await?;
+    anyhow::ensure!(!resp.body.ok, "an out-of-bounds cold miss must be refused");
+    conn.close(0u32.into(), b"done");
+
+    anyhow::ensure!(
+        counter_value(
+            &metrics,
+            "serve_stream_rejected_range_not_satisfiable_total"
+        )? == 1,
+        "the spine's pre-signature gate must answer RangeNotSatisfiable"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "the gate lives inside the spine tier (entered, then refused pre-signature)"
+    );
+
+    // The released floor reservation must not leak: an in-bounds request on the
+    // SAME handler now serves the whole blob.
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        pool_id,
+        provider,
+        hash,
+        0,
+        0,
+        RATE_PER_MB,
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_slice() == blob.as_slice(),
+        "an in-bounds request after the refusal must still serve"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The span-capped floor guard, ACCEPT direction: a pool that covers one small
+/// aligned span but not a full credit window must be SERVED for a bounded
+/// request (the guard prices the span), and refused for a whole-blob request
+/// (the guard prices the window). Guards the `.min(credit_floor)` cap — a
+/// regression to the uncapped floor silently refuses every small ranged
+/// request from modest pools.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn span_capped_floor_accepts_a_small_range_a_window_poor_pool() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    // A small aligned span: 3 groups = 48 KiB. min_payment(48 KiB, rate 10) = 1;
+    // min_payment(1 MiB window, rate 10) = 10. remaining = 5 sits between.
+    let (req_off, req_len) = (16 * 1024u64, 48 * 1024u64);
+    let aligned = align_range(req_off, req_len, blob_size)?;
+    let (a_start, a_end) = (aligned.fetch_start(), aligned.fetch_end());
+    let span = blob
+        .get(usize::try_from(a_start)?..usize::try_from(a_end)?)
+        .ok_or_else(|| anyhow::anyhow!("aligned span out of bounds"))?
+        .to_vec();
+    let range_val = format!("bytes={a_start}-{}", a_end - 1);
+
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", range_val.as_str()))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(span))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x6A);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+
+    // Build the handler with a pool view whose remaining (5 µUSDC) covers the
+    // 48 KiB span (1 µUSDC) but not a one-chunk window (10 µUSDC). M is 0 in
+    // this fixture.
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id,
+        client_eth.address(),
+        provider,
+        U256::from(10_000_000u64),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn PoolStateStore> = store;
+    let mut status = std::collections::HashMap::new();
+    status.insert(
+        pool_id,
+        decdn_node::pool_view::PoolStatus {
+            owner: client_eth.address(),
+            remaining: U256::from(5u64),
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
+        },
+    );
+    let pool_view =
+        Arc::new(StatusMapPoolView { status }) as Arc<dyn decdn_node::pool_view::PoolView>;
+    let handler = build_handler_full_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        &domains(),
+        16,
+        |deps| deps.pool_view = Some(pool_view),
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // ACCEPT: the bounded request is served, span-priced.
+    let got = ranged_paid_pull(
+        &client_ep,
+        target.clone(),
+        client_node_id,
+        &client_eth,
+        pool_id,
+        provider,
+        hash,
+        req_off,
+        req_len,
+        RATE_PER_MB,
+    )
+    .await?;
+    let want = blob
+        .get(usize::try_from(req_off)?..usize::try_from(req_off + req_len)?)
+        .ok_or_else(|| anyhow::anyhow!("requested range out of bounds"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "a span the pool can cover must be served"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_insufficient_deposit_total")? == 0,
+        "the span-capped floor must not refuse a coverable range"
+    );
+
+    // REFUSE: the whole-blob request prices a full window the pool cannot cover.
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let binding_hash =
+        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = client_eth
+        .sign_hash_sync(&binding_hash)?
+        .as_bytes()
+        .to_vec();
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: client_eth.address().into(),
+            binding_signature,
+        }),
+        capability: None,
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id.into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x9005,
+    };
+    let payload =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame_to(&mut send, &payload).await?;
+    let (resp, _resp_ext) = read_stream_response(&mut recv).await?;
+    anyhow::ensure!(
+        !resp.body.ok,
+        "a whole-blob request against a window-poor pool must be refused"
+    );
+    conn.close(0u32.into(), b"done");
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// [`decdn_node::pool_view::PoolView`] over a fixed map, for the floor-guard
+/// tests.
+#[derive(Debug)]
+struct StatusMapPoolView {
+    status: std::collections::HashMap<B256, decdn_node::pool_view::PoolStatus>,
+}
+
+#[async_trait::async_trait]
+impl decdn_node::pool_view::PoolView for StatusMapPoolView {
+    async fn status(&self, pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        self.status.get(&pool_id).copied()
+    }
+}
+
 /// A distinctive 3 MiB payload plus its outboard: larger than `PULL_WINDOW_FLOOR`,
 /// so a whole-blob own-origin miss takes several pull-leg draws.
 fn large_blob_with_outboard() -> (Vec<u8>, Vec<u8>, Hash) {

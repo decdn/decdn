@@ -224,21 +224,16 @@ impl ClientHandler {
             }
         };
 
-        // (3b) Bounds gate on the now-known geometry, BEFORE the claim and the
-        // signature: an offset at or past the end, or an end past the blob, is
-        // `RangeNotSatisfiable` here exactly as on the direct-serve path. Signing
-        // `ok: true` first would turn a bad range into a stream failure.
-        if range_out_of_bounds(req.byte_offset, req.byte_len, total_bytes) {
-            release_reservation_unspent(floor_reservation.as_ref());
-            return self
-                .respond_error(
-                    &mut send,
-                    req,
-                    ServeRejectReason::RangeNotSatisfiable,
-                    rate_per_mb,
-                )
-                .await;
-        }
+        // Deliberately NO bounds gate on this total (#1895, deflation direction):
+        // `total_bytes` is the peer's signed but unverified handshake value, so
+        // refusing a bounded/resumed request against it with a client-attributable
+        // `RangeNotSatisfiable` would let a holder UNDER-report a blob's size and
+        // make every relay refuse valid ranges — the mirror of the inflation
+        // attack the received-byte ceiling exists for. A total that genuinely
+        // cannot satisfy the request surfaces in `serve_leg`'s own bounds check
+        // as a stream fault attributed to the pull, never to the client. The
+        // own-origin twin keeps its pre-signature gate: that total is this
+        // node's own origin probe.
 
         // (4) No size gate on the CLAIMED total (#1895): `total_bytes` is the peer's
         // signed but unverified handshake value, so refusing on it would let a holder
@@ -268,9 +263,13 @@ impl ClientHandler {
 
         // (6a) Atomically claim the fill (ADR 038): under one registry lock,
         // decide whether this miss OWNS a fresh pull for `hash` or ATTACHES as an
-        // observer to a live one. Two concurrent same-hash misses therefore share ONE
-        // upstream pull (no double spend, #305) while each keeps its own per-channel
-        // voucher stream. `make_session` builds the shared `FillSession` only on an
+        // observer to a live one. Two concurrent same-hash misses whose starts sit
+        // at or behind the live fill's paid frontier therefore share ONE upstream
+        // pull (no double spend, #305) while each keeps its own per-channel voucher
+        // stream; a request AHEAD of that frontier owns its own pull instead
+        // (#2062 — attaching would starve it behind the other client's payments),
+        // at the cost of fetching the overlap twice (`fill_not_coalesced`,
+        // decdn#2069 §4). `make_session` builds the shared `FillSession` only on an
         // owning branch (`Owner` or `Mixed`), with its PAID content frontier at the
         // request's ABSOLUTE content start (`req.byte_offset`), so a non-zero-offset
         // request does not show a window of phantom lead and immediately `Wait`.
@@ -559,20 +558,38 @@ impl ClientHandler {
         // Pre-flight floor-M guard (shared-payment-pool model) — the own-origin
         // twin of the peer path and of `dispatch.rs`. Refuse the serve when the
         // pool's on-chain remaining minus the refundable floor `M` cannot cover
-        // the reserved floor. The floor is one credit window, CAPPED BY THE
-        // REQUEST'S ALIGNED SPAN when the request bounds itself — the same pricing
-        // `dispatch.rs` reserved, so a request accepted there is never refused
-        // here for a sub-window span. `pool_remaining` is the cached
-        // `getPool.remaining` threaded from the serve gate; `None` fails open
-        // (on-chain `redeem` is the backstop). The own-origin leg fronts no
-        // upstream USDC, but delivery is billed per voucher, so a pool that cannot
-        // cover the floor is refused here for wire-parity with the peer path
-        // rather than served for free.
-        let guard_bytes = if req.byte_len > 0 {
-            aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(credit_floor)
-        } else {
-            credit_floor
-        };
+        // the reserved floor. `pool_remaining` is the cached `getPool.remaining`
+        // threaded from the serve gate; `None` fails open (on-chain `redeem` is
+        // the backstop). The own-origin leg fronts no upstream USDC, but delivery
+        // is billed per voucher, so a pool that cannot cover the floor is refused
+        // here for wire-parity with the peer path rather than served for free.
+        //
+        // (2) Bounds gate first, on the probed geometry, BEFORE the guard and the
+        // signature: an offset at or past the end, or an end past the blob, is
+        // `RangeNotSatisfiable` here exactly as on the direct-serve path — never
+        // `InsufficientDeposit` (the range, not the pool, is the problem), and
+        // never a signed `ok: true` that turns a bad range into a stream failure.
+        // This total is the node's OWN origin probe, so unlike the peer twin the
+        // gate cannot be steered by a lying counterparty (#1895).
+        if range_out_of_bounds(req.byte_offset, req.byte_len, total_bytes) {
+            release_reservation_unspent(floor_reservation.as_ref());
+            return self
+                .respond_error(
+                    &mut send,
+                    req,
+                    ServeRejectReason::RangeNotSatisfiable,
+                    rate_per_mb,
+                )
+                .await;
+        }
+
+        // The floor is capped by the request's aligned span — priced against the
+        // PROBED total (in hand here, unlike dispatch's pre-fill reservation), so
+        // a resumed tail near the blob end span-caps too, and a request accepted
+        // at dispatch is never refused here for a sub-window span. In bounds per
+        // the gate above, so `aligned_span` never saturates.
+        let guard_bytes =
+            aligned_span(req.byte_offset, req.byte_len, total_bytes).min(credit_floor);
         if let Some(remaining) = pool_remaining
             && !self.pool_remaining_covers_window(remaining, guard_bytes, rate_per_mb)
         {
@@ -589,22 +606,6 @@ impl ClientHandler {
                     &mut send,
                     req,
                     ServeRejectReason::InsufficientDeposit,
-                    rate_per_mb,
-                )
-                .await;
-        }
-
-        // (2b) Bounds gate on the probed geometry, BEFORE the signature: an offset
-        // at or past the end, or an end past the blob, is `RangeNotSatisfiable`
-        // here exactly as on the direct-serve path. Signing `ok: true` first would
-        // turn a bad range into a stream failure.
-        if range_out_of_bounds(req.byte_offset, req.byte_len, total_bytes) {
-            release_reservation_unspent(floor_reservation.as_ref());
-            return self
-                .respond_error(
-                    &mut send,
-                    req,
-                    ServeRejectReason::RangeNotSatisfiable,
                     rate_per_mb,
                 )
                 .await;
