@@ -391,7 +391,7 @@ async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
     let provider = server_eth.address();
-    let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
         pool_id,
         client_eth.address(),
@@ -462,6 +462,11 @@ async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result
     anyhow::ensure!(
         !cache.has(hash).await?,
         "a range pull must leave the blob partial, not a full holder"
+    );
+    // Routing proof: the bounded miss took the own-origin two-leg streaming tier.
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "a bounded cold miss must take the own-origin two-leg tier"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -678,9 +683,10 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
 async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
     // A resume request (`byte_offset > 0`, `byte_len == 0`) is a whole-tail
     // read: `byte_len == 0` means "to end-of-blob" (ADR 005), NOT zero bytes.
-    // The handler passes it straight through `pull_through_range` /
-    // `export_range`, both of which resolve `0` to the blob end — this proves
-    // the tail is fetched and served, end to end.
+    // The two-leg spine resolves `0` to the blob end in both legs (`missing_ranges`
+    // for the pull, the serve leg's clamp for delivery) — this proves the tail is
+    // fetched and served, end to end, and that a resumed miss streams rather than
+    // buffering.
     let (blob, outboard, hash) = blob_with_outboard();
     let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let hex = hash.to_hex();
@@ -721,7 +727,7 @@ async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
     let provider = server_eth.address();
-    let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
         pool_id,
         client_eth.address(),
@@ -765,6 +771,11 @@ async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
     anyhow::ensure!(
         !cache.has(hash).await?,
         "a tail range pull leaves the blob partial"
+    );
+    // Routing proof: the resumed miss took the own-origin two-leg streaming tier.
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "a resumed cold miss must take the own-origin two-leg tier"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -986,6 +997,210 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
         counter_value(&metrics, "bytes_served_total")? > 0,
         "the served blob must count as bytes served"
     );
+    Ok(())
+}
+
+/// The shape `decdn fetch` / `decdn bundle pull` actually send on a cold miss:
+/// `byte_offset == 0, byte_len == total_bytes` — a BOUNDED request that covers the
+/// whole blob. It must take the same two-leg streaming tier as the unbounded
+/// `(0, 0)` request: the signed response goes out before the origin download
+/// finishes, so a multi-GiB blob does not trip the client's stall clock. The tier
+/// counter `local_outboard_serves_total` firing once is the proof of routing; the
+/// byte-exact delivery is the proof the range-clamped serve leg is correct.
+#[tokio::test(flavor = "multi_thread")]
+async fn bounded_whole_blob_own_origin_miss_streams_via_backend_origin() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let aligned = align_range(0, blob_size, blob_size)?;
+    let (a_start, a_end) = (aligned.fetch_start(), aligned.fetch_end());
+    let span = blob
+        .get(usize::try_from(a_start)?..usize::try_from(a_end)?)
+        .ok_or_else(|| anyhow::anyhow!("aligned span out of bounds"))?
+        .to_vec();
+    let range_val = format!("bytes={a_start}-{}", a_end - 1);
+
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", range_val.as_str()))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(span.clone()))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x62);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        pool_id,
+        provider,
+        hash,
+        0,
+        blob_size,
+        RATE_PER_MB,
+    )
+    .await?;
+
+    anyhow::ensure!(
+        got.as_slice() == blob.as_slice(),
+        "bounded whole-blob delivery mismatch: got {} bytes, want {}",
+        got.len(),
+        blob.len()
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "a bounded whole-blob miss must take the own-origin two-leg tier"
+    );
+    let wholeblob_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && !r.headers.contains_key("range")
+    })
+    .await?;
+    anyhow::ensure!(
+        wholeblob_gets == 0,
+        "the spine pulls ranged spans only, saw {wholeblob_gets} un-ranged GET(s)"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// An UNALIGNED bounded request (`byte_offset` inside a chunk group) through the
+/// spine. The serve leg must map paid wire back to content from the group-aligned
+/// fetch start, not the raw offset, and the client must receive exactly the bytes
+/// it asked for (the range decoder trims the aligned superset).
+#[tokio::test(flavor = "multi_thread")]
+async fn bounded_unaligned_offset_own_origin_miss_streams_the_exact_bytes() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    // 20 KiB is NOT a 16 KiB group boundary; 30 KiB ends mid-group too.
+    let (req_off, req_len) = (20 * 1024u64, 30 * 1024u64);
+    let aligned = align_range(req_off, req_len, blob_size)?;
+    let (a_start, a_end) = (aligned.fetch_start(), aligned.fetch_end());
+    anyhow::ensure!(
+        a_start == 16 * 1024 && a_end == 64 * 1024,
+        "test premise: aligned span"
+    );
+    let span = blob
+        .get(usize::try_from(a_start)?..usize::try_from(a_end)?)
+        .ok_or_else(|| anyhow::anyhow!("aligned span out of bounds"))?
+        .to_vec();
+    let range_val = format!("bytes={a_start}-{}", a_end - 1);
+
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", range_val.as_str()))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(span.clone()))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x63);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        pool_id,
+        provider,
+        hash,
+        req_off,
+        req_len,
+        RATE_PER_MB,
+    )
+    .await?;
+
+    let want = blob
+        .get(usize::try_from(req_off)?..usize::try_from(req_off + req_len)?)
+        .ok_or_else(|| anyhow::anyhow!("requested range out of bounds"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "unaligned range mismatch: got {} bytes, want {}",
+        got.len(),
+        want.len()
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "an unaligned bounded miss must take the own-origin two-leg tier"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -1703,11 +1918,9 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
 /// origin fetch, both serve byte-exact, and neither hangs. This is the disjoint
 /// twin of `concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull`.
 ///
-/// Own-origin serving is whole-blob-gated today, so disjoint RANGES of one hash are
-/// not expressible through dispatch; two distinct hashes are the integration-level
-/// stand-in (per B3.4c's adaptation note). The disjoint-RANGE case is covered at
-/// the registry layer by `fill_session.rs`'s `claim_disjoint_both_own` /
-/// `disjoint_halves_do_not_attach`. The proof here: the origin serves EACH hash's
+/// Two distinct hashes keep the two fills independent at the registry layer;
+/// disjoint RANGES of one hash coalesce per `fill_session.rs`'s
+/// `claim_disjoint_both_own` / `disjoint_halves_do_not_attach`. The proof here: the origin serves EACH hash's
 /// ranged span exactly once (TWO fetches, one per hash — not one shared, not
 /// double), both clients receive their whole blob byte-exact, and the whole race
 /// completes inside a hard timeout (no wedge / no deadlock).

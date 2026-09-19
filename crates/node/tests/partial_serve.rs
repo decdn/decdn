@@ -355,7 +355,7 @@ async fn partial_serve_within_cached_range_serves_without_any_fill() -> anyhow::
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
-async fn partial_serve_mixed_range_falls_through_to_fill() -> anyhow::Result<()> {
+async fn partial_serve_mixed_range_pulls_only_the_missing_group() -> anyhow::Result<()> {
     let group = CHUNK_GROUP_BYTES;
     let total = 5 * group;
     let (hash, plaintext, outboard) = synth_blob(usize::try_from(total)?);
@@ -375,23 +375,21 @@ async fn partial_serve_mixed_range_falls_through_to_fill() -> anyhow::Result<()>
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.to_vec()))
         .mount(&server)
         .await;
-    // The requested span (group 0 + group 1) — group 0 is already cached,
-    // group 1 is not, so this is a genuine mixed present/absent range.
+    // The requested span is group 0 + group 1. Group 0 is already cached, group 1
+    // is not, so the pull leg's `missing_ranges` is exactly group 1 — and that is
+    // the ONLY ranged GET the origin may see. Mount a 206 for group 1 alone; a
+    // request for the whole span (a re-fetch of the held group) 404s and fails.
     let (req_off, req_len) = (0u64, 2 * group);
-    let aligned = align_range(req_off, req_len, total)?;
-    let span = plaintext
-        .get(usize::try_from(aligned.fetch_start())?..usize::try_from(aligned.fetch_end())?)
-        .ok_or_else(|| anyhow::anyhow!("aligned span out of bounds"))?
+    let gap = align_range(group, group, total)?;
+    let gap_bytes = plaintext
+        .get(usize::try_from(gap.fetch_start())?..usize::try_from(gap.fetch_end())?)
+        .ok_or_else(|| anyhow::anyhow!("gap span out of bounds"))?
         .to_vec();
-    let range_val = format!(
-        "bytes={}-{}",
-        aligned.fetch_start(),
-        aligned.fetch_end() - 1
-    );
+    let range_val = format!("bytes={}-{}", gap.fetch_start(), gap.fetch_end() - 1);
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .and(wiremock::matchers::header("range", range_val.as_str()))
-        .respond_with(ResponseTemplate::new(206).set_body_bytes(span))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(gap_bytes))
         .mount(&server)
         .await;
 
@@ -467,8 +465,8 @@ async fn partial_serve_mixed_range_falls_through_to_fill() -> anyhow::Result<()>
         want.len()
     );
 
-    // The mixed request did NOT short-circuit as a cache hit: the origin-tier
-    // range pull-through actually ran and fetched the aligned span.
+    // The mixed request neither short-circuited as a cache hit nor re-fetched the
+    // held group: exactly one ranged GET, and it is the gap (group 1) alone.
     let ranged_gets = count_requests(&server, |r| {
         r.method.as_str() == "GET"
             && r.url.path() == format!("/{hex}")
@@ -477,9 +475,7 @@ async fn partial_serve_mixed_range_falls_through_to_fill() -> anyhow::Result<()>
     .await?;
     anyhow::ensure!(
         ranged_gets == 1,
-        "expected the mixed present/absent range to trigger one origin range \
-         pull-through GET (proving it did not short-circuit as a direct cache \
-         serve), got {ranged_gets}"
+        "expected exactly one ranged GET for the missing group, got {ranged_gets}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;

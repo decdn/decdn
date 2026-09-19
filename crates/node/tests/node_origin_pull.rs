@@ -8122,17 +8122,15 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
     Ok(())
 }
 
-/// A resumed cache-miss request (`byte_offset > 0`) must NOT engage the fused
-/// window path: the incremental whole-blob BLAKE3 is only valid from offset 0,
-/// so the handler gates the fused serve on `req.byte_offset == 0` and falls a
-/// resumed miss back to the buffered path (`client.rs` §window-paced gate). With
-/// the window provider attached but no buffered origin on B's empty cache, the
-/// buffered fallback cleanly refuses. The regression this guards: dropping the
-/// offset-0 gate would route a resumed request into the fused path, which pulls
-/// and verifies from byte 0 and would mis-serve / mis-cache the blob (#856).
+/// A resumed cache-miss request (`byte_offset > 0`) IS served by the fused window
+/// path: the serve leg clamps delivery to `[offset, end)`, the pull leg fills only
+/// `missing_ranges(offset, 0)`, and every chunk group verifies against the root
+/// independently (ADR 038), so no tier needs byte 0. The proof is the signed
+/// `ok: true` response carrying the whole-blob `total_bytes` — a buffered fallback
+/// on B's empty cache would have refused.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
-async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()> {
+async fn window_pull_through_resumed_offset_is_served_by_the_fused_path() -> Result<()> {
     use alloy::signers::SignerSync;
 
     let payload = vec![0x7Eu8; PAYLOAD_LEN];
@@ -8145,7 +8143,7 @@ async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()>
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x7F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, _b_operator) =
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, _b_metrics, _local_rep, _b_operator) =
         build_node_b(
             a_id,
             a_addr,
@@ -8203,35 +8201,16 @@ async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()>
         ClientMessage::StreamResponse(r) => r,
         other => anyhow::bail!("expected StreamResponse, got {other:?}"),
     };
-    // The resumed miss is refused by the buffered fallback (no buffered origin),
-    // NOT served by the fused path.
     anyhow::ensure!(
-        !resp.body.ok,
-        "resumed offset>0 miss must be refused, not served (code rides in the trailing ext)"
+        resp.body.ok,
+        "a resumed offset>0 miss must be served by the fused window path"
+    );
+    anyhow::ensure!(
+        usize::try_from(resp.body.total_bytes)? == PAYLOAD_LEN,
+        "the fused path commits to the whole-blob total, got {}",
+        resp.body.total_bytes
     );
     conn.close(0u32.into(), b"done");
-
-    // The serve-miss pull-through must never have run: no window pause, no
-    // upstream verify — and crucially B must have made NO upstream pull (empty
-    // progress log) and cached NOTHING. A regression that dropped the offset-0
-    // gate would trip at least the upstream pull (non-empty log).
-    anyhow::ensure!(
-        counter_value(&b_metrics, "node_pull_through_window_paused_total")? == 0,
-        "serve-miss window pause must not fire for a resumed (offset>0) request"
-    );
-    anyhow::ensure!(
-        counter_value(&b_metrics, "node_pull_through_upstream_verify_failed_total")? == 0,
-        "serve-miss upstream verify must not run for a resumed (offset>0) request"
-    );
-    anyhow::ensure!(
-        progress_log(&recorded)?.is_empty(),
-        "B must not have pulled upstream for a resumed (offset>0) miss, got {:?}",
-        progress_log(&recorded)?
-    );
-    anyhow::ensure!(
-        !cache_b.has(hash).await?,
-        "B must not have cached anything for a refused resumed request"
-    );
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
