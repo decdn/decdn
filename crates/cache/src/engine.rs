@@ -9009,6 +9009,8 @@ mod tests {
         size: u64,
         support_range: bool,
         max_req: AtomicU64,
+        /// Windows starting at or past this offset come back one byte short.
+        short_from: u64,
         /// When true, [`Origin::fetch_outboard`] returns a transport
         /// [`OriginPullError`] instead of a clean decline — the degraded-origin
         /// case the serviceability probe must surface as a fault (#1129), not as a
@@ -9026,6 +9028,7 @@ mod tests {
                 size: u64::try_from(payload.len()).unwrap_or(u64::MAX),
                 support_range: true,
                 max_req: AtomicU64::new(0),
+                short_from: u64::MAX,
                 fault_outboard: false,
             }
         }
@@ -9040,6 +9043,7 @@ mod tests {
                 size,
                 support_range: false,
                 max_req: AtomicU64::new(0),
+                short_from: u64::MAX,
                 fault_outboard: true,
             }
         }
@@ -9107,7 +9111,10 @@ mod tests {
             self.max_req.fetch_max(req.len(), Ordering::SeqCst);
             let result = if hash == self.hash && self.support_range {
                 let s = usize::try_from(req.fetch_start).unwrap_or(usize::MAX);
-                let e = usize::try_from(req.fetch_end).unwrap_or(usize::MAX);
+                let mut e = usize::try_from(req.fetch_end).unwrap_or(usize::MAX);
+                if req.fetch_start >= self.short_from {
+                    e = e.saturating_sub(1);
+                }
                 match self.data.get(s..e) {
                     Some(span) => crate::OriginRangeFetch::Ranged {
                         data: Bytes::copy_from_slice(span),
@@ -9233,6 +9240,51 @@ mod tests {
         anyhow::ensure!(
             matches!(fault, Some(CacheError::VerifyFailed { expected }) if expected == hash),
             "a corrupt own origin must be a hard VerifyFailed, got {fault:?}"
+        );
+        Ok(())
+    }
+
+    /// A later window the origin returns short cannot verify against `H`, so the
+    /// wire ends on a HARD [`CacheError::VerifyFailed`] — the same verdict a
+    /// wrong-length first window gets at open.
+    #[tokio::test]
+    async fn origin_range_wire_hard_faults_on_short_window() -> anyhow::Result<()> {
+        use bao_tree::io::outboard::PreOrderMemOutboard;
+
+        let data = multi_window_test_blob();
+        let ob = PreOrderMemOutboard::create(&data, crate::range_pull::IROH_BLOCK_SIZE);
+        let hash = Hash::from(*ob.root.as_bytes());
+        let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let aligned = crate::range_pull::align_range(0, 0, total)
+            .map_err(|e| anyhow::anyhow!("align: {e}"))?;
+
+        let mut origin = RangeStubOrigin::serving(hash, &data, Bytes::from(ob.data.clone()));
+        origin.short_from = crate::RANGE_PULL_WINDOW_BYTES;
+        let tmp = tempfile::tempdir()?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
+        let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
+            anyhow::bail!("expected Some(wire) — the first window serves");
+        };
+        let (_, fault) = drain_wire(wire).await;
+        anyhow::ensure!(
+            matches!(fault, Some(CacheError::VerifyFailed { expected }) if expected == hash),
+            "a short later window must be a hard VerifyFailed, got {fault:?}"
+        );
+
+        let mut origin = RangeStubOrigin::serving(hash, &data, Bytes::from(ob.data.clone()));
+        origin.short_from = 0;
+        let tmp = tempfile::tempdir()?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
+        let err = engine
+            .origin_range_wire(hash, &aligned)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?;
+        anyhow::ensure!(
+            matches!(err, CacheError::VerifyFailed { expected } if expected == hash),
+            "a short first window must be a hard VerifyFailed, got {err:?}"
         );
         Ok(())
     }

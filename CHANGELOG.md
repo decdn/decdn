@@ -734,7 +734,9 @@ since project inception and will roll into the first tagged release.
   (4) origin range pulls run at once across both paths; a pull past the bound waits
   rather than degrading to a whole-blob pull. The `Origin` trait's `fetch_range`
   becomes the data-only `fetch_range_data` — the outboard comes from
-  `fetch_outboard` — so a custom `Origin` implementation must rename it.
+  `fetch_outboard` — so a custom `Origin` that overrode `fetch_range` must
+  implement both `fetch_range_data` and `fetch_outboard`; overriding only one
+  silently disables range pulls.
 - **`DecdnWatcherTaskPanicked` could never evaluate.** Its expr was
   `rate({__name__=~"decdn_.+_task_panicked_total"}[10m]) > 0`, and `rate()` drops
   `__name__`, so the five per-watcher series on a node collapsed to five identical

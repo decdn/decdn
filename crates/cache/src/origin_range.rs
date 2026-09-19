@@ -176,6 +176,35 @@ fn park_fault(slot: &FaultSlot, fault: CacheError) {
     }
 }
 
+/// Reject a window that is not exactly `[start, end)` long. A wrong-length
+/// origin response cannot verify against `H` — the same malformed-response
+/// verdict [`crate::range_pull::encode_verified_range`] gives — so it parks a
+/// [`CacheError::VerifyFailed`].
+fn check_window_len(
+    data: &Bytes,
+    start: u64,
+    end: u64,
+    hash: Hash,
+    fault: &FaultSlot,
+) -> io::Result<()> {
+    if u64::try_from(data.len()).ok() == Some(end.saturating_sub(start)) {
+        return Ok(());
+    }
+    tracing::warn!(
+        %hash,
+        window_start = start,
+        window_end = end,
+        got = data.len(),
+        "own origin served a wrong-length range window; hard local-origin fault \
+         (no degrade — committed to serving under H)",
+    );
+    park_fault(fault, CacheError::VerifyFailed { expected: hash });
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "origin range window has the wrong length",
+    ))
+}
+
 /// An [`AsyncSliceReader`] over one origin's span that holds a single window at
 /// a time and loads the window covering each read on demand. The encoder walks
 /// the range front to back, so each window is fetched once.
@@ -241,6 +270,7 @@ impl OriginWindowReader {
         let fetched = self.cursor.fetch_window(start, end).await;
         match fetched {
             Ok(Some(data)) => {
+                check_window_len(&data, start, end, self.cursor.hash, &self.fault)?;
                 self.window_start = start;
                 self.window = data;
                 Ok(())
@@ -383,6 +413,11 @@ impl OriginRangeWire {
         let kind = cursor.origin().kind();
         let ranges: ChunkRanges = aligned.chunk_ranges().clone();
         let fault: FaultSlot = Arc::new(Mutex::new(None));
+        if let Some((start, end)) = window_spans(aligned).next()
+            && check_window_len(&first, start, end, hash, &fault).is_err()
+        {
+            return Err(CacheError::VerifyFailed { expected: hash });
+        }
         let reader = OriginWindowReader::new(cursor, aligned, first, Arc::clone(&fault));
         let (tx, rx) = mpsc::channel(WIRE_CHANNEL_CAP);
         let task_fault = Arc::clone(&fault);

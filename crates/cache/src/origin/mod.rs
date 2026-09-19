@@ -363,8 +363,14 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// `{H}.obao4` outboard separately through [`Self::fetch_outboard`].
     ///
     /// The default implementation returns [`OriginRangeFetch::Unsupported`],
-    /// so a custom [`Origin`] needs no change and the engine degrades to a
-    /// whole-blob [`Self::fetch`] pull. The three shipped adapters override it.
+    /// so the engine degrades to a whole-blob [`Self::fetch`] pull. A range
+    /// pull needs BOTH this method and [`Self::fetch_outboard`]: an origin that
+    /// overrides only one never range-pulls. The three shipped adapters
+    /// override both.
+    ///
+    /// `data` must be exactly `req.len()` bytes. A wrong-length window fails
+    /// verification: the engine degrades the range pull, and the own-origin
+    /// serve-miss path reports [`crate::CacheError::VerifyFailed`].
     ///
     /// Like [`Self::fetch`], the origin is a dumb byte store: the returned
     /// `data` is **untrusted** and verified against the root `H` by the engine
@@ -392,9 +398,9 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// malformed/foreign. A range pull reads the outboard exactly once, then
     /// fetches the span window by window through [`Self::fetch_range_data`].
     ///
-    /// The default implementation returns [`OutboardFetch::Unsupported`], so
-    /// a custom [`Origin`] needs no change. The three shipped adapters
-    /// override it.
+    /// The default implementation returns [`OutboardFetch::Unsupported`], which
+    /// also disables range pulls (see [`Self::fetch_range_data`]). The three
+    /// shipped adapters override it.
     ///
     /// Like [`Self::fetch_range_data`], returning [`OutboardFetch::Unsupported`]
     /// or [`OutboardFetch::NotFound`] is never an error — only a genuine
