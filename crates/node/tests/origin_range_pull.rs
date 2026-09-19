@@ -323,6 +323,57 @@ fn decode_bao_range(
     Ok(slice.to_vec())
 }
 
+/// The CLI's throwaway handshake (`open_fetch_prelude`): a bound `(0, 0)` request,
+/// read the signed `StreamResponse` for `total_bytes`, then close the connection
+/// without paying or reading a byte. Returns the advertised total.
+async fn throwaway_open(
+    client_ep: &iroh::Endpoint,
+    target: EndpointAddr,
+    client_node_id: B256,
+    client_eth: &Arc<PrivateKeySigner>,
+    pool_id: B256,
+    hash: Hash,
+) -> anyhow::Result<u64> {
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let binding_hash =
+        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = client_eth
+        .sign_hash_sync(&binding_hash)?
+        .as_bytes()
+        .to_vec();
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: client_eth.address().into(),
+            binding_signature,
+        }),
+        capability: None,
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id.into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x9002,
+    };
+    let payload =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame_to(&mut send, &payload).await?;
+    let (resp, resp_ext) = read_stream_response(&mut recv).await?;
+    anyhow::ensure!(resp.body.ok, "throwaway open refused: {:?}", resp_ext.error);
+    // Exactly what `UpstreamPull::abort` / `Drop` do on the CLI: close the
+    // connection; the node's serve leg learns of it on its next write.
+    conn.close(0u32.into(), b"client-abandoned");
+    Ok(resp.body.total_bytes)
+}
+
 async fn write_frame_to(send: &mut SendStream, payload: &[u8]) -> anyhow::Result<()> {
     write_frame(send, payload)
         .await
@@ -1198,6 +1249,292 @@ async fn bounded_unaligned_offset_own_origin_miss_streams_the_exact_bytes() -> a
     anyhow::ensure!(
         counter_value(&metrics, "local_outboard_serves_total")? == 1,
         "an unaligned bounded miss must take the own-origin two-leg tier"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The CLI's real sequence on a cold miss: a throwaway `(0, 0)` open dropped as soon
+/// as the header lands, then the real `(0, total)` open — against a MULTI-DRAW blob
+/// with a slow origin, so the throwaway's fill is still live when the real open
+/// arrives. Observed ordering: the real open's `serve_audit` parks on the store's
+/// per-hash slot until the throwaway's current draw is admitted, then probes the
+/// origin and claims — attaching to the live fill or owning a fresh one, depending
+/// on whether the throwaway's serve leg has torn down yet. Every ordering must give
+/// a byte-exact delivery, both opens entering the two-leg tier, the outboard fetched
+/// at most once per open, no whole-blob GET, and no span fetched twice in full.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = large_blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    // Slow dynamic 206 responder: every draw takes 300 ms, so the throwaway's
+    // fill is mid-flight when the real open lands.
+    let blob_for_resp = blob.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header_exists("range"))
+        .respond_with(move |req: &Request| {
+            let span = req
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .and_then(|(s, e)| Some((usize::try_from(s).ok()?, usize::try_from(e).ok()?)))
+                .and_then(|(s, e)| blob_for_resp.get(s..=e));
+            match span {
+                Some(body) => ResponseTemplate::new(206)
+                    .set_body_bytes(body.to_vec())
+                    .set_delay(Duration::from_millis(300)),
+                None => ResponseTemplate::new(416),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x64);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let total = throwaway_open(
+        &client_ep,
+        target.clone(),
+        client_node_id,
+        &client_eth,
+        pool_id,
+        hash,
+    )
+    .await?;
+    anyhow::ensure!(total == blob_size, "throwaway header total mismatch");
+
+    // Immediately — no sleep — the real open, exactly as `drive` does.
+    let got = tokio::time::timeout(
+        Duration::from_secs(30),
+        ranged_paid_pull(
+            &client_ep,
+            target,
+            client_node_id,
+            &client_eth,
+            pool_id,
+            provider,
+            hash,
+            0,
+            total,
+            RATE_PER_MB,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("real open hung behind the throwaway's fill"))??;
+    anyhow::ensure!(
+        got.as_slice() == blob.as_slice(),
+        "real open after a throwaway must deliver byte-exact"
+    );
+    anyhow::ensure!(
+        cache.has(hash).await?,
+        "the real client paid the fill to the end"
+    );
+
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 2,
+        "both the throwaway and the real open must enter the two-leg tier"
+    );
+    let outboard_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET" && r.url.path() == format!("/{hex}.obao4")
+    })
+    .await?;
+    anyhow::ensure!(
+        outboard_gets <= 2,
+        "the outboard is fetched at most once per open (the probe), never per draw; saw {outboard_gets}"
+    );
+    let wholeblob_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && !r.headers.contains_key("range")
+    })
+    .await?;
+    anyhow::ensure!(wholeblob_gets == 0, "saw {wholeblob_gets} un-ranged GET(s)");
+    // No span fetched twice in full: every ranged GET carries a distinct Range.
+    let reqs = server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("wiremock request recording disabled"))?;
+    let ranges: Vec<String> = reqs
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == format!("/{hex}"))
+        .filter_map(|r| r.headers.get("range").and_then(|v| v.to_str().ok()))
+        .map(str::to_owned)
+        .collect();
+    anyhow::ensure!(
+        ranges.len() >= 2,
+        "test premise: a 3 MiB blob takes several draws, saw {ranges:?}"
+    );
+    let mut distinct = ranges.clone();
+    distinct.sort();
+    distinct.dedup();
+    anyhow::ensure!(
+        distinct.len() == ranges.len(),
+        "a span was fetched twice in full: {ranges:?}"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The other ordering: the throwaway's fill is already TORN DOWN (last-out cancel,
+/// or complete for a small blob) when the real open arrives. The real open must own
+/// a fresh fill or hit the cache — never park on the dead session — and deliver
+/// byte-exact within a hard timeout.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn throwaway_open_torn_down_before_real_open_still_serves() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    let blob_for_resp = blob.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header_exists("range"))
+        .respond_with(move |req: &Request| {
+            let span = req
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .and_then(|(s, e)| Some((usize::try_from(s).ok()?, usize::try_from(e).ok()?)))
+                .and_then(|(s, e)| blob_for_resp.get(s..=e));
+            match span {
+                Some(body) => ResponseTemplate::new(206).set_body_bytes(body.to_vec()),
+                None => ResponseTemplate::new(416),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x65);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let (handler, _cache, _metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let total = throwaway_open(
+        &client_ep,
+        target.clone(),
+        client_node_id,
+        &client_eth,
+        pool_id,
+        hash,
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let got = tokio::time::timeout(
+        Duration::from_secs(20),
+        ranged_paid_pull(
+            &client_ep,
+            target,
+            client_node_id,
+            &client_eth,
+            pool_id,
+            provider,
+            hash,
+            0,
+            total,
+            RATE_PER_MB,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("real open hung after the throwaway's teardown"))??;
+    anyhow::ensure!(
+        got.as_slice() == blob.as_slice(),
+        "real open after a torn-down throwaway must deliver byte-exact"
+    );
+
+    // Never a whole-blob GET, and at most one extra ranged draw for the span the
+    // cancelled fill was mid-way through.
+    let wholeblob_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && !r.headers.contains_key("range")
+    })
+    .await?;
+    anyhow::ensure!(wholeblob_gets == 0, "saw {wholeblob_gets} un-ranged GET(s)");
+    let ranged_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers.contains_key("range")
+    })
+    .await?;
+    anyhow::ensure!(
+        ranged_gets <= 2,
+        "a torn-down throwaway costs at most one duplicate draw, saw {ranged_gets}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;

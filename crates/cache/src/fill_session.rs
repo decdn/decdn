@@ -1952,6 +1952,86 @@ mod fill_registry_tests {
         assert!(!mapped(&reg, hash), "last observer left — session removed");
     }
 
+    #[test]
+    fn claim_after_last_out_release_owns_a_fresh_session() {
+        // The CLI's throwaway open: claim, then the ONLY observer leaves. The
+        // registry cancels and unmaps that session under the lock. The real open's
+        // claim must then OWN a fresh session — never attach to the cancelled one.
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0xD9);
+
+        let FillClaim::Owner {
+            session: first,
+            lease,
+        } = reg.claim(hash, 0, 0, total, || FillSession::new(root(0xD9), total))
+        else {
+            panic!("owns");
+        };
+        assert!(lease.release().is_none(), "no parked pull handle to join");
+        assert!(
+            first.is_cancelled(),
+            "last-out release cancels the throwaway's fill"
+        );
+        assert!(!mapped(&reg, hash), "the cancelled session is unmapped");
+
+        let FillClaim::Owner {
+            session: second,
+            lease: _second_lease,
+        } = reg.claim(hash, 0, total, total, || {
+            FillSession::new(root(0xD9), total)
+        })
+        else {
+            panic!("the real open must own, not attach");
+        };
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a fresh session, not the cancelled one"
+        );
+        assert!(!second.is_cancelled());
+        assert_eq!(second.observer_count(), 1);
+    }
+
+    #[test]
+    fn claim_before_last_out_release_keeps_the_fill_alive() {
+        // The other ordering: the real open attaches BEFORE the throwaway's
+        // teardown. The teardown then is not last-out, so it must not cancel.
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0xDA);
+
+        let FillClaim::Owner {
+            session,
+            lease: throwaway,
+        } = reg.claim(hash, 0, 0, total, || FillSession::new(root(0xDA), total))
+        else {
+            panic!("owns");
+        };
+        let FillClaim::Attach {
+            session: attached,
+            lease: real,
+        } = reg.claim(hash, 0, total, total, || panic!("attaches"))
+        else {
+            panic!("the real open attaches to the live fill");
+        };
+        assert!(Arc::ptr_eq(&session, &attached));
+
+        assert!(throwaway.release().is_none());
+        assert!(
+            !session.is_cancelled(),
+            "the real observer keeps the fill alive"
+        );
+        assert!(mapped(&reg, hash));
+        assert_eq!(session.observer_count(), 1);
+
+        assert!(real.release().is_none());
+        assert!(
+            session.is_cancelled(),
+            "the real observer's exit is last-out"
+        );
+        assert!(!mapped(&reg, hash));
+    }
+
     /// A sibling session for the same hash survives when one session's last observer
     /// leaves: removal is by pointer identity, and the hash key (and its shared
     /// outboard) stay while any session remains under it.
