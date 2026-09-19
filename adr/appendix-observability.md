@@ -395,7 +395,7 @@ The panels draw on the whole exported surface, not only the [§ Metric Registry]
 | [`monitoring/dashboard-chain.json`](../monitoring/dashboard-chain.json) | Chain, payments and slash safety (`uid: decdn-chain`): watcher liveness for all five watchers, the capacity-bond and active-staker registries with a world map of active nodes by declared region, and both sides of the payment flow. |
 | [`monitoring/dashboard-node.json`](../monitoring/dashboard-node.json) | Single-node drilldown (`uid: decdn-node`): host resources, process state, iroh transport, DHT and probe, plus that node's logs and traces. |
 
-All four share a datasource variable per signal — `${DS_PROMETHEUS}`, `${DS_LOKI}`, `${DS_TEMPO}` — and scope every selector with `deployment_environment`, `region` and `instance`. They cross-link through a dashboard link on the `decdn` tag.
+All four share a datasource variable per signal — `${DS_PROMETHEUS}`, `${DS_LOKI}`, `${DS_TEMPO}`. The `$env`, `$region` and `$instance` variables read the Prometheus labels `deployment_environment`, `region` and `instance`. The Loki selectors use `unit="decdn-node.service"` and `instance`. They do not use `job`, because the log streams keep the host job for the Linux Server integration. The Loki `instance` label must equal the Prometheus `instance` label. The dashboards cross-link through a dashboard link on the `decdn` tag.
 
 #### Two query shapes worth knowing
 

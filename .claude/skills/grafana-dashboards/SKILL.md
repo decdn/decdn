@@ -41,9 +41,12 @@ four-dashboard suite, alerting rules, and logs and traces to go with them.
 Add a row to an existing dashboard before starting a fifth one.
 
 **All three signals are live.** Metrics reach Grafana Cloud Prometheus as `job="decdn-node"`;
-logs reach Loki as `{job="integrations/node_exporter", unit="decdn-node.service"}`; traces
-reach Tempo as `resource.service.name="decdn-node"`. Grafana Alloy on each host does all
-three — its config lives in `internal-devops`, not here.
+logs reach Loki as `{service_name="decdn-node", unit="decdn-node.service"}`; traces
+reach Tempo as `resource.service.name="decdn-node"`. The log streams keep
+`job="integrations/node_exporter"` because Grafana Cloud's Linux Server integration joins logs to
+host metrics on `job` + `instance`, so never select daemon logs by `job`. Dashboard log panels
+select on `unit` + `instance`. Grafana Alloy on each host does all three — its config lives in
+`internal-devops`, not here.
 
 **Metric names are gated by tests, not by promtool.** No CI workflow references `monitoring/`.
 The only thing tying these files to the code is the test module in `crates/node/src/metrics.rs`:
