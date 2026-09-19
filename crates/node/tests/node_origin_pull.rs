@@ -1272,6 +1272,7 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
+    let spans = support::capture_spans();
     let payload = vec![0xABu8; PAYLOAD_LEN];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
@@ -1399,6 +1400,24 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     );
 
     shutdown([task_a], [&ep_b, &ep_a]).await?;
+
+    // The pull runs on its own thread and runtime; its spans must still nest
+    // under the fetch: node_pull ⊃ upstream_stream ⊃ open_progressive_pull.
+    let key = hash.to_string();
+    let pulls = spans.matching("upstream_stream", "hash", &key);
+    anyhow::ensure!(
+        pulls.iter().any(|s| s.parent == Some("node_pull")
+            && s.fields.get("outcome").map(String::as_str) == Some("filled")),
+        "upstream_stream: {pulls:?}"
+    );
+    let opens = spans.matching("open_progressive_pull", "hash", &key);
+    anyhow::ensure!(
+        !opens.is_empty()
+            && opens.iter().all(|s| s.parent == Some("upstream_stream")
+                && s.fields.contains_key("byte_offset")
+                && s.fields.contains_key("byte_len")),
+        "open_progressive_pull must nest under upstream_stream with its range: {opens:?}"
+    );
     Ok(())
 }
 

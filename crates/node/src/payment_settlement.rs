@@ -64,7 +64,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, B256, Bytes, Signature, U256};
+use alloy::primitives::{Address, B256, Bytes, Signature, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
@@ -77,7 +77,7 @@ use decdn_incentive::{
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument as _, debug, error, info, warn};
 
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{Checkpoint, ColdStart, CursorStart, LogSink};
@@ -1452,7 +1452,22 @@ async fn redeem_sweep<P: Provider + Clone>(
 /// timeout / non-oversize send error records one `redemption_failure` and leaves
 /// the claims for the next sweep (cumulative, monotone, retry-safe). Does NOT seed
 /// the paid cache — each paid voucher emits its own `PoolRedeemed`.
+///
+/// Runs inside an `onchain_tx` span that records the transaction hash (`tx`)
+/// and the `outcome`. A halved retry nests its two halves as child spans.
 #[allow(clippy::cognitive_complexity)]
+#[tracing::instrument(
+    name = "onchain_tx",
+    skip_all,
+    fields(
+        op = "redeemMany",
+        depth = depth,
+        voucher_count = lanes.len(),
+        tx = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    )
+)]
 async fn submit_chunk<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
@@ -1463,6 +1478,7 @@ async fn submit_chunk<P: Provider + Clone>(
     if lanes.is_empty() {
         return;
     }
+    let span = tracing::Span::current();
     let batches = group_by_pool(&lanes);
     let cap_count: usize = batches.iter().map(|b| b.capabilities.len()).sum();
     let voucher_count = lanes.len();
@@ -1470,6 +1486,8 @@ async fn submit_chunk<P: Provider + Clone>(
     let sent = contract.redeemMany(batches).send().await;
     match send_and_await_receipt(sent, Some(REDEEM_RECEIPT_TIMEOUT)).await {
         TxOutcome::Landed(receipt) => {
+            span.record("tx", tracing::field::display(receipt.transaction_hash));
+            span.record("outcome", "landed");
             info!(
                 pool_count,
                 cap_count,
@@ -1491,6 +1509,7 @@ async fn submit_chunk<P: Provider + Clone>(
                 && depth < MAX_SPLIT_DEPTH
                 && is_oversize_send_err(&err.to_string()) =>
         {
+            span.record("outcome", "split");
             let mid = lanes.len() / 2;
             let right = lanes.split_off(mid);
             warn!(
@@ -1501,18 +1520,22 @@ async fn submit_chunk<P: Provider + Clone>(
             Box::pin(submit_chunk(contract, store, right, metrics, depth + 1)).await;
         }
         TxOutcome::Reverted(receipt) => {
+            record_tx_failure(&span, "reverted", Some(receipt.transaction_hash));
             metrics.redemption_failure();
             warn!(voucher_count, tx = %receipt.transaction_hash, "redeemMany reverted on-chain; leaving claims for retry");
         }
         TxOutcome::SendErr(err) => {
+            record_tx_failure(&span, "send_failed", None);
             metrics.redemption_failure();
             warn!(error = %sanitize_rpc_display(&err), voucher_count, "redeemMany send failed; leaving claims for retry");
         }
         TxOutcome::ReceiptErr { error, tx_hash } => {
+            record_tx_failure(&span, "receipt_failed", Some(tx_hash));
             metrics.redemption_failure();
             warn!(error = %sanitize_rpc_display(&error), voucher_count, tx = %tx_hash, "redeemMany receipt failed; leaving claims for retry");
         }
         TxOutcome::Timeout { tx_hash } => {
+            record_tx_failure(&span, "timeout", Some(tx_hash));
             metrics.redemption_failure();
             warn!(voucher_count, tx = %tx_hash, timeout = ?REDEEM_RECEIPT_TIMEOUT, "redeemMany receipt timed out; leaving claims for retry");
         }
@@ -1674,6 +1697,16 @@ fn reconcile_plans(plans: Vec<PlannedLane>, onchain_paid: &[U256]) -> (Vec<Plann
     (kept, skipped)
 }
 
+/// Record a failed transaction's `outcome`, its hash when one was issued, and
+/// an error status on its `onchain_tx` span.
+fn record_tx_failure(span: &tracing::Span, outcome: &'static str, tx: Option<TxHash>) {
+    if let Some(tx) = tx {
+        span.record("tx", tracing::field::display(tx));
+    }
+    span.record("outcome", outcome);
+    span.record("otel.status_code", "ERROR");
+}
+
 async fn redeem_planned_lanes<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
@@ -1691,12 +1724,17 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
     if chunks.is_empty() {
         return;
     }
-    if !flush_store_durable(store, metrics, strict_flush).await && strict_flush {
-        return;
+    let span = tracing::info_span!("redeem_cycle", chunks = chunks.len(), strict_flush);
+    async move {
+        if !flush_store_durable(store, metrics, strict_flush).await && strict_flush {
+            return;
+        }
+        for chunk in chunks {
+            submit_chunk(contract, store, chunk, metrics, 0).await;
+        }
     }
-    for chunk in chunks {
-        submit_chunk(contract, store, chunk, metrics, 0).await;
-    }
+    .instrument(span)
+    .await;
 }
 
 /// Mutable debounce bookkeeping for [`DebouncedCheckpointStore`], guarded by a

@@ -6,12 +6,69 @@ use super::{
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
     FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey, LaneSlot,
     OwnedSemaphorePermit, PublicKey, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore,
-    SendStream, ServeRejectReason, StreamReadError, StreamResponseBody, U256, VarInt,
-    read_first_message, reset_stream, verify_binding,
+    SendStream, ServeRejectReason, StreamReadError, StreamRequest, StreamResponseBody, U256,
+    VarInt, read_first_message, reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
 use tokio::task::{JoinError, JoinSet};
+
+use futures_util::FutureExt as _;
+use tracing::Instrument as _;
+
+use super::outcome::{ResetCause, ServeEnd};
+
+/// The root span for one inbound serve stream.
+///
+/// The request fields (`hash`, `pool_id`, `byte_offset`, `byte_len`) are
+/// recorded once the client binding verifies, so a stream reset before that has
+/// none. `outcome` / `reason` / `bytes` are recorded once the stream ends
+/// ([`ServeEnd::record`]), or `outcome` / `error` when it ends on an error.
+/// `peer` and `local_node_id` render as lowercase-hex iroh ids, the same as the
+/// requester's `open_progressive_pull` span records them, so one trace query
+/// joins the two sides of a transfer on `hash`, `pool_id`, `byte_offset` and
+/// the swapped ids.
+pub(super) fn serve_stream_span(peer: PublicKey, local_node_id: PublicKey) -> tracing::Span {
+    tracing::info_span!(
+        "serve_stream",
+        otel.kind = "server",
+        otel.status_code = tracing::field::Empty,
+        direction = "inbound",
+        %peer,
+        %local_node_id,
+        hash = tracing::field::Empty,
+        pool_id = tracing::field::Empty,
+        byte_offset = tracing::field::Empty,
+        byte_len = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+        reason = tracing::field::Empty,
+        error = tracing::field::Empty,
+        bytes = tracing::field::Empty,
+    )
+}
+
+/// Records `outcome = "cancelled"` on a serve stream's span when its task is
+/// dropped before the stream ends — an abort on shutdown, while the task waits
+/// on the client. Disarmed (set to `None`) once the stream ends, so the span's
+/// outcome is still recorded exactly once.
+struct CancelledMark(Option<tracing::Span>);
+
+impl Drop for CancelledMark {
+    fn drop(&mut self) {
+        if let Some(span) = self.0.take() {
+            span.record("outcome", "cancelled");
+        }
+    }
+}
+
+/// Record the request fields of a [`serve_stream_span`].
+pub(super) fn record_request(span: &tracing::Span, req: &StreamRequest) {
+    span.record("hash", tracing::field::display(Hash::from_bytes(req.hash)));
+    span.record("pool_id", tracing::field::display(B256::from(req.pool_id)));
+    span.record("byte_offset", req.byte_offset);
+    span.record("byte_len", req.byte_len);
+}
 
 impl ClientHandler {
     /// Accept the connection-level rate-limit permit, then serve each inbound
@@ -72,7 +129,7 @@ impl ClientHandler {
         let peer = conn.remote_id();
 
         let idle_timeout = self.idle_timeout.unwrap_or(APP_IDLE_TIMEOUT);
-        let mut inflight: JoinSet<anyhow::Result<()>> = JoinSet::new();
+        let mut inflight: JoinSet<()> = JoinSet::new();
         loop {
             tokio::select! {
                 biased;
@@ -84,13 +141,41 @@ impl ClientHandler {
                         // Boxed: the serve future is large (clippy::large_futures),
                         // and spawning the boxed future keeps it off the accept
                         // task's stack frame. Each task holds its own `Arc<Self>`.
-                        inflight.spawn(Box::pin(this.serve_stream(
+                        let span = serve_stream_span(peer, self.node_id);
+                        let serve = Box::pin(Arc::clone(&this).serve_stream(
                             send,
                             recv,
                             permit,
                             bound,
                             peer,
-                        )));
+                        ));
+                        inflight.spawn(
+                            async move {
+                                let span = tracing::Span::current();
+                                let mut unended = CancelledMark(Some(span.clone()));
+                                // Caught only to mark the span, then resumed, so the
+                                // `JoinSet` still sees the panic and meters it.
+                                let ended = AssertUnwindSafe(serve).catch_unwind().await;
+                                unended.0 = None;
+                                match ended {
+                                    Ok(Ok(end)) => end.record(&span),
+                                    Ok(Err(e)) => {
+                                        span.record("outcome", "failed");
+                                        span.record(
+                                            "error",
+                                            tracing::field::display(format_args!("{e:#}")),
+                                        );
+                                        this.log_stream_end(&e, &span);
+                                    }
+                                    Err(panic) => {
+                                        span.record("outcome", "panicked");
+                                        span.record("otel.status_code", "ERROR");
+                                        std::panic::resume_unwind(panic);
+                                    }
+                                }
+                            }
+                            .instrument(span),
+                        );
                     }
                     // The connection closed (client done) or errored — stop
                     // accepting new streams. Not a handler fault.
@@ -127,19 +212,18 @@ impl ClientHandler {
 
     /// File one finished per-stream task by its join outcome.
     ///
-    /// A task that returned an error routes to [`Self::log_stream_end`], which
-    /// attributes it to peer or node by the marker on the error chain. A
-    /// [`JoinError`] means the task did not return a value — the `JoinSet`
+    /// The task logs its own error inside its span ([`Self::log_stream_end`]),
+    /// so only a [`JoinError`] reaches here. It means the task did not return a
+    /// value — the `JoinSet`
     /// isolates that from the connection, which keeps serving its other streams —
     /// and splits two ways: a PANIC is a node-side bug, metered on
     /// `decdn_serve_stream_node_fault_total` and logged at `error!` so its rate is
     /// alertable; a CANCELLATION is a benign teardown artifact (the drain path
     /// never aborts, so this only arises on runtime shutdown), logged at `debug!`
     /// and not counted.
-    fn note_joined_stream(&self, joined: Result<anyhow::Result<()>, JoinError>) {
+    fn note_joined_stream(&self, joined: Result<(), JoinError>) {
         match joined {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => self.log_stream_end(&e),
+            Ok(()) => {}
             Err(join_err) if join_err.is_panic() => {
                 self.metrics.serve_stream_node_fault();
                 tracing::error!(error = %join_err, "client stream task panicked");
@@ -162,11 +246,13 @@ impl ClientHandler {
     /// logs at `debug!`.
     ///
     /// `{e:#}` rather than `{e}`: the marker sits in the chain, so the alternate
-    /// form is what prints the cause beside it.
-    fn log_stream_end(&self, e: &anyhow::Error) {
+    /// form is what prints the cause beside it. A node-side fault also marks the
+    /// stream's `span` as an error for the trace backend.
+    fn log_stream_end(&self, e: &anyhow::Error, span: &tracing::Span) {
         if super::wire::is_peer_attributable(e) {
             tracing::debug!(error = %format_args!("{e:#}"), "client stream ended with error");
         } else {
+            span.record("otel.status_code", "ERROR");
             self.metrics.serve_stream_node_fault();
             tracing::error!(
                 error = %format_args!("{e:#}"),
@@ -175,7 +261,8 @@ impl ClientHandler {
         }
     }
 
-    /// Serve one delivery stream end to end.
+    /// Serve one delivery stream end to end. Returns how the stream ended
+    /// ([`ServeEnd`]); an `Err` is recorded on the span as `outcome = failed`.
     ///
     /// Kept as one linear, ADR-ordered sequence (read → bind → blob gate →
     /// channel → sign → deliver); splitting it would scatter the ADR-005
@@ -189,7 +276,7 @@ impl ClientHandler {
         permit: Option<OwnedSemaphorePermit>,
         bound_addr: Arc<ArcSwapOption<Address>>,
         peer: PublicKey,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<ServeEnd> {
         let client_node_id = B256::from(*peer.as_bytes());
         let first = match read_first_message(&mut recv).await {
             Ok(first) => first,
@@ -209,7 +296,7 @@ impl ClientHandler {
         // cap exists to shed load, not to add work to the reject path.
         if permit.is_none() {
             reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
-            return Ok(());
+            return Ok(ServeEnd::Reset(ResetCause::StreamCapFull));
         }
 
         let FirstMessage::Delivery(req, ext) = first;
@@ -245,7 +332,7 @@ impl ClientHandler {
                     }
                     self.metrics.serve_stream_rejected_bad_binding();
                     reset_stream(&mut send, &mut recv, APP_ERR_MALFORMED_MESSAGE);
-                    return Ok(());
+                    return Ok(ServeEnd::Reset(ResetCause::BadBinding));
                 }
                 Err(e) => {
                     if let Some(suppressed) = self.binding_warn.admit() {
@@ -259,12 +346,13 @@ impl ClientHandler {
                     }
                     self.metrics.serve_stream_rejected_bad_binding();
                     reset_stream(&mut send, &mut recv, APP_ERR_MALFORMED_MESSAGE);
-                    return Ok(());
+                    return Ok(ServeEnd::Reset(ResetCause::BadBinding));
                 }
             }
         }
 
         let hash = Hash::from_bytes(req.hash);
+        record_request(&tracing::Span::current(), &req);
 
         // The request's price: the node's configured `rate_per_mb`, quoted
         // verbatim and threaded to every refusal and to the window tier. The

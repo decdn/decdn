@@ -8,6 +8,7 @@ use decdn_cache::CacheResult;
 use futures_util::{Stream, StreamExt};
 
 use super::MAX_PROOFS_PER_CHUNK;
+use super::outcome::{ServeEnd, ServeStop};
 use super::voucher::StreamAnchor;
 use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
 use super::{
@@ -204,7 +205,7 @@ impl ClientHandler {
         client_node_id: B256,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<ServeEnd> {
         // Owned here so the pool floor reservation reconciles at every exit —
         // success, `?`, disconnect, panic — exactly like `LaneSlot`. The serve loop
         // below releases it once the stream repays a floor; on any other exit the
@@ -415,7 +416,12 @@ impl ClientHandler {
                                     )));
                             }
                         }
-                        VoucherStop::Rejected => return Ok(()),
+                        VoucherStop::Rejected => {
+                            return Ok(ServeEnd::Stopped {
+                                stop: ServeStop::VoucherRejected,
+                                bytes: delivered,
+                            });
+                        }
                     }
                 }
             }
@@ -484,7 +490,10 @@ impl ClientHandler {
                         pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
                         "mid-stream PoolExhausted: pool can no longer fund the floor credit committed across its signers; owner should top up the deposit. This is the POOL level — stopped_signer names the terminated stream, not the cause; a per-signer gate refusal never reaches here"
                     );
-                    return Ok(());
+                    return Ok(ServeEnd::Stopped {
+                        stop: ServeStop::PoolExhausted,
+                        bytes: delivered,
+                    });
                 }
 
                 // Mid-stream SIGNER cap-headroom re-check (ADR 003 §Pool solvency),
@@ -518,7 +527,10 @@ impl ClientHandler {
                         pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
                         "mid-stream SignerCapExhausted: this signer drained its shared cap at other nodes since admission, so its cap−spent headroom no longer covers the committed floor; owner should raise the signer's cap or delegate a fresh capability. This is the SIGNER level, distinct from PoolExhausted — the pool may still be solvent on other signers' budgets"
                     );
-                    return Ok(());
+                    return Ok(ServeEnd::Stopped {
+                        stop: ServeStop::SignerCapExhausted,
+                        bytes: delivered,
+                    });
                 }
             }
 
@@ -539,7 +551,10 @@ impl ClientHandler {
             // `!done` guard.
             if collected_any && !done && self.takedown_landed(hash, funder) {
                 self.terminate_for_takedown(send, recv, hash);
-                return Ok(());
+                return Ok(ServeEnd::Stopped {
+                    stop: ServeStop::Takedown,
+                    bytes: delivered,
+                });
             }
 
             if done {
@@ -567,7 +582,7 @@ impl ClientHandler {
         // speculatively warmed this blob (a no-op for an untagged / non-speculative
         // hash), on the same clean-completion edge as the ADR 040 hit sighting.
         self.credit_warming_serve(hash, delivered);
-        Ok(())
+        Ok(ServeEnd::Completed { bytes: delivered })
     }
 }
 

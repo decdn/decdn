@@ -4,6 +4,7 @@ use super::{
     Address, B256, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneKey,
     RangePullOutcome, StreamRequest,
 };
+use tracing::Instrument as _;
 
 impl ClientHandler {
     /// Whether `req` is authorized to trigger a paid pull-through (#831): it must
@@ -68,6 +69,17 @@ impl ClientHandler {
     /// present locally, and — when it is not — whether the cause was a clean miss
     /// or a hard fault (#1129).
     pub(super) async fn try_pull_through(&self, hash: Hash, timeout: Duration) -> FillOutcome {
+        let span = fill_span("node", hash);
+        let outcome = self
+            .node_pull_through(hash, timeout)
+            .instrument(span.clone())
+            .await;
+        span.record("outcome", outcome.as_str());
+        outcome
+    }
+
+    /// The body of [`Self::try_pull_through`], run inside its span.
+    async fn node_pull_through(&self, hash: Hash, timeout: Duration) -> FillOutcome {
         match tokio::time::timeout(timeout, self.cache.populate(hash)).await {
             Ok(Ok(())) => FillOutcome::Filled,
             // A clean miss — no origin/provider had it — is the normal
@@ -119,6 +131,17 @@ impl ClientHandler {
     /// the background (#1610 removed the detached warm), so the blob is re-fetched
     /// on the next real client request (see [`Self::on_local_populate_timeout`]).
     pub(super) async fn try_local_populate(&self, hash: Hash, timeout: Duration) -> FillOutcome {
+        let span = fill_span("local", hash);
+        let outcome = self
+            .local_populate(hash, timeout)
+            .instrument(span.clone())
+            .await;
+        span.record("outcome", outcome.as_str());
+        outcome
+    }
+
+    /// The body of [`Self::try_local_populate`], run inside its span.
+    async fn local_populate(&self, hash: Hash, timeout: Duration) -> FillOutcome {
         match tokio::time::timeout(timeout, self.cache.populate_local(hash)).await {
             Ok(Ok(())) => FillOutcome::Filled,
             Ok(Err(e @ (CacheError::NotFound { .. } | CacheError::NoOrigin { .. }))) => {
@@ -342,4 +365,16 @@ impl ClientHandler {
             FillOutcome::CleanMiss
         }
     }
+}
+
+/// The span around one cache-fill attempt for a serve miss. `tier` is `node`
+/// (a paid pull from an upstream deCDN node) or `local` (the operator's own
+/// origin). `outcome` is recorded once the attempt ends.
+fn fill_span(tier: &'static str, hash: Hash) -> tracing::Span {
+    tracing::info_span!(
+        "pull_through",
+        tier,
+        %hash,
+        outcome = tracing::field::Empty,
+    )
 }

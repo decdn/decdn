@@ -82,7 +82,7 @@ use decdn_client_pull::{BudgetPacer, PeerSource, drive};
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{Instrument as _, debug, warn};
 
 use decdn_reputation::{LocalReputation, Outcome};
 
@@ -595,101 +595,119 @@ impl Origin for NodeOrigin {
         _max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
         let deps_lock = Arc::clone(&self.deps);
+        let span = tracing::info_span!(
+            "node_pull",
+            %hash,
+            outcome = tracing::field::Empty,
+        );
         Box::pin(async move {
-            let Some(deps) = deps_lock.get() else {
-                // Pull-through not provisioned (feature disabled or the buyer
-                // bootstrap failed). A clean miss — the engine surfaces NotFound
-                // to the handler, which behaves as it did pre-#831. The engine
-                // enforces `max_bytes` on whatever any provisioned pull returns,
-                // so it is not consulted here.
-                return Ok(OriginFetch::NotFound);
-            };
-            let hash_bytes = *hash.as_bytes();
-            let target = DhtHash::from_bytes(hash_bytes);
-            // ONE budget for the whole fetch, spent across both phases — see
-            // `PullOutcome`.
-            let mut budget = MAX_PROVIDER_ATTEMPTS;
-            // `node_pull_attempts` counts pull ORCHESTRATIONS ("found ≥1 candidate
-            // to try"), and is the denominator for the success / corruption /
-            // unreachable rates. One `fetch` is one orchestration however many
-            // candidate lists it walks, so a probe-cache hit that exhausts its
-            // providers and falls through to the cold path must still meter
-            // exactly once — otherwise every such fetch inflates the denominator
-            // and quietly deflates every rate built on it.
-            let mut attempt_metered = false;
-            // Latched across BOTH walks, like `attempt_metered` — see
-            // `miss_answer` for what it buys.
-            let mut miss = PullMiss::Clean;
+            let result = async move {
+                let Some(deps) = deps_lock.get() else {
+                    // Pull-through not provisioned (feature disabled or the buyer
+                    // bootstrap failed). A clean miss — the engine surfaces NotFound
+                    // to the handler, which behaves as it did pre-#831. The engine
+                    // enforces `max_bytes` on whatever any provisioned pull returns,
+                    // so it is not consulted here.
+                    return Ok(OriginFetch::NotFound);
+                };
+                let hash_bytes = *hash.as_bytes();
+                let target = DhtHash::from_bytes(hash_bytes);
+                // ONE budget for the whole fetch, spent across both phases — see
+                // `PullOutcome`.
+                let mut budget = MAX_PROVIDER_ATTEMPTS;
+                // `node_pull_attempts` counts pull ORCHESTRATIONS ("found ≥1 candidate
+                // to try"), and is the denominator for the success / corruption /
+                // unreachable rates. One `fetch` is one orchestration however many
+                // candidate lists it walks, so a probe-cache hit that exhausts its
+                // providers and falls through to the cold path must still meter
+                // exactly once — otherwise every such fetch inflates the denominator
+                // and quietly deflates every rate built on it.
+                let mut attempt_metered = false;
+                // Latched across BOTH walks, like `attempt_metered` — see
+                // `miss_answer` for what it buys.
+                let mut miss = PullMiss::Clean;
 
-            // ADR 001 §Probe cache: "On a cache miss the requester checks the probe
-            // cache first; if a valid entry exists, it skips DHT lookup and goes
-            // straight to selection."
-            if let Some(cached) = cached_candidates(deps, target).await {
-                deps.metrics.probe_cache_hit();
-                deps.metrics.node_pull_attempt();
-                attempt_metered = true;
-                let outcome = try_pull(&deps_lock, deps, &cached, hash_bytes, budget).await;
-                match outcome.payload {
-                    Ok(()) => return Ok(OriginFetch::AlreadyAdmitted),
-                    Err(failed) => miss = miss.or(failed),
+                // ADR 001 §Probe cache: "On a cache miss the requester checks the probe
+                // cache first; if a valid entry exists, it skips DHT lookup and goes
+                // straight to selection."
+                if let Some(cached) = cached_candidates(deps, target).await {
+                    deps.metrics.probe_cache_hit();
+                    deps.metrics.node_pull_attempt();
+                    attempt_metered = true;
+                    let outcome = try_pull(&deps_lock, deps, &cached, hash_bytes, budget).await;
+                    match outcome.payload {
+                        Ok(()) => return Ok(OriginFetch::AlreadyAdmitted),
+                        Err(failed) => miss = miss.or(failed),
+                    }
+                    budget = budget.saturating_sub(outcome.attempts);
+                    // Every cached provider we had budget to try failed to deliver.
+                    // The entry has been disproved by the only evidence that outranks
+                    // a probe — actual pulls — so drop it rather than let it keep
+                    // hitting for the rest of its TTL. Any untried tail beyond
+                    // `budget` is forfeited with it: a fresh probe is cheaper than
+                    // trusting a list whose top-ranked members just failed.
+                    deps.probe_cache.invalidate(&target);
+                    if budget == 0 {
+                        // The cached candidates ate the whole fetch-wide budget.
+                        // Running a fresh lookup + probe now would either exceed the
+                        // worst case `outer_pull_deadline` is sized for, or discover
+                        // providers it has no attempts left to try. The entry is gone,
+                        // so the next fetch goes cold.
+                        //
+                        // Answered through `miss_answer` like the cold-path arm below,
+                        // so an exhausted budget spent on OUR faults is not signed to a
+                        // client as an absent blob (#1560).
+                        debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
+                        return miss_answer(miss);
+                    }
+                } else {
+                    deps.metrics.probe_cache_miss();
                 }
-                budget = budget.saturating_sub(outcome.attempts);
-                // Every cached provider we had budget to try failed to deliver.
-                // The entry has been disproved by the only evidence that outranks
-                // a probe — actual pulls — so drop it rather than let it keep
-                // hitting for the rest of its TTL. Any untried tail beyond
-                // `budget` is forfeited with it: a fresh probe is cheaper than
-                // trusting a list whose top-ranked members just failed.
-                deps.probe_cache.invalidate(&target);
-                if budget == 0 {
-                    // The cached candidates ate the whole fetch-wide budget.
-                    // Running a fresh lookup + probe now would either exceed the
-                    // worst case `outer_pull_deadline` is sized for, or discover
-                    // providers it has no attempts left to try. The entry is gone,
-                    // so the next fetch goes cold.
-                    //
-                    // Answered through `miss_answer` like the cold-path arm below,
-                    // so an exhausted budget spent on OUR faults is not signed to a
-                    // client as an absent blob (#1560).
-                    debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
+
+                // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
+                // This is the generic `Origin::fetch` path (the buffered `populate` fill),
+                // a hash-only pull with no client namespace, so it takes no on-chain
+                // origin-directory fallback (`NO_NAMESPACE`). The namespace-aware
+                // client-serve serve-miss path is `open_pull_leg`.
+                let providers = discover(deps, hash_bytes, U256::ZERO).await;
+                if providers.is_empty() {
+                    // `node_pull_no_providers` means "the blob is unavailable on the
+                    // network, NOT a pull failure" — mutually exclusive with
+                    // `node_pull_attempts` per fetch. A hit-then-fallthrough fetch
+                    // already TRIED cached providers (and metered the attempt), so an
+                    // empty re-discovery here is a pull story, not an availability
+                    // one; metering both would break that exclusivity.
+                    if !attempt_metered {
+                        deps.metrics.node_pull_no_providers();
+                    }
+                    debug!(%hash, "node-origin: no providers discovered for cache-miss pull");
                     return miss_answer(miss);
                 }
-            } else {
-                deps.metrics.probe_cache_miss();
-            }
-
-            // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
-            // This is the generic `Origin::fetch` path (the buffered `populate` fill),
-            // a hash-only pull with no client namespace, so it takes no on-chain
-            // origin-directory fallback (`NO_NAMESPACE`). The namespace-aware
-            // client-serve serve-miss path is `open_pull_leg`.
-            let providers = discover(deps, hash_bytes, U256::ZERO).await;
-            if providers.is_empty() {
-                // `node_pull_no_providers` means "the blob is unavailable on the
-                // network, NOT a pull failure" — mutually exclusive with
-                // `node_pull_attempts` per fetch. A hit-then-fallthrough fetch
-                // already TRIED cached providers (and metered the attempt), so an
-                // empty re-discovery here is a pull story, not an availability
-                // one; metering both would break that exclusivity.
                 if !attempt_metered {
-                    deps.metrics.node_pull_no_providers();
+                    deps.metrics.node_pull_attempt();
                 }
-                debug!(%hash, "node-origin: no providers discovered for cache-miss pull");
-                return miss_answer(miss);
+                // Writes the probe cache at its tail. The buffered fill is a
+                // single-source pull (`try_pull`), so one working holder is enough.
+                let ranked = probe_and_rank(deps, providers, hash_bytes, ProbeGather::EarlyExit).await;
+                match try_pull(&deps_lock, deps, &ranked, hash_bytes, budget)
+                    .await
+                    .payload
+                {
+                    Ok(()) => Ok(OriginFetch::AlreadyAdmitted),
+                    Err(failed) => miss_answer(miss.or(failed)),
+                }
             }
-            if !attempt_metered {
-                deps.metrics.node_pull_attempt();
-            }
-            // Writes the probe cache at its tail. The buffered fill is a
-            // single-source pull (`try_pull`), so one working holder is enough.
-            let ranked = probe_and_rank(deps, providers, hash_bytes, ProbeGather::EarlyExit).await;
-            match try_pull(&deps_lock, deps, &ranked, hash_bytes, budget)
-                .await
-                .payload
-            {
-                Ok(()) => Ok(OriginFetch::AlreadyAdmitted),
-                Err(failed) => miss_answer(miss.or(failed)),
-            }
+            .instrument(span.clone())
+            .await;
+            span.record(
+                "outcome",
+                match &result {
+                    Ok(OriginFetch::AlreadyAdmitted | OriginFetch::Found { .. }) => "filled",
+                    Ok(OriginFetch::NotFound) => "not_found",
+                    Err(_) => "failed",
+                },
+            );
+            result
         })
     }
 
@@ -1234,6 +1252,15 @@ pub enum PullMiss {
 }
 
 impl PullMiss {
+    /// The `outcome` value an `upstream_stream` span records for this miss.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean_miss",
+            Self::LocalFault => "local_fault",
+            Self::BelowMargin => "below_margin",
+        }
+    }
+
     /// Which miss a classified failure is.
     ///
     /// Exhaustive on purpose, like [`classify_refusal`] and [`voucher_verdict`]: a
@@ -1501,12 +1528,49 @@ fn lane_ledger(
 /// held in RAM (#1682). Returns the [`PullMiss`] this failure is on a miss (try
 /// the next candidate either way — a local fault latches, it does not abort the
 /// walk, #1560).
+///
+/// Runs inside an `upstream_stream` span. Its `hash`, `pool_id`, `peer` and
+/// `local_node_id` fields match the upstream's `serve_stream` span field for
+/// field (with `peer` and `local_node_id` swapped), so one trace query joins
+/// the two sides of the transfer across nodes. Each gap the pull opens is a
+/// child `open_progressive_pull` span that adds the gap's `byte_offset` and
+/// `byte_len`.
+async fn pull_from_candidate(
+    deps_lock: &Arc<OnceLock<NodeOriginDeps>>,
+    deps: &NodeOriginDeps,
+    candidate: &Candidate,
+    hash_bytes: [u8; 32],
+) -> Result<(), PullMiss> {
+    let span = tracing::info_span!(
+        "upstream_stream",
+        otel.kind = "client",
+        direction = "outbound",
+        peer = %DhtNodeId::from_bytes(candidate.node_id),
+        local_node_id = %deps.endpoint.id(),
+        hash = %DhtHash::from_bytes(hash_bytes),
+        pool_id = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    );
+    let result = pull_from_candidate_in_span(deps_lock, deps, candidate, hash_bytes)
+        .instrument(span.clone())
+        .await;
+    span.record(
+        "outcome",
+        match result {
+            Ok(()) => "filled",
+            Err(miss) => miss.as_str(),
+        },
+    );
+    result
+}
+
+/// The body of [`pull_from_candidate`], run inside its span.
 // Sequential resolve → open → fetch → classify pipeline; the tracing macros and
 // the success/failure classification inflate the cognitive-complexity + line
 // metrics past threshold (same inflation noted in `chain_staker_set`). Splitting
 // it would scatter a single linear flow across helpers.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-async fn pull_from_candidate(
+async fn pull_from_candidate_in_span(
     deps_lock: &Arc<OnceLock<NodeOriginDeps>>,
     deps: &NodeOriginDeps,
     candidate: &Candidate,
@@ -1560,6 +1624,7 @@ async fn pull_from_candidate(
             return Err(PullMiss::for_verdict(verdict));
         }
     };
+    tracing::Span::current().record("pool_id", tracing::field::display(ctx.pool_id));
     let started = Instant::now();
     // The ledger is CALLER-owned, and the watermark is settled from it by a `Drop`
     // guard ([`SettleOnDrop`]) rather than by a copy-back after the await (#1145
@@ -1705,10 +1770,14 @@ async fn pull_from_candidate(
     // as a success or as a short landing).
     let reactive_funded = Arc::new(AtomicBool::new(false));
     let reactive_funded_for_thread = Arc::clone(&reactive_funded);
+    // The pull runs on its own thread and runtime, which starts with no span.
+    // Carry the caller's span across so the pull's events stay in its trace.
+    let pull_span = tracing::Span::current();
     let join = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        let _entered = pull_span.enter();
         Ok::<_, std::io::Error>(rt.block_on(async move {
             let store = NodeAdmitStore::new(engine, hash, total_bytes, None);
             // Capture the lane seed before `ctx` moves behind the mutex, so the

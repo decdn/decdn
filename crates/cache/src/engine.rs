@@ -3306,6 +3306,18 @@ impl CacheEngine {
     /// so the caller falls back to a whole-blob pull (which re-surfaces the real
     /// fault if the blob is genuinely unreachable). A *missing-outboard* /
     /// *no-range* origin likewise returns [`RangePullOutcome::Unsupported`].
+    #[tracing::instrument(
+        name = "origin_range_pull",
+        skip_all,
+        fields(
+            %hash,
+            byte_offset = byte_offset,
+            byte_len = byte_len,
+            outcome = tracing::field::Empty,
+            error = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        )
+    )]
     pub async fn pull_through_range(
         &self,
         hash: Hash,
@@ -3313,74 +3325,79 @@ impl CacheEngine {
         byte_len: u64,
         blob_size: u64,
     ) -> CacheResult<RangePullOutcome> {
-        if self.inner.origins.is_empty() {
-            return Err(CacheError::NoOrigin { hash });
-        }
-        // Logical-eviction guard (#279): once an operator has run
-        // `decdn node evict <hash>` (e.g. a DMCA takedown), a subsequent range
-        // pull must not silently re-fetch the evicted span from the origin and
-        // undo the eviction — exactly as `get` / `populate` refuse. The
-        // eviction is sticky for the life of `<cache_dir>/evicted.log`.
-        self.lift_reclaimed_quarantine(hash).await;
-        if self.refuses(hash) {
+        let result: CacheResult<RangePullOutcome> = async {
+            if self.inner.origins.is_empty() {
+                return Err(CacheError::NoOrigin { hash });
+            }
+            // Logical-eviction guard (#279): once an operator has run
+            // `decdn node evict <hash>` (e.g. a DMCA takedown), a subsequent range
+            // pull must not silently re-fetch the evicted span from the origin and
+            // undo the eviction — exactly as `get` / `populate` refuse. The
+            // eviction is sticky for the life of `<cache_dir>/evicted.log`.
+            self.lift_reclaimed_quarantine(hash).await;
+            if self.refuses(hash) {
+                if let Some(m) = &self.inner.metrics {
+                    m.misses.inc();
+                }
+                return Err(CacheError::NotFound { hash });
+            }
+            // Reject an out-of-bounds request up front (ADR 005 §Bounded byte
+            // ranges: reject, never silently clamp). `align_range` owns the bound
+            // check; map its typed error onto the engine's origin-error surface so
+            // the caller sees a coherent `CacheError` rather than a cache-internal
+            // type.
+            let aligned =
+                align_range(byte_offset, byte_len, blob_size).map_err(|e| CacheError::OriginError {
+                    hash,
+                    source: anyhow::Error::new(e).context("range pull-through: invalid byte range"),
+                })?;
+
             if let Some(m) = &self.inner.metrics {
-                m.misses.inc();
+                m.origin_fetches.inc();
             }
-            return Err(CacheError::NotFound { hash });
-        }
-        // Reject an out-of-bounds request up front (ADR 005 §Bounded byte
-        // ranges: reject, never silently clamp). `align_range` owns the bound
-        // check; map its typed error onto the engine's origin-error surface so
-        // the caller sees a coherent `CacheError` rather than a cache-internal
-        // type.
-        let aligned =
-            align_range(byte_offset, byte_len, blob_size).map_err(|e| CacheError::OriginError {
-                hash,
-                source: anyhow::Error::new(e).context("range pull-through: invalid byte range"),
-            })?;
+            let root = *hash.as_bytes();
+            let req = OriginRangeRequest {
+                fetch_start: aligned.fetch_start(),
+                fetch_end: aligned.fetch_end(),
+            };
 
-        if let Some(m) = &self.inner.metrics {
-            m.origin_fetches.inc();
-        }
-        let root = *hash.as_bytes();
-        let req = OriginRangeRequest {
-            fetch_start: aligned.fetch_start(),
-            fetch_end: aligned.fetch_end(),
-        };
-
-        // Walk the origin fallback chain (#284). A per-origin `Unsupported`
-        // (no outboard / no range) advances to the next origin; a genuine
-        // origin transport / verify fault is recorded and the chain advances.
-        // A local-store fault (`CacheError::Store`: disk full / IO) fails fast
-        // and is NOT masked by trying another origin — consistent with
-        // whole-blob `pull_through`, where `Store` short-circuits the chain
-        // (a misbehaving *local* store is not fixed by a different *origin*).
-        // The first origin that serves and verifies a range wins.
-        let mut last_err: Option<CacheError> = None;
-        for origin in &self.inner.origins {
-            match self
-                .range_pull_attempt(Arc::clone(origin), hash, root, blob_size, &aligned, req)
-                .await
-            {
-                Ok(RangePullOutcome::Served) => return Ok(RangePullOutcome::Served),
-                Ok(RangePullOutcome::Unsupported) => {}
-                // Local store fault: fail fast, do not advance the chain.
-                Err(e @ CacheError::Store(_)) => return Err(e),
-                Err(e) => last_err = Some(e),
+            // Walk the origin fallback chain (#284). A per-origin `Unsupported`
+            // (no outboard / no range) advances to the next origin; a genuine
+            // origin transport / verify fault is recorded and the chain advances.
+            // A local-store fault (`CacheError::Store`: disk full / IO) fails fast
+            // and is NOT masked by trying another origin — consistent with
+            // whole-blob `pull_through`, where `Store` short-circuits the chain
+            // (a misbehaving *local* store is not fixed by a different *origin*).
+            // The first origin that serves and verifies a range wins.
+            let mut last_err: Option<CacheError> = None;
+            for origin in &self.inner.origins {
+                match self
+                    .range_pull_attempt(Arc::clone(origin), hash, root, blob_size, &aligned, req)
+                    .await
+                {
+                    Ok(RangePullOutcome::Served) => return Ok(RangePullOutcome::Served),
+                    Ok(RangePullOutcome::Unsupported) => {}
+                    // Local store fault: fail fast, do not advance the chain.
+                    Err(e @ CacheError::Store(_)) => return Err(e),
+                    Err(e) => last_err = Some(e),
+                }
             }
+            // Every origin declined the optimization. If any errored, the caller
+            // still falls back to a whole-blob pull (which will surface the real
+            // error if the blob is genuinely unreachable), so prefer the degrade
+            // signal — but log a genuine fault so it isn't silently swallowed.
+            if let Some(e) = last_err {
+                tracing::warn!(
+                    %hash,
+                    error = %e,
+                    "range pull-through attempt errored on every origin; degrading to whole-blob pull",
+                );
+            }
+            Ok(RangePullOutcome::Unsupported)
         }
-        // Every origin declined the optimization. If any errored, the caller
-        // still falls back to a whole-blob pull (which will surface the real
-        // error if the blob is genuinely unreachable), so prefer the degrade
-        // signal — but log a genuine fault so it isn't silently swallowed.
-        if let Some(e) = last_err {
-            tracing::warn!(
-                %hash,
-                error = %e,
-                "range pull-through attempt errored on every origin; degrading to whole-blob pull",
-            );
-        }
-        Ok(RangePullOutcome::Unsupported)
+        .await;
+        record_origin_pull(&tracing::Span::current(), &result);
+        result
     }
 
     /// One range-pull attempt against a single origin: fetch the aligned span
@@ -4545,221 +4562,242 @@ impl CacheEngine {
     /// [`FillMode::CommitOnly`] always yields `None`. Prefer the
     /// [`Self::pull_through_bytes`] / [`Self::pull_through_fill`] wrappers, which
     /// are total and hide the `Option` entirely.
-    #[allow(clippy::too_many_lines)] // One linear chain walk; each outcome arm carries the rationale for its own fallback/return decision, and splitting the match out would separate those from the loop state (`last_err`, `any_not_found`, `any_short_circuit`) they exist to explain.
+    ///
+    /// Runs inside an `origin_pull` span: one per chain walk, with the paid
+    /// node→node fallback's `node_pull` span nested inside when the walk reaches
+    /// the `Peer` origin.
+    #[allow(clippy::too_many_lines)]
+    // One linear chain walk; each outcome arm carries the rationale for its own fallback/return decision, and splitting the match out would separate those from the loop state (`last_err`, `any_not_found`, `any_short_circuit`) they exist to explain.
+    #[tracing::instrument(
+        name = "origin_pull",
+        skip_all,
+        fields(
+            %hash,
+            local_only = local_only,
+            outcome = tracing::field::Empty,
+            error = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        )
+    )]
     async fn pull_through(
         &self,
         hash: Hash,
         local_only: bool,
         mode: FillMode,
     ) -> CacheResult<Option<Bytes>> {
-        // Every pull_through entry is a `get()` cache miss, regardless
-        // of how the pull resolves. Coalesced waiters that find a hit
-        // on retry never call `pull_through`, so they never reach this
-        // bump (their `hits` increment lives in the waiter branch of
-        // `get`).
-        if let Some(m) = &self.inner.metrics {
-            m.misses.inc();
-        }
-        // Reject pulls with no *eligible* origin early. With `local_only`
-        // (#1116) the `Peer` origin (the paid node→node fallback) is skipped, so
-        // a chain of nothing but `Peer` origins is a fast `NoOrigin`, like an
-        // empty chain — checked before the `origin_fetches` bump so that metric
-        // still counts only real local fetch attempts.
-        if !self.has_eligible_origin(local_only) {
-            return Err(CacheError::NoOrigin { hash });
-        }
-
-        // Bump the per-fetch denominator once per `pull_through` —
-        // preserving #285 semantics where the counter is per
-        // cache-miss-call, not per origin attempted. Alerts that
-        // page on `origin_retry_exhausted_total / origin_fetches_total`
-        // continue to be a per-call ratio; the new
-        // `origin_fallback_total` separately counts chain-walk steps.
-        if let Some(m) = &self.inner.metrics {
-            m.origin_fetches.inc();
-        }
-        let max_blob_bytes = self.inner.max_blob_bytes;
-        let policy = self.inner.retry_policy;
-
-        // Fallback chain walk (#284). Each origin gets its own retry
-        // budget; on retry-exhaustion / Permanent / NotFound we advance
-        // to the next entry. Deterministic per-origin failures
-        // (`HashMismatch`, `BlobTooLarge`, `Store`) intentionally do
-        // not fall back — they indicate a misbehaving backend that
-        // must surface, not be masked by trying a different one.
-        let mut last_err: Option<OriginPullError> = None;
-        let mut any_not_found = false;
-        let mut any_short_circuit = false;
-        let total = self.inner.origins.len();
-        for (idx, origin) in self.inner.origins.iter().enumerate() {
-            // #1116: a `local_only` populate never touches the `Peer` origin
-            // (the paid node→node fallback), so an operator serving its OWN
-            // configured fs/http/s3 origin fronts no upstream USDC. Skipped
-            // before the breaker/retry machinery so it costs nothing.
-            if local_only && origin.kind() == OriginKind::Peer {
-                continue;
+        let result: CacheResult<Option<Bytes>> = async {
+            // Every pull_through entry is a `get()` cache miss, regardless
+            // of how the pull resolves. Coalesced waiters that find a hit
+            // on retry never call `pull_through`, so they never reach this
+            // bump (their `hits` increment lives in the waiter branch of
+            // `get`).
+            if let Some(m) = &self.inner.metrics {
+                m.misses.inc();
             }
-            let origin = Arc::clone(origin);
-            // Per-origin circuit-breaker (#963). An OPEN breaker
-            // short-circuits this origin *before* the retry/backoff
-            // loop runs, so a sustained outage on this backend costs no
-            // backoff — the chain just advances to the next origin (or,
-            // if every origin is OPEN, surfaces a fast `OriginError`).
-            // `breakers` is parallel to `origins` by index; `get` keeps
-            // the access non-panicking per the workspace anti-panic
-            // policy (a missing slot would be a construction bug, in
-            // which case we degrade to "no breaker" rather than panic).
-            let breaker = self.inner.breakers.get(idx);
-            // Admit (or short-circuit) under the breaker. The `Proceed`
-            // arm carries a `TrialGuard` that owns any HALF-OPEN trial
-            // slot; it MUST stay alive across the `.await` below so that
-            // a cancelled future (client disconnect / timeout) drops it
-            // and reclaims the slot rather than leaking it (#963). A
-            // `None` breaker (construction degraded to "no breaker")
-            // admits unconditionally with no guard.
-            let trial_guard = match breaker.map(OriginBreaker::acquire) {
-                Some(Admission::ShortCircuit) => {
-                    any_short_circuit = true;
-                    self.emit_breaker_short_circuit_advance(hash, idx, total, origin.kind());
+            // Reject pulls with no *eligible* origin early. With `local_only`
+            // (#1116) the `Peer` origin (the paid node→node fallback) is skipped, so
+            // a chain of nothing but `Peer` origins is a fast `NoOrigin`, like an
+            // empty chain — checked before the `origin_fetches` bump so that metric
+            // still counts only real local fetch attempts.
+            if !self.has_eligible_origin(local_only) {
+                return Err(CacheError::NoOrigin { hash });
+            }
+
+            // Bump the per-fetch denominator once per `pull_through` —
+            // preserving #285 semantics where the counter is per
+            // cache-miss-call, not per origin attempted. Alerts that
+            // page on `origin_retry_exhausted_total / origin_fetches_total`
+            // continue to be a per-call ratio; the new
+            // `origin_fallback_total` separately counts chain-walk steps.
+            if let Some(m) = &self.inner.metrics {
+                m.origin_fetches.inc();
+            }
+            let max_blob_bytes = self.inner.max_blob_bytes;
+            let policy = self.inner.retry_policy;
+
+            // Fallback chain walk (#284). Each origin gets its own retry
+            // budget; on retry-exhaustion / Permanent / NotFound we advance
+            // to the next entry. Deterministic per-origin failures
+            // (`HashMismatch`, `BlobTooLarge`, `Store`) intentionally do
+            // not fall back — they indicate a misbehaving backend that
+            // must surface, not be masked by trying a different one.
+            let mut last_err: Option<OriginPullError> = None;
+            let mut any_not_found = false;
+            let mut any_short_circuit = false;
+            let total = self.inner.origins.len();
+            for (idx, origin) in self.inner.origins.iter().enumerate() {
+                // #1116: a `local_only` populate never touches the `Peer` origin
+                // (the paid node→node fallback), so an operator serving its OWN
+                // configured fs/http/s3 origin fronts no upstream USDC. Skipped
+                // before the breaker/retry machinery so it costs nothing.
+                if local_only && origin.kind() == OriginKind::Peer {
                     continue;
                 }
-                Some(Admission::Proceed(_state, guard)) => Some(guard),
-                None => None,
-            };
+                let origin = Arc::clone(origin);
+                // Per-origin circuit-breaker (#963). An OPEN breaker
+                // short-circuits this origin *before* the retry/backoff
+                // loop runs, so a sustained outage on this backend costs no
+                // backoff — the chain just advances to the next origin (or,
+                // if every origin is OPEN, surfaces a fast `OriginError`).
+                // `breakers` is parallel to `origins` by index; `get` keeps
+                // the access non-panicking per the workspace anti-panic
+                // policy (a missing slot would be a construction bug, in
+                // which case we degrade to "no breaker" rather than panic).
+                let breaker = self.inner.breakers.get(idx);
+                // Admit (or short-circuit) under the breaker. The `Proceed`
+                // arm carries a `TrialGuard` that owns any HALF-OPEN trial
+                // slot; it MUST stay alive across the `.await` below so that
+                // a cancelled future (client disconnect / timeout) drops it
+                // and reclaims the slot rather than leaking it (#963). A
+                // `None` breaker (construction degraded to "no breaker")
+                // admits unconditionally with no guard.
+                let trial_guard = match breaker.map(OriginBreaker::acquire) {
+                    Some(Admission::ShortCircuit) => {
+                        any_short_circuit = true;
+                        self.emit_breaker_short_circuit_advance(hash, idx, total, origin.kind());
+                        continue;
+                    }
+                    Some(Admission::Proceed(_state, guard)) => Some(guard),
+                    None => None,
+                };
 
-            let (outcome, terminal) =
-                run_with_retry_classified(policy, self.inner.metrics.as_ref(), hash, || {
-                    self.pull_through_attempt(
-                        Arc::clone(&origin),
+                let (outcome, terminal) =
+                    run_with_retry_classified(policy, self.inner.metrics.as_ref(), hash, || {
+                        self.pull_through_attempt(
+                            Arc::clone(&origin),
+                            hash,
+                            max_blob_bytes,
+                            policy,
+                            mode,
+                        )
+                    })
+                    .await;
+                // Commit the breaker outcome through the guard (defusing its
+                // cancellation-release path). A `None` guard is the degraded
+                // "no breaker" case and records nothing.
+                Self::record_breaker_outcome(trial_guard, terminal);
+
+                // Track *this iteration's* outcome class so the post-match
+                // log records the correct cause. `last_err.is_some()` is
+                // cumulative across iterations and would mislabel a later
+                // NotFound advance as "primary failed" once any earlier
+                // origin had errored.
+                let advance_was_error = match outcome {
+                    Ok(PullThroughOutcome::Bytes(bytes)) => {
+                        // Announce the successful commit to any DHT
+                        // republish-scheduler subscribers (ADR 022 §STORE
+                        // Flow). `broadcast::send` returns `Err(SendError)`
+                        // only when there are no active subscribers, which
+                        // is the normal state when no DHT republish task
+                        // exists — ignore. We deliberately do NOT emit on
+                        // the local-store hit short-circuit at line ~1090:
+                        // the consumer cares about *fresh* commits (which
+                        // start a new TTL cycle), and a get-from-local
+                        // doesn't change the holder's relationship with the
+                        // blob.
+                        let _ = self.inner.inserts_tx.send(hash);
+                        return Ok(Some(bytes));
+                    }
+                    // Same successful commit, minus the read-back the caller did not
+                    // want (#1132) — so it must broadcast the insert identically.
+                    Ok(PullThroughOutcome::Committed) => {
+                        let _ = self.inner.inserts_tx.send(hash);
+                        return Ok(None);
+                    }
+                    Ok(PullThroughOutcome::NotFound) => {
+                        any_not_found = true;
+                        false
+                    }
+                    Ok(PullThroughOutcome::BlobTooLarge) => {
+                        return Err(CacheError::BlobTooLarge {
+                            hash,
+                            limit_bytes: max_blob_bytes,
+                        });
+                    }
+                    Ok(PullThroughOutcome::HashMismatch { actual }) => {
+                        return Err(CacheError::HashMismatch {
+                            expected: hash,
+                            actual,
+                        });
+                    }
+                    Ok(PullThroughOutcome::Store(err)) => return Err(CacheError::Store(err)),
+                    Err(e) => {
+                        last_err = Some(e);
+                        true
+                    }
+                };
+
+                // Final entry already tried; don't log a "fallback" for a
+                // chain that has nowhere left to advance.
+                if idx + 1 < total {
+                    self.emit_chain_advance(
                         hash,
-                        max_blob_bytes,
-                        policy,
-                        mode,
-                    )
-                })
-                .await;
-            // Commit the breaker outcome through the guard (defusing its
-            // cancellation-release path). A `None` guard is the degraded
-            // "no breaker" case and records nothing.
-            Self::record_breaker_outcome(trial_guard, terminal);
+                        idx,
+                        origin.kind(),
+                        advance_was_error,
+                        last_err.as_ref(),
+                    );
+                }
+            }
 
-            // Track *this iteration's* outcome class so the post-match
-            // log records the correct cause. `last_err.is_some()` is
-            // cumulative across iterations and would mislabel a later
-            // NotFound advance as "primary failed" once any earlier
-            // origin had errored.
-            let advance_was_error = match outcome {
-                Ok(PullThroughOutcome::Bytes(bytes)) => {
-                    // Announce the successful commit to any DHT
-                    // republish-scheduler subscribers (ADR 022 §STORE
-                    // Flow). `broadcast::send` returns `Err(SendError)`
-                    // only when there are no active subscribers, which
-                    // is the normal state when no DHT republish task
-                    // exists — ignore. We deliberately do NOT emit on
-                    // the local-store hit short-circuit at line ~1090:
-                    // the consumer cares about *fresh* commits (which
-                    // start a new TTL cycle), and a get-from-local
-                    // doesn't change the holder's relationship with the
-                    // blob.
-                    let _ = self.inner.inserts_tx.send(hash);
-                    return Ok(Some(bytes));
-                }
-                // Same successful commit, minus the read-back the caller did not
-                // want (#1132) — so it must broadcast the insert identically.
-                Ok(PullThroughOutcome::Committed) => {
-                    let _ = self.inner.inserts_tx.send(hash);
-                    return Ok(None);
-                }
-                Ok(PullThroughOutcome::NotFound) => {
-                    any_not_found = true;
-                    false
-                }
-                Ok(PullThroughOutcome::BlobTooLarge) => {
-                    return Err(CacheError::BlobTooLarge {
-                        hash,
-                        limit_bytes: max_blob_bytes,
-                    });
-                }
-                Ok(PullThroughOutcome::HashMismatch { actual }) => {
-                    return Err(CacheError::HashMismatch {
-                        expected: hash,
-                        actual,
-                    });
-                }
-                Ok(PullThroughOutcome::Store(err)) => return Err(CacheError::Store(err)),
-                Err(e) => {
-                    last_err = Some(e);
-                    true
-                }
-            };
-
-            // Final entry already tried; don't log a "fallback" for a
-            // chain that has nowhere left to advance.
-            if idx + 1 < total {
-                self.emit_chain_advance(
+            // All origins exhausted. Any non-NotFound failure beats a pure
+            // NotFound because "known backend errored" is more diagnostic
+            // than "no backend had it" — operators triaging a 5xx benefit
+            // from the underlying error, and a real NotFound only fires
+            // when every origin agreed the blob is absent.
+            if let Some(e) = last_err {
+                Err(CacheError::OriginError {
                     hash,
-                    idx,
-                    origin.kind(),
-                    advance_was_error,
-                    last_err.as_ref(),
+                    source: e.into_inner(),
+                })
+            } else if any_short_circuit {
+                // Every origin that wasn't a definitive NotFound was
+                // short-circuited by an OPEN breaker (#963). There is no
+                // `last_err` to surface (we never ran the retry loop for
+                // those origins), but returning `NotFound` would be wrong —
+                // the blob may well exist; we just refused to pull it while
+                // the origin is shedding load. Surface a fast `OriginError`
+                // so the caller sees "origin unavailable" rather than a
+                // spurious 404, *without* having incurred any backoff.
+                Err(CacheError::OriginError {
+                    hash,
+                    source: anyhow::anyhow!(
+                        "origin circuit-breaker open: all eligible origins are \
+                         fast-failing during a sustained outage (#963)"
+                    ),
+                })
+            } else if any_not_found {
+                Err(CacheError::NotFound { hash })
+            } else {
+                // Structurally unreachable: every iteration of the loop
+                // above takes exactly one match arm. The five non-`Err`
+                // arms all `return`; the `NotFound` arm sets
+                // `any_not_found`; the breaker short-circuit sets
+                // `any_short_circuit`; the `Err` arm sets `last_err`. To
+                // reach this branch the chain must be non-empty (`is_empty()`
+                // check at the top of `pull_through`) and have produced
+                // no `last_err`, no `any_not_found`, and no
+                // `any_short_circuit` — impossible under the current
+                // `PullThroughOutcome` taxonomy. Reaching it
+                // would mean a future variant was added without wiring
+                // the corresponding flag, and a debug-only assert would
+                // compile out in release builds. Emit an operator-visible
+                // log and fall through to a `NotFound` surface so the
+                // observable behaviour stays bounded (`unreachable!()`
+                // would also be correct but the workspace policy prefers
+                // a logged fallback over a release-panic in a hot path).
+                tracing::error!(
+                    hash = %hash,
+                    "internal invariant violated: non-empty origin chain produced \
+                     neither a NotFound nor an Err — likely a missing flag on a new \
+                     PullThroughOutcome variant",
                 );
+                Err(CacheError::NotFound { hash })
             }
         }
-
-        // All origins exhausted. Any non-NotFound failure beats a pure
-        // NotFound because "known backend errored" is more diagnostic
-        // than "no backend had it" — operators triaging a 5xx benefit
-        // from the underlying error, and a real NotFound only fires
-        // when every origin agreed the blob is absent.
-        if let Some(e) = last_err {
-            Err(CacheError::OriginError {
-                hash,
-                source: e.into_inner(),
-            })
-        } else if any_short_circuit {
-            // Every origin that wasn't a definitive NotFound was
-            // short-circuited by an OPEN breaker (#963). There is no
-            // `last_err` to surface (we never ran the retry loop for
-            // those origins), but returning `NotFound` would be wrong —
-            // the blob may well exist; we just refused to pull it while
-            // the origin is shedding load. Surface a fast `OriginError`
-            // so the caller sees "origin unavailable" rather than a
-            // spurious 404, *without* having incurred any backoff.
-            Err(CacheError::OriginError {
-                hash,
-                source: anyhow::anyhow!(
-                    "origin circuit-breaker open: all eligible origins are \
-                     fast-failing during a sustained outage (#963)"
-                ),
-            })
-        } else if any_not_found {
-            Err(CacheError::NotFound { hash })
-        } else {
-            // Structurally unreachable: every iteration of the loop
-            // above takes exactly one match arm. The five non-`Err`
-            // arms all `return`; the `NotFound` arm sets
-            // `any_not_found`; the breaker short-circuit sets
-            // `any_short_circuit`; the `Err` arm sets `last_err`. To
-            // reach this branch the chain must be non-empty (`is_empty()`
-            // check at the top of `pull_through`) and have produced
-            // no `last_err`, no `any_not_found`, and no
-            // `any_short_circuit` — impossible under the current
-            // `PullThroughOutcome` taxonomy. Reaching it
-            // would mean a future variant was added without wiring
-            // the corresponding flag, and a debug-only assert would
-            // compile out in release builds. Emit an operator-visible
-            // log and fall through to a `NotFound` surface so the
-            // observable behaviour stays bounded (`unreachable!()`
-            // would also be correct but the workspace policy prefers
-            // a logged fallback over a release-panic in a hot path).
-            tracing::error!(
-                hash = %hash,
-                "internal invariant violated: non-empty origin chain produced \
-                 neither a NotFound nor an Err — likely a missing flag on a new \
-                 PullThroughOutcome variant",
-            );
-            Err(CacheError::NotFound { hash })
-        }
+        .await;
+        record_origin_pull(&tracing::Span::current(), &result);
+        result
     }
 
     /// Bump the `origin_fallback` counter and emit a structured log for
@@ -5371,6 +5409,26 @@ where
             }
         },
     )
+}
+
+/// Record the end of an `origin_pull` / `origin_range_pull` span once. A
+/// clean miss (`NotFound` / `NoOrigin`) is `not_found` with no error status,
+/// since walking a chain that lacks the blob is normal; every other failure
+/// is `failed` with its error text and an error status.
+fn record_origin_pull<T>(span: &tracing::Span, result: &CacheResult<T>) {
+    match result {
+        Ok(_) => {
+            span.record("outcome", "filled");
+        }
+        Err(CacheError::NotFound { .. } | CacheError::NoOrigin { .. }) => {
+            span.record("outcome", "not_found");
+        }
+        Err(e) => {
+            span.record("outcome", "failed");
+            span.record("error", tracing::field::display(e));
+            span.record("otel.status_code", "ERROR");
+        }
+    }
 }
 
 #[cfg(test)]

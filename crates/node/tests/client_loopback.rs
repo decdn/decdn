@@ -304,6 +304,7 @@ fn unbound_context(client_signer: Arc<PrivateKeySigner>, deposit: U256) -> PoolC
 /// the persisted channel state advances to nonce 2 / full byte count.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()> {
+    let spans = support::capture_spans();
     let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
@@ -378,7 +379,35 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
     );
     anyhow::ensure!(only.last_amount() > U256::ZERO, "amount must be non-zero");
 
+    // The real serve path records its end once on its span: completed, with the
+    // bytes it wrote and the join keys the requester's spans carry. The server
+    // task drains the client's FIN after `StreamEnd`, so its span can close a
+    // moment after the fetch returns; wait for it before shutdown would abort it.
+    let key = hash.to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while spans.matching("serve_stream", "hash", &key).is_empty()
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     shutdown([server_task], [&client_ep, &server_ep]).await?;
+
+    let served = spans.matching("serve_stream", "hash", &key);
+    let [span] = served.as_slice() else {
+        anyhow::bail!("expected one serve_stream span for the hash, got {served:?}");
+    };
+    anyhow::ensure!(
+        span.fields.get("outcome").map(String::as_str) == Some("completed"),
+        "outcome: {span:?}"
+    );
+    anyhow::ensure!(
+        span.fields.get("bytes").is_some_and(|b| b != "0"),
+        "bytes: {span:?}"
+    );
+    anyhow::ensure!(
+        span.fields.get("peer").map(String::as_str) == Some(client_ep.id().to_string().as_str()),
+        "peer: {span:?}"
+    );
     Ok(())
 }
 
@@ -8650,6 +8679,7 @@ async fn local_origin_preferred_over_peer_window_path() -> anyhow::Result<()> {
 /// node→node fallthrough nor short-circuits the miss handling.
 #[tokio::test(flavor = "multi_thread")]
 async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
+    let spans = support::capture_spans();
     let payload = vec![0x2Bu8; 64 * 1024];
     let hash = decdn_cache::Hash::new(&payload);
     // A filesystem origin that does NOT contain the blob (empty dir), plus an
@@ -8717,6 +8747,39 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
     assert_reject_reason(&metrics, 0, 1)?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
+
+    // The refusal and the miss chain under it land on the spans: the local
+    // tier finds nothing, its origin walk is a clean `not_found` (no error
+    // status), and the stream records a signed `cache_miss` refusal.
+    let key = hash.to_string();
+    let field = |span: &support::CapturedSpan, name: &str| span.fields.get(name).cloned();
+    let served = spans.matching("serve_stream", "hash", &key);
+    let [serve] = served.as_slice() else {
+        anyhow::bail!("expected one serve_stream span for the hash, got {served:?}");
+    };
+    anyhow::ensure!(
+        field(serve, "outcome").as_deref() == Some("refused")
+            && field(serve, "reason").as_deref() == Some("cache_miss"),
+        "serve_stream: {serve:?}"
+    );
+    let fills = spans.matching("pull_through", "hash", &key);
+    anyhow::ensure!(
+        fills
+            .iter()
+            .any(|s| field(s, "tier").as_deref() == Some("local")
+                && field(s, "outcome").as_deref() == Some("clean_miss")
+                && s.parent == Some("serve_stream")),
+        "pull_through: {fills:?}"
+    );
+    let walks = spans.matching("origin_pull", "hash", &key);
+    anyhow::ensure!(
+        walks
+            .iter()
+            .any(|s| field(s, "outcome").as_deref() == Some("not_found")
+                && field(s, "otel.status_code").is_none()
+                && s.parent == Some("pull_through")),
+        "origin_pull: {walks:?}"
+    );
     Ok(())
 }
 

@@ -103,7 +103,7 @@ impl ClientHandler {
         fault_seen: bool,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<super::outcome::ServeEnd> {
         // The ADR 011 OPEN-TIME deny gates are already discharged on the only
         // path that reaches here: `serve_stream` refuses a denylisted hash
         // before the availability check, and this branch is entered only behind
@@ -344,9 +344,14 @@ impl ClientHandler {
             // window allows.
             let credit_ramp_divisor = self.credit_ramp_divisor;
             let credit_max = self.credit_max;
+            // The pull runs on its own thread and runtime, which starts with no
+            // span: open its span here, under the serve stream's, and enter it
+            // there so the pull's spans and events stay in this trace.
+            let pull_span = tracing::info_span!("serve_miss_pull", tier = "node", %hash);
             let spawned = std::thread::Builder::new()
                 .name("serve-miss-pull".to_string())
                 .spawn(move || {
+                    let _entered = pull_span.enter();
                     match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -493,7 +498,7 @@ impl ClientHandler {
         pool_remaining: Option<U256>,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<super::outcome::ServeEnd> {
         // Mark that the own-origin serve-miss tier fired for this request, before
         // any admission guard below — the tier-selection signal (#1130), not a
         // success signal; an early reject still counts as
@@ -646,9 +651,14 @@ impl ClientHandler {
                 total_bytes,
                 ledger,
             );
+            // The pull runs on its own thread and runtime, which starts with no
+            // span: open its span here, under the serve stream's, and enter it
+            // there so the pull's spans and events stay in this trace.
+            let pull_span = tracing::info_span!("serve_miss_pull", tier = "local", %hash);
             let spawned = std::thread::Builder::new()
                 .name("serve-miss-local-pull".to_string())
                 .spawn(move || {
+                    let _entered = pull_span.enter();
                     match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()

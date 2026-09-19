@@ -2037,7 +2037,7 @@
       },
       "title": "Span rate by operation",
       "type": "timeseries",
-      "description": "Every span here is currently produced by a dependency crate (iroh, quinn, alloy) and only exists because the log filter sits at debug. deCDN itself carries no #[instrument] attributes yet, so this panel is a placeholder that lights up when it does.",
+      "description": "Spans per second by name across the fleet. Only deCDN spans are exported; dependency crates' spans are filtered at the node. serve_stream counts inbound client streams; upstream_stream and open_progressive_pull count paid miss pulls from other nodes; onchain_tx counts redeemMany submissions.",
       "targets": [
         {
           "datasource": {

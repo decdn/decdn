@@ -3544,7 +3544,7 @@
       },
       "title": "Span rate by operation",
       "type": "timeseries",
-      "description": "Every name here belongs to a dependency crate — iroh, quinn, alloy. deCDN carries no #[instrument] attributes, so the serve leg, pull leg and settlement path produce no spans of their own yet. These panels are built against the operations that will exist.",
+      "description": "Spans per second by name. Only deCDN spans are exported; dependency crates' spans are filtered at the node. serve_stream is one inbound client stream. A buffered miss nests pull_through, origin_pull, node_pull, upstream_stream and open_progressive_pull under it; a streaming miss nests serve_miss_pull and open_progressive_pull. origin_range_pull is a ranged origin fetch; dht_lookup, redeem_cycle and onchain_tx cover discovery and settlement.",
       "targets": [
         {
           "datasource": {
@@ -3626,106 +3626,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
         "y": 98
       },
       "id": 40
-    },
-    {
-      "datasource": {
-        "type": "tempo",
-        "uid": "${DS_TEMPO}"
-      },
-      "title": "Probe duration",
-      "type": "timeseries",
-      "description": "The only latency distribution available anywhere in this stack: the exporter registers no histograms, so Prometheus cannot produce a quantile. Exemplars link straight to the trace.",
-      "targets": [
-        {
-          "datasource": {
-            "type": "tempo",
-            "uid": "${DS_TEMPO}"
-          },
-          "query": "{resource.service.name=\"decdn-node\" && name=\"run-probe\"} | quantile_over_time(duration, .5, .95, .99)",
-          "refId": "A",
-          "legendFormat": "p{{p}}",
-          "queryType": "traceql",
-          "limit": 50,
-          "tableType": "spans"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "table",
-          "placement": "right",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 98
-      },
-      "id": 41
     },
     {
       "datasource": {
@@ -3854,6 +3759,101 @@
         "y": 106
       },
       "id": 43
+    },
+    {
+      "datasource": {
+        "type": "tempo",
+        "uid": "${DS_TEMPO}"
+      },
+      "title": "deCDN operation latency",
+      "type": "timeseries",
+      "description": "p50 and p95 duration of each deCDN span. serve_stream covers a whole client stream, so its duration tracks blob size; upstream_stream and open_progressive_pull are the paid miss pull and its time to first byte; onchain_tx is one redeemMany from send to receipt. Filter a trace by outcome to split completed from refused or failed streams.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "${DS_TEMPO}"
+          },
+          "query": "{resource.service.name=\"decdn-node\" && resource.service.instance.id=\"$node\" && name=~\"serve_stream|pull_through|serve_miss_pull|origin_pull|origin_range_pull|node_pull|upstream_stream|open_progressive_pull|dht_lookup|redeem_cycle|onchain_tx\"} | quantile_over_time(duration, .5, .95) by (name)",
+          "refId": "A",
+          "legendFormat": "{{name}} p{{p}}",
+          "queryType": "traceql",
+          "limit": 50,
+          "tableType": "spans"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 114
+      },
+      "id": 44
     }
   ],
   "preload": false,
