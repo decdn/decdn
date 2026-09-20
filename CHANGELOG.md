@@ -1948,8 +1948,12 @@ since project inception and will roll into the first tagged release.
   `PaymentPool.getPools` by the keystore address and prints every pool in every
   lifecycle state with its on-chain `deposit`, `totalRedeemed` and reclaim
   window, marking which ones the local record tracks. `TRACKED` distinguishes
-  `no` from `?`: an unreadable store leaves the column unknown rather than
-  claiming every pool is untracked. Unlike `close --all` / `reclaim --all` it is
+  `no` from `?`: a pool the local record cannot answer for — an unreadable
+  store, or a row that will not decode — is unknown rather than untracked,
+  because the remedies differ (a lost store versus a record to repair) and one
+  bad row must not blank the verdict for the pools either side of it. The
+  undecodable ids are named on stderr, as the store-backed listings already
+  do. Unlike `close --all` / `reclaim --all` it is
   **not** refused on a node's data dir — those two write, this one reads, and a
   node host is where it is most needed. `--json` emits a third document shape
   with `source: "chain"`; read `source` before `pools`, as with the other two.

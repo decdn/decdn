@@ -1108,8 +1108,16 @@ async fn list_all(
             deposit: U256::from(pool.deposit),
             total_redeemed: U256::from(pool.totalRedeemed),
             dispute_deadline: pool.disputeDeadline,
-            tracked: tracked.as_ref().map(|set| set.contains(&pool_id)),
+            tracked: tracked.as_ref().and_then(|local| local.verdict(pool_id)),
         });
+    }
+
+    // The corrupt rows are named on stderr here too, so `--all` is not the one
+    // listing that stays silent about a deposit stranded by an unreadable
+    // record. stdout keeps only the table, for scripts.
+    if let Some(local) = tracked.as_ref() {
+        let undecodable: Vec<PoolId> = local.undecodable.iter().copied().collect();
+        write_skipped_pools(&mut std::io::stderr().lock(), &undecodable)?;
     }
 
     let mut out = std::io::stdout().lock();
@@ -1130,41 +1138,82 @@ async fn list_all(
     Ok(())
 }
 
-/// The pool ids the local record tracks, or `None` when it could not be read.
+/// What the local record says about the pools the chain reports.
+///
+/// Two sets, because "the store has no row for this pool" and "the store has a
+/// row it cannot decode" are different answers, and only the first means the
+/// deposit is untracked. An undecodable row is still a row: `pool_id` is the
+/// table's primary key, so it survives whatever corrupted the value bytes, and
+/// the store demonstrably holds that pool.
+#[derive(Debug, Default)]
+struct TrackedPools {
+    /// Pools whose local record decoded.
+    decoded: std::collections::BTreeSet<PoolId>,
+    /// Pools with a local row that could not be decoded. The escrowed deposit
+    /// is untracked until the record is repaired — a different remedy from an
+    /// absent row, so it must not render as one.
+    undecodable: std::collections::BTreeSet<PoolId>,
+}
+
+impl TrackedPools {
+    /// Whether the local record tracks `pool_id`: `None` when a row exists but
+    /// could not be decoded, so the honest answer for that one pool is unknown
+    /// while every other pool's answer stays exact.
+    fn verdict(&self, pool_id: PoolId) -> Option<bool> {
+        if self.undecodable.contains(&pool_id) {
+            return None;
+        }
+        Some(self.decoded.contains(&pool_id))
+    }
+}
+
+impl From<BuyerLoad> for TrackedPools {
+    fn from(load: BuyerLoad) -> Self {
+        Self {
+            decoded: load.pools.iter().map(|p| p.pool_id).collect(),
+            undecodable: load.skipped.into_iter().collect(),
+        }
+    }
+}
+
+/// What the local record tracks, or `None` when it could not be read at all.
 ///
 /// `None` is a real answer here, not a failure: it is what an operator sees
 /// when the store is the thing that was lost, and rendering it as "unknown"
 /// beside the chain's rows is more honest than reporting every pool untracked.
+/// It is reserved for the whole-store case — one undecodable row makes that one
+/// pool unknown, never the others.
 async fn tracked_pool_ids(
     args: &cli::PoolListArgs,
     config_path: Option<&Path>,
     data_dir: &Path,
-) -> Option<std::collections::BTreeSet<PoolId>> {
-    let ids = |load: BuyerLoad| -> std::collections::BTreeSet<PoolId> {
-        load.pools.iter().map(|p| p.pool_id).collect()
-    };
+) -> Option<TrackedPools> {
     match classify_buyer_store(data_dir) {
         BuyerStoreOwner::Client => RedbBuyerPoolStore::open(data_dir)
             .and_then(|store| store.load_all())
             .ok()
-            .map(ids),
+            .map(TrackedPools::from),
         BuyerStoreOwner::Node { data_dir, .. } => {
             // The same two routes the plain listing takes: off disk when no
             // daemon holds the file, over the admin RPC when one does.
             match ReadOnlyBuyerPoolStore::open_file(&node_buyer_db(&data_dir)) {
-                Ok(reader) => reader.load_all().ok().map(ids),
+                Ok(reader) => reader.load_all().ok().map(TrackedPools::from),
                 Err(_) => daemon_pool_ids(args, config_path).await,
             }
         }
     }
 }
 
-/// Ask a running daemon which pools it tracks. `None` on any failure — this
-/// feeds one column, never the listing itself.
+/// Ask a running daemon what it tracks. `None` on any failure — this feeds one
+/// column, never the listing itself.
+///
+/// `skipped` crosses the admin wire as hex strings for exactly this reason: the
+/// daemon cannot decode those rows either, and dropping them here would report
+/// the pools as untracked.
 async fn daemon_pool_ids(
     args: &cli::PoolListArgs,
     config_path: Option<&Path>,
-) -> Option<std::collections::BTreeSet<PoolId>> {
+) -> Option<TrackedPools> {
     if args.timeout_ms == 0 {
         return None;
     }
@@ -1175,12 +1224,18 @@ async fn daemon_pool_ids(
         .build(&url)
         .ok()?;
     let resp: BuyerPoolsResponse = client.pools().await.ok()?;
-    Some(
-        resp.pools
+    Some(TrackedPools {
+        decoded: resp
+            .pools
             .iter()
             .filter_map(|p| PoolId::from_str(&p.pool_id).ok())
             .collect(),
-    )
+        undecodable: resp
+            .skipped
+            .iter()
+            .filter_map(|p| PoolId::from_str(p).ok())
+            .collect(),
+    })
 }
 
 /// Read the CLI's own `buyer-pools.redb` under `data_dir`.
@@ -1402,8 +1457,8 @@ struct ChainPoolRow {
     /// Absolute Unix deadline after which a `Closing` pool is reclaimable. `0`
     /// while the pool is still `Open`.
     dispute_deadline: u64,
-    /// Whether the local record tracks this pool; `None` when that record
-    /// could not be read at all.
+    /// Whether the local record tracks this pool; `None` when it gave no usable
+    /// answer for this pool. See [`TrackedPools::verdict`].
     tracked: Option<bool>,
 }
 
@@ -1430,8 +1485,10 @@ fn reclaimable_label(row: &ChainPoolRow, now: u64) -> String {
     }
 }
 
-/// `yes` / `no` / `?`, where `?` means the local record could not be read —
-/// which is not the same claim as "this pool is untracked".
+/// `yes` / `no` / `?`, where `?` means the local record gave no usable answer
+/// for this pool — the whole store was unreadable, or it holds a row for this
+/// pool that will not decode. Neither is the claim "this pool is untracked",
+/// and the remedies differ: one is a lost store, the other a record to repair.
 const fn tracked_label(tracked: Option<bool>) -> &'static str {
     match tracked {
         Some(true) => "yes",
@@ -1497,7 +1554,8 @@ struct PoolListAllJson {
     /// `PaymentPool` address the pools live in.
     payment_pool: String,
     /// Whether the local record could be read at all. When `false`, every
-    /// pool's `tracked` is `null` and says nothing about the pool.
+    /// pool's `tracked` is `null` and says nothing about the pool. When `true`,
+    /// a `null` `tracked` is specific to that pool: its row will not decode.
     local_store_read: bool,
     /// Every pool the owner holds, in the order the contract enumerates them.
     pools: Vec<ChainPoolJson>,
@@ -1519,8 +1577,9 @@ struct ChainPoolJson {
     dispute_deadline: u64,
     /// True once the dispute window has elapsed and the pool is `Closing`.
     reclaimable_now: bool,
-    /// Whether the local record tracks this pool; `null` when that record could
-    /// not be read.
+    /// Whether the local record tracks this pool; `null` when the record gave
+    /// no usable answer — an unreadable store, or a row for this pool that will
+    /// not decode. Read `local_store_read` to tell the two apart.
     tracked: Option<bool>,
 }
 
@@ -1994,6 +2053,50 @@ mod tests {
         assert!(untracked.contains(" no "), "{untracked}");
         let unreadable = row_for(0x33);
         assert!(unreadable.contains(" ? "), "{unreadable}");
+    }
+
+    /// A pool whose local row will not decode is NOT untracked: the store holds
+    /// a row for it, keyed by a `pool_id` that survives whatever corrupted the
+    /// value bytes. Reporting `no` would send the operator to `pool close`
+    /// (recover a stranded deposit) when the remedy is repairing a record. One
+    /// bad row must also not blank the verdict for the pools either side of it.
+    #[test]
+    fn an_undecodable_row_is_unknown_not_untracked() {
+        let decoded = B256::repeat_byte(0x11);
+        let corrupt = B256::repeat_byte(0x22);
+        let absent = B256::repeat_byte(0x33);
+        let local = TrackedPools {
+            decoded: [decoded].into_iter().collect(),
+            undecodable: [corrupt].into_iter().collect(),
+        };
+
+        assert_eq!(local.verdict(decoded), Some(true));
+        assert_eq!(local.verdict(absent), Some(false), "no row means untracked");
+        assert_eq!(
+            local.verdict(corrupt),
+            None,
+            "a row that will not decode is unknown, not untracked"
+        );
+        assert_eq!(tracked_label(local.verdict(corrupt)), "?");
+    }
+
+    /// `BuyerLoad`'s two halves land in the two sets — the conversion is where
+    /// `skipped` would otherwise be dropped, which is what made an undecodable
+    /// row read as `no`.
+    #[test]
+    fn a_buyer_load_keeps_its_skipped_rows() {
+        let state = BuyerPoolState::new(
+            B256::repeat_byte(0x11),
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0xcd),
+            U256::from(1u64),
+        );
+        let local = TrackedPools::from(BuyerLoad {
+            pools: vec![state],
+            skipped: vec![B256::repeat_byte(0x22)],
+        });
+        assert_eq!(local.verdict(B256::repeat_byte(0x11)), Some(true));
+        assert_eq!(local.verdict(B256::repeat_byte(0x22)), None);
     }
 
     /// An owner with nothing on chain gets a sentinel, not a bare header — the
