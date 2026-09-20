@@ -477,19 +477,38 @@ It reconciles against `PaymentPool.getPools` at startup and adopts the pool it
 already owns, so this heals on its own; what follows is for confirming it, and
 for recovering deposits an older build stranded before it did.
 
-1. Read `decdn_buyer_pool_adoption_failures_total`. Any increment means the
-   node could not tell whether it already owned a pool and is about to open a
-   second one; `decdn pool list` (which reads the local store) then shows
-   nothing while the chain says otherwise.
-2. The node adopts the newest solvent `Open` pool at startup. Look for
-   `adopted this node's existing on-chain payment pool` in the log, and for
-   `this node owns further open payment pools it is not using`, which names the
-   stranded ids.
+**Read the node's pools with `decdn node pools`, not `decdn pool list`.** There
+are two buyer stores under `identity.data_dir` and they are unrelated: the
+daemon's `buyer.redb`, and a client-owned `buyer-pools.redb` that `decdn fetch`
+and `decdn pool` use. A running daemon holds an exclusive lock on its file, so
+nothing can read it from disk; `decdn node pools` asks the daemon over the admin
+RPC. `decdn pool list --config /etc/decdn/node.toml` routes to the same place and
+names the file it read, so `pools=0` is always attributable to one store or the
+other.
+
+1. Run `decdn node pools`. It reports every pool the daemon tracks, its deposit,
+   and the per-lane amounts already signed away. Compare that against
+   `decdn_buyer_pool_adoption_failures_total`: any increment means the node
+   could not tell whether it already owned a pool and was about to open a second
+   one.
+2. The node adopts the newest solvent `Open` pool at startup, and on **every**
+   boot it enumerates `getPools` to name deposits it is not using. Look for
+   `this node owns further open payment pools it is not using`, which lists the
+   stranded ids, and — only when an adoption happened — `adopted this node's
+   existing on-chain payment pool`. The stranded warning fires whether or not
+   anything was adopted, so its absence means there is nothing stranded.
 3. Recover those with `decdn pool close --pool <poolId>`, then
-   `decdn pool reclaim --all` once the pool's `disputeWindow` has elapsed
-   (48-72h, governance-set). Do **not** use `close --all`: it would close the
-   pool the node just adopted.
-4. Lanes on an adopted pool resume from their on-chain watermark, so a provider
+   `decdn pool reclaim --pool <poolId>` once the pool's `disputeWindow` has
+   elapsed (48-72h, governance-set). Both commands run their on-chain leg
+   normally from a node host but leave the daemon's row alone — they cannot
+   write a store the daemon holds — and say so. If you closed the pool the
+   daemon was using, restart `decdn-node` so its bootstrap re-adopts, and
+   confirm with `decdn node pools`.
+4. `close --all` and `reclaim --all` are refused on a node's data dir. They
+   enumerate from chain by keystore address, so on a node host they would close
+   the pool the daemon is paying from right now. Name the stranded pools
+   individually.
+5. Lanes on an adopted pool resume from their on-chain watermark, so a provider
    still holding an unredeemed voucher is briefly ahead of the node and rejects
    its first vouchers. That clears on the provider's next redemption; no action.
 

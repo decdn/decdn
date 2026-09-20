@@ -15,10 +15,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::signers::local::PrivateKeySigner;
+use anyhow::Context as _;
 use decdn_client_pull::buyer_pool::{
     ToppedUpPool, ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool,
     top_up, topped_up_effect,
 };
+use decdn_common::admin::{AdminRpcClient as _, BuyerPoolsResponse};
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_common::redact::sanitize_rpc_display;
@@ -34,7 +36,7 @@ use decdn_client_pull::provider;
 /// Dispatch `decdn pool <subcommand>`.
 pub async fn pool_dispatch(args: &cli::PoolArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     match &args.command {
-        cli::PoolCommand::List(a) => list(a, config_path),
+        cli::PoolCommand::List(a) => list(a, config_path).await,
         cli::PoolCommand::Open(a) => open(a, config_path).await,
         cli::PoolCommand::TopUp(a) => top_up_cmd(a, config_path).await,
         cli::PoolCommand::Close(a) => close(a, config_path).await,
@@ -69,6 +71,120 @@ fn resolve_data_dir(data_dir: Option<PathBuf>, file: &FileConfig) -> anyhow::Res
         .ok_or_else(|| {
             anyhow::anyhow!("data_dir not set and no default available (pass --data-dir)")
         })
+}
+
+/// Which buyer store a resolved `data_dir` belongs to.
+///
+/// The client and the daemon keep their buyer pools in two different files in
+/// the same directory — `buyer-pools.redb` and `buyer.redb` — sharing one table
+/// format but nothing else. A `pool` command pointed at a daemon's `data_dir`
+/// would otherwise open (and, via `Database::create`, *manufacture*) the client
+/// file and report its emptiness as the node's state (#2078).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BuyerStoreOwner {
+    /// No daemon store here, so the CLI owns `buyer-pools.redb` in this dir.
+    Client,
+    /// A `decdn-node` daemon owns this data dir. It holds redb's
+    /// process-exclusive lock on `buyer.redb` for its whole lifetime, so the
+    /// CLI can neither read nor write that file — not even read-only — and must
+    /// not create a second, unrelated store beside it.
+    Node {
+        /// The dir itself, so both store paths can be named in a message —
+        /// which file produced a `pools=0` must never be ambiguous.
+        data_dir: PathBuf,
+    },
+}
+
+/// The daemon's buyer store within `data_dir`.
+fn node_buyer_db(data_dir: &Path) -> PathBuf {
+    data_dir.join(decdn_incentive::buyer_pool_table::NODE_BUYER_DB_FILE)
+}
+
+/// The client's buyer store within `data_dir`.
+fn client_buyer_db(data_dir: &Path) -> PathBuf {
+    data_dir.join(decdn_incentive::buyer_pool_table::CLIENT_BUYER_DB_FILE)
+}
+
+/// Classify `data_dir` by whether the daemon's buyer store is present.
+///
+/// `buyer.redb` is the precise signal: the daemon's store opens every
+/// per-family file at bring-up, so it exists if and only if a `decdn-node` has
+/// run against this dir. `node.secret` would not discriminate — a client
+/// keygen writes one too.
+fn classify_buyer_store(data_dir: &Path) -> BuyerStoreOwner {
+    if node_buyer_db(data_dir).exists() {
+        BuyerStoreOwner::Node {
+            data_dir: data_dir.to_path_buf(),
+        }
+    } else {
+        BuyerStoreOwner::Client
+    }
+}
+
+impl BuyerStoreOwner {
+    /// Refuse a command that would escrow or credit a deposit into a store the
+    /// daemon never reads.
+    ///
+    /// `open` and `top-up` are the two that *create* the stranded-deposit
+    /// condition: the USDC leaves the wallet, the row lands in the client file,
+    /// and the daemon opens a second pool on its next miss. There is no
+    /// honest way to do this half-correctly, so it does not run at all.
+    ///
+    /// # Errors
+    ///
+    /// Errors when this is [`BuyerStoreOwner::Node`].
+    fn refuse_escrow(&self, verb: &str) -> anyhow::Result<()> {
+        let Self::Node { data_dir } = self else {
+            return Ok(());
+        };
+        anyhow::bail!(
+            "refusing to {verb}: this data dir belongs to a decdn-node daemon (it holds {}), \
+             and `decdn pool` writes a separate client store ({}) the daemon never reads. The \
+             escrowed USDC would be invisible to the node, which would then open a second pool \
+             of its own. The daemon manages its own pool — it opens one at first miss and tops \
+             it up from blockchain.buyer_working_deposit_micro_usdc. Run `decdn node pools` to \
+             see what it holds, or pass --data-dir <client dir> to act as a separate buyer.",
+            node_buyer_db(data_dir).display(),
+            client_buyer_db(data_dir).display(),
+        )
+    }
+
+    /// Refuse a chain-wide `--all` sweep against a node data dir.
+    ///
+    /// `close --all` / `reclaim --all` enumerate from chain by keystore
+    /// address, not from the local store, so on a node host they would close
+    /// the pool the daemon is actively paying from while the local forget
+    /// silently no-ops. A single `--pool <id>` is the stranded-pool recovery
+    /// path and stays available.
+    ///
+    /// # Errors
+    ///
+    /// Errors when this is [`BuyerStoreOwner::Node`].
+    fn refuse_sweep(&self, verb: &str) -> anyhow::Result<()> {
+        let Self::Node { data_dir } = self else {
+            return Ok(());
+        };
+        anyhow::bail!(
+            "refusing to {verb} --all: this data dir belongs to a decdn-node daemon ({}), and \
+             --all enumerates every pool this keystore owns ON CHAIN — including the one the \
+             daemon is paying from right now. Run `decdn node pools` to see which pool that is, \
+             then {verb} the stranded ones individually with --pool <poolId>.",
+            node_buyer_db(data_dir).display(),
+        )
+    }
+
+    /// The store handle the mutating commands should use: `Some` for a client
+    /// data dir, `None` for a node's — nothing may be written there.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store open error for a client data dir.
+    fn open_for_write(&self, data_dir: &Path) -> anyhow::Result<Option<RedbBuyerPoolStore>> {
+        match self {
+            Self::Client => Ok(Some(RedbBuyerPoolStore::open(data_dir)?)),
+            Self::Node { .. } => Ok(None),
+        }
+    }
 }
 
 fn resolve_chain(args: &cli::PoolChainArgs, file: &FileConfig) -> anyhow::Result<Resolved> {
@@ -153,6 +269,9 @@ fn ensure_owned(on_chain_owner: Address, ours: Address, pool_id: PoolId) -> anyh
 async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
     let chain = resolve_chain(&args.chain, &file)?;
+    // Before the keystore prompt and before any chain work: escrowing into a
+    // store the daemon never reads is the failure, not a degraded outcome.
+    classify_buyer_store(&chain.data_dir).refuse_escrow("open a pool")?;
 
     let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
     let signer = Arc::new(load_buyer_signer(&chain)?);
@@ -206,6 +325,7 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
     let file = load_file_config(config_path)?;
     let chain = resolve_chain(&args.chain, &file)?;
     let pool_id = parse_pool_id(&args.pool)?;
+    classify_buyer_store(&chain.data_dir).refuse_escrow("top up a pool")?;
 
     let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
     let signer = Arc::new(load_buyer_signer(&chain)?);
@@ -243,6 +363,103 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
         grade_deposit_credit(store.add_deposit(owner, pool_id, credited), &effect, tx)?;
     println!("topped up pool {pool_id} by {credited} µUSDC; deposit now {new_deposit} µUSDC");
     Ok(())
+}
+
+/// Where a landed `closePool` / `reclaim` records that the pool is gone.
+///
+/// The on-chain leg of both is identical either way; only the local
+/// bookkeeping differs, and on a daemon's data dir there is none the CLI can
+/// legitimately do (#2078).
+#[derive(Debug, Clone, Copy)]
+enum LocalBookkeeping<'a> {
+    /// Clear the row in the client store this CLI owns.
+    Store(&'a RedbBuyerPoolStore),
+    /// A `decdn-node` daemon owns this data dir. Its `buyer.redb` is locked
+    /// for the daemon's lifetime, so the row stays as it is and the operator
+    /// is told so — the alternative, a no-op `forget` graded as a clean close,
+    /// is the silent lie this variant exists to remove.
+    DaemonOwned(&'a Path),
+}
+
+impl LocalBookkeeping<'_> {
+    /// Build from the store the command opened: `None` means the data dir is a
+    /// daemon's, so `buyer_db` names the file that was left untouched.
+    const fn new<'a>(
+        store: Option<&'a RedbBuyerPoolStore>,
+        buyer_db: &'a Path,
+    ) -> LocalBookkeeping<'a> {
+        match store {
+            Some(store) => LocalBookkeeping::Store(store),
+            None => LocalBookkeeping::DaemonOwned(buyer_db),
+        }
+    }
+
+    /// Say, on stderr, that the daemon's row survives and what to do about it.
+    /// The on-chain state has already changed, so this is not a warning the
+    /// operator may ignore: the daemon still believes it owns a live pool.
+    fn report_daemon_row_untouched(buyer_db: &Path, pool_id: PoolId, verb: &str) {
+        eprintln!(
+            "warning: pool {pool_id} {verb} on-chain, but the daemon's row in {} was NOT cleared \
+             — a running decdn-node holds that store and no other process can write it. If this \
+             is the pool the daemon is using, restart decdn-node so its bootstrap reconciles \
+             against the chain, and confirm with `decdn node pools`.",
+            buyer_db.display()
+        );
+    }
+
+    /// Clear the row after a mined `closePool`.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the client store faulted — see [`grade_local_forget`].
+    fn forget_after_close(
+        self,
+        owner: Address,
+        pool_id: PoolId,
+        tx: TxHash,
+        reclaim_note: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Store(store) => grade_local_forget(
+                store.forget_if_pool(owner, pool_id),
+                pool_id,
+                tx,
+                reclaim_note,
+            ),
+            Self::DaemonOwned(buyer_db) => {
+                Self::report_daemon_row_untouched(buyer_db, pool_id, "closed");
+                Ok(())
+            }
+        }
+    }
+
+    /// Clear the row after a mined `reclaim`. Best-effort on both arms: the
+    /// refund itself already landed.
+    fn forget_after_reclaim(self, owner: Address, pool_id: PoolId) {
+        match self {
+            Self::Store(store) => {
+                // `Ok(false)` costs nothing: reclaim is permissionless and the
+                // row is legitimately absent after a `pool close` or a prior
+                // reclaim. An `Err` is not free — the row may survive pointing
+                // at a pool that is now `Closed`, whose `deposit` field still
+                // reads healthy, so a later fetch reuses it and signs vouchers
+                // `redeemMany` rejects outright. Warn rather than fail: the
+                // refund itself landed, and re-running the reclaim is what
+                // clears the row.
+                if let Err(e) = store.forget_if_pool(owner, pool_id) {
+                    eprintln!(
+                        "warning: pool {pool_id} reclaimed on-chain but clearing it from the \
+                         local store failed: {e}; if the row survived, a later fetch reuses this \
+                         closed pool and its vouchers are rejected — re-run `decdn pool reclaim \
+                         --pool {pool_id}` to clear it"
+                    );
+                }
+            }
+            Self::DaemonOwned(buyer_db) => {
+                Self::report_daemon_row_untouched(buyer_db, pool_id, "reclaimed");
+            }
+        }
+    }
 }
 
 /// Grade the local row-clear that follows a mined `closePool`.
@@ -403,7 +620,7 @@ fn batch_result(tally: &BatchTally, verb: &str) -> anyhow::Result<()> {
 /// reverted, or the local row-clear faulted after a landed close.
 async fn close_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
-    store: &RedbBuyerPoolStore,
+    store: LocalBookkeeping<'_>,
     owner: Address,
     pool_id: PoolId,
 ) -> anyhow::Result<String>
@@ -440,12 +657,7 @@ where
             // One note for both the success line and the failure, so the two
             // cannot drift into different instructions for the same deadline.
             let reclaim_note = format!("run `decdn pool reclaim --pool {pool_id}` {deadline_note}");
-            grade_local_forget(
-                store.forget_if_pool(owner, pool_id),
-                pool_id,
-                receipt.transaction_hash,
-                &reclaim_note,
-            )?;
+            store.forget_after_close(owner, pool_id, receipt.transaction_hash, &reclaim_note)?;
             Ok(reclaim_note)
         }
         TxOutcome::Reverted => anyhow::bail!(
@@ -466,7 +678,7 @@ where
 /// row-clear only warns — the refund itself landed.
 async fn reclaim_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
-    store: &RedbBuyerPoolStore,
+    store: LocalBookkeeping<'_>,
     owner: Address,
     pool_id: PoolId,
 ) -> anyhow::Result<()>
@@ -490,21 +702,7 @@ where
 
     match receipt_outcome(receipt.status()) {
         TxOutcome::Landed => {
-            // `Ok(false)` costs nothing: reclaim is permissionless and the row
-            // is legitimately absent after a `pool close` or a prior reclaim.
-            // An `Err` is not free — the row may survive pointing at a pool
-            // that is now `Closed`, whose `deposit` field still reads healthy,
-            // so a later fetch reuses it and signs vouchers `redeemMany`
-            // rejects outright. Warn rather than fail: the refund itself
-            // landed, and re-running the reclaim is what clears the row.
-            if let Err(e) = store.forget_if_pool(owner, pool_id) {
-                eprintln!(
-                    "warning: pool {pool_id} reclaimed on-chain but clearing it from the local \
-                     store failed: {e}; if the row survived, a later fetch reuses this closed \
-                     pool and its vouchers are rejected — re-run `decdn pool reclaim --pool \
-                     {pool_id}` to clear it"
-                );
-            }
+            store.forget_after_reclaim(owner, pool_id);
             Ok(())
         }
         TxOutcome::Reverted => anyhow::bail!(
@@ -526,14 +724,22 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
     // `--all` sweep (clap's arg group guarantees exactly one of the two).
     let target = args.pool.as_deref().map(parse_pool_id).transpose()?;
 
-    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
+    let store_owner = classify_buyer_store(&chain.data_dir);
+    if target.is_none() {
+        // `--all` enumerates from chain, not from the store, so on a node data
+        // dir it would close the pool the daemon is paying from right now.
+        store_owner.refuse_sweep("close")?;
+    }
+    let store = store_owner.open_for_write(&chain.data_dir)?;
+    let buyer_db = node_buyer_db(&chain.data_dir);
+    let books = LocalBookkeeping::new(store.as_ref(), &buyer_db);
     let signer = Arc::new(load_buyer_signer(&chain)?);
     let owner = signer.address();
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentPool::new(chain.payment_pool, rpc);
 
     let Some(pool_id) = target else {
-        return close_all(&contract, &store, owner).await;
+        return close_all(&contract, books, owner).await;
     };
 
     let pool = contract
@@ -547,7 +753,7 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
         "pool {pool_id} is not Open — nothing to close (already closing or closed)"
     );
 
-    let reclaim_note = close_and_forget(&contract, &store, owner, pool_id).await?;
+    let reclaim_note = close_and_forget(&contract, books, owner, pool_id).await?;
     println!("closed pool {pool_id}; dispute window open — {reclaim_note}");
     Ok(())
 }
@@ -557,7 +763,7 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
 /// the exit code is nonzero only if any pool failed.
 async fn close_all<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
-    store: &RedbBuyerPoolStore,
+    store: LocalBookkeeping<'_>,
     owner: Address,
 ) -> anyhow::Result<()>
 where
@@ -621,17 +827,23 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
     // `--all` sweep (clap's arg group guarantees exactly one of the two).
     let target = args.pool.as_deref().map(parse_pool_id).transpose()?;
 
-    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
+    let store_owner = classify_buyer_store(&chain.data_dir);
+    if target.is_none() {
+        store_owner.refuse_sweep("reclaim")?;
+    }
+    let store = store_owner.open_for_write(&chain.data_dir)?;
+    let buyer_db = node_buyer_db(&chain.data_dir);
+    let books = LocalBookkeeping::new(store.as_ref(), &buyer_db);
     let signer = Arc::new(load_buyer_signer(&chain)?);
     let owner = signer.address();
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentPool::new(chain.payment_pool, rpc);
 
     let Some(pool_id) = target else {
-        return reclaim_all(&contract, &store, owner).await;
+        return reclaim_all(&contract, books, owner).await;
     };
 
-    reclaim_and_forget(&contract, &store, owner, pool_id).await?;
+    reclaim_and_forget(&contract, books, owner, pool_id).await?;
     println!("reclaimed pool {pool_id}; residual deposit refunded to its owner");
     Ok(())
 }
@@ -643,7 +855,7 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
 /// the exit code is nonzero only if any pool failed.
 async fn reclaim_all<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
-    store: &RedbBuyerPoolStore,
+    store: LocalBookkeeping<'_>,
     owner: Address,
 ) -> anyhow::Result<()>
 where
@@ -934,15 +1146,31 @@ impl OwnerVerdict {
 }
 
 /// `decdn pool list` / `status`: read-only dump of the tracked buyer pools and
-/// their per-lane voucher watermark. Reads only the buyer store — no chain,
-/// keystore, or network access.
-fn list(args: &cli::PoolListArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+/// their per-lane voucher watermark.
+///
+/// Names the store it read, always. There are two, in the same directory and
+/// with the same table format but no other relation: the CLI's own
+/// `buyer-pools.redb` and a daemon's `buyer.redb`. Reading the first and
+/// reporting it as the second is what made `pools=0` meaningless on a node host
+/// (#2078), so on a daemon's data dir this asks the daemon instead — redb holds
+/// that file exclusively for the daemon's lifetime, so there is no disk path to
+/// it while the node is up.
+async fn list(args: &cli::PoolListArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let data_dir = match args.data_dir.clone() {
         Some(dir) => expand_tilde(&dir),
         None => resolve_data_dir(None, &load_file_config(config_path)?)?,
     };
 
-    let store = RedbBuyerPoolStore::open(&data_dir)?;
+    match classify_buyer_store(&data_dir) {
+        BuyerStoreOwner::Node { data_dir } => list_from_daemon(args, config_path, &data_dir).await,
+        BuyerStoreOwner::Client => list_from_client_store(args, &data_dir),
+    }
+}
+
+/// Read the CLI's own `buyer-pools.redb` under `data_dir`.
+fn list_from_client_store(args: &cli::PoolListArgs, data_dir: &Path) -> anyhow::Result<()> {
+    let store_path = client_buyer_db(data_dir);
+    let store = RedbBuyerPoolStore::open(data_dir)?;
     let BuyerLoad {
         mut pools,
         mut skipped,
@@ -955,16 +1183,78 @@ fn list(args: &cli::PoolListArgs, config_path: Option<&Path>) -> anyhow::Result<
     let mut out = std::io::stdout().lock();
     if args.json {
         let view = PoolListJson {
+            store: store_path.display().to_string(),
+            source: SOURCE_CLIENT_STORE,
             pools: pools.iter().map(PoolJson::from).collect(),
             skipped: skipped.iter().map(|p| format!("{p:#x}")).collect(),
         };
         serde_json::to_writer_pretty(&mut out, &view)?;
         writeln!(out)?;
     } else {
+        writeln!(out, "store={}", store_path.display())?;
         write_pools(&mut out, &pools, &skipped)?;
     }
     Ok(())
 }
+
+/// Read a running daemon's `buyer.redb` through `admin_v1_pools`.
+///
+/// An unreachable daemon is a hard error, not a fallback to the client store:
+/// that store is a different file with unrelated contents, and printing its
+/// `pools=0` here is precisely the failure this path exists to prevent.
+async fn list_from_daemon(
+    args: &cli::PoolListArgs,
+    config_path: Option<&Path>,
+    data_dir: &Path,
+) -> anyhow::Result<()> {
+    let buyer_db = node_buyer_db(data_dir);
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+    let url = crate::commands::node::resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+    let client = jsonrpsee::http_client::HttpClientBuilder::default()
+        .request_timeout(std::time::Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let resp: BuyerPoolsResponse = client.pools().await.map_err(|err| {
+        crate::commands::node::classify_client_error(&url, args.timeout_ms, err).context(format!(
+            "{} is a decdn-node data dir, so the pools that matter are in {} — which a running \
+             daemon holds exclusively and no other process can open. This command therefore \
+             asks the daemon, and the daemon did not answer. Start decdn-node, or pass \
+             --data-dir <client dir> to inspect a client store instead.",
+            data_dir.display(),
+            buyer_db.display(),
+        ))
+    })?;
+
+    let mut out = std::io::stdout().lock();
+    if args.json {
+        let view = DaemonPoolListJson {
+            store: buyer_db.display().to_string(),
+            source: SOURCE_DAEMON,
+            pools: &resp.pools,
+            skipped: &resp.skipped,
+        };
+        serde_json::to_writer_pretty(&mut out, &view)?;
+        writeln!(out)?;
+    } else {
+        writeln!(
+            out,
+            "store={} (read from the running daemon)",
+            buyer_db.display()
+        )?;
+        write_buyer_pools(&mut out, &resp)?;
+    }
+    Ok(())
+}
+
+/// `source` value for a listing read directly from the CLI's own store.
+const SOURCE_CLIENT_STORE: &str = "client_store";
+/// `source` value for a listing the running daemon answered.
+const SOURCE_DAEMON: &str = "daemon";
 
 /// Warn about every undecodable buyer row on stderr. The `pool_id` (the store's
 /// primary key) is the only available repair handle.
@@ -1012,11 +1302,72 @@ fn write_pools(
     Ok(())
 }
 
-/// Top-level `--json` document.
+/// Render a daemon's buyer-pool snapshot as an aligned table, in the same
+/// columns [`write_pools`] uses for the client store, so an operator reading
+/// both sees one view rather than two dialects. Pure (writes to any sink) so
+/// the layout is unit-testable without an admin hop.
+///
+/// Shared by `decdn node pools` and by `decdn pool list` when it routes to a
+/// running daemon.
+pub(crate) fn write_buyer_pools(
+    w: &mut impl Write,
+    resp: &BuyerPoolsResponse,
+) -> std::io::Result<()> {
+    for pool_id in &resp.skipped {
+        writeln!(
+            w,
+            "warning: buyer pool {pool_id} could not be decoded; its deposit remains escrowed but \
+             untracked until the record is repaired"
+        )?;
+    }
+    writeln!(w, "pools={}", resp.pools.len())?;
+    if resp.pools.is_empty() {
+        if resp.skipped.is_empty() {
+            writeln!(w, "(no tracked pools)")?;
+        }
+        return Ok(());
+    }
+    writeln!(
+        w,
+        "{:<14} {:<14} {:<14} {:>14} {:>8}",
+        "POOL", "OWNER", "TOKEN", "DEPOSIT", "LANES"
+    )?;
+    for p in &resp.pools {
+        writeln!(
+            w,
+            "{:<14} {:<14} {:<14} {:>14} {:>8}",
+            short_hex(&p.pool_id),
+            short_hex(&p.owner),
+            short_hex(&p.token),
+            format_usdc_u256(U256::from(p.deposit_micro_usdc)),
+            p.lanes.len(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Top-level `--json` document for a listing of the CLI's own store.
+///
+/// `store` and `source` are the half a machine consumer needs to know *which*
+/// buyer store answered: the same command on the same host can read either
+/// file, and they are unrelated (#2078).
 #[derive(Serialize)]
 struct PoolListJson {
+    store: String,
+    source: &'static str,
     pools: Vec<PoolJson>,
     skipped: Vec<String>,
+}
+
+/// Top-level `--json` document for a listing the daemon answered. Borrows the
+/// admin DTOs rather than re-shaping them, so the JSON a client-store listing
+/// and a daemon listing produce stay structurally comparable.
+#[derive(Serialize)]
+struct DaemonPoolListJson<'a> {
+    store: String,
+    source: &'static str,
+    pools: &'a [decdn_common::admin::BuyerPoolSnapshot],
+    skipped: &'a [String],
 }
 
 /// Serializable view for `--json`, including the per-lane watermark so a
@@ -1246,6 +1597,131 @@ mod tests {
             Address::repeat_byte(0xcd),
             U256::from(deposit_micro),
         )
+    }
+
+    // ---- node-vs-client data dir (#2078) ----
+
+    /// The daemon's `buyer.redb` is the signal, and nothing else is. An empty
+    /// dir, or one holding only the client store, is a client data dir.
+    #[test]
+    fn classify_buyer_store_keys_on_the_daemon_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(classify_buyer_store(dir.path()), BuyerStoreOwner::Client);
+
+        // The client's own store does not make it a node data dir.
+        std::fs::write(dir.path().join("buyer-pools.redb"), b"x").unwrap();
+        assert_eq!(classify_buyer_store(dir.path()), BuyerStoreOwner::Client);
+
+        std::fs::write(dir.path().join("buyer.redb"), b"x").unwrap();
+        assert_eq!(
+            classify_buyer_store(dir.path()),
+            BuyerStoreOwner::Node {
+                data_dir: dir.path().to_path_buf()
+            }
+        );
+    }
+
+    /// `open` / `top-up` are refused on a node data dir, and the refusal names
+    /// both files — an operator who sees only "refused" cannot tell which of
+    /// the two stores the command was about to write.
+    #[test]
+    fn escrow_is_refused_on_a_node_data_dir() {
+        let owner = BuyerStoreOwner::Node {
+            data_dir: PathBuf::from("/var/lib/decdn"),
+        };
+        let err = owner.refuse_escrow("open a pool").unwrap_err().to_string();
+        assert!(err.contains("/var/lib/decdn/buyer.redb"), "{err}");
+        assert!(err.contains("/var/lib/decdn/buyer-pools.redb"), "{err}");
+        assert!(err.contains("decdn node pools"), "{err}");
+        // A client data dir is unaffected.
+        BuyerStoreOwner::Client
+            .refuse_escrow("open a pool")
+            .unwrap();
+    }
+
+    /// `--all` enumerates from chain, so on a node data dir it would close the
+    /// pool the daemon is paying from. Refused; the single-`--pool` recovery
+    /// path is named as the alternative.
+    #[test]
+    fn sweep_is_refused_on_a_node_data_dir() {
+        let owner = BuyerStoreOwner::Node {
+            data_dir: PathBuf::from("/var/lib/decdn"),
+        };
+        let err = owner.refuse_sweep("close").unwrap_err().to_string();
+        assert!(err.contains("--pool"), "{err}");
+        assert!(err.contains("/var/lib/decdn/buyer.redb"), "{err}");
+        BuyerStoreOwner::Client.refuse_sweep("close").unwrap();
+    }
+
+    /// A node data dir yields no writable store, so nothing is created there.
+    #[test]
+    fn node_data_dir_opens_no_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = BuyerStoreOwner::Node {
+            data_dir: dir.path().to_path_buf(),
+        };
+        assert!(owner.open_for_write(dir.path()).unwrap().is_none());
+        assert!(
+            !dir.path().join("buyer-pools.redb").exists(),
+            "classifying a node data dir must not create the client store"
+        );
+    }
+
+    /// A landed close on a node data dir does not claim the row was cleared —
+    /// it reports that the daemon's row survives. The `Ok` here is the
+    /// on-chain leg succeeding, which it did.
+    #[test]
+    fn daemon_owned_bookkeeping_does_not_claim_a_clean_close() {
+        let books = LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb"));
+        books
+            .forget_after_close(
+                Address::repeat_byte(0x11),
+                B256::repeat_byte(0x22),
+                TxHash::repeat_byte(0x33),
+                "run `decdn pool reclaim` later",
+            )
+            .expect("the on-chain close landed; the local row is reported, not graded");
+    }
+
+    /// The daemon renderer shares [`write_pools`]'s columns and its empty
+    /// sentinel, so the two listings read as one view.
+    #[test]
+    fn write_buyer_pools_matches_the_client_table_shape() {
+        let mut buf = Vec::new();
+        write_buyer_pools(
+            &mut buf,
+            &BuyerPoolsResponse {
+                pools: Vec::new(),
+                skipped: Vec::new(),
+            },
+        )
+        .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("pools=0"), "{out}");
+        assert!(out.contains("(no tracked pools)"), "{out}");
+
+        let mut buf = Vec::new();
+        write_buyer_pools(
+            &mut buf,
+            &BuyerPoolsResponse {
+                pools: vec![decdn_common::admin::BuyerPoolSnapshot {
+                    pool_id: "0xabcdef0123456789".to_string(),
+                    owner: "0x1111111111111111".to_string(),
+                    token: "0x2222222222222222".to_string(),
+                    deposit_micro_usdc: 1_500_000,
+                    lanes: Vec::new(),
+                }],
+                skipped: vec!["0x4444".to_string()],
+            },
+        )
+        .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("1.500000"), "{out}");
+        assert!(out.contains("pools=1"), "{out}");
+        assert!(
+            out.contains("0x4444"),
+            "an undecodable row must be named: {out}"
+        );
     }
 
     #[test]

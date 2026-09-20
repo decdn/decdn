@@ -19,8 +19,9 @@ use decdn_client_pull::discovery::{self, NodeCandidate, SELECT_K, select_candida
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::probe::probe_once;
 use decdn_common::admin::{
-    AdminRpcClient, BindingStatus, DrainRequest, DrainResponse, EvictRequest, EvictResponse,
-    HealthResponse, LaneSnapshot, LanesResponse, ReloadResponse, SlashesResponse, StatusResponse,
+    AdminRpcClient, BindingStatus, BuyerPoolsResponse, DrainRequest, DrainResponse, EvictRequest,
+    EvictResponse, HealthResponse, LaneSnapshot, LanesResponse, ReloadResponse, SlashesResponse,
+    StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -64,6 +65,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Status(s) => status(s, global_config).await,
         cli::NodeCommand::Lanes(c) => lanes(c, global_config).await,
         cli::NodeCommand::Slashes(s) => slashes(s, global_config).await,
+        cli::NodeCommand::Pools(p) => pools(p, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
         cli::NodeCommand::Reload(r) => reload(r, global_config).await,
         cli::NodeCommand::Drain(d) => drain(d, global_config).await,
@@ -707,6 +709,45 @@ pub async fn slashes(args: &cli::SlashesArgs, global_config: Option<&Path>) -> a
     Ok(())
 }
 
+/// `decdn node pools`: call `admin_v1_pools` on the running node and print its
+/// buyer-side `PaymentPool` state — the pools it pays upstream providers from.
+///
+/// This is the only read path to the daemon's `buyer.redb`: redb holds a
+/// process-exclusive lock on that file for the node's lifetime, so nothing can
+/// open it from disk while the node is up (#2078).
+pub async fn pools(args: &cli::PoolsArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+
+    let config_path = args.config.as_deref().or(global_config);
+    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let parsed: BuyerPoolsResponse = client
+        .pools()
+        .await
+        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
+
+    if args.json {
+        let pretty =
+            serde_json::to_string_pretty(&parsed).context("failed to encode pools as JSON")?;
+        println!("{pretty}");
+    } else {
+        let mut stdout = io::stdout().lock();
+        crate::commands::pool::write_buyer_pools(&mut stdout, &parsed)
+            .context("failed to write pools table")?;
+    }
+
+    Ok(())
+}
+
 /// Write the slash table to `w`. Pure function (takes `&mut impl
 /// Write`) so the formatting is unit-testable without an HTTP hop,
 /// mirroring [`write_lanes_table`]. A summary line carries the count as a
@@ -751,7 +792,11 @@ fn write_slashes_table(w: &mut impl io::Write, resp: &SlashesResponse) -> io::Re
 ///   the code and message so the operator can tell a misconfigured
 ///   method name from a real server failure.
 /// - Anything else → passed through with the URL as context.
-fn classify_client_error(url: &str, timeout_ms: u64, err: JsonRpcClientError) -> anyhow::Error {
+pub(crate) fn classify_client_error(
+    url: &str,
+    timeout_ms: u64,
+    err: JsonRpcClientError,
+) -> anyhow::Error {
     match err {
         JsonRpcClientError::RequestTimeout => anyhow::anyhow!(
             "admin at {url} did not respond within {timeout_ms}ms; \

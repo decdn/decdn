@@ -99,7 +99,12 @@ const SETTLE_DB_FILE: &str = "settle.redb";
 const CHECKPOINT_DB_FILE: &str = "checkpoint.redb";
 
 /// File name of the buyer pool redb database (buyer state + owner index).
-const BUYER_DB_FILE: &str = "buyer.redb";
+///
+/// Shared with the CLI through [`decdn_incentive::buyer_pool_table`] so both
+/// sides name the same file: an operator tool that wants this store has to know
+/// it is not the client's
+/// [`CLIENT_BUYER_DB_FILE`](decdn_incentive::buyer_pool_table::CLIENT_BUYER_DB_FILE).
+const BUYER_DB_FILE: &str = decdn_incentive::buyer_pool_table::NODE_BUYER_DB_FILE;
 
 /// Byte width of a [`LaneKey`] on disk: `pool_id ‖ signer ‖ provider` =
 /// `32 + 20 + 20`.

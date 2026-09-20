@@ -1354,6 +1354,13 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
 /// enumerated oldest-first and a later one is the one a previous adoption cycle
 /// would have been using.
 ///
+/// The enumeration runs whether or not anything is adopted, and that is the
+/// second half of the job: every open pool beside the one in use is a deposit
+/// this node is not spending, and [`report_stranded_pools`] is the only thing
+/// that names them. Reporting them solely after an adoption would leave the
+/// steady state — an intact store and a deposit stranded by an earlier build —
+/// permanently silent.
+///
 /// Adopting is deliberately softer than the rest of bootstrap. A failure here
 /// leaves the store untouched and returns `false`, so the first miss falls
 /// through to the ordinary lazy open — an RPC blip while enumerating must not
@@ -1365,29 +1372,31 @@ async fn reconcile_owned_pool<P: Provider + Clone>(
     token: Address,
     metrics: &Arc<Metrics>,
 ) -> bool {
-    match adoption_applies(store, owner) {
-        AdoptionCheck::Applies => {}
-        AdoptionCheck::AlreadyTracked => return false,
-        AdoptionCheck::Unknown => {
-            metrics.buyer_pool_adoption_failure();
-            return false;
-        }
+    let check = adoption_applies(store, owner);
+    if matches!(check, AdoptionCheck::Unknown) {
+        metrics.buyer_pool_adoption_failure();
+        return false;
     }
 
-    let ids = match enumerate_owned_pools(contract, owner).await {
-        Ok(ids) => ids,
-        Err(err) => {
-            metrics.buyer_pool_adoption_failure();
-            warn!(
-                error = %format_args!("{err:#}"),
-                "could not enumerate this node's on-chain pools; a pool it already owns \
-                 stays unadopted and the next miss opens a fresh one"
-            );
-            return false;
-        }
+    let adopting = matches!(check, AdoptionCheck::Applies);
+    let Some(open) = enumerate_open_pools(contract, owner, adopting, metrics).await else {
+        return false;
     };
 
-    let Some((pool_id, pool, stranded)) = newest_open_pool(contract, ids).await else {
+    let tracked = match check {
+        // The store already names the pool in use, so everything else this
+        // owner holds open is stranded — including pools this node never chose
+        // and would never have selected.
+        AdoptionCheck::AlreadyTracked(pool_id) => {
+            report_stranded_pools(&recoverable_beside(&open, pool_id));
+            return false;
+        }
+        AdoptionCheck::Applies => newest_solvent(&open),
+        // Handled above; enumerating never happens on this arm.
+        AdoptionCheck::Unknown => None,
+    };
+
+    let Some((pool_id, pool)) = tracked else {
         return false;
     };
     let state = BuyerPoolState::new(pool_id, owner, token, U256::from(pool.deposit));
@@ -1400,7 +1409,7 @@ async fn reconcile_owned_pool<P: Provider + Clone>(
         );
         return false;
     }
-    report_stranded_pools(&stranded);
+    report_stranded_pools(&recoverable_beside(&open, pool_id));
     info!(
         %pool_id,
         deposit = pool.deposit,
@@ -1408,6 +1417,74 @@ async fn reconcile_owned_pool<P: Provider + Clone>(
         "adopted this node's existing on-chain payment pool; not opening a second one"
     );
     true
+}
+
+/// Every `Open` pool this `owner` holds on chain, newest first, or `None` when
+/// the chain could not be asked.
+///
+/// Runs on BOTH reconciliation paths, not only when adopting. A node whose
+/// store is intact is the steady state, and it is exactly the state in which an
+/// older build's stranded deposit sits unnoticed: nothing else ever asks the
+/// chain what this owner holds, so nothing ever names it (#2078).
+///
+/// `adopting` decides how a failure is reported, and the distinction matters:
+/// `decdn_buyer_pool_adoption_failures_total` means "could not tell whether it
+/// already owned a pool and is about to open a second one", which is what the
+/// runbook reads it as. A sweep that could not run beside an already-tracked
+/// pool was never going to adopt anything, so it warns instead of counting.
+async fn enumerate_open_pools<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: Address,
+    adopting: bool,
+    metrics: &Arc<Metrics>,
+) -> Option<Vec<(PoolId, PaymentPool::Pool)>> {
+    let ids = match enumerate_owned_pools(contract, owner).await {
+        Ok(ids) => ids,
+        Err(err) if adopting => {
+            metrics.buyer_pool_adoption_failure();
+            warn!(
+                error = %format_args!("{err:#}"),
+                "could not enumerate this node's on-chain pools; a pool it already owns \
+                 stays unadopted and the next miss opens a fresh one"
+            );
+            return None;
+        }
+        Err(err) => {
+            warn!(
+                error = %format_args!("{err:#}"),
+                "could not enumerate this node's on-chain pools; a deposit stranded beside \
+                 the pool it is using would go unreported this boot"
+            );
+            return None;
+        }
+    };
+    Some(open_pools(contract, ids).await)
+}
+
+/// Every open pool in `open` other than `in_use` that still holds something to
+/// recover — the set [`report_stranded_pools`] names.
+///
+/// Solvency is the filter because the warning promises the deposits are
+/// recoverable, and a fully-redeemed pool refunds nothing: `reclaim` returns
+/// `deposit - totalRedeemed`. It is the same test that decides adoptability, so
+/// a pool this node would refuse to adopt is also one it will not ask an
+/// operator to chase.
+fn recoverable_beside(open: &[(PoolId, PaymentPool::Pool)], in_use: PoolId) -> Vec<PoolId> {
+    open.iter()
+        .filter(|(id, pool)| *id != in_use && pool.deposit > pool.totalRedeemed)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// The newest pool in `open` that still has something to spend.
+///
+/// A fully-redeemed pool is still `Open` on chain, and adopting one would wedge
+/// the node: `reuse_or_report` would answer `Some` forever, so no fresh pool
+/// would ever open, against a deposit that can fund no voucher.
+fn newest_solvent(open: &[(PoolId, PaymentPool::Pool)]) -> Option<(PoolId, PaymentPool::Pool)> {
+    open.iter()
+        .find(|(_, pool)| pool.deposit > pool.totalRedeemed)
+        .map(|(id, pool)| (*id, pool.clone()))
 }
 
 /// What bootstrap knows about whether `owner` already has a tracked pool.
@@ -1420,8 +1497,10 @@ async fn reconcile_owned_pool<P: Provider + Clone>(
 enum AdoptionCheck {
     /// The store holds no pool for this owner, so adoption applies.
     Applies,
-    /// The store already tracks a pool; there is nothing to adopt.
-    AlreadyTracked,
+    /// The store already tracks this pool; there is nothing to adopt. The id
+    /// rides along because the stranded set is "every other open pool", and
+    /// the tracked pool is not necessarily the one an adoption would pick.
+    AlreadyTracked(PoolId),
     /// The store could not be read, so what it holds is unknown.
     Unknown,
 }
@@ -1434,7 +1513,7 @@ enum AdoptionCheck {
 fn adoption_applies(store: &Arc<dyn BuyerPoolStore>, owner: Address) -> AdoptionCheck {
     match store.get_by_owner(owner) {
         Ok(None) => AdoptionCheck::Applies,
-        Ok(Some(_)) => AdoptionCheck::AlreadyTracked,
+        Ok(Some(state)) => AdoptionCheck::AlreadyTracked(state.pool_id),
         Err(err) => {
             warn!(
                 error = %format_args!("{err:#}"),
@@ -1451,6 +1530,10 @@ fn adoption_applies(store: &Arc<dyn BuyerPoolStore>, owner: Address) -> Adoption
 ///
 /// Nothing else reports which ids they are: adoption takes one pool and the rest
 /// are invisible, which is how a deposit stays stranded indefinitely.
+///
+/// The remedy names each pool explicitly. `--all` is refused on a node's data
+/// dir precisely because it enumerates from chain and would close the pool this
+/// node is paying from (#2078).
 fn report_stranded_pools(stranded: &[PoolId]) {
     if stranded.is_empty() {
         return;
@@ -1459,36 +1542,29 @@ fn report_stranded_pools(stranded: &[PoolId]) {
         count = stranded.len(),
         pools = ?stranded,
         "this node owns further open payment pools it is not using; their deposits are \
-         recoverable with `decdn pool close --pool <id>` then `decdn pool reclaim --all`"
+         recoverable with `decdn pool close --pool <id>` then, after the dispute window, \
+         `decdn pool reclaim --pool <id>`. Name each id: `--all` would close the pool this \
+         node is using, and is refused on a node's data dir. Neither command clears this \
+         node's own record — restart it afterwards if you closed the pool it is using"
     );
 }
 
-/// The newest adoptable pool in `ids` with its on-chain state, plus every other
-/// open pool the walk passed — deposits this node holds and is not using.
+/// Every `Open` pool in `ids` with its on-chain state, newest first.
 ///
 /// `ids` arrives oldest-first from `getPools`, and this walks it in reverse: a
 /// later pool is the one a previous adoption cycle would have been using, and
 /// the earlier ones are what the cycle stranded. A pool whose state cannot be
 /// read is skipped rather than failing the walk — one unreadable row must not
 /// hide a live pool behind it.
-///
-/// A pool is adoptable only while it is `Open` **and** still has something to
-/// spend. A fully-redeemed pool is still `Open` on chain, and adopting one would
-/// wedge the node: `reuse_or_report` would answer `Some` forever, so no fresh
-/// pool would ever open, against a deposit that can fund no voucher.
-async fn newest_open_pool<P: Provider + Clone>(
+async fn open_pools<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     ids: Vec<PoolId>,
-) -> Option<(PoolId, PaymentPool::Pool, Vec<PoolId>)> {
-    let mut adopted: Option<(PoolId, PaymentPool::Pool)> = None;
-    let mut open_pools: Vec<PoolId> = Vec::new();
+) -> Vec<(PoolId, PaymentPool::Pool)> {
+    let mut open = Vec::new();
     for pool_id in ids.into_iter().rev() {
         match contract.getPool(pool_id).call().await {
             Ok(pool) if matches!(pool.status, PaymentPool::Status::Open) => {
-                open_pools.push(pool_id);
-                if adopted.is_none() && pool.deposit > pool.totalRedeemed {
-                    adopted = Some((pool_id, pool));
-                }
+                open.push((pool_id, pool));
             }
             Ok(_) => {}
             Err(err) => {
@@ -1496,9 +1572,7 @@ async fn newest_open_pool<P: Provider + Clone>(
             }
         }
     }
-    let (pool_id, pool) = adopted?;
-    open_pools.retain(|id| *id != pool_id);
-    Some((pool_id, pool, open_pools))
+    open
 }
 
 /// Open the node's buyer pool and persist it, unless a concurrent open already
@@ -1877,12 +1951,15 @@ mod tests {
         assert!(store.get_by_owner(owner).unwrap().is_none());
     }
 
-    /// A store that already tracks a pool is left alone.
+    /// A store that already tracks a pool is left alone — even though the path
+    /// now enumerates the chain on every boot to find stranded deposits.
     ///
     /// The chain is stocked with a DIFFERENT adoptable pool, so a build that
     /// dropped the already-tracked check would adopt it and fail the assertion.
-    /// An empty queue would not: the mocked transport errors an unexpected call,
-    /// and the error path returns `false` too.
+    /// The queue holds exactly the `getPools` + `getPool` pair that sweep
+    /// consumes; an empty one would not prove the same thing, because the
+    /// mocked transport errors an unexpected call and the error path also
+    /// returns `false`.
     #[tokio::test]
     async fn reconcile_is_a_no_op_when_the_store_already_tracks_a_pool() {
         use alloy::sol_types::SolValue;
@@ -1912,6 +1989,122 @@ mod tests {
         assert_eq!(
             store.get_by_owner(owner).unwrap().unwrap().pool_id,
             existing
+        );
+    }
+
+    /// The stranded set on the already-tracked path is measured against the
+    /// pool the STORE names, not the one an adoption would have picked (#2078).
+    ///
+    /// The chain holds two open pools, neither of them the tracked one. A
+    /// build that reused the adoption selector would call the newer of the two
+    /// "in use" and report only the older; both are stranded.
+    #[test]
+    fn stranded_set_excludes_only_the_pool_actually_in_use() {
+        let owner = Address::repeat_byte(1);
+        let in_use = PoolId::from([9u8; 32]);
+        let other_a = PoolId::from([0xAA; 32]);
+        let other_b = PoolId::from([0xBB; 32]);
+        let open = vec![
+            (
+                other_b,
+                onchain_pool(owner, PaymentPool::Status::Open, 8_000),
+            ),
+            (
+                in_use,
+                onchain_pool(owner, PaymentPool::Status::Open, 5_000),
+            ),
+            (
+                other_a,
+                onchain_pool(owner, PaymentPool::Status::Open, 9_000),
+            ),
+        ];
+        assert_eq!(recoverable_beside(&open, in_use), vec![other_b, other_a]);
+    }
+
+    /// A fully-redeemed pool refunds nothing, so it is not reported as a
+    /// recoverable deposit — the warning promises recoverability, and chasing
+    /// a zero residual is noise on every boot.
+    #[test]
+    fn stranded_set_skips_a_fully_redeemed_pool() {
+        let owner = Address::repeat_byte(1);
+        let in_use = PoolId::from([9u8; 32]);
+        let spent = PoolId::from([0xAA; 32]);
+        let mut pool = onchain_pool(owner, PaymentPool::Status::Open, 9_000);
+        pool.totalRedeemed = pool.deposit;
+        assert!(recoverable_beside(&[(spent, pool)], in_use).is_empty());
+    }
+
+    /// The already-tracked path enumerates and reaches the stranded sweep
+    /// rather than returning early (#2078). Proven by mock consumption: the
+    /// queue holds exactly `getPools` + two `getPool`s, and the transport
+    /// errors on an unexpected call, so a build that returned early would
+    /// leave responses unspent and a build that over-called would fault.
+    #[tokio::test]
+    async fn reconcile_sweeps_for_stranded_pools_when_the_store_is_intact() {
+        use alloy::sol_types::SolValue;
+
+        let owner = Address::repeat_byte(1);
+        let token = Address::repeat_byte(2);
+        let existing = PoolId::from([9u8; 32]);
+        let stranded_a = PoolId::from([0xAA; 32]);
+        let stranded_b = PoolId::from([0xBB; 32]);
+
+        let contract = mocked_pool_contract(vec![
+            vec![stranded_a, stranded_b].abi_encode().into(),
+            // Walked newest-first, so `stranded_b` is read before `stranded_a`.
+            onchain_pool(owner, PaymentPool::Status::Open, 8_000)
+                .abi_encode()
+                .into(),
+            onchain_pool(owner, PaymentPool::Status::Open, 9_000)
+                .abi_encode()
+                .into(),
+        ]);
+        let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+        store
+            .record(&BuyerPoolState::new(
+                existing,
+                owner,
+                token,
+                U256::from(5_000u64),
+            ))
+            .unwrap();
+
+        let metrics = metrics();
+        assert!(!reconcile_owned_pool(&contract, &store, owner, token, &metrics).await);
+        // Nothing adopted: the tracked row is untouched.
+        assert_eq!(
+            store.get_by_owner(owner).unwrap().unwrap().pool_id,
+            existing
+        );
+    }
+
+    /// A failed enumeration on the already-tracked path is a warning, not an
+    /// adoption failure. The counter's meaning — and the runbook's reading of
+    /// it — is "about to open a second pool", which this path never is.
+    #[tokio::test]
+    async fn a_failed_stranded_sweep_is_not_counted_as_an_adoption_failure() {
+        let owner = Address::repeat_byte(1);
+        let token = Address::repeat_byte(2);
+        let existing = PoolId::from([9u8; 32]);
+
+        // Empty queue: the mocked transport errors the `getPools` call.
+        let contract = mocked_pool_contract(vec![]);
+        let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+        store
+            .record(&BuyerPoolState::new(
+                existing,
+                owner,
+                token,
+                U256::from(5_000u64),
+            ))
+            .unwrap();
+
+        let metrics = metrics();
+        assert!(!reconcile_owned_pool(&contract, &store, owner, token, &metrics).await);
+        assert_eq!(
+            adoption_failures(&metrics),
+            0,
+            "a stranded sweep that could not run is not an adoption failure"
         );
     }
 

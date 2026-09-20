@@ -1582,6 +1582,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let buyer_channel_store: Arc<dyn decdn_incentive::BuyerPoolStore> = Arc::new(
         crate::channel_store::BuyerPoolStoreHandle::new(Arc::clone(&infra.concrete_channel_store)),
     );
+    // `admin_v1_pools` reads the SAME store the bootstrap below writes adoptions
+    // and top-ups into. It has to be the same handle, not a second open of
+    // `buyer.redb`: redb holds a process-exclusive lock on that file for the
+    // daemon's lifetime, which is why no CLI can read it from disk (#2078).
+    let buyer_channel_store_for_admin = Arc::clone(&buyer_channel_store);
     // The buyer-side PaymentPool bootstrap (whose on-chain round-trips —
     // notably the one-time USDC `approve` receipt — can block for many
     // minutes on a stuck tx, bounded by `APPROVE_RECEIPT_TIMEOUT`) and
@@ -2197,6 +2202,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             lane_activity: ch.client_handler.lane_activity_clock(),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
         })
+        // Buyer-pool introspection for `admin_v1_pools` (#2078). The SAME store
+        // handle `BuyerPoolService` records into, so the admin surface reports
+        // what the daemon believes — the only read path to `buyer.redb` while
+        // this process holds redb's exclusive lock on it.
+        .with_buyer_pools(Arc::clone(&buyer_channel_store_for_admin))
         // Slash-detection introspection for `admin_v1_slashes` (#1032). Shares
         // the in-memory store the watcher appends to — read-only here.
         .with_slash_detection(admin::SlashStatusHandles {

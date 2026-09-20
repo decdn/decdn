@@ -29,8 +29,10 @@ use crate::buyer_pool_table::BuyerPoolTable;
 use crate::lane::{LaneKey, PoolId};
 use crate::store::StoreError;
 
-/// File name of the buyer-pool redb database within the data dir.
-const BUYER_POOLS_DB_FILE: &str = "buyer-pools.redb";
+/// File name of the buyer-pool redb database within the data dir. Defined beside
+/// the daemon's [`crate::buyer_pool_table::NODE_BUYER_DB_FILE`] so the two names
+/// stay together.
+const BUYER_POOLS_DB_FILE: &str = crate::buyer_pool_table::CLIENT_BUYER_DB_FILE;
 
 /// Buyer-only `redb`-backed [`BuyerPoolStore`]. One redb file, one table;
 /// every mutating call fsyncs on commit (`Durability::Immediate`).
