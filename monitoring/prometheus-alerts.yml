@@ -660,12 +660,23 @@ groups:
             operator key has gas.
 
       - alert: DecdnBuyerWalletUnfunded
-        # Scoped to nodes that actually buy: a cache-only node never opens a
-        # pool, so its zero is correct. `decdn_node_pull_attempts_total`
-        # existing at all is the marker that node-to-node pull-through is on.
+        # Scoped on `> 0`, not on the series existing: every metric is registered
+        # unconditionally, so a cache-only node exports
+        # decdn_node_pull_attempts_total at 0 and an `>= 0` guard would match it
+        # too — firing on exactly the nodes whose empty wallet is correct.
+        # Having ATTEMPTED a pull is the observable marker that this node buys.
+        #
+        # The cost is a warm-up gap: a freshly started node does not alert until
+        # its first miss. That is the safe direction, and an unfunded wallet is
+        # reached through an attempt anyway — the pull is attempted, then the
+        # openPool reverts — so the real condition still fires.
+        #
+        # Threshold is the 10 USDC default for
+        # blockchain.buyer_working_deposit_micro_usdc; raise it alongside that
+        # knob, which PromQL cannot read.
         expr: |
           decdn_buyer_wallet_usdc < 10000000
-            and on(instance) (decdn_node_pull_attempts_total >= 0)
+            and on(instance) (decdn_node_pull_attempts_total > 0)
         for: 30m
         labels:
           component: payments

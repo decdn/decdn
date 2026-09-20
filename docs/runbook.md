@@ -460,10 +460,11 @@ the ERC-20 transfer, so the node can pay no provider and every cache miss falls
 through to origin.
 
 1. Read `decdn_buyer_wallet_usdc`, and
-   `decdn_pool_open_failures_insufficient_deposit_total` beside it.
+   `decdn_pool_open_failures_insufficient_deposit_total` beside it. The gauge is
+   refreshed once per reclaim sweep, so allow up to an hour after funding.
 2. Send USDC to the operator address. Circle's Sepolia faucet is the testnet
    source (see [Testnet faucet](#testnet-faucet)); `decdn whoami` prints the
-   address.
+   address, given the keystore password.
 3. No restart is needed — the next miss opens the pool.
 
 A wallet with an old string-revert USDC reports the same shortfall through
@@ -476,13 +477,18 @@ It reconciles against `PaymentPool.getPools` at startup and adopts the pool it
 already owns, so this heals on its own; what follows is for confirming it, and
 for recovering deposits an older build stranded before it did.
 
-1. `decdn pool list --all` enumerates every pool this keystore owns, from chain.
-   More than one `Open` pool means earlier deposits are stranded.
-2. The node adopts the newest `Open` pool at startup — look for
-   `adopted this node's existing on-chain payment pool` in the log.
-3. Recover the others with `decdn pool close --pool <poolId>`, then
-   `decdn pool reclaim --all` once the 48h `disputeWindow` has elapsed. Do
-   **not** use `close --all`: it would close the pool the node just adopted.
+1. Read `decdn_buyer_pool_adoption_failures_total`. Any increment means the
+   node could not tell whether it already owned a pool and is about to open a
+   second one; `decdn pool list` (which reads the local store) then shows
+   nothing while the chain says otherwise.
+2. The node adopts the newest solvent `Open` pool at startup. Look for
+   `adopted this node's existing on-chain payment pool` in the log, and for
+   `this node owns further open payment pools it is not using`, which names the
+   stranded ids.
+3. Recover those with `decdn pool close --pool <poolId>`, then
+   `decdn pool reclaim --all` once the pool's `disputeWindow` has elapsed
+   (48-72h, governance-set). Do **not** use `close --all`: it would close the
+   pool the node just adopted.
 4. Lanes on an adopted pool resume from their on-chain watermark, so a provider
    still holding an unredeemed voucher is briefly ahead of the node and rejects
    its first vouchers. That clears on the provider's next redemption; no action.

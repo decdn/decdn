@@ -124,62 +124,12 @@ pub(crate) enum ProbeGather {
     CoverageUnion,
 }
 
-/// Record a buyer channel open/reuse failure on `err` to the metrics in `deps`,
-/// emitting a structured-log line with the failure-class `reason` (#966).
-///
-/// Bumps the unlabeled `node_pull_pool_open_failures` total and, when the
-/// error chain carries a [`PoolOpenFailureReason`] (attached by the
-/// `open_pool` kernel for the three `openPool`-tx failure classes), the
-/// matching `decdn_pool_open_failures_{reason}_total` sibling counter.
-///
-/// **One failure moves the total once.** The metering invariant across the buyer
-/// path is: a site meters the total if and only if it marks the error
-/// [`OpenReported`]. Every leg of the detached open task does both, so a leg that
-/// reports itself returns at the `OpenReported` arm below without being restated —
-/// and the arm that meters here is reached only by a failure nobody else counted.
-/// Breaking that pairing is what once made `node_pull_pool_open_failures_total`
-/// read at twice `node_pull_attempts_total` (#2072).
-///
-/// Three outcomes are NOT failures and return before that: [`PoolOpenPending`] (the
-/// open outlived our budget and continues in the background), a reserved slot (a
-/// reconcile holds the slot; retry), and anything the detached open task has already
-/// reported ([`OpenReported`]) — which includes every one of `run_open`'s legs,
-/// store faults, unreclaimable-expired channels and the `openPool` tx itself. So the
-/// unlabeled arm below is genuinely a *residual*: an open/reuse failure raised
-/// outside the open task itself.
-///
-/// Returns the [`PullMiss`] this failure is (#1560), so a channel open that failed because
-/// of a fault in THIS node is not answered to the client as an absent blob. That matters
-/// more than the buyer-key case #1560 was filed for: the loudest node-wide buyer faults in
-/// this crate all land here, each of which would otherwise sign every client a
-/// clean `NotFound` — a poisoned `opens_in_flight` mutex ("this node can no longer
-/// open a buyer channel to ANY
-/// provider and must be restarted"), an unreadable channel store ("can neither open nor
-/// reuse a channel to any provider until the store recovers"), a store WRITE that leaves a
-/// deposit untracked, a panicked open task, and a wallet that cannot fund a deposit.
-///
-/// **Attribution is decided at the raising site, not here.** Every one of those legs is
-/// typed [`LocalPullFault`] where it is raised, and this function only reads the marker.
-/// That split is not stylistic: [`OpenReported`] means "already logged and metered, do not
-/// restate" — it says nothing about whose fault the failure is — and every leg of the open
-/// task attaches it. So the by-reason classification below runs only for a failure
-/// raised outside the task; the `openPool` legs are classified where they are raised,
-/// which is also where the full error chain is still intact to log.
-///
-/// Consequently the `LocalPullFault`-marked legs are the node-wide ones: the store and
-/// lock faults, and an `InsufficientDeposit` — a wallet that cannot fund a deposit
-/// cannot pay any provider, so walking to the next candidate is futile and a `NotFound`
-/// would misdescribe this node. The unmarked legs are the deliberate `Clean` ones: a
-/// pending open, a reconcile-held slot, an unreclaimable expired channel, a
-/// `ContractRevert` (deterministic on-chain, possibly specific to this provider), and an
-/// `RpcError` (transient at the network layer by its own definition). Refusing
-/// `InternalError` for any of those would steer clients off a node that is fine.
 /// Which arm of the pool-open ladder an error falls in, decided from its typed
 /// markers alone.
 ///
-/// Split out from [`record_pool_open_failure`] so the metering invariant — one
+/// Separate from [`record_pool_open_failure`] so the metering invariant — one
 /// failure moves `node_pull_pool_open_failures_total` exactly once — is testable
-/// without standing up a whole [`NodeOriginDeps`]. The ladder below is the only
+/// without standing up a whole [`NodeOriginDeps`]. That ladder is the only
 /// caller; it reads this and then does the metrics and logging the arm calls for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PoolOpenArm {
@@ -212,6 +162,58 @@ fn classify_pool_open_arm(err: &anyhow::Error) -> PoolOpenArm {
     }
 }
 
+/// Record a buyer channel open/reuse failure on `err` to the metrics in `deps`,
+/// emitting a structured-log line with the failure-class `reason` (#966).
+///
+/// Bumps the unlabeled `node_pull_pool_open_failures` total and, when the
+/// error chain carries a [`PoolOpenFailureReason`] (attached by the
+/// `open_pool` kernel for the three `openPool`-tx failure classes), the
+/// matching `decdn_pool_open_failures_{reason}_total` sibling counter.
+///
+/// **One failure moves the total once.** The metering invariant across the buyer
+/// path is: a site meters the total if and only if it marks the error
+/// [`OpenReported`]. Every leg of the detached open task does both, so a leg that
+/// reports itself returns at the `OpenReported` arm below without being restated —
+/// and the arm that meters here is reached only by a failure nobody else counted.
+/// A leg that breaks the pairing doubles `node_pull_pool_open_failures_total`
+/// against `node_pull_attempts_total` (#2072).
+///
+/// Two outcomes are NOT failures and return before that: [`PoolOpenPending`] (the
+/// open outlived our budget and continues in the background), and anything the
+/// detached open task has already reported ([`OpenReported`]) — which includes every one of `run_open`'s legs: the
+/// under-slot store re-read, the `openPool` tx, and the `store.record` that persists
+/// it, plus a join fault if the task itself does not run to completion. So the
+/// unlabeled arm below is genuinely a *residual*: an open/reuse failure raised
+/// outside the open task itself.
+///
+/// Returns the [`PullMiss`] this failure is (#1560), so a channel open that failed because
+/// of a fault in THIS node is not answered to the client as an absent blob. That matters
+/// more than the buyer-key case #1560 was filed for: the loudest node-wide buyer faults in
+/// this crate all land here, each of which would otherwise sign every client a
+/// clean `NotFound` — a poisoned `opens_in_flight` mutex ("this node can no longer
+/// open a buyer pool to ANY provider and must be restarted"), an unreadable buyer pool
+/// store ("can neither open nor reuse a pool until the store recovers"), a store WRITE
+/// that leaves a deposit untracked, an open task that does not run to completion, a lane
+/// whose already-paid watermark cannot be established, and a wallet that cannot fund a
+/// deposit.
+///
+/// **Attribution is decided at the raising site, not here.** Every one of those legs is
+/// typed [`LocalPullFault`] where it is raised, and this function only reads the marker.
+/// That split is not stylistic: [`OpenReported`] means "already logged and metered, do not
+/// restate" — it says nothing about whose fault the failure is — and every leg of the open
+/// task attaches it. So the by-reason classification below runs only for a failure
+/// raised outside the task; the `openPool` legs are classified where they are raised,
+/// which is also where the full error chain is still intact to log.
+///
+/// Consequently the `LocalPullFault`-marked legs are the node-wide ones: the store and
+/// lock faults, and an `InsufficientDeposit` — a wallet that cannot fund a deposit
+/// cannot pay any provider, so walking to the next candidate is futile and a `NotFound`
+/// would misdescribe this node. The unmarked legs are the deliberate `Clean` ones: a
+/// pending open and a `ContractRevert` — deterministic on-chain state that says
+/// nothing about this node's ability to pay, so another candidate may still deliver.
+/// Refusing `InternalError` for that would steer clients off a node that is fine.
+/// An `RpcError` is NOT among them: `openPool` names no provider, so a chain lane
+/// that cannot carry the transaction cannot carry it for any candidate.
 // The arms are a flat sentinel ladder; splitting it would scatter one decision.
 #[allow(clippy::cognitive_complexity)]
 fn record_pool_open_failure(
@@ -309,8 +311,8 @@ fn record_pool_open_failure(
     }
     // The residual is node-local by elimination: every leg of the open task returns above
     // (marked or `OpenReported`), so what reaches here was raised outside it and points at
-    // this node's own state. In practice the only such leg today is a supervisor aborted at
-    // runtime shutdown, where "do not retry this node" is if anything the more useful answer.
+    // this node's own state. In practice that is a capability-signing fault in `pin_ctx`
+    // or a poisoned lock.
     //
     // This is a catch-all that defaults to the LOUDER verdict, which is the opposite
     // discipline from `PullMiss::for_verdict` (deliberately catch-all-free so no future
@@ -2973,8 +2975,8 @@ mod tests {
     /// A failed `openPool` tx moves `node_pull_pool_open_failures_total` exactly
     /// once, because the open task meters it and marks it [`OpenReported`] — so
     /// the classifier's residual arm, which is the counter's other writer, never
-    /// sees it. Two writers for one failure is what made the live fleet report 46
-    /// pool-open failures against 23 pull attempts (#2072).
+    /// sees it. Two writers for one failure double the counter against
+    /// `node_pull_attempts_total` (#2072).
     #[test]
     fn a_reported_open_failure_is_not_metered_a_second_time() {
         for reason in [
@@ -2994,9 +2996,9 @@ mod tests {
 
     /// A wallet that cannot fund the deposit is node-wide: it can pay no provider,
     /// so the open task marks it [`LocalPullFault`] as well and the classifier
-    /// refuses rather than signing the client a clean `NotFound`. Before #2072 this
-    /// leg carried no marker at all and fell to the residual arm, which both
-    /// double-counted it and blamed the local store for a chain revert.
+    /// refuses rather than signing the client a clean `NotFound`. An unmarked leg
+    /// would fall to the residual arm instead, which both double-counts it and
+    /// blames the local store for a chain fault (#2072).
     #[test]
     fn an_insufficient_deposit_is_a_local_fault() {
         let err = anyhow::anyhow!("submit openPool: ERC20: transfer amount exceeds balance")

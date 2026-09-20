@@ -278,10 +278,9 @@ mod tests {
         );
     }
 
-    /// The exact payload the live fleet's USDC reverted `openPool` with: a
-    /// string-revert token, not `OpenZeppelin` v5. Classifying this as
-    /// `ContractRevert` is what left an under-funded wallet reported as an
-    /// opaque on-chain fault naming no remedy.
+    /// A string-revert token, not `OpenZeppelin` v5 — the shape a pre-custom-error
+    /// USDC reverts `openPool` with. Classifying it as `ContractRevert` reports an
+    /// under-funded wallet as an opaque on-chain fault naming no remedy.
     #[test]
     fn erc20_string_revert_balance_is_insufficient_deposit() {
         let data = Bytes::from(

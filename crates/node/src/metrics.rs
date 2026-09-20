@@ -194,12 +194,36 @@ pub struct DecdnMetrics {
     /// and nothing else reports on it: an operator who never funds this wallet
     /// sees a node that serves perfectly and silently buys nothing, because
     /// every `openPool` reverts on the ERC-20 transfer. Read once per
-    /// buyer-wallet tick, so it lags a spend by up to one interval.
+    ///
+    /// Read at bootstrap and once per reclaim sweep (`RECLAIM_SWEEP_INTERVAL`),
+    /// so it lags a spend — or an operator top-up, which is the reading that
+    /// matters — by up to that long.
     ///
     /// Zero is meaningful only on a node with
     /// `cache.node_to_node_pull_through_enabled` on; a cache-only node never
     /// opens a pool and has no reason to hold USDC.
     pub buyer_wallet_usdc: Gauge,
+    /// `decdn_buyer_lane_seed_failures_total`: this node could not establish a
+    /// lane's already-paid watermark, so it refused the pull rather than
+    /// resuming the lane from zero.
+    ///
+    /// A lane resumed from zero is stranded permanently, not for one pull: the
+    /// pull persists its own progress on every exit path, which gives the lane a
+    /// local row and stops the reseed ever running for that provider again. The
+    /// node refuses instead, and this counts how often. A sustained rate means
+    /// the chain lane or the buyer store is unhealthy and this node is buying
+    /// nothing from the affected providers.
+    pub buyer_lane_seed_failures: Counter,
+    /// `decdn_buyer_pool_adoption_failures_total`: bootstrap could not tell
+    /// whether this node already owns a payment pool on chain, so it left the
+    /// first cache miss to open one.
+    ///
+    /// Every increment is a chance that the node escrows a second deposit beside
+    /// one it already holds. Adoption runs once per process, so this cannot
+    /// self-correct before the next restart. Pair with
+    /// `decdn_buyer_wallet_usdc`: the two together are what distinguishes "no
+    /// pool to adopt" from "could not look".
+    pub buyer_pool_adoption_failures: Counter,
     /// Total raw USDC this node holds in accepted vouchers that it has not yet
     /// redeemed on-chain — the sum of `owed − paid` across every inbound lane
     /// the redeemer plans to collect. Refreshed once per redeemer self-tick
@@ -816,10 +840,10 @@ pub struct DecdnMetrics {
     /// **One failure moves this counter once.** A site increments it if and only
     /// if it marks the error `OpenReported`, which is what stops the classifier
     /// in `node_origin` from restating a failure the open task already counted.
-    /// Against `node_pull_attempts_total` this reads above 1.0 legitimately — a
+    /// Against `node_pull_attempts_total` this reads above 1.0 legitimately: a
     /// pull orchestration meters one attempt and may open a lane per candidate
-    /// and per assembled run — but a clean 2× ratio is the signature of a leg
-    /// that meters without marking (#2072).
+    /// and per assembled run. A clean 2× ratio is the signature of a leg that
+    /// meters without marking (#2072).
     pub node_pull_pool_open_failures: Counter,
     /// `decdn_pool_open_failures_insufficient_deposit_total` (#966): a buyer
     /// `openPool` tx reverted because the node's USDC balance/allowance could
@@ -1798,9 +1822,8 @@ impl Metrics {
     /// Lane-scoped on purpose: the pool deposit behind those lanes is a
     /// pool-level on-chain quantity that no lane carries, so it is published
     /// separately by [`Self::set_pool_deposit_usdc`] on the redeemer's tick.
-    /// Reporting both from here is what left `decdn_pool_deposit_usdc` pinned
-    /// at zero, since every caller of the old two-value setter had only a lane
-    /// count to give it (#2072).
+    /// A lane carries no pool deposit, so a lane-scoped caller could only ever
+    /// pass zero for one (#2072).
     pub(crate) fn set_lanes_open(&self, open: usize) {
         self.decdn.lanes_open.set(sat(open));
     }
@@ -1828,6 +1851,17 @@ impl Metrics {
     /// Publish the USDC balance of this node's own buyer wallet.
     pub(crate) fn set_buyer_wallet_usdc(&self, balance: U256) {
         self.decdn.buyer_wallet_usdc.set(sat_u256(balance));
+    }
+
+    /// Count a refused pull whose lane watermark could not be established.
+    pub(crate) fn buyer_lane_seed_failure(&self) {
+        self.decdn.buyer_lane_seed_failures.inc();
+    }
+
+    /// Count a bootstrap that could not determine whether this node already owns
+    /// a payment pool.
+    pub(crate) fn buyer_pool_adoption_failure(&self) {
+        self.decdn.buyer_pool_adoption_failures.inc();
     }
 
     /// Register iroh's transport metrics under the `decdn_iroh_` prefix so

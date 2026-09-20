@@ -161,6 +161,8 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | `decdn_onchain_tx_timeout_total` | Counter | R | live | Issued node transactions whose receipt did not arrive inside the caller's bound. The transaction can still mine; its hash is in the `warn!` line. |
 | `decdn_pool_deposit_usdc` | Gauge | M | live | USDC still recoverable from the pools currently paying this node: the sum of `deposit - totalRedeemed` over the distinct pools the redeemer plans lanes against. Already-redeemed funds have left the pool, so this is the ceiling those pools can still pay, not their lifetime deposits. Refreshed once per redeemer self-tick, beside `decdn_unredeemed_usdc`. |
 | `decdn_buyer_wallet_usdc` | Gauge | M | live | USDC in this node's own buyer wallet — what it can still escrow when it opens a payment pool on its cache-miss leg. An unfunded wallet reverts every `openPool` on the ERC-20 transfer, which reads as a node that serves perfectly and buys nothing. Read once per reclaim sweep, so it lags a spend by up to one interval. Zero is meaningful only where `cache.node_to_node_pull_through_enabled` is on; a cache-only node never opens a pool. |
+| `decdn_buyer_lane_seed_failures_total` | Counter | M | live | Pulls refused because this node could not establish a lane's already-paid watermark. Resuming such a lane from zero is permanent, not per-pull: the pull persists its own progress on every exit path, which gives the lane a local row and stops the reseed ever running for that provider again. The node refuses instead. A sustained rate means the chain lane or the buyer store is unhealthy and this node is buying nothing from the affected providers. |
+| `decdn_buyer_pool_adoption_failures_total` | Counter | M | live | Bootstraps that could not determine whether this node already owns a payment pool on chain, so the first cache miss opens one. Every increment is a chance the node escrows a second deposit beside one it already holds. Adoption runs once per process, so this does not self-correct before the next restart. |
 | `decdn_unredeemed_usdc` | Gauge | M | live | Raw USDC in accepted vouchers this node has not redeemed on-chain. The value sums `owed − paid` over the lanes the redeemer plans to collect. The redeemer refreshes it once per self-tick, so it lags live accrual by up to one `redeem_interval_secs`. |
 | `decdn_buyer_pool_store_skipped_undecodable_records_total` | Counter | M | live | Buyer-pool rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy pools from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
 | `decdn_vouchers_signed_total` | Counter | M | planned | Vouchers this node signed as the payer (node-to-node pulls). |
@@ -268,7 +270,7 @@ The origin directory is not a watcher — it is a lazy, on-demand TTL cache with
 
 Health is an **admin JSON-RPC method**, `admin_v1_health`, served on the admin
 listener (`admin.listen`) — not an HTTP route beside `/metrics`. `decdn node
-status` and `decdn node drain --wait` are its callers. It returns:
+health` and `decdn node drain --wait` are its callers. It returns:
 
 ```json
 {

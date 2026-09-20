@@ -1066,9 +1066,17 @@ fn sum_unredeemed(plans: &[PlannedLane]) -> U256 {
 /// nothing rather than a guess — the same fail-quiet direction the planner
 /// takes on an unknown pool.
 ///
-/// Scoped to planned lanes, which is what makes it "pools currently paying this
-/// node": the projection also folds `PoolOpened` for pools this node has no
-/// lane on, and summing those would report the network's escrow as its own.
+/// Scoped to planned lanes, which is what bounds it to this node's own
+/// counterparties: the projection also folds `PoolOpened` for pools this node
+/// has no lane on, and summing those would report the network's escrow as its
+/// own. The precise reading is therefore "pools that currently owe this node",
+/// not every pool it has ever been paid by — a lane settles out of the planned
+/// set once it is fully redeemed. The caller skips the publish on an empty plan
+/// set so that settling out does not read as the escrow disappearing.
+///
+/// A pool the projection has not folded contributes nothing rather than a
+/// guess, so the gauge under-reports in the window after a restart where the
+/// planner has deliberately failed open on an unknown pool.
 fn sum_recoverable_deposit(plans: &[PlannedLane], pool_view: &PoolProjection) -> U256 {
     let mut seen: HashSet<PoolId> = HashSet::new();
     plans
@@ -1474,7 +1482,14 @@ async fn redeem_sweep<P: Provider + Clone>(
     // floor is still owed and rides a later sweep, so counting it here is what
     // makes the gauge "USDC waiting to be redeemed" rather than "redeeming now".
     metrics.set_unredeemed_usdc(sum_unredeemed(&plans));
-    metrics.set_pool_deposit_usdc(sum_recoverable_deposit(&plans, pool_view));
+    // Only when there is something to measure. An empty plan set is the HEALTHY
+    // steady state — everything owed has been redeemed — and publishing zero for
+    // it would sawtooth the gauge to 0 after every successful sweep, which reads
+    // exactly like insolvent counterparties. Leaving the last value standing is
+    // the same discipline the buyer-wallet read takes.
+    if !plans.is_empty() {
+        metrics.set_pool_deposit_usdc(sum_recoverable_deposit(&plans, pool_view));
+    }
     redeem_planned_lanes(
         contract,
         store,

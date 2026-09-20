@@ -740,8 +740,14 @@ since project inception and will roll into the first tagged release.
   old way. A lane with no local progress reseeds from the contract's
   `watermark(pool, signer, provider)`, because `PoolLedger` signs `prior + accrued`
   and resuming a paid lane from zero signs cumulatives the contract pays nothing
-  for. `enumerate_owned_pools` moved from `decdn-cli` to
-  `decdn_incentive::payment_pool` so both binaries share one pager.
+  for. That read **refuses the pull** on failure rather than degrading: the pull
+  persists its own progress on every exit path, so a zero-resumed lane gains a
+  local row and the reseed never runs for that provider again — one RPC blip
+  would strand the lane permanently. A fully-redeemed pool is skipped (it is
+  still `Open` on chain, and adopting one would wedge buying against a deposit
+  that funds no voucher), and any further open pools are named in the log so
+  their deposits are recoverable. `enumerate_owned_pools` moved from `decdn-cli`
+  to `decdn_incentive::payment_pool` so both binaries share one pager.
 
 - **Node: one failed `openPool` moved `node_pull_pool_open_failures_total` twice,
   and blamed the wrong host (#2072).** `run_open`'s `openPool` leg metered the
@@ -750,10 +756,14 @@ since project inception and will roll into the first tagged release.
   against 23 pull attempts. That fall-through also scored a chain revert as
   `node_pull_local_fault_total` and logged "suspect this node's store or lock
   state" for an on-chain failure. The leg now meters once where it is raised,
-  marks `OpenReported`, and adds `LocalPullFault` only for an insufficient
-  deposit — a wallet that cannot fund a deposit can pay no provider. The ladder's
-  arm choice is a pure `classify_pool_open_arm`, so the one-increment invariant is
-  unit tested.
+  marks `OpenReported`, and adds `LocalPullFault` for the failures that no other
+  provider can answer. `openPool` names no provider, so neither an unfunded
+  wallet nor a chain lane that cannot carry the transaction varies per candidate:
+  both now refuse rather than walking the candidate list and then reporting the
+  blob absent. A `ContractRevert` still walks on. The join-error leg meters too,
+  which is what makes the "meters iff marks `OpenReported`" invariant true rather
+  than merely documented. The ladder's arm choice is a pure
+  `classify_pool_open_arm`, so the one-increment invariant is unit tested.
 
 - **Incentive: an under-funded wallet was classified `contract_revert` (#2072).**
   `PoolOpenFailureReason` matched only `OpenZeppelin` v5 custom errors, so a USDC
@@ -768,7 +778,9 @@ since project inception and will roll into the first tagged release.
   checks that a series is exported, not that anything sets it. The redeemer tick
   now publishes `Σ (deposit − totalRedeemed)` over the pools it plans lanes
   against, beside `decdn_unredeemed_usdc`; the lane count gets its own
-  `set_lanes_open`.
+  `set_lanes_open`. The publish is skipped when nothing is pending redemption —
+  the healthy steady state — so the gauge does not sawtooth to zero after every
+  successful sweep and read as insolvent counterparties.
 
 - **Cache: origin range pulls held the whole requested span in memory — twice
   (#2065).** A few multi-GB range requests against a partially held blob OOM-killed
@@ -1802,8 +1814,13 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
-- **Metrics: the node reports its own buyer wallet (#2072).** New gauge
-  `decdn_buyer_wallet_usdc`, read once per reclaim sweep and at bootstrap. The
+- **Metrics: the buyer leg reports itself (#2072).** New gauge
+  `decdn_buyer_wallet_usdc`, read once per reclaim sweep and at bootstrap, plus
+  two counters for the states that silently cost USDC:
+  `decdn_buyer_lane_seed_failures_total` (pulls refused because a lane's
+  already-paid watermark could not be established) and
+  `decdn_buyer_pool_adoption_failures_total` (bootstraps that could not tell
+  whether this node already owns a pool, and so are about to open a second). The
   buyer leg is the one part of the node that spends rather than earns, and
   nothing reported on it: an operator who never funded the wallet saw a node that
   served perfectly and silently bought nothing. Two alerts go with it —

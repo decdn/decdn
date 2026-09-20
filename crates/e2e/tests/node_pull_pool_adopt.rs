@@ -3,12 +3,12 @@
 //!
 //! The buyer store (`buyer.redb`, under `identity.data_dir`) is the node's only
 //! local record that it owns a funded `PaymentPool` deposit. A reset data dir —
-//! a moved volume, a re-provisioned host — loses it. Before this fix the node
-//! then opened a *second* deposit beside the first, forgot that one too, and
-//! once its wallet was drained every cache-miss pull failed
+//! a moved volume, a re-provisioned host — loses it. A node that cannot recover
+//! from that opens a *second* deposit beside the first, forgets that one too,
+//! and once its wallet is drained every cache-miss pull fails
 //! `ERC20: transfer amount exceeds balance` with its own escrow sitting idle
-//! on-chain. ADR 003 §node→node says a pool is opened once and reused, and that
-//! owner funds are never stranded; both were false.
+//! on-chain — against ADR 003 §node→node, which says a pool is opened once and
+//! reused and that owner funds are never stranded.
 //!
 //! The unit tests in `crates/node/src/buyer_channel.rs` cover the adoption
 //! DECISION (newest `Open` wins, a `Closing` pool is skipped, an unreachable
@@ -115,8 +115,14 @@ async fn run() -> anyhow::Result<()> {
     // Two blobs, both only on the SEEDER. The first drives the pull that opens
     // the SERVER's pool and advances a lane; the second is fetched after the
     // store loss, so it can only be served if the adopted pool still buys.
-    let first = make_blob(4 * CHUNK_GROUP + 11);
-    let second = make_blob(6 * CHUNK_GROUP + 37);
+    // `second` is deliberately SMALLER than `first`. The reseed is what makes the
+    // second pull resume ABOVE the watermark the first one left; without it the
+    // lane restarts at zero and signs a cumulative priced on `second` alone,
+    // which is below that watermark — a stale cumulative `_applyVoucher` pays
+    // nothing for. Sizing `second` larger would let a from-zero cumulative clear
+    // the watermark by accident and the journey would pass with the reseed gone.
+    let first = make_blob(6 * CHUNK_GROUP + 37);
+    let second = make_blob(2 * CHUNK_GROUP + 11);
 
     let (seeder, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[&first, &second]).await?;
     let (first_hash, second_hash) = {
@@ -165,6 +171,13 @@ async fn run() -> anyhow::Result<()> {
         got_first == first,
         "the first pull delivered the wrong bytes"
     );
+    anyhow::ensure!(
+        second.len() < first.len(),
+        "this journey needs `second` smaller than `first`, so a lane resumed from zero \
+         regresses below the watermark the first pull left (got {} vs {})",
+        second.len(),
+        first.len()
+    );
 
     let pool_contract = PaymentPool::new(chain.addrs().payment_pool, chain.admin().clone());
     let owner = server.operator_addr();
@@ -207,14 +220,13 @@ async fn run() -> anyhow::Result<()> {
     std::fs::remove_file(&buyer_store).context("remove the SERVER's buyer pool store")?;
     server.restart().await?;
 
-    // (1) The restarted node adopted the pool it already owned. The owner's
-    // on-chain pool count is unchanged, so no second deposit was escrowed —
-    // this is the assertion the bug would fail, with `after.len() == 2`.
-    let after = enumerate_owned_pools(&pool_contract, owner).await?;
+    // (1) Nothing was opened at bootstrap. The node opens lazily on a miss, so
+    // this alone cannot catch a reverted adoption — assertion (4) is where a
+    // second deposit would appear.
+    let at_boot = enumerate_owned_pools(&pool_contract, owner).await?;
     anyhow::ensure!(
-        after == before,
-        "a node that lost its buyer store must adopt the pool it owns, not open a second \
-         (before {before:?}, after {after:?})"
+        at_boot == before,
+        "bootstrap must not open a pool (before {before:?}, at_boot {at_boot:?})"
     );
 
     // (2) The second fetch completes. It can only do so if the adopted pool pays
@@ -258,6 +270,35 @@ async fn run() -> anyhow::Result<()> {
         watermark.bytesDelivered,
         advanced.bytesDelivered
     );
+    // The delta is the SECOND blob's own price, not some smaller remainder. A
+    // lane resumed from zero could only ever move the watermark by less, because
+    // the contract pays the increment over what it already holds.
+    let paid = advanced.amount - watermark.amount;
+    let expected = price_micro_usdc(second.len());
+    anyhow::ensure!(
+        paid == expected,
+        "the adopted lane must pay the second blob's full price: expected {expected}, \
+         paid {paid} (watermark {} -> {})",
+        watermark.amount,
+        advanced.amount
+    );
+
+    // (4) Still exactly one pool. A node that failed to adopt would have opened a
+    // second one to serve the fetch above, which is the bug's only on-chain trace.
+    let after = enumerate_owned_pools(&pool_contract, owner).await?;
+    anyhow::ensure!(
+        after == before,
+        "a node that lost its buyer store must adopt the pool it owns, not open a second \
+         (before {before:?}, after {after:?})"
+    );
 
     Ok(())
+}
+
+/// The whole-blob wire price at [`RATE_PER_MB`], rounded up the way the contract
+/// and the ledger both round: a partial megabyte is charged.
+fn price_micro_usdc(bytes: usize) -> u64 {
+    const MB: u128 = 1024 * 1024;
+    let cost = (bytes as u128 * u128::from(RATE_PER_MB)).div_ceil(MB);
+    u64::try_from(cost).unwrap_or(u64::MAX)
 }

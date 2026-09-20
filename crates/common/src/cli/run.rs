@@ -198,7 +198,7 @@ pub struct ObservabilityArgs {
     #[arg(long, value_name = "FORMAT", env = "DECDN_LOG_FORMAT")]
     pub log_format: Option<LogFormat>,
 
-    /// HTTP port for Prometheus metrics and /health endpoint [default: 9090].
+    /// HTTP port for the Prometheus /metrics endpoint [default: 9090].
     #[arg(long, value_name = "PORT", env = "DECDN_METRICS_PORT")]
     pub metrics_port: Option<u16>,
 
