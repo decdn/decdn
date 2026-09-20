@@ -20,9 +20,10 @@
 //! dir; the two files share a table format and nothing else. A data dir holding
 //! any of the daemon's stores — not just `buyer.redb`, which is the file a
 //! reset loses — is a node's. Pointed at one, `list` reports the node's pools
-//! over the admin RPC (while the daemon runs it holds that file exclusively,
-//! so there is no disk path to it),
-//! and the commands that would escrow into a store the node never reads —
+//! over the admin RPC while the daemon runs, because redb's lock leaves no disk
+//! path to that file; with the daemon stopped the lock is gone, so `list` reads
+//! the same `buyer.redb` directly and labels the listing as a disk read.
+//! The commands that would escrow into a store the node never reads —
 //! `open`, `top-up`, and the chain-enumerating `close --all` / `reclaim --all` —
 //! refuse. `close --pool` and `reclaim --pool` still run, and say plainly that
 //! the daemon's own record was left untouched.
@@ -47,11 +48,15 @@ pub enum PoolCommand {
     /// Read-only, and it names the store it read — on the `store=` line, or
     /// the `store` field under `--json`. On a client data dir that is the
     /// CLI's own `buyer-pools.redb`, read directly. On a `decdn-node` daemon's
-    /// data dir it is the daemon's `buyer.redb`, read over the admin RPC:
-    /// while that daemon runs it holds the file exclusively, so nothing can
-    /// open it from disk. The two are separate stores — a client listing says
-    /// nothing about a node, and vice versa — and their `--json` pool objects
-    /// differ, so read `source` before parsing them.
+    /// data dir it is the daemon's `buyer.redb`: over the admin RPC while the
+    /// daemon runs, since it holds that file exclusively, and read off disk
+    /// when it does not — a post-mortem after a crash, or a host down for
+    /// maintenance. A disk read says so on the `store=` line and carries
+    /// `source=node_store_offline` under `--json`.
+    ///
+    /// The stores are separate — a client listing says nothing about a node,
+    /// and vice versa — and the three sources do not emit the same `--json`
+    /// pool objects, so read `source` before parsing them.
     #[command(visible_alias = "status")]
     List(PoolListArgs),
     /// Open a fresh `PaymentPool` deposit, escrowing `--deposit-micro-usdc`

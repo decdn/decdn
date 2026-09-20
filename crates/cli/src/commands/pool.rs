@@ -25,7 +25,7 @@ use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore};
-use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
+use decdn_incentive::buyer_pool_redb::{ReadOnlyBuyerPoolStore, RedbBuyerPoolStore};
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
 use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
 use decdn_incentive::{Capability, CapabilityGrant, PoolId, voucher_domain};
@@ -1063,10 +1063,27 @@ async fn list(args: &cli::PoolListArgs, config_path: Option<&Path>) -> anyhow::R
 fn list_from_client_store(args: &cli::PoolListArgs, data_dir: &Path) -> anyhow::Result<()> {
     let store_path = client_buyer_db(data_dir);
     let store = RedbBuyerPoolStore::open(data_dir)?;
+    let load = store.load_all()?;
+    write_store_listing(args, &store_path, SOURCE_CLIENT_STORE, "", load)
+}
+
+/// Render a [`BuyerLoad`] this process read out of a redb file itself.
+///
+/// Shared by the client store and the offline read of a stopped daemon's
+/// store. `provenance` is appended to the `store=` line: the two reads produce
+/// the same row shape from different files, so which file — and whether a
+/// daemon was running — must be on the output, not inferred.
+fn write_store_listing(
+    args: &cli::PoolListArgs,
+    store_path: &Path,
+    source: &'static str,
+    provenance: &str,
+    load: BuyerLoad,
+) -> anyhow::Result<()> {
     let BuyerLoad {
         mut pools,
         mut skipped,
-    } = store.load_all()?;
+    } = load;
     // Stable output regardless of the store's internal key order.
     pools.sort_by_key(|p| p.pool_id);
     skipped.sort_unstable();
@@ -1076,24 +1093,33 @@ fn list_from_client_store(args: &cli::PoolListArgs, data_dir: &Path) -> anyhow::
     if args.json {
         let view = PoolListJson {
             store: store_path.display().to_string(),
-            source: SOURCE_CLIENT_STORE,
+            source,
             pools: pools.iter().map(PoolJson::from).collect(),
             skipped: skipped.iter().map(|p| format!("{p:#x}")).collect(),
         };
         serde_json::to_writer_pretty(&mut out, &view)?;
         writeln!(out)?;
     } else {
-        writeln!(out, "store={}", store_path.display())?;
+        writeln!(out, "store={}{provenance}", store_path.display())?;
         write_pools(&mut out, &pools, &skipped)?;
     }
     Ok(())
 }
 
-/// Read a running daemon's `buyer.redb` through `admin_v1_pools`.
+/// Read a node's `buyer.redb` — through `admin_v1_pools` while the daemon runs,
+/// and off disk when it does not.
 ///
-/// An unreachable daemon is a hard error, not a fallback to the client store:
-/// that store is a different file with unrelated contents, and printing its
-/// `pools=0` here is precisely the failure this path exists to prevent.
+/// The fallback is never the *client* store: that is a different file with
+/// unrelated contents, and printing its `pools=0` here is precisely the failure
+/// this path exists to prevent. It is the daemon's own file, read-only.
+///
+/// Only a refused connection takes the offline route. `redb` holds its
+/// process-exclusive lock for the lifetime of an open `Database`, so a
+/// read-only open succeeding is itself the proof that no daemon holds the file
+/// — and one failing with `AlreadyOpen` is proof that one does, which makes a
+/// refused admin port an admin-URL problem rather than a stopped node. A
+/// timeout or a `Call` error means the daemon answered or is answering, so
+/// neither goes near the file.
 async fn list_from_daemon(
     args: &cli::PoolListArgs,
     config_path: Option<&Path>,
@@ -1111,31 +1137,21 @@ async fn list_from_daemon(
         .build(&url)
         .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
 
-    let resp: BuyerPoolsResponse = client.pools().await.map_err(|err| {
-        // A `Call` error means the daemon ANSWERED and refused — it is up, so
-        // telling the operator to start it would send them the wrong way. Only
-        // the transport and timeout arms warrant that advice.
-        let answered = matches!(err, jsonrpsee::core::client::Error::Call(_));
-        let classified = crate::commands::node::classify_client_error(&url, args.timeout_ms, err);
-        if answered {
-            classified.context(format!(
-                "{} is a decdn-node data dir, so its buyer pools live in {}, which this command \
-                 reads through the daemon — a running daemon holds that file exclusively. The \
-                 daemon answered and refused the read.",
-                data_dir.display(),
-                buyer_db.display(),
-            ))
-        } else {
-            classified.context(format!(
-                "{} is a decdn-node data dir, so the pools that matter are in {} — which a \
-                 running daemon holds exclusively and no other process can open. This command \
-                 therefore asks the daemon, and the daemon did not answer. Start decdn-node, or \
-                 pass --data-dir <client dir> to inspect a client store instead.",
-                data_dir.display(),
-                buyer_db.display(),
-            ))
+    let resp: BuyerPoolsResponse = match client.pools().await {
+        Ok(resp) => resp,
+        // Connection refused: nothing is listening, so the daemon is very
+        // likely down and its store readable. Try it before reporting.
+        Err(jsonrpsee::core::client::Error::Transport(inner))
+            if crate::commands::node::is_connection_refused(inner.as_ref()) =>
+        {
+            return list_from_stopped_daemon(args, data_dir, &buyer_db, &url, inner.as_ref());
         }
-    })?;
+        Err(err) => {
+            return Err(unreachable_daemon_error(
+                args, data_dir, &buyer_db, &url, err,
+            ));
+        }
+    };
 
     let mut out = std::io::stdout().lock();
     if args.json {
@@ -1159,10 +1175,103 @@ async fn list_from_daemon(
     Ok(())
 }
 
+/// The error for an admin call that produced no pools, explaining which file
+/// the answer would have come from.
+fn unreachable_daemon_error(
+    args: &cli::PoolListArgs,
+    data_dir: &Path,
+    buyer_db: &Path,
+    url: &str,
+    err: jsonrpsee::core::client::Error,
+) -> anyhow::Error {
+    {
+        // A `Call` error means the daemon ANSWERED and refused — it is up, so
+        // telling the operator to start it would send them the wrong way. Only
+        // the transport and timeout arms warrant that advice.
+        let answered = matches!(err, jsonrpsee::core::client::Error::Call(_));
+        let classified = crate::commands::node::classify_client_error(url, args.timeout_ms, err);
+        if answered {
+            classified.context(format!(
+                "{} is a decdn-node data dir, so its buyer pools live in {}, which this command \
+                 reads through the daemon — a running daemon holds that file exclusively. The \
+                 daemon answered and refused the read.",
+                data_dir.display(),
+                buyer_db.display(),
+            ))
+        } else {
+            classified.context(format!(
+                "{} is a decdn-node data dir, so the pools that matter are in {} — which a \
+                 running daemon holds exclusively and no other process can open. This command \
+                 therefore asks the daemon, and the daemon did not answer. Start decdn-node, or \
+                 pass --data-dir <client dir> to inspect a client store instead.",
+                data_dir.display(),
+                buyer_db.display(),
+            ))
+        }
+    }
+}
+
+/// Read a stopped daemon's `buyer.redb` off disk, or say why that is not what
+/// is happening.
+///
+/// Three outcomes, and the third is why this is not simply a fallback:
+///
+/// - the file opens read-only, so no daemon holds it: render it, labelled as a
+///   disk read, so provenance stays on the output.
+/// - the file is write-locked, so a daemon IS running: the admin URL is wrong,
+///   not the node down. Say that instead — it is the answer the operator needs.
+/// - anything else: the original unreachable-daemon error, with what the disk
+///   read found appended, because "no daemon answered AND the store will not
+///   open" is two facts, not one.
+fn list_from_stopped_daemon(
+    args: &cli::PoolListArgs,
+    data_dir: &Path,
+    buyer_db: &Path,
+    url: &str,
+    transport: &(dyn std::error::Error + Send + Sync + 'static),
+) -> anyhow::Result<()> {
+    match ReadOnlyBuyerPoolStore::open_file(buyer_db) {
+        Ok(reader) => {
+            let load = reader.load_all()?;
+            write_store_listing(
+                args,
+                buyer_db,
+                SOURCE_NODE_STORE_OFFLINE,
+                " (read from disk; no daemon running)",
+                load,
+            )
+        }
+        Err(decdn_incentive::StoreError::AlreadyOpen { .. }) => anyhow::bail!(
+            "admin at {url} refused the connection ({transport}), but a process holds {} \
+             exclusively — so a decdn-node IS running against {}, and the admin URL or              admin_port is wrong rather than the node being down. Pass --admin-url, or check              admin_port in the node's config.",
+            buyer_db.display(),
+            data_dir.display(),
+        ),
+        Err(store_err) => Err(anyhow::anyhow!(
+            "admin at {url} refused the connection ({transport}); is the node running, and is \
+             admin_port configured correctly? Reading {} from disk instead did not work either: \
+             {store_err}",
+            buyer_db.display(),
+        )
+        .context(format!(
+            "{} is a decdn-node data dir, so the pools that matter are in {} — not in a client \
+             store. Pass --data-dir <client dir> to inspect a client store instead.",
+            data_dir.display(),
+            buyer_db.display(),
+        ))),
+    }
+}
+
 /// `source` value for a listing read directly from the CLI's own store.
 const SOURCE_CLIENT_STORE: &str = "client_store";
 /// `source` value for a listing the running daemon answered.
 const SOURCE_DAEMON: &str = "daemon";
+/// `source` value for a listing read off a stopped daemon's own store file.
+///
+/// Its own value, never [`SOURCE_CLIENT_STORE`], even though the row shape is
+/// identical: the two come from different files with unrelated contents, and
+/// conflating them is the whole defect this area exists to prevent.
+const SOURCE_NODE_STORE_OFFLINE: &str = "node_store_offline";
 
 /// Warn about every undecodable buyer row on stderr. The `pool_id` (the store's
 /// primary key) is the only available repair handle.

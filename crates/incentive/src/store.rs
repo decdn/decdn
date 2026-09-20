@@ -332,6 +332,19 @@ pub enum StoreError {
         /// Filesystem path of the locked database file.
         path: std::path::PathBuf,
     },
+    /// The database was not closed cleanly and needs the repair pass that only
+    /// a writer performs, so a read-only open cannot proceed. Reached by the
+    /// post-mortem read of a crashed daemon's store (#2084): the very case that
+    /// read exists for is also the one that can leave the file unrepaired.
+    #[error(
+        "the pool store at {path} was not shut down cleanly and needs a repair pass a \
+         read-only open cannot run — start decdn-node once against this data dir to repair it, \
+         then read it again"
+    )]
+    NeedsRepair {
+        /// Filesystem path of the unrepaired database file.
+        path: std::path::PathBuf,
+    },
 }
 
 /// In-memory [`PoolStateStore`] for tests and the trait's reference semantics.

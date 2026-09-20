@@ -181,7 +181,10 @@ reads and writes `buyer-pools.redb`. A `decdn pool` command whose data dir holds
 of the daemon's stores (`decdn_common::data_dir::DAEMON_STORE_FILES` — `buyer.redb`,
 `lanes.redb`, `settle.redb`, `checkpoint.redb`) is pointed at a node: it reports the
 node's pools through the admin RPC (`decdn node pools`) and refuses to escrow into a
-store the node never reads. The whole set marks the dir, not `buyer.redb` alone,
+store the node never reads. The daemon holds its lock only while it runs, so with the
+daemon stopped `decdn pool list` reads `buyer.redb` directly and marks the listing as
+a disk read. It never falls back to the client's file, because that file holds
+different pools. The whole set marks the dir, not `buyer.redb` alone,
 because that is the file a reset loses — and the window where it is missing is when
 an operator is most likely to reach for `decdn pool`.
 

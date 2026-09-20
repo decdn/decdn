@@ -187,12 +187,129 @@ async fn list_with_data_dir_ignores_broken_config_env_expansion() {
 /// listening, the command fails — and, critically, leaves no `buyer-pools.redb`
 /// behind. Creating that file and reporting its emptiness as the node's state
 /// is the defect this pins (#2078).
+/// A daemon's `buyer.redb`, written by the real daemon store and then closed.
+/// Returns the pool id recorded into it.
+fn seed_stopped_daemon_store(data_dir: &std::path::Path) -> B256 {
+    use decdn_node::channel_store::{BuyerPoolStoreHandle, PersistentPoolStateStore};
+
+    let pool_id = B256::repeat_byte(0x5a);
+    let store = std::sync::Arc::new(PersistentPoolStateStore::open(data_dir).unwrap());
+    let state = BuyerPoolState::new(
+        pool_id,
+        Address::repeat_byte(0x5a),
+        Address::repeat_byte(0xcd),
+        U256::from(7_000_000u64),
+    );
+    BuyerPoolStoreHandle::new(std::sync::Arc::clone(&store))
+        .record(&state)
+        .unwrap();
+    // Dropping the last handle releases redb's process-exclusive lock — the
+    // daemon exiting, in one line.
+    drop(store);
+    pool_id
+}
+
+/// #2084: with the daemon stopped, its `buyer.redb` is readable and nothing
+/// else can show it. The listing must come from that file, and must say so —
+/// the provenance is what keeps it distinguishable from the client store's
+/// identically-shaped rows.
+#[test]
+fn a_stopped_daemons_store_is_read_from_disk_and_labelled() {
+    let dir = data_dir();
+    let pool_id = seed_stopped_daemon_store(dir.path());
+
+    let output = common::decdn_command(dir.path())
+        .args([
+            "pool",
+            "list",
+            // Nothing listens here, so the admin call is refused.
+            "--admin-url",
+            "http://127.0.0.1:1",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn pool list");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a stopped daemon's store must read: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("buyer.redb"), "{stdout}");
+    assert!(
+        stdout.contains("read from disk; no daemon running"),
+        "the listing must name where it came from: {stdout}"
+    );
+    assert!(stdout.contains("pools=1"), "{stdout}");
+    assert!(
+        !dir.path().join("buyer-pools.redb").exists(),
+        "the offline read must not manufacture a client store"
+    );
+
+    // `--json` carries the same provenance in a field, not in prose.
+    let json_out = common::decdn_command(dir.path())
+        .args([
+            "pool",
+            "list",
+            "--json",
+            "--admin-url",
+            "http://127.0.0.1:1",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn pool list --json");
+    let v: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(v["source"], "node_store_offline");
+    assert!(v["store"].as_str().unwrap().ends_with("buyer.redb"), "{v}");
+    assert_eq!(v["pools"][0]["pool_id"], format!("{pool_id:#x}"));
+}
+
+/// A refused admin port with the store still write-locked means a daemon IS
+/// running and the admin URL is wrong — the opposite diagnosis from "the node
+/// is down", and the one the old message could not make.
+#[test]
+fn a_locked_store_says_the_admin_url_is_wrong_not_that_the_node_is_down() {
+    use decdn_node::channel_store::PersistentPoolStateStore;
+
+    let dir = data_dir();
+    // Held for the duration of the command: the daemon is up, the admin port
+    // in the flag is simply not its.
+    let _daemon = PersistentPoolStateStore::open(dir.path()).unwrap();
+
+    let output = common::decdn_command(dir.path())
+        .args([
+            "pool",
+            "list",
+            "--admin-url",
+            "http://127.0.0.1:1",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn pool list");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("admin URL") || stderr.contains("admin_port"),
+        "the error must point at the admin URL: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Start decdn-node"),
+        "a daemon holding the store is not a stopped daemon: {stderr}"
+    );
+}
+
 #[test]
 fn node_data_dir_is_not_read_as_a_client_store() {
     let dir = data_dir();
     let buyer_db = dir.path().join("buyer.redb");
-    // Content is irrelevant: presence is the signal, and the CLI must never
-    // open this file — a live daemon holds redb's exclusive lock on it.
+    // Presence is the signal. This one is not a real redb file, so the offline
+    // disk read (#2084) cannot salvage it either — and the command must still
+    // never reach for the CLIENT store, which is the bug.
     std::fs::write(&buyer_db, b"not a real redb file").unwrap();
 
     let output = common::decdn_command(dir.path())
