@@ -64,6 +64,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -205,6 +206,51 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapCountLayer {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(tx, cap_count);
+        }
+    }
+}
+
+/// A `tracing_subscriber` [`Layer`](tracing_subscriber::Layer) that counts the
+/// redeemer's pre-redeem watermark-reconciliation fail-open warns, keyed on the
+/// `stage = "reconcile"` **field** rather than the message text (the same
+/// discipline as [`CapCountLayer`] keying on `tx`/`cap_count`): the message is
+/// prose and may be reworded, the field is the contract.
+///
+/// The count must stay at zero. `reconcile_onchain_watermarks` reads through the
+/// contract's own `getWatermarks`, so a warn here means the seller is paying gas
+/// for a `redeemMany` it never reconciled — the regression #2076 fixed.
+struct ReconcileFailureLayer {
+    count: Arc<AtomicUsize>,
+}
+
+/// Sets its flag when an event carries `stage = "reconcile"`. The field is a
+/// `&'static str`, which `Visit` funnels through `record_str`, so that is the
+/// override this needs (the default `record_str` would `Debug`-quote it).
+#[derive(Default)]
+struct ReconcileStageVisitor {
+    hit: bool,
+}
+
+impl tracing::field::Visit for ReconcileStageVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "stage" && value == "reconcile" {
+            self.hit = true;
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ReconcileFailureLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = ReconcileStageVisitor::default();
+        event.record(&mut visitor);
+        if visitor.hit {
+            self.count.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -408,6 +454,9 @@ async fn run_e2e() -> anyhow::Result<()> {
     // printed.
     // `try_init` is idempotent (harmless on a re-run).
     let cap_count_log: Arc<Mutex<HashMap<B256, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Pre-redeem watermark-reconciliation fail-open warns; must stay at zero
+    // (#2076). WARN passes the layers' `info` floor.
+    let reconcile_failures: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     // `tracing_subscriber::fmt()` (the builder this replaces) defaults its
     // filter to `INFO`; a bare `Registry` + layers has no such default and
     // would pass every level (including the very chatty `TRACE` RPC/transport
@@ -426,6 +475,12 @@ async fn run_e2e() -> anyhow::Result<()> {
         .with(
             CapCountLayer {
                 captured: Arc::clone(&cap_count_log),
+            }
+            .with_filter(level()),
+        )
+        .with(
+            ReconcileFailureLayer {
+                count: Arc::clone(&reconcile_failures),
             }
             .with_filter(level()),
         )
@@ -934,6 +989,46 @@ async fn run_e2e() -> anyhow::Result<()> {
         "second redeem on an already-registered lane never landed"
     );
 
+    // BATCHED WATERMARK READ PROOF (#2076). The `sol!` block is a hand-written
+    // restatement of the ABI, so only a live contract proves the batch return
+    // decodes. Two entries, not one: a single-element array hides a whole class
+    // of dynamic-array offset bugs. The second triple names a provider that
+    // never redeemed, so it must read back as the empty lane.
+    let batch_lanes = pool_read
+        .getWatermarks(
+            vec![pool_id, pool_id],
+            vec![client_addr, client_addr],
+            vec![node_addr, Address::ZERO],
+        )
+        .call()
+        .await?;
+    anyhow::ensure!(
+        batch_lanes.len() == 2,
+        "getWatermarks must return one lane per input triple, got {}",
+        batch_lanes.len()
+    );
+    for (idx, (signer, provider)) in [(client_addr, node_addr), (client_addr, Address::ZERO)]
+        .into_iter()
+        .enumerate()
+    {
+        let single = pool_read
+            .getWatermark(pool_id, signer, provider)
+            .call()
+            .await?;
+        let batched = batch_lanes
+            .get(idx)
+            .ok_or_else(|| anyhow::anyhow!("getWatermarks entry {idx} missing"))?;
+        anyhow::ensure!(
+            batched.amount == single.amount && batched.bytesDelivered == single.bytesDelivered,
+            "getWatermarks entry {idx} disagrees with getWatermark: batched=({}, {}) \
+             single=({}, {})",
+            batched.amount,
+            batched.bytesDelivered,
+            single.amount,
+            single.bytesDelivered
+        );
+    }
+
     // The Authorization is unchanged by the second sweep (registration is
     // set-once on-chain; a re-attached `CapabilityReg` would be a harmless
     // no-op — the `cap_count` assertion just below is what actually proves
@@ -1024,6 +1119,15 @@ async fn run_e2e() -> anyhow::Result<()> {
         "second sweep must attach NO CapabilityReg — registration is already known from the \
          persisted registered_until watermark, so the batched-read skip must fire: \
          cap_count={cap_count_second}"
+    );
+
+    // The pre-redeem reconciliation read must actually decode. Against a build
+    // whose read cannot be served this fires on every sweep (#2076).
+    anyhow::ensure!(
+        reconcile_failures.load(Ordering::Relaxed) == 0,
+        "pre-redeem watermark reconciliation failed open {} time(s); the seller submitted \
+         redeemMany batches it never reconciled (#2076)",
+        reconcile_failures.load(Ordering::Relaxed)
     );
 
     // ============================================================

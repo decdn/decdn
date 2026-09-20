@@ -2749,6 +2749,69 @@ contract PaymentPoolTest is Test {
         pool.getAuthorizations(ids, signers);
     }
 
+    function test_getWatermarks_batchesRedeemedAndUntouchedLanes() public {
+        bytes32 id0 = _open();
+        address provider2 = address(0xCAFE);
+        vm.prank(provider);
+        _redeemOne(
+            id0, signer, provider, 300e6, 30_000_000, _voucher(id0, 300e6, 30_000_000), _cap(id0, SPENDING_CAP, expiry)
+        );
+        bytes32 id1 = _open(); // nothing redeemed here
+
+        // Three triples: the redeemed lane, the same pool and signer under a
+        // different provider, and an untouched pool.
+        bytes32[] memory ids = new bytes32[](3);
+        ids[0] = id0;
+        ids[1] = id0;
+        ids[2] = id1;
+        address[] memory signers = new address[](3);
+        signers[0] = signer;
+        signers[1] = signer;
+        signers[2] = signer;
+        address[] memory providers = new address[](3);
+        providers[0] = provider;
+        providers[1] = provider2;
+        providers[2] = provider;
+
+        PaymentPool.Lane[] memory lanes = pool.getWatermarks(ids, signers, providers);
+        assertEq(lanes.length, 3);
+        // Redeemed lane: identical to the single-read view.
+        assertEq(lanes[0].amount, 300e6);
+        assertEq(lanes[0].bytesDelivered, 30_000_000);
+        // The provider axis is the one `getAuthorizations` cannot exercise: the
+        // same (pool, signer) under another provider is a distinct, empty lane.
+        assertEq(lanes[1].amount, 0);
+        assertEq(lanes[1].bytesDelivered, 0);
+        assertEq(lanes[2].amount, 0);
+        assertEq(lanes[2].bytesDelivered, 0);
+        // Each entry equals the single-read view for the same triple.
+        for (uint256 i = 0; i < lanes.length; i++) {
+            PaymentPool.Lane memory single = pool.getWatermark(ids[i], signers[i], providers[i]);
+            assertEq(lanes[i].amount, single.amount);
+            assertEq(lanes[i].bytesDelivered, single.bytesDelivered);
+        }
+    }
+
+    function test_getWatermarks_revertsOnLengthMismatch() public {
+        bytes32[] memory ids = new bytes32[](2);
+        address[] memory shortSigners = new address[](1);
+        address[] memory providers = new address[](2);
+        vm.expectRevert(PaymentPool.LengthMismatch.selector);
+        pool.getWatermarks(ids, shortSigners, providers);
+
+        address[] memory signers = new address[](2);
+        address[] memory shortProviders = new address[](1);
+        vm.expectRevert(PaymentPool.LengthMismatch.selector);
+        pool.getWatermarks(ids, signers, shortProviders);
+    }
+
+    function test_getWatermarks_emptyBatchReturnsEmpty() public view {
+        bytes32[] memory ids = new bytes32[](0);
+        address[] memory signers = new address[](0);
+        address[] memory providers = new address[](0);
+        assertEq(pool.getWatermarks(ids, signers, providers).length, 0);
+    }
+
     // -----------------------------------------------------------------
     // getRateBounds
     // -----------------------------------------------------------------

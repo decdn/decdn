@@ -675,6 +675,25 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         return watermark[poolId][signer][provider];
     }
 
+    /// @notice Batch companion to `getWatermark`: one
+    ///         `watermark[poolId][signer][provider]` read per
+    ///         `(poolIds[i], signers[i], providers[i])` triple, in input order.
+    ///         A redeemer reconciles every planned lane in one call.
+    /// @dev    Reverts `LengthMismatch` when the three arrays differ in length. A pure
+    ///         loop over the existing mapping — no storage is written and no triple is
+    ///         deduplicated.
+    function getWatermarks(bytes32[] calldata poolIds, address[] calldata signers, address[] calldata providers)
+        external
+        view
+        returns (Lane[] memory lanes)
+    {
+        if (poolIds.length != signers.length || poolIds.length != providers.length) revert LengthMismatch();
+        lanes = new Lane[](poolIds.length);
+        for (uint256 i = 0; i < poolIds.length; i++) {
+            lanes[i] = watermark[poolIds[i]][signers[i]][providers[i]];
+        }
+    }
+
     function getRateBounds() external view returns (uint256 floor) {
         return deliveryFloor;
     }

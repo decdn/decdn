@@ -138,6 +138,16 @@ const REDEEM_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 /// (a transient error mis-flagged as oversize) at 2^6 doomed sub-sends.
 const MAX_SPLIT_DEPTH: u32 = 6;
 
+/// Lanes per pre-redeem `getWatermarks` read ([`reconcile_onchain_watermarks`]).
+/// [`plan_lanes`] plans every persisted lane owed more than it is paid, so the
+/// count is bounded by nothing the redeemer controls — the per-transaction
+/// voucher cap chunks the *submit*, after this read. 512 triples is ~49 KB of
+/// calldata, ~32 KB of return and ~1.1M gas, inside any provider's `eth_call`
+/// ceiling. A plain const, not a config knob: no operator knowledge makes a
+/// better choice here, and reusing the per-tx voucher cap would refragment the
+/// read whenever an operator lowered it.
+const WATERMARK_READ_BATCH_MAX: usize = 512;
+
 /// Current Unix time in seconds, compared against a lane's cached
 /// `registered_until` to skip the on-chain authorization read while the
 /// registration is still live (`registered_until > now`). A broken system clock
@@ -1649,69 +1659,86 @@ async fn flush_store_durable(
 /// skip their submit on a failed flush (`strict_flush`); the forced
 /// close/shutdown paths redeem regardless, since forfeiting the whole claim at the
 /// deadline is worse than a bounded re-serve risk.
-/// Read the on-chain paid watermark for every planned lane in one Multicall3
-/// round-trip and drop any lane the chain already shows settled to its claim
-/// value — the last check before spending gas on a `redeemMany` the contract
-/// would silently no-op (its own `claimed <= w.amount` guard,
-/// `PaymentPool.redeem`). A surviving lane's `unredeemed` is recomputed from the
-/// fresh on-chain paid, so the per-chunk floor gates on the true delta.
+/// Read the on-chain paid watermark for every planned lane and drop any lane the
+/// chain already shows settled to its claim value — the last check before
+/// spending gas on a `redeemMany` the contract would silently no-op (its own
+/// `claimed <= w.amount` guard, `PaymentPool.redeem`). A surviving lane's
+/// `unredeemed` is recomputed from the fresh on-chain paid, so the per-chunk
+/// floor gates on the true delta.
 ///
 /// This is the freshest possible signal and complements the durable paid cache:
 /// the event-fed cache can lag the chain between poll ticks, and another actor
-/// could have redeemed the same lane. The read is `getWatermark` against the
-/// deployed contract via alloy's canonical Multicall3 aggregate — no new
-/// contract surface, no per-lane `eth_call` fan-out.
+/// could have redeemed the same lane. The read is the contract's own
+/// `getWatermarks` batch view: one `eth_call` per batch of at most
+/// [`WATERMARK_READ_BATCH_MAX`] lanes, no per-lane fan-out and no dependency on
+/// a contract outside the protocol's own deployment.
 ///
-/// **Fail-open.** A multicall/RPC error (or a chain without Multicall3) returns
-/// the plans unchanged and submits: the contract's own no-op guard is the
-/// backstop, and the only cost of a stale read is the gas this check saves. It
-/// never holds up a redemption on a read it could not make.
+/// **Fail-open.** An RPC error, a timeout or a short return submits the lanes it
+/// could not read unchanged: the contract's own no-op guard is the backstop, and
+/// the only cost of a stale read is the gas this check saves. It never holds up
+/// a redemption on a read it could not make. The prefix it did read still
+/// reconciles, so a failure partway through a multi-batch read keeps the savings
+/// from the batches that landed.
 async fn reconcile_onchain_watermarks<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     plans: Vec<PlannedLane>,
     metrics: &Arc<Metrics>,
 ) -> Vec<PlannedLane> {
+    // An empty plan set is the healthy steady state, so short-circuit rather than
+    // issue an `eth_call` with three empty arrays on every idle sweep.
     if plans.is_empty() {
         return plans;
     }
-    let mut call = contract
-        .provider()
-        .multicall()
-        .dynamic::<PaymentPool::getWatermarkCall>();
-    for plan in &plans {
-        call = call.add_dynamic(contract.getWatermark(
-            plan.pool_id,
-            plan.key.signer,
-            plan.key.provider,
-        ));
-    }
-    // Bound the read: the alloy HTTP provider has no request timeout, so a hung
-    // RPC would wedge the redeemer loop forever — the opposite of fail-open. A
-    // timeout folds into the error arm and submits unchanged (degrade-and-continue,
-    // per `timed`); the default bound (`DEFAULT_RPC_CALL_TIMEOUT`) applies.
-    let lanes = match timed(None, "pre-redeem getWatermark multicall", call.aggregate()).await {
-        Ok(lanes) => lanes,
-        Err(err) => {
-            warn!(
-                error = %sanitize_rpc_display(err),
-                lanes = plans.len(),
-                "pre-redeem watermark reconciliation failed; submitting on the contract's own no-op guard"
-            );
-            return plans;
+    let mut onchain_paid: Vec<U256> = Vec::with_capacity(plans.len());
+    for chunk in plans.chunks(WATERMARK_READ_BATCH_MAX) {
+        let mut pool_ids = Vec::with_capacity(chunk.len());
+        let mut signers = Vec::with_capacity(chunk.len());
+        let mut providers = Vec::with_capacity(chunk.len());
+        for plan in chunk {
+            pool_ids.push(plan.pool_id);
+            signers.push(plan.key.signer);
+            providers.push(plan.key.provider);
         }
-    };
-    // The aggregate returns one `Lane` per call in input order. A mismatch is a
-    // provider/Multicall3 fault — fail open rather than mis-pair a watermark with
-    // the wrong lane.
-    if lanes.len() != plans.len() {
-        warn!(
-            expected = plans.len(),
-            got = lanes.len(),
-            "watermark reconciliation returned a mismatched count; submitting unchanged"
+        // Bound the read: the alloy HTTP provider has no request timeout, so a hung
+        // RPC would wedge the redeemer loop forever — the opposite of fail-open. A
+        // timeout folds into the error arm and submits the unread tail unchanged
+        // (degrade-and-continue, per `timed`); the default bound
+        // (`DEFAULT_RPC_CALL_TIMEOUT`) applies.
+        let builder = contract.getWatermarks(pool_ids, signers, providers);
+        let lanes = match timed(None, "pre-redeem getWatermarks", builder.call()).await {
+            Ok(lanes) => lanes,
+            Err(err) => {
+                warn!(
+                    stage = "reconcile",
+                    error = %sanitize_rpc_display(err),
+                    lanes = chunk.len(),
+                    "pre-redeem watermark reconciliation failed; submitting on the contract's own no-op guard"
+                );
+                break;
+            }
+        };
+        // The contract returns one `Lane` per input triple, in input order, so a
+        // mis-pairing is impossible; only an under-read is reachable. Take the
+        // prefix and stop — `reconcile_plans` keeps the untouched tail.
+        let short = lanes.len() < chunk.len();
+        if lanes.len() != chunk.len() {
+            warn!(
+                stage = "reconcile",
+                expected = chunk.len(),
+                got = lanes.len(),
+                "watermark reconciliation returned a mismatched count; submitting the unread lanes unchanged"
+            );
+        }
+        onchain_paid.extend(
+            lanes
+                .iter()
+                .take(chunk.len())
+                .map(|lane| U256::from(lane.amount)),
         );
-        return plans;
+        if short {
+            break;
+        }
     }
-    let onchain_paid: Vec<U256> = lanes.iter().map(|lane| U256::from(lane.amount)).collect();
     let (kept, skipped) = reconcile_plans(plans, &onchain_paid);
     if skipped > 0 {
         metrics.redemption_reconciled_skip_by(skipped);
@@ -1723,8 +1750,9 @@ async fn reconcile_onchain_watermarks<P: Provider + Clone>(
 /// on-chain paid watermark (parallel to `plans`, same order), drop every lane the
 /// chain already shows settled to its claim value and recompute `unredeemed` for
 /// the survivors from that fresh paid. Returns the kept lanes and the count
-/// dropped. `onchain_paid` MUST be the same length as `plans` (the caller checks
-/// the multicall parity); a shorter slice conservatively keeps the untouched tail.
+/// dropped. `onchain_paid` is a prefix of `plans`, in the same order: the caller
+/// supplies a shorter slice when a batch errors or under-returns, and the
+/// untouched tail is conservatively kept.
 fn reconcile_plans(plans: Vec<PlannedLane>, onchain_paid: &[U256]) -> (Vec<PlannedLane>, u64) {
     let mut kept = Vec::with_capacity(plans.len());
     let mut skipped = 0u64;
@@ -2614,6 +2642,134 @@ mod tests {
         assert_eq!(
             kept.first().map(|p| p.unredeemed),
             Some(U256::from(1_000u64))
+        );
+    }
+
+    /// A mocked `PaymentPool` whose `eth_call` queue returns one ABI-encoded
+    /// `getWatermarks` result per entry — one entry per expected batch, each
+    /// holding that batch's lanes.
+    ///
+    /// Encoded with `getWatermarksCall::abi_encode_returns`, not `SolValue`: the
+    /// return is a *dynamic* array, so unlike the static-tuple `Pool` /
+    /// `Authorization` / `Lane` fixtures elsewhere in this file, the standalone
+    /// value encoding is not the function-return encoding (the head carries an
+    /// offset word).
+    fn mocked_getwatermarks_pool(
+        responses: &[Vec<PaymentPool::Lane>],
+    ) -> (
+        PaymentPool::PaymentPoolInstance<impl Provider + Clone + 'static>,
+        alloy::providers::mock::Asserter,
+    ) {
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+        use alloy::sol_types::SolCall;
+
+        let asserter = Asserter::new();
+        for lanes in responses {
+            asserter.push_success(&Bytes::from(
+                PaymentPool::getWatermarksCall::abi_encode_returns(lanes),
+            ));
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        (PaymentPool::new(Address::ZERO, provider), asserter)
+    }
+
+    fn lane(amount: u64) -> PaymentPool::Lane {
+        PaymentPool::Lane {
+            amount,
+            bytesDelivered: 0,
+        }
+    }
+
+    /// The whole point of the pre-redeem read (#2076): a lane the chain already
+    /// shows settled to its claim value leaves the redeem batch, and a survivor's
+    /// `unredeemed` is recomputed from the fresh read rather than the stale plan.
+    #[tokio::test]
+    async fn reconcile_drops_a_lane_the_chain_already_settled() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (contract, _asserter) = mocked_getwatermarks_pool(&[vec![lane(1_000), lane(400)]]);
+        let plans = vec![planned(1, 0, 1_000, false), planned(1, 1, 1_000, false)];
+
+        let kept = reconcile_onchain_watermarks(&contract, plans, &metrics).await;
+
+        assert_eq!(kept.len(), 1, "the settled lane leaves the batch");
+        let survivor = kept
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("one lane survives"))?;
+        assert_eq!(survivor.key.signer, Address::from([1u8; 20]));
+        assert_eq!(
+            survivor.unredeemed,
+            U256::from(600u64),
+            "recomputed from the fresh on-chain paid (1000 owed − 400 paid)"
+        );
+        let text = metrics.encode()?;
+        anyhow::ensure!(
+            text.lines()
+                .any(|l| l == "decdn_redemption_reconciled_skip_total 1"),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    /// Fail-open: a read the node could not make never holds up a redemption.
+    #[tokio::test]
+    async fn reconcile_fails_open_on_a_read_error() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        // An empty queue makes the mocked transport error on the first call.
+        let (contract, _asserter) = mocked_getwatermarks_pool(&[]);
+        let plans = vec![planned(1, 0, 1_000, false), planned(1, 1, 2_000, false)];
+
+        let kept = reconcile_onchain_watermarks(&contract, plans, &metrics).await;
+
+        assert_eq!(kept.len(), 2, "every lane survives an unreadable batch");
+        assert_eq!(
+            kept.iter().map(|p| p.unredeemed).collect::<Vec<_>>(),
+            vec![U256::from(1_000u64), U256::from(2_000u64)]
+        );
+        let text = metrics.encode()?;
+        anyhow::ensure!(
+            text.lines()
+                .any(|l| l == "decdn_redemption_reconciled_skip_total 0"),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    /// An under-returning batch reconciles the prefix and keeps the unread tail.
+    #[tokio::test]
+    async fn reconcile_pairs_the_prefix_on_a_short_return() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (contract, _asserter) = mocked_getwatermarks_pool(&[vec![lane(1_000)]]);
+        let plans = vec![planned(1, 0, 1_000, false), planned(1, 1, 2_000, false)];
+
+        let kept = reconcile_onchain_watermarks(&contract, plans, &metrics).await;
+
+        assert_eq!(kept.len(), 1, "the read lane is settled and drops");
+        let survivor = kept
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("the unread lane survives"))?;
+        assert_eq!(survivor.key.signer, Address::from([1u8; 20]));
+        assert_eq!(
+            survivor.unredeemed,
+            U256::from(2_000u64),
+            "the unread lane is kept unchanged"
+        );
+        Ok(())
+    }
+
+    /// The idle steady state issues no `eth_call` at all.
+    #[tokio::test]
+    async fn reconcile_empty_plans_issues_no_call() {
+        let metrics = Arc::new(Metrics::new());
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(1)]]);
+
+        let kept = reconcile_onchain_watermarks(&contract, vec![], &metrics).await;
+
+        assert!(kept.is_empty());
+        assert_eq!(
+            asserter.read_q().len(),
+            1,
+            "the queued getWatermarks response is untouched by an empty plan set"
         );
     }
 

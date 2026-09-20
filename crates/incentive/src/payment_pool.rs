@@ -20,7 +20,10 @@
 //!   expiry, spent), `getAuthorizations(poolIds, signers)` (the batch
 //!   companion to `getAuthorization`, one read per pair in input order),
 //!   `getWatermark(poolId, signer, provider)` (the
-//!   cumulative-paid lane a redeemer advances), `ownerPoolNonce(owner)` (next
+//!   cumulative-paid lane a redeemer advances),
+//!   `getWatermarks(poolIds, signers, providers)` (the batch companion to
+//!   `getWatermark`, one read per triple in input order),
+//!   `ownerPoolNonce(owner)` (next
 //!   nonce used to derive a pool id), `getPools(owner, offset, limit)` (page
 //!   of an owner's pool ids), and `getRateBounds()` (the governable per-MB
 //!   delivery-rate floor);
@@ -215,6 +218,17 @@ mod sol_types {
                 external
                 view
                 returns (Lane memory);
+
+            /// Batch companion to `getWatermark`: one
+            /// `watermark[poolId][signer][provider]` read per `(poolIds[i],
+            /// signers[i], providers[i])` triple, in input order. Reverts on a
+            /// length mismatch. The redeemer reconciles every planned lane
+            /// against the chain in one call instead of one `eth_call` per
+            /// lane.
+            function getWatermarks(bytes32[] calldata poolIds, address[] calldata signers, address[] calldata providers)
+                external
+                view
+                returns (Lane[] memory);
 
             /// Governable per-megabyte delivery-rate floor (ADR 003). A soft
             /// floor: `redeem` settles a sub-floor voucher in full and clamps
@@ -551,7 +565,7 @@ mod tests {
         assert_eq!(
             PaymentPool::Lane::eip712_encode_type(),
             "Lane(uint64 amount,uint64 bytesDelivered)",
-            "getWatermark"
+            "getWatermark / getWatermarks"
         );
     }
 
@@ -605,6 +619,17 @@ mod tests {
         assert_eq!(
             PaymentPool::getAuthorizationsCall::SIGNATURE,
             "getAuthorizations(bytes32[],address[])"
+        );
+    }
+
+    /// Batch companion selector for `getWatermark` (the seller's pre-redeem
+    /// reconciliation read).
+    #[test]
+    fn get_watermarks_signature_matches_contract() {
+        use alloy::sol_types::SolCall;
+        assert_eq!(
+            PaymentPool::getWatermarksCall::SIGNATURE,
+            "getWatermarks(bytes32[],address[],address[])"
         );
     }
 }
