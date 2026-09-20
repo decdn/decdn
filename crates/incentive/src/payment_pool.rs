@@ -203,6 +203,14 @@ mod sol_types {
 
             /// A `(signer, provider)` lane's cumulative-paid amount and
             /// cumulative paid-proportional bytes delivered.
+            ///
+            /// Read by the seller's pre-redeem reconciliation, and by the buyer
+            /// to reseed a lane whose local progress it has lost: a voucher at
+            /// or below the watermark is a transient-empty redemption that pays
+            /// nothing, so a buyer resuming from zero would stream bytes nobody
+            /// can cash. It reflects *redeemed* vouchers only — a provider still
+            /// holding an unredeemed voucher is ahead of it, by at most its own
+            /// redemption threshold.
             function getWatermark(bytes32 poolId, address signer, address provider)
                 external
                 view
@@ -226,6 +234,7 @@ mod sol_types {
                 external
                 view
                 returns (bytes32[] memory);
+
 
             // -----------------------------------------------------------------
             // Write functions (owner path)
@@ -354,6 +363,51 @@ pub use sol_types::{FeeRouter, PaymentPool};
 pub fn to_pool_u64(value: alloy::primitives::U256, what: &str) -> anyhow::Result<u64> {
     u64::try_from(value)
         .map_err(|_| anyhow::anyhow!("{what} {value} exceeds the PaymentPool's uint64 field"))
+}
+
+/// One page of [`enumerate_owned_pools`]. `getPools` clamps `limit` to the
+/// remaining count, so a short page ends the walk with no separate
+/// `ownerPoolNonce` read.
+const OWNED_POOLS_PAGE: usize = 256;
+
+/// Every pool id `owner` has opened, read from chain oldest-first by paging
+/// `getPools`.
+///
+/// Chain-authoritative, which is the point: the local buyer store drops a row
+/// at close and is lost outright if the data dir is reset, so it cannot answer
+/// "do I already own a pool". Asking the chain instead is what stops a node
+/// from escrowing a second deposit against a pool it has simply forgotten
+/// (#2072), and it enumerates pools in every lifecycle state, which is what
+/// reaching a historical `Closing` pool awaiting reclaim needs.
+///
+/// # Errors
+///
+/// Errors if any page read fails, naming the offset that failed.
+pub async fn enumerate_owned_pools<P>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: alloy::primitives::Address,
+) -> anyhow::Result<Vec<crate::lane::PoolId>>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    use alloy::primitives::U256;
+
+    let mut ids = Vec::new();
+    let mut offset: u64 = 0;
+    loop {
+        let page = contract
+            .getPools(owner, U256::from(offset), U256::from(OWNED_POOLS_PAGE))
+            .call()
+            .await
+            .map_err(|e| anyhow::anyhow!("getPools(offset={offset}) failed: {e}"))?;
+        let n = page.len();
+        ids.extend(page);
+        if n < OWNED_POOLS_PAGE {
+            break;
+        }
+        offset = offset.saturating_add(u64::try_from(n)?);
+    }
+    Ok(ids)
 }
 
 #[cfg(test)]

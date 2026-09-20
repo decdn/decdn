@@ -1268,14 +1268,14 @@
       },
       "title": "Peers known",
       "type": "stat",
-      "description": "Entries in this node's address directory.",
+      "description": "Entries in this node's address directory: the NodeId → operator address bindings the node-to-node pull leg resolves against. Scoped to nodes that have attempted a pull — every metric is registered unconditionally, so a cache-only node exports a permanent 0 that is not a collapsed directory, and only having attempted a pull distinguishes the two (#1231, #2072).",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "decdn_node_address_directory_size{instance=~\"$node\"}",
+          "expr": "decdn_node_address_directory_size{instance=~\"$node\"}\n  and on(instance) (decdn_node_pull_attempts_total > 0)",
           "refId": "A"
         }
       ],

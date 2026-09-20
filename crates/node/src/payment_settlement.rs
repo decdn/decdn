@@ -60,7 +60,7 @@
 //! drop.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1056,6 +1056,38 @@ fn sum_unredeemed(plans: &[PlannedLane]) -> U256 {
         .fold(U256::ZERO, |acc, plan| acc.saturating_add(plan.unredeemed))
 }
 
+/// Sum the value still recoverable from the distinct pools behind `plans` —
+/// `Σ (deposit − totalRedeemed)`, the ceiling those pools can still pay this
+/// node. Feeds the `decdn_pool_deposit_usdc` gauge once per sweep.
+///
+/// `remaining`, not the raw deposit: already-redeemed funds have left the pool
+/// and are not recoverable from it, so counting them would overstate what the
+/// node can still collect. A pool the projection has not folded contributes
+/// nothing rather than a guess — the same fail-quiet direction the planner
+/// takes on an unknown pool.
+///
+/// Scoped to planned lanes, which is what bounds it to this node's own
+/// counterparties: the projection also folds `PoolOpened` for pools this node
+/// has no lane on, and summing those would report the network's escrow as its
+/// own. The precise reading is therefore "pools that currently owe this node",
+/// not every pool it has ever been paid by — a lane settles out of the planned
+/// set once it is fully redeemed. The caller skips the publish on an empty plan
+/// set so that settling out does not read as the escrow disappearing.
+///
+/// A pool the projection has not folded contributes nothing rather than a
+/// guess, so the gauge under-reports in the window after a restart where the
+/// planner has deliberately failed open on an unknown pool.
+fn sum_recoverable_deposit(plans: &[PlannedLane], pool_view: &PoolProjection) -> U256 {
+    let mut seen: HashSet<PoolId> = HashSet::new();
+    plans
+        .iter()
+        .filter(|plan| seen.insert(plan.pool_id))
+        .filter_map(|plan| pool_view.snapshot(plan.pool_id))
+        .fold(U256::ZERO, |acc, status| {
+            acc.saturating_add(status.remaining)
+        })
+}
+
 /// Group planned lanes into one `PoolBatch` per distinct pool, in first-seen
 /// order, so the contract amortizes each pool's status read and `totalRedeemed`
 /// write across its lanes. A lane's capability registration (present only on a
@@ -1450,6 +1482,14 @@ async fn redeem_sweep<P: Provider + Clone>(
     // floor is still owed and rides a later sweep, so counting it here is what
     // makes the gauge "USDC waiting to be redeemed" rather than "redeeming now".
     metrics.set_unredeemed_usdc(sum_unredeemed(&plans));
+    // Only when there is something to measure. An empty plan set is the HEALTHY
+    // steady state — everything owed has been redeemed — and publishing zero for
+    // it would sawtooth the gauge to 0 after every successful sweep, which reads
+    // exactly like insolvent counterparties. Leaving the last value standing is
+    // the same discipline the buyer-wallet read takes.
+    if !plans.is_empty() {
+        metrics.set_pool_deposit_usdc(sum_recoverable_deposit(&plans, pool_view));
+    }
     redeem_planned_lanes(
         contract,
         store,

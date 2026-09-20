@@ -444,6 +444,55 @@ action is required.
    [ADR 028 SlashAppeal](../adr/028-slashing-appeals.md) path, with its own bond
    and evidence rules, and it is the only appeal surface the protocol carries.
 
+## Node-to-node pulls never succeed (buyer wallet or pool)
+
+**Symptoms:** `decdn_node_pull_attempts_total` climbs while
+`decdn_node_pull_success_total` stays flat; origin pull-through volume is high
+against content the fleet already holds; the node serves inbound requests
+normally, so nothing else alerts. `DecdnNodePullNeverSucceeds` fires after 6h.
+
+The node's buyer leg is the one part of it that *spends*. It opens one
+`PaymentPool` deposit of `blockchain.buyer_working_deposit_micro_usdc` (10 USDC
+by default) and reuses it for every upstream pull. Two things break it.
+
+**Cause (1): the operator wallet holds no USDC.** Every `openPool` reverts on
+the ERC-20 transfer, so the node can pay no provider and every cache miss falls
+through to origin.
+
+1. Read `decdn_buyer_wallet_usdc`, and
+   `decdn_pool_open_failures_insufficient_deposit_total` beside it. The gauge is
+   refreshed once per reclaim sweep, so allow up to an hour after funding.
+2. Send USDC to the operator address. Circle's Sepolia faucet is the testnet
+   source (see [Testnet faucet](#testnet-faucet)); `decdn whoami` prints the
+   address, given the keystore password.
+3. No restart is needed — the next miss opens the pool.
+
+A wallet with an old string-revert USDC reports the same shortfall through
+`insufficient_deposit` rather than `contract_revert`; both mean fund the wallet.
+
+**Cause (2): the node owns a pool it has forgotten.** The buyer-pool store lives
+under `identity.data_dir`. If that directory is reset — a moved volume, a
+re-provisioned host — the node loses the only local record that it owns a pool.
+It reconciles against `PaymentPool.getPools` at startup and adopts the pool it
+already owns, so this heals on its own; what follows is for confirming it, and
+for recovering deposits an older build stranded before it did.
+
+1. Read `decdn_buyer_pool_adoption_failures_total`. Any increment means the
+   node could not tell whether it already owned a pool and is about to open a
+   second one; `decdn pool list` (which reads the local store) then shows
+   nothing while the chain says otherwise.
+2. The node adopts the newest solvent `Open` pool at startup. Look for
+   `adopted this node's existing on-chain payment pool` in the log, and for
+   `this node owns further open payment pools it is not using`, which names the
+   stranded ids.
+3. Recover those with `decdn pool close --pool <poolId>`, then
+   `decdn pool reclaim --all` once the pool's `disputeWindow` has elapsed
+   (48-72h, governance-set). Do **not** use `close --all`: it would close the
+   pool the node just adopted.
+4. Lanes on an adopted pool resume from their on-chain watermark, so a provider
+   still holding an unredeemed voucher is briefly ahead of the node and rejects
+   its first vouchers. That clears on the provider's next redemption; no action.
+
 ## Refusing paying clients (insufficient deposit)
 
 **Symptoms:** clients report a blob as missing that this node holds; delivery
@@ -520,8 +569,8 @@ tops up — see
 3. For cause (1), no action. If the rate is high because many clients open dust
    channels deliberately, note that the refusal now happens *before* any fill
    (#1519), so it costs this node nothing beyond the signature.
-4. Do not raise a deposit floor to "fix" this. There is no on-chain minimum
-   deposit beyond non-zero
+4. Do not raise a deposit floor to "fix" this. `PaymentPool.minDeposit` ships
+   dormant at 0 and is governance-set
    ([ADR 003 § Deposit Economics](../adr/003-payments.md#deposit-economics));
    service is bounded by what a deposit funds, which is exactly what this refusal
    is enforcing.
