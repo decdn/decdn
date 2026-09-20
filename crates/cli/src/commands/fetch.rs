@@ -68,6 +68,8 @@ use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::probe::probe_once;
 use decdn_client_pull::provider;
 
+use super::buyer_store::{DataDirSource, open_client_store_for_buy};
+
 /// Per-candidate probe timeout during auto-discovery (#936). The K probes run
 /// concurrently, so this bounds selection latency rather than the overall fetch
 /// (`--timeout-ms`); a dead candidate falls out of selection after this.
@@ -160,6 +162,11 @@ pub(crate) struct ResolvedChain {
     /// keystore. Client-scoped (`~/.decdn/client`) unless an explicit
     /// `--data-dir`/`identity.data_dir` is given.
     pub(crate) data_dir: PathBuf,
+    /// Which step of the ladder produced [`Self::data_dir`]. A node's data dir
+    /// is acceptable when the operator named it and not when it merely fell out
+    /// of the config file, so the guard needs the provenance, not just the path
+    /// (#2082).
+    pub(crate) data_dir_source: DataDirSource,
     /// Client region for region-first discovery ordering (`--region` >
     /// `identity.region`). `None` skips the ordering.
     pub(crate) region: Option<String>,
@@ -262,12 +269,21 @@ pub(crate) fn resolve_chain(
     // Client data dir: an explicit `--data-dir`/`identity.data_dir` wins,
     // otherwise the client-scoped `~/.decdn/client` (not the node-shaped
     // `~/.decdn`, so a pure client install doesn't masquerade as a node).
-    let data_dir = args
+    // Which step won is carried forward: on a node host `identity.data_dir`
+    // points at the daemon's dir, and buying from there under the node's own
+    // keystore is a refusal unless the operator asked for it by name (#2082).
+    let (data_dir, data_dir_source) = args
         .data_dir
         .clone()
-        .or_else(|| file.identity.as_ref().and_then(|i| i.data_dir.clone()))
-        .map(|p| expand_tilde(&p))
-        .or_else(cli::default_client_data_dir)
+        .map(|p| (p, DataDirSource::Flag))
+        .or_else(|| {
+            file.identity
+                .as_ref()
+                .and_then(|i| i.data_dir.clone())
+                .map(|p| (p, DataDirSource::Config))
+        })
+        .map(|(p, source)| (expand_tilde(&p), source))
+        .or_else(|| cli::default_client_data_dir().map(|p| (p, DataDirSource::Default)))
         .ok_or_else(|| {
             anyhow::anyhow!("data_dir not set and no default available (pass --data-dir)")
         })?;
@@ -315,6 +331,7 @@ pub(crate) fn resolve_chain(
         keystore,
         keystore_password_file: args.keystore_password_file.as_deref().map(expand_tilde),
         data_dir,
+        data_dir_source,
         region,
         region_allowlist,
         working_deposit,
@@ -1272,7 +1289,9 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let grant = resolve_delegation_grant(common, &mut chain)?;
 
     // The buyer-pool store, opened once and recorded into by open-or-reuse.
-    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
+    // The guard runs here, before the keystore password prompt: the answer
+    // depends only on the data dir, and a refusal must not cost a prompt first.
+    let store = open_client_store_for_buy(&chain.data_dir, chain.data_dir_source, "fetch")?;
 
     // One discovery-enabled endpoint, reused for probing and the delivery dial.
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;

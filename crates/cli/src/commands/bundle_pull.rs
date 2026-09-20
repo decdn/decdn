@@ -77,6 +77,7 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 
 use super::bundle_manifest::{self, SavedManifest, SavedMtime};
+use super::buyer_store::open_client_store_for_buy;
 use super::chain_ctx;
 use super::fetch;
 use super::manifest::build_glob_set;
@@ -849,7 +850,10 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // top-up in `chain`.
     let grant = fetch::resolve_delegation_grant(common, &mut chain)?;
 
-    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
+    // Same guard as `decdn fetch`, for the same reason and before the same
+    // password prompt: a node's data dir is a buy target only when the
+    // operator named it (#2082).
+    let store = open_client_store_for_buy(&chain.data_dir, chain.data_dir_source, "pull")?;
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
 
     // Selection + the buyer signer, resolved per path (see `resolve_selection`).

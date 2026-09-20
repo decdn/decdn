@@ -10,6 +10,7 @@ pub mod bond;
 pub mod bundle;
 pub mod bundle_manifest;
 pub mod bundle_pull;
+pub(crate) mod buyer_store;
 pub mod chain_ctx;
 pub mod chunker;
 pub mod config;

@@ -185,6 +185,15 @@ store the node never reads. The whole set marks the dir, not `buyer.redb` alone,
 because that is the file a reset loses — and the window where it is missing is when
 an operator is most likely to reach for `decdn pool`.
 
+`decdn fetch` and `decdn bundle pull` apply a weaker rule to the same dirs. A human
+who buys content on a node host is a separate client, so an explicit `--data-dir`
+that names a node's dir is accepted. An implicit one is not: `identity.data_dir` in
+the config file resolves to the node's dir with nothing on the command line, and the
+keystore defaults to that dir too, so the client pool opens under the node's own
+operator address. The daemon then reports that deposit as stranded, and after a store
+reset it can adopt the pool and sign a second voucher series on one lane. These two
+commands therefore refuse a node's data dir unless the command line names it.
+
 Default configuration:
 
 A client and a node share one schema (`decdn_common::config::FileConfig`), and `deny_unknown_fields`
