@@ -92,32 +92,42 @@ enum BuyerStoreOwner {
         /// The dir itself, so both store paths can be named in a message —
         /// which file produced a `pools=0` must never be ambiguous.
         data_dir: PathBuf,
+        /// The daemon-owned file that gave it away. Named in the refusal so an
+        /// operator whose `buyer.redb` is missing can see WHY the dir was
+        /// still judged a node's.
+        marker: &'static str,
     },
 }
 
 /// The daemon's buyer store within `data_dir`.
 fn node_buyer_db(data_dir: &Path) -> PathBuf {
-    data_dir.join(decdn_incentive::buyer_pool_table::NODE_BUYER_DB_FILE)
+    data_dir.join(decdn_common::data_dir::NODE_BUYER_DB_FILE)
 }
 
 /// The client's buyer store within `data_dir`.
 fn client_buyer_db(data_dir: &Path) -> PathBuf {
-    data_dir.join(decdn_incentive::buyer_pool_table::CLIENT_BUYER_DB_FILE)
+    data_dir.join(decdn_common::data_dir::CLIENT_BUYER_DB_FILE)
 }
 
-/// Classify `data_dir` by whether the daemon's buyer store is present.
+/// Classify `data_dir` by whether a `decdn-node` daemon owns it.
 ///
-/// `buyer.redb` is the precise signal: the daemon's store opens every
-/// per-family file at bring-up, so it exists if and only if a `decdn-node` has
-/// run against this dir. `node.secret` would not discriminate — a client
-/// keygen writes one too.
+/// Keys on ANY of the daemon's store files, not `buyer.redb` alone. The buyer
+/// store is precisely the file that goes missing in the reset this whole change
+/// is about — a moved volume, a re-provisioned host, or an operator deleting it
+/// to force re-adoption — and a dir whose `buyer.redb` is gone but whose
+/// `lanes.redb` remains is still a node's. Keying on the missing file would
+/// classify it `Client` and escrow a second deposit into a store the daemon
+/// never reads, which is the bug, recreated at exactly the moment an operator
+/// is recovering from it.
+///
+/// `node.secret` is deliberately not a marker — a client keygen writes one too.
 fn classify_buyer_store(data_dir: &Path) -> BuyerStoreOwner {
-    if node_buyer_db(data_dir).exists() {
-        BuyerStoreOwner::Node {
+    match decdn_common::data_dir::daemon_marker(data_dir) {
+        Some(marker) => BuyerStoreOwner::Node {
             data_dir: data_dir.to_path_buf(),
-        }
-    } else {
-        BuyerStoreOwner::Client
+            marker,
+        },
+        None => BuyerStoreOwner::Client,
     }
 }
 
@@ -134,18 +144,20 @@ impl BuyerStoreOwner {
     ///
     /// Errors when this is [`BuyerStoreOwner::Node`].
     fn refuse_escrow(&self, verb: &str) -> anyhow::Result<()> {
-        let Self::Node { data_dir } = self else {
+        let Self::Node { data_dir, marker } = self else {
             return Ok(());
         };
         anyhow::bail!(
-            "refusing to {verb}: this data dir belongs to a decdn-node daemon (it holds {}), \
-             and `decdn pool` writes a separate client store ({}) the daemon never reads. The \
+            "refusing to {verb}: {} belongs to a decdn-node daemon (it holds {marker}), and \
+             `decdn pool` writes a separate client store ({}) the daemon never reads. The \
              escrowed USDC would be invisible to the node, which would then open a second pool \
              of its own. The daemon manages its own pool — it opens one at first miss and tops \
              it up from blockchain.buyer_working_deposit_micro_usdc. Run `decdn node pools` to \
-             see what it holds, or pass --data-dir <client dir> to act as a separate buyer.",
-            node_buyer_db(data_dir).display(),
+             see what it holds ({} is its copy), or pass --data-dir <client dir> to act as a \
+             separate buyer.",
+            data_dir.display(),
             client_buyer_db(data_dir).display(),
+            node_buyer_db(data_dir).display(),
         )
     }
 
@@ -161,7 +173,7 @@ impl BuyerStoreOwner {
     ///
     /// Errors when this is [`BuyerStoreOwner::Node`].
     fn refuse_sweep(&self, verb: &str) -> anyhow::Result<()> {
-        let Self::Node { data_dir } = self else {
+        let Self::Node { data_dir, .. } = self else {
             return Ok(());
         };
         anyhow::bail!(
@@ -1162,7 +1174,9 @@ async fn list(args: &cli::PoolListArgs, config_path: Option<&Path>) -> anyhow::R
     };
 
     match classify_buyer_store(&data_dir) {
-        BuyerStoreOwner::Node { data_dir } => list_from_daemon(args, config_path, &data_dir).await,
+        BuyerStoreOwner::Node { data_dir, .. } => {
+            list_from_daemon(args, config_path, &data_dir).await
+        }
         BuyerStoreOwner::Client => list_from_client_store(args, &data_dir),
     }
 }
@@ -1220,14 +1234,29 @@ async fn list_from_daemon(
         .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
 
     let resp: BuyerPoolsResponse = client.pools().await.map_err(|err| {
-        crate::commands::node::classify_client_error(&url, args.timeout_ms, err).context(format!(
-            "{} is a decdn-node data dir, so the pools that matter are in {} — which a running \
-             daemon holds exclusively and no other process can open. This command therefore \
-             asks the daemon, and the daemon did not answer. Start decdn-node, or pass \
-             --data-dir <client dir> to inspect a client store instead.",
-            data_dir.display(),
-            buyer_db.display(),
-        ))
+        // A `Call` error means the daemon ANSWERED and refused — it is up, so
+        // telling the operator to start it would send them the wrong way. Only
+        // the transport and timeout arms warrant that advice.
+        let answered = matches!(err, jsonrpsee::core::client::Error::Call(_));
+        let classified = crate::commands::node::classify_client_error(&url, args.timeout_ms, err);
+        if answered {
+            classified.context(format!(
+                "{} is a decdn-node data dir, so its buyer pools live in {}, which this command \
+                 reads through the daemon — a running daemon holds that file exclusively. The \
+                 daemon answered and refused the read.",
+                data_dir.display(),
+                buyer_db.display(),
+            ))
+        } else {
+            classified.context(format!(
+                "{} is a decdn-node data dir, so the pools that matter are in {} — which a \
+                 running daemon holds exclusively and no other process can open. This command \
+                 therefore asks the daemon, and the daemon did not answer. Start decdn-node, or \
+                 pass --data-dir <client dir> to inspect a client store instead.",
+                data_dir.display(),
+                buyer_db.display(),
+            ))
+        }
     })?;
 
     let mut out = std::io::stdout().lock();
@@ -1616,8 +1645,40 @@ mod tests {
         assert_eq!(
             classify_buyer_store(dir.path()),
             BuyerStoreOwner::Node {
-                data_dir: dir.path().to_path_buf()
+                data_dir: dir.path().to_path_buf(),
+                marker: decdn_common::data_dir::NODE_BUYER_DB_FILE,
             }
+        );
+    }
+
+    /// A node data dir whose `buyer.redb` has been deleted is STILL a node's.
+    ///
+    /// This is the reset that the whole change is about, and the repo's own
+    /// `node_pull_pool_adopt` e2e performs it: remove the buyer store, restart,
+    /// let the daemon re-adopt. In the window before that restart the other
+    /// daemon stores are still on disk. Keying classification on the one file
+    /// that is missing would call it a client dir and let `pool open` escrow a
+    /// second deposit — recreating the bug exactly when an operator is
+    /// recovering from it.
+    #[test]
+    fn a_node_data_dir_whose_buyer_store_was_deleted_is_still_a_node_s() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lanes.redb"), b"x").unwrap();
+        std::fs::write(dir.path().join("settle.redb"), b"x").unwrap();
+        // No `buyer.redb` — it was deleted to force re-adoption.
+        assert!(!dir.path().join("buyer.redb").exists());
+
+        let owner = classify_buyer_store(dir.path());
+        assert!(
+            matches!(owner, BuyerStoreOwner::Node { .. }),
+            "a data dir with daemon stores but no buyer.redb must not be a client's"
+        );
+        // And the guards still bite, which is the point.
+        assert!(owner.refuse_escrow("open a pool").is_err());
+        assert!(owner.open_for_write(dir.path()).unwrap().is_none());
+        assert!(
+            !dir.path().join("buyer-pools.redb").exists(),
+            "no client store may be created in a node data dir mid-recovery"
         );
     }
 
@@ -1628,6 +1689,7 @@ mod tests {
     fn escrow_is_refused_on_a_node_data_dir() {
         let owner = BuyerStoreOwner::Node {
             data_dir: PathBuf::from("/var/lib/decdn"),
+            marker: decdn_common::data_dir::NODE_BUYER_DB_FILE,
         };
         let err = owner.refuse_escrow("open a pool").unwrap_err().to_string();
         assert!(err.contains("/var/lib/decdn/buyer.redb"), "{err}");
@@ -1646,6 +1708,7 @@ mod tests {
     fn sweep_is_refused_on_a_node_data_dir() {
         let owner = BuyerStoreOwner::Node {
             data_dir: PathBuf::from("/var/lib/decdn"),
+            marker: decdn_common::data_dir::NODE_BUYER_DB_FILE,
         };
         let err = owner.refuse_sweep("close").unwrap_err().to_string();
         assert!(err.contains("--pool"), "{err}");
@@ -1659,6 +1722,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owner = BuyerStoreOwner::Node {
             data_dir: dir.path().to_path_buf(),
+            marker: decdn_common::data_dir::NODE_BUYER_DB_FILE,
         };
         assert!(owner.open_for_write(dir.path()).unwrap().is_none());
         assert!(

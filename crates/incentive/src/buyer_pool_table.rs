@@ -34,21 +34,6 @@ use crate::buyer_pool::{
 use crate::lane::{LaneKey, PoolId};
 use crate::store::StoreError;
 
-/// File name of the client's buyer-only store within a data dir.
-///
-/// `decdn fetch`, `decdn bundle pull`, and `decdn pool` own this file. It is a
-/// different file from [`NODE_BUYER_DB_FILE`] in the same directory, so a CLI
-/// pointed at a daemon's data dir reads a store the daemon never writes.
-pub const CLIENT_BUYER_DB_FILE: &str = "buyer-pools.redb";
-
-/// File name of the daemon's buyer store within a data dir.
-///
-/// `decdn-node` owns this file, and `redb` holds a process-exclusive advisory
-/// lock on it for the lifetime of the open `Database` — so while the daemon
-/// runs, no other process can open it, not even read-only. A CLI that wants the
-/// daemon's buyer-pool state asks the daemon over the admin RPC.
-pub const NODE_BUYER_DB_FILE: &str = "buyer.redb";
-
 /// The buyer table: name, key type, and value type.
 ///
 /// **The whole thing is a frozen on-disk identifier**, and it is

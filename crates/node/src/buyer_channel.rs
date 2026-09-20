@@ -1384,12 +1384,20 @@ async fn reconcile_owned_pool<P: Provider + Clone>(
     };
 
     let tracked = match check {
-        // The store already names the pool in use, so everything else this
-        // owner holds open is stranded — including pools this node never chose
-        // and would never have selected.
-        AdoptionCheck::AlreadyTracked(pool_id) => {
+        // The tracked pool is still open on chain, so it is the one in use and
+        // everything else this owner holds open is stranded — including pools
+        // this node never chose and would never have selected.
+        AdoptionCheck::AlreadyTracked(pool_id) if is_open(&open, pool_id) => {
             report_stranded_pools(&recoverable_beside(&open, pool_id));
             return false;
+        }
+        // The store names a pool the chain no longer lists as open. Drop the
+        // row and reconcile as if the store had been empty.
+        AdoptionCheck::AlreadyTracked(pool_id) => {
+            if !drop_stale_row(store, owner, pool_id, metrics) {
+                return false;
+            }
+            newest_solvent(&open)
         }
         AdoptionCheck::Applies => newest_solvent(&open),
         // Handled above; enumerating never happens on this arm.
@@ -1459,6 +1467,50 @@ async fn enumerate_open_pools<P: Provider + Clone>(
         }
     };
     Some(open_pools(contract, ids).await)
+}
+
+/// Forget a tracked row whose pool the chain no longer lists as open, so the
+/// caller may adopt or open a replacement. Returns whether the row is gone.
+///
+/// Nothing can be bought against a closed or reclaimed pool — `redeemMany`
+/// rejects every voucher on one — but [`BuyerPoolService::reuse_or_report`]
+/// reads the tracked row without a status check, so a node that kept this row
+/// would pin every pull to that pool and stream bytes it can never pay for.
+/// This is the state `decdn pool close --pool` run from a node host leaves
+/// behind: it lands the close on chain but cannot write the daemon's store.
+///
+/// A failed forget counts as an adoption failure: the row survives, so the node
+/// really is stuck on an unusable pool, which is what that counter means.
+fn drop_stale_row(
+    store: &Arc<dyn BuyerPoolStore>,
+    owner: Address,
+    pool_id: PoolId,
+    metrics: &Arc<Metrics>,
+) -> bool {
+    warn!(
+        %pool_id,
+        "the tracked buyer pool is no longer open on chain; dropping the stale row so this \
+         node stops pinning its pulls to a pool that can fund no voucher"
+    );
+    if let Err(err) = store.forget_if_pool(owner, pool_id) {
+        metrics.buyer_pool_adoption_failure();
+        warn!(
+            %pool_id,
+            error = %format_args!("{err:#}"),
+            "could not drop the stale buyer pool row; this node keeps reusing a pool that can \
+             fund no voucher until the store recovers"
+        );
+        return false;
+    }
+    true
+}
+
+/// Whether `pool_id` is among the owner's currently-`Open` pools.
+///
+/// The store's row is not evidence of this: a pool closed or reclaimed out of
+/// band leaves the row behind, and nothing else on the buy path checks status.
+fn is_open(open: &[(PoolId, PaymentPool::Pool)], pool_id: PoolId) -> bool {
+    open.iter().any(|(id, _)| *id == pool_id)
 }
 
 /// Every open pool in `open` other than `in_use` that still holds something to
@@ -1969,9 +2021,18 @@ mod tests {
         let existing = PoolId::from([9u8; 32]);
         let other = PoolId::from([0xCC; 32]);
 
+        // Both are open on chain. `existing` must be listed: a tracked pool the
+        // chain does NOT list as open is stale, and reconciliation replaces it
+        // (see `a_tracked_pool_the_chain_has_closed_is_dropped_and_replaced`).
+        // The walk is newest-first, so `other` is read before `existing` — and
+        // `other` is what a build that dropped the already-tracked check would
+        // adopt, which is what the row assertion below catches.
         let contract = mocked_pool_contract(vec![
-            vec![other].abi_encode().into(),
+            vec![existing, other].abi_encode().into(),
             onchain_pool(owner, PaymentPool::Status::Open, 10_000_000)
+                .abi_encode()
+                .into(),
+            onchain_pool(owner, PaymentPool::Status::Open, 5_000)
                 .abi_encode()
                 .into(),
         ]);
@@ -2036,7 +2097,7 @@ mod tests {
 
     /// The already-tracked path enumerates and reaches the stranded sweep
     /// rather than returning early (#2078). Proven by mock consumption: the
-    /// queue holds exactly `getPools` + two `getPool`s, and the transport
+    /// queue holds exactly `getPools` + three `getPool`s, and the transport
     /// errors on an unexpected call, so a build that returned early would
     /// leave responses unspent and a build that over-called would fault.
     #[tokio::test]
@@ -2050,12 +2111,18 @@ mod tests {
         let stranded_b = PoolId::from([0xBB; 32]);
 
         let contract = mocked_pool_contract(vec![
-            vec![stranded_a, stranded_b].abi_encode().into(),
-            // Walked newest-first, so `stranded_b` is read before `stranded_a`.
+            vec![existing, stranded_a, stranded_b].abi_encode().into(),
+            // Walked newest-first: `stranded_b`, `stranded_a`, then `existing`.
+            // `existing` is listed open because that is the steady state this
+            // test describes — the tracked pool is live and the other two are
+            // deposits an earlier build left behind.
             onchain_pool(owner, PaymentPool::Status::Open, 8_000)
                 .abi_encode()
                 .into(),
             onchain_pool(owner, PaymentPool::Status::Open, 9_000)
+                .abi_encode()
+                .into(),
+            onchain_pool(owner, PaymentPool::Status::Open, 5_000)
                 .abi_encode()
                 .into(),
         ]);
@@ -2078,7 +2145,89 @@ mod tests {
         );
     }
 
-    /// A failed enumeration on the already-tracked path is a warning, not an
+    /// A row pointing at a pool the chain no longer lists as open is dropped,
+    /// and another open pool is adopted in its place (#2081 review).
+    ///
+    /// This is the state the node-host `decdn pool close --pool` path leaves
+    /// behind: it cannot write the daemon's store, so the row survives the
+    /// close. Without this, `adoption_applies` answers `AlreadyTracked`
+    /// forever, `reuse_or_report` keeps pinning every pull to a closed pool,
+    /// and `redeemMany` rejects every voucher signed against it — a node that
+    /// streams bytes it can never pay for. Restarting alone did not heal it.
+    #[tokio::test]
+    async fn a_tracked_pool_the_chain_has_closed_is_dropped_and_replaced() {
+        use alloy::sol_types::SolValue;
+
+        let owner = Address::repeat_byte(1);
+        let token = Address::repeat_byte(2);
+        let closed = PoolId::from([9u8; 32]);
+        let live = PoolId::from([0xAA; 32]);
+
+        // The chain lists only the live pool as open; `closed` is absent from
+        // `getPools`, exactly as a reclaimed pool would be.
+        let contract = mocked_pool_contract(vec![
+            vec![live].abi_encode().into(),
+            onchain_pool(owner, PaymentPool::Status::Open, 9_000)
+                .abi_encode()
+                .into(),
+        ]);
+        let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+        store
+            .record(&BuyerPoolState::new(
+                closed,
+                owner,
+                token,
+                U256::from(5_000u64),
+            ))
+            .unwrap();
+
+        assert!(
+            reconcile_owned_pool(&contract, &store, owner, token, &metrics()).await,
+            "a stale row must not block adoption of a pool this owner really holds"
+        );
+        assert_eq!(
+            store.get_by_owner(owner).unwrap().unwrap().pool_id,
+            live,
+            "the stale row must be replaced by the live pool, not kept beside it"
+        );
+    }
+
+    /// The same stale row with nothing to replace it is still dropped, so the
+    /// next miss opens a fresh pool rather than reusing the closed one.
+    #[tokio::test]
+    async fn a_stale_row_is_dropped_even_when_no_other_pool_is_open() {
+        use alloy::sol_types::SolValue;
+
+        let owner = Address::repeat_byte(1);
+        let token = Address::repeat_byte(2);
+        let closed = PoolId::from([9u8; 32]);
+
+        // `getPools` still lists it, but its status is `Closed`, so it is not
+        // in the open set.
+        let contract = mocked_pool_contract(vec![
+            vec![closed].abi_encode().into(),
+            onchain_pool(owner, PaymentPool::Status::Closed, 5_000)
+                .abi_encode()
+                .into(),
+        ]);
+        let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+        store
+            .record(&BuyerPoolState::new(
+                closed,
+                owner,
+                token,
+                U256::from(5_000u64),
+            ))
+            .unwrap();
+
+        assert!(!reconcile_owned_pool(&contract, &store, owner, token, &metrics()).await);
+        assert!(
+            store.get_by_owner(owner).unwrap().is_none(),
+            "the row must be gone so the next miss opens a fresh pool"
+        );
+    }
+
+    /// A failed enumeration on the already-tracked path is a warning, not an    /// A failed enumeration on the already-tracked path is a warning, not an
     /// adoption failure. The counter's meaning — and the runbook's reading of
     /// it — is "about to open a second pool", which this path never is.
     #[tokio::test]

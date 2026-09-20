@@ -639,6 +639,12 @@ pub const BUYER_POOL_STORE_ERROR_CODE: i32 = -32_010;
 /// pulls" and "this node owns no pools" demand opposite responses from an
 /// operator hunting a stranded deposit, and rendering the first as the second
 /// is the ambiguity this method exists to remove.
+///
+/// The production runtime always attaches the buyer store, so a running daemon
+/// does not answer this today; it covers a test or future CLI-only bring-up
+/// that raises the admin surface without a buy leg, the same posture as
+/// [`DHT_UNAVAILABLE_CODE`]. The alternative for that arm would be an empty
+/// list, which is the answer this code exists to avoid giving.
 pub const BUYER_POOL_UNAVAILABLE_CODE: i32 = -32_011;
 
 /// Admin RPC surface. Versioned via the namespace prefix

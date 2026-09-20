@@ -90,21 +90,21 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 use serde::{Deserialize, Serialize};
 
 /// File name of the seller lane redb database within `data_dir`.
-const LANES_DB_FILE: &str = "lanes.redb";
+const LANES_DB_FILE: &str = decdn_common::data_dir::NODE_LANES_DB_FILE;
 
 /// File name of the pending-settle redb database (seller and buyer sets).
-const SETTLE_DB_FILE: &str = "settle.redb";
+const SETTLE_DB_FILE: &str = decdn_common::data_dir::NODE_SETTLE_DB_FILE;
 
 /// File name of the settlement-watcher checkpoint redb database.
-const CHECKPOINT_DB_FILE: &str = "checkpoint.redb";
+const CHECKPOINT_DB_FILE: &str = decdn_common::data_dir::NODE_CHECKPOINT_DB_FILE;
 
 /// File name of the buyer pool redb database (buyer state + owner index).
 ///
-/// Shared with the CLI through [`decdn_incentive::buyer_pool_table`] so both
-/// sides name the same file: an operator tool that wants this store has to know
-/// it is not the client's
-/// [`CLIENT_BUYER_DB_FILE`](decdn_incentive::buyer_pool_table::CLIENT_BUYER_DB_FILE).
-const BUYER_DB_FILE: &str = decdn_incentive::buyer_pool_table::NODE_BUYER_DB_FILE;
+/// Shared with the CLI through [`decdn_common::data_dir`] so both sides name
+/// the same file: an operator tool that wants this store has to know it is not
+/// the client's
+/// [`CLIENT_BUYER_DB_FILE`](decdn_common::data_dir::CLIENT_BUYER_DB_FILE).
+const BUYER_DB_FILE: &str = decdn_common::data_dir::NODE_BUYER_DB_FILE;
 
 /// Byte width of a [`LaneKey`] on disk: `pool_id ‖ signer ‖ provider` =
 /// `32 + 20 + 20`.

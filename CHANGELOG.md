@@ -29,11 +29,15 @@ since project inception and will roll into the first tagged release.
 ### Changed (BREAKING)
 
 - **CLI: `decdn pool` refuses to write a store a `decdn-node` daemon owns
-  (#2078).** Every `pool` subcommand used `<data_dir>/buyer-pools.redb`, the
-  *client's* store. A daemon keeps its buyer state in `<data_dir>/buyer.redb`, so
+  (#2078).** Every store-backed `pool` subcommand — `list`, `open`, `top-up`,
+  `close`, `reclaim`; `assign` touches no store — used
+  `<data_dir>/buyer-pools.redb`, the *client's* store. A daemon keeps its buyer state in `<data_dir>/buyer.redb`, so
   on a node host the CLI read and wrote a different file than the node it was
   pointed at — and `Database::create` manufactured that file where none existed.
-  A data dir containing `buyer.redb` is now recognized as a daemon's:
+  A data dir containing any of the daemon's store files (`buyer.redb`,
+  `lanes.redb`, `settle.redb`, `checkpoint.redb` — the whole set, because the
+  buyer store is exactly the file a reset loses) is now recognized as a
+  daemon's:
   `pool open` and `pool top-up` refuse (they escrow USDC into a store the node
   never reads, which is exactly the stranded deposit #2075 exists to prevent);
   `close --all` and `reclaim --all` refuse (they enumerate from chain by keystore
@@ -744,6 +748,15 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+- **Node: a buyer-pool row the chain no longer lists as open wedged the buy leg
+  (#2078).** `reuse_or_report` reads the tracked row without a status check, and
+  bootstrap answered `AlreadyTracked` for any row at all, so a pool closed or
+  reclaimed out of band — which is what `decdn pool close --pool` from a node
+  host leaves behind, since it cannot write the daemon's store — pinned every
+  later pull to a pool `redeemMany` rejects every voucher against. Restarting
+  did not help. Bootstrap now checks the tracked pool against the chain's open
+  set, drops a stale row, and adopts or opens a replacement.
 
 - **Node: a node with an intact buyer store never reported its stranded pools
   (#2078).** `reconcile_owned_pool` returned as soon as the store named a tracked

@@ -496,14 +496,26 @@ other.
    `this node owns further open payment pools it is not using`, which lists the
    stranded ids, and — only when an adoption happened — `adopted this node's
    existing on-chain payment pool`. The stranded warning fires whether or not
-   anything was adopted, so its absence means there is nothing stranded.
+   anything was adopted.
+
+   Absence of that warning only means "nothing stranded" **if the sweep
+   completed**. A failed enumeration logs `could not enumerate this node's
+   on-chain pools` and returns without sweeping, and an unreadable individual
+   pool logs `could not read an owned pool's state; skipping it`. Either line
+   means the answer is unknown, not clean — fix the RPC endpoint and restart to
+   re-run the sweep.
 3. Recover those with `decdn pool close --pool <poolId>`, then
    `decdn pool reclaim --pool <poolId>` once the pool's `disputeWindow` has
    elapsed (48-72h, governance-set). Both commands run their on-chain leg
    normally from a node host but leave the daemon's row alone — they cannot
-   write a store the daemon holds — and say so. If you closed the pool the
-   daemon was using, restart `decdn-node` so its bootstrap re-adopts, and
-   confirm with `decdn node pools`.
+   write a store the daemon holds — and say so.
+
+   If you closed the pool the daemon was using, restart `decdn-node`. Its
+   bootstrap checks the tracked pool against the chain's open set, drops a row
+   whose pool is no longer open, and adopts or opens a replacement
+   (`the tracked buyer pool is no longer open on chain`). Until that restart the
+   node keeps pinning its pulls to the closed pool and every voucher it signs is
+   rejected at redemption, so do not defer it. Confirm with `decdn node pools`.
 4. `close --all` and `reclaim --all` are refused on a node's data dir. They
    enumerate from chain by keystore address, so on a node host they would close
    the pool the daemon is paying from right now. Name the stranded pools
