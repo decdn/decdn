@@ -1143,7 +1143,7 @@ impl BuyerPoolStoreHandle {
         Self { inner }
     }
 
-    /// View this store's `lanes.redb` as the buyer pool table.
+    /// View this store's `buyer.redb` as the buyer pool table.
     ///
     /// Not `const` — it derefs the `Arc`, which const fns cannot do.
     fn table(&self) -> BuyerPoolTable<'_> {
@@ -1628,6 +1628,38 @@ mod tests {
             anyhow::ensure!(
                 mode == DB_FILE_MODE,
                 "{file} mode {mode:o} != expected {DB_FILE_MODE:o}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `decdn_common::data_dir::DAEMON_STORE_FILES` claims that a daemon's
+    /// bring-up creates every file in the set and nothing outside it. That
+    /// claim is what `daemon_marker` — and therefore the CLI's node-vs-client
+    /// classification (#2078) — rests on, so it is checked here rather than
+    /// asserted in prose. A fifth store added to `open_with` without a matching
+    /// entry in the set fails this test.
+    #[test]
+    fn open_creates_exactly_the_daemon_store_files() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let _store = PersistentPoolStateStore::open(dir.path())?;
+
+        for file in decdn_common::data_dir::DAEMON_STORE_FILES {
+            anyhow::ensure!(
+                dir.path().join(file).exists(),
+                "{file} is in DAEMON_STORE_FILES but open() did not create it"
+            );
+        }
+
+        for entry in std::fs::read_dir(dir.path())? {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with(".redb") {
+                continue;
+            }
+            anyhow::ensure!(
+                decdn_common::data_dir::DAEMON_STORE_FILES.contains(&name.as_ref()),
+                "open() created {name}, which DAEMON_STORE_FILES does not name"
             );
         }
         Ok(())

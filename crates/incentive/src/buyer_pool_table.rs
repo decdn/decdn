@@ -9,11 +9,11 @@
 //!   `buyer-pools.redb` for the client (`decdn fetch`, #940). (Code span,
 //!   not a link: that module exists only under the `redb` feature, so
 //!   linking it would break a `buyer-store-core`-only doc build.)
-//! - `decdn-node`'s `pool_store::PersistentPoolStateStore` owns the buyer
+//! - `decdn-node`'s `channel_store::PersistentPoolStateStore` owns the buyer
 //!   table in its own `buyer.redb`, one of the per-family redb files it opens
-//!   under `data_dir` (the seller lane, pending-settle, floor-loss, and
-//!   watcher-checkpoint families each get their own file too, so no family's
-//!   commit waits on another's writer slot).
+//!   under `data_dir` (the seller lane, pending-settle, and watcher-checkpoint
+//!   families each get their own file too, so no family's commit waits on
+//!   another's writer slot).
 //!
 //! That is a file-ownership difference, not a logic difference, so both
 //! stores supply only their own `Database` and delegate the actual work to

@@ -268,17 +268,25 @@ pub(crate) fn evaluate_receipts(facts: &FileFacts, path: &Path) -> Finding {
     }
 }
 
+/// Every store file the doctor checks in a data dir: the daemon's own set,
+/// plus the client store a `decdn fetch` / `decdn pool` invocation leaves
+/// behind when it is pointed at the same directory.
+///
+/// Sourced from [`decdn_common::data_dir`] rather than spelled here, so a fifth
+/// daemon store reaches the permission and zero-length checks with the same
+/// edit that teaches `daemon_marker` about it. A private copy drifts: it once
+/// listed a `floor-loss.redb` that nothing creates.
+fn checked_store_files() -> impl Iterator<Item = &'static str> {
+    decdn_common::data_dir::DAEMON_STORE_FILES
+        .iter()
+        .copied()
+        .chain(std::iter::once(
+            decdn_common::data_dir::CLIENT_BUYER_DB_FILE,
+        ))
+}
+
 /// Push all state-group findings.
 pub(crate) fn check_state(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bool) {
-    const REDB: &[&str] = &[
-        "lanes.redb",
-        "settle.redb",
-        "floor-loss.redb",
-        "checkpoint.redb",
-        "buyer.redb",
-        "buyer-pools.redb",
-    ];
-
     let data_dir = &cfg.identity.data_dir;
 
     let secret_path = data_dir.join("node.secret");
@@ -291,7 +299,7 @@ pub(crate) fn check_state(report: &mut Report, cfg: &ResolvedConfig, daemon_runn
     report.push(evaluate_keystore(&FileFacts::read(keystore), keystore));
 
     // redb stores.
-    for name in REDB {
+    for name in checked_store_files() {
         let path = data_dir.join(name);
         let facts = FileFacts::read(&path);
         report.push(evaluate_redb(name, &facts, &path));
@@ -581,5 +589,22 @@ mod tests {
         assert_eq!(f.id, "state.receipts");
         assert_eq!(f.severity, Severity::Warn);
         assert!(f.title.to_lowercase().contains("cannot stat"));
+    }
+
+    /// The doctor's list is the shared one, so a store added to
+    /// `DAEMON_STORE_FILES` is checked here without a second edit — and a name
+    /// nothing creates cannot linger in it.
+    #[test]
+    fn checked_files_are_the_shared_store_names() {
+        let checked: Vec<&str> = checked_store_files().collect();
+        for name in decdn_common::data_dir::DAEMON_STORE_FILES {
+            assert!(checked.contains(name), "{name} is unchecked");
+        }
+        assert!(checked.contains(&decdn_common::data_dir::CLIENT_BUYER_DB_FILE));
+        assert_eq!(
+            checked.len(),
+            decdn_common::data_dir::DAEMON_STORE_FILES.len() + 1,
+            "the doctor checks a file no store owns: {checked:?}"
+        );
     }
 }
