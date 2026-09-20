@@ -180,8 +180,26 @@ pub struct DecdnMetrics {
     streams_active: Family<StreamLabels, Gauge>,
     /// Currently open inbound serve lanes (distinct `(pool, signer, provider)` keys).
     pub lanes_open: Gauge,
-    /// Total raw USDC deposits across the pools currently paying this node.
+    /// Raw USDC still recoverable from the pools currently paying this node:
+    /// `Σ (deposit − totalRedeemed)` over the distinct pools the redeemer
+    /// planned lanes against, refreshed once per redeemer self-tick beside
+    /// [`Self::unredeemed_usdc`]. Already-redeemed funds have left the pool, so
+    /// this is the ceiling those pools can still pay — not their lifetime
+    /// deposits. Operator-visible name: `decdn_pool_deposit_usdc`.
     pub pool_deposit_usdc: Gauge,
+    /// Raw USDC in this node's own buyer wallet — what it can still escrow as a
+    /// deposit when it opens a payment pool on its cache-miss leg.
+    ///
+    /// The buyer leg is the one part of the node that spends rather than earns,
+    /// and nothing else reports on it: an operator who never funds this wallet
+    /// sees a node that serves perfectly and silently buys nothing, because
+    /// every `openPool` reverts on the ERC-20 transfer. Read once per
+    /// buyer-wallet tick, so it lags a spend by up to one interval.
+    ///
+    /// Zero is meaningful only on a node with
+    /// `cache.node_to_node_pull_through_enabled` on; a cache-only node never
+    /// opens a pool and has no reason to hold USDC.
+    pub buyer_wallet_usdc: Gauge,
     /// Total raw USDC this node holds in accepted vouchers that it has not yet
     /// redeemed on-chain — the sum of `owed − paid` across every inbound lane
     /// the redeemer plans to collect. Refreshed once per redeemer self-tick
@@ -1775,10 +1793,29 @@ impl Metrics {
         Arc::clone(&self.cache)
     }
 
-    /// Replace the inbound lane gauges with a snapshot from the live store.
-    pub(crate) fn set_inbound_lane_snapshot(&self, open: usize, deposit: U256) {
+    /// Publish the count of inbound lanes the node holds open.
+    ///
+    /// Lane-scoped on purpose: the pool deposit behind those lanes is a
+    /// pool-level on-chain quantity that no lane carries, so it is published
+    /// separately by [`Self::set_pool_deposit_usdc`] on the redeemer's tick.
+    /// Reporting both from here is what left `decdn_pool_deposit_usdc` pinned
+    /// at zero, since every caller of the old two-value setter had only a lane
+    /// count to give it (#2072).
+    pub(crate) fn set_lanes_open(&self, open: usize) {
         self.decdn.lanes_open.set(sat(open));
-        self.decdn.pool_deposit_usdc.set(sat_u256(deposit));
+    }
+
+    /// Publish the on-chain value still recoverable from the pools currently
+    /// paying this node — `Σ (deposit − totalRedeemed)` over the distinct pools
+    /// the redeemer planned lanes against.
+    ///
+    /// Called once per redeemer self-tick beside
+    /// [`Self::set_unredeemed_usdc`], so the two money gauges share a cadence
+    /// and can be read against each other: `unredeemed` is what the node has
+    /// earned and not yet cashed, and this is the ceiling the pools can still
+    /// pay it.
+    pub(crate) fn set_pool_deposit_usdc(&self, remaining: U256) {
+        self.decdn.pool_deposit_usdc.set(sat_u256(remaining));
     }
 
     /// Publish the total raw USDC held in accepted-but-unredeemed vouchers.
@@ -1786,6 +1823,11 @@ impl Metrics {
     /// gauge tracks what the node plans to redeem as of the last interval.
     pub(crate) fn set_unredeemed_usdc(&self, total: U256) {
         self.decdn.unredeemed_usdc.set(sat_u256(total));
+    }
+
+    /// Publish the USDC balance of this node's own buyer wallet.
+    pub(crate) fn set_buyer_wallet_usdc(&self, balance: U256) {
+        self.decdn.buyer_wallet_usdc.set(sat_u256(balance));
     }
 
     /// Register iroh's transport metrics under the `decdn_iroh_` prefix so

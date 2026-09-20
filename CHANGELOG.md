@@ -727,6 +727,49 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Node: a reset buyer-pool store stranded the node's deposit and wedged every
+  node-to-node pull (#2072).** The buyer store was the only record that the node
+  owned a `PaymentPool` deposit, so a moved or re-provisioned `identity.data_dir`
+  lost it. The node then opened a second deposit beside the first, forgot that one
+  too, and once the wallet was drained every cache-miss pull failed
+  `ERC20: transfer amount exceeds balance` with its own escrow sitting idle
+  on-chain — contradicting ADR 003 §node→node ("a pool is opened once and reused",
+  "owner funds are never stranded"). `BuyerPoolService::bootstrap` now reconciles
+  against `PaymentPool.getPools` and adopts the newest `Open` pool the owner
+  already holds; adoption failure is soft, leaving the first miss to open one the
+  old way. A lane with no local progress reseeds from the contract's
+  `watermark(pool, signer, provider)`, because `PoolLedger` signs `prior + accrued`
+  and resuming a paid lane from zero signs cumulatives the contract pays nothing
+  for. `enumerate_owned_pools` moved from `decdn-cli` to
+  `decdn_incentive::payment_pool` so both binaries share one pager.
+
+- **Node: one failed `openPool` moved `node_pull_pool_open_failures_total` twice,
+  and blamed the wrong host (#2072).** `run_open`'s `openPool` leg metered the
+  counter without marking the error `OpenReported`, so the `node_origin` classifier
+  counted it again in its residual arm — the live fleet read 46 pool-open failures
+  against 23 pull attempts. That fall-through also scored a chain revert as
+  `node_pull_local_fault_total` and logged "suspect this node's store or lock
+  state" for an on-chain failure. The leg now meters once where it is raised,
+  marks `OpenReported`, and adds `LocalPullFault` only for an insufficient
+  deposit — a wallet that cannot fund a deposit can pay no provider. The ladder's
+  arm choice is a pure `classify_pool_open_arm`, so the one-increment invariant is
+  unit tested.
+
+- **Incentive: an under-funded wallet was classified `contract_revert` (#2072).**
+  `PoolOpenFailureReason` matched only `OpenZeppelin` v5 custom errors, so a USDC
+  that reverts `Error("ERC20: transfer amount exceeds balance")` — the deployed
+  Sepolia token — reported as an opaque on-chain fault naming no remedy. String
+  reverts now classify as `insufficient_deposit` on their message.
+
+- **Metrics: `decdn_pool_deposit_usdc` was hardcoded to zero (#2072).** Both
+  callers of the seller-side lane snapshot passed `U256::ZERO`, because a lane
+  carries no pool deposit — the gauge has read zero since #1667 while
+  `adr/appendix-observability.md` documented it `live`, and the name gate only
+  checks that a series is exported, not that anything sets it. The redeemer tick
+  now publishes `Σ (deposit − totalRedeemed)` over the pools it plans lanes
+  against, beside `decdn_unredeemed_usdc`; the lane count gets its own
+  `set_lanes_open`.
+
 - **Cache: origin range pulls held the whole requested span in memory — twice
   (#2065).** A few multi-GB range requests against a partially held blob OOM-killed
   the node. `CacheEngine::pull_through_range` now reads the `{H}.obao4` outboard once
@@ -1758,6 +1801,16 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+- **Metrics: the node reports its own buyer wallet (#2072).** New gauge
+  `decdn_buyer_wallet_usdc`, read once per reclaim sweep and at bootstrap. The
+  buyer leg is the one part of the node that spends rather than earns, and
+  nothing reported on it: an operator who never funded the wallet saw a node that
+  served perfectly and silently bought nothing. Two alerts go with it —
+  `DecdnBuyerWalletUnfunded` (below one working deposit, scoped to nodes that
+  actually pull) and `DecdnNodePullNeverSucceeds` (attempts with no success over
+  6h), plus a `docs/runbook.md` section covering wallet funding and recovering a
+  pool the node has forgotten.
 
 - **Metrics: the serve path reports its own cache hit rate.** New siblings
   `decdn_serve_cache_{hit,partial_hit,miss}_total`, bumped at the

@@ -25,7 +25,7 @@ use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
-use decdn_incentive::payment_pool::PaymentPool;
+use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
 use decdn_incentive::{Capability, CapabilityGrant, PoolId, voucher_domain};
 use serde::Serialize;
 
@@ -390,39 +390,6 @@ fn batch_result(tally: &BatchTally, verb: &str) -> anyhow::Result<()> {
         tally.failed
     );
     Ok(())
-}
-
-/// Every pool id this `owner` has opened, read from chain oldest-first by paging
-/// `getPools`. Chain-authoritative: unlike the local buyer store (which drops a
-/// row at close), this enumerates pools in every lifecycle state, which is what
-/// `--all` needs to reach historical `Closing` pools awaiting reclaim.
-async fn enumerate_owned_pools<P>(
-    contract: &PaymentPool::PaymentPoolInstance<P>,
-    owner: Address,
-) -> anyhow::Result<Vec<PoolId>>
-where
-    P: alloy::providers::Provider + Clone,
-{
-    // `getPools` clamps `limit` to the remaining count and returns an empty page
-    // once `offset` passes the owner's nonce, so a short page ends the walk
-    // without a separate `ownerPoolNonce` read.
-    const PAGE: usize = 256;
-    let mut ids = Vec::new();
-    let mut offset: u64 = 0;
-    loop {
-        let page = contract
-            .getPools(owner, U256::from(offset), U256::from(PAGE))
-            .call()
-            .await
-            .map_err(|e| anyhow::anyhow!("getPools(offset={offset}) failed: {e}"))?;
-        let n = page.len();
-        ids.extend(page);
-        if n < PAGE {
-            break;
-        }
-        offset = offset.saturating_add(u64::try_from(n)?);
-    }
-    Ok(ids)
 }
 
 /// Send `closePool(pool_id)`, wait for the receipt, and on success clear the
