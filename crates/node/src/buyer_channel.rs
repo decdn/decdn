@@ -805,7 +805,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         }
         let onchain = match self
             .contract
-            .watermark(state.pool_id, lane.signer, provider_addr)
+            .getWatermark(state.pool_id, lane.signer, provider_addr)
             .call()
             .await
         {
@@ -836,7 +836,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// Commit one lane seed read from the chain, reporting whether the store now
     /// holds it. Split from [`Self::reseed_lane_from_chain`] so the read, the
     /// decision and the write each stay legible on their own.
-    fn persist_lane_seed(&self, lane: LaneKey, onchain: &PaymentPool::watermarkReturn) -> bool {
+    fn persist_lane_seed(&self, lane: LaneKey, onchain: &PaymentPool::Lane) -> bool {
         match self.store.advance_progress(
             self.owner,
             lane.pool_id,
@@ -1764,9 +1764,17 @@ mod tests {
         );
         store.record(&adopted).unwrap();
 
-        // `watermark(...)` returns the Lane struct flattened to (uint64, uint64).
+        // `getWatermark(...)` returns one `Lane`; the struct is a static tuple,
+        // so its `SolValue` encoding equals the single-struct return.
         let service = mocked_service(
-            vec![(191_205u64, 4_096u64).abi_encode_sequence().into()],
+            vec![
+                PaymentPool::Lane {
+                    amount: 191_205,
+                    bytesDelivered: 4_096,
+                }
+                .abi_encode()
+                .into(),
+            ],
             Arc::clone(&store),
             Arc::clone(&signer),
             owner,
@@ -1832,7 +1840,14 @@ mod tests {
         );
         let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
         let service = mocked_service(
-            vec![(0u64, 0u64).abi_encode_sequence().into()],
+            vec![
+                PaymentPool::Lane {
+                    amount: 0,
+                    bytesDelivered: 0,
+                }
+                .abi_encode()
+                .into(),
+            ],
             Arc::clone(&store),
             Arc::clone(&signer),
             owner,

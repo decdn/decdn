@@ -203,6 +203,14 @@ mod sol_types {
 
             /// A `(signer, provider)` lane's cumulative-paid amount and
             /// cumulative paid-proportional bytes delivered.
+            ///
+            /// Read by the seller's pre-redeem reconciliation, and by the buyer
+            /// to reseed a lane whose local progress it has lost: a voucher at
+            /// or below the watermark is a transient-empty redemption that pays
+            /// nothing, so a buyer resuming from zero would stream bytes nobody
+            /// can cash. It reflects *redeemed* vouchers only — a provider still
+            /// holding an unredeemed voucher is ahead of it, by at most its own
+            /// redemption threshold.
             function getWatermark(bytes32 poolId, address signer, address provider)
                 external
                 view
@@ -227,23 +235,6 @@ mod sol_types {
                 view
                 returns (bytes32[] memory);
 
-            /// Per-`(pool, signer, provider)` redemption lane (public mapping
-            /// getter; the `Lane` struct is returned flattened). Both fields
-            /// are watermarks that only ever advance, so this is the chain's
-            /// answer to "what cumulative has this lane already been paid".
-            ///
-            /// The buyer reads it to reseed a lane whose local progress it has
-            /// lost: a voucher at or below the watermark is a transient-empty
-            /// redemption that pays nothing, so a buyer that resumed from zero
-            /// would stream bytes nobody can cash.
-            ///
-            /// It reflects *redeemed* vouchers only. A provider still holding
-            /// an unredeemed voucher is ahead of it, by at most its own
-            /// redemption threshold.
-            function watermark(bytes32 poolId, address signer, address provider)
-                external
-                view
-                returns (uint64 amount, uint64 bytesDelivered);
 
             // -----------------------------------------------------------------
             // Write functions (owner path)
