@@ -785,23 +785,33 @@ pub struct DecdnMetrics {
     /// [`Outcome::RegionLatencyMismatch`]: decdn_reputation::Outcome::RegionLatencyMismatch
     pub node_region_latency_penalty: Counter,
     /// `decdn_node_pull_pool_open_failures_total` (#831): a buyer
-    /// `open_or_reuse_channel` failed before a pull could start. This is the
-    /// node's own payment-side fault (gas, RPC, expired channel), NOT the
+    /// `open_or_reuse_pool` failed before a pull could start. This is the
+    /// node's own payment-side fault (gas, RPC, expired pool), NOT the
     /// provider's — a sustained rate means node→node buying is wedged. This is
     /// the *unlabeled total* across all causes; the
     /// `pool_open_failures_*_total` family below (#966) breaks the
-    /// `openChannel`-tx failures out by cause so an operator can tell a
+    /// `openPool`-tx failures out by cause so an operator can tell a
     /// misconfiguration (`insufficient_deposit`) from infrastructure
     /// (`rpc_error`). It also covers store/expired-reclaim causes the by-reason
     /// family does not, so the two are not expected to sum equal.
+    ///
+    /// **One failure moves this counter once.** A site increments it if and only
+    /// if it marks the error `OpenReported`, which is what stops the classifier
+    /// in `node_origin` from restating a failure the open task already counted.
+    /// Against `node_pull_attempts_total` this reads above 1.0 legitimately — a
+    /// pull orchestration meters one attempt and may open a lane per candidate
+    /// and per assembled run — but a clean 2× ratio is the signature of a leg
+    /// that meters without marking (#2072).
     pub node_pull_pool_open_failures: Counter,
     /// `decdn_pool_open_failures_insufficient_deposit_total` (#966): a buyer
-    /// `openChannel` tx reverted because the node's USDC balance/allowance could
+    /// `openPool` tx reverted because the node's USDC balance/allowance could
     /// not cover the deposit, or the deposit was zero — either as requested, or
     /// as the balance delta actually received under a fee-on-transfer token.
     /// Both zero cases revert the same argument-less `ZeroAmount`, so this
     /// counter cannot separate them; the wallet balance is what distinguishes a
-    /// misconfigured deposit from a token that shaved it. A *misconfiguration*
+    /// misconfigured deposit from a token that shaved it. A token that reverts
+    /// in the older `Error(string)` style lands here too, matched on its message
+    /// rather than a custom-error selector. A *misconfiguration*
     /// signal either way — the fix is operator-side (fund the wallet, raise the
     /// configured deposit), not infrastructure. A plain counter
     /// field carries no label dimension (a labeled series would need a `Family`),
@@ -811,13 +821,13 @@ pub struct DecdnMetrics {
     /// the `_total` suffix.
     pub pool_open_failures_insufficient_deposit: Counter,
     /// `decdn_pool_open_failures_contract_revert_total` (#966): a buyer
-    /// `openChannel` tx reverted on-chain for a reason other than insufficient
+    /// `openPool` tx reverted on-chain for a reason other than insufficient
     /// deposit (provider not active, a paused contract, a mined revert whose
     /// reason is not recoverable from the receipt). The deposit was not
     /// escrowed; the cause is on-chain state, not this node's wallet or RPC.
     pub pool_open_failures_contract_revert: Counter,
     /// `decdn_pool_open_failures_rpc_error_total` (#966): a buyer
-    /// `openChannel` submit or receipt wait failed at the transport layer (no
+    /// `openPool` submit or receipt wait failed at the transport layer (no
     /// revert data) — connectivity, a timed-out receipt, a nonce blip. A
     /// *transient infrastructure* signal; retrying typically clears it. Pair
     /// with the two reverting counters above to tell "operator under-funded the

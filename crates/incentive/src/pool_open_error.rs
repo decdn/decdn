@@ -32,11 +32,14 @@
 //! (caught at gas estimation, so it surfaces on `send()` before a receipt),
 //! whereas a transport fault carries none. A present revert selector is decoded
 //! against the known insufficient-deposit error signatures to split
-//! `InsufficientDeposit` from a generic `ContractRevert`.
+//! `InsufficientDeposit` from a generic `ContractRevert`. A token that reverts
+//! in the older `Error(string)` style carries no custom-error selector, so its
+//! message is matched for the same shortfall — an under-funded wallet reads as
+//! `InsufficientDeposit` whichever revert style the deployed USDC uses.
 
 use alloy::primitives::Bytes;
 use alloy::sol;
-use alloy::sol_types::SolError;
+use alloy::sol_types::{Revert, SolError};
 
 sol! {
     /// `PaymentPool.openPool` reverts this when the requested deposit — or
@@ -144,6 +147,9 @@ impl std::fmt::Display for PoolOpenFailureReason {
 /// insufficient-deposit error selectors (the leading 4 bytes). A too-short
 /// payload (no full selector) is treated as not-matching, so it falls through to
 /// the generic `ContractRevert` class rather than panicking on a slice.
+///
+/// A token that predates custom errors reverts `Error(string)` instead, so the
+/// string payload is matched as well — see [`is_erc20_shortfall_string`].
 fn is_insufficient_deposit_selector(revert_data: &[u8]) -> bool {
     let Some(selector) = revert_data.get(..4) else {
         return false;
@@ -152,18 +158,55 @@ fn is_insufficient_deposit_selector(revert_data: &[u8]) -> bool {
         || selector == BelowMinDeposit::SELECTOR
         || selector == ERC20InsufficientBalance::SELECTOR
         || selector == ERC20InsufficientAllowance::SELECTOR
+        || is_erc20_shortfall_string(revert_data)
+}
+
+/// Whether `revert_data` is a solidity `Error(string)` revert whose message is
+/// an ERC-20 balance or allowance shortfall.
+///
+/// `PaymentPool.openPool` bubbles whatever its `safeTransferFrom` reverts, and
+/// the USDC deployments the network settles against are not all
+/// `OpenZeppelin` v5: a token built on the string-revert `require` style emits
+/// `Error("ERC20: transfer amount exceeds balance")` rather than the
+/// `ERC20InsufficientBalance` custom error. Both mean the same thing to an
+/// operator — fund the wallet — so both classify as
+/// [`PoolOpenFailureReason::InsufficientDeposit`]. Matching on the message
+/// text is what the payload affords: a string revert carries no structured
+/// discriminant, and the alternative is reporting an under-funded wallet as an
+/// opaque `ContractRevert` that names no remedy.
+fn is_erc20_shortfall_string(revert_data: &[u8]) -> bool {
+    let Some(reason) = Revert::abi_decode(revert_data).ok().map(|r| r.reason) else {
+        return false;
+    };
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("exceeds balance")
+        || reason.contains("insufficient balance")
+        || reason.contains("exceeds allowance")
+        || reason.contains("insufficient allowance")
 }
 
 /// Whether an ERC-20 revert is specifically an *allowance* shortfall
 /// (`ERC20InsufficientAllowance`) — the one class a just-in-time `approve`
 /// can fix. An insufficient-balance revert, a zero-amount revert, or any
 /// other selector returns `false`: an `approve` cannot recover those, so the
-/// caller must treat them as terminal. Pass alloy's `Error::as_revert_data()`.
+/// caller must treat them as terminal. A string-revert token spells the same
+/// shortfall as `Error("ERC20: insufficient allowance")`, which counts too.
+/// Pass alloy's `Error::as_revert_data()`.
 #[must_use]
 pub fn is_erc20_allowance_shortfall(revert_data: Option<&Bytes>) -> bool {
-    revert_data
-        .and_then(|data| data.get(..4))
+    let Some(data) = revert_data else {
+        return false;
+    };
+    if data
+        .get(..4)
         .is_some_and(|selector| selector == ERC20InsufficientAllowance::SELECTOR)
+    {
+        return true;
+    }
+    Revert::abi_decode(data).is_ok_and(|r| {
+        let reason = r.reason.to_ascii_lowercase();
+        reason.contains("exceeds allowance") || reason.contains("insufficient allowance")
+    })
 }
 
 #[cfg(test)]
@@ -233,6 +276,59 @@ mod tests {
             PoolOpenFailureReason::classify_revert_data(Some(&data)),
             PoolOpenFailureReason::InsufficientDeposit
         );
+    }
+
+    /// The exact payload the live fleet's USDC reverted `openPool` with: a
+    /// string-revert token, not `OpenZeppelin` v5. Classifying this as
+    /// `ContractRevert` is what left an under-funded wallet reported as an
+    /// opaque on-chain fault naming no remedy.
+    #[test]
+    fn erc20_string_revert_balance_is_insufficient_deposit() {
+        let data = Bytes::from(
+            Revert::from("ERC20: transfer amount exceeds balance".to_owned()).abi_encode(),
+        );
+        assert_eq!(
+            PoolOpenFailureReason::classify_revert_data(Some(&data)),
+            PoolOpenFailureReason::InsufficientDeposit
+        );
+    }
+
+    #[test]
+    fn erc20_string_revert_allowance_is_insufficient_deposit_and_a_shortfall() {
+        for reason in [
+            "ERC20: insufficient allowance",
+            "ERC20: transfer amount exceeds allowance",
+        ] {
+            let data = Bytes::from(Revert::from(reason.to_owned()).abi_encode());
+            assert_eq!(
+                PoolOpenFailureReason::classify_revert_data(Some(&data)),
+                PoolOpenFailureReason::InsufficientDeposit,
+                "{reason}"
+            );
+            assert!(is_erc20_allowance_shortfall(Some(&data)), "{reason}");
+        }
+    }
+
+    /// A balance shortfall is terminal for the just-in-time `approve` path: no
+    /// `approve` recovers it, whichever revert style the token uses.
+    #[test]
+    fn erc20_string_revert_balance_is_not_an_allowance_shortfall() {
+        let data = Bytes::from(
+            Revert::from("ERC20: transfer amount exceeds balance".to_owned()).abi_encode(),
+        );
+        assert!(!is_erc20_allowance_shortfall(Some(&data)));
+    }
+
+    /// An unrelated string revert stays a generic `ContractRevert` — the
+    /// message match must not swallow every `Error(string)` payload.
+    #[test]
+    fn unrelated_string_revert_is_contract_revert() {
+        let data = Bytes::from(Revert::from("Pausable: paused".to_owned()).abi_encode());
+        assert_eq!(
+            PoolOpenFailureReason::classify_revert_data(Some(&data)),
+            PoolOpenFailureReason::ContractRevert
+        );
+        assert!(!is_erc20_allowance_shortfall(Some(&data)));
     }
 
     #[test]

@@ -35,7 +35,9 @@ use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore, LaneKey, PoolId};
+use decdn_incentive::{
+    AdvanceOutcome, BuyerPoolState, BuyerPoolStore, LaneKey, PoolId, PoolOpenFailureReason,
+};
 use futures_util::FutureExt;
 use tracing::{debug, error, info, warn};
 
@@ -1154,12 +1156,36 @@ async fn run_open<P: Provider + Clone>(
         }
     }
 
-    let opened = open_pool(contract, signer, voucher_domain, token, owner, deposit)
-        .await
-        .inspect_err(|err| {
+    // The open task is the reporter for every one of its legs, so this one meters
+    // and logs here and marks the error `OpenReported` — a caller still waiting on
+    // the shared open must not restate it. Metering the by-reason sibling here too
+    // is what keeps the unlabeled total and the family reconcilable: the classifier's
+    // residual arm never sees a leg that reports itself.
+    //
+    // An `InsufficientDeposit` is additionally `LocalPullFault`: a wallet that cannot
+    // fund a deposit cannot pay ANY provider, so trying the next candidate is futile
+    // and answering the client `NotFound` would be a lie about this node's state. A
+    // `ContractRevert` or `RpcError` stays unmarked — those may be specific to this
+    // provider or transient, and another candidate may still deliver.
+    let opened = match open_pool(contract, signer, voucher_domain, token, owner, deposit).await {
+        Ok(opened) => opened,
+        Err(err) => {
             error!(error = %format_args!("{err:#}"), "buyer pool open failed");
             metrics.node_pull_pool_open_failure();
-        })?;
+            let reason = err.downcast_ref::<PoolOpenFailureReason>().copied();
+            if let Some(reason) = reason {
+                metrics.pool_open_failure_by_reason(reason);
+            }
+            let err = err.context(OpenReported);
+            return Err(
+                if reason == Some(PoolOpenFailureReason::InsufficientDeposit) {
+                    err.context(LocalPullFault)
+                } else {
+                    err
+                },
+            );
+        }
+    };
 
     if let Err(err) = store.record(&opened.state) {
         // The deposit is escrowed on-chain (`openPool` mined) but the row could not
