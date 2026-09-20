@@ -45,8 +45,12 @@ since project inception and will roll into the first tagged release.
   `close --pool` and `reclaim --pool` still run their on-chain leg — the stranded
   pool recovery path — but no longer report a no-op local `forget` as a clean
   close, naming the daemon row they could not touch instead. `pool list` routes to
-  the daemon (see Added) and always prints `store=<path>`, so `pools=0` names the
-  file that produced it. `pool list --json` gains `store` and `source` fields.
+  the daemon (see Added) and prints `store=<path>` above the table, so `pools=0`
+  names the file that produced it. `pool list --json` gains `store` and `source`
+  fields instead; read `source` before the pool objects, because the two stores
+  emit different shapes (`deposit_usdc` as a decimal string and lowercase
+  addresses from the client store, `deposit_micro_usdc` as a number and EIP-55
+  addresses from the daemon). `decdn node pools` names the admin URL it asked.
   Scripts that ran `pool open` against a node config must stop: the daemon opens
   and tops up its own pool from `blockchain.buyer_working_deposit_micro_usdc`.
 
@@ -748,6 +752,19 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+- **Node: bootstrap distinguishes "this pool is not open" from "its status could
+  not be read" (#2078).** The stale-row drop below judged a tracked pool by its
+  absence from the set of pools read as `Open`, and a `getPool` call that faulted
+  produced the same absence. One transient RPC error at bootstrap — there is no
+  retry on that call — would therefore delete the node's only record of a funded
+  pool, and the next miss would escrow a second deposit: the #2072 failure,
+  self-inflicted, and invisible because the stranded-pool report cannot name a
+  pool it failed to read either. A row is now dropped only on a successful read
+  that returned a non-`Open` status. An id `getPools` does not list also counts
+  as unknown: that view derives ids from `ownerPoolNonce` and `closePool` /
+  `reclaim` only change a pool's status, so it is append-only and an absent id
+  has no on-chain producer.
 
 - **Node: a buyer-pool row the chain no longer lists as open wedged the buy leg
   (#2078).** `reuse_or_report` reads the tracked row without a status check, and

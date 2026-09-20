@@ -477,10 +477,10 @@ It reconciles against `PaymentPool.getPools` at startup and adopts the pool it
 already owns, so this heals on its own; what follows is for confirming it, and
 for recovering deposits an older build stranded before it did.
 
-**Read the node's pools with `decdn node pools`, not `decdn pool list`.** There
-are two buyer stores under `identity.data_dir` and they are unrelated: the
-daemon's `buyer.redb`, and a client-owned `buyer-pools.redb` that `decdn fetch`
-and `decdn pool` use. A running daemon holds an exclusive lock on its file, so
+**Read the node's pools with `decdn node pools`, not `decdn pool list`.** Two
+unrelated buyer stores can sit under `identity.data_dir`: the daemon's
+`buyer.redb`, and a client-owned `buyer-pools.redb` that `decdn fetch` and
+`decdn pool` use. On a clean node host only the first exists. A running daemon holds an exclusive lock on its file, so
 nothing can read it from disk; `decdn node pools` asks the daemon over the admin
 RPC. `decdn pool list --config /etc/decdn/node.toml` routes to the same place and
 names the file it read, so `pools=0` is always attributable to one store or the
@@ -500,9 +500,10 @@ other.
 
    Absence of that warning only means "nothing stranded" **if the sweep
    completed**. A failed enumeration logs `could not enumerate this node's
-   on-chain pools` and returns without sweeping, and an unreadable individual
-   pool logs `could not read an owned pool's state; skipping it`. Either line
-   means the answer is unknown, not clean — fix the RPC endpoint and restart to
+   on-chain pools`, an unreadable individual pool logs `could not read an owned
+   pool's state`, and an unreadable buyer store skips reconciliation entirely
+   (`buyer pool store read failed before on-chain reconciliation`). Any of the
+   three means the answer is unknown, not clean — fix the cause and restart to
    re-run the sweep.
 3. Recover those with `decdn pool close --pool <poolId>`, then
    `decdn pool reclaim --pool <poolId>` once the pool's `disputeWindow` has
@@ -514,8 +515,10 @@ other.
    bootstrap checks the tracked pool against the chain's open set, drops a row
    whose pool is no longer open, and adopts or opens a replacement
    (`the tracked buyer pool is no longer open on chain`). Until that restart the
-   node keeps pinning its pulls to the closed pool and every voucher it signs is
-   rejected at redemption, so do not defer it. Confirm with `decdn node pools`.
+   node keeps pinning its pulls to the closed pool. Its vouchers still redeem
+   while the dispute window is open, and stop the moment it elapses — so the
+   wedge is delayed, not absent, and the residual is refunded to the owner at
+   `reclaim` either way. Confirm with `decdn node pools`.
 4. `close --all` and `reclaim --all` are refused on a node's data dir. They
    enumerate from chain by keystore address, so on a node host they would close
    the pool the daemon is paying from right now. Name the stranded pools

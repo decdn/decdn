@@ -17,9 +17,11 @@
 //!
 //! These commands own the **client's** buyer store, `buyer-pools.redb`. A
 //! `decdn-node` daemon keeps its own buyer pools in `buyer.redb` in its data
-//! dir; the two files share a table format and nothing else. Pointed at a
-//! daemon's data dir, `list` reports the node's pools over the admin RPC (that
-//! file is locked for the daemon's lifetime, so there is no disk path to it),
+//! dir; the two files share a table format and nothing else. A data dir holding
+//! any of the daemon's stores — not just `buyer.redb`, which is the file a
+//! reset loses — is a node's. Pointed at one, `list` reports the node's pools
+//! over the admin RPC (while the daemon runs it holds that file exclusively,
+//! so there is no disk path to it),
 //! and the commands that would escrow into a store the node never reads —
 //! `open`, `top-up`, and the chain-enumerating `close --all` / `reclaim --all` —
 //! refuse. `close --pool` and `reclaim --pool` still run, and say plainly that
@@ -42,12 +44,14 @@ pub struct PoolArgs {
 pub enum PoolCommand {
     /// List the tracked buyer pools and their per-lane voucher watermark.
     ///
-    /// Read-only, and it always names the store it read. On a client data dir
-    /// that is the CLI's own `buyer-pools.redb`, read directly. On a
-    /// `decdn-node` daemon's data dir it is the daemon's `buyer.redb`, read
-    /// over the admin RPC — that file is locked for the daemon's lifetime, so
-    /// nothing can open it from disk while the node runs. The two are separate
-    /// stores: a client listing says nothing about a node, and vice versa.
+    /// Read-only, and it names the store it read — on the `store=` line, or
+    /// the `store` field under `--json`. On a client data dir that is the
+    /// CLI's own `buyer-pools.redb`, read directly. On a `decdn-node` daemon's
+    /// data dir it is the daemon's `buyer.redb`, read over the admin RPC:
+    /// while that daemon runs it holds the file exclusively, so nothing can
+    /// open it from disk. The two are separate stores — a client listing says
+    /// nothing about a node, and vice versa — and their `--json` pool objects
+    /// differ, so read `source` before parsing them.
     #[command(visible_alias = "status")]
     List(PoolListArgs),
     /// Open a fresh `PaymentPool` deposit, escrowing `--deposit-micro-usdc`

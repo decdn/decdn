@@ -740,7 +740,12 @@ pub async fn pools(args: &cli::PoolsArgs, global_config: Option<&Path>) -> anyho
             serde_json::to_string_pretty(&parsed).context("failed to encode pools as JSON")?;
         println!("{pretty}");
     } else {
+        crate::commands::pool::write_skipped_buyer_pools(&mut io::stderr().lock(), &parsed.skipped)
+            .context("failed to write skipped pools")?;
         let mut stdout = io::stdout().lock();
+        // Name the daemon that answered, for the same reason `pool list` names
+        // the file it read: an unattributed `pools=0` is the defect (#2078).
+        writeln!(stdout, "store={url} (admin RPC)").context("failed to write pools header")?;
         crate::commands::pool::write_buyer_pools(&mut stdout, &parsed)
             .context("failed to write pools table")?;
     }

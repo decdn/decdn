@@ -371,8 +371,8 @@ async fn pools_without_buyer_leg_is_an_error_over_http() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("expected an unavailable error"))?
         .to_string();
     assert!(
-        err.contains("buyer payment-pool leg"),
-        "error should name the missing buyer leg, got: {err}"
+        err.contains("no buyer payment-pool store is attached"),
+        "error should name the missing store, not blame config, got: {err}"
     );
 
     let _ = stop_tx.send(());

@@ -84,10 +84,12 @@ fn resolve_data_dir(data_dir: Option<PathBuf>, file: &FileConfig) -> anyhow::Res
 enum BuyerStoreOwner {
     /// No daemon store here, so the CLI owns `buyer-pools.redb` in this dir.
     Client,
-    /// A `decdn-node` daemon owns this data dir. It holds redb's
-    /// process-exclusive lock on `buyer.redb` for its whole lifetime, so the
-    /// CLI can neither read nor write that file — not even read-only — and must
-    /// not create a second, unrelated store beside it.
+    /// A `decdn-node` daemon owns this data dir. `decdn pool` owns only the
+    /// client store, so it must not create a second, unrelated store beside
+    /// the daemon's. Classification is file presence, not liveness: while that
+    /// daemon runs, redb's process-exclusive lock also makes reading its
+    /// `buyer.redb` from disk impossible, which is why the read goes over the
+    /// admin RPC.
     Node {
         /// The dir itself, so both store paths can be named in a message —
         /// which file produced a `pools=0` must never be ambiguous.
@@ -280,10 +282,12 @@ fn ensure_owned(on_chain_owner: Address, ours: Address, pool_id: PoolId) -> anyh
 /// per-provider open.
 async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
+    // Before chain coordinates are even resolved, and so before the keystore
+    // prompt: escrowing into a store the daemon never reads is the failure,
+    // not a degraded outcome, and the answer depends only on the data dir.
+    let data_dir = resolve_data_dir(args.chain.data_dir.clone(), &file)?;
+    classify_buyer_store(&data_dir).refuse_escrow("open a pool")?;
     let chain = resolve_chain(&args.chain, &file)?;
-    // Before the keystore prompt and before any chain work: escrowing into a
-    // store the daemon never reads is the failure, not a degraded outcome.
-    classify_buyer_store(&chain.data_dir).refuse_escrow("open a pool")?;
 
     let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
     let signer = Arc::new(load_buyer_signer(&chain)?);
@@ -335,9 +339,10 @@ struct PoolOpenJson {
 /// `decdn pool top-up`: add funds to a pool the caller owns (`topUp`).
 async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
+    let data_dir = resolve_data_dir(args.chain.data_dir.clone(), &file)?;
+    classify_buyer_store(&data_dir).refuse_escrow("top up a pool")?;
     let chain = resolve_chain(&args.chain, &file)?;
     let pool_id = parse_pool_id(&args.pool)?;
-    classify_buyer_store(&chain.data_dir).refuse_escrow("top up a pool")?;
 
     let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
     let signer = Arc::new(load_buyer_signer(&chain)?);
@@ -386,10 +391,10 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
 enum LocalBookkeeping<'a> {
     /// Clear the row in the client store this CLI owns.
     Store(&'a RedbBuyerPoolStore),
-    /// A `decdn-node` daemon owns this data dir. Its `buyer.redb` is locked
-    /// for the daemon's lifetime, so the row stays as it is and the operator
-    /// is told so — the alternative, a no-op `forget` graded as a clean close,
-    /// is the silent lie this variant exists to remove.
+    /// A `decdn-node` daemon owns this data dir. `decdn pool` has no code path
+    /// to that daemon's `buyer.redb`, so its row stays as it is and the
+    /// operator is told so — the alternative, a no-op `forget` graded as a
+    /// clean close, is the silent lie this variant exists to remove.
     DaemonOwned(&'a Path),
 }
 
@@ -411,10 +416,10 @@ impl LocalBookkeeping<'_> {
     /// operator may ignore: the daemon still believes it owns a live pool.
     fn report_daemon_row_untouched(buyer_db: &Path, pool_id: PoolId, verb: &str) {
         eprintln!(
-            "warning: pool {pool_id} {verb} on-chain, but the daemon's row in {} was NOT cleared \
-             — a running decdn-node holds that store and no other process can write it. If this \
-             is the pool the daemon is using, restart decdn-node so its bootstrap reconciles \
-             against the chain, and confirm with `decdn node pools`.",
+            "warning: pool {pool_id} {verb} on-chain, but the daemon's row in {} was NOT \
+             cleared — `decdn pool` writes only the client store, and a running decdn-node holds \
+             its own exclusively. Run `decdn node pools`: if that pool is listed, the daemon is \
+             still using it — restart decdn-node so its bootstrap reconciles against the chain.",
             buyer_db.display()
         );
     }
@@ -730,18 +735,18 @@ where
 /// pool this keystore owns; `--pool` closes exactly one.
 async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
-    let chain = resolve_chain(&args.chain, &file)?;
     // Parse the target id before any store/keystore/provider work, so a
     // malformed `--pool` fails fast without touching the chain. `None` is the
     // `--all` sweep (clap's arg group guarantees exactly one of the two).
     let target = args.pool.as_deref().map(parse_pool_id).transpose()?;
 
-    let store_owner = classify_buyer_store(&chain.data_dir);
+    let store_owner = classify_buyer_store(&resolve_data_dir(args.chain.data_dir.clone(), &file)?);
     if target.is_none() {
         // `--all` enumerates from chain, not from the store, so on a node data
         // dir it would close the pool the daemon is paying from right now.
         store_owner.refuse_sweep("close")?;
     }
+    let chain = resolve_chain(&args.chain, &file)?;
     let store = store_owner.open_for_write(&chain.data_dir)?;
     let buyer_db = node_buyer_db(&chain.data_dir);
     let books = LocalBookkeeping::new(store.as_ref(), &buyer_db);
@@ -833,16 +838,16 @@ where
 /// whose window has elapsed; `--pool` reclaims exactly one.
 async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
-    let chain = resolve_chain(&args.chain, &file)?;
     // Parse the target id before any store/keystore/provider work, so a
     // malformed `--pool` fails fast without touching the chain. `None` is the
     // `--all` sweep (clap's arg group guarantees exactly one of the two).
     let target = args.pool.as_deref().map(parse_pool_id).transpose()?;
 
-    let store_owner = classify_buyer_store(&chain.data_dir);
+    let store_owner = classify_buyer_store(&resolve_data_dir(args.chain.data_dir.clone(), &file)?);
     if target.is_none() {
         store_owner.refuse_sweep("reclaim")?;
     }
+    let chain = resolve_chain(&args.chain, &file)?;
     let store = store_owner.open_for_write(&chain.data_dir)?;
     let buyer_db = node_buyer_db(&chain.data_dir);
     let books = LocalBookkeeping::new(store.as_ref(), &buyer_db);
@@ -1163,7 +1168,7 @@ impl OwnerVerdict {
 /// Names the store it read, always. There are two, in the same directory and
 /// with the same table format but no other relation: the CLI's own
 /// `buyer-pools.redb` and a daemon's `buyer.redb`. Reading the first and
-/// reporting it as the second is what made `pools=0` meaningless on a node host
+/// reporting it as the second makes `pools=0` meaningless on a node host
 /// (#2078), so on a daemon's data dir this asks the daemon instead — redb holds
 /// that file exclusively for the daemon's lifetime, so there is no disk path to
 /// it while the node is up.
@@ -1270,6 +1275,7 @@ async fn list_from_daemon(
         serde_json::to_writer_pretty(&mut out, &view)?;
         writeln!(out)?;
     } else {
+        write_skipped_buyer_pools(&mut std::io::stderr().lock(), &resp.skipped)?;
         writeln!(
             out,
             "store={} (read from the running daemon)",
@@ -1333,8 +1339,15 @@ fn write_pools(
 
 /// Render a daemon's buyer-pool snapshot as an aligned table, in the same
 /// columns [`write_pools`] uses for the client store, so an operator reading
-/// both sees one view rather than two dialects. Pure (writes to any sink) so
-/// the layout is unit-testable without an admin hop.
+/// both sees the same shape. Pure (writes to any sink) so the layout is
+/// unit-testable without an admin hop.
+///
+/// Addresses arrive EIP-55 checksummed from the wire, where the client path
+/// renders them lowercase — the columns match, the casing does not.
+///
+/// Writes the table only. Undecodable rows go to stderr through
+/// [`write_skipped_buyer_pools`], as they do on the client path, so a script
+/// capturing stdout does not find warning lines ahead of `pools=`.
 ///
 /// Shared by `decdn node pools` and by `decdn pool list` when it routes to a
 /// running daemon.
@@ -1342,13 +1355,6 @@ pub(crate) fn write_buyer_pools(
     w: &mut impl Write,
     resp: &BuyerPoolsResponse,
 ) -> std::io::Result<()> {
-    for pool_id in &resp.skipped {
-        writeln!(
-            w,
-            "warning: buyer pool {pool_id} could not be decoded; its deposit remains escrowed but \
-             untracked until the record is repaired"
-        )?;
-    }
     writeln!(w, "pools={}", resp.pools.len())?;
     if resp.pools.is_empty() {
         if resp.skipped.is_empty() {
@@ -1375,6 +1381,22 @@ pub(crate) fn write_buyer_pools(
     Ok(())
 }
 
+/// Warn about every undecodable row in a daemon's answer, on stderr — the
+/// stream [`write_skipped_pools`] uses for the client store's equivalent.
+pub(crate) fn write_skipped_buyer_pools(
+    w: &mut impl Write,
+    skipped: &[String],
+) -> std::io::Result<()> {
+    for pool_id in skipped {
+        writeln!(
+            w,
+            "warning: buyer pool {pool_id} could not be decoded; its deposit remains escrowed but \
+             untracked until the record is repaired"
+        )?;
+    }
+    Ok(())
+}
+
 /// Top-level `--json` document for a listing of the CLI's own store.
 ///
 /// `store` and `source` are the half a machine consumer needs to know *which*
@@ -1388,9 +1410,14 @@ struct PoolListJson {
     skipped: Vec<String>,
 }
 
-/// Top-level `--json` document for a listing the daemon answered. Borrows the
-/// admin DTOs rather than re-shaping them, so the JSON a client-store listing
-/// and a daemon listing produce stay structurally comparable.
+/// Top-level `--json` document for a listing the daemon answered.
+///
+/// Borrows the admin DTOs rather than re-shaping them, so the wire types stay
+/// the single definition of the daemon's answer. The consequence is that the
+/// two sources do NOT emit the same pool objects: this one carries
+/// `deposit_micro_usdc` as a number and EIP-55 addresses, where a client-store
+/// listing carries `deposit_usdc` as a decimal string and lowercase addresses.
+/// Read `source` before parsing `pools`.
 #[derive(Serialize)]
 struct DaemonPoolListJson<'a> {
     store: String,
@@ -1630,10 +1657,11 @@ mod tests {
 
     // ---- node-vs-client data dir (#2078) ----
 
-    /// The daemon's `buyer.redb` is the signal, and nothing else is. An empty
-    /// dir, or one holding only the client store, is a client data dir.
+    /// `buyer.redb` is one of the daemon markers, and the client's own store
+    /// is not a marker at all. The rest of the set is covered by
+    /// `a_node_data_dir_whose_buyer_store_was_deleted_is_still_a_node_s`.
     #[test]
-    fn classify_buyer_store_keys_on_the_daemon_file() {
+    fn classify_buyer_store_keys_on_a_daemon_file_not_the_client_one() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(classify_buyer_store(dir.path()), BuyerStoreOwner::Client);
 
@@ -1783,9 +1811,16 @@ mod tests {
         assert!(out.contains("1.500000"), "{out}");
         assert!(out.contains("pools=1"), "{out}");
         assert!(
-            out.contains("0x4444"),
-            "an undecodable row must be named: {out}"
+            !out.contains("0x4444"),
+            "undecodable rows belong on stderr, not in the table sink: {out}"
         );
+
+        // …and they are still reported, on the stream the client path uses.
+        let mut warnings = Vec::new();
+        write_skipped_buyer_pools(&mut warnings, &["0x4444".to_string()]).unwrap();
+        let warnings = String::from_utf8(warnings).unwrap();
+        assert!(warnings.contains("0x4444"), "{warnings}");
+        assert!(warnings.contains("escrowed"), "{warnings}");
     }
 
     #[test]

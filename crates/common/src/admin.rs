@@ -507,7 +507,8 @@ pub struct BuyerPoolSnapshot {
     /// `u64::try_from(..).unwrap_or(u64::MAX)`, so a deposit that somehow
     /// exceeded `u64::MAX` micro-USDC (~1.8e13 USDC — unreachable for a real
     /// pool) saturates rather than wraps. The same holds for every
-    /// micro-USDC field on [`BuyerLaneSnapshot`].
+    /// `U256`-derived field on [`BuyerLaneSnapshot`], including
+    /// `last_bytes_delivered`.
     pub deposit_micro_usdc: u64,
     /// Every lane funded from this pool, ordered by `(signer, provider)`. One
     /// pool fans out to every provider the owner pays (ADR 003), so this is
@@ -630,9 +631,9 @@ pub const SLASH_DETECTION_UNAVAILABLE_CODE: i32 = -32_009;
 /// the other.
 pub const BUYER_POOL_STORE_ERROR_CODE: i32 = -32_010;
 
-/// JSON-RPC error code: `admin_v1_pools` was called on a node with no buyer
-/// leg wired (no `[blockchain]` configuration, so the node never pays for
-/// upstream pulls).
+/// JSON-RPC error code: `admin_v1_pools` was called on an admin surface with
+/// no buyer pool store attached, so it can say nothing about what this node
+/// tracks.
 ///
 /// Deliberately an error rather than an empty list — unlike `admin_v1_lanes`,
 /// which reports zero lanes as a legitimate state. "This node does not pay for
@@ -640,9 +641,9 @@ pub const BUYER_POOL_STORE_ERROR_CODE: i32 = -32_010;
 /// operator hunting a stranded deposit, and rendering the first as the second
 /// is the ambiguity this method exists to remove.
 ///
-/// The production runtime always attaches the buyer store, so a running daemon
-/// does not answer this today; it covers a test or future CLI-only bring-up
-/// that raises the admin surface without a buy leg, the same posture as
+/// The production runtime attaches the buyer store unconditionally, so a
+/// running daemon does not answer this: it covers a hand-built `AdminState` —
+/// a test, or a future bring-up with no buy leg — the same posture as
 /// [`DHT_UNAVAILABLE_CODE`]. The alternative for that arm would be an empty
 /// list, which is the answer this code exists to avoid giving.
 pub const BUYER_POOL_UNAVAILABLE_CODE: i32 = -32_011;

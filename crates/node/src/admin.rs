@@ -109,10 +109,12 @@ pub struct AdminState {
     /// The node's buyer-side pool store, backing `admin_v1_pools` (#2078),
     /// attached via [`AdminState::with_buyer_pools`]. The SAME handle the buy
     /// loop records adoptions and top-ups into, so the admin surface reports
-    /// what the daemon actually believes. `None` (no `[blockchain]` wiring, or
-    /// a unit test) → `pools` returns [`BUYER_POOL_UNAVAILABLE_CODE`], never an
-    /// empty list: a node that does not pay for pulls and a node that owns no
-    /// pools call for opposite operator responses.
+    /// what the daemon actually believes. The production runtime always
+    /// attaches it, so `None` means a hand-built `AdminState` — a test, or a
+    /// future bring-up with no buy leg — and answers
+    /// [`BUYER_POOL_UNAVAILABLE_CODE`] rather than an empty list: a node that
+    /// tracks nothing and a node that owns no pools call for opposite operator
+    /// responses.
     buyer_pools: Option<BuyerPoolHandle>,
     /// Slash-detection handles backing `admin_v1_slashes` (#1032), attached via
     /// [`AdminState::with_slash_detection`]. `None` (no `slash_judge_address`
@@ -447,7 +449,8 @@ impl AdminState {
     /// Attach the buyer pool store so `admin_v1_pools` can report this node's
     /// buyer-side `PaymentPool` state (#2078). The production runtime calls
     /// this once after `new` with the SAME handle `BuyerPoolService` writes
-    /// through; without it, `pools` returns [`BUYER_POOL_UNAVAILABLE_CODE`].
+    /// through, unconditionally; without it, `pools` returns
+    /// [`BUYER_POOL_UNAVAILABLE_CODE`].
     #[must_use]
     pub fn with_buyer_pools(mut self, buyer_pools: Arc<dyn BuyerPoolStore>) -> Self {
         self.buyer_pools = Some(BuyerPoolHandle(buyer_pools));
@@ -873,8 +876,8 @@ impl AdminRpcServer for AdminRpcImpl {
         let Some(store) = self.state.buyer_pools.as_ref() else {
             return Err(ErrorObjectOwned::owned(
                 BUYER_POOL_UNAVAILABLE_CODE,
-                "this node has no buyer payment-pool leg wired ([blockchain] is unconfigured), so \
-                 it opens no pools and pays no provider",
+                "no buyer payment-pool store is attached to this admin surface, so this node \
+                 tracks no pools and pays no provider",
                 None::<()>,
             ));
         };

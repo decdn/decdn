@@ -28,10 +28,10 @@
 //!      only a real seeder redeeming real vouchers shows that.
 //!   4. **An operator can read any of it.** `redb` holds an exclusive lock on
 //!      `buyer.redb` for the daemon's lifetime, so the read has to cross the
-//!      admin RPC — a mocked store proves nothing about that. The fleet report
-//!      behind #2078 was an operator running `decdn pool list` against a
-//!      healthy node and reading its `pools=0` as corroboration of the
-//!      forgotten-pool bug, because it had silently opened a different store.
+//!      admin RPC — a mocked store proves nothing about that. An operator who
+//!      runs `decdn pool list` against a healthy node must not read its output
+//!      as corroboration of the forgotten-pool bug, which is what a silently
+//!      opened second store produces (#2078).
 //!
 //! Topology mirrors `node_pull_topup.rs`: a cold pull-through SERVER that holds
 //! nothing, satisfying a client miss only by a paid pull from a SEEDER that
@@ -302,9 +302,9 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // (5) The operator can SEE all of the above from the CLI (#2078). Everything
-    // up to here is invisible without a `cast` call; the fleet report that opened
-    // that issue was an operator running `decdn pool list` against a healthy node
-    // and reading `pools=0` as corroboration of the forgotten-pool bug.
+    // up to here is invisible without a `cast` call, and a `pool list` that
+    // silently reads a different store reports `pools=0` on this healthy node —
+    // which an operator reads as corroboration of the forgotten-pool bug.
     assert_operator_can_read_the_adopted_pool(&server, original_pool).await?;
 
     Ok(())
