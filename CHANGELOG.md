@@ -1759,6 +1759,39 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Metrics: the serve path reports its own cache hit rate.** New siblings
+  `decdn_serve_cache_{hit,partial_hit,miss}_total`, bumped at the
+  blob-availability gate in the client dispatch path — ahead of the load-shed
+  admission, so the ratio stays a property of the store rather than of current
+  pressure. Exactly one of the three fires per request reaching the gate; a
+  withdrawn hash is refused before it and counts in none.
+  - These exist because `decdn_cache_hits_total` and
+    `decdn_cache_bytes_returned_total` are scoped to `CacheEngine::get`, the
+    whole-blob buffered read the paid serve path never calls — it streams
+    through `export_bao_range_stream` instead. A node serving only paying
+    clients therefore holds both at zero under full production load — while
+    `decdn_cache_misses_total`, which the fill tiers bump too, keeps climbing,
+    so the pair reads as a populated permanent 0% rather than an empty series, so the fleet dashboard's hit-ratio panel read a permanent
+    0% and its throughput panel plotted a flat-zero series as "served". The
+    registry rows for the `get`-scoped counters now say so, and the panels read
+    `decdn_bytes_served_total` for delivered bytes.
+  - `decdn_serve_cache_partial_hit_total` is counted apart from the plain hit so
+    the payoff of partial-holder advertisement (ADR 038) stays legible; both are
+    hits for hit-rate purposes.
+
+- **Monitoring: unattributed stream failures and pull success rate are on the
+  dashboards.** The fleet overview and the delivery dashboard gain a residual
+  panel — `rate(decdn_streams_failed_total{direction="inbound"})` minus the 22
+  seller-leg counters that each end exactly one inbound stream — which makes a failure mode that no counter names
+  visible as a step change. The overview also promotes node-to-node pull success
+  rate, so a pull leg failing every attempt reads as a ratio pinned at zero
+  rather than as low traffic. `decdn_serve_stream_rejected_bad_binding_total` and
+  `decdn_node_pull_pool_open_failures_total` join the refusal and pull-failure
+  breakdowns they were missing from, and eleven further exported-but-unplotted
+  series (probe read faults, the fee-shares watcher downtime/restart pair, the
+  reconciled-redemption skip, the per-peer rate-limit prune sweeps and the iroh
+  path-composition family) land on their existing panels.
+
 - **Metrics: stream outcomes, byte volume, on-chain transactions and DHT
   health are exported, and the gaps they expose now alert.** New series:
   `decdn_streams_{completed,failed}_total{direction}`, `decdn_bytes_served_total`,

@@ -2156,6 +2156,60 @@
           "expr": "sum(rate(decdn_iroh_socket_relay_home_change_total{instance=~\"$node\"}[$__rate_interval]))",
           "refId": "E",
           "legendFormat": "home relay changed"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_iroh_socket_paths_direct_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "F",
+          "legendFormat": "direct paths"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_iroh_socket_paths_relay_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "G",
+          "legendFormat": "relay paths"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_iroh_socket_paths_custom_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "H",
+          "legendFormat": "custom paths"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_iroh_socket_transport_custom_paths_added_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "I",
+          "legendFormat": "custom added"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_iroh_socket_transport_custom_paths_removed_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "J",
+          "legendFormat": "custom removed"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_iroh_socket_update_direct_addrs_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "K",
+          "legendFormat": "direct addrs updated"
         }
       ],
       "fieldConfig": {
@@ -3008,6 +3062,24 @@
           "expr": "sum(rate(decdn_dht_rate_limit_prune_sweeps_per_ip_total{instance=~\"$node\"}[$__rate_interval]))",
           "refId": "F",
           "legendFormat": "dht ip sweeps"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_probe_rate_limit_prune_sweeps_per_peer_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "G",
+          "legendFormat": "probe peer sweeps"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_dht_rate_limit_prune_sweeps_per_peer_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "H",
+          "legendFormat": "dht peer sweeps"
         }
       ],
       "fieldConfig": {
@@ -3120,6 +3192,15 @@
           "expr": "sum(rate(decdn_probe_cache_misses_total{instance=~\"$node\"}[$__rate_interval]))",
           "refId": "C",
           "legendFormat": "probe-cache misses"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_probe_read_faults_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "D",
+          "legendFormat": "probe read faults"
         }
       ],
       "fieldConfig": {

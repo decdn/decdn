@@ -1119,6 +1119,61 @@ pub struct DecdnMetrics {
     /// never bumps this counter, which is what lets a test or dashboard tell
     /// the two fill strategies apart deterministically instead of by timing.
     pub local_outboard_serves: Counter,
+    /// `decdn_serve_cache_hit_total`: paid serves the blob-availability gate
+    /// classified as servable from a COMPLETE locally-held blob, before any fill
+    /// tier runs. One bump per request the gate classifies, in
+    /// `handlers::client::dispatch`.
+    ///
+    /// Counted BEFORE the load-shed admission call, so a shed refusal still
+    /// records the availability decision it refused. That keeps the hit rate a
+    /// property of the store rather than of the node's current pressure — a
+    /// node shedding hard would otherwise report a hit rate that collapses
+    /// exactly when an operator most needs to read it.
+    ///
+    /// This is the serve-path twin of `decdn_cache_hits_total`, and the two are
+    /// not interchangeable: the cache-crate counter meters
+    /// `CacheEngine::get()`, the whole-blob buffered read, which the paid serve
+    /// path never calls — it streams through `export_bao_range_stream` instead.
+    /// A node that serves only paying clients therefore holds
+    /// `decdn_cache_hits_total` at zero however full its store is. Its partner
+    /// `decdn_cache_misses_total` is NOT confined to `get` — the fill tiers bump
+    /// it too — so that pair reads as a populated, permanently-0% ratio rather
+    /// than as an empty one, which is why the serve path needs its own family.
+    ///
+    /// Sibling of `serve_cache_partial_hit` and `serve_cache_miss`. At most one
+    /// of the three is bumped per request, and two requests that reach
+    /// `serve_audit` bump none: a withdrawn hash (operator evict or corruption
+    /// quarantine) is refused `EvictedSinceProbe`, and a `serve_audit` store
+    /// fault is refused `InternalError`. Neither is an availability class — one
+    /// is a refusal, the other is the store failing to answer — so the ratio's
+    /// denominator deliberately excludes both. Field has no `_total` suffix
+    /// because the `OpenMetrics` encoder appends it.
+    pub serve_cache_hit: Counter,
+    /// `decdn_serve_cache_partial_hit_total`: paid serves admitted from a blob
+    /// that is not `Complete` but whose held chunk groups already cover the
+    /// requested span (#1506). Counted apart from `serve_cache_hit` because the
+    /// two answer different questions — this one is the payoff of the
+    /// range-keyed partial-holder advertisement a node makes over
+    /// `cdn/probe/v1` and the DHT, and folding it into the plain hit would hide
+    /// whether that mechanism carries any traffic. Both are hits for hit-rate
+    /// purposes.
+    pub serve_cache_partial_hit: Counter,
+    /// `decdn_serve_cache_miss_total`: paid serves the gate could not satisfy
+    /// from locally-held bytes. Counts the ADMISSION decision and nothing
+    /// downstream of it — a fill tier may never run at all, because the bump
+    /// precedes the load-shed gate, the pre-spend floor reservation, and the
+    /// `pull_authorized` check that every tier is gated on. A shed refusal, a
+    /// floor refusal and an unbound request therefore all count here having
+    /// asked no origin and no peer. Where a tier does run and satisfies the
+    /// blob, the request still counts here; the refusal siblings
+    /// (`serve_stream_rejected_*`) say whether it ended in a refusal.
+    ///
+    /// Also absorbs one non-absence: `partial_hit_size` resolves the local
+    /// bitfield with `.ok()?`, so a store fault while answering "do my held
+    /// ranges cover this span?" reads as "they do not" and lands here. That is
+    /// the conflation the `serve_audit` `Err` arm exists to avoid one branch
+    /// earlier, and it bounds how clean a reading of this counter can be.
+    pub serve_cache_miss: Counter,
     /// `decdn_origin_directory_get_origins_failures_total`: `getOrigins`
     /// lookups that failed on a cold-namespace cache miss. The directory fails
     /// closed on each (resolves no origins for that request, does not cache
@@ -2359,6 +2414,16 @@ recorders! {
     /// admission guard; distinguishes this tier from the buffered
     /// `populate_local` fallback regardless of this request's eventual outcome.
     local_outboard_serve => local_outboard_serves.inc();
+
+    /// The blob-availability gate classified a paid serve as servable from a
+    /// complete local blob. Bumped before the shed gate and before any fill
+    /// tier can run.
+    serve_cache_hit => serve_cache_hit.inc();
+    /// The gate classified a paid serve as servable from a partial blob whose
+    /// held chunk groups cover the requested span (#1506).
+    serve_cache_partial_hit => serve_cache_partial_hit.inc();
+    /// The gate could not satisfy a paid serve locally, so a fill tier runs.
+    serve_cache_miss => serve_cache_miss.inc();
 
     /// A buyer→upstream pull hit this node's own `pull_timeout` deadline (#857).
     /// A buyer-side condition, so it does not score the provider's reputation.
@@ -4205,6 +4270,44 @@ mod tests {
             assert!(
                 has_metric_line(&text, name, expected),
                 "counter {name} should report {expected} after 1 miss + 1 hit:\n{text}"
+            );
+        }
+    }
+
+    /// The serve-path hit family exports at zero and each recorder bumps its
+    /// own sibling.
+    ///
+    /// The zero floor is the load-bearing half. These three exist because the
+    /// `get`-scoped `decdn_cache_hits_total` sits at a permanent zero on a node
+    /// that only serves paying clients, and a dashboard cannot tell that apart
+    /// from "no requests yet". A family that only appeared after its first bump
+    /// would reintroduce exactly that ambiguity for its own first hour.
+    #[test]
+    fn serve_cache_hit_family_exports_and_records() {
+        let metrics = Metrics::new();
+        let names = [
+            "decdn_serve_cache_hit_total",
+            "decdn_serve_cache_partial_hit_total",
+            "decdn_serve_cache_miss_total",
+        ];
+        let text = metrics.encode().unwrap();
+        for name in names {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "{name} must export at zero before the first serve:\n{text}"
+            );
+        }
+
+        // One bump each, so a recorder wired to the wrong sibling shows up as a
+        // count on a name it should not have touched.
+        metrics.serve_cache_hit();
+        metrics.serve_cache_partial_hit();
+        metrics.serve_cache_miss();
+        let text = metrics.encode().unwrap();
+        for name in names {
+            assert!(
+                has_metric_line(&text, name, 1),
+                "{name} should report 1 after its recorder fired once:\n{text}"
             );
         }
     }
