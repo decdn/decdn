@@ -318,9 +318,14 @@ fn eth_address_line(
                 match eth_identity::load_signer(keystore, pw.as_str()) {
                     Ok(signer) => note(format!("eth address: {}", signer.address())),
                     Err(err) => EthLine {
+                        // The root cause, not the whole chain: every wrapping
+                        // layer repeats this path, and the innermost message is
+                        // the one that separates a wrong password from a
+                        // keystore that is broken.
                         line: format!(
-                            "eth address: (keystore at {} did not open with this password: {err})",
-                            keystore.display()
+                            "eth address: (keystore at {} did not open with this password: {})",
+                            keystore.display(),
+                            err.root_cause()
                         ),
                         retryable: true,
                     },
