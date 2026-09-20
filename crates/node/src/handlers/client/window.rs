@@ -1,7 +1,6 @@
 //! Window-paced pull-through serve path (#856, ADR 037).
 
 use alloy::primitives::U256;
-use bytes::Bytes;
 
 use super::dispatch::{aligned_span, range_out_of_bounds};
 
@@ -489,7 +488,7 @@ impl ClientHandler {
     /// `NodeFunder`, and no upstream counterparty.
     ///
     /// `total_bytes` is the origin-probe size the caller already confirmed
-    /// serviceable, and `outboard` is the `{H}.obao4` that probe fetched. The
+    /// serviceable (`origin_size` + a published `{H}.obao4` outboard). The
     /// request may be whole-blob, bounded, or resumed: the serve leg clamps delivery
     /// to `[byte_offset, end)` and the local pull leg fills only that span's missing
     /// chunk groups, so a bounded request pulls exactly its aligned span from
@@ -524,7 +523,6 @@ impl ClientHandler {
         lane_key: LaneKey,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         total_bytes: u64,
-        outboard: Bytes,
         pool_remaining: Option<U256>,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
@@ -706,7 +704,6 @@ impl ClientHandler {
                 engine.clone(),
                 *hash.as_bytes(),
                 total_bytes,
-                outboard,
                 ledger,
             );
             // The pull runs on its own thread and runtime, which starts with no

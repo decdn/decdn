@@ -1,7 +1,7 @@
-//! Windowed origin range pulls (#2065): the origin's `{H}.obao4` outboard is
-//! read once per fill and handed in, and the requested span is fetched in
-//! bounded windows of [`RANGE_PULL_WINDOW_BYTES`], so a draw holds
-//! `O(window + outboard)` bytes whatever its length.
+//! Windowed origin range pulls (#2065): an origin's `{H}.obao4` outboard is read
+//! once, and the requested span is fetched in bounded windows of
+//! [`RANGE_PULL_WINDOW_BYTES`], so a range pull holds `O(window + outboard)`
+//! bytes whatever its length.
 //!
 //! [`crate::CacheEngine::origin_range_wire`] (the own-origin serve-miss spine's
 //! pull leg) builds on the `OriginRangeCursor` here. It needs ONE coherent
@@ -25,7 +25,7 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 use crate::error::{CacheError, CacheResult};
 use crate::metrics::CacheMetrics;
-use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest};
+use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
 use crate::range_pull::{AlignedRange, IROH_BLOCK_SIZE};
 
 /// Largest data span one [`Origin::fetch_range_data`] call fetches. A multiple
@@ -116,16 +116,12 @@ pub(crate) struct OriginRangeCursor {
 }
 
 impl OriginRangeCursor {
-    /// Open a cursor on `origin` for `aligned` with `outboard`, the untrusted
-    /// `{H}.obao4` the caller fetched ONCE for the whole fill
-    /// ([`crate::CacheEngine::origin_fetch_outboard_bytes`]) and reuses for every
-    /// draw (#2061); the cursor fetches no outboard of its own. It fetches the
-    /// first window eagerly. `Ok(None)` when this origin declines that window,
-    /// so the caller can advance the origin chain before it commits to this
-    /// origin.
+    /// Open a cursor on `origin` for `aligned`: read the outboard once, then
+    /// fetch the first window. `Ok(None)` when this origin declines (no
+    /// outboard, or it declines the first window), so the caller can advance
+    /// the origin chain before it commits to this origin.
     ///
-    /// Meters every fetched window as `pull_through_bytes`; the outboard was
-    /// metered once where it was fetched.
+    /// Meters the outboard and every fetched window as `pull_through_bytes`.
     ///
     /// # Errors
     ///
@@ -134,9 +130,23 @@ impl OriginRangeCursor {
         origin: Arc<dyn Origin>,
         hash: Hash,
         aligned: &AlignedRange,
-        outboard: Bytes,
+        outboard_max: u64,
         metrics: Option<Arc<CacheMetrics>>,
     ) -> CacheResult<Option<Self>> {
+        let outboard = match origin
+            .fetch_outboard(hash, outboard_max)
+            .await
+            .map_err(|e| CacheError::OriginError {
+                hash,
+                source: e.into_inner(),
+            })? {
+            OutboardFetch::Found(ob) => ob,
+            OutboardFetch::NotFound | OutboardFetch::Unsupported => return Ok(None),
+        };
+        if let Some(m) = &metrics {
+            m.pull_through_bytes
+                .inc_by(u64::try_from(outboard.len()).unwrap_or(u64::MAX));
+        }
         let mut cursor = Self {
             origin,
             hash,
@@ -154,7 +164,7 @@ impl OriginRangeCursor {
         }
     }
 
-    /// The untrusted pre-order outboard this cursor was opened with.
+    /// The untrusted pre-order outboard this cursor read on open.
     pub(crate) fn outboard(&self) -> Bytes {
         self.outboard.clone()
     }
@@ -615,7 +625,7 @@ mod tests {
 
     use super::*;
     use crate::error::OriginPullError;
-    use crate::origin::{OriginFetch, OutboardFetch};
+    use crate::origin::OriginFetch;
     use crate::range_pull::align_range;
 
     #[test]
@@ -696,15 +706,11 @@ mod tests {
         });
         let hash = Hash::new(&blob);
         let aligned = align_range(0, 0, u64::try_from(blob.len()).unwrap()).unwrap();
-        let OutboardFetch::Found(outboard) = origin.fetch_outboard(hash, u64::MAX).await.unwrap()
-        else {
-            unreachable!("fixture origin publishes the outboard");
-        };
         let cursor = OriginRangeCursor::open(
             Arc::clone(&origin) as Arc<dyn Origin>,
             hash,
             &aligned,
-            outboard,
+            u64::MAX,
             None,
         )
         .await

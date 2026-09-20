@@ -946,7 +946,7 @@ impl ClientHandler {
                 // Any request shape routes here: the serve leg clamps to
                 // `[byte_offset, end)` and the pull leg fills only that span's missing
                 // chunk groups, so a bounded request costs exactly its aligned span
-                // plus one outboard read in origin egress.
+                // in origin egress.
                 //
                 // Serviceability is confirmed by `origin_size` +
                 // `origin_fetch_outboard_bytes` (an origin publishes the outboard) —
@@ -972,10 +972,8 @@ impl ClientHandler {
                                 // Serviceable: size known and an origin publishes the
                                 // outboard. Enter the orchestration directly — it claims
                                 // the fill (owner-or-attach) internally after signing the
-                                // response, so no coalescing decision happens here. The
-                                // outboard fetched here is the one the pull leg reuses
-                                // for every draw (#2061).
-                                Ok(Some(outboard)) => {
+                                // response, so no coalescing decision happens here.
+                                Ok(Some(_)) => {
                                     // Boxed: the serve future is large
                                     // (clippy::large_futures). `pull_authorized`
                                     // (checked in the `if` above) guarantees a
@@ -990,7 +988,6 @@ impl ClientHandler {
                                             lk,
                                             ln,
                                             total,
-                                            outboard,
                                             pool_status.map(|s| s.remaining),
                                             rate_per_mb,
                                             floor_reservation,

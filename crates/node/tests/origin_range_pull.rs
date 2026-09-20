@@ -12,7 +12,7 @@
 //!
 //! Two shapes of origin:
 //! 1. The origin publishes the sibling `{H}.obao4` outboard → the handler
-//!    streams (HEAD for the size, one outboard GET, `206` ranged data GETs per
+//!    streams (HEAD for the size, outboard GETs, `206` ranged data GETs per
 //!    draw), serves the span, and a partial request leaves the blob **partial**
 //!    (never a whole-blob GET).
 //! 2. The origin does NOT publish the outboard → the spine declines and the
@@ -1375,8 +1375,8 @@ async fn bounded_unaligned_offset_own_origin_miss_streams_the_exact_bytes() -> a
 /// per-hash slot until the throwaway's current draw is admitted, then probes the
 /// origin and claims — attaching to the live fill or owning a fresh one, depending
 /// on whether the throwaway's serve leg has torn down yet. Every ordering must give
-/// a byte-exact delivery, both opens entering the two-leg tier, the outboard fetched
-/// at most once per open, no whole-blob GET, and no span fetched twice in full.
+/// a byte-exact delivery, both opens entering the two-leg tier, no whole-blob GET,
+/// and no span fetched twice in full.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::Result<()> {
@@ -1486,14 +1486,6 @@ async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::R
     anyhow::ensure!(
         counter_value(&metrics, "local_outboard_serves_total")? == 2,
         "both the throwaway and the real open must enter the two-leg tier"
-    );
-    let outboard_gets = count_requests(&server, |r| {
-        r.method.as_str() == "GET" && r.url.path() == format!("/{hex}.obao4")
-    })
-    .await?;
-    anyhow::ensure!(
-        outboard_gets <= 2,
-        "the outboard is fetched at most once per open (the probe), never per draw; saw {outboard_gets}"
     );
     let wholeblob_gets = count_requests(&server, |r| {
         r.method.as_str() == "GET"
@@ -2305,132 +2297,6 @@ fn large_blob_with_outboard() -> (Vec<u8>, Vec<u8>, Hash) {
     let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
     let hash = Hash::from_bytes(*ob.root.as_bytes());
     (blob, ob.data, hash)
-}
-
-/// #2061 §1: the pull leg fetches `{H}.obao4` ONCE per fill, not once per draw.
-/// A 3 MiB blob is several draws at the ramp floor; the origin must see exactly
-/// one outboard GET (the serviceability probe's, handed to the pull leg) and at
-/// least two ranged data GETs (proof the pull really was multi-draw).
-#[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)]
-async fn own_origin_miss_fetches_the_outboard_once_across_draws() -> anyhow::Result<()> {
-    let (blob, outboard, hash) = large_blob_with_outboard();
-    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
-    let hex = hash.to_hex();
-
-    let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
-        .mount(&server)
-        .await;
-    // Dynamic 206 responder: whatever aligned span a draw asks for.
-    let blob_for_resp = blob.clone();
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}")))
-        .and(header_exists("range"))
-        .respond_with(move |req: &Request| {
-            let span = req
-                .headers
-                .get("range")
-                .and_then(|v| v.to_str().ok())
-                .and_then(parse_byte_range)
-                .and_then(|(s, e)| Some((usize::try_from(s).ok()?, usize::try_from(e).ok()?)))
-                .and_then(|(s, e)| blob_for_resp.get(s..=e));
-            match span {
-                Some(body) => ResponseTemplate::new(206).set_body_bytes(body.to_vec()),
-                None => ResponseTemplate::new(416),
-            }
-        })
-        .mount(&server)
-        .await;
-
-    let pool_id = B256::repeat_byte(0x61);
-    let client_eth = Arc::new(PrivateKeySigner::random());
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = Arc::new(PrivateKeySigner::random());
-    let provider = server_eth.address();
-    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
-        &server.uri(),
-        pool_id,
-        client_eth.address(),
-        &server_eth,
-        server_id,
-        None,
-    )
-    .await?;
-
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    let got = ranged_paid_pull(
-        &client_ep,
-        target,
-        client_node_id,
-        &client_eth,
-        pool_id,
-        provider,
-        hash,
-        0,
-        0,
-        RATE_PER_MB,
-    )
-    .await?;
-    anyhow::ensure!(
-        got.as_slice() == blob.as_slice(),
-        "multi-draw delivery mismatch"
-    );
-    anyhow::ensure!(
-        counter_value(&metrics, "local_outboard_serves_total")? == 1,
-        "the own-origin two-leg tier must serve this miss"
-    );
-
-    let outboard_gets = count_requests(&server, |r| {
-        r.method.as_str() == "GET" && r.url.path() == format!("/{hex}.obao4")
-    })
-    .await?;
-    let ranged_gets = count_requests(&server, |r| {
-        r.method.as_str() == "GET"
-            && r.url.path() == format!("/{hex}")
-            && r.headers.contains_key("range")
-    })
-    .await?;
-    anyhow::ensure!(
-        ranged_gets >= 2,
-        "test premise: a 3 MiB blob must take several draws, saw {ranged_gets}"
-    );
-    // The minimum-draw fix's integration signal (#2061 §2): a draw covers at
-    // least half the ramped window (with the floor / final-draw / serve-demand
-    // carve-outs), so the count is bounded by roughly 2·total/window plus the
-    // floor-paced ramp-up. Well under one draw per voucher (which would be
-    // hundreds for 3 MiB): a generous ceiling that only a regression to
-    // chunk-sized draws can cross. Each draw is additionally split into 4 MiB
-    // origin fetch windows, which cannot raise the GET count here (every draw
-    // fits one window).
-    anyhow::ensure!(
-        ranged_gets <= 24,
-        "a 3 MiB pull must not regress to chunk-sized draws, saw {ranged_gets} ranged GETs"
-    );
-    anyhow::ensure!(
-        outboard_gets == 1,
-        "the outboard must be fetched once per fill, saw {outboard_gets} GET(s) across {ranged_gets} draws"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
 }
 
 /// INTERIOR-HOLD own-origin serve-miss (Flow A). The node already holds an aligned

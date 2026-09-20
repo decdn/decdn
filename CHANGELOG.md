@@ -32,8 +32,7 @@ since project inception and will roll into the first tagged release.
   (#2065).** The outboard comes from `Origin::fetch_outboard`, read once per fill.
   A custom `Origin` that overrode `fetch_range` must implement both methods;
   overriding only one silently disables range pulls. `CacheEngine::origin_encode_range`
-  is now the streaming `CacheEngine::origin_range_wire`, which takes that one
-  outboard.
+  is now the streaming `CacheEngine::origin_range_wire`.
 - **Node: every authorized `cdn/client/v1` cache miss — whole blob, bounded range,
   resumed tail — routes through the two-leg serve-miss spine when its origin (or a
   window provider) is serviceable (#2060).** The buffered `try_range_pull_through`

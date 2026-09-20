@@ -109,10 +109,9 @@ pub(crate) struct PullLegTarget {
 struct DownstreamWait {
     /// The session's downstream frontiers.
     watch: DownstreamWatch,
-    /// Bumps `node_pull_through_window_paused` on a window-bound pause (the pull
-    /// hit its ADR 037 window and waits for downstream payment to clear or a
-    /// serve leg to park at its frontier) and `node_pull_min_draw_waits` on a
-    /// minimum-draw batching pause (#2061).
+    /// Bumps `node_pull_through_window_paused` on each pause — the pull hit its ADR
+    /// 037 window and is waiting for downstream payment to clear or a serve leg to
+    /// park at its frontier.
     metrics: Arc<crate::metrics::Metrics>,
 }
 
@@ -135,20 +134,10 @@ impl DownstreamWait {
 }
 
 impl PacingWait for DownstreamWait {
-    fn wait(
-        &self,
-        observed: DownstreamFrontier,
-        batching: bool,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        // Meter the two Wait causes apart (#2061): a minimum-draw batching pause
-        // is healthy pipelining, while `window_paused` keeps meaning "the ADR
-        // 037 window binds" — counted independent of whether we then park or
-        // short-circuit on a raced advance.
-        if batching {
-            self.metrics.node_pull_min_draw_wait();
-        } else {
-            self.metrics.node_pull_through_window_paused();
-        }
+    fn wait(&self, observed: DownstreamFrontier) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        // The pull hit its ADR 037 window: count the pause (the decision was `Wait`),
+        // independent of whether we then park or short-circuit on a raced advance.
+        self.metrics.node_pull_through_window_paused();
         Box::pin(self.watch.past(observed.served_paid, observed.serve_demand))
     }
 }
@@ -1380,11 +1369,7 @@ mod local_pull_leg_tests {
         total: u64,
     ) -> anyhow::Result<Option<Result<(), FillError>>> {
         let hash = Hash::from(root);
-        let outboard = engine
-            .origin_fetch_outboard_bytes(hash, total)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("fixture origin must publish the outboard"))?;
-        let source = BackendSource::new(engine.clone(), root, total, outboard, fresh_ledger());
+        let source = BackendSource::new(engine.clone(), root, total, fresh_ledger());
         // Start the served frontier at `total` so the downstream `RampPacer` never
         // gates the pull (this test exercises the completion path, not the window).
         let session = FillSession::starting_at(bao_tree::blake3::Hash::from(root), total, total);
@@ -1530,7 +1515,7 @@ mod downstream_wait_tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            hook.wait(DownstreamFrontier::default(), false),
+            hook.wait(DownstreamFrontier::default()),
         )
         .await
         .expect("wait must observe the raced demand advance, not wedge on a lost notify");
@@ -1546,7 +1531,7 @@ mod downstream_wait_tests {
         session.demand_up_to(64 * 1024);
         let observed = hook.frontier();
 
-        let wait = hook.wait(observed, false);
+        let wait = hook.wait(observed);
         tokio::pin!(wait);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), wait.as_mut())
@@ -1583,7 +1568,7 @@ mod downstream_wait_tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            hook.wait(DownstreamFrontier::default(), false),
+            hook.wait(DownstreamFrontier::default()),
         )
         .await
         .expect("wait must observe the raced advance, not wedge on a lost notify");
@@ -1604,7 +1589,7 @@ mod downstream_wait_tests {
             async {
                 tokio::time::timeout(
                     Duration::from_secs(5),
-                    hook.wait(DownstreamFrontier::default(), false),
+                    hook.wait(DownstreamFrontier::default()),
                 )
                 .await
                 .expect("a later advance must wake the parked wait");

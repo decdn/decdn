@@ -3306,12 +3306,6 @@ impl CacheEngine {
                         );
                         continue;
                     }
-                    // The outboard is origin egress too; metered here, once per
-                    // fill, since every draw of the fill reuses it (#2061).
-                    if let Some(m) = &self.inner.metrics {
-                        m.pull_through_bytes
-                            .inc_by(u64::try_from(ob.len()).unwrap_or(u64::MAX));
-                    }
                     return Ok(Some(ob));
                 }
                 Ok(OutboardFetch::NotFound | OutboardFetch::Unsupported) => {}
@@ -3340,14 +3334,12 @@ impl CacheEngine {
 
     /// Stream the header-less interleaved bao **wire** (ADR 038) for
     /// `aligned`'s span out of the configured origins, verified against the
-    /// root `H` with `outboard` — the untrusted `{H}.obao4` the caller fetched
-    /// ONCE ([`Self::origin_fetch_outboard_bytes`]) and reuses for every draw of
-    /// the fill (#2061). This is the raw-fetch half of a range pull WITHOUT the
-    /// import (the node's `NodeAdmitStore` sink admits, fed by
+    /// root `H` — the raw-fetch half of a range pull WITHOUT the import (the
+    /// node's `NodeAdmitStore` sink admits, fed by
     /// `decdn_client_pull::BlobSource`).
     ///
-    /// The first origin that serves the first window wins; a per-origin
-    /// decline or transport fault advances the chain. The wire is produced
+    /// The first origin that serves the outboard and the first window wins; a
+    /// per-origin decline or transport fault advances the chain. The wire is produced
     /// window by window ([`crate::RANGE_PULL_WINDOW_BYTES`]) by a background
     /// encode that holds a permit from the engine-wide pool of
     /// [`crate::MAX_CONCURRENT_RANGE_PULLS`], so memory stays
@@ -3363,9 +3355,8 @@ impl CacheEngine {
     ///
     /// # Errors
     ///
-    /// - [`CacheError::VerifyFailed`] — `outboard` has the wrong length for the
-    ///   blob, or the winning origin served a wrong-length first window; neither
-    ///   can verify against `H`.
+    /// - [`CacheError::VerifyFailed`] — the winning origin served a wrong-length
+    ///   outboard or a wrong-length first window; neither can verify against `H`.
     /// - [`CacheError::OriginError`] — no origin opened the range and at least
     ///   one failed with a transport fault (the last such fault).
     ///
@@ -3374,16 +3365,16 @@ impl CacheEngine {
         &self,
         hash: Hash,
         aligned: &AlignedRange,
-        outboard: Bytes,
     ) -> CacheResult<Option<OriginRangeWire>> {
         let permit = Self::range_pull_permit(&self.inner.own_origin_range_pulls).await?;
+        let outboard_max = expected_outboard_len(aligned.blob_size()).saturating_add(64);
         let mut last_err: Option<CacheError> = None;
         for origin in &self.inner.origins {
             let opened = OriginRangeCursor::open(
                 Arc::clone(origin),
                 hash,
                 aligned,
-                outboard.clone(),
+                outboard_max,
                 self.inner.metrics.clone(),
             )
             .await;
@@ -9001,22 +8992,6 @@ mod tests {
         Ok((engine, tmp))
     }
 
-    /// Open the wire the way the node does: the outboard is probed ONCE
-    /// (`origin_fetch_outboard_bytes`) and handed to every draw. An origin that
-    /// publishes no outboard hands the wire an empty one; the wire then declines
-    /// or faults on its own terms, exactly as the caller would see.
-    async fn wire_for(
-        engine: &CacheEngine,
-        hash: Hash,
-        aligned: &AlignedRange,
-    ) -> CacheResult<Option<OriginRangeWire>> {
-        let outboard = engine
-            .origin_fetch_outboard_bytes(hash, aligned.blob_size())
-            .await?
-            .unwrap_or_default();
-        engine.origin_range_wire(hash, aligned, outboard).await
-    }
-
     /// An origin that stops serving (declines) a later window ends the wire on
     /// an `OriginError`, not a `VerifyFailed` and not a clean end.
     #[tokio::test]
@@ -9024,7 +8999,10 @@ mod tests {
         let (_, hash, mut origin, aligned) = multi_window_stub();
         origin.decline_from = crate::RANGE_PULL_WINDOW_BYTES;
         let (engine, _tmp) = stub_engine(vec![origin]).await?;
-        let wire = wire_for(&engine, hash, &aligned).await?.expect("opens");
+        let wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .expect("opens");
         let (_, fault) = drain_wire(wire).await;
         anyhow::ensure!(
             matches!(fault, Some(CacheError::OriginError { .. })),
@@ -9039,7 +9017,10 @@ mod tests {
         let (_, hash, mut origin, aligned) = multi_window_stub();
         origin.fail_from = crate::RANGE_PULL_WINDOW_BYTES;
         let (engine, _tmp) = stub_engine(vec![origin]).await?;
-        let wire = wire_for(&engine, hash, &aligned).await?.expect("opens");
+        let wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .expect("opens");
         let (_, fault) = drain_wire(wire).await;
         anyhow::ensure!(
             matches!(fault, Some(CacheError::OriginError { .. })),
@@ -9055,7 +9036,10 @@ mod tests {
         let (_, hash, mut origin, aligned) = multi_window_stub();
         origin.panic_from = crate::RANGE_PULL_WINDOW_BYTES;
         let (engine, _tmp) = stub_engine(vec![origin]).await?;
-        let wire = wire_for(&engine, hash, &aligned).await?.expect("opens");
+        let wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .expect("opens");
         let (_, fault) = drain_wire(wire).await;
         anyhow::ensure!(
             matches!(fault, Some(CacheError::OriginError { .. })),
@@ -9078,23 +9062,28 @@ mod tests {
 
         let mut wires = Vec::new();
         for _ in 0..crate::MAX_CONCURRENT_RANGE_PULLS {
-            let mut wire = wire_for(&engine, hash, &aligned).await?.expect("opens");
+            let mut wire = engine
+                .origin_range_wire(hash, &aligned)
+                .await?
+                .expect("opens");
             anyhow::ensure!(matches!(wire.next_chunk().await, Some(Ok(_))));
             wires.push(wire);
         }
         anyhow::ensure!(
             tokio::time::timeout(
                 Duration::from_millis(200),
-                wire_for(&engine, hash, &aligned)
+                engine.origin_range_wire(hash, &aligned)
             )
             .await
             .is_err(),
             "a full own-origin pool must make the next open wait",
         );
         drop(wires);
-        let reopened =
-            tokio::time::timeout(Duration::from_secs(10), wire_for(&engine, hash, &aligned))
-                .await??;
+        let reopened = tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.origin_range_wire(hash, &aligned),
+        )
+        .await??;
         anyhow::ensure!(
             reopened.is_some(),
             "dropped wires must release their permits"
@@ -9114,7 +9103,10 @@ mod tests {
         let origin = RangeStubOrigin::serving(hash, &[], outboard.clone());
         let (engine, _tmp) = stub_engine(vec![origin]).await?;
         let aligned = crate::range_pull::align_range(0, 0, 0)?;
-        let wire = wire_for(&engine, hash, &aligned).await?.expect("opens");
+        let wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .expect("opens");
         let (wire, fault) = drain_wire(wire).await;
         anyhow::ensure!(fault.is_none(), "the empty blob must not fault: {fault:?}");
         let reference = encode_verified_range(root, &aligned, &[], outboard)?;
@@ -9131,7 +9123,10 @@ mod tests {
         declining.support_range = false;
         let faulting = RangeStubOrigin::outboard_faulting(hash, aligned.blob_size());
         let (engine, _tmp) = stub_engine(vec![faulting, declining, serving]).await?;
-        let wire = wire_for(&engine, hash, &aligned).await?.expect("opens");
+        let wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .expect("opens");
         let (wire, fault) = drain_wire(wire).await;
         anyhow::ensure!(
             fault.is_none(),
@@ -9155,7 +9150,8 @@ mod tests {
         let (_, hash, _, aligned) = multi_window_stub();
         let faulting = RangeStubOrigin::outboard_faulting(hash, aligned.blob_size());
         let (engine, _tmp) = stub_engine(vec![faulting]).await?;
-        let err = wire_for(&engine, hash, &aligned)
+        let err = engine
+            .origin_range_wire(hash, &aligned)
             .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected an OriginError"))?;
@@ -9185,7 +9181,7 @@ mod tests {
         // Start mid-blob so the range is not window-aligned to the blob start.
         let aligned = crate::range_pull::align_range(3 * crate::CHUNK_GROUP_BYTES, 0, total)
             .map_err(|e| anyhow::anyhow!("align: {e}"))?;
-        let Some(wire) = wire_for(&engine, hash, &aligned).await? else {
+        let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
             anyhow::bail!("expected Some(wire) — the origin serves the range + outboard");
         };
         let (wire, fault) = drain_wire(wire).await;
@@ -9251,7 +9247,7 @@ mod tests {
 
         let aligned = crate::range_pull::align_range(0, 0, total)
             .map_err(|e| anyhow::anyhow!("align: {e}"))?;
-        let Some(wire) = wire_for(&engine, hash, &aligned).await? else {
+        let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
             anyhow::bail!("expected Some(wire) — the first window serves");
         };
         let (_, fault) = drain_wire(wire).await;
@@ -9280,7 +9276,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
-        let Some(wire) = wire_for(&engine, hash, &aligned).await? else {
+        let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
             anyhow::bail!("expected Some(wire) — the first window serves");
         };
         let (_, fault) = drain_wire(wire).await;
@@ -9309,7 +9305,8 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
-        let err = wire_for(&engine, hash, &aligned)
+        let err = engine
+            .origin_range_wire(hash, &aligned)
             .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?;
@@ -9334,7 +9331,8 @@ mod tests {
 
         let aligned = crate::range_pull::align_range(0, 0, total)
             .map_err(|e| anyhow::anyhow!("align: {e}"))?;
-        let err = wire_for(&engine, hash, &aligned)
+        let err = engine
+            .origin_range_wire(hash, &aligned)
             .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?;
@@ -9362,7 +9360,7 @@ mod tests {
         let aligned = crate::range_pull::align_range(0, 0, total)
             .map_err(|e| anyhow::anyhow!("align: {e}"))?;
         anyhow::ensure!(
-            wire_for(&engine, hash, &aligned).await?.is_none(),
+            engine.origin_range_wire(hash, &aligned).await?.is_none(),
             "an unsupported origin must degrade origin_range_wire to Ok(None)"
         );
         Ok(())
@@ -9382,27 +9380,11 @@ mod tests {
 
         let serving = RangeStubOrigin::serving(hash, &data, outboard.clone());
         let tmp = tempfile::tempdir()?;
-        let metrics = Arc::new(crate::metrics::CacheMetrics::default());
-        let engine = CacheEngine::open_full(
-            tmp.path(),
-            vec![Arc::new(serving) as Arc<dyn Origin>],
-            64,
-            PinnedHashes::default(),
-            RetryPolicy::default(),
-            CircuitBreakerPolicy::default(),
-            Some(Arc::clone(&metrics)),
-            std::time::Duration::ZERO,
-        )
-        .await?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(serving) as Arc<dyn Origin>], 64).await?;
         anyhow::ensure!(
-            engine.origin_fetch_outboard_bytes(hash, total).await? == Some(outboard.clone()),
+            engine.origin_fetch_outboard_bytes(hash, total).await? == Some(outboard),
             "a publishing origin must return its outboard bytes"
-        );
-        // The outboard is origin egress, metered once per fill (#2061) — the
-        // per-draw metering moved to `origin_range_wire`'s data spans.
-        anyhow::ensure!(
-            metrics.pull_through_bytes.get() == u64::try_from(outboard.len()).unwrap_or(u64::MAX),
-            "outboard bytes must land in pull_through_bytes"
         );
 
         let bare = OutboardStubOrigin::new(&data, None);
