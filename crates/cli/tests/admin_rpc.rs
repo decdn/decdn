@@ -30,8 +30,11 @@ const fn nz(v: u64) -> NonZeroU64 {
 use decdn_cache::CacheEngine;
 use decdn_cli::commands::node as commands;
 use decdn_common::admin::{AdminRpcClient, DrainRequest};
-use decdn_common::cli::{DrainArgs, EvictArgs, HealthArgs, LanesArgs, ReloadArgs, StatusArgs};
-use decdn_incentive::{LaneState, MemoryPoolStateStore, PoolStateStore};
+use decdn_common::cli::{
+    DrainArgs, EvictArgs, HealthArgs, LanesArgs, PoolsArgs, ReloadArgs, StatusArgs,
+};
+use decdn_incentive::buyer_pool::{BuyerPoolState, BuyerPoolStore};
+use decdn_incentive::{LaneState, MemoryBuyerPoolStore, MemoryPoolStateStore, PoolStateStore};
 use decdn_node::admin::{
     self, AdminState, DhtStatusHandles, DrainTrigger, LaneActivityClock, LaneStatusHandles,
 };
@@ -290,6 +293,115 @@ async fn lanes_without_handles_returns_empty_over_http() -> anyhow::Result<()> {
 
     let _ = stop_tx.send(());
     join.await?;
+    Ok(())
+}
+
+/// `admin_v1_pools` round-trips through real HTTP (#2078): a seeded buyer
+/// store surfaces every pool, sorted by id, with its deposit intact.
+#[tokio::test]
+async fn pools_round_trips_seeded_store() -> anyhow::Result<()> {
+    use alloy::primitives::{Address, B256, U256};
+
+    let store = Arc::new(MemoryBuyerPoolStore::new());
+    // Two owners, so both rows survive the store's owner index.
+    store.record(&BuyerPoolState::new(
+        B256::repeat_byte(0xbb),
+        Address::repeat_byte(0x22),
+        Address::repeat_byte(0xcd),
+        U256::from(9_000_000u64),
+    ))?;
+    store.record(&BuyerPoolState::new(
+        B256::repeat_byte(0xaa),
+        Address::repeat_byte(0x11),
+        Address::repeat_byte(0xcd),
+        U256::from(10_000_000u64),
+    ))?;
+
+    let (cache, _tmp) = test_cache().await?;
+    let state = AdminState::new(
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        Arc::new(DrainTrigger::new()),
+        Arc::new(Metrics::new()),
+    )
+    .with_buyer_pools(store as Arc<dyn BuyerPoolStore>);
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+
+    let client = HttpClientBuilder::default().build(&url)?;
+    let resp = client.pools().await?;
+    assert_eq!(resp.pools.len(), 2);
+    assert!(resp.skipped.is_empty());
+    let first = resp
+        .pools
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing first pool"))?;
+    assert_eq!(first.pool_id, format!("{:#x}", B256::repeat_byte(0xaa)));
+    assert_eq!(first.deposit_micro_usdc, 10_000_000);
+    assert!(first.owner.starts_with("0x"));
+
+    let _ = stop_tx.send(());
+    join.await?;
+    Ok(())
+}
+
+/// `admin_v1_pools` on a node with no buyer leg wired is an error over the
+/// wire, not an empty list. A node that never pays for pulls and a node that
+/// owns no pools demand opposite responses from an operator chasing a
+/// stranded deposit, and the CLI must be able to tell them apart (#2078).
+#[tokio::test]
+async fn pools_without_buyer_leg_is_an_error_over_http() -> anyhow::Result<()> {
+    let (cache, _tmp) = test_cache().await?;
+    let state = AdminState::new(
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        Arc::new(DrainTrigger::new()),
+        Arc::new(Metrics::new()),
+    );
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+
+    let client = HttpClientBuilder::default().build(&url)?;
+    let err = client
+        .pools()
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected an unavailable error"))?
+        .to_string();
+    assert!(
+        err.contains("no buyer payment-pool store is attached"),
+        "error should name the missing store, not blame config, got: {err}"
+    );
+
+    let _ = stop_tx.send(());
+    join.await?;
+    Ok(())
+}
+
+/// CLI `pools` against a dropped listener surfaces the connection-refused
+/// hint, same as the other admin subcommands.
+#[tokio::test]
+async fn cli_pools_surfaces_connection_refused() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    drop(listener);
+
+    let args = PoolsArgs {
+        admin_url: Some(format!("http://{addr}")),
+        config: None,
+        json: false,
+        timeout_ms: 2_000,
+    };
+    let err = commands::pools(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
+        .to_string();
+    assert!(
+        err.contains("refused"),
+        "error should mention 'refused', got: {err}"
+    );
     Ok(())
 }
 

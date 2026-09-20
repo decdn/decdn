@@ -34,8 +34,9 @@ pub use fetch::{ClientFetchArgs, FetchArgs};
 pub use key_gen::KeyGenArgs;
 pub use node::{
     BondArgs, ChainArgs, DeregisterArgs, DoctorArgs, DrainArgs, EvictArgs, HealthArgs, LanesArgs,
-    LookupArgs, NodeArgs, NodeCommand, RegisterArgs, ReloadArgs, RotateKeyArgs, RotateKeyTarget,
-    SlashesArgs, StatusArgs, TopArgs, UnbondArgs, UpdateMultiaddrsArgs, UpdateRegionArgs,
+    LookupArgs, NodeArgs, NodeCommand, PoolsArgs, RegisterArgs, ReloadArgs, RotateKeyArgs,
+    RotateKeyTarget, SlashesArgs, StatusArgs, TopArgs, UnbondArgs, UpdateMultiaddrsArgs,
+    UpdateRegionArgs,
 };
 pub use origin::{OriginArgs, OriginCommand, OriginImportArgs};
 pub use pool::{

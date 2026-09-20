@@ -28,6 +28,32 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **CLI: `decdn pool` refuses to write a store a `decdn-node` daemon owns
+  (#2078).** Every store-backed `pool` subcommand — `list`, `open`, `top-up`,
+  `close`, `reclaim`; `assign` touches no store — used
+  `<data_dir>/buyer-pools.redb`, the *client's* store. A daemon keeps its buyer state in `<data_dir>/buyer.redb`, so
+  on a node host the CLI read and wrote a different file than the node it was
+  pointed at — and `Database::create` manufactured that file where none existed.
+  A data dir containing any of the daemon's store files (`buyer.redb`,
+  `lanes.redb`, `settle.redb`, `checkpoint.redb` — the whole set, because the
+  buyer store is exactly the file a reset loses) is now recognized as a
+  daemon's:
+  `pool open` and `pool top-up` refuse (they escrow USDC into a store the node
+  never reads, which is exactly the stranded deposit #2075 exists to prevent);
+  `close --all` and `reclaim --all` refuse (they enumerate from chain by keystore
+  address, so they would close the pool the daemon is paying from right now);
+  `close --pool` and `reclaim --pool` still run their on-chain leg — the stranded
+  pool recovery path — but no longer report a no-op local `forget` as a clean
+  close, naming the daemon row they could not touch instead. `pool list` routes to
+  the daemon (see Added) and prints `store=<path>` above the table, so `pools=0`
+  names the file that produced it. `pool list --json` gains `store` and `source`
+  fields instead; read `source` before the pool objects, because the two stores
+  emit different shapes (`deposit_usdc` as a decimal string and lowercase
+  addresses from the client store, `deposit_micro_usdc` as a number and EIP-55
+  addresses from the daemon). `decdn node pools` names the admin URL it asked.
+  Scripts that ran `pool open` against a node config must stop: the daemon opens
+  and tops up its own pool from `blockchain.buyer_working_deposit_micro_usdc`.
+
 - **Cache: `Origin::fetch_range` is now the data-only `Origin::fetch_range_data`
   (#2065).** The outboard comes from `Origin::fetch_outboard`, read once per range
   pull. A custom `Origin` that overrode `fetch_range` must implement both methods;
@@ -726,6 +752,41 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+- **Node: bootstrap distinguishes "this pool is not open" from "its status could
+  not be read" (#2078).** The stale-row drop below judged a tracked pool by its
+  absence from the set of pools read as `Open`, and a `getPool` call that faulted
+  produced the same absence. One transient RPC error at bootstrap — there is no
+  retry on that call — would therefore delete the node's only record of a funded
+  pool, and the next miss would escrow a second deposit: the #2072 failure,
+  self-inflicted, and invisible because the stranded-pool report cannot name a
+  pool it failed to read either. A row is now dropped only on a successful read
+  that returned a non-`Open` status. An id `getPools` does not list also counts
+  as unknown: that view derives ids from `ownerPoolNonce` and `closePool` /
+  `reclaim` only change a pool's status, so it is append-only and an absent id
+  has no on-chain producer.
+
+- **Node: a buyer-pool row the chain no longer lists as open wedged the buy leg
+  (#2078).** `reuse_or_report` reads the tracked row without a status check, and
+  bootstrap answered `AlreadyTracked` for any row at all, so a pool closed or
+  reclaimed out of band — which is what `decdn pool close --pool` from a node
+  host leaves behind, since it cannot write the daemon's store — pinned every
+  later pull to a pool `redeemMany` rejects every voucher against. Restarting
+  did not help. Bootstrap now checks the tracked pool against the chain's open
+  set, drops a stale row, and adopts or opens a replacement.
+
+- **Node: a node with an intact buyer store never reported its stranded pools
+  (#2078).** `reconcile_owned_pool` returned as soon as the store named a tracked
+  pool, before it enumerated `getPools` — so `report_stranded_pools` was reachable
+  only on the adoption path. The steady state (store intact, a deposit stranded by
+  an earlier build) was therefore permanently silent, and only a direct `getPools`
+  read surfaced it. The enumeration now runs on every bootstrap, and the stranded
+  set is measured against the pool the *store* names rather than the one an
+  adoption would have selected. A fully-redeemed `Open` pool is no longer listed:
+  `reclaim` refunds `deposit - totalRedeemed`, so there is nothing to recover.
+  `decdn_buyer_pool_adoption_failures_total` is deliberately **not** widened — an
+  enumeration failure on the already-tracked path warns instead, because the
+  counter means "about to open a second pool" and that path never is.
 
 - **Node: the pre-redeem watermark reconciliation never decoded on a chain
   without Multicall3 (#2076).** The seller's last gas check before a `redeemMany`
@@ -1835,6 +1896,20 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+- **Admin/CLI: `admin_v1_pools` and `decdn node pools` read the node's buyer-side
+  `PaymentPool` state (#2078).** The buyer-side counterpart of `admin_v1_lanes` /
+  `decdn node lanes`: every pool the buy leg tracks, the deposit it believes each
+  holds, and the per-lane amount already signed away to each provider. This is the
+  *only* read path to that state on a running node — `redb` holds a
+  process-exclusive lock on `buyer.redb` for the daemon's lifetime, so no other
+  process can open it, not even read-only. A node with no `[blockchain]` wiring
+  answers `BUYER_POOL_UNAVAILABLE_CODE` (`-32011`) rather than an empty list,
+  because "this node never pays for pulls" and "this node owns no pools" send an
+  operator hunting a stranded deposit in opposite directions; a store read failure
+  answers `BUYER_POOL_STORE_ERROR_CODE` (`-32010`). `decdn pool list` gains
+  `--admin-url` and `--timeout-ms`, used only when the data dir turns out to be a
+  daemon's.
 
 - **Metrics: the buyer leg reports itself (#2072).** New gauge
   `decdn_buyer_wallet_usdc`, read once per reclaim sweep and at bootstrap, plus

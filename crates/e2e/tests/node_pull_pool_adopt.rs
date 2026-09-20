@@ -26,6 +26,12 @@
 //!      below the contract's watermark, which `_applyVoucher` treats as
 //!      transient-empty. The node would stream real bytes and buy none of them;
 //!      only a real seeder redeeming real vouchers shows that.
+//!   4. **An operator can read any of it.** `redb` holds an exclusive lock on
+//!      `buyer.redb` for the daemon's lifetime, so the read has to cross the
+//!      admin RPC — a mocked store proves nothing about that. An operator who
+//!      runs `decdn pool list` against a healthy node must not read its output
+//!      as corroboration of the forgotten-pool bug, which is what a silently
+//!      opened second store produces (#2078).
 //!
 //! Topology mirrors `node_pull_topup.rs`: a cold pull-through SERVER that holds
 //! nothing, satisfying a client miss only by a paid pull from a SEEDER that
@@ -42,8 +48,9 @@ use alloy::primitives::U256;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_e2e::chain::ChainFixture;
+use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::client::ClientFixture;
-use decdn_e2e::node::NodeFixture;
+use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture};
 use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
 
 /// Overall ceiling so an unbounded await fails fast. This journey stands up two
@@ -93,6 +100,8 @@ fn make_blob(len: usize) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_that_lost_its_buyer_store_adopts_its_pool_instead_of_opening_a_second()
 -> anyhow::Result<()> {
+    // Fail before the chain and two daemons come up, not five minutes in.
+    ensure_decdn_cli_built()?;
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
         .await
         .context("buyer-pool adoption e2e exceeded the overall timeout")??;
@@ -290,6 +299,108 @@ async fn run() -> anyhow::Result<()> {
         after == before,
         "a node that lost its buyer store must adopt the pool it owns, not open a second \
          (before {before:?}, after {after:?})"
+    );
+
+    // (5) The operator can SEE all of the above from the CLI (#2078). Everything
+    // up to here is invisible without a `cast` call, and a `pool list` that
+    // silently reads a different store reports `pools=0` on this healthy node —
+    // which an operator reads as corroboration of the forgotten-pool bug.
+    assert_operator_can_read_the_adopted_pool(&server, original_pool).await?;
+
+    Ok(())
+}
+
+/// Drive the real `decdn` binary against the live daemon and pin the operator's
+/// view of its buyer pool (#2078).
+///
+/// Only reachable against a real daemon: `redb` holds an exclusive lock on
+/// `buyer.redb` for the node's lifetime, so the read has to go over the admin
+/// RPC, and a unit test with a mocked store proves nothing about that.
+async fn assert_operator_can_read_the_adopted_pool(
+    server: &NodeFixture,
+    adopted: alloy::primitives::B256,
+) -> anyhow::Result<()> {
+    let adopted_hex = format!("{adopted:#x}");
+    let client_store = server.data_dir().join("buyer-pools.redb");
+
+    // `decdn node pools` reports the pool the daemon actually adopted.
+    let out = tokio::process::Command::from(decdn_command(server.data_dir(), KEYSTORE_PASSWORD)?)
+        .args(["node", "pools", "--config"])
+        .arg(server.config_path())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("spawn decdn node pools")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "decdn node pools failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    anyhow::ensure!(
+        stdout.contains("pools=1"),
+        "decdn node pools must report the adopted pool, got: {stdout}"
+    );
+
+    // `decdn pool list` against the node's config routes to the same place,
+    // names `buyer.redb`, and — the regression — leaves no client store behind.
+    let out = tokio::process::Command::from(decdn_command(server.data_dir(), KEYSTORE_PASSWORD)?)
+        .args(["pool", "list", "--config"])
+        .arg(server.config_path())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("spawn decdn pool list")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "decdn pool list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    anyhow::ensure!(
+        stdout.contains("buyer.redb") && stdout.contains("pools=1"),
+        "pool list must name the daemon's store and report its pool, got: {stdout}"
+    );
+    anyhow::ensure!(
+        stdout.contains(&adopted_hex[..12]),
+        "pool list must show the adopted pool id {adopted_hex}, got: {stdout}"
+    );
+    anyhow::ensure!(
+        !client_store.exists(),
+        "pool list must not create {} inside a node data dir",
+        client_store.display()
+    );
+
+    // `decdn pool open` is refused rather than escrowing a second deposit into
+    // a store the daemon never reads. Every other required argument is supplied,
+    // so a clap rejection cannot be mistaken for the guard firing.
+    let out = tokio::process::Command::from(decdn_command(server.data_dir(), KEYSTORE_PASSWORD)?)
+        .args([
+            "pool",
+            "open",
+            "--deposit-micro-usdc",
+            "1000000",
+            "--config",
+        ])
+        .arg(server.config_path())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("spawn decdn pool open")?;
+    anyhow::ensure!(
+        !out.status.success(),
+        "decdn pool open must be refused on a node data dir, but it succeeded: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    anyhow::ensure!(
+        stderr.contains("buyer.redb"),
+        "the refusal must name the daemon's store, got: {stderr}"
+    );
+    anyhow::ensure!(
+        !client_store.exists(),
+        "a refused pool open must not create {}",
+        client_store.display()
     );
 
     Ok(())

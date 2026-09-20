@@ -465,6 +465,73 @@ pub struct LanesResponse {
     pub redeem_threshold_micro_usdc: u64,
 }
 
+/// One lane the node pays on, as the buyer's own store records it
+/// (`admin_v1_pools`). The buyer-side mirror of [`LaneSnapshot`]: where that
+/// reports what a lane has accrued *against* this node, this reports what this
+/// node has already promised to pay a provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuyerLaneSnapshot {
+    /// The capability signer whose key authorized the vouchers on this lane
+    /// (`LaneKey::signer`), EIP-55 checksummed hex. Equal to the pool owner for
+    /// the ordinary self-signing case, and a delegate key otherwise.
+    pub voucher_signer: String,
+    /// The provider being paid on this lane (`LaneKey::provider`), EIP-55
+    /// checksummed hex.
+    pub provider: String,
+    /// Cumulative amount of the last voucher this node signed on the lane, in
+    /// micro-USDC. This is the node's own spend watermark: re-signing a lower
+    /// total is what strands a channel, so it is the figure to compare against
+    /// a provider's complaint.
+    pub last_amount_micro_usdc: u64,
+    /// Bytes delivered as of that same voucher.
+    pub last_bytes_delivered: u64,
+}
+
+/// One `PaymentPool` deposit the node's buyer leg tracks (`admin_v1_pools`).
+///
+/// The amounts are the *stored* ones, not a chain read: this is what the daemon
+/// believes, which is the half an operator cannot otherwise see. A disagreement
+/// with `PaymentPool.getPool` is itself the diagnostic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuyerPoolSnapshot {
+    /// The on-chain pool id, `0x`-prefixed 32-byte hex.
+    pub pool_id: String,
+    /// The deposit owner — this node's operator address, EIP-55 checksummed hex.
+    pub owner: String,
+    /// The ERC-20 the pool is denominated in (USDC per ADR 003), EIP-55
+    /// checksummed hex.
+    pub token: String,
+    /// The pool's escrowed deposit in micro-USDC, as the store recorded it.
+    ///
+    /// The stored value is a `U256`; the server narrows with
+    /// `u64::try_from(..).unwrap_or(u64::MAX)`, so a deposit that somehow
+    /// exceeded `u64::MAX` micro-USDC (~1.8e13 USDC — unreachable for a real
+    /// pool) saturates rather than wraps. The same holds for every
+    /// `U256`-derived field on [`BuyerLaneSnapshot`], including
+    /// `last_bytes_delivered`.
+    pub deposit_micro_usdc: u64,
+    /// Every lane funded from this pool, ordered by `(signer, provider)`. One
+    /// pool fans out to every provider the owner pays (ADR 003), so this is
+    /// where the pool's spend is actually visible.
+    pub lanes: Vec<BuyerLaneSnapshot>,
+}
+
+/// Snapshot of the node's buyer-side `PaymentPool` state (`admin_v1_pools`).
+///
+/// This is the only way to read `buyer.redb` on a running node: `redb` holds a
+/// process-exclusive lock on that file for the daemon's lifetime, so no CLI can
+/// open it — not even read-only — while the node is up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuyerPoolsResponse {
+    /// One entry per tracked pool, ordered by `pool_id` so the output is stable
+    /// across calls regardless of the store's internal key order.
+    pub pools: Vec<BuyerPoolSnapshot>,
+    /// `pool_id`s whose stored record would not decode, `0x`-prefixed hex.
+    /// Their deposits stay escrowed but untracked, so an empty [`Self::pools`]
+    /// beside a non-empty `skipped` does not mean "this node owns no pools".
+    pub skipped: Vec<String>,
+}
+
 /// One slash detected against this node's operator (`SlashJudge.Slashed`,
 /// #1032, G-NODE-05). Surfaced so an operator (or a keeper script) can notice a
 /// slash and file `decdn appeal slash` within the 30-day window without watching
@@ -557,6 +624,29 @@ pub const POOL_STORE_ERROR_CODE: i32 = -32_007;
 /// invocation). Benign config state, distinct from a generic failure so an
 /// operator gets "no slash detection on this node" rather than an opaque error.
 pub const SLASH_DETECTION_UNAVAILABLE_CODE: i32 = -32_009;
+
+/// JSON-RPC error code: `admin_v1_pools` could not read the buyer pool store.
+/// Distinct from [`POOL_STORE_ERROR_CODE`], which covers the seller-side lane
+/// store: the two are different files, and a fault in one says nothing about
+/// the other.
+pub const BUYER_POOL_STORE_ERROR_CODE: i32 = -32_010;
+
+/// JSON-RPC error code: `admin_v1_pools` was called on an admin surface with
+/// no buyer pool store attached, so it can say nothing about what this node
+/// tracks.
+///
+/// Deliberately an error rather than an empty list — unlike `admin_v1_lanes`,
+/// which reports zero lanes as a legitimate state. "This node does not pay for
+/// pulls" and "this node owns no pools" demand opposite responses from an
+/// operator hunting a stranded deposit, and rendering the first as the second
+/// is the ambiguity this method exists to remove.
+///
+/// The production runtime attaches the buyer store unconditionally, so a
+/// running daemon does not answer this: it covers a hand-built `AdminState` —
+/// a test, or a future bring-up with no buy leg — the same posture as
+/// [`DHT_UNAVAILABLE_CODE`]. The alternative for that arm would be an empty
+/// list, which is the answer this code exists to avoid giving.
+pub const BUYER_POOL_UNAVAILABLE_CODE: i32 = -32_011;
 
 /// Admin RPC surface. Versioned via the namespace prefix
 /// (`admin_v1_...`): new methods may be added backwards-compatibly
@@ -662,6 +752,21 @@ pub trait AdminRpc {
     /// when the slash watcher is not wired on this node.
     #[method(name = "slashes")]
     async fn slashes(&self) -> RpcResult<SlashesResponse>;
+
+    /// Return the node's buyer-side `PaymentPool` state: every pool its buyer
+    /// leg tracks, the deposit it believes each holds, and the per-lane spend
+    /// watermark it has signed against each provider.
+    ///
+    /// This is the buyer-side counterpart of [`Self::lanes`], and the only read
+    /// path to `buyer.redb` on a running node — `redb` holds a
+    /// process-exclusive lock on that file for the daemon's lifetime, so a CLI
+    /// pointed at the daemon's data dir cannot open it and would otherwise
+    /// report an unrelated empty store as the node's state.
+    ///
+    /// Returns [`BUYER_POOL_UNAVAILABLE_CODE`] when no buyer leg is wired, and
+    /// [`BUYER_POOL_STORE_ERROR_CODE`] when the store cannot be read.
+    #[method(name = "pools")]
+    async fn pools(&self) -> RpcResult<BuyerPoolsResponse>;
 }
 
 /// Decode a 64-character hex BLAKE3 hash into a [`struct@Hash`].
@@ -772,6 +877,40 @@ mod tests {
             back.operator_address.as_deref(),
             Some("0x52908400098527886E0F7030069857D2E4169EE7")
         );
+    }
+
+    /// `BuyerPoolsResponse` round-trips through serde unchanged — guards the
+    /// nested shape both the server and `decdn node pools` (de)serialize, and
+    /// pins that `skipped` survives independently of `pools` (an empty `pools`
+    /// beside a non-empty `skipped` is a real state, #2078).
+    #[test]
+    fn buyer_pools_response_round_trips() {
+        let resp = BuyerPoolsResponse {
+            pools: vec![BuyerPoolSnapshot {
+                pool_id: "0xabcd".to_string(),
+                owner: "0x52908400098527886E0F7030069857D2E4169EE7".to_string(),
+                token: "0x00cc".to_string(),
+                deposit_micro_usdc: 10_000_000,
+                lanes: vec![BuyerLaneSnapshot {
+                    voucher_signer: "0x00aa".to_string(),
+                    provider: "0x00bb".to_string(),
+                    last_amount_micro_usdc: 191_205,
+                    last_bytes_delivered: 4_194_304,
+                }],
+            }],
+            skipped: vec!["0x4444".to_string()],
+        };
+        let json = serde_json::to_string(&resp).expect("serialize BuyerPoolsResponse");
+        let back: BuyerPoolsResponse =
+            serde_json::from_str(&json).expect("deserialize BuyerPoolsResponse");
+        let pool = back.pools.first().expect("one pool");
+        assert_eq!(pool.pool_id, "0xabcd");
+        assert_eq!(pool.deposit_micro_usdc, 10_000_000);
+        let lane = pool.lanes.first().expect("one lane");
+        assert_eq!(lane.provider, "0x00bb");
+        assert_eq!(lane.last_amount_micro_usdc, 191_205);
+        assert_eq!(lane.last_bytes_delivered, 4_194_304);
+        assert_eq!(back.skipped, vec!["0x4444".to_string()]);
     }
 
     /// `LanesResponse` round-trips through serde unchanged — guards the

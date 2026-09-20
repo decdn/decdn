@@ -14,6 +14,18 @@
 //! lookup, because one pool fans out to every provider the owner pays
 //! (ADR 003). `close` and `reclaim` also accept `--all`, which enumerates every
 //! pool this keystore owns on-chain (`getPools`) and acts on each eligible one.
+//!
+//! These commands own the **client's** buyer store, `buyer-pools.redb`. A
+//! `decdn-node` daemon keeps its own buyer pools in `buyer.redb` in its data
+//! dir; the two files share a table format and nothing else. A data dir holding
+//! any of the daemon's stores — not just `buyer.redb`, which is the file a
+//! reset loses — is a node's. Pointed at one, `list` reports the node's pools
+//! over the admin RPC (while the daemon runs it holds that file exclusively,
+//! so there is no disk path to it),
+//! and the commands that would escrow into a store the node never reads —
+//! `open`, `top-up`, and the chain-enumerating `close --all` / `reclaim --all` —
+//! refuse. `close --pool` and `reclaim --pool` still run, and say plainly that
+//! the daemon's own record was left untouched.
 
 use std::path::PathBuf;
 
@@ -30,8 +42,16 @@ pub struct PoolArgs {
 /// Client-side payment-pool lifecycle operations.
 #[derive(Subcommand, Debug)]
 pub enum PoolCommand {
-    /// List the tracked buyer pools and their per-lane voucher watermark
-    /// (read-only; reads the buyer store, no chain or network access).
+    /// List the tracked buyer pools and their per-lane voucher watermark.
+    ///
+    /// Read-only, and it names the store it read — on the `store=` line, or
+    /// the `store` field under `--json`. On a client data dir that is the
+    /// CLI's own `buyer-pools.redb`, read directly. On a `decdn-node` daemon's
+    /// data dir it is the daemon's `buyer.redb`, read over the admin RPC:
+    /// while that daemon runs it holds the file exclusively, so nothing can
+    /// open it from disk. The two are separate stores — a client listing says
+    /// nothing about a node, and vice versa — and their `--json` pool objects
+    /// differ, so read `source` before parsing them.
     #[command(visible_alias = "status")]
     List(PoolListArgs),
     /// Open a fresh `PaymentPool` deposit, escrowing `--deposit-micro-usdc`
@@ -215,8 +235,11 @@ pub struct PoolChainArgs {
 
 /// `decdn pool list` / `status` flags.
 ///
-/// Read-only: only the data dir (to locate the buyer store) is consulted; no
-/// chain coordinates, keystore, or network endpoint are needed.
+/// Read-only. Needs no chain coordinates and no keystore. It reads the data
+/// dir's client buyer store — unless that data dir belongs to a `decdn-node`
+/// daemon, in which case it asks the daemon over the admin RPC instead (the
+/// daemon's own store is locked for its lifetime), and the admin flags below
+/// apply.
 #[derive(Args, Debug)]
 pub struct PoolListArgs {
     /// Data dir holding the buyer-pool store (else `identity.data_dir` >
@@ -227,4 +250,15 @@ pub struct PoolListArgs {
     /// Emit the tracked pools as JSON instead of the aligned table.
     #[arg(long)]
     pub json: bool,
+
+    /// Base URL of the daemon's admin HTTP surface, used only when the data
+    /// dir turns out to be a node's. Also read from `DECDN_ADMIN_URL`; if
+    /// unset, the port is derived from `observability.admin_port` in the
+    /// config file, then the built-in default.
+    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
+    pub admin_url: Option<String>,
+
+    /// Roundtrip timeout in milliseconds for that admin call.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
 }

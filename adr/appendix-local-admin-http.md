@@ -28,6 +28,9 @@ Method set (the `AdminRpc` trait in `decdn-common` is the canonical surface):
 | `admin_v1_reload`  | none                    | `ReloadResponse`  |
 | `admin_v1_lanes`   | none                    | `LanesResponse`   |
 | `admin_v1_slashes` | none                    | `SlashesResponse` |
+| `admin_v1_pools`   | none                    | `BuyerPoolsResponse` |
+
+`admin_v1_pools` reports the node's buyer-side `PaymentPool` state. This is the only read path to that state on a running node. The daemon keeps it in `<data_dir>/buyer.redb`, and `redb` holds a process-exclusive lock on that file for the daemon's lifetime, so no other process can open it — not even read-only. A CLI that reads the client store (`buyer-pools.redb`) in the same directory reads a different, unrelated file.
 
 Response format:
 

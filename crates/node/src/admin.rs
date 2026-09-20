@@ -18,13 +18,15 @@ use std::time::{Duration, Instant};
 use alloy::primitives::{Address, U256};
 use decdn_cache::{CacheEngine, CacheError};
 use decdn_common::admin::{
-    AdminRpcServer, BucketStat, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE, DHT_POISONED_CODE,
-    DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview, EvictRequest, EvictResponse,
-    HealthResponse, LaneSnapshot, LanesResponse, POOL_STORE_ERROR_CODE, RELOAD_ERROR_CODE,
-    RecordStoreHealth, ReloadResponse, RepublishHealth, RoutingHealth,
-    SLASH_DETECTION_UNAVAILABLE_CODE, SlashRecordDto, SlashesResponse, StatusResponse,
-    parse_hash_arg,
+    AdminRpcServer, BUYER_POOL_STORE_ERROR_CODE, BUYER_POOL_UNAVAILABLE_CODE, BucketStat,
+    BuyerLaneSnapshot, BuyerPoolSnapshot, BuyerPoolsResponse, CACHE_ERROR_CODE,
+    CONFIG_PATH_UNSET_CODE, DHT_POISONED_CODE, DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse,
+    EvictPreview, EvictRequest, EvictResponse, HealthResponse, LaneSnapshot, LanesResponse,
+    POOL_STORE_ERROR_CODE, RELOAD_ERROR_CODE, RecordStoreHealth, ReloadResponse, RepublishHealth,
+    RoutingHealth, SLASH_DETECTION_UNAVAILABLE_CODE, SlashRecordDto, SlashesResponse,
+    StatusResponse, parse_hash_arg,
 };
+use decdn_incentive::buyer_pool::{BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::{LaneKey, LaneState, PoolStateStore};
 
 pub use crate::handlers::client::LaneActivityClock;
@@ -104,6 +106,16 @@ pub struct AdminState {
     /// payment surface legitimately has zero lanes to report, and the
     /// CLI's empty-table sentinel covers it.
     lanes: Option<LaneStatusHandles>,
+    /// The node's buyer-side pool store, backing `admin_v1_pools` (#2078),
+    /// attached via [`AdminState::with_buyer_pools`]. The SAME handle the buy
+    /// loop records adoptions and top-ups into, so the admin surface reports
+    /// what the daemon actually believes. The production runtime always
+    /// attaches it, so `None` means a hand-built `AdminState` — a test, or a
+    /// future bring-up with no buy leg — and answers
+    /// [`BUYER_POOL_UNAVAILABLE_CODE`] rather than an empty list: a node that
+    /// tracks nothing and a node that owns no pools call for opposite operator
+    /// responses.
+    buyer_pools: Option<BuyerPoolHandle>,
     /// Slash-detection handles backing `admin_v1_slashes` (#1032), attached via
     /// [`AdminState::with_slash_detection`]. `None` (no `slash_judge_address`
     /// wired / unit tests) → `slashes` returns [`SLASH_DETECTION_UNAVAILABLE_CODE`].
@@ -138,6 +150,21 @@ pub struct AdminState {
     /// `None` (unit tests, and any build with no chain wiring) reports
     /// `operator_address: None`, the honest answer when nothing supplied one.
     operator_address: Option<Address>,
+}
+
+/// The buyer pool store handle `admin_v1_pools` reads, wrapped so
+/// [`AdminState`] keeps its `Debug` derive. An `Arc` clone of the store the
+/// buy loop already writes through, so attaching it adds read access, not new
+/// ownership.
+#[derive(Clone)]
+pub struct BuyerPoolHandle(Arc<dyn BuyerPoolStore>);
+
+// `AdminState` derives `Debug`, and `dyn BuyerPoolStore` carries no `Debug`
+// bound, so name the wrapper without formatting the handle.
+impl std::fmt::Debug for BuyerPoolHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuyerPoolHandle").finish_non_exhaustive()
+    }
 }
 
 /// Read-only lane handles the `admin_v1_lanes` handler snapshots (issue
@@ -347,6 +374,7 @@ impl AdminState {
             metrics,
             dht: None,
             lanes: None,
+            buyer_pools: None,
             slash_detection: None,
             binding: BindingReport::unknown(),
             warming: None,
@@ -415,6 +443,17 @@ impl AdminState {
     #[must_use]
     pub fn with_lanes(mut self, lanes: LaneStatusHandles) -> Self {
         self.lanes = Some(lanes);
+        self
+    }
+
+    /// Attach the buyer pool store so `admin_v1_pools` can report this node's
+    /// buyer-side `PaymentPool` state (#2078). The production runtime calls
+    /// this once after `new` with the SAME handle `BuyerPoolService` writes
+    /// through, unconditionally; without it, `pools` returns
+    /// [`BUYER_POOL_UNAVAILABLE_CODE`].
+    #[must_use]
+    pub fn with_buyer_pools(mut self, buyer_pools: Arc<dyn BuyerPoolStore>) -> Self {
+        self.buyer_pools = Some(BuyerPoolHandle(buyer_pools));
         self
     }
 
@@ -828,6 +867,105 @@ impl AdminRpcServer for AdminRpcImpl {
             .collect();
         Ok(SlashesResponse { slashes })
     }
+
+    async fn pools(&self) -> RpcResult<BuyerPoolsResponse> {
+        // Not wired is an ERROR here, unlike `lanes`. A node with no buyer leg
+        // never pays for an upstream pull, and rendering that as "zero pools"
+        // is what sends an operator hunting a stranded deposit in the wrong
+        // place (#2078).
+        let Some(store) = self.state.buyer_pools.as_ref() else {
+            return Err(ErrorObjectOwned::owned(
+                BUYER_POOL_UNAVAILABLE_CODE,
+                "no buyer payment-pool store is attached to this admin surface, so this node \
+                 tracks no pools and pays no provider",
+                None::<()>,
+            ));
+        };
+
+        // `load_all` on the redb-backed store is blocking I/O (the store trait
+        // is sync per ADR appendix-poc-production-seams §1). Run it on the
+        // blocking pool so we don't stall a runtime worker.
+        let store = Arc::clone(&store.0);
+        let load = tokio::task::spawn_blocking(move || store.load_all())
+            .await
+            .map_err(|join_err| {
+                // `JoinError` is returned on panic OR cancellation (e.g.
+                // runtime shutdown); name the actual cause so a cancelled task
+                // at teardown isn't misread as a panic.
+                let cause = if join_err.is_cancelled() {
+                    "cancelled"
+                } else {
+                    "panicked"
+                };
+                tracing::error!(
+                    error = %join_err,
+                    cause,
+                    "buyer-pool-store load task did not complete"
+                );
+                ErrorObjectOwned::owned(
+                    BUYER_POOL_STORE_ERROR_CODE,
+                    "buyer pool store load task failed",
+                    None::<()>,
+                )
+            })?
+            .map_err(|store_err| {
+                tracing::error!(
+                    error = %store_err,
+                    "admin_v1_pools could not load buyer pool store"
+                );
+                ErrorObjectOwned::owned(
+                    BUYER_POOL_STORE_ERROR_CODE,
+                    format!("buyer pool store load failed: {store_err}"),
+                    None::<()>,
+                )
+            })?;
+
+        Ok(build_buyer_pools_response(load.pools, &load.skipped))
+    }
+}
+
+/// Build the wire [`BuyerPoolsResponse`] from loaded buyer pool states and the
+/// `pool_id`s whose rows would not decode. Pure (no I/O) so the shape and the
+/// ordering are unit-testable without a store or an async runtime.
+///
+/// Both lists are sorted — pools by `pool_id`, lanes by `(signer, provider)` —
+/// because the store's iteration order is a redb implementation detail and an
+/// operator diffing two calls should see a change only when the state changed.
+/// `U256` amounts narrow to `u64` micro-USDC via `try_from(..).unwrap_or(u64::MAX)`;
+/// a real pool is bounded by its on-chain deposit, so the saturation arm is
+/// unreachable.
+fn build_buyer_pools_response(
+    mut pools: Vec<BuyerPoolState>,
+    skipped: &[decdn_incentive::lane::PoolId],
+) -> BuyerPoolsResponse {
+    pools.sort_by_key(|p| p.pool_id);
+    let pools = pools
+        .iter()
+        .map(|p| {
+            let mut lanes: Vec<_> = p.lanes().collect();
+            lanes.sort_by_key(|(lane, _)| (lane.signer, lane.provider));
+            BuyerPoolSnapshot {
+                pool_id: format!("{:#x}", p.pool_id),
+                owner: p.owner.to_string(),
+                token: p.token.to_string(),
+                deposit_micro_usdc: u64::try_from(p.deposit).unwrap_or(u64::MAX),
+                lanes: lanes
+                    .into_iter()
+                    .map(|(lane, progress)| BuyerLaneSnapshot {
+                        voucher_signer: lane.signer.to_string(),
+                        provider: lane.provider.to_string(),
+                        last_amount_micro_usdc: u64::try_from(progress.last_amount)
+                            .unwrap_or(u64::MAX),
+                        last_bytes_delivered: u64::try_from(progress.last_bytes)
+                            .unwrap_or(u64::MAX),
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    let mut skipped: Vec<_> = skipped.iter().map(|p| format!("{p:#x}")).collect();
+    skipped.sort();
+    BuyerPoolsResponse { pools, skipped }
 }
 
 /// Build the wire `LaneSnapshot` list from loaded lane states, the
@@ -1958,7 +2096,7 @@ mod tests {
 
     // ---- admin_v1_lanes (issue #749) ----
 
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, B256};
     use decdn_incentive::MemoryPoolStateStore;
 
     /// Build a hydrated [`LaneState`] with the given identity + outstanding
@@ -2097,6 +2235,122 @@ mod tests {
         assert_eq!(second.outstanding_micro_usdc, 100_000);
         assert!(!second.settlement_eligible);
         Ok(())
+    }
+
+    // ---- admin_v1_pools (#2078) ----
+
+    /// Seed one buyer pool with two lanes, deliberately out of sorted order.
+    fn mk_buyer_pool(pool_byte: u8, deposit: u64) -> BuyerPoolState {
+        BuyerPoolState::hydrate(
+            B256::repeat_byte(pool_byte),
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0xcd),
+            U256::from(deposit),
+            vec![
+                (
+                    LaneKey {
+                        pool_id: B256::repeat_byte(pool_byte),
+                        signer: Address::repeat_byte(0x11),
+                        provider: Address::repeat_byte(0xbb),
+                    },
+                    decdn_incentive::buyer_pool::BuyerLaneProgress {
+                        last_amount: U256::from(2_000u64),
+                        last_bytes: U256::from(20_000u64),
+                    },
+                ),
+                (
+                    LaneKey {
+                        pool_id: B256::repeat_byte(pool_byte),
+                        signer: Address::repeat_byte(0x11),
+                        provider: Address::repeat_byte(0xaa),
+                    },
+                    decdn_incentive::buyer_pool::BuyerLaneProgress {
+                        last_amount: U256::from(1_000u64),
+                        last_bytes: U256::from(10_000u64),
+                    },
+                ),
+            ],
+        )
+    }
+
+    /// `admin_v1_pools` with no buyer store wired is an ERROR, not an empty
+    /// list. The distinction is the whole point of the method (#2078): "this
+    /// node never pays for pulls" and "this node owns no pools" send an
+    /// operator hunting a stranded deposit in opposite directions.
+    #[tokio::test]
+    async fn pools_without_store_is_unavailable_not_empty() {
+        let (state, _tmp) = state_with().await;
+        let rpc = AdminRpcImpl::new(state);
+        let err = rpc.pools().await.expect_err("pools must fail when unwired");
+        assert_eq!(err.code(), BUYER_POOL_UNAVAILABLE_CODE);
+    }
+
+    /// End-to-end through the RPC method: a seeded store surfaces every pool
+    /// and every lane, sorted, with the micro-USDC amounts intact.
+    #[tokio::test]
+    async fn pools_rpc_reports_seeded_store() -> anyhow::Result<()> {
+        let store = Arc::new(decdn_incentive::MemoryBuyerPoolStore::new());
+        // Recorded newest-id-first so the response's sort is doing real work.
+        store.record(&mk_buyer_pool(0xbb, 9_000_000))?;
+        store.record(&mk_buyer_pool(0xaa, 10_000_000))?;
+
+        let (state, _tmp) = state_with().await;
+        let rpc = AdminRpcImpl::new(state.with_buyer_pools(store as Arc<dyn BuyerPoolStore>));
+        let resp = rpc.pools().await.expect("pools ok");
+
+        assert_eq!(resp.pools.len(), 2);
+        assert!(resp.skipped.is_empty());
+        let first = resp.pools.first().expect("first pool");
+        assert_eq!(
+            first.pool_id,
+            format!("{:#x}", B256::repeat_byte(0xaa)),
+            "pools sort by pool_id, not store order"
+        );
+        assert_eq!(first.deposit_micro_usdc, 10_000_000);
+        // Lanes sort by (signer, provider); 0xaa..aa precedes 0xbb..bb.
+        let lane = first.lanes.first().expect("first lane");
+        assert_eq!(lane.provider, Address::repeat_byte(0xaa).to_string());
+        assert_eq!(lane.last_amount_micro_usdc, 1_000);
+        assert_eq!(lane.last_bytes_delivered, 10_000);
+        Ok(())
+    }
+
+    /// A deposit beyond `u64::MAX` micro-USDC saturates rather than wrapping.
+    /// Unreachable for a real pool, but the narrowing must not silently report
+    /// a tiny deposit for a huge one.
+    #[test]
+    fn build_buyer_pools_response_saturates_oversized_deposit() {
+        let pool = BuyerPoolState::new(
+            B256::repeat_byte(0x01),
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0xcd),
+            U256::MAX,
+        );
+        let resp = build_buyer_pools_response(vec![pool], &[]);
+        assert_eq!(
+            resp.pools.first().expect("pool").deposit_micro_usdc,
+            u64::MAX
+        );
+    }
+
+    /// An empty `pools` beside a non-empty `skipped` is a real state and must
+    /// survive to the wire: the escrowed deposit behind an undecodable row is
+    /// exactly what an operator is looking for.
+    #[test]
+    fn build_buyer_pools_response_keeps_skipped_when_no_pool_decodes() {
+        let resp = build_buyer_pools_response(
+            Vec::new(),
+            &[B256::repeat_byte(0x44), B256::repeat_byte(0x22)],
+        );
+        assert!(resp.pools.is_empty());
+        assert_eq!(
+            resp.skipped,
+            vec![
+                format!("{:#x}", B256::repeat_byte(0x22)),
+                format!("{:#x}", B256::repeat_byte(0x44)),
+            ],
+            "skipped ids sort for stable output"
+        );
     }
 
     /// Reader wiring guard (issue #1733): the RPC reads last-voucher ages off

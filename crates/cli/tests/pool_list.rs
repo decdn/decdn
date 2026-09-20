@@ -6,6 +6,10 @@
 //! for both the seeded and the empty case. The table/JSON *shape* is covered
 //! by the unit tests next to the command impl (`commands::pool`); this file
 //! owns the on-disk round-trip only.
+//!
+//! It also owns the node-data-dir regression (#2078): a data dir holding a
+//! daemon's `buyer.redb` must not be read as if it were a client store, and
+//! must not gain a `buyer-pools.redb` as a side effect of being looked at.
 
 #![cfg(unix)] // The buyer store enforces POSIX `0o700` on its data dir.
 #![allow(
@@ -38,6 +42,9 @@ fn list_args(data_dir: &std::path::Path, json: bool) -> PoolArgs {
         command: PoolCommand::List(PoolListArgs {
             data_dir: Some(data_dir.to_path_buf()),
             json,
+            // Unused on a client data dir; only a node's routes to the daemon.
+            admin_url: None,
+            timeout_ms: 5_000,
         }),
     }
 }
@@ -146,6 +153,11 @@ fn json_lists_skipped_pools_in_band_alongside_healthy_pools() {
     // blind to the escrowed-but-untracked deposit.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"skipped\""), "{stdout}");
+    // The provenance fields are the machine-readable half of the fix: a script
+    // must be able to tell WHICH store produced a listing, and the two sources
+    // emit different pool-object shapes (#2078).
+    assert!(stdout.contains("\"source\": \"client_store\""), "{stdout}");
+    assert!(stdout.contains("buyer-pools.redb"), "{stdout}");
     assert!(
         stdout.contains(&format!("{corrupt_pool_id:#x}")),
         "{stdout}"
@@ -168,4 +180,142 @@ async fn list_with_data_dir_ignores_broken_config_env_expansion() {
     pool_dispatch(&list_args(dir.path(), false), Some(&cfg))
         .await
         .expect("list with --data-dir must not load or env-expand the config");
+}
+
+/// A data dir holding a daemon's `buyer.redb` is a node's, and `list` must say
+/// so rather than reading the unrelated client store beside it. With no daemon
+/// listening, the command fails — and, critically, leaves no `buyer-pools.redb`
+/// behind. Creating that file and reporting its emptiness as the node's state
+/// is the defect this pins (#2078).
+#[test]
+fn node_data_dir_is_not_read_as_a_client_store() {
+    let dir = data_dir();
+    let buyer_db = dir.path().join("buyer.redb");
+    // Content is irrelevant: presence is the signal, and the CLI must never
+    // open this file — a live daemon holds redb's exclusive lock on it.
+    std::fs::write(&buyer_db, b"not a real redb file").unwrap();
+
+    let output = common::decdn_command(dir.path())
+        .args([
+            "pool",
+            "list",
+            // A port nothing listens on, so the admin call fails fast.
+            "--admin-url",
+            "http://127.0.0.1:1",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn pool list");
+
+    assert!(
+        !output.status.success(),
+        "an unreachable daemon must fail, not fall back to the client store: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("buyer.redb"),
+        "the error must name the file that holds the pools: {stderr}"
+    );
+    assert!(
+        !dir.path().join("buyer-pools.redb").exists(),
+        "pool list must not create a client store inside a node data dir"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("pools=0"),
+        "reporting an empty client store as the node's state is the bug: {stdout}"
+    );
+}
+
+/// A client listing names the file it read, so `pools=0` is interpretable.
+#[test]
+fn client_listing_names_the_store_it_read() {
+    let dir = data_dir();
+    let output = common::decdn_command(dir.path())
+        .args(["pool", "list", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn pool list");
+    assert!(
+        output.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("buyer-pools.redb"), "{stdout}");
+    assert!(stdout.contains("pools=0"), "{stdout}");
+}
+
+/// The guards live at their call sites, so pin them THERE, not only on the
+/// classifier. Each of these runs the real binary; deleting the one-line guard
+/// from `open`, `top_up_cmd`, `close` or `reclaim` turns the corresponding
+/// assertion red. The guard runs before the keystore prompt and before any
+/// chain work, so none of these needs an RPC endpoint or a signer.
+mod node_dir_guards {
+    use super::{common, data_dir};
+
+    /// Run `decdn pool <args>` in a data dir made to look like a daemon's, and
+    /// return stderr. Asserts a non-zero exit and that no client store was
+    /// manufactured — the side effect that started #2078.
+    fn refused(args: &[&str]) -> String {
+        let dir = data_dir();
+        // Not the buyer store: `lanes.redb` alone marks a node data dir, which
+        // is the mid-recovery window where the old classifier got it wrong.
+        std::fs::write(dir.path().join("lanes.redb"), b"x").unwrap();
+
+        let output = common::decdn_command(dir.path())
+            .args(args)
+            .arg("--data-dir")
+            .arg(dir.path())
+            .output()
+            .expect("run decdn pool");
+
+        assert!(
+            !output.status.success(),
+            "expected a refusal for {args:?}, got success: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            !dir.path().join("buyer-pools.redb").exists(),
+            "a refused {args:?} must not create a client store in a node data dir"
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    #[test]
+    fn pool_open_is_refused() {
+        let stderr = refused(&["pool", "open", "--deposit-micro-usdc", "1000000"]);
+        assert!(stderr.contains("buyer.redb"), "{stderr}");
+        assert!(stderr.contains("decdn node pools"), "{stderr}");
+    }
+
+    #[test]
+    fn pool_top_up_is_refused() {
+        let stderr = refused(&[
+            "pool",
+            "top-up",
+            "--pool",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "--amount-micro-usdc",
+            "1000000",
+        ]);
+        assert!(stderr.contains("buyer.redb"), "{stderr}");
+    }
+
+    /// `--all` enumerates from chain by keystore address, so on a node host it
+    /// would close the pool the daemon is paying from right now.
+    #[test]
+    fn close_all_is_refused_and_names_the_single_pool_alternative() {
+        let stderr = refused(&["pool", "close", "--all"]);
+        assert!(stderr.contains("--pool"), "{stderr}");
+        assert!(stderr.contains("buyer.redb"), "{stderr}");
+    }
+
+    #[test]
+    fn reclaim_all_is_refused() {
+        let stderr = refused(&["pool", "reclaim", "--all"]);
+        assert!(stderr.contains("--pool"), "{stderr}");
+    }
 }
