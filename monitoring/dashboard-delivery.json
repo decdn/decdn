@@ -560,6 +560,15 @@
           "expr": "sum(rate(decdn_serve_stream_rejected_internal_error_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "Q",
           "legendFormat": "internal error"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_serve_stream_rejected_bad_binding_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "R",
+          "legendFormat": "bad binding"
         }
       ],
       "fieldConfig": {
@@ -809,6 +818,15 @@
           "expr": "sum(rate(decdn_client_idle_close_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "E",
           "legendFormat": "idle close"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_probe_read_faults_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "F",
+          "legendFormat": "probe read faults"
         }
       ],
       "fieldConfig": {
@@ -1239,6 +1257,15 @@
           "expr": "sum(rate(decdn_node_pull_abandon_drain_timeout_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "L",
           "legendFormat": "abandon drain timeout"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_node_pull_pool_open_failures_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "M",
+          "legendFormat": "pool open failure"
         }
       ],
       "fieldConfig": {
@@ -1903,18 +1930,27 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "title": "Hit ratio",
+      "title": "Serve hit ratio",
       "type": "timeseries",
-      "description": "Unguarded on purpose — an idle node shows a gap, not a false 0%.",
+      "description": "Serve-path hit rate: (hit + partial hit) / (hit + partial hit + miss), decided at the blob-availability gate before any fill tier or load-shed admission. This is NOT decdn_cache_hits_total — that one meters CacheEngine::get, the whole-blob buffered read the paid serve path never calls, so it sits at zero on a node that only serves paying clients however full its store is. Deliberately unguarded division: an idle node renders a gap rather than a fabricated 0%.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (instance) (rate(decdn_cache_hits_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])) / (sum by (instance) (rate(decdn_cache_hits_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])) + sum by (instance) (rate(decdn_cache_misses_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "(\n  sum by (instance) (rate(decdn_serve_cache_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  + sum by (instance) (rate(decdn_serve_cache_partial_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n)\n/\n(\n  sum by (instance) (rate(decdn_serve_cache_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  + sum by (instance) (rate(decdn_serve_cache_partial_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  + sum by (instance) (rate(decdn_serve_cache_miss_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n)",
           "refId": "A",
           "legendFormat": "{{instance}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (instance) (rate(decdn_serve_cache_partial_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n/\n(\n  sum by (instance) (rate(decdn_serve_cache_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  + sum by (instance) (rate(decdn_serve_cache_partial_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  + sum by (instance) (rate(decdn_serve_cache_miss_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n)",
+          "refId": "B",
+          "legendFormat": "{{instance}} — partial share"
         }
       ],
       "fieldConfig": {
@@ -2867,6 +2903,98 @@
         "y": 72
       },
       "id": 26
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Unattributed stream failures",
+      "type": "timeseries",
+      "description": "Seller-leg stream failures that no reason counter claims: rate(streams_failed{direction=\"inbound\"}) minus every serve_stream_rejected_*, midstream, node-fault, takedown and economics-refused sibling. A standing positive floor is expected and healthy — a client that closes early, and the free header handshake a downstream node's miss pull opens and closes after the response, both count as failures by design and have no reason counter. Read the SHAPE, not the level: a step change means a failure mode arrived that no counter names, and the refusal breakdown above will not show it. Goes negative only if a reason counter double-counts a single failure.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_streams_failed_total{direction=\"inbound\",deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_bad_binding_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_cache_miss_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_chain_hash_denied_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_chain_stale_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_evicted_since_probe_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_foreign_declined_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_hash_denied_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_insufficient_deposit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_internal_error_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_load_shed_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_load_shed_miss_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_origin_denied_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_owner_mismatch_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_pool_unconfirmed_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_range_not_satisfiable_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_signer_cap_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_signer_floor_at_cap_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_unknown_lane_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_midstream_pool_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_midstream_signer_cap_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_node_fault_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_terminated_takedown_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_economics_refused_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "no reason counter"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 79
+      },
+      "id": 9003
     }
   ],
   "preload": false,

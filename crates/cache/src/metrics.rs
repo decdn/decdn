@@ -20,11 +20,19 @@
 //! Operators reason about cache health from four ratios:
 //!
 //! - **Hit rate** — `decdn_cache_hits_total / (decdn_cache_hits_total +
-//!   decdn_cache_misses_total)`.
+//!   decdn_cache_misses_total)`. Scoped to `CacheEngine::get`. The paid
+//!   serve path never calls `get` — it streams through
+//!   `export_bao_range_stream` — so on a node serving paying clients this
+//!   ratio describes a path that carries no traffic. Read the node crate's
+//!   `decdn_serve_cache_{hit,partial_hit,miss}_total` for the serve-path hit
+//!   rate.
 //! - **Origin egress amplification** —
-//!   `decdn_cache_pull_through_bytes_total / decdn_cache_bytes_returned_total`.
+//!   `decdn_cache_pull_through_bytes_total / decdn_bytes_served_total`.
 //!   Equal to 1.0 when the cache is acting as pure pass-through; trends
-//!   toward 0 as cached content gets re-served.
+//!   toward 0 as cached content gets re-served. The denominator is the node
+//!   crate's wire-write counter rather than `decdn_cache_bytes_returned_total`
+//!   for the same reason: `bytes_returned` is `get`-scoped and holds at zero
+//!   under a full serve load.
 //! - **Origin retry health** —
 //!   `decdn_cache_origin_retry_exhausted_total / decdn_cache_origin_fetches_total`.
 //!   Sustained nonzero rate = user-visible origin failures the retry

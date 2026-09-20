@@ -287,6 +287,15 @@
           "expr": "decdn_settlement_watcher_down_seconds{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}",
           "refId": "D",
           "legendFormat": "settlement — {{instance}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "decdn_fee_shares_watcher_down_seconds{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}",
+          "refId": "E",
+          "legendFormat": "fee_shares — {{instance}}"
         }
       ],
       "fieldConfig": {
@@ -408,6 +417,15 @@
           "expr": "sum(rate(decdn_settlement_watcher_restarts_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "D",
           "legendFormat": "settlement"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_fee_shares_watcher_restarts_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "E",
+          "legendFormat": "fee_shares"
         }
       ],
       "fieldConfig": {
@@ -1906,6 +1924,15 @@
           "expr": "sum(rate(decdn_redeem_hints_dropped_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "C",
           "legendFormat": "redeem hints dropped"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_redemption_reconciled_skip_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "D",
+          "legendFormat": "skipped — already reconciled"
         }
       ],
       "fieldConfig": {

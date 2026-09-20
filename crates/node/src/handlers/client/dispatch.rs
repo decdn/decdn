@@ -698,6 +698,10 @@ impl ClientHandler {
         #[allow(unused_assignments)]
         let mut shed_slot: Option<crate::load_shed::ShedSlot> = None;
         if audit.is_serveable() {
+            // Serve-path hit rate (see `Metrics::serve_cache_hit`). Metered on the
+            // availability decision itself, ahead of the shed gate below, so the
+            // ratio stays a property of the store rather than of current pressure.
+            self.metrics.serve_cache_hit();
             match self
                 .shed
                 .try_admit(crate::load_shed::RequestClass::CacheHit, client_node_id)
@@ -746,6 +750,10 @@ impl ClientHandler {
                 .partial_hit_size(hash, req.byte_offset, req.byte_len)
                 .await
             {
+                // A covering partial is a hit for hit-rate purposes, counted
+                // apart so the payoff of partial-holder advertisement stays
+                // legible (see `Metrics::serve_cache_partial_hit`).
+                self.metrics.serve_cache_partial_hit();
                 match self
                     .shed
                     .try_admit(crate::load_shed::RequestClass::CacheHit, client_node_id)
@@ -779,6 +787,11 @@ impl ClientHandler {
                 // Keeping the gate here — ahead of channel-ownership and any
                 // fill — preserves "shed before committing serve resources /
                 // before any origin spend".
+                //
+                // The miss sibling of the two hit counters above, on the same
+                // pre-shed footing: the gate cannot satisfy this request from
+                // held bytes, so a fill tier will run.
+                self.metrics.serve_cache_miss();
                 match self
                     .shed
                     .try_admit(crate::load_shed::RequestClass::CacheMiss, client_node_id)
