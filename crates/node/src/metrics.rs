@@ -193,7 +193,7 @@ pub struct DecdnMetrics {
     /// The buyer leg is the one part of the node that spends rather than earns,
     /// and nothing else reports on it: an operator who never funds this wallet
     /// sees a node that serves perfectly and silently buys nothing, because
-    /// every `openPool` reverts on the ERC-20 transfer. Read once per
+    /// every `openPool` reverts on the ERC-20 transfer.
     ///
     /// Read at bootstrap and once per reclaim sweep (`RECLAIM_SWEEP_INTERVAL`),
     /// so it lags a spend — or an operator top-up, which is the reading that

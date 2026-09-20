@@ -162,7 +162,7 @@ fn classify_pool_open_arm(err: &anyhow::Error) -> PoolOpenArm {
     }
 }
 
-/// Record a buyer channel open/reuse failure on `err` to the metrics in `deps`,
+/// Record a buyer pool open/reuse failure on `err` to the metrics in `deps`,
 /// emitting a structured-log line with the failure-class `reason` (#966).
 ///
 /// Bumps the unlabeled `node_pull_pool_open_failures` total and, when the
@@ -186,7 +186,7 @@ fn classify_pool_open_arm(err: &anyhow::Error) -> PoolOpenArm {
 /// unlabeled arm below is genuinely a *residual*: an open/reuse failure raised
 /// outside the open task itself.
 ///
-/// Returns the [`PullMiss`] this failure is (#1560), so a channel open that failed because
+/// Returns the [`PullMiss`] this failure is (#1560), so a pool open that failed because
 /// of a fault in THIS node is not answered to the client as an absent blob. That matters
 /// more than the buyer-key case #1560 was filed for: the loudest node-wide buyer faults in
 /// this crate all land here, each of which would otherwise sign every client a
@@ -226,9 +226,9 @@ fn record_pool_open_failure(
     // means this node's chain lane is too slow for `CHANNEL_OPEN_CALLER_BUDGET`, which is a
     // very different diagnosis from a reverting or under-funded open.
     //
-    // NOT `node_pull_timeout_sec`. The channel open has its OWN budget;
+    // NOT `node_pull_timeout_sec`. The pool open has its OWN budget;
     // `DEFAULT_NODE_PULL_TIMEOUT_SEC`'s own doc says outright that "raising this to
-    // give a slow L2 more room does nothing: that is the channel open." That knob is
+    // give a slow L2 more room does nothing: that is the pool open." That knob is
     // inert for this symptom.
     let arm = classify_pool_open_arm(err);
     if arm == PoolOpenArm::Pending {
@@ -255,7 +255,7 @@ fn record_pool_open_failure(
         deps.metrics.node_pull_local_fault();
         warn!(
             %provider_addr, error = %err,
-            "node-origin: LOCAL buyer-side fault opening a channel — this node cannot pay \
+            "node-origin: LOCAL buyer-side fault opening a pool — this node cannot pay \
              any provider; exonerating the upstream and refusing rather than reporting a miss"
         );
         return PullMiss::LocalFault;
@@ -266,10 +266,10 @@ fn record_pool_open_failure(
     // unobserved exactly when it is least affordable. This arm keeps the caller that
     // DID happen to still be waiting from double-counting it.
     if arm == PoolOpenArm::Reported {
-        debug!(%provider_addr, error = %err, "node-origin: buyer channel open failed (reported by the open task)");
+        debug!(%provider_addr, error = %err, "node-origin: buyer pool open failed (reported by the open task)");
         // Reported by the open path and NOT typed as ours there, so it is one of the legs
         // that leaves this node able to pay somebody else: a `ContractRevert`, an `RpcError`,
-        // or an expired channel that could not be reclaimed. Another candidate may still
+        // or an expired pool that could not be reclaimed. Another candidate may still
         // deliver, and if none does, `NotFound` is a true statement about what we could
         // obtain. Everything the open path knows to be node-wide arrives marked and returned
         // one arm above — the marker is the contract, not this arm's guesswork.
@@ -284,7 +284,7 @@ fn record_pool_open_failure(
     // returned above, so what reaches here is raised OUTSIDE the task — which makes this
     // arm node-local faults, not peer behaviour: a store read fault on the reuse fast
     // path, a poisoned `opens_in_flight` mutex (which wedges every open for the life of
-    // the process), or a channel that opened on-chain and is somehow not live in the
+    // the process), or a pool that opened on-chain and is somehow not live in the
     // store. None of those are things an operator should have to scrape debug logs to
     // see; at the default `RUST_LOG=info` a `debug!` here meant watching
     // `node_pull_pool_open_failures_total` climb with no line explaining any of it.
@@ -297,7 +297,7 @@ fn record_pool_open_failure(
             %provider_addr,
             reason = reason.as_label(),
             error = %err,
-            "node-origin: buyer channel open/reuse failed on a classified chain fault \
+            "node-origin: buyer pool open/reuse failed on a classified chain fault \
              raised outside the open task"
         );
     } else {
@@ -305,7 +305,7 @@ fn record_pool_open_failure(
             %provider_addr,
             reason = "unclassified",
             error = %err,
-            "node-origin: buyer channel open/reuse failed (raised outside the open task — \
+            "node-origin: buyer pool open/reuse failed (raised outside the open task — \
              suspect this node's store or lock state, not the peer)"
         );
     }
