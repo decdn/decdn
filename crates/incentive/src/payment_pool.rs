@@ -222,9 +222,10 @@ mod sol_types {
             /// Batch companion to `getWatermark`: one
             /// `watermark[poolId][signer][provider]` read per `(poolIds[i],
             /// signers[i], providers[i])` triple, in input order. Reverts on a
-            /// length mismatch. The redeemer reconciles every planned lane
-            /// against the chain in one call instead of one `eth_call` per
-            /// lane.
+            /// length mismatch. The redeemer reconciles a bounded batch of
+            /// planned lanes against the chain in one call instead of one
+            /// `eth_call` per lane; a larger plan set takes one call per
+            /// batch.
             function getWatermarks(bytes32[] calldata poolIds, address[] calldata signers, address[] calldata providers)
                 external
                 view

@@ -479,10 +479,14 @@ async fn run_e2e() -> anyhow::Result<()> {
             .with_filter(level()),
         )
         .with(
+            // A fixed `WARN` floor, NOT `level()`: this gate fails open, so its
+            // correctness must not depend on a filter the environment can widen
+            // or narrow. The `cap_count` gate can share `level()` because a
+            // filtered-away log line makes its lookup fail closed.
             ReconcileFailureLayer {
                 count: Arc::clone(&reconcile_failures),
             }
-            .with_filter(level()),
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
         )
         .try_init();
 

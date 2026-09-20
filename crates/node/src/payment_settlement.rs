@@ -2757,6 +2757,69 @@ mod tests {
         Ok(())
     }
 
+    /// Spanning `WATERMARK_READ_BATCH_MAX` splits the read, and a later batch
+    /// that fails keeps the savings from the batches that landed: the settled
+    /// lane in batch 1 still leaves the redeem set even though batch 2 errored.
+    /// This is the one behavioural difference from returning `plans` wholesale
+    /// on any error.
+    #[tokio::test]
+    async fn reconcile_keeps_the_first_batch_when_a_later_one_fails() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        // Batch 1 reads in full (its first lane settled); batch 2 has no queued
+        // response, so the mocked transport errors on it.
+        let mut first = vec![lane(0); WATERMARK_READ_BATCH_MAX];
+        if let Some(head) = first.first_mut() {
+            *head = lane(1_000);
+        }
+        let (contract, _asserter) = mocked_getwatermarks_pool(&[first]);
+        let plans: Vec<PlannedLane> = (0..=WATERMARK_READ_BATCH_MAX)
+            .map(|i| planned(1, u8::try_from(i % 251).unwrap_or(0), 1_000, false))
+            .collect();
+
+        let kept = reconcile_onchain_watermarks(&contract, plans, &metrics).await;
+
+        assert_eq!(
+            kept.len(),
+            WATERMARK_READ_BATCH_MAX,
+            "only the settled lane from the batch that landed is dropped; the \
+             unread tail survives the failed batch"
+        );
+        let text = metrics.encode()?;
+        anyhow::ensure!(
+            text.lines()
+                .any(|l| l == "decdn_redemption_reconciled_skip_total 1"),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    /// A short return in an early batch stops the read there: the prefix it did
+    /// deliver reconciles and every later lane is kept unchanged.
+    #[tokio::test]
+    async fn reconcile_stops_at_a_short_early_batch() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        // Batch 1 under-returns (2 lanes for 512), so batch 2 is never issued.
+        let (contract, asserter) =
+            mocked_getwatermarks_pool(&[vec![lane(1_000), lane(1_000)], vec![lane(1_000)]]);
+        let plans: Vec<PlannedLane> = (0..=WATERMARK_READ_BATCH_MAX)
+            .map(|i| planned(1, u8::try_from(i % 251).unwrap_or(0), 1_000, false))
+            .collect();
+
+        let kept = reconcile_onchain_watermarks(&contract, plans, &metrics).await;
+
+        assert_eq!(
+            kept.len(),
+            WATERMARK_READ_BATCH_MAX - 1,
+            "the two lanes the short batch covered are settled and drop"
+        );
+        assert_eq!(
+            asserter.read_q().len(),
+            1,
+            "the second batch is never issued after a short return"
+        );
+        Ok(())
+    }
+
     /// The idle steady state issues no `eth_call` at all.
     #[tokio::test]
     async fn reconcile_empty_plans_issues_no_call() {
