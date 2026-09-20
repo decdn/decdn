@@ -2764,10 +2764,12 @@ contract PaymentPoolTest is Test {
         ids[0] = id0;
         ids[1] = id0;
         ids[2] = id1;
+        // The signer axis must vary too: with an all-identical array a
+        // `watermark[poolIds[i]][signers[0]][providers[i]]` mis-index passes.
         address[] memory signers = new address[](3);
         signers[0] = signer;
         signers[1] = signer;
-        signers[2] = signer;
+        signers[2] = address(0x519E);
         address[] memory providers = new address[](3);
         providers[0] = provider;
         providers[1] = provider2;
@@ -2803,6 +2805,28 @@ contract PaymentPoolTest is Test {
         address[] memory shortProviders = new address[](1);
         vm.expectRevert(PaymentPool.LengthMismatch.selector);
         pool.getWatermarks(ids, signers, shortProviders);
+    }
+
+    /// The Rust redeemer caps a batch at 512 triples and justifies that number
+    /// with a gas figure. Nothing else measures it: the unit tests mock the
+    /// transport and the e2e reads two triples. This pins the real cost of a
+    /// full-size batch through the gas snapshot, so a change that makes the
+    /// read too expensive for an `eth_call` shows up as a snapshot diff rather
+    /// than as a silent fail-open in production.
+    function test_getWatermarks_fullSizeBatch() public {
+        uint256 n = 512;
+        bytes32 id = _open();
+        bytes32[] memory ids = new bytes32[](n);
+        address[] memory signers = new address[](n);
+        address[] memory providers = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            ids[i] = id;
+            signers[i] = signer;
+            providers[i] = address(uint160(i + 1));
+        }
+
+        PaymentPool.Lane[] memory lanes = pool.getWatermarks(ids, signers, providers);
+        assertEq(lanes.length, n);
     }
 
     function test_getWatermarks_emptyBatchReturnsEmpty() public view {

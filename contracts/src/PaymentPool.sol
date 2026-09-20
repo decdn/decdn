@@ -678,7 +678,8 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     /// @notice Batch companion to `getWatermark`: one
     ///         `watermark[poolId][signer][provider]` read per
     ///         `(poolIds[i], signers[i], providers[i])` triple, in input order.
-    ///         A redeemer reconciles every planned lane in one call.
+    ///         A redeemer reconciles a batch of planned lanes in one call
+    ///         instead of one `eth_call` per lane.
     /// @dev    Reverts `LengthMismatch` when the three arrays differ in length. A pure
     ///         loop over the existing mapping — no storage is written and no triple is
     ///         deduplicated.

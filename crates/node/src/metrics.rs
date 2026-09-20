@@ -583,6 +583,28 @@ pub struct DecdnMetrics {
     /// expected catch-up. Operator-visible name:
     /// `decdn_redemption_reconciled_skip_total`.
     pub redemption_reconciled_skip: Counter,
+    /// Pre-submit on-chain watermark batches that landed and were reconciled
+    /// against the chain. Counted once per `getWatermarks` batch that decoded,
+    /// so a redeem sweep over more lanes than the read batch caps contributes
+    /// one per batch. This is the *attempt* signal
+    /// `redemption_reconciled_skip` cannot give: that counter is legitimately
+    /// zero on a healthy sweep with nothing to drop, so zero alone cannot
+    /// separate "the reconciliation ran and found nothing" from "the
+    /// reconciliation never ran". Read the two together — a redeemer planning
+    /// lanes with this flat at zero is not reconciling at all. Operator-visible
+    /// name: `decdn_redemption_reconcile_ok_total`.
+    pub redemption_reconcile_ok: Counter,
+    /// Pre-submit on-chain watermark batches that did not land — an RPC error,
+    /// a `timed` timeout, or a return whose length did not match the batch.
+    /// Counted once per failed batch. The read is fail-open (the contract's own
+    /// `claimed <= w.amount` guard is the backstop), so a sustained rate costs
+    /// gas rather than correctness: the seller submits `redeemMany` batches it
+    /// never checked against the chain. A sustained non-zero rate means the
+    /// chain RPC is rejecting or timing out the batch read — check the
+    /// endpoint's `eth_call` response-size and gas ceilings against the read
+    /// batch size. Operator-visible name:
+    /// `decdn_redemption_reconcile_failures_total`.
+    pub redemption_reconcile_failures: Counter,
     /// Buyer-side reclaim-sweep attempts (`try_reclaim`) that failed — a failed
     /// `getChannel`/`reclaimExpired` RPC, a receipt wait, an on-chain revert, or
     /// a failed store write when clearing the local record after a reclaim/drop
@@ -2261,6 +2283,16 @@ recorders! {
     /// their claim value (the `redeemMany` no-op guard, avoided before it costs
     /// gas).
     redemption_reconciled_skip_by(n: u64) => redemption_reconciled_skip.inc_by(n);
+
+    /// A pre-submit on-chain watermark batch landed and was reconciled against
+    /// the chain — the attempt signal that makes a zero
+    /// `redemption_reconciled_skip` readable.
+    redemption_reconcile_ok => redemption_reconcile_ok.inc();
+
+    /// A pre-submit on-chain watermark batch did not land (RPC error, timeout,
+    /// or a mismatched return length). Fail-open: the lanes it could not read
+    /// are submitted unchanged.
+    redemption_reconcile_failure => redemption_reconcile_failures.inc();
 
     /// A buyer-side reclaim-sweep attempt (`try_reclaim`) failed — an RPC/receipt
     /// error, an on-chain revert, or a failed store write when clearing the local

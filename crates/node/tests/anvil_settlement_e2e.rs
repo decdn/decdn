@@ -218,27 +218,43 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapCountLayer {
 ///
 /// The count must stay at zero. `reconcile_onchain_watermarks` reads through the
 /// contract's own `getWatermarks`, so a warn here means the seller is paying gas
-/// for a `redeemMany` it never reconciled — the regression #2076 fixed.
+/// for a `redeemMany` it never reconciled (#2076).
 struct ReconcileFailureLayer {
     count: Arc<AtomicUsize>,
 }
 
-/// Sets its flag when an event carries `stage = "reconcile"`. The field is a
-/// `&'static str`, which `Visit` funnels through `record_str`, so that is the
-/// override this needs (the default `record_str` would `Debug`-quote it).
+/// Sets its flag when an event carries `stage = "reconcile"`.
+///
+/// A `&str` value reaches `record_str`, so that is the fast path. `record_debug`
+/// covers it too rather than being left empty, because every way of *missing*
+/// the field is a silent pass on a gate whose assertion is "the count is zero":
+/// a call site written `stage = %s` or `stage = ?s`, or carrying a value that is
+/// not a string, dispatches to `record_debug` and would otherwise disarm the
+/// gate permanently. The `Debug` spelling of a string is quoted, the `Display`
+/// wrapper's is not, so both are trimmed to one form.
 #[derive(Default)]
 struct ReconcileStageVisitor {
     hit: bool,
 }
 
-impl tracing::field::Visit for ReconcileStageVisitor {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "stage" && value == "reconcile" {
+impl ReconcileStageVisitor {
+    fn observe(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "stage" && value.trim_matches('"') == "reconcile" {
             self.hit = true;
         }
     }
+}
 
-    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+impl tracing::field::Visit for ReconcileStageVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.observe(field, value);
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "stage" {
+            self.observe(field, &format!("{value:?}"));
+        }
+    }
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ReconcileFailureLayer {
@@ -455,13 +471,14 @@ async fn run_e2e() -> anyhow::Result<()> {
     // `try_init` is idempotent (harmless on a re-run).
     let cap_count_log: Arc<Mutex<HashMap<B256, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     // Pre-redeem watermark-reconciliation fail-open warns; must stay at zero
-    // (#2076). WARN passes the layers' `info` floor.
+    // (#2076).
     let reconcile_failures: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     // `tracing_subscriber::fmt()` (the builder this replaces) defaults its
     // filter to `INFO`; a bare `Registry` + layers has no such default and
     // would pass every level (including the very chatty `TRACE` RPC/transport
-    // spans), so each layer restates the `INFO` floor explicitly via
-    // `EnvFilter` (honoring `RUST_LOG` if set, `info` otherwise).
+    // spans), so each layer sets its own floor explicitly: `EnvFilter` for the
+    // two that honor `RUST_LOG` (`info` otherwise), and a fixed `WARN` for the
+    // reconcile gate, which must not depend on the environment at all.
     let level = || {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
@@ -935,6 +952,22 @@ async fn run_e2e() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("watermark checked above"))?
         .clone();
 
+    // `Lane` is two same-typed `uint64`s, so a field-order drift between the
+    // hand-written `sol!` struct and the Solidity one decodes without error and
+    // reads `bytesDelivered` as `amount`. Every other assertion here compares a
+    // decoded lane against another decoded lane, which a swap satisfies
+    // symmetrically. Pinning `amount` against a value derived from the payment
+    // side — not from another decode — is what makes the swap observable.
+    anyhow::ensure!(
+        watermark_after_first.amount >= REDEEM_THRESHOLD_MICRO_USDC
+            && watermark_after_first.amount < watermark_after_first.bytesDelivered,
+        "Lane.amount must be the micro-USDC paid (>= the redeem threshold {}), well below the \
+         byte count: amount={} bytesDelivered={}",
+        REDEEM_THRESHOLD_MICRO_USDC,
+        watermark_after_first.amount,
+        watermark_after_first.bytesDelivered
+    );
+
     // Re-deliver the same blob on the identical lane, continuing the ledger from
     // the first delivery's cumulative totals as the NODE holds them, not as the
     // chain shows them. The two differ: a delivery settles over several
@@ -1010,6 +1043,12 @@ async fn run_e2e() -> anyhow::Result<()> {
         batch_lanes.len() == 2,
         "getWatermarks must return one lane per input triple, got {}",
         batch_lanes.len()
+    );
+    anyhow::ensure!(
+        batch_lanes
+            .get(1)
+            .is_some_and(|l| l.amount == 0 && l.bytesDelivered == 0),
+        "the never-redeemed triple must read back as the empty lane"
     );
     for (idx, (signer, provider)) in [(client_addr, node_addr), (client_addr, Address::ZERO)]
         .into_iter()
@@ -1123,15 +1162,6 @@ async fn run_e2e() -> anyhow::Result<()> {
         "second sweep must attach NO CapabilityReg — registration is already known from the \
          persisted registered_until watermark, so the batched-read skip must fire: \
          cap_count={cap_count_second}"
-    );
-
-    // The pre-redeem reconciliation read must actually decode. Against a build
-    // whose read cannot be served this fires on every sweep (#2076).
-    anyhow::ensure!(
-        reconcile_failures.load(Ordering::Relaxed) == 0,
-        "pre-redeem watermark reconciliation failed open {} time(s); the seller submitted \
-         redeemMany batches it never reconciled (#2076)",
-        reconcile_failures.load(Ordering::Relaxed)
     );
 
     // ============================================================
@@ -1317,6 +1347,32 @@ async fn run_e2e() -> anyhow::Result<()> {
     // (quiesce the redeemer, run a final redeem sweep).
     settlement_poller.shutdown();
     service.shutdown(Duration::from_secs(30)).await;
+
+    // PRE-REDEEM RECONCILIATION GATE (#2076). Asserted here, after the forced
+    // close/shutdown sweep, so the shutdown leg's reads are covered too.
+    //
+    // Both halves are needed. The failure count alone is an assertion of
+    // absence, satisfied equally by "every read landed" and "no read was ever
+    // issued" — deleting the call site would keep it green. The success count
+    // is the positive companion: this journey plans lanes and redeems them
+    // repeatedly, so a reconciliation that runs must land batches.
+    let reconcile_metrics = metrics.encode()?;
+    let reconcile_ok = reconcile_metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("decdn_redemption_reconcile_ok_total "))
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("decdn_redemption_reconcile_ok_total not exported"))?;
+    anyhow::ensure!(
+        reconcile_failures.load(Ordering::Relaxed) == 0,
+        "pre-redeem watermark reconciliation failed open {} time(s); the seller submitted \
+         redeemMany batches it never reconciled (#2076)",
+        reconcile_failures.load(Ordering::Relaxed)
+    );
+    anyhow::ensure!(
+        reconcile_ok > 0,
+        "no pre-redeem watermark batch ever landed; the reconciliation is not running at all, \
+         which the zero-failure assertion above cannot distinguish from healthy (#2076)"
+    );
 
     client_ep.close().await;
     server_ep.close().await;

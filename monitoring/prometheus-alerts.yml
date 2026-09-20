@@ -565,6 +565,25 @@ groups:
             lines (each carries the tx hash when one was issued) and check the
             RPC provider and the operator key's gas balance.
 
+      - alert: DecdnWatermarkReconcileFailing
+        expr: increase(decdn_redemption_reconcile_failures_total[30m]) > 2
+        for: 30m
+        labels:
+          component: payments
+          severity: warning
+        annotations:
+          summary: "Pre-redeem watermark reconciliation failing on {{ $labels.instance }}"
+          description: |
+            The getWatermarks batch read before each redeemMany keeps failing:
+            an RPC error, a timeout, or a return whose length did not match the
+            batch.
+            The read is fail-open, so claims are still submitted and the
+            contract's own no-op guard keeps them correct — the cost is gas
+            spent on lanes the chain already settled, not lost revenue.
+            Check the RPC endpoint's eth_call response-size and gas ceilings
+            against the read batch size, and read the stage="reconcile" warn!
+            lines for the underlying error.
+
       - alert: DecdnOnchainTxTimeouts
         expr: increase(decdn_onchain_tx_timeout_total[1h]) > 0
         for: 0m

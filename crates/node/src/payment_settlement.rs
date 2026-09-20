@@ -142,8 +142,12 @@ const MAX_SPLIT_DEPTH: u32 = 6;
 /// [`plan_lanes`] plans every persisted lane owed more than it is paid, so the
 /// count is bounded by nothing the redeemer controls — the per-transaction
 /// voucher cap chunks the *submit*, after this read. 512 triples is ~49 KB of
-/// calldata, ~32 KB of return and ~1.1M gas, inside any provider's `eth_call`
-/// ceiling. A plain const, not a config knob: no operator knowledge makes a
+/// calldata and ~32 KB of return, and under 3M gas — `test_getWatermarks_fullSizeBatch`
+/// measures a batch this size and the gas snapshot tracks it, so a change that
+/// makes the read too expensive shows up as a snapshot diff. That is well inside
+/// the `eth_call` ceilings providers commonly set. An endpoint that rejects a
+/// batch anyway surfaces as `redemption_reconcile_failures`, not as a wrong
+/// answer. A plain const, not a config knob: no operator knowledge makes a
 /// better choice here, and reusing the per-tx voucher cap would refragment the
 /// read whenever an operator lowered it.
 const WATERMARK_READ_BATCH_MAX: usize = 512;
@@ -1648,17 +1652,6 @@ async fn flush_store_durable(
     }
 }
 
-/// Chunk planned lanes under the per-chunk floor + voucher-count cap and submit
-/// each chunk. `floor == U256::ZERO` forces every lane (the close/shutdown path).
-///
-/// Floors the redeemed watermark first: flushes the lane store durable AFTER the
-/// lanes were planned (their cumulative amounts already read) and BEFORE any
-/// chunk goes on-chain, so a crash right after a submit still finds on-disk
-/// `owed ≥ submitted` (`record` is monotone, so the flush persists at least every
-/// value in the batch). The periodic sweep and hint path require this floor and
-/// skip their submit on a failed flush (`strict_flush`); the forced
-/// close/shutdown paths redeem regardless, since forfeiting the whole claim at the
-/// deadline is worse than a bounded re-serve risk.
 /// Read the on-chain paid watermark for every planned lane and drop any lane the
 /// chain already shows settled to its claim value — the last check before
 /// spending gas on a `redeemMany` the contract would silently no-op (its own
@@ -1673,12 +1666,15 @@ async fn flush_store_durable(
 /// [`WATERMARK_READ_BATCH_MAX`] lanes, no per-lane fan-out and no dependency on
 /// a contract outside the protocol's own deployment.
 ///
-/// **Fail-open.** An RPC error, a timeout or a short return submits the lanes it
-/// could not read unchanged: the contract's own no-op guard is the backstop, and
-/// the only cost of a stale read is the gas this check saves. It never holds up
-/// a redemption on a read it could not make. The prefix it did read still
-/// reconciles, so a failure partway through a multi-batch read keeps the savings
-/// from the batches that landed.
+/// **Fail-open.** An RPC error, a timeout or a mismatched return length submits
+/// the lanes it could not read unchanged: the contract's own no-op guard is the
+/// backstop, and the only cost of a stale read is the gas this check saves. It
+/// never holds up a redemption on a read it could not make. A failed batch stops
+/// the read there, so later batches are not issued; the batches already read
+/// still reconcile and keep their savings. Each batch meters itself through
+/// `redemption_reconcile_ok` / `redemption_reconcile_failure`, because a zero
+/// `redemption_reconciled_skip` alone cannot separate a healthy sweep with
+/// nothing to drop from a read that never landed.
 async fn reconcile_onchain_watermarks<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     plans: Vec<PlannedLane>,
@@ -1714,30 +1710,33 @@ async fn reconcile_onchain_watermarks<P: Provider + Clone>(
                     lanes = chunk.len(),
                     "pre-redeem watermark reconciliation failed; submitting on the contract's own no-op guard"
                 );
+                metrics.redemption_reconcile_failure();
                 break;
             }
         };
-        // The contract returns one `Lane` per input triple, in input order, so a
-        // mis-pairing is impossible; only an under-read is reachable. Take the
-        // prefix and stop — `reconcile_plans` keeps the untouched tail.
-        let short = lanes.len() < chunk.len();
+        // A well-behaved contract returns one `Lane` per input triple, in input
+        // order. Any other length means the decoder and the chain disagree about
+        // the return shape, so the batch's values cannot be trusted to pair with
+        // this chunk's plans — a long return may be offset, and dropping a lane
+        // on a mis-paired watermark forfeits its claim on the forced-close path.
+        // Keep only a short return's prefix, which is still positionally sound,
+        // and stop either way; `reconcile_plans` keeps the untouched tail.
         if lanes.len() != chunk.len() {
             warn!(
                 stage = "reconcile",
                 expected = chunk.len(),
                 got = lanes.len(),
-                "watermark reconciliation returned a mismatched count; submitting the unread lanes unchanged"
+                "watermark reconciliation returned a mismatched count; submitting the \
+                 unreconciled lanes unchanged"
             );
-        }
-        onchain_paid.extend(
-            lanes
-                .iter()
-                .take(chunk.len())
-                .map(|lane| U256::from(lane.amount)),
-        );
-        if short {
+            metrics.redemption_reconcile_failure();
+            if lanes.len() < chunk.len() {
+                onchain_paid.extend(lanes.iter().map(|lane| U256::from(lane.amount)));
+            }
             break;
         }
+        metrics.redemption_reconcile_ok();
+        onchain_paid.extend(lanes.iter().map(|lane| U256::from(lane.amount)));
     }
     let (kept, skipped) = reconcile_plans(plans, &onchain_paid);
     if skipped > 0 {
@@ -1800,6 +1799,17 @@ fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) ->
     })
 }
 
+/// Chunk planned lanes under the per-chunk floor + voucher-count cap and submit
+/// each chunk. `floor == U256::ZERO` forces every lane (the close/shutdown path).
+///
+/// Floors the redeemed watermark first: flushes the lane store durable AFTER the
+/// lanes were planned (their cumulative amounts already read) and BEFORE any
+/// chunk goes on-chain, so a crash right after a submit still finds on-disk
+/// `owed ≥ submitted` (`record` is monotone, so the flush persists at least every
+/// value in the batch). The periodic sweep and hint path require this floor and
+/// skip their submit on a failed flush (`strict_flush`); the forced
+/// close/shutdown paths redeem regardless, since forfeiting the whole claim at the
+/// deadline is worse than a bounded re-serve risk.
 async fn redeem_planned_lanes<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
@@ -2651,7 +2661,7 @@ mod tests {
     ///
     /// Encoded with `getWatermarksCall::abi_encode_returns`, not `SolValue`: the
     /// return is a *dynamic* array, so unlike the static-tuple `Pool` /
-    /// `Authorization` / `Lane` fixtures elsewhere in this file, the standalone
+    /// `Authorization` fixtures elsewhere in this file, the standalone
     /// value encoding is not the function-return encoding (the head carries an
     /// offset word).
     fn mocked_getwatermarks_pool(
@@ -2760,8 +2770,6 @@ mod tests {
     /// Spanning `WATERMARK_READ_BATCH_MAX` splits the read, and a later batch
     /// that fails keeps the savings from the batches that landed: the settled
     /// lane in batch 1 still leaves the redeem set even though batch 2 errored.
-    /// This is the one behavioural difference from returning `plans` wholesale
-    /// on any error.
     #[tokio::test]
     async fn reconcile_keeps_the_first_batch_when_a_later_one_fails() -> Result<()> {
         let metrics = Arc::new(Metrics::new());
@@ -2817,6 +2825,112 @@ mod tests {
             1,
             "the second batch is never issued after a short return"
         );
+        Ok(())
+    }
+
+    /// Two batches that both land. This is what pins the chunking itself: the
+    /// mock returns whatever is queued regardless of how many triples were
+    /// asked for, so a test whose batches never both succeed passes just as
+    /// well against an implementation that does not chunk at all. Putting the
+    /// settled lane in the *second* batch, and requiring the queue to be
+    /// drained, fixes the call count, the batch size, the accumulation across
+    /// batches and the cross-batch pairing offset at once.
+    #[tokio::test]
+    async fn reconcile_reads_every_batch_and_pairs_across_the_boundary() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        // Batch 1: 512 untouched lanes. Batch 2: the single settled lane.
+        let (contract, asserter) = mocked_getwatermarks_pool(&[
+            vec![lane(0); WATERMARK_READ_BATCH_MAX],
+            vec![lane(1_000)],
+        ]);
+        let plans: Vec<PlannedLane> = (0..=WATERMARK_READ_BATCH_MAX)
+            .map(|i| planned(1, u8::try_from(i % 251).unwrap_or(0), 1_000, false))
+            .collect();
+
+        let kept = reconcile_onchain_watermarks(&contract, plans, &metrics).await;
+
+        assert_eq!(
+            asserter.read_q().len(),
+            0,
+            "both batches are issued; an unchunked read would leave one queued"
+        );
+        assert_eq!(
+            kept.len(),
+            WATERMARK_READ_BATCH_MAX,
+            "the lane settled in the SECOND batch is the one dropped"
+        );
+        let text = metrics.encode()?;
+        for expected in [
+            "decdn_redemption_reconciled_skip_total 1",
+            "decdn_redemption_reconcile_ok_total 2",
+            "decdn_redemption_reconcile_failures_total 0",
+        ] {
+            anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
+        }
+        Ok(())
+    }
+
+    /// A batch that fails stops the read: no later batch is issued, so a lane
+    /// settled beyond the failure is never paired against the wrong plan.
+    #[tokio::test]
+    async fn reconcile_stops_at_a_failed_middle_batch() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        // Batch 1 lands. Batch 2 has no queued response and errors. Batch 3's
+        // response stays queued, proving the read stopped rather than skipped.
+        let (contract, asserter) =
+            mocked_getwatermarks_pool(&[vec![lane(0); WATERMARK_READ_BATCH_MAX]]);
+        let plans: Vec<PlannedLane> = (0..=2 * WATERMARK_READ_BATCH_MAX)
+            .map(|i| planned(1, u8::try_from(i % 251).unwrap_or(0), 1_000, false))
+            .collect();
+
+        let kept = reconcile_onchain_watermarks(&contract, plans, &metrics).await;
+
+        assert_eq!(
+            asserter.read_q().len(),
+            0,
+            "batch 1 consumed the only queued response"
+        );
+        assert_eq!(
+            kept.len(),
+            2 * WATERMARK_READ_BATCH_MAX + 1,
+            "batch 1 found nothing settled and batches 2-3 were never read, so \
+             every lane survives"
+        );
+        let text = metrics.encode()?;
+        for expected in [
+            "decdn_redemption_reconcile_ok_total 1",
+            "decdn_redemption_reconcile_failures_total 1",
+        ] {
+            anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
+        }
+        Ok(())
+    }
+
+    /// A return LONGER than the batch proves the decoder and the chain disagree
+    /// about the return shape, so its values pair with nothing reliably. The
+    /// batch fails rather than dropping a lane on data it cannot trust.
+    #[tokio::test]
+    async fn reconcile_fails_the_batch_on_an_over_return() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        // Three lanes for a two-plan batch, the first of them "settled".
+        let (contract, _asserter) =
+            mocked_getwatermarks_pool(&[vec![lane(1_000), lane(1_000), lane(1_000)]]);
+        let plans = vec![planned(1, 0, 1_000, false), planned(1, 1, 1_000, false)];
+
+        let kept = reconcile_onchain_watermarks(&contract, plans, &metrics).await;
+
+        assert_eq!(
+            kept.len(),
+            2,
+            "no lane is dropped on a return the decoder cannot trust"
+        );
+        let text = metrics.encode()?;
+        for expected in [
+            "decdn_redemption_reconciled_skip_total 0",
+            "decdn_redemption_reconcile_failures_total 1",
+        ] {
+            anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
+        }
         Ok(())
     }
 

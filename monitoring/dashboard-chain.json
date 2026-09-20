@@ -1933,6 +1933,15 @@
           "expr": "sum(rate(decdn_redemption_reconciled_skip_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "D",
           "legendFormat": "skipped — already reconciled"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_redemption_reconcile_failures_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "E",
+          "legendFormat": "reconcile read failed (fail-open)"
         }
       ],
       "fieldConfig": {

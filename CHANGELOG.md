@@ -727,21 +727,27 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
-- **Node: the pre-redeem watermark reconciliation never decoded, so every redeem
-  sweep submitted unreconciled (#2076).** The seller's last gas check before a
-  `redeemMany` batched its per-lane `getWatermark` reads through Multicall3 at
-  `0xcA11bde05977b3631167028862bE2a173976CA11`. Nothing in the protocol deploys
-  that contract and anvil does not predeploy it, so `eth_call` returned empty,
-  alloy decoded the empty buffer as `ABI decoding failed: buffer overrun`, and the
-  fail-open arm submitted the plans unchanged — on every sweep, silently, because
-  the contract's own `claimed <= w.amount` guard makes an already-redeemed lane a
-  harmless no-op. The read is now `PaymentPool.getWatermarks(bytes32[], address[],
+- **Node: the pre-redeem watermark reconciliation never decoded on a chain
+  without Multicall3 (#2076).** The seller's last gas check before a `redeemMany`
+  batched its per-lane `getWatermark` reads through Multicall3 at
+  `0xcA11bde05977b3631167028862bE2a173976CA11` — a contract the protocol neither
+  deploys nor verifies. Where it is absent, including every `anvil` chain, the
+  `eth_call` returned empty, alloy decoded the empty buffer as `ABI decoding
+  failed: buffer overrun`, and the fail-open arm submitted the plans unchanged on
+  every sweep. It stayed silent because the contract's own `claimed <= w.amount`
+  guard makes an already-redeemed lane a harmless no-op, so the only symptom was
+  wasted gas. The read is now `PaymentPool.getWatermarks(bytes32[], address[],
   address[])`, the batch companion to `getWatermark`: one `eth_call` per batch of
   at most 512 lanes, against the protocol's own deployment. A failed or
-  short-returning batch still reconciles the prefix it read instead of discarding
-  the whole result, and `decdn_redemption_reconciled_skip_total` starts reporting
-  real values. This is an **additive contract-surface change** — one new view
-  selector on `PaymentPool`; no storage layout, event or write path changes.
+  short-returning batch keeps the prefix already read instead of discarding the
+  whole result, and a return whose length does not match the batch fails that
+  batch rather than pairing values it cannot trust. Each batch now meters itself
+  as `decdn_redemption_reconcile_ok_total` /
+  `decdn_redemption_reconcile_failures_total`, with a `DecdnWatermarkReconcileFailing`
+  alert — a zero `decdn_redemption_reconciled_skip_total` alone cannot separate a
+  healthy sweep from a read that never landed, which is what let this hide. This
+  is an **additive contract-surface change** — one new view selector on
+  `PaymentPool`; no storage layout, event or write path changes.
 
 - **Node: a reset buyer-pool store stranded the node's deposit and wedged every
   node-to-node pull (#2072).** The buyer store was the only record that the node
