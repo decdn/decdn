@@ -1121,7 +1121,7 @@ pub struct DecdnMetrics {
     pub local_outboard_serves: Counter,
     /// `decdn_serve_cache_hit_total`: paid serves the blob-availability gate
     /// classified as servable from a COMPLETE locally-held blob, before any fill
-    /// tier runs. One bump per request reaching the `serve_audit` gate in
+    /// tier runs. One bump per request the gate classifies, in
     /// `handlers::client::dispatch`.
     ///
     /// Counted BEFORE the load-shed admission call, so a shed refusal still
@@ -1135,26 +1135,44 @@ pub struct DecdnMetrics {
     /// `CacheEngine::get()`, the whole-blob buffered read, which the paid serve
     /// path never calls — it streams through `export_bao_range_stream` instead.
     /// A node that serves only paying clients therefore holds
-    /// `decdn_cache_hits_total` at zero however full its store is, which is why
-    /// the serve-path hit rate needs its own family.
+    /// `decdn_cache_hits_total` at zero however full its store is. Its partner
+    /// `decdn_cache_misses_total` is NOT confined to `get` — the fill tiers bump
+    /// it too — so that pair reads as a populated, permanently-0% ratio rather
+    /// than as an empty one, which is why the serve path needs its own family.
     ///
-    /// Sibling of `serve_cache_partial_hit` and `serve_cache_miss`; exactly one
-    /// of the three is bumped per request that reaches the gate. Field has no
-    /// `_total` suffix because the `OpenMetrics` encoder appends it.
+    /// Sibling of `serve_cache_partial_hit` and `serve_cache_miss`. At most one
+    /// of the three is bumped per request, and two requests that reach
+    /// `serve_audit` bump none: a withdrawn hash (operator evict or corruption
+    /// quarantine) is refused `EvictedSinceProbe`, and a `serve_audit` store
+    /// fault is refused `InternalError`. Neither is an availability class — one
+    /// is a refusal, the other is the store failing to answer — so the ratio's
+    /// denominator deliberately excludes both. Field has no `_total` suffix
+    /// because the `OpenMetrics` encoder appends it.
     pub serve_cache_hit: Counter,
     /// `decdn_serve_cache_partial_hit_total`: paid serves admitted from a blob
     /// that is not `Complete` but whose held chunk groups already cover the
     /// requested span (#1506). Counted apart from `serve_cache_hit` because the
-    /// two answer different questions — this one is the payoff of partial-holder
-    /// advertisement, and folding it into the plain hit would hide whether that
-    /// mechanism carries any traffic. Both are hits for hit-rate purposes.
+    /// two answer different questions — this one is the payoff of the
+    /// range-keyed partial-holder advertisement a node makes over
+    /// `cdn/probe/v1` and the DHT, and folding it into the plain hit would hide
+    /// whether that mechanism carries any traffic. Both are hits for hit-rate
+    /// purposes.
     pub serve_cache_partial_hit: Counter,
     /// `decdn_serve_cache_miss_total`: paid serves the gate could not satisfy
-    /// from locally-held bytes, so at least one fill tier ran (origin range
-    /// pull, own-origin populate, window-paced or buffered node-to-node
-    /// pull-through). Counts the ADMISSION decision, not the outcome: a miss
-    /// that a fill tier then satisfies still counts here, and the refusal
-    /// siblings (`serve_stream_rejected_*`) say whether it ended in a refusal.
+    /// from locally-held bytes. Counts the ADMISSION decision and nothing
+    /// downstream of it — a fill tier may never run at all, because the bump
+    /// precedes the load-shed gate, the pre-spend floor reservation, and the
+    /// `pull_authorized` check that every tier is gated on. A shed refusal, a
+    /// floor refusal and an unbound request therefore all count here having
+    /// asked no origin and no peer. Where a tier does run and satisfies the
+    /// blob, the request still counts here; the refusal siblings
+    /// (`serve_stream_rejected_*`) say whether it ended in a refusal.
+    ///
+    /// Also absorbs one non-absence: `partial_hit_size` resolves the local
+    /// bitfield with `.ok()?`, so a store fault while answering "do my held
+    /// ranges cover this span?" reads as "they do not" and lands here. That is
+    /// the conflation the `serve_audit` `Err` arm exists to avoid one branch
+    /// earlier, and it bounds how clean a reading of this counter can be.
     pub serve_cache_miss: Counter,
     /// `decdn_origin_directory_get_origins_failures_total`: `getOrigins`
     /// lookups that failed on a cold-namespace cache miss. The directory fails

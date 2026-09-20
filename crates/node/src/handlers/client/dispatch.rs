@@ -790,7 +790,9 @@ impl ClientHandler {
                 //
                 // The miss sibling of the two hit counters above, on the same
                 // pre-shed footing: the gate cannot satisfy this request from
-                // held bytes, so a fill tier will run.
+                // held bytes. It records that classification only — the shed
+                // gate below, the floor reservation, and `pull_authorized` can
+                // each end the request before any fill tier runs.
                 self.metrics.serve_cache_miss();
                 match self
                     .shed

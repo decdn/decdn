@@ -9345,6 +9345,25 @@ async fn cache_hit_refused_under_egress_saturation() -> anyhow::Result<()> {
         refusal_ext.error
     );
 
+    // The availability gate counts ahead of the shed gate, so a serve the shed
+    // refuses still records the hit it refused. This is the only assertion in
+    // the suite that pins that ordering: every other test runs a permissive
+    // limiter, so moving the bump inside the `Ok(slot)` arm would pass all of
+    // them while making the fleet hit-rate panel collapse under exactly the
+    // pressure it exists to survive.
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&encoded, "decdn_serve_cache_hit_total 1"),
+        "a shed-refused cache hit must still count as a hit:\n{encoded}"
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_load_shed_hit_total 1"
+        ),
+        "the shed refusal keeps its own reason counter:\n{encoded}"
+    );
+
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
