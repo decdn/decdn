@@ -138,28 +138,46 @@ mod tests {
         assert!(!should_warn_now(500, 1_000_000, interval));
     }
 
-    /// Racing callers: exactly one warns per window, and its successor's count
-    /// covers every event the window swallowed. Kills a plain `store` in place
-    /// of the compare-exchange (two winners) and a `fetch_add` moved after the
-    /// gate (losers uncounted).
+    /// Racing callers: exactly one warns per window, and every event lands on
+    /// a line. The winner's `swap` races the losers' `fetch_add`s, so the
+    /// split between the winner's count and its successor's is scheduling-
+    /// dependent; their sum is not, and that is what the test pins. Kills a
+    /// `fetch_add` moved after the gate (losers uncounted) on every run, and a
+    /// plain `store` in place of the compare-exchange (two winners) only on
+    /// the runs where two threads land inside the load-to-store window.
     #[test]
     fn racing_callers_admit_one_line_and_count_every_event() {
+        const THREADS: u64 = 8;
+        const EVENTS_PER_THREAD: u64 = 500;
         let throttle = WarnThrottle::new(Duration::from_mins(5));
         let admitted = std::sync::atomic::AtomicU64::new(0);
+        let reported = std::sync::atomic::AtomicU64::new(0);
+        // Release every thread at once so they contend for the first window,
+        // rather than the first-spawned thread finishing before the rest start.
+        let start = std::sync::Barrier::new(usize::try_from(THREADS).unwrap_or(usize::MAX));
         std::thread::scope(|scope| {
-            for _ in 0..8 {
+            for _ in 0..THREADS {
                 scope.spawn(|| {
-                    for _ in 0..500 {
-                        if throttle.admit().is_some() {
+                    start.wait();
+                    for _ in 0..EVENTS_PER_THREAD {
+                        if let Some(suppressed) = throttle.admit() {
                             admitted.fetch_add(1, Ordering::Relaxed);
+                            reported.fetch_add(suppressed, Ordering::Relaxed);
                         }
                     }
                 });
             }
         });
-        assert_eq!(admitted.load(Ordering::Relaxed), 1);
+        assert_eq!(admitted.load(Ordering::Relaxed), 1, "one line per window");
         throttle.force_open();
-        assert_eq!(throttle.admit(), Some(3_999));
+        // Two lines were admitted; every other event is suppressed on one of
+        // them, never on both and never on neither.
+        let winner = reported.load(Ordering::Relaxed);
+        assert_eq!(
+            throttle.admit().map(|successor| winner + successor),
+            Some(THREADS * EVENTS_PER_THREAD - 1),
+            "the winner's count plus its successor's covers every swallowed event"
+        );
     }
 
     /// The suppressed count IS the feature — it is what distinguishes one
