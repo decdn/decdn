@@ -14,6 +14,8 @@
 //! lookup, because one pool fans out to every provider the owner pays
 //! (ADR 003). `close` and `reclaim` also accept `--all`, which enumerates every
 //! pool this keystore owns on-chain (`getPools`) and acts on each eligible one.
+//! `list --all` enumerates the same set read-only, which is the only way to see
+//! a pool the local store has lost.
 //!
 //! These commands own the **client's** buyer store, `buyer-pools.redb`. A
 //! `decdn-node` daemon keeps its own buyer pools in `buyer.redb` in its data
@@ -55,8 +57,11 @@ pub enum PoolCommand {
     /// `source=node_store_offline` under `--json`.
     ///
     /// The stores are separate — a client listing says nothing about a node,
-    /// and vice versa — and the three sources do not emit the same `--json`
-    /// pool objects, so read `source` before parsing them.
+    /// and vice versa — and the sources do not emit the same `--json` pool
+    /// objects, so read `source` before parsing them.
+    ///
+    /// `--all` replaces all of that with the chain's own answer: every pool the
+    /// keystore owns, whether or not any local store knows about it.
     #[command(visible_alias = "status")]
     List(PoolListArgs),
     /// Open a fresh `PaymentPool` deposit, escrowing `--deposit-micro-usdc`
@@ -240,19 +245,31 @@ pub struct PoolChainArgs {
 
 /// `decdn pool list` / `status` flags.
 ///
-/// Read-only. Needs no chain coordinates and no keystore. It reads the data
-/// dir's client buyer store — unless that data dir belongs to a `decdn-node`
-/// daemon, in which case it asks the daemon over the admin RPC instead (the
-/// daemon's own store is locked for its lifetime), and the admin flags below
-/// apply.
+/// Read-only. The default listing needs no chain coordinates and no keystore:
+/// it reads the data dir's client buyer store — unless that data dir belongs to
+/// a `decdn-node` daemon, in which case it asks the daemon over the admin RPC
+/// while that daemon runs and reads its store off disk when it does not, and
+/// the admin flags below apply. `--all` is the other view, and it does need the
+/// chain flags and the keystore.
 #[derive(Args, Debug)]
 pub struct PoolListArgs {
-    /// Data dir holding the buyer-pool store (else `identity.data_dir` >
-    /// default).
-    #[arg(long, value_name = "PATH")]
-    pub data_dir: Option<PathBuf>,
+    /// List every pool this keystore owns ON CHAIN (`getPools`), in every
+    /// lifecycle state, marking which ones the local store tracks.
+    ///
+    /// The answer to "what do I actually own?" when the local store is the
+    /// thing that was lost — a reset `identity.data_dir` drops the only record
+    /// of a funded deposit, and the default listing then prints nothing
+    /// because it is reading the file that went missing. When the two views
+    /// disagree, believe the chain: the disagreement is itself the diagnostic.
+    ///
+    /// Reads and writes nothing, so unlike `close --all` / `reclaim --all` it
+    /// is NOT refused on a node's data dir — a node host is where it is most
+    /// needed. It does need `--rpc-url`/`--payment-pool-address` and the
+    /// keystore, whose address it enumerates by.
+    #[arg(long)]
+    pub all: bool,
 
-    /// Emit the tracked pools as JSON instead of the aligned table.
+    /// Emit the pools as JSON instead of the aligned table.
     #[arg(long)]
     pub json: bool,
 
@@ -266,4 +283,9 @@ pub struct PoolListArgs {
     /// Roundtrip timeout in milliseconds for that admin call.
     #[arg(long, value_name = "MS", default_value_t = 5_000)]
     pub timeout_ms: u64,
+
+    /// Chain + store coordinates. Only `--data-dir` matters to the default
+    /// listing; the rest are what `--all` enumerates with.
+    #[command(flatten)]
+    pub chain: PoolChainArgs,
 }

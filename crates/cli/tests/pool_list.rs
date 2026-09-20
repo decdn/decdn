@@ -25,7 +25,7 @@ mod common;
 
 use alloy::primitives::{Address, B256, U256};
 use decdn_cli::commands::pool::pool_dispatch;
-use decdn_common::cli::{PoolArgs, PoolCommand, PoolListArgs};
+use decdn_common::cli::{PoolArgs, PoolChainArgs, PoolCommand, PoolListArgs};
 use decdn_incentive::buyer_pool::{BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 
@@ -40,11 +40,20 @@ fn data_dir() -> tempfile::TempDir {
 fn list_args(data_dir: &std::path::Path, json: bool) -> PoolArgs {
     PoolArgs {
         command: PoolCommand::List(PoolListArgs {
-            data_dir: Some(data_dir.to_path_buf()),
+            // The store-backed listing; `--all` is covered against a real chain.
+            all: false,
             json,
             // Unused on a client data dir; only a node's routes to the daemon.
             admin_url: None,
             timeout_ms: 5_000,
+            chain: PoolChainArgs {
+                data_dir: Some(data_dir.to_path_buf()),
+                rpc_url: None,
+                payment_pool_address: None,
+                chain_id: None,
+                keystore: None,
+                keystore_password_file: None,
+            },
         }),
     }
 }
