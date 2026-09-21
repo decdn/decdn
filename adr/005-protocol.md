@@ -280,6 +280,8 @@ enum StreamError {
     InternalError,     // Unexpected failure; do not retry this node
     EvictedSinceProbe, // Blob was evicted between probe and stream request — not slash evidence; an accountable, signed refusal (see below)
     VoucherRejected { reason: VoucherRejectReason, bundle: Option<WatermarkBundle> }, // Mid-stream payment-voucher rejection (carried in a StreamError message, not in the initial StreamResponse) — see VoucherRejected semantics below; `bundle` carries the node's true watermark on a gated regression/exhaustion reject
+    OriginBlacklisted, // Pool funder is on the origin blacklist — permanent for this pool (ADR 011 § StreamRequest Response)
+    HashBlacklisted,   // Blob is on the governance blacklist or this operator's local denylist — the two are deliberately indistinguishable (ADR 011 § StreamRequest Response)
     InsufficientDeposit, // Pool's remaining deposit minus the refundable floor M cannot cover a credit window; spoken ONLY to the proven pool owner so its top-up loop recovers (a prober gets NotFound) — see ADR 003 § Pool solvency
 }
 

@@ -988,7 +988,9 @@ mod tests {
         ClientRangedStore, Cumulative, PoolContext, PoolLedger, UpstreamPullHeader,
         UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
     };
-    use decdn_protocol::client::{StreamError, VoucherRejectReason};
+    use decdn_protocol::client::{
+        StreamError, StreamResponse, StreamResponseBody, StreamResponseExt, VoucherRejectReason,
+    };
 
     const GROUP: u64 = CHUNK_GROUP_BYTES;
 
@@ -1683,9 +1685,32 @@ mod tests {
             let n = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
                 if n == 0 {
-                    return Err(anyhow::Error::new(UpstreamRefused::mid_stream(
-                        StreamError::InsufficientDeposit,
-                    )));
+                    // A real open-stage refusal: the node signs `StreamResponse
+                    // { ok: false }` with the delivery-side `InsufficientDeposit` in
+                    // the trailing ext, exactly the shape `open_progressive_pull`
+                    // builds via the crate-private `UpstreamRefused::open`. Built here
+                    // (rather than `mid_stream`) so the refusal carries open-stage
+                    // evidence — which is what `is_insufficient_deposit` now requires.
+                    let body = StreamResponseBody {
+                        hash,
+                        ok: false,
+                        rate_per_mb: 1,
+                        total_bytes: self.inner.total_bytes(),
+                        pool_id: [0u8; 32],
+                        timestamp_us: 0,
+                    };
+                    // `open` retains the response as-is without re-validating the
+                    // signature, so an EOA-length (65-byte) placeholder slash-sig is
+                    // enough — this test exercises the top-up routing, not slash
+                    // evidence.
+                    let resp = StreamResponse {
+                        body,
+                        slash_sig: vec![0u8; 65],
+                    };
+                    let ext = StreamResponseExt {
+                        error: Some(StreamError::InsufficientDeposit),
+                    };
+                    return Err(UpstreamRefused::open(resp, &ext));
                 }
                 self.inner.open(hash, range).await
             })
