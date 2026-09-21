@@ -149,14 +149,16 @@ fn group_by_hash<'a>(entries: &[&'a ManifestEntry]) -> Vec<HashGroup<'a>> {
 /// Order hash-groups smallest whole-file first so a shared chunk's assigned
 /// fetcher (the smallest containing entry, per [`build_fetch_plan`]) starts — and
 /// finishes — before the larger entries that defer to it, keeping the tail-reconcile
-/// wait short. A group's entries share one blob, so the group's size is its first
-/// entry's declared `size`; an unsized group sorts last (it can never be a sized
+/// wait short. A group's entries share one blob, so the group's size is any entry's
+/// declared `size` (the same OR-across-same-hash-entries rule as
+/// [`total_content_bytes`], so a group with one unsized duplicate path still sorts
+/// by its real size); a group no entry sizes sorts last (it can never be a sized
 /// donor). Ties break on the group hash for a deterministic order.
 fn order_groups_smallest_first(mut groups: Vec<HashGroup<'_>>) -> Vec<HashGroup<'_>> {
     groups.sort_by(|a, b| {
-        let a_size = a.entries.first().and_then(|e| e.size);
-        let b_size = b.entries.first().and_then(|e| e.size);
-        // `None` sorts last: map to the max sentinel for the size comparison.
+        let a_size = a.entries.iter().find_map(|e| e.size);
+        let b_size = b.entries.iter().find_map(|e| e.size);
+        // A group no entry sizes sorts last: map to the max sentinel for the compare.
         let key = |s: Option<u64>| s.unwrap_or(u64::MAX);
         key(a_size)
             .cmp(&key(b_size))
@@ -2608,8 +2610,11 @@ impl ChunkIndex {
     /// sweep in [`PullCtx::pull_all`]. Excludes any [`Self::seed_disk`] source —
     /// an on-disk OUTPUT file the sweep must never delete.
     fn sources(&self) -> Vec<PathBuf> {
-        let seeded = self.seeded.lock().unwrap_or_else(PoisonError::into_inner);
+        // Acquire `map` before `seeded` — the single lock order every site follows
+        // (`register`/`seed_disk` touch `map` first), so no pair of these methods
+        // can ever invert and deadlock.
         let map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        let seeded = self.seeded.lock().unwrap_or_else(PoisonError::into_inner);
         let mut seen: HashSet<&Path> = HashSet::new();
         let mut out = Vec::new();
         for m in map.values() {
@@ -4323,9 +4328,38 @@ mod tests {
         let ordered = order_groups_smallest_first(group_by_hash(&refs));
         let sizes: Vec<_> = ordered
             .iter()
-            .map(|g| g.entries.first().and_then(|e| e.size))
+            .map(|g| g.entries.iter().find_map(|e| e.size))
             .collect();
         assert_eq!(sizes, vec![Some(10), Some(100), Some(900)]);
+    }
+
+    /// A group's size is any entry that declares one, not strictly the first: a
+    /// group whose first duplicate path is unsized but whose second is small must
+    /// still sort early, not last.
+    #[test]
+    fn groups_ordered_by_any_declared_size_not_just_the_first() {
+        let whole = format!("b3:{}", blake3::Hash::from_bytes([0x42; 32]).to_hex());
+        // Two paths for the same small blob; the first is unsized on the wire.
+        let unsized_first = ManifestEntry {
+            path: "a".into(),
+            hash: whole.clone(),
+            size: None,
+            chunks: None,
+        };
+        let sized_dup = ManifestEntry {
+            path: "b".into(),
+            hash: whole,
+            size: Some(10),
+            chunks: None,
+        };
+        let big = mentry(0x01, 900, &[(900, 0x91)]);
+        let refs = vec![&big, &unsized_first, &sized_dup];
+        let ordered = order_groups_smallest_first(group_by_hash(&refs));
+        let sizes: Vec<_> = ordered
+            .iter()
+            .map(|g| g.entries.iter().find_map(|e| e.size))
+            .collect();
+        assert_eq!(sizes, vec![Some(10), Some(900)]);
     }
 
     /// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive` writes
