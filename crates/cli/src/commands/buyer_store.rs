@@ -67,6 +67,34 @@ pub(crate) fn client_buyer_db(data_dir: &Path) -> PathBuf {
     data_dir.join(decdn_common::data_dir::CLIENT_BUYER_DB_FILE)
 }
 
+/// Whether a buy may adopt a pool its wallet already owns on chain, when the
+/// client store has no row for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChainAdoption {
+    /// A client data dir. The wallet's pools are this client's own, so a lost
+    /// row is recovered from chain rather than escrowing a second deposit.
+    Allowed,
+    /// A node's data dir, named on the command line (#2082). The keystore is
+    /// the node's operator key, so the wallet's newest live pool is the one the
+    /// daemon is paying from: adopting it would put a second, independent
+    /// voucher series on the daemon's own lanes. The buy opens its own pool
+    /// instead.
+    Refused,
+}
+
+impl ChainAdoption {
+    /// The rule for a buy whose client store lives in `data_dir`.
+    ///
+    /// Reads the same daemon markers as [`classify_buyer_store`], so the verdict
+    /// is about the directory the store was opened in, not a second opinion.
+    pub(crate) fn for_data_dir(data_dir: &Path) -> Self {
+        match classify_buyer_store(data_dir) {
+            BuyerStoreOwner::Client { .. } => Self::Allowed,
+            BuyerStoreOwner::Node { .. } => Self::Refused,
+        }
+    }
+}
+
 /// Classify `data_dir` by whether a `decdn-node` daemon owns it.
 ///
 /// Keys on ANY of the daemon's store files, not `buyer.redb` alone. The buyer
@@ -284,6 +312,31 @@ mod tests {
                 data_dir: dir.path().to_path_buf(),
                 marker: decdn_common::data_dir::NODE_BUYER_DB_FILE,
             }
+        );
+    }
+
+    /// A buy from a node's data dir never adopts, and a client dir always may.
+    ///
+    /// The keystore in a node's dir is the daemon's operator key, so the
+    /// wallet's newest live pool is the one the daemon is paying from. Adopting
+    /// it would put a second, independent voucher series on the daemon's lanes.
+    /// Keyed on the same markers as `classify_buyer_store`, so a dir whose
+    /// `buyer.redb` was deleted mid-recovery is still refused.
+    #[test]
+    fn chain_adoption_is_refused_in_a_node_data_dir() {
+        let client = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ChainAdoption::for_data_dir(client.path()),
+            ChainAdoption::Allowed
+        );
+
+        let node = tempfile::tempdir().unwrap();
+        std::fs::write(node.path().join("lanes.redb"), b"x").unwrap();
+        assert!(!node.path().join("buyer.redb").exists());
+        assert_eq!(
+            ChainAdoption::for_data_dir(node.path()),
+            ChainAdoption::Refused,
+            "a node dir must refuse adoption even with its buyer store gone"
         );
     }
 

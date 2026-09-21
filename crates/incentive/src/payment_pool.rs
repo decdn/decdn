@@ -391,7 +391,7 @@ const OWNED_POOLS_PAGE: usize = 256;
 /// Chain-authoritative, which is the point: the local buyer store drops a row
 /// at close and is lost outright if the data dir is reset, so it cannot answer
 /// "do I already own a pool". Asking the chain instead is what stops a node
-/// from escrowing a second deposit against a pool it has simply forgotten
+/// or client from escrowing a second deposit against a pool it has simply forgotten
 /// (#2072), and it enumerates pools in every lifecycle state, which is what
 /// reaching a historical `Closing` pool awaiting reclaim needs.
 ///
@@ -423,6 +423,53 @@ where
         offset = offset.saturating_add(u64::try_from(n)?);
     }
     Ok(ids)
+}
+
+/// The newest pool `owner` holds on this contract that is `Open` and still has
+/// deposit left to spend, or `None` if it holds no such pool.
+///
+/// This is the chain's answer to "do I already own a pool I can pay from",
+/// which the local buyer store cannot give once it has lost its row — to a
+/// reset data dir, a new machine, or a store-format change. Opening a pool on
+/// that question's behalf when this would have answered `Some` escrows a second
+/// deposit beside a live one, and reverts when the wallet's remaining USDC
+/// cannot cover it.
+///
+/// Newest first, because a later pool is the one an earlier session would have
+/// been paying from. That assumes the wallet has one buyer: a wallet shared by
+/// two buyers — a node's operator key used by a client as well — has no single
+/// "earlier session", and the caller must not adopt at all. A fully-redeemed pool is still `Open` on chain, and
+/// adopting one would leave nothing to spend, so solvency is part of the test.
+///
+/// # Errors
+///
+/// Errors if the enumeration or any pool read fails. A read that faulted says
+/// nothing about whether that pool is live, and treating it as absent is
+/// exactly the unobserved second deposit this exists to prevent — so the
+/// caller learns it could not tell, rather than being told there is no pool.
+pub async fn newest_solvent_owned_pool<P>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: alloy::primitives::Address,
+) -> anyhow::Result<Option<(crate::lane::PoolId, PaymentPool::Pool)>>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    use anyhow::Context as _;
+    for pool_id in enumerate_owned_pools(contract, owner)
+        .await?
+        .into_iter()
+        .rev()
+    {
+        let pool = contract
+            .getPool(pool_id)
+            .call()
+            .await
+            .with_context(|| format!("getPool({pool_id}) failed"))?;
+        if matches!(pool.status, PaymentPool::Status::Open) && pool.deposit > pool.totalRedeemed {
+            return Ok(Some((pool_id, pool)));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -510,6 +557,143 @@ mod tests {
         assert_eq!(decoded.lanes[0].bytesPaid, 2_000);
         assert_eq!(decoded.lanes[1].signer, signer_b);
         assert_eq!(decoded.lanes[1].newPaidCumulative, 7_000);
+    }
+
+    /// A `PaymentPool` whose `eth_call`s are answered in order from `calls`: the
+    /// first answers `getPools`, each later one a `getPool`. `None` faults the
+    /// call, as a transient RPC error does.
+    fn mocked(
+        calls: Vec<Option<alloy::primitives::Bytes>>,
+    ) -> PaymentPool::PaymentPoolInstance<impl alloy::providers::Provider + Clone + 'static> {
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+        let asserter = Asserter::new();
+        for call in calls {
+            match call {
+                Some(response) => asserter.push_success(&response),
+                None => asserter.push_failure_msg("transient rpc fault"),
+            }
+        }
+        PaymentPool::new(
+            Address::ZERO,
+            ProviderBuilder::new().connect_mocked_client(asserter),
+        )
+    }
+
+    fn pool(status: PaymentPool::Status, deposit: u64, redeemed: u64) -> PaymentPool::Pool {
+        PaymentPool::Pool {
+            owner: Address::repeat_byte(1),
+            status,
+            disputeDeadline: 0,
+            deposit,
+            totalRedeemed: redeemed,
+        }
+    }
+
+    /// Of two pools that can both still pay, the newer is adopted.
+    ///
+    /// Both answers are solvent, so a walk in the wrong direction returns the
+    /// other id however the mock's positional answers line up — this pins the
+    /// order itself, not an accident of which answer each read happened to get.
+    #[tokio::test]
+    async fn adopts_the_newer_of_two_solvent_pools() -> anyhow::Result<()> {
+        use alloy::sol_types::SolValue;
+        let older = B256::repeat_byte(0xAA);
+        let newer = B256::repeat_byte(0xBB);
+        let contract = mocked(vec![
+            Some(vec![older, newer].abi_encode().into()),
+            Some(
+                pool(PaymentPool::Status::Open, 10_000_000, 2_000_000)
+                    .abi_encode()
+                    .into(),
+            ),
+            Some(
+                pool(PaymentPool::Status::Open, 10_000_000, 3_000_000)
+                    .abi_encode()
+                    .into(),
+            ),
+        ]);
+        let (id, _) = super::newest_solvent_owned_pool(&contract, Address::repeat_byte(1))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("two solvent open pools are on chain"))?;
+        anyhow::ensure!(id == newer, "the walk must go newest-first, got {id}");
+        Ok(())
+    }
+
+    /// The newest pool that can still pay wins, and a newer one that cannot is
+    /// passed over rather than adopted.
+    ///
+    /// A fully-redeemed pool is still `Open` on chain. Adopting it would hand the
+    /// buyer a pool with nothing to spend, and — since nothing opens beside an
+    /// adopted pool — leave it unable to pay anyone.
+    #[tokio::test]
+    async fn adopts_the_newest_pool_that_can_still_pay() -> anyhow::Result<()> {
+        use alloy::sol_types::SolValue;
+        let older = B256::repeat_byte(0xAA);
+        let newer = B256::repeat_byte(0xBB);
+        // `getPools` is oldest-first; the walk reads the newer one first.
+        let contract = mocked(vec![
+            Some(vec![older, newer].abi_encode().into()),
+            Some(
+                pool(PaymentPool::Status::Open, 10_000_000, 10_000_000)
+                    .abi_encode()
+                    .into(),
+            ),
+            Some(
+                pool(PaymentPool::Status::Open, 10_000_000, 1_106_908)
+                    .abi_encode()
+                    .into(),
+            ),
+        ]);
+        let (id, adopted) = super::newest_solvent_owned_pool(&contract, Address::repeat_byte(1))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("a solvent open pool is on chain"))?;
+        anyhow::ensure!(id == older, "the fully-redeemed newer pool must be skipped");
+        anyhow::ensure!(adopted.totalRedeemed == 1_106_908);
+        Ok(())
+    }
+
+    /// Nothing left to adopt is `None`, which is the one answer that licenses
+    /// opening a fresh pool.
+    #[tokio::test]
+    async fn answers_none_when_no_owned_pool_can_pay() -> anyhow::Result<()> {
+        use alloy::sol_types::SolValue;
+        let contract = mocked(vec![
+            Some(vec![B256::repeat_byte(0xAA)].abi_encode().into()),
+            Some(
+                pool(PaymentPool::Status::Closing, 10_000_000, 0)
+                    .abi_encode()
+                    .into(),
+            ),
+        ]);
+        anyhow::ensure!(
+            super::newest_solvent_owned_pool(&contract, Address::repeat_byte(1))
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    /// A pool read that faults is an error, never `None`.
+    ///
+    /// `None` means "you own nothing you can pay from — open one", and a caller
+    /// acts on it by escrowing a deposit. A faulted read says nothing about
+    /// whether that pool is live, so answering `None` on it would escrow a second
+    /// deposit beside a pool the wallet already funded — which, on a wallet
+    /// whose USDC is all in the first, reverts outright.
+    #[tokio::test]
+    async fn a_faulted_pool_read_is_an_error_not_an_empty_answer() {
+        use alloy::sol_types::SolValue;
+        let contract = mocked(vec![
+            Some(vec![B256::repeat_byte(0xAA)].abi_encode().into()),
+            None,
+        ]);
+        assert!(
+            super::newest_solvent_owned_pool(&contract, Address::repeat_byte(1))
+                .await
+                .is_err(),
+            "\"could not tell\" must not become \"no pool, go open one\""
+        );
     }
 
     /// The narrowing guard on the money path: every USDC amount crosses into
