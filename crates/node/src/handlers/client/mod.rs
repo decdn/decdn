@@ -35,7 +35,7 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use dashmap::DashMap;
-use decdn_cache::{CHUNK_GROUP_BYTES, CacheEngine, CacheError, Hash, RangePullOutcome};
+use decdn_cache::{CHUNK_GROUP_BYTES, CacheEngine, CacheError, Hash};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::{PoolStateStore, StoreError};
 use decdn_incentive::{

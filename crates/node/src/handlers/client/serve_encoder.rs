@@ -952,6 +952,10 @@ mod tests {
             panic!("A owns its whole request");
         };
 
+        // A's client has paid up to 2g, so a request starting there is at (not
+        // ahead of) A's paid frontier and may share A's fill for the overlap.
+        a_session.advance_served(2 * G);
+
         // Client B: [2g,5g) overlaps A's prefix → MIXED. B owns only the remainder
         // [3g,5g) and attaches A for the [2g,3g) overlap — the "share one pull".
         let FillClaim::Mixed {
@@ -962,7 +966,7 @@ mod tests {
             owner_lease: _ol,
             attach_lease: _al,
         } = engine.claim_fill(hash, 2 * G, 3 * G, total, || {
-            FillSession::new(a_root, total)
+            FillSession::starting_at(a_root, total, 2 * G)
         })
         else {
             panic!("B mixes: owns the remainder, attaches the overlap sibling");

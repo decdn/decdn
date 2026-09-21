@@ -660,12 +660,6 @@ impl ClientHandler {
         // admission-time job of the pool ceiling and the per-signer live cap.
         let mut floor_reservation: Option<FloorReservation> = None;
 
-        // Set by the origin-tier range pull-through below (#823) when a
-        // bounded/offset cache-miss request was filled as a *partial* blob.
-        // Carries the authoritative whole-blob size (from the origin size
-        // probe) past the size gate, which can't `inspect` a partial blob.
-        let mut range_pulled_size: Option<u64> = None;
-
         // Blob availability gate. A store fault is NOT an absence: an
         // `Unavailable` audit means the node genuinely lacks the blob (NotFound
         // / EvictedSinceProbe), but `Err` is a transient local store failure
@@ -836,32 +830,19 @@ impl ClientHandler {
                 // On a successful fill, fall through to the normal size-gate +
                 // delivery path; otherwise it stays a `NotFound`.
                 //
-                // Origin-tier range pull-through (#823, ADR 037 §Origin-tier
-                // pull-through). When the
-                // request is a bounded/offset range, scope the cache-miss origin
-                // fetch to exactly the requested span (fetch `[offset, offset+len)`
-                // + the `{H}.obao4` outboard, bao-verify, import a partial blob)
-                // instead of pulling the whole blob to serve a slice. Gated on
-                // the same pull-authorization as the whole-blob fill. Best-effort:
-                // any decline (unknown origin size, no published outboard, no
-                // `Range` support, verify failure) leaves `range_pulled_size` as
-                // `None` and falls through to the whole-blob path below, which is
-                // always correct (ADR 037 §"Fallback is always correct").
-                // The fault latch (#1129). Declared BEFORE the range tier, not after
-                // it: the range pull can hit a `CacheError::Store` of its own, and a
-                // latch that only starts at the local tier would drop it. Today the
-                // local tier happens to re-detect such a fault (it re-walks the same
-                // origin chain), but that is a coincidence of the current tier
-                // ordering, not an invariant — and this is the one bug the file
-                // exists to prevent. Latch every tier.
+                // Every request shape — whole blob, bounded, resumed — takes the same
+                // two-leg spine on its preferred tiers: the spine signs first and its
+                // pull leg fetches only the requested span's missing chunk groups
+                // (ADR 037 §Origin-tier pull-through). The FALLBACK tiers below it
+                // (`try_local_populate`, the buffered pull-through) still import the
+                // whole blob before the size gate answers; they serve exactly the
+                // requested span at delivery.
+                // The fault latch (#1129): declared before the first tier so every
+                // tier's `CacheError::Store` lands in it.
                 // Pre-spend deposit floor (#1519). Every fill tier below spends:
-                // the range and local tiers front the operator's own origin
-                // egress, and the buffered tier's `cache.populate` walks the paid
-                // `Peer` origin and fronts real upstream USDC. (The range tier is
-                // own-egress-only because `NodeOrigin` does not implement
-                // `Origin::fetch_range_data` — `pull_through_range` iterates every
-                // origin with no `local_only` filter, so the day it does, that tier
-                // starts fronting upstream USDC too. Nothing would fail.) All three are gated
+                // the own-origin spine and the local tier front the operator's own
+                // origin egress, and the peer spine and the buffered tier front real
+                // upstream USDC. All are gated
                 // on channel OWNERSHIP (`pull_authorized`) and none on solvency,
                 // so before this floor a dust-deposit channel could name N absent
                 // hashes, make the node pay for each, and be refused afterwards by
@@ -968,28 +949,22 @@ impl ClientHandler {
                 }
 
                 let mut fault_seen = false;
-                if (req.byte_offset > 0 || req.byte_len > 0)
-                    && self.pull_authorized(&req, verified_client)
-                {
-                    let (size, range_outcome) = self.try_range_pull_through(hash, &req).await;
-                    range_pulled_size = size;
-                    fault_seen |= range_outcome.is_fault();
-                }
 
                 let mut locally_filled = false;
 
                 // Own-origin serve-miss via the two decoupled legs.
                 // When the node's OWN configured fs/http/s3 origin can prove it
                 // serves `hash` — it knows the size AND publishes the {H}.obao4
-                // outboard — serve the whole blob by running the local pull leg (fill
+                // outboard — serve the request by running the local pull leg (fill
                 // the cache from origin) beside the serve leg (stream the filling
                 // cache to the paying client), exactly like the node→node window path
                 // but with NO upstream, NO channel, and NO payment on the ingest side.
                 // Time-to-first-byte does not wait for the whole blob to land.
                 //
-                // Whole-blob only (offset==0 && len==0): ranged/resumed own-origin
-                // serve-miss is not yet wired through the two-leg spine, so a bounded
-                // request never routes here.
+                // Any request shape routes here: the serve leg clamps to
+                // `[byte_offset, end)` and the pull leg fills only that span's missing
+                // chunk groups, so a bounded request costs exactly its aligned span
+                // in origin egress.
                 //
                 // Serviceability is confirmed by `origin_size` +
                 // `origin_fetch_outboard_bytes` (an origin publishes the outboard) —
@@ -1008,12 +983,7 @@ impl ClientHandler {
                 // streams the same filling cache to its own client (no double origin
                 // egress). The registry is range-aware, so this coalescing is not
                 // limited to the whole-blob case.
-                if range_pulled_size.is_none()
-                    && !locally_filled
-                    && req.byte_offset == 0
-                    && req.byte_len == 0
-                    && self.pull_authorized(&req, verified_client)
-                {
+                if self.pull_authorized(&req, verified_client) {
                     match self.cache.origin_size(hash).await {
                         Ok(Some(total)) => {
                             match self.cache.origin_fetch_outboard_bytes(hash, total).await {
@@ -1052,20 +1022,22 @@ impl ClientHandler {
                                 // reports InternalError not NotFound, then fall
                                 // through — another source may still serve.
                                 Err(e) => {
-                                    tracing::debug!(%hash, error = %e, "own-origin outboard probe faulted; falling through");
+                                    self.metrics.node_pull_through_error();
+                                    tracing::warn!(%hash, error = %e, "own-origin outboard probe faulted; falling through");
                                     fault_seen = true;
                                 }
                             }
                         }
                         // No origin knows the size, or no origin is configured at
                         // all — both a clean fall-through (degrade). `origin_size`
-                        // already returns Ok(None) for most declines, so only
-                        // NoOrigin and transport faults reach the Err arms.
+                        // returns Ok(None) only for clean declines; a probe that
+                        // ends on a transport fault reaches the Err arm below.
                         Ok(None) | Err(CacheError::NoOrigin { .. }) => {}
                         // Any other origin fault latches `fault_seen` (#1129) so a
                         // later-tier miss reports InternalError not NotFound.
                         Err(e) => {
-                            tracing::debug!(%hash, error = %e, "own-origin size probe faulted; falling through");
+                            self.metrics.node_pull_through_error();
+                            tracing::warn!(%hash, error = %e, "own-origin size probe faulted; falling through");
                             fault_seen = true;
                         }
                     }
@@ -1095,8 +1067,7 @@ impl ClientHandler {
                 // `InsufficientDeposit` — keep their own reasons: they are
                 // client-attributable and would refuse regardless of origin
                 // health.)
-                if range_pulled_size.is_none()
-                    && !locally_filled
+                if !locally_filled
                     && let Some(timeout) = self.local_populate
                     && self.pull_authorized(&req, verified_client)
                 {
@@ -1114,25 +1085,15 @@ impl ClientHandler {
                 // speculative exposure is bounded to the ramped credit window
                 // (#1669).
                 //
-                // It requires `byte_offset == 0 && byte_len == 0` (a whole-blob
-                // request). This is a conservative constraint on the ROUTING, not a
-                // limit of the serve leg: `serve_leg` clamps delivery to
-                // `[offset, offset + len)` and bills only the wire it delivers, and
-                // the pull leg is range-minimized (it pulls only
-                // `missing_ranges(offset, len)`), so the two-leg spine is
-                // range-correct. Ranged and resumed serve-miss through that spine is
-                // simply not yet wired end-to-end, so a bounded or resumed request
-                // falls to the buffered path below, which serves exactly the
-                // requested span via `export_range` (#823).
-                if range_pulled_size.is_some() || locally_filled {
-                    // The requested span/blob is already present — a verified
-                    // partial blob from the range pull, or the whole blob just
-                    // filled from a local origin (#1116). Skip the node→node fill
-                    // and fall through to the size gate + delivery (which serves a
-                    // partial via `export_range`).
+                // Any request shape routes here. `serve_leg` clamps delivery to
+                // `[offset, offset + len)` and bills only the wire it delivers; the
+                // pull leg pulls only `missing_ranges(offset, len)` upstream, so a
+                // bounded or resumed request fronts exactly its span.
+                if locally_filled {
+                    // The whole blob just filled from a local origin (#1116). Skip
+                    // the node→node fill and fall through to the size gate +
+                    // delivery.
                 } else if let Some(origin) = self.pull_through_origin.as_ref()
-                    && req.byte_offset == 0
-                    && req.byte_len == 0
                     && self.pull_authorized(&req, verified_client)
                 {
                     // Boxed: the serve future is large; keep it off the
@@ -1160,8 +1121,8 @@ impl ClientHandler {
                         .await;
                     }
                 } else {
-                    // Buffered pull-through (#831): used when
-                    // the window provider is unset or for a resumed request.
+                    // Buffered pull-through (#831): used when no window provider is
+                    // set.
                     let buffered = match self.pull_through {
                         Some(timeout) if self.pull_authorized(&req, verified_client) => {
                             self.try_pull_through(hash, timeout).await
@@ -1185,10 +1146,7 @@ impl ClientHandler {
         // miss-serve return paths below.
         let _shed_slot = shed_slot;
 
-        // Size gate. An origin-tier range pull (#823) imported only a *partial*
-        // blob, so `inspect` can't report the whole-blob size — but the origin
-        // size probe already gave us the authoritative total, which the client
-        // needs for resume math. Use it directly in that case. A plain cache hit
+        // Size gate. A plain cache hit
         // carries its size from the `serve_audit` above (#1789 item 7 part B),
         // so it skips the redundant `inspect` store hop entirely — including a
         // genuinely empty blob, which audits as serveable at size 0.
@@ -1201,9 +1159,7 @@ impl ClientHandler {
         // `StreamResponse` the delivery then contradicts, and the receiver
         // (expecting 0 bytes) would abort on the first chunk. Surface the fault
         // instead.
-        let total_bytes = if let Some(total) = range_pulled_size {
-            total
-        } else if let Some(size) = hit_size {
+        let total_bytes = if let Some(size) = hit_size {
             size
         } else {
             let size = match self.cache.inspect(hash).await {
@@ -1242,25 +1198,17 @@ impl ClientHandler {
         // `deliver`'s `export_range` then aborts mid-stream. A whole-blob request
         // (`byte_offset == 0 && byte_len == 0`) is always in bounds for a present
         // blob; `byte_len == 0` on a non-zero offset is the in-bounds whole-tail
-        // read. Mirrors `range_pull::align_range`'s bound check on the origin
-        // tier so the serve tier rejects the same ranges.
-        if req.byte_offset > 0 || req.byte_len > 0 {
-            let out_of_bounds = req.byte_offset >= total_bytes
-                || (req.byte_len > 0
-                    && req
-                        .byte_offset
-                        .checked_add(req.byte_len)
-                        .is_none_or(|end| end > total_bytes));
-            if out_of_bounds {
-                return self
-                    .respond_error(
-                        &mut send,
-                        &req,
-                        ServeRejectReason::RangeNotSatisfiable,
-                        rate_per_mb,
-                    )
-                    .await;
-            }
+        // read. Mirrors `align_range`'s bound check, shared with the two-leg
+        // spine via `range_out_of_bounds`.
+        if range_out_of_bounds(req.byte_offset, req.byte_len, total_bytes) {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::RangeNotSatisfiable,
+                    rate_per_mb,
+                )
+                .await;
         }
 
         // Resolve the lane (must be pre-persisted — see module docs / #327).
@@ -1445,7 +1393,7 @@ impl ClientHandler {
 /// is also 0). Total-saturating throughout: the caller's range bounds check has
 /// already rejected an out-of-bounds request, and a zero-length blob correctly
 /// yields 0.
-fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) -> u64 {
+pub(super) fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) -> u64 {
     let end = if byte_len > 0 {
         byte_offset.saturating_add(byte_len).min(total_bytes)
     } else {
@@ -1459,9 +1407,50 @@ fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) -> u64 {
     aligned_end.saturating_sub(start)
 }
 
+/// Whether `[byte_offset, byte_offset + byte_len)` (`byte_len == 0` = to the
+/// blob end) lies outside a `total_bytes`-byte blob. Mirrors
+/// [`decdn_bao_range::align_range`]'s bound check so every serve tier — the
+/// direct-serve gate and the two-leg spine — refuses the same ranges with
+/// `RangeNotSatisfiable` BEFORE it signs a response. A whole-blob request
+/// (`0, 0`) is always in bounds, including for the empty blob.
+pub(super) const fn range_out_of_bounds(byte_offset: u64, byte_len: u64, total_bytes: u64) -> bool {
+    if byte_offset == 0 && byte_len == 0 {
+        return false;
+    }
+    if byte_offset >= total_bytes {
+        return true;
+    }
+    if byte_len == 0 {
+        return false;
+    }
+    match byte_offset.checked_add(byte_len) {
+        Some(end) => end > total_bytes,
+        None => true,
+    }
+}
+
 #[cfg(test)]
-mod aligned_span_tests {
-    use super::{CHUNK_GROUP_BYTES, aligned_span};
+mod range_helper_tests {
+    use super::{CHUNK_GROUP_BYTES, aligned_span, range_out_of_bounds};
+
+    #[test]
+    fn range_out_of_bounds_mirrors_align_range() {
+        let total = 100 * 1024;
+        // Whole blob and in-bounds tails / bounds are satisfiable.
+        assert!(!range_out_of_bounds(0, 0, total));
+        assert!(!range_out_of_bounds(16 * 1024, 0, total));
+        assert!(!range_out_of_bounds(16 * 1024, 32 * 1024, total));
+        assert!(!range_out_of_bounds(0, total, total));
+        // Offset at/past the end, an end past the blob, or an overflowing end.
+        assert!(range_out_of_bounds(total, 0, total));
+        assert!(range_out_of_bounds(total + 1, 0, total));
+        assert!(range_out_of_bounds(16 * 1024, total, total));
+        assert!(range_out_of_bounds(u64::MAX, 1, total));
+        assert!(range_out_of_bounds(1, u64::MAX, total));
+        // The empty blob is addressable only as (0, 0).
+        assert!(!range_out_of_bounds(0, 0, 0));
+        assert!(range_out_of_bounds(0, 1, 0));
+    }
 
     const G: u64 = CHUNK_GROUP_BYTES;
 

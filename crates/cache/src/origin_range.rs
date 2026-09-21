@@ -3,18 +3,13 @@
 //! [`RANGE_PULL_WINDOW_BYTES`], so a range pull holds `O(window + outboard)`
 //! bytes whatever its length.
 //!
-//! Two engine paths build on the `OriginRangeCursor` here:
-//!
-//! - [`crate::CacheEngine::pull_through_range`] verifies and imports each
-//!   window as its own partial-blob slice. A window's bao encoding carries every
-//!   parent node on the path to its chunk groups, so it verifies and imports on
-//!   its own.
-//! - [`crate::CacheEngine::origin_range_wire`] (Flow A) needs ONE coherent
-//!   header-less wire for the whole range — joined per-window encodings would
-//!   repeat the shared parent nodes. It runs a single
-//!   [`bao_tree::io::fsm::encode_ranges_validated`] over an
-//!   `OriginWindowReader` that pulls the cursor's windows in order, and streams
-//!   the output through a bounded channel ([`OriginRangeWire`]).
+//! [`crate::CacheEngine::origin_range_wire`] (the own-origin serve-miss spine's
+//! pull leg) builds on the `OriginRangeCursor` here. It needs ONE coherent
+//! header-less wire for the whole draw — joined per-window encodings would
+//! repeat the shared parent nodes — so it runs a single
+//! [`bao_tree::io::fsm::encode_ranges_validated`] over an `OriginWindowReader`
+//! that pulls the cursor's windows in order, and streams the output through a
+//! bounded channel ([`OriginRangeWire`]).
 
 use std::io;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -40,13 +35,9 @@ use crate::range_pull::{AlignedRange, IROH_BLOCK_SIZE};
 /// the requested length.
 pub const RANGE_PULL_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Origin range pulls that run at once on EACH of the two range-pull paths.
-/// [`crate::CacheEngine::pull_through_range`] and
-/// [`crate::CacheEngine::origin_range_wire`] draw from separate pools, so a
-/// long cold-miss range pull never stalls an own-origin serve that has already
-/// committed to a paying client. A caller past its pool's bound waits for a
-/// permit rather than degrading, because the degrade is a whole-blob origin
-/// pull — more egress, not less.
+/// [`crate::CacheEngine::origin_range_wire`] draws that run at once. A caller
+/// past the bound waits for a permit rather than degrading, because the degrade
+/// is a whole-blob origin pull — more egress, not less.
 pub const MAX_CONCURRENT_RANGE_PULLS: usize = 4;
 
 /// Encoded chunks the Flow A encoder buffers ahead of its consumer before it
@@ -95,7 +86,6 @@ impl Iterator for WindowSpans {
 #[derive(Debug)]
 pub(crate) struct OriginWindow {
     pub(crate) start: u64,
-    pub(crate) end: u64,
     pub(crate) data: Bytes,
 }
 
@@ -234,7 +224,7 @@ impl OriginRangeCursor {
                 got: data.len(),
             }));
         }
-        Ok(Some(WindowFetch::Window(OriginWindow { start, end, data })))
+        Ok(Some(WindowFetch::Window(OriginWindow { start, data })))
     }
 }
 

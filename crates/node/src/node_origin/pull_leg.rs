@@ -537,6 +537,7 @@ pub(crate) async fn run_pull_leg(
         divisor: credit_ramp_divisor,
         floor: credit_floor,
         credit_max,
+        paid_base: session.served_start(),
     };
     let config = DriveConfig {
         working_deposit: deps.config.working_deposit,
@@ -1077,6 +1078,7 @@ pub(crate) async fn run_local_pull_leg(
         divisor: credit_ramp_divisor,
         floor: credit_floor,
         credit_max,
+        paid_base: session.served_start(),
     };
     // `working_deposit == ZERO` disables the pacer's reactive top-up arm entirely, so
     // the settle-wait budget is inert here; keep the smallest sane values.

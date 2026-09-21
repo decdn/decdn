@@ -224,9 +224,7 @@ impl OriginFetch {
 /// against the root `H` before any byte is imported or served — avoiding
 /// whole-blob origin egress to serve a byte range on a cache miss, with memory
 /// bounded by the window rather than the span (#2065). The verifier is
-/// the engine: [`crate::range_pull::encode_verified_range`] per window on the
-/// [`crate::CacheEngine::pull_through_range`] path, one
-/// [`bao_tree::io::fsm::encode_ranges_validated`] pass on the
+/// the engine: one [`bao_tree::io::fsm::encode_ranges_validated`] pass on the
 /// [`crate::CacheEngine::origin_range_wire`] path.
 ///
 /// The optimization is **best-effort**: when the origin does not honor
@@ -379,10 +377,8 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     ///
     /// Like [`Self::fetch`], the origin is a dumb byte store: the returned
     /// `data` is **untrusted** and verified against the root `H` by
-    /// the engine: [`crate::range_pull::encode_verified_range`] per window on the
-    /// [`crate::CacheEngine::pull_through_range`] path, one
-    /// [`bao_tree::io::fsm::encode_ranges_validated`] pass on the
-    /// [`crate::CacheEngine::origin_range_wire`] path — before any byte is
+    /// the engine: one [`bao_tree::io::fsm::encode_ranges_validated`] pass on
+    /// the [`crate::CacheEngine::origin_range_wire`] path — before any byte is
     /// imported or served.
     ///
     /// Returning [`OriginRangeFetch::Unsupported`] is the correct, expected
@@ -427,9 +423,10 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// the `{H}.obao4` outboard alone only pins the size to within one chunk
     /// group (`IROH_BLOCK_SIZE`, 16 KiB — the final group's true length isn't in
     /// the tree). The
-    /// `cdn/client/v1` serving handler calls this on a cold ranged cache miss
-    /// — via [`crate::CacheEngine::origin_size`] — before
-    /// [`crate::CacheEngine::pull_through_range`].
+    /// `cdn/client/v1` serving handler calls this on a cold cache miss — via
+    /// [`crate::CacheEngine::origin_size`] — before it signs a response and
+    /// runs the two-leg serve-miss spine over
+    /// [`crate::CacheEngine::origin_range_wire`].
     ///
     /// The probe is cheap (HTTP `HEAD` / S3 `HeadObject` / `fs` metadata), and
     /// `Ok(None)` is an **authoritative** "this origin does not hold the
@@ -445,11 +442,11 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// origin-only serve gate and the DHT announce set read `Ok(None)` as an
     /// absence they may memoise, sign as `NotFound` to a paying client, and
     /// unschedule from republish — an outage folded into `None` does all
-    /// three. Callers that only want the best-effort range scope
-    /// (`CacheEngine::origin_size`) swallow the error themselves and fall back
-    /// to a whole-blob [`Self::fetch`], which re-surfaces a persistent fault
-    /// at its proper severity. The default returns `Ok(None)`, so a custom
-    /// [`Origin`] needs no change and simply never range-pulls.
+    /// three. `CacheEngine::origin_size` advances the origin chain past a
+    /// per-origin fault, but a probe that ends on faults surfaces the last one
+    /// (#1129): the serve path must report a degraded node, not an empty one.
+    /// The default returns `Ok(None)`, so a custom [`Origin`] needs no change
+    /// and simply never range-pulls.
     fn size(
         &self,
         _hash: Hash,

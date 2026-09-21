@@ -121,6 +121,12 @@ fn single_file_import_is_readable_and_range_serves() {
             }
             other => panic!("expected Ranged, got {other:?}"),
         }
+        match reader.fetch_outboard(hash, 1 << 30).await.unwrap() {
+            OutboardFetch::Found(outboard) => {
+                assert!(!outboard.is_empty(), "outboard must be served for a range");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
     });
 }
 

@@ -1,8 +1,7 @@
 //! Cache-fill tiers for the serve-miss path.
 
 use super::{
-    Address, B256, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneKey,
-    RangePullOutcome, StreamRequest,
+    Address, B256, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneKey, StreamRequest,
 };
 use tracing::Instrument as _;
 
@@ -198,74 +197,6 @@ impl ClientHandler {
         FillOutcome::CleanMiss
     }
 
-    /// Attempt to fill a bounded/offset cache-miss request by pulling only the
-    /// requested byte span from origin (#823, ADR 037 §Origin-tier
-    /// pull-through), rather than the whole
-    /// blob. Returns `Some(total_blob_size)` when the span is now present as a
-    /// verified partial blob (the size is the authoritative whole-blob length
-    /// the size gate advertises to the client), or `None` to degrade to the
-    /// whole-blob pull-through path.
-    ///
-    /// The blob's exact total size is needed up front to anchor the requested
-    /// sub-range in the bao tree, so this first probes the origin
-    /// ([`CacheEngine::origin_size`](super::CacheEngine::origin_size) — a cheap `HEAD`/`HeadObject`/stat). An
-    /// unknown size, or an origin that can't serve a verified range
-    /// ([`RangePullOutcome::Unsupported`]), degrades to `None`. Every failure
-    /// mode here is best-effort: the caller falls back to a whole-blob pull,
-    /// which is always correct.
-    ///
-    /// The second element is the tier's [`FillOutcome`] for the FAULT LATCH only
-    /// (#1129) — never `Filled`, since "did this tier fill?" is carried by the
-    /// `Option`. A `CacheError::Store` here is a real local fault and must latch:
-    /// degrading to the whole-blob path is right for SERVICE (that path may fill
-    /// from a different store route), but if nothing ends up filling, the refusal
-    /// must report a degraded node, not an empty one.
-    pub(super) async fn try_range_pull_through(
-        &self,
-        hash: Hash,
-        req: &StreamRequest,
-    ) -> (Option<u64>, FillOutcome) {
-        let blob_size = match self.cache.origin_size(hash).await {
-            Ok(Some(size)) => size,
-            Ok(None) => return (None, FillOutcome::CleanMiss),
-            Err(e) => {
-                tracing::debug!(%hash, error = %e, "origin size probe failed; degrading to whole-blob pull");
-                return (None, FillOutcome::CleanMiss);
-            }
-        };
-        match self
-            .cache
-            .pull_through_range(hash, req.byte_offset, req.byte_len, blob_size)
-            .await
-        {
-            Ok(RangePullOutcome::Served) => (Some(blob_size), FillOutcome::CleanMiss),
-            Ok(RangePullOutcome::Unsupported) => (None, FillOutcome::CleanMiss),
-            // A local store fault (`pull_through_range` fail-fasts on
-            // `CacheError::Store` — disk-full / IO / a fault in the partial
-            // `import_bao_bytes` path — rather than masking it behind another
-            // origin) is a genuine local problem. It still degrades to the
-            // whole-blob path (so the client isn't denied service if that path
-            // can fill from a different store route), but it is metered and
-            // LATCHED as a fault: a fault localized to the partial-import path
-            // would otherwise be silently masked by a whole-blob fallback that
-            // then cleanly misses, leaving the range optimization quietly disabled
-            // AND reporting a broken store as an empty cache.
-            Err(e @ CacheError::Store(_)) => {
-                self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "range pull-through hit a local store fault; degrading to whole-blob pull");
-                (None, FillOutcome::HardFault)
-            }
-            // An out-of-bounds range or a logically-evicted hash surfaces as an
-            // error; degrade to the whole-blob path (which re-applies the same
-            // eviction guard and bound checks) rather than failing the stream.
-            // Deterministic, so not a fault (see [`FillOutcome::HardFault`]).
-            Err(e) => {
-                tracing::debug!(%hash, error = %e, "range pull-through declined; degrading to whole-blob pull");
-                (None, FillOutcome::CleanMiss)
-            }
-        }
-    }
-
     /// The partial-serve gate (#1506): whether `[byte_offset, byte_offset +
     /// byte_len)` is already fully present in the LOCAL cache of a blob
     /// `serve_audit` reports unserveable (not `Complete`) — the counterpart
@@ -292,9 +223,8 @@ impl ClientHandler {
     /// serve (#1506 C3).
     ///
     /// Reuses [`CacheEngine::missing_ranges`](super::CacheEngine::missing_ranges)'s
-    /// own size contract — the same `blob_size` source
-    /// [`Self::try_range_pull_through`] resolves via
-    /// [`CacheEngine::origin_size`](super::CacheEngine::origin_size) for the
+    /// own size contract — the same `blob_size` the own-origin spine resolves
+    /// via [`CacheEngine::origin_size`](super::CacheEngine::origin_size) for the
     /// ORIGIN-backed case; here the size comes from the LOCAL store's own
     /// bitfield, since a purely local partial has no origin to probe.
     pub(super) async fn partial_hit_size(

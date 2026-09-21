@@ -95,6 +95,16 @@ pub struct CacheMetrics {
     /// call, success or failure). Denominator for any retry-exhaustion
     /// alert.
     pub origin_fetches: Counter,
+    /// Serve-miss fill claims NOT coalesced onto a live same-hash fill because
+    /// the request starts ahead of that fill's paid frontier (#2062): attaching
+    /// would park the request on a pull that advances only as the other
+    /// client pays. The refused attach opens its own pull, so the overlap
+    /// with the live fill is fetched from origin twice — duplicate egress
+    /// (own-origin S3, or upstream USDC on the peer tier) in exchange for
+    /// liveness. Emitted name: `decdn_cache_fill_not_coalesced_total`.
+    /// Operator-actionable: a sustained rate means clients habitually resume
+    /// ahead of what payers have cleared (see decdn#2069 §4).
+    pub fill_not_coalesced: Counter,
     /// Origin fetches that gave up after exhausting `max_retries`
     /// (#285). Operator-actionable: any nonzero rate = user-visible
     /// origin failures the retry budget couldn't save.
