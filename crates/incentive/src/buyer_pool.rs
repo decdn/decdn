@@ -67,11 +67,16 @@ pub struct BuyerLaneProgress {
 /// `payment_pool` is the **deployment tag** that tells two such pools apart. It
 /// is not part of the store key: a [`BuyerPoolStore`] is keyed by `pool_id`
 /// alone, so it cannot hold rows for two deployments under one id — recording
-/// the second overwrites the first. What the tag buys is detection, at the one
-/// point that matters: a row whose `payment_pool` is not the contract the node
-/// is configured against describes a pool this node no longer talks to, its
-/// lane progress priced bytes the live contract has never seen, and
-/// reconciliation drops it rather than resume against it and under-pay.
+/// the second overwrites the first. What the tag buys is detection, and every
+/// path that reuses a persisted row owes it a check (see [`Self::is_on`]).
+///
+/// A row on a contract the node is not configured against carries two numbers
+/// that are wrong here, in opposite directions. Its lane progress would seed
+/// the first voucher at a cumulative the live pool has never redeemed against,
+/// so the provider collects the whole of it for bytes it never delivered here.
+/// Its `deposit` may over-state what the live pool can fund, so vouchers signed
+/// past the real balance stop redeeming. Neither is recoverable by resuming
+/// more carefully; the row has to go.
 ///
 /// `owner` is a **secondary reuse index** — the
 /// open-pool trigger looks it up to decide whether to reuse an existing pool
@@ -93,7 +98,8 @@ pub struct BuyerPoolState {
     /// The `PaymentPool` contract this pool lives on — the deployment tag, not
     /// part of the store key (see the field invariant above). `pool_id` repeats
     /// across deployments, so this is the only field that distinguishes a live
-    /// pool from a same-id pool on a contract the node has since moved off.
+    /// pool from a same-id pool on a contract the node is not configured
+    /// against.
     pub payment_pool: Address,
     /// The on-chain pool owner: put up the deposit, receives the refund, and
     /// the only address `topUp`/`closePool`/`reclaim` accept. Equals the
@@ -133,10 +139,10 @@ impl BuyerPoolState {
 
     /// Whether this row describes a pool on `payment_pool`.
     ///
-    /// The bootstrap reconciliation calls this before it trusts anything else
-    /// in the row: a `false` means the row was written against a different
-    /// `PaymentPool` deployment, and its `pool_id` may nonetheless collide
-    /// with a live pool here (see the field invariant).
+    /// Every path that reuses a persisted row must check this first, and treat
+    /// a `false` as "no row": it means the row was written against a different
+    /// `PaymentPool` deployment, and its `pool_id` may nonetheless name an
+    /// existing, unrelated pool here (see the field invariant).
     #[must_use]
     pub fn is_on(&self, payment_pool: Address) -> bool {
         self.payment_pool == payment_pool

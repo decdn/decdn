@@ -926,11 +926,21 @@ fn identity_fresh_candidates(
 /// persisted [`BuyerPoolState::token`] equals a fresh on-chain read — letting a
 /// repeat fetch skip the `usdc()` `eth_call`. Only a first-ever pool falls
 /// through to the on-chain read.
+///
+/// "Immutable per contract" is the whole premise, so the row has to be on the
+/// contract being read: a row from another `PaymentPool` deployment caches that
+/// deployment's `usdc()`, and answering with it would approve and price against
+/// the wrong token. Such a row reads as absent and the caller pays the
+/// round-trip.
 fn cached_pool_token(
     store: &RedbBuyerPoolStore,
     self_address: Address,
+    payment_pool: Address,
 ) -> anyhow::Result<Option<Address>> {
-    Ok(store.get_by_owner(self_address)?.map(|state| state.token))
+    Ok(store
+        .get_by_owner(self_address)?
+        .filter(|state| state.is_on(payment_pool))
+        .map(|state| state.token))
 }
 
 /// Region-filter a candidate set to at most [`discovery::SELECT_K`], then
@@ -1328,7 +1338,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // the eth_call; only a first-ever pool (no row) pays the `usdc()` round-trip.
     // The reuse branch of `open_or_reuse_pool` already trusts this same
     // `state.token`, so this only makes the top-level value consistent with it.
-    let token = match cached_pool_token(&store, self_address)? {
+    let token = match cached_pool_token(&store, self_address, chain.payment_pool)? {
         Some(token) => token,
         None => contract
             .usdc()
@@ -3325,7 +3335,16 @@ pub(crate) async fn open_or_reuse_pool<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    if let Some(state) = store.get_by_owner(self_address)? {
+    // A row from another `PaymentPool` deployment is not this contract's pool,
+    // whatever its id says. `pool_id` is `keccak256(owner, ownerPoolNonce)` and a
+    // redeploy restarts that nonce, so the id alone will eventually name an
+    // existing, unrelated pool here — and its lane progress would seed the first
+    // voucher at a cumulative this pool has never redeemed against, paying the
+    // provider for bytes it never delivered. Ignore it and open a fresh pool.
+    if let Some(state) = store
+        .get_by_owner(self_address)?
+        .filter(|state| state.is_on(payment_pool_addr))
+    {
         let lane = LaneKey {
             pool_id: state.pool_id,
             signer: self_address,
@@ -3611,14 +3630,15 @@ mod tests {
         let store = RedbBuyerPoolStore::open(&dir.path().join("data"))?;
         let owner = Address::repeat_byte(0x11);
         let token = Address::repeat_byte(0x22);
+        let payment_pool = Address::repeat_byte(0x9c);
 
         // No row yet -> None -> caller must read usdc() on the open path.
-        assert_eq!(cached_pool_token(&store, owner)?, None);
+        assert_eq!(cached_pool_token(&store, owner, payment_pool)?, None);
 
         // Persist a pool row for this owner.
         let state = BuyerPoolState::new(
             B256::repeat_byte(0xAB),
-            Address::repeat_byte(0x9c),
+            payment_pool,
             owner,
             token,
             U256::from(1_000u64),
@@ -3626,9 +3646,19 @@ mod tests {
         store.record(&state)?;
 
         // Row present -> the immutable token comes back with no contract read.
-        assert_eq!(cached_pool_token(&store, owner)?, Some(token));
+        assert_eq!(cached_pool_token(&store, owner, payment_pool)?, Some(token));
         // A different owner has no row -> still None.
-        assert_eq!(cached_pool_token(&store, Address::repeat_byte(0x33))?, None);
+        assert_eq!(
+            cached_pool_token(&store, Address::repeat_byte(0x33), payment_pool)?,
+            None
+        );
+        // The row is the same, but it names another deployment's `usdc()`.
+        // Answering with it would approve and price the wrong token.
+        assert_eq!(
+            cached_pool_token(&store, owner, Address::repeat_byte(0xDE))?,
+            None,
+            "a row from another PaymentPool deployment must not seed the token cache"
+        );
         Ok(())
     }
 

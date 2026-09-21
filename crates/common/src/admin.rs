@@ -495,7 +495,18 @@ pub struct BuyerLaneSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuyerPoolSnapshot {
     /// The on-chain pool id, `0x`-prefixed 32-byte hex.
+    ///
+    /// Unique only within one `payment_pool`: the contract derives it as
+    /// `keccak256(owner, ownerPoolNonce)` and a fresh deployment restarts that
+    /// nonce, so two deployments' Nth pools share an id. Read it alongside
+    /// `payment_pool`, never alone.
     pub pool_id: String,
+    /// The `PaymentPool` the row was written against, EIP-55 checksummed hex.
+    ///
+    /// The only field that tells a live pool from a same-id pool on a contract
+    /// the node is not configured against — which is what makes it the field to
+    /// check when a tracked id and an on-chain enumeration appear to agree.
+    pub payment_pool: String,
     /// The deposit owner — this node's operator address, EIP-55 checksummed hex.
     pub owner: String,
     /// The ERC-20 the pool is denominated in (USDC per ADR 003), EIP-55
@@ -888,6 +899,7 @@ mod tests {
         let resp = BuyerPoolsResponse {
             pools: vec![BuyerPoolSnapshot {
                 pool_id: "0xabcd".to_string(),
+                payment_pool: "0x00dd".to_string(),
                 owner: "0x52908400098527886E0F7030069857D2E4169EE7".to_string(),
                 token: "0x00cc".to_string(),
                 deposit_micro_usdc: 10_000_000,

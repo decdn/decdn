@@ -825,7 +825,7 @@ impl ClientFixture {
         let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_pool);
         let state = BuyerPoolState::new(
             pool_id,
-            Address::repeat_byte(0x9c),
+            chain.addrs().payment_pool,
             self.signer.address(),
             chain.usdc(),
             U256::from(DEPOSIT_MICRO_USDC),

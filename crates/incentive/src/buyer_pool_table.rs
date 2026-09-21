@@ -47,12 +47,19 @@ use crate::store::StoreError;
 /// Callers supply the `Database` (the one thing they legitimately differ
 /// on) and nothing else.
 ///
-/// **`_v4`**: the primary key is `pool_id` (32 bytes) and the record carries
-/// the `PaymentPool` address the pool lives on plus a variable-length
-/// per-lane progress table. A future incompatible layout
-/// change bumps this suffix so `redb`'s key/value type-name check rejects an
-/// old-suffix file outright — a mismatched file is cleanly ignored (ignored
-/// table, not misread), never live-migrated.
+/// **`_v4`**: the primary key is `pool_id` (32 bytes); the value carries the
+/// `PaymentPool` address the pool lives on plus a variable-length per-lane
+/// progress table. A layout change that is not a trailing addition bumps this
+/// suffix.
+///
+/// A file written under an older suffix holds no table of this name, so
+/// `open_table` reports `TableDoesNotExist` and every read path treats the
+/// store as empty: the old rows are ignored, never misread and never
+/// live-migrated. **A suffix bump therefore orphans every row written before
+/// it** — including rows for pools on the configured contract, which the node
+/// then re-adopts from chain. (The key/value *type-name* check `redb` persists
+/// per table is a separate guard, and it fires on a type change, not on this
+/// rename: the key/value types here are unchanged.)
 const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8]> =
     TableDefinition::new("buyer_pool_state_v4");
 
@@ -69,7 +76,12 @@ const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8
 const BUYER_OWNER_INDEX_TABLE: TableDefinition<'static, &'static [u8; 20], &'static [u8; 32]> =
     TableDefinition::new("buyer_pool_owner_index_v4");
 
-/// Highest buyer-record `schema_version` this binary can decode.
+/// The buyer-record `schema_version` this binary reads and writes.
+///
+/// Matched exactly, not as a ceiling. The fields are positional, so a record
+/// written under a different version does not decode into these fields — it
+/// decodes into the wrong ones, silently. Refusing anything that is not this
+/// exact layout is the only answer that cannot mis-map.
 const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 2;
 
 /// Sanity ceiling on trailing bytes per record. Trailing bytes are tolerated
@@ -93,9 +105,12 @@ struct StoredLane {
 /// byte arrays so the encoded width per field is stable across postcard
 /// versions; `lanes` is the one variable-length part, encoded as a postcard
 /// `Vec` (length-prefixed).
-/// `schema_version` lives in the value (not the key) so a future additive
-/// field can ship without renaming the table — decode uses
-/// [`postcard::take_from_bytes`], tolerating trailing bytes.
+/// `schema_version` lives in the value, not the key. A field appended at the
+/// END ships under a bumped `schema_version` alone — decode uses
+/// [`postcard::take_from_bytes`], which tolerates trailing bytes. A field
+/// inserted anywhere else shifts every field after it, so it needs the
+/// table-name suffix bumped too, or an older record would decode into the wrong
+/// fields.
 ///
 /// **The field order is the wire order.** Postcard encodes struct fields
 /// positionally and unnamed, so reordering or retyping a field silently
@@ -145,7 +160,7 @@ impl From<&BuyerPoolState> for StoredBuyerPoolState {
 
 impl StoredBuyerPoolState {
     fn into_state(self, pool_id: PoolId) -> Result<BuyerPoolState, StoreError> {
-        if self.schema_version > BUYER_SUPPORTED_SCHEMA_VERSION {
+        if self.schema_version != BUYER_SUPPORTED_SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchema {
                 found: self.schema_version,
                 supported: BUYER_SUPPORTED_SCHEMA_VERSION,
@@ -1015,6 +1030,44 @@ mod tests {
     /// hydration — that would disable the whole buyer path and the reclaim
     /// sweep (PR #753 review). `load_all` skips it; the point lookup still
     /// surfaces the precise error.
+    /// An OLDER record is rejected, not decoded.
+    ///
+    /// This is why the version is matched exactly rather than as a ceiling. The
+    /// fields are positional and `payment_pool` sits third, so a v1 record —
+    /// which has no such field — would decode `owner` into `payment_pool`,
+    /// `token` into `owner`, and so on: every field after `pool_id` shifted by
+    /// one, with no error. A silently wrong deployment tag is the one outcome
+    /// this whole change exists to prevent, so the reader refuses it instead.
+    #[test]
+    fn older_schema_version_is_rejected_not_misdecoded() -> anyhow::Result<()> {
+        let (_d, db) = db()?;
+        let s = state(1);
+        let mut stored = StoredBuyerPoolState::from(&s);
+        stored.schema_version = 1;
+        let encoded = postcard::to_allocvec(&stored)?;
+        tbl(&db).insert_raw(s.pool_id, &encoded)?;
+
+        let load = tbl(&db).load_all()?;
+        anyhow::ensure!(
+            load.pools.is_empty(),
+            "an older-schema record must be skipped by load_all, never hydrated",
+        );
+        anyhow::ensure!(load.skipped == vec![s.pool_id]);
+        let err = tbl(&db)
+            .get_by_pool_id(s.pool_id)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("an older schema must reject on get_by_pool_id"))?;
+        anyhow::ensure!(
+            matches!(
+                err,
+                StoreError::UnsupportedSchema { found, supported }
+                    if found == 1 && supported == BUYER_SUPPORTED_SCHEMA_VERSION
+            ),
+            "expected UnsupportedSchema for the older record, got {err:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn future_schema_version_skipped_on_hydration() -> anyhow::Result<()> {
         let (_d, db) = db()?;
