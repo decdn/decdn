@@ -281,13 +281,25 @@ there is no separate verify toggle.
 ### Chunked entries
 
 A `chunks` entry (see [Chunked files](#chunked-files)) is still one
-whole-file blob. `bundle pull` fetches it whole over the paid path,
-except for a byte range whose hint hash matches a range another entry
-in the same run already fetched and verified — that range is spliced in
-from the sibling's on-disk bytes instead, and the client pays only for
-the remaining, "complement," ranges. A splice source is always the
-verified bytes of a completed, whole-file-hash-checked entry, never an
+whole-file blob, fetched over the paid path. When a chunk hint hash
+appears in two or more entries, the run assigns that shared chunk to one
+entry — its smallest holder — and only that entry pays to fetch it. Every
+other entry that names the chunk splices the range from the assigned
+holder's on-disk bytes and pays nothing for it. A splice source is always
+the verified bytes of a completed, whole-file-hash-checked entry, never an
 independently fetched chunk.
+
+The run schedules entries smallest whole-file first, so a shared chunk's
+assigned holder starts — and finishes — before the larger entries that
+splice from it. Each entry drives and pays for its own ranges up front (its
+unique chunks, the chunks assigned to it, and any un-splice-able edge
+groups); it does not drive the ranges it defers to a sibling. It reconciles
+those deferred ranges at its tail: it splices each one as the assigned
+holder registers it, and waits on the holder rather than a clock, because
+the deferred bytes are exactly what that holder is still downloading. A
+deferred range is driven and paid for by the waiting entry only if its
+assigned holder FINISHES without producing the chunk — a failed fetch — so
+the run always completes and never pays more than a direct fetch.
 
 The reassembled bytes are verified against the whole-file `hash` before
 the destination appears, by atomic rename, so a present file is
