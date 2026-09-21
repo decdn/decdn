@@ -68,14 +68,14 @@ pub const MAX_CHAIN_LENGTH: u8 = 255;
 
 /// Exact byte length of an EOA secp256k1 voucher signature (`r‖s‖v`, 32+32+1).
 /// Mirrors [`SLASH_SIG_LEN`]; both are the EOA off-chain signing form (ADR 024
-/// §Off-Chain ERC-1271 Verification). Carried as a `Vec<u8>` on the wire (serde
+/// §Off-Chain Signature Verification — EOA Recovery Only). Carried as a `Vec<u8>` on the wire (serde
 /// derives array impls only up to `[T; 32]`), with the length pinned by
 /// [`Voucher::validate`].
 pub const VOUCHER_SIG_LEN: usize = 65;
 
 /// Exact byte length of a `BindNodeId` client-binding signature (`r‖s‖v`,
 /// 32+32+1). The same EOA off-chain EIP-712 signing form as [`SLASH_SIG_LEN`] /
-/// [`VOUCHER_SIG_LEN`] (ADR 024 §Off-Chain ERC-1271 Verification); pinned by
+/// [`VOUCHER_SIG_LEN`] (ADR 024 §Off-Chain Signature Verification — EOA Recovery Only); pinned by
 /// [`ClientBinding::validate`].
 pub const BINDING_SIG_LEN: usize = 65;
 

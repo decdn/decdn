@@ -112,7 +112,7 @@ pub enum MessageValidationError {
     },
     /// A wire [`crate::client::Voucher`]'s `signature` is not
     /// [`crate::client::VOUCHER_SIG_LEN`] bytes. The EOA off-chain voucher
-    /// signing form (ADR 024 §Off-Chain ERC-1271 Verification) is exactly that
+    /// signing form (ADR 024 §Off-Chain Signature Verification — EOA Recovery Only) is exactly that
     /// length; receivers reject deviations before reconstructing the EIP-712
     /// typed data.
     #[error("Voucher.signature has invalid length {len} (EOA form is 65 bytes)")]
@@ -178,7 +178,7 @@ pub enum MessageValidationError {
     /// The EOA form is exactly [`crate::client::VOUCHER_SIG_LEN`] bytes but an
     /// ERC-1271 contract-signer form may be longer, so only the non-empty
     /// floor is a wire-level check; the rest is `decdn_incentive`'s job
-    /// (ADR 024 §Off-Chain ERC-1271 Verification).
+    /// (ADR 024 §Off-Chain Signature Verification — EOA Recovery Only).
     #[error("WireCapability.owner_signature is empty")]
     EmptyCapabilitySignature,
 }

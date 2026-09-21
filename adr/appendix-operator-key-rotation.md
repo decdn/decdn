@@ -4,15 +4,16 @@
 
 ## Context
 
-A node operator routinely holds three keys:
+A node operator routinely holds two keys:
 
 | Key | Curve / scheme | Purpose | Where it lives |
 |-----|----------------|---------|----------------|
 | **iroh node-key** | Ed25519 | Wire identity (`NodeId`); authenticates the iroh QUIC handshake ([ADR 005](005-protocol.md#adr-005-wire-protocol)). `ProbeResponse`/`StreamResponse` body attribution is `slash_sig` — see [ADR 014 § Slash Signatures — secp256k1 EIP-712](014-on-chain-verification.md#slash-signatures--secp256k1-eip-712). | iroh keystore on the signing host |
-| **Ethereum signing key** | secp256k1 | On-chain identity for staking, pool ops, voucher receipt. Signs EIP-712 `BindNodeId`/`bindingSignature` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** `slash_sig` on every `ProbeResponse`/`StreamResponse` ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)); the latter's hot-signing burden motivates the production session-key path. | EVM keystore (EOA) — the default and the only form requesters can verify off-chain — **or** a Safe owner key, if the operator chose a Safe (cold paths only; see [§ EOA → Safe migration (one-time, optional)](#eoa--safe-migration-one-time-optional)) **or** session key delegated by a Safe (production [§ Voucher session-key rotation (production)](#voucher-session-key-rotation-production) of [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)) |
-| **Slash-sig session key** *(production only)* | secp256k1 | Per-message hot-signing of `slash_sig` digests on `ProbeResponse`/`StreamResponse` at wire speed under a 2-of-3 Safe; authorized via `erc7579/smartsessions` ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) [§ Session Keys — Deferred to Production via ERC-7579 smartsessions](024-account-abstraction.md#session-keys--deferred-to-production-via-erc-7579-smartsessions)). Client-side voucher session keys (also production, also smartsessions) are a separate client-owned concern. | Signing host, scoped by the session-key policy |
+| **Ethereum signing key** | secp256k1 | On-chain identity for staking, pool ops, voucher receipt. Signs EIP-712 `BindNodeId`/`bindingSignature` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** `slash_sig` on every `ProbeResponse`/`StreamResponse` ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). | EVM keystore (EOA) — the default and the only form requesters can verify off-chain — **or** a Safe owner key, if the operator chose a Safe (cold paths only; see [§ EOA → Safe migration (one-time, optional)](#eoa--safe-migration-one-time-optional)) |
 
-Rotation reasons: (1) **compromise** — suspected leak, revoke **today**; (2) **scheduled hygiene** — routine annual, no time pressure; (3) **hardware migration** — host replacement, HSM enrolment, or PoC EOA → production Safe.
+A node whose serving identity is a smart account — a Safe custodying funds while a hot key signs `slash_sig` — is unimplemented ([ADR 024 § Unimplemented — Operator Custody While Serving](024-account-abstraction.md#unimplemented--operator-custody-while-serving)). There is no third operator key and no procedure to rotate one.
+
+Rotation reasons: (1) **compromise** — suspected leak, revoke **today**; (2) **scheduled hygiene** — routine annual, no time pressure; (3) **hardware migration** — host replacement, HSM enrolment, or EOA → Safe on the cold paths.
 
 The path differs by key and account type.
 
@@ -22,20 +23,20 @@ The path differs by key and account type.
                   ┌─────────────────────────────┐
                   │ Which key needs rotation?   │
                   └──────────────┬──────────────┘
-            ┌───────────────────┼───────────────────┐
-            ▼                   ▼                   ▼
-   ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-   │ iroh node-key    │ │ Ethereum signing │ │ slash-sig session│
-   │ (Ed25519)        │ │ key (secp256k1)  │ │ key (production) │
-   └─────────┬────────┘ └────────┬─────────┘ └────────┬─────────┘
-             │                   │                    │
-             ▼                   ▼                    ▼
-        § iroh node-key rotation only procedure       Account / goal?         § Voucher session-key rotation (production) procedure
-                                 │
-              ┌──────────────────┼──────────────────┐
-              ▼                  ▼                  ▼
-        EOA staying EOA   EOA → Safe (one-time)   Already on Safe
-            § EOA → EOA migration (PoC default)                § EOA → Safe migration (one-time, optional)                     § Safe owner / session-key rotation (production preferred path)
+            ┌───────────────────┴───────────────────┐
+            ▼                                       ▼
+   ┌──────────────────┐                    ┌──────────────────┐
+   │ iroh node-key    │                    │ Ethereum signing │
+   │ (Ed25519)        │                    │ key (secp256k1)  │
+   └─────────┬────────┘                    └────────┬─────────┘
+             │                                      │
+             ▼                                      ▼
+        § iroh node-key rotation only procedure       Account / goal?
+                                                    │
+                           ┌────────────────────────┼────────────────────────┐
+                           ▼                        ▼                        ▼
+                     EOA staying EOA          EOA → Safe (one-time)     Already on Safe
+              § EOA → EOA migration (PoC default)   § EOA → Safe migration (one-time, optional)   § Safe owner rotation (optional)
 ```
 
 If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain, preserves Ethereum identity), Ethereum key second (heavyweight). See [§ Rotating both the iroh and Ethereum keys](#rotating-both-the-iroh-and-ethereum-keys).
@@ -146,45 +147,22 @@ Procedure:
 
 `SignatureChecker` is wired across every contract per [ADR 024 § Universal `SignatureChecker` in All Contracts](024-account-abstraction.md#universal-signaturechecker-in-all-contracts), so a Safe is a drop-in EOA replacement. The migration follows [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) (deregister → unbond → withdraw → re-register from the Safe), performed once, yielding a stable on-chain identity for all subsequent rotations.
 
-After migration, the Safe holds TOKEN and executes `register` / `openPool` / `closePool` / `topUp`. The Safe's owner key rotates thereafter ([§ Safe owner / session-key rotation (production preferred path)](#safe-owner--session-key-rotation-production-preferred-path)).
+After migration, the Safe holds TOKEN and executes `register` / `openPool` / `closePool` / `topUp`. The Safe's owner key rotates thereafter ([§ Safe owner rotation (optional)](#safe-owner-rotation-optional)).
 
-> **Constraint — off-chain `slash_sig`.** A Safe-addressed operator's `StreamResponse` `slash_sig` is verified **off-chain** by the paying client, which recovers the signer from the 65-byte signature and compares it against the registered address. A Safe owner-key signature recovers to the owner, not to the Safe, so the client rejects the response. (The probe leg is shape-checked only today — full attribution there is the on-chain `SlashJudge`'s job — so a Safe-addressed node can be probed but not paid.) Until off-chain ERC-1271 verification lands ([ADR 024 § Off-Chain ERC-1271 Verification](024-account-abstraction.md#off-chain-erc-1271-verification)), a Safe is usable for the **cold** paths — bond, register, pool open/close, unbond — but not as the address a node serves traffic under. Plan this migration for Production alongside the session-key path, or keep the serving identity on an EOA.
+> **Constraint — off-chain `slash_sig`.** A Safe-addressed operator's `StreamResponse` `slash_sig` is verified **off-chain** by the paying client, which recovers the signer from the 65-byte signature and compares it against the registered address. A Safe owner-key signature recovers to the owner, not to the Safe, so the client rejects the response. (The probe leg is shape-checked only today — full attribution there is the on-chain `SlashJudge`'s job — so a Safe-addressed node can be probed but not paid.) A Safe is therefore usable for the **cold** paths — bond, register, pool open/close, unbond — but not as the address a node serves traffic under. Serving from a Safe while a hot key signs `slash_sig` is unimplemented, and the ERC-1271 route that looks obvious is unsound for slash-critical signing ([ADR 024 § Unimplemented — Operator Custody While Serving](024-account-abstraction.md#unimplemented--operator-custody-while-serving)). Keep the serving identity on an EOA.
 
-### Safe owner / session-key rotation (production preferred path)
+### Safe owner rotation (optional)
 
-The cheap path — the on-chain Safe address does not change.
+The cheap path — the on-chain Safe address does not change. It applies to an operator who moved the on-chain identity to a Safe for cold-path custody ([§ EOA → Safe migration (one-time, optional)](#eoa--safe-migration-one-time-optional)); the Safe still cannot serve traffic (constraint above).
 
-#### PoC (1-of-1 Safe)
-
-Replace the single owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)`. The Safe address is unchanged; bond, channels, `firstBondedAt`, and `age_ramp` progress all carry over. No iroh-side action needed.
-
-#### Production (2-of-3 + `erc7579/smartsessions`)
-
-Two cases:
-
-- **Owner rotation:** standard 2-of-3 owner swap via the multisig owners. No protocol-level action needed.
-- **Session-key rotation:** revoke the old session key via the `erc7579/smartsessions` revocation interface; install a new one with the same policy ([ADR 024 § Session Keys — Deferred to Production via ERC-7579 smartsessions](024-account-abstraction.md#session-keys--deferred-to-production-via-erc-7579-smartsessions)). Slash-evidence signing resumes against the new key with no on-chain identity change.
-
-Procedure (session-key rotation):
-
-1. Generate a new session-key keypair on the signing host.
-2. Build the install-session-key transaction — owners co-sign per the Safe threshold.
-3. Submit; wait for confirmation.
-4. Update the node config to load the new session key. Restart (no drain — slash-evidence signing is the only path using this key, and it is per-message).
-5. **After** the new key has signed at least one wire-level slash digest successfully, revoke the old session key via the same module.
-
-If the old key is *suspected compromised*, reverse the order: revoke first, then install. Brief slash-signing outage is acceptable to keep the compromised key unusable.
-
-## Voucher session-key rotation (production)
-
-Same as [§ Safe owner / session-key rotation (production preferred path)](#safe-owner--session-key-rotation-production-preferred-path), with no iroh-side caveats.
+Replace an owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)` (1-of-1), or a standard owner swap via the multisig owners (2-of-3). The Safe address is unchanged; bond, channels, `firstBondedAt`, and `age_ramp` progress all carry over. No iroh-side action needed, and no protocol-level action needed.
 
 ## Rotating both the iroh and Ethereum keys
 
 Rotate **iroh first**, then Ethereum:
 
 1. Run [§ iroh node-key rotation only](#iroh-node-key-rotation-only) to completion. `bindNodeId` finality is one block confirmation plus the `NodeIdBound` event — no unbonding period (nothing on this path touches the bond; bond exit is always a separate `requestUnbond` + `unbond`, per [ADR 003 § Node Registry](003-payments.md#node-registry)).
-2. Run [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default), [§ EOA → Safe migration (one-time, optional)](#eoa--safe-migration-one-time-optional), or [§ Safe owner / session-key rotation (production preferred path)](#safe-owner--session-key-rotation-production-preferred-path) per the account-type goal. Replay protection between the steps is the per-address `bindingNonce`, incremented when [§ iroh node-key rotation only](#iroh-node-key-rotation-only) ran ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) — no extra cooling-off window required.
+2. Run [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default), [§ EOA → Safe migration (one-time, optional)](#eoa--safe-migration-one-time-optional), or [§ Safe owner rotation (optional)](#safe-owner-rotation-optional) per the account-type goal. Replay protection between the steps is the per-address `bindingNonce`, incremented when [§ iroh node-key rotation only](#iroh-node-key-rotation-only) ran ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) — no extra cooling-off window required.
 
 Reverse order works but is wasteful: [§ Ethereum signing-key rotation only](#ethereum-signing-key-rotation-only) takes the node offline for the unbonding window anyway, so [§ iroh node-key rotation only](#iroh-node-key-rotation-only) work after [§ Ethereum signing-key rotation only](#ethereum-signing-key-rotation-only) is a no-op against an already-deregistered node.
 
@@ -199,12 +177,11 @@ Exception: **emergency compromise of the Ethereum key.** Run [§ Ethereum signin
 | Node key replaced with no on-chain rebinding | `decdn node health` reports `binding=mismatch`, and the daemon logs a WARN at start. The node is **unslashable**: `SlashJudge` resolves an accused node through the binding | Bind the key on disk with `decdn node rotate-key --key iroh --bind-existing`, or restore the key the binding names. Restart, then confirm `binding=bound` |
 | Mid-procedure abort during [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) (deregister submitted, withdraw not done) | `CapacityBond.isActiveNode(nodeId) == false`, stake still locked | Wait the unbonding window; you may re-register from the same address before it elapses — old `nodeId` is reusable |
 | [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) step 7: latent voucher submitted by a counterparty | `closePool` event against old address post-deregister | Old keystore must be reachable; `closePool` runs against the old address regardless of registration state |
-| [§ Safe owner / session-key rotation (production preferred path)](#safe-owner--session-key-rotation-production-preferred-path) session-key revocation fails | Module revert | Revert to the old session key, file a bug; slash signing degrades gracefully (still-valid old-key signatures accepted) |
 
 ## What this runbook does not cover
 
 - **Client-side iroh-key rotation.** See [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model), inline "Key rotation": open client→node channels survive client iroh-key rotation (keyed by the client's Ethereum address), mirroring the operator-side carry-over in [§ iroh node-key rotation only](#iroh-node-key-rotation-only).
-- **Out-of-scope production hot-signing alternatives.** Hardware-wallet and HSM-backed voucher signing are infeasible per [ADR 012 § Consequences](012-client.md#consequences) — 2–5s confirmation latencies cannot keep pace with stream-open, rollover, and close signatures, nor with the per-response `slash_sig`. A separate delegated-signer *contract* is unnecessary — the pool already authorizes capped, expiring signers off-chain by owner-signed capability ([ADR 003 § PaymentPool](003-payments.md#paymentpool)), which covers delegation without new contract surface and, unlike an immutable pin, carries native revocation via `expiry`. The sole production hot-signing path is [ADR 024 § Session Keys — Deferred to Production via ERC-7579 smartsessions](024-account-abstraction.md#session-keys--deferred-to-production-via-erc-7579-smartsessions).
+- **Hot-signing alternatives.** Hardware-wallet and HSM-backed voucher signing are infeasible per [ADR 012 § Consequences](012-client.md#consequences) — 2–5s confirmation latencies cannot keep pace with stream-open, rollover, and close signatures, nor with the per-response `slash_sig`. On the buyer side the pool already authorizes capped, expiring signers off-chain by owner-signed capability ([ADR 003 § PaymentPool](003-payments.md#paymentpool)), which covers delegation without new contract surface and, unlike an immutable pin, carries native revocation via `expiry`. On the operator side, separating a hot serving key from Safe-custodied funds is unimplemented; the shape a future design would take is an EOA delegation mirroring that same capability, not an ERC-1271 session key ([ADR 024 § Unimplemented — Operator Custody While Serving](024-account-abstraction.md#unimplemented--operator-custody-while-serving)).
 - **Compromised-key incident response.** This runbook describes mechanics. If a key is *believed compromised*, the operator should also: alert peer operators out-of-band and rotate before any further wire-level signature under the compromised key. There is no protocol-funded incident reserve (the `SafetyReserve` was retired — see [ADR 026 § Incident recourse](026-tokenomics.md#incident-recourse-no-standing-reserve)); any discretionary restitution for losses is a DAO Treasury governance matter.
 
 ## Cross-ADR Impact
@@ -215,5 +192,5 @@ Exception: **emergency compromise of the Ethereum key.** Run [§ Ethereum signin
 - [ADR 008 — Local per-peer reputation](008-reputation.md#adr-008-reputation-system)
 - [ADR 012 — Client iroh-key rotation analogue](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)
 - [ADR 019 — `registerNode`, `deregisterNode`, re-onboarding flow](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow)
-- [ADR 024 — Smart-account session keys via `erc7579/smartsessions`](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)
+- [ADR 024 — `SignatureChecker` on-chain, EOA recovery off-chain, and the unimplemented operator-custody residual](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)
 - [`appendix-local-admin-http.md` — `admin_v1_drain` invocation](appendix-local-admin-http.md#appendix-local-admin-http-surface)
