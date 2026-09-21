@@ -1534,10 +1534,18 @@ fn reconcile_tracked(
 /// in place long enough to be enumerated is what turns a stale row into a
 /// silent resume against a live, unrelated pool.
 ///
-/// A failed forget refuses the adoption rather than proceeding. The row is
-/// still there and still collides, so adopting beside it would leave the store
-/// holding two rows for one owner with the foreign one shadowing the fresh one
-/// at the next `get_by_owner`.
+/// Returns whether this owner's reuse lookup can no longer reach the foreign
+/// row — which is the property adoption needs, and is weaker than "the record
+/// is erased". [`BuyerPoolStore::forget_if_pool`] is a compare-and-delete on
+/// the owner index, and `get_by_owner` resolves only through that index, so its
+/// `Ok(false)` — index absent, or already pointing elsewhere — leaves nothing
+/// mapping this owner to the foreign row and is a success here. Any main-table
+/// record left behind is unreachable by reuse, and a later `record` of the same
+/// id overwrites it.
+///
+/// Only a store `Err` refuses the adoption: there the mapping may well survive,
+/// and adopting beside it would leave the reuse lookup free to answer with the
+/// foreign row at the next boot.
 fn drop_foreign_row(
     store: &Arc<dyn BuyerPoolStore>,
     owner: Address,

@@ -57,16 +57,21 @@ pub struct BuyerLaneProgress {
 /// Buyer-held state for one pool, fanned out across every `(signer,
 /// provider)` lane the owner has signed vouchers on.
 ///
-/// **Field invariant:** `(payment_pool, pool_id)` is the **identity key**.
-/// `pool_id` alone is not: the contract derives it as
+/// **Field invariant:** `pool_id` is the **store key**, and it is unique only
+/// within one deployment. The contract derives it as
 /// `keccak256(owner, ownerPoolNonce)` over neither the contract address nor
 /// the chain id, and a fresh `PaymentPool` deployment restarts
 /// `ownerPoolNonce` at zero — so the same owner's Nth pool carries the same
-/// `pool_id` in every deployment. `payment_pool` is what tells two such pools
-/// apart, and a row whose `payment_pool` is not the one the node is
-/// configured against describes a pool on a contract this node no longer
-/// talks to: its lane progress priced bytes that the live contract has never
-/// seen, so resuming against it would under-pay.
+/// `pool_id` in every deployment.
+///
+/// `payment_pool` is the **deployment tag** that tells two such pools apart. It
+/// is not part of the store key: a [`BuyerPoolStore`] is keyed by `pool_id`
+/// alone, so it cannot hold rows for two deployments under one id — recording
+/// the second overwrites the first. What the tag buys is detection, at the one
+/// point that matters: a row whose `payment_pool` is not the contract the node
+/// is configured against describes a pool this node no longer talks to, its
+/// lane progress priced bytes the live contract has never seen, and
+/// reconciliation drops it rather than resume against it and under-pay.
 ///
 /// `owner` is a **secondary reuse index** — the
 /// open-pool trigger looks it up to decide whether to reuse an existing pool
@@ -82,13 +87,13 @@ pub struct BuyerLaneProgress {
 pub struct BuyerPoolState {
     /// On-chain `poolId` (`keccak256(owner, ownerPoolNonce)`) — learned by
     /// decoding the `PoolOpened` event from the open tx receipt (atomic with
-    /// the open; no follow-up `getPool` read). The store's primary key, and
-    /// unique only within one `payment_pool` — see the field invariant.
+    /// the open; no follow-up `getPool` read). The store's key, and unique
+    /// only within one `payment_pool` — see the field invariant.
     pub pool_id: PoolId,
-    /// The `PaymentPool` contract this pool lives on. Part of the identity
-    /// key (see the field invariant above): `pool_id` repeats across
-    /// deployments, so this is the only field that distinguishes a live pool
-    /// from a same-id pool on a contract the node has since moved off.
+    /// The `PaymentPool` contract this pool lives on — the deployment tag, not
+    /// part of the store key (see the field invariant above). `pool_id` repeats
+    /// across deployments, so this is the only field that distinguishes a live
+    /// pool from a same-id pool on a contract the node has since moved off.
     pub payment_pool: Address,
     /// The on-chain pool owner: put up the deposit, receives the refund, and
     /// the only address `topUp`/`closePool`/`reclaim` accept. Equals the
