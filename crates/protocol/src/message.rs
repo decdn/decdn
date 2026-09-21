@@ -98,9 +98,9 @@ pub enum MessageValidationError {
     RateIsZero,
     /// `slash_sig` is missing or not [`SLASH_SIG_LEN`] bytes. ADR 014 §1
     /// mandates a non-empty signature on every `ProbeResponse`; the
-    /// EOA-only off-chain signing path (ADR 024 §Off-Chain ERC-1271
-    /// Verification) makes that exactly [`SLASH_SIG_LEN`], which requesters
-    /// MUST reject deviations from.
+    /// EOA-only off-chain signing path (ADR 024 §Off-Chain Signature
+    /// Verification — EOA Recovery Only) makes that exactly [`SLASH_SIG_LEN`],
+    /// which requesters MUST reject deviations from.
     #[error(
         "slash_sig has invalid length {len} \
          (ADR 014 §1: mandatory non-empty; EOA form is {expected} bytes)",
