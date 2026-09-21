@@ -3266,7 +3266,13 @@ where
         .call()
         .await
         .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
-    let state = BuyerPoolState::new(pool_id, pool.owner, token, U256::from(pool.deposit));
+    let state = BuyerPoolState::new(
+        pool_id,
+        *contract.address(),
+        pool.owner,
+        token,
+        U256::from(pool.deposit),
+    );
     let ctx = PoolContext::for_pool(&state, Arc::clone(signer), voucher_dom.clone())
         .with_provider(provider, prior_bytes, prior_amount)
         .with_capability(signed_capability);
@@ -3610,8 +3616,13 @@ mod tests {
         assert_eq!(cached_pool_token(&store, owner)?, None);
 
         // Persist a pool row for this owner.
-        let state =
-            BuyerPoolState::new(B256::repeat_byte(0xAB), owner, token, U256::from(1_000u64));
+        let state = BuyerPoolState::new(
+            B256::repeat_byte(0xAB),
+            Address::repeat_byte(0x9c),
+            owner,
+            token,
+            U256::from(1_000u64),
+        );
         store.record(&state)?;
 
         // Row present -> the immutable token comes back with no contract read.

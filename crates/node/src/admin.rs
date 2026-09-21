@@ -2243,6 +2243,7 @@ mod tests {
     fn mk_buyer_pool(pool_byte: u8, deposit: u64) -> BuyerPoolState {
         BuyerPoolState::hydrate(
             B256::repeat_byte(pool_byte),
+            Address::repeat_byte(0x9c),
             Address::repeat_byte(0x11),
             Address::repeat_byte(0xcd),
             U256::from(deposit),
@@ -2322,6 +2323,7 @@ mod tests {
     fn build_buyer_pools_response_saturates_oversized_deposit() {
         let pool = BuyerPoolState::new(
             B256::repeat_byte(0x01),
+            Address::repeat_byte(0x9c),
             Address::repeat_byte(0x11),
             Address::repeat_byte(0xcd),
             U256::MAX,
@@ -2370,6 +2372,7 @@ mod tests {
         let resp = build_buyer_pools_response(
             vec![BuyerPoolState::new(
                 tracked,
+                Address::repeat_byte(0x9c),
                 Address::repeat_byte(0x11),
                 Address::repeat_byte(0xcd),
                 U256::from(1u64),

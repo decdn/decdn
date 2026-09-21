@@ -306,12 +306,14 @@ async fn pools_round_trips_seeded_store() -> anyhow::Result<()> {
     // Two owners, so both rows survive the store's owner index.
     store.record(&BuyerPoolState::new(
         B256::repeat_byte(0xbb),
+        Address::repeat_byte(0x9c),
         Address::repeat_byte(0x22),
         Address::repeat_byte(0xcd),
         U256::from(9_000_000u64),
     ))?;
     store.record(&BuyerPoolState::new(
         B256::repeat_byte(0xaa),
+        Address::repeat_byte(0x9c),
         Address::repeat_byte(0x11),
         Address::repeat_byte(0xcd),
         U256::from(10_000_000u64),

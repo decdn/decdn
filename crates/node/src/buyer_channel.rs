@@ -1377,12 +1377,20 @@ async fn reconcile_owned_pool<P: Provider + Clone>(
     // third variant alive downstream would let a future edit turn "the store
     // could not be read" into "the store is empty, go open a pool" — the
     // duplicate-deposit bug — without a compile error.
-    let tracked: Option<PoolId> = match adoption_applies(store, owner) {
+    let payment_pool = *contract.address();
+    let tracked: Option<PoolId> = match adoption_applies(store, owner, payment_pool) {
         AdoptionCheck::Unknown => {
             metrics.buyer_pool_adoption_failure();
             return false;
         }
         AdoptionCheck::Applies => None,
+        AdoptionCheck::Foreign(pool_id) => {
+            if !drop_foreign_row(store, owner, pool_id, payment_pool) {
+                metrics.buyer_pool_adoption_failure();
+                return false;
+            }
+            None
+        }
         AdoptionCheck::AlreadyTracked(pool_id) => Some(pool_id),
     };
 
@@ -1402,7 +1410,13 @@ async fn reconcile_owned_pool<P: Provider + Clone>(
     let Some((pool_id, pool)) = candidate else {
         return false;
     };
-    let state = BuyerPoolState::new(pool_id, owner, token, U256::from(pool.deposit));
+    let state = BuyerPoolState::new(
+        pool_id,
+        payment_pool,
+        owner,
+        token,
+        U256::from(pool.deposit),
+    );
     if let Err(err) = store.record(&state) {
         metrics.buyer_pool_adoption_failure();
         warn!(
@@ -1511,6 +1525,44 @@ fn reconcile_tracked(
     }
 }
 
+/// Forget a tracked row that belongs to a different `PaymentPool` deployment,
+/// so nothing reuses it here. Returns whether the row is gone.
+///
+/// This runs BEFORE the on-chain enumeration, and that order is the point: the
+/// row's `pool_id` is one this contract can mint too (the derivation omits the
+/// contract address, and a redeploy restarts the owner's nonce), so leaving it
+/// in place long enough to be enumerated is what turns a stale row into a
+/// silent resume against a live, unrelated pool.
+///
+/// A failed forget refuses the adoption rather than proceeding. The row is
+/// still there and still collides, so adopting beside it would leave the store
+/// holding two rows for one owner with the foreign one shadowing the fresh one
+/// at the next `get_by_owner`.
+fn drop_foreign_row(
+    store: &Arc<dyn BuyerPoolStore>,
+    owner: Address,
+    pool_id: PoolId,
+    payment_pool: Address,
+) -> bool {
+    warn!(
+        %pool_id,
+        %payment_pool,
+        "the tracked buyer pool belongs to a different PaymentPool deployment; dropping the \
+         stale row. Its deposit, if any, is recoverable only against the contract it was \
+         opened on"
+    );
+    if let Err(err) = store.forget_if_pool(owner, pool_id) {
+        warn!(
+            %pool_id,
+            error = %format_args!("{err:#}"),
+            "could not drop the foreign buyer pool row; refusing to adopt this boot rather \
+             than risk reusing it against a same-id pool on this contract"
+        );
+        return false;
+    }
+    true
+}
+
 /// Forget a tracked row whose pool the chain no longer lists as open, so the
 /// caller may adopt or open a replacement. Returns whether the row is gone.
 ///
@@ -1558,6 +1610,14 @@ fn drop_stale_row(store: &Arc<dyn BuyerPoolStore>, owner: Address, pool_id: Pool
 enum AdoptionCheck {
     /// The store holds no pool for this owner, so adoption applies.
     Applies,
+    /// The store holds a pool for this owner, but on a different
+    /// `PaymentPool` deployment. Adoption applies, and the foreign row must be
+    /// dropped before anything reuses it: `pool_id` is
+    /// `keccak256(owner, ownerPoolNonce)` with the contract address nowhere in
+    /// it, and a fresh deployment restarts that nonce at zero, so this row's id
+    /// will eventually name a REAL and unrelated pool here — carrying lane
+    /// progress that priced bytes the live contract never saw.
+    Foreign(PoolId),
     /// The store already tracks this pool; there is nothing to adopt. The id
     /// rides along because the stranded set is "every other open pool", and
     /// the tracked pool is not necessarily the one an adoption would pick.
@@ -1571,9 +1631,14 @@ enum AdoptionCheck {
 /// An unreadable store answers [`AdoptionCheck::Unknown`], never `Applies`:
 /// writing an adopted row into a store whose contents are unknown risks a second
 /// row beside one already there, which is the failure adoption exists to prevent.
-fn adoption_applies(store: &Arc<dyn BuyerPoolStore>, owner: Address) -> AdoptionCheck {
+fn adoption_applies(
+    store: &Arc<dyn BuyerPoolStore>,
+    owner: Address,
+    payment_pool: Address,
+) -> AdoptionCheck {
     match store.get_by_owner(owner) {
         Ok(None) => AdoptionCheck::Applies,
+        Ok(Some(state)) if !state.is_on(payment_pool) => AdoptionCheck::Foreign(state.pool_id),
         Ok(Some(state)) => AdoptionCheck::AlreadyTracked(state.pool_id),
         Err(err) => {
             warn!(
@@ -2084,6 +2149,90 @@ mod tests {
         assert_eq!(adopted.token, token);
     }
 
+    /// A row written against a DIFFERENT `PaymentPool` deployment is dropped,
+    /// not reused — even though its `pool_id` is one this contract can also
+    /// mint.
+    ///
+    /// This is the redeploy wedge. `poolId` is
+    /// `keccak256(owner, ownerPoolNonce)` with no contract address in it, and
+    /// a fresh deployment restarts the nonce at zero, so the tracked id of the
+    /// owner's Nth pool on the old contract is byte-identical to its Nth pool
+    /// here. Keeping the row would first pin every pull to a pool this
+    /// contract has never heard of, and then — once the nonce walks back over
+    /// that id — silently resume against a REAL and unrelated pool, carrying
+    /// lane progress that priced bytes it never delivered.
+    #[tokio::test]
+    async fn reconcile_drops_a_row_from_another_payment_pool_deployment() {
+        use alloy::sol_types::SolValue;
+
+        let owner = Address::repeat_byte(1);
+        let token = Address::repeat_byte(2);
+        // The id the stale row tracks — and the id this contract will hand out
+        // again, because the derivation omits the contract address.
+        let colliding = PoolId::from([0xAA; 32]);
+
+        let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+        store
+            .record(&BuyerPoolState::new(
+                colliding,
+                // NOT the mocked contract's address (`Address::ZERO`).
+                Address::repeat_byte(0xDE),
+                owner,
+                token,
+                U256::from(10_000_000u64),
+            ))
+            .expect("seed the foreign row");
+
+        // The foreign row is dropped before the walk, so adoption applies and
+        // the enumeration runs: this contract really does list `colliding`.
+        let contract = mocked_pool_contract(vec![
+            vec![colliding].abi_encode().into(),
+            onchain_pool(owner, PaymentPool::Status::Open, 4_000_000)
+                .abi_encode()
+                .into(),
+        ]);
+
+        assert!(reconcile_owned_pool(&contract, &store, owner, token, &metrics()).await);
+
+        let row = store.get_by_owner(owner).unwrap().expect("row recorded");
+        assert_eq!(
+            row.payment_pool,
+            Address::ZERO,
+            "the surviving row must belong to the contract this node is configured against"
+        );
+        assert_eq!(
+            row.deposit,
+            U256::from(4_000_000u64),
+            "the deposit must come from THIS contract's pool, not the stale row's 10_000_000 — \
+             equality here would mean the foreign row was reused under a colliding id"
+        );
+    }
+
+    /// The foreign-row check keys on the contract address alone: a row on the
+    /// configured deployment is left to the ordinary reconciliation, whatever
+    /// its id.
+    #[tokio::test]
+    async fn reconcile_keeps_a_row_on_the_configured_deployment() {
+        let owner = Address::repeat_byte(1);
+        let pool_id = PoolId::from([0xAA; 32]);
+        let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+        store
+            .record(&BuyerPoolState::new(
+                pool_id,
+                Address::ZERO,
+                owner,
+                Address::repeat_byte(2),
+                U256::from(10_000_000u64),
+            ))
+            .expect("seed the local row");
+
+        assert_eq!(
+            adoption_applies(&store, owner, Address::ZERO),
+            AdoptionCheck::AlreadyTracked(pool_id),
+            "a row on the configured PaymentPool is tracked, never foreign"
+        );
+    }
+
     /// A pool the owner closed is not a pool to resume on, so the walk keeps
     /// going and settles on the live one behind it.
     #[tokio::test]
@@ -2178,6 +2327,7 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 existing,
+                Address::ZERO,
                 owner,
                 token,
                 U256::from(5_000u64),
@@ -2281,6 +2431,7 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 existing,
+                Address::ZERO,
                 owner,
                 token,
                 U256::from(5_000u64),
@@ -2340,6 +2491,7 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 closed,
+                Address::ZERO,
                 owner,
                 token,
                 U256::from(5_000u64),
@@ -2390,6 +2542,7 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 tracked,
+                Address::ZERO,
                 owner,
                 token,
                 U256::from(5_000u64),
@@ -2435,6 +2588,7 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 tracked,
+                Address::ZERO,
                 owner,
                 token,
                 U256::from(5_000u64),
@@ -2471,6 +2625,7 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 closed,
+                Address::ZERO,
                 owner,
                 token,
                 U256::from(5_000u64),
@@ -2499,6 +2654,7 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 existing,
+                Address::ZERO,
                 owner,
                 token,
                 U256::from(5_000u64),
@@ -2562,6 +2718,7 @@ mod tests {
         let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
         let adopted = BuyerPoolState::new(
             pool_id,
+            Address::ZERO,
             owner,
             Address::repeat_byte(2),
             U256::from(10_000_000u64),
@@ -2661,6 +2818,7 @@ mod tests {
         let signer = signer();
         let state = BuyerPoolState::new(
             PoolId::from([7u8; 32]),
+            Address::ZERO,
             owner,
             Address::repeat_byte(2),
             U256::from(10_000_000u64),
@@ -2711,6 +2869,7 @@ mod tests {
         let signer = signer();
         let state = BuyerPoolState::new(
             PoolId::from([7u8; 32]),
+            Address::ZERO,
             owner,
             Address::repeat_byte(2),
             U256::from(10_000_000u64),
@@ -2835,7 +2994,10 @@ mod tests {
         // Empty queue: reaching the chain at all would be the bug.
         let contract = mocked_pool_contract(Vec::new());
 
-        assert_eq!(adoption_applies(&store, owner), AdoptionCheck::Unknown);
+        assert_eq!(
+            adoption_applies(&store, owner, *contract.address()),
+            AdoptionCheck::Unknown
+        );
         assert!(
             !reconcile_owned_pool(&contract, &store, owner, Address::repeat_byte(2), &metrics)
                 .await
@@ -2969,6 +3131,7 @@ mod tests {
         let pool_id = decdn_incentive::PoolId::from([7u8; 32]);
         let mut state = BuyerPoolState::new(
             pool_id,
+            Address::ZERO,
             Address::repeat_byte(1),
             Address::repeat_byte(2),
             U256::from(10_000u64),
@@ -3354,6 +3517,7 @@ mod tests {
         let provider = Address::repeat_byte(9);
         let state = BuyerPoolState::new(
             decdn_incentive::PoolId::from([7u8; 32]),
+            Address::ZERO,
             Address::repeat_byte(1),
             Address::repeat_byte(2),
             U256::from(10_000u64),

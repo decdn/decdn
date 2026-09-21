@@ -2130,6 +2130,7 @@ mod tests {
     fn mk_state(byte: u8, deposit_micro: u64) -> BuyerPoolState {
         BuyerPoolState::new(
             B256::repeat_byte(byte),
+            Address::repeat_byte(0x9c),
             Address::repeat_byte(byte),
             Address::repeat_byte(0xcd),
             U256::from(deposit_micro),
@@ -2285,6 +2286,7 @@ mod tests {
     fn a_buyer_load_keeps_its_skipped_rows() {
         let state = BuyerPoolState::new(
             B256::repeat_byte(0x11),
+            Address::repeat_byte(0x9c),
             Address::repeat_byte(0x11),
             Address::repeat_byte(0xcd),
             U256::from(1u64),

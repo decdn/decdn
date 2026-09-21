@@ -64,6 +64,7 @@ fn seed(data_dir: &std::path::Path, owner_byte: u8) {
     let store = RedbBuyerPoolStore::open(data_dir).unwrap();
     let state = BuyerPoolState::new(
         B256::repeat_byte(owner_byte),
+        Address::repeat_byte(0x9c),
         Address::repeat_byte(owner_byte),
         Address::repeat_byte(0xcd),
         U256::from(2_000_000u64),
@@ -200,6 +201,7 @@ fn seed_stopped_daemon_store(data_dir: &std::path::Path) -> B256 {
     let store = std::sync::Arc::new(PersistentPoolStateStore::open(data_dir).unwrap());
     let state = BuyerPoolState::new(
         pool_id,
+        Address::repeat_byte(0x9c),
         Address::repeat_byte(0x5a),
         Address::repeat_byte(0xcd),
         U256::from(7_000_000u64),

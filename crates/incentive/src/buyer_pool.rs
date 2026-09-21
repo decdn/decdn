@@ -57,9 +57,18 @@ pub struct BuyerLaneProgress {
 /// Buyer-held state for one pool, fanned out across every `(signer,
 /// provider)` lane the owner has signed vouchers on.
 ///
-/// **Field invariant:** `pool_id` is the **identity key** (the store's
-/// primary key; the on-chain `poolId` decoded from the `PoolOpened` event in
-/// the open tx receipt). `owner` is a **secondary reuse index** — the
+/// **Field invariant:** `(payment_pool, pool_id)` is the **identity key**.
+/// `pool_id` alone is not: the contract derives it as
+/// `keccak256(owner, ownerPoolNonce)` over neither the contract address nor
+/// the chain id, and a fresh `PaymentPool` deployment restarts
+/// `ownerPoolNonce` at zero — so the same owner's Nth pool carries the same
+/// `pool_id` in every deployment. `payment_pool` is what tells two such pools
+/// apart, and a row whose `payment_pool` is not the one the node is
+/// configured against describes a pool on a contract this node no longer
+/// talks to: its lane progress priced bytes that the live contract has never
+/// seen, so resuming against it would under-pay.
+///
+/// `owner` is a **secondary reuse index** — the
 /// open-pool trigger looks it up to decide whether to reuse an existing pool
 /// instead of opening a new one — not the identity key: two pools can
 /// (transiently) exist for the same owner, e.g. across a rotate. Per-lane
@@ -73,8 +82,14 @@ pub struct BuyerLaneProgress {
 pub struct BuyerPoolState {
     /// On-chain `poolId` (`keccak256(owner, ownerPoolNonce)`) — learned by
     /// decoding the `PoolOpened` event from the open tx receipt (atomic with
-    /// the open; no follow-up `getPool` read). The store's primary key.
+    /// the open; no follow-up `getPool` read). The store's primary key, and
+    /// unique only within one `payment_pool` — see the field invariant.
     pub pool_id: PoolId,
+    /// The `PaymentPool` contract this pool lives on. Part of the identity
+    /// key (see the field invariant above): `pool_id` repeats across
+    /// deployments, so this is the only field that distinguishes a live pool
+    /// from a same-id pool on a contract the node has since moved off.
+    pub payment_pool: Address,
     /// The on-chain pool owner: put up the deposit, receives the refund, and
     /// the only address `topUp`/`closePool`/`reclaim` accept. Equals the
     /// local key for a self-funded pool. The reuse index in
@@ -94,14 +109,32 @@ impl BuyerPoolState {
     /// Construct fresh state for a newly-opened buyer pool, with no lanes
     /// touched yet.
     #[must_use]
-    pub fn new(pool_id: PoolId, owner: Address, token: Address, deposit: U256) -> Self {
+    pub fn new(
+        pool_id: PoolId,
+        payment_pool: Address,
+        owner: Address,
+        token: Address,
+        deposit: U256,
+    ) -> Self {
         Self {
             pool_id,
+            payment_pool,
             owner,
             token,
             deposit,
             lanes: HashMap::new(),
         }
+    }
+
+    /// Whether this row describes a pool on `payment_pool`.
+    ///
+    /// The bootstrap reconciliation calls this before it trusts anything else
+    /// in the row: a `false` means the row was written against a different
+    /// `PaymentPool` deployment, and its `pool_id` may nonetheless collide
+    /// with a live pool here (see the field invariant).
+    #[must_use]
+    pub fn is_on(&self, payment_pool: Address) -> bool {
+        self.payment_pool == payment_pool
     }
 
     /// Reconstruct pool state from a trusted persistent store — the one
@@ -110,6 +143,7 @@ impl BuyerPoolState {
     #[must_use]
     pub fn hydrate(
         pool_id: PoolId,
+        payment_pool: Address,
         owner: Address,
         token: Address,
         deposit: U256,
@@ -117,6 +151,7 @@ impl BuyerPoolState {
     ) -> Self {
         Self {
             pool_id,
+            payment_pool,
             owner,
             token,
             deposit,
@@ -573,6 +608,7 @@ mod tests {
         let owner = Address::from(obytes);
         let mut state = BuyerPoolState::new(
             PoolId::from(idbytes),
+            Address::repeat_byte(0x9c),
             owner,
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::from(10_000_000u64),
@@ -644,6 +680,7 @@ mod tests {
     fn advance_lane_accepts_monotonic_and_equal() -> anyhow::Result<()> {
         let mut s = BuyerPoolState::new(
             b256!("11111111111111111111111111111111111111111111111111111111111111ab"),
+            Address::repeat_byte(0x9c),
             address!("00000000000000000000000000000000000000a1"),
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::ZERO,
@@ -735,6 +772,7 @@ mod tests {
         let store = MemoryBuyerPoolStore::new();
         let s = BuyerPoolState::new(
             b256!("22222222222222222222222222222222222222222222222222222222222222ab"),
+            Address::repeat_byte(0x9c),
             address!("00000000000000000000000000000000000000a3"),
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::from(10_000_000u64),

@@ -47,13 +47,14 @@ use crate::store::StoreError;
 /// Callers supply the `Database` (the one thing they legitimately differ
 /// on) and nothing else.
 ///
-/// **`_v3`**: the primary key is `pool_id` (32 bytes) and the record carries
-/// a variable-length per-lane progress table. A future incompatible layout
+/// **`_v4`**: the primary key is `pool_id` (32 bytes) and the record carries
+/// the `PaymentPool` address the pool lives on plus a variable-length
+/// per-lane progress table. A future incompatible layout
 /// change bumps this suffix so `redb`'s key/value type-name check rejects an
 /// old-suffix file outright — a mismatched file is cleanly ignored (ignored
 /// table, not misread), never live-migrated.
 const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8]> =
-    TableDefinition::new("buyer_pool_state_v3");
+    TableDefinition::new("buyer_pool_state_v4");
 
 /// Secondary index: `owner (20 bytes) → pool_id (32 bytes)`. Maintained
 /// alongside [`BUYER_POOL_TABLE`] on every `record`/`forget`/
@@ -66,10 +67,10 @@ const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8
 /// only visible via [`BuyerPoolTable::load_all`] (the reclaim sweep's path)
 /// — never via [`BuyerPoolTable::get_by_owner`].
 const BUYER_OWNER_INDEX_TABLE: TableDefinition<'static, &'static [u8; 20], &'static [u8; 32]> =
-    TableDefinition::new("buyer_pool_owner_index_v3");
+    TableDefinition::new("buyer_pool_owner_index_v4");
 
 /// Highest buyer-record `schema_version` this binary can decode.
-const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 2;
 
 /// Sanity ceiling on trailing bytes per record. Trailing bytes are tolerated
 /// (forward-compat with additive schema changes), but a `remainder.len()`
@@ -109,6 +110,7 @@ struct StoredLane {
 struct StoredBuyerPoolState {
     schema_version: u32,
     pool_id: [u8; 32],
+    payment_pool: [u8; 20],
     owner: [u8; 20],
     token: [u8; 20],
     deposit: [u8; 32],
@@ -132,6 +134,7 @@ impl From<&BuyerPoolState> for StoredBuyerPoolState {
         Self {
             schema_version: BUYER_SUPPORTED_SCHEMA_VERSION,
             pool_id: state.pool_id.into(),
+            payment_pool: state.payment_pool.into(),
             owner: state.owner.into(),
             token: state.token.into(),
             deposit: state.deposit.to_be_bytes(),
@@ -166,6 +169,7 @@ impl StoredBuyerPoolState {
             .collect();
         Ok(BuyerPoolState::hydrate(
             pool_id,
+            Address::from(self.payment_pool),
             Address::from(self.owner),
             Address::from(self.token),
             U256::from_be_bytes(self.deposit),
@@ -764,6 +768,7 @@ mod tests {
         let pool_id = PoolId::from(id);
         let mut s = BuyerPoolState::new(
             pool_id,
+            Address::repeat_byte(0x9c),
             owner,
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::from(10_000_000u64),
@@ -808,6 +813,7 @@ mod tests {
         };
         let mut s = BuyerPoolState::new(
             pool_id,
+            Address::repeat_byte(0x9c),
             owner,
             Address::repeat_byte(0x33),
             U256::from(0xAAAA_AAAA_AAAA_AAAAu64),
@@ -827,7 +833,7 @@ mod tests {
 
     use alloy::primitives::B256;
 
-    /// Postcard encoding of [`golden_state`] (schema v1). Two lanes, sorted
+    /// Postcard encoding of [`golden_state`] (schema v2). Two lanes, sorted
     /// by `(signer, provider)` for a deterministic encoding regardless of
     /// `HashMap` iteration order.
     ///
@@ -836,8 +842,9 @@ mod tests {
     /// `last_amount` already says which chain the lane resumes on — there is no
     /// counter here to keep, and none to get wrong.
     const GOLDEN_RECORD_HEX: &str = concat!(
-        "01",                                                               // schema_version (varint)
+        "02",                                                               // schema_version (varint)
         "1111111111111111111111111111111111111111111111111111111111111111", // pool_id
+        "9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c",                         // payment_pool
         "2222222222222222222222222222222222222222",                         // owner
         "3333333333333333333333333333333333333333",                         // token
         "000000000000000000000000000000000000000000000000aaaaaaaaaaaaaaaa", // deposit
@@ -1402,6 +1409,7 @@ mod tests {
         let db = std::sync::Arc::new(db);
         let mut base = BuyerPoolState::new(
             PoolId::repeat_byte(6),
+            Address::repeat_byte(0x9c),
             Address::repeat_byte(6),
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::from(1_000u64),

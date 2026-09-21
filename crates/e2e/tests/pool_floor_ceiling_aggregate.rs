@@ -406,7 +406,13 @@ fn delegate_context(
     voucher_dom: &alloy::dyn_abi::Eip712Domain,
 ) -> anyhow::Result<PoolContext> {
     let binding = sign_client_binding(&delegate, own_node_id, bind_domain)?;
-    let state = BuyerPoolState::new(pool_id, owner_addr, token, deposit);
+    let state = BuyerPoolState::new(
+        pool_id,
+        Address::repeat_byte(0x9c),
+        owner_addr,
+        token,
+        deposit,
+    );
     Ok(
         PoolContext::for_pool(&state, Arc::new(delegate), voucher_dom.clone())
             .with_provider(provider, U256::ZERO, U256::ZERO)

@@ -380,7 +380,7 @@ pub async fn open_pool<P: Provider + Clone>(
     // that in `PoolOpened.deposit`, precisely so a fee-on-transfer token cannot
     // over-state a pool against the shared USDC balance.
     let credited = opened.deposit;
-    let state = BuyerPoolState::new(pool_id, owner, token, credited);
+    let state = BuyerPoolState::new(pool_id, *contract.address(), owner, token, credited);
     // A self-owned capability delegates spend to the owner's OWN key, so the cap
     // bounds nothing a delegated capability would: the pool deposit is already
     // the real spending bound (redemption pays min(desired, cap-spent,
