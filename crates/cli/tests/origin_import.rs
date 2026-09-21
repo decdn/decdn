@@ -35,7 +35,7 @@ fn rt() -> tokio::runtime::Runtime {
 fn import_args(input: &Path, origin: &Path) -> OriginImportArgs {
     OriginImportArgs {
         input: input.to_path_buf(),
-        to: Some(format!("fs:{}", origin.display())),
+        to: Some(origin.display().to_string()),
         move_source: false,
         bundle: None,
         force: false,
@@ -501,7 +501,7 @@ fn chunk_flags_require_optimize() {
         "-i",
         tree.path().to_str().unwrap(),
         "--to",
-        &format!("fs:{}", origin.path().display()),
+        &origin.path().display().to_string(),
         "--chunk-avg",
         "2MiB",
     ]);
@@ -537,7 +537,7 @@ fn optimize_stores_whole_file_blobs_and_chunk_hints() {
         "-i",
         tree.path().to_str().unwrap(),
         "--to",
-        &format!("fs:{}", origin.path().display()),
+        &origin.path().display().to_string(),
         "--optimize",
         "--json",
     ]);
@@ -688,7 +688,7 @@ fn optimize_single_file_emits_one_entry_manifest() {
         "-i",
         file.to_str().unwrap(),
         "--to",
-        &format!("fs:{}", origin.path().display()),
+        &origin.path().display().to_string(),
         "--optimize",
         "--bundle",
         bundle.to_str().unwrap(),
@@ -749,7 +749,7 @@ fn optimize_and_move_are_rejected_together() {
         "-i",
         file.to_str().unwrap(),
         "--to",
-        &format!("fs:{}", origin.path().display()),
+        &origin.path().display().to_string(),
         "--optimize",
         "--move",
     ]);
@@ -782,7 +782,7 @@ fn optimize_whole_file_blob_matches_entry_hash() {
         "-i",
         tree.path().to_str().unwrap(),
         "--to",
-        &format!("fs:{}", origin.path().display()),
+        &origin.path().display().to_string(),
         "--optimize",
         "--json",
     ]);

@@ -8,11 +8,10 @@
 //! group rather than under `decdn node` (whose every subcommand talks to a
 //! running node over the loopback admin surface, `appendix-local-admin-http.md`).
 //!
-//! The hash + outboard computation is backend-independent (an origin store is
-//! content-addressed with an identical object layout across the fs and s3
-//! backends); only the final write differs. The `--to` target selects the
-//! backend, so an `s3://` writer is an additive follow-up rather than a rewrite.
-//! v1 implements the `fs:<dir>` target.
+//! `--to` is a local filesystem directory: the store is written to disk and
+//! nowhere else. An S3 origin needs no separate writer, because the fs and S3
+//! object layouts are byte-identical — import to a directory and `aws s3 sync`
+//! it up to the bucket.
 
 use std::path::PathBuf;
 
@@ -54,18 +53,18 @@ pub struct OriginImportArgs {
     #[arg(short = 'i', long, value_name = "PATH")]
     pub input: PathBuf,
 
-    /// Target origin store to populate, as `<backend>:<location>`:
+    /// Directory to populate — a local filesystem origin store rooted here,
+    /// created if absent. This is the only write backend; pass the path
+    /// directly (`--to /var/lib/decdn/origin`), with no scheme prefix.
     ///
-    /// - `fs:<dir>` — a local filesystem origin store rooted at `<dir>`
-    ///   (created if absent). **Implemented.**
-    /// - `s3://<bucket>/<prefix>` — an S3 origin store. **Not yet implemented**
-    ///   (a follow-up; the object layout is identical, only the writer differs).
-    ///
-    /// An HTTP origin is a read-only static server, not a write target: seed the
-    /// `fs:` layout onto the disk it serves instead.
+    /// To populate an S3 origin, import to a local directory and then
+    /// `aws s3 sync <dir> s3://<bucket>/<prefix>`: the fs and S3 object layouts
+    /// are byte-identical, so the sync needs no renaming. An `s3://` or
+    /// `http(s)://` value is rejected with that recipe rather than treated as a
+    /// path.
     ///
     /// Required unless `--dry-run`.
-    #[arg(long, value_name = "TARGET")]
+    #[arg(long, value_name = "DIR")]
     pub to: Option<String>,
 
     /// Move each source file into the target instead of copying it. Across
@@ -165,7 +164,7 @@ mod tests {
         // No clap default: `None` = unset, so the wiring (Task 6) can reject
         // `--chunk-avg` given without `--optimize`. The 4 MiB default is applied
         // downstream, not by clap.
-        let w = Wrap::try_parse_from(["x", "-i", "d", "--to", "fs:/o"]).unwrap();
+        let w = Wrap::try_parse_from(["x", "-i", "d", "--to", "/o"]).unwrap();
         assert_eq!(w.args.chunk_avg, None);
         assert!(!w.args.optimize);
         assert!(!w.args.dry_run);
@@ -180,13 +179,13 @@ mod tests {
 
     #[test]
     fn subfolder_is_none_by_default() {
-        let w = Wrap::try_parse_from(["x", "-i", "d", "--to", "fs:/o"]).unwrap();
+        let w = Wrap::try_parse_from(["x", "-i", "d", "--to", "/o"]).unwrap();
         assert_eq!(w.args.subfolder, None);
     }
 
     #[test]
     fn parses_subfolder() {
-        let w = Wrap::try_parse_from(["x", "-i", "d", "--to", "fs:/o", "--subfolder", "assets/v1"])
+        let w = Wrap::try_parse_from(["x", "-i", "d", "--to", "/o", "--subfolder", "assets/v1"])
             .unwrap();
         assert_eq!(w.args.subfolder.as_deref(), Some("assets/v1"));
     }

@@ -211,8 +211,12 @@ lists, not at import time.
 `bundle pull` consumes a chunked manifest exactly as it consumes an
 unchunked one — see [Chunked entries](#chunked-entries) under Pull.
 
-`--to <backend>:<location>` writes blobs into a cache origin store and
-is normally required. `--dry-run` makes it optional: it writes no blobs
+`--to <dir>` writes blobs into a local filesystem cache origin store and
+is normally required. The filesystem is the only write backend. To fill an
+S3 origin, import to a directory and then run `aws s3 sync <dir>
+s3://<bucket>/<prefix>`. The fs and S3 object layouts are identical, so the
+sync renames nothing. An `s3://` or `http(s)://` value is rejected with that
+recipe. `--dry-run` makes `--to` optional: it writes no blobs
 anywhere and prints the canonical manifest bytes to stdout instead, so
 `origin import --dry-run` is the local "just make me a manifest" path —
 a publisher who only wants the manifest, without seeding an origin
