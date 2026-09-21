@@ -22,12 +22,17 @@
 //! shows only when a keystore password is available (the
 //! `DECDN_KEYSTORE_PASSWORD` env var, a `--keystore-password-file`, or an
 //! interactive prompt on a TTY); otherwise the line is a note (no keystore, or a
-//! password is needed). One resolved password unlocks whichever keystores are
-//! present.
+//! password is needed).
+//!
+//! One resolved password is tried against whichever keystores are present, and
+//! the two can hold different ones — `key-gen` writes them at different times
+//! and prompts for each. A keystore that does not open degrades its own line to
+//! a note naming the reason; every other line still prints, and the command
+//! still exits 0. On a TTY the failing keystore gets one more prompt of its own
+//! before the note.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
 use decdn_common::{cli, identity};
 use decdn_incentive::eth_identity::{self, PasswordSource, PasswordUse};
 use zeroize::Zeroizing;
@@ -109,8 +114,12 @@ fn resolve_data_dir(
 /// still reports.
 ///
 /// The password is resolved once, and only when a keystore is present, then
-/// applied to whichever keystores exist. Split from [`whoami`] so the ordering
-/// and the client/node sections are testable without capturing stdout.
+/// tried against whichever keystores exist. A keystore the shared password does
+/// not open gets one prompt of its own on a TTY, then degrades to a note — the
+/// two keystores can legitimately hold different passwords (#2008), and one
+/// wrong password must not take the whole report down. Split from [`whoami`] so
+/// the ordering and the client/node sections are testable without capturing
+/// stdout.
 fn report(data_dir: &Path, password_file: Option<&Path>) -> anyhow::Result<Vec<String>> {
     let mut lines = Vec::new();
 
@@ -155,7 +164,12 @@ fn report(data_dir: &Path, password_file: Option<&Path>) -> anyhow::Result<Vec<S
         KeystorePassword::Unavailable
     };
 
-    lines.push(eth_address_line(&node_keystore, &node_state, &password)?);
+    lines.push(unlock_line(
+        &node_keystore,
+        &node_state,
+        &password,
+        "node eth keystore password",
+    ));
     if matches!(client_state, KeystoreState::Present) {
         lines.push(format!(
             "client keystore path: {}",
@@ -163,11 +177,59 @@ fn report(data_dir: &Path, password_file: Option<&Path>) -> anyhow::Result<Vec<S
         ));
         lines.push(format!(
             "client {}",
-            eth_address_line(&client_keystore, &client_state, &password)?
+            unlock_line(
+                &client_keystore,
+                &client_state,
+                &password,
+                "client eth keystore password",
+            )
         ));
     }
 
     Ok(lines)
+}
+
+/// One keystore's `eth address:` line, with a second attempt when the shared
+/// password does not open it and a TTY is there to ask on.
+///
+/// The retry is what makes two keystores with two passwords reportable. The
+/// shared password is the common case and is tried first, so an install whose
+/// keystores share a password prompts once, as it would with no retry at all.
+///
+/// The first attempt's note goes to stderr before the prompt. Without it the
+/// prompt appears with no explanation — the report is buffered and printed
+/// after this returns — and an operator who set `DECDN_KEYSTORE_PASSWORD`
+/// cannot see why it was not used. It also keeps a failure no password can fix,
+/// such as a keystore at `0o644`, from reading as a password problem: the
+/// reason is on screen before anything is typed.
+///
+/// A failed retry, or no TTY to retry on, leaves a note — the reason is on the
+/// line either way, and the rest of the report is unaffected.
+fn unlock_line(
+    keystore: &Path,
+    state: &KeystoreState,
+    password: &KeystorePassword,
+    prompt_label: &str,
+) -> String {
+    let attempt = eth_address_line(keystore, state, password);
+    if !attempt.retryable || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return attempt.line;
+    }
+    eprintln!("warning: {}", attempt.line);
+    let sources = [PasswordSource::Prompt {
+        usage: PasswordUse::Unlock,
+    }];
+    match super::chain_ctx::read_keystore_password(&sources, prompt_label) {
+        Ok(resolved) => {
+            let retry = KeystorePassword::Supplied(resolved.into_secret());
+            eth_address_line(keystore, state, &retry).line
+        }
+        // A prompt that cannot be read is not a reason to lose the report. Say
+        // that it was the terminal, though: the first attempt's note blames
+        // "this password", and after a prompt an operator reads that as the one
+        // they just typed.
+        Err(err) => format!("{} [no second attempt: {}]", attempt.line, err.root_cause()),
+    }
 }
 
 /// Classify the keystore path without letting a non-`NotFound` stat error read
@@ -220,9 +282,25 @@ fn password_source_present(sources: &[PasswordSource]) -> bool {
     })
 }
 
+/// One attempt at an eth-address line, and whether another password could
+/// still change the answer.
+struct EthLine {
+    /// The line to print — an address, or a note saying why there is none.
+    line: String,
+    /// True when a keystore is present and the password tried did not open it.
+    /// Only then is a second prompt worth the operator's time.
+    retryable: bool,
+}
+
 /// Format the eth-address line: decrypt the keystore when a password was
 /// supplied, report it absent when there is no keystore, and otherwise note
 /// that a password is needed.
+///
+/// A keystore that does not decrypt is a note, not an error. The node and
+/// client keystores are written at different times under separate prompts, so
+/// one password failing on one of them says nothing about the other, and
+/// aborting would print neither (#2008). The failure text rides on the line, so
+/// a corrupt file is as visible as a wrong password.
 ///
 /// Split from [`whoami`] so the decrypt branch and the notes are testable
 /// without touching the environment or a TTY.
@@ -230,24 +308,38 @@ fn eth_address_line(
     keystore: &Path,
     state: &KeystoreState,
     password: &KeystorePassword,
-) -> anyhow::Result<String> {
+) -> EthLine {
+    let note = |line: String| EthLine {
+        line,
+        retryable: false,
+    };
     match state {
-        KeystoreState::Absent => Ok(format!(
+        KeystoreState::Absent => note(format!(
             "eth address: (no keystore at {})",
             keystore.display()
         )),
         KeystoreState::Present => match password {
-            KeystorePassword::Unavailable => Ok(format!(
+            KeystorePassword::Unavailable => note(format!(
                 "eth address: (keystore present at {}; set DECDN_KEYSTORE_PASSWORD or pass \
                  --keystore-password-file to show it)",
                 keystore.display()
             )),
             KeystorePassword::Supplied(pw) => {
-                let signer =
-                    eth_identity::load_signer(keystore, pw.as_str()).with_context(|| {
-                        format!("failed to load keystore at {}", keystore.display())
-                    })?;
-                Ok(format!("eth address: {}", signer.address()))
+                match eth_identity::load_signer(keystore, pw.as_str()) {
+                    Ok(signer) => note(format!("eth address: {}", signer.address())),
+                    Err(err) => EthLine {
+                        // The root cause, not the whole chain: every wrapping
+                        // layer repeats this path, and the innermost message is
+                        // the one that separates a wrong password from a
+                        // keystore that is broken.
+                        line: format!(
+                            "eth address: (keystore at {} did not open with this password: {})",
+                            keystore.display(),
+                            err.root_cause()
+                        ),
+                        retryable: true,
+                    },
+                }
             }
         },
     }
@@ -348,14 +440,14 @@ mod tests {
         let keystore = eth_identity::keystore_path(dir.path());
 
         let before = file_names(dir.path());
-        let line = eth_address_line(
+        let attempt = eth_address_line(
             &keystore,
             &KeystoreState::Present,
             &KeystorePassword::Supplied(Zeroizing::new(TEST_PASSWORD.to_owned())),
-        )
-        .unwrap();
+        );
 
-        assert_eq!(line, format!("eth address: {address}"));
+        assert_eq!(attempt.line, format!("eth address: {address}"));
+        assert!(!attempt.retryable, "a decrypted keystore needs no retry");
         assert_eq!(
             before,
             file_names(dir.path()),
@@ -367,15 +459,19 @@ mod tests {
     #[test]
     fn address_line_without_password_notes_one_is_needed() {
         let keystore = Path::new("/data/keystore.json");
-        let line = eth_address_line(
+        let attempt = eth_address_line(
             keystore,
             &KeystoreState::Present,
             &KeystorePassword::Unavailable,
-        )
-        .unwrap();
+        );
+        let line = attempt.line;
         assert!(
             line.starts_with("eth address:") && line.contains("password"),
             "expected a password note, got {line:?}"
+        );
+        assert!(
+            !attempt.retryable,
+            "no password source was present, so there is nothing to retry with"
         );
     }
 
@@ -383,32 +479,48 @@ mod tests {
     #[test]
     fn address_line_without_keystore_notes_it_is_absent() {
         let keystore = Path::new("/data/keystore.json");
-        let line = eth_address_line(
+        let attempt = eth_address_line(
             keystore,
             &KeystoreState::Absent,
             &KeystorePassword::Unavailable,
-        )
-        .unwrap();
+        );
+        let line = attempt.line;
         assert!(
             line.starts_with("eth address:") && line.contains("no keystore"),
             "expected a 'no keystore' note, got {line:?}"
         );
+        assert!(!attempt.retryable, "there is no keystore to retry against");
     }
 
-    /// A wrong password is a hard error on the eth line, not a silent note.
+    /// A wrong password degrades its own line to a note naming the keystore and
+    /// the reason, and marks the attempt retryable — it must not abort the
+    /// report, because the other keystore's password may well be correct
+    /// (#2008).
     #[test]
-    fn address_line_with_wrong_password_errors() {
+    fn address_line_with_wrong_password_notes_and_asks_for_a_retry() {
         let dir = secure_tempdir();
         generate_and_persist(dir.path(), TEST_PASSWORD, false).unwrap();
         let keystore = eth_identity::keystore_path(dir.path());
 
-        let err = eth_address_line(
+        let attempt = eth_address_line(
             &keystore,
             &KeystoreState::Present,
             &KeystorePassword::Supplied(Zeroizing::new("definitely-wrong".to_owned())),
-        )
-        .expect_err("a wrong password must error");
-        assert!(format!("{err:#}").contains("keystore"), "got: {err:#}");
+        );
+        assert!(
+            attempt.line.starts_with("eth address: (keystore at "),
+            "got: {:?}",
+            attempt.line
+        );
+        assert!(
+            attempt.line.contains("did not open with this password"),
+            "the line must say why there is no address: {:?}",
+            attempt.line
+        );
+        assert!(
+            attempt.retryable,
+            "a present keystore that did not open is exactly the retry case"
+        );
     }
 
     /// `keystore_state` classifies an absent path as `Absent` (not an error)
@@ -485,6 +597,46 @@ mod tests {
         assert!(
             !eth_identity::keystore_path(dir.path()).exists(),
             "report must not create a node keystore"
+        );
+    }
+
+    /// The #2008 repro: the node and client keystores were created at
+    /// different times under separate prompts, so they hold different
+    /// passwords. One password file cannot open both, and one `Mac Mismatch`
+    /// must not abort the report — that would print nothing at all, including
+    /// for the keystore whose password was correct. Both lines print, the one
+    /// that opened shows its address, and `report` does not error.
+    #[test]
+    fn report_survives_two_keystores_with_two_passwords() {
+        let dir = secure_tempdir();
+        let secret = identity::load_or_generate(dir.path()).unwrap();
+        let node_address = generate_and_persist(dir.path(), TEST_PASSWORD, false).unwrap();
+        let client_dir = dir.path().join("client");
+        generate_and_persist(&client_dir, "a-different-password", false).unwrap();
+
+        // A password file is the only source a test can supply: the env var
+        // would need `set_var`, and stdin is not a TTY under the runner — which
+        // also means the failing keystore gets no retry prompt here.
+        let pw_file = dir.path().join("password");
+        std::fs::write(&pw_file, TEST_PASSWORD).unwrap();
+
+        let lines = report(dir.path(), Some(&pw_file)).unwrap();
+
+        assert!(
+            lines.contains(&format!("node id: {}", secret.public())),
+            "the node id must print, got {lines:?}"
+        );
+        assert!(
+            lines.contains(&format!("eth address: {node_address}")),
+            "the keystore this password DOES open must show its address, got {lines:?}"
+        );
+        let client_line = lines
+            .iter()
+            .find(|l| l.starts_with("client eth address:"))
+            .expect("the client eth line must print");
+        assert!(
+            client_line.contains("did not open with this password"),
+            "the keystore this password does not open degrades to a note: {client_line:?}"
         );
     }
 

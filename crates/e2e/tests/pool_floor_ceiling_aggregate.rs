@@ -256,6 +256,7 @@ async fn run() -> anyhow::Result<()> {
         let (signer, cap) = delegate_lane(owner.signer(), pool_id, delegate_expiry, &voucher_dom)?;
         contexts.push(delegate_context(
             pool_id,
+            chain.addrs().payment_pool,
             owner.address(),
             chain.usdc(),
             deposit,
@@ -395,6 +396,7 @@ fn delegate_lane(
 #[allow(clippy::too_many_arguments)]
 fn delegate_context(
     pool_id: alloy::primitives::B256,
+    payment_pool: Address,
     owner_addr: Address,
     token: Address,
     deposit: U256,
@@ -406,7 +408,7 @@ fn delegate_context(
     voucher_dom: &alloy::dyn_abi::Eip712Domain,
 ) -> anyhow::Result<PoolContext> {
     let binding = sign_client_binding(&delegate, own_node_id, bind_domain)?;
-    let state = BuyerPoolState::new(pool_id, owner_addr, token, deposit);
+    let state = BuyerPoolState::new(pool_id, payment_pool, owner_addr, token, deposit);
     Ok(
         PoolContext::for_pool(&state, Arc::new(delegate), voucher_dom.clone())
             .with_provider(provider, U256::ZERO, U256::ZERO)

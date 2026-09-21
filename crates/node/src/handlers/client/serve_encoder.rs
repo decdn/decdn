@@ -353,7 +353,7 @@ impl CoherentFrameProducer {
     ) -> anyhow::Result<Self> {
         // The chunk-group-aligned ranges the client's verified stream covers (ADR
         // 038). `end == offset` (empty request) yields empty ranges — an empty
-        // stream — handled naturally by the encoder.
+        // stream: the encode future below skips the encoder and ends at once.
         let ranges = if end > offset {
             align_range(offset, end - offset, total)
                 .map(|a| a.chunk_ranges().clone())
@@ -374,6 +374,13 @@ impl CoherentFrameProducer {
             let mut writer = writer;
             let mut data = data;
             let mut outboard = outboard;
+            // The empty range (the 0-byte blob) has an empty wire. The async
+            // encoder, unlike the sync one, does not short-circuit empty ranges
+            // and trips a debug assertion walking them, so skip it. `writer`
+            // still drops here, so the frame channel closes and the stream ends.
+            if ranges.is_empty() {
+                return Ok(());
+            }
             encode_ranges_validated(&mut data, &mut outboard, ranges.as_ref(), &mut writer)
                 .await
                 .map_err(|e| anyhow::anyhow!("coherent range encode failed: {e}"))
@@ -1060,5 +1067,25 @@ mod tests {
             !reader.covers_locally(&range),
             "an evicted hash is refused locally, mirroring present_ranges"
         );
+    }
+
+    /// The 0-byte blob encodes to an empty stream: no frame, no fault. Its request
+    /// range is empty, and bao-tree's async encoder trips a debug assertion on
+    /// empty ranges, so the producer must skip the encode rather than walk them.
+    #[tokio::test]
+    async fn the_empty_blob_encodes_an_empty_stream() {
+        let (root, _plaintext, _outboard) = synth_blob(0);
+        let hash = Hash::from(root);
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await.unwrap();
+        let session = FillSession::new(bao_tree::blake3::Hash::from(root), 0);
+        let store = NodeRangedStore::new(engine, hash, 0);
+        let producer = CoherentFrameProducer::new(store, session, 0, 0, 0).unwrap();
+
+        let served = tokio::time::timeout(std::time::Duration::from_secs(5), drain(producer))
+            .await
+            .expect("the empty encode ends without waiting on a pull")
+            .expect("the empty encode does not fault");
+        assert!(served.is_empty(), "the 0-byte blob has an empty wire");
     }
 }

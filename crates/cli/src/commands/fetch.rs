@@ -68,6 +68,8 @@ use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::probe::probe_once;
 use decdn_client_pull::provider;
 
+use super::buyer_store::{DataDirSource, open_client_store_for_buy};
+
 /// Per-candidate probe timeout during auto-discovery (#936). The K probes run
 /// concurrently, so this bounds selection latency rather than the overall fetch
 /// (`--timeout-ms`); a dead candidate falls out of selection after this.
@@ -160,6 +162,11 @@ pub(crate) struct ResolvedChain {
     /// keystore. Client-scoped (`~/.decdn/client`) unless an explicit
     /// `--data-dir`/`identity.data_dir` is given.
     pub(crate) data_dir: PathBuf,
+    /// Which step of the ladder produced [`Self::data_dir`]. A node's data dir
+    /// is acceptable when the operator named it and not when it merely fell out
+    /// of the config file, so the guard needs the provenance, not just the path
+    /// (#2082).
+    pub(crate) data_dir_source: DataDirSource,
     /// Client region for region-first discovery ordering (`--region` >
     /// `identity.region`). `None` skips the ordering.
     pub(crate) region: Option<String>,
@@ -262,12 +269,21 @@ pub(crate) fn resolve_chain(
     // Client data dir: an explicit `--data-dir`/`identity.data_dir` wins,
     // otherwise the client-scoped `~/.decdn/client` (not the node-shaped
     // `~/.decdn`, so a pure client install doesn't masquerade as a node).
-    let data_dir = args
+    // Which step won is carried forward: on a node host `identity.data_dir`
+    // points at the daemon's dir, and buying from there under the node's own
+    // keystore is a refusal unless the operator asked for it by name (#2082).
+    let (data_dir, data_dir_source) = args
         .data_dir
         .clone()
-        .or_else(|| file.identity.as_ref().and_then(|i| i.data_dir.clone()))
-        .map(|p| expand_tilde(&p))
-        .or_else(cli::default_client_data_dir)
+        .map(|p| (p, DataDirSource::Flag))
+        .or_else(|| {
+            file.identity
+                .as_ref()
+                .and_then(|i| i.data_dir.clone())
+                .map(|p| (p, DataDirSource::Config))
+        })
+        .map(|(p, source)| (expand_tilde(&p), source))
+        .or_else(|| cli::default_client_data_dir().map(|p| (p, DataDirSource::Default)))
         .ok_or_else(|| {
             anyhow::anyhow!("data_dir not set and no default available (pass --data-dir)")
         })?;
@@ -315,6 +331,7 @@ pub(crate) fn resolve_chain(
         keystore,
         keystore_password_file: args.keystore_password_file.as_deref().map(expand_tilde),
         data_dir,
+        data_dir_source,
         region,
         region_allowlist,
         working_deposit,
@@ -909,11 +926,21 @@ fn identity_fresh_candidates(
 /// persisted [`BuyerPoolState::token`] equals a fresh on-chain read — letting a
 /// repeat fetch skip the `usdc()` `eth_call`. Only a first-ever pool falls
 /// through to the on-chain read.
+///
+/// "Immutable per contract" is the whole premise, so the row has to be on the
+/// contract being read: a row from another `PaymentPool` deployment caches that
+/// deployment's `usdc()`, and answering with it would approve and price against
+/// the wrong token. Such a row reads as absent and the caller pays the
+/// round-trip.
 fn cached_pool_token(
     store: &RedbBuyerPoolStore,
     self_address: Address,
+    payment_pool: Address,
 ) -> anyhow::Result<Option<Address>> {
-    Ok(store.get_by_owner(self_address)?.map(|state| state.token))
+    Ok(store
+        .get_by_owner(self_address)?
+        .filter(|state| state.is_on(payment_pool))
+        .map(|state| state.token))
 }
 
 /// Region-filter a candidate set to at most [`discovery::SELECT_K`], then
@@ -1272,7 +1299,9 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let grant = resolve_delegation_grant(common, &mut chain)?;
 
     // The buyer-pool store, opened once and recorded into by open-or-reuse.
-    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
+    // The guard runs here, before the keystore password prompt: the answer
+    // depends only on the data dir, and a refusal must not cost a prompt first.
+    let store = open_client_store_for_buy(&chain.data_dir, chain.data_dir_source, "fetch")?;
 
     // One discovery-enabled endpoint, reused for probing and the delivery dial.
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
@@ -1309,7 +1338,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // the eth_call; only a first-ever pool (no row) pays the `usdc()` round-trip.
     // The reuse branch of `open_or_reuse_pool` already trusts this same
     // `state.token`, so this only makes the top-level value consistent with it.
-    let token = match cached_pool_token(&store, self_address)? {
+    let token = match cached_pool_token(&store, self_address, chain.payment_pool)? {
         Some(token) => token,
         None => contract
             .usdc()
@@ -3247,7 +3276,13 @@ where
         .call()
         .await
         .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
-    let state = BuyerPoolState::new(pool_id, pool.owner, token, U256::from(pool.deposit));
+    let state = BuyerPoolState::new(
+        pool_id,
+        *contract.address(),
+        pool.owner,
+        token,
+        U256::from(pool.deposit),
+    );
     let ctx = PoolContext::for_pool(&state, Arc::clone(signer), voucher_dom.clone())
         .with_provider(provider, prior_bytes, prior_amount)
         .with_capability(signed_capability);
@@ -3300,7 +3335,16 @@ pub(crate) async fn open_or_reuse_pool<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    if let Some(state) = store.get_by_owner(self_address)? {
+    // A row from another `PaymentPool` deployment is not this contract's pool,
+    // whatever its id says. `pool_id` is `keccak256(owner, ownerPoolNonce)` and a
+    // redeploy restarts that nonce, so the id alone will eventually name an
+    // existing, unrelated pool here — and its lane progress would seed the first
+    // voucher at a cumulative this pool has never redeemed against, paying the
+    // provider for bytes it never delivered. Ignore it and open a fresh pool.
+    if let Some(state) = store
+        .get_by_owner(self_address)?
+        .filter(|state| state.is_on(payment_pool_addr))
+    {
         let lane = LaneKey {
             pool_id: state.pool_id,
             signer: self_address,
@@ -3586,19 +3630,35 @@ mod tests {
         let store = RedbBuyerPoolStore::open(&dir.path().join("data"))?;
         let owner = Address::repeat_byte(0x11);
         let token = Address::repeat_byte(0x22);
+        let payment_pool = Address::repeat_byte(0x9c);
 
         // No row yet -> None -> caller must read usdc() on the open path.
-        assert_eq!(cached_pool_token(&store, owner)?, None);
+        assert_eq!(cached_pool_token(&store, owner, payment_pool)?, None);
 
         // Persist a pool row for this owner.
-        let state =
-            BuyerPoolState::new(B256::repeat_byte(0xAB), owner, token, U256::from(1_000u64));
+        let state = BuyerPoolState::new(
+            B256::repeat_byte(0xAB),
+            payment_pool,
+            owner,
+            token,
+            U256::from(1_000u64),
+        );
         store.record(&state)?;
 
         // Row present -> the immutable token comes back with no contract read.
-        assert_eq!(cached_pool_token(&store, owner)?, Some(token));
+        assert_eq!(cached_pool_token(&store, owner, payment_pool)?, Some(token));
         // A different owner has no row -> still None.
-        assert_eq!(cached_pool_token(&store, Address::repeat_byte(0x33))?, None);
+        assert_eq!(
+            cached_pool_token(&store, Address::repeat_byte(0x33), payment_pool)?,
+            None
+        );
+        // The row is the same, but it names another deployment's `usdc()`.
+        // Answering with it would approve and price the wrong token.
+        assert_eq!(
+            cached_pool_token(&store, owner, Address::repeat_byte(0xDE))?,
+            None,
+            "a row from another PaymentPool deployment must not seed the token cache"
+        );
         Ok(())
     }
 

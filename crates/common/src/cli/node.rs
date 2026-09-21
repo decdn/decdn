@@ -62,6 +62,19 @@ pub enum NodeCommand {
     /// without watching the chain directly. Same admin-URL resolution and
     /// timeout semantics as `decdn node health`.
     Slashes(SlashesArgs),
+    /// Print the running node's buyer-side `PaymentPool` state via
+    /// `admin_v1_pools` (#2078): every pool the node's buy leg tracks, the
+    /// deposit it believes each holds, and the per-lane amount it has already
+    /// signed away to each provider. This is the node's *spending* side — the
+    /// mirror of `decdn node lanes`, which reports what it has earned.
+    ///
+    /// The only way to read this state on a running node: the daemon holds an
+    /// exclusive lock on its `buyer.redb` for its whole lifetime, so no
+    /// command can open that file from disk while the node is up. `decdn pool
+    /// list` manages a **separate**, client-owned store and says nothing about
+    /// this one. Same admin-URL resolution and timeout semantics as
+    /// `decdn node health`.
+    Pools(PoolsArgs),
     /// Forcibly remove a single blob from the local cache (issue #279).
     /// The removal is permanent: the node never serves or re-fetches the hash
     /// again. Useful for DMCA takedown and storage reclamation.
@@ -333,6 +346,38 @@ pub struct SlashesArgs {
 
     /// Emit the admin response body as JSON instead of the human-readable
     /// summary + slash table.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Roundtrip timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
+}
+
+/// `decdn node pools` — read the node's buyer-side `PaymentPool` state via
+/// `admin_v1_pools` (#2078). Same admin-URL resolution and timeout semantics as
+/// `decdn node health`.
+#[derive(Args, Debug)]
+pub struct PoolsArgs {
+    /// Base URL of the node's admin HTTP surface.
+    ///
+    /// Also read from `DECDN_ADMIN_URL` when unset; clap folds the env
+    /// var into this field. If still unset, the admin port is derived
+    /// from `observability.admin_port` in the config file (see
+    /// `--config`). Example: `http://127.0.0.1:9191`.
+    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
+    pub admin_url: Option<String>,
+
+    /// Path to the TOML config file used to derive the admin URL when
+    /// `--admin-url` / `DECDN_ADMIN_URL` are unset. Takes precedence
+    /// over the top-level `decdn --config`; if neither is set,
+    /// resolution falls through to `~/.decdn/node.toml` and then the
+    /// built-in default port.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Emit the admin response body as JSON instead of the human-readable
+    /// summary + pool table.
     #[arg(long)]
     pub json: bool,
 

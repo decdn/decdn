@@ -65,8 +65,9 @@ impl WarnThrottle {
     /// the line is swallowed.
     ///
     /// Racing callers never both warn for one window: the loser of the
-    /// compare-exchange returns `None`, and the winner's count already includes
-    /// the loser's event, because every caller counts before it checks.
+    /// compare-exchange returns `None`, and its event is still counted — on the
+    /// winner's line or on the next one — because every caller counts before it
+    /// checks.
     pub(crate) fn admit(&self) -> Option<u64> {
         self.suppressed.fetch_add(1, Ordering::Relaxed);
         let now_ms = now_ms();
@@ -138,28 +139,92 @@ mod tests {
         assert!(!should_warn_now(500, 1_000_000, interval));
     }
 
-    /// Racing callers: exactly one warns per window, and its successor's count
-    /// covers every event the window swallowed. Kills a plain `store` in place
-    /// of the compare-exchange (two winners) and a `fetch_add` moved after the
-    /// gate (losers uncounted).
+    /// Racing callers: exactly one warns per window, and every event lands on
+    /// a line. The winner's `swap` races the losers' `fetch_add`s, so the
+    /// split between the winner's count and its successor's is scheduling-
+    /// dependent; their sum is not, and that is what the test pins. Kills a
+    /// `fetch_add` moved after the gate (losers uncounted) on every run, and a
+    /// plain `store` in place of the compare-exchange (two winners) only on
+    /// the runs where two threads land inside the load-to-store window.
     #[test]
     fn racing_callers_admit_one_line_and_count_every_event() {
+        const THREADS: usize = 8;
+        const EVENTS_PER_THREAD: u64 = 500;
         let throttle = WarnThrottle::new(Duration::from_mins(5));
         let admitted = std::sync::atomic::AtomicU64::new(0);
+        let reported = std::sync::atomic::AtomicU64::new(0);
+        // Release every thread at once so they contend for the first window,
+        // rather than the first-spawned thread finishing before the rest start.
+        let start = std::sync::Barrier::new(THREADS);
         std::thread::scope(|scope| {
-            for _ in 0..8 {
+            for _ in 0..THREADS {
                 scope.spawn(|| {
-                    for _ in 0..500 {
-                        if throttle.admit().is_some() {
+                    start.wait();
+                    for _ in 0..EVENTS_PER_THREAD {
+                        if let Some(suppressed) = throttle.admit() {
                             admitted.fetch_add(1, Ordering::Relaxed);
+                            reported.fetch_add(suppressed, Ordering::Relaxed);
                         }
                     }
                 });
             }
         });
-        assert_eq!(admitted.load(Ordering::Relaxed), 1);
+        assert_eq!(admitted.load(Ordering::Relaxed), 1, "one line per window");
         throttle.force_open();
-        assert_eq!(throttle.admit(), Some(3_999));
+        // Two lines in total: the winner's inside the scope and the successor's
+        // here. Every other event is counted on exactly one of them, so the two
+        // counts sum to every event but the two lines themselves.
+        let winner = reported.load(Ordering::Relaxed);
+        let expected = u64::try_from(THREADS)
+            .ok()
+            .map(|threads| threads * EVENTS_PER_THREAD - 1);
+        assert_eq!(
+            throttle.admit().map(|successor| winner + successor),
+            expected,
+            "the winner's count plus its successor's covers every swallowed event"
+        );
+    }
+
+    /// The gate is atomic: only the first event of a fresh throttle can race,
+    /// so the test above contends for it once per run and a plain `store` in
+    /// place of the compare-exchange survives most runs. Repeating the
+    /// first-window race on a fresh throttle each round, with a spin release
+    /// instead of a `Barrier` (whose condvar wake-up skew dwarfs the
+    /// load-to-store window), kills that mutant on every run.
+    #[test]
+    fn racing_first_events_never_both_warn() {
+        use std::sync::atomic::AtomicBool;
+
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 100;
+        for round in 0..ROUNDS {
+            let throttle = WarnThrottle::new(Duration::from_mins(5));
+            let admitted = std::sync::atomic::AtomicU64::new(0);
+            let ready = std::sync::atomic::AtomicUsize::new(0);
+            let go = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn(|| {
+                        ready.fetch_add(1, Ordering::Relaxed);
+                        while !go.load(Ordering::Relaxed) {
+                            std::hint::spin_loop();
+                        }
+                        if throttle.admit().is_some() {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+                while ready.load(Ordering::Relaxed) < THREADS {
+                    std::hint::spin_loop();
+                }
+                go.store(true, Ordering::Relaxed);
+            });
+            assert_eq!(
+                admitted.load(Ordering::Relaxed),
+                1,
+                "round {round}: exactly one racing first event warns"
+            );
+        }
     }
 
     /// The suppressed count IS the feature — it is what distinguishes one

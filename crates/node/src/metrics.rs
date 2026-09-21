@@ -180,8 +180,50 @@ pub struct DecdnMetrics {
     streams_active: Family<StreamLabels, Gauge>,
     /// Currently open inbound serve lanes (distinct `(pool, signer, provider)` keys).
     pub lanes_open: Gauge,
-    /// Total raw USDC deposits across the pools currently paying this node.
+    /// Raw USDC still recoverable from the pools currently paying this node:
+    /// `Σ (deposit − totalRedeemed)` over the distinct pools the redeemer
+    /// planned lanes against, refreshed once per redeemer self-tick beside
+    /// [`Self::unredeemed_usdc`]. Already-redeemed funds have left the pool, so
+    /// this is the ceiling those pools can still pay — not their lifetime
+    /// deposits. Operator-visible name: `decdn_pool_deposit_usdc`.
     pub pool_deposit_usdc: Gauge,
+    /// Raw USDC in this node's own buyer wallet — what it can still escrow as a
+    /// deposit when it opens a payment pool on its cache-miss leg.
+    ///
+    /// The buyer leg is the one part of the node that spends rather than earns,
+    /// and nothing else reports on it: an operator who never funds this wallet
+    /// sees a node that serves perfectly and silently buys nothing, because
+    /// every `openPool` reverts on the ERC-20 transfer.
+    ///
+    /// Read at bootstrap and once per reclaim sweep (`RECLAIM_SWEEP_INTERVAL`),
+    /// so it lags a spend — or an operator top-up, which is the reading that
+    /// matters — by up to that long.
+    ///
+    /// Zero is meaningful only on a node with
+    /// `cache.node_to_node_pull_through_enabled` on; a cache-only node never
+    /// opens a pool and has no reason to hold USDC.
+    pub buyer_wallet_usdc: Gauge,
+    /// `decdn_buyer_lane_seed_failures_total`: this node could not establish a
+    /// lane's already-paid watermark, so it refused the pull rather than
+    /// resuming the lane from zero.
+    ///
+    /// A lane resumed from zero is stranded permanently, not for one pull: the
+    /// pull persists its own progress on every exit path, which gives the lane a
+    /// local row and stops the reseed ever running for that provider again. The
+    /// node refuses instead, and this counts how often. A sustained rate means
+    /// the chain lane or the buyer store is unhealthy and this node is buying
+    /// nothing from the affected providers.
+    pub buyer_lane_seed_failures: Counter,
+    /// `decdn_buyer_pool_adoption_failures_total`: bootstrap could not tell
+    /// whether this node already owns a payment pool on chain, so it left the
+    /// first cache miss to open one.
+    ///
+    /// Every increment is a chance that the node escrows a second deposit beside
+    /// one it already holds. Adoption runs once per process, so this cannot
+    /// self-correct before the next restart. Pair with
+    /// `decdn_buyer_wallet_usdc`: the two together are what distinguishes "no
+    /// pool to adopt" from "could not look".
+    pub buyer_pool_adoption_failures: Counter,
     /// Total raw USDC this node holds in accepted vouchers that it has not yet
     /// redeemed on-chain — the sum of `owed − paid` across every inbound lane
     /// the redeemer plans to collect. Refreshed once per redeemer self-tick
@@ -541,6 +583,28 @@ pub struct DecdnMetrics {
     /// expected catch-up. Operator-visible name:
     /// `decdn_redemption_reconciled_skip_total`.
     pub redemption_reconciled_skip: Counter,
+    /// Pre-submit on-chain watermark batches that landed and were reconciled
+    /// against the chain. Counted once per `getWatermarks` batch that decoded,
+    /// so a redeem sweep over more lanes than the read batch caps contributes
+    /// one per batch. This is the *attempt* signal
+    /// `redemption_reconciled_skip` cannot give: that counter is legitimately
+    /// zero on a healthy sweep with nothing to drop, so zero alone cannot
+    /// separate "the reconciliation ran and found nothing" from "the
+    /// reconciliation never ran". Read the two together — a redeemer planning
+    /// lanes with this flat at zero is not reconciling at all. Operator-visible
+    /// name: `decdn_redemption_reconcile_ok_total`.
+    pub redemption_reconcile_ok: Counter,
+    /// Pre-submit on-chain watermark batches that did not land — an RPC error,
+    /// a `timed` timeout, or a return whose length did not match the batch.
+    /// Counted once per failed batch. The read is fail-open (the contract's own
+    /// `claimed <= w.amount` guard is the backstop), so a sustained rate costs
+    /// gas rather than correctness: the seller submits `redeemMany` batches it
+    /// never checked against the chain. A sustained non-zero rate means the
+    /// chain RPC is rejecting or timing out the batch read — check the
+    /// endpoint's `eth_call` response-size and gas ceilings against the read
+    /// batch size. Operator-visible name:
+    /// `decdn_redemption_reconcile_failures_total`.
+    pub redemption_reconcile_failures: Counter,
     /// Buyer-side reclaim-sweep attempts (`try_reclaim`) that failed — a failed
     /// `getChannel`/`reclaimExpired` RPC, a receipt wait, an on-chain revert, or
     /// a failed store write when clearing the local record after a reclaim/drop
@@ -785,23 +849,33 @@ pub struct DecdnMetrics {
     /// [`Outcome::RegionLatencyMismatch`]: decdn_reputation::Outcome::RegionLatencyMismatch
     pub node_region_latency_penalty: Counter,
     /// `decdn_node_pull_pool_open_failures_total` (#831): a buyer
-    /// `open_or_reuse_channel` failed before a pull could start. This is the
-    /// node's own payment-side fault (gas, RPC, expired channel), NOT the
+    /// `open_or_reuse_pool` failed before a pull could start. This is the
+    /// node's own payment-side fault (gas, RPC, expired pool), NOT the
     /// provider's — a sustained rate means node→node buying is wedged. This is
     /// the *unlabeled total* across all causes; the
     /// `pool_open_failures_*_total` family below (#966) breaks the
-    /// `openChannel`-tx failures out by cause so an operator can tell a
+    /// `openPool`-tx failures out by cause so an operator can tell a
     /// misconfiguration (`insufficient_deposit`) from infrastructure
     /// (`rpc_error`). It also covers store/expired-reclaim causes the by-reason
     /// family does not, so the two are not expected to sum equal.
+    ///
+    /// **One failure moves this counter once.** A site increments it if and only
+    /// if it marks the error `OpenReported`, which is what stops the classifier
+    /// in `node_origin` from restating a failure the open task already counted.
+    /// Against `node_pull_attempts_total` this reads above 1.0 legitimately: a
+    /// pull orchestration meters one attempt and may open a lane per candidate
+    /// and per assembled run. A clean 2× ratio is the signature of a leg that
+    /// meters without marking (#2072).
     pub node_pull_pool_open_failures: Counter,
     /// `decdn_pool_open_failures_insufficient_deposit_total` (#966): a buyer
-    /// `openChannel` tx reverted because the node's USDC balance/allowance could
+    /// `openPool` tx reverted because the node's USDC balance/allowance could
     /// not cover the deposit, or the deposit was zero — either as requested, or
     /// as the balance delta actually received under a fee-on-transfer token.
     /// Both zero cases revert the same argument-less `ZeroAmount`, so this
     /// counter cannot separate them; the wallet balance is what distinguishes a
-    /// misconfigured deposit from a token that shaved it. A *misconfiguration*
+    /// misconfigured deposit from a token that shaved it. A token that reverts
+    /// in the older `Error(string)` style lands here too, matched on its message
+    /// rather than a custom-error selector. A *misconfiguration*
     /// signal either way — the fix is operator-side (fund the wallet, raise the
     /// configured deposit), not infrastructure. A plain counter
     /// field carries no label dimension (a labeled series would need a `Family`),
@@ -811,13 +885,13 @@ pub struct DecdnMetrics {
     /// the `_total` suffix.
     pub pool_open_failures_insufficient_deposit: Counter,
     /// `decdn_pool_open_failures_contract_revert_total` (#966): a buyer
-    /// `openChannel` tx reverted on-chain for a reason other than insufficient
+    /// `openPool` tx reverted on-chain for a reason other than insufficient
     /// deposit (provider not active, a paused contract, a mined revert whose
     /// reason is not recoverable from the receipt). The deposit was not
     /// escrowed; the cause is on-chain state, not this node's wallet or RPC.
     pub pool_open_failures_contract_revert: Counter,
     /// `decdn_pool_open_failures_rpc_error_total` (#966): a buyer
-    /// `openChannel` submit or receipt wait failed at the transport layer (no
+    /// `openPool` submit or receipt wait failed at the transport layer (no
     /// revert data) — connectivity, a timed-out receipt, a nonce blip. A
     /// *transient infrastructure* signal; retrying typically clears it. Pair
     /// with the two reverting counters above to tell "operator under-funded the
@@ -1765,10 +1839,28 @@ impl Metrics {
         Arc::clone(&self.cache)
     }
 
-    /// Replace the inbound lane gauges with a snapshot from the live store.
-    pub(crate) fn set_inbound_lane_snapshot(&self, open: usize, deposit: U256) {
+    /// Publish the count of inbound lanes the node holds open.
+    ///
+    /// Lane-scoped on purpose: the pool deposit behind those lanes is a
+    /// pool-level on-chain quantity that no lane carries, so it is published
+    /// separately by [`Self::set_pool_deposit_usdc`] on the redeemer's tick.
+    /// A lane carries no pool deposit, so a lane-scoped caller could only ever
+    /// pass zero for one (#2072).
+    pub(crate) fn set_lanes_open(&self, open: usize) {
         self.decdn.lanes_open.set(sat(open));
-        self.decdn.pool_deposit_usdc.set(sat_u256(deposit));
+    }
+
+    /// Publish the on-chain value still recoverable from the pools currently
+    /// paying this node — `Σ (deposit − totalRedeemed)` over the distinct pools
+    /// the redeemer planned lanes against.
+    ///
+    /// Called once per redeemer self-tick beside
+    /// [`Self::set_unredeemed_usdc`], so the two money gauges share a cadence
+    /// and can be read against each other: `unredeemed` is what the node has
+    /// earned and not yet cashed, and this is the ceiling the pools can still
+    /// pay it.
+    pub(crate) fn set_pool_deposit_usdc(&self, remaining: U256) {
+        self.decdn.pool_deposit_usdc.set(sat_u256(remaining));
     }
 
     /// Publish the total raw USDC held in accepted-but-unredeemed vouchers.
@@ -1776,6 +1868,22 @@ impl Metrics {
     /// gauge tracks what the node plans to redeem as of the last interval.
     pub(crate) fn set_unredeemed_usdc(&self, total: U256) {
         self.decdn.unredeemed_usdc.set(sat_u256(total));
+    }
+
+    /// Publish the USDC balance of this node's own buyer wallet.
+    pub(crate) fn set_buyer_wallet_usdc(&self, balance: U256) {
+        self.decdn.buyer_wallet_usdc.set(sat_u256(balance));
+    }
+
+    /// Count a refused pull whose lane watermark could not be established.
+    pub(crate) fn buyer_lane_seed_failure(&self) {
+        self.decdn.buyer_lane_seed_failures.inc();
+    }
+
+    /// Count a bootstrap that could not determine whether this node already owns
+    /// a payment pool.
+    pub(crate) fn buyer_pool_adoption_failure(&self) {
+        self.decdn.buyer_pool_adoption_failures.inc();
     }
 
     /// Register iroh's transport metrics under the `decdn_iroh_` prefix so
@@ -2175,6 +2283,16 @@ recorders! {
     /// their claim value (the `redeemMany` no-op guard, avoided before it costs
     /// gas).
     redemption_reconciled_skip_by(n: u64) => redemption_reconciled_skip.inc_by(n);
+
+    /// A pre-submit on-chain watermark batch landed and was reconciled against
+    /// the chain — the attempt signal that makes a zero
+    /// `redemption_reconciled_skip` readable.
+    redemption_reconcile_ok => redemption_reconcile_ok.inc();
+
+    /// A pre-submit on-chain watermark batch did not land (RPC error, timeout,
+    /// or a mismatched return length). Fail-open: the lanes it could not read
+    /// are submitted unchanged.
+    redemption_reconcile_failure => redemption_reconcile_failures.inc();
 
     /// A buyer-side reclaim-sweep attempt (`try_reclaim`) failed — an RPC/receipt
     /// error, an on-chain revert, or a failed store write when clearing the local

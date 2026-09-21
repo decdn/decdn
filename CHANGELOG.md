@@ -28,6 +28,69 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Buyer pool rows are scoped to their `PaymentPool` deployment, and the
+  buyer table moves to `_v4` (#2087).** `PaymentPool.openPool` derives
+  `poolId = keccak256(owner, ownerPoolNonce)` — no contract address, no chain
+  id — and a fresh deployment restarts that nonce at zero, so the same owner's
+  Nth pool carries a byte-identical id on every deployment. A persisted row was
+  therefore ambiguous across a redeploy, and worse than ambiguous: once the
+  owner's nonce walked back over the tracked id, the row named an existing,
+  unrelated pool, and the node resumed lane progress the live pool had never
+  redeemed against — paying a provider for bytes it never delivered.
+  `BuyerPoolState` now carries `payment_pool`, every path that reuses a row
+  checks it (node bootstrap, the node's pull hot path, `decdn fetch`), and the
+  node drops a foreign row at bootstrap. **Both buyer tables move from `_v3` to
+  `_v4`, which orphans every row written by an earlier binary** — including
+  rows for pools on the configured contract. Those read as an empty store on
+  first boot: a node re-adopts from chain, and a client opens a fresh pool. A
+  deposit held by an orphaned row is recoverable only against the contract it
+  was opened on, and the bootstrap warning names that address. `payment_pool`
+  is now surfaced by `decdn pool list --json` and `admin_v1_pools`.
+
+- **CLI: `decdn fetch` and `decdn bundle pull` refuse a `decdn-node` data dir
+  they were not pointed at (#2082).** `decdn pool` already refused to escrow
+  into a daemon's data dir (#2078), but these two opened the client store on
+  the same resolved `data_dir` with no such check — and the keystore defaults
+  to that dir too, so on a node host they opened a client pool under the
+  **node's own operator address**. The daemon's stranded-pool report then names
+  a pool a human may be fetching against, and its adoption path can take that
+  pool over, putting two independent voucher watermarks on one lane. A human
+  buying on a node host is a legitimately separate client, so the rule is
+  weaker than `pool`'s: `--data-dir <node dir>` on the command line is accepted,
+  while arriving there implicitly — `identity.data_dir` from
+  `~/.decdn/node.toml`, which is the node's dir on a node host — is refused.
+  Scripts that ran a bare `decdn fetch` on a node host must add
+  `--data-dir <client dir>` (the usual intent) or name the node's dir
+  explicitly. The refusal runs before the keystore prompt. Recorded in
+  [ADR 012](adr/012-client.md) beside the store-split paragraph, where the
+  asymmetry was previously an omission rather than a decision.
+
+- **CLI: `decdn pool` refuses to write a store a `decdn-node` daemon owns
+  (#2078).** Every store-backed `pool` subcommand — `list`, `open`, `top-up`,
+  `close`, `reclaim`; `assign` touches no store — used
+  `<data_dir>/buyer-pools.redb`, the *client's* store. A daemon keeps its buyer state in `<data_dir>/buyer.redb`, so
+  on a node host the CLI read and wrote a different file than the node it was
+  pointed at — and `Database::create` manufactured that file where none existed.
+  A data dir containing any of the daemon's store files (`buyer.redb`,
+  `lanes.redb`, `settle.redb`, `checkpoint.redb` — the whole set, because the
+  buyer store is exactly the file a reset loses) is now recognized as a
+  daemon's:
+  `pool open` and `pool top-up` refuse (they escrow USDC into a store the node
+  never reads, which is exactly the stranded deposit #2075 exists to prevent);
+  `close --all` and `reclaim --all` refuse (they enumerate from chain by keystore
+  address, so they would close the pool the daemon is paying from right now);
+  `close --pool` and `reclaim --pool` still run their on-chain leg — the stranded
+  pool recovery path — but no longer report a no-op local `forget` as a clean
+  close, naming the daemon row they could not touch instead. `pool list` routes to
+  the daemon (see Added) and prints `store=<path>` above the table, so `pools=0`
+  names the file that produced it. `pool list --json` gains `store` and `source`
+  fields instead; read `source` before the pool objects, because the two stores
+  emit different shapes (`deposit_usdc` as a decimal string and lowercase
+  addresses from the client store, `deposit_micro_usdc` as a number and EIP-55
+  addresses from the daemon). `decdn node pools` names the admin URL it asked.
+  Scripts that ran `pool open` against a node config must stop: the daemon opens
+  and tops up its own pool from `blockchain.buyer_working_deposit_micro_usdc`.
+
 - **Cache: `Origin::fetch_range` is now the data-only `Origin::fetch_range_data`
   (#2065).** The outboard comes from `Origin::fetch_outboard`, read once per fill.
   A custom `Origin` that overrode `fetch_range` must implement both methods;
@@ -735,6 +798,142 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+- **CLI: `decdn whoami` reports a keystore the shared password does not open
+  (#2008).** The command resolved one password and applied it to both
+  `<data_dir>/keystore.json` and `<data_dir>/client/keystore.json`. `key-gen`
+  writes those at different times and prompts for each, so they can hold
+  different passwords — and when they did, the first `Mac Mismatch` aborted the
+  whole command. Nothing printed: not the node id, not the key paths, not the
+  address of the keystore whose password was correct. The shared password is
+  still tried first; a keystore it does not open now degrades its own line to a
+  note naming the keystore and the reason, and on a TTY that keystore gets one
+  prompt of its own before the note. Every other line still prints and the
+  command exits 0, which is what its documented ordering already promised for
+  the node id and the paths.
+
+- **CLI/node: `decdn doctor` checks the store files a daemon actually owns
+  (#2083).** `doctor` kept a private copy of the daemon's store-file list and
+  it had drifted: it reported on a `floor-loss.redb` that nothing creates, and
+  a fifth daemon store would have been checked by nothing. The list now comes
+  from `decdn_common::data_dir::DAEMON_STORE_FILES` plus `CLIENT_BUYER_DB_FILE`,
+  the same names the daemon's own store and the client store use. A new
+  `channel_store` test asserts that opening `PersistentPoolStateStore` creates
+  every file in that set and no `.redb` outside it, which turns the premise
+  `daemon_marker` — and with it the node-vs-client classification from #2078 —
+  rests on into a checked fact.
+
+- **Node: bootstrap distinguishes "this pool is not open" from "its status could
+  not be read" (#2078).** The stale-row drop below judged a tracked pool by its
+  absence from the set of pools read as `Open`, and a `getPool` call that faulted
+  produced the same absence. One transient RPC error at bootstrap — there is no
+  retry on that call — would therefore delete the node's only record of a funded
+  pool, and the next miss would escrow a second deposit: the #2072 failure,
+  self-inflicted, and invisible because the stranded-pool report cannot name a
+  pool it failed to read either. A row is now dropped only on a successful read
+  that returned a non-`Open` status. An id `getPools` does not list also counts
+  as unknown: that view derives ids from `ownerPoolNonce` and `closePool` /
+  `reclaim` only change a pool's status, so it is append-only and an absent id
+  has no on-chain producer.
+
+- **Node: a buyer-pool row the chain no longer lists as open wedged the buy leg
+  (#2078).** `reuse_or_report` reads the tracked row without a status check, and
+  bootstrap answered `AlreadyTracked` for any row at all, so a pool closed or
+  reclaimed out of band — which is what `decdn pool close --pool` from a node
+  host leaves behind, since it cannot write the daemon's store — pinned every
+  later pull to a pool `redeemMany` rejects every voucher against. Restarting
+  did not help. Bootstrap now checks the tracked pool against the chain's open
+  set, drops a stale row, and adopts or opens a replacement.
+
+- **Node: a node with an intact buyer store never reported its stranded pools
+  (#2078).** `reconcile_owned_pool` returned as soon as the store named a tracked
+  pool, before it enumerated `getPools` — so `report_stranded_pools` was reachable
+  only on the adoption path. The steady state (store intact, a deposit stranded by
+  an earlier build) was therefore permanently silent, and only a direct `getPools`
+  read surfaced it. The enumeration now runs on every bootstrap, and the stranded
+  set is measured against the pool the *store* names rather than the one an
+  adoption would have selected. A fully-redeemed `Open` pool is no longer listed:
+  `reclaim` refunds `deposit - totalRedeemed`, so there is nothing to recover.
+  `decdn_buyer_pool_adoption_failures_total` is deliberately **not** widened — an
+  enumeration failure on the already-tracked path warns instead, because the
+  counter means "about to open a second pool" and that path never is.
+
+- **Node: the pre-redeem watermark reconciliation never decoded on a chain
+  without Multicall3 (#2076).** The seller's last gas check before a `redeemMany`
+  batched its per-lane `getWatermark` reads through Multicall3 at
+  `0xcA11bde05977b3631167028862bE2a173976CA11` — a contract the protocol neither
+  deploys nor verifies. Where it is absent, including every `anvil` chain, the
+  `eth_call` returned empty, alloy decoded the empty buffer as `ABI decoding
+  failed: buffer overrun`, and the fail-open arm submitted the plans unchanged on
+  every sweep. It stayed silent because the contract's own `claimed <= w.amount`
+  guard makes an already-redeemed lane a harmless no-op, so the only symptom was
+  wasted gas. The read is now `PaymentPool.getWatermarks(bytes32[], address[],
+  address[])`, the batch companion to `getWatermark`: one `eth_call` per batch of
+  at most 512 lanes, against the protocol's own deployment. A failed or
+  short-returning batch keeps the prefix already read instead of discarding the
+  whole result, and a return whose length does not match the batch fails that
+  batch rather than pairing values it cannot trust. Each batch now meters itself
+  as `decdn_redemption_reconcile_ok_total` /
+  `decdn_redemption_reconcile_failures_total`, with a `DecdnWatermarkReconcileFailing`
+  alert — a zero `decdn_redemption_reconciled_skip_total` alone cannot separate a
+  healthy sweep from a read that never landed, which is what let this hide. This
+  is an **additive contract-surface change** — one new view selector on
+  `PaymentPool`; no storage layout, event or write path changes.
+
+- **Node: a reset buyer-pool store stranded the node's deposit and wedged every
+  node-to-node pull (#2072).** The buyer store was the only record that the node
+  owned a `PaymentPool` deposit, so a moved or re-provisioned `identity.data_dir`
+  lost it. The node then opened a second deposit beside the first, forgot that one
+  too, and once the wallet was drained every cache-miss pull failed
+  `ERC20: transfer amount exceeds balance` with its own escrow sitting idle
+  on-chain — contradicting ADR 003 §node→node ("a pool is opened once and reused",
+  "owner funds are never stranded"). `BuyerPoolService::bootstrap` now reconciles
+  against `PaymentPool.getPools` and adopts the newest `Open` pool the owner
+  already holds; adoption failure is soft, leaving the first miss to open one the
+  old way. A lane with no local progress reseeds from the contract's
+  `watermark(pool, signer, provider)`, because `PoolLedger` signs `prior + accrued`
+  and resuming a paid lane from zero signs cumulatives the contract pays nothing
+  for. That read **refuses the pull** on failure rather than degrading: the pull
+  persists its own progress on every exit path, so a zero-resumed lane gains a
+  local row and the reseed never runs for that provider again — one RPC blip
+  would strand the lane permanently. A fully-redeemed pool is skipped (it is
+  still `Open` on chain, and adopting one would wedge buying against a deposit
+  that funds no voucher), and any further open pools are named in the log so
+  their deposits are recoverable. `enumerate_owned_pools` moved from `decdn-cli`
+  to `decdn_incentive::payment_pool` so both binaries share one pager.
+
+- **Node: one failed `openPool` moved `node_pull_pool_open_failures_total` twice,
+  and blamed the wrong host (#2072).** `run_open`'s `openPool` leg metered the
+  counter without marking the error `OpenReported`, so the `node_origin` classifier
+  counted it again in its residual arm — the live fleet read 46 pool-open failures
+  against 23 pull attempts. That fall-through also scored a chain revert as
+  `node_pull_local_fault_total` and logged "suspect this node's store or lock
+  state" for an on-chain failure. The leg now meters once where it is raised,
+  marks `OpenReported`, and adds `LocalPullFault` for the failures that no other
+  provider can answer. `openPool` names no provider, so neither an unfunded
+  wallet nor a chain lane that cannot carry the transaction varies per candidate:
+  both now refuse rather than walking the candidate list and then reporting the
+  blob absent. A `ContractRevert` still walks on. The join-error leg meters too,
+  which is what makes the "meters iff marks `OpenReported`" invariant true rather
+  than merely documented. The ladder's arm choice is a pure
+  `classify_pool_open_arm`, so the one-increment invariant is unit tested.
+
+- **Incentive: an under-funded wallet was classified `contract_revert` (#2072).**
+  `PoolOpenFailureReason` matched only `OpenZeppelin` v5 custom errors, so a USDC
+  that reverts `Error("ERC20: transfer amount exceeds balance")` — the deployed
+  Sepolia token — reported as an opaque on-chain fault naming no remedy. String
+  reverts now classify as `insufficient_deposit` on their message.
+
+- **Metrics: `decdn_pool_deposit_usdc` was hardcoded to zero (#2072).** Both
+  callers of the seller-side lane snapshot passed `U256::ZERO`, because a lane
+  carries no pool deposit — the gauge has read zero since #1667 while
+  `adr/appendix-observability.md` documented it `live`, and the name gate only
+  checks that a series is exported, not that anything sets it. The redeemer tick
+  now publishes `Σ (deposit − totalRedeemed)` over the pools it plans lanes
+  against, beside `decdn_unredeemed_usdc`; the lane count gets its own
+  `set_lanes_open`. The publish is skipped when nothing is pending redemption —
+  the healthy steady state — so the gauge does not sawtooth to zero after every
+  successful sweep and read as insolvent counterparties.
 
 - **Cache: origin range pulls held the whole requested span in memory — twice
   (#2065).** A few multi-GB range requests against a partially held blob OOM-killed
@@ -1767,6 +1966,115 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+- **CLI: `decdn pool list --all` shows every pool the keystore owns on chain
+  (#2077).** `pool list` read only the local buyer store, so it could not show
+  a pool whose store row was gone — precisely the situation an operator runs it
+  in. A reset `identity.data_dir` loses the only local record of a funded
+  deposit, and the default listing then prints nothing, because the file it
+  reads is the file that went missing. `--all` enumerates
+  `PaymentPool.getPools` by the keystore address and prints every pool in every
+  lifecycle state with its on-chain `deposit`, `totalRedeemed` and reclaim
+  window, marking which ones the local record tracks. Every local read on this
+  path is read-only: `--all` sends no transaction, writes no pool record, and
+  manufactures no store — creating one and reporting its emptiness is the #2078
+  defect, and it would make a lost store indistinguishable from a store that
+  tracks nothing. `TRACKED` distinguishes `no` from `?`: a pool the local record
+  cannot answer for — an unreadable store, or a row that will not decode — is
+  unknown rather than untracked, because the remedies differ (a lost store
+  versus a record to repair) and one bad row must not blank the verdict for the
+  pools either side of it. A store that will not open is named on stderr with
+  the reason, and the table carries `local_store=read|unreadable` so the
+  distinction is not `--json`-only. Unlike `close --all` / `reclaim --all` it is
+  **not** refused on a node's data dir — those two write, this one reads, and a
+  node host is where it is most needed. `--json` emits a third document shape
+  with `source: "chain"`; read `source` before `pools`, as with the other two.
+  `PoolListArgs` now flattens `PoolChainArgs`, matching `close` and `reclaim`:
+  `--data-dir` is unchanged and the chain flags are new, read only by `--all`.
+  The `docs/runbook.md` stranded-pool section that was written around this gap
+  now uses it.
+
+- **CLI: `decdn pool list` reads a stopped node's `buyer.redb` off disk
+  (#2084).** #2081 routed the listing on a node data dir through
+  `admin_v1_pools` and deliberately did not fall back to the client store,
+  which left a stopped node's buyer store readable by nothing — no route for a
+  post-mortem after a crash, or for a host down for maintenance. `redb` holds
+  its process-exclusive lock only for the lifetime of an open `Database`, so on
+  a refused admin connection the CLI now tries a read-only open of the daemon's
+  own `buyer.redb`. It opens, so no daemon holds it: the listing renders with
+  `store=… (read from disk; no daemon running)` and `source=node_store_offline`
+  under `--json` — its own value, never the client store's. It is write-locked,
+  so a daemon **is** running: the error says the admin URL or `admin_port` is
+  wrong rather than telling the operator to start a node that is already up.
+  Anything else keeps the previous error with the disk read's reason appended.
+  New `decdn_incentive::buyer_pool_redb::ReadOnlyBuyerPoolStore` takes a file
+  path rather than a data dir and never creates, which is what keeps #2078
+  closed; a `redb` database left unrepaired by a crash reports the new
+  `StoreError::NeedsRepair`, naming the one fix (start the daemon once). Only a
+  refused connection takes this route — a timeout or a JSON-RPC error means the
+  daemon answered, so neither goes near the file.
+
+- **Admin/CLI: `admin_v1_pools` and `decdn node pools` read the node's buyer-side
+  `PaymentPool` state (#2078).** The buyer-side counterpart of `admin_v1_lanes` /
+  `decdn node lanes`: every pool the buy leg tracks, the deposit it believes each
+  holds, and the per-lane amount already signed away to each provider. This is the
+  *only* read path to that state on a running node — `redb` holds a
+  process-exclusive lock on `buyer.redb` for the daemon's lifetime, so no other
+  process can open it, not even read-only. A node with no `[blockchain]` wiring
+  answers `BUYER_POOL_UNAVAILABLE_CODE` (`-32011`) rather than an empty list,
+  because "this node never pays for pulls" and "this node owns no pools" send an
+  operator hunting a stranded deposit in opposite directions; a store read failure
+  answers `BUYER_POOL_STORE_ERROR_CODE` (`-32010`). `decdn pool list` gains
+  `--admin-url` and `--timeout-ms`, used only when the data dir turns out to be a
+  daemon's.
+
+- **Metrics: the buyer leg reports itself (#2072).** New gauge
+  `decdn_buyer_wallet_usdc`, read once per reclaim sweep and at bootstrap, plus
+  two counters for the states that silently cost USDC:
+  `decdn_buyer_lane_seed_failures_total` (pulls refused because a lane's
+  already-paid watermark could not be established) and
+  `decdn_buyer_pool_adoption_failures_total` (bootstraps that could not tell
+  whether this node already owns a pool, and so are about to open a second). The
+  buyer leg is the one part of the node that spends rather than earns, and
+  nothing reported on it: an operator who never funded the wallet saw a node that
+  served perfectly and silently bought nothing. Two alerts go with it —
+  `DecdnBuyerWalletUnfunded` (below one working deposit, scoped to nodes that
+  actually pull) and `DecdnNodePullNeverSucceeds` (attempts with no success over
+  6h), plus a `docs/runbook.md` section covering wallet funding and recovering a
+  pool the node has forgotten.
+
+- **Metrics: the serve path reports its own cache hit rate.** New siblings
+  `decdn_serve_cache_{hit,partial_hit,miss}_total`, bumped at the
+  blob-availability gate in the client dispatch path — ahead of the load-shed
+  admission, so the ratio stays a property of the store rather than of current
+  pressure. Exactly one of the three fires per request reaching the gate; a
+  withdrawn hash is refused before it and counts in none.
+  - These exist because `decdn_cache_hits_total` and
+    `decdn_cache_bytes_returned_total` are scoped to `CacheEngine::get`, the
+    whole-blob buffered read the paid serve path never calls — it streams
+    through `export_bao_range_stream` instead. A node serving only paying
+    clients therefore holds both at zero under full production load — while
+    `decdn_cache_misses_total`, which the fill tiers bump too, keeps climbing,
+    so the pair reads as a populated permanent 0% rather than an empty series, so the fleet dashboard's hit-ratio panel read a permanent
+    0% and its throughput panel plotted a flat-zero series as "served". The
+    registry rows for the `get`-scoped counters now say so, and the panels read
+    `decdn_bytes_served_total` for delivered bytes.
+  - `decdn_serve_cache_partial_hit_total` is counted apart from the plain hit so
+    the payoff of partial-holder advertisement (ADR 038) stays legible; both are
+    hits for hit-rate purposes.
+
+- **Monitoring: unattributed stream failures and pull success rate are on the
+  dashboards.** The fleet overview and the delivery dashboard gain a residual
+  panel — `rate(decdn_streams_failed_total{direction="inbound"})` minus the 22
+  seller-leg counters that each end exactly one inbound stream — which makes a failure mode that no counter names
+  visible as a step change. The overview also promotes node-to-node pull success
+  rate, so a pull leg failing every attempt reads as a ratio pinned at zero
+  rather than as low traffic. `decdn_serve_stream_rejected_bad_binding_total` and
+  `decdn_node_pull_pool_open_failures_total` join the refusal and pull-failure
+  breakdowns they were missing from, and eleven further exported-but-unplotted
+  series (probe read faults, the fee-shares watcher downtime/restart pair, the
+  reconciled-redemption skip, the per-peer rate-limit prune sweeps and the iroh
+  path-composition family) land on their existing panels.
 
 - **Metrics: stream outcomes, byte volume, on-chain transactions and DHT
   health are exported, and the gaps they expose now alert.** New series:

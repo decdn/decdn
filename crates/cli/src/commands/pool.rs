@@ -15,26 +15,33 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::signers::local::PrivateKeySigner;
+use anyhow::Context as _;
 use decdn_client_pull::buyer_pool::{
     ToppedUpPool, ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool,
     top_up, topped_up_effect,
 };
+use decdn_common::admin::{AdminRpcClient as _, BuyerPoolsResponse};
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore};
-use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
+use decdn_incentive::buyer_pool_redb::{ReadOnlyBuyerPoolStore, RedbBuyerPoolStore};
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
-use decdn_incentive::payment_pool::PaymentPool;
+use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
 use decdn_incentive::{Capability, CapabilityGrant, PoolId, voucher_domain};
 use serde::Serialize;
 
 use decdn_client_pull::provider;
 
+use super::buyer_store::{
+    BuyerStoreOwner, classify_buyer_store, client_buyer_db, node_buyer_db,
+    open_client_store_for_escrow,
+};
+
 /// Dispatch `decdn pool <subcommand>`.
 pub async fn pool_dispatch(args: &cli::PoolArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     match &args.command {
-        cli::PoolCommand::List(a) => list(a, config_path),
+        cli::PoolCommand::List(a) => list(a, config_path).await,
         cli::PoolCommand::Open(a) => open(a, config_path).await,
         cli::PoolCommand::TopUp(a) => top_up_cmd(a, config_path).await,
         cli::PoolCommand::Close(a) => close(a, config_path).await,
@@ -152,9 +159,12 @@ fn ensure_owned(on_chain_owner: Address, ours: Address, pool_id: PoolId) -> anyh
 /// per-provider open.
 async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
+    // Before chain coordinates are even resolved, and so before the keystore
+    // prompt: escrowing into a store the daemon never reads is the failure,
+    // not a degraded outcome, and the answer depends only on the data dir.
+    let data_dir = resolve_data_dir(args.chain.data_dir.clone(), &file)?;
+    let store = open_client_store_for_escrow(&data_dir, "open a pool")?;
     let chain = resolve_chain(&args.chain, &file)?;
-
-    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
     let signer = Arc::new(load_buyer_signer(&chain)?);
     let owner = signer.address();
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
@@ -204,10 +214,10 @@ struct PoolOpenJson {
 /// `decdn pool top-up`: add funds to a pool the caller owns (`topUp`).
 async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
+    let data_dir = resolve_data_dir(args.chain.data_dir.clone(), &file)?;
+    let store = open_client_store_for_escrow(&data_dir, "top up a pool")?;
     let chain = resolve_chain(&args.chain, &file)?;
     let pool_id = parse_pool_id(&args.pool)?;
-
-    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
     let signer = Arc::new(load_buyer_signer(&chain)?);
     let owner = signer.address();
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
@@ -243,6 +253,103 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
         grade_deposit_credit(store.add_deposit(owner, pool_id, credited), &effect, tx)?;
     println!("topped up pool {pool_id} by {credited} µUSDC; deposit now {new_deposit} µUSDC");
     Ok(())
+}
+
+/// Where a landed `closePool` / `reclaim` records that the pool is gone.
+///
+/// The on-chain leg of both is identical either way; only the local
+/// bookkeeping differs, and on a daemon's data dir there is none the CLI can
+/// legitimately do (#2078).
+#[derive(Debug, Clone, Copy)]
+enum LocalBookkeeping<'a> {
+    /// Clear the row in the client store this CLI owns.
+    Store(&'a RedbBuyerPoolStore),
+    /// A `decdn-node` daemon owns this data dir. `decdn pool` has no code path
+    /// to that daemon's `buyer.redb`, so its row stays as it is and the
+    /// operator is told so — the alternative, a no-op `forget` graded as a
+    /// clean close, is the silent lie this variant exists to remove.
+    DaemonOwned(&'a Path),
+}
+
+impl LocalBookkeeping<'_> {
+    /// Build from the store the command opened: `None` means the data dir is a
+    /// daemon's, so `buyer_db` names the file that was left untouched.
+    const fn new<'a>(
+        store: Option<&'a RedbBuyerPoolStore>,
+        buyer_db: &'a Path,
+    ) -> LocalBookkeeping<'a> {
+        match store {
+            Some(store) => LocalBookkeeping::Store(store),
+            None => LocalBookkeeping::DaemonOwned(buyer_db),
+        }
+    }
+
+    /// Say, on stderr, that the daemon's row survives and what to do about it.
+    /// The on-chain state has already changed, so this is not a warning the
+    /// operator may ignore: the daemon still believes it owns a live pool.
+    fn report_daemon_row_untouched(buyer_db: &Path, pool_id: PoolId, verb: &str) {
+        eprintln!(
+            "warning: pool {pool_id} {verb} on-chain, but the daemon's row in {} was NOT \
+             cleared — `decdn pool` writes only the client store, and a running decdn-node holds \
+             its own exclusively. Run `decdn node pools`: if that pool is listed, the daemon is \
+             still using it — restart decdn-node so its bootstrap reconciles against the chain.",
+            buyer_db.display()
+        );
+    }
+
+    /// Clear the row after a mined `closePool`.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the client store faulted — see [`grade_local_forget`].
+    fn forget_after_close(
+        self,
+        owner: Address,
+        pool_id: PoolId,
+        tx: TxHash,
+        reclaim_note: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Store(store) => grade_local_forget(
+                store.forget_if_pool(owner, pool_id),
+                pool_id,
+                tx,
+                reclaim_note,
+            ),
+            Self::DaemonOwned(buyer_db) => {
+                Self::report_daemon_row_untouched(buyer_db, pool_id, "closed");
+                Ok(())
+            }
+        }
+    }
+
+    /// Clear the row after a mined `reclaim`. Best-effort on both arms: the
+    /// refund itself already landed.
+    fn forget_after_reclaim(self, owner: Address, pool_id: PoolId) {
+        match self {
+            Self::Store(store) => {
+                // `Ok(false)` costs nothing: reclaim is permissionless and the
+                // row is legitimately absent after a `pool close` or a prior
+                // reclaim. An `Err` is not free — the row may survive pointing
+                // at a pool that is now `Closed`, whose `deposit` field still
+                // reads healthy, so a later fetch reuses it and signs vouchers
+                // `redeemMany` rejects outright. Warn rather than fail: the
+                // refund itself landed, and re-running the reclaim is what
+                // clears the row.
+                if let Err(e) = store.forget_if_pool(owner, pool_id) {
+                    eprintln!(
+                        "warning: pool {pool_id} reclaimed on-chain but clearing it from the \
+                         local store failed: {e}; if the row survived, a later fetch reuses this \
+                         closed pool and its vouchers are rejected — re-run `decdn pool reclaim \
+                         --pool {pool_id}` to clear it"
+                    );
+                }
+            }
+            Self::DaemonOwned(buyer_db) => {
+                Self::report_daemon_row_untouched(buyer_db, pool_id, "reclaimed");
+            }
+        }
+    }
 }
 
 /// Grade the local row-clear that follows a mined `closePool`.
@@ -392,39 +499,6 @@ fn batch_result(tally: &BatchTally, verb: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Every pool id this `owner` has opened, read from chain oldest-first by paging
-/// `getPools`. Chain-authoritative: unlike the local buyer store (which drops a
-/// row at close), this enumerates pools in every lifecycle state, which is what
-/// `--all` needs to reach historical `Closing` pools awaiting reclaim.
-async fn enumerate_owned_pools<P>(
-    contract: &PaymentPool::PaymentPoolInstance<P>,
-    owner: Address,
-) -> anyhow::Result<Vec<PoolId>>
-where
-    P: alloy::providers::Provider + Clone,
-{
-    // `getPools` clamps `limit` to the remaining count and returns an empty page
-    // once `offset` passes the owner's nonce, so a short page ends the walk
-    // without a separate `ownerPoolNonce` read.
-    const PAGE: usize = 256;
-    let mut ids = Vec::new();
-    let mut offset: u64 = 0;
-    loop {
-        let page = contract
-            .getPools(owner, U256::from(offset), U256::from(PAGE))
-            .call()
-            .await
-            .map_err(|e| anyhow::anyhow!("getPools(offset={offset}) failed: {e}"))?;
-        let n = page.len();
-        ids.extend(page);
-        if n < PAGE {
-            break;
-        }
-        offset = offset.saturating_add(u64::try_from(n)?);
-    }
-    Ok(ids)
-}
-
 /// Send `closePool(pool_id)`, wait for the receipt, and on success clear the
 /// local buyer row so a later fetch opens a fresh pool. Ownership and `Open`
 /// status are the caller's responsibility. Returns the reclaim note shared by
@@ -436,7 +510,7 @@ where
 /// reverted, or the local row-clear faulted after a landed close.
 async fn close_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
-    store: &RedbBuyerPoolStore,
+    store: LocalBookkeeping<'_>,
     owner: Address,
     pool_id: PoolId,
 ) -> anyhow::Result<String>
@@ -473,12 +547,7 @@ where
             // One note for both the success line and the failure, so the two
             // cannot drift into different instructions for the same deadline.
             let reclaim_note = format!("run `decdn pool reclaim --pool {pool_id}` {deadline_note}");
-            grade_local_forget(
-                store.forget_if_pool(owner, pool_id),
-                pool_id,
-                receipt.transaction_hash,
-                &reclaim_note,
-            )?;
+            store.forget_after_close(owner, pool_id, receipt.transaction_hash, &reclaim_note)?;
             Ok(reclaim_note)
         }
         TxOutcome::Reverted => anyhow::bail!(
@@ -499,7 +568,7 @@ where
 /// row-clear only warns — the refund itself landed.
 async fn reclaim_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
-    store: &RedbBuyerPoolStore,
+    store: LocalBookkeeping<'_>,
     owner: Address,
     pool_id: PoolId,
 ) -> anyhow::Result<()>
@@ -523,21 +592,7 @@ where
 
     match receipt_outcome(receipt.status()) {
         TxOutcome::Landed => {
-            // `Ok(false)` costs nothing: reclaim is permissionless and the row
-            // is legitimately absent after a `pool close` or a prior reclaim.
-            // An `Err` is not free — the row may survive pointing at a pool
-            // that is now `Closed`, whose `deposit` field still reads healthy,
-            // so a later fetch reuses it and signs vouchers `redeemMany`
-            // rejects outright. Warn rather than fail: the refund itself
-            // landed, and re-running the reclaim is what clears the row.
-            if let Err(e) = store.forget_if_pool(owner, pool_id) {
-                eprintln!(
-                    "warning: pool {pool_id} reclaimed on-chain but clearing it from the local \
-                     store failed: {e}; if the row survived, a later fetch reuses this closed \
-                     pool and its vouchers are rejected — re-run `decdn pool reclaim --pool \
-                     {pool_id}` to clear it"
-                );
-            }
+            store.forget_after_reclaim(owner, pool_id);
             Ok(())
         }
         TxOutcome::Reverted => anyhow::bail!(
@@ -553,20 +608,28 @@ where
 /// pool this keystore owns; `--pool` closes exactly one.
 async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
-    let chain = resolve_chain(&args.chain, &file)?;
     // Parse the target id before any store/keystore/provider work, so a
     // malformed `--pool` fails fast without touching the chain. `None` is the
     // `--all` sweep (clap's arg group guarantees exactly one of the two).
     let target = args.pool.as_deref().map(parse_pool_id).transpose()?;
 
-    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
+    let store_owner = classify_buyer_store(&resolve_data_dir(args.chain.data_dir.clone(), &file)?);
+    if target.is_none() {
+        // `--all` enumerates from chain, not from the store, so on a node data
+        // dir it would close the pool the daemon is paying from right now.
+        store_owner.refuse_sweep("close")?;
+    }
+    let chain = resolve_chain(&args.chain, &file)?;
+    let store = store_owner.open_for_write()?;
+    let buyer_db = node_buyer_db(&chain.data_dir);
+    let books = LocalBookkeeping::new(store.as_ref(), &buyer_db);
     let signer = Arc::new(load_buyer_signer(&chain)?);
     let owner = signer.address();
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentPool::new(chain.payment_pool, rpc);
 
     let Some(pool_id) = target else {
-        return close_all(&contract, &store, owner).await;
+        return close_all(&contract, books, owner).await;
     };
 
     let pool = contract
@@ -580,7 +643,7 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
         "pool {pool_id} is not Open — nothing to close (already closing or closed)"
     );
 
-    let reclaim_note = close_and_forget(&contract, &store, owner, pool_id).await?;
+    let reclaim_note = close_and_forget(&contract, books, owner, pool_id).await?;
     println!("closed pool {pool_id}; dispute window open — {reclaim_note}");
     Ok(())
 }
@@ -590,7 +653,7 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
 /// the exit code is nonzero only if any pool failed.
 async fn close_all<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
-    store: &RedbBuyerPoolStore,
+    store: LocalBookkeeping<'_>,
     owner: Address,
 ) -> anyhow::Result<()>
 where
@@ -648,23 +711,29 @@ where
 /// whose window has elapsed; `--pool` reclaims exactly one.
 async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
-    let chain = resolve_chain(&args.chain, &file)?;
     // Parse the target id before any store/keystore/provider work, so a
     // malformed `--pool` fails fast without touching the chain. `None` is the
     // `--all` sweep (clap's arg group guarantees exactly one of the two).
     let target = args.pool.as_deref().map(parse_pool_id).transpose()?;
 
-    let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
+    let store_owner = classify_buyer_store(&resolve_data_dir(args.chain.data_dir.clone(), &file)?);
+    if target.is_none() {
+        store_owner.refuse_sweep("reclaim")?;
+    }
+    let chain = resolve_chain(&args.chain, &file)?;
+    let store = store_owner.open_for_write()?;
+    let buyer_db = node_buyer_db(&chain.data_dir);
+    let books = LocalBookkeeping::new(store.as_ref(), &buyer_db);
     let signer = Arc::new(load_buyer_signer(&chain)?);
     let owner = signer.address();
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentPool::new(chain.payment_pool, rpc);
 
     let Some(pool_id) = target else {
-        return reclaim_all(&contract, &store, owner).await;
+        return reclaim_all(&contract, books, owner).await;
     };
 
-    reclaim_and_forget(&contract, &store, owner, pool_id).await?;
+    reclaim_and_forget(&contract, books, owner, pool_id).await?;
     println!("reclaimed pool {pool_id}; residual deposit refunded to its owner");
     Ok(())
 }
@@ -676,7 +745,7 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
 /// the exit code is nonzero only if any pool failed.
 async fn reclaim_all<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
-    store: &RedbBuyerPoolStore,
+    store: LocalBookkeeping<'_>,
     owner: Address,
 ) -> anyhow::Result<()>
 where
@@ -967,19 +1036,355 @@ impl OwnerVerdict {
 }
 
 /// `decdn pool list` / `status`: read-only dump of the tracked buyer pools and
-/// their per-lane voucher watermark. Reads only the buyer store — no chain,
-/// keystore, or network access.
-fn list(args: &cli::PoolListArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
-    let data_dir = match args.data_dir.clone() {
+/// their per-lane voucher watermark.
+///
+/// Names the store it read, always. There are two, in the same directory and
+/// with the same table format but no other relation: the CLI's own
+/// `buyer-pools.redb` and a daemon's `buyer.redb`. Reading the first and
+/// reporting it as the second makes `pools=0` meaningless on a node host
+/// (#2078), so on a daemon's data dir this asks the daemon instead — redb holds
+/// that file exclusively for the daemon's lifetime, so there is no disk path to
+/// it while the node is up.
+async fn list(args: &cli::PoolListArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let data_dir = match args.chain.data_dir.clone() {
         Some(dir) => expand_tilde(&dir),
         None => resolve_data_dir(None, &load_file_config(config_path)?)?,
     };
 
-    let store = RedbBuyerPoolStore::open(&data_dir)?;
+    if args.all {
+        return list_all(args, config_path, &data_dir).await;
+    }
+
+    match classify_buyer_store(&data_dir) {
+        BuyerStoreOwner::Node { data_dir, .. } => {
+            list_from_daemon(args, config_path, &data_dir).await
+        }
+        BuyerStoreOwner::Client { data_dir } => list_from_client_store(args, &data_dir),
+    }
+}
+
+/// `decdn pool list --all`: every pool this keystore owns on chain.
+///
+/// The local listings answer "what does this store remember?". This answers
+/// "what do I own?", and the two are different questions precisely when it
+/// matters: a reset data dir loses the only local record of a funded deposit,
+/// and the store-backed listing then prints nothing because the file it reads
+/// is the file that went missing (#2072). The chain still has the pool.
+///
+/// Read-only, so unlike `close --all` / `reclaim --all` it is not refused on a
+/// node's data dir. Those two write — they would close the pool the daemon is
+/// paying from. This one looks.
+///
+/// The local view is consulted best-effort, and feeds three things: the
+/// `TRACKED` column, the `local_store=` / `local_store_read` flag, and the
+/// stderr warning naming rows that will not decode. An unreadable store leaves
+/// the column unknown rather than failing the listing, because an unreadable
+/// store is the case this exists for.
+async fn list_all(
+    args: &cli::PoolListArgs,
+    config_path: Option<&Path>,
+    data_dir: &Path,
+) -> anyhow::Result<()> {
+    let file = load_file_config(config_path)?;
+    let chain = resolve_chain(&args.chain, &file)?;
+    let signer = Arc::new(load_buyer_signer(&chain)?);
+    let owner = signer.address();
+    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+    let contract = PaymentPool::new(chain.payment_pool, rpc);
+
+    let ids = enumerate_owned_pools(&contract, owner).await?;
+    let tracked = tracked_pool_ids(args, config_path, data_dir).await;
+    let now = unix_now()?;
+
+    let mut rows = Vec::with_capacity(ids.len());
+    for pool_id in ids {
+        let pool = contract.getPool(pool_id).call().await.map_err(|e| {
+            anyhow::anyhow!(
+                "getPool({pool_id}) failed: {}",
+                decdn_common::redact::sanitize_err_chain(&anyhow::anyhow!("{e}"))
+            )
+        })?;
+        rows.push(ChainPoolRow {
+            pool_id,
+            status: pool.status,
+            deposit: U256::from(pool.deposit),
+            total_redeemed: U256::from(pool.totalRedeemed),
+            dispute_deadline: pool.disputeDeadline,
+            tracked: tracked.as_ref().and_then(|local| local.verdict(pool_id)),
+        });
+    }
+
+    // The corrupt rows are named on stderr here too, so `--all` is not the one
+    // listing that stays silent about a deposit stranded by an unreadable
+    // record. stdout keeps only the table, for scripts.
+    if let Some(local) = tracked.as_ref() {
+        write_skipped_pools(&mut std::io::stderr().lock(), &local.undecodable())?;
+    }
+
+    let mut out = std::io::stdout().lock();
+    if args.json {
+        let view = PoolListAllJson {
+            source: SOURCE_CHAIN,
+            owner: format!("{owner:#x}"),
+            chain_id: chain.chain_id,
+            payment_pool: format!("{:#x}", chain.payment_pool),
+            local_store_read: tracked.is_some(),
+            pools: rows.iter().map(|r| ChainPoolJson::at(r, now)).collect(),
+        };
+        serde_json::to_writer_pretty(&mut out, &view)?;
+        writeln!(out)?;
+    } else {
+        write_chain_pools(
+            &mut out,
+            owner,
+            chain.chain_id,
+            &rows,
+            now,
+            tracked.is_some(),
+        )?;
+    }
+    Ok(())
+}
+
+/// The state of one pool's row in the local record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowState {
+    /// The row decoded.
+    Decoded,
+    /// A row exists and will not decode. The escrowed deposit is untracked
+    /// until the record is repaired — a different remedy from an absent row, so
+    /// it must not render as one.
+    Undecodable,
+}
+
+/// What the local record says about the pools the chain reports.
+///
+/// One entry per pool the record mentions, because "the store has no row for
+/// this pool" and "the store has a row it cannot decode" are different answers
+/// and only the first means the deposit is untracked. An undecodable row is
+/// still a row: `pool_id` is the table's primary key, so it survives whatever
+/// corrupted the value bytes, and the store demonstrably holds that pool.
+///
+/// A map rather than two sets, so a pool cannot be both at once.
+#[derive(Debug, Default)]
+struct TrackedPools(std::collections::BTreeMap<PoolId, RowState>);
+
+impl TrackedPools {
+    /// Whether the local record tracks `pool_id`: `None` when a row exists but
+    /// could not be decoded, so the honest answer for that one pool is unknown
+    /// while every other pool's answer stays exact.
+    fn verdict(&self, pool_id: PoolId) -> Option<bool> {
+        match self.0.get(&pool_id) {
+            Some(RowState::Decoded) => Some(true),
+            Some(RowState::Undecodable) => None,
+            None => Some(false),
+        }
+    }
+
+    /// The pools with a row that will not decode, for the operator warning.
+    fn undecodable(&self) -> Vec<PoolId> {
+        self.0
+            .iter()
+            .filter(|(_, state)| **state == RowState::Undecodable)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Project a running daemon's `admin_v1_pools` answer.
+    ///
+    /// `None` when any id on the wire will not parse. That is a format drift
+    /// between the daemon's spelling and this binary's, and the failure mode of
+    /// guessing is the worst one available: a dropped id renders as `no`, which
+    /// tells an operator to close a pool the daemon is paying from right now.
+    /// One unparseable id makes the whole answer untrustworthy, so it is
+    /// reported as unknown rather than partially believed.
+    fn from_wire(resp: &BuyerPoolsResponse) -> Option<Self> {
+        let mut rows = std::collections::BTreeMap::new();
+        for (id, state) in resp
+            .pools
+            .iter()
+            .map(|p| (p.pool_id.as_str(), RowState::Decoded))
+            .chain(
+                resp.skipped
+                    .iter()
+                    .map(|p| (p.as_str(), RowState::Undecodable)),
+            )
+        {
+            rows.insert(PoolId::from_str(id).ok()?, state);
+        }
+        Some(Self(rows))
+    }
+}
+
+impl From<BuyerLoad> for TrackedPools {
+    fn from(load: BuyerLoad) -> Self {
+        Self(
+            load.pools
+                .iter()
+                .map(|p| (p.pool_id, RowState::Decoded))
+                .chain(
+                    load.skipped
+                        .into_iter()
+                        .map(|id| (id, RowState::Undecodable)),
+                )
+                .collect(),
+        )
+    }
+}
+
+/// What the local record tracks, or `None` when it gave no usable answer.
+///
+/// `None` is a real answer, not a failure: it is what an operator sees when the
+/// store is the thing that was lost, and rendering it as "unknown" beside the
+/// chain's rows is more honest than reporting every pool untracked. It covers
+/// the whole store — one undecodable row makes that one pool unknown, never the
+/// others.
+///
+/// **Every read here is read-only.** `--all` sends no transaction and writes no
+/// pool record, and it must not manufacture a store either: creating an empty
+/// one and reporting its emptiness is the #2078 defect, and it would also make
+/// a lost store — the condition this command exists to surface — indistinguish-
+/// able from a store that tracks nothing.
+///
+/// A store that will not open is named on stderr rather than folded into the
+/// column, because `?` alone cannot say whether to restore a backup, wait for
+/// another process, or repair a record.
+async fn tracked_pool_ids(
+    args: &cli::PoolListArgs,
+    config_path: Option<&Path>,
+    data_dir: &Path,
+) -> Option<TrackedPools> {
+    match classify_buyer_store(data_dir) {
+        BuyerStoreOwner::Client { data_dir } => read_local_pools(&client_buyer_db(&data_dir)),
+        BuyerStoreOwner::Node { data_dir, .. } => {
+            let buyer_db = node_buyer_db(&data_dir);
+            match ReadOnlyBuyerPoolStore::open_file(&buyer_db) {
+                Ok(reader) => load_local_pools(&reader, &buyer_db),
+                // Only the lock means "a daemon holds this file"; that is the
+                // one failure the admin RPC can answer instead. Every other
+                // failure is about the file, and asking the daemon would report
+                // it as an unknown column with no reason attached.
+                Err(decdn_incentive::StoreError::AlreadyOpen { .. }) => {
+                    daemon_pool_ids(args, config_path).await
+                }
+                Err(err) => {
+                    warn_unreadable_store(&buyer_db, &err);
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Read a buyer store at `path` without creating or locking it.
+///
+/// An absent store is an empty [`TrackedPools`], not an unknown: nothing is
+/// tracked, which is exactly what a reset data dir should report against the
+/// pools the chain still holds.
+fn read_local_pools(path: &Path) -> Option<TrackedPools> {
+    match ReadOnlyBuyerPoolStore::open_file(path) {
+        Ok(reader) => load_local_pools(&reader, path),
+        Err(decdn_incentive::StoreError::Absent { .. }) => Some(TrackedPools::default()),
+        Err(err) => {
+            warn_unreadable_store(path, &err);
+            None
+        }
+    }
+}
+
+/// Hydrate an opened store, naming a read failure rather than silently
+/// blanking the column.
+fn load_local_pools(reader: &ReadOnlyBuyerPoolStore, path: &Path) -> Option<TrackedPools> {
+    match reader.load_all() {
+        Ok(load) => Some(TrackedPools::from(load)),
+        Err(err) => {
+            warn_unreadable_store(path, &err);
+            None
+        }
+    }
+}
+
+/// Say on stderr why the `TRACKED` column is unknown.
+///
+/// The column has one glyph for every reason, so without this an operator
+/// cannot tell a store another process holds from one that needs restoring
+/// from backup. stdout keeps only the table, for scripts.
+fn warn_unreadable_store(path: &Path, err: &decdn_incentive::StoreError) {
+    let mut w = std::io::stderr().lock();
+    let _ = writeln!(
+        w,
+        "warning: the local buyer store at {} could not be read ({err}); every TRACKED value \
+         below is unknown, which is not the same as untracked",
+        path.display()
+    );
+}
+
+/// Ask a running daemon what it tracks. `None` on any failure — this feeds one
+/// column, never the listing itself.
+///
+/// `skipped` crosses the admin wire as hex strings for exactly this reason: the
+/// daemon cannot decode those rows either, and dropping them here would report
+/// the pools as untracked.
+async fn daemon_pool_ids(
+    args: &cli::PoolListArgs,
+    config_path: Option<&Path>,
+) -> Option<TrackedPools> {
+    if args.timeout_ms == 0 {
+        // `list` rejects this outright; here the listing still stands, so say
+        // what was skipped rather than leaving an unexplained column.
+        let mut w = std::io::stderr().lock();
+        let _ = writeln!(
+            w,
+            "warning: --timeout-ms 0 skips the daemon lookup (jsonrpsee reads a zero duration \
+             as 'never'), so every TRACKED value below is unknown"
+        );
+        return None;
+    }
+    let url =
+        crate::commands::node::resolve_admin_url(args.admin_url.as_deref(), config_path).ok()?;
+    let client = jsonrpsee::http_client::HttpClientBuilder::default()
+        .request_timeout(std::time::Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .ok()?;
+    let resp: BuyerPoolsResponse = client.pools().await.ok()?;
+    let tracked = TrackedPools::from_wire(&resp);
+    if tracked.is_none() {
+        let mut w = std::io::stderr().lock();
+        let _ = writeln!(
+            w,
+            "warning: the daemon reported a pool id this binary cannot parse, so every TRACKED \
+             value below is unknown. The daemon and this CLI disagree on the wire format — \
+             check that both are the same build."
+        );
+    }
+    tracked
+}
+
+/// Read the CLI's own `buyer-pools.redb` under `data_dir`.
+fn list_from_client_store(args: &cli::PoolListArgs, data_dir: &Path) -> anyhow::Result<()> {
+    let store_path = client_buyer_db(data_dir);
+    let store = RedbBuyerPoolStore::open(data_dir)?;
+    let load = store.load_all()?;
+    write_store_listing(args, &store_path, SOURCE_CLIENT_STORE, "", load)
+}
+
+/// Render a [`BuyerLoad`] this process read out of a redb file itself.
+///
+/// Shared by the client store and the offline read of a stopped daemon's
+/// store. `provenance` is appended to the `store=` line: the two reads produce
+/// the same row shape from different files, so which file — and whether a
+/// daemon was running — must be on the output, not inferred.
+fn write_store_listing(
+    args: &cli::PoolListArgs,
+    store_path: &Path,
+    source: &'static str,
+    provenance: &str,
+    load: BuyerLoad,
+) -> anyhow::Result<()> {
     let BuyerLoad {
         mut pools,
         mut skipped,
-    } = store.load_all()?;
+    } = load;
     // Stable output regardless of the store's internal key order.
     pools.sort_by_key(|p| p.pool_id);
     skipped.sort_unstable();
@@ -988,16 +1393,384 @@ fn list(args: &cli::PoolListArgs, config_path: Option<&Path>) -> anyhow::Result<
     let mut out = std::io::stdout().lock();
     if args.json {
         let view = PoolListJson {
+            store: store_path.display().to_string(),
+            source,
             pools: pools.iter().map(PoolJson::from).collect(),
             skipped: skipped.iter().map(|p| format!("{p:#x}")).collect(),
         };
         serde_json::to_writer_pretty(&mut out, &view)?;
         writeln!(out)?;
     } else {
+        writeln!(out, "store={}{provenance}", store_path.display())?;
         write_pools(&mut out, &pools, &skipped)?;
     }
     Ok(())
 }
+
+/// Read a node's `buyer.redb` — through `admin_v1_pools` while the daemon runs,
+/// and off disk when it does not.
+///
+/// The fallback is never the *client* store: that is a different file with
+/// unrelated contents, and printing its `pools=0` here is precisely the failure
+/// this path exists to prevent. It is the daemon's own file, read-only.
+///
+/// Only a refused connection takes the offline route, because it is the one
+/// failure that positively means nothing is listening. A `Call` error means the
+/// daemon ANSWERED and refused, so it is up. Every other transport error and
+/// every timeout is ambiguous — a dropped packet, a firewall, a blackholing
+/// port — and an ambiguous signal must not be resolved by opening a file a
+/// running daemon may own.
+///
+/// On the refused path the lock settles it: `redb` holds its process-exclusive
+/// lock for the lifetime of an open `Database`, so a read-only open succeeding
+/// proves no daemon holds the file, and `AlreadyOpen` proves one does — which
+/// makes a refused admin port an admin-URL problem rather than a stopped node.
+async fn list_from_daemon(
+    args: &cli::PoolListArgs,
+    config_path: Option<&Path>,
+    data_dir: &Path,
+) -> anyhow::Result<()> {
+    let buyer_db = node_buyer_db(data_dir);
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+    let url = crate::commands::node::resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+    let client = jsonrpsee::http_client::HttpClientBuilder::default()
+        .request_timeout(std::time::Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let resp: BuyerPoolsResponse = match client.pools().await {
+        Ok(resp) => resp,
+        // Connection refused: nothing is listening, so the daemon is very
+        // likely down and its store readable. Try it before reporting.
+        Err(jsonrpsee::core::client::Error::Transport(inner))
+            if crate::commands::node::is_connection_refused(inner.as_ref()) =>
+        {
+            return list_from_stopped_daemon(args, data_dir, &buyer_db, &url, inner.as_ref());
+        }
+        Err(err) => {
+            return Err(unreachable_daemon_error(
+                args, data_dir, &buyer_db, &url, err,
+            ));
+        }
+    };
+
+    let mut out = std::io::stdout().lock();
+    if args.json {
+        let view = DaemonPoolListJson {
+            store: buyer_db.display().to_string(),
+            source: SOURCE_DAEMON,
+            pools: &resp.pools,
+            skipped: &resp.skipped,
+        };
+        serde_json::to_writer_pretty(&mut out, &view)?;
+        writeln!(out)?;
+    } else {
+        write_skipped_buyer_pools(&mut std::io::stderr().lock(), &resp.skipped)?;
+        writeln!(
+            out,
+            "store={} (read from the running daemon)",
+            buyer_db.display()
+        )?;
+        write_buyer_pools(&mut out, &resp)?;
+    }
+    Ok(())
+}
+
+/// The error for an admin call that produced no pools, explaining which file
+/// the answer would have come from.
+fn unreachable_daemon_error(
+    args: &cli::PoolListArgs,
+    data_dir: &Path,
+    buyer_db: &Path,
+    url: &str,
+    err: jsonrpsee::core::client::Error,
+) -> anyhow::Error {
+    {
+        // A `Call` error means the daemon ANSWERED and refused — it is up, so
+        // telling the operator to start it would send them the wrong way. Only
+        // the transport and timeout arms warrant that advice.
+        let answered = matches!(err, jsonrpsee::core::client::Error::Call(_));
+        let classified = crate::commands::node::classify_client_error(url, args.timeout_ms, err);
+        if answered {
+            classified.context(format!(
+                "{} is a decdn-node data dir, so its buyer pools live in {}, which this command \
+                 reads through the daemon — a running daemon holds that file exclusively. The \
+                 daemon answered and refused the read.",
+                data_dir.display(),
+                buyer_db.display(),
+            ))
+        } else {
+            classified.context(format!(
+                "{} is a decdn-node data dir, so the pools that matter are in {} — which a \
+                 running daemon holds exclusively and no other process can open. This command \
+                 therefore asks the daemon, and the daemon did not answer. Start decdn-node, or \
+                 pass --data-dir <client dir> to inspect a client store instead.",
+                data_dir.display(),
+                buyer_db.display(),
+            ))
+        }
+    }
+}
+
+/// Read a stopped daemon's `buyer.redb` off disk, or say why that is not what
+/// is happening.
+///
+/// Three outcomes, and the third is why this is not simply a fallback:
+///
+/// - the file opens read-only, so no daemon holds it: render it, labelled as a
+///   disk read, so provenance stays on the output.
+/// - the file is write-locked, so a daemon IS running: the admin URL is wrong,
+///   not the node down. Say that instead — it is the answer the operator needs.
+/// - anything else: the original unreachable-daemon error, with what the disk
+///   read found appended, because "no daemon answered AND the store will not
+///   open" is two facts, not one.
+fn list_from_stopped_daemon(
+    args: &cli::PoolListArgs,
+    data_dir: &Path,
+    buyer_db: &Path,
+    url: &str,
+    transport: &(dyn std::error::Error + Send + Sync + 'static),
+) -> anyhow::Result<()> {
+    match ReadOnlyBuyerPoolStore::open_file(buyer_db) {
+        Ok(reader) => {
+            let load = reader.load_all()?;
+            write_store_listing(
+                args,
+                buyer_db,
+                SOURCE_NODE_STORE_OFFLINE,
+                " (read from disk; no daemon running)",
+                load,
+            )
+        }
+        Err(decdn_incentive::StoreError::AlreadyOpen { .. }) => anyhow::bail!(
+            "admin at {url} refused the connection ({transport}), but a process holds {} \
+             exclusively — so a decdn-node IS running against {}. The admin URL or admin_port \
+             is wrong, not the node down. Pass --admin-url, or check admin_port in the node's \
+             config.",
+            buyer_db.display(),
+            data_dir.display(),
+        ),
+        // A crashed daemon is both unreachable AND unrepaired, so this is the
+        // common post-mortem case, not a footnote on the generic failure. The
+        // remedy names the process that owns the file, which the store cannot.
+        Err(decdn_incentive::StoreError::NeedsRepair { .. }) => anyhow::bail!(
+            "admin at {url} refused the connection ({transport}), and {} was not shut down \
+             cleanly — it needs a repair pass that only a writable open can run. Start \
+             decdn-node once against {} to repair it, then read it again.",
+            buyer_db.display(),
+            data_dir.display(),
+        ),
+        // No store at all is an answer, not a failure to report: this node has
+        // never opened a pool, or the store was deleted to force re-adoption.
+        Err(decdn_incentive::StoreError::Absent { .. }) => anyhow::bail!(
+            "admin at {url} refused the connection ({transport}), and {} does not exist — this \
+             node holds no buyer pools on disk. It has not opened one, or the store was deleted \
+             to force re-adoption. Start decdn-node and read it again, or run `decdn pool list \
+             --all` to see what this keystore owns on chain.",
+            buyer_db.display(),
+        ),
+        Err(store_err) => Err(anyhow::anyhow!(
+            "admin at {url} refused the connection ({transport}); is the node running, and is \
+             admin_port configured correctly? Reading {} from disk instead did not work either: \
+             {store_err}",
+            buyer_db.display(),
+        )
+        .context(format!(
+            "{} is a decdn-node data dir, so the pools that matter are in {} — not in a client \
+             store. Pass --data-dir <client dir> to inspect a client store instead.",
+            data_dir.display(),
+            buyer_db.display(),
+        ))),
+    }
+}
+
+/// One pool as the chain describes it, plus whether the local record has it.
+///
+/// No `Debug`: the `sol!`-generated `Status` has none. [`status_label`] is the
+/// spelling anything user-facing wants anyway.
+struct ChainPoolRow {
+    /// On-chain `poolId`.
+    pool_id: PoolId,
+    /// Lifecycle state from `getPool`.
+    status: PaymentPool::Status,
+    /// Escrowed deposit, in micro-USDC.
+    deposit: U256,
+    /// Cumulative amount redeemed against the pool, in micro-USDC.
+    total_redeemed: U256,
+    /// Absolute Unix deadline after which a `Closing` pool is reclaimable. `0`
+    /// while the pool is still `Open`.
+    dispute_deadline: u64,
+    /// Whether the local record tracks this pool; `None` when it gave no usable
+    /// answer for this pool. See [`TrackedPools::verdict`].
+    tracked: Option<bool>,
+}
+
+/// Wire spelling of a `getPool` status, matching the lowercase vocabulary the
+/// rest of the `pool` output uses.
+const fn status_label(status: PaymentPool::Status) -> &'static str {
+    match status {
+        PaymentPool::Status::Open => "open",
+        PaymentPool::Status::Closing => "closing",
+        PaymentPool::Status::Closed => "closed",
+        // `sol!` enums carry a hidden invalid variant.
+        _ => "?",
+    }
+}
+
+/// When the pool's residual can be reclaimed, in the operator's terms.
+fn reclaimable_label(row: &ChainPoolRow, now: u64) -> String {
+    match plan_reclaim(row.status, row.dispute_deadline, now) {
+        ReclaimPlan::Reclaim => "now".to_string(),
+        ReclaimPlan::SkipOpen => "close it first".to_string(),
+        ReclaimPlan::SkipInWindow(deadline) => format_expiry(deadline, now),
+        ReclaimPlan::SkipClosed => "already reclaimed".to_string(),
+        ReclaimPlan::SkipUnknown => "?".to_string(),
+    }
+}
+
+/// `yes` / `no` / `?`, where `?` means the local record gave no usable answer
+/// for this pool — the whole store was unreadable, or it holds a row for this
+/// pool that will not decode. Neither is the claim "this pool is untracked",
+/// and the remedies differ: one is a lost store, the other a record to repair.
+const fn tracked_label(tracked: Option<bool>) -> &'static str {
+    match tracked {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "?",
+    }
+}
+
+/// Render `--all` as the aligned table.
+///
+/// Same conventions as [`write_pools`]: a `key=value` summary line first so
+/// scripts can grep without `--json`, a sentinel when there is nothing, and the
+/// one variable-width column last and unpadded.
+fn write_chain_pools(
+    w: &mut impl Write,
+    owner: Address,
+    chain_id: u64,
+    rows: &[ChainPoolRow],
+    now: u64,
+    local_store_read: bool,
+) -> std::io::Result<()> {
+    // `local_store=` is what separates a column of `?` that means "no local
+    // answer at all" from one that means "these rows will not decode". Without
+    // it the table is silently lossy about the one condition `--all` exists to
+    // surface, and only `--json` carries the distinction.
+    writeln!(
+        w,
+        "owner={owner:#x} chain_id={chain_id} pools={} local_store={}",
+        rows.len(),
+        if local_store_read {
+            "read"
+        } else {
+            "unreadable"
+        },
+    )?;
+    if rows.is_empty() {
+        writeln!(w, "(this keystore owns no pools on this contract)")?;
+        return Ok(());
+    }
+    writeln!(
+        w,
+        "{:<14} {:<8} {:>14} {:>14} {:>7} RECLAIMABLE",
+        "POOL", "STATUS", "DEPOSIT", "REDEEMED", "TRACKED"
+    )?;
+    for row in rows {
+        writeln!(
+            w,
+            "{:<14} {:<8} {:>14} {:>14} {:>7} {}",
+            short_hex(&format!("{:#x}", row.pool_id)),
+            status_label(row.status),
+            format_usdc_u256(row.deposit),
+            format_usdc_u256(row.total_redeemed),
+            tracked_label(row.tracked),
+            reclaimable_label(row, now),
+        )?;
+    }
+    Ok(())
+}
+
+/// `--all` as JSON.
+///
+/// A third shape beside [`PoolListJson`] and [`DaemonPoolListJson`], and
+/// deliberately so: these rows come from the chain, carry lifecycle fields the
+/// stores do not hold, and carry no lanes. Read `source` before `pools`.
+#[derive(Serialize)]
+struct PoolListAllJson {
+    /// Always [`SOURCE_CHAIN`].
+    source: &'static str,
+    /// The keystore address the pools were enumerated by.
+    owner: String,
+    /// Chain id the contract was read on.
+    chain_id: u64,
+    /// `PaymentPool` address the pools live in.
+    payment_pool: String,
+    /// Whether the local record could be read at all. When `false`, every
+    /// pool's `tracked` is `null` and says nothing about the pool. When `true`,
+    /// a `null` `tracked` is specific to that pool: its row will not decode.
+    local_store_read: bool,
+    /// Every pool the owner holds, in the order the contract enumerates them.
+    pools: Vec<ChainPoolJson>,
+}
+
+/// One `--all` pool.
+#[derive(Serialize)]
+struct ChainPoolJson {
+    /// On-chain `poolId`, `0x`-prefixed hex.
+    pool_id: String,
+    /// `open`, `closing`, `closed`, or `?`.
+    status: &'static str,
+    /// Escrowed deposit, in micro-USDC.
+    deposit_micro_usdc: String,
+    /// Cumulative redeemed amount, in micro-USDC.
+    total_redeemed_micro_usdc: String,
+    /// Absolute Unix deadline after which the residual is reclaimable; `0`
+    /// while the pool is `Open`.
+    dispute_deadline: u64,
+    /// True once the dispute window has elapsed and the pool is `Closing`.
+    reclaimable_now: bool,
+    /// Whether the local record tracks this pool; `null` when the record gave
+    /// no usable answer — an unreadable store, or a row for this pool that will
+    /// not decode. Read `local_store_read` to tell the two apart.
+    tracked: Option<bool>,
+}
+
+impl ChainPoolJson {
+    /// Project a row as of `now`, so the time-dependent field is computed once
+    /// against the same clock the table uses.
+    fn at(row: &ChainPoolRow, now: u64) -> Self {
+        Self {
+            pool_id: format!("{:#x}", row.pool_id),
+            status: status_label(row.status),
+            deposit_micro_usdc: row.deposit.to_string(),
+            total_redeemed_micro_usdc: row.total_redeemed.to_string(),
+            dispute_deadline: row.dispute_deadline,
+            reclaimable_now: matches!(
+                plan_reclaim(row.status, row.dispute_deadline, now),
+                ReclaimPlan::Reclaim
+            ),
+            tracked: row.tracked,
+        }
+    }
+}
+
+/// `source` value for a listing read directly from the CLI's own store.
+const SOURCE_CLIENT_STORE: &str = "client_store";
+/// `source` value for a listing the running daemon answered.
+const SOURCE_DAEMON: &str = "daemon";
+/// `source` value for a listing read off a stopped daemon's own store file.
+///
+/// Its own value, never [`SOURCE_CLIENT_STORE`], even though the row shape is
+/// identical: the two come from different files with unrelated contents, and
+/// conflating them is the whole defect this area exists to prevent.
+const SOURCE_NODE_STORE_OFFLINE: &str = "node_store_offline";
+/// `source` value for the chain-authoritative `--all` listing.
+const SOURCE_CHAIN: &str = "chain";
 
 /// Warn about every undecodable buyer row on stderr. The `pool_id` (the store's
 /// primary key) is the only available repair handle.
@@ -1045,11 +1818,93 @@ fn write_pools(
     Ok(())
 }
 
-/// Top-level `--json` document.
+/// Render a daemon's buyer-pool snapshot as an aligned table, in the same
+/// columns [`write_pools`] uses for the client store, so an operator reading
+/// both sees the same shape. Pure (writes to any sink) so the layout is
+/// unit-testable without an admin hop.
+///
+/// Addresses arrive EIP-55 checksummed from the wire, where the client path
+/// renders them lowercase — the columns match, the casing does not.
+///
+/// Writes the table only. Undecodable rows go to stderr through
+/// [`write_skipped_buyer_pools`], as they do on the client path, so a script
+/// capturing stdout does not find warning lines ahead of `pools=`.
+///
+/// Shared by `decdn node pools` and by `decdn pool list` when it routes to a
+/// running daemon.
+pub(crate) fn write_buyer_pools(
+    w: &mut impl Write,
+    resp: &BuyerPoolsResponse,
+) -> std::io::Result<()> {
+    writeln!(w, "pools={}", resp.pools.len())?;
+    if resp.pools.is_empty() {
+        if resp.skipped.is_empty() {
+            writeln!(w, "(no tracked pools)")?;
+        }
+        return Ok(());
+    }
+    writeln!(
+        w,
+        "{:<14} {:<14} {:<14} {:>14} {:>8}",
+        "POOL", "OWNER", "TOKEN", "DEPOSIT", "LANES"
+    )?;
+    for p in &resp.pools {
+        writeln!(
+            w,
+            "{:<14} {:<14} {:<14} {:>14} {:>8}",
+            short_hex(&p.pool_id),
+            short_hex(&p.owner),
+            short_hex(&p.token),
+            format_usdc_u256(U256::from(p.deposit_micro_usdc)),
+            p.lanes.len(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Warn about every undecodable row in a daemon's answer, on stderr — the
+/// stream [`write_skipped_pools`] uses for the client store's equivalent.
+pub(crate) fn write_skipped_buyer_pools(
+    w: &mut impl Write,
+    skipped: &[String],
+) -> std::io::Result<()> {
+    for pool_id in skipped {
+        writeln!(
+            w,
+            "warning: buyer pool {pool_id} could not be decoded; its deposit remains escrowed but \
+             untracked until the record is repaired"
+        )?;
+    }
+    Ok(())
+}
+
+/// Top-level `--json` document for a listing of the CLI's own store.
+///
+/// `store` and `source` are the half a machine consumer needs to know *which*
+/// buyer store answered: the same command on the same host can read either
+/// file, and they are unrelated (#2078).
 #[derive(Serialize)]
 struct PoolListJson {
+    store: String,
+    source: &'static str,
     pools: Vec<PoolJson>,
     skipped: Vec<String>,
+}
+
+/// Top-level `--json` document for a listing the daemon answered.
+///
+/// Borrows the admin DTOs rather than re-shaping them, so the wire types stay
+/// the single definition of the daemon's answer. The consequence is that the
+/// two sources do NOT emit the same pool objects: this one carries
+/// `deposit_micro_usdc` as a number and EIP-55 addresses, where a client-store
+/// listing carries `deposit_usdc` as a decimal string and lowercase addresses.
+/// Read `source` before parsing `pools`.
+#[derive(Serialize)]
+struct DaemonPoolListJson<'a> {
+    store: String,
+    source: &'static str,
+    pools: &'a [decdn_common::admin::BuyerPoolSnapshot],
+    skipped: &'a [String],
 }
 
 /// Serializable view for `--json`, including the per-lane watermark so a
@@ -1058,6 +1913,7 @@ struct PoolListJson {
 #[derive(Serialize)]
 struct PoolJson {
     pool_id: String,
+    payment_pool: String,
     owner: String,
     token: String,
     deposit_usdc: String,
@@ -1076,6 +1932,7 @@ impl From<&BuyerPoolState> for PoolJson {
     fn from(p: &BuyerPoolState) -> Self {
         Self {
             pool_id: format!("{:#x}", p.pool_id),
+            payment_pool: format!("{:#x}", p.payment_pool),
             owner: format!("{:#x}", p.owner),
             token: format!("{:#x}", p.token),
             deposit_usdc: format_usdc_u256(p.deposit),
@@ -1275,10 +2132,260 @@ mod tests {
     fn mk_state(byte: u8, deposit_micro: u64) -> BuyerPoolState {
         BuyerPoolState::new(
             B256::repeat_byte(byte),
+            Address::repeat_byte(0x9c),
             Address::repeat_byte(byte),
             Address::repeat_byte(0xcd),
             U256::from(deposit_micro),
         )
+    }
+
+    /// A landed close on a node data dir does not claim the row was cleared —
+    /// it reports that the daemon's row survives. The `Ok` here is the
+    /// on-chain leg succeeding, which it did.
+    #[test]
+    fn daemon_owned_bookkeeping_does_not_claim_a_clean_close() {
+        let books = LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb"));
+        books
+            .forget_after_close(
+                Address::repeat_byte(0x11),
+                B256::repeat_byte(0x22),
+                TxHash::repeat_byte(0x33),
+                "run `decdn pool reclaim` later",
+            )
+            .expect("the on-chain close landed; the local row is reported, not graded");
+    }
+
+    /// `--all` renders every lifecycle state, and `TRACKED` distinguishes
+    /// "the store does not have this pool" from "the store could not be read"
+    /// — the second is the case the flag exists for, and reporting it as the
+    /// first would be a false claim about the pool.
+    #[test]
+    fn write_chain_pools_separates_untracked_from_unreadable() {
+        const NOW: u64 = 1_000_000;
+        let rows = vec![
+            ChainPoolRow {
+                pool_id: B256::repeat_byte(0x11),
+                status: PaymentPool::Status::Open,
+                deposit: U256::from(2_500_000u64),
+                total_redeemed: U256::from(1_000_000u64),
+                dispute_deadline: 0,
+                tracked: Some(true),
+            },
+            ChainPoolRow {
+                pool_id: B256::repeat_byte(0x22),
+                status: PaymentPool::Status::Closing,
+                deposit: U256::from(1_000_000u64),
+                total_redeemed: U256::ZERO,
+                dispute_deadline: NOW + 3_600,
+                tracked: Some(false),
+            },
+            ChainPoolRow {
+                pool_id: B256::repeat_byte(0x33),
+                status: PaymentPool::Status::Closed,
+                deposit: U256::ZERO,
+                total_redeemed: U256::from(1_000_000u64),
+                dispute_deadline: NOW - 1,
+                tracked: None,
+            },
+        ];
+
+        let mut buf = Vec::new();
+        write_chain_pools(&mut buf, Address::repeat_byte(0xab), 42, &rows, NOW, true).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(out.contains("chain_id=42"), "{out}");
+        assert!(out.contains("pools=3"), "{out}");
+        assert!(out.contains("open"), "{out}");
+        assert!(out.contains("closing"), "{out}");
+        assert!(out.contains("closed"), "{out}");
+        assert!(out.contains("2.500000"), "{out}");
+        assert!(out.contains("close it first"), "{out}");
+        assert!(out.contains("already reclaimed"), "{out}");
+
+        let row_for = |byte: u8| {
+            let tag = short_hex(&format!("{:#x}", B256::repeat_byte(byte)));
+            out.lines()
+                .find(|l| l.starts_with(&tag))
+                .map(str::to_owned)
+                .expect("every row renders")
+        };
+        let untracked = row_for(0x22);
+        assert!(untracked.contains(" no "), "{untracked}");
+        let unreadable = row_for(0x33);
+        assert!(unreadable.contains(" ? "), "{unreadable}");
+    }
+
+    /// A pool whose local row will not decode is NOT untracked: the store holds
+    /// a row for it, keyed by a `pool_id` that survives whatever corrupted the
+    /// value bytes. Reporting `no` would send the operator to `pool close`
+    /// (recover a stranded deposit) when the remedy is repairing a record. One
+    /// bad row must also not blank the verdict for the pools either side of it.
+    #[test]
+    fn an_undecodable_row_is_unknown_not_untracked() {
+        let decoded = B256::repeat_byte(0x11);
+        let corrupt = B256::repeat_byte(0x22);
+        let absent = B256::repeat_byte(0x33);
+        let local = TrackedPools(
+            [
+                (decoded, RowState::Decoded),
+                (corrupt, RowState::Undecodable),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        assert_eq!(local.verdict(decoded), Some(true));
+        assert_eq!(local.verdict(absent), Some(false), "no row means untracked");
+        assert_eq!(
+            local.verdict(corrupt),
+            None,
+            "a row that will not decode is unknown, not untracked"
+        );
+        assert_eq!(tracked_label(local.verdict(corrupt)), "?");
+    }
+
+    /// A `pool_id` spelling this binary cannot parse must make the whole answer
+    /// unknown. Dropping it silently renders the pool `no`, which tells an
+    /// operator to close a pool the daemon may be paying from right now.
+    ///
+    /// The other half of the drift guard is in `decdn-node`, where the wire
+    /// spelling is produced: `build_buyer_pools_response_ids_parse_back`.
+    #[test]
+    fn a_wire_response_round_trips_and_an_unparseable_id_is_not_a_no() {
+        let decoded = B256::repeat_byte(0x11);
+        let corrupt = B256::repeat_byte(0x22);
+        // The `{:#x}` spelling the daemon emits; `decdn-node`'s
+        // `build_buyer_pools_response_ids_parse_back` pins that it still does.
+        let resp = BuyerPoolsResponse {
+            pools: vec![decdn_common::admin::BuyerPoolSnapshot {
+                pool_id: format!("{decoded:#x}"),
+                payment_pool: "0x00dd".to_string(),
+                owner: format!("{:?}", Address::repeat_byte(0x11)),
+                token: format!("{:?}", Address::repeat_byte(0xcd)),
+                deposit_micro_usdc: 1,
+                lanes: Vec::new(),
+            }],
+            skipped: vec![format!("{corrupt:#x}")],
+        };
+        let local = TrackedPools::from_wire(&resp).expect("the daemon's own spelling must parse");
+        assert_eq!(local.verdict(decoded), Some(true));
+        assert_eq!(local.verdict(corrupt), None);
+        assert_eq!(local.verdict(B256::repeat_byte(0x33)), Some(false));
+
+        let drifted = BuyerPoolsResponse {
+            pools: Vec::new(),
+            skipped: vec!["not-a-pool-id".to_owned()],
+        };
+        assert!(
+            TrackedPools::from_wire(&drifted).is_none(),
+            "a spelling this binary cannot parse makes the answer unknown, never `no`"
+        );
+    }
+
+    /// `BuyerLoad`'s two halves land in the two sets — the conversion is where
+    /// `skipped` would otherwise be dropped, which is what made an undecodable
+    /// row read as `no`.
+    #[test]
+    fn a_buyer_load_keeps_its_skipped_rows() {
+        let state = BuyerPoolState::new(
+            B256::repeat_byte(0x11),
+            Address::repeat_byte(0x9c),
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0xcd),
+            U256::from(1u64),
+        );
+        let local = TrackedPools::from(BuyerLoad {
+            pools: vec![state],
+            skipped: vec![B256::repeat_byte(0x22)],
+        });
+        assert_eq!(local.verdict(B256::repeat_byte(0x11)), Some(true));
+        assert_eq!(local.verdict(B256::repeat_byte(0x22)), None);
+    }
+
+    /// An owner with nothing on chain gets a sentinel, not a bare header — the
+    /// same shape the store listings use, so one reader parses all of them.
+    #[test]
+    fn write_chain_pools_empty_emits_sentinel() {
+        let mut buf = Vec::new();
+        write_chain_pools(&mut buf, Address::repeat_byte(0xab), 1, &[], 0, true).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("pools=0"), "{out}");
+        assert!(out.contains("owns no pools"), "{out}");
+        assert!(!out.contains("POOL "), "no header without rows: {out}");
+    }
+
+    /// A `Closing` pool past its window reads as reclaimable in both renderings
+    /// from one `plan_reclaim` call — the table and the JSON must not be able
+    /// to disagree about it.
+    #[test]
+    fn reclaimable_now_agrees_between_table_and_json() {
+        const NOW: u64 = 500;
+        let row = ChainPoolRow {
+            pool_id: B256::repeat_byte(0x44),
+            status: PaymentPool::Status::Closing,
+            deposit: U256::from(1u64),
+            total_redeemed: U256::ZERO,
+            dispute_deadline: NOW - 1,
+            tracked: Some(true),
+        };
+        assert_eq!(reclaimable_label(&row, NOW), "now");
+        assert!(ChainPoolJson::at(&row, NOW).reclaimable_now);
+
+        let inside = ChainPoolRow {
+            dispute_deadline: NOW + 60,
+            ..row
+        };
+        assert!(reclaimable_label(&inside, NOW).starts_with("Unix "));
+        assert!(!ChainPoolJson::at(&inside, NOW).reclaimable_now);
+    }
+
+    /// The daemon renderer shares [`write_pools`]'s columns and its empty
+    /// sentinel, so the two listings read as one view.
+    #[test]
+    fn write_buyer_pools_matches_the_client_table_shape() {
+        let mut buf = Vec::new();
+        write_buyer_pools(
+            &mut buf,
+            &BuyerPoolsResponse {
+                pools: Vec::new(),
+                skipped: Vec::new(),
+            },
+        )
+        .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("pools=0"), "{out}");
+        assert!(out.contains("(no tracked pools)"), "{out}");
+
+        let mut buf = Vec::new();
+        write_buyer_pools(
+            &mut buf,
+            &BuyerPoolsResponse {
+                pools: vec![decdn_common::admin::BuyerPoolSnapshot {
+                    pool_id: "0xabcdef0123456789".to_string(),
+                    payment_pool: "0x00dd".to_string(),
+                    owner: "0x1111111111111111".to_string(),
+                    token: "0x2222222222222222".to_string(),
+                    deposit_micro_usdc: 1_500_000,
+                    lanes: Vec::new(),
+                }],
+                skipped: vec!["0x4444".to_string()],
+            },
+        )
+        .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("1.500000"), "{out}");
+        assert!(out.contains("pools=1"), "{out}");
+        assert!(
+            !out.contains("0x4444"),
+            "undecodable rows belong on stderr, not in the table sink: {out}"
+        );
+
+        // …and they are still reported, on the stream the client path uses.
+        let mut warnings = Vec::new();
+        write_skipped_buyer_pools(&mut warnings, &["0x4444".to_string()]).unwrap();
+        let warnings = String::from_utf8(warnings).unwrap();
+        assert!(warnings.contains("0x4444"), "{warnings}");
+        assert!(warnings.contains("escrowed"), "{warnings}");
     }
 
     #[test]

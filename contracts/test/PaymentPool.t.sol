@@ -2749,6 +2749,93 @@ contract PaymentPoolTest is Test {
         pool.getAuthorizations(ids, signers);
     }
 
+    function test_getWatermarks_batchesRedeemedAndUntouchedLanes() public {
+        bytes32 id0 = _open();
+        address provider2 = address(0xCAFE);
+        vm.prank(provider);
+        _redeemOne(
+            id0, signer, provider, 300e6, 30_000_000, _voucher(id0, 300e6, 30_000_000), _cap(id0, SPENDING_CAP, expiry)
+        );
+        bytes32 id1 = _open(); // nothing redeemed here
+
+        // Three triples: the redeemed lane, the same pool and signer under a
+        // different provider, and an untouched pool.
+        bytes32[] memory ids = new bytes32[](3);
+        ids[0] = id0;
+        ids[1] = id0;
+        ids[2] = id1;
+        // The signer axis must vary too: with an all-identical array a
+        // `watermark[poolIds[i]][signers[0]][providers[i]]` mis-index passes.
+        address[] memory signers = new address[](3);
+        signers[0] = signer;
+        signers[1] = signer;
+        signers[2] = address(0x519E);
+        address[] memory providers = new address[](3);
+        providers[0] = provider;
+        providers[1] = provider2;
+        providers[2] = provider;
+
+        PaymentPool.Lane[] memory lanes = pool.getWatermarks(ids, signers, providers);
+        assertEq(lanes.length, 3);
+        // Redeemed lane: identical to the single-read view.
+        assertEq(lanes[0].amount, 300e6);
+        assertEq(lanes[0].bytesDelivered, 30_000_000);
+        // The provider axis is the one `getAuthorizations` cannot exercise: the
+        // same (pool, signer) under another provider is a distinct, empty lane.
+        assertEq(lanes[1].amount, 0);
+        assertEq(lanes[1].bytesDelivered, 0);
+        assertEq(lanes[2].amount, 0);
+        assertEq(lanes[2].bytesDelivered, 0);
+        // Each entry equals the single-read view for the same triple.
+        for (uint256 i = 0; i < lanes.length; i++) {
+            PaymentPool.Lane memory single = pool.getWatermark(ids[i], signers[i], providers[i]);
+            assertEq(lanes[i].amount, single.amount);
+            assertEq(lanes[i].bytesDelivered, single.bytesDelivered);
+        }
+    }
+
+    function test_getWatermarks_revertsOnLengthMismatch() public {
+        bytes32[] memory ids = new bytes32[](2);
+        address[] memory shortSigners = new address[](1);
+        address[] memory providers = new address[](2);
+        vm.expectRevert(PaymentPool.LengthMismatch.selector);
+        pool.getWatermarks(ids, shortSigners, providers);
+
+        address[] memory signers = new address[](2);
+        address[] memory shortProviders = new address[](1);
+        vm.expectRevert(PaymentPool.LengthMismatch.selector);
+        pool.getWatermarks(ids, signers, shortProviders);
+    }
+
+    /// The Rust redeemer caps a batch at 512 triples and justifies that number
+    /// with a gas figure. Nothing else measures it: the unit tests mock the
+    /// transport and the e2e reads two triples. This pins the real cost of a
+    /// full-size batch through the gas snapshot, so a change that makes the
+    /// read too expensive for an `eth_call` shows up as a snapshot diff rather
+    /// than as a silent fail-open in production.
+    function test_getWatermarks_fullSizeBatch() public {
+        uint256 n = 512;
+        bytes32 id = _open();
+        bytes32[] memory ids = new bytes32[](n);
+        address[] memory signers = new address[](n);
+        address[] memory providers = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            ids[i] = id;
+            signers[i] = signer;
+            providers[i] = address(uint160(i + 1));
+        }
+
+        PaymentPool.Lane[] memory lanes = pool.getWatermarks(ids, signers, providers);
+        assertEq(lanes.length, n);
+    }
+
+    function test_getWatermarks_emptyBatchReturnsEmpty() public view {
+        bytes32[] memory ids = new bytes32[](0);
+        address[] memory signers = new address[](0);
+        address[] memory providers = new address[](0);
+        assertEq(pool.getWatermarks(ids, signers, providers).length, 0);
+    }
+
     // -----------------------------------------------------------------
     // getRateBounds
     // -----------------------------------------------------------------

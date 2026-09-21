@@ -421,6 +421,15 @@ fn assert_one_completed_inbound_stream(metrics: &Metrics, vouchers: u64) -> anyh
         "decdn_streams_completed_total{direction=\"inbound\"} 1".to_string(),
         "decdn_streams_failed_total{direction=\"inbound\"} 0".to_string(),
         format!("decdn_vouchers_received_total {vouchers}"),
+        // The harness seeds the blob locally, so the availability gate must
+        // classify this serve as a complete-blob hit and leave both siblings
+        // at zero. Pinned here because the serve path reads the store through
+        // `export_bao_range_stream`, never `CacheEngine::get` — the `get`-scoped
+        // `decdn_cache_hits_total` stays at zero throughout a real serve, so it
+        // cannot stand in for this assertion.
+        "decdn_serve_cache_hit_total 1".to_string(),
+        "decdn_serve_cache_partial_hit_total 0".to_string(),
+        "decdn_serve_cache_miss_total 0".to_string(),
     ] {
         anyhow::ensure!(
             metric_line_present(&encoded, &line),
@@ -9334,6 +9343,25 @@ async fn cache_hit_refused_under_egress_saturation() -> anyhow::Result<()> {
         ),
         "expected the collapsed NotFound wire code, got {:?}",
         refusal_ext.error
+    );
+
+    // The availability gate counts ahead of the shed gate, so a serve the shed
+    // refuses still records the hit it refused. This is the only assertion in
+    // the suite that pins that ordering: every other test runs a permissive
+    // limiter, so moving the bump inside the `Ok(slot)` arm would pass all of
+    // them while making the fleet hit-rate panel collapse under exactly the
+    // pressure it exists to survive.
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&encoded, "decdn_serve_cache_hit_total 1"),
+        "a shed-refused cache hit must still count as a hit:\n{encoded}"
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_load_shed_hit_total 1"
+        ),
+        "the shed refusal keeps its own reason counter:\n{encoded}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;

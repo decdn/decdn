@@ -248,6 +248,44 @@ async fn write_frame_to(send: &mut SendStream, payload: &[u8]) -> anyhow::Result
         .map_err(|e| anyhow::anyhow!("write frame: {e}"))
 }
 
+/// Read one unlabelled `decdn_*` counter out of an encoded registry. A counter
+/// that has never been bumped still exports, so an absent line reads as 0 and a
+/// typo in `name` is indistinguishable from a counter at rest — pair every `== 0`
+/// assertion below with a sibling asserted non-zero on the same encode.
+fn counter_value(metrics: &Arc<decdn_node::metrics::Metrics>, name: &str) -> anyhow::Result<u64> {
+    let text = metrics
+        .encode()
+        .map_err(|e| anyhow::anyhow!("encode metrics: {e}"))?;
+    let prefix = format!("decdn_{name} ");
+    Ok(text
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0))
+}
+
+/// The serve-path availability gate classified this request as `expect`, and as
+/// nothing else. Asserting all three names together is what makes the assertion
+/// meaningful: a bump wired to the wrong sibling moves one of the two zeros.
+fn assert_serve_cache_class(
+    metrics: &Arc<decdn_node::metrics::Metrics>,
+    expect: &str,
+) -> anyhow::Result<()> {
+    for name in [
+        "serve_cache_hit",
+        "serve_cache_partial_hit",
+        "serve_cache_miss",
+    ] {
+        let want = u64::from(name == expect);
+        let got = counter_value(metrics, &format!("{name}_total"))?;
+        anyhow::ensure!(
+            got == want,
+            "decdn_{name}_total should be {want} for a {expect} classification, got {got}"
+        );
+    }
+    Ok(())
+}
+
 async fn count_requests(
     server: &MockServer,
     pred: impl Fn(&wiremock::Request) -> bool,
@@ -348,6 +386,11 @@ async fn partial_serve_within_cached_range_serves_without_any_fill() -> anyhow::
         got.len(),
         want.len()
     );
+
+    // No origin and no pull-through are wired here, so the covering partial is
+    // the only thing that could have served this — which makes it the one place
+    // the partial classification is proven rather than inferred.
+    assert_serve_cache_class(&metrics, "serve_cache_partial_hit")?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
@@ -477,6 +520,11 @@ async fn partial_serve_mixed_range_pulls_only_the_missing_group() -> anyhow::Res
         ranged_gets == 1,
         "expected exactly one ranged GET for the missing group, got {ranged_gets}"
     );
+
+    // The counter-side statement of the same fact, and the sharper one: the
+    // origin GET above proves a fill ran, this proves the partial gate DECLINED
+    // rather than that it was never consulted.
+    assert_serve_cache_class(&metrics, "serve_cache_miss")?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())

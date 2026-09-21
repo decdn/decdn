@@ -46,7 +46,7 @@ Siblings are the default because each reason in these families has an **unrelate
 
 **`decdn_probe_hold_unavailable_total{reason}` is the one deliberate exception among reason splits.** Its three values share one *aggregate* and one budget axis (all three derive from `max_probe_holds`), so operators query the aggregate first and drill in on the label second — the shape a label serves well. They pointedly do **not** share an alert: the alert filters to `reason="exhausted"`, because `disabled` is an intentional operator choice and `stake_lane_reserved` has its own knob; being able to express that filter is part of what the label buys. Note this is the one labelled *reason split*, not the only labelled metric — `decdn_streams_active{direction}` and `decdn_staker_set_active_by_region{node_region}` are labelled on other axes. A new split should follow the sibling convention unless it meets that same bar. Either way the invariant is absolute: **no metric may silently stop exporting at zero**, and an alert whose remedy applies to only one reason must carry the corresponding filter. `decdn_staker_set_active_by_region{node_region}` is the one exception. A region with no active node has no series, so the world map shows no empty country. The name is absent when no active node has a valid region. `decdn_staker_set_active_unknown_region` and `decdn_staker_set_active_count` always export, and they show the zero case.
 
-All metrics are exported in **Prometheus text format 0.0.4** on a configurable HTTP port (default `9090`) at `/metrics`. The same port exposes `/health` (see [Health Endpoint](#health-endpoint)). The port MUST be operator-configurable and MUST NOT be publicly accessible without authentication in production (firewall or auth proxy).
+All metrics are exported in **Prometheus text format 0.0.4** on a configurable HTTP port (default `9090`) at `/metrics`. Health is separate: it is the `admin_v1_health` JSON-RPC method on the admin listener, not a route on this port (see [Health](#health)). The port MUST be operator-configurable and MUST NOT be publicly accessible without authentication in production (firewall or auth proxy).
 
 ### Metric Registry
 
@@ -104,9 +104,12 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 |--------|------|------|--------|-------------|
 | `decdn_cache_bytes` | Gauge | M | live | Total cache size in bytes (all blobs). Paired with `decdn_cache_size_limit_bytes` for a saturation ratio. |
 | `decdn_cache_size_limit_bytes` | Gauge | R | live | Configured cache capacity in bytes (`cache.cache_size_mb × 1 048 576`). See [ADR 040](040-cache-policy.md#adr-040-pluggable-cache-admission-and-eviction-policies). |
-| `decdn_cache_hits_total` | Counter | M | live | Probe or stream requests satisfied from local cache. |
-| `decdn_cache_misses_total` | Counter | M | live | Probe or stream requests requiring origin pull or peer pull. |
-| `decdn_cache_bytes_returned_total` | Counter | R | live | Bytes returned from `CacheEngine::get` to the caller on success. Counts both cache-hit and pull-through-success paths. |
+| `decdn_cache_hits_total` | Counter | M | live | `CacheEngine::get` calls satisfied from the local store. Scoped to that whole-blob buffered read, which the paid serve path never calls — read `decdn_serve_cache_hit_total` for the serve-path hit rate. |
+| `decdn_cache_misses_total` | Counter | M | live | Local-store lookups that did not find the blob. Wider scope than `decdn_cache_hits_total`: bumped by `CacheEngine::get`, and also by `populate`/`populate_local` and `pull_through_range`, which the serve-path fill tiers do call. Pairing it with the `get`-only `hits` therefore yields a populated, permanently-0% ratio on a serving node rather than an empty one. |
+| `decdn_cache_bytes_returned_total` | Counter | R | live | Bytes returned from `CacheEngine::get` to the caller on success. Counts both cache-hit and pull-through-success paths. `get`-scoped like `decdn_cache_hits_total`, so a node that only serves paying clients holds this at zero — measure delivered bytes with `decdn_bytes_served_total`, noting that it counts the bao wire form (content plus interleaved proof nodes, over chunk-group-aligned ranges) written to clients and to downstream nodes, so it runs a few percent above raw content delivered. |
+| `decdn_serve_cache_hit_total` | Counter | M | live | Paid serves the blob-availability gate classified as servable from a complete locally-held blob, before any fill tier runs. Counted ahead of the load-shed gate, so the hit rate stays a property of the store rather than of current pressure. Sibling of `decdn_serve_cache_partial_hit_total` and `decdn_serve_cache_miss_total`; at most one of the three is bumped per request. Two requests that reach the gate bump none: a withdrawn hash (operator evict, corruption quarantine) is refused `EvictedSinceProbe`, and a `serve_audit` store fault is refused `InternalError`. Neither is an availability class, so the ratio's denominator excludes both. |
+| `decdn_serve_cache_partial_hit_total` | Counter | R | live | Paid serves admitted from a blob that is not `Complete` but whose held chunk groups already cover the requested span ([ADR 022 § Range-keyed partial-holder discovery](022-content-discovery.md#range-keyed-partial-holder-discovery)). A hit for hit-rate purposes, counted apart so the payoff of partial-holder advertisement stays legible. |
+| `decdn_serve_cache_miss_total` | Counter | M | live | Paid serves the gate could not satisfy from held bytes. Counts the admission decision and nothing downstream of it: the bump precedes the load-shed gate, the pre-spend floor reservation and the `pull_authorized` check every fill tier is gated on, so a shed refusal, a floor refusal and an unbound request all count here having asked no origin and no peer. A miss a tier does satisfy still counts here; the `decdn_serve_stream_rejected_*` siblings say whether it ended in a refusal. Also absorbs a store fault during the partial-coverage lookup, which reads as absence. |
 | `decdn_cache_pull_through_bytes_total` | Counter | R | live | Bytes received from origin during a cache miss, counted regardless of BLAKE3 verification or store landing — origin egress is paid either way. Independent of `decdn_cache_bytes_returned_total`: equal values mean pure pass-through; `bytes_returned_total >> pull_through_bytes_total` indicates effective caching. |
 | `decdn_cache_fill_not_coalesced_total` | Counter | R | live | Serve-miss fill claims not coalesced onto a live same-hash fill because the request starts ahead of that fill's paid frontier (decdn#2062). The refused attach opens its own pull, so the overlap is fetched from origin twice. A sustained rate means clients habitually resume ahead of what payers have cleared (decdn#2069, duplicate-egress section). |
 | `decdn_cache_evictions_total` | Counter | R | live | Blobs evicted by LRU pressure (eviction-driver loop). See [ADR 040](040-cache-policy.md#adr-040-pluggable-cache-admission-and-eviction-policies). |
@@ -157,7 +160,10 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | `decdn_onchain_tx_send_failed_total` | Counter | R | live | Node transactions the RPC refused at `send`. No transaction was issued. An oversize `redeemMany` that the redeemer then halves and retries counts here once. |
 | `decdn_onchain_tx_receipt_failed_total` | Counter | R | live | Issued node transactions whose receipt wait failed. The transaction can still mine; its hash is in the `warn!` line. |
 | `decdn_onchain_tx_timeout_total` | Counter | R | live | Issued node transactions whose receipt did not arrive inside the caller's bound. The transaction can still mine; its hash is in the `warn!` line. |
-| `decdn_pool_deposit_usdc` | Gauge | M | live | Total USDC deposited in pools currently paying this node. Represents maximum on-chain recoverable value. |
+| `decdn_pool_deposit_usdc` | Gauge | M | live | USDC still recoverable from the pools currently paying this node: the sum of `deposit - totalRedeemed` over the distinct pools the redeemer plans lanes against. Already-redeemed funds have left the pool, so this is the ceiling those pools can still pay, not their lifetime deposits. Refreshed once per redeemer self-tick, beside `decdn_unredeemed_usdc`. |
+| `decdn_buyer_wallet_usdc` | Gauge | M | live | USDC in this node's own buyer wallet — what it can still escrow when it opens a payment pool on its cache-miss leg. An unfunded wallet reverts every `openPool` on the ERC-20 transfer, which reads as a node that serves perfectly and buys nothing. Read once per reclaim sweep, so it lags a spend by up to one interval. Zero is meaningful only where `cache.node_to_node_pull_through_enabled` is on; a cache-only node never opens a pool. |
+| `decdn_buyer_lane_seed_failures_total` | Counter | M | live | Pulls refused because this node could not establish a lane's already-paid watermark. Resuming such a lane from zero is permanent, not per-pull: the pull persists its own progress on every exit path, which gives the lane a local row and stops the reseed ever running for that provider again. The node refuses instead. A sustained rate means the chain lane or the buyer store is unhealthy and this node is buying nothing from the affected providers. |
+| `decdn_buyer_pool_adoption_failures_total` | Counter | M | live | Bootstraps that could not determine whether this node already owns a payment pool on chain, so the first cache miss opens one. Every increment is a chance the node escrows a second deposit beside one it already holds. Adoption runs once per process, so this does not self-correct before the next restart. |
 | `decdn_unredeemed_usdc` | Gauge | M | live | Raw USDC in accepted vouchers this node has not redeemed on-chain. The value sums `owed − paid` over the lanes the redeemer plans to collect. The redeemer refreshes it once per self-tick, so it lags live accrual by up to one `redeem_interval_secs`. |
 | `decdn_buyer_pool_store_skipped_undecodable_records_total` | Counter | M | live | Buyer-pool rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy pools from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
 | `decdn_vouchers_signed_total` | Counter | M | planned | Vouchers this node signed as the payer (node-to-node pulls). |
@@ -176,7 +182,7 @@ Reputation is local-only per [ADR 008](008-reputation.md#adr-008-reputation-syst
 
 | Metric | Type | Tier | Status | Description |
 |--------|------|------|--------|-------------|
-| `decdn_node_uptime_seconds` | Gauge | R | live | Seconds since the node process started. Used by the `/health` endpoint and operator dashboards to correlate events with restarts. |
+| `decdn_node_uptime_seconds` | Gauge | R | live | Seconds since the node process started. Mirrors `admin_v1_health`'s `uptime_s`; operator dashboards use it to correlate events with restarts. |
 | `decdn_config_reload_failures_total` | Counter | R | live | SIGHUP or admin config reloads that failed. Sections committed before the failure stay applied. The other sections keep their previous values. |
 | `decdn_receipt_write_failures_total` | Counter | R | live | Download-receipt audit records the writer failed to persist: an I/O error or a panicked write task. Audit only; settlement is unaffected. |
 | `decdn_otlp_export_failures_total` | Counter | R | live | OTLP span-export batches whose export call failed: connect error, non-OK gRPC status, or timeout. A sustained rate means traces are lost. The counter does not count spans that the batch queue drops when full, or spans that a collector rejects inside an OK partial-success reply, so 0 does not prove that no traces were lost. The SDK logs queue drops as `BatchSpanProcessor.SpanDroppingStarted` and `BatchSpanProcessor.SpansDropped` under the `opentelemetry_sdk` target. Stays 0 when `observability.otlp_endpoint` is unset or the node emits no spans. |
@@ -261,41 +267,42 @@ The origin directory is not a watcher — it is a lazy, on-demand TTL cache with
 
 > **Alert on the gauge, not the restart-counter rate.** The `*_watcher_restarts_total` counters are edge-triggered through a `Mutex<Option<Instant>>` whose update is skipped on a poisoned lock (anti-panic policy) — once poisoned, the counter freezes silently, so `rate(*_watcher_restarts_total[5m])` can go permanently quiet with no signal that it did. Alert on `*_down_seconds` (a poisoned lock there reports `i64::MAX`, the safe direction) for sustained chain-read outages, and on `time() - *_last_tick_timestamp_seconds` for liveness. The restart counter is for correlation/depth, not as a primary alert.
 
-### Health Endpoint
+### Health
 
-`GET /health` (same HTTP port as `/metrics`) returns a JSON object:
+Health is an **admin JSON-RPC method**, `admin_v1_health`, served on the admin
+listener (`admin.listen`) — not an HTTP route beside `/metrics`. `decdn node
+health` and `decdn node drain --wait` are its callers. It returns:
 
 ```json
 {
-  "status": "ready" | "degraded" | "not_ready",
   "node_id": "<hex iroh NodeId>",
-  "registry_active": true,
-  "blacklist_synced": true,
-  "staker_set_active_count": 27,
-  "lanes_open": 3,
-  "pool_deposit_usdc": "15.23",
-  "node_uptime_seconds": 3601
+  "uptime_s": 3601,
+  "in_flight_streams": 3,
+  "binding": "bound",
+  "bound_node_id": "<hex iroh NodeId>",
+  "registry_active": true
 }
 ```
 
-**JSON key → Prometheus metric mapping:**
+The body is `decdn_common::admin::HealthResponse`; that struct is the shape, and
+this block tracks it. The endpoint is a readiness and identity probe, not a
+second metrics surface — every quantity an operator graphs comes from
+`/metrics`, so nothing is mirrored here.
 
-| JSON key | Prometheus metric | Notes |
-|----------|------------------|-------|
-| `staker_set_active_count` | `decdn_staker_set_active_count` | Cached active-staker set size (registry health) |
-| `lanes_open` | `decdn_lanes_open` | Direct gauge value |
-| `pool_deposit_usdc` | `decdn_pool_deposit_usdc` | Formatted as decimal string for readability; metric stores raw value |
-| `node_uptime_seconds` | `decdn_node_uptime_seconds` | Direct gauge value |
-
-**Status semantics:**
-
-| `status` | Meaning |
+| JSON key | Meaning |
 |----------|---------|
-| `ready` | All Phase 4 acceptance criteria satisfied ([ADR 019](019-node-onboarding.md#phase-4--accepting-paid-delivery)); serving traffic. |
-| `degraded` | Running but one or more non-critical conditions impaired (e.g., DHT routing table sparse, a chain-event watcher in backoff). Traffic still accepted. |
-| `not_ready` | A mandatory startup check failed or is incomplete (blacklist un-synced, rate floor not loaded, not registered). Not accepting traffic. |
+| `node_id` | This node's iroh public key, lowercase hex |
+| `uptime_s` | Whole seconds since process start, from a monotonic `Instant` |
+| `in_flight_streams` | QUIC handler tasks holding a dispatch permit; `decdn node drain --wait` polls it |
+| `binding` | Whether `node_id` is the key bound to this operator on-chain: `bound`, `mismatch`, `unbound` or `unknown`. Sampled once at bring-up |
+| `bound_node_id` | The key the operator IS bound to, when it could be read. Names the key to restore on a `mismatch` |
+| `registry_active` | Whether this node is in the on-chain active-staker set right now. Read live on every poll. The answer to "my node is up, why is it earning nothing" |
 
-HTTP status codes: `200` for `ready` and `degraded`; `503` for `not_ready`. Monitoring systems SHOULD alert on `503` responses.
+There is no aggregate `status` verdict and no HTTP status code to alert on. A
+successful call means the daemon is up and answering; what it is up *for* is
+`registry_active` and `binding`, which an operator reads directly. Liveness and
+degradation are `/metrics` questions — see the watcher `*_down_seconds` and
+`*_last_tick_timestamp_seconds` gauges above.
 
 ### Structured Logging
 
@@ -427,7 +434,7 @@ Covers M-tier slash-safety metrics, the full delivery and pull surface, and the 
 - Mandatory M-tier slash-risk metrics enforced at startup, so operators cannot accidentally run without slash-risk visibility.
 - Canonical `decdn_` prefix and `_total` suffix allow automated registry validation (e.g., a CI check that exported names match the registry).
 - Alert thresholds provide actionable defaults for new operators.
-- The `/health` endpoint integrates with standard load balancers and container readiness probes without parsing Prometheus text.
+- `admin_v1_health` answers readiness and identity without parsing Prometheus text, for operators and for `decdn node drain --wait`.
 
 ### Negative
 

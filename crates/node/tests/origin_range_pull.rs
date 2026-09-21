@@ -1149,6 +1149,13 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
         counter_value(&metrics, "local_outboard_serves_total")? == 1,
         "the own-origin two-leg serve tier must fire once"
     );
+    // A tier fired at all only because the availability gate classified this as
+    // a miss, so the two statements must agree.
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_cache_miss_total")? == 1
+            && counter_value(&metrics, "serve_cache_hit_total")? == 0,
+        "a serve that ran a fill tier must be classified a miss, not a hit"
+    );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     // The operator's own origin is not a peer: the fill counts as bytes served,

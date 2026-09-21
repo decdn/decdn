@@ -102,7 +102,7 @@ Run a node. `setup` performs the pre-flight checks, bonds TOKEN against the on-c
 decdn config init
 decdn setup --mbps 100 --region US --multiaddr /ip4/203.0.113.10/udp/4433/quic-v1
 decdn-node run --config ~/.decdn/node.toml
-decdn node health          # then `node status`, `node lanes`, `node top`
+decdn node health          # then `node status`, `node lanes`, `node pools`, `node top`
 ```
 
 Fetch content. A pool is a single deposit that fans out to every provider paid from it,

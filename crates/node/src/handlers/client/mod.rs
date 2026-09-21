@@ -1227,7 +1227,7 @@ pub struct ClientHandler {
     /// Serializes the read-and-publish half of [`Self::tune_lane_gauge`], so
     /// two concurrent lane-lifecycle calls cannot publish `decdn_lanes_open`
     /// out of order. The atomic alone fixes the count, not the publication:
-    /// without this the slower task's `set_inbound_lane_snapshot` overwrites a
+    /// without this the slower task's `set_lanes_open` overwrites a
     /// fresher lane count with its own staler one, and the gauge stays wrong
     /// until the next lifecycle event. Held across one atomic RMW and one gauge
     /// store, never across an `.await` or a map walk.
@@ -1406,14 +1406,13 @@ impl ClientHandler {
                 })),
             );
         }
-        // Deposit is a pool-level, on-chain quantity (getPool), not carried per
-        // lane, so the seller-side snapshot reports lane count only. Seed the
-        // atomic lane counter once at hydrate; `register_lane`/`forget_lane`
-        // tune it from then on (#1789 item 3).
+        // Seed the atomic lane counter once at hydrate; `register_lane` /
+        // `forget_lane` tune it from then on (#1789 item 3). The pool deposit
+        // behind these lanes is published separately, by the redeemer tick that
+        // can actually see it (#2072).
         let open_lanes = map.len();
         let lane_count = AtomicUsize::new(open_lanes);
-        deps.metrics
-            .set_inbound_lane_snapshot(open_lanes, U256::ZERO);
+        deps.metrics.set_lanes_open(open_lanes);
         // The floor accumulator is purely in-memory: no stream is live at boot, so
         // every `live_reservation` starts at zero and nothing is loaded from disk.
         let pool_floor: HashMap<B256, PoolFloorState> = HashMap::new();
@@ -2266,11 +2265,11 @@ impl ClientHandler {
     /// Apply one lane-lifecycle `delta` to the live-lane count and publish the
     /// resulting `decdn_lanes_open` gauge.
     ///
-    /// Deposit is a pool-level, on-chain quantity (`getPool`), not carried per
-    /// lane, so the seller-side snapshot reports the lane count only (#1789
-    /// item 3). The count comes from the atomic RMW's own result rather than a
-    /// re-read, and [`Self::lane_gauge_publish`] orders the publish, so the
-    /// gauge always reflects the most recent lifecycle event.
+    /// The count comes from the atomic RMW's own result rather than a re-read,
+    /// and [`Self::lane_gauge_publish`] orders the publish, so the gauge always
+    /// reflects the most recent lifecycle event. The pool deposit behind these
+    /// lanes is a pool-level on-chain quantity no lane carries, so it is
+    /// published by the redeemer tick instead (#2072).
     fn tune_lane_gauge(&self, delta: isize) {
         let _publish = self
             .lane_gauge_publish
@@ -2285,7 +2284,7 @@ impl ClientHandler {
                 .fetch_sub(1, Ordering::Relaxed)
                 .saturating_sub(1)
         };
-        self.metrics.set_inbound_lane_snapshot(open, U256::ZERO);
+        self.metrics.set_lanes_open(open);
     }
 }
 
@@ -3070,7 +3069,7 @@ mod tests {
     ///
     /// Multi-threaded on purpose, and the gauge is read WITHOUT a settling
     /// republish: the publish is the half the atomic does not make safe on its
-    /// own, so a lost `set_inbound_lane_snapshot` ordering leaves a stale value
+    /// own, so a lost `set_lanes_open` ordering leaves a stale value
     /// that only an extra refresh would paper over.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lane_gauge_matches_live_count_after_concurrent_register_and_remove() {

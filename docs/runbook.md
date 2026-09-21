@@ -444,6 +444,106 @@ action is required.
    [ADR 028 SlashAppeal](../adr/028-slashing-appeals.md) path, with its own bond
    and evidence rules, and it is the only appeal surface the protocol carries.
 
+## Node-to-node pulls never succeed (buyer wallet or pool)
+
+**Symptoms:** `decdn_node_pull_attempts_total` climbs while
+`decdn_node_pull_success_total` stays flat; origin pull-through volume is high
+against content the fleet already holds; the node serves inbound requests
+normally, so nothing else alerts. `DecdnNodePullNeverSucceeds` fires after 6h.
+
+The node's buyer leg is the one part of it that *spends*. It opens one
+`PaymentPool` deposit of `blockchain.buyer_working_deposit_micro_usdc` (10 USDC
+by default) and reuses it for every upstream pull. Two things break it.
+
+**Cause (1): the operator wallet holds no USDC.** Every `openPool` reverts on
+the ERC-20 transfer, so the node can pay no provider and every cache miss falls
+through to origin.
+
+1. Read `decdn_buyer_wallet_usdc`, and
+   `decdn_pool_open_failures_insufficient_deposit_total` beside it. The gauge is
+   refreshed once per reclaim sweep, so allow up to an hour after funding.
+2. Send USDC to the operator address. Circle's Sepolia faucet is the testnet
+   source (see [Testnet faucet](#testnet-faucet)); `decdn whoami` prints the
+   address, given the keystore password.
+3. No restart is needed — the next miss opens the pool.
+
+A wallet with an old string-revert USDC reports the same shortfall through
+`insufficient_deposit` rather than `contract_revert`; both mean fund the wallet.
+
+**Cause (2): the node owns a pool it has forgotten.** The buyer-pool store lives
+under `identity.data_dir`. If that directory is reset — a moved volume, a
+re-provisioned host — the node loses the only local record that it owns a pool.
+It reconciles against `PaymentPool.getPools` at startup and adopts the pool it
+already owns, so this heals on its own; what follows is for confirming it, and
+for recovering deposits an older build stranded before it did.
+
+**Read the node's pools with `decdn node pools`, not `decdn pool list`.** Two
+unrelated buyer stores can sit under `identity.data_dir`: the daemon's
+`buyer.redb`, and a client-owned `buyer-pools.redb` that `decdn fetch` and
+`decdn pool` use. On a clean node host only the first exists. A running daemon holds an exclusive lock on its file, so
+nothing can read it from disk; `decdn node pools` asks the daemon over the admin
+RPC. `decdn pool list --config /etc/decdn/node.toml` routes to the same place and
+names the file it read, so `pools=0` is always attributable to one store or the
+other. With the daemon **stopped** the lock is gone, and that same `pool list`
+reads `buyer.redb` off disk and marks the listing `(read from disk; no daemon
+running)` — the post-mortem route after a crash. A crashed daemon may leave the
+file needing redb's repair pass, which only a writer runs; start `decdn-node`
+once and read it again.
+
+**`decdn pool list --all` answers the question the stores cannot.** It
+enumerates `PaymentPool.getPools` by the keystore address and shows every pool
+in every lifecycle state, with its on-chain `deposit`, `totalRedeemed`, reclaim
+window, and whether the local record tracks it. That is the view that survives a
+reset `identity.data_dir`, because it reads no local file to produce the list.
+It is read-only, so it is not refused on a node's data dir the way `close --all`
+is. When the two views disagree, believe the chain: the disagreement is the
+diagnostic.
+
+1. Run `decdn node pools`, and `decdn pool list --all` beside it. The first
+   reports every pool the daemon tracks, its deposit, and the per-lane amounts
+   already signed away; the second reports every pool the wallet owns on chain.
+   A pool in the second and not the first is a stranded deposit. Compare both
+   against
+   `decdn_buyer_pool_adoption_failures_total`: any increment means the node
+   could not tell whether it already owned a pool and was about to open a second
+   one.
+2. The node adopts the newest solvent `Open` pool at startup, and on **every**
+   boot it enumerates `getPools` to name deposits it is not using. Look for
+   `this node owns further open payment pools it is not using`, which lists the
+   stranded ids, and — only when an adoption happened — `adopted this node's
+   existing on-chain payment pool`. The stranded warning fires whether or not
+   anything was adopted.
+
+   Absence of that warning only means "nothing stranded" **if the sweep
+   completed**. A failed enumeration logs `could not enumerate this node's
+   on-chain pools`, an unreadable individual pool logs `could not read an owned
+   pool's state`, and an unreadable buyer store skips reconciliation entirely
+   (`buyer pool store read failed before on-chain reconciliation`). Any of the
+   three means the answer is unknown, not clean — fix the cause and restart to
+   re-run the sweep.
+3. Recover those with `decdn pool close --pool <poolId>`, then
+   `decdn pool reclaim --pool <poolId>` once the pool's `disputeWindow` has
+   elapsed (48-72h, governance-set). Both commands run their on-chain leg
+   normally from a node host but leave the daemon's row alone — they cannot
+   write a store the daemon holds — and say so.
+
+   If you closed the pool the daemon was using, restart `decdn-node`. Its
+   bootstrap checks the tracked pool against the chain's open set, drops a row
+   whose pool is no longer open, and adopts or opens a replacement
+   (`the tracked buyer pool is no longer open on chain`). Until that restart the
+   node keeps pinning its pulls to the closed pool. Its vouchers still redeem
+   while the dispute window is open, and stop the moment it elapses — so the
+   wedge is delayed, not absent, and the residual is refunded to the owner at
+   `reclaim` either way. Confirm with `decdn node pools`.
+4. `close --all` and `reclaim --all` are refused on a node's data dir. They
+   enumerate from chain by keystore address, so on a node host they would close
+   the pool the daemon is paying from right now. Name the stranded pools
+   individually — `pool list --all` is how you find their ids, and it is allowed
+   there because it sends no transaction and writes no pool record.
+5. Lanes on an adopted pool resume from their on-chain watermark, so a provider
+   still holding an unredeemed voucher is briefly ahead of the node and rejects
+   its first vouchers. That clears on the provider's next redemption; no action.
+
 ## Refusing paying clients (insufficient deposit)
 
 **Symptoms:** clients report a blob as missing that this node holds; delivery
@@ -520,8 +620,8 @@ tops up — see
 3. For cause (1), no action. If the rate is high because many clients open dust
    channels deliberately, note that the refusal now happens *before* any fill
    (#1519), so it costs this node nothing beyond the signature.
-4. Do not raise a deposit floor to "fix" this. There is no on-chain minimum
-   deposit beyond non-zero
+4. Do not raise a deposit floor to "fix" this. `PaymentPool.minDeposit` ships
+   dormant at 0 and is governance-set
    ([ADR 003 § Deposit Economics](../adr/003-payments.md#deposit-economics));
    service is bounded by what a deposit funds, which is exactly what this refusal
    is enforcing.

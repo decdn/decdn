@@ -20,17 +20,19 @@
 use std::path::Path;
 
 use alloy::primitives::{Address, U256};
-use redb::Database;
+use redb::{Database, ReadOnlyDatabase};
 
 use crate::buyer_pool::{
     AdvanceOutcome, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome,
 };
-use crate::buyer_pool_table::BuyerPoolTable;
+use crate::buyer_pool_table::{BuyerPoolTable, load_all_from};
 use crate::lane::{LaneKey, PoolId};
 use crate::store::StoreError;
 
-/// File name of the buyer-pool redb database within the data dir.
-const BUYER_POOLS_DB_FILE: &str = "buyer-pools.redb";
+/// File name of the buyer-pool redb database within the data dir. Named in
+/// [`decdn_common::data_dir`] beside the daemon's own stores, so a tool can
+/// tell a client data dir from a node's before it writes to either.
+const BUYER_POOLS_DB_FILE: &str = decdn_common::data_dir::CLIENT_BUYER_DB_FILE;
 
 /// Buyer-only `redb`-backed [`BuyerPoolStore`]. One redb file, one table;
 /// every mutating call fsyncs on commit (`Durability::Immediate`).
@@ -97,6 +99,104 @@ impl RedbBuyerPoolStore {
     #[cfg(feature = "test-util")]
     pub fn insert_raw_buyer_record(&self, pool_id: PoolId, bytes: &[u8]) -> Result<(), StoreError> {
         self.table().insert_raw(pool_id, bytes)
+    }
+}
+
+/// A buyer-pool store opened read-only, by file path.
+///
+/// The reader for any buyer store this process must not write: a **stopped**
+/// `decdn-node` daemon's `buyer.redb` under post-mortem inspection (#2084), or
+/// the client's own `buyer-pools.redb` when a command only needs to look.
+///
+/// `redb` holds its process-exclusive lock for the lifetime of an open
+/// [`Database`], so the lock doubles as a liveness signal: a successful open
+/// proves no process holds the file, and [`StoreError::AlreadyOpen`] proves one
+/// does.
+///
+/// Two differences from [`RedbBuyerPoolStore`] are load-bearing:
+///
+/// - It takes a **file path**, not a data dir. A directory holds two unrelated
+///   buyer stores, and a reader must not have to guess which one it means.
+/// - It **never creates**. [`redb::ReadOnlyDatabase::open`] cannot, which is
+///   what keeps #2078 closed: pointed at a path with no store it reports
+///   [`StoreError::Absent`], rather than manufacturing an empty store and
+///   reporting its emptiness as state.
+///
+/// Clearing a row is a separate decision and would need the write lock this
+/// type deliberately does not take.
+pub struct ReadOnlyBuyerPoolStore {
+    db: ReadOnlyDatabase,
+    path: std::path::PathBuf,
+}
+
+/// Hand-written because `redb::ReadOnlyDatabase` has no `Debug`. The path is
+/// the identifying fact anyway — the handle itself prints nothing useful.
+impl std::fmt::Debug for ReadOnlyBuyerPoolStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadOnlyBuyerPoolStore")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReadOnlyBuyerPoolStore {
+    /// Open the buyer-pool database at `path` read-only.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::AlreadyOpen`] when a process holds the write lock, which
+    ///   means a daemon is running against this file.
+    /// - [`StoreError::NeedsRepair`] when the file was not closed cleanly. A
+    ///   read-only open cannot run redb's repair pass, so the file reads only
+    ///   after a writable open has repaired it.
+    /// - [`StoreError::Absent`] when no file exists at `path`. A routine state,
+    ///   not a fault: a data dir whose store was deleted to force re-adoption
+    ///   has none, and so does a dir no buyer has used.
+    /// - [`StoreError::Backend`] for anything else.
+    pub fn open_file(path: &Path) -> Result<Self, StoreError> {
+        let db = ReadOnlyDatabase::open(path).map_err(|err| match err {
+            redb::DatabaseError::DatabaseAlreadyOpen => StoreError::AlreadyOpen {
+                path: path.to_path_buf(),
+            },
+            redb::DatabaseError::RepairAborted => StoreError::NeedsRepair {
+                path: path.to_path_buf(),
+            },
+            // An absent file is the one `other` worth naming: it is a routine
+            // state whose honest report is "there is no store here", and
+            // leaving it as a backend errno makes a caller infer it.
+            redb::DatabaseError::Storage(redb::StorageError::Io(ref io))
+                if io.kind() == std::io::ErrorKind::NotFound =>
+            {
+                StoreError::Absent {
+                    path: path.to_path_buf(),
+                }
+            }
+            other => StoreError::Backend(format!(
+                "open buyer pool db read-only at {}: {other}",
+                path.display()
+            )),
+        })?;
+        Ok(Self {
+            db,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// The file this store reads. Callers name it in their own output, because
+    /// which file produced a listing must never be ambiguous.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Load every persisted buyer pool, with the same decode-and-skip semantics
+    /// a live store applies.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] if the table or its iterator is unreadable.
+    pub fn load_all(&self) -> Result<BuyerLoad, StoreError> {
+        load_all_from(&self.db)
     }
 }
 
@@ -174,6 +274,7 @@ mod tests {
         };
         let mut s = BuyerPoolState::new(
             pool_id,
+            Address::repeat_byte(0x9c),
             owner,
             Address::repeat_byte(0xaa),
             U256::from(1_000_000u64),
@@ -209,6 +310,72 @@ mod tests {
         // Releasing the first handle frees the lock; a fresh open then succeeds.
         drop(first);
         RedbBuyerPoolStore::open(&data)?;
+        Ok(())
+    }
+
+    /// The #2084 read: a store written by one process, closed, and then read
+    /// by another. A dropped `Database` releases redb's lock, so the rows come
+    /// back byte-for-byte through the read-only path — which is what makes a
+    /// stopped daemon's `buyer.redb` inspectable at all.
+    #[test]
+    fn a_closed_store_reads_back_read_only() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data = dir.path().join("d");
+        let (recorded, _) = state(7, 4096, 9)?;
+        {
+            let store = RedbBuyerPoolStore::open(&data)?;
+            store.record(&recorded)?;
+        }
+
+        let path = data.join(BUYER_POOLS_DB_FILE);
+        let reader = ReadOnlyBuyerPoolStore::open_file(&path)?;
+        anyhow::ensure!(reader.path() == path, "the reader must name its file");
+        let load = reader.load_all()?;
+        anyhow::ensure!(load.skipped.is_empty(), "no row should be skipped");
+        anyhow::ensure!(
+            load.pools == vec![recorded],
+            "read-only load must match what was written: {:?}",
+            load.pools
+        );
+        Ok(())
+    }
+
+    /// The lock is the liveness signal. While a writer holds the file, the
+    /// read-only open fails with `AlreadyOpen` — so a caller can tell "no
+    /// daemon is running" from "a daemon has this file" without guessing.
+    #[test]
+    fn read_only_open_reports_a_live_writer_as_already_open() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data = dir.path().join("d");
+        let writer = RedbBuyerPoolStore::open(&data)?;
+        let path = data.join(BUYER_POOLS_DB_FILE);
+
+        let err = ReadOnlyBuyerPoolStore::open_file(&path)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("a read-only open must not race a live writer"))?;
+        anyhow::ensure!(
+            matches!(&err, StoreError::AlreadyOpen { path: p } if p == &path),
+            "wrong error or path: {err:?}"
+        );
+
+        drop(writer);
+        ReadOnlyBuyerPoolStore::open_file(&path)?;
+        Ok(())
+    }
+
+    /// The property that keeps #2078 closed: the read-only path never creates.
+    /// Pointed at a dir with no store, it reports that there is none rather
+    /// than manufacturing an empty one and reporting its emptiness as state.
+    #[test]
+    fn read_only_open_creates_nothing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("buyer.redb");
+
+        anyhow::ensure!(
+            ReadOnlyBuyerPoolStore::open_file(&path).is_err(),
+            "an absent store must not open"
+        );
+        anyhow::ensure!(!path.exists(), "a read-only open must not create the file");
         Ok(())
     }
 
