@@ -8,11 +8,21 @@
 //! per blob (#936): with an explicit `--node-id` every entry is pulled from that
 //! one node, otherwise each distinct blob discovers its own holder among the
 //! region-nearest active nodes. Every group's fetch — a plain whole-file blob,
-//! or a hint-carrying entry's complement-range fetch — fans out concurrently,
+//! or a hint-carrying entry's pay-now-range fetch — fans out concurrently,
 //! bounded by one global `--jobs` cap (`PullCtx.gate`). A manifest `chunks`
 //! entry is never fetched or stored as its own blob: its hints only let a
 //! byte range shared with another entry be recognized and spliced from disk
 //! instead of paid for again.
+//!
+//! **Shared chunks are fetched once.** When a chunk hint hash appears in two or
+//! more entries, the run assigns that chunk to one entry — its smallest holder,
+//! computed up front from the whole manifest by `build_fetch_plan` — and only
+//! that entry pays to fetch it. Groups are scheduled smallest-first, so a holder
+//! starts before the larger entries that share its chunks. Each entry drives its
+//! own ranges (unique chunks, chunks assigned to it, un-splice-able edges) up
+//! front and defers the rest; at its tail it splices each deferred range as the
+//! assigned holder registers it, waiting on the holder — not a clock — and driving
+//! a deferred range itself only if that holder finishes without producing it.
 //!
 //! **One shared pool.** The whole bundle pulls from the caller's single
 //! `PaymentPool` deposit (ADR 003) — opened once and reused across every
@@ -133,6 +143,27 @@ fn group_by_hash<'a>(entries: &[&'a ManifestEntry]) -> Vec<HashGroup<'a>> {
             group.entries.push(*entry);
         }
     }
+    groups
+}
+
+/// Order hash-groups smallest whole-file first so a shared chunk's assigned
+/// fetcher (the smallest containing entry, per [`build_fetch_plan`]) starts — and
+/// finishes — before the larger entries that defer to it, keeping the tail-reconcile
+/// wait short. A group's entries share one blob, so the group's size is any entry's
+/// declared `size` (the same OR-across-same-hash-entries rule as
+/// [`total_content_bytes`], so a group with one unsized duplicate path still sorts
+/// by its real size); a group no entry sizes sorts last (it can never be a sized
+/// donor). Ties break on the group hash for a deterministic order.
+fn order_groups_smallest_first(mut groups: Vec<HashGroup<'_>>) -> Vec<HashGroup<'_>> {
+    groups.sort_by(|a, b| {
+        let a_size = a.entries.iter().find_map(|e| e.size);
+        let b_size = b.entries.iter().find_map(|e| e.size);
+        // A group no entry sizes sorts last: map to the max sentinel for the compare.
+        let key = |s: Option<u64>| s.unwrap_or(u64::MAX);
+        key(a_size)
+            .cmp(&key(b_size))
+            .then_with(|| a.hash.cmp(b.hash))
+    });
     groups
 }
 
@@ -1635,6 +1666,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // one blob is assembled, never that it is one paid unit per distinct hash.
         let index = ChunkIndex::default();
         let refs: Vec<&ManifestEntry> = entries.iter().collect();
+        // Assign every chunk shared by two or more entries to its smallest holder,
+        // so that shared chunk is fetched once (by that holder) and spliced into
+        // every other entry — computed once from the whole manifest.
+        let fetch_plan = build_fetch_plan(entries);
         // Pre-pass: classify every entry against the output tree and the saved
         // skip-cache before any fetch, so an updated file at an already-present
         // path is written rather than silently skipped.
@@ -1646,7 +1681,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // completed group's records fold onto it and rewrite the cache as the
         // pull progresses.
         let (outcomes, transfer) = self
-            .pull_plain(&refs, out_root, overwrite, &index, &disk, saved)
+            .pull_plain(
+                &refs,
+                out_root,
+                overwrite,
+                &index,
+                &fetch_plan,
+                &disk,
+                saved,
+            )
             .await;
 
         // A donor entry's finalized staging blob is the source a recipient splices
@@ -1671,16 +1714,20 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// blob whose chunk hints overlap an already-materialized sibling pays only for
     /// the complement. Live per-group bars are bounded at `--jobs`; `PullCtx.gate`
     /// is the real cap on in-flight fetches.
+    // The run-wide context (index, fetch plan, disk pre-pass, flush cache) all
+    // threads through here; bundling it into a struct would only rename the fields.
+    #[allow(clippy::too_many_arguments)]
     async fn pull_plain(
         &self,
         entries: &[&ManifestEntry],
         out_root: &Path,
         overwrite: bool,
         index: &ChunkIndex,
+        fetch_plan: &FetchPlan,
         disk: &DiskState,
         saved: SavedManifest,
     ) -> (Vec<EntryOutcome>, Transfer) {
-        let groups_by_hash = group_by_hash(entries);
+        let groups_by_hash = order_groups_smallest_first(group_by_hash(entries));
         let group_count = groups_by_hash.len().max(1);
         // Completed groups' skip-cache records flow to the flush task over this
         // channel. Unbounded so a `send` from the fetch-driving side never blocks
@@ -1700,8 +1747,17 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                     let group_entries: Vec<&ManifestEntry> = group.entries.clone();
                     async move {
                         let outcomes = self
-                            .fetch_group(group, out_root, overwrite, index, disk)
+                            .fetch_group(group, out_root, overwrite, index, fetch_plan, disk)
                             .await;
+                        // Mark this group's blob finished (whatever the outcome) so a
+                        // tail-reconcile waiter deferring a chunk assigned to it stops
+                        // waiting and pays for the range itself if the group failed to
+                        // register that chunk.
+                        if let Some(en) = group_entries.first()
+                            && let Ok(whole) = fetch::parse_hash(&en.hash)
+                        {
+                            index.mark_finished(whole);
+                        }
                         // `fetch_group` returns one outcome per entry, in order;
                         // `build_completed_updates` relies on that to correlate a
                         // path to its outcome by position. Assert the invariant for
@@ -1782,6 +1838,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     ///
     /// On success the entry's chunks are registered into `index` so later entries
     /// can splice from this blob.
+    #[allow(clippy::too_many_arguments)]
     async fn pull_entry(
         &self,
         hash: [u8; 32],
@@ -1789,6 +1846,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         total: Option<u64>,
         staging: &Path,
         index: &ChunkIndex,
+        fetch_plan: &FetchPlan,
         progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<()> {
         // An already-finalized `<hex>` staging blob — a prior run promoted it, or
@@ -1817,22 +1875,27 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             remove_staging(staging);
         }
 
-        // Plan the dedup only when there is something to dedup against: hints and a
-        // known total. The finalized-staging fast path above already returned, so
-        // `staging` does not exist here.
+        // Plan the reassembly only when there is something to dedup against: hints
+        // and a known total. The finalized-staging fast path above already
+        // returned, so `staging` does not exist here. A chunk already materialized
+        // (a pre-seeded on-disk donor, or a sibling that already finished) becomes a
+        // splice `donor`; a chunk this run assigns to another entry becomes
+        // `deferred` (waited for at the tail); the rest is driven. When neither a
+        // donor nor a deferral applies, there is nothing to dedup — fall through to
+        // the plain whole-file fetch.
         let plan = match (hints, total) {
             (Some(hints), Some(total)) if !hints.is_empty() => {
                 let guard = index.map.lock().unwrap_or_else(PoisonError::into_inner);
-                let plan = plan_dedup(hints, &guard, total);
+                let plan = plan_reassembly(hints, &guard, fetch_plan, hash, total);
                 drop(guard);
-                (!plan.donor.is_empty()).then_some((plan, total))
+                (!plan.donor.is_empty() || !plan.deferred.is_empty()).then_some((plan, total))
             }
             _ => None,
         };
 
         let Some((plan, total)) = plan else {
-            // No donor overlap — pay for the whole file, then register its chunks
-            // so a *later* entry can dedup against it.
+            // No donor overlap and nothing deferred — pay for the whole file, then
+            // register its chunks so a *later* entry can dedup against it.
             self.fetch_to_staging(hash, staging, progress).await?;
             index.register(hints, staging);
             return Ok(());
@@ -1876,8 +1939,16 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             }
         };
 
-        let outcome =
-            reassemble_dedup(&driver, &plan, total, hints, index, &finish_progress).await?;
+        let outcome = reassemble_dedup(
+            &driver,
+            &plan,
+            total,
+            hints,
+            index,
+            fetch_plan,
+            &finish_progress,
+        )
+        .await?;
         self.dedup_stats
             .spliced_bytes
             .fetch_add(outcome.spliced_bytes, Ordering::Relaxed);
@@ -1899,6 +1970,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         overwrite: bool,
         index: &ChunkIndex,
+        fetch_plan: &FetchPlan,
         disk: &DiskState,
     ) -> Vec<EntryOutcome> {
         // The group's shared hash is carried explicitly; parse it once, and a bad
@@ -2018,6 +2090,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 total,
                 &staging,
                 index,
+                fetch_plan,
                 file_bar.callback(),
             )
             .await;
@@ -2128,34 +2201,65 @@ impl<P: Provider + Clone> RangeDriver for CtxRangeDriver<'_, P> {
     }
 }
 
-/// Reassemble one dedup entry's blob into `staging`: drive the complement, splice
-/// the donor ranges from disk, verify the whole-file BLAKE3, and promote — using
-/// `driver` for every paid range drive.
+/// Ensure the ranged-store `.partial` exists at the whole-file size, so a splice
+/// can seek and write into it. A drive normally creates it; an entry with nothing
+/// to drive (every chunk is a donor or deferred) has no drive, so this creates a
+/// sparse file of `total` bytes. A `.partial` already present (a drive made it, or
+/// a resumed run) is left untouched.
+fn ensure_partial(partial: &Path, total: u64) -> anyhow::Result<()> {
+    if partial.try_exists()? {
+        return Ok(());
+    }
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(partial)
+        .with_context(|| format!("create {}", partial.display()))?;
+    f.set_len(total)
+        .with_context(|| format!("size {}", partial.display()))?;
+    Ok(())
+}
+
+/// Reassemble one dedup entry's blob into `staging`: drive the pay-now ranges,
+/// splice the donor ranges from disk, reconcile the deferred (sibling-assigned)
+/// ranges at the tail, verify the whole-file BLAKE3, and promote — using `driver`
+/// for every paid range drive.
 ///
 /// The authoritative gate throughout is the whole-file BLAKE3; a bad or lying hint
 /// only ever costs a re-download, never a corrupt output or a spuriously-failed
-/// entry. After EVERY range drive (the complement, a donor re-fetch, and the
-/// whole-blob re-drive) the store may have completed — `drive` then finalized and
-/// renamed `<hex>.partial` -> `<hex>`. Each such point checks `staging.try_exists()`
-/// and returns success rather than opening a `.partial` that no longer exists: a
-/// resumed run whose prior `.partial` already held the donor-overlap ranges hits
-/// this on the very FIRST complement drive.
+/// entry. After EVERY range drive (pay-now, a donor re-fetch, a deferred fallback,
+/// and the whole-blob re-drive) the store may have completed — `drive` then
+/// finalized and renamed `<hex>.partial` -> `<hex>`. Each such point checks
+/// `staging.try_exists()` and returns success rather than opening a `.partial` that
+/// no longer exists: a resumed run whose prior `.partial` already held every range
+/// hits this on the very FIRST pay-now drive.
 ///
-/// `finish_progress` trues the file + total bars up to 100% on success: donor
-/// bytes are spliced from disk and never flow through `drive`'s progress callback,
-/// so a mostly-spliced entry would otherwise leave its bars short.
+/// The deferred ranges are chunks this run assigned to a smaller sibling
+/// ([`build_fetch_plan`]). They are NOT driven up front; the tail loop waits on the
+/// [`ChunkIndex`] progress signal and splices each one as its assigned fetcher
+/// registers it — so the shared bytes are fetched once, by that sibling, and copied
+/// here from disk. The wait is never a fixed timeout (the deferred bytes are exactly
+/// what the sibling is still downloading): a deferred range is driven-and-paid here
+/// only if its assigned fetcher FINISHES without registering the chunk (a failed
+/// fetcher), which keeps the run live and never worse than fetching it directly.
 ///
-/// Returns the entry's [`DedupOutcome`] — bytes actually spliced from disk and
-/// hints dropped by a fault — for the run-level report. A resume that finalized on
-/// the first complement drive spliced nothing this run; a self-heal whole-blob
-/// re-drive discards every splice, so it reports zero spliced bytes and counts all
-/// its donors as ignored.
+/// `finish_progress` trues the file + total bars up to 100% on success: donor bytes
+/// are spliced from disk and never flow through `drive`'s progress callback, so a
+/// mostly-spliced entry would otherwise leave its bars short.
+///
+/// Returns the entry's [`DedupOutcome`] — bytes actually spliced from disk and hints
+/// dropped by a fault — for the run-level report. A resume that finalized on the
+/// first pay-now drive spliced nothing this run; a self-heal whole-blob re-drive
+/// discards every splice, so it reports zero spliced bytes and counts all its donors
+/// as ignored.
 async fn reassemble_dedup(
     driver: &dyn RangeDriver,
-    plan: &DedupPlan,
+    plan: &ReassemblePlan,
     total: u64,
     hints: Option<&[Hint]>,
     index: &ChunkIndex,
+    fetch_plan: &FetchPlan,
     finish_progress: &dyn Fn(),
 ) -> anyhow::Result<DedupOutcome> {
     let hash = driver.hash();
@@ -2166,26 +2270,30 @@ async fn reassemble_dedup(
         .map(|d| d.aligned.1)
         .fold(0u64, u64::saturating_add);
 
-    // Pay only for the bytes no donor covers.
-    driver.drive(&plan.complement).await?;
-
-    // A resumed run may already hold the donor-overlap bytes in `.partial`, so this
-    // first complement drive can COMPLETE the store — `drive` then ran its
-    // whole-blob bao sweep against `hash` and renamed `<hex>.partial` -> `<hex>`.
-    // The blob is finalized and verified; splicing would open a `.partial` that no
-    // longer exists. Register the donor chunks and return. No splice ran this run,
-    // so nothing is reported spliced.
-    if staging.try_exists()? {
-        finish_progress();
-        index.register(hints, staging);
-        return Ok(DedupOutcome::default());
+    // Pay only for the pay-now ranges (this entry's unique + self-assigned chunks
+    // and any un-splice-able edges); donors are spliced and deferred ranges wait.
+    // An entry with nothing to drive (every chunk is a donor or deferred) skips the
+    // drive entirely and splices into a freshly-sized `.partial`.
+    if !plan.drive.is_empty() {
+        driver.drive(&plan.drive).await?;
+        // A resumed run may already hold every range in `.partial`, so this first
+        // drive can COMPLETE the store — `drive` then ran its whole-blob bao sweep
+        // against `hash` and renamed `<hex>.partial` -> `<hex>`. The blob is
+        // finalized and verified; splicing would open a `.partial` that no longer
+        // exists. Register the donor chunks and return. No splice ran this run.
+        if staging.try_exists()? {
+            finish_progress();
+            index.register(hints, staging);
+            return Ok(DedupOutcome::default());
+        }
     }
 
     let partial = partial_path(staging);
+    ensure_partial(&partial, total)?;
 
-    // Verify + splice each donor range off the executor. A donor whose chunk no
-    // longer hashes to its hint (a lying donor hint, or a short read) is re-fetched
-    // normally rather than trusted.
+    // Verify + splice each initially-available donor range off the executor. A donor
+    // whose chunk no longer hashes to its hint (a lying donor hint, or a short read)
+    // is re-fetched normally rather than trusted.
     let donors = plan.donor.clone();
     let partial_for_splice = partial.clone();
     let refetch: Vec<(u64, u64)> =
@@ -2199,11 +2307,6 @@ async fn reassemble_dedup(
     let mut hints_ignored = u64::try_from(refetch.len()).unwrap_or(u64::MAX);
     if !refetch.is_empty() {
         driver.drive(&refetch).await?;
-        // If every donor was untrusted, `refetch` is the whole donor set, so the
-        // driven complement plus this re-fetch cover the whole blob: `drive` then
-        // ran its whole-blob bao sweep against `hash` and renamed `.partial` ->
-        // `staging`. The blob is finalized and verified — do not hash/promote a
-        // `.partial` that no longer exists; register the donor chunks and return.
         if staging.try_exists()? {
             finish_progress();
             index.register(hints, staging);
@@ -2212,6 +2315,23 @@ async fn reassemble_dedup(
                 hints_ignored,
             });
         }
+    }
+
+    // Tail reconcile: splice each deferred (sibling-assigned) range as its fetcher
+    // registers it, waiting on the index's progress signal. A deferred chunk whose
+    // assigned fetcher finishes WITHOUT producing it (a failed fetcher) is driven
+    // and paid here instead, so the run never hangs.
+    let (tail_spliced, tail_ignored) =
+        reconcile_deferred(driver, &partial, &plan.deferred, index, fetch_plan).await?;
+    spliced_bytes = spliced_bytes.saturating_add(tail_spliced);
+    hints_ignored = hints_ignored.saturating_add(tail_ignored);
+    if staging.try_exists()? {
+        finish_progress();
+        index.register(hints, staging);
+        return Ok(DedupOutcome {
+            spliced_bytes,
+            hints_ignored,
+        });
     }
 
     // The authoritative check: the whole reassembled blob must hash to `hash`.
@@ -2226,7 +2346,8 @@ async fn reassemble_dedup(
         // re-verify. Every donor is discarded, so nothing was saved and all of them
         // count as ignored.
         spliced_bytes = 0;
-        hints_ignored = u64::try_from(plan.donor.len()).unwrap_or(u64::MAX);
+        hints_ignored =
+            u64::try_from(plan.donor.len().saturating_add(plan.deferred.len())).unwrap_or(u64::MAX);
         tracing::warn!(
             "bundle pull: entry {} failed its whole-file hash after range-dedup; \
              re-fetching the whole blob",
@@ -2272,6 +2393,101 @@ async fn reassemble_dedup(
         spliced_bytes,
         hints_ignored,
     })
+}
+
+/// Tail reconcile for one entry's deferred (sibling-assigned) chunks: splice each
+/// as its assigned fetcher registers it in `index`, waiting on the index progress
+/// signal between scans rather than polling on a clock. A deferred chunk whose
+/// assigned fetcher FINISHES without registering it (a failed fetcher, or one with
+/// no recorded assignee) — or one registered under a length that disagrees with the
+/// hint — is driven and paid here instead, so the entry always completes and the run
+/// never hangs. Returns `(spliced_bytes, hints_ignored)`: bytes served from a splice,
+/// and deferred chunks that fell back to a paid drive.
+async fn reconcile_deferred(
+    driver: &dyn RangeDriver,
+    partial: &Path,
+    deferred: &[Hint],
+    index: &ChunkIndex,
+    fetch_plan: &FetchPlan,
+) -> anyhow::Result<(u64, u64)> {
+    let mut waiting: Vec<Hint> = deferred.to_vec();
+    let mut spliced_bytes = 0u64;
+    let mut ignored = 0u64;
+    if waiting.is_empty() {
+        return Ok((0, 0));
+    }
+    let notified = index.progress.notified();
+    tokio::pin!(notified);
+    loop {
+        // Register as a waiter BEFORE scanning so a registration/finish between the
+        // scan and the await is not lost (`notify_waiters` stores no permit).
+        notified.as_mut().enable();
+
+        let mut ready: Vec<DonorRange> = Vec::new();
+        let mut fallback: Vec<(u64, u64)> = Vec::new();
+        let mut still: Vec<Hint> = Vec::new();
+        {
+            let guard = index.map.lock().unwrap_or_else(PoisonError::into_inner);
+            for h in &waiting {
+                // A trustworthy donor for this chunk is available now — splice it.
+                if let Some(d) = guard.get(&h.hash).and_then(|m| donor_for(h, m)) {
+                    ready.push(d);
+                    continue;
+                }
+                // Otherwise keep waiting ONLY while the assigned fetcher is still
+                // running and might yet register a good donor. Stop waiting — and pay
+                // for the interior here — once that fetcher has finished without
+                // producing it, or a registered donor's length disagreed (present but
+                // untrusted), or there is no recorded assignee at all.
+                let present_but_untrusted = guard.contains_key(&h.hash);
+                let fetcher_running = fetch_plan
+                    .assigned
+                    .get(&h.hash)
+                    .copied()
+                    .is_some_and(|a| !index.is_finished(a));
+                if fetcher_running && !present_but_untrusted {
+                    still.push(*h);
+                } else if let Some(iv) = aligned_interior(h) {
+                    fallback.push(iv);
+                    ignored = ignored.saturating_add(1);
+                }
+            }
+        }
+
+        if !ready.is_empty() {
+            let ready_total: u64 = ready
+                .iter()
+                .map(|d| d.aligned.1)
+                .fold(0, u64::saturating_add);
+            let partial_c = partial.to_path_buf();
+            let refetch: Vec<(u64, u64)> =
+                tokio::task::spawn_blocking(move || splice_donors(&partial_c, &ready))
+                    .await
+                    .map_err(|e| anyhow!("deferred splice task: {e}"))??;
+            let refetch_total: u64 = refetch.iter().map(|r| r.1).fold(0, u64::saturating_add);
+            spliced_bytes = spliced_bytes.saturating_add(ready_total.saturating_sub(refetch_total));
+            ignored = ignored.saturating_add(u64::try_from(refetch.len()).unwrap_or(u64::MAX));
+            fallback.extend(refetch);
+        }
+
+        if !fallback.is_empty() {
+            driver.drive(&fallback).await?;
+            // A fallback drive may complete the store (`drive` renames
+            // `.partial` -> `<hex>`); no more splicing is then possible or needed.
+            if driver.staging().try_exists()? {
+                return Ok((spliced_bytes, ignored));
+            }
+        }
+
+        waiting = still;
+        if waiting.is_empty() {
+            return Ok((spliced_bytes, ignored));
+        }
+
+        // Block until the next registration or group-finish, then rescan.
+        notified.as_mut().await;
+        notified.set(index.progress.notified());
+    }
 }
 
 /// The run-end sweep of donor staging blobs: remove every registered donor
@@ -2356,6 +2572,15 @@ struct ChunkIndex {
     /// [`Self::sources`] so the run-end staging sweep never deletes a
     /// materialized output.
     seeded: std::sync::Mutex<HashSet<PathBuf>>,
+    /// Whole-file hashes of groups whose fetch has FINISHED this run, success or
+    /// failure. A tail-reconcile waiter watches this: once the entry a deferred
+    /// chunk is assigned to has finished without registering that chunk, the waiter
+    /// stops waiting and drives the range itself (the assigned fetcher failed). It
+    /// only ever grows.
+    finished: std::sync::Mutex<HashSet<[u8; 32]>>,
+    /// Pinged whenever a donor is registered/seeded or a group finishes, so a
+    /// tail-reconcile waiter re-checks its deferred chunks without polling.
+    progress: tokio::sync::Notify,
 }
 
 impl ChunkIndex {
@@ -2367,22 +2592,29 @@ impl ChunkIndex {
         let Some(hints) = hints else {
             return;
         };
-        let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
-        for h in hints {
-            map.entry(h.hash).or_insert_with(|| MaterializedRange {
-                source: source.to_path_buf(),
-                offset: h.offset,
-                len: h.len,
-            });
+        {
+            let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+            for h in hints {
+                map.entry(h.hash).or_insert_with(|| MaterializedRange {
+                    source: source.to_path_buf(),
+                    offset: h.offset,
+                    len: h.len,
+                });
+            }
         }
+        // New donors may unblock a tail-reconcile waiter.
+        self.progress.notify_waiters();
     }
 
     /// The distinct donor staging blobs registered this run, for the run-end
     /// sweep in [`PullCtx::pull_all`]. Excludes any [`Self::seed_disk`] source —
     /// an on-disk OUTPUT file the sweep must never delete.
     fn sources(&self) -> Vec<PathBuf> {
-        let seeded = self.seeded.lock().unwrap_or_else(PoisonError::into_inner);
+        // Acquire `map` before `seeded` — the single lock order every site follows
+        // (`register`/`seed_disk` touch `map` first), so no pair of these methods
+        // can ever invert and deadlock.
         let map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        let seeded = self.seeded.lock().unwrap_or_else(PoisonError::into_inner);
         let mut seen: HashSet<&Path> = HashSet::new();
         let mut out = Vec::new();
         for m in map.values() {
@@ -2408,8 +2640,34 @@ impl ChunkIndex {
                 len,
             });
         }
-        let mut seeded = self.seeded.lock().unwrap_or_else(PoisonError::into_inner);
-        seeded.insert(source.to_path_buf());
+        {
+            let mut seeded = self.seeded.lock().unwrap_or_else(PoisonError::into_inner);
+            seeded.insert(source.to_path_buf());
+        }
+        // A pre-seeded on-disk donor may unblock a tail-reconcile waiter.
+        self.progress.notify_waiters();
+    }
+
+    /// Record that a group's fetch has finished this run (success or failure) and
+    /// wake any tail-reconcile waiter. A waiter watching a deferred chunk assigned
+    /// to `whole` stops waiting once `whole` is finished but the chunk never
+    /// registered — the assigned fetcher failed to produce it, so the waiter drives
+    /// the range itself.
+    fn mark_finished(&self, whole: [u8; 32]) {
+        {
+            let mut finished = self.finished.lock().unwrap_or_else(PoisonError::into_inner);
+            finished.insert(whole);
+        }
+        self.progress.notify_waiters();
+    }
+
+    /// Whether the group with whole-file hash `whole` has finished fetching this
+    /// run (see [`Self::mark_finished`]).
+    fn is_finished(&self, whole: [u8; 32]) -> bool {
+        self.finished
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&whole)
     }
 
     /// Mark a donor `source` as a resume prefix the run-end sweep must keep: its
@@ -2450,15 +2708,6 @@ struct DonorRange {
     chunk_len: u64,
 }
 
-/// The dedup plan for one entry: donor ranges to splice from disk and the
-/// complement ranges to pay for.
-struct DedupPlan {
-    /// Group-aligned ranges a materialized sibling already holds.
-    donor: Vec<DonorRange>,
-    /// The `(offset, len)` runs no donor covers — the bytes to drive and pay for.
-    complement: Vec<(u64, u64)>,
-}
-
 /// Turn an entry's optional chunk list into placed [`Hint`]s, or `None` when the
 /// entry should be fetched as a plain whole-file blob: no `chunks`, no whole-file
 /// `size` to validate against, an unparseable chunk hash, or chunk sizes that do
@@ -2490,57 +2739,169 @@ fn hints_of(entry: &ManifestEntry) -> Option<Vec<Hint>> {
     Some(hints)
 }
 
-/// Plan the range-dedup for one entry against the run's chunk `index`.
+/// Resolve one placed hint against a materialized donor into a splice-able
+/// [`DonorRange`], or `None` when the chunk cannot be trusted or has no
+/// group-aligned interior to splice:
 ///
-/// For each hint whose chunk is already materialized, `[offset, offset + len)` is
-/// aligned INWARD to 16 KiB chunk groups — only whole groups fully inside the hint
-/// become a donor range, and the ≤1 partial group at each edge falls into the
-/// complement (the ranged store bao-verifies on group boundaries, so a donor
-/// splice must land on them). A hint smaller than one group, or unaligned so no
-/// whole group fits, contributes no donor range. The complement is `total` minus
-/// the union of the donor ranges — the bytes that must still be paid for.
-fn plan_dedup(
-    hints: &[Hint],
-    index: &HashMap<[u8; 32], MaterializedRange>,
-    total: u64,
-) -> DedupPlan {
+/// - A donor whose claimed chunk length disagrees with the hint (`m.len != h.len`)
+///   is one side's manifest lying about the chunk — dropped, so the range stays a
+///   paid, bao-verified fetch rather than a placement that runs past the donor's
+///   real chunk end.
+/// - Inward group alignment: the first group boundary at or after the hint's
+///   offset to the last boundary at or before its end. A chunk with no whole group
+///   inside its span (`g_start >= g_end`) yields `None`; its partial edge groups
+///   are left to the paid complement.
+fn donor_for(h: &Hint, m: &MaterializedRange) -> Option<DonorRange> {
     let group = CHUNK_GROUP_BYTES;
-    let mut donor = Vec::new();
-    let mut donor_union: Vec<(u64, u64)> = Vec::new();
-    for h in hints {
-        let Some(m) = index.get(&h.hash) else {
+    if m.len != h.len {
+        return None;
+    }
+    let hint_end = h.offset.saturating_add(h.len);
+    let g_start = h.offset.div_ceil(group).saturating_mul(group);
+    let g_end = (hint_end / group) * group;
+    if g_start >= g_end {
+        return None;
+    }
+    let alen = g_end - g_start;
+    let src_offset = m.offset.saturating_add(g_start - h.offset);
+    Some(DonorRange {
+        aligned: (g_start, alen),
+        source: m.source.clone(),
+        src_offset,
+        chunk_hash: h.hash,
+        chunk_src_offset: m.offset,
+        chunk_len: m.len,
+    })
+}
+
+/// The run-level shared-chunk fetch plan: which entry pays to fetch each chunk that
+/// appears in two or more entry positions across the whole manifest. A chunk in one
+/// position only is absent — its sole entry pays for it as part of its complement.
+/// Built once per run, so every entry derives the same assignment with no
+/// coordination.
+#[derive(Debug, Default)]
+struct FetchPlan {
+    /// Shared chunk hash → the whole-file hash of the entry assigned to fetch it.
+    /// The assignee is the smallest containing entry by whole-file size, tie-broken
+    /// by whole-file hash bytes, so the fetcher finishes soonest and every waiter is
+    /// a larger entry whose own tail comes later.
+    assigned: HashMap<[u8; 32], [u8; 32]>,
+}
+
+/// Build the run-level [`FetchPlan`]: assign every chunk shared by two or more entry
+/// positions to its smallest containing entry (tie-break by whole-file hash), so a
+/// shared chunk is fetched and paid for exactly once per run and spliced into every
+/// other entry that names it. An entry without usable hints or an unparseable
+/// whole-file hash takes no part. An entry with no declared `size` ranks as
+/// `u64::MAX`, so a sized sharer — the only kind that can be spliced from anyway —
+/// always wins the assignment.
+fn build_fetch_plan(entries: &[ManifestEntry]) -> FetchPlan {
+    struct Occurrence {
+        count: u32,
+        best_size: u64,
+        best_whole: [u8; 32],
+    }
+    let mut seen: HashMap<[u8; 32], Occurrence> = HashMap::new();
+    for e in entries {
+        let Ok(whole) = fetch::parse_hash(&e.hash) else {
             continue;
         };
-        // The same chunk hash but a different claimed length: one side's manifest
-        // lies about this chunk. Don't dedup it — leave the hint's range in the
-        // complement (paid for and bao-verified) instead of trusting a placement
-        // that would run past the donor's real chunk end.
-        if m.len != h.len {
+        let Some(hints) = hints_of(e) else {
             continue;
+        };
+        let size = e.size.unwrap_or(u64::MAX);
+        for h in &hints {
+            seen.entry(h.hash)
+                .and_modify(|o| {
+                    o.count = o.count.saturating_add(1);
+                    if (size, whole) < (o.best_size, o.best_whole) {
+                        o.best_size = size;
+                        o.best_whole = whole;
+                    }
+                })
+                .or_insert(Occurrence {
+                    count: 1,
+                    best_size: size,
+                    best_whole: whole,
+                });
         }
-        let hint_end = h.offset.saturating_add(h.len);
-        // Inward alignment: first group boundary at or after `offset`, last group
-        // boundary at or before `hint_end`.
-        let g_start = h.offset.div_ceil(group).saturating_mul(group);
-        let g_end = (hint_end / group) * group;
-        if g_start >= g_end {
-            continue;
-        }
-        let alen = g_end - g_start;
-        let src_offset = m.offset.saturating_add(g_start - h.offset);
-        donor.push(DonorRange {
-            aligned: (g_start, alen),
-            source: m.source.clone(),
-            src_offset,
-            chunk_hash: h.hash,
-            chunk_src_offset: m.offset,
-            chunk_len: m.len,
-        });
-        donor_union.push((g_start, alen));
     }
-    DedupPlan {
-        complement: complement_runs(&donor_union, total),
+    let assigned = seen
+        .into_iter()
+        .filter(|(_, o)| o.count >= 2)
+        .map(|(hash, o)| (hash, o.best_whole))
+        .collect();
+    FetchPlan { assigned }
+}
+
+/// Whether a chunk hint has a non-empty group-aligned interior — the only part a
+/// splice can cover. A chunk with no whole group inside its span cannot be
+/// deferred (its bytes must be driven and paid), matching [`donor_for`]'s inward
+/// alignment. Returns the aligned `(offset, len)` when one exists.
+fn aligned_interior(h: &Hint) -> Option<(u64, u64)> {
+    let group = CHUNK_GROUP_BYTES;
+    let hint_end = h.offset.saturating_add(h.len);
+    let g_start = h.offset.div_ceil(group).saturating_mul(group);
+    let g_end = (hint_end / group) * group;
+    (g_start < g_end).then_some((g_start, g_end - g_start))
+}
+
+/// One entry's reassembly plan, computed from the live [`ChunkIndex`] snapshot and
+/// the run-level [`FetchPlan`]. The three range sets tile the blob:
+///
+/// - `donor`: chunks already materialized somewhere (a pre-seeded on-disk file, or
+///   a sibling that already finished) — spliced immediately, no fetch.
+/// - `deferred`: chunks assigned to a DIFFERENT entry and not yet available —
+///   waited for and spliced at the tail once the assigned fetcher registers them
+///   (or driven as a fallback if that fetcher finishes without producing them).
+/// - `drive`: everything else — this entry's unique and self-assigned chunks, plus
+///   any un-splice-able edge groups — driven and paid for now. It is the complement
+///   of the donor and deferred interiors within the whole-file size.
+///
+/// With an empty [`FetchPlan`] (no shared chunks) `deferred` is empty and the plan
+/// reduces to today's donor/complement split.
+struct ReassemblePlan {
+    donor: Vec<DonorRange>,
+    deferred: Vec<Hint>,
+    drive: Vec<(u64, u64)>,
+}
+
+/// Build an entry's [`ReassemblePlan`] for the entry whose whole-file hash is
+/// `whole`. A chunk currently in `index` becomes a `donor` (spliced now); a chunk
+/// the [`FetchPlan`] assigns to another entry, not yet available, with a
+/// splice-able interior becomes `deferred`; the rest is driven. `total` is the
+/// entry's whole-file size.
+fn plan_reassembly(
+    hints: &[Hint],
+    index: &HashMap<[u8; 32], MaterializedRange>,
+    fetch_plan: &FetchPlan,
+    whole: [u8; 32],
+    total: u64,
+) -> ReassemblePlan {
+    let mut donor = Vec::new();
+    let mut deferred = Vec::new();
+    let mut covered: Vec<(u64, u64)> = Vec::new();
+    for h in hints {
+        if let Some(m) = index.get(&h.hash)
+            && let Some(d) = donor_for(h, m)
+        {
+            covered.push(d.aligned);
+            donor.push(d);
+            continue;
+        }
+        let assigned_elsewhere = fetch_plan
+            .assigned
+            .get(&h.hash)
+            .is_some_and(|owner| *owner != whole);
+        if assigned_elsewhere && let Some(interior) = aligned_interior(h) {
+            deferred.push(*h);
+            covered.push(interior);
+        }
+    }
+    ReassemblePlan {
+        drive: complement_runs(&covered, total),
         donor,
+        deferred,
     }
 }
 
@@ -3632,7 +3993,7 @@ mod tests {
             offset: GROUP,
             len: GROUP,
         }];
-        let plan = plan_dedup(&hints, &index, total);
+        let plan = plan_reassembly(&hints, &index, &FetchPlan::default(), [0; 32], total);
 
         assert_eq!(plan.donor.len(), 1);
         let d = &plan.donor[0];
@@ -3641,7 +4002,7 @@ mod tests {
         assert_eq!(d.src_offset, 0);
         assert_eq!(d.chunk_hash, h);
         assert_eq!((d.chunk_src_offset, d.chunk_len), (0, GROUP));
-        assert_eq!(plan.complement, vec![(0, GROUP), (2 * GROUP, GROUP)]);
+        assert_eq!(plan.drive, vec![(0, GROUP), (2 * GROUP, GROUP)]);
     }
 
     /// An unaligned hint contributes only its interior whole groups; the donor's
@@ -3667,7 +4028,7 @@ mod tests {
             offset: 100,
             len: 2 * GROUP + 500,
         }];
-        let plan = plan_dedup(&hints, &index, total);
+        let plan = plan_reassembly(&hints, &index, &FetchPlan::default(), [0; 32], total);
 
         assert_eq!(plan.donor.len(), 1);
         let d = &plan.donor[0];
@@ -3677,7 +4038,7 @@ mod tests {
         assert_eq!(d.aligned, (GROUP, GROUP));
         // Source offset shifts by (GROUP - 100) from the chunk's donor start.
         assert_eq!(d.src_offset, 5000 + (GROUP - 100));
-        assert_eq!(plan.complement, vec![(0, GROUP), (2 * GROUP, 2 * GROUP)]);
+        assert_eq!(plan.drive, vec![(0, GROUP), (2 * GROUP, 2 * GROUP)]);
     }
 
     /// A chunk not in the index contributes no donor: the complement is the whole
@@ -3690,9 +4051,15 @@ mod tests {
             offset: 0,
             len: GROUP,
         }];
-        let plan = plan_dedup(&hints, &HashMap::new(), total);
+        let plan = plan_reassembly(
+            &hints,
+            &HashMap::new(),
+            &FetchPlan::default(),
+            [0; 32],
+            total,
+        );
         assert!(plan.donor.is_empty());
-        assert_eq!(plan.complement, vec![(0, total)]);
+        assert_eq!(plan.drive, vec![(0, total)]);
     }
 
     /// A hint smaller than one chunk group (or unaligned so no whole group fits)
@@ -3715,9 +4082,9 @@ mod tests {
             offset: 0,
             len: 1000,
         }];
-        let plan = plan_dedup(&hints, &index, total);
+        let plan = plan_reassembly(&hints, &index, &FetchPlan::default(), [0; 32], total);
         assert!(plan.donor.is_empty());
-        assert_eq!(plan.complement, vec![(0, total)]);
+        assert_eq!(plan.drive, vec![(0, total)]);
     }
 
     /// Review #2 (money-band): a recipient hint that names a real donor chunk hash
@@ -3746,12 +4113,12 @@ mod tests {
             offset: 0,
             len: 2 * GROUP,
         }];
-        let plan = plan_dedup(&hints, &index, total);
+        let plan = plan_reassembly(&hints, &index, &FetchPlan::default(), [0; 32], total);
         assert!(
             plan.donor.is_empty(),
             "a length-mismatched donor must not be spliced"
         );
-        assert_eq!(plan.complement, vec![(0, total)]);
+        assert_eq!(plan.drive, vec![(0, total)]);
     }
 
     /// Review #2 (money-band): a per-donor copy that would run past the donor
@@ -3846,9 +4213,9 @@ mod tests {
             staging: staging.clone(),
             drives: std::cell::Cell::new(0),
         };
-        // A dedup plan with a real donor (the path is never read — the guard
-        // returns before any splice).
-        let plan = DedupPlan {
+        // A reassembly plan with a real donor (the path is never read — the guard
+        // returns before any splice) and nothing deferred.
+        let plan = ReassemblePlan {
             donor: vec![DonorRange {
                 aligned: (GROUP, GROUP),
                 source: tmp.path().join("donor-never-read"),
@@ -3857,19 +4224,315 @@ mod tests {
                 chunk_src_offset: 0,
                 chunk_len: GROUP,
             }],
-            complement: vec![(0, GROUP)],
+            deferred: Vec::new(),
+            drive: vec![(0, GROUP)],
         };
         let index = ChunkIndex::default();
+        let fetch_plan = FetchPlan::default();
 
-        let res = reassemble_dedup(&driver, &plan, 2 * GROUP, None, &index, &|| {}).await;
+        let res =
+            reassemble_dedup(&driver, &plan, 2 * GROUP, None, &index, &fetch_plan, &|| {}).await;
 
         assert!(
             res.is_ok(),
-            "a first complement drive that finalizes the blob must succeed, not \
+            "a first pay-now drive that finalizes the blob must succeed, not \
              fail on a missing .partial: {res:?}"
         );
-        assert_eq!(driver.drives.get(), 1, "only the complement drive ran");
+        assert_eq!(driver.drives.get(), 1, "only the pay-now drive ran");
         assert!(staging.try_exists().expect("stat staging"));
+    }
+
+    /// A chunked entry, built from `(chunk_size, chunk_hash_byte)` pairs whose sizes
+    /// sum to the whole-file size, with a whole-file hash of `[whole; 32]`.
+    fn mentry(whole: u8, size: u64, chunks: &[(u64, u8)]) -> ManifestEntry {
+        ManifestEntry {
+            path: format!("e{whole:02x}"),
+            hash: format!("b3:{}", blake3::Hash::from_bytes([whole; 32]).to_hex()),
+            size: Some(size),
+            chunks: Some(chunks.iter().map(|&(s, b)| chunk(s, b)).collect()),
+        }
+    }
+
+    /// A shared chunk is assigned to its SMALLEST containing entry, so the fetcher
+    /// finishes soonest; a unique chunk is left unassigned (its sole entry pays).
+    #[test]
+    fn fetch_plan_assigns_shared_chunk_to_smallest_entry() {
+        let a = mentry(0x0a, 100, &[(40, 0xc0), (60, 0xc1)]);
+        let b = mentry(0x0b, 300, &[(60, 0xc1), (240, 0xc2)]);
+        let plan = build_fetch_plan(&[a, b]);
+        assert_eq!(plan.assigned.get(&[0xc1; 32]), Some(&[0x0a; 32]));
+        assert!(!plan.assigned.contains_key(&[0xc0; 32]));
+        assert!(!plan.assigned.contains_key(&[0xc2; 32]));
+    }
+
+    /// Equal-size sharers tie-break on the whole-file hash, and the assignment is
+    /// independent of manifest order.
+    #[test]
+    fn fetch_plan_tie_breaks_by_whole_hash_and_is_order_independent() {
+        let p1 = build_fetch_plan(&[
+            mentry(0x0a, 60, &[(60, 0xc1)]),
+            mentry(0x0b, 60, &[(60, 0xc1)]),
+        ]);
+        let p2 = build_fetch_plan(&[
+            mentry(0x0b, 60, &[(60, 0xc1)]),
+            mentry(0x0a, 60, &[(60, 0xc1)]),
+        ]);
+        assert_eq!(p1.assigned, p2.assigned);
+        let winner = std::cmp::min([0x0a; 32], [0x0b; 32]);
+        assert_eq!(p1.assigned.get(&[0xc1; 32]), Some(&winner));
+    }
+
+    /// An entry defers a chunk the plan assigns to a smaller sibling (it will splice
+    /// it), and drives its own unique chunk.
+    #[test]
+    fn plan_reassembly_defers_a_chunk_assigned_to_a_sibling() {
+        let total = 3 * GROUP + 50_000;
+        let b = mentry(0x0b, total, &[(3 * GROUP, 0x01), (50_000, 0x02)]);
+        let fetch_plan = build_fetch_plan(&[
+            mentry(0x0a, 3 * GROUP, &[(3 * GROUP, 0x01)]),
+            mentry(0x0b, total, &[(3 * GROUP, 0x01), (50_000, 0x02)]),
+        ]);
+        let hints = hints_of(&b).expect("valid hints");
+        let plan = plan_reassembly(&hints, &HashMap::new(), &fetch_plan, [0x0b; 32], total);
+        // c1 (assigned to the smaller a) is deferred; nothing is a donor yet.
+        assert_eq!(plan.deferred.len(), 1);
+        assert_eq!(plan.deferred[0].hash, [0x01; 32]);
+        assert!(plan.donor.is_empty());
+        // The drive is the complement of c1's interior — the c2 region.
+        assert_eq!(plan.drive, vec![(3 * GROUP, 50_000)]);
+    }
+
+    /// A shared chunk with no group-aligned interior cannot be spliced, so it is
+    /// paid (driven) rather than deferred, even when assigned to a sibling.
+    #[test]
+    fn plan_reassembly_pays_a_sub_group_shared_chunk_it_cannot_splice() {
+        let b = mentry(0x0b, 200, &[(100, 0x09), (100, 0x08)]);
+        let fetch_plan = build_fetch_plan(&[
+            mentry(0x0a, 100, &[(100, 0x09)]),
+            mentry(0x0b, 200, &[(100, 0x09), (100, 0x08)]),
+        ]);
+        let hints = hints_of(&b).expect("valid hints");
+        let plan = plan_reassembly(&hints, &HashMap::new(), &fetch_plan, [0x0b; 32], 200);
+        assert!(plan.deferred.is_empty());
+        assert_eq!(plan.drive, vec![(0, 200)]);
+    }
+
+    /// Groups are scheduled smallest whole-file first (unsized last), tie-broken by
+    /// hash, so a shared chunk's assigned fetcher runs before its larger consumers.
+    #[test]
+    fn groups_ordered_smallest_first_stable() {
+        let big = mentry(0x01, 900, &[(900, 0x91)]);
+        let small = mentry(0x02, 10, &[(10, 0x92)]);
+        let mid = mentry(0x03, 100, &[(100, 0x93)]);
+        let refs = vec![&big, &small, &mid];
+        let ordered = order_groups_smallest_first(group_by_hash(&refs));
+        let sizes: Vec<_> = ordered
+            .iter()
+            .map(|g| g.entries.iter().find_map(|e| e.size))
+            .collect();
+        assert_eq!(sizes, vec![Some(10), Some(100), Some(900)]);
+    }
+
+    /// A group's size is any entry that declares one, not strictly the first: a
+    /// group whose first duplicate path is unsized but whose second is small must
+    /// still sort early, not last.
+    #[test]
+    fn groups_ordered_by_any_declared_size_not_just_the_first() {
+        let whole = format!("b3:{}", blake3::Hash::from_bytes([0x42; 32]).to_hex());
+        // Two paths for the same small blob; the first is unsized on the wire.
+        let unsized_first = ManifestEntry {
+            path: "a".into(),
+            hash: whole.clone(),
+            size: None,
+            chunks: None,
+        };
+        let sized_dup = ManifestEntry {
+            path: "b".into(),
+            hash: whole,
+            size: Some(10),
+            chunks: None,
+        };
+        let big = mentry(0x01, 900, &[(900, 0x91)]);
+        let refs = vec![&big, &unsized_first, &sized_dup];
+        let ordered = order_groups_smallest_first(group_by_hash(&refs));
+        let sizes: Vec<_> = ordered
+            .iter()
+            .map(|g| g.entries.iter().find_map(|e| e.size))
+            .collect();
+        assert_eq!(sizes, vec![Some(10), Some(900)]);
+    }
+
+    /// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive` writes
+    /// the requested ranges' correct bytes into `<staging>.partial` (creating it,
+    /// pre-sized), never finalizing `<hex>` itself — so `reassemble_dedup` exercises
+    /// its splice + whole-file verify + promote path. Records every driven range.
+    struct RecordingDriver {
+        hash: [u8; 32],
+        staging: PathBuf,
+        content: Vec<u8>,
+        driven: std::sync::Mutex<Vec<(u64, u64)>>,
+    }
+    impl RangeDriver for RecordingDriver {
+        fn hash(&self) -> [u8; 32] {
+            self.hash
+        }
+        fn staging(&self) -> &Path {
+            &self.staging
+        }
+        fn drive<'a>(
+            &'a self,
+            ranges: &'a [(u64, u64)],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
+            Box::pin(async move {
+                use std::io::{Seek, SeekFrom, Write};
+                let partial = self.staging.with_extension("partial");
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&partial)
+                    .expect("open partial");
+                let total = u64::try_from(self.content.len()).expect("content len fits u64");
+                f.set_len(total).expect("size partial");
+                for &(off, len) in ranges {
+                    self.driven.lock().expect("driven lock").push((off, len));
+                    let start = usize::try_from(off).expect("offset fits usize");
+                    let end = usize::try_from(off + len).expect("end fits usize");
+                    f.seek(SeekFrom::Start(off)).expect("seek");
+                    f.write_all(&self.content[start..end]).expect("write range");
+                }
+                f.sync_all().expect("sync partial");
+                Ok(())
+            })
+        }
+    }
+
+    /// A deferred chunk whose assigned fetcher registers its donor only AFTER the
+    /// consumer has started is still spliced at the tail — never driven — so the
+    /// shared bytes are paid for once (by the sibling) and copied here from disk.
+    #[tokio::test]
+    async fn reconcile_deferred_splices_a_late_registered_donor() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let total = 4 * GROUP;
+        let content: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let whole = *blake3::hash(&content).as_bytes();
+
+        // Deferred chunk = the first two groups; its hash is what the donor must
+        // re-hash to. The consumer's own pay-now range is the last two groups.
+        let deferred_len = 2 * GROUP;
+        let dl = usize::try_from(deferred_len).expect("fits usize");
+        let chunk_hash = *blake3::hash(&content[..dl]).as_bytes();
+
+        let staging = tmp.path().join("blob");
+        let driver = RecordingDriver {
+            hash: whole,
+            staging: staging.clone(),
+            content: content.clone(),
+            driven: std::sync::Mutex::new(Vec::new()),
+        };
+        let plan = ReassemblePlan {
+            donor: Vec::new(),
+            deferred: vec![Hint {
+                hash: chunk_hash,
+                offset: 0,
+                len: deferred_len,
+            }],
+            drive: vec![(deferred_len, 2 * GROUP)],
+        };
+        let index = std::sync::Arc::new(ChunkIndex::default());
+        let mut fetch_plan = FetchPlan::default();
+        // The deferred chunk is assigned to some sibling whole hash.
+        fetch_plan.assigned.insert(chunk_hash, [0xaa; 32]);
+
+        // Register the donor a moment after the consumer starts, simulating a
+        // sibling finishing mid-run.
+        let donor_path = tmp.path().join("donor");
+        std::fs::write(&donor_path, &content[..dl]).expect("write donor");
+        let index_bg = index.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            index_bg.register(
+                Some(&[Hint {
+                    hash: chunk_hash,
+                    offset: 0,
+                    len: deferred_len,
+                }]),
+                &donor_path,
+            );
+        });
+
+        let res = reassemble_dedup(&driver, &plan, total, None, &index, &fetch_plan, &|| {}).await;
+        assert!(res.is_ok(), "reassembly must succeed: {res:?}");
+        assert!(staging.try_exists().expect("stat staging"));
+        let got = std::fs::read(&staging).expect("read staging");
+        assert_eq!(
+            got, content,
+            "reassembled blob must match the whole content"
+        );
+        // The deferred range was spliced, never driven.
+        let driven_ranges = driver.driven.lock().expect("driven lock").clone();
+        assert!(
+            driven_ranges.iter().all(|&(off, _)| off >= deferred_len),
+            "the deferred range must be spliced, not driven: {driven_ranges:?}"
+        );
+    }
+
+    /// When a deferred chunk's assigned fetcher FINISHES without registering it (a
+    /// failed fetcher), the tail reconcile drives (pays for) the range itself, so
+    /// the entry still completes — liveness, never a hang.
+    #[tokio::test]
+    async fn reconcile_deferred_pays_when_the_assigned_fetcher_never_produces_it() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let total = 4 * GROUP;
+        let content: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let whole = *blake3::hash(&content).as_bytes();
+        let deferred_len = 2 * GROUP;
+        let dl = usize::try_from(deferred_len).expect("fits usize");
+        let chunk_hash = *blake3::hash(&content[..dl]).as_bytes();
+
+        let staging = tmp.path().join("blob");
+        let driver = RecordingDriver {
+            hash: whole,
+            staging: staging.clone(),
+            content: content.clone(),
+            driven: std::sync::Mutex::new(Vec::new()),
+        };
+        let plan = ReassemblePlan {
+            donor: Vec::new(),
+            deferred: vec![Hint {
+                hash: chunk_hash,
+                offset: 0,
+                len: deferred_len,
+            }],
+            drive: vec![(deferred_len, 2 * GROUP)],
+        };
+        let index = std::sync::Arc::new(ChunkIndex::default());
+        let mut fetch_plan = FetchPlan::default();
+        fetch_plan.assigned.insert(chunk_hash, [0xaa; 32]);
+
+        // The assigned fetcher finishes shortly, producing nothing.
+        let index_bg = index.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            index_bg.mark_finished([0xaa; 32]);
+        });
+
+        let res = reassemble_dedup(&driver, &plan, total, None, &index, &fetch_plan, &|| {}).await;
+        assert!(res.is_ok(), "reassembly must succeed via fallback: {res:?}");
+        let got = std::fs::read(&staging).expect("read staging");
+        assert_eq!(got, content);
+        // The deferred range was driven (paid) as a fallback.
+        let driven_ranges = driver.driven.lock().expect("driven lock").clone();
+        assert!(
+            driven_ranges
+                .iter()
+                .any(|&(off, len)| off == 0 && len == deferred_len),
+            "the deferred range must be driven as a fallback: {driven_ranges:?}"
+        );
     }
 
     /// Review #3 (money-band): the run-end sweep removes a normal donor staging
