@@ -2191,7 +2191,16 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
         // `REFUSAL_SUPPRESSION_TTL`. `Overloaded` is backpressure, which the code's own
         // policy says to respect rather than punish; suppressing the peer for five
         // minutes over a load spike lasting seconds is punishing it.
-        StreamError::NotFound | StreamError::Overloaded => RefusalVerdict::Transient,
+        // `InsufficientDeposit` (ADR 003 §Pool solvency, option 2 / #2013) is our
+        // OWN upstream buyer pool falling short of this peer's floor `M` — the peer
+        // spoke it because we proved lane ownership on that pool. It says nothing
+        // about the peer and clears when our pull driver tops the pool up, so it is
+        // `Transient` like `NotFound`: the driver's own top-up loop is the real
+        // remedy; a verdict is reached here only once that loop gave up, and then
+        // re-routing (or a later retry) is right.
+        StreamError::NotFound | StreamError::Overloaded | StreamError::InsufficientDeposit => {
+            RefusalVerdict::Transient
+        }
         // `VoucherRejected` never reaches here any more: `pull_verdict` unwraps it out of
         // `UpstreamRefused` and routes it to `voucher_verdict`, which is the only place that
         // decides what a rejected voucher costs the channel (#1145 review).
@@ -3201,13 +3210,19 @@ mod tests {
                 "{error:?} is a lasting fact about this (peer, hash)"
             );
         }
-        // `NotFound` is the one that matters. `wire_error` collapses `InsufficientDeposit`
-        // and `UnknownChannel` — an empty deposit of OURS, and the window where the
-        // upstream's chain watcher has not yet seen the channel WE just opened — onto it,
-        // deliberately, so channel balances cannot be probed. At the full TTL either one
-        // blackholed a healthy peer for five minutes over a condition that had already
-        // passed. `Overloaded` is a load spike, which the policy says to respect.
-        for error in [StreamError::NotFound, StreamError::Overloaded] {
+        // `NotFound` is the one that matters. `wire_error` collapses `UnknownChannel`
+        // — the window where the upstream's chain watcher has not yet seen the channel
+        // WE just opened — onto it, deliberately, so channel existence cannot be probed.
+        // At the full TTL that blackholed a healthy peer for five minutes over a
+        // condition that had already passed. `InsufficientDeposit` is our own upstream
+        // pool short of the peer's floor `M` (option 2 / #2013), likewise transient and
+        // no fault of the peer. `Overloaded` is a load spike, which the policy says to
+        // respect.
+        for error in [
+            StreamError::NotFound,
+            StreamError::Overloaded,
+            StreamError::InsufficientDeposit,
+        ] {
             assert_eq!(
                 classify_refusal(&error),
                 RefusalVerdict::Transient,

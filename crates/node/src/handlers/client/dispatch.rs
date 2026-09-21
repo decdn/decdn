@@ -642,8 +642,11 @@ impl ClientHandler {
         // the exact aligned span. Both use `try_reserve_floor`, whose budget check and
         // `live_reservation += reserved` increment run under ONE `pool_floor` lock, so
         // two concurrent admissions on a near-exhausted pool cannot both pass. A
-        // refusal collapses to `InsufficientDeposit` → wire `NotFound`,
-        // indistinguishable from any other miss (no balance leak).
+        // pool-floor refusal reports `InsufficientDeposit` → wire
+        // `StreamError::InsufficientDeposit`: this gate runs past the lane-ownership
+        // proof, so its audience is the proven owner and it speaks the true reason
+        // for the owner's top-up loop (option 2 / #2013), not the ambiguous
+        // `NotFound` that unauthenticated misses collapse to.
         //
         // Held at fn scope so the reservation is released on EVERY exit via `Drop`.
         // Every serve path that reaches a serve loop MOVES it in and threads it through:

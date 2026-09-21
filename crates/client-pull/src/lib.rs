@@ -2160,6 +2160,26 @@ pub fn resume_may_be_stale(err: &anyhow::Error) -> bool {
         .is_some_and(|refused| matches!(refused.error(), StreamError::NotFound))
 }
 
+/// Whether `err` is an open-time [`StreamError::InsufficientDeposit`] refusal
+/// (ADR 003 §Pool solvency, option 2 / #2013): the serving node proved us the
+/// authenticated pool owner and told us its refundable floor `M` outruns our
+/// pool's remaining deposit, so the pool cannot cover a credit window here.
+///
+/// The driver routes this into its fund-and-retry loop the same way it routes a
+/// ledger-corroborated exhaustion: it tops the deposit up toward the buyer's own
+/// `working_deposit` ceiling and re-opens, so a node's larger-than-estimated `M`
+/// no longer dead-ends a fetch on an ambiguous `NotFound`. Unlike
+/// [`genuine_exhaustion`], this needs no ledger corroboration — our own numbers
+/// say we CAN afford the next voucher; only the node's private `M` (which we
+/// cannot compute) is higher. The buyer's ceiling is the sole clamp on how much a
+/// (possibly lying) node can make us escrow, so trusting the owner-only refusal is
+/// money-safe.
+#[must_use]
+pub fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<UpstreamRefused>()
+        .is_some_and(|refused| matches!(refused.error(), StreamError::InsufficientDeposit))
+}
+
 /// The wire-byte bound for a fetch of `[byte_offset, byte_offset + byte_len)`
 /// (`byte_len == 0` meaning "to end") of a `total_bytes` blob: the bao-encoded
 /// size of the chunk-group-aligned range (content plus interleaved proof, ADR

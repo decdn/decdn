@@ -7952,8 +7952,9 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
 
 /// The per-pool floor ceiling covers the window pull-through MISS path, not only
 /// the cache-hit path: a same-lane stream already in flight makes a concurrent
-/// same-lane MISS refuse with the collapsed `NotFound` wire code before it ever
-/// opens a second upstream pull.
+/// same-lane MISS refuse — with the owner-facing `InsufficientDeposit` wire code
+/// (option 2 / #2013), since the bound leaf is a proven lane owner — before it
+/// ever opens a second upstream pull.
 ///
 /// Both leaves share ONE lane — same `pool_id` (the gated upstream's channel id
 /// reused as the leaf channel) and same signer, dialed over two independent
@@ -8051,7 +8052,9 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
 
     // Leaf 2: same lane, concurrent with leaf 1 still in flight. Drive the
     // request by hand (rather than `leaf_paced_pull`, which bails on a refusal)
-    // so the refusal itself — the collapsed `NotFound` wire code — is asserted.
+    // so the refusal itself — the owner-facing `InsufficientDeposit` wire code
+    // (option 2 / #2013), spoken because this bound leaf is a proven lane owner —
+    // is asserted.
     let leaf2_sk = fresh_key();
     let leaf2_node_id = B256::from(*leaf2_sk.public().as_bytes());
     let (leaf2_ep, _) = local_endpoint(leaf2_sk, vec![]).await?;
@@ -8100,8 +8103,9 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
         "concurrent same-lane MISS must be refused while budget covers only one floor"
     );
     anyhow::ensure!(
-        matches!(resp2_ext.error, Some(StreamError::NotFound)),
-        "expected the collapsed NotFound wire code for the pool-ceiling refusal, got {:?}",
+        matches!(resp2_ext.error, Some(StreamError::InsufficientDeposit)),
+        "expected the owner-facing InsufficientDeposit wire code for the pool-ceiling refusal, \
+         got {:?}",
         resp2_ext.error
     );
     conn2.close(0u32.into(), b"refused");

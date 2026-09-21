@@ -422,7 +422,8 @@ pub struct StreamResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StreamResponseExt {
     /// Delivery-side failure code when `body.ok == false` (`NotFound`,
-    /// `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`).
+    /// `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`,
+    /// `OriginBlacklisted`, `HashBlacklisted`, `InsufficientDeposit`).
     /// Unsigned and informational. `VoucherRejected` never rides here — it is
     /// delivered mid-stream via [`ClientMessage::StreamError`].
     ///
@@ -1068,12 +1069,12 @@ impl WatermarkBundle {
 /// All codes are unsigned and informational — never on-chain evidence.
 ///
 /// New variants are appended at the end, never inserted: the postcard
-/// discriminant is the declaration index, so `OriginBlacklisted` and
-/// `HashBlacklisted` sit after `VoucherRejected` even though they read as
-/// delivery-side neighbours of `EvictedSinceProbe`. Moving them would silently
-/// renumber `VoucherRejected` on the wire — an ADR 013 Tier-3 break. Use
-/// [`StreamError::is_delivery_side`], not variant position, to reason about the
-/// domain split.
+/// discriminant is the declaration index, so `OriginBlacklisted`,
+/// `HashBlacklisted`, and `InsufficientDeposit` sit after `VoucherRejected` even
+/// though they read as delivery-side neighbours of `EvictedSinceProbe`. Moving
+/// them would silently renumber `VoucherRejected` on the wire — an ADR 013
+/// Tier-3 break. Use [`StreamError::is_delivery_side`], not variant position, to
+/// reason about the domain split.
 ///
 /// The same append-only discipline applies WITHIN a struct-variant's fields:
 /// postcard encodes a struct variant's payload positionally, in declaration
@@ -1135,6 +1136,29 @@ pub enum StreamError {
     /// legal exposure. Retry on a different node: a local entry binds only this
     /// one, and a governance entry will be refused everywhere.
     HashBlacklisted,
+    /// The pool funding this stream cannot cover a credit window: its on-chain
+    /// remaining deposit, minus the node's refundable floor `M`, is short (ADR
+    /// 003 §Pool solvency). A delivery-side, open-time refusal — the node signs
+    /// `ok: false` before committing to serve.
+    ///
+    /// Spoken ONLY to a requester that has proven lane authorization on this pool
+    /// (a verified client binding whose signer holds an owner-signed capability
+    /// for the pool, or a registered on-chain signer). An unauthenticated prober
+    /// never reaches the floor gate — it is refused earlier as a plain
+    /// [`Self::NotFound`], which is what keeps a pool's balance unmappable off the
+    /// wire (#1520). The proven owner already reads the pool's on-chain
+    /// `remaining`, so this leaks it no balance it could not compute; it learns
+    /// only the inequality `remaining − M < window`, an owner-only, self-funded
+    /// bound on the node's private `M`.
+    ///
+    /// Recovery: the pool **owner tops up the deposit** and re-opens. The buyer's
+    /// reactive top-up loop routes this into a fund-and-retry against its own
+    /// `working_deposit` ceiling, so a node's larger-than-estimated `M` no longer
+    /// dead-ends the fetch. Terminal only once the buyer's ceiling or top-up
+    /// budget is spent. Distinct from the mid-stream
+    /// [`VoucherRejectReason::PoolExhausted`], which fires after the node has
+    /// already committed to serving; this is the open-time equivalent.
+    InsufficientDeposit,
 }
 
 impl StreamError {
@@ -1634,6 +1658,7 @@ mod tests {
             },
             StreamError::OriginBlacklisted,
             StreamError::HashBlacklisted,
+            StreamError::InsufficientDeposit,
         ]
         .into_iter()
         .enumerate()
@@ -2405,6 +2430,7 @@ mod tests {
             // "everything except VoucherRejected" rule honest as the enum grows.
             StreamError::OriginBlacklisted,
             StreamError::HashBlacklisted,
+            StreamError::InsufficientDeposit,
         ] {
             assert!(e.is_delivery_side(), "{e:?} is delivery-side");
             assert!(!e.is_mid_stream(), "{e:?} is not mid-stream");

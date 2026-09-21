@@ -1992,7 +1992,12 @@ where
     {
         Ok(opened) => opened,
         Err(err) => {
-            let _ = peer_store.record_failure(&node_id, now_secs_cli());
+            // An `InsufficientDeposit` refusal (option 2 / #2013) is OUR pool falling
+            // short of this node's floor `M`, not a fault of the peer — so it must not
+            // suppress the peer as a candidate. Every other open failure scores it.
+            if !decdn_client_pull::is_insufficient_deposit(&err) {
+                let _ = peer_store.record_failure(&node_id, now_secs_cli());
+            }
             return Err(annotate_unbound_cache_miss(err, &header_ctx));
         }
     };

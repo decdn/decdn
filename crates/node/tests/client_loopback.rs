@@ -2254,7 +2254,9 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
     let first =
         stall_delivery_at_closing_voucher(&conn, *hash_a.as_bytes(), wire_a, Some(&ext)).await?;
 
-    // Second concurrent same-lane stream: refused with NotFound.
+    // Second concurrent same-lane stream: refused by the pool ceiling. This lane
+    // is a proven owner, so the refusal speaks the owner-facing
+    // `InsufficientDeposit` (option 2 / #2013), not the prober-facing `NotFound`.
     let (refusal, refusal_ext) =
         open_expecting_refusal(&conn, *hash_b.as_bytes(), Some(&ext)).await?;
     anyhow::ensure!(
@@ -2264,9 +2266,9 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
     anyhow::ensure!(
         matches!(
             refusal_ext.error,
-            Some(decdn_protocol::client::StreamError::NotFound)
+            Some(decdn_protocol::client::StreamError::InsufficientDeposit)
         ),
-        "expected the collapsed NotFound wire code, got {:?}",
+        "expected the owner-facing InsufficientDeposit wire code, got {:?}",
         refusal_ext.error
     );
 
@@ -3927,12 +3929,16 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
                 !resp.body.ok,
                 "an underfunded channel must be refused pre-serve, not served"
             );
+            // Option 2 / #2013: this requester seeded a KNOWN, OWNED lane and proved
+            // it with a client binding, so it reaches the floor gate as a proven pool
+            // owner — and the node speaks the true `InsufficientDeposit` (not the
+            // prober-facing `NotFound`) so the owner's reactive top-up loop can recover.
             anyhow::ensure!(
                 matches!(
                     resp_ext.error,
-                    Some(decdn_protocol::client::StreamError::NotFound)
+                    Some(decdn_protocol::client::StreamError::InsufficientDeposit)
                 ),
-                "expected the collapsed NotFound wire code, got {:?}",
+                "expected the owner-facing InsufficientDeposit wire code, got {:?}",
                 resp_ext.error
             );
         }
@@ -3944,7 +3950,7 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
             &metrics.encode()?,
             "decdn_serve_stream_rejected_insufficient_deposit_total 1"
         ),
-        "the refusal must be distinguishable server-side — the wire code is lossy"
+        "the refusal must be distinguishable server-side"
     );
     // The acceptance criterion of #1516: zero bytes served. The channel never
     // advanced, so nothing was delivered and nothing was owed.
@@ -5233,12 +5239,14 @@ async fn concurrent_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
         !refusal.body.ok,
         "the fourth concurrent lane must be refused while three live floors are held"
     );
+    // A proven-owner lane refused by the pool ceiling gets the owner-facing
+    // `InsufficientDeposit` (option 2 / #2013), not the prober-facing `NotFound`.
     anyhow::ensure!(
         matches!(
             refusal_ext.error,
-            Some(decdn_protocol::client::StreamError::NotFound)
+            Some(decdn_protocol::client::StreamError::InsufficientDeposit)
         ),
-        "expected the collapsed NotFound wire code, got {:?}",
+        "expected the owner-facing InsufficientDeposit wire code, got {:?}",
         refusal_ext.error
     );
 
@@ -7269,12 +7277,15 @@ async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()>
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         (ClientMessage::StreamResponse(resp), resp_ext) => {
             anyhow::ensure!(!resp.body.ok, "an underfunded miss must be refused");
+            // Bound + known lane → the pre-spend floor gate refuses a proven owner,
+            // so the wire code is the owner-facing `InsufficientDeposit` (option 2 /
+            // #2013), not the prober-facing `NotFound`.
             anyhow::ensure!(
                 matches!(
                     resp_ext.error,
-                    Some(decdn_protocol::client::StreamError::NotFound)
+                    Some(decdn_protocol::client::StreamError::InsufficientDeposit)
                 ),
-                "expected the collapsed NotFound wire code, got {:?}",
+                "expected the owner-facing InsufficientDeposit wire code, got {:?}",
                 resp_ext.error
             );
         }
