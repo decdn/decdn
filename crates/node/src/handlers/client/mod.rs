@@ -546,9 +546,12 @@ impl Drop for FloorReservation {
 }
 
 /// Which floor gate refused an admission
-/// ([`ClientHandler::try_reserve_floor`]). All collapse to one `NotFound` on the
-/// wire; they stay distinct here so the per-reason metric separates "this pool
-/// cannot pay" from the node-local per-signer live cap.
+/// ([`ClientHandler::try_reserve_floor`]). They stay distinct here so the
+/// per-reason metric separates "this pool cannot pay" from the node-local
+/// per-signer live cap, and they part on the wire too: the pool arm speaks the
+/// owner-only [`StreamError::InsufficientDeposit`] (both floor gates run past the
+/// lane-ownership proof — option 2 / #2013), while the signer arm stays a plain
+/// `NotFound`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FloorRefusal {
     /// The pool-wide ceiling: `remaining − M` cannot cover the live floor
@@ -606,31 +609,42 @@ enum ServeRejectReason {
     InternalError,
     UnknownChannel,
     OwnerMismatch,
+    /// The pool's on-chain remaining deposit, minus the node's refundable floor
+    /// `M`, can no longer cover a credit window (ADR 003 §Pool solvency). UNLIKE
+    /// its siblings below, this one does NOT collapse to `NotFound`: it is
+    /// reachable only past the lane-ownership proof (a known lane keyed to a
+    /// verified signer holding an owner-signed capability), so its audience is the
+    /// proven pool owner — never an unauthenticated prober — and it ships the true
+    /// wire [`StreamError::InsufficientDeposit`] so that owner's reactive top-up
+    /// loop can fund past the node's `M` and re-open (option 2 / #2013, see
+    /// [`Self::wire_error`]).
     InsufficientDeposit,
     /// A wired `PoolView` could not confirm the request's pool on-chain: the pool
     /// has no on-chain record, is closed/reclaimed, or the admit-path `getPool`
     /// faulted. The node refuses rather than serve a pool it cannot confirm is live
-    /// and solvent (ADR 003 §Pool solvency). Distinct from [`Self::InsufficientDeposit`]
-    /// for the per-reason metric ONLY — both collapse to `NotFound` on the wire (see
-    /// [`Self::wire_error`]), so a client cannot tell an unconfirmed pool from a
-    /// drained one, and an operator can tell a chain/RPC problem from real
-    /// deposit exhaustion.
+    /// and solvent (ADR 003 §Pool solvency). Collapses to `NotFound` on the wire
+    /// (see [`Self::wire_error`]) — unlike [`Self::InsufficientDeposit`], this
+    /// refusal can precede any lane-ownership proof, so it must stay a plain miss:
+    /// a client cannot tell an unconfirmed pool from a drained one, while an
+    /// operator can tell a chain/RPC problem from real deposit exhaustion.
     PoolUnconfirmed,
     /// The request's voucher signer is registered on-chain with `cap − spent` below
     /// a serve floor, or its authorization could not be confirmed. A signer's `cap`
     /// is shared across every provider (ADR 003 §Pool solvency), so a "spent"
     /// capability — one whose signer has already drawn its full `cap` at other nodes
     /// — is uncashable here: the node would serve for vouchers it could never
-    /// redeem. Distinct from [`Self::InsufficientDeposit`] and [`Self::PoolUnconfirmed`]
-    /// for the per-reason metric ONLY — all three collapse to `NotFound` on the wire
-    /// (see [`Self::wire_error`]), so no pool or signer state leaks.
+    /// redeem. Collapses to `NotFound` on the wire (see [`Self::wire_error`]) — it
+    /// keys on a per-signer quantity distinct from the pool floor
+    /// [`Self::InsufficientDeposit`] names, and stays a plain miss so no signer
+    /// state leaks.
     SignerCapExhausted,
     /// One capability signer's live un-vouchered reservation already fills its
     /// `k`-window concurrency cap (ADR 003 §Pool solvency, per-signer floor
     /// isolation). The pool itself can still pay and co-tenants are unaffected; the
     /// cap is signer-scoped and clears as that signer's in-flight streams pay.
-    /// Distinct from [`Self::InsufficientDeposit`] for the per-reason metric ONLY —
-    /// both collapse to `NotFound` on the wire, see [`Self::wire_error`].
+    /// Collapses to `NotFound` on the wire (see [`Self::wire_error`]) — a node-local
+    /// concurrency stop, cleared by waiting rather than by a top-up, so unlike
+    /// [`Self::InsufficientDeposit`] it names no owner-actionable pool state.
     SignerFloorAtCap,
     /// A cache-HIT serve shed under node overload — egress saturation, or this
     /// client's fair-share cap while the node is pressured. Distinct from
@@ -682,16 +696,29 @@ impl ServeRejectReason {
     ///
     /// The requester side of this mapping is `decdn_client_pull::UpstreamRefused`,
     /// which recovers the wire code — and ONLY the wire code — from a refusal
-    /// (#1144). So the `NotFound` collapse is what a requester sees for all six
+    /// (#1144). So the `NotFound` collapse is what a requester sees for the miss
     /// reasons below, and the reputation consequences it draws must hold for the
     /// weakest of them. They do: it scores `NotFound` as no fault at all, and only
-    /// `InternalError` as a degraded peer.
+    /// `InternalError` as a degraded peer. `InsufficientDeposit` is the lone
+    /// non-collapsing floor refusal — reachable only past the lane-ownership proof,
+    /// so it is spoken to the proven owner (option 2 / #2013) and likewise scored
+    /// as no peer fault.
     const fn wire_error(self) -> StreamError {
         match self {
-            // `InsufficientDeposit` collapses to `NotFound` alongside the other miss
-            // reasons (#856): it must be wire-indistinguishable so a probing client
-            // cannot map out a pool's remaining balances; the distinction survives
-            // only in the per-reason metric. `RangeNotSatisfiable` collapses to
+            // `InsufficientDeposit` is the one floor-`M` refusal that does NOT
+            // collapse to `NotFound` (ADR 003 §Pool solvency, option 2 / #2013). It is
+            // reachable only past the lane-ownership proof — the floor gate fires behind
+            // a known lane keyed to a verified signer that holds an owner-signed
+            // capability — so its audience is never an unauthenticated prober but the
+            // proven pool owner, which already reads the pool's on-chain `remaining` and
+            // so learns no balance off the wire it could not compute. Speaking the true
+            // reason lets the owner's reactive top-up loop fund past the node's
+            // larger-than-estimated `M` and re-open, instead of dead-ending on an
+            // ambiguous `NotFound`. `SignerCapExhausted`, `SignerFloorAtCap`, and
+            // `PoolUnconfirmed` stay collapsed below: each keys on a different quantity
+            // than the pool floor this signal names.
+            Self::InsufficientDeposit => StreamError::InsufficientDeposit,
+            // `RangeNotSatisfiable` collapses to
             // `NotFound` alongside the other "won't serve this" reasons: an
             // out-of-bounds bounded range is a client error, but signalling it as
             // `NotFound` (rather than `InternalError`) keeps it reputation-benign —
@@ -701,7 +728,6 @@ impl ServeRejectReason {
             Self::CacheMiss
             | Self::UnknownChannel
             | Self::OwnerMismatch
-            | Self::InsufficientDeposit
             | Self::PoolUnconfirmed
             | Self::SignerCapExhausted
             | Self::SignerFloorAtCap
@@ -3225,7 +3251,6 @@ mod tests {
             ServeRejectReason::CacheMiss,
             ServeRejectReason::UnknownChannel,
             ServeRejectReason::OwnerMismatch,
-            ServeRejectReason::InsufficientDeposit,
             // A distinct wire code here would hand a prober an oracle: with
             // throwaway signer keys it could binary-search per-signer headroom and
             // reconstruct `remaining − M`, the pool-balance map this collapse exists
@@ -3237,6 +3262,34 @@ mod tests {
                 reason.wire_error(),
                 decdn_protocol::StreamError::NotFound,
                 "{reason:?} must stay wire-indistinguishable"
+            );
+        }
+    }
+
+    /// Option 2 / #2013: the pool-floor refusal is the ONE floor gate that does not
+    /// collapse to `NotFound`. It is reachable only past the lane-ownership proof —
+    /// the floor reservation fires behind a known lane keyed to a verified signer
+    /// holding an owner-signed capability — so its audience is the proven pool
+    /// owner, never an unauthenticated prober, and it ships the true reason so the
+    /// owner's reactive top-up loop can recover it. The per-signer floor gates
+    /// (`SignerFloorAtCap`, `SignerCapExhausted`) and the unconfirmed-pool gate stay
+    /// collapsed: each keys on a different quantity than the pool floor.
+    #[test]
+    fn insufficient_deposit_speaks_its_true_code_but_signer_gates_stay_collapsed() {
+        assert_eq!(
+            ServeRejectReason::InsufficientDeposit.wire_error(),
+            decdn_protocol::StreamError::InsufficientDeposit,
+            "the pool floor refusal is spoken to the proven owner"
+        );
+        for reason in [
+            ServeRejectReason::SignerFloorAtCap,
+            ServeRejectReason::SignerCapExhausted,
+            ServeRejectReason::PoolUnconfirmed,
+        ] {
+            assert_eq!(
+                reason.wire_error(),
+                decdn_protocol::StreamError::NotFound,
+                "{reason:?} keys on a per-signer/confirm quantity and stays a plain miss"
             );
         }
     }

@@ -2160,6 +2160,36 @@ pub fn resume_may_be_stale(err: &anyhow::Error) -> bool {
         .is_some_and(|refused| matches!(refused.error(), StreamError::NotFound))
 }
 
+/// Whether `err` is an **open-time** [`StreamError::InsufficientDeposit`] refusal
+/// (ADR 003 §Pool solvency, option 2 / #2013): the serving node proved us the
+/// authenticated pool owner and told us its refundable floor `M` outruns our
+/// pool's remaining deposit, so the pool cannot cover a credit window here.
+///
+/// `InsufficientDeposit` is a delivery-side code — a legitimate one rides ONLY in
+/// the signed open-stage `StreamResponse { ok: false }`, never mid-stream. So this
+/// gates on open-stage evidence ([`UpstreamRefused::evidence`] present): a
+/// protocol-violating peer that emits a bare mid-stream `StreamError::InsufficientDeposit`
+/// (no signed response) is NOT honored as a floor refusal and never drives the
+/// top-up loop.
+///
+/// The driver routes an open-stage refusal into its fund-and-retry loop the same
+/// way it routes a ledger-corroborated exhaustion: it tops the deposit up toward
+/// the buyer's own `working_deposit` ceiling and re-opens, so a node's
+/// larger-than-estimated `M` no longer dead-ends a fetch on an ambiguous
+/// `NotFound`. Unlike [`genuine_exhaustion`], this needs no ledger corroboration —
+/// our own numbers say we CAN afford the next voucher; only the node's private `M`
+/// (which we cannot compute) is higher. The buyer's ceiling is the sole clamp on
+/// how much a (possibly lying) node can make us escrow, so trusting the owner-only
+/// refusal is money-safe.
+#[must_use]
+pub fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<UpstreamRefused>()
+        .is_some_and(|refused| {
+            matches!(refused.error(), StreamError::InsufficientDeposit)
+                && refused.evidence().is_some()
+        })
+}
+
 /// The wire-byte bound for a fetch of `[byte_offset, byte_offset + byte_len)`
 /// (`byte_len == 0` meaning "to end") of a `total_bytes` blob: the bao-encoded
 /// size of the chunk-group-aligned range (content plus interleaved proof, ADR
@@ -4339,6 +4369,71 @@ mod tests {
             operator.address(),
             &domain,
         )?;
+        Ok(())
+    }
+
+    /// Option 2 / #2013: `is_insufficient_deposit` recognises an open-stage
+    /// `InsufficientDeposit` (the node signed `ok: false` with the code in the ext),
+    /// which is the only shape a legitimate floor refusal takes, and REJECTS a bare
+    /// mid-stream `StreamError::InsufficientDeposit` — a protocol violation that must
+    /// not drive the top-up loop.
+    #[test]
+    fn is_insufficient_deposit_matches_only_the_open_stage_refusal() -> anyhow::Result<()> {
+        use decdn_protocol::client::{StreamError, StreamResponse, StreamResponseBody};
+
+        use super::{UpstreamRefused, is_insufficient_deposit};
+
+        let body = StreamResponseBody {
+            hash: [0x5Au8; 32],
+            ok: false,
+            rate_per_mb: 10,
+            total_bytes: 0,
+            pool_id: [0x77u8; 32],
+            timestamp_us: 1_700_000_000_000_000,
+        };
+        let response = StreamResponse {
+            body,
+            slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
+        };
+        let ext = decdn_protocol::StreamResponseExt {
+            error: Some(StreamError::InsufficientDeposit),
+        };
+        let open = UpstreamRefused::open(response, &ext);
+        anyhow::ensure!(
+            is_insufficient_deposit(&open),
+            "an open-stage InsufficientDeposit must be recognised"
+        );
+
+        let mid = anyhow::Error::new(UpstreamRefused::mid_stream(
+            StreamError::InsufficientDeposit,
+        ));
+        anyhow::ensure!(
+            !is_insufficient_deposit(&mid),
+            "a mid-stream InsufficientDeposit is protocol-violating and must NOT be honored"
+        );
+
+        // A different open-stage code is not a floor refusal either.
+        let other_body = StreamResponseBody {
+            hash: [0x5Au8; 32],
+            ok: false,
+            rate_per_mb: 10,
+            total_bytes: 0,
+            pool_id: [0x77u8; 32],
+            timestamp_us: 0,
+        };
+        let other = UpstreamRefused::open(
+            StreamResponse {
+                body: other_body,
+                slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
+            },
+            &decdn_protocol::StreamResponseExt {
+                error: Some(StreamError::NotFound),
+            },
+        );
+        anyhow::ensure!(
+            !is_insufficient_deposit(&other),
+            "an open-stage NotFound is not a floor refusal"
+        );
         Ok(())
     }
 

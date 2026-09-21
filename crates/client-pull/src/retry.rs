@@ -46,7 +46,9 @@ pub enum RetryDisposition {
 ///   its size is identical whoever serves it, and its received bytes stay over the
 ///   client's cap.
 /// - Every other refusal ([`StreamError::NotFound`], `Overloaded`,
-///   `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`, `HashBlacklisted`)
+///   `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`, `HashBlacklisted`,
+///   `InsufficientDeposit` — the last being a serving node's floor `M` beyond our
+///   estimate, which a smaller-`M` provider may still admit)
 ///   and every non-refusal error — a stall (the progress deadline tripped), a
 ///   transport fault, or a bao/hash verification failure on the bytes this node
 ///   served — is a property of this provider's delivery, so the fetch **fails
@@ -73,6 +75,20 @@ pub fn retry_disposition(err: &anyhow::Error) -> RetryDisposition {
     if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
         return match refused.error() {
             StreamError::OriginBlacklisted | StreamError::VoucherRejected { .. } => Terminal,
+            // An open-time `InsufficientDeposit` (ADR 003 §Pool solvency, option 2 /
+            // #2013) is the serving node's floor `M` outrunning our estimate. It is
+            // `RetryElsewhere`, not terminal: a DIFFERENT provider may reserve a
+            // smaller `M` and admit the same pool. The driver reaches this classifier
+            // only after its own top-up loop gave up (it surfaces that terminal as a
+            // typed [`crate::PoolExhausted`], not as this refusal), so failover here
+            // is the last resort, not a bypass of the top-up recovery. Spelled out
+            // rather than folded into the catch-all so a future default change cannot
+            // silently make a floor refusal terminal.
+            #[expect(
+                clippy::match_same_arms,
+                reason = "explicit arm documents that a floor refusal fails over, guarding intent"
+            )]
+            StreamError::InsufficientDeposit => RetryElsewhere,
             _ => RetryElsewhere,
         };
     }
@@ -149,6 +165,9 @@ mod tests {
             StreamError::InternalError,
             StreamError::EvictedSinceProbe,
             StreamError::HashBlacklisted,
+            // A floor-`M` open refusal (option 2 / #2013): a smaller-`M` provider
+            // may still admit the same pool, so fail over rather than end the fetch.
+            StreamError::InsufficientDeposit,
         ] {
             assert_eq!(
                 retry_disposition(&refusal(error.clone())),

@@ -81,8 +81,8 @@ use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{
     Cumulative, MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, ProgressCallback,
-    UpstreamPullHeader, genuine_exhaustion, reject_empty_claim_for_nonempty_root,
-    resumable_watermark, resume_may_be_stale,
+    UpstreamPullHeader, genuine_exhaustion, is_insufficient_deposit,
+    reject_empty_claim_for_nonempty_root, resumable_watermark, resume_may_be_stale,
 };
 
 /// The shared pool cannot fund the next voucher: its remaining deposit is below
@@ -851,16 +851,40 @@ where
 
                     // 1. A stale-resume refusal while we are waiting out a top-up:
                     //    the node's watcher has not caught up yet. Sleep and retry
-                    //    the same sub-range, bounded by the settle budget.
+                    //    the same sub-range, bounded by the settle budget. An
+                    //    `InsufficientDeposit` re-open (option 2 / #2013) qualifies for
+                    //    the same wait: right after a `topUp` the node's chain watcher
+                    //    may still read the pre-top-up `remaining − M` and refuse the
+                    //    authenticated owner with this code, exactly as an honest node's
+                    //    range gate refuses a stale offset with `NotFound`.
                     if awaiting_settle
                         && settle_waits < config.max_settle_waits
-                        && resume_may_be_stale(&err)
+                        && (resume_may_be_stale(&err) || is_insufficient_deposit(&err))
                     {
                         settle_waits = settle_waits.saturating_add(1);
                         tokio::time::sleep(config.settle_backoff).await;
                         continue;
                     }
                     awaiting_settle = false;
+
+                    // 1b. An open-time `InsufficientDeposit` refusal (option 2 / #2013):
+                    //     the serving node proved us the authenticated pool owner and
+                    //     told us its refundable floor `M` outruns our pool's remaining
+                    //     deposit. Our own ledger says we can still afford the next
+                    //     voucher — only the node's private `M` is higher than we
+                    //     estimated — so `genuine_exhaustion` below would reject it. Route
+                    //     it into the fund-and-retry loop directly: the pacer tops the
+                    //     deposit up toward our `working_deposit` ceiling and re-opens,
+                    //     clearing the node's `remaining − M ≥ window` gate. If the
+                    //     ceiling (or the top-up budget) is already spent the pacer
+                    //     refuses on the next pass, ending the fetch truthfully as
+                    //     `PoolExhausted` rather than on an ambiguous miss. The ceiling is
+                    //     the sole clamp on how much a lying node can make us escrow, so
+                    //     trusting this owner-only signal is money-safe.
+                    if is_insufficient_deposit(&err) {
+                        exhaustion_confirmed = true;
+                        continue;
+                    }
 
                     // 2 & 3 both read the shared context. Neither `resumable_watermark`
                     // nor `genuine_exhaustion` awaits, so the guard is held only
@@ -962,9 +986,11 @@ mod tests {
     use crate::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
     use crate::{
         ClientRangedStore, Cumulative, PoolContext, PoolLedger, UpstreamPullHeader,
-        UpstreamVoucherRejected, VoucherProgress,
+        UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
     };
-    use decdn_protocol::client::VoucherRejectReason;
+    use decdn_protocol::client::{
+        StreamError, StreamResponse, StreamResponseBody, StreamResponseExt, VoucherRejectReason,
+    };
 
     const GROUP: u64 = CHUNK_GROUP_BYTES;
 
@@ -1632,6 +1658,139 @@ mod tests {
             drive_config.settle_backoff
         );
 
+        assert!(store.is_complete().await.expect("is_complete"));
+        let got = store.read(0, 0).await.expect("read whole blob");
+        assert_eq!(got.as_ref(), plaintext.as_slice());
+    }
+
+    /// A [`BlobSource`] that refuses its FIRST open with an owner-only
+    /// [`StreamError::InsufficientDeposit`] (ADR 003 §Pool solvency, option 2 /
+    /// #2013) — the serving node's floor `M` beyond the buyer's estimate — and
+    /// serves every later open from the inner [`ScriptedSource`]. The refusal
+    /// arrives at the open (the node signed `ok: false`, so there is no header and
+    /// no reader), exactly as a real one does.
+    struct RefuseFirstOpenShortDeposit {
+        inner: ScriptedSource,
+        opens: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BlobSource for RefuseFirstOpenShortDeposit {
+        type Reader = <ScriptedSource as BlobSource>::Reader;
+
+        fn open(
+            &self,
+            hash: [u8; 32],
+            range: AlignedRange,
+        ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
+            let n = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 0 {
+                    // A real open-stage refusal: the node signs `StreamResponse
+                    // { ok: false }` with the delivery-side `InsufficientDeposit` in
+                    // the trailing ext, exactly the shape `open_progressive_pull`
+                    // builds via the crate-private `UpstreamRefused::open`. Built here
+                    // (rather than `mid_stream`) so the refusal carries open-stage
+                    // evidence — which is what `is_insufficient_deposit` now requires.
+                    let body = StreamResponseBody {
+                        hash,
+                        ok: false,
+                        rate_per_mb: 1,
+                        total_bytes: self.inner.total_bytes(),
+                        pool_id: [0u8; 32],
+                        timestamp_us: 0,
+                    };
+                    // `open` retains the response as-is without re-validating the
+                    // signature, so an EOA-length (65-byte) placeholder slash-sig is
+                    // enough — this test exercises the top-up routing, not slash
+                    // evidence.
+                    let resp = StreamResponse {
+                        body,
+                        slash_sig: vec![0u8; 65],
+                    };
+                    let ext = StreamResponseExt {
+                        error: Some(StreamError::InsufficientDeposit),
+                    };
+                    return Err(UpstreamRefused::open(resp, &ext));
+                }
+                self.inner.open(hash, range).await
+            })
+        }
+
+        fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async move { self.inner.finish(reader).await })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_insufficient_deposit_open_refusal_tops_up_and_reopens() {
+        // Option 2 / #2013: the buyer's ledger CAN afford the next voucher — its
+        // deposit sits well above the voucher cost — so `genuine_exhaustion` rejects
+        // the refusal. Only the node's private floor `M` is higher than the buyer
+        // estimated, and the buyer cannot compute it. The driver must trust the
+        // owner-only `InsufficientDeposit` signal, top the deposit up toward its own
+        // `working_deposit` ceiling, and re-open — rather than dead-end as it would
+        // on the ambiguous `NotFound` this refusal used to collapse to.
+        let total = 2 * GROUP;
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let inner = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        let root = inner.root();
+        let source = RefuseFirstOpenShortDeposit {
+            inner,
+            opens: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let pacer = BudgetPacer::new();
+        let funder = FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)));
+
+        let mut ctx = healthy_ctx();
+        // Affordable next voucher (deposit ≫ cost), so the refusal is NOT a
+        // ledger-corroborated exhaustion; the recovery is driven purely by the
+        // dedicated `InsufficientDeposit` route.
+        ctx.deposit = U256::from(1_000u64);
+        let ctx = Arc::new(Mutex::new(ctx));
+
+        let drive_config = DriveConfig {
+            // Headroom above the current deposit so the pacer has something to add.
+            working_deposit: U256::from(10_000u64),
+            seller_reserve: U256::ZERO,
+            max_settle_waits: 2,
+            settle_backoff: std::time::Duration::from_secs(2),
+        };
+
+        drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &drive_config,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("drive recovers an InsufficientDeposit refusal via one top-up");
+
+        assert_eq!(
+            source.opens.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one refused open + one re-open after the top-up"
+        );
+        assert_eq!(
+            funder.calls().len(),
+            1,
+            "exactly one top-up funded past the node's larger-than-estimated M"
+        );
         assert!(store.is_complete().await.expect("is_complete"));
         let got = store.read(0, 0).await.expect("read whole blob");
         assert_eq!(got.as_ref(), plaintext.as_slice());

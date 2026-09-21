@@ -33,14 +33,16 @@
 //!    refused. Its own per-signer live cap is pristine (a fresh key, zero live), so
 //!    the ONLY thing that can refuse it is the pool ceiling: the
 //!    aggregate would exceed `remaining − M`. The refusal is `PoolExhausted`,
-//!    which `FloorRefusal`→`ServeRejectReason` maps to `InsufficientDeposit` and
-//!    `ServeRejectReason::wire_error` collapses onto the wire `NotFound` every
-//!    reject reason shares.
+//!    which `FloorRefusal`→`ServeRejectReason` maps to `InsufficientDeposit`, and
+//!    `ServeRejectReason::wire_error` speaks the true wire
+//!    `StreamError::InsufficientDeposit` to the authenticated owner (option 2 /
+//!    #2013) — the floor gate is reached only past the lane-ownership proof, so a
+//!    prober never sees it, and the proven owner can act on it.
 //!
 //! No admin surface exposes the pool's live floor accumulator (it is accounting,
 //! not policy), so this journey asserts what is observable end to end: which
 //! streams the node admits, which it refuses, and the per-reason reject counters
-//! behind the collapsed `NotFound`. The blob every stream requests is a cache HIT,
+//! behind the wire refusal. The blob every stream requests is a cache HIT,
 //! so availability can never explain a refusal; a delta on
 //! `decdn_serve_stream_rejected_insufficient_deposit_total` pins the refusal to
 //! the pool ceiling, and a flat
@@ -148,10 +150,10 @@ const HELD_STREAMS: u64 = 2;
 /// that can refuse the overflow stream is the pool ceiling, which is the whole
 /// point.
 const SIGNER_WINDOWS: u64 = 64;
-/// The node-local reject counter behind the collapsed wire `NotFound` for a pool
-/// ceiling refusal: `FloorRefusal::PoolExhausted` →
-/// `ServeRejectReason::InsufficientDeposit`. A `0→1` delta across the overflow
-/// request pins the refusal to the pool ceiling.
+/// The node-local reject counter behind a pool-ceiling refusal:
+/// `FloorRefusal::PoolExhausted` → `ServeRejectReason::InsufficientDeposit`
+/// (which the authenticated owner also sees on the wire, option 2 / #2013). A
+/// `0→1` delta across the overflow request pins the refusal to the pool ceiling.
 const INSUFFICIENT_DEPOSIT_METRIC: &str = "decdn_serve_stream_rejected_insufficient_deposit_total";
 /// The per-signer live-cap reject counter. It must stay FLAT across the overflow
 /// request: the refusal is the pool ceiling, not the per-signer cap, so spraying a
@@ -337,11 +339,12 @@ async fn run() -> anyhow::Result<()> {
              reached remaining − M — spraying a fresh signer identity must not buy more envelope",
             stream.delivered
         ),
-        OpenOutcome::Refused(StreamError::NotFound) => {}
+        OpenOutcome::Refused(StreamError::InsufficientDeposit) => {}
         OpenOutcome::Refused(other) => anyhow::bail!(
             "the overflow signer was refused, but with {other:?} rather than the expected \
-             `NotFound` (`ServeRejectReason::wire_error` collapses the pool-ceiling refusal onto \
-             `NotFound`, same as every other reject reason)"
+             `InsufficientDeposit` (`ServeRejectReason::wire_error` speaks the pool-ceiling refusal \
+             to the authenticated owner as `InsufficientDeposit`, option 2 / #2013 — this driver is \
+             a proven lane owner)"
         ),
     }
     let deposit_rejects_after = node.scrape_metric(INSUFFICIENT_DEPOSIT_METRIC).await?;
