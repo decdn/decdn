@@ -809,10 +809,13 @@ since project inception and will roll into the first tagged release.
   nothing; that is one extra read per new lane, and a fault on it now aborts the
   fetch. An adopted pool's refill decision counts what the pool has already paid
   out (`totalRedeemed`), so a pool other lanes drained is topped up rather than
-  trusted as full. A buy from a node's data dir — named with `--data-dir`
-  (#2082) — never adopts: its keystore is the operator's, so the wallet's live
-  pool is the daemon's own, and adopting it would put a second voucher series
-  on the daemon's lanes.
+  trusted as full. A buy whose store or key belongs to a node never adopts —
+  a node's dir named with `--data-dir` (#2082), or a client dir pointed at the
+  node's keystore with `--keystore`/`blockchain.eth_keystore`: the wallet is the
+  operator's, so its live pool is the daemon's own, and adopting it would put a
+  second voucher series on the daemon's lanes. Adoption assumes one buyer per
+  wallet, and a key copied out of a node's dir, or shared between two clients,
+  is not detectable locally.
 
 - **CLI: `decdn whoami` reports a keystore the shared password does not open
   (#2008).** The command resolved one password and applied it to both

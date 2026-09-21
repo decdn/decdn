@@ -69,28 +69,45 @@ pub(crate) fn client_buyer_db(data_dir: &Path) -> PathBuf {
 
 /// Whether a buy may adopt a pool its wallet already owns on chain, when the
 /// client store has no row for it.
+///
+/// Adoption assumes the wallet has one buyer: the newest live pool it owns is
+/// taken to be this client's own. A wallet shared with another buyer breaks
+/// that, because adopting the other buyer's pool puts a second, independent
+/// voucher series on its lanes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChainAdoption {
-    /// A client data dir. The wallet's pools are this client's own, so a lost
-    /// row is recovered from chain rather than escrowing a second deposit.
+    /// Neither the store nor the key belongs to a node, so the wallet's pools
+    /// are this client's own and a lost row is recovered from chain rather than
+    /// escrowing a second deposit.
     Allowed,
-    /// A node's data dir, named on the command line (#2082). The keystore is
-    /// the node's operator key, so the wallet's newest live pool is the one the
-    /// daemon is paying from: adopting it would put a second, independent
-    /// voucher series on the daemon's own lanes. The buy opens its own pool
-    /// instead.
+    /// The store or the key belongs to a `decdn-node` daemon, so the wallet is
+    /// the node's operator and its newest live pool is the one the daemon is
+    /// paying from. The buy opens its own pool instead.
     Refused,
 }
 
 impl ChainAdoption {
-    /// The rule for a buy whose client store lives in `data_dir`.
+    /// The rule for a buy whose client store lives in `data_dir` and which
+    /// signs with the keystore at `keystore`.
     ///
-    /// Reads the same daemon markers as [`classify_buyer_store`], so the verdict
-    /// is about the directory the store was opened in, not a second opinion.
-    pub(crate) fn for_data_dir(data_dir: &Path) -> Self {
-        match classify_buyer_store(data_dir) {
-            BuyerStoreOwner::Client { .. } => Self::Allowed,
-            BuyerStoreOwner::Node { .. } => Self::Refused,
+    /// Both are checked, because they resolve independently: `--data-dir`
+    /// (#2082) puts a client store in a node's dir, and `--keystore` or
+    /// `blockchain.eth_keystore` points a client dir at a node's operator key.
+    /// Either way the wallet is the daemon's. The keystore is judged by the
+    /// directory that holds it, read against the same daemon markers as
+    /// [`classify_buyer_store`].
+    ///
+    /// This recognises a key that lives in a node's data dir. It cannot
+    /// recognise one copied out of it, or a wallet two clients share — nothing
+    /// local distinguishes those from a wallet with one buyer.
+    pub(crate) fn for_buy(data_dir: &Path, keystore: &Path) -> Self {
+        let node_owned =
+            |dir: &Path| matches!(classify_buyer_store(dir), BuyerStoreOwner::Node { .. });
+        let key_dir = keystore.parent().unwrap_or(Path::new(""));
+        if node_owned(data_dir) || node_owned(key_dir) {
+            Self::Refused
+        } else {
+            Self::Allowed
         }
     }
 }
@@ -325,8 +342,9 @@ mod tests {
     #[test]
     fn chain_adoption_is_refused_in_a_node_data_dir() {
         let client = tempfile::tempdir().unwrap();
+        let client_key = client.path().join("keystore.json");
         assert_eq!(
-            ChainAdoption::for_data_dir(client.path()),
+            ChainAdoption::for_buy(client.path(), &client_key),
             ChainAdoption::Allowed
         );
 
@@ -334,9 +352,26 @@ mod tests {
         std::fs::write(node.path().join("lanes.redb"), b"x").unwrap();
         assert!(!node.path().join("buyer.redb").exists());
         assert_eq!(
-            ChainAdoption::for_data_dir(node.path()),
+            ChainAdoption::for_buy(node.path(), &node.path().join("keystore.json")),
             ChainAdoption::Refused,
             "a node dir must refuse adoption even with its buyer store gone"
+        );
+    }
+
+    /// A client dir signing with the node's operator key refuses adoption too.
+    ///
+    /// `--keystore` resolves independently of `--data-dir`, so the store can be
+    /// a client's while the wallet is the daemon's. The wallet is what decides
+    /// whose pools it owns, so its key is checked as well as the store's dir.
+    #[test]
+    fn chain_adoption_is_refused_for_a_node_operator_key_used_from_a_client_dir() {
+        let client = tempfile::tempdir().unwrap();
+        let node = tempfile::tempdir().unwrap();
+        std::fs::write(node.path().join("lanes.redb"), b"x").unwrap();
+        assert_eq!(
+            ChainAdoption::for_buy(client.path(), &node.path().join("keystore.json")),
+            ChainAdoption::Refused,
+            "a client dir must not adopt the daemon's pool through its operator key"
         );
     }
 

@@ -3186,9 +3186,9 @@ where
         chain.payment_pool,
         chain.working_deposit,
         chain.max_approve,
-        // The store this fetch writes was opened from `chain.data_dir`, so the
-        // verdict is about that same directory.
-        ChainAdoption::for_data_dir(&chain.data_dir),
+        // The store this fetch writes was opened from `chain.data_dir`, and it
+        // signs with `chain.keystore`; the verdict covers both.
+        ChainAdoption::for_buy(&chain.data_dir, &chain.keystore),
     )
     .await?;
     attach_client_binding(ctx, chain, endpoint, signer)

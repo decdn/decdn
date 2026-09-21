@@ -1384,8 +1384,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                     self.chain.payment_pool,
                     self.chain.working_deposit,
                     self.chain.max_approve,
-                    // `self.store` was opened from `self.chain.data_dir`.
-                    ChainAdoption::for_data_dir(&self.chain.data_dir),
+                    // `self.store` was opened from `self.chain.data_dir`, and
+                    // the pull signs with `self.chain.keystore`.
+                    ChainAdoption::for_buy(&self.chain.data_dir, &self.chain.keystore),
                 )
                 .await?
             };
