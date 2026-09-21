@@ -9,11 +9,11 @@
 //!   `buyer-pools.redb` for the client (`decdn fetch`, #940). (Code span,
 //!   not a link: that module exists only under the `redb` feature, so
 //!   linking it would break a `buyer-store-core`-only doc build.)
-//! - `decdn-node`'s `pool_store::PersistentPoolStateStore` owns the buyer
+//! - `decdn-node`'s `channel_store::PersistentPoolStateStore` owns the buyer
 //!   table in its own `buyer.redb`, one of the per-family redb files it opens
-//!   under `data_dir` (the seller lane, pending-settle, floor-loss, and
-//!   watcher-checkpoint families each get their own file too, so no family's
-//!   commit waits on another's writer slot).
+//!   under `data_dir` (the seller lane, pending-settle, and watcher-checkpoint
+//!   families each get their own file too, so no family's commit waits on
+//!   another's writer slot).
 //!
 //! That is a file-ownership difference, not a logic difference, so both
 //! stores supply only their own `Database` and delegate the actual work to
@@ -210,6 +210,59 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<BuyerPoolSta
     stored.into_state(pool_id)
 }
 
+/// Load every persisted buyer pool from any readable `redb` database.
+///
+/// Generic over [`redb::ReadableDatabase`] so one decode-and-skip
+/// implementation serves both a read-write [`Database`] — the daemon and the
+/// client store while their process owns the file — and a
+/// [`redb::ReadOnlyDatabase`] opened against a stopped daemon's file for
+/// post-mortem inspection (#2084). The skip semantics documented on
+/// [`BuyerPoolTable::load_all`] are the point: they must not fork between the
+/// two callers.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] if the table or its iterator is unreadable.
+pub(crate) fn load_all_from<D: ReadableDatabase>(db: &D) -> Result<BuyerLoad, StoreError> {
+    let read_txn = db
+        .begin_read()
+        .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+    let table = match read_txn.open_table(BUYER_POOL_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BuyerLoad::default()),
+        Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+    };
+    let mut out = Vec::new();
+    let mut skipped = Vec::new();
+    let iter = table
+        .iter()
+        .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
+    for entry in iter {
+        let (key_guard, value_guard) =
+            entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
+        let key_bytes: [u8; 32] = *key_guard.value();
+        match decode_record(key_bytes, value_guard.value()) {
+            Ok(state) => out.push(state),
+            Err(err) => {
+                let pool_id = PoolId::from(key_bytes);
+                skipped.push(pool_id);
+                tracing::error!(
+                    %pool_id,
+                    error = %err,
+                    event = "buyer_pool_store_skip_undecodable_record",
+                    "buyer pool hydration: skipping an undecodable record; its escrowed \
+                     deposit is untracked and will not be auto-reclaimed until the record is \
+                     repaired (other pools remain healthy)",
+                );
+            }
+        }
+    }
+    Ok(BuyerLoad {
+        pools: out,
+        skipped,
+    })
+}
+
 /// `db` viewed as the buyer-pool table: a typed capability over a
 /// caller-owned [`Database`]. Zero-cost — it borrows and owns nothing, and
 /// does no I/O until a method is called. Construct one per operation.
@@ -282,44 +335,7 @@ impl<'a> BuyerPoolTable<'a> {
     ///
     /// [`StoreError::Backend`] if the table or its iterator is unreadable.
     pub fn load_all(&self) -> Result<BuyerLoad, StoreError> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        let table = match read_txn.open_table(BUYER_POOL_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BuyerLoad::default()),
-            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
-        };
-        let mut out = Vec::new();
-        let mut skipped = Vec::new();
-        let iter = table
-            .iter()
-            .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
-        for entry in iter {
-            let (key_guard, value_guard) =
-                entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
-            let key_bytes: [u8; 32] = *key_guard.value();
-            match decode_record(key_bytes, value_guard.value()) {
-                Ok(state) => out.push(state),
-                Err(err) => {
-                    let pool_id = PoolId::from(key_bytes);
-                    skipped.push(pool_id);
-                    tracing::error!(
-                        %pool_id,
-                        error = %err,
-                        event = "buyer_pool_store_skip_undecodable_record",
-                        "buyer pool hydration: skipping an undecodable record; its escrowed \
-                         deposit is untracked and will not be auto-reclaimed until the record is \
-                         repaired (other pools remain healthy)",
-                    );
-                }
-            }
-        }
-        Ok(BuyerLoad {
-            pools: out,
-            skipped,
-        })
+        load_all_from(self.db)
     }
 
     /// Persist (insert or overwrite) the state for one pool, keyed by

@@ -25,7 +25,7 @@ mod common;
 
 use alloy::primitives::{Address, B256, U256};
 use decdn_cli::commands::pool::pool_dispatch;
-use decdn_common::cli::{PoolArgs, PoolCommand, PoolListArgs};
+use decdn_common::cli::{PoolArgs, PoolChainArgs, PoolCommand, PoolListArgs};
 use decdn_incentive::buyer_pool::{BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 
@@ -40,11 +40,20 @@ fn data_dir() -> tempfile::TempDir {
 fn list_args(data_dir: &std::path::Path, json: bool) -> PoolArgs {
     PoolArgs {
         command: PoolCommand::List(PoolListArgs {
-            data_dir: Some(data_dir.to_path_buf()),
+            // The store-backed listing; `--all` is covered against a real chain.
+            all: false,
             json,
             // Unused on a client data dir; only a node's routes to the daemon.
             admin_url: None,
             timeout_ms: 5_000,
+            chain: PoolChainArgs {
+                data_dir: Some(data_dir.to_path_buf()),
+                rpc_url: None,
+                payment_pool_address: None,
+                chain_id: None,
+                keystore: None,
+                keystore_password_file: None,
+            },
         }),
     }
 }
@@ -182,17 +191,172 @@ async fn list_with_data_dir_ignores_broken_config_env_expansion() {
         .expect("list with --data-dir must not load or env-expand the config");
 }
 
+/// A daemon's `buyer.redb`, written by the real daemon store and then closed.
+/// Returns the pool id recorded into it.
+fn seed_stopped_daemon_store(data_dir: &std::path::Path) -> B256 {
+    use decdn_node::channel_store::{BuyerPoolStoreHandle, PersistentPoolStateStore};
+
+    let pool_id = B256::repeat_byte(0x5a);
+    let store = std::sync::Arc::new(PersistentPoolStateStore::open(data_dir).unwrap());
+    let state = BuyerPoolState::new(
+        pool_id,
+        Address::repeat_byte(0x5a),
+        Address::repeat_byte(0xcd),
+        U256::from(7_000_000u64),
+    );
+    BuyerPoolStoreHandle::new(std::sync::Arc::clone(&store))
+        .record(&state)
+        .unwrap();
+    // Dropping the last handle releases redb's process-exclusive lock — the
+    // daemon exiting, in one line.
+    drop(store);
+    pool_id
+}
+
+/// #2084: with the daemon stopped, its `buyer.redb` is readable and nothing
+/// else can show it. The listing must come from that file, and must say so —
+/// the provenance is what keeps it distinguishable from the client store's
+/// identically-shaped rows.
+#[test]
+fn a_stopped_daemons_store_is_read_from_disk_and_labelled() {
+    let dir = data_dir();
+    let pool_id = seed_stopped_daemon_store(dir.path());
+
+    let output = common::decdn_command(dir.path())
+        .args([
+            "pool",
+            "list",
+            // Nothing listens here, so the admin call is refused.
+            "--admin-url",
+            "http://127.0.0.1:1",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn pool list");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a stopped daemon's store must read: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("buyer.redb"), "{stdout}");
+    assert!(
+        stdout.contains("read from disk; no daemon running"),
+        "the listing must name where it came from: {stdout}"
+    );
+    assert!(stdout.contains("pools=1"), "{stdout}");
+    assert!(
+        !dir.path().join("buyer-pools.redb").exists(),
+        "the offline read must not manufacture a client store"
+    );
+
+    // `--json` carries the same provenance in a field, not in prose.
+    let json_out = common::decdn_command(dir.path())
+        .args([
+            "pool",
+            "list",
+            "--json",
+            "--admin-url",
+            "http://127.0.0.1:1",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn pool list --json");
+    let v: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(v["source"], "node_store_offline");
+    assert!(v["store"].as_str().unwrap().ends_with("buyer.redb"), "{v}");
+    assert_eq!(v["pools"][0]["pool_id"], format!("{pool_id:#x}"));
+}
+
+/// A refused admin port with the store still write-locked means a daemon IS
+/// running and the admin URL is wrong — the opposite diagnosis from "the node
+/// is down", and the two send an operator opposite ways.
+#[test]
+fn a_locked_store_says_the_admin_url_is_wrong_not_that_the_node_is_down() {
+    use decdn_node::channel_store::PersistentPoolStateStore;
+
+    let dir = data_dir();
+    // Held for the duration of the command: the daemon is up, the admin port
+    // in the flag is simply not its.
+    let _daemon = PersistentPoolStateStore::open(dir.path()).unwrap();
+
+    let output = common::decdn_command(dir.path())
+        .args([
+            "pool",
+            "list",
+            "--admin-url",
+            "http://127.0.0.1:1",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn pool list");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("IS running") && stderr.contains("exclusively"),
+        "the error must say a daemon holds the store, which is the claim that \
+         separates it from a stopped node: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Start decdn-node"),
+        "a daemon holding the store is not a stopped daemon: {stderr}"
+    );
+}
+
+/// `--all` reads the chain, not a store, so the sweep refusal that guards
+/// `close --all` / `reclaim --all` must not reach it — a node host is where the
+/// chain-authoritative view is most needed. It fails here for want of a chain,
+/// which is the point: it got past the classifier, and it left no client store
+/// behind on the way.
+#[test]
+fn list_all_is_not_refused_on_a_node_data_dir() {
+    let dir = data_dir();
+    std::fs::write(dir.path().join("lanes.redb"), b"x").unwrap();
+
+    let output = common::decdn_command(dir.path())
+        .args([
+            "pool",
+            "list",
+            "--all",
+            // Nothing listens here, so the chain read fails after the guard.
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--payment-pool-address",
+            "0x0000000000000000000000000000000000000001",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn pool list --all");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("refusing to"),
+        "--all reads only, so the sweep refusal must not reach it: {stderr}"
+    );
+    assert!(
+        !dir.path().join("buyer-pools.redb").exists(),
+        "--all must not manufacture a client store in a node data dir"
+    );
+}
+
 /// A data dir holding a daemon's `buyer.redb` is a node's, and `list` must say
-/// so rather than reading the unrelated client store beside it. With no daemon
-/// listening, the command fails — and, critically, leaves no `buyer-pools.redb`
-/// behind. Creating that file and reporting its emptiness as the node's state
-/// is the defect this pins (#2078).
+/// so rather than reading the unrelated client store beside it. When the admin
+/// call is refused AND the file will not open off disk, the command fails —
+/// and, critically, leaves no `buyer-pools.redb` behind. Creating that file and
+/// reporting its emptiness as the node's state is the defect this pins (#2078).
 #[test]
 fn node_data_dir_is_not_read_as_a_client_store() {
     let dir = data_dir();
     let buyer_db = dir.path().join("buyer.redb");
-    // Content is irrelevant: presence is the signal, and the CLI must never
-    // open this file — a live daemon holds redb's exclusive lock on it.
+    // Presence is the signal. This one is not a real redb file, so the offline
+    // disk read (#2084) cannot salvage it either — and the command must still
+    // never reach for the CLIENT store, which is the bug.
     std::fs::write(&buyer_db, b"not a real redb file").unwrap();
 
     let output = common::decdn_command(dir.path())
@@ -262,7 +426,8 @@ mod node_dir_guards {
     fn refused(args: &[&str]) -> String {
         let dir = data_dir();
         // Not the buyer store: `lanes.redb` alone marks a node data dir, which
-        // is the mid-recovery window where the old classifier got it wrong.
+        // is the mid-recovery window a classifier keyed on the buyer store
+        // gets wrong.
         std::fs::write(dir.path().join("lanes.redb"), b"x").unwrap();
 
         let output = common::decdn_command(dir.path())

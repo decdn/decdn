@@ -28,6 +28,24 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **CLI: `decdn fetch` and `decdn bundle pull` refuse a `decdn-node` data dir
+  they were not pointed at (#2082).** `decdn pool` already refused to escrow
+  into a daemon's data dir (#2078), but these two opened the client store on
+  the same resolved `data_dir` with no such check — and the keystore defaults
+  to that dir too, so on a node host they opened a client pool under the
+  **node's own operator address**. The daemon's stranded-pool report then names
+  a pool a human may be fetching against, and its adoption path can take that
+  pool over, putting two independent voucher watermarks on one lane. A human
+  buying on a node host is a legitimately separate client, so the rule is
+  weaker than `pool`'s: `--data-dir <node dir>` on the command line is accepted,
+  while arriving there implicitly — `identity.data_dir` from
+  `~/.decdn/node.toml`, which is the node's dir on a node host — is refused.
+  Scripts that ran a bare `decdn fetch` on a node host must add
+  `--data-dir <client dir>` (the usual intent) or name the node's dir
+  explicitly. The refusal runs before the keystore prompt. Recorded in
+  [ADR 012](adr/012-client.md) beside the store-split paragraph, where the
+  asymmetry was previously an omission rather than a decision.
+
 - **CLI: `decdn pool` refuses to write a store a `decdn-node` daemon owns
   (#2078).** Every store-backed `pool` subcommand — `list`, `open`, `top-up`,
   `close`, `reclaim`; `assign` touches no store — used
@@ -752,6 +770,30 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+- **CLI: `decdn whoami` reports a keystore the shared password does not open
+  (#2008).** The command resolved one password and applied it to both
+  `<data_dir>/keystore.json` and `<data_dir>/client/keystore.json`. `key-gen`
+  writes those at different times and prompts for each, so they can hold
+  different passwords — and when they did, the first `Mac Mismatch` aborted the
+  whole command. Nothing printed: not the node id, not the key paths, not the
+  address of the keystore whose password was correct. The shared password is
+  still tried first; a keystore it does not open now degrades its own line to a
+  note naming the keystore and the reason, and on a TTY that keystore gets one
+  prompt of its own before the note. Every other line still prints and the
+  command exits 0, which is what its documented ordering already promised for
+  the node id and the paths.
+
+- **CLI/node: `decdn doctor` checks the store files a daemon actually owns
+  (#2083).** `doctor` kept a private copy of the daemon's store-file list and
+  it had drifted: it reported on a `floor-loss.redb` that nothing creates, and
+  a fifth daemon store would have been checked by nothing. The list now comes
+  from `decdn_common::data_dir::DAEMON_STORE_FILES` plus `CLIENT_BUYER_DB_FILE`,
+  the same names the daemon's own store and the client store use. A new
+  `channel_store` test asserts that opening `PersistentPoolStateStore` creates
+  every file in that set and no `.redb` outside it, which turns the premise
+  `daemon_marker` — and with it the node-vs-client classification from #2078 —
+  rests on into a checked fact.
 
 - **Node: bootstrap distinguishes "this pool is not open" from "its status could
   not be read" (#2078).** The stale-row drop below judged a tracked pool by its
@@ -1896,6 +1938,53 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+- **CLI: `decdn pool list --all` shows every pool the keystore owns on chain
+  (#2077).** `pool list` read only the local buyer store, so it could not show
+  a pool whose store row was gone — precisely the situation an operator runs it
+  in. A reset `identity.data_dir` loses the only local record of a funded
+  deposit, and the default listing then prints nothing, because the file it
+  reads is the file that went missing. `--all` enumerates
+  `PaymentPool.getPools` by the keystore address and prints every pool in every
+  lifecycle state with its on-chain `deposit`, `totalRedeemed` and reclaim
+  window, marking which ones the local record tracks. Every local read on this
+  path is read-only: `--all` sends no transaction, writes no pool record, and
+  manufactures no store — creating one and reporting its emptiness is the #2078
+  defect, and it would make a lost store indistinguishable from a store that
+  tracks nothing. `TRACKED` distinguishes `no` from `?`: a pool the local record
+  cannot answer for — an unreadable store, or a row that will not decode — is
+  unknown rather than untracked, because the remedies differ (a lost store
+  versus a record to repair) and one bad row must not blank the verdict for the
+  pools either side of it. A store that will not open is named on stderr with
+  the reason, and the table carries `local_store=read|unreadable` so the
+  distinction is not `--json`-only. Unlike `close --all` / `reclaim --all` it is
+  **not** refused on a node's data dir — those two write, this one reads, and a
+  node host is where it is most needed. `--json` emits a third document shape
+  with `source: "chain"`; read `source` before `pools`, as with the other two.
+  `PoolListArgs` now flattens `PoolChainArgs`, matching `close` and `reclaim`:
+  `--data-dir` is unchanged and the chain flags are new, read only by `--all`.
+  The `docs/runbook.md` stranded-pool section that was written around this gap
+  now uses it.
+
+- **CLI: `decdn pool list` reads a stopped node's `buyer.redb` off disk
+  (#2084).** #2081 routed the listing on a node data dir through
+  `admin_v1_pools` and deliberately did not fall back to the client store,
+  which left a stopped node's buyer store readable by nothing — no route for a
+  post-mortem after a crash, or for a host down for maintenance. `redb` holds
+  its process-exclusive lock only for the lifetime of an open `Database`, so on
+  a refused admin connection the CLI now tries a read-only open of the daemon's
+  own `buyer.redb`. It opens, so no daemon holds it: the listing renders with
+  `store=… (read from disk; no daemon running)` and `source=node_store_offline`
+  under `--json` — its own value, never the client store's. It is write-locked,
+  so a daemon **is** running: the error says the admin URL or `admin_port` is
+  wrong rather than telling the operator to start a node that is already up.
+  Anything else keeps the previous error with the disk read's reason appended.
+  New `decdn_incentive::buyer_pool_redb::ReadOnlyBuyerPoolStore` takes a file
+  path rather than a data dir and never creates, which is what keeps #2078
+  closed; a `redb` database left unrepaired by a crash reports the new
+  `StoreError::NeedsRepair`, naming the one fix (start the daemon once). Only a
+  refused connection takes this route — a timeout or a JSON-RPC error means the
+  daemon answered, so neither goes near the file.
 
 - **Admin/CLI: `admin_v1_pools` and `decdn node pools` read the node's buyer-side
   `PaymentPool` state (#2078).** The buyer-side counterpart of `admin_v1_lanes` /

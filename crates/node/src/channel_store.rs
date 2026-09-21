@@ -1105,8 +1105,9 @@ impl PersistentPoolStateStore {
 // The record codec and every table operation live in
 // `decdn_incentive::buyer_pool_table` — the same code the client's
 // `RedbBuyerPoolStore` runs (#1246). This file keeps only the wiring: which
-// file the table lives in (`lanes.redb`, shared with the seller, pending-settle,
-// and watcher-checkpoint tables) and which `TableDefinition` names it.
+// file the table lives in (`buyer.redb`, its own per-family file, so a buyer
+// commit never waits on the seller lane, pending-settle or watcher-checkpoint
+// writer slot) and which `TableDefinition` names it.
 // ---------------------------------------------------------------------------
 
 /// Test/e2e-only seam on the concrete store. Kept here rather than on the
@@ -1128,9 +1129,11 @@ impl PersistentPoolStateStore {
 
 /// [`BuyerPoolStore`] adapter over the shared [`PersistentPoolStateStore`].
 ///
-/// Holds an `Arc` to the same store the seller path uses, so both the seller
-/// `lane_state_v1` table and the buyer pool table live in one redb file behind
-/// one handle. Hand this to the buyer service as `Arc<dyn BuyerPoolStore>`.
+/// Holds an `Arc` to the same store the seller path uses. The seller's
+/// `lane_state_v1` table and the buyer pool table sit in separate redb files
+/// (`lanes.redb` and `buyer.redb`) behind that one handle, so neither family's
+/// commit waits on the other's writer slot. Hand this to the buyer service as
+/// `Arc<dyn BuyerPoolStore>`.
 #[derive(Debug, Clone)]
 pub struct BuyerPoolStoreHandle {
     inner: std::sync::Arc<PersistentPoolStateStore>,
@@ -1143,7 +1146,7 @@ impl BuyerPoolStoreHandle {
         Self { inner }
     }
 
-    /// View this store's `lanes.redb` as the buyer pool table.
+    /// View this store's `buyer.redb` as the buyer pool table.
     ///
     /// Not `const` — it derefs the `Arc`, which const fns cannot do.
     fn table(&self) -> BuyerPoolTable<'_> {
@@ -1152,7 +1155,7 @@ impl BuyerPoolStoreHandle {
 }
 
 /// Every method delegates to [`decdn_incentive::buyer_pool_table`]; this newtype
-/// contributes the `lanes.redb` wiring, not the logic.
+/// contributes the `buyer.redb` wiring, not the logic.
 impl BuyerPoolStore for BuyerPoolStoreHandle {
     fn load_all(&self) -> Result<BuyerLoad, StoreError> {
         self.table().load_all()
@@ -1628,6 +1631,38 @@ mod tests {
             anyhow::ensure!(
                 mode == DB_FILE_MODE,
                 "{file} mode {mode:o} != expected {DB_FILE_MODE:o}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `decdn_common::data_dir::DAEMON_STORE_FILES` claims that a daemon's
+    /// bring-up creates every file in the set and nothing outside it. That
+    /// claim is what `daemon_marker` — and therefore the CLI's node-vs-client
+    /// classification (#2078) — rests on, so it is checked here rather than
+    /// asserted in prose. A fifth store added to `open_with` without a matching
+    /// entry in the set fails this test.
+    #[test]
+    fn open_creates_exactly_the_daemon_store_files() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let _store = PersistentPoolStateStore::open(dir.path())?;
+
+        for file in decdn_common::data_dir::DAEMON_STORE_FILES {
+            anyhow::ensure!(
+                dir.path().join(file).exists(),
+                "{file} is in DAEMON_STORE_FILES but open() did not create it"
+            );
+        }
+
+        for entry in std::fs::read_dir(dir.path())? {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with(".redb") {
+                continue;
+            }
+            anyhow::ensure!(
+                decdn_common::data_dir::DAEMON_STORE_FILES.contains(&name.as_ref()),
+                "open() created {name}, which DAEMON_STORE_FILES does not name"
             );
         }
         Ok(())

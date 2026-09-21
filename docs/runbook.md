@@ -484,10 +484,26 @@ unrelated buyer stores can sit under `identity.data_dir`: the daemon's
 nothing can read it from disk; `decdn node pools` asks the daemon over the admin
 RPC. `decdn pool list --config /etc/decdn/node.toml` routes to the same place and
 names the file it read, so `pools=0` is always attributable to one store or the
-other.
+other. With the daemon **stopped** the lock is gone, and that same `pool list`
+reads `buyer.redb` off disk and marks the listing `(read from disk; no daemon
+running)` — the post-mortem route after a crash. A crashed daemon may leave the
+file needing redb's repair pass, which only a writer runs; start `decdn-node`
+once and read it again.
 
-1. Run `decdn node pools`. It reports every pool the daemon tracks, its deposit,
-   and the per-lane amounts already signed away. Compare that against
+**`decdn pool list --all` answers the question the stores cannot.** It
+enumerates `PaymentPool.getPools` by the keystore address and shows every pool
+in every lifecycle state, with its on-chain `deposit`, `totalRedeemed`, reclaim
+window, and whether the local record tracks it. That is the view that survives a
+reset `identity.data_dir`, because it reads no local file to produce the list.
+It is read-only, so it is not refused on a node's data dir the way `close --all`
+is. When the two views disagree, believe the chain: the disagreement is the
+diagnostic.
+
+1. Run `decdn node pools`, and `decdn pool list --all` beside it. The first
+   reports every pool the daemon tracks, its deposit, and the per-lane amounts
+   already signed away; the second reports every pool the wallet owns on chain.
+   A pool in the second and not the first is a stranded deposit. Compare both
+   against
    `decdn_buyer_pool_adoption_failures_total`: any increment means the node
    could not tell whether it already owned a pool and was about to open a second
    one.
@@ -522,7 +538,8 @@ other.
 4. `close --all` and `reclaim --all` are refused on a node's data dir. They
    enumerate from chain by keystore address, so on a node host they would close
    the pool the daemon is paying from right now. Name the stranded pools
-   individually.
+   individually — `pool list --all` is how you find their ids, and it is allowed
+   there because it sends no transaction and writes no pool record.
 5. Lanes on an adopted pool resume from their on-chain watermark, so a provider
    still holding an unredeemed voucher is briefly ahead of the node and rejects
    its first vouchers. That clears on the provider's next redemption; no action.

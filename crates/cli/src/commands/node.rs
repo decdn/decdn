@@ -831,7 +831,7 @@ pub(crate) fn classify_client_error(
 /// layers deep and the exact intermediate types are implementation
 /// details, so match on the innermost `io::Error` kind instead of any
 /// particular transport type.
-fn is_connection_refused(err: &(dyn std::error::Error + 'static)) -> bool {
+pub(crate) fn is_connection_refused(err: &(dyn std::error::Error + 'static)) -> bool {
     io_error_kind_in_source_chain(err, |kind| kind == std::io::ErrorKind::ConnectionRefused)
 }
 

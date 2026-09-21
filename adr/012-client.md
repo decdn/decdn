@@ -181,9 +181,21 @@ reads and writes `buyer-pools.redb`. A `decdn pool` command whose data dir holds
 of the daemon's stores (`decdn_common::data_dir::DAEMON_STORE_FILES` — `buyer.redb`,
 `lanes.redb`, `settle.redb`, `checkpoint.redb`) is pointed at a node: it reports the
 node's pools through the admin RPC (`decdn node pools`) and refuses to escrow into a
-store the node never reads. The whole set marks the dir, not `buyer.redb` alone,
+store the node never reads. The daemon holds its lock only while it runs, so with the
+daemon stopped `decdn pool list` reads `buyer.redb` directly and marks the listing as
+a disk read. It never falls back to the client's file, because that file holds
+different pools. The whole set marks the dir, not `buyer.redb` alone,
 because that is the file a reset loses — and the window where it is missing is when
 an operator is most likely to reach for `decdn pool`.
+
+`decdn fetch` and `decdn bundle pull` apply a weaker rule to the same dirs. A human
+who buys content on a node host is a separate client, so an explicit `--data-dir`
+that names a node's dir is accepted. An implicit one is not: `identity.data_dir` in
+the config file resolves to the node's dir with nothing on the command line, and the
+keystore defaults to that dir too, so the client pool opens under the node's own
+operator address. The daemon then reports that deposit as stranded, and after a store
+reset it can adopt the pool and sign a second voucher series on one lane. These two
+commands therefore refuse a node's data dir unless the command line names it.
 
 Default configuration:
 
