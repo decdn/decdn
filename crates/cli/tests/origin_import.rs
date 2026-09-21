@@ -35,7 +35,7 @@ fn rt() -> tokio::runtime::Runtime {
 fn import_args(input: &Path, origin: &Path) -> OriginImportArgs {
     OriginImportArgs {
         input: input.to_path_buf(),
-        to: Some(origin.display().to_string()),
+        to: Some(origin.to_path_buf()),
         move_source: false,
         bundle: None,
         force: false,

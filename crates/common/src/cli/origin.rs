@@ -64,8 +64,13 @@ pub struct OriginImportArgs {
     /// path.
     ///
     /// Required unless `--dry-run`.
+    ///
+    /// A `PathBuf`, not a `String`, so a non-UTF-8 directory path is accepted
+    /// on Unix like `--input` is. Scheme sniffing (`s3://` / `http(s)://` /
+    /// legacy `fs:`) runs on the UTF-8 view; a non-UTF-8 path cannot be one of
+    /// those, so it is unambiguously a filesystem directory.
     #[arg(long, value_name = "DIR")]
-    pub to: Option<String>,
+    pub to: Option<PathBuf>,
 
     /// Move each source file into the target instead of copying it. Across
     /// filesystems this falls back to copy-then-unlink. A source whose content

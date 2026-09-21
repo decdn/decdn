@@ -55,32 +55,38 @@ enum ImportTarget {
 /// a write target and produces an error that spells out the supported path; a
 /// legacy `fs:` prefix is rejected with a hint to drop it, so an operator's
 /// muscle memory does not silently create a directory literally named `fs:…`.
-fn parse_target(raw: &str) -> anyhow::Result<ImportTarget> {
-    if raw.is_empty() {
-        bail!("--to needs a directory, e.g. --to /var/lib/decdn/origin");
+///
+/// The scheme checks run on the path's UTF-8 view. A non-UTF-8 path (valid on
+/// Unix) can be none of those ASCII schemes, so it falls straight through to
+/// the filesystem arm rather than being rejected for not being UTF-8.
+fn parse_target(raw: &Path) -> anyhow::Result<ImportTarget> {
+    if let Some(s) = raw.to_str() {
+        if s.is_empty() {
+            bail!("--to needs a directory, e.g. --to /var/lib/decdn/origin");
+        }
+        if s.starts_with("s3://") {
+            bail!(
+                "--to {s} is not a write target: `origin import` writes a local \
+                 filesystem store only. The fs and S3 object layouts are identical, so \
+                 import to a directory and sync it up:\n  \
+                 decdn origin import -i <input> --to <dir>\n  \
+                 aws s3 sync <dir> {s}"
+            );
+        }
+        if s.starts_with("http://") || s.starts_with("https://") {
+            bail!(
+                "--to {s} is not a write target: an HTTP origin is a read-only static \
+                 server — seed a local directory and serve it from that disk instead"
+            );
+        }
+        if s.strip_prefix("fs:").is_some() {
+            bail!(
+                "--to no longer takes an `fs:` prefix — pass the directory path \
+                 directly, e.g. --to /var/lib/decdn/origin"
+            );
+        }
     }
-    if raw.starts_with("s3://") {
-        bail!(
-            "--to {raw} is not a write target: `origin import` writes a local \
-             filesystem store only. The fs and S3 object layouts are identical, so \
-             import to a directory and sync it up:\n  \
-             decdn origin import -i <input> --to <dir>\n  \
-             aws s3 sync <dir> {raw}"
-        );
-    }
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        bail!(
-            "--to {raw} is not a write target: an HTTP origin is a read-only static \
-             server — seed a local directory and serve it from that disk instead"
-        );
-    }
-    if raw.strip_prefix("fs:").is_some() {
-        bail!(
-            "--to no longer takes an `fs:` prefix — pass the directory path \
-             directly, e.g. --to /var/lib/decdn/origin"
-        );
-    }
-    Ok(ImportTarget::Fs(PathBuf::from(raw)))
+    Ok(ImportTarget::Fs(raw.to_path_buf()))
 }
 
 /// One-line JSON / human status report emitted after a successful import.
@@ -233,7 +239,13 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
     let subfolder = resolve_subfolder(args.subfolder.as_deref())?;
 
     let write = !args.dry_run;
-    let origin_label = args.to.clone().unwrap_or_else(|| "(dry-run)".to_string());
+    // `--to` is a path; the report's `origin` field is a display string, so a
+    // non-UTF-8 target degrades lossily here — only for the human/JSON label,
+    // never for the actual write path, which keeps the raw `PathBuf`.
+    let origin_label = args
+        .to
+        .as_ref()
+        .map_or_else(|| "(dry-run)".to_string(), |p| p.display().to_string());
 
     let input = args.input.clone();
     let follow = args.follow_symlinks;
@@ -912,7 +924,7 @@ mod tests {
 
     #[test]
     fn parse_target_accepts_bare_path() {
-        match parse_target("/var/lib/decdn/origin").unwrap() {
+        match parse_target(Path::new("/var/lib/decdn/origin")).unwrap() {
             ImportTarget::Fs(p) => assert_eq!(p, PathBuf::from("/var/lib/decdn/origin")),
         }
     }
@@ -920,14 +932,14 @@ mod tests {
     #[test]
     fn parse_target_accepts_relative_bare_path() {
         // A relative directory is a filesystem path like any other.
-        match parse_target("origin").unwrap() {
+        match parse_target(Path::new("origin")).unwrap() {
             ImportTarget::Fs(p) => assert_eq!(p, PathBuf::from("origin")),
         }
     }
 
     #[test]
     fn parse_target_rejects_empty() {
-        let err = parse_target("").unwrap_err();
+        let err = parse_target(Path::new("")).unwrap_err();
         assert!(format!("{err:#}").contains("needs a directory"));
     }
 
@@ -935,7 +947,7 @@ mod tests {
     fn parse_target_s3_points_at_aws_sync() {
         // The S3 target is not a writer; the error must hand the operator the
         // exact import-then-sync recipe, echoing the requested s3:// URL.
-        let err = parse_target("s3://bucket/prefix").unwrap_err();
+        let err = parse_target(Path::new("s3://bucket/prefix")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("aws s3 sync"), "got: {msg}");
         assert!(msg.contains("s3://bucket/prefix"), "got: {msg}");
@@ -943,7 +955,7 @@ mod tests {
 
     #[test]
     fn parse_target_http_is_not_a_write_target() {
-        let err = parse_target("https://example.com").unwrap_err();
+        let err = parse_target(Path::new("https://example.com")).unwrap_err();
         assert!(format!("{err:#}").contains("not a write target"));
     }
 
@@ -951,8 +963,23 @@ mod tests {
     fn parse_target_rejects_legacy_fs_prefix() {
         // `fs:` is gone; rejecting it (rather than treating it as a path) keeps
         // an operator from silently seeding a directory named `fs:...`.
-        let err = parse_target("fs:/var/lib/decdn/origin").unwrap_err();
+        let err = parse_target(Path::new("fs:/var/lib/decdn/origin")).unwrap_err();
         assert!(format!("{err:#}").contains("no longer takes an `fs:` prefix"));
+    }
+
+    #[test]
+    fn parse_target_non_utf8_path_is_filesystem() {
+        // A non-UTF-8 Unix path can be none of the ASCII schemes, so it must
+        // fall through to the filesystem arm rather than erroring.
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let raw = OsStr::from_bytes(b"/var/lib/decdn/\xff\xfeorigin");
+            match parse_target(Path::new(raw)).unwrap() {
+                ImportTarget::Fs(p) => assert_eq!(p.as_os_str(), raw),
+            }
+        }
     }
 
     #[test]
