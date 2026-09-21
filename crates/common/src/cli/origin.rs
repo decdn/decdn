@@ -202,7 +202,7 @@ mod tests {
             "-i",
             "d",
             "--to",
-            "fs:/o",
+            "/o",
             "--optimize",
             "--chunk-avg",
             "2MiB",

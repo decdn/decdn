@@ -987,7 +987,7 @@ mod tests {
         let report = ImportReport {
             imported: 3,
             bytes: 42,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([
                 ("a.txt".into(), "b3:aaaa".into()),
                 ("dir/b.txt".into(), "b3:bbbb".into()),
@@ -1005,7 +1005,7 @@ mod tests {
         assert_eq!(obj.len(), 9);
         assert_eq!(obj["imported"].as_u64(), Some(3));
         assert_eq!(obj["bytes"].as_u64(), Some(42));
-        assert_eq!(obj["origin"].as_str(), Some("fs:/tmp/origin"));
+        assert_eq!(obj["origin"].as_str(), Some("/tmp/origin"));
         assert_eq!(obj["files"]["a.txt"].as_str(), Some("b3:aaaa"));
         assert_eq!(obj["files"]["dir/b.txt"].as_str(), Some("b3:bbbb"));
         assert_eq!(obj["bundle_hash"].as_str(), Some("b3:cafef00d"));
@@ -1020,7 +1020,7 @@ mod tests {
         let report = ImportReport {
             imported: 1,
             bytes: 10,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([("a.txt".into(), "b3:aaaa".into())]),
             bundle_hash: Some("b3:cafef00d".into()),
             moved: false,
@@ -1042,7 +1042,7 @@ mod tests {
         let report = ImportReport {
             imported: 1,
             bytes: 10,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([("a.txt".into(), "b3:aaaa".into())]),
             bundle_hash: Some("b3:cafef00d".into()),
             moved: false,
@@ -1061,7 +1061,7 @@ mod tests {
         let report = ImportReport {
             imported: 2,
             bytes: 100,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([("a.bin".into(), "b3:aaaa".into())]),
             bundle_hash: Some("b3:cafef00d".into()),
             moved: false,
@@ -1081,7 +1081,7 @@ mod tests {
         let report = ImportReport {
             imported: 2,
             bytes: 100,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([("a.bin".into(), "b3:aaaa".into())]),
             bundle_hash: Some("b3:cafef00d".into()),
             moved: false,
@@ -1100,7 +1100,7 @@ mod tests {
         let report = ImportReport {
             imported: 1,
             bytes: 10,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([("blob.bin".into(), "b3:deadbeef".into())]),
             bundle_hash: None,
             moved: true,
@@ -1121,7 +1121,7 @@ mod tests {
         let report = ImportReport {
             imported: 1,
             bytes: 10,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([("blob.bin".into(), "b3:deadbeef".into())]),
             bundle_hash: None,
             moved: false,
@@ -1140,7 +1140,7 @@ mod tests {
         let report = ImportReport {
             imported: 2,
             bytes: 20,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([
                 ("a.txt".into(), "b3:aaaa".into()),
                 ("b.txt".into(), "b3:bbbb".into()),

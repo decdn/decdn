@@ -691,7 +691,7 @@ async fn run_from_optimize_import() -> anyhow::Result<()> {
             .arg("-i")
             .arg(src_dir.path())
             .arg("--to")
-            .arg(format!("fs:{}", import_store.display()))
+            .arg(&import_store)
             .arg("--optimize")
             .arg("--chunk-avg")
             .arg(&chunk_bytes)
