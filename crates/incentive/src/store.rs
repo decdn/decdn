@@ -333,16 +333,29 @@ pub enum StoreError {
         path: std::path::PathBuf,
     },
     /// The database was not closed cleanly and needs the repair pass that only
-    /// a writer performs, so a read-only open cannot proceed. Reached by the
-    /// post-mortem read of a crashed daemon's store (#2084): the very case that
-    /// read exists for is also the one that can leave the file unrepaired.
+    /// a writable open performs, so a read-only open cannot proceed. Reached by
+    /// the post-mortem read of a crashed daemon's store (#2084): the very case
+    /// that read exists for is also the one that can leave the file unrepaired.
+    ///
+    /// The remedy is a writable open, and which process performs it depends on
+    /// who owns the file — so the caller names it, not this variant.
     #[error(
-        "the pool store at {path} was not shut down cleanly and needs a repair pass a \
-         read-only open cannot run — start decdn-node once against this data dir to repair it, \
-         then read it again"
+        "the pool store at {path} was not shut down cleanly and needs a repair pass that only \
+         a writable open can run"
     )]
     NeedsRepair {
         /// Filesystem path of the unrepaired database file.
+        path: std::path::PathBuf,
+    },
+    /// No database file exists at the path. Distinct from
+    /// [`StoreError::Backend`] because it is a routine state, not a fault: a
+    /// data dir whose store was deleted to force re-adoption has no file, and
+    /// the honest report is "there is no store here", not an errno.
+    ///
+    /// Only a read-only open produces this. A writable open creates the file.
+    #[error("no pool store exists at {path}")]
+    Absent {
+        /// Filesystem path that holds no database.
         path: std::path::PathBuf,
     },
 }

@@ -104,26 +104,26 @@ impl RedbBuyerPoolStore {
 
 /// A buyer-pool store opened read-only, by file path.
 ///
-/// Exists for one job: reading a **stopped** `decdn-node` daemon's
-/// `buyer.redb` for post-mortem inspection (#2084). `redb` holds its
-/// process-exclusive lock only for the lifetime of an open [`Database`], so
-/// once the daemon exits the file is readable — and the lock is also what tells
-/// the two cases apart. A successful open therefore proves no daemon holds the
-/// file; [`StoreError::AlreadyOpen`] proves one does.
+/// The reader for any buyer store this process must not write: a **stopped**
+/// `decdn-node` daemon's `buyer.redb` under post-mortem inspection (#2084), or
+/// the client's own `buyer-pools.redb` when a command only needs to look.
+///
+/// `redb` holds its process-exclusive lock for the lifetime of an open
+/// [`Database`], so the lock doubles as a liveness signal: a successful open
+/// proves no process holds the file, and [`StoreError::AlreadyOpen`] proves one
+/// does.
 ///
 /// Two differences from [`RedbBuyerPoolStore`] are load-bearing:
 ///
-/// - It takes a **file path**, not a data dir. The target is the daemon's
-///   `buyer.redb`, not the client's `buyer-pools.redb`, and a reader must not
-///   have to guess which of the two a directory means.
-/// - It **never creates**. `open_read_only` cannot, which is what keeps #2078
-///   closed: pointing this at a dir with no store reports that there is none,
-///   rather than manufacturing an empty one and reporting it as the node's
-///   state.
+/// - It takes a **file path**, not a data dir. A directory holds two unrelated
+///   buyer stores, and a reader must not have to guess which one it means.
+/// - It **never creates**. [`redb::ReadOnlyDatabase::open`] cannot, which is
+///   what keeps #2078 closed: pointed at a path with no store it reports
+///   [`StoreError::Absent`], rather than manufacturing an empty store and
+///   reporting its emptiness as state.
 ///
-/// Reads only. There is no write path here on purpose — clearing a stopped
-/// daemon's row is a separate decision, and would need the write lock this type
-/// deliberately does not take.
+/// Clearing a row is a separate decision and would need the write lock this
+/// type deliberately does not take.
 pub struct ReadOnlyBuyerPoolStore {
     db: ReadOnlyDatabase,
     path: std::path::PathBuf,
@@ -147,9 +147,12 @@ impl ReadOnlyBuyerPoolStore {
     /// - [`StoreError::AlreadyOpen`] when a process holds the write lock, which
     ///   means a daemon is running against this file.
     /// - [`StoreError::NeedsRepair`] when the file was not closed cleanly. A
-    ///   read-only open cannot run redb's repair pass, so a crashed daemon's
-    ///   store reads only after that daemon has started once more.
-    /// - [`StoreError::Backend`] for anything else, including an absent file.
+    ///   read-only open cannot run redb's repair pass, so the file reads only
+    ///   after a writable open has repaired it.
+    /// - [`StoreError::Absent`] when no file exists at `path`. A routine state,
+    ///   not a fault: a data dir whose store was deleted to force re-adoption
+    ///   has none, and so does a dir no buyer has used.
+    /// - [`StoreError::Backend`] for anything else.
     pub fn open_file(path: &Path) -> Result<Self, StoreError> {
         let db = ReadOnlyDatabase::open(path).map_err(|err| match err {
             redb::DatabaseError::DatabaseAlreadyOpen => StoreError::AlreadyOpen {
@@ -158,6 +161,16 @@ impl ReadOnlyBuyerPoolStore {
             redb::DatabaseError::RepairAborted => StoreError::NeedsRepair {
                 path: path.to_path_buf(),
             },
+            // An absent file is the one `other` worth naming: it is a routine
+            // state whose honest report is "there is no store here", and
+            // leaving it as a backend errno makes a caller infer it.
+            redb::DatabaseError::Storage(redb::StorageError::Io(ref io))
+                if io.kind() == std::io::ErrorKind::NotFound =>
+            {
+                StoreError::Absent {
+                    path: path.to_path_buf(),
+                }
+            }
             other => StoreError::Backend(format!(
                 "open buyer pool db read-only at {}: {other}",
                 path.display()

@@ -155,6 +155,10 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ---- 5. `--all` still has the answer, and says the store does not.
+    // The store-backed listing above re-created the file it reads (that is the
+    // writable client path, unchanged); drop it again so what follows is about
+    // `--all` alone, which must never need the file to exist.
+    std::fs::remove_file(&store_file).context("delete the re-created client store")?;
     let all: serde_json::Value = serde_json::from_str(&run_pool(
         client_dir.path(),
         &["list", "--all", "--json"],
@@ -169,19 +173,52 @@ async fn run() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         row["tracked"] == serde_json::Value::Bool(false),
-        "the rebuilt store does not track it, and --all must say so: {row}"
+        "no store file means nothing is tracked, and --all must say so: {row}"
     );
     anyhow::ensure!(
         all["local_store_read"] == serde_json::Value::Bool(true),
-        "the store was re-created and read, so `tracked` is a real answer: {all}"
+        "an absent store is a read answer — nothing is tracked — not an \
+         unreadable one: {all}"
+    );
+    anyhow::ensure!(
+        !store_file.exists(),
+        "--all must not re-create the store it reports on"
     );
 
-    // And the human-readable table carries the same two facts.
+    // And the human-readable table carries the same facts.
     let table = run_pool(client_dir.path(), &["list", "--all"], &chain_argv)?;
     anyhow::ensure!(table.contains("pools=1"), "{table}");
     anyhow::ensure!(
+        table.contains("local_store=read"),
+        "the table must say whether the local record answered: {table}"
+    );
+    anyhow::ensure!(
         table.contains("open") && table.contains("10.000000"),
         "the table must show the state and the deposit: {table}"
+    );
+
+    // ---- 6. A store that exists but will not open is a different answer from
+    // one that is absent, and the two must not render alike: the first is
+    // "unknown, go look", the second is "nothing is tracked".
+    std::fs::write(&store_file, b"not a redb file").context("write a broken store")?;
+    let broken: serde_json::Value = serde_json::from_str(&run_pool(
+        client_dir.path(),
+        &["list", "--all", "--json"],
+        &chain_argv,
+    )?)
+    .context("parse pool list --all --json over a broken store")?;
+    anyhow::ensure!(
+        broken["local_store_read"] == serde_json::Value::Bool(false),
+        "an unreadable store must not report as read: {broken}"
+    );
+    anyhow::ensure!(
+        broken["pools"][0]["tracked"] == serde_json::Value::Null,
+        "an unreadable store answers for no pool: {broken}"
+    );
+    let broken_table = run_pool(client_dir.path(), &["list", "--all"], &chain_argv)?;
+    anyhow::ensure!(
+        broken_table.contains("local_store=unreadable"),
+        "the table must carry the distinction, not only --json: {broken_table}"
     );
     Ok(())
 }

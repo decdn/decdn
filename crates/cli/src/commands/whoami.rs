@@ -48,7 +48,6 @@ enum KeystoreState {
 }
 
 /// How the keystore password was resolved before printing the eth address.
-#[derive(Clone)]
 enum KeystorePassword {
     /// A password source was present and supplied this value.
     Supplied(Zeroizing<String>),
@@ -193,11 +192,19 @@ fn report(data_dir: &Path, password_file: Option<&Path>) -> anyhow::Result<Vec<S
 /// One keystore's `eth address:` line, with a second attempt when the shared
 /// password does not open it and a TTY is there to ask on.
 ///
-/// The retry is what makes two keystores with two passwords reportable: the
-/// shared password stays the common case and is tried first, so an install
-/// where both match prompts no more than it does today. A failed retry, or no
-/// TTY to retry on, leaves the note from the first attempt — the reason is on
-/// the line either way, and the rest of the report is unaffected.
+/// The retry is what makes two keystores with two passwords reportable. The
+/// shared password is the common case and is tried first, so an install whose
+/// keystores share a password prompts once, as it would with no retry at all.
+///
+/// The first attempt's note goes to stderr before the prompt. Without it the
+/// prompt appears with no explanation — the report is buffered and printed
+/// after this returns — and an operator who set `DECDN_KEYSTORE_PASSWORD`
+/// cannot see why it was not used. It also keeps a failure no password can fix,
+/// such as a keystore at `0o644`, from reading as a password problem: the
+/// reason is on screen before anything is typed.
+///
+/// A failed retry, or no TTY to retry on, leaves a note — the reason is on the
+/// line either way, and the rest of the report is unaffected.
 fn unlock_line(
     keystore: &Path,
     state: &KeystoreState,
@@ -208,6 +215,7 @@ fn unlock_line(
     if !attempt.retryable || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return attempt.line;
     }
+    eprintln!("warning: {}", attempt.line);
     let sources = [PasswordSource::Prompt {
         usage: PasswordUse::Unlock,
     }];
@@ -216,9 +224,11 @@ fn unlock_line(
             let retry = KeystorePassword::Supplied(resolved.into_secret());
             eth_address_line(keystore, state, &retry).line
         }
-        // A prompt that cannot be read is not a reason to lose the report; the
-        // first attempt's note already names the keystore that did not open.
-        Err(_) => attempt.line,
+        // A prompt that cannot be read is not a reason to lose the report. Say
+        // that it was the terminal, though: the first attempt's note blames
+        // "this password", and after a prompt an operator reads that as the one
+        // they just typed.
+        Err(err) => format!("{} [no second attempt: {}]", attempt.line, err.root_cause()),
     }
 }
 
@@ -592,10 +602,10 @@ mod tests {
 
     /// The #2008 repro: the node and client keystores were created at
     /// different times under separate prompts, so they hold different
-    /// passwords. One password file cannot open both, and the command used to
-    /// abort on the first `Mac Mismatch` and print nothing at all — including
-    /// for the keystore whose password was correct. Both lines must print, the
-    /// one that opened must show its address, and `report` must not error.
+    /// passwords. One password file cannot open both, and one `Mac Mismatch`
+    /// must not abort the report — that would print nothing at all, including
+    /// for the keystore whose password was correct. Both lines print, the one
+    /// that opened shows its address, and `report` does not error.
     #[test]
     fn report_survives_two_keystores_with_two_passwords() {
         let dir = secure_tempdir();

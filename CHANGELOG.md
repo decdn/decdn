@@ -1947,13 +1947,17 @@ since project inception and will roll into the first tagged release.
   reads is the file that went missing. `--all` enumerates
   `PaymentPool.getPools` by the keystore address and prints every pool in every
   lifecycle state with its on-chain `deposit`, `totalRedeemed` and reclaim
-  window, marking which ones the local record tracks. `TRACKED` distinguishes
-  `no` from `?`: a pool the local record cannot answer for — an unreadable
-  store, or a row that will not decode — is unknown rather than untracked,
-  because the remedies differ (a lost store versus a record to repair) and one
-  bad row must not blank the verdict for the pools either side of it. The
-  undecodable ids are named on stderr, as the store-backed listings already
-  do. Unlike `close --all` / `reclaim --all` it is
+  window, marking which ones the local record tracks. Every local read on this
+  path is read-only: `--all` sends no transaction, writes no pool record, and
+  manufactures no store — creating one and reporting its emptiness is the #2078
+  defect, and it would make a lost store indistinguishable from a store that
+  tracks nothing. `TRACKED` distinguishes `no` from `?`: a pool the local record
+  cannot answer for — an unreadable store, or a row that will not decode — is
+  unknown rather than untracked, because the remedies differ (a lost store
+  versus a record to repair) and one bad row must not blank the verdict for the
+  pools either side of it. A store that will not open is named on stderr with
+  the reason, and the table carries `local_store=read|unreadable` so the
+  distinction is not `--json`-only. Unlike `close --all` / `reclaim --all` it is
   **not** refused on a node's data dir — those two write, this one reads, and a
   node host is where it is most needed. `--json` emits a third document shape
   with `source: "chain"`; read `source` before `pools`, as with the other two.

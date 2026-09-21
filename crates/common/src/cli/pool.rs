@@ -47,21 +47,22 @@ pub struct PoolArgs {
 pub enum PoolCommand {
     /// List the tracked buyer pools and their per-lane voucher watermark.
     ///
-    /// Read-only, and it names the store it read — on the `store=` line, or
-    /// the `store` field under `--json`. On a client data dir that is the
-    /// CLI's own `buyer-pools.redb`, read directly. On a `decdn-node` daemon's
-    /// data dir it is the daemon's `buyer.redb`: over the admin RPC while the
-    /// daemon runs, since it holds that file exclusively, and read off disk
-    /// when it does not — a post-mortem after a crash, or a host down for
-    /// maintenance. A disk read says so on the `store=` line and carries
-    /// `source=node_store_offline` under `--json`.
+    /// Read-only. The store-backed listings name the store they read — on the
+    /// `store=` line, or the `store` field under `--json` — and `--all` names
+    /// the chain instead, carrying no `store` field at all.
     ///
-    /// The stores are separate — a client listing says nothing about a node,
-    /// and vice versa — and the sources do not emit the same `--json` pool
-    /// objects, so read `source` before parsing them.
+    /// Four `source` values, and they do not emit the same `--json` pool
+    /// objects, so read `source` first:
     ///
-    /// `--all` replaces all of that with the chain's own answer: every pool the
-    /// keystore owns, whether or not any local store knows about it.
+    /// - `client_store` — the CLI's own `buyer-pools.redb`, read directly.
+    /// - `daemon` — a running `decdn-node`, over the admin RPC, because it
+    ///   holds its `buyer.redb` exclusively while it runs.
+    /// - `node_store_offline` — a stopped node's `buyer.redb`, read off disk: a
+    ///   post-mortem after a crash, or a host down for maintenance.
+    /// - `chain` — `--all`, which reads no local store to build its list.
+    ///
+    /// The two stores are separate: a client listing says nothing about a node,
+    /// and vice versa.
     #[command(visible_alias = "status")]
     List(PoolListArgs),
     /// Open a fresh `PaymentPool` deposit, escrowing `--deposit-micro-usdc`
@@ -256,16 +257,14 @@ pub struct PoolListArgs {
     /// List every pool this keystore owns ON CHAIN (`getPools`), in every
     /// lifecycle state, marking which ones the local store tracks.
     ///
-    /// The answer to "what do I actually own?" when the local store is the
-    /// thing that was lost — a reset `identity.data_dir` drops the only record
-    /// of a funded deposit, and the default listing then prints nothing
-    /// because it is reading the file that went missing. When the two views
-    /// disagree, believe the chain: the disagreement is itself the diagnostic.
+    /// The view that survives a reset `identity.data_dir`, because it reads no
+    /// local file to build its list. When the two views disagree, believe the
+    /// chain: the disagreement is itself the diagnostic.
     ///
-    /// Reads and writes nothing, so unlike `close --all` / `reclaim --all` it
-    /// is NOT refused on a node's data dir — a node host is where it is most
-    /// needed. It does need `--rpc-url`/`--payment-pool-address` and the
-    /// keystore, whose address it enumerates by.
+    /// Sends no transaction and writes no pool record, so unlike `close --all`
+    /// / `reclaim --all` it is NOT refused on a node's data dir. Needs
+    /// `--rpc-url`, `--payment-pool-address`, and the keystore whose address it
+    /// enumerates by.
     #[arg(long)]
     pub all: bool,
 
@@ -280,7 +279,10 @@ pub struct PoolListArgs {
     #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
     pub admin_url: Option<String>,
 
-    /// Roundtrip timeout in milliseconds for that admin call.
+    /// Roundtrip timeout in milliseconds for that admin call. Must be > 0 —
+    /// jsonrpsee reads a zero duration as "never" rather than "immediately".
+    /// Under `--all` a zero skips the daemon lookup and leaves `TRACKED`
+    /// unknown instead of failing.
     #[arg(long, value_name = "MS", default_value_t = 5_000)]
     pub timeout_ms: u64,
 

@@ -274,8 +274,9 @@ pub(crate) fn evaluate_receipts(facts: &FileFacts, path: &Path) -> Finding {
 ///
 /// Sourced from [`decdn_common::data_dir`] rather than spelled here, so a fifth
 /// daemon store reaches the permission and zero-length checks with the same
-/// edit that teaches `daemon_marker` about it. A private copy drifts: it once
-/// listed a `floor-loss.redb` that nothing creates.
+/// edit that teaches `daemon_marker` about it. A private copy drifts into
+/// naming files nothing creates; `checked_files_are_the_shared_store_names`
+/// holds the count.
 fn checked_store_files() -> impl Iterator<Item = &'static str> {
     decdn_common::data_dir::DAEMON_STORE_FILES
         .iter()

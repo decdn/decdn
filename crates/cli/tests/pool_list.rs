@@ -191,11 +191,6 @@ async fn list_with_data_dir_ignores_broken_config_env_expansion() {
         .expect("list with --data-dir must not load or env-expand the config");
 }
 
-/// A data dir holding a daemon's `buyer.redb` is a node's, and `list` must say
-/// so rather than reading the unrelated client store beside it. With no daemon
-/// listening, the command fails — and, critically, leaves no `buyer-pools.redb`
-/// behind. Creating that file and reporting its emptiness as the node's state
-/// is the defect this pins (#2078).
 /// A daemon's `buyer.redb`, written by the real daemon store and then closed.
 /// Returns the pool id recorded into it.
 fn seed_stopped_daemon_store(data_dir: &std::path::Path) -> B256 {
@@ -278,7 +273,7 @@ fn a_stopped_daemons_store_is_read_from_disk_and_labelled() {
 
 /// A refused admin port with the store still write-locked means a daemon IS
 /// running and the admin URL is wrong — the opposite diagnosis from "the node
-/// is down", and the one the old message could not make.
+/// is down", and the two send an operator opposite ways.
 #[test]
 fn a_locked_store_says_the_admin_url_is_wrong_not_that_the_node_is_down() {
     use decdn_node::channel_store::PersistentPoolStateStore;
@@ -303,8 +298,9 @@ fn a_locked_store_says_the_admin_url_is_wrong_not_that_the_node_is_down() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("admin URL") || stderr.contains("admin_port"),
-        "the error must point at the admin URL: {stderr}"
+        stderr.contains("IS running") && stderr.contains("exclusively"),
+        "the error must say a daemon holds the store, which is the claim that \
+         separates it from a stopped node: {stderr}"
     );
     assert!(
         !stderr.contains("Start decdn-node"),
@@ -312,6 +308,48 @@ fn a_locked_store_says_the_admin_url_is_wrong_not_that_the_node_is_down() {
     );
 }
 
+/// `--all` reads the chain, not a store, so the sweep refusal that guards
+/// `close --all` / `reclaim --all` must not reach it — a node host is where the
+/// chain-authoritative view is most needed. It fails here for want of a chain,
+/// which is the point: it got past the classifier, and it left no client store
+/// behind on the way.
+#[test]
+fn list_all_is_not_refused_on_a_node_data_dir() {
+    let dir = data_dir();
+    std::fs::write(dir.path().join("lanes.redb"), b"x").unwrap();
+
+    let output = common::decdn_command(dir.path())
+        .args([
+            "pool",
+            "list",
+            "--all",
+            // Nothing listens here, so the chain read fails after the guard.
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--payment-pool-address",
+            "0x0000000000000000000000000000000000000001",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn pool list --all");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("refusing to"),
+        "--all reads only, so the sweep refusal must not reach it: {stderr}"
+    );
+    assert!(
+        !dir.path().join("buyer-pools.redb").exists(),
+        "--all must not manufacture a client store in a node data dir"
+    );
+}
+
+/// A data dir holding a daemon's `buyer.redb` is a node's, and `list` must say
+/// so rather than reading the unrelated client store beside it. When the admin
+/// call is refused AND the file will not open off disk, the command fails —
+/// and, critically, leaves no `buyer-pools.redb` behind. Creating that file and
+/// reporting its emptiness as the node's state is the defect this pins (#2078).
 #[test]
 fn node_data_dir_is_not_read_as_a_client_store() {
     let dir = data_dir();
@@ -388,7 +426,8 @@ mod node_dir_guards {
     fn refused(args: &[&str]) -> String {
         let dir = data_dir();
         // Not the buyer store: `lanes.redb` alone marks a node data dir, which
-        // is the mid-recovery window where the old classifier got it wrong.
+        // is the mid-recovery window a classifier keyed on the buyer store
+        // gets wrong.
         std::fs::write(dir.path().join("lanes.redb"), b"x").unwrap();
 
         let output = common::decdn_command(dir.path())

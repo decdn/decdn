@@ -18,7 +18,11 @@ use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BuyerStoreOwner {
     /// No daemon store here, so the CLI owns `buyer-pools.redb` in this dir.
-    Client,
+    Client {
+        /// The dir this verdict is about. Carried so the verdict and the store
+        /// it authorizes cannot be about two different directories.
+        data_dir: PathBuf,
+    },
     /// A `decdn-node` daemon owns this data dir. The CLI owns only the client
     /// store, so it must not create a second, unrelated store beside the
     /// daemon's. Classification is file presence, not liveness: while that
@@ -81,7 +85,9 @@ pub(crate) fn classify_buyer_store(data_dir: &Path) -> BuyerStoreOwner {
             data_dir: data_dir.to_path_buf(),
             marker,
         },
-        None => BuyerStoreOwner::Client,
+        None => BuyerStoreOwner::Client {
+            data_dir: data_dir.to_path_buf(),
+        },
     }
 }
 
@@ -121,8 +127,8 @@ impl BuyerStoreOwner {
     /// address, not from the local store, so on a node host they would close
     /// the pool the daemon is actively paying from while the local forget
     /// silently no-ops. A single `--pool <id>` is the stranded-pool recovery
-    /// path and stays available. `list --all` reads and writes nothing, so it
-    /// is not refused.
+    /// path and stays available. `list --all` sends no transaction and writes
+    /// no pool record, so it is not refused.
     ///
     /// # Errors
     ///
@@ -167,9 +173,13 @@ impl BuyerStoreOwner {
         if source == DataDirSource::Flag {
             return Ok(());
         }
+        // `Flag` returned above, so the two remaining steps are the whole
+        // match — no wildcard, so a fourth ladder step fails to compile here
+        // rather than silently printing one of these.
         let named = match source {
+            DataDirSource::Flag => return Ok(()),
             DataDirSource::Config => "identity.data_dir in the config file",
-            DataDirSource::Default | DataDirSource::Flag => "the default client data dir",
+            DataDirSource::Default => "the default client data dir",
         };
         anyhow::bail!(
             "refusing to {verb}: {} came from {named}, and it belongs to a decdn-node daemon (it \
@@ -188,15 +198,16 @@ impl BuyerStoreOwner {
     /// The store handle the mutating commands should use: `Some` for a client
     /// data dir, `None` for a node's — nothing may be written there.
     ///
+    /// Takes no path. The dir it opens is the dir it classified, so a caller
+    /// cannot hold a `Client` verdict about one directory and open a store in
+    /// another — which is #2078 with an extra step.
+    ///
     /// # Errors
     ///
     /// Propagates the store open error for a client data dir.
-    pub(crate) fn open_for_write(
-        &self,
-        data_dir: &Path,
-    ) -> anyhow::Result<Option<RedbBuyerPoolStore>> {
+    pub(crate) fn open_for_write(&self) -> anyhow::Result<Option<RedbBuyerPoolStore>> {
         match self {
-            Self::Client => Ok(Some(RedbBuyerPoolStore::open(data_dir)?)),
+            Self::Client { data_dir } => Ok(Some(RedbBuyerPoolStore::open(data_dir)?)),
             Self::Node { .. } => Ok(None),
         }
     }
@@ -204,8 +215,7 @@ impl BuyerStoreOwner {
 
 /// Classify, refuse, and open in one step, for a command that escrows.
 ///
-/// The guard and the open used to be two statements a caller had to remember to
-/// write in that order. Fusing them means a new escrowing subcommand cannot
+/// The guard and the open are one call, so a new escrowing subcommand cannot
 /// forget the check: there is no way to reach the store without passing it.
 ///
 /// # Errors
@@ -218,7 +228,9 @@ pub(crate) fn open_client_store_for_escrow(
 ) -> anyhow::Result<RedbBuyerPoolStore> {
     let owner = classify_buyer_store(data_dir);
     owner.refuse_escrow(verb)?;
-    Ok(RedbBuyerPoolStore::open(data_dir)?)
+    owner
+        .open_for_write()?
+        .ok_or_else(|| anyhow::anyhow!("a node data dir has no writable client store"))
 }
 
 /// Classify, refuse an unnamed node dir, and open, for a command that buys.
@@ -237,7 +249,12 @@ pub(crate) fn open_client_store_for_buy(
 ) -> anyhow::Result<RedbBuyerPoolStore> {
     let owner = classify_buyer_store(data_dir);
     owner.refuse_implicit_node_dir(verb, source)?;
-    Ok(RedbBuyerPoolStore::open(data_dir)?)
+    // A named node dir is the operator's call, so the buy proceeds there — the
+    // one place a `Node` verdict still opens a client store.
+    match owner.open_for_write()? {
+        Some(store) => Ok(store),
+        None => Ok(RedbBuyerPoolStore::open(data_dir)?),
+    }
 }
 
 #[cfg(test)]
@@ -251,11 +268,14 @@ mod tests {
     #[test]
     fn classify_buyer_store_keys_on_a_daemon_file_not_the_client_one() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(classify_buyer_store(dir.path()), BuyerStoreOwner::Client);
+        let client = || BuyerStoreOwner::Client {
+            data_dir: dir.path().to_path_buf(),
+        };
+        assert_eq!(classify_buyer_store(dir.path()), client());
 
         // The client's own store does not make it a node data dir.
         std::fs::write(dir.path().join("buyer-pools.redb"), b"x").unwrap();
-        assert_eq!(classify_buyer_store(dir.path()), BuyerStoreOwner::Client);
+        assert_eq!(classify_buyer_store(dir.path()), client());
 
         std::fs::write(dir.path().join("buyer.redb"), b"x").unwrap();
         assert_eq!(
@@ -291,7 +311,7 @@ mod tests {
         );
         // And the guards still bite, which is the point.
         assert!(owner.refuse_escrow("open a pool").is_err());
-        assert!(owner.open_for_write(dir.path()).unwrap().is_none());
+        assert!(owner.open_for_write().unwrap().is_none());
         assert!(
             !dir.path().join("buyer-pools.redb").exists(),
             "no client store may be created in a node data dir mid-recovery"
@@ -312,9 +332,11 @@ mod tests {
         assert!(err.contains("/var/lib/decdn/buyer-pools.redb"), "{err}");
         assert!(err.contains("decdn node pools"), "{err}");
         // A client data dir is unaffected.
-        BuyerStoreOwner::Client
-            .refuse_escrow("open a pool")
-            .unwrap();
+        BuyerStoreOwner::Client {
+            data_dir: PathBuf::from("/tmp/client"),
+        }
+        .refuse_escrow("open a pool")
+        .unwrap();
     }
 
     /// `--all` enumerates from chain, so on a node data dir it would close the
@@ -329,7 +351,11 @@ mod tests {
         let err = owner.refuse_sweep("close").unwrap_err().to_string();
         assert!(err.contains("--pool"), "{err}");
         assert!(err.contains("/var/lib/decdn/buyer.redb"), "{err}");
-        BuyerStoreOwner::Client.refuse_sweep("close").unwrap();
+        BuyerStoreOwner::Client {
+            data_dir: PathBuf::from("/tmp/client"),
+        }
+        .refuse_sweep("close")
+        .unwrap();
     }
 
     /// A node data dir yields no writable store, so nothing is created there.
@@ -340,7 +366,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             marker: decdn_common::data_dir::NODE_BUYER_DB_FILE,
         };
-        assert!(owner.open_for_write(dir.path()).unwrap().is_none());
+        assert!(owner.open_for_write().unwrap().is_none());
         assert!(
             !dir.path().join("buyer-pools.redb").exists(),
             "classifying a node data dir must not create the client store"
@@ -374,9 +400,11 @@ mod tests {
             DataDirSource::Config,
             DataDirSource::Default,
         ] {
-            BuyerStoreOwner::Client
-                .refuse_implicit_node_dir("fetch", source)
-                .unwrap();
+            BuyerStoreOwner::Client {
+                data_dir: PathBuf::from("/tmp/client"),
+            }
+            .refuse_implicit_node_dir("fetch", source)
+            .unwrap();
         }
     }
 

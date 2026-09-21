@@ -1105,8 +1105,9 @@ impl PersistentPoolStateStore {
 // The record codec and every table operation live in
 // `decdn_incentive::buyer_pool_table` — the same code the client's
 // `RedbBuyerPoolStore` runs (#1246). This file keeps only the wiring: which
-// file the table lives in (`lanes.redb`, shared with the seller, pending-settle,
-// and watcher-checkpoint tables) and which `TableDefinition` names it.
+// file the table lives in (`buyer.redb`, its own per-family file, so a buyer
+// commit never waits on the seller lane, pending-settle or watcher-checkpoint
+// writer slot) and which `TableDefinition` names it.
 // ---------------------------------------------------------------------------
 
 /// Test/e2e-only seam on the concrete store. Kept here rather than on the
@@ -1128,9 +1129,11 @@ impl PersistentPoolStateStore {
 
 /// [`BuyerPoolStore`] adapter over the shared [`PersistentPoolStateStore`].
 ///
-/// Holds an `Arc` to the same store the seller path uses, so both the seller
-/// `lane_state_v1` table and the buyer pool table live in one redb file behind
-/// one handle. Hand this to the buyer service as `Arc<dyn BuyerPoolStore>`.
+/// Holds an `Arc` to the same store the seller path uses. The seller's
+/// `lane_state_v1` table and the buyer pool table sit in separate redb files
+/// (`lanes.redb` and `buyer.redb`) behind that one handle, so neither family's
+/// commit waits on the other's writer slot. Hand this to the buyer service as
+/// `Arc<dyn BuyerPoolStore>`.
 #[derive(Debug, Clone)]
 pub struct BuyerPoolStoreHandle {
     inner: std::sync::Arc<PersistentPoolStateStore>,
@@ -1152,7 +1155,7 @@ impl BuyerPoolStoreHandle {
 }
 
 /// Every method delegates to [`decdn_incentive::buyer_pool_table`]; this newtype
-/// contributes the `lanes.redb` wiring, not the logic.
+/// contributes the `buyer.redb` wiring, not the logic.
 impl BuyerPoolStore for BuyerPoolStoreHandle {
     fn load_all(&self) -> Result<BuyerLoad, StoreError> {
         self.table().load_all()

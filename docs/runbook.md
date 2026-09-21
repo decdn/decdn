@@ -539,7 +539,7 @@ diagnostic.
    enumerate from chain by keystore address, so on a node host they would close
    the pool the daemon is paying from right now. Name the stranded pools
    individually — `pool list --all` is how you find their ids, and it is allowed
-   there because it only reads.
+   there because it sends no transaction and writes no pool record.
 5. Lanes on an adopted pool resume from their on-chain watermark, so a provider
    still holding an unredeemed voucher is briefly ahead of the node and rejects
    its first vouchers. That clears on the provider's next redemption; no action.

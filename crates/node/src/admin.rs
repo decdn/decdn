@@ -2353,6 +2353,38 @@ mod tests {
         );
     }
 
+    /// Every id this response carries must parse back as a `PoolId`.
+    ///
+    /// The CLI matches these ids against the chain's own enumeration to decide
+    /// which pools the node tracks (`decdn pool list --all`). A spelling it
+    /// cannot parse means a pool the daemon is paying from renders as
+    /// untracked, which reads as a stranded deposit to recover. Nothing else
+    /// compares the two sides of this format, so it is pinned where the
+    /// spelling is produced.
+    #[test]
+    fn build_buyer_pools_response_ids_parse_back() {
+        use std::str::FromStr as _;
+
+        let tracked = B256::repeat_byte(0x01);
+        let skipped = B256::repeat_byte(0x02);
+        let resp = build_buyer_pools_response(
+            vec![BuyerPoolState::new(
+                tracked,
+                Address::repeat_byte(0x11),
+                Address::repeat_byte(0xcd),
+                U256::from(1u64),
+            )],
+            &[skipped],
+        );
+
+        let parsed = B256::from_str(&resp.pools.first().expect("pool").pool_id)
+            .expect("a tracked pool id must parse back");
+        assert_eq!(parsed, tracked);
+        let parsed = B256::from_str(resp.skipped.first().expect("skipped"))
+            .expect("a skipped pool id must parse back");
+        assert_eq!(parsed, skipped);
+    }
+
     /// Reader wiring guard (issue #1733): the RPC reads last-voucher ages off
     /// the client handler's live lane registry via [`LaneActivityClock`]. A
     /// stamped lane must report `Some(age)` and sort ahead of an idle lane with
