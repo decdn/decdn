@@ -2,41 +2,40 @@
 //!
 //! A `bundle pull` run fetches many blobs concurrently, so it renders a stack of
 //! per-file bars — one per in-flight pull, bounded by `--jobs` — above one bottom
-//! **total** bar, all sharing an [`indicatif::MultiProgress`]. A finished file's
-//! bar clears, so only active pulls stay on screen.
+//! **total** bar, all sharing an [`indicatif::MultiProgress`], under a one-line
+//! header naming the run and its download vs on-disk sizes. A finished file's bar
+//! clears, so only active pulls stay on screen.
 //!
-//! Both rows are in **content** bytes. A per-file bar tracks the `(received,
-//! expected)` pair a single pull's delivery [`ProgressCallback`] reports — the
-//! verified content position against the blob's `total_bytes`, known from its
-//! signed `StreamResponse`. The **total** bar has its denominator fixed on the
-//! first frame from the manifest's declared sizes (`total_content_bytes`): the run
-//! knows up front exactly how many content bytes it will deliver, so the total
-//! reads "delivered of the whole download" from the start rather than growing as
-//! pulls begin. Each pull folds its progress into the total scaled to the
-//! manifest's declared size — `size × received / expected`, which pins the
-//! contribution to the manifest's figure even if the delivered blob's
-//! `total_bytes` differs from it — a monotonic value that lands on exactly the
-//! declared size at completion, so the total ends at exactly 100%.
+//! The **total** bar meters the run's **download** — the bytes actually fetched
+//! after shared-chunk dedup (`download_bytes`), fixed up front as its denominator so
+//! it reads "downloaded of the whole download" from the start. Only delivered bytes
+//! fold into it (each file's delivery callback, capped at that file's download
+//! size); bytes spliced from disk are free and never inflate it, so its rate and ETA
+//! describe real transfer, not reconstruction. The header shows the download total
+//! beside the whole on-disk content size (`total_content_bytes`), so the dedup
+//! saving is visible.
 //!
-//! Rate and ETA are shown on the **total** bar only, computed from total content
-//! bytes with the same time-weighted moving average `decdn fetch` uses. A per-file
-//! bar shows just its byte counts: with `--jobs` pulls sharing one link, a single
-//! file's rate is only its share of the bandwidth and its ETA reads as stuck
-//! whenever another file is being served, while the whole download keeps moving.
-//! Bytes credited for already-present files shift the meter's baseline without
-//! feeding the rate, so a resumed run reports transfer speed, not disk speed.
+//! A **per-file** bar reads `downloaded/download-total (reconstructed)` plus a phase
+//! word. During the download it tracks the pull's delivered content against the
+//! blob's download size; when the download is done but a deferred chunk is still
+//! being fetched by a sibling it shows `pending siblings…`; during the whole-file
+//! verify it shows `reconstructing…` and fills with bytes hashed, so a multi-GB
+//! reconstruction never sits as a frozen row; before the first byte it shows
+//! `discovering…`. A per-file bar carries no rate/ETA: with `--jobs` pulls sharing
+//! one link, a single file's rate is only its share of the bandwidth and reads as
+//! stuck whenever another file has the bandwidth, while the total bar keeps moving.
 //!
-//! The total bar is shown only when the manifest declares sizes. A blob with no
-//! declared size contributes nothing to the denominator and moves the total not at
-//! all. If no kept entry (one that survives the include/exclude filters) declares
-//! a size, the total bar is omitted and only per-file bars render.
+//! The total bar and header are shown only when the manifest declares sizes. A blob
+//! with no declared size contributes nothing to the denominator. If no kept entry
+//! (one that survives the include/exclude filters) declares a size, the total bar is
+//! omitted and only per-file bars render.
 //!
 //! The whole renderer is silent — every bar a no-op, every file's delivery
 //! callback `None` — when stderr is not a terminal or the run is `--json`, so
 //! piped and scripted output is byte-for-byte what it was before per-file bars.
 
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -76,19 +75,19 @@ struct Inner {
     /// The shared container every bar draws into — the process-global one when
     /// logging is on (so bars and log lines coexist), else a standalone one.
     mp: indicatif::MultiProgress,
-    /// The bottom total bar, in content bytes with a fixed denominator, carrying
+    /// The bottom total bar, in download bytes with a fixed denominator, carrying
     /// the run's rate/ETA; per-file bars insert before it. `None` when the manifest
     /// declares no sizes, in which case only per-file bars render.
     total: Option<TotalBar>,
 }
 
-/// The bottom total bar plus the rate meter behind its `{msg}`. Every content
-/// byte folded into the total passes through [`inc`](Self::inc), which samples
-/// the meter; already-present bytes pass through [`credit`](Self::credit), which
-/// moves the bar without feeding the rate. Cloning shares the same bar and meter.
+/// The bottom total bar plus the rate meter behind its `{msg}`. Every downloaded
+/// byte folded into the total passes through [`inc`](Self::inc), which samples the
+/// meter; bytes spliced from disk never reach it, so its rate is a transfer rate.
+/// Cloning shares the same bar and meter.
 #[derive(Clone)]
 pub(crate) struct TotalBar {
-    /// The `indicatif` bar, in content bytes with a fixed length.
+    /// The `indicatif` bar, in download bytes with a fixed length.
     bar: indicatif::ProgressBar,
     /// The whole-download rate estimate, sampled on every transferred increment.
     speed: Arc<Mutex<fetch::SpeedState>>,
@@ -119,16 +118,6 @@ impl TotalBar {
     fn inc(&self, bytes: u64) {
         self.bar.inc(bytes);
         self.refresh_rate();
-    }
-
-    /// Advance the total by `bytes` that were not transferred (already on disk)
-    /// without feeding the rate: the meter's baseline shifts past them so the
-    /// next transferred increment is measured on its own.
-    fn credit(&self, bytes: u64) {
-        self.bar.inc(bytes);
-        if let Ok(mut s) = self.speed.lock() {
-            s.shift(bytes);
-        }
     }
 
     /// Sample the meter at the bar's current position and rewrite the `{msg}` as
@@ -167,15 +156,37 @@ impl PullProgress {
     /// when stderr is not a terminal or the run is `--json`, so non-interactive
     /// output is unchanged.
     ///
-    /// `total_content` is the run's whole-download content size — the fixed total
-    /// bar denominator (`total_content_bytes`). `None` (the manifest declared no
-    /// sizes) omits the total bar and renders only per-file bars.
-    pub(crate) fn new(json: bool, total_content: Option<u64>) -> Self {
+    /// `download_total` is the run's **download** size — the bytes actually fetched
+    /// after shared-chunk dedup (`download_bytes`) and the fixed total-bar
+    /// denominator. `content_total` is the whole on-disk size (`total_content_bytes`),
+    /// shown alongside in the header so the dedup saving is visible. `label` names
+    /// the run (the output directory). `download_total` `None`/0 (the manifest
+    /// declared no sizes) omits the total bar and renders only per-file bars.
+    pub(crate) fn new(
+        json: bool,
+        download_total: Option<u64>,
+        content_total: Option<u64>,
+        label: &str,
+    ) -> Self {
         if json || !std::io::stderr().is_terminal() {
             return Self::disabled();
         }
         let mp = crate::logging::progress_container();
-        let total = total_content
+        // Header: what the run downloads vs what lands on disk after dedup. Printed
+        // once above the live bars; only when a download size is known and dedup
+        // actually saves bytes is the "on disk" figure worth showing.
+        if let Some(dl) = download_total.filter(|n| *n > 0) {
+            let header = match content_total.filter(|c| *c > dl) {
+                Some(content) => format!(
+                    "{label} · {} to download · {} on disk",
+                    indicatif::HumanBytes(dl),
+                    indicatif::HumanBytes(content),
+                ),
+                None => format!("{label} · {} to download", indicatif::HumanBytes(dl)),
+            };
+            let _ = mp.println(header);
+        }
+        let total = download_total
             .filter(|n| *n > 0)
             .map(|len| Self::add_total_bar(&mp, len));
         Self {
@@ -199,74 +210,82 @@ impl PullProgress {
         Self { inner: None }
     }
 
-    /// Insert a new per-file bar above the total bar (or at the bottom when there
-    /// is no total bar), then style it, label it `label`, preset its length to
-    /// `size` when declared, and start its steady tick — all after the insert (see
-    /// [`TICK`] for why nothing touches the bar before the container owns it).
-    fn insert_file_bar(i: &Inner, label: String, size: Option<u64>) -> indicatif::ProgressBar {
+    /// The per-file bar style: a bold label, a free-form `{msg}` (the file's
+    /// `downloaded/download-total (reconstructed)` counts plus a phase word, all
+    /// formatted by [`FilePhase`]), and the wide bar. The counts live in `{msg}`
+    /// rather than the built-in `{bytes}/{total_bytes}` so the same row can read as
+    /// download progress and then as reconstruction without the bar's own length
+    /// having to mean two different things.
+    fn file_style() -> indicatif::ProgressStyle {
+        indicatif::ProgressStyle::with_template("{prefix:.bold} {msg}[{wide_bar:.cyan/blue}]")
+            .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+            .progress_chars("=>-")
+    }
+
+    /// Insert a new per-file bar above the total bar (or at the bottom when there is
+    /// no total bar), style and label it, set its length to the file's download size
+    /// (the download-phase denominator), and start its steady tick — all after the
+    /// insert (see [`TICK`] for why nothing touches the bar before the container
+    /// owns it).
+    fn insert_file_bar(i: &Inner, label: &str, download_total: u64) -> indicatif::ProgressBar {
         let bar = match &i.total {
             Some(total) => {
-                i.mp.insert_before(&total.bar, indicatif::ProgressBar::new(0))
+                i.mp.insert_before(&total.bar, indicatif::ProgressBar::new(download_total))
             }
-            None => i.mp.add(indicatif::ProgressBar::new(0)),
+            None => i.mp.add(indicatif::ProgressBar::new(download_total)),
         };
-        bar.set_style(fetch::labeled_delivery_style());
-        bar.set_prefix(label);
-        if let Some(n) = size {
-            bar.set_length(n);
-        }
+        bar.set_style(Self::file_style());
+        bar.set_prefix(label.to_string());
         bar.enable_steady_tick(TICK);
         bar
     }
 
     /// A per-file bar for a whole-blob pull, labeled `label` and inserted above the
-    /// total bar. `size` (the manifest's content size, when declared) sets an
-    /// initial bar length so it reads sensibly during the pre-byte handshake; the
-    /// first progress callback (the driver's pre-stream `base_present` report)
-    /// replaces it with the authoritative `total_bytes`. It is also the pull's
-    /// scaled contribution to the total bar.
+    /// total bar. `download_total` is the blob's download (pay-now) bytes — the
+    /// bar's download-phase length and the `x/y` denominator; `reconstruct_total` is
+    /// the bytes it splices from disk — shown in parentheses and, during the verify,
+    /// the extra span the bar fills. Their sum is the blob's whole size. The bar's
+    /// download progress also folds into the total bar's download meter.
     ///
     /// When disabled the returned [`FileBar`] is silent and its
-    /// [`FileBar::callback`] is `None`, so the fetch path runs byte-bar-free
-    /// exactly as it did before per-file bars.
-    pub(crate) fn file_bar(&self, label: String, size: Option<u64>) -> FileBar {
+    /// [`FileBar::callback`] is `None`, so the fetch path runs byte-bar-free exactly
+    /// as it did before per-file bars.
+    pub(crate) fn file_bar(
+        &self,
+        label: &str,
+        download_total: u64,
+        reconstruct_total: u64,
+    ) -> FileBar {
         let Some(i) = &self.inner else {
             return FileBar::disabled();
         };
-        let bar = Self::insert_file_bar(i, label, size);
-        // The file bar tracks the pull's own progress; the total bar gets that
-        // progress scaled to the manifest's declared `size`. A pull with no
-        // declared size still shows its own bar but adds nothing to the total.
-        let file_cb = file_position_callback(bar.clone());
-        let contrib = i
-            .total
-            .as_ref()
-            .zip(size)
-            .map(|(total, s)| content_contributor(total.clone(), s));
-        let cb = move |received: u64, expected: u64| {
-            file_cb(received, expected);
-            if let Some(c) = &contrib {
-                c(received, expected);
+        let bar = Self::insert_file_bar(i, label, download_total);
+        let phase = FilePhase {
+            bar,
+            download_total,
+            reconstruct_total,
+        };
+        phase.render(0, "");
+        // The delivery callback advances this file's download and folds the same
+        // downloaded bytes into the total bar's download meter (capped at the file's
+        // download size — a dedup entry's driver never delivers past its pay-now
+        // ranges, but the cap keeps the total honest regardless).
+        let total = i.total.clone();
+        let cb_phase = phase.clone();
+        let prev = AtomicU64::new(0);
+        let cb = move |received: u64, _expected: u64| {
+            cb_phase.download(received);
+            if let Some(t) = &total {
+                let capped = received.min(cb_phase.download_total);
+                let last = prev.fetch_max(capped, Ordering::Relaxed);
+                if capped > last {
+                    t.inc(capped - last);
+                }
             }
         };
         FileBar {
-            bar: Some(bar),
+            phase: Some(phase),
             cb: Some(Box::new(cb)),
-        }
-    }
-
-    /// Credit an already-present file's content `size` straight to the total bar.
-    /// A skipped file (every destination on disk) does no fetch and drives no
-    /// delivery callback, but its content is part of the whole-download total
-    /// (`total_content_bytes` counts it), so without this credit the total could
-    /// never reach 100% on a resumed or already-present run. A no-op when disabled,
-    /// when there is no total bar, or when `size` is absent (then it is not in the
-    /// denominator either). Shows no per-file bar — a skip is instantaneous.
-    pub(crate) fn credit_skipped(&self, size: Option<u64>) {
-        if let Some(i) = &self.inner
-            && let (Some(total), Some(s)) = (&i.total, size)
-        {
-            total.credit(s);
         }
     }
 
@@ -281,11 +300,77 @@ impl PullProgress {
     }
 }
 
-/// One file's (or fetch-once hash group's) progress bar plus the delivery callback
-/// that drives it. Silent when the renderer is disabled.
+/// One file's (or fetch-once hash group's) live bar state: the bar, its download
+/// and reconstruct sizes, and the formatting of its `x/y (z) phase-word` message.
+/// Cloning shares the same underlying bar.
+#[derive(Clone)]
+struct FilePhase {
+    bar: indicatif::ProgressBar,
+    /// Download (pay-now) bytes — the `x/y` denominator and download-phase length.
+    download_total: u64,
+    /// Bytes spliced from disk — shown in `(…)` and, during verify, the extra span.
+    reconstruct_total: u64,
+}
+
+impl FilePhase {
+    /// Set the message to `downloaded/download-total[ (reconstructed)][ word]`, in
+    /// human byte units. `word` is a phase hint (`pending siblings…`,
+    /// `reconstructing…`, `discovering…`) or empty during a plain download.
+    fn render(&self, downloaded: u64, word: &str) {
+        let counts = format!(
+            "{}/{}",
+            indicatif::HumanBytes(downloaded.min(self.download_total)),
+            indicatif::HumanBytes(self.download_total),
+        );
+        let recon = if self.reconstruct_total > 0 {
+            format!(" ({})", indicatif::HumanBytes(self.reconstruct_total))
+        } else {
+            String::new()
+        };
+        let tail = if word.is_empty() {
+            String::new()
+        } else {
+            format!(" {word}")
+        };
+        self.bar.set_message(format!("{counts}{recon}{tail} "));
+    }
+
+    /// Advance the download: bar length stays the download total, position tracks the
+    /// delivered bytes, and the counts re-render.
+    fn download(&self, received: u64) {
+        self.bar.set_length(self.download_total);
+        self.bar.set_position(received.min(self.download_total));
+        self.render(received, "");
+    }
+
+    /// Enter the `pending siblings…` wait: the download is done (bar full), and the
+    /// blob is now waiting for a sibling to register a deferred chunk.
+    fn pending(&self) {
+        self.bar.set_position(self.download_total);
+        self.render(self.download_total, "pending siblings…");
+    }
+
+    /// Enter the `discovering…` phase: probing holders before any byte arrives.
+    fn discovering(&self) {
+        self.render(0, "discovering…");
+    }
+
+    /// Enter the `reconstructing…` verify: the bar now spans the whole blob size
+    /// (download + reconstruct) and fills with bytes hashed.
+    fn start_reconstructing(&self) {
+        self.bar
+            .set_length(self.download_total.saturating_add(self.reconstruct_total));
+        self.bar.set_position(0);
+        self.render(self.download_total, "reconstructing…");
+    }
+}
+
+/// One file's (or fetch-once hash group's) progress handle: its [`FilePhase`] plus
+/// the delivery callback that drives the download. Silent when the renderer is
+/// disabled.
 pub(crate) struct FileBar {
-    /// The bar to clear when the pull settles; `None` when disabled.
-    bar: Option<indicatif::ProgressBar>,
+    /// The live bar state; `None` when disabled.
+    phase: Option<FilePhase>,
     /// The delivery callback handed to the fetch path; `None` when disabled.
     cb: Option<Box<ProgressCallback>>,
 }
@@ -294,7 +379,7 @@ impl FileBar {
     /// A silent bar: no rendering, no callback.
     fn disabled() -> Self {
         Self {
-            bar: None,
+            phase: None,
             cb: None,
         }
     }
@@ -305,60 +390,36 @@ impl FileBar {
         self.cb.as_deref()
     }
 
+    /// Show the `discovering…` phase (probing holders before any byte arrives).
+    pub(crate) fn set_discovering(&self) {
+        if let Some(p) = &self.phase {
+            p.discovering();
+        }
+    }
+
+    /// Show the `pending siblings…` phase (download done, waiting on a sibling to
+    /// register a deferred chunk).
+    pub(crate) fn set_pending(&self) {
+        if let Some(p) = &self.phase {
+            p.pending();
+        }
+    }
+
+    /// Enter the `reconstructing…` verify and return a progress reporter to feed the
+    /// running byte count of the whole-file hash into, so the bar keeps moving
+    /// through the verify instead of freezing. `None` when disabled — the hash then
+    /// runs without a progress callback, as before.
+    pub(crate) fn reconstruct_reporter(&self) -> Option<Box<dyn Fn(u64) + Send + Sync>> {
+        let p = self.phase.as_ref()?;
+        p.start_reconstructing();
+        let bar = p.bar.clone();
+        Some(Box::new(move |hashed: u64| bar.set_position(hashed)))
+    }
+
     /// Clear the bar once the file's pull settles (success or failure).
     pub(crate) fn finish(self) {
-        if let Some(bar) = self.bar {
-            bar.finish_and_clear();
-        }
-    }
-}
-
-/// `size × num / den`, clamped so `num ≤ den`, as a `u64`. The result is at most
-/// `size`, so the narrowing back from `u128` cannot lose data.
-fn scaled(size: u64, num: u64, den: u64) -> u64 {
-    if den == 0 {
-        return 0;
-    }
-    let v = u128::from(size) * u128::from(num.min(den)) / u128::from(den);
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "v <= size, which is a u64, so the value fits"
-    )]
-    {
-        v as u64
-    }
-}
-
-/// The delivery callback for one whole-file bar: it sets the bar length to the
-/// pull's `total_bytes` once and advances the position to the cumulative verified
-/// content-byte count. No rate — that lives on the total bar.
-fn file_position_callback(bar: indicatif::ProgressBar) -> impl Fn(u64, u64) {
-    // `expected` is constant across the pull, so set the length once (it takes a
-    // write lock) rather than on every chunk in the hot receive loop.
-    let length_set = AtomicBool::new(false);
-    move |received: u64, expected: u64| {
-        if !length_set.swap(true, Ordering::Relaxed) {
-            bar.set_length(expected);
-        }
-        bar.set_position(received);
-    }
-}
-
-/// A whole-file pull's fold into the total bar: it maps the pull's cumulative
-/// `(received, expected)` onto the manifest's declared size (`size × received /
-/// expected`) and adds only the increase since the previous update. `expected`
-/// (the pull's `total_bytes`) is constant, so the mapped value is monotonic and
-/// reaches exactly `size` when the pull completes.
-fn content_contributor(total: TotalBar, size: u64) -> impl Fn(u64, u64) {
-    let prev = AtomicU64::new(0);
-    move |received: u64, expected: u64| {
-        if expected == 0 {
-            return;
-        }
-        let content = scaled(size, received, expected);
-        let last = prev.fetch_max(content, Ordering::Relaxed);
-        if content > last {
-            total.inc(content - last);
+        if let Some(p) = self.phase {
+            p.bar.finish_and_clear();
         }
     }
 }
@@ -393,25 +454,6 @@ mod tests {
         assert_eq!(file_label(&[]), "(entry)");
     }
 
-    #[test]
-    fn scaled_is_proportional_and_capped() {
-        assert_eq!(scaled(1000, 0, 4000), 0);
-        assert_eq!(scaled(1000, 1000, 4000), 250);
-        assert_eq!(scaled(1000, 4000, 4000), 1000);
-        // `received` past `expected` (overshoot) is clamped, never over 100%.
-        assert_eq!(scaled(1000, 5000, 4000), 1000);
-        // A zero denominator (no length yet) is zero, not a divide-by-zero.
-        assert_eq!(scaled(1000, 10, 0), 0);
-    }
-
-    // A hidden but length-bounded bar (as production builds via `ProgressBar::new`)
-    // tracks position/length, so the content accounting is testable without a
-    // terminal. `ProgressBar::hidden()` starts unbounded (length `None`), where
-    // `inc_length` is a no-op — so tests must start from `Some(0)`.
-    fn test_bar() -> indicatif::ProgressBar {
-        indicatif::ProgressBar::with_draw_target(Some(0), indicatif::ProgressDrawTarget::hidden())
-    }
-
     /// A hidden total bar of fixed content length `len`, with its own rate meter.
     fn hidden_total(len: u64) -> TotalBar {
         TotalBar::wrap(indicatif::ProgressBar::with_draw_target(
@@ -421,73 +463,87 @@ mod tests {
     }
 
     #[test]
-    fn content_contributor_scales_progress_to_declared_size() {
-        // A pull reporting progress against an `expected` of 4000 for a declared
-        // size of 1000: the total advances in declared bytes and ends on exactly 1000.
-        let total = hidden_total(1000);
-        let contrib = content_contributor(total.clone(), 1000);
-        contrib(0, 4000);
-        assert_eq!(total.position(), 0);
-        contrib(2000, 4000);
-        assert_eq!(total.position(), 500);
-        contrib(4000, 4000);
-        assert_eq!(total.position(), 1000);
-    }
-
-    #[test]
-    fn content_contributor_without_expected_is_inert() {
-        let total = hidden_total(1000);
-        let contrib = content_contributor(total.clone(), 1000);
-        // Pre-byte handshake: expected not yet known, so nothing folds in.
-        contrib(0, 0);
-        assert_eq!(total.position(), 0);
-    }
-
-    #[test]
     fn disabled_file_bar_has_no_callback() {
         let fb = FileBar::disabled();
         assert!(fb.callback().is_none());
     }
 
-    #[test]
-    fn credit_skipped_advances_total_by_the_skipped_content_size() {
-        // An already-present file drives no delivery callback, so its content is
-        // credited straight to the total; a run of all-skipped files still reaches
-        // 100%.
-        let total = hidden_total(300);
+    /// A hidden [`PullProgress`] whose total bar denominates the run's download. The
+    /// total bar is added to the container so a per-file `insert_before` has an
+    /// anchor, exactly as production builds it.
+    fn hidden_pp(download_total: u64) -> (PullProgress, TotalBar) {
+        let mp =
+            indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        let total = TotalBar::wrap(mp.add(indicatif::ProgressBar::new(download_total)));
         let pp = PullProgress {
             inner: Some(Inner {
-                mp: indicatif::MultiProgress::with_draw_target(
-                    indicatif::ProgressDrawTarget::hidden(),
-                ),
+                mp,
                 total: Some(total.clone()),
             }),
         };
-        pp.credit_skipped(Some(100));
-        pp.credit_skipped(Some(200));
-        assert_eq!(total.position(), 300);
-        // A sizeless skip is inert (it is not in the denominator either).
-        pp.credit_skipped(None);
-        assert_eq!(total.position(), 300);
+        (pp, total)
     }
 
     #[test]
-    fn credit_skipped_is_a_no_op_when_disabled() {
-        // No total bar, no panic.
-        PullProgress::disabled().credit_skipped(Some(100));
+    fn file_bar_download_folds_into_the_total_capped_at_download_bytes() {
+        // A blob that downloads 1000 and reconstructs 500 from disk. Its delivery
+        // callback advances the total's DOWNLOAD meter by the delivered bytes only,
+        // capped at the download size — a splice never inflates the download total.
+        let (pp, total) = hidden_pp(1000);
+        let fb = pp.file_bar("m", 1000, 500);
+        let cb = fb.callback().expect("enabled");
+        cb(400, 9999);
+        assert_eq!(total.position(), 400);
+        cb(1000, 9999);
+        assert_eq!(total.position(), 1000);
+        // Delivery past the download size (should not happen, but be safe) does not
+        // push the total past the download denominator.
+        cb(1200, 9999);
+        assert_eq!(total.position(), 1000);
     }
 
     #[test]
-    fn file_position_callback_sets_length_once_and_tracks_position() {
-        let bar = test_bar();
-        let cb = file_position_callback(bar.clone());
-        cb(0, 400);
-        assert_eq!(bar.length(), Some(400));
-        assert_eq!(bar.position(), 0);
-        cb(250, 400);
-        assert_eq!(bar.position(), 250);
-        // No rate/ETA message on a per-file bar.
-        assert_eq!(bar.message(), "");
+    fn file_bar_message_shows_download_counts_and_reconstruct_size() {
+        let (pp, _total) = hidden_pp(1000);
+        let fb = pp.file_bar("m", 1000, 500);
+        let bar = &fb.phase.as_ref().expect("enabled").bar;
+        fb.callback().expect("enabled")(400, 0);
+        let msg = bar.message();
+        // "<downloaded>/<download-total> (<reconstruct>)".
+        assert!(msg.contains('/'), "{msg}");
+        assert!(msg.contains('('), "{msg}");
+    }
+
+    #[test]
+    fn file_bar_reconstructing_spans_the_whole_blob_and_tracks_hashed_bytes() {
+        let (pp, _total) = hidden_pp(1000);
+        let fb = pp.file_bar("m", 1000, 500);
+        let reporter = fb.reconstruct_reporter().expect("enabled");
+        let bar = &fb.phase.as_ref().expect("enabled").bar;
+        // The bar now spans the whole blob (download + reconstruct) and fills with
+        // bytes hashed, so a multi-GB verify is never a frozen row.
+        assert_eq!(bar.length(), Some(1500));
+        reporter(750);
+        assert_eq!(bar.position(), 750);
+        assert!(
+            bar.message().contains("reconstructing"),
+            "{}",
+            bar.message()
+        );
+    }
+
+    #[test]
+    fn file_bar_pending_marks_the_download_done_and_waiting() {
+        let (pp, _total) = hidden_pp(1000);
+        let fb = pp.file_bar("m", 1000, 500);
+        fb.set_pending();
+        let bar = &fb.phase.as_ref().expect("enabled").bar;
+        assert_eq!(bar.position(), 1000, "download is complete while pending");
+        assert!(
+            bar.message().contains("pending siblings"),
+            "{}",
+            bar.message()
+        );
     }
 
     #[test]
@@ -499,34 +555,5 @@ mod tests {
         let msg = total.bar.message();
         assert!(msg.starts_with('('), "{msg}");
         assert!(msg.contains("ETA"), "{msg}");
-    }
-
-    #[test]
-    fn total_bar_credit_moves_the_bar_but_not_the_rate() {
-        let t0 = Instant::now();
-        let total = hidden_total(1000);
-        // Two transferred samples one second apart establish a rate.
-        total.inc(100);
-        let before = total
-            .speed
-            .lock()
-            .map(|mut s| s.observe(t0 + Duration::from_secs(1), 200))
-            .expect("unpoisoned");
-        assert!(before > 0.0);
-        // A credited (already-present) chunk moves the bar only: the next sample
-        // one second later sees just its own 100 transferred bytes.
-        total.credit(500);
-        let after = total
-            .speed
-            .lock()
-            .map(|mut s| s.observe(t0 + Duration::from_secs(2), 800))
-            .expect("unpoisoned");
-        assert_eq!(total.position(), 600, "inc(100) + credit(500)");
-        // 100 B/s both times, smoothed toward the same value: had the credit fed
-        // the rate, the second sample would have read a 600 B/s burst.
-        assert!(
-            after < 2.0 * before,
-            "credit leaked into the rate: {before} -> {after}"
-        );
     }
 }

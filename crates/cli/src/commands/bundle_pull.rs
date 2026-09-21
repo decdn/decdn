@@ -559,6 +559,70 @@ fn total_content_bytes(entries: &[ManifestEntry]) -> Option<u64> {
     any_sized.then_some(sum)
 }
 
+/// One blob's static **download** (pay-now) bytes and its **reconstruct**
+/// (spliced-from-disk) bytes, planned against `index` under the run's
+/// [`FetchPlan`]: `download` is the sum of the blob's drive ranges (its unique and
+/// self-assigned chunks — a shared chunk it defers to a sibling is spliced, not
+/// downloaded) and `reconstruct` is the rest of its declared `size`. A plain
+/// (unhinted) blob downloads its whole `size` and reconstructs nothing. Returns
+/// `(0, 0)` when the blob declares no size. Passing an empty `index` gives the
+/// fresh-pull figures; a resumed run's pre-seeded donors only shrink `download`.
+fn blob_download_reconstruct(
+    group: &HashGroup<'_>,
+    fetch_plan: &FetchPlan,
+    index: &HashMap<[u8; 32], MaterializedRange>,
+) -> (u64, u64) {
+    let Some(total) = group.entries.iter().find_map(|e| e.size) else {
+        return (0, 0);
+    };
+    let hints = group.entries.first().and_then(|e| hints_of(e));
+    let whole = group
+        .entries
+        .first()
+        .and_then(|e| fetch::parse_hash(&e.hash).ok());
+    let download = match (hints, whole) {
+        (Some(hints), Some(whole)) => plan_reassembly(&hints, index, fetch_plan, whole, total)
+            .drive
+            .iter()
+            .map(|r| r.1)
+            .fold(0u64, u64::saturating_add),
+        // No usable hints (or an unparseable hash) → the whole blob is downloaded.
+        _ => total,
+    };
+    (download, total.saturating_sub(download))
+}
+
+/// The run's static **download** total — the content bytes it pays to fetch, deduped
+/// by whole-file `hash` and by shared chunk (each shared chunk counted once, under
+/// its assigned fetcher). This is the total progress bar's denominator; the run
+/// finishes downloading exactly these bytes and splices the rest from disk. `None`
+/// when nothing kept declares a size (no total bar). Computed against an empty index
+/// (the fresh-pull figure), so a resumed run downloads at most this.
+/// The run label for the progress header: the output directory's final component,
+/// or its whole path when it has none (a bare root).
+fn run_label(output: &Path) -> String {
+    output.file_name().map_or_else(
+        || output.to_string_lossy().into_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+fn download_bytes(entries: &[ManifestEntry], fetch_plan: &FetchPlan) -> Option<u64> {
+    let refs: Vec<&ManifestEntry> = entries.iter().collect();
+    let empty = HashMap::new();
+    let mut sum = 0u64;
+    let mut any = false;
+    for group in group_by_hash(&refs) {
+        if group.entries.iter().find_map(|e| e.size).is_none() {
+            continue;
+        }
+        any = true;
+        let (download, _) = blob_download_reconstruct(&group, fetch_plan, &empty);
+        sum = sum.saturating_add(download);
+    }
+    any.then_some(sum)
+}
+
 /// The compiled `--include`/`--exclude` globs that select which manifest entries
 /// a pull run fetches. Both sets match an entry's POSIX relative `path` — the
 /// manifest field (`models/a.bin`), never the on-disk absolute path — with the
@@ -952,9 +1016,16 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     };
 
     // The kept manifest is known: enable the multi-bar renderer (silent off a
-    // terminal or under `--json`). Its total bar's denominator is the run's whole
-    // content size, fixed now from the manifest's declared sizes.
-    ctx.progress = PullProgress::new(args.json, total_content_bytes(&manifest.entries));
+    // terminal or under `--json`). Its total bar meters the run's **download** — the
+    // bytes actually fetched after shared-chunk dedup — with the whole on-disk
+    // content size shown alongside in the header, both fixed now from the manifest.
+    let manifest_fetch_plan = build_fetch_plan(&manifest.entries);
+    ctx.progress = PullProgress::new(
+        args.json,
+        download_bytes(&manifest.entries, &manifest_fetch_plan),
+        total_content_bytes(&manifest.entries),
+        &run_label(&args.output),
+    );
 
     // Loaded once for the whole run: the pre-pass skip decisions above consult it,
     // and it seeds the incremental skip-cache flush inside `pull_all` — a run's
@@ -1847,8 +1918,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         staging: &Path,
         index: &ChunkIndex,
         fetch_plan: &FetchPlan,
-        progress: Option<&ProgressCallback>,
+        file: Option<&pull_progress::FileBar>,
     ) -> anyhow::Result<()> {
+        // The byte-delivery callback drives the file bar's download and the total
+        // bar's download meter; the `file` handle also carries the phase transitions
+        // (discovering / pending / reconstructing) the byte callback cannot express.
+        let progress = file.and_then(|f| f.callback());
         // An already-finalized `<hex>` staging blob — a prior run promoted it, or
         // this run finalized it and crashed in the promote-to-materialize window —
         // is the complete blob, BLAKE3-verified when it was promoted. Materialize
@@ -1873,6 +1948,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 return Ok(());
             }
             remove_staging(staging);
+        }
+
+        // Until the first byte lands, the entry is discovering holders — surfaced so
+        // a slow or stalling probe (a blob no probed node answers for) does not look
+        // like a frozen empty bar. The delivery callback switches the row to its
+        // download counts on the first chunk.
+        if let Some(f) = file {
+            f.set_discovering();
         }
 
         // Plan the reassembly only when there is something to dedup against: hints
@@ -1946,6 +2029,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             hints,
             index,
             fetch_plan,
+            file,
             &finish_progress,
         )
         .await?;
@@ -2015,12 +2099,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
         // Every destination already present (or failed to resolve) → no fetch, no
         // payment. This is the whole point of the group: a duplicate path that is
-        // already on disk costs nothing. The group's content is still part of the
-        // whole-download total, so credit it straight to the total bar — no fetch
-        // callback will, and the total would otherwise never reach 100%.
+        // already on disk costs nothing. It downloads nothing, so it contributes
+        // nothing to the total bar's download meter — no credit, no bar.
         if !slots.iter().any(|s| matches!(s, Slot::Write { .. })) {
-            self.progress
-                .credit_skipped(group.entries.iter().find_map(|e| e.size));
             return slots
                 .into_iter()
                 .map(|s| match s {
@@ -2056,8 +2137,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .await
             .unwrap_or(None);
             if let Some(len) = verified_len {
-                self.progress
-                    .credit_skipped(group.entries.iter().find_map(|e| e.size));
+                // A whole-file link downloads nothing, so it adds nothing to the
+                // total bar's download meter.
                 return materialize_from_donor(slots, &donor, len).await;
             }
         }
@@ -2073,16 +2154,20 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             Err(e) => return fail_all(slots, &e),
         };
 
-        // One per-file bar for this group's single pull, labeled by its
-        // destination path(s) — a fetch-once hash group shows one bar for every
-        // path it lands at. The manifest's content size (all entries share a blob,
-        // so one size) seeds the bar length as a pre-byte estimate; the first
-        // delivered chunk replaces it with the authoritative wire length.
+        // One per-file bar for this group's single pull, labeled by its destination
+        // path(s) — a fetch-once hash group shows one bar for every path it lands at.
+        // The bar meters the blob's download (pay-now) bytes and shows its
+        // reconstruct (spliced-from-disk) bytes in parentheses; both come from the
+        // static plan against the run's fetch plan (an empty donor index — the
+        // fresh-pull split), matching the header's download total.
         let paths: Vec<String> = group.entries.iter().map(|e| e.path.clone()).collect();
-        let size_estimate = group.entries.iter().find_map(|e| e.size);
-        let file_bar = self
-            .progress
-            .file_bar(pull_progress::file_label(&paths), size_estimate);
+        let (download_bytes_of_blob, reconstruct_bytes_of_blob) =
+            blob_download_reconstruct(&group, fetch_plan, &HashMap::new());
+        let file_bar = self.progress.file_bar(
+            &pull_progress::file_label(&paths),
+            download_bytes_of_blob,
+            reconstruct_bytes_of_blob,
+        );
         let fetched = self
             .pull_entry(
                 hash,
@@ -2091,7 +2176,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 &staging,
                 index,
                 fetch_plan,
-                file_bar.callback(),
+                Some(&file_bar),
             )
             .await;
         file_bar.finish();
@@ -2253,6 +2338,7 @@ fn ensure_partial(partial: &Path, total: u64) -> anyhow::Result<()> {
 /// first pay-now drive spliced nothing this run; a self-heal whole-blob re-drive
 /// discards every splice, so it reports zero spliced bytes and counts all its donors
 /// as ignored.
+#[allow(clippy::too_many_arguments)]
 async fn reassemble_dedup(
     driver: &dyn RangeDriver,
     plan: &ReassemblePlan,
@@ -2260,6 +2346,7 @@ async fn reassemble_dedup(
     hints: Option<&[Hint]>,
     index: &ChunkIndex,
     fetch_plan: &FetchPlan,
+    file: Option<&pull_progress::FileBar>,
     finish_progress: &dyn Fn(),
 ) -> anyhow::Result<DedupOutcome> {
     let hash = driver.hash();
@@ -2322,7 +2409,7 @@ async fn reassemble_dedup(
     // assigned fetcher finishes WITHOUT producing it (a failed fetcher) is driven
     // and paid here instead, so the run never hangs.
     let (tail_spliced, tail_ignored) =
-        reconcile_deferred(driver, &partial, &plan.deferred, index, fetch_plan).await?;
+        reconcile_deferred(driver, &partial, &plan.deferred, index, fetch_plan, file).await?;
     spliced_bytes = spliced_bytes.saturating_add(tail_spliced);
     hints_ignored = hints_ignored.saturating_add(tail_ignored);
     if staging.try_exists()? {
@@ -2334,11 +2421,17 @@ async fn reassemble_dedup(
         });
     }
 
-    // The authoritative check: the whole reassembled blob must hash to `hash`.
+    // The authoritative check: the whole reassembled blob must hash to `hash`. This
+    // hash of the full blob is the slow tail of a mostly-spliced entry, so it drives
+    // the file row's `reconstructing…` bar with its running byte count — otherwise
+    // the row would sit frozen while a multi-GB blob verifies.
+    let reporter = file.and_then(pull_progress::FileBar::reconstruct_reporter);
     let partial_for_hash = partial.clone();
-    let got = tokio::task::spawn_blocking(move || hash_partial(&partial_for_hash))
-        .await
-        .map_err(|e| anyhow!("whole-file hash task: {e}"))??;
+    let got = tokio::task::spawn_blocking(move || {
+        hash_partial_with_progress(&partial_for_hash, reporter.as_deref())
+    })
+    .await
+    .map_err(|e| anyhow!("whole-file hash task: {e}"))??;
     if got != hash {
         // A lying recipient hint placed a chunk at the wrong offset. Drop the
         // spliced ranges by re-driving the whole blob (the ranged store fetches
@@ -2409,6 +2502,7 @@ async fn reconcile_deferred(
     deferred: &[Hint],
     index: &ChunkIndex,
     fetch_plan: &FetchPlan,
+    file: Option<&pull_progress::FileBar>,
 ) -> anyhow::Result<(u64, u64)> {
     let mut waiting: Vec<Hint> = deferred.to_vec();
     let mut spliced_bytes = 0u64;
@@ -2484,6 +2578,11 @@ async fn reconcile_deferred(
             return Ok((spliced_bytes, ignored));
         }
 
+        // Nothing to do this pass but wait on a sibling — surface it on the file row
+        // (its download is done; the total bar shows the run is still moving).
+        if let Some(f) = file {
+            f.set_pending();
+        }
         // Block until the next registration or group-finish, then rescan.
         notified.as_mut().await;
         notified.set(index.progress.notified());
@@ -3006,11 +3105,22 @@ fn copy_exact(src: &mut std::fs::File, out: &mut std::fs::File, len: u64) -> std
 /// BLAKE3 of the whole `partial` data file, streamed so an arbitrarily large blob
 /// never loads into memory at once.
 fn hash_partial(partial: &Path) -> anyhow::Result<[u8; 32]> {
+    hash_partial_with_progress(partial, None)
+}
+
+/// BLAKE3 of the whole `partial` data file, streamed, reporting the cumulative bytes
+/// hashed to `progress` after each read — so a caller can advance a progress bar
+/// through a multi-GB verify instead of showing a frozen row.
+fn hash_partial_with_progress(
+    partial: &Path,
+    progress: Option<&(dyn Fn(u64) + Send + Sync)>,
+) -> anyhow::Result<[u8; 32]> {
     use std::io::Read;
     let mut f =
         std::fs::File::open(partial).with_context(|| format!("open {}", partial.display()))?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 1 << 20];
+    let mut hashed_bytes = 0u64;
     loop {
         let n = f
             .read(&mut buf)
@@ -3022,6 +3132,10 @@ fn hash_partial(partial: &Path) -> anyhow::Result<[u8; 32]> {
             .get(..n)
             .ok_or_else(|| anyhow!("short read buffer slice"))?;
         hasher.update(slice);
+        if let Some(cb) = progress {
+            hashed_bytes = hashed_bytes.saturating_add(u64::try_from(n).unwrap_or(0));
+            cb(hashed_bytes);
+        }
     }
     Ok(*hasher.finalize().as_bytes())
 }
@@ -4230,8 +4344,17 @@ mod tests {
         let index = ChunkIndex::default();
         let fetch_plan = FetchPlan::default();
 
-        let res =
-            reassemble_dedup(&driver, &plan, 2 * GROUP, None, &index, &fetch_plan, &|| {}).await;
+        let res = reassemble_dedup(
+            &driver,
+            &plan,
+            2 * GROUP,
+            None,
+            &index,
+            &fetch_plan,
+            None,
+            &|| {},
+        )
+        .await;
 
         assert!(
             res.is_ok(),
@@ -4362,6 +4485,42 @@ mod tests {
         assert_eq!(sizes, vec![Some(10), Some(900)]);
     }
 
+    /// The run download total counts each shared chunk once (under its assigned
+    /// holder) and every unique byte, so a bundle that shares content downloads less
+    /// than its whole on-disk size; the per-blob split reports the same figures.
+    #[test]
+    fn download_bytes_counts_shared_chunks_once() {
+        let a = mentry(0x0a, 3 * GROUP, &[(3 * GROUP, 0x01)]);
+        let total_b = 3 * GROUP + 50_000;
+        let b = mentry(0x0b, total_b, &[(3 * GROUP, 0x01), (50_000, 0x02)]);
+        let fetch_plan = build_fetch_plan(&[
+            mentry(0x0a, 3 * GROUP, &[(3 * GROUP, 0x01)]),
+            mentry(0x0b, total_b, &[(3 * GROUP, 0x01), (50_000, 0x02)]),
+        ]);
+
+        // a downloads its whole 3*GROUP (it is c1's assigned holder); b downloads only
+        // its unique c2 (50_000) and splices c1 from a.
+        let empty = HashMap::new();
+        let refs_a = vec![&a];
+        let refs_b = vec![&b];
+        let group_a = group_by_hash(&refs_a).pop().expect("group a");
+        let group_b = group_by_hash(&refs_b).pop().expect("group b");
+        assert_eq!(
+            blob_download_reconstruct(&group_a, &fetch_plan, &empty),
+            (3 * GROUP, 0)
+        );
+        assert_eq!(
+            blob_download_reconstruct(&group_b, &fetch_plan, &empty),
+            (50_000, 3 * GROUP)
+        );
+
+        // The run total is the sum: 3*GROUP + 50_000, well under the on-disk content.
+        assert_eq!(
+            download_bytes(&[a, b], &fetch_plan),
+            Some(3 * GROUP + 50_000)
+        );
+    }
+
     /// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive` writes
     /// the requested ranges' correct bytes into `<staging>.partial` (creating it,
     /// pre-sized), never finalizing `<hex>` itself — so `reassemble_dedup` exercises
@@ -4463,7 +4622,17 @@ mod tests {
             );
         });
 
-        let res = reassemble_dedup(&driver, &plan, total, None, &index, &fetch_plan, &|| {}).await;
+        let res = reassemble_dedup(
+            &driver,
+            &plan,
+            total,
+            None,
+            &index,
+            &fetch_plan,
+            None,
+            &|| {},
+        )
+        .await;
         assert!(res.is_ok(), "reassembly must succeed: {res:?}");
         assert!(staging.try_exists().expect("stat staging"));
         let got = std::fs::read(&staging).expect("read staging");
@@ -4521,7 +4690,17 @@ mod tests {
             index_bg.mark_finished([0xaa; 32]);
         });
 
-        let res = reassemble_dedup(&driver, &plan, total, None, &index, &fetch_plan, &|| {}).await;
+        let res = reassemble_dedup(
+            &driver,
+            &plan,
+            total,
+            None,
+            &index,
+            &fetch_plan,
+            None,
+            &|| {},
+        )
+        .await;
         assert!(res.is_ok(), "reassembly must succeed via fallback: {res:?}");
         let got = std::fs::read(&staging).expect("read staging");
         assert_eq!(got, content);
