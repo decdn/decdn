@@ -589,11 +589,12 @@ pub struct RegisterArgs {
 ///
 /// A `ValueEnum` with **no default**: the two paths differ by orders of
 /// magnitude in cost and are not interchangeable, so the operator names one.
-/// The runbook's third key — the production slash-sig session key — has no
-/// variant here because it has no implementation to drive
-/// (`adr/024-account-abstraction.md` § Session Keys defers it to an
-/// `erc7579/smartsessions` module); rotating it is a Safe-module operation, not
-/// a deCDN one.
+/// These are the operator's only two keys. There is no separate slash-sig
+/// signing key: an operator serves from the EOA it registered, so `slash_sig`
+/// is signed by the Ethereum key above. Serving from a smart account while a
+/// hot key signs `slash_sig` is unimplemented
+/// (`adr/024-account-abstraction.md` § Unimplemented — Operator Custody While
+/// Serving), so there is no third variant to rotate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum RotateKeyTarget {
     /// The iroh Ed25519 node key — the wire `NodeId`. One `bindNodeId`

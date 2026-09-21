@@ -95,7 +95,7 @@ contract TokenTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // EIP-2612 Permit (ADR 024 / ERC-4337 + ERC-1271 path)
+    // EIP-2612 Permit (gasless approval; ADR 003 § gas abstraction)
     // -----------------------------------------------------------------
 
     function test_permit_setsAllowance() public {

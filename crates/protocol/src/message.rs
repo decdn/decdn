@@ -98,9 +98,9 @@ pub enum MessageValidationError {
     RateIsZero,
     /// `slash_sig` is missing or not [`SLASH_SIG_LEN`] bytes. ADR 014 §1
     /// mandates a non-empty signature on every `ProbeResponse`; the
-    /// EOA-only off-chain signing path (ADR 024 §Off-Chain ERC-1271
-    /// Verification) makes that exactly [`SLASH_SIG_LEN`], which requesters
-    /// MUST reject deviations from.
+    /// EOA-only off-chain signing path (ADR 024 §Off-Chain Signature
+    /// Verification — EOA Recovery Only) makes that exactly [`SLASH_SIG_LEN`],
+    /// which requesters MUST reject deviations from.
     #[error(
         "slash_sig has invalid length {len} \
          (ADR 014 §1: mandatory non-empty; EOA form is {expected} bytes)",
@@ -112,7 +112,7 @@ pub enum MessageValidationError {
     },
     /// A wire [`crate::client::Voucher`]'s `signature` is not
     /// [`crate::client::VOUCHER_SIG_LEN`] bytes. The EOA off-chain voucher
-    /// signing form (ADR 024 §Off-Chain ERC-1271 Verification) is exactly that
+    /// signing form (ADR 024 §Off-Chain Signature Verification — EOA Recovery Only) is exactly that
     /// length; receivers reject deviations before reconstructing the EIP-712
     /// typed data.
     #[error("Voucher.signature has invalid length {len} (EOA form is 65 bytes)")]
@@ -178,7 +178,7 @@ pub enum MessageValidationError {
     /// The EOA form is exactly [`crate::client::VOUCHER_SIG_LEN`] bytes but an
     /// ERC-1271 contract-signer form may be longer, so only the non-empty
     /// floor is a wire-level check; the rest is `decdn_incentive`'s job
-    /// (ADR 024 §Off-Chain ERC-1271 Verification).
+    /// (ADR 024 §Off-Chain Signature Verification — EOA Recovery Only).
     #[error("WireCapability.owner_signature is empty")]
     EmptyCapabilitySignature,
 }

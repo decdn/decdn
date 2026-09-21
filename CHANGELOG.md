@@ -2424,6 +2424,35 @@ since project inception and will roll into the first tagged release.
 
 ### Removed
 
+- **ADR 024's ERC-7579 session-key production plan (#1848).** The deferred
+  plan — a Safe-7579 adapter plus the `erc7579/smartsessions` session-key
+  module for hot-path `slash_sig` / voucher signing, an ERC-4337 paymaster,
+  and a bundler — is retired from ADR 024, along with its off-chain ERC-1271
+  verification branch. It had no live consumer and no code footprint (only
+  prose and doc-comments referenced it), and the buyer side it aimed at is
+  already covered by ADR 003 capability delegation: a Safe funds a pool and
+  delegates a capped, expiring EOA `signer`, verified off-chain by recovery,
+  with no account-abstraction machinery. The shipped, load-bearing piece —
+  universal `SignatureChecker` on-chain (`PaymentPool`, `CapacityBond`,
+  `SlashJudge`, `DecdnGovernor`) and EOA-recovery-only off-chain verification —
+  stays as present-tense canon. ADR 024 gains an **§ Unimplemented — Operator
+  Custody While Serving** section that records the one real residual (a node
+  whose serving identity is a smart account, unreachable via capability
+  delegation because `registerNode` binds `msg.sender`) and why the obvious
+  ERC-1271 route is unsound for it: ERC-1271 validity is mutable and
+  operator-controlled, so a signature re-verified later as slash evidence can
+  be made invalid after payment (selective validator, post-payment revocation),
+  DoS'd via a gas-bomb validator, or wrongly cached from an off-chain RPC. The
+  recorded direction is a native EOA operator-signer delegation mirroring the
+  ADR 003 buyer capability, keeping `slash_sig` EOA-recovered — a future ADR,
+  not a commitment here. Dependents move with it: ADR 012, ADR 019, ADR 003's
+  ephemeral-binding note, `appendix-operator-key-rotation.md` (the third
+  "slash-sig session key" and its rotation procedures are gone; the runbook is
+  two keys), `architecture.md`'s ADR 024 summary, and the `RotateKeyTarget`
+  doc note plus the renamed off-chain-verification citations in
+  `crates/protocol` and `crates/incentive`. Docs and comments only — no
+  runtime, wire, config, or ABI impact. ADR 024 stays **Draft**.
+
 - **GitHub Agentic Workflows (gh-aw) and the Agentic Triage workflow.** The
   `issue-triage` workflow (`.md` source and generated `.lock.yml`), `aw.json`,
   `.github/aw/actions-lock.json`, the `agentic-workflows` Copilot agent file,
