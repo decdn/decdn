@@ -274,6 +274,7 @@ mod tests {
         };
         let mut s = BuyerPoolState::new(
             pool_id,
+            Address::repeat_byte(0x9c),
             owner,
             Address::repeat_byte(0xaa),
             U256::from(1_000_000u64),

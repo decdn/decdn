@@ -1913,6 +1913,7 @@ struct DaemonPoolListJson<'a> {
 #[derive(Serialize)]
 struct PoolJson {
     pool_id: String,
+    payment_pool: String,
     owner: String,
     token: String,
     deposit_usdc: String,
@@ -1931,6 +1932,7 @@ impl From<&BuyerPoolState> for PoolJson {
     fn from(p: &BuyerPoolState) -> Self {
         Self {
             pool_id: format!("{:#x}", p.pool_id),
+            payment_pool: format!("{:#x}", p.payment_pool),
             owner: format!("{:#x}", p.owner),
             token: format!("{:#x}", p.token),
             deposit_usdc: format_usdc_u256(p.deposit),
@@ -2130,6 +2132,7 @@ mod tests {
     fn mk_state(byte: u8, deposit_micro: u64) -> BuyerPoolState {
         BuyerPoolState::new(
             B256::repeat_byte(byte),
+            Address::repeat_byte(0x9c),
             Address::repeat_byte(byte),
             Address::repeat_byte(0xcd),
             U256::from(deposit_micro),
@@ -2256,6 +2259,7 @@ mod tests {
         let resp = BuyerPoolsResponse {
             pools: vec![decdn_common::admin::BuyerPoolSnapshot {
                 pool_id: format!("{decoded:#x}"),
+                payment_pool: "0x00dd".to_string(),
                 owner: format!("{:?}", Address::repeat_byte(0x11)),
                 token: format!("{:?}", Address::repeat_byte(0xcd)),
                 deposit_micro_usdc: 1,
@@ -2285,6 +2289,7 @@ mod tests {
     fn a_buyer_load_keeps_its_skipped_rows() {
         let state = BuyerPoolState::new(
             B256::repeat_byte(0x11),
+            Address::repeat_byte(0x9c),
             Address::repeat_byte(0x11),
             Address::repeat_byte(0xcd),
             U256::from(1u64),
@@ -2357,6 +2362,7 @@ mod tests {
             &BuyerPoolsResponse {
                 pools: vec![decdn_common::admin::BuyerPoolSnapshot {
                     pool_id: "0xabcdef0123456789".to_string(),
+                    payment_pool: "0x00dd".to_string(),
                     owner: "0x1111111111111111".to_string(),
                     token: "0x2222222222222222".to_string(),
                     deposit_micro_usdc: 1_500_000,

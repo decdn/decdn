@@ -28,6 +28,25 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Buyer pool rows are scoped to their `PaymentPool` deployment, and the
+  buyer table moves to `_v4` (#2087).** `PaymentPool.openPool` derives
+  `poolId = keccak256(owner, ownerPoolNonce)` — no contract address, no chain
+  id — and a fresh deployment restarts that nonce at zero, so the same owner's
+  Nth pool carries a byte-identical id on every deployment. A persisted row was
+  therefore ambiguous across a redeploy, and worse than ambiguous: once the
+  owner's nonce walked back over the tracked id, the row named an existing,
+  unrelated pool, and the node resumed lane progress the live pool had never
+  redeemed against — paying a provider for bytes it never delivered.
+  `BuyerPoolState` now carries `payment_pool`, every path that reuses a row
+  checks it (node bootstrap, the node's pull hot path, `decdn fetch`), and the
+  node drops a foreign row at bootstrap. **Both buyer tables move from `_v3` to
+  `_v4`, which orphans every row written by an earlier binary** — including
+  rows for pools on the configured contract. Those read as an empty store on
+  first boot: a node re-adopts from chain, and a client opens a fresh pool. A
+  deposit held by an orphaned row is recoverable only against the contract it
+  was opened on, and the bootstrap warning names that address. `payment_pool`
+  is now surfaced by `decdn pool list --json` and `admin_v1_pools`.
+
 - **CLI: `decdn fetch` and `decdn bundle pull` refuse a `decdn-node` data dir
   they were not pointed at (#2082).** `decdn pool` already refused to escrow
   into a daemon's data dir (#2078), but these two opened the client store on
