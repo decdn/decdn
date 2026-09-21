@@ -42,7 +42,8 @@ since project inception and will roll into the first tagged release.
   node drops a foreign row at bootstrap. **Both buyer tables move from `_v3` to
   `_v4`, which orphans every row written by an earlier binary** — including
   rows for pools on the configured contract. Those read as an empty store on
-  first boot: a node re-adopts from chain, and a client opens a fresh pool. A
+  first boot, and both a node and a client re-adopt the live pool from chain
+  (see the client-adoption entry under Fixed). A
   deposit held by an orphaned row is recoverable only against the contract it
   was opened on, and the bootstrap warning names that address. `payment_pool`
   is now surfaced by `decdn pool list --json` and `admin_v1_pools`.
@@ -798,6 +799,32 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+- **CLI: `decdn fetch` and `decdn bundle pull` adopt the pool the wallet
+  already owns on chain, instead of opening a second one.** The client decided
+  whether it owned a pool from its local store alone, so a lost row read as "no
+  pool": it escrowed a fresh `buyer_working_deposit_micro_usdc` beside the live
+  one. On a wallet whose USDC was already escrowed in that pool the second
+  `openPool` reverted outright (`ERC20: transfer amount exceeds balance`, graded
+  `insufficient_deposit`). The `_v4` buyer-table move in #2087 made this the
+  common case — every client row written before it reads as absent — but any
+  store loss reached it: a reset data dir, a new machine. With no usable row the
+  client now asks the chain (`getPools`) and adopts the newest `Open` pool that
+  still has deposit to spend, recording it; it opens a pool only when none
+  qualifies, and a chain read that fails aborts rather than opening one. A lane
+  with no local record — every lane of an adopted pool, and a tracked pool's
+  first contact with a provider — resumes from the chain watermark
+  (`getWatermark`) rather than zero, where every voucher at or below it redeems
+  nothing; that is one extra read per new lane, and a fault on it now aborts the
+  fetch. An adopted pool's refill decision counts what the pool has already paid
+  out (`totalRedeemed`), so a pool other lanes drained is topped up rather than
+  trusted as full. A buy whose store or key belongs to a node never adopts —
+  a node's dir named with `--data-dir` (#2082), or a client dir pointed at the
+  node's keystore with `--keystore`/`blockchain.eth_keystore`: the wallet is the
+  operator's, so its live pool is the daemon's own, and adopting it would put a
+  second voucher series on the daemon's lanes. Adoption assumes one buyer per
+  wallet, and a key copied out of a node's dir, or shared between two clients,
+  is not detectable locally.
 
 - **CLI: `decdn whoami` reports a keystore the shared password does not open
   (#2008).** The command resolved one password and applied it to both

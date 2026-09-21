@@ -87,7 +87,7 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 
 use super::bundle_manifest::{self, SavedManifest, SavedMtime};
-use super::buyer_store::open_client_store_for_buy;
+use super::buyer_store::{ChainAdoption, open_client_store_for_buy};
 use super::chain_ctx;
 use super::fetch;
 use super::manifest::build_glob_set;
@@ -1415,6 +1415,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                     self.chain.payment_pool,
                     self.chain.working_deposit,
                     self.chain.max_approve,
+                    // `self.store` was opened from `self.chain.data_dir`, and
+                    // the pull signs with `self.chain.keystore`.
+                    ChainAdoption::for_buy(&self.chain.data_dir, &self.chain.keystore),
                 )
                 .await?
             };
