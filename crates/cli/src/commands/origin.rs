@@ -3,11 +3,15 @@
 //!
 //! For every blob it writes the sharded data object `{base}/{hex[0..2]}/{hex}`
 //! and its sibling pre-order bao outboard `{hex}.obao4` — the exact layout the
-//! daemon reads back (ADR 037 §Origin-tier pull-through). The hash + outboard
-//! computation is backend-independent (an origin store is content-addressed with
-//! an identical object layout across the fs and s3 backends); only the final
-//! write differs, so the `--to` target selects a writer. v1 implements the
-//! `fs:<dir>` target; `s3://` is an additive follow-up.
+//! daemon reads back (ADR 037 §Origin-tier pull-through).
+//!
+//! `--to` is a local filesystem directory: the store is written to disk and
+//! nowhere else. Populating an S3 origin needs no separate writer, because the
+//! fs and S3 object layouts are byte-identical (the S3 reader keys objects
+//! `{prefix}{hex[0..2]}/{hex}` to match this on-disk shard) — import to a local
+//! directory and `aws s3 sync` it up. `parse_target` turns an `s3://` (or
+//! `http(s)://`) target into an error that spells out that recipe rather than
+//! writing to a directory named after the URL.
 //!
 //! The work is synchronous (bao encoding + filesystem writes are sync), wrapped
 //! once in `tokio::task::spawn_blocking` from the async entry point so the CLI's
@@ -37,36 +41,52 @@ pub async fn origin_dispatch(args: &OriginArgs) -> anyhow::Result<()> {
     }
 }
 
-/// The parsed `--to` target. Only the filesystem writer is implemented; the
-/// enum exists so an `s3://` writer is an additive variant, not a rewrite.
+/// The parsed `--to` target. The filesystem is the only write backend, so this
+/// is a one-variant enum — it stays an enum so the write dispatch reads as a
+/// `match` and a future backend is an added arm, not a rewrite.
 #[derive(Debug)]
 enum ImportTarget {
     /// A local filesystem origin store rooted at this directory.
     Fs(PathBuf),
 }
 
-/// Parse a `--to <backend>:<location>` target string. `fs:<dir>` is the only
-/// implemented backend; `s3://` and `http(s)://` produce actionable errors.
-fn parse_target(raw: &str) -> anyhow::Result<ImportTarget> {
-    if let Some(dir) = raw.strip_prefix("fs:") {
-        if dir.is_empty() {
-            bail!("--to fs: needs a directory, e.g. --to fs:/var/lib/decdn/origin");
+/// Parse a `--to <dir>` target. The target is a local filesystem directory —
+/// the default and only write backend. An `s3://` or `http(s)://` target is not
+/// a write target and produces an error that spells out the supported path; a
+/// legacy `fs:` prefix is rejected with a hint to drop it, so an operator's
+/// muscle memory does not silently create a directory literally named `fs:…`.
+///
+/// The scheme checks run on the path's UTF-8 view. A non-UTF-8 path (valid on
+/// Unix) can be none of those ASCII schemes, so it falls straight through to
+/// the filesystem arm rather than being rejected for not being UTF-8.
+fn parse_target(raw: &Path) -> anyhow::Result<ImportTarget> {
+    if let Some(s) = raw.to_str() {
+        if s.is_empty() {
+            bail!("--to needs a directory, e.g. --to /var/lib/decdn/origin");
         }
-        return Ok(ImportTarget::Fs(PathBuf::from(dir)));
+        if s.starts_with("s3://") {
+            bail!(
+                "--to {s} is not a write target: `origin import` writes a local \
+                 filesystem store only. The fs and S3 object layouts are identical, so \
+                 import to a directory and sync it up:\n  \
+                 decdn origin import -i <input> --to <dir>\n  \
+                 aws s3 sync <dir> {s}"
+            );
+        }
+        if s.starts_with("http://") || s.starts_with("https://") {
+            bail!(
+                "--to {s} is not a write target: an HTTP origin is a read-only static \
+                 server — seed a local directory and serve it from that disk instead"
+            );
+        }
+        if s.strip_prefix("fs:").is_some() {
+            bail!(
+                "--to no longer takes an `fs:` prefix — pass the directory path \
+                 directly, e.g. --to /var/lib/decdn/origin"
+            );
+        }
     }
-    if raw.starts_with("s3://") {
-        bail!(
-            "--to {raw} is not yet implemented; v1 imports to a fs: target only \
-             (the object layout is identical, so s3 is a fast follow)"
-        );
-    }
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        bail!(
-            "--to {raw} is not a write target: an HTTP origin is a read-only \
-             static server — seed the fs: layout onto the disk it serves instead"
-        );
-    }
-    bail!("--to {raw} is not a recognized target; use fs:<dir>");
+    Ok(ImportTarget::Fs(raw.to_path_buf()))
 }
 
 /// One-line JSON / human status report emitted after a successful import.
@@ -219,7 +239,13 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
     let subfolder = resolve_subfolder(args.subfolder.as_deref())?;
 
     let write = !args.dry_run;
-    let origin_label = args.to.clone().unwrap_or_else(|| "(dry-run)".to_string());
+    // `--to` is a path; the report's `origin` field is a display string, so a
+    // non-UTF-8 target degrades lossily here — only for the human/JSON label,
+    // never for the actual write path, which keeps the raw `PathBuf`.
+    let origin_label = args
+        .to
+        .as_ref()
+        .map_or_else(|| "(dry-run)".to_string(), |p| p.display().to_string());
 
     let input = args.input.clone();
     let follow = args.follow_symlinks;
@@ -897,34 +923,63 @@ mod tests {
     }
 
     #[test]
-    fn parse_target_accepts_fs() {
-        match parse_target("fs:/var/lib/decdn/origin").unwrap() {
+    fn parse_target_accepts_bare_path() {
+        match parse_target(Path::new("/var/lib/decdn/origin")).unwrap() {
             ImportTarget::Fs(p) => assert_eq!(p, PathBuf::from("/var/lib/decdn/origin")),
         }
     }
 
     #[test]
-    fn parse_target_rejects_empty_fs_dir() {
-        let err = parse_target("fs:").unwrap_err();
+    fn parse_target_accepts_relative_bare_path() {
+        // A relative directory is a filesystem path like any other.
+        match parse_target(Path::new("origin")).unwrap() {
+            ImportTarget::Fs(p) => assert_eq!(p, PathBuf::from("origin")),
+        }
+    }
+
+    #[test]
+    fn parse_target_rejects_empty() {
+        let err = parse_target(Path::new("")).unwrap_err();
         assert!(format!("{err:#}").contains("needs a directory"));
     }
 
     #[test]
-    fn parse_target_s3_is_not_yet_implemented() {
-        let err = parse_target("s3://bucket/prefix").unwrap_err();
-        assert!(format!("{err:#}").contains("not yet implemented"));
+    fn parse_target_s3_points_at_aws_sync() {
+        // The S3 target is not a writer; the error must hand the operator the
+        // exact import-then-sync recipe, echoing the requested s3:// URL.
+        let err = parse_target(Path::new("s3://bucket/prefix")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("aws s3 sync"), "got: {msg}");
+        assert!(msg.contains("s3://bucket/prefix"), "got: {msg}");
     }
 
     #[test]
     fn parse_target_http_is_not_a_write_target() {
-        let err = parse_target("https://example.com").unwrap_err();
+        let err = parse_target(Path::new("https://example.com")).unwrap_err();
         assert!(format!("{err:#}").contains("not a write target"));
     }
 
     #[test]
-    fn parse_target_rejects_unknown_scheme() {
-        let err = parse_target("/plain/path").unwrap_err();
-        assert!(format!("{err:#}").contains("not a recognized target"));
+    fn parse_target_rejects_legacy_fs_prefix() {
+        // `fs:` is gone; rejecting it (rather than treating it as a path) keeps
+        // an operator from silently seeding a directory named `fs:...`.
+        let err = parse_target(Path::new("fs:/var/lib/decdn/origin")).unwrap_err();
+        assert!(format!("{err:#}").contains("no longer takes an `fs:` prefix"));
+    }
+
+    #[test]
+    fn parse_target_non_utf8_path_is_filesystem() {
+        // A non-UTF-8 Unix path can be none of the ASCII schemes, so it must
+        // fall through to the filesystem arm rather than erroring.
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let raw = OsStr::from_bytes(b"/var/lib/decdn/\xff\xfeorigin");
+            match parse_target(Path::new(raw)).unwrap() {
+                ImportTarget::Fs(p) => assert_eq!(p.as_os_str(), raw),
+            }
+        }
     }
 
     #[test]
@@ -932,7 +987,7 @@ mod tests {
         let report = ImportReport {
             imported: 3,
             bytes: 42,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([
                 ("a.txt".into(), "b3:aaaa".into()),
                 ("dir/b.txt".into(), "b3:bbbb".into()),
@@ -950,7 +1005,7 @@ mod tests {
         assert_eq!(obj.len(), 9);
         assert_eq!(obj["imported"].as_u64(), Some(3));
         assert_eq!(obj["bytes"].as_u64(), Some(42));
-        assert_eq!(obj["origin"].as_str(), Some("fs:/tmp/origin"));
+        assert_eq!(obj["origin"].as_str(), Some("/tmp/origin"));
         assert_eq!(obj["files"]["a.txt"].as_str(), Some("b3:aaaa"));
         assert_eq!(obj["files"]["dir/b.txt"].as_str(), Some("b3:bbbb"));
         assert_eq!(obj["bundle_hash"].as_str(), Some("b3:cafef00d"));
@@ -965,7 +1020,7 @@ mod tests {
         let report = ImportReport {
             imported: 1,
             bytes: 10,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([("a.txt".into(), "b3:aaaa".into())]),
             bundle_hash: Some("b3:cafef00d".into()),
             moved: false,
@@ -987,7 +1042,7 @@ mod tests {
         let report = ImportReport {
             imported: 1,
             bytes: 10,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([("a.txt".into(), "b3:aaaa".into())]),
             bundle_hash: Some("b3:cafef00d".into()),
             moved: false,
@@ -1006,7 +1061,7 @@ mod tests {
         let report = ImportReport {
             imported: 2,
             bytes: 100,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([("a.bin".into(), "b3:aaaa".into())]),
             bundle_hash: Some("b3:cafef00d".into()),
             moved: false,
@@ -1026,7 +1081,7 @@ mod tests {
         let report = ImportReport {
             imported: 2,
             bytes: 100,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([("a.bin".into(), "b3:aaaa".into())]),
             bundle_hash: Some("b3:cafef00d".into()),
             moved: false,
@@ -1045,7 +1100,7 @@ mod tests {
         let report = ImportReport {
             imported: 1,
             bytes: 10,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([("blob.bin".into(), "b3:deadbeef".into())]),
             bundle_hash: None,
             moved: true,
@@ -1066,7 +1121,7 @@ mod tests {
         let report = ImportReport {
             imported: 1,
             bytes: 10,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([("blob.bin".into(), "b3:deadbeef".into())]),
             bundle_hash: None,
             moved: false,
@@ -1085,7 +1140,7 @@ mod tests {
         let report = ImportReport {
             imported: 2,
             bytes: 20,
-            origin: "fs:/tmp/origin".into(),
+            origin: "/tmp/origin".into(),
             files: BTreeMap::from([
                 ("a.txt".into(), "b3:aaaa".into()),
                 ("b.txt".into(), "b3:bbbb".into()),
