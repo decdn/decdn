@@ -695,19 +695,27 @@ fn render_selection(entries: &[ManifestEntry]) -> String {
 }
 
 /// Reject a bundle whose paths cannot round-trip through the `--select` editor
-/// buffer: a path that starts with `#` (indistinguishable from a comment) or
-/// contains a tab, newline, or carriage return (which would split or break its
-/// line). Such paths are pathological for a POSIX relative filename; `--select`
-/// refuses them loudly rather than silently dropping a file the user meant to
-/// keep. `--include`/`--exclude` still handle these bundles.
+/// buffer exactly. [`parse_selection`] reads a kept line as the text before the
+/// first tab, trimmed, and skips a line whose first non-whitespace character is
+/// `#`. A path therefore fails to round-trip when it:
+/// - differs from its trimmed form (leading/trailing whitespace, which
+///   [`parse_selection`] strips — including whitespace before a `#`, which would
+///   make the line read as a comment and silently drop the file), or
+/// - has `#` as its first non-whitespace character (read as a comment), or
+/// - contains a tab, newline, or carriage return (splits or breaks its line).
+///
+/// Such paths are pathological for a POSIX relative filename; `--select` refuses
+/// them loudly rather than silently dropping a file the user meant to keep.
+/// `--include`/`--exclude` still handle these bundles.
 fn check_selectable(entries: &[ManifestEntry]) -> anyhow::Result<()> {
-    if let Some(bad) = entries
-        .iter()
-        .find(|e| e.path.starts_with('#') || e.path.contains(['\t', '\n', '\r']))
-    {
+    if let Some(bad) = entries.iter().find(|e| {
+        let p = e.path.as_str();
+        p != p.trim() || p.trim_start().starts_with('#') || p.contains(['\t', '\n', '\r'])
+    }) {
         bail!(
-            "--select cannot represent the path {:?} (paths starting with '#' or \
-             containing a tab/newline are unsupported); use --include/--exclude instead",
+            "--select cannot represent the path {:?} (paths with leading/trailing \
+             whitespace, a leading '#', or a tab/newline are unsupported); use \
+             --include/--exclude instead",
             bad.path
         );
     }
@@ -802,7 +810,8 @@ fn select_entries(entries: Vec<ManifestEntry>) -> anyhow::Result<Vec<ManifestEnt
 /// Resolve the editor command from `$VISUAL`/`$EDITOR` into program + arguments,
 /// falling back to `vi`. `$VISUAL` wins over `$EDITOR`; a missing or
 /// blank/whitespace-only value is treated as unset. The value may carry arguments
-/// (`code --wait`), split on whitespace like `git` does; the scratch file path is
+/// (`code --wait`): it is split on ASCII whitespace, with no shell quoting or
+/// escaping — an argument cannot itself contain a space. The scratch file path is
 /// appended by the caller, not here. Never empty — the fallback guarantees at
 /// least `["vi"]`.
 fn editor_command(visual: Option<&str>, editor: Option<&str>) -> Vec<String> {
@@ -817,8 +826,9 @@ fn editor_command(visual: Option<&str>, editor: Option<&str>) -> Vec<String> {
 
 /// Open `buffer` in the user's editor and return the saved contents. The editor
 /// is `$VISUAL`, then `$EDITOR`, then `vi`; the value may carry arguments
-/// (`code --wait`), split on whitespace like `git` does. The buffer is staged in
-/// a temporary file that is removed when this returns.
+/// (`code --wait`), split on ASCII whitespace with no shell quoting (see
+/// [`editor_command`]). The buffer is staged in a temporary file that is removed
+/// when this returns.
 fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
     let mut file = tempfile::Builder::new()
         .prefix("decdn-select-")
@@ -3722,11 +3732,10 @@ async fn flush_now(out_root: &Path, acc: &SavedManifest) -> bool {
     }
 }
 
-/// Report an empty would-fetch set. `by_filter` is true only when a non-empty
-/// bundle was emptied by `--include`/`--exclude`, so the operator learns their
-/// globs matched nothing rather than mistaking it for an empty bundle.
 /// Why a pull ended with no entries to fetch — picks the message
-/// [`report_nothing_to_fetch`] prints.
+/// [`report_nothing_to_fetch`] prints, so the operator learns the actual cause
+/// (an empty bundle, globs that matched nothing, or a fully deselected list)
+/// rather than mistaking one for another.
 #[derive(Clone, Copy)]
 enum NothingReason {
     /// The bundle manifest itself is empty.
@@ -4292,6 +4301,12 @@ mod tests {
     fn check_selectable_rejects_hash_leading_and_tabbed_paths() {
         assert!(check_selectable(&[sel_entry("#weird.bin", 1)]).is_err());
         assert!(check_selectable(&[sel_entry("has\ttab.bin", 1)]).is_err());
+        // Leading whitespace before a '#' would read as a comment and be
+        // silently dropped by parse_selection — must be rejected here.
+        assert!(check_selectable(&[sel_entry(" #weird.bin", 1)]).is_err());
+        // Any leading/trailing whitespace cannot round-trip (parse trims it).
+        assert!(check_selectable(&[sel_entry(" leading.bin", 1)]).is_err());
+        assert!(check_selectable(&[sel_entry("trailing.bin ", 1)]).is_err());
         assert!(check_selectable(&[sel_entry("fine/name.bin", 1)]).is_ok());
     }
 
