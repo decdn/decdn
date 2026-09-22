@@ -462,6 +462,77 @@ groups:
             failure — not a client problem. Check the node's error logs; the
             throttled `error!` names the specific failure.
 
+      # ADR 041 serve-economics buy refusals. Alert only on the `amortized`
+      # regime: it means the source's warming allowance is spent (or warming is
+      # off) so the ceiling is the grief-proof floor and every candidate is
+      # above it — this node's own sell rate or margin config is too tight,
+      # which is the operator-actionable half. The `warming` regime is "the
+      # market is above the market price", a condition no local change fixes, so
+      # it is dashboard-only — alerting it would page for someone else's prices.
+      # A raw rate, not a ratio: the refusal signs the client NotFound and never
+      # reaches the wire, so there is no serve-attempt counter to divide by.
+      - alert: DecdnServeEconomicsTooTight
+        expr: sum by (instance) (rate(decdn_serve_economics_refused_amortized_total[10m])) > 0.1
+        for: 15m
+        labels:
+          component: delivery
+          severity: warning
+        annotations:
+          summary: "Serve economics too tight to relay on {{ $labels.instance }}"
+          description: |
+            This node keeps declining cache-miss relays because every upstream
+            quote is above its amortized buy floor — the sell rate or margin
+            config cannot resell the bytes for a profit. The node serves its own
+            content fine but relays nothing, silently (the refusal signs the
+            client NotFound). Raise sell_rate_base or loosen serve-economics
+            margin config, or confirm this node is meant to be origin-only.
+
+      # ADR 041 / load-shed overload refusals. Alert on the two reasons a node
+      # can act on — node concurrency and egress saturation — summed. The third
+      # reason, client_at_capacity, is per-client fairness working as designed on
+      # a healthy node, so it is dashboard- and log-only (same treatment as
+      # decdn_serve_stream_rejected_signer_floor_at_cap_total); alerting it would
+      # page for one client's own burst.
+      - alert: DecdnLoadSheddingUnderPressure
+        expr: |
+          sum by (instance) (
+            rate(decdn_load_shed_refused_node_at_capacity_total[5m])
+            + rate(decdn_load_shed_refused_egress_saturated_total[5m])
+          ) > 0.1
+        for: 10m
+        labels:
+          component: delivery
+          severity: warning
+        annotations:
+          summary: "Shedding new serves under load on {{ $labels.instance }}"
+          description: |
+            The node is refusing new paid serves because it is at its concurrency
+            high-water mark or its egress budget. In-flight streams stay fast, but
+            new clients are turned away (NotFound, so they re-route). Check the
+            load-shed panels: raise max_concurrent_serves_high for concurrency, or
+            egress_budget_mbps / bandwidth for egress. Sustained shedding means
+            this node needs more capacity or a lighter share of traffic.
+
+      # ADR 041 per-source warming grief cap. A sustained rate of speculative
+      # buys downgraded to the amortized floor means one or more upstream sources
+      # are draining their allowance faster than serves refund it — either a
+      # genuine dud source or a grief attempt. The cap is doing its job (the loss
+      # is bounded per source), so this is informational, not urgent.
+      - alert: DecdnWarmingGriefedDown
+        expr: sum by (instance) (rate(decdn_warming_speculative_blocked_total[15m])) > 0.05
+        for: 30m
+        labels:
+          component: delivery
+          severity: info
+        annotations:
+          summary: "Warming allowance being griefed down on {{ $labels.instance }}"
+          description: |
+            Above-floor warming buys are being downgraded to the amortized floor
+            because upstream sources have spent their per-source allowance. The
+            grief cap bounds the loss, so this is not urgent, but a sustained rate
+            with a rising decdn_warming_sources_blocked means warming is largely
+            disabled in practice — investigate which sources are serving duds.
+
       # Removed in #1513: DecdnHashMismatchAppearing, which read
       # decdn_streams_failed_total{reason="hash_mismatch"}. That family carries
       # `direction` only, never a `reason`, so such a rule is permanently

@@ -95,6 +95,14 @@ impl LoadShedController {
         self.policy.load().pressure_active()
     }
 
+    /// Node-wide serves in flight, for the `decdn_load_shed_streams_in_flight`
+    /// gauge. Reads the same live counter `try_admit` feeds into the pressure
+    /// snapshot, so the gauge tracks exactly what the policy decides against.
+    #[must_use]
+    pub fn node_in_flight(&self) -> u32 {
+        self.state.node_in_flight()
+    }
+
     /// Swap in a policy rebuilt from a new resolved config. Live counters and
     /// the egress meter are preserved; only the decision policy changes.
     pub fn reload(&self, cfg: &ResolvedLoadShed) {

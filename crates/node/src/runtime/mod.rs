@@ -1640,11 +1640,17 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // from `try_admit`, and that operators watch via metrics.
     let egress_ewma_stop_tx = {
         let shed = Arc::clone(&ch.shed_controller);
+        let warming = Arc::clone(&ch.warming);
         let metrics = Arc::clone(&infra.node_metrics);
         spawn_periodic(&mut tasks, "egress_ewma", EGRESS_EWMA_INTERVAL, move || {
             let bps = shed.sample_egress(EGRESS_EWMA_INTERVAL.as_secs());
             metrics.load_shed_egress_bps(i64::try_from(bps).unwrap_or(i64::MAX));
             metrics.load_shed_pressure_active(shed.pressure_active());
+            // Live concurrency against the shed high-water mark (#load-shed
+            // telemetry), and how many upstream sources warming has cut off
+            // (ADR 041), sampled on the same interval as the egress EWMA.
+            metrics.load_shed_streams_in_flight(shed.node_in_flight());
+            metrics.warming_sources_blocked(warming.blocked_source_count());
         })
     };
 

@@ -152,6 +152,29 @@ struct NodeRegionLabels {
     node_region: String,
 }
 
+/// Which buy-ceiling regime an ADR 041 serve-economics refusal was decided
+/// under, dispatched to the matching sibling counter by
+/// [`Metrics::serve_economics_refused`].
+///
+/// Not a metric label: per `adr/appendix-observability.md` § Reason splits the
+/// convention is sibling counters, and the two regimes have distinct operator
+/// remedies. `Warming` means the source still had allowance, so the ceiling was
+/// the market price `max(sell, amortized)` and the market itself is above it —
+/// the market is too hot to relay into. `Amortized` means the source's warming
+/// allowance is spent (or warming is off), so the ceiling had already dropped
+/// to the grief-proof floor — the node's own sell rate or margin config is too
+/// tight. The regime is also emitted as a structured `debug!` field at the
+/// refusal site so a single event carries the candidate rate and ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeEconomicsRegime {
+    /// The source had warming allowance: the ceiling was the market price and
+    /// the market is above it.
+    Warming,
+    /// The source's warming allowance is spent (or warming is off): the ceiling
+    /// was the amortized floor and this node's serve economics are too tight.
+    Amortized,
+}
+
 /// Build a [`WatcherHook`] that invokes one `&self` recorder on a shared
 /// `Metrics`, deduping the per-watcher `Box::new(move || metrics.foo())`
 /// closures each watcher site would otherwise define (#1251). All
@@ -925,7 +948,24 @@ pub struct DecdnMetrics {
     /// `NotFound` for this — the pricing floor never reaches the wire — so a
     /// sustained rate is visible only here, and means this node's serve economics
     /// (or the market it is buying into) are too tight to relay profitably.
+    ///
+    /// The aggregate over both regime siblings below, mirroring the
+    /// `pool_open_failures_*` shape: bumped on every refusal beside the regime
+    /// counter, so a dashboard can rate the total and drill into the split.
     pub serve_economics_refused: Counter,
+    /// `decdn_serve_economics_refused_warming_total` (ADR 041): the subset of
+    /// [`Self::serve_economics_refused`] where the source still had warming
+    /// allowance, so the ceiling was the market price `max(sell, amortized)` and
+    /// the market itself is above it. Remedy: the market is too hot to relay
+    /// into — there is no local config fix. See [`ServeEconomicsRegime`].
+    pub serve_economics_refused_warming: Counter,
+    /// `decdn_serve_economics_refused_amortized_total` (ADR 041): the subset of
+    /// [`Self::serve_economics_refused`] where the source's warming allowance was
+    /// spent (or warming is off), so the ceiling was already the amortized floor.
+    /// Remedy: this node's own sell rate or margin config is too tight. A rising
+    /// split toward this regime is the operator-actionable one. See
+    /// [`ServeEconomicsRegime`].
+    pub serve_economics_refused_amortized: Counter,
     /// `decdn_node_pull_timeout_total` (#857): a buyer→upstream pull hit one of this node's
     /// own deadlines. Like a channel-open failure this is a buyer-side condition (a possibly
     /// mis-sized local budget), NOT evidence the provider is unreachable, so it does NOT tar
@@ -1462,6 +1502,47 @@ pub struct DecdnMetrics {
     /// `decdn_load_shed_pressure_active`: 1 while the load-shed policy considers
     /// the node pressured, else 0.
     pub load_shed_pressure_active: Gauge,
+    /// `decdn_load_shed_streams_in_flight`: node-wide serves in flight, sampled
+    /// from the shed controller's live counter beside the egress EWMA. Read it
+    /// against the configured high-water mark to see how close the node is to
+    /// shedding on concurrency — the `pressure_active` gauge only says whether
+    /// the mark is crossed, not the headroom.
+    pub load_shed_streams_in_flight: Gauge,
+    /// `decdn_load_shed_refused_node_at_capacity_total`: new serves shed because
+    /// node-wide concurrency was above the high-water mark. The
+    /// [`crate::load_shed::ShedReason::NodeAtCapacity`] sibling — per
+    /// `adr/appendix-observability.md` § Reason splits each shed reason is a
+    /// sibling counter, because the remedy differs: this one says add capacity or
+    /// raise `max_concurrent_serves_high`. Orthogonal to the hit/miss split in
+    /// `serve_stream_rejected_load_shed_{hit,miss}`, which counts the same
+    /// refusals by cache class.
+    pub load_shed_refused_node_at_capacity: Counter,
+    /// `decdn_load_shed_refused_egress_saturated_total`: new serves shed because
+    /// measured egress reached the configured budget
+    /// ([`crate::load_shed::ShedReason::EgressSaturated`]). Remedy: raise
+    /// `egress_budget_mbps` or add bandwidth. See
+    /// [`Self::load_shed_refused_node_at_capacity`].
+    pub load_shed_refused_egress_saturated: Counter,
+    /// `decdn_load_shed_refused_client_at_capacity_total`: new serves shed
+    /// because one client already held its fair share while the node was
+    /// pressured ([`crate::load_shed::ShedReason::ClientAtCapacity`]). This is
+    /// fairness working as designed, not node distress — remedy is usually none.
+    /// See [`Self::load_shed_refused_node_at_capacity`].
+    pub load_shed_refused_client_at_capacity: Counter,
+    /// `decdn_warming_speculative_blocked_total` (ADR 041): times an above-floor
+    /// (speculative) warming buy was downgraded to the amortized floor because
+    /// the upstream source's per-source allowance was spent. Counted only when
+    /// warming is enabled (`warming_budget > 0`), so a node with warming off does
+    /// not report every source as blocked. A sustained rate means one or more
+    /// sources are being griefed down — pair it with
+    /// [`Self::warming_sources_blocked`] for how many.
+    pub warming_speculative_blocked: Counter,
+    /// `decdn_warming_sources_blocked` (ADR 041): how many upstream sources
+    /// currently hold no warming allowance (spent ledger, refill projected
+    /// forward), sampled beside the egress EWMA. A rising gauge with a rising
+    /// [`Self::warming_speculative_blocked`] is warming being throttled by real
+    /// per-source losses; either at zero means warming is unconstrained.
+    pub warming_sources_blocked: Gauge,
 
     // ---- Uniform watcher liveness + panic surface (#1316, #1320) ----
     //
@@ -1939,6 +2020,36 @@ impl Metrics {
         }
     }
 
+    /// Record an ADR 041 serve-economics refusal: bumps the
+    /// `decdn_serve_economics_refused_total` aggregate and the matching regime
+    /// sibling. Enum-dispatch shape of [`Self::pool_open_failure_by_reason`];
+    /// both counters are plain siblings on `self.decdn`, so they export at zero
+    /// from a fresh registry without pre-materialization. Pairs with the
+    /// structured `debug!` at the refusal site in [`crate::node_origin`].
+    pub fn serve_economics_refused(&self, regime: ServeEconomicsRegime) {
+        self.decdn.serve_economics_refused.inc();
+        match regime {
+            ServeEconomicsRegime::Warming => self.decdn.serve_economics_refused_warming.inc(),
+            ServeEconomicsRegime::Amortized => self.decdn.serve_economics_refused_amortized.inc(),
+        };
+    }
+
+    /// Record a load-shed refusal broken out by cause into its sibling counter
+    /// (`decdn_load_shed_refused_*_total`). Per `adr/appendix-observability.md`
+    /// § Reason splits each shed reason is a sibling, not a label, because the
+    /// remedies differ. The exhaustive `match` is the gate: a new
+    /// [`crate::load_shed::ShedReason`] variant fails to compile until it is
+    /// given a counter here. Pairs with the structured `debug!` at each shed
+    /// site in [`crate::handlers::client`].
+    pub fn load_shed_refused(&self, reason: crate::load_shed::ShedReason) {
+        use crate::load_shed::ShedReason;
+        match reason {
+            ShedReason::NodeAtCapacity => self.decdn.load_shed_refused_node_at_capacity.inc(),
+            ShedReason::EgressSaturated => self.decdn.load_shed_refused_egress_saturated.inc(),
+            ShedReason::ClientAtCapacity => self.decdn.load_shed_refused_client_at_capacity.inc(),
+        };
+    }
+
     /// Record a probe that could not be answered from a guaranteed eviction
     /// hold, broken out by cause on the `reason` label of
     /// `decdn_probe_hold_unavailable_total` (#1443). Hand-written rather than
@@ -2407,11 +2518,6 @@ recorders! {
     /// decision, so it does not score the provider.
     node_pull_rate_above_ceiling => node_pull_rate_above_ceiling.inc();
 
-    /// A cache-miss buy had candidates but every one quoted above this node's
-    /// serve-economics buy ceiling, so the buyer declined an unprofitable relay
-    /// (ADR 041). A buyer-side policy decision, so it does not score the provider.
-    serve_economics_refused => serve_economics_refused.inc();
-
     /// Record a paid-delivery (`serve_stream`) request refused because the
     /// blob was evicted between probe and stream (#876).
     serve_stream_rejected_evicted_since_probe => serve_stream_rejected_evicted_since_probe.inc();
@@ -2514,6 +2620,18 @@ recorders! {
 
     /// Record whether the load-shed policy considers the node pressured (1 for yes, 0 for no).
     load_shed_pressure_active(active: bool) => load_shed_pressure_active.set(i64::from(active));
+
+    /// Publish node-wide serves in flight, sampled from the shed controller
+    /// beside the egress EWMA. `u32 -> i64` is lossless.
+    load_shed_streams_in_flight(n: u32) => load_shed_streams_in_flight.set(i64::from(n));
+
+    /// Record an above-floor warming buy downgraded to the amortized floor
+    /// because the source's per-source allowance was spent (ADR 041).
+    warming_speculative_blocked => warming_speculative_blocked.inc();
+
+    /// Publish how many upstream sources currently hold no warming allowance
+    /// (ADR 041), sampled beside the egress EWMA.
+    warming_sources_blocked(n: usize) => warming_sources_blocked.set(sat(n));
 
     /// The window-paced serve loop paused the upstream pull at the ramped credit
     /// window to wait for the downstream voucher to clear (#856, #1669).
@@ -3886,6 +4004,7 @@ mod tests {
         metrics.serve_stream_rejected_load_shed_miss();
         metrics.load_shed_egress_bps(1_234);
         metrics.load_shed_pressure_active(true);
+        metrics.load_shed_streams_in_flight(7);
         let text = metrics.encode().unwrap();
         assert!(
             text.contains("decdn_serve_stream_rejected_load_shed_hit_total 1"),
@@ -3897,6 +4016,108 @@ mod tests {
         );
         assert!(text.contains("decdn_load_shed_egress_bps 1234"), "{text}");
         assert!(text.contains("decdn_load_shed_pressure_active 1"), "{text}");
+        assert!(
+            has_metric_line(&text, "decdn_load_shed_streams_in_flight", 7),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn load_shed_refused_counters_start_at_zero_and_increment_per_reason() {
+        use crate::load_shed::ShedReason;
+        // Reason splits are siblings, not labels (ADR § Reason splits): each
+        // shed reason has an unrelated remedy, so bumping one must not move
+        // another, and all three must export at zero from a fresh registry.
+        let metrics = Metrics::new();
+        let names = [
+            "decdn_load_shed_refused_node_at_capacity_total",
+            "decdn_load_shed_refused_egress_saturated_total",
+            "decdn_load_shed_refused_client_at_capacity_total",
+        ];
+        let text = metrics.encode().unwrap();
+        for name in names {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "{name} not at zero:\n{text}"
+            );
+        }
+
+        metrics.load_shed_refused(ShedReason::NodeAtCapacity);
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_load_shed_refused_node_at_capacity_total", 1),
+            "the named reason must increment:\n{text}"
+        );
+        for untouched in [
+            "decdn_load_shed_refused_egress_saturated_total",
+            "decdn_load_shed_refused_client_at_capacity_total",
+        ] {
+            assert!(
+                has_metric_line(&text, untouched, 0),
+                "{untouched} must stay at zero:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_economics_refused_splits_by_regime_and_bumps_the_aggregate() {
+        // Mirrors the `pool_open_failures_*` shape: an aggregate plus regime
+        // siblings, all exported at zero from a fresh registry. Each refusal
+        // bumps the aggregate and exactly one regime sibling.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        for name in [
+            "decdn_serve_economics_refused_total",
+            "decdn_serve_economics_refused_warming_total",
+            "decdn_serve_economics_refused_amortized_total",
+        ] {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "{name} not at zero:\n{text}"
+            );
+        }
+
+        metrics.serve_economics_refused(ServeEconomicsRegime::Warming);
+        metrics.serve_economics_refused(ServeEconomicsRegime::Amortized);
+        metrics.serve_economics_refused(ServeEconomicsRegime::Amortized);
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_serve_economics_refused_total", 3),
+            "aggregate must sum both regimes:\n{text}"
+        );
+        assert!(
+            has_metric_line(&text, "decdn_serve_economics_refused_warming_total", 1),
+            "{text}"
+        );
+        assert!(
+            has_metric_line(&text, "decdn_serve_economics_refused_amortized_total", 2),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn warming_block_metrics_start_at_zero_and_increment() {
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_warming_speculative_blocked_total", 0),
+            "{text}"
+        );
+        assert!(
+            has_metric_line(&text, "decdn_warming_sources_blocked", 0),
+            "{text}"
+        );
+        metrics.warming_speculative_blocked();
+        metrics.warming_sources_blocked(4);
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_warming_speculative_blocked_total", 1),
+            "{text}"
+        );
+        assert!(
+            has_metric_line(&text, "decdn_warming_sources_blocked", 4),
+            "{text}"
+        );
     }
 
     /// Every counter and gauge this node exposes for stream outcomes, byte

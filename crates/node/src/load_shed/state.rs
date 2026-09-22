@@ -36,6 +36,15 @@ impl ShedState {
         (node, per)
     }
 
+    /// Node-wide serves in flight across all clients — the same count
+    /// [`Self::counts`] returns as its first element, without needing a client
+    /// key. Sampled onto the `decdn_load_shed_streams_in_flight` gauge so an
+    /// operator can read live concurrency against the shed high-water mark.
+    #[must_use]
+    pub fn node_in_flight(&self) -> u32 {
+        self.node_active.load(Ordering::Relaxed)
+    }
+
     /// Increment both counters and hand back the RAII slot.
     #[must_use]
     pub fn acquire(self: &Arc<Self>, client: B256) -> ShedSlot {
