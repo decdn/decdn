@@ -82,9 +82,9 @@ use futures_util::StreamExt as _;
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
 use crate::{
-    MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, ProgressCallback, UpstreamPullHeader,
-    genuine_exhaustion, heal_watermark_desync, is_insufficient_deposit,
-    reject_empty_claim_for_nonempty_root, rejection_watermark, resume_may_be_stale,
+    MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, UpstreamPullHeader, genuine_exhaustion,
+    heal_watermark_desync, is_insufficient_deposit, reject_empty_claim_for_nonempty_root,
+    rejection_watermark, resume_may_be_stale,
 };
 
 /// The shared pool cannot fund the next voucher: its remaining deposit is below
@@ -439,7 +439,7 @@ pub async fn drive<St, S, P, F>(
     offset: u64,
     len: u64,
     config: &DriveConfig,
-    on_progress: Option<&ProgressCallback>,
+    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     pacing_wait: Option<&dyn PacingWait>,
     downstream: Option<&(dyn Fn() -> DownstreamFrontier + Send + Sync)>,
     pool: Option<&SharedPool<'_>>,
@@ -657,7 +657,7 @@ pub async fn drive_range_set<St, S, P, F>(
     ranges: &[(u64, u64)],
     concurrency: NonZeroUsize,
     config: &DriveConfig,
-    on_progress: Option<&ProgressCallback>,
+    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     pool: Option<&SharedPool<'_>>,
 ) -> anyhow::Result<()>
 where
@@ -784,7 +784,7 @@ pub(crate) async fn fill_gap<St, S, P, F>(
     total_bytes: u64,
     config: &DriveConfig,
     counters: &mut DriveCounters,
-    on_progress: Option<&ProgressCallback>,
+    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     // Multi-source only: the shared whole-blob delivered-byte counter every lane
     // folds its own leg deltas into, so the bar reads ONE monotonic position
     // across interleaved lanes rather than each lane's divergent local

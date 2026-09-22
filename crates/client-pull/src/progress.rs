@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
@@ -167,6 +167,47 @@ impl ThroughputFloor {
     }
 }
 
+/// Resolve once the bytes counted in `counter` stay below `floor_bps` across a
+/// trailing `window`, the same floor a single pull's stream is held to.
+///
+/// A per-stream floor judges one stream; a fetch that opens many short legs
+/// makes each of them briefly healthy while the wait between them belongs to no
+/// stream, so the fetch as a whole can crawl without any stream stalling
+/// (#2120). This watches a fetch's whole progress instead: `counter` is its
+/// delivered position across every leg, and the wall clock runs through the
+/// gaps between legs. The first `window` is grace, as for a stream.
+///
+/// While `paused` is set the clock does not run: a fetch waiting on its own
+/// on-chain top-up is not stalled by its provider. The caller sets it before
+/// the wait and clears it once bytes flow again. A `window` of zero never
+/// resolves.
+pub async fn throughput_watchdog(
+    counter: Arc<AtomicU64>,
+    window: Duration,
+    floor_bps: u64,
+    paused: &AtomicBool,
+) {
+    if window.is_zero() {
+        return std::future::pending().await;
+    }
+    let mut floor =
+        ThroughputFloor::new(FloorConfig { window, floor_bps }, counter, Instant::now());
+    let mut sampler = tokio::time::interval(crate::stall_sample_period(window));
+    sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        sampler.tick().await;
+        let now = Instant::now();
+        if paused.load(Ordering::Acquire) {
+            floor.pause(now);
+            continue;
+        }
+        floor.resume(now);
+        if floor.evaluate(now) == FloorVerdict::Stalled {
+            return;
+        }
+    }
+}
+
 /// Bytes that must cross the window to clear the floor: `floor_bps · window`, never below
 /// one byte so `floor_bps == 0` still catches a full wedge.
 fn required_bytes(window: Duration, floor_bps: u64) -> u64 {
@@ -220,6 +261,64 @@ mod floor_tests {
             verdict = f.evaluate(t0 + Duration::from_secs(s));
         }
         assert_eq!(verdict, FloorVerdict::Stalled);
+    }
+
+    /// The watchdog resolves once a counter stays flat across a window after
+    /// its grace, and not before.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_trips_on_a_flat_counter_after_one_window() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let paused = AtomicBool::new(false);
+        let started = Instant::now();
+        throughput_watchdog(Arc::clone(&counter), Duration::from_secs(20), 4096, &paused).await;
+        let took = started.elapsed();
+        assert!(took >= Duration::from_secs(20), "{took:?}");
+        assert!(took <= Duration::from_secs(25), "{took:?}");
+    }
+
+    /// A counter moving above the floor keeps the watchdog quiet; once it
+    /// stops, the watchdog resolves.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_stays_quiet_while_bytes_flow() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let paused = AtomicBool::new(false);
+        let feeder = Arc::clone(&counter);
+        let feed = async move {
+            for _ in 0..60 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                feeder.fetch_add(100 * 1024, Ordering::Relaxed);
+            }
+        };
+        let started = Instant::now();
+        tokio::join!(
+            throughput_watchdog(Arc::clone(&counter), Duration::from_secs(20), 4096, &paused),
+            feed,
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(80),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// While paused the watchdog never resolves; after the pause it needs a
+    /// flat window of its own.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_does_not_count_a_pause() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let paused = AtomicBool::new(true);
+        let dog = throughput_watchdog(Arc::clone(&counter), Duration::from_secs(20), 4096, &paused);
+        tokio::pin!(dog);
+        let during = tokio::time::timeout(Duration::from_mins(2), &mut dog).await;
+        assert!(during.is_err(), "no trip while paused");
+        paused.store(false, Ordering::Release);
+        let resumed = Instant::now();
+        dog.await;
+        assert!(
+            resumed.elapsed() >= Duration::from_secs(20),
+            "{:?}",
+            resumed.elapsed()
+        );
     }
 
     #[tokio::test(start_paused = true)]

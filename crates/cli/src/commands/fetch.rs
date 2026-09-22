@@ -43,7 +43,7 @@ use decdn_client_pull::buyer_pool::{
 };
 use decdn_client_pull::driver::{DriveConfig, drive, drive_range_set, first_leg};
 use decdn_client_pull::sink::PullReader;
-use decdn_client_pull::source::{BlobSource as _, Funder, PrimedSource, SourceFuture};
+use decdn_client_pull::source::{BlobSource as _, Funder, IngestStore, PrimedSource, SourceFuture};
 use decdn_client_pull::{
     BudgetPacer, ClientRangedStore, Cumulative, DownloadTarget, Downloader, LaneHandle,
     LaneLedgers, NoCache, PeerSource, PoolContext, PoolExhausted, PoolLedger, ProgressCallback,
@@ -1972,6 +1972,143 @@ impl<P> FetchPrelude<'_, P> {
     }
 }
 
+/// How often a drive under watch logs its progress at `-v`.
+const ENTRY_RATE_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A drive that stayed below the throughput floor across a whole window,
+/// counted over every leg and the gaps between them (#2120).
+///
+/// A per-stream floor cannot see this: each short leg is briefly healthy, and
+/// the wait between legs belongs to no stream. It is a property of the
+/// provider serving the drive, so it fails over like a stall.
+#[derive(Debug)]
+pub(crate) struct EntryStalled {
+    window: Duration,
+    floor_bps: u64,
+    landed: u64,
+    total: u64,
+}
+
+impl std::fmt::Display for EntryStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "delivery stayed below {} B/s for {}s, counted across every leg ({} of {} bytes \
+             present)",
+            self.floor_bps,
+            self.window.as_secs(),
+            self.landed,
+            self.total,
+        )
+    }
+}
+
+impl std::error::Error for EntryStalled {}
+
+/// Whether `err` is a drive-level [`EntryStalled`].
+fn is_entry_stall(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<EntryStalled>().is_some()
+}
+
+/// One drive's delivered position across all of its legs, for the drive-level
+/// throughput floor and its `-v` progress line.
+#[derive(Debug, Default)]
+struct EntryWatch {
+    /// The highest whole-blob position the drive has reported.
+    landed: Arc<std::sync::atomic::AtomicU64>,
+    /// Set while the drive waits on its own top-up: from the `topUp` until the
+    /// next byte lands, which also covers the wait for the node to see it.
+    paused: std::sync::atomic::AtomicBool,
+}
+
+impl EntryWatch {
+    /// Record a reported position. Progress past the last one ends a pause.
+    fn observe(&self, position: u64) {
+        use std::sync::atomic::Ordering;
+        if self.landed.fetch_max(position, Ordering::Relaxed) < position {
+            self.paused.store(false, Ordering::Release);
+        }
+    }
+
+    fn landed(&self) -> u64 {
+        self.landed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A [`Funder`] that pauses an [`EntryWatch`] for each top-up, so the time a
+/// drive spends escrowing more USDC is not read as the provider stalling.
+struct PausingFunder<'w, F> {
+    inner: &'w F,
+    paused: &'w std::sync::atomic::AtomicBool,
+}
+
+impl<F: Funder> Funder for PausingFunder<'_, F> {
+    fn max_topups(&self) -> u32 {
+        self.inner.max_topups()
+    }
+
+    fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
+        self.paused
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.inner.top_up(additional)
+    }
+}
+
+/// Run `drive` under the drive-level throughput floor (#2120): the same
+/// `--min-throughput-bps` over `--stall-timeout-ms` a single stream is held to,
+/// judged on `watch`'s position across every leg and the time between them.
+/// A drive that trips it ends with [`EntryStalled`], which fails over to the
+/// next provider. At `-v` it also logs the drive's position, rate and ETA every
+/// [`ENTRY_RATE_LOG_INTERVAL`].
+///
+/// The drive is dropped when the floor trips, so its own final flush of the
+/// present record does not run; the caller flushes before persisting its
+/// watermark.
+async fn watched_drive(
+    deadlines: PullDeadlines,
+    hash: [u8; 32],
+    total: u64,
+    watch: &EntryWatch,
+    drive: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + '_>>,
+) -> anyhow::Result<()> {
+    let log = async {
+        let mut tick = tokio::time::interval(ENTRY_RATE_LOG_INTERVAL);
+        tick.tick().await;
+        let mut speed = SpeedState::default();
+        speed.observe(Instant::now(), watch.landed());
+        loop {
+            tick.tick().await;
+            let landed = watch.landed();
+            let bps = speed.observe(Instant::now(), landed);
+            tracing::info!(
+                "{}: {} of {} ({}, {})",
+                blake3::Hash::from_bytes(hash).to_hex(),
+                indicatif::HumanBytes(landed),
+                indicatif::HumanBytes(total),
+                fmt_rate(bps),
+                fmt_eta(total.saturating_sub(landed), bps),
+            );
+        }
+    };
+    let floor = decdn_client_pull::throughput_watchdog(
+        Arc::clone(&watch.landed),
+        deadlines.window(),
+        deadlines.floor_bps(),
+        &watch.paused,
+    );
+    tokio::select! {
+        biased;
+        driven = drive => driven,
+        () = floor => Err(anyhow::Error::new(EntryStalled {
+            window: deadlines.window(),
+            floor_bps: deadlines.floor_bps(),
+            landed: watch.landed(),
+            total,
+        })),
+        () = log => Err(anyhow::anyhow!("the progress log ended")),
+    }
+}
+
 /// What a [`FetchPrelude`] opens before its drive, and so how it learns the
 /// blob's size.
 #[derive(Clone, Copy, Debug)]
@@ -2222,29 +2359,50 @@ where
     )
     .await?;
     let pool = prelude.pool();
+    let watch = EntryWatch::default();
+    let watched = |position: u64, total: u64| {
+        watch.observe(position);
+        if let Some(cb) = progress {
+            cb(position, total);
+        }
+    };
+    let funder = PausingFunder {
+        inner: &prelude.funder,
+        paused: &watch.paused,
+    };
 
     // The gap-driven fetch: `drive` pulls ONLY `missing_ranges(0, 0)` — the whole
     // blob on a fresh fetch, just the gap on a resume — into the ranged store,
     // which bao-verifies every byte on `ingest_stream` and promotes the `.partial`
     // to `output` on `finalize`.
-    let drive_result = drive(
-        &prelude.ranged_store,
-        &prelude.peer_source,
-        &prelude.pacer,
-        &prelude.funder,
-        &prelude.ctx,
-        &prelude.ledger,
+    let drive_result = watched_drive(
+        deps.deadlines,
         hash,
-        0,
-        0,
-        &prelude.drive_config,
-        progress,
-        None, // pacing_wait: BudgetPacer never returns PaceDecision::Wait
-        None, // served_paid: no downstream leg on the client path
-        pool.as_ref(),
+        prelude.total_bytes,
+        &watch,
+        Box::pin(drive(
+            &prelude.ranged_store,
+            &prelude.peer_source,
+            &prelude.pacer,
+            &funder,
+            &prelude.ctx,
+            &prelude.ledger,
+            hash,
+            0,
+            0,
+            &prelude.drive_config,
+            Some(&watched),
+            None, // pacing_wait: BudgetPacer never returns PaceDecision::Wait
+            None, // served_paid: no downstream leg on the client path
+            pool.as_ref(),
+        )),
     )
     .await;
     prelude.peer_source.clear();
+    if drive_result.as_ref().is_err_and(is_entry_stall) {
+        // The dropped drive skipped its own final flush.
+        let _ = IngestStore::flush_present_record(&prelude.ranged_store).await;
+    }
     // The handshake succeeded (the sample above is real) but delivery itself
     // failed — still a failure of this source for selection purposes, so stamp
     // it. This runs AFTER the handshake's `record_sample`, so a failing body
@@ -2309,6 +2467,7 @@ pub(crate) struct RangeSession<'a, P> {
     store: &'a RedbBuyerPoolStore,
     lane: LaneKey,
     hash: [u8; 32],
+    deadlines: PullDeadlines,
 }
 
 impl<'a, P> RangeSession<'a, P>
@@ -2365,16 +2524,19 @@ where
             store: deps.store,
             lane,
             hash,
+            deadlines: deps.deadlines,
         })
     }
 
     /// Fill `ranges` of the blob, up to `concurrency` gaps at a time, then
-    /// persist the lane's watermark.
+    /// persist the lane's watermark. The drive runs under the drive-level
+    /// throughput floor ([`watched_drive`]), because its many short legs each
+    /// clear the per-stream floor however slowly the drive as a whole advances.
     ///
     /// # Errors
     ///
     /// The first failed gap's fault (see [`drive_range_set`]), annotated for an
-    /// unbound or underfunded cache miss.
+    /// unbound or underfunded cache miss, or [`EntryStalled`].
     pub(crate) async fn drive(
         &self,
         ranges: &[(u64, u64)],
@@ -2383,22 +2545,43 @@ where
     ) -> anyhow::Result<()> {
         let prelude = &self.prelude;
         let pool = prelude.pool();
-        let driven = drive_range_set(
-            &prelude.ranged_store,
-            &prelude.peer_source,
-            &prelude.pacer,
-            &prelude.funder,
-            &prelude.ctx,
-            &prelude.ledger,
+        let watch = EntryWatch::default();
+        let watched = |position: u64, total: u64| {
+            watch.observe(position);
+            if let Some(cb) = progress {
+                cb(position, total);
+            }
+        };
+        let funder = PausingFunder {
+            inner: &prelude.funder,
+            paused: &watch.paused,
+        };
+        let driven = watched_drive(
+            self.deadlines,
             self.hash,
-            ranges,
-            concurrency,
-            &prelude.drive_config,
-            progress,
-            pool.as_ref(),
+            prelude.total_bytes,
+            &watch,
+            Box::pin(drive_range_set(
+                &prelude.ranged_store,
+                &prelude.peer_source,
+                &prelude.pacer,
+                &funder,
+                &prelude.ctx,
+                &prelude.ledger,
+                self.hash,
+                ranges,
+                concurrency,
+                &prelude.drive_config,
+                Some(&watched),
+                pool.as_ref(),
+            )),
         )
         .await;
         prelude.peer_source.clear();
+        if driven.as_ref().is_err_and(is_entry_stall) {
+            // The dropped drive skipped its own final flush.
+            let _ = IngestStore::flush_present_record(&prelude.ranged_store).await;
+        }
         let driven = driven.map_err(|err| {
             let _ = prelude
                 .peer_store
@@ -3394,7 +3577,7 @@ impl SpeedState {
     clippy::cast_precision_loss,
     reason = "byte counts stay far below f64's 2^53 exact-integer ceiling"
 )]
-const fn bytes_as_f64(n: u64) -> f64 {
+pub(crate) const fn bytes_as_f64(n: u64) -> f64 {
     n as f64
 }
 
@@ -5143,6 +5326,140 @@ mod tests {
     }
 
     /// ETA divides remaining bytes by the smoothed rate; below a usable rate it
+    /// The watch keeps the highest position it saw, and only forward progress
+    /// ends a top-up pause.
+    #[test]
+    fn entry_watch_keeps_the_highest_position_and_resumes_on_progress() {
+        use std::sync::atomic::Ordering;
+        let watch = EntryWatch::default();
+        watch.observe(100);
+        watch.paused.store(true, Ordering::Release);
+        watch.observe(50);
+        assert_eq!(watch.landed(), 100);
+        assert!(
+            watch.paused.load(Ordering::Acquire),
+            "no progress, still paused"
+        );
+        watch.observe(100);
+        assert!(
+            watch.paused.load(Ordering::Acquire),
+            "a repeat is not progress"
+        );
+        watch.observe(101);
+        assert_eq!(watch.landed(), 101);
+        assert!(!watch.paused.load(Ordering::Acquire));
+    }
+
+    /// A funder that records its top-ups and always credits them.
+    struct CountingFunder(std::sync::atomic::AtomicU32);
+
+    impl Funder for CountingFunder {
+        fn max_topups(&self) -> u32 {
+            7
+        }
+
+        fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move { Ok(DepositOutcome::Added(additional)) })
+        }
+    }
+
+    /// A top-up pauses the drive's floor and still reaches the real funder.
+    #[tokio::test]
+    async fn pausing_funder_pauses_the_watch_for_a_top_up() {
+        use std::sync::atomic::Ordering;
+        let watch = EntryWatch::default();
+        let inner = CountingFunder(std::sync::atomic::AtomicU32::new(0));
+        let funder = PausingFunder {
+            inner: &inner,
+            paused: &watch.paused,
+        };
+        assert_eq!(funder.max_topups(), 7);
+        let credited = funder.top_up(U256::from(5u8)).await.expect("top up");
+        assert!(matches!(credited, DepositOutcome::Added(_)));
+        assert_eq!(inner.0.load(Ordering::Relaxed), 1);
+        assert!(watch.paused.load(Ordering::Acquire));
+    }
+
+    fn floor_deadlines() -> PullDeadlines {
+        PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30), 4096)
+            .expect("valid deadlines")
+    }
+
+    /// A drive that stops delivering is ended by the drive-level floor after one
+    /// window, as a stall that fails over to the next provider (#2120).
+    #[tokio::test(start_paused = true)]
+    async fn watched_drive_ends_a_crawling_drive_as_a_stall() {
+        let watch = EntryWatch::default();
+        watch.observe(1000);
+        let started = tokio::time::Instant::now();
+        let err = watched_drive(
+            floor_deadlines(),
+            [7; 32],
+            1 << 20,
+            &watch,
+            Box::pin(std::future::pending()),
+        )
+        .await
+        .expect_err("the floor trips");
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_secs(30) && took <= Duration::from_secs(35),
+            "{took:?}"
+        );
+        assert!(is_entry_stall(&err));
+        assert_eq!(retry_disposition(&err), RetryDisposition::RetryElsewhere);
+        assert!(format!("{err}").contains("1000 of 1048576 bytes"), "{err}");
+    }
+
+    /// A drive that finishes returns its own result untouched.
+    #[tokio::test(start_paused = true)]
+    async fn watched_drive_returns_the_drive_result() {
+        let watch = EntryWatch::default();
+        watched_drive(
+            floor_deadlines(),
+            [7; 32],
+            1,
+            &watch,
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+        .expect("the drive's own Ok");
+        let err = watched_drive(
+            floor_deadlines(),
+            [7; 32],
+            1,
+            &watch,
+            Box::pin(async { Err(anyhow::anyhow!("its own error")) }),
+        )
+        .await
+        .expect_err("the drive's own error");
+        assert!(!is_entry_stall(&err));
+        assert_eq!(format!("{err}"), "its own error");
+    }
+
+    /// While a top-up has the watch paused, a drive that delivers nothing is not
+    /// a stall.
+    #[tokio::test(start_paused = true)]
+    async fn watched_drive_does_not_count_a_top_up() {
+        let watch = EntryWatch::default();
+        watch
+            .paused
+            .store(true, std::sync::atomic::Ordering::Release);
+        let driven = watched_drive(
+            floor_deadlines(),
+            [7; 32],
+            1,
+            &watch,
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_mins(2)).await;
+                Ok(())
+            }),
+        )
+        .await;
+        driven.expect("a paused drive outlives the window");
+    }
+
     /// reports `ETA --` rather than a divide-by-tiny blow-up, and a huge
     /// projection is clamped so `Duration::from_secs_f64` cannot overflow.
     #[test]

@@ -2247,8 +2247,28 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     ///
     /// On success the entry's chunks are registered into `index` so later entries
     /// can splice from this blob.
+    /// [`Self::pull_entry_untimed`], plus one `-v` line when the entry lands
+    /// with its size, the time the whole entry took, and its effective rate
+    /// (#2120).
     #[allow(clippy::too_many_arguments)]
     async fn pull_entry(
+        &self,
+        hash: [u8; 32],
+        hints: Option<&[Hint]>,
+        total: Option<u64>,
+        staging: &Path,
+        index: &ChunkIndex,
+        fetch_plan: &FetchPlan,
+        file: Option<&pull_progress::FileBar>,
+    ) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        self.pull_entry_untimed(hash, hints, total, staging, index, fetch_plan, file)
+            .await
+            .inspect(|()| log_entry_done(hash, staging, started.elapsed()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn pull_entry_untimed(
         &self,
         hash: [u8; 32],
         hints: Option<&[Hint]>,
@@ -2570,6 +2590,25 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
         GroupRun::done(outcomes)
     }
+}
+
+/// Log a finished entry's size, time and effective rate at `-v` (#2120), so a
+/// run's slow entries can be told from its fast ones. The time covers the whole
+/// entry: probing, every drive, any splice and the whole-file check.
+fn log_entry_done(hash: [u8; 32], staging: &Path, elapsed: std::time::Duration) {
+    let bytes = std::fs::metadata(staging).map_or(0, |m| m.len());
+    let secs = elapsed.as_secs_f64();
+    let rate = if secs > 0.0 {
+        fetch::fmt_rate(fetch::bytes_as_f64(bytes) / secs)
+    } else {
+        fetch::fmt_rate(0.0)
+    };
+    tracing::info!(
+        "bundle pull: {}: {} in {:.1}s ({rate})",
+        blake3::Hash::from_bytes(hash).to_hex(),
+        indicatif::HumanBytes(bytes),
+        secs,
+    );
 }
 
 /// The range-drive step [`reassemble_dedup`] performs against one entry: drive

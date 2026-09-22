@@ -825,6 +825,56 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: a range-dedup bundle entry pays its complement over one warm session,
+  concurrently (#2119).** An entry that shares most of its chunks with a sibling
+  pays for about one 16 KiB chunk group at each seam its donors cannot cover —
+  about 1,300 ranges for a 13.8 GB file. `bundle pull` paid them one at a time,
+  each on a new QUIC connection with its own handshake, so the complement took
+  close to an hour. The entry now opens one session per provider and reuses it
+  for every drive (the complement, a donor re-fetch, each deferred fallback, the
+  self-heal re-drive). The session keeps one connection open, redials it if it
+  closes, and fills the merged ranges up to `--max-lane-streams` at a time
+  through `decdn_client_pull::drive_range_set`.
+- **CLI: the fetch prelude's first open is the drive's first leg, not a
+  throwaway (#2063).** `decdn fetch` and `bundle pull` opened every entry once
+  to read its size, dropped that pull, and opened the same range again. The
+  node treats each open as real, so every cold entry cost a duplicate origin
+  draw and a delayed first byte. The prelude now opens exactly the range the
+  drive opens first (`decdn_client_pull::first_leg`) and parks it in a
+  `PrimedSource`, which hands it to that open. A range-dedup entry, whose size
+  the manifest gives, opens a bounded first leg instead of the whole blob. A
+  multi-source fetch still drops its size probe.
+- **CLI: a bundle entry that crawls fails over (#2120).** The throughput floor
+  (`--min-throughput-bps` over `--stall-timeout-ms`) judged one stream at a
+  time, and each short range leg is briefly healthy, so an entry could deliver
+  under 1 MB/s for 20 minutes with no stall and no failover. Every drive now
+  also runs under the same floor measured on the entry's own progress across all
+  of its legs and the waits between them, with the clock stopped while the entry
+  waits on its own top-up. A drive that trips it fails over like a stall. At
+  `-v`, a drive logs its progress, rate and ETA every 10 s, and each entry logs
+  its size, time and rate when it lands.
+- **CLI: failed bundle entries are retried, and a provider list that runs out
+  says so (#2118).** Each entry walked its candidates once, the last failure
+  logged no warning, and a provider that failed once never served the entry
+  again, so one transient fault could lose a large entry for the whole run. The
+  new `--entry-retries N` (default 2) re-runs each entry that failed with a
+  retryable error after the first pass, backing off 2 s, then 4 s, doubling to
+  a 30 s cap. Each round probes again and resumes from the entry's `.partial`,
+  so no byte is paid for twice. A pool exhaustion now fails over on the
+  range-dedup path as it already did on the whole-file path, the last failover
+  logs a warning, and the error of an entry that ran out of providers names how
+  many it tried. A retried entry's bar does not count its landed prefix into the
+  total bar twice. A range-dedup entry with nothing to pay for up front now
+  creates a real ranged store before it splices, so a later drive no longer
+  truncates the spliced bytes and pays for the whole blob again.
+- **CLI: an unreadable data dir no longer passes as a client's (#2086).**
+  `decdn_common::data_dir::daemon_marker` used `Path::exists`, which reads every
+  stat error as "absent", so a node data dir whose store files could not be
+  stat'd (a permission denial, a loop, a transient I/O fault) was classified as a
+  client's, and the guards that refuse to escrow, sweep or buy into a node's dir
+  let the command through. It now returns `io::Result` and treats only
+  `NotFound` as absent; the guards, `ChainAdoption::for_buy` and `pool list`
+  refuse or report the owner as unknown instead.
 - **Node: a cold multi-GB cache miss streams at bandwidth, not one round trip
   per chunk (#2061).** The two-leg serve-miss spine re-read the whole
   `{H}.obao4` outboard (blob / 256 bytes) from the origin on every draw, and

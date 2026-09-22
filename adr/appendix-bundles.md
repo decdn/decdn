@@ -270,7 +270,11 @@ as `decdn fetch`):
   [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1).
 - **Failover and retry.** Each entry tries its probed candidates in order. A
   retryable failure moves to the next candidate. A terminal failure stops
-  the entry. When the last candidate fails, the entry's error says that
+  the entry. A stall is a retryable failure. A stream stalls when it stays
+  below `--min-throughput-bps` for `--stall-timeout-ms`. A drive stalls when
+  its delivered bytes, counted across all of its legs and the waits between
+  them, stay below the same floor. The drive's clock stops while the entry
+  waits on its own top-up. When the last candidate fails, the entry's error says that
   every candidate failed. After the first pass over the bundle,
   `--entry-retries` (default 2) runs each entry that failed retryably again.
   Before each round the pull waits: 2 s, then double the last wait, to a
