@@ -221,7 +221,13 @@ where
         // a cache write failure never fails the delivered stream. The store is
         // left at `.partial` (a stream is not kept as a file), and reading its
         // fully-present content needs no finalize.
-        if let Ok(whole) = state.store.read(0, state.total).await {
+        //
+        // Only when the cache actually stores it: a `NoCache` (the `decdn fetch
+        // -o -` path) reports `caches() == false`, so a huge blob is never read
+        // whole into memory just to be dropped — the stream stays memory-bounded.
+        if cache.caches()
+            && let Ok(whole) = state.store.read(0, state.total).await
+        {
             let _ = cache.put(hash, 0, whole).await;
         }
     }
@@ -718,6 +724,53 @@ mod tests {
         anyhow::ensure!(
             blake3::hash(&got).as_bytes() == &root,
             "drained stream must be BLAKE3-identical to the root"
+        );
+        Ok(())
+    }
+
+    /// A sink that reports `caches() == false` is NEVER teed the whole blob on a
+    /// clean finish — the `Streamer` skips the whole-blob read (and the memory it
+    /// would cost) that only exists to populate a cache. This is what keeps a
+    /// `decdn fetch -o -` of a huge blob from spiking its whole size into RAM at
+    /// the end.
+    #[tokio::test]
+    async fn a_non_caching_sink_is_not_teed_the_whole_blob() -> anyhow::Result<()> {
+        #[derive(Default)]
+        struct PutSpy {
+            puts: std::sync::atomic::AtomicUsize,
+        }
+        impl BlobCache for PutSpy {
+            fn caches(&self) -> bool {
+                false
+            }
+            fn get(
+                &self,
+                _hash: [u8; 32],
+                _offset: u64,
+                _len: u64,
+            ) -> crate::SinkFuture<'_, Option<Bytes>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn put(
+                &self,
+                _hash: [u8; 32],
+                _offset: u64,
+                _bytes: Bytes,
+            ) -> crate::SinkFuture<'_, ()> {
+                self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let blob = payload(1_500_000);
+        let (source, ledger) = paying_source(blob.clone())?;
+        let spy = Arc::new(PutSpy::default());
+        let got = drain(source, ledger, spy.clone(), &PullConfig::default()).await?;
+
+        anyhow::ensure!(got == blob, "the stream still drains correctly");
+        anyhow::ensure!(
+            spy.puts.load(std::sync::atomic::Ordering::SeqCst) == 0,
+            "a non-caching sink must not be teed the whole blob"
         );
         Ok(())
     }
