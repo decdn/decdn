@@ -148,15 +148,20 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
     /// Persist the store's current in-memory present-range snapshot to its
     /// durable record. The single-writer flush point (spec §5.5): several
     /// `ingest_stream` calls can run concurrently on one store (the
-    /// multi-source scheduler), so the record is no longer written per
-    /// checkpoint — callers flush it explicitly instead. `drive` calls this
-    /// once after its gap loop, before `finalize`, so the single-source path
-    /// keeps its resume durability without per-checkpoint fsyncs.
+    /// multi-source scheduler), so no checkpoint writes the record — callers
+    /// flush it explicitly instead. `drive` calls this once after its gap loop,
+    /// before `finalize`, so the single-source path keeps its resume durability
+    /// without per-checkpoint fsyncs.
+    ///
+    /// The snapshot is taken when this is called; the returned future writes
+    /// it. An implementation that touches the disk does so off the runtime
+    /// workers, because the paid pulls that share the runtime pay from their
+    /// decode loops.
     ///
     /// # Errors
     ///
     /// Any I/O failure persisting the record.
-    fn flush_present_record(&self) -> std::io::Result<()>;
+    fn flush_present_record(&self) -> SourceFuture<'_, ()>;
 }
 
 /// The injected pool top-up seam. Wraps the deployment's funding path — the

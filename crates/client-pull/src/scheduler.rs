@@ -34,14 +34,20 @@
 //! A worker's `fill_gap` runs under a [`tokio::select!`] against a per-source
 //! `CancelHandle` and a progress-relative watchdog, so it can be interrupted
 //! mid-fetch. Because [`crate::ClientRangedStore::ingest_stream`] durably
-//! checkpoints verified groups as it streams, dropping the `fill_gap` future
-//! leaves the delivered+verified prefix in the store — [`RangedStore::missing_ranges`](decdn_bao_range::RangedStore::missing_ranges)
-//! then reports only the true remainder, so a cancel never loses or refetches a
-//! verified byte. Two triggers drive one cancellation mechanism:
+//! checkpoints verified groups every `INGEST_CHECKPOINT_BYTES` as it streams,
+//! dropping the `fill_gap` future keeps every checkpointed prefix in the store —
+//! [`RangedStore::missing_ranges`](decdn_bao_range::RangedStore::missing_ranges)
+//! then reports only the un-checkpointed remainder. A cancel re-fetches at most
+//! the unflushed batch plus a detached flush that lands after the requeue (less
+//! than two intervals), never a byte an earlier checkpoint made durable. Two
+//! triggers drive one cancellation mechanism:
 //!
 //! - **Steal.** When a freed worker steals a busy victim's tail `[mid, end)`,
-//!   `Work::pick` trims the victim's assignment to `[start, mid)` AND signals
-//!   the victim's `CancelHandle`. The victim stops fetching past `mid`,
+//!   `Work::pick` trims the victim's assignment to `[start, mid)`. Once the
+//!   stealer confirms the tail still has missing bytes, `Work::cancel_victim`
+//!   signals the victim's `CancelHandle`. A tail the victim has already
+//!   delivered is not a reason to cancel: the victim finishes its leg
+//!   normally. Otherwise the victim stops fetching past `mid`,
 //!   re-queues the still-missing part of its trimmed `[start, mid)` to
 //!   `pending`, and picks again — so the stolen tail is fetched (and paid for)
 //!   by exactly ONE source, not two. Without this the victim's already-running
@@ -141,12 +147,21 @@ impl<S> std::fmt::Debug for SourceLane<'_, S> {
     }
 }
 
+/// A range [`Work::pick`] handed to a worker. `victim` is set when the range is
+/// a stolen tail: the peer it was taken from and that peer's unit number
+/// ([`Work::units`]) at the steal, for [`Work::cancel_victim`].
+struct Picked {
+    range: AlignedRange,
+    victim: Option<(usize, u64)>,
+}
+
 /// Per-source interrupt: an edge-triggered wakeup ([`Notify`]) plus a `flag`
 /// that says the wakeup means "cancel", not a stale permit. The stealer sets
 /// `flag` and wakes the victim under the `Work` lock; the victim clears it on
 /// its next `Work::pick`, also under the lock, so the two never race.
 struct CancelHandle {
-    /// `true` once a steal has claimed this source's tail; the victim must stop.
+    /// `true` once a stealer confirms the tail it took from this source still
+    /// has missing bytes ([`Work::cancel_victim`]); the victim must stop.
     flag: AtomicBool,
     /// Wakes the victim's `cancelled` future so it re-reads `flag` promptly.
     notify: Notify,
@@ -214,9 +229,10 @@ where
 /// watchdog.
 ///
 /// `missing_bytes` progress is checkpoint-granular — it advances only every 4
-/// MiB `INGEST_CHECKPOINT_BYTES` interval — so `unit_deadline` must sit
-/// comfortably above `4 MiB / min-expected-throughput` to avoid falsely
-/// reassigning a healthy-but-slow source mid-checkpoint.
+/// MiB `INGEST_CHECKPOINT_BYTES` interval, when that batch's flush lands — so
+/// `unit_deadline` must sit comfortably above `4 MiB / min-expected-throughput`
+/// plus one flush's disk latency, to avoid falsely reassigning a
+/// healthy-but-slow source mid-checkpoint.
 async fn watchdog<St>(store: &St, start: u64, len: u64, deadline: Duration)
 where
     St: IngestStore,
@@ -316,9 +332,15 @@ struct Work {
     pending: VecDeque<AlignedRange>,
     /// Per-source current range, `None` when the source holds nothing.
     in_flight: Vec<Option<(u64, u64)>>,
-    /// Per-source interrupt handles, indexed like `in_flight`. A steal signals
-    /// `cancel[victim]`; the victim clears it on its next `pick`.
+    /// Per-source interrupt handles, indexed like `in_flight`.
+    /// [`Work::cancel_victim`] signals `cancel[victim]` after a steal; the
+    /// victim clears it on its next `pick`.
     cancel: Vec<Arc<CancelHandle>>,
+    /// Per-source count of units started, indexed like `in_flight`. Every
+    /// [`Work::pick`] by worker `i` bumps `units[i]`, so a number names one
+    /// unit. A steal only trims its victim's slot and never bumps it, so a
+    /// victim trimmed by two stealers is still on the same unit.
+    units: Vec<u64>,
     /// `alive[i]` is `false` once worker `i` has permanently left the set (see
     /// [`Work::retire`]) — never coming back to `pick` again, whether because
     /// it ran out of coverable work or because it faulted.
@@ -348,10 +370,12 @@ impl Work {
     /// dequeues, an entry it cannot serve — #1506); when none remain, steal
     /// the aligned second half of the largest COVERABLE range still in flight
     /// ([`steal_split`]), trimming the victim so no other freed worker can
-    /// re-steal the same tail. Records the choice in `in_flight[i]`. `Ok(None)`
-    /// means there is nothing this worker can start right now — it parks until
-    /// a peer changes the work state, and exits only once [`Work::all_idle`]
-    /// holds.
+    /// re-steal the same tail. Records the choice in `in_flight[i]`. A steal
+    /// does NOT cancel the victim here: the caller does that with
+    /// [`Work::cancel_victim`] once it knows the tail still has missing bytes.
+    /// `Ok(None)` means there is nothing this worker can start right now — it
+    /// parks until a peer changes the work state, and exits only once
+    /// [`Work::all_idle`] holds.
     ///
     /// # Errors
     ///
@@ -363,13 +387,17 @@ impl Work {
         i: usize,
         total_bytes: u64,
         coverage: &Coverage,
-    ) -> anyhow::Result<Option<AlignedRange>> {
+    ) -> anyhow::Result<Option<Picked>> {
         // This worker is starting a fresh unit: clear any cancel signal left from
         // a prior unit, under the lock, so a stale `notify_one` permit cannot
         // spuriously cancel the new unit (see `cancelled`).
         match self.cancel.get(i) {
             Some(handle) => handle.flag.store(false, Ordering::Release),
             None => anyhow::bail!("worker index {i} out of range for cancel handles"),
+        }
+        match self.units.get_mut(i) {
+            Some(unit) => *unit = unit.wrapping_add(1),
+            None => anyhow::bail!("worker index {i} out of range for unit counters"),
         }
         let coverable = self.pending.iter().position(|seg| {
             covers_byte_range(coverage, seg.fetch_start(), seg.fetch_len(), total_bytes)
@@ -379,7 +407,10 @@ impl Work {
             // in range; `VecDeque::remove` returns `Option`, never panics.
             if let Some(seg) = self.pending.remove(pos) {
                 *self.slot_mut(i)? = Some((seg.fetch_start(), seg.fetch_len()));
-                return Ok(Some(seg));
+                return Ok(Some(Picked {
+                    range: seg,
+                    victim: None,
+                }));
             }
         }
 
@@ -428,24 +459,39 @@ impl Work {
             *len = half.fetch_start() - *start;
             Some(victim)
         });
-        let Some(victim) = trimmed else {
+        let Some((victim, unit)) = trimmed.and_then(|v| Some((v, *self.units.get(v)?))) else {
             *self.slot_mut(i)? = None;
             return Ok(None);
         };
 
-        // Signal the victim to STOP fetching past the split. Its already-running
-        // `fill_gap` would otherwise fetch — and pay for — the tail this worker
-        // just took. Set the flag then wake it, both under the caller's `Work`
-        // lock, serialized against the victim's own `pick` reset above.
-        // `notify_one` stores a permit if the victim is not parked yet, so the
-        // signal is never lost.
+        *self.slot_mut(i)? = Some((half.fetch_start(), half.fetch_len()));
+        Ok(Some(Picked {
+            range: half,
+            victim: Some((victim, unit)),
+        }))
+    }
+
+    /// Signal a steal's victim to STOP fetching past the split. Its
+    /// already-running `fill_gap` would otherwise fetch — and pay for — the tail
+    /// the stealer took. The signal fires only while the victim still runs
+    /// `unit`, the unit the steal trimmed. A victim that has since finished,
+    /// faulted, or re-queued holds no slot or runs a later unit, and cancelling
+    /// that unit would be wrong. A second steal from the same victim trims its
+    /// slot again but leaves `unit` unchanged, so this cancel still fires. Set
+    /// the flag then wake it, both under the caller's `Work` lock, serialized
+    /// against the victim's own `pick` reset. `notify_one` stores a permit if
+    /// the victim is not parked yet, so the signal is never lost.
+    fn cancel_victim(&self, victim: usize, unit: u64) {
+        let same_unit = self.units.get(victim) == Some(&unit)
+            && self.in_flight.get(victim).is_some_and(Option::is_some);
+        if !same_unit {
+            tracing::debug!(victim, unit, "steal victim moved on; cancel skipped");
+            return;
+        }
         if let Some(handle) = self.cancel.get(victim) {
             handle.flag.store(true, Ordering::Release);
             handle.notify.notify_one();
         }
-
-        *self.slot_mut(i)? = Some((half.fetch_start(), half.fetch_len()));
-        Ok(Some(half))
     }
 
     /// Release worker `i`'s lane once its `fill_gap` returns, so a peer's steal
@@ -573,7 +619,8 @@ where
         anyhow::bail!("worker index {i} out of range for lane coverage");
     };
     // This worker's cancel handle, cloned once so `cancelled` can await it
-    // OUTSIDE the `Work` lock while a peer's `pick` signals it under the lock.
+    // OUTSIDE the `Work` lock while a peer's `Work::cancel_victim` signals it
+    // under the lock.
     let handle = {
         let w = work.lock().await;
         match w.cancel.get(i).map(Arc::clone) {
@@ -602,7 +649,7 @@ where
             let mut w = work.lock().await;
             w.pick(i, total_bytes, my_coverage)?
         };
-        let Some(range) = picked else {
+        let Some(Picked { range, victim }) = picked else {
             // Nothing to start right now. Exit only when no peer holds anything
             // and nothing is queued; otherwise park — a peer's range is still
             // draining toward a requeue or a splittable size.
@@ -632,6 +679,13 @@ where
             work.lock().await.clear(i)?;
             wake();
             continue;
+        }
+        // A stolen tail with missing bytes: stop the victim at the split so the
+        // tail is fetched and paid for once. A fully present tail skips this,
+        // so a victim that has already delivered its range reaches its own
+        // `finish` instead of being dropped just before it.
+        if let Some((v, unit)) = victim {
+            work.lock().await.cancel_victim(v, unit);
         }
 
         // Drive each still-missing gap OUTSIDE the lock, racing it against a steal
@@ -727,7 +781,8 @@ where
             // Stolen: re-queue the trimmed remainder and stay live. The
             // credit-window tail [paid_frontier, checkpointed_frontier) is NOT
             // re-billed here — resume is checkpoint-frontier via `missing_ranges`,
-            // a bounded (<= credit window + one 4 MiB INGEST_CHECKPOINT_BYTES),
+            // a bounded (<= credit window + two 4 MiB INGEST_CHECKPOINT_BYTES
+            // intervals: the dropped batch plus a flush still in flight),
             // client-favorable gap identical to the existing single-source
             // cross-invocation resume, deliberately NOT the single-source
             // same-leg re-bill contract.
@@ -861,7 +916,7 @@ where
     if gaps.is_empty() {
         // Already fully held: persist the present record and return (the caller
         // finalizes).
-        store.flush_present_record()?;
+        store.flush_present_record().await?;
         return Ok(());
     }
 
@@ -946,6 +1001,7 @@ where
             .map(|_| Arc::new(CancelHandle::new()))
             .collect(),
         alive: vec![true; lanes.len()],
+        units: vec![0; lanes.len()],
     });
     // Wakes workers parked because nothing was pickable, whenever a peer frees,
     // re-queues, or leaves the set.
@@ -1057,7 +1113,7 @@ where
     // off the per-checkpoint hot path. This runs on the FAILURE path too: the
     // bytes the fan-out did deliver are paid for, and dropping the record here
     // makes the next invocation re-fetch and re-pay for them.
-    let flushed = store.flush_present_record();
+    let flushed = store.flush_present_record().await;
     outcome?;
     flushed?;
 
@@ -1443,6 +1499,10 @@ mod tests {
     /// fix the client planner assigned one run per block and the scheduler split
     /// each run by holder count, opening `blocks × N` streams (here 3 × 3 = 9) for a
     /// blob that needs only N. Every holder still contributes.
+    ///
+    /// The check reads each holder's FIRST open, which is its seeded span: every
+    /// worker picks from `pending` before any worker can finish. Later opens are
+    /// tail steals and requeues, whose count depends on how the lanes interleave.
     #[tokio::test]
     async fn large_multi_block_gap_seeds_about_one_span_per_holder() -> anyhow::Result<()> {
         let total = 3 * DISCOVERY_BLOCK_BYTES;
@@ -1490,14 +1550,16 @@ mod tests {
             data,
             "assembled byte-identical across the fan-out"
         );
-        let opens =
-            src_a.opened_ranges().len() + src_b.opened_ranges().len() + src_c.opened_ranges().len();
-        // ~N = 3 spans, one per holder. The old `blocks × N` seeding opened 9. Allow
-        // a little slack for an opportunistic tail-steal, but stay well under 9.
-        assert!(
-            opens <= 6,
-            "fan-out seeds ~N contiguous spans, not blocks × N: {opens} opens across 3 holders"
-        );
+        // N = 3 spans of 64 MiB, one per holder. The old `blocks × N` seeding
+        // opened nine ~21 MiB pieces, so each holder's first open was one of those.
+        for (name, src) in [("a", &src_a), ("b", &src_b), ("c", &src_c)] {
+            let first = src.opened_ranges().first().copied();
+            assert!(
+                first.is_some_and(|(_, len)| len >= total / 4),
+                "fan-out seeds ~N contiguous spans, not blocks × N: holder {name}'s \
+                 first open is {first:?} of a {total}-byte blob"
+            );
+        }
         assert!(
             src_a.opened_bytes() > 0 && src_b.opened_bytes() > 0 && src_c.opened_bytes() > 0,
             "every holder contributes: a={} b={} c={}",
@@ -1923,6 +1985,7 @@ mod tests {
             in_flight: vec![None, None],
             cancel: vec![Arc::new(CancelHandle::new()), Arc::new(CancelHandle::new())],
             alive: vec![true, true],
+            units: vec![0, 0],
         };
 
         // Source 0 faults out. Its block-0 entry has no surviving coverer and must
@@ -1955,6 +2018,97 @@ mod tests {
         Ok(())
     }
 
+    /// A steal trims the victim but does not cancel it: the stealer cancels
+    /// only after it confirms the stolen tail still has missing bytes, and
+    /// only while the victim still runs the unit the steal trimmed. A second
+    /// steal from the same victim does not hide the first stealer's cancel,
+    /// and a victim that has moved on to a new unit keeps it.
+    #[tokio::test]
+    async fn steal_cancels_the_victim_only_through_cancel_victim() -> anyhow::Result<()> {
+        use std::collections::VecDeque;
+        use std::sync::atomic::Ordering;
+
+        use super::{CancelHandle, Work};
+
+        let total = DISCOVERY_BLOCK_BYTES;
+        let coverage = cov(1, &[0]);
+        let fresh_work = || Work {
+            pending: VecDeque::new(),
+            in_flight: vec![Some((0, total)), None, None],
+            cancel: (0..3).map(|_| Arc::new(CancelHandle::new())).collect(),
+            alive: vec![true, true, true],
+            units: vec![1, 0, 0],
+        };
+        let victim_flag = |w: &Work| {
+            w.cancel
+                .first()
+                .is_some_and(|h| h.flag.load(Ordering::Acquire))
+        };
+
+        // A single steal: `pick` trims but does not cancel; `cancel_victim` does.
+        let mut work = fresh_work();
+        let first = work
+            .pick(1, total, &coverage)?
+            .ok_or_else(|| anyhow::anyhow!("worker 1 must steal worker 0's tail"))?;
+        let (victim, unit) = first
+            .victim
+            .ok_or_else(|| anyhow::anyhow!("a steal must name its victim"))?;
+        assert_eq!(victim, 0);
+        assert_eq!(
+            work.in_flight.first().copied().flatten(),
+            Some((0, first.range.fetch_start()))
+        );
+        assert!(!victim_flag(&work), "pick alone must not cancel the victim");
+        work.cancel_victim(victim, unit);
+        assert!(
+            victim_flag(&work),
+            "the victim must be cancelled at the split"
+        );
+
+        // Two steals from one victim before the first stealer cancels: the
+        // second trim leaves the victim on the same unit, so the first
+        // stealer's cancel still fires even if the second stealer skips its own.
+        let mut work = fresh_work();
+        let first = work
+            .pick(1, total, &coverage)?
+            .ok_or_else(|| anyhow::anyhow!("worker 1 must steal"))?;
+        let (v1, u1) = first
+            .victim
+            .ok_or_else(|| anyhow::anyhow!("first steal names its victim"))?;
+        // A second stealer trims the victim again, to the first quarter.
+        *work.slot_mut(v1)? = Some((0, first.range.fetch_start() / 2));
+        work.cancel_victim(v1, u1);
+        assert!(
+            victim_flag(&work),
+            "a second trim must not hide the first stealer's cancel"
+        );
+
+        // The victim finished and started a new unit: a late cancel must not hit it.
+        let mut work = fresh_work();
+        let stolen = work
+            .pick(1, total, &coverage)?
+            .ok_or_else(|| anyhow::anyhow!("worker 1 must steal"))?;
+        let (victim, unit) = stolen
+            .victim
+            .ok_or_else(|| anyhow::anyhow!("a steal must name its victim"))?;
+        work.clear(victim)?;
+        work.pending
+            .push_back(decdn_bao_range::align_range(0, 1, total)?);
+        work.pick(victim, total, &coverage)?
+            .ok_or_else(|| anyhow::anyhow!("the victim must pick its new unit"))?;
+        work.cancel_victim(victim, unit);
+        assert!(
+            !victim_flag(&work),
+            "a victim on a new unit must not be cancelled"
+        );
+
+        // The victim finished and holds nothing: nothing to cancel.
+        work.clear(victim)?;
+        work.cancel_victim(victim, unit);
+        assert!(!victim_flag(&work), "an idle victim must not be cancelled");
+        Ok(())
+    }
+
     /// THE double-pay test: a fast source and an artificially slow one over a
     /// 64 MiB blob, arranged so a steal DEFINITELY fires (the slow source stalls
     /// before its first byte, so the fast source finishes its own segment and
@@ -1968,11 +2122,13 @@ mod tests {
         let ledger_fast = Arc::new(PoolLedger::new(Cumulative::default()));
         let ledger_slow = Arc::new(PoolLedger::new(Cumulative::default()));
         let src_fast = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_fast));
-        // Every leg the slow source opens stalls 200 ms before its first byte —
-        // long enough that the fast source (only cooperative yields) always
-        // finishes first and steals, deterministically forcing the steal path.
+        // Every leg the slow source opens stalls 1 s before its first byte —
+        // long enough that the fast source always finishes its 32 MiB first and
+        // steals, deterministically forcing the steal path. The fast leg yields
+        // while each 4 MiB checkpoint fsyncs, so the margin must cover eight
+        // fsyncs on a loaded machine.
         let src_slow = ScriptedSource::new(data.clone())?
-            .slow_to_start(Duration::from_millis(200))
+            .slow_to_start(Duration::from_secs(1))
             .paying(Arc::clone(&ledger_slow));
         let root = src_fast.root();
         let (store, dir) = fresh_store(root, total);
@@ -2112,6 +2268,16 @@ mod tests {
              {total_delivered} (slow_finish={}, stealer={}) for a {total}-byte blob",
             src_slow_finish.delivered_bytes(),
             src_stealer.delivered_bytes(),
+        );
+        // The stolen range was already present, so the steal must not cancel the
+        // victim: its leg reaches `finish` and bills its own lane. A cancel here
+        // would drop the victim inside the `finish` stall, leaving its ledger at
+        // zero although it delivered its whole segment.
+        let finish_committed = ledger_finish.committed();
+        assert!(
+            finish_committed.bytes > U256::ZERO,
+            "a victim whose tail is already present must finish and bill its leg: \
+             {finish_committed:?}"
         );
         Ok(())
     }
@@ -2530,9 +2696,14 @@ mod tests {
     /// sources would pay a second provider's bytes on
     /// the first provider's lane; here each lane's `committed().bytes` matches its
     /// OWN source's delivered wire, proving the lanes are separate.
+    ///
+    /// Each lane covers one discovery block of a two-block blob, so neither can
+    /// steal the other's range. The scripted double bills a leg only in
+    /// `finish`, so a leg a steal cancels would read as unpaid here and hide
+    /// which ledger the lane uses.
     #[tokio::test]
     async fn distinct_providers_each_pay_their_own_lane() -> anyhow::Result<()> {
-        let data = blob(64 * 1024 * 1024);
+        let data = blob(usize::try_from(2 * DISCOVERY_BLOCK_BYTES)?);
         let total = data.len() as u64;
         let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
         let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
@@ -2545,8 +2716,8 @@ mod tests {
 
         // Two DISTINCT on-chain providers — the operator spread `admit_sources`
         // produces. Each lane carries its own ctx (its own `provider`) and ledger.
-        let lane_a = lane(&src_a, Arc::clone(&ledger_a), 0xA1);
-        let lane_b = lane(&src_b, Arc::clone(&ledger_b), 0xB2);
+        let lane_a = lane_with_coverage(&src_a, Arc::clone(&ledger_a), 0xA1, cov(2, &[0]));
+        let lane_b = lane_with_coverage(&src_b, Arc::clone(&ledger_b), 0xB2, cov(2, &[1]));
         let provider_a = lane_a.ctx.lock().expect("ctx").provider;
         let provider_b = lane_b.ctx.lock().expect("ctx").provider;
         assert_ne!(
@@ -2971,8 +3142,8 @@ mod tests {
             Box::pin(async { Err(anyhow::anyhow!("unsupported on ScriptedMissing")) })
         }
 
-        fn flush_present_record(&self) -> std::io::Result<()> {
-            Ok(())
+        fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
         }
     }
 
