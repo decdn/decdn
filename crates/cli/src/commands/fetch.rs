@@ -2564,14 +2564,18 @@ where
     Ok(drained)
 }
 
-/// Build one payment lane per admitted candidate, then learn the blob's
-/// `total_bytes` from a header-only open — FAILING OVER across the lanes until
-/// one answers (the handshake signs no voucher, so it pays nothing). An
-/// unreachable or refusing first holder therefore does not sink the fetch when
-/// other candidates are healthy; a candidate refused only for OUR deposit
+/// Learn the blob's `total_bytes` from a header-only open, building one payment
+/// lane per admitted candidate in order and FAILING OVER to the next until one
+/// answers (the handshake signs no voucher, so it pays nothing). An unreachable
+/// or refusing first holder therefore does not sink the fetch when other
+/// candidates are healthy; a candidate refused only for OUR deposit
 /// (`InsufficientDeposit`) is not suppressed as a peer fault (mirrors
 /// `open_fetch_prelude`). Shared by the stdout stream, the file download, and
 /// `bundle pull`'s multi-source face paths.
+///
+/// Returns the lanes built so far — every candidate up to and including the
+/// one that answered, in `admitted` order — so a caller whose size gate then
+/// declines has built no lane past it. [`build_remaining_lanes`] builds the rest.
 ///
 /// `open_lock` serializes each lane's pool open-or-reuse against other fetches on
 /// the same on-chain pool (`bundle pull` passes its bundle-wide lock; a solo
@@ -2579,7 +2583,7 @@ where
 /// from the run's shared `LaneLedgers` so concurrent entries share one per-lane
 /// voucher watermark.
 #[allow(clippy::too_many_arguments)]
-async fn build_admitted_lanes_and_total<'a, P>(
+async fn probe_admitted_total<'a, P>(
     deps: &DriveFetchDeps<'a, P>,
     grant: Option<&CapabilityGrant>,
     signer: &Arc<PrivateKeySigner>,
@@ -2593,27 +2597,23 @@ async fn build_admitted_lanes_and_total<'a, P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let mut lanes = Vec::with_capacity(admitted.len());
-    for candidate in admitted {
-        lanes.push(
-            build_multi_lane(
-                deps,
-                grant,
-                signer,
-                voucher_dom,
-                candidate,
-                relays,
-                open_lock,
-                ledgers,
-            )
-            .await?,
-        );
-    }
     let peer_store = decdn_client_pull::PeerStore::open(&deps.chain.data_dir);
     let peer_store_cfg = decdn_client_pull::StoreConfig::default();
+    let mut lanes = Vec::with_capacity(admitted.len());
     let mut total_bytes = None;
     let mut last_probe_err = None;
-    for (lane, candidate) in lanes.iter().zip(admitted.iter()) {
+    for candidate in admitted {
+        let lane = build_multi_lane(
+            deps,
+            grant,
+            signer,
+            voucher_dom,
+            candidate,
+            relays,
+            open_lock,
+            ledgers,
+        )
+        .await?;
         let probe_target = multi_source_target(candidate, relays);
         let ctx = lane
             .ctx
@@ -2649,7 +2649,6 @@ where
                     &peer_store_cfg,
                 );
                 total_bytes = Some(header.total_bytes);
-                break;
             }
             Err(err) => {
                 if !decdn_client_pull::is_insufficient_deposit(&err) {
@@ -2661,6 +2660,10 @@ where
                 });
             }
         }
+        lanes.push(lane);
+        if total_bytes.is_some() {
+            break;
+        }
     }
     match total_bytes {
         Some(total_bytes) => Ok((lanes, total_bytes)),
@@ -2671,6 +2674,43 @@ where
             )
         })),
     }
+}
+
+/// Build a payment lane for every admitted candidate past the `lanes` that
+/// [`probe_admitted_total`] already built, keeping `admitted` order. Called only
+/// once the caller has decided to fan out, so a declined fetch builds no extra
+/// lane (no pool open-or-reuse, no `open_lock` turn).
+#[allow(clippy::too_many_arguments)]
+async fn build_remaining_lanes<'a, P>(
+    deps: &DriveFetchDeps<'a, P>,
+    grant: Option<&CapabilityGrant>,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_dom: &Eip712Domain,
+    admitted: &[NodeCandidate],
+    relays: &[RelayUrl],
+    open_lock: Option<&tokio::sync::Mutex<()>>,
+    ledgers: Option<&LaneLedgers>,
+    lanes: &mut Vec<MultiLane<'a>>,
+) -> anyhow::Result<()>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    for candidate in admitted.iter().skip(lanes.len()) {
+        lanes.push(
+            build_multi_lane(
+                deps,
+                grant,
+                signer,
+                voucher_dom,
+                candidate,
+                relays,
+                open_lock,
+                ledgers,
+            )
+            .await?,
+        );
+    }
+    Ok(())
 }
 
 /// Split each built [`MultiLane`] into the [`StreamCandidate`] a face owns (it
@@ -2724,8 +2764,8 @@ fn persist_face_watermarks(
 /// mid-stream fails over to another with no re-pull or re-pay. Returns the
 /// content bytes streamed.
 ///
-/// Progress draws on stderr and is suppressed when stdout is not a TTY, so a
-/// piped consumer sees clean bytes and no bar. Each lane's voucher watermark is
+/// Progress draws on stderr, only when stderr is a terminal; stdout carries
+/// nothing but the verified bytes. Each lane's voucher watermark is
 /// persisted after the stream, exactly as the file path does — the `Streamer`
 /// face does not persist, so this thin CLI layer does.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2756,7 +2796,7 @@ where
     }
 
     // A solo stdout stream has no shared pool lock or ledger registry.
-    let (lanes, total_bytes) = build_admitted_lanes_and_total(
+    let (mut lanes, total_bytes) = probe_admitted_total(
         deps,
         grant,
         signer,
@@ -2768,7 +2808,22 @@ where
         None,
     )
     .await?;
+    build_remaining_lanes(
+        deps,
+        grant,
+        signer,
+        voucher_dom,
+        &admitted,
+        relays,
+        None,
+        None,
+        &mut lanes,
+    )
+    .await?;
     let (stream_candidates, handles) = split_face_lanes(lanes, coverage_by_node, total_bytes);
+    // Keep the first lane's ctx to annotate an unbound-namespace cache miss on
+    // failure, as the file path does.
+    let first_ctx = stream_candidates.first().map(|c| Arc::clone(&c.ctx));
 
     let funder = CliFunder {
         contract: deps.contract,
@@ -2782,9 +2837,16 @@ where
     };
     let drive_config = DriveConfig::cli(deps.chain.working_deposit);
     // The user's `--max-sources` is the front lane cap; read-ahead stays the
-    // default (the outstanding-spend bound for an abandoned pipe).
+    // default (the outstanding-spend bound for an abandoned pipe). With the
+    // multi-source kill switch off, the stream holds one lane at a time and the
+    // other holders stay failover candidates only.
+    let lane_cap = if common.multi_source_enabled() {
+        common.max_sources.max(1)
+    } else {
+        1
+    };
     let pull_config = PullConfig {
-        streamer_lane_cap: common.max_sources.max(1),
+        streamer_lane_cap: lane_cap,
         ..PullConfig::new()
     };
 
@@ -2795,18 +2857,28 @@ where
         .map_err(|e| anyhow::anyhow!("open stream scratch dir: {e}"))?;
 
     let streamer = Streamer::new(stream_candidates, funder, drive_config, scratch.path());
-    let mut reader = streamer
+    let (mut reader, mut drive) = streamer
         .open(hash, total_bytes, &pull_config, Arc::new(NoCache))
         .await?;
 
-    // Progress on stderr, suppressed when stdout is not a TTY (a piped consumer
-    // gets clean verified bytes and no bar).
-    let bar = std::io::IsTerminal::is_terminal(&std::io::stdout()).then(delivery_progress);
+    // The bar draws on stderr, so it shows only when stderr is a terminal; stdout
+    // carries the verified bytes either way.
+    let bar = std::io::IsTerminal::is_terminal(&std::io::stderr()).then(delivery_progress);
     let on_progress: Option<&dyn Fn(u64, u64)> =
         bar.as_ref().map(|(_, cb, _)| cb as &dyn Fn(u64, u64));
 
+    // The drive runs beside the copy, not inside its reads: a blocked stdout
+    // must not stop an open paid leg from paying and draining. The read-ahead
+    // window bounds how far it runs ahead of the pipe.
     let mut stdout = tokio::io::stdout();
-    let copy_result = copy_verified(&mut reader, &mut stdout, total_bytes, on_progress).await;
+    let copy_result = drive
+        .alongside(copy_verified(
+            &mut reader,
+            &mut stdout,
+            total_bytes,
+            on_progress,
+        ))
+        .await;
 
     if let Some((bar, _, _)) = &bar {
         bar.finish_and_clear();
@@ -2815,7 +2887,10 @@ where
     // Persist every lane's watermark before surfacing a stream error.
     persist_face_watermarks(deps.store, deps.self_address, &handles);
 
-    copy_result
+    copy_result.map_err(|err| match first_ctx.as_ref().map(|c| c.lock()) {
+        Some(Ok(guard)) => annotate_unbound_cache_miss(err, &guard),
+        _ => err,
+    })
 }
 
 /// Fetch `hash` to `output` via the [`Downloader`] consumption face (#1848 4c) —
@@ -2907,7 +2982,7 @@ pub(crate) async fn multi_source_download<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let (lanes, total_bytes) = build_admitted_lanes_and_total(
+    let (mut lanes, total_bytes) = probe_admitted_total(
         deps,
         grant,
         signer,
@@ -2936,10 +3011,23 @@ where
         );
         return Ok(None);
     }
+    // The gate engaged: only now build the lanes past the one that answered.
+    build_remaining_lanes(
+        deps,
+        grant,
+        signer,
+        voucher_dom,
+        &admitted,
+        relays,
+        open_lock,
+        ledgers,
+        &mut lanes,
+    )
+    .await?;
 
     let (stream_candidates, handles) = split_face_lanes(lanes, coverage_by_node, total_bytes);
     // Keep the first lane's ctx to annotate an unbound-namespace cache miss on
-    // failure, the same context the inline multi-source path attached.
+    // failure.
     let first_ctx = stream_candidates.first().map(|c| Arc::clone(&c.ctx));
 
     let funder = CliFunder {
