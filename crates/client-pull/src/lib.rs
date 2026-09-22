@@ -96,6 +96,11 @@ mod scheduler;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
 /// (spec §5.3): no I/O, no async.
 mod segment;
+/// The `Streamer` consumption face (#1848 T6): stream one blob's verified,
+/// contiguous front to a consumer as it arrives, paced by consumption and bounded
+/// to one read-ahead window ahead of the read cursor. A fetch-like single-blob
+/// face over the same engine, with no chunk dedup.
+pub mod streamer;
 // Docs live in `sink.rs` as `//!`. Deliberately NOT documented here as well:
 // rustdoc resolves intra-doc links on a `mod` item in THIS file's scope, so the
 // module's own links (`content_paid_frontier`, …) would go unresolved
@@ -129,6 +134,7 @@ pub use retry::{RetryDisposition, retry_disposition};
 pub use scheduler::{MultiSourceConfig, SourceLane, multi_source_fetch};
 pub use sink::{BlobCache, ByteSink, NoCache, SinkFuture};
 pub use source::{BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource};
+pub use streamer::{Streamer, VerifiedReader};
 
 #[cfg(any(test, feature = "test-util"))]
 pub use sink::{MemoryBlobCache, VecByteSink};
