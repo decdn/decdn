@@ -56,6 +56,13 @@ impl WarmConnection {
     pub(crate) const fn connection(&self) -> &Connection {
         &self.conn
     }
+
+    /// Whether the connection has closed (a peer close, an idle timeout, a
+    /// transport fault). A closed connection opens no more streams, so a holder
+    /// that keeps one across many opens dials a fresh one in its place.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.conn.close_reason().is_some()
+    }
 }
 
 impl Drop for WarmConnection {

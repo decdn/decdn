@@ -325,7 +325,8 @@ fn decode_bao_range(
     Ok(slice.to_vec())
 }
 
-/// The CLI's throwaway handshake (`open_fetch_prelude`): a bound `(0, 0)` request,
+/// The CLI's header-only open ahead of a multi-source fetch
+/// (`probe_admitted_total`): a bound `(0, 0)` request,
 /// read the signed `StreamResponse` for `total_bytes`, then close the connection
 /// without paying or reading a byte. Returns the advertised total.
 async fn throwaway_open(
@@ -1385,7 +1386,7 @@ async fn bounded_unaligned_offset_own_origin_miss_streams_the_exact_bytes() -> a
     Ok(())
 }
 
-/// The CLI's real sequence on a cold miss: a throwaway `(0, 0)` open dropped as soon
+/// The CLI's multi-source sequence on a cold miss: a throwaway `(0, 0)` open dropped as soon
 /// as the header lands, then the real `(0, total)` open — against a MULTI-DRAW blob
 /// with a slow origin, so the throwaway's fill is still live when the real open
 /// arrives. Observed ordering: the real open's `serve_audit` parks on the store's

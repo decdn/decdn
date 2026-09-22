@@ -261,7 +261,11 @@ as `decdn fetch`):
   ledger keeps voucher issuance monotonic across concurrent streams on a
   lane. The serving node credits each stream's delivered bytes from the
   lane's one cumulative watermark, so a fast stream does not starve a slow
-  co-stream. Distinct lanes proceed in parallel. A blob that clears the
+  co-stream. Distinct lanes proceed in parallel. A range-dedup entry pays for
+  its ranges through one session per provider. The session opens one
+  connection and reuses it for every range of the entry. It fills up to
+  `--max-lane-streams` ranges at once, within the lane permits that are free.
+  A blob that clears the
   multi-source gate fans out to its admitted holders per
   [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1).
 - **Failover and retry.** Each entry tries its probed candidates in order. A

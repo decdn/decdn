@@ -35,19 +35,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
+use decdn_bao_range::align_range;
 use decdn_client_pull::buyer_pool::{
     LOW_WATER_DIVISOR, SELF_CAPABILITY_CAP, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
     grade_deposit_credit, issue_self_capability, open_pool, refill_amount, top_up,
     topped_up_effect,
 };
-use decdn_client_pull::driver::{DriveConfig, drive};
-use decdn_client_pull::source::{Funder, SourceFuture};
+use decdn_client_pull::driver::{DriveConfig, drive, drive_range_set, first_leg};
+use decdn_client_pull::sink::PullReader;
+use decdn_client_pull::source::{BlobSource as _, Funder, PrimedSource, SourceFuture};
 use decdn_client_pull::{
     BudgetPacer, ClientRangedStore, Cumulative, DownloadTarget, Downloader, LaneHandle,
     LaneLedgers, NoCache, PeerSource, PoolContext, PoolExhausted, PoolLedger, ProgressCallback,
     PullConfig, PullDeadlines, RetryDisposition, SharedPool, StreamCandidate, Streamer,
-    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, open_progressive_pull,
-    retry_disposition, sign_client_binding,
+    UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
+    open_progressive_pull, retry_disposition, sign_client_binding,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -1904,10 +1906,10 @@ type SpentFn<'a> = Box<dyn Fn() -> U256 + Send + Sync + 'a>;
 /// closes over.
 type CreditFn<'a> = Box<dyn Fn(U256) -> anyhow::Result<()> + Send + Sync + 'a>;
 
-/// Everything [`drive_fetch`] and [`drive_ranges`] need before they can call
-/// [`drive`]: the handshake-derived `total_bytes`, the opened
-/// [`ClientRangedStore`] beside the caller's file, and the payment plumbing
-/// (source/pacer/funder/ledger/ctx) both callers hand to `drive`.
+/// Everything [`drive_fetch`] and [`RangeSession`] need before they can drive:
+/// the blob's `total_bytes`, the opened [`ClientRangedStore`] beside the
+/// caller's file, and the payment plumbing (source/pacer/funder/ledger/ctx)
+/// both callers hand to the driver.
 ///
 /// Owns the pool-wide `spent`/`credit` closures and the per-fetch top-up
 /// counter [`SharedPool`] borrows from, so a caller builds its `Option<SharedPool>`
@@ -1921,7 +1923,9 @@ struct FetchPrelude<'a, P> {
     /// Opened (or resumed) beside the caller's file; `drive` ingests into this
     /// and — only once the WHOLE blob is present — finalizes it itself.
     ranged_store: ClientRangedStore,
-    peer_source: PeerSource<'a>,
+    /// The lane's source, holding the prelude's first pull until the drive's
+    /// first open takes it. Cleared once the drive returns.
+    peer_source: PrimedSource<PeerSource<'a>>,
     pacer: BudgetPacer,
     funder: CliFunder<'a, P>,
     /// Shared (`Arc<Mutex<_>>`) with the driver and source: the source clones
@@ -1968,11 +1972,39 @@ impl<P> FetchPrelude<'_, P> {
     }
 }
 
-/// Open the shared prelude both `drive_fetch` and `drive_ranges` need: learn
-/// `total_bytes` from a throwaway header-only handshake (paying nothing — no
-/// voucher is signed until the first paid interval), open the
+/// What a [`FetchPrelude`] opens before its drive, and so how it learns the
+/// blob's size.
+#[derive(Clone, Copy, Debug)]
+enum PreludeLeg<'r> {
+    /// The whole blob, size unknown (`decdn fetch`, a whole-file bundle entry):
+    /// open `[0, to end)` and read the signed `total_bytes` off the response.
+    WholeBlob,
+    /// A blob of known size whose drive fills `ranges` (a range-dedup bundle
+    /// entry, sized by its manifest): open exactly the drive's first leg, or
+    /// nothing when every byte of `ranges` is already present.
+    Known {
+        total: u64,
+        ranges: &'r [(u64, u64)],
+    },
+}
+
+/// Open the shared prelude both `drive_fetch` and [`RangeSession`] need: open
+/// the pull the drive starts with (see [`PreludeLeg`]), open the
 /// [`ClientRangedStore`] beside `entry_path`, and build the lane's
 /// source/pacer/funder/ledger/ctx.
+///
+/// The pull opened here is the drive's own first leg, not a throwaway (#2063).
+/// The node treats every open as real: it signs, claims a fill, and on a miss
+/// starts an origin draw, so an open that is only read for its header and then
+/// dropped costs a duplicate draw and delays the real one. The prelude opens
+/// the exact range the drive's first leg asks for ([`first_leg`]) and parks it in
+/// the [`PrimedSource`], which hands it to that first open. On a whole-blob
+/// resume the first gap is not the whole blob, so the pull opened to read the
+/// size is dropped instead, as the size must be known before the store can say
+/// what is missing. The caller clears the source once the drive returns.
+///
+/// `warm` keeps one connection to the provider for every open (#2119), for a
+/// caller that drives many small ranges.
 ///
 /// The store sits beside `entry_path`, keyed by its file name, so its
 /// eventually-promoted path IS `entry_path` (no post-finalize rename) and its
@@ -1980,12 +2012,12 @@ impl<P> FetchPrelude<'_, P> {
 /// `.partial.ranges` record resumes; only the still-missing bytes are ever
 /// re-pulled and no already-held byte is re-paid.
 ///
-/// This handshake is also the observed-TTFB boundary the peer store wants
-/// (#1906-series): a source that cannot even complete it is stamped as a
-/// failure, and one that does hands back a real stream-derived latency —
-/// best-effort in both directions (`let _ =`), never failing the fetch. The
-/// cache-miss annotation is applied here too, so an unbound or underfunded
-/// refusal is explained at this first contact.
+/// The first open is also the observed-TTFB boundary the peer store wants
+/// (#1906-series): a source that cannot complete it is stamped as a failure,
+/// and one that does hands back a real stream-derived latency — best-effort in
+/// both directions (`let _ =`), never failing the fetch. The cache-miss
+/// annotation is applied here too, so an unbound or underfunded refusal is
+/// explained at this first contact.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn open_fetch_prelude<'a, P>(
     deps: &DriveFetchDeps<'a, P>,
@@ -1996,6 +2028,8 @@ async fn open_fetch_prelude<'a, P>(
     hash: [u8; 32],
     entry_path: &Path,
     ledgers: Option<&'a LaneLedgers>,
+    first: PreludeLeg<'_>,
+    warm: bool,
 ) -> anyhow::Result<FetchPrelude<'a, P>>
 where
     P: alloy::providers::Provider + Clone,
@@ -2024,80 +2058,11 @@ where
     let peer_store = decdn_client_pull::PeerStore::open(&deps.chain.data_dir);
     let peer_store_cfg = decdn_client_pull::StoreConfig::default();
 
-    // Learn the whole-blob size before constructing the ranged store: the store is
-    // keyed on `(root, total_bytes)`, and the signed `StreamResponse` header is the
-    // authoritative source of `total_bytes`. This throwaway open is a handshake
-    // only — no voucher is signed until the first paid interval, so it pays nothing
-    // — and its pull is dropped immediately; `drive` re-opens exactly the gaps it
-    // needs. The cache-miss annotation is applied here too, so an unbound or
-    // underfunded refusal is still explained at this first contact.
-    let header_ctx = ctx
-        .lock()
-        .map_err(|_| anyhow::anyhow!("lane context lock poisoned"))?
-        .clone();
-    let (header, first_pull) = match open_progressive_pull(
-        deps.endpoint,
-        target.clone(),
-        &header_ctx,
-        Arc::clone(&ledger),
-        deps.slash_dom,
-        provider,
-        hash,
-        deps.namespace_id,
-        0,
-        micros_now(),
-        deps.max_blob_bytes,
-        deps.max_rate_per_mb,
-        deps.deadlines,
-        0,
-        // One long-lived runtime: this connection's driver outlives the fetch.
-        None,
-    )
-    .await
-    {
-        Ok(opened) => opened,
-        Err(err) => {
-            // An `InsufficientDeposit` refusal (option 2 / #2013) is OUR pool falling
-            // short of this node's floor `M`, not a fault of the peer — so it must not
-            // suppress the peer as a candidate. Every other open failure scores it.
-            if !decdn_client_pull::is_insufficient_deposit(&err) {
-                let _ = peer_store.record_failure(&node_id, now_secs_cli());
-            }
-            return Err(annotate_unbound_cache_miss(err, &header_ctx));
-        }
-    };
-    // The stream's own quoted rate supersedes any remembered probe rate — it is
-    // the authoritative figure this fetch is actually paying.
-    let _ = peer_store.record_sample(
-        &node_id,
-        header.ttfb_ms,
-        header.rate_per_mb,
-        now_secs_cli(),
-        &peer_store_cfg,
-    );
-    let total_bytes = header.total_bytes;
-    drop(first_pull);
-
-    let (store_dir, stem) = ranged_store_location(entry_path)?;
-    let ranged_store = ClientRangedStore::open_or_create(&store_dir, &stem, hash, total_bytes)
-        .map_err(|e| anyhow::anyhow!("open ranged store for {}: {e}", entry_path.display()))?;
-
-    let funder = CliFunder {
-        contract: deps.contract,
-        rpc: deps.rpc,
-        store: deps.store,
-        owner: deps.self_address,
-        pool_id,
-        token: deps.token,
-        payment_pool_addr: deps.chain.payment_pool,
-        max_approve: deps.chain.max_approve,
-    };
-
     // The context is already shared behind interior mutability (from
     // `lane_ledger`): the source clones it to open each gap's pull, and the
     // driver credits a mid-fetch top-up's new deposit through the same handle
     // so the next open sees it.
-    let peer_source = PeerSource::new(
+    let peer = PeerSource::new(
         deps.endpoint,
         target,
         Arc::clone(&ctx),
@@ -2109,6 +2074,82 @@ where
         deps.max_rate_per_mb,
         deps.deadlines,
     );
+    let peer_source = PrimedSource::new(if warm {
+        peer.with_warm_connection()
+    } else {
+        peer
+    });
+    let (store_dir, stem) = ranged_store_location(entry_path)?;
+    let open_store = |total_bytes: u64| {
+        ClientRangedStore::open_or_create(&store_dir, &stem, hash, total_bytes)
+            .map_err(|e| anyhow::anyhow!("open ranged store for {}: {e}", entry_path.display()))
+    };
+    // Score the first open: a refusal or fault stamps the peer (except an
+    // `InsufficientDeposit` refusal (option 2 / #2013), which is OUR pool falling
+    // short of this node's floor `M`, not a fault of the peer), and a success
+    // files its stream-derived latency and quoted rate — the authoritative figure
+    // this fetch is actually paying, superseding any remembered probe rate.
+    let scored = |opened: anyhow::Result<(UpstreamPullHeader, PullReader)>| match opened {
+        Ok((header, reader)) => {
+            let _ = peer_store.record_sample(
+                &node_id,
+                header.ttfb_ms,
+                header.rate_per_mb,
+                now_secs_cli(),
+                &peer_store_cfg,
+            );
+            Ok((header, reader))
+        }
+        Err(err) => {
+            if !decdn_client_pull::is_insufficient_deposit(&err) {
+                let _ = peer_store.record_failure(&node_id, now_secs_cli());
+            }
+            Err(match ctx.lock() {
+                Ok(guard) => annotate_unbound_cache_miss(err, &guard),
+                Err(_) => err,
+            })
+        }
+    };
+
+    let max_blob = peer_source.max_blob_size_bytes();
+    let (total_bytes, ranged_store) = match first {
+        PreludeLeg::WholeBlob => {
+            let (header, reader) = scored(peer_source.inner().open_whole(hash).await)?;
+            let total_bytes = header.total_bytes;
+            let ranged_store = open_store(total_bytes)?;
+            let whole = align_range(0, 0, total_bytes)?;
+            if first_leg(&ranged_store, &[(0, 0)], max_blob).await? == Some(whole.clone()) {
+                peer_source.prime(hash, whole, header, reader);
+            }
+            (total_bytes, ranged_store)
+        }
+        PreludeLeg::Known { total, ranges } => {
+            let ranged_store = open_store(total)?;
+            if let Some(leg) = first_leg(&ranged_store, ranges, max_blob).await? {
+                let (header, reader) = scored(peer_source.inner().open(hash, leg.clone()).await)?;
+                if header.total_bytes != total {
+                    anyhow::bail!(
+                        "provider {provider} reports {} bytes for {}, but the manifest says {total}",
+                        header.total_bytes,
+                        blake3::Hash::from_bytes(hash).to_hex(),
+                    );
+                }
+                peer_source.prime(hash, leg, header, reader);
+            }
+            (total, ranged_store)
+        }
+    };
+
+    let funder = CliFunder {
+        contract: deps.contract,
+        rpc: deps.rpc,
+        store: deps.store,
+        owner: deps.self_address,
+        pool_id,
+        token: deps.token,
+        payment_pool_addr: deps.chain.payment_pool,
+        max_approve: deps.chain.max_approve,
+    };
     let pacer = BudgetPacer::new();
     let drive_config = DriveConfig::cli(deps.chain.working_deposit);
 
@@ -2167,8 +2208,19 @@ where
         signer: deps.self_address,
         provider,
     };
-    let prelude =
-        open_fetch_prelude(deps, ctx, target, provider, pool_id, hash, output, ledgers).await?;
+    let prelude = open_fetch_prelude(
+        deps,
+        ctx,
+        target,
+        provider,
+        pool_id,
+        hash,
+        output,
+        ledgers,
+        PreludeLeg::WholeBlob,
+        false,
+    )
+    .await?;
     let pool = prelude.pool();
 
     // The gap-driven fetch: `drive` pulls ONLY `missing_ranges(0, 0)` — the whole
@@ -2192,6 +2244,7 @@ where
         pool.as_ref(),
     )
     .await;
+    prelude.peer_source.clear();
     // The handshake succeeded (the sample above is real) but delivery itself
     // failed — still a failure of this source for selection purposes, so stamp
     // it. This runs AFTER the handshake's `record_sample`, so a failing body
@@ -2235,101 +2288,150 @@ where
     Ok(prelude.total_bytes)
 }
 
-/// Fetch the given byte ranges of blob `hash` into the entry's `.partial`
-/// beside `staging`, opening the pool + store once. Each range is bao-verified
-/// against `hash`. Like [`drive`], this finalizes the blob — renaming
-/// `.partial` to `staging` — as soon as
-/// these ranges, together with whatever the store already held, cover the
-/// whole blob; otherwise `.partial` is left in place for the caller to keep
-/// splicing or to drive further. Returns the ranged store either way: the
-/// caller checks whether `staging` now exists to tell a finalized blob from
-/// one still open at `.partial`, and reads verified ranges from the returned
-/// store only in the latter case.
+/// One range-dedup entry's paid drives against one provider (#2119): the
+/// lane, the ranged store beside the entry's staging path, and one warm
+/// connection, opened once and reused by every drive of the entry — the
+/// pay-now complement, a donor re-fetch, each deferred fallback, and the
+/// self-heal re-drive.
 ///
-/// Reuses the same prelude [`drive_fetch`] opens (handshake, ranged store,
-/// source/pacer/funder/ledger/ctx) rather than re-deriving it. Like
-/// `drive_fetch`, it persists the lane's voucher watermark once, after its
-/// ranges are driven: on success at the committed cumulative, and on an
-/// ambiguous failure HIGH (`settlement`), so a failed or resumed range-dedup
-/// pull never re-pays a byte already bought. The `.partial` and its sidecars
-/// are left in place on error — the resume prefix a retry inherits.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn drive_ranges<P>(
-    deps: &DriveFetchDeps<'_, P>,
-    ctx: PoolContext,
-    target: EndpointAddr,
-    provider: Address,
-    pool_id: PoolId,
+/// Each drive fills its ranges concurrently ([`drive_range_set`]) and, like
+/// [`drive_fetch`], finalizes the blob — renaming `.partial` to the staging
+/// path — as soon as the store holds the whole of it; otherwise `.partial` is
+/// left in place for the caller to keep splicing or to drive further. Each
+/// drive persists the lane's voucher watermark once, after its ranges: on
+/// success at the committed cumulative, and on an ambiguous failure HIGH
+/// (`settlement`), so a failed or resumed range-dedup pull never re-pays a
+/// byte already bought. The `.partial` and its sidecars are left in place on
+/// error — the resume prefix a retry inherits. A session whose drive failed is
+/// not used again; the caller opens a new one against the next provider.
+pub(crate) struct RangeSession<'a, P> {
+    prelude: FetchPrelude<'a, P>,
+    store: &'a RedbBuyerPoolStore,
+    lane: LaneKey,
     hash: [u8; 32],
-    staging: &Path,
-    ranges: &[(u64, u64)],
-    ledgers: Option<&LaneLedgers>,
-    progress: Option<&ProgressCallback>,
-) -> anyhow::Result<ClientRangedStore>
+}
+
+impl<'a, P> RangeSession<'a, P>
 where
     P: alloy::providers::Provider + Clone,
 {
-    let lane = LaneKey {
-        pool_id,
-        signer: deps.self_address,
-        provider,
-    };
-    let prelude =
-        open_fetch_prelude(deps, ctx, target, provider, pool_id, hash, staging, ledgers).await?;
-    let pool = prelude.pool();
+    /// Open a session for `hash` (`total` bytes, from the manifest) against
+    /// `target`/`provider`, with its store beside `staging`. `first_ranges` are
+    /// the ranges the first [`drive`](Self::drive) will fill: the session opens
+    /// that drive's first leg now and hands it to the drive (#2063), and opens
+    /// nothing when every byte of them is already present.
+    ///
+    /// # Errors
+    ///
+    /// The first leg's open failing (annotated as [`drive_fetch`] annotates
+    /// it), a provider whose signed size disagrees with `total`, or the store
+    /// failing to open.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open(
+        deps: &DriveFetchDeps<'a, P>,
+        ctx: PoolContext,
+        target: EndpointAddr,
+        provider: Address,
+        pool_id: PoolId,
+        hash: [u8; 32],
+        staging: &Path,
+        total: u64,
+        first_ranges: &[(u64, u64)],
+        ledgers: Option<&'a LaneLedgers>,
+    ) -> anyhow::Result<Self> {
+        let lane = LaneKey {
+            pool_id,
+            signer: deps.self_address,
+            provider,
+        };
+        let prelude = open_fetch_prelude(
+            deps,
+            ctx,
+            target,
+            provider,
+            pool_id,
+            hash,
+            staging,
+            ledgers,
+            PreludeLeg::Known {
+                total,
+                ranges: first_ranges,
+            },
+            true,
+        )
+        .await?;
+        Ok(Self {
+            prelude,
+            store: deps.store,
+            lane,
+            hash,
+        })
+    }
 
-    // Drive every range, stopping at the first failure but recording it rather
-    // than returning immediately — the watermark below must be persisted whether
-    // the sequence succeeded or failed, exactly as `drive_fetch` does.
-    let mut drive_result: anyhow::Result<()> = Ok(());
-    for &(offset, len) in ranges {
-        let one = drive(
+    /// Fill `ranges` of the blob, up to `concurrency` gaps at a time, then
+    /// persist the lane's watermark.
+    ///
+    /// # Errors
+    ///
+    /// The first failed gap's fault (see [`drive_range_set`]), annotated for an
+    /// unbound or underfunded cache miss.
+    pub(crate) async fn drive(
+        &self,
+        ranges: &[(u64, u64)],
+        concurrency: std::num::NonZeroUsize,
+        progress: Option<&ProgressCallback>,
+    ) -> anyhow::Result<()> {
+        let prelude = &self.prelude;
+        let pool = prelude.pool();
+        let driven = drive_range_set(
             &prelude.ranged_store,
             &prelude.peer_source,
             &prelude.pacer,
             &prelude.funder,
             &prelude.ctx,
             &prelude.ledger,
-            hash,
-            offset,
-            len,
+            self.hash,
+            ranges,
+            concurrency,
             &prelude.drive_config,
             progress,
-            None, // pacing_wait: BudgetPacer never returns PaceDecision::Wait
-            None, // served_paid: no downstream leg on the client path
             pool.as_ref(),
         )
         .await;
-        if let Err(err) = one {
+        prelude.peer_source.clear();
+        let driven = driven.map_err(|err| {
             let _ = prelude
                 .peer_store
                 .record_failure(&prelude.node_id, now_secs_cli());
-            drive_result = Err(match prelude.ctx.lock() {
+            match prelude.ctx.lock() {
                 Ok(guard) => annotate_unbound_cache_miss(err, &guard),
                 Err(_) => err,
-            });
-            break;
-        }
+            }
+        });
+
+        // Persist the voucher watermark from the shared ledger, the same
+        // money-safe rule `drive_fetch` applies: the committed cumulative on
+        // success or an explicit voucher rejection, the armed settlement (HIGH)
+        // on any other failure so a reuse never re-signs a spent lane state.
+        // Take the rebase anchor before reading the totals: every read after it
+        // is at or above it.
+        let rebase_anchor = prelude.ledger.take_unsaved_rebase();
+        let vprogress = select_watermark(
+            &driven,
+            prelude.ledger.committed(),
+            prelude.ledger.settlement(),
+            prelude.prior_amount,
+            rebase_anchor,
+        );
+        persist_watermark(
+            self.store,
+            self.lane.signer,
+            self.lane.pool_id,
+            self.lane,
+            &vprogress,
+        );
+        driven
     }
-
-    // Persist the voucher watermark from the shared ledger, the same money-safe
-    // rule `drive_fetch` applies: the committed cumulative on success or an
-    // explicit voucher rejection, the armed settlement (HIGH) on any other
-    // failure so a reuse never re-signs a spent lane state.
-    // Take the rebase anchor before reading the totals: every read after it is
-    // at or above it.
-    let rebase_anchor = prelude.ledger.take_unsaved_rebase();
-    let vprogress = select_watermark(
-        &drive_result,
-        prelude.ledger.committed(),
-        prelude.ledger.settlement(),
-        prelude.prior_amount,
-        rebase_anchor,
-    );
-    persist_watermark(deps.store, deps.self_address, pool_id, lane, &vprogress);
-
-    drive_result?;
-    Ok(prelude.ranged_store)
 }
 
 /// One built payment lane for a multi-source fetch: the per-provider
@@ -2576,6 +2678,11 @@ where
 /// Returns the lanes built so far — every candidate up to and including the
 /// one that answered, in `admitted` order — so a caller whose size gate then
 /// declines has built no lane past it. [`build_remaining_lanes`] builds the rest.
+///
+/// The open is dropped once its header is read, unlike the prelude of a
+/// single-source drive, which hands its first open to the drive (#2063). The
+/// multi-source scheduler's first unit is a segment of the blob, never the
+/// whole-blob range this open asks for, so no leg could adopt it.
 ///
 /// `open_lock` serializes each lane's pool open-or-reuse against other fetches on
 /// the same on-chain pool (`bundle pull` passes its bundle-wide lock; a solo

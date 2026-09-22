@@ -67,15 +67,17 @@
 //! through the same seam.
 
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::primitives::U256;
 use bao_tree::ChunkRanges;
-use decdn_bao_range::{CHUNK_GROUP_BYTES, align_range};
+use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, RangedStore, align_range};
 use decdn_incentive::DepositOutcome;
+use futures_util::StreamExt as _;
 
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
@@ -410,7 +412,7 @@ pub(crate) fn ranges_content_len(ranges: &ChunkRanges, total_bytes: u64) -> u64 
 ///    contiguous gaps. If none are missing, skip straight to the completion check.
 /// 2. For each gap, run a per-gap resume/pay loop: assemble a [`PaceState`] from
 ///    the ledger/ctx/store/header and let the [`Pacer`] choose `Draw` / `TopUp` /
-///    `Wait` / `Done` / `Refuse`. A `Draw` opens the gap's [`AlignedRange`](decdn_bao_range::AlignedRange) through the
+///    `Wait` / `Done` / `Refuse`. A `Draw` opens the gap's [`AlignedRange`] through the
 ///    [`BlobSource`], streams it into the store (which checkpoints durably), and
 ///    finishes the pull. A mid-gap fault re-enters with the checkpointed prefix
 ///    already held, so the re-open covers only the un-checkpointed tail.
@@ -530,6 +532,229 @@ where
     // renames the whole `.partial`, which it cannot do while bytes outside `R`
     // are still missing. A whole-blob `R` reaches this complete; a partial `R`
     // leaves the `.partial` in place for a later fetch to finish.
+    if store.is_complete().await? {
+        store.finalize().await?;
+    }
+    Ok(())
+}
+
+/// The aligned range one paid leg opens: the unpaid tail `[resume_start,
+/// gap_end)` of a gap, clamped to the `up_to_bytes` the pacer authorized.
+///
+/// The received-byte ceiling (#1895) caps the leg too, so the delivered frontier
+/// can pass `max_blob_size_bytes` by at most one chunk group, at which point
+/// [`fill_gap`]'s loop-top check aborts. Without this a [`crate::BudgetPacer`],
+/// which draws the whole gap remainder, would pull an entire oversized blob before
+/// that check ever runs. `resume_start` is always at or below the ceiling here (a
+/// `resume_start` past it means the loop-top check already aborted), so
+/// `cap_end - resume_start` is at least one chunk group and never collapses the
+/// length to the `0` ("to end") sentinel. `max_blob_size_bytes == 0` is unlimited.
+///
+/// The one computation both [`fill_gap`] and [`first_leg`] use, so a caller that
+/// opens the first leg ahead of the drive opens exactly the range the drive asks
+/// for.
+pub(crate) fn leg_range(
+    resume_start: u64,
+    gap_end: u64,
+    up_to_bytes: u64,
+    max_blob_size_bytes: u64,
+    total_bytes: u64,
+) -> anyhow::Result<AlignedRange> {
+    let draw_len = gap_end.saturating_sub(resume_start).min(up_to_bytes);
+    let draw_len = if max_blob_size_bytes > 0 {
+        let cap_end = max_blob_size_bytes.saturating_add(CHUNK_GROUP_BYTES);
+        draw_len.min(cap_end.saturating_sub(resume_start))
+    } else {
+        draw_len
+    };
+    Ok(align_range(resume_start, draw_len, total_bytes)?)
+}
+
+/// The missing gaps of every range in `ranges`, merged and in ascending order.
+/// Each range is `(offset, len)`, and `len == 0` means "to the end of the blob".
+/// Overlapping or adjacent ranges merge, so the gaps are disjoint.
+async fn range_set_gaps<St: RangedStore + ?Sized>(
+    store: &St,
+    ranges: &[(u64, u64)],
+) -> anyhow::Result<Vec<(u64, u64)>> {
+    let mut missing = ChunkRanges::empty();
+    for &(offset, len) in ranges {
+        missing |= store.missing_ranges(offset, len).await?;
+    }
+    Ok(contiguous_byte_ranges(&missing, store.total_bytes()))
+}
+
+/// The aligned range a drive of `ranges` over `store` opens first, or `None`
+/// when every byte of them is already present.
+///
+/// A caller that must open a pull before the drive starts (to read the signed
+/// `total_bytes`, or to learn whether the peer will serve) opens exactly this
+/// range and hands the live pull to the drive through a [`crate::PrimedSource`],
+/// so that first open does double duty instead of being thrown away (#2063).
+/// It is the range [`drive`] and [`drive_range_set`] open for their first gap
+/// on a lane with nothing paid yet, because both draw the whole unpaid gap with
+/// [`crate::BudgetPacer`]. `max_blob_size_bytes` is the source's received-byte
+/// ceiling ([`BlobSource::max_blob_size_bytes`]).
+///
+/// # Errors
+///
+/// A store query failure, or a range that does not align against the blob.
+pub async fn first_leg<St: RangedStore + ?Sized>(
+    store: &St,
+    ranges: &[(u64, u64)],
+    max_blob_size_bytes: u64,
+) -> anyhow::Result<Option<AlignedRange>> {
+    let gaps = range_set_gaps(store, ranges).await?;
+    let Some(&(start, len)) = gaps.first() else {
+        return Ok(None);
+    };
+    leg_range(
+        start,
+        start.saturating_add(len),
+        u64::MAX,
+        max_blob_size_bytes,
+        store.total_bytes(),
+    )
+    .map(Some)
+}
+
+/// Satisfy every range in `ranges` of blob `hash`, filling their gaps up to
+/// `concurrency` at a time (#2119). Each range is `(offset, len)`, and
+/// `len == 0` means "to the end of the blob".
+///
+/// A range-dedup entry pays for many small, scattered ranges: one chunk group
+/// at each boundary its donors cannot cover. One [`drive`] per range runs them
+/// strictly one after another, each with its own flush and completion check.
+/// This drives the whole set as one fetch instead: the missing gaps of every
+/// range are merged, so concurrent gaps never overlap, and they are filled
+/// through the one `source` (which can hold one warm connection for all of
+/// them) while one interval flush owns the present record.
+///
+/// Concurrent gaps need a [`SharedPool`]: the top-up budget and the spend are
+/// facts of the pool, and each concurrent gap keeps its own per-gap counters.
+/// With `pool == None` the gaps run one at a time over one set of counters,
+/// exactly as [`drive`] runs them.
+///
+/// After the first failed gap no new gap starts. The gaps already in flight
+/// finish, because each one pays as it lands and stopping it mid-leg buys
+/// nothing back. The first error is returned. As in [`drive`], whatever landed
+/// is flushed on the failure path too, and the blob is finalized only when the
+/// whole of it is present.
+///
+/// # Errors
+///
+/// The first gap's terminal fault (see [`drive`]), a flush failure, or a
+/// `finalize` failure.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_range_set<St, S, P, F>(
+    store: &St,
+    source: &S,
+    pacer: &P,
+    funder: &F,
+    ctx: &Arc<Mutex<PoolContext>>,
+    ledger: &Arc<PoolLedger>,
+    hash: [u8; 32],
+    ranges: &[(u64, u64)],
+    concurrency: NonZeroUsize,
+    config: &DriveConfig,
+    on_progress: Option<&ProgressCallback>,
+    pool: Option<&SharedPool<'_>>,
+) -> anyhow::Result<()>
+where
+    St: IngestStore,
+    S: BlobSource,
+    P: Pacer,
+    F: Funder,
+{
+    let total_bytes = store.total_bytes();
+    reject_empty_claim_for_nonempty_root(total_bytes, hash)?;
+    let base_present = ranges_content_len(&store.present_ranges().await?, total_bytes);
+    if let Some(cb) = on_progress {
+        cb(base_present, total_bytes);
+    }
+    let gaps = range_set_gaps(store, ranges).await?;
+    let width = if pool.is_some() { concurrency.get() } else { 1 };
+
+    let outcome = drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async {
+        if width == 1 {
+            let mut counters = DriveCounters::new();
+            for (gap_start, gap_len) in gaps {
+                fill_gap(
+                    store,
+                    source,
+                    pacer,
+                    funder,
+                    ctx,
+                    ledger,
+                    hash,
+                    gap_start,
+                    gap_len,
+                    total_bytes,
+                    config,
+                    &mut counters,
+                    on_progress,
+                    None,
+                    None,
+                    None,
+                    pool,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+        // Concurrent gaps fold their legs into one whole-blob position, seeded
+        // with what was already present, so the bar never runs backwards as
+        // legs interleave.
+        let delivered = AtomicU64::new(base_present);
+        let failed = AtomicBool::new(false);
+        let mut first_err: Option<anyhow::Error> = None;
+        let mut legs = futures_util::stream::iter(gaps)
+            .map(|(gap_start, gap_len)| {
+                let (delivered, failed) = (&delivered, &failed);
+                async move {
+                    if failed.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let mut counters = DriveCounters::new();
+                    let filled = fill_gap(
+                        store,
+                        source,
+                        pacer,
+                        funder,
+                        ctx,
+                        ledger,
+                        hash,
+                        gap_start,
+                        gap_len,
+                        total_bytes,
+                        config,
+                        &mut counters,
+                        on_progress,
+                        Some(delivered),
+                        None,
+                        None,
+                        pool,
+                    )
+                    .await;
+                    if filled.is_err() {
+                        failed.store(true, Ordering::Release);
+                    }
+                    filled
+                }
+            })
+            .buffer_unordered(width);
+        while let Some(filled) = legs.next().await {
+            if let Err(err) = filled {
+                first_err.get_or_insert(err);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    })
+    .await;
+
+    let flushed = store.flush_present_record().await;
+    outcome?;
+    flushed?;
     if store.is_complete().await? {
         store.finalize().await?;
     }
@@ -822,23 +1047,13 @@ where
                     return Ok(());
                 }
                 let resume_start = paid_frontier;
-                let draw_len = gap_end.saturating_sub(resume_start).min(up_to_bytes);
-                // Received-byte ceiling (#1895): cap this leg so the delivered
-                // frontier can exceed `max_blob_size_bytes` by at most one chunk
-                // group, at which point the loop-top check aborts. Without this a
-                // `BudgetPacer` (which draws the whole gap remainder) would pull an
-                // entire oversized blob before that check ever runs. `resume_start` is
-                // always at or below the ceiling here — a `resume_start` past it means
-                // the loop-top check already aborted — so `cap_end - resume_start` is
-                // at least one chunk group and never collapses `draw_len` to the `0`
-                // ("to end") sentinel. `0` = unlimited.
-                let draw_len = if max_blob_size_bytes > 0 {
-                    let cap_end = max_blob_size_bytes.saturating_add(CHUNK_GROUP_BYTES);
-                    draw_len.min(cap_end.saturating_sub(resume_start))
-                } else {
-                    draw_len
-                };
-                let aligned = align_range(resume_start, draw_len, total_bytes)?;
+                let aligned = leg_range(
+                    resume_start,
+                    gap_end,
+                    up_to_bytes,
+                    max_blob_size_bytes,
+                    total_bytes,
+                )?;
 
                 // Whole-blob content already present, so `ingest_stream`'s
                 // per-range progress can be offset into overall progress: the bar
@@ -1050,9 +1265,15 @@ mod tests {
     };
     use decdn_incentive::DepositOutcome;
 
-    use super::{DriveConfig, contiguous_byte_ranges, drive, ranges_content_len};
+    use std::num::NonZeroUsize;
+
+    use super::{
+        DriveConfig, SharedPool, contiguous_byte_ranges, drive, drive_range_set, first_leg,
+        ranges_content_len,
+    };
     use crate::ProgressCallback;
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState};
+    use crate::source::PrimedSource;
     use crate::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
     use crate::{
         ClientRangedStore, Cumulative, PoolContext, PoolLedger, UpstreamPullHeader,
@@ -1228,6 +1449,333 @@ mod tests {
             plaintext.as_slice(),
             "assembled bytes byte-exact"
         );
+    }
+
+    /// Drive `ranges` as one set over a fresh store at `concurrency`, with or
+    /// without a shared pool, and hand back the source and store to inspect.
+    async fn drive_set(
+        total: u64,
+        ranges: &[(u64, u64)],
+        concurrency: usize,
+        shared_pool: bool,
+        tweak: impl FnOnce(ScriptedSource) -> ScriptedSource,
+    ) -> (
+        anyhow::Result<()>,
+        ScriptedSource,
+        ClientRangedStore,
+        Vec<u8>,
+    ) {
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = tweak(
+            ScriptedSource::new(plaintext.clone())
+                .expect("source")
+                .paying(Arc::clone(&ledger)),
+        );
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+        let spent_ledger = Arc::clone(&ledger);
+        let spent = move || spent_ledger.committed().amount;
+        let credit = |_: U256| Ok(());
+        let topups = std::sync::atomic::AtomicU32::new(0);
+        let pool = SharedPool {
+            spent: &spent,
+            topups_used: &topups,
+            credit: &credit,
+        };
+        let result = drive_range_set(
+            &store,
+            &source,
+            &BudgetPacer::new(),
+            &healthy_funder(),
+            &ctx,
+            &ledger,
+            root,
+            ranges,
+            NonZeroUsize::new(concurrency).expect("non-zero"),
+            &config(),
+            None,
+            shared_pool.then_some(&pool),
+        )
+        .await;
+        (result, source, store, plaintext)
+    }
+
+    /// Every other group of a 64-group blob: 32 disjoint ranges.
+    fn scattered(total: u64) -> Vec<(u64, u64)> {
+        (0..total / GROUP)
+            .step_by(2)
+            .map(|g| (g * GROUP, GROUP))
+            .collect()
+    }
+
+    /// A range set runs its gaps concurrently, opens each gap once and only
+    /// its gap, and leaves a partial blob unfinalized; driving the rest then
+    /// finalizes it byte-exact (#2119).
+    #[tokio::test]
+    async fn a_range_set_fills_each_gap_once_and_concurrently() {
+        let total = 64 * GROUP;
+        let ranges = scattered(total);
+        let (result, source, store, plaintext) = drive_set(total, &ranges, 4, true, |s| s).await;
+        result.expect("drive the range set");
+
+        let mut opened = source.opened_ranges();
+        opened.sort_unstable();
+        assert_eq!(opened, ranges, "each range opened once, nothing else");
+        let peak = source.peak_in_flight();
+        assert!(
+            peak > 1 && peak <= 4,
+            "legs overlap up to the width: {peak}"
+        );
+        assert!(!store.is_complete().await.expect("is_complete"));
+        for &(off, len) in &ranges {
+            let got = store.read(off, len).await.expect("read range");
+            assert_eq!(got.as_ref(), &plaintext[off as usize..(off + len) as usize]);
+        }
+
+        // The rest of the blob as a second set completes and finalizes it.
+        let root = store.root();
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let rest = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        drive_range_set(
+            &store,
+            &rest,
+            &BudgetPacer::new(),
+            &healthy_funder(),
+            &Arc::new(Mutex::new(healthy_ctx())),
+            &ledger,
+            root,
+            &[(0, 0)],
+            NonZeroUsize::MIN,
+            &config(),
+            None,
+            None,
+        )
+        .await
+        .expect("drive the rest");
+        assert_eq!(rest.opened_ranges().len(), ranges.len(), "only the holes");
+        assert!(store.is_complete().await.expect("is_complete"));
+        let whole = store.read(0, 0).await.expect("read whole blob");
+        assert_eq!(whole.as_ref(), plaintext.as_slice());
+    }
+
+    /// Overlapping and adjacent ranges merge into one gap, so concurrent legs
+    /// never cover the same bytes.
+    #[tokio::test]
+    async fn overlapping_ranges_merge_into_one_gap() {
+        let total = 8 * GROUP;
+        let ranges = [
+            (0, GROUP),
+            (GROUP, GROUP),
+            (GROUP / 2, GROUP),
+            (4 * GROUP, GROUP),
+        ];
+        let (result, source, _store, _) = drive_set(total, &ranges, 4, true, |s| s).await;
+        result.expect("drive");
+        let mut opened = source.opened_ranges();
+        opened.sort_unstable();
+        assert_eq!(opened, vec![(0, 2 * GROUP), (4 * GROUP, GROUP)]);
+    }
+
+    /// Without a shared pool the top-up budget lives in one lane's counters, so
+    /// the set runs one gap at a time whatever width is asked for.
+    #[tokio::test]
+    async fn without_a_shared_pool_a_range_set_runs_serially() {
+        let total = 16 * GROUP;
+        let (result, source, _store, _) =
+            drive_set(total, &scattered(total), 4, false, |s| s).await;
+        result.expect("drive");
+        assert_eq!(source.peak_in_flight(), 1);
+    }
+
+    /// After the first failed gap no new gap opens; the first error returns.
+    #[tokio::test]
+    async fn a_failed_gap_stops_new_gaps_from_opening() {
+        let total = 32 * GROUP;
+        let (result, source, _store, _) = drive_set(total, &scattered(total), 2, true, |s| {
+            s.with_fault_after(64, || anyhow::anyhow!("scripted reset"))
+        })
+        .await;
+        let err = result.expect_err("every leg faults");
+        assert!(format!("{err:#}").contains("scripted reset"), "{err:#}");
+        assert_eq!(
+            source.opened_ranges().len(),
+            2,
+            "only the two legs already in flight opened"
+        );
+    }
+
+    /// `first_leg` is exactly the range the drive opens first, both on a fresh
+    /// blob and on a resume, so a primed pull of it is adopted (#2063).
+    #[tokio::test]
+    async fn first_leg_is_the_range_the_drive_opens_first() {
+        let total = 4 * GROUP;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        let fresh = fresh_store(root, total);
+        assert_eq!(
+            first_leg(&fresh, &[(0, 0)], 0).await.expect("first leg"),
+            Some(align_range(0, 0, total).expect("align")),
+            "a fresh whole-blob drive opens the whole blob"
+        );
+
+        let resumed = fresh_store(root, total);
+        preadmit(
+            &resumed,
+            &plaintext,
+            &outboard,
+            &align_range(0, GROUP, total).expect("align"),
+        )
+        .await;
+        let want = first_leg(&resumed, &[(0, 0)], 0)
+            .await
+            .expect("first leg")
+            .expect("a gap remains");
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        drive(
+            &resumed,
+            &source,
+            &BudgetPacer::new(),
+            &healthy_funder(),
+            &Arc::new(Mutex::new(healthy_ctx())),
+            &ledger,
+            root,
+            0,
+            0,
+            &config(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("drive");
+        assert_eq!(
+            source.opened_ranges().first().copied(),
+            Some((want.fetch_start(), want.fetch_len()))
+        );
+
+        // The received-byte ceiling caps the first leg exactly as it caps a
+        // drawn leg: one chunk group past the ceiling.
+        assert_eq!(
+            first_leg(&fresh, &[(0, 0)], GROUP)
+                .await
+                .expect("first leg"),
+            Some(align_range(0, 2 * GROUP, total).expect("align"))
+        );
+        let full = fresh_store(root, total);
+        preadmit(
+            &full,
+            &plaintext,
+            &outboard,
+            &align_range(0, 0, total).expect("align"),
+        )
+        .await;
+        assert_eq!(
+            first_leg(&full, &[(0, 0)], 0).await.expect("first leg"),
+            None
+        );
+    }
+
+    /// A primed pull of the first leg is adopted, so the drive opens nothing
+    /// itself (#2063).
+    #[tokio::test]
+    async fn a_primed_first_leg_is_adopted_not_reopened() {
+        let total = 4 * GROUP;
+        let (root, plaintext, _) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let primed = PrimedSource::new(
+            ScriptedSource::new(plaintext.clone())
+                .expect("source")
+                .paying(Arc::clone(&ledger)),
+        );
+        let range = align_range(0, 0, total).expect("align");
+        let (header, reader) = primed
+            .inner()
+            .open(root, range.clone())
+            .await
+            .expect("priming open");
+        primed.prime(root, range, header, reader);
+
+        drive(
+            &store,
+            &primed,
+            &BudgetPacer::new(),
+            &healthy_funder(),
+            &Arc::new(Mutex::new(healthy_ctx())),
+            &ledger,
+            root,
+            0,
+            0,
+            &config(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("drive");
+        assert_eq!(
+            primed.inner().opened_ranges(),
+            vec![(0, total)],
+            "only the priming open ever reached the source"
+        );
+        assert_eq!(
+            store.read(0, 0).await.expect("read").as_ref(),
+            plaintext.as_slice()
+        );
+    }
+
+    /// An open of another range goes to the wrapped source and leaves the
+    /// primed pull parked; `clear` drops it; a stale one is never adopted.
+    #[tokio::test(start_paused = true)]
+    async fn a_primed_pull_answers_only_its_own_fresh_range() {
+        let total = 4 * GROUP;
+        let (root, plaintext, _) = synth_blob(total as usize);
+        let primed = PrimedSource::new(ScriptedSource::new(plaintext).expect("source"));
+        let first = align_range(0, GROUP, total).expect("align");
+        let other = align_range(GROUP, GROUP, total).expect("align");
+        let prime = |range: AlignedRange| {
+            let primed = &primed;
+            async move {
+                let (h, r) = primed
+                    .inner()
+                    .open(root, range.clone())
+                    .await
+                    .expect("open");
+                primed.prime(root, range, h, r);
+            }
+        };
+
+        prime(first.clone()).await;
+        primed.open(root, other.clone()).await.expect("other range");
+        assert_eq!(primed.inner().opened_ranges().len(), 2, "delegated");
+        primed.open(root, first.clone()).await.expect("adopted");
+        assert_eq!(
+            primed.inner().opened_ranges().len(),
+            2,
+            "adopted, not opened"
+        );
+
+        prime(first.clone()).await;
+        primed.clear();
+        primed.open(root, first.clone()).await.expect("after clear");
+        assert_eq!(
+            primed.inner().opened_ranges().len(),
+            4,
+            "cleared, so opened"
+        );
+
+        prime(first.clone()).await;
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        primed.open(root, first).await.expect("stale");
+        assert_eq!(primed.inner().opened_ranges().len(), 6, "stale, so opened");
     }
 
     #[tokio::test]

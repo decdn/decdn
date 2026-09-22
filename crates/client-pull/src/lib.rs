@@ -120,7 +120,9 @@ pub use coverage_plan::{
 };
 pub use decdn_bao_range::RangedStore;
 pub use downloader::{DownloadTarget, Downloader};
-pub use driver::{PacingWait, PoolExhausted, SharedPool, WaitReason, drive};
+pub use driver::{
+    PacingWait, PoolExhausted, SharedPool, WaitReason, drive, drive_range_set, first_leg,
+};
 pub use ledger::{
     ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released, StreamProof,
 };
@@ -135,7 +137,9 @@ pub use rate_limited::{UpstreamRateLimited, rate_limit_shed};
 pub use retry::{RetryDisposition, retry_disposition};
 pub use scheduler::{ConsumptionPacing, MultiSourceConfig, SourceLane, multi_source_fetch};
 pub use sink::{BlobCache, ByteSink, NoCache, SinkFuture};
-pub use source::{BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource, SourceFuture};
+pub use source::{
+    BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource, PrimedSource, SourceFuture,
+};
 pub use streamer::{StreamCandidate, StreamDrive, Streamer, VerifiedReader};
 
 #[cfg(any(test, feature = "test-util"))]

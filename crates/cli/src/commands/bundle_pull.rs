@@ -125,6 +125,18 @@ impl RangeTargets {
             RangeTargets::Discovered(order) => order.iter().map(|c| c.eth_address).collect(),
         }
     }
+
+    /// Each candidate's dial target and registry dial hints, in failover order.
+    /// The pinned target has no hints: it is reached through `--addr`.
+    fn targets(&self) -> Vec<(FetchTarget, Vec<std::net::SocketAddr>)> {
+        match self {
+            RangeTargets::Pinned(pinned) => vec![(*pinned, Vec::new())],
+            RangeTargets::Discovered(order) => order
+                .iter()
+                .map(|c| ((c.node_id, c.eth_address), c.dial_addrs()))
+                .collect(),
+        }
+    }
 }
 
 /// Group manifest entries by their blob `hash`, preserving first-seen order both
@@ -1499,6 +1511,21 @@ impl LaneStreamCap {
             .map_err(|_| anyhow!("bundle pull lane-stream cap closed"))
     }
 
+    /// Up to `max` more stream permits for `provider`, taking only those free
+    /// right now. Never waits, so it cannot deadlock against a caller that holds
+    /// one permit set and waits for another; an entry that gets none drives with
+    /// the one permit it already holds.
+    async fn try_extra(
+        &self,
+        provider: Address,
+        max: usize,
+    ) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let sem = self.semaphore(provider).await;
+        std::iter::from_fn(|| Arc::clone(&sem).try_acquire_owned().ok())
+            .take(max)
+            .collect()
+    }
+
     /// Acquire one stream permit for every distinct provider in `providers`, in
     /// one global order (sorted, deduped `Address`), and return them held for the
     /// caller's whole fetch. Acquiring every multi-provider set in the same order
@@ -1803,7 +1830,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
     /// Build one entry's ready-to-drive [`PoolContext`] and dial target for
     /// `provider`, shared by the whole-blob ([`Self::fetch_to_staging_from`]) and
-    /// ranged ([`Self::drive_ranges_from`]) drive paths.
+    /// ranged ([`Self::open_range_session`]) drive paths.
     ///
     /// Delegated (`--capability`): every entry adopts the named pool + owner
     /// capability (no on-chain open). Self-owned: open-or-reuse the caller's pool
@@ -1925,30 +1952,28 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         }
     }
 
-    /// Drive the given byte `ranges` of `hash` directly from `node_id`/`provider`
-    /// into `staging`'s `.partial`, returning the ranged store. The ranged twin of
-    /// [`Self::fetch_to_staging_from`]: builds the same context and target, then calls
-    /// [`fetch::drive_ranges`] (which bao-verifies each range against `hash`,
-    /// finalizing `staging` if these ranges complete the whole blob (otherwise
-    /// leaving `.partial` for the caller's splice-and-promote), and persists the
-    /// lane's voucher watermark so a resume never re-pays).
-    async fn drive_ranges_from(
-        &self,
-        hash: [u8; 32],
+    /// Open a range-drive session for `hash` against `node_id`/`provider`, with
+    /// its store beside `staging` (#2119). The ranged twin of
+    /// [`Self::fetch_to_staging_from`]: it builds the same context and target,
+    /// then opens a [`fetch::RangeSession`] that every range drive of the entry
+    /// reuses while this provider serves it. `first_ranges` are the ranges the
+    /// session's first drive fills; the session opens that drive's first leg now.
+    #[allow(clippy::too_many_arguments)]
+    async fn open_range_session<'s>(
+        &'s self,
         fetch_target: FetchTarget,
         dial_addrs: &[std::net::SocketAddr],
+        hash: [u8; 32],
         staging: &Path,
-        ranges: &[(u64, u64)],
-        progress: Option<&ProgressCallback>,
-    ) -> anyhow::Result<ClientRangedStore> {
+        total: u64,
+        first_ranges: &[(u64, u64)],
+    ) -> anyhow::Result<fetch::RangeSession<'s, P>> {
         let provider = fetch_target.1;
         let (ctx, target) = self.build_pull_ctx(fetch_target, dial_addrs).await?;
-
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
         let pool_id = ctx.pool_id;
-
-        let result = fetch::drive_ranges(
+        fetch::RangeSession::open(
             &deps,
             ctx,
             target,
@@ -1956,16 +1981,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             pool_id,
             hash,
             staging,
-            ranges,
+            total,
+            first_ranges,
             Some(&self.ledgers),
-            progress,
         )
-        .await;
-        match (result, self.grant.is_some()) {
-            (Ok(store), _) => Ok(store),
-            (Err(err), true) => Err(fetch::annotate_delegated_exhaustion(err)),
-            (Err(err), false) => Err(err),
-        }
+        .await
     }
 
     /// Resolve the provider order for one dedup entry's range drives ONCE — the
@@ -1993,48 +2013,6 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         .await?
         .candidates;
         Ok(RangeTargets::Discovered(order))
-    }
-
-    /// Drive `ranges` of `hash` into `staging`'s `.partial` over a PRE-RESOLVED
-    /// provider order (from [`Self::resolve_range_targets`]) — the pinned
-    /// `--node-id`, or the probed discovery order walked with single-source
-    /// failover (a retryable failure advances to the next candidate). Re-dials the
-    /// resolved candidates without re-probing, so repeated sub-drives of one entry
-    /// share a single probe round. The caller already holds a
-    /// [`gate`](PullCtx::gate) permit, so this does not take one itself.
-    ///
-    /// Unlike [`Self::fetch_to_staging`] there is no multi-source fan-out here: the
-    /// range-dedup path is an optimization over one source, and every driven range
-    /// is still bao-verified against `hash`, so a single lane stays sound.
-    async fn drive_ranges_ordered(
-        &self,
-        targets: &RangeTargets,
-        hash: [u8; 32],
-        staging: &Path,
-        ranges: &[(u64, u64)],
-        progress: Option<&ProgressCallback>,
-    ) -> anyhow::Result<ClientRangedStore> {
-        let order = match targets {
-            RangeTargets::Pinned(pinned) => {
-                return self
-                    .drive_ranges_from(hash, *pinned, &[], staging, ranges, progress)
-                    .await;
-            }
-            RangeTargets::Discovered(order) => order,
-        };
-
-        walk_candidates(
-            order,
-            "the entry's ranges",
-            |cand| cand.eth_address.to_string(),
-            |cand| async move {
-                let target = (cand.node_id, cand.eth_address);
-                let dial_addrs = cand.dial_addrs();
-                self.drive_ranges_from(hash, target, &dial_addrs, staging, ranges, progress)
-                    .await
-            },
-        )
-        .await
     }
 
     /// Fetch one blob fully into memory — used only for the bundle manifest
@@ -2256,7 +2234,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// - No hints (or `total` unknown, or the blob is already finalized at
     ///   `staging`), or no chunk overlaps a materialized sibling → the plain
     ///   whole-file [`Self::fetch_to_staging`] path.
-    /// - Otherwise the dedup path: pay to [`Self::drive_ranges_ordered`] only the
+    /// - Otherwise the dedup path: pay through a [`CtxRangeDriver`] for only the
     ///   *complement* (the group-aligned bytes no donor covers) into `staging`'s
     ///   `.partial`, then splice each donor range from its sibling's on-disk blob.
     ///   Each donor chunk is confirmed present at the recorded source offset by
@@ -2363,13 +2341,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // concurrent stream to a shared lane mid-reassembly. Sorted `Address` order
         // keeps it deadlock-free against a fan-out entry's permit set.
         let _lane_permits = self.lane_cap.permit_set(&targets.providers()).await?;
-        let driver = CtxRangeDriver {
-            ctx: self,
-            targets: &targets,
-            hash,
-            staging,
-            progress,
-        };
+        let driver = CtxRangeDriver::new(self, &targets, hash, staging, total, progress);
 
         // On any dedup-path success, true up the file + total progress bars to
         // 100%: donor bytes are spliced from disk and never flow through `drive`'s
@@ -2626,12 +2598,128 @@ trait RangeDriver {
 /// The production [`RangeDriver`]: the live paid range-drive path over a
 /// pre-resolved provider order (so repeated sub-drives of one entry share one
 /// probe round).
+///
+/// Every drive of the entry — the pay-now complement, a donor re-fetch, each
+/// deferred fallback, the self-heal re-drive — reuses one [`fetch::RangeSession`]
+/// while its provider serves: one first-leg open and one warm connection for
+/// the entry, not one per drive or per range (#2119). A drive that fails drops
+/// the session and fails over to the next candidate, and the entry never goes
+/// back to a provider that failed it; a retry round (`--entry-retries`) starts
+/// a new driver over a fresh probe. The session drives up to
+/// `--max-lane-streams` gaps at once, using the permits for its provider that
+/// are free when it opens beyond the one the entry already holds.
 struct CtxRangeDriver<'a, P: Provider + Clone> {
     ctx: &'a PullCtx<'a, P>,
     targets: &'a RangeTargets,
     hash: [u8; 32],
     staging: &'a Path,
+    total: u64,
     progress: Option<&'a ProgressCallback>,
+    /// The open session, if any, and which candidate it drives from.
+    session: tokio::sync::Mutex<Option<ActiveRangeSession<'a, P>>>,
+    /// The first candidate a drive still tries: every earlier one failed this
+    /// entry.
+    next: std::sync::atomic::AtomicUsize,
+}
+
+/// A [`CtxRangeDriver`]'s open session and what it may use.
+struct ActiveRangeSession<'a, P> {
+    /// The session's candidate, as an index into the entry's failover order.
+    candidate: usize,
+    session: fetch::RangeSession<'a, P>,
+    /// How many gaps a drive may fill at once: the entry's one lane permit plus
+    /// the extra ones held here.
+    concurrency: std::num::NonZeroUsize,
+    _extra_permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl<'a, P: Provider + Clone> CtxRangeDriver<'a, P> {
+    /// A driver for one entry, with no session open yet.
+    fn new(
+        ctx: &'a PullCtx<'a, P>,
+        targets: &'a RangeTargets,
+        hash: [u8; 32],
+        staging: &'a Path,
+        total: u64,
+        progress: Option<&'a ProgressCallback>,
+    ) -> Self {
+        Self {
+            ctx,
+            targets,
+            hash,
+            staging,
+            total,
+            progress,
+            session: tokio::sync::Mutex::new(None),
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Drive `ranges` from candidate `index` (`target`, `dial_addrs`), opening its
+    /// session first unless it is the one already open. A failure drops the
+    /// session and moves [`Self::next`] past this candidate.
+    async fn drive_on(
+        &self,
+        index: usize,
+        target: FetchTarget,
+        dial_addrs: &[std::net::SocketAddr],
+        ranges: &[(u64, u64)],
+    ) -> anyhow::Result<()> {
+        let mut slot = self.session.lock().await;
+        let driven = async {
+            if slot.as_ref().is_none_or(|open| open.candidate != index) {
+                // Close the last provider's session (and its connection) first.
+                *slot = None;
+                let session = self
+                    .ctx
+                    .open_range_session(
+                        target,
+                        dial_addrs,
+                        self.hash,
+                        self.staging,
+                        self.total,
+                        ranges,
+                    )
+                    .await?;
+                let extra = self
+                    .ctx
+                    .lane_cap
+                    .try_extra(target.1, self.ctx.lane_cap.n.saturating_sub(1))
+                    .await;
+                let concurrency = std::num::NonZeroUsize::new(1 + extra.len())
+                    .unwrap_or(std::num::NonZeroUsize::MIN);
+                *slot = Some(ActiveRangeSession {
+                    candidate: index,
+                    session,
+                    concurrency,
+                    _extra_permits: extra,
+                });
+            }
+            let open = slot
+                .as_ref()
+                .ok_or_else(|| anyhow!("range session missing after open"))?;
+            open.session
+                .drive(ranges, open.concurrency, self.progress)
+                .await
+        }
+        .await;
+        let Err(err) = driven else {
+            return Ok(());
+        };
+        *slot = None;
+        self.next.store(
+            index.saturating_add(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // On the delegated path a terminal owner-remedy reason reconnects to the
+        // owner-side remedy (the delegate cannot self-resolve it), the same as
+        // `fetch`.
+        Err(if self.ctx.grant.is_some() {
+            fetch::annotate_delegated_exhaustion(err)
+        } else {
+            err
+        })
+    }
 }
 
 impl<P: Provider + Clone> RangeDriver for CtxRangeDriver<'_, P> {
@@ -2648,10 +2736,23 @@ impl<P: Provider + Clone> RangeDriver for CtxRangeDriver<'_, P> {
         ranges: &'a [(u64, u64)],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
         Box::pin(async move {
-            self.ctx
-                .drive_ranges_ordered(self.targets, self.hash, self.staging, ranges, self.progress)
-                .await
-                .map(|_store| ())
+            let targets = self.targets.targets();
+            if let RangeTargets::Pinned(_) = self.targets {
+                // A pinned `--node-id` is its own only candidate: nothing to walk.
+                let Some((target, dial_addrs)) = targets.first() else {
+                    bail!("no pinned target");
+                };
+                return self.drive_on(0, *target, dial_addrs, ranges).await;
+            }
+            let start = self.next.load(std::sync::atomic::Ordering::Relaxed);
+            let order: Vec<_> = targets.iter().enumerate().skip(start).collect();
+            walk_candidates(
+                &order,
+                "the entry's ranges",
+                |(_, (target, _))| target.1.to_string(),
+                |&(index, (target, dial_addrs))| self.drive_on(index, *target, dial_addrs, ranges),
+            )
+            .await
         })
     }
 }
@@ -6713,6 +6814,22 @@ mod tests {
             format!("{err:#}").contains("--provider-address requires --node-id"),
             "expected the validate() guard error, got: {err:#}"
         );
+    }
+
+    /// `try_extra` takes only the permits free right now, never more than asked
+    /// and never past the cap, and they return to the pool when dropped.
+    #[tokio::test]
+    async fn lane_stream_cap_try_extra_takes_only_free_permits() {
+        let p1 = Address::repeat_byte(1);
+        let cap = LaneStreamCap::new(4);
+        let held = cap.permit(p1).await.unwrap();
+        let extra = cap.try_extra(p1, 3).await;
+        assert_eq!(extra.len(), 3, "the three free permits");
+        assert!(cap.try_extra(p1, 3).await.is_empty(), "the cap is reached");
+        drop(extra);
+        assert_eq!(cap.try_extra(p1, 2).await.len(), 2, "no more than asked");
+        drop(held);
+        assert_eq!(cap.try_extra(p1, 10).await.len(), 4, "never past the cap");
     }
 
     #[tokio::test]

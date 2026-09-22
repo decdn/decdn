@@ -27,7 +27,7 @@
 //! node 1).
 
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
@@ -35,9 +35,11 @@ use decdn_bao_range::AlignedRange;
 use decdn_incentive::DepositOutcome;
 use iroh::{Endpoint, EndpointAddr};
 
+use crate::connection::WarmConnection;
 use crate::sink::{PullReader, StashedFault};
 use crate::{
-    DialObserver, PoolContext, PoolLedger, PullDeadlines, UpstreamPullHeader, VoucherProgress,
+    DialObserver, PoolContext, PoolLedger, PullDeadlines, UpstreamPull, UpstreamPullHeader,
+    VoucherProgress,
 };
 
 /// A boxed, `Send` future returned by the async trait methods in this module —
@@ -232,7 +234,14 @@ fn micros_now() -> u64 {
 /// the `Arc<Mutex<..>>` lets both see one state. `open` locks it only to CLONE
 /// the context out (single-writer per fetch — the driver never opens a pull
 /// concurrently with a top-up), then drops the guard before awaiting, so no
-/// lock is ever held across an `.await`.
+/// lock is ever held across an `.await`. Concurrent opens (a range set driven
+/// several gaps at a time) each take their own snapshot; a snapshot that misses a
+/// top-up landing at the same moment only under-states the deposit, and the
+/// driver's post-top-up settle wait already covers a refusal on that.
+///
+/// By default every open dials its own connection. A source built
+/// [`with_warm_connection`](Self::with_warm_connection) dials once and opens
+/// every pull as a new stream on that connection instead (#2119).
 pub struct PeerSource<'a> {
     endpoint: &'a Endpoint,
     target: EndpointAddr,
@@ -253,6 +262,11 @@ pub struct PeerSource<'a> {
     /// connection is left live on the pull runtime, so a caller-side wrapper around
     /// the returned reader cannot see them.
     on_connect: Option<&'a DialObserver<'a>>,
+    /// The one connection every open reuses, when the source keeps one warm.
+    /// `None` dials per open. The inner `None` is a warm source that has not
+    /// dialled yet, or whose connection closed and is dialled again on the next
+    /// open.
+    warm: Option<tokio::sync::Mutex<Option<Arc<WarmConnection>>>>,
 }
 
 impl std::fmt::Debug for PeerSource<'_> {
@@ -266,6 +280,7 @@ impl std::fmt::Debug for PeerSource<'_> {
             .field("max_blob_size_bytes", &self.max_blob_size_bytes)
             .field("max_rate_per_mb", &self.max_rate_per_mb)
             .field("deadlines", &self.deadlines)
+            .field("warm", &self.warm.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -304,6 +319,7 @@ impl<'a> PeerSource<'a> {
             max_rate_per_mb,
             deadlines,
             on_connect: None,
+            warm: None,
         }
     }
 
@@ -316,6 +332,138 @@ impl<'a> PeerSource<'a> {
         self.on_connect = Some(on_connect);
         self
     }
+
+    /// Keep one connection to the target warm and open every pull on it.
+    ///
+    /// A fetch that opens many small legs against one provider (a range-dedup
+    /// entry's boundary groups) otherwise pays a dial, a QUIC handshake and a
+    /// teardown per leg (#2119). Each pull is still its own stream with its own
+    /// signed request and response, so nothing about payment changes. A
+    /// connection that closes (an idle timeout while the fetch waits on a
+    /// sibling, a peer close) is dialled again on the next open, and an open that
+    /// fails because the connection closed under it is retried once on a fresh
+    /// one; an open sends no voucher, so the retry pays nothing. The connection
+    /// closes when the source drops.
+    ///
+    /// Dials through a warm connection are not reported to a
+    /// [`with_dial_observer`](Self::with_dial_observer) observer; a caller that
+    /// needs one keeps the per-open dial.
+    #[must_use]
+    pub fn with_warm_connection(mut self) -> Self {
+        self.warm = Some(tokio::sync::Mutex::new(None));
+        self
+    }
+
+    /// Open the whole blob (`byte_len == 0`, "to end") from offset 0.
+    ///
+    /// For a caller that must read the signed `total_bytes` before it can size
+    /// the store a drive fills. Hand the result to a [`PrimedSource`] primed at
+    /// `align_range(0, 0, total_bytes)` and the drive's first leg adopts this
+    /// pull rather than opening the same range a second time (#2063).
+    ///
+    /// # Errors
+    ///
+    /// The same faults as [`BlobSource::open`].
+    pub fn open_whole(&self, hash: [u8; 32]) -> SourceFuture<'_, (UpstreamPullHeader, PullReader)> {
+        Box::pin(async move {
+            let pull = self.open_pull(hash, 0, 0).await?;
+            Ok((pull.0, PullReader::new(pull.1)))
+        })
+    }
+
+    /// Open `[byte_offset, +byte_len)` of `hash` (`byte_len == 0` = to end), on
+    /// the warm connection when the source keeps one.
+    async fn open_pull(
+        &self,
+        hash: [u8; 32],
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+        // Snapshot the shared context, then drop the guard before the await —
+        // `open_progressive_pull` needs `&PoolContext` for its whole call, and no
+        // std `Mutex` guard may be held across an `.await`.
+        let ctx = {
+            self.ctx
+                .lock()
+                .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+                .clone()
+        };
+        let Some(slot) = &self.warm else {
+            return crate::open_progressive_pull(
+                self.endpoint,
+                self.target.clone(),
+                &ctx,
+                Arc::clone(&self.ledger),
+                self.slash_domain,
+                self.expected_signer,
+                hash,
+                self.namespace_id,
+                byte_offset,
+                micros_now(),
+                self.max_blob_size_bytes,
+                self.max_rate_per_mb,
+                self.deadlines,
+                byte_len,
+                self.on_connect,
+            )
+            .await;
+        };
+        let conn = self.warm_connection(slot).await?;
+        match self.open_on(&conn, &ctx, hash, byte_offset, byte_len).await {
+            Err(_) if conn.is_closed() => {
+                let conn = self.warm_connection(slot).await?;
+                self.open_on(&conn, &ctx, hash, byte_offset, byte_len).await
+            }
+            opened => opened,
+        }
+    }
+
+    /// The warm connection, dialled when there is none yet or the last one
+    /// closed. The slot's lock is held across the dial, so concurrent opens share
+    /// one dial rather than racing several.
+    async fn warm_connection(
+        &self,
+        slot: &tokio::sync::Mutex<Option<Arc<WarmConnection>>>,
+    ) -> anyhow::Result<Arc<WarmConnection>> {
+        let mut held = slot.lock().await;
+        if let Some(conn) = held.as_ref().filter(|c| !c.is_closed()) {
+            return Ok(Arc::clone(conn));
+        }
+        let conn = Arc::new(
+            WarmConnection::connect(self.endpoint, self.target.clone(), self.deadlines.open())
+                .await?,
+        );
+        *held = Some(Arc::clone(&conn));
+        Ok(conn)
+    }
+
+    /// Open one pull as a new stream on `conn`.
+    async fn open_on(
+        &self,
+        conn: &WarmConnection,
+        ctx: &PoolContext,
+        hash: [u8; 32],
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+        crate::open_progressive_pull_on(
+            conn,
+            ctx,
+            Arc::clone(&self.ledger),
+            self.slash_domain,
+            self.expected_signer,
+            hash,
+            self.namespace_id,
+            byte_offset,
+            micros_now(),
+            self.max_blob_size_bytes,
+            self.max_rate_per_mb,
+            self.deadlines,
+            byte_len,
+            None,
+        )
+        .await
+    }
 }
 
 impl BlobSource for PeerSource<'_> {
@@ -327,34 +475,9 @@ impl BlobSource for PeerSource<'_> {
         range: AlignedRange,
     ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
         Box::pin(async move {
-            // Snapshot the shared context (single-writer per fetch, so this can
-            // never race a top-up), then drop the guard before the await —
-            // `open_progressive_pull` needs `&PoolContext` for its whole call,
-            // and no std `Mutex` guard may be held across an `.await`.
-            let ctx = {
-                self.ctx
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
-                    .clone()
-            };
-            let (header, pull) = crate::open_progressive_pull(
-                self.endpoint,
-                self.target.clone(),
-                &ctx,
-                Arc::clone(&self.ledger),
-                self.slash_domain,
-                self.expected_signer,
-                hash,
-                self.namespace_id,
-                range.fetch_start(),
-                micros_now(),
-                self.max_blob_size_bytes,
-                self.max_rate_per_mb,
-                self.deadlines,
-                range.fetch_len(),
-                self.on_connect,
-            )
-            .await?;
+            let (header, pull) = self
+                .open_pull(hash, range.fetch_start(), range.fetch_len())
+                .await?;
             Ok((header, PullReader::new(pull)))
         })
     }
@@ -365,6 +488,139 @@ impl BlobSource for PeerSource<'_> {
 
     fn max_blob_size_bytes(&self) -> u64 {
         self.max_blob_size_bytes
+    }
+}
+
+/// How long a primed pull may wait for its adopting open. A pull opened ahead of
+/// its drive is only worth adopting straight away: an idle one is a stream the
+/// peer is holding bytes on, and a peer that sees no voucher for long enough
+/// drops it. A primed pull older than this is dropped and the open goes to the
+/// wrapped source.
+const PRIMED_MAX_IDLE: Duration = Duration::from_secs(2);
+
+/// A pull opened ahead of the drive, waiting for the open it answers.
+struct Primed<R> {
+    hash: [u8; 32],
+    range: AlignedRange,
+    header: UpstreamPullHeader,
+    reader: R,
+    at: tokio::time::Instant,
+}
+
+/// A [`BlobSource`] that hands one already-open pull to the drive (#2063).
+///
+/// A caller that opens a pull before the drive (to read the signed
+/// `total_bytes` the store is sized from, or to learn whether the peer serves
+/// at all) would otherwise drop it and let the drive open the same range again.
+/// The node treats every open as real: it signs, claims a fill, and starts an
+/// origin draw, so the thrown-away open costs a duplicate draw and delays the
+/// real one. [`prime`](Self::prime) parks the live pull here instead, and the
+/// drive's first [`open`](BlobSource::open) of exactly that hash and range takes
+/// it. Any other open, and an open that finds the primed pull older than two
+/// seconds, goes to the wrapped source.
+///
+/// Adoption is by exact [`AlignedRange`] equality, never by containment: a
+/// pull's [`finish`](BlobSource::finish) drains and pays to its stream end, so a
+/// longer pull in place of a shorter leg would pay for bytes the leg never asked
+/// for. Call [`clear`](Self::clear) once the drive returns, so a pull no open
+/// took is closed at once rather than left idle.
+pub struct PrimedSource<S: BlobSource> {
+    inner: S,
+    primed: Mutex<Option<Primed<S::Reader>>>,
+}
+
+impl<S: BlobSource> std::fmt::Debug for PrimedSource<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let primed = self.primed.lock().is_ok_and(|p| p.is_some());
+        f.debug_struct("PrimedSource")
+            .field("primed", &primed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: BlobSource> PrimedSource<S> {
+    /// Wrap `inner` with nothing primed.
+    #[must_use]
+    pub const fn new(inner: S) -> Self {
+        Self {
+            inner,
+            primed: Mutex::new(None),
+        }
+    }
+
+    /// Park a live pull of `range` of `hash` for the next open of exactly that
+    /// range. Replaces (and so closes) any pull still parked.
+    pub fn prime(
+        &self,
+        hash: [u8; 32],
+        range: AlignedRange,
+        header: UpstreamPullHeader,
+        reader: S::Reader,
+    ) {
+        let parked = Primed {
+            hash,
+            range,
+            header,
+            reader,
+            at: tokio::time::Instant::now(),
+        };
+        if let Ok(mut slot) = self.primed.lock() {
+            *slot = Some(parked);
+        }
+    }
+
+    /// Close a parked pull that no open took.
+    pub fn clear(&self) {
+        let parked = self.primed.lock().ok().and_then(|mut slot| slot.take());
+        drop(parked);
+    }
+
+    /// The wrapped source.
+    pub const fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    /// Take the parked pull if it answers an open of `range` of `hash`. A stale
+    /// parked pull is dropped here whatever the open asks for; a fresh one for
+    /// another range stays parked.
+    fn take(
+        &self,
+        hash: [u8; 32],
+        range: &AlignedRange,
+    ) -> Option<(UpstreamPullHeader, S::Reader)> {
+        let mut slot = self.primed.lock().ok()?;
+        let parked = slot.take()?;
+        if parked.at.elapsed() > PRIMED_MAX_IDLE {
+            return None;
+        }
+        if parked.hash == hash && parked.range == *range {
+            return Some((parked.header, parked.reader));
+        }
+        *slot = Some(parked);
+        None
+    }
+}
+
+impl<S: BlobSource> BlobSource for PrimedSource<S> {
+    type Reader = S::Reader;
+
+    fn open(
+        &self,
+        hash: [u8; 32],
+        range: AlignedRange,
+    ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
+        match self.take(hash, &range) {
+            Some(adopted) => Box::pin(async move { Ok(adopted) }),
+            None => self.inner.open(hash, range),
+        }
+    }
+
+    fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+        self.inner.finish(reader)
+    }
+
+    fn max_blob_size_bytes(&self) -> u64 {
+        self.inner.max_blob_size_bytes()
     }
 }
 
@@ -449,6 +705,11 @@ mod doubles {
         /// zero and it would never complete. `None` keeps the pre-payment "unpaid
         /// double" behaviour for tests that do not drive `fill_gap` to completion.
         ledger: Option<Arc<crate::PoolLedger>>,
+        /// Legs opened and not yet finished. A faulted leg is never finished, so
+        /// this reads true only on a run with no faults.
+        in_flight: Arc<AtomicU64>,
+        /// The most legs [`in_flight`](Self::in_flight) ever held at once.
+        peak_in_flight: Arc<AtomicU64>,
     }
 
     impl std::fmt::Debug for ScriptedSource {
@@ -483,7 +744,16 @@ mod doubles {
                 finish_stall: None,
                 stall_after: None,
                 ledger: None,
+                in_flight: Arc::new(AtomicU64::new(0)),
+                peak_in_flight: Arc::new(AtomicU64::new(0)),
             })
+        }
+
+        /// The most legs this source ever had open and unfinished at once. A
+        /// driver that runs its gaps one at a time reads `1`.
+        #[must_use]
+        pub fn peak_in_flight(&self) -> u64 {
+            self.peak_in_flight.load(Ordering::SeqCst)
         }
 
         /// Delay every `finish` by `stall` after its range is fully delivered,
@@ -614,6 +884,8 @@ mod doubles {
                 if let Ok(mut log) = self.opened.lock() {
                     log.push((range.fetch_start(), range.fetch_len()));
                 }
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
                 let mut wire = self.wire_for(&range)?;
                 let mut fault = None;
                 if let Some((after, make)) = &self.fault
@@ -656,6 +928,7 @@ mod doubles {
                 if let Some(stall) = self.finish_stall {
                     tokio::time::sleep(stall).await;
                 }
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
                 let Some(ledger) = &self.ledger else {
                     // Unpaid double: no channel, nothing to drain, no watermark.
                     return Ok(VoucherProgress::default());
