@@ -134,6 +134,31 @@ pub(crate) async fn cache_with_blob(
     Ok((cache, hash, cache_dir))
 }
 
+/// Like [`spawn_server`], but counts every connection the server accepts. The
+/// warm-connection reuse test reads the counter to prove the client dialled
+/// exactly once across two hash fetches.
+pub(crate) fn spawn_server_counting(
+    server_ep: Endpoint,
+    handler: Arc<ClientHandler>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    let task = tokio::spawn(async move {
+        while let Some(incoming) = server_ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = ClientProtocol::new(Arc::clone(&handler)).accept(conn).await;
+        }
+    });
+    (task, accepted)
+}
+
 /// A connection limiter with all gates wide open (the common-case test setup).
 pub(crate) fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
     let cfg = ResolvedSecurity {
