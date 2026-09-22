@@ -2875,83 +2875,25 @@ async fn stream_to_stdout<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    // Stream across every admissible holder (capped to `--max-sources` inside the
-    // Streamer); a single holder is fine too. No size gate: a paced stream's
-    // fan-out is the Streamer's small lane cap, not the file path's floor.
-    let admitted = discovery::admit_sources(candidates.to_vec(), common.max_sources);
-    let Some((first_candidate, rest_candidates)) = admitted.split_first() else {
+    // Stream across every admissible holder; a single holder is fine too. Clamp
+    // `--max-sources` to at least one so a `0` never admits an empty set — the
+    // Streamer caps at >=1 lane regardless, and a paced stream's fan-out is that
+    // small cap, not the file path's size floor (so there is no size gate here).
+    let admitted = discovery::admit_sources(candidates.to_vec(), common.max_sources.max(1));
+    if admitted.is_empty() {
         anyhow::bail!(
             "no candidate holders to stream {} from",
             blake3::Hash::from_bytes(hash).to_hex()
         );
-    };
+    }
 
-    // Learn `total_bytes` from a header-only open against the first holder (the
-    // handshake signs no voucher, so it pays nothing), reusing its opened pool for
-    // the lane built here.
-    let first = build_multi_lane(
-        deps,
-        grant,
-        signer,
-        voucher_dom,
-        first_candidate,
-        relays,
-        None,
-        None,
-    )
-    .await?;
-    let probe_target = multi_source_target(first_candidate, relays);
-    let peer_store = decdn_client_pull::PeerStore::open(&deps.chain.data_dir);
-    let peer_store_cfg = decdn_client_pull::StoreConfig::default();
-    let header = {
-        let ctx = first
-            .ctx
-            .lock()
-            .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
-            .clone();
-        match open_progressive_pull(
-            deps.endpoint,
-            probe_target,
-            &ctx,
-            Arc::clone(&first.ledger),
-            deps.slash_dom,
-            first.provider,
-            hash,
-            deps.namespace_id,
-            0,
-            micros_now(),
-            deps.max_blob_bytes,
-            deps.max_rate_per_mb,
-            deps.deadlines,
-            0,
-            None,
-        )
-        .await
-        {
-            Ok((header, pull)) => {
-                drop(pull);
-                header
-            }
-            Err(err) => {
-                let _ = peer_store.record_failure(&first.node_id, now_secs_cli());
-                return Err(match first.ctx.lock() {
-                    Ok(guard) => annotate_unbound_cache_miss(err, &guard),
-                    Err(_) => err,
-                });
-            }
-        }
-    };
-    let _ = peer_store.record_sample(
-        &first.node_id,
-        header.ttfb_ms,
-        header.rate_per_mb,
-        now_secs_cli(),
-        &peer_store_cfg,
-    );
-    let total_bytes = header.total_bytes;
-
-    let mut lanes = vec![first];
-    for candidate in rest_candidates {
+    // Build every admitted lane up front (each opens/reuses its provider pool),
+    // then learn `total_bytes` from a header-only open, FAILING OVER across the
+    // lanes until one answers (the handshake signs no voucher, so it pays
+    // nothing) — so an unreachable or refusing first holder does not sink the
+    // whole stdout stream when other candidates are healthy.
+    let mut lanes = Vec::with_capacity(admitted.len());
+    for candidate in &admitted {
         lanes.push(
             build_multi_lane(
                 deps,
@@ -2966,6 +2908,70 @@ where
             .await?,
         );
     }
+    let peer_store = decdn_client_pull::PeerStore::open(&deps.chain.data_dir);
+    let peer_store_cfg = decdn_client_pull::StoreConfig::default();
+    let mut total_bytes = None;
+    let mut last_probe_err = None;
+    for (lane, candidate) in lanes.iter().zip(admitted.iter()) {
+        let probe_target = multi_source_target(candidate, relays);
+        let ctx = lane
+            .ctx
+            .lock()
+            .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+            .clone();
+        match open_progressive_pull(
+            deps.endpoint,
+            probe_target,
+            &ctx,
+            Arc::clone(&lane.ledger),
+            deps.slash_dom,
+            lane.provider,
+            hash,
+            deps.namespace_id,
+            0,
+            micros_now(),
+            deps.max_blob_bytes,
+            deps.max_rate_per_mb,
+            deps.deadlines,
+            0,
+            None,
+        )
+        .await
+        {
+            Ok((header, pull)) => {
+                drop(pull);
+                let _ = peer_store.record_sample(
+                    &lane.node_id,
+                    header.ttfb_ms,
+                    header.rate_per_mb,
+                    now_secs_cli(),
+                    &peer_store_cfg,
+                );
+                total_bytes = Some(header.total_bytes);
+                break;
+            }
+            Err(err) => {
+                // An `InsufficientDeposit` refusal is OUR pool falling short of the
+                // node's floor, not a peer fault — do not suppress the candidate for
+                // it (mirrors `open_fetch_prelude`).
+                if !decdn_client_pull::is_insufficient_deposit(&err) {
+                    let _ = peer_store.record_failure(&lane.node_id, now_secs_cli());
+                }
+                last_probe_err = Some(match lane.ctx.lock() {
+                    Ok(guard) => annotate_unbound_cache_miss(err, &guard),
+                    Err(_) => err,
+                });
+            }
+        }
+    }
+    let Some(total_bytes) = total_bytes else {
+        return Err(last_probe_err.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "no admitted holder answered the header open for {}",
+                blake3::Hash::from_bytes(hash).to_hex()
+            )
+        }));
+    };
 
     // Split each lane into the [`StreamCandidate`] the Streamer owns (it takes the
     // `PeerSource`) and the watermark handle that outlives it (a clone of the same
