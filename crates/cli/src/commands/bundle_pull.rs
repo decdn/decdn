@@ -1524,7 +1524,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // total the lanes fold their per-leg deltas into, so the bar never jumps
         // between lanes). The admitted set already computed for the gate is
         // moved into the fan-out so `admit_sources` runs only once.
-        fetch::try_multi_source_fetch_from_admitted(
+        fetch::multi_source_download(
             &deps,
             self.common,
             self.grant.as_ref(),
