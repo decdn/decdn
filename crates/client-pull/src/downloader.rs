@@ -13,13 +13,14 @@
 //!
 //! It is the download half of the same core the `Streamer` (the consumption-paced
 //! single-blob face) uses — the Downloader just uncaps the fan-out and drops the
-//! consumer pacing. Bundles are the main scenario: a bundle is a set of
-//! `(hash, total_bytes)` entries, so `fetch_to_dir` takes a slice of them and
-//! writes one file per entry, named by its content-address hex; a single blob is
-//! a bundle of one.
+//! consumer pacing. Bundles are the main scenario: a bundle is a set of blobs, so
+//! both entry points take a slice and write one file per blob. `fetch_to_paths`
+//! writes each blob to a caller-chosen destination (a bundle's manifest paths, or
+//! a single `decdn fetch -o` target); `fetch_to_dir` is the convenience over it
+//! that names each file by its content-address hex under a directory. A single
+//! blob is a bundle of one.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use crate::driver::DriveConfig;
 use crate::pacer::BudgetPacer;
@@ -28,11 +29,20 @@ use crate::source::{BlobSource, Funder};
 use crate::streamer::{StreamCandidate, source_lanes};
 use crate::{ClientRangedStore, ProgressCallback, PullConfig, RangedStore};
 
-/// A downloading lane that makes no verified progress for this long is reassigned
-/// to another holder (the multi-source stall watchdog). A full-throughput
-/// download has no consumer to pace against, so the watchdog — not consumption
-/// backpressure — is what fails a silently-stalled source over.
-const DOWNLOAD_UNIT_DEADLINE: Duration = Duration::from_secs(30);
+/// One blob to fetch and where to write it: the content `hash` (the bao root),
+/// its `total_bytes` (authoritative for keying the store and sizing the fetch),
+/// and the caller-chosen `dest` path the `.partial` and final file are keyed by.
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadTarget<'a> {
+    /// The blob's BLAKE3 content address (its bao root); every ingested byte is
+    /// verified against it.
+    pub hash: [u8; 32],
+    /// The blob's content length in bytes.
+    pub total_bytes: u64,
+    /// Where to write the finished blob. The `.partial` store and the promoted
+    /// final file are keyed by this path, so the finished file IS `dest`.
+    pub dest: &'a Path,
+}
 
 /// Fetch content-addressed blobs — a bundle, or a single blob — to files in a
 /// directory, reusing the shared multi-source core (`multi_source_fetch` +
@@ -122,47 +132,102 @@ where
         &self,
         entries: &[([u8; 32], u64)],
         dir: &Path,
-        // The Downloader fetches at full throughput; no `PullConfig` tunable
-        // changes that yet. Taken for API symmetry with the `Streamer` and so a
-        // future per-download tunable has a home.
         config: &PullConfig,
         on_progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        let _ = config;
+        // Name each blob's destination by its content-address hex under `dir`,
+        // then fetch to those explicit paths. A caller that wants its own names
+        // (a bundle's manifest paths) uses [`Self::fetch_to_paths`] directly.
+        let dests: Vec<PathBuf> = entries
+            .iter()
+            .map(|&(hash, _)| dir.join(blake3::Hash::from_bytes(hash).to_hex().as_str()))
+            .collect();
+        let targets: Vec<DownloadTarget<'_>> = entries
+            .iter()
+            .zip(dests.iter())
+            .map(|(&(hash, total_bytes), dest)| DownloadTarget {
+                hash,
+                total_bytes,
+                dest,
+            })
+            .collect();
+        self.fetch_to_paths(&targets, config, on_progress).await
+    }
+
+    /// Fetch every [`DownloadTarget`] to its own `dest` path, returning the
+    /// written paths in target order. Each blob's `.partial` and final file are
+    /// keyed by `dest` (its parent directory and file name), so a resumed
+    /// download re-pulls only what it lacks and the promoted file IS `dest` — no
+    /// post-finalize rename. The parent directory of each `dest` is created if
+    /// missing.
+    ///
+    /// Each target opens a [`ClientRangedStore`] beside its file and drives only
+    /// its missing ranges across the candidate set through `multi_source_fetch`
+    /// (bao-verifying every byte, failing over between candidates), then finalizes
+    /// — promoting `.partial` to `dest`. Writes land at their absolute offsets, so
+    /// out-of-order and multi-source fills assemble correctly; a resumed download
+    /// (or a bundle layer's chunk-hint dedup, pre-seeded into the `.partial`)
+    /// re-pulls only what it lacks. The whole blob is fetched at full throughput,
+    /// with `config.download_unit_deadline` the per-lane stall watchdog.
+    ///
+    /// `total_bytes` is authoritative for keying the store, and the target `hash`
+    /// is the bao root every ingested byte is verified against: a wrong size or
+    /// hash surfaces as a verification failure, never as silent corruption.
+    ///
+    /// `on_progress`, when set, is called with the core's verified CONTENT
+    /// progress for the target CURRENTLY fetching — `(position, total_bytes)`,
+    /// both content bytes, resetting to that target's own total at each new one.
+    ///
+    /// # Errors
+    ///
+    /// A `dest` with no file name, a store open/create/finalize I/O error, or any
+    /// fault `multi_source_fetch` raises for a target once every candidate is
+    /// exhausted. The first failing target aborts the batch; targets already
+    /// written stay on disk (and any `.partial` a failed target left is the resume
+    /// prefix a retry inherits).
+    pub async fn fetch_to_paths(
+        &self,
+        targets: &[DownloadTarget<'_>],
+        config: &PullConfig,
+        on_progress: Option<&ProgressCallback>,
+    ) -> anyhow::Result<Vec<PathBuf>> {
         // Fail early and clearly on an empty candidate set, rather than deep inside
-        // `multi_source_fetch` on the first entry with a less obvious message.
+        // `multi_source_fetch` on the first target with a less obvious message.
         anyhow::ensure!(
             !self.candidates.is_empty(),
             "a Downloader needs at least one provider candidate to fetch from"
         );
-        std::fs::create_dir_all(dir)
-            .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", dir.display()))?;
         let pacer = BudgetPacer::new();
-        let mut written = Vec::with_capacity(entries.len());
-        for &(hash, total_bytes) in entries {
-            let stem = blake3::Hash::from_bytes(hash).to_hex();
-            let store = ClientRangedStore::open_or_create(dir, stem.as_str(), hash, total_bytes)
-                .map_err(|e| anyhow::anyhow!("open ranged store for {stem}: {e}"))?;
+        let mut written = Vec::with_capacity(targets.len());
+        for target in targets {
+            let (dir, stem) = dest_store_location(target.dest)?;
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", dir.display()))?;
+            let store =
+                ClientRangedStore::open_or_create(&dir, &stem, target.hash, target.total_bytes)
+                    .map_err(|e| {
+                        anyhow::anyhow!("open ranged store for {}: {e}", target.dest.display())
+                    })?;
             // One lane per provider, each carrying its candidate's measured
             // coverage (a `None` candidate is a full holder), so a partial holder
             // (#1506) is never assigned a range it does not hold. For a multi-blob
-            // download, a candidate that does not fully cover every entry must be
+            // download, a candidate that does not fully cover every target must be
             // fetched per blob with per-blob coverage.
-            let lanes = source_lanes(&self.candidates, total_bytes);
+            let lanes = source_lanes(&self.candidates, target.total_bytes);
             let ms = MultiSourceConfig {
                 // Uncapped fan-out — a download wants every holder striping in
                 // parallel, unlike the Streamer's small bounded front.
                 max_sources: self.candidates.len().max(1),
-                unit_deadline: DOWNLOAD_UNIT_DEADLINE,
+                unit_deadline: config.download_unit_deadline,
             };
             multi_source_fetch(
                 &store,
                 &lanes,
                 &pacer,
                 &self.funder,
-                hash,
+                target.hash,
                 0,
-                total_bytes,
+                target.total_bytes,
                 &self.drive_config,
                 &ms,
                 on_progress,
@@ -174,10 +239,26 @@ where
             // `multi_source_fetch` flushes the present record but does not promote;
             // a download keeps the file, so finalize (verify + promote `.partial`).
             store.finalize().await?;
-            written.push(dir.join(stem.as_str()));
+            written.push(target.dest.to_path_buf());
         }
         Ok(written)
     }
+}
+
+/// The directory and stem a [`DownloadTarget`]'s `.partial` store lives under, so
+/// its promoted final path IS `dest` (no post-finalize rename): `dest`'s parent
+/// (or the current directory for a bare file name) and `dest`'s own file name.
+fn dest_store_location(dest: &Path) -> anyhow::Result<(PathBuf, String)> {
+    let dir = match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let stem = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("download dest {} has no usable file name", dest.display()))?
+        .to_string();
+    Ok((dir, stem))
 }
 
 #[cfg(test)]
@@ -189,6 +270,7 @@ mod tests {
     use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::DepositOutcome;
 
+    use super::DownloadTarget;
     use super::Downloader;
     use crate::driver::DriveConfig;
     use crate::source::{FakeFunder, ScriptedSource};
@@ -341,6 +423,50 @@ mod tests {
         anyhow::ensure!(
             max_pos.load(std::sync::atomic::Ordering::SeqCst) == total,
             "final progress must reach the blob's total content bytes"
+        );
+        Ok(())
+    }
+
+    /// `fetch_to_paths` writes each blob to its caller-named destination (not a
+    /// content-hex name), keyed and promoted by that name, and the file is
+    /// BLAKE3-identical to the source blob (#1848 4c).
+    #[tokio::test]
+    async fn fetch_to_paths_writes_each_blob_to_its_named_dest() -> anyhow::Result<()> {
+        let blob = payload(1_500_000);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
+        let root = source.root();
+        let total = u64::try_from(blob.len())?;
+
+        let downloader = Downloader::new(
+            vec![candidate(source, ledger, 0xA1)],
+            funder(),
+            drive_config(),
+        );
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("my-model.safetensors");
+
+        let paths = downloader
+            .fetch_to_paths(
+                &[DownloadTarget {
+                    hash: root,
+                    total_bytes: total,
+                    dest: &dest,
+                }],
+                &PullConfig::default(),
+                None,
+            )
+            .await?;
+
+        anyhow::ensure!(
+            paths == vec![dest.clone()],
+            "returns the caller's destination path, not a hex name"
+        );
+        let got = std::fs::read(&dest)?;
+        anyhow::ensure!(got == blob, "written file is byte-identical to the blob");
+        anyhow::ensure!(
+            blake3::hash(&got).as_bytes() == &root,
+            "written file is BLAKE3-identical to the entry hash"
         );
         Ok(())
     }

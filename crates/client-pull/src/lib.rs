@@ -111,13 +111,15 @@ pub mod sink;
 /// seam), plus scripted test doubles.
 pub mod source;
 
-pub use config::{DEFAULT_READ_AHEAD_BYTES, DEFAULT_STREAMER_LANE_CAP, PullConfig};
+pub use config::{
+    DEFAULT_DOWNLOAD_UNIT_DEADLINE, DEFAULT_READ_AHEAD_BYTES, DEFAULT_STREAMER_LANE_CAP, PullConfig,
+};
 pub use connection::WarmConnection;
 pub use coverage_plan::{
     CoveredRun, SourceCoverage, covering_sources, plan_covered_runs, spread_segments,
 };
 pub use decdn_bao_range::RangedStore;
-pub use downloader::Downloader;
+pub use downloader::{DownloadTarget, Downloader};
 pub use driver::{PacingWait, PoolExhausted, SharedPool, drive};
 pub use ledger::{
     ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released, StreamProof,

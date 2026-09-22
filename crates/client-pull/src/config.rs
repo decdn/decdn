@@ -21,6 +21,13 @@ pub const DEFAULT_READ_AHEAD_BYTES: u64 = 16 * 1024 * 1024;
 /// `Downloader` uncaps this.
 pub const DEFAULT_STREAMER_LANE_CAP: usize = 2;
 
+/// Default [`PullConfig::download_unit_deadline`]: 30 seconds. A downloading lane
+/// that makes no verified progress for this long is reassigned to another holder
+/// (the multi-source stall watchdog). A full-throughput download has no consumer
+/// to pace against, so the watchdog — not consumption backpressure — is what
+/// fails a silently-stalled source over.
+pub const DEFAULT_DOWNLOAD_UNIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Zero-config tunables shared by the consumption faces.
 ///
 /// Overrides are opt-in: [`PullConfig::default`] is the whole configuration a
@@ -41,6 +48,13 @@ pub struct PullConfig {
     /// on the front, not the wide striping a full download does. The `Downloader`
     /// uncaps it.
     pub streamer_lane_cap: usize,
+    /// The `Downloader`'s per-lane stall watchdog: a downloading lane that makes
+    /// no verified progress for this long is reassigned to another holder. A
+    /// full-throughput download has no consumer to pace against, so this — not
+    /// consumption backpressure — is what fails a silently-stalled source over.
+    /// The `Streamer` ignores it (a paced lane parked on the consumer cursor is
+    /// not a stall).
+    pub download_unit_deadline: std::time::Duration,
 }
 
 impl PullConfig {
@@ -51,6 +65,7 @@ impl PullConfig {
         Self {
             read_ahead_bytes: DEFAULT_READ_AHEAD_BYTES,
             streamer_lane_cap: DEFAULT_STREAMER_LANE_CAP,
+            download_unit_deadline: DEFAULT_DOWNLOAD_UNIT_DEADLINE,
         }
     }
 }
@@ -80,5 +95,17 @@ mod tests {
         // or chain access can hide in a `const fn`.
         const CFG: PullConfig = PullConfig::new();
         assert_eq!(CFG.read_ahead_bytes, DEFAULT_READ_AHEAD_BYTES);
+    }
+
+    #[test]
+    fn default_download_unit_deadline_is_the_documented_constant() {
+        assert_eq!(
+            PullConfig::default().download_unit_deadline,
+            super::DEFAULT_DOWNLOAD_UNIT_DEADLINE
+        );
+        assert_eq!(
+            super::DEFAULT_DOWNLOAD_UNIT_DEADLINE,
+            std::time::Duration::from_secs(30)
+        );
     }
 }
