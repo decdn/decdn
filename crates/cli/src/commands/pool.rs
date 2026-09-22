@@ -613,7 +613,7 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
     // `--all` sweep (clap's arg group guarantees exactly one of the two).
     let target = args.pool.as_deref().map(parse_pool_id).transpose()?;
 
-    let store_owner = classify_buyer_store(&resolve_data_dir(args.chain.data_dir.clone(), &file)?);
+    let store_owner = classify_buyer_store(&resolve_data_dir(args.chain.data_dir.clone(), &file)?)?;
     if target.is_none() {
         // `--all` enumerates from chain, not from the store, so on a node data
         // dir it would close the pool the daemon is paying from right now.
@@ -716,7 +716,7 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
     // `--all` sweep (clap's arg group guarantees exactly one of the two).
     let target = args.pool.as_deref().map(parse_pool_id).transpose()?;
 
-    let store_owner = classify_buyer_store(&resolve_data_dir(args.chain.data_dir.clone(), &file)?);
+    let store_owner = classify_buyer_store(&resolve_data_dir(args.chain.data_dir.clone(), &file)?)?;
     if target.is_none() {
         store_owner.refuse_sweep("reclaim")?;
     }
@@ -1055,7 +1055,7 @@ async fn list(args: &cli::PoolListArgs, config_path: Option<&Path>) -> anyhow::R
         return list_all(args, config_path, &data_dir).await;
     }
 
-    match classify_buyer_store(&data_dir) {
+    match classify_buyer_store(&data_dir)? {
         BuyerStoreOwner::Node { data_dir, .. } => {
             list_from_daemon(args, config_path, &data_dir).await
         }
@@ -1254,7 +1254,19 @@ async fn tracked_pool_ids(
     config_path: Option<&Path>,
     data_dir: &Path,
 ) -> Option<TrackedPools> {
-    match classify_buyer_store(data_dir) {
+    let owner = match classify_buyer_store(data_dir) {
+        Ok(owner) => owner,
+        Err(err) => {
+            let mut w = std::io::stderr().lock();
+            let _ = writeln!(
+                w,
+                "warning: {err:#}; every TRACKED value below is unknown, which is not the same \
+                 as untracked"
+            );
+            return None;
+        }
+    };
+    match owner {
         BuyerStoreOwner::Client { data_dir } => read_local_pools(&client_buyer_db(&data_dir)),
         BuyerStoreOwner::Node { data_dir, .. } => {
             let buyer_db = node_buyer_db(&data_dir);

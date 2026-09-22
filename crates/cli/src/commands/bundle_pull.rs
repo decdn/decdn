@@ -865,6 +865,7 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 /// published at two (or more) bundle paths. Non-empty by construction; the
 /// shared `hash` is carried explicitly so consumers never re-derive it from an
 /// arbitrary member.
+#[derive(Clone)]
 struct HashGroup<'a> {
     hash: &'a str,
     entries: Vec<&'a ManifestEntry>,
@@ -899,6 +900,26 @@ enum EntryOutcome {
         path: String,
         err: String,
     },
+}
+
+/// One hash-group's result for one round of the pull.
+struct GroupRun {
+    /// One outcome per entry in the group, in order.
+    outcomes: Vec<EntryOutcome>,
+    /// The group's fetch failed with an error a later `--entry-retries` round
+    /// may cure ([`entry_retryable`]). Only a failed blob fetch sets it; a
+    /// materialize failure keeps its paid staging blob for the next run instead.
+    retry: bool,
+}
+
+impl GroupRun {
+    /// A result no later round can change.
+    const fn done(outcomes: Vec<EntryOutcome>) -> Self {
+        Self {
+            outcomes,
+            retry: false,
+        }
+    }
 }
 
 /// One-line `--json` summary. `fetched`/`linked`/`skipped`/`failed` are entry
@@ -1173,11 +1194,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
 
     // `--namespace <id>` → big-endian `uint256`; absent => `NO_NAMESPACE`
     // (best-effort cache/DHT). Same conversion as `decdn fetch`.
-    let namespace_id = args
-        .namespace
-        .map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
-            alloy::primitives::U256::from(n).to_be_bytes()
-        });
+    let namespace_id = namespace_id(args.namespace);
 
     let mut ctx = PullCtx {
         endpoint: &endpoint,
@@ -1202,6 +1219,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         jobs: args.jobs.max(1),
         gate: tokio::sync::Semaphore::new(args.jobs.max(1)),
         lane_cap: LaneStreamCap::new(args.max_lane_streams),
+        entry_retries: args.entry_retries,
         // Silent during the manifest fetch below (a single blob); replaced once
         // the kept entries are known and their sizes decide the total-bar mode.
         progress: PullProgress::disabled(),
@@ -1253,6 +1271,15 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     report(&outcomes, transfer, dedup, &args.output, args.json)
 }
 
+/// The bundle-level namespace id (ADR 002) every paid pull in the run carries:
+/// `--namespace <id>` as a big-endian `uint256`, or `NO_NAMESPACE` when the flag
+/// was omitted.
+fn namespace_id(namespace: Option<u64>) -> [u8; 32] {
+    namespace.map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
+        alloy::primitives::U256::from(n).to_be_bytes()
+    })
+}
+
 /// The kept manifest for the run: the pre-read local one (already filtered up
 /// front), or the `--hash` bundle blob fetched into memory and filtered here.
 /// `Ok(None)` means the manifest is empty after filtering — [`report_nothing_to_fetch`]
@@ -1298,6 +1325,129 @@ async fn obtain_manifest<P: Provider + Clone>(
         return Ok(None);
     }
     Ok(Some(m))
+}
+
+/// Walk one entry's ordered candidates with single-source failover (#1174,
+/// ADR 037 § Fallback): try each in turn, stop on the first success or a
+/// [`RetryDisposition::Terminal`] error, and fail over on anything else.
+///
+/// A shared-pool exhaustion ([`PoolExhausted`]) fails over too, per
+/// [`retry_disposition`]: another provider's rate may fit what the deposit
+/// holds. Every failover logs a warning naming the provider, and so does the
+/// last one. The error that exhausts the list carries the candidate count as
+/// context, so the end-of-run summary says the entry ran out of providers and
+/// not only what the last one said (#2118). The context wraps the original
+/// error, so [`retry_disposition`] still classifies it.
+async fn walk_candidates<'c, C, T, Fut>(
+    order: &'c [C],
+    what: &str,
+    label: impl Fn(&C) -> String,
+    mut attempt: impl FnMut(&'c C) -> Fut,
+) -> anyhow::Result<T>
+where
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let n = order.len();
+    for (i, cand) in order.iter().enumerate() {
+        let err = match attempt(cand).await {
+            Ok(v) => return Ok(v),
+            Err(err) => err,
+        };
+        if retry_disposition(&err) == RetryDisposition::Terminal {
+            return Err(err);
+        }
+        if i + 1 < n {
+            tracing::warn!(
+                "bundle pull: provider {} could not deliver {what} ({err:#}); failing over to \
+                 the next of {n} candidate(s)",
+                label(cand),
+            );
+            continue;
+        }
+        tracing::warn!(
+            "bundle pull: provider {} could not deliver {what} ({err:#}); every one of {n} \
+             candidate(s) has now failed",
+            label(cand),
+        );
+        return Err(err.context(format!(
+            "all {n} candidate provider(s) failed to deliver {what}"
+        )));
+    }
+    Err(anyhow!("no candidate node could deliver {what}"))
+}
+
+/// Whether a failed entry is worth another round after the first pass
+/// (`--entry-retries`, #2118).
+///
+/// A [`RetryDisposition::RetryElsewhere`] failure is a property of the
+/// providers the entry tried, so a later round, which probes again and
+/// re-admits every provider, can succeed. A [`PoolExhausted`] is excluded even
+/// though it fails over within a pass: every provider already refused the
+/// deposit, and another round would only repeat the refusal.
+fn entry_retryable(err: &anyhow::Error) -> bool {
+    retry_disposition(err) == RetryDisposition::RetryElsewhere
+        && err.downcast_ref::<PoolExhausted>().is_none()
+}
+
+/// The wait before retry round `round` (1-based): 2 s, doubling, capped at
+/// 30 s. The wait gives a provider that dropped out time to recover before
+/// the round probes it again.
+fn entry_retry_backoff(round: u32) -> std::time::Duration {
+    const BASE: std::time::Duration = std::time::Duration::from_secs(2);
+    const CAP: std::time::Duration = std::time::Duration::from_secs(30);
+    BASE.saturating_mul(2u32.saturating_pow(round.saturating_sub(1)))
+        .min(CAP)
+}
+
+/// Run `items` through `run`, at most `jobs` at a time, then re-run the items
+/// whose result asks for it for up to `retries` more rounds, waiting
+/// [`entry_retry_backoff`] before each round.
+///
+/// `settle` sees every result as it lands, with the item's index in `items`,
+/// and returns whether that item should go into the next round. A later
+/// round's result for an item replaces the earlier one in whatever `settle`
+/// records.
+async fn run_with_retries<G, R, Fut>(
+    items: Vec<G>,
+    jobs: usize,
+    retries: u32,
+    run: impl Fn(G) -> Fut,
+    mut settle: impl FnMut(usize, R) -> bool,
+) where
+    G: Clone,
+    Fut: std::future::Future<Output = R>,
+{
+    let mut pending: Vec<(usize, G)> = items.into_iter().enumerate().collect();
+    let mut round = 0u32;
+    while !pending.is_empty() {
+        let mut next: Vec<(usize, G)> = Vec::new();
+        let width = jobs.min(pending.len()).max(1);
+        let mut stream = futures_util::stream::iter(pending)
+            .map(|(i, item)| {
+                let fut = run(item.clone());
+                async move { (i, item, fut.await) }
+            })
+            .buffer_unordered(width);
+        while let Some((i, item, result)) = stream.next().await {
+            if settle(i, result) {
+                next.push((i, item));
+            }
+        }
+        drop(stream);
+        if next.is_empty() || round >= retries {
+            return;
+        }
+        round += 1;
+        let wait = entry_retry_backoff(round);
+        tracing::warn!(
+            "bundle pull: {} entr(ies) failed with a retryable error; retry round {round} of \
+             {retries} starts in {}s",
+            next.len(),
+            wait.as_secs(),
+        );
+        tokio::time::sleep(wait).await;
+        pending = next;
+    }
 }
 
 /// Per-provider cap on concurrent streams to one `(pool, signer, provider)`
@@ -1428,10 +1578,14 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// fetched, so it never takes a permit of its own.
     gate: tokio::sync::Semaphore,
     /// Per-provider cap on concurrent same-lane streams (`--max-lane-streams`,
-    /// default 1). Acquired around every stream: one permit for a single-provider
+    /// default 4). Acquired around every stream: one permit for a single-provider
     /// stream, a sorted permit set for a multi-source fan-out. Bounds only
     /// per-provider concurrency; `--jobs` still bounds cross-lane parallelism.
     lane_cap: LaneStreamCap,
+    /// How many more rounds a retryably-failed entry gets after the first pass
+    /// (`--entry-retries`). Each round re-probes and resumes the entry's
+    /// `.partial`; `0` runs the single pass only.
+    entry_retries: u32,
     /// The run's multi-bar progress renderer: one per-file bar per active pull
     /// above a bottom total bar (silent off a terminal or under `--json`). Set
     /// once the kept manifest is known — its entries decide the total-bar mode —
@@ -1627,38 +1781,24 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             }
         }
 
-        let order = order.candidates;
-
-        let mut last_err: Option<anyhow::Error> = None;
-        for (attempt, cand) in order.iter().enumerate() {
-            let target = (cand.node_id, cand.eth_address);
-            // Registry multiaddrs as direct-address hints for a relay-free dial
-            // to a reachable node (ADR 001 § Node Discovery).
-            let dial_addrs = cand.dial_addrs();
-            // The failover walk streams from one provider per attempt, so it holds
-            // just that provider's lane-stream permit for the attempt, released
-            // before the next candidate.
-            let _lane_permit = self.lane_cap.permit(cand.eth_address).await?;
-            let err = match self
-                .fetch_to_staging_from(hash, target, &dial_addrs, staging, progress)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(err) => err,
-            };
-            let more = attempt + 1 < order.len();
-            if retry_disposition(&err) == RetryDisposition::Terminal || !more {
-                return Err(err);
-            }
-            tracing::warn!(
-                "bundle pull: provider {} could not deliver an entry ({err:#}); failing over to \
-                 the next of {} candidate(s)",
-                cand.eth_address,
-                order.len(),
-            );
-            last_err = Some(err);
-        }
-        Err(last_err.unwrap_or_else(|| anyhow!("no candidate node could deliver the entry")))
+        walk_candidates(
+            &order.candidates,
+            "the entry",
+            |cand| cand.eth_address.to_string(),
+            |cand| async move {
+                let target = (cand.node_id, cand.eth_address);
+                // Registry multiaddrs as direct-address hints for a relay-free
+                // dial to a reachable node (ADR 001 § Node Discovery).
+                let dial_addrs = cand.dial_addrs();
+                // The failover walk streams from one provider per attempt, so it
+                // holds just that provider's lane-stream permit for the attempt,
+                // released before the next candidate.
+                let _lane_permit = self.lane_cap.permit(cand.eth_address).await?;
+                self.fetch_to_staging_from(hash, target, &dial_addrs, staging, progress)
+                    .await
+            },
+        )
+        .await
     }
 
     /// Build one entry's ready-to-drive [`PoolContext`] and dial target for
@@ -1708,7 +1848,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                     self.chain.max_approve,
                     // `self.store` was opened from `self.chain.data_dir`, and
                     // the pull signs with `self.chain.keystore`.
-                    ChainAdoption::for_buy(&self.chain.data_dir, &self.chain.keystore),
+                    ChainAdoption::for_buy(&self.chain.data_dir, &self.chain.keystore)?,
                 )
                 .await?
             };
@@ -1883,33 +2023,18 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             RangeTargets::Discovered(order) => order,
         };
 
-        let mut last_err: Option<anyhow::Error> = None;
-        for (attempt, cand) in order.iter().enumerate() {
-            let target = (cand.node_id, cand.eth_address);
-            let dial_addrs = cand.dial_addrs();
-            let err = match self
-                .drive_ranges_from(hash, target, &dial_addrs, staging, ranges, progress)
-                .await
-            {
-                Ok(store) => return Ok(store),
-                Err(err) => err,
-            };
-            let more = attempt + 1 < order.len();
-            if retry_disposition(&err) == RetryDisposition::Terminal
-                || err.downcast_ref::<PoolExhausted>().is_some()
-                || !more
-            {
-                return Err(err);
-            }
-            tracing::warn!(
-                "bundle pull: provider {} could not deliver an entry's ranges ({err:#}); failing \
-                 over to the next of {} candidate(s)",
-                cand.eth_address,
-                order.len(),
-            );
-            last_err = Some(err);
-        }
-        Err(last_err.unwrap_or_else(|| anyhow!("no candidate node could deliver the entry ranges")))
+        walk_candidates(
+            order,
+            "the entry's ranges",
+            |cand| cand.eth_address.to_string(),
+            |cand| async move {
+                let target = (cand.node_id, cand.eth_address);
+                let dial_addrs = cand.dial_addrs();
+                self.drive_ranges_from(hash, target, &dial_addrs, staging, ranges, progress)
+                    .await
+            },
+        )
+        .await
     }
 
     /// Fetch one blob fully into memory — used only for the bundle manifest
@@ -2011,9 +2136,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     // The run-wide context (index, fetch plan, disk pre-pass, flush cache) all
     // threads through here; bundling it into a struct would only rename the fields.
     #[allow(clippy::too_many_arguments)]
-    async fn pull_plain(
+    async fn pull_plain<'e>(
         &self,
-        entries: &[&ManifestEntry],
+        entries: &[&'e ManifestEntry],
         out_root: &Path,
         overwrite: bool,
         index: &ChunkIndex,
@@ -2030,65 +2155,77 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let (flush_tx, flush_rx) = tokio::sync::mpsc::unbounded_channel::<FlushBatch>();
 
         // The fetch-driving side: run every group through `fetch_group` bounded by
-        // `--jobs`, and as each completes, forward its recordable files (built here
-        // while the group's entries are in scope) to the flush task and keep the
-        // outcomes for the run summary.
+        // `--jobs`, then re-run the groups that failed retryably for up to
+        // `--entry-retries` more rounds (#2118). As each run completes, forward its
+        // recordable files (built here while the group's entries are in scope) to
+        // the flush task and keep its outcomes for the run summary; a retry
+        // round's outcomes replace the round before.
         let drive = async {
-            let mut stream = futures_util::stream::iter(groups_by_hash)
-                .map(|group| {
-                    // Cheap clone of the group's entry refs so `fetch_group` can
-                    // consume `group` while we still correlate outcomes to entries.
-                    let group_entries: Vec<&ManifestEntry> = group.entries.clone();
-                    async move {
-                        let outcomes = self
-                            .fetch_group(group, out_root, overwrite, index, fetch_plan, disk)
-                            .await;
-                        // Mark this group's blob finished (whatever the outcome) so a
-                        // tail-reconcile waiter deferring a chunk assigned to it stops
-                        // waiting and pays for the range itself if the group failed to
-                        // register that chunk.
-                        if let Some(en) = group_entries.first()
-                            && let Ok(whole) = fetch::parse_hash(&en.hash)
-                        {
-                            index.mark_finished(whole);
-                        }
-                        // `fetch_group` returns one outcome per entry, in order;
-                        // `build_completed_updates` relies on that to correlate a
-                        // path to its outcome by position. Assert the invariant for
-                        // completed groups so a future divergence is caught in
-                        // debug builds rather than silently truncating the zip.
-                        debug_assert_eq!(
-                            group_entries.len(),
-                            outcomes.len(),
-                            "fetch_group must return one outcome per entry"
-                        );
-                        let updates = build_completed_updates(&group_entries, &outcomes, out_root);
-                        (outcomes, updates)
+            let mut groups: Vec<Vec<EntryOutcome>> = vec![Vec::new(); groups_by_hash.len()];
+            let run = |group: HashGroup<'e>| {
+                // Cheap clone of the group's entry refs so `fetch_group` can consume
+                // `group` while we still correlate outcomes to entries.
+                let group_entries: Vec<&'e ManifestEntry> = group.entries.clone();
+                async move {
+                    let run = self
+                        .fetch_group(group, out_root, overwrite, index, fetch_plan, disk)
+                        .await;
+                    // Mark this group's blob finished (whatever the outcome) so a
+                    // tail-reconcile waiter deferring a chunk assigned to it stops
+                    // waiting and pays for the range itself if the group failed to
+                    // register that chunk.
+                    if let Some(en) = group_entries.first()
+                        && let Ok(whole) = fetch::parse_hash(&en.hash)
+                    {
+                        index.mark_finished(whole);
                     }
-                })
-                // Live-bar fan-out bounded by --jobs; the global gate is the real in-flight-fetch cap.
-                .buffer_unordered(self.jobs.min(group_count));
-            let mut groups: Vec<Vec<EntryOutcome>> = Vec::new();
-            while let Some((outcomes, updates)) = stream.next().await {
-                if !updates.is_empty() {
-                    // Newly-fetched content bytes drive the byte-cadence flush; a
-                    // link/skip records a file but lands no new bytes.
-                    let fetched_bytes = outcomes
-                        .iter()
-                        .map(|o| match o {
-                            EntryOutcome::Fetched(n) => *n,
-                            _ => 0,
-                        })
-                        .sum();
-                    // Unbounded send: fails only if the flush task is gone, which
-                    // never happens before `drive` drops `flush_tx` below.
-                    let _ = flush_tx.send(FlushBatch {
-                        updates,
-                        fetched_bytes,
-                    });
+                    // `fetch_group` returns one outcome per entry, in order;
+                    // `build_completed_updates` relies on that to correlate a path
+                    // to its outcome by position. Assert the invariant so a future
+                    // divergence is caught in debug builds rather than silently
+                    // truncating the zip.
+                    debug_assert_eq!(
+                        group_entries.len(),
+                        run.outcomes.len(),
+                        "fetch_group must return one outcome per entry"
+                    );
+                    let updates = build_completed_updates(&group_entries, &run.outcomes, out_root);
+                    (run, updates)
                 }
-                groups.push(outcomes);
-            }
+            };
+            run_with_retries(
+                groups_by_hash,
+                // Live-bar fan-out bounded by --jobs; the global gate is the real
+                // in-flight-fetch cap.
+                self.jobs.min(group_count),
+                self.entry_retries,
+                run,
+                |i, (run, updates): (GroupRun, BTreeMap<String, bundle_manifest::SavedFile>)| {
+                    if !updates.is_empty() {
+                        // Newly-fetched content bytes drive the byte-cadence flush;
+                        // a link/skip records a file but lands no new bytes.
+                        let fetched_bytes = run
+                            .outcomes
+                            .iter()
+                            .map(|o| match o {
+                                EntryOutcome::Fetched(n) => *n,
+                                _ => 0,
+                            })
+                            .sum();
+                        // Unbounded send: fails only if the flush task is gone,
+                        // which never happens before `drive` drops `flush_tx` below.
+                        let _ = flush_tx.send(FlushBatch {
+                            updates,
+                            fetched_bytes,
+                        });
+                    }
+                    if let Some(slot) = groups.get_mut(i) {
+                        *slot = run.outcomes;
+                    }
+                    run.retry
+                },
+            )
+            .await;
             // Closing the channel tells the flush task to do its final write.
             drop(flush_tx);
             groups
@@ -2270,7 +2407,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// writable destination receives the materialized bytes and every other is a
     /// hard link (or copy) of it (#1306). Returns one [`EntryOutcome`] per input
     /// entry, in order. Never panics or short-circuits — every failure becomes an
-    /// [`EntryOutcome::Failed`].
+    /// [`EntryOutcome::Failed`], and the [`GroupRun`] says whether a later
+    /// `--entry-retries` round may cure it.
     async fn fetch_group(
         &self,
         group: HashGroup<'_>,
@@ -2279,17 +2417,19 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         index: &ChunkIndex,
         fetch_plan: &FetchPlan,
         disk: &DiskState,
-    ) -> Vec<EntryOutcome> {
+    ) -> GroupRun {
         // The group's shared hash is carried explicitly; parse it once, and a bad
         // hash fails every path in the group.
         let hash = match fetch::parse_hash(group.hash) {
             Ok(h) => h,
             Err(e) => {
-                return group
-                    .entries
-                    .iter()
-                    .map(|en| EntryOutcome::failed(&en.path, &e))
-                    .collect();
+                return GroupRun::done(
+                    group
+                        .entries
+                        .iter()
+                        .map(|en| EntryOutcome::failed(&en.path, &e))
+                        .collect(),
+                );
             }
         };
 
@@ -2325,13 +2465,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // already on disk costs nothing. It downloads nothing, so it contributes
         // nothing to the total bar's download meter — no credit, no bar.
         if !slots.iter().any(|s| matches!(s, Slot::Write { .. })) {
-            return slots
-                .into_iter()
-                .map(|s| match s {
-                    Slot::Failed(o) => o,
-                    _ => EntryOutcome::Skipped,
-                })
-                .collect();
+            return GroupRun::done(
+                slots
+                    .into_iter()
+                    .map(|s| match s {
+                        Slot::Failed(o) => o,
+                        _ => EntryOutcome::Skipped,
+                    })
+                    .collect(),
+            );
         }
 
         // Whole-file dedup: an identical file already sits somewhere in the root
@@ -2362,7 +2504,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             if let Some(len) = verified_len {
                 // A whole-file link downloads nothing, so it adds nothing to the
                 // total bar's download meter.
-                return materialize_from_donor(slots, &donor, len).await;
+                return GroupRun::done(materialize_from_donor(slots, &donor, len).await);
             }
         }
 
@@ -2374,7 +2516,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // an all-skipped group.
         let staging = match staging_path(out_root, hash) {
             Ok(p) => p,
-            Err(e) => return fail_all(slots, &e),
+            Err(e) => return GroupRun::done(fail_all(slots, &e)),
         };
 
         // One per-file bar for this group's single pull, labeled by its destination
@@ -2407,8 +2549,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // `pull_entry` (whole-file or dedup) leaves the `<hex>.partial` +
             // `.obao4`/`.ranges` sidecars in place on error — they are what the
             // next run resumes from rather than re-paying for bytes already landed
-            // (same contract as `fetch`'s `<output>.partial` store).
-            return fail_all(slots, &e);
+            // (same contract as `fetch`'s `<output>.partial` store). A retryable
+            // failure goes into the next `--entry-retries` round, which resumes
+            // from them.
+            return GroupRun {
+                retry: entry_retryable(&e),
+                outcomes: fail_all(slots, &e),
+            };
         }
 
         // `materialize` reads `staging` (not moved), so a retry after a failed
@@ -2449,7 +2596,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             index.mark_retained(&staging);
         }
 
-        outcomes
+        GroupRun::done(outcomes)
     }
 }
 
@@ -2509,24 +2656,36 @@ impl<P: Provider + Clone> RangeDriver for CtxRangeDriver<'_, P> {
     }
 }
 
-/// Ensure the ranged-store `.partial` exists at the whole-file size, so a splice
-/// can seek and write into it. A drive normally creates it; an entry with nothing
-/// to drive (every chunk is a donor or deferred) has no drive, so this creates a
-/// sparse file of `total` bytes. A `.partial` already present (a drive made it, or
-/// a resumed run) is left untouched.
-fn ensure_partial(partial: &Path, total: u64) -> anyhow::Result<()> {
-    if partial.try_exists()? {
-        return Ok(());
-    }
+/// Ensure `staging`'s ranged store exists with its `.partial` at the whole-file
+/// size, so a splice can seek and write into it.
+///
+/// A drive normally creates the store; an entry with nothing to drive (every
+/// chunk is a donor or deferred) has no drive, so this creates it. It always
+/// makes a real store with its `.ranges` record, never a bare `.partial`: a
+/// later drive into the same entry (a donor re-fetch, a deferred fallback, the
+/// self-heal re-drive) calls `open_or_create`, which keys resume on the
+/// `.ranges` record and truncates a `.partial` that lacks one — wiping every
+/// byte already spliced into it. A store that already has its record (a drive
+/// made it, or a resumed run) is reopened as is. The data file is then extended
+/// to `total`, sparsely, because the whole-file hash reads its full length.
+fn ensure_partial(staging: &Path, hash: [u8; 32], total: u64) -> anyhow::Result<PathBuf> {
+    let (dir, stem) = fetch::ranged_store_location(staging)?;
+    ClientRangedStore::open_or_create(&dir, &stem, hash, total)
+        .with_context(|| format!("open the ranged store for {}", staging.display()))?;
+    let partial = partial_path(staging);
     let f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(false)
-        .open(partial)
-        .with_context(|| format!("create {}", partial.display()))?;
-    f.set_len(total)
-        .with_context(|| format!("size {}", partial.display()))?;
-    Ok(())
+        .open(&partial)
+        .with_context(|| format!("open {}", partial.display()))?;
+    if f.metadata()
+        .with_context(|| format!("stat {}", partial.display()))?
+        .len()
+        < total
+    {
+        f.set_len(total)
+            .with_context(|| format!("size {}", partial.display()))?;
+    }
+    Ok(partial)
 }
 
 /// Reassemble one dedup entry's blob into `staging`: drive the pay-now ranges,
@@ -2598,8 +2757,7 @@ async fn reassemble_dedup(
         }
     }
 
-    let partial = partial_path(staging);
-    ensure_partial(&partial, total)?;
+    let partial = ensure_partial(staging, hash, total)?;
 
     // Verify + splice each initially-available donor range off the executor. A donor
     // whose chunk no longer hashes to its hint (a lying donor hint, or a short read)
@@ -4005,6 +4163,180 @@ fn group_transfer(outcomes: &[EntryOutcome]) -> Transfer {
 mod tests {
     use super::*;
 
+    fn exhausted() -> anyhow::Error {
+        anyhow::Error::new(PoolExhausted {
+            gap_start: 0,
+            gap_len: 1,
+        })
+    }
+
+    fn terminal() -> anyhow::Error {
+        anyhow::Error::new(decdn_client_pull::BlobTooLarge {
+            received: 1 << 40,
+            ceiling: 1 << 20,
+        })
+    }
+
+    /// The walk stops at the first success and never tries the rest.
+    #[tokio::test]
+    async fn walk_candidates_stops_at_the_first_success() {
+        let tried = std::sync::Mutex::new(Vec::new());
+        let got = walk_candidates(&[1, 2, 3], "x", u8::to_string, |c: &u8| {
+            tried.lock().expect("lock").push(*c);
+            let c = *c;
+            async move {
+                if c == 2 {
+                    Ok(c)
+                } else {
+                    Err(anyhow!("fault {c}"))
+                }
+            }
+        })
+        .await
+        .expect("the second candidate delivers");
+        assert_eq!(got, 2);
+        assert_eq!(*tried.lock().expect("lock"), vec![1, 2]);
+    }
+
+    /// A terminal error stops the walk and surfaces unchanged: another provider
+    /// would fail the same way.
+    #[tokio::test]
+    async fn walk_candidates_stops_on_a_terminal_error() {
+        let tried = std::sync::Mutex::new(Vec::new());
+        let err = walk_candidates(&[1u8, 2], "x", u8::to_string, |c: &u8| {
+            tried.lock().expect("lock").push(*c);
+            async { Err::<(), _>(terminal()) }
+        })
+        .await
+        .expect_err("terminal");
+        assert_eq!(*tried.lock().expect("lock"), vec![1]);
+        assert!(
+            err.downcast_ref::<decdn_client_pull::BlobTooLarge>()
+                .is_some()
+        );
+        assert!(
+            !format!("{err:#}").contains("candidate provider"),
+            "{err:#}"
+        );
+    }
+
+    /// A pool exhaustion fails over within the walk: a cheaper provider may fit
+    /// what the deposit holds (`retry_disposition`, #1174). Both the whole-file
+    /// and the range walks follow this one rule (#2118).
+    #[tokio::test]
+    async fn walk_candidates_fails_over_on_pool_exhaustion() {
+        let tried = std::sync::Mutex::new(Vec::new());
+        walk_candidates(&[1u8, 2], "x", u8::to_string, |c: &u8| {
+            tried.lock().expect("lock").push(*c);
+            let c = *c;
+            async move { if c == 1 { Err(exhausted()) } else { Ok(()) } }
+        })
+        .await
+        .expect("the second candidate delivers");
+        assert_eq!(*tried.lock().expect("lock"), vec![1, 2]);
+    }
+
+    /// Running out of candidates names that fact in the error the run summary
+    /// prints, and the original error still classifies through the context.
+    #[tokio::test]
+    async fn walk_candidates_says_when_every_candidate_failed() {
+        let err = walk_candidates(&[1u8, 2, 3], "the entry", u8::to_string, |_: &u8| async {
+            Err::<(), _>(exhausted())
+        })
+        .await
+        .expect_err("every candidate fails");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("all 3 candidate provider(s) failed to deliver the entry"),
+            "{msg}"
+        );
+        assert!(err.downcast_ref::<PoolExhausted>().is_some());
+        assert_eq!(retry_disposition(&err), RetryDisposition::RetryElsewhere);
+    }
+
+    #[tokio::test]
+    async fn walk_candidates_with_no_candidates_errors() {
+        let none: [u8; 0] = [];
+        let err = walk_candidates(&none, "the entry", u8::to_string, |_: &u8| async { Ok(()) })
+            .await
+            .expect_err("nothing to try");
+        assert!(format!("{err}").contains("no candidate node"), "{err}");
+    }
+
+    /// Only a failure a later round can cure goes into it. A spent pool is
+    /// excluded: every provider already refused the deposit.
+    #[test]
+    fn entry_retryable_excludes_terminal_and_exhausted_failures() {
+        assert!(entry_retryable(&anyhow!("early eof")));
+        assert!(!entry_retryable(&terminal()));
+        assert!(!entry_retryable(&exhausted()));
+        assert!(!entry_retryable(
+            &exhausted().context("all 2 candidate provider(s) failed")
+        ));
+    }
+
+    #[test]
+    fn entry_retry_backoff_doubles_to_a_cap() {
+        let secs: Vec<u64> = (1..=6).map(|r| entry_retry_backoff(r).as_secs()).collect();
+        assert_eq!(secs, vec![2, 4, 8, 16, 30, 30]);
+        assert_eq!(entry_retry_backoff(u32::MAX).as_secs(), 30);
+    }
+
+    /// Items that ask for a retry run again, up to the round limit, after the
+    /// backoff; a later result replaces the earlier one; and an item that
+    /// succeeds drops out of the next round.
+    #[tokio::test(start_paused = true)]
+    async fn run_with_retries_reruns_only_the_items_that_ask() {
+        // Item `i` fails its first `i` runs.
+        let runs = std::sync::Mutex::new(vec![0u32; 4]);
+        let mut last = vec![None; 4];
+        let started = tokio::time::Instant::now();
+        run_with_retries(
+            vec![0usize, 1, 2, 3],
+            2,
+            2,
+            |i| {
+                let n = {
+                    let mut runs = runs.lock().expect("lock");
+                    let slot = runs.get_mut(i).expect("item");
+                    *slot += 1;
+                    *slot
+                };
+                async move { n > u32::try_from(i).expect("small") }
+            },
+            |i, ok: bool| {
+                *last.get_mut(i).expect("item") = Some(ok);
+                !ok
+            },
+        )
+        .await;
+        // Item 3 needs a fourth run, but two retry rounds allow three.
+        assert_eq!(*runs.lock().expect("lock"), vec![1, 2, 3, 3]);
+        assert_eq!(last, vec![Some(true), Some(true), Some(true), Some(false)]);
+        // Two rounds waited 2 s then 4 s.
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(6));
+    }
+
+    /// `--entry-retries 0` runs the single pass and never waits.
+    #[tokio::test(start_paused = true)]
+    async fn run_with_retries_zero_runs_once() {
+        let runs = std::sync::atomic::AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        run_with_retries(
+            vec![()],
+            1,
+            0,
+            |()| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                async { false }
+            },
+            |_, ok: bool| !ok,
+        )
+        .await;
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+
     #[test]
     fn build_completed_updates_records_present_omits_failed() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -4874,10 +5206,13 @@ mod tests {
         );
     }
 
-    /// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive` writes
-    /// the requested ranges' correct bytes into `<staging>.partial` (creating it,
-    /// pre-sized), never finalizing `<hex>` itself — so `reassemble_dedup` exercises
-    /// its splice + whole-file verify + promote path. Records every driven range.
+    /// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive` opens
+    /// the entry's ranged store the way the real drive does (`open_or_create`, so
+    /// a `.partial` without its `.ranges` record is truncated exactly as in
+    /// production), then writes the requested ranges' correct bytes into
+    /// `<staging>.partial`, pre-sized, never finalizing `<hex>` itself — so
+    /// `reassemble_dedup` exercises its splice + whole-file verify + promote path.
+    /// Records every driven range.
     struct RecordingDriver {
         hash: [u8; 32],
         staging: PathBuf,
@@ -4897,14 +5232,15 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
             Box::pin(async move {
                 use std::io::{Seek, SeekFrom, Write};
+                let total = u64::try_from(self.content.len()).expect("content len fits u64");
+                let (dir, stem) = fetch::ranged_store_location(&self.staging).expect("location");
+                ClientRangedStore::open_or_create(&dir, &stem, self.hash, total)
+                    .expect("open ranged store");
                 let partial = self.staging.with_extension("partial");
                 let mut f = std::fs::OpenOptions::new()
                     .write(true)
-                    .create(true)
-                    .truncate(false)
                     .open(&partial)
                     .expect("open partial");
-                let total = u64::try_from(self.content.len()).expect("content len fits u64");
                 f.set_len(total).expect("size partial");
                 for &(off, len) in ranges {
                     self.driven.lock().expect("driven lock").push((off, len));
@@ -4917,6 +5253,78 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    /// An entry with nothing to pay for up front splices its donors into a store
+    /// that `ensure_partial` created, and a later fallback drive into the same
+    /// entry must keep those spliced bytes. A bare `.partial` with no `.ranges`
+    /// record would be truncated by that drive's `open_or_create`, the whole-file
+    /// hash would then fail, and the self-heal would pay for the whole blob.
+    #[tokio::test]
+    async fn a_fallback_drive_keeps_the_bytes_spliced_before_it() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let total = 4 * GROUP;
+        let content: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let whole = *blake3::hash(&content).as_bytes();
+        let half = usize::try_from(2 * GROUP).expect("fits usize");
+
+        // The first half comes from a verified on-disk donor.
+        let donor_path = tmp.path().join("donor");
+        std::fs::write(&donor_path, &content[..half]).expect("write donor");
+        let donor_hash = *blake3::hash(&content[..half]).as_bytes();
+        // The second half is deferred to a sibling that has already finished
+        // without producing it, so it falls back to a paid drive.
+        let deferred_hash = *blake3::hash(&content[half..]).as_bytes();
+
+        let staging = tmp.path().join("blob");
+        let driver = RecordingDriver {
+            hash: whole,
+            staging: staging.clone(),
+            content: content.clone(),
+            driven: std::sync::Mutex::new(Vec::new()),
+        };
+        let plan = ReassemblePlan {
+            donor: vec![DonorRange {
+                aligned: (0, 2 * GROUP),
+                source: donor_path,
+                src_offset: 0,
+                chunk_hash: donor_hash,
+                chunk_src_offset: 0,
+                chunk_len: 2 * GROUP,
+            }],
+            deferred: vec![Hint {
+                hash: deferred_hash,
+                offset: 2 * GROUP,
+                len: 2 * GROUP,
+            }],
+            drive: Vec::new(),
+        };
+        let index = ChunkIndex::default();
+        let mut fetch_plan = FetchPlan::default();
+        fetch_plan.assigned.insert(deferred_hash, [0xaa; 32]);
+        index.mark_finished([0xaa; 32]);
+
+        let outcome = reassemble_dedup(
+            &driver,
+            &plan,
+            total,
+            None,
+            &index,
+            &fetch_plan,
+            None,
+            &|| {},
+        )
+        .await
+        .expect("reassembly must succeed");
+        assert_eq!(std::fs::read(&staging).expect("read staging"), content);
+        assert_eq!(
+            driver.driven.lock().expect("driven lock").clone(),
+            vec![(2 * GROUP, 2 * GROUP)],
+            "only the deferred half is paid for; no self-heal re-drive"
+        );
+        assert_eq!(outcome.spliced_bytes, 2 * GROUP);
     }
 
     /// A deferred chunk whose assigned fetcher registers its donor only AFTER the

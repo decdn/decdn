@@ -256,14 +256,25 @@ as `decdn fetch`):
   triggers no fetch of its own (the group still fetches once if any
   sibling path needs bytes).
 - **Concurrency** is bounded by `--jobs` (over distinct blobs). Fetches share a
-  `LaneLedger` per `(pool, signer, provider)` lane, and `--max-lane-streams`
-  (default 1) caps how many of them run at once on one lane: the shared
+  `LaneLedger` per `(pool, signer, provider)` lane. `--max-lane-streams`
+  (default 4) caps how many streams run at once on one lane. The shared
   ledger keeps voucher issuance monotonic across concurrent streams on a
-  lane, but a fast stream still advances the lane's one cumulative
-  watermark ahead of a slow co-stream and starves it, so the default keeps
-  one stream per lane. Distinct lanes proceed in parallel. A blob that
-  clears the multi-source gate fans out to its admitted holders per
+  lane. The serving node credits each stream's delivered bytes from the
+  lane's one cumulative watermark, so a fast stream does not starve a slow
+  co-stream. Distinct lanes proceed in parallel. A blob that clears the
+  multi-source gate fans out to its admitted holders per
   [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1).
+- **Failover and retry.** Each entry tries its probed candidates in order. A
+  retryable failure moves to the next candidate. A terminal failure stops
+  the entry. When the last candidate fails, the entry's error says that
+  every candidate failed. After the first pass over the bundle,
+  `--entry-retries` (default 2) runs each entry that failed retryably again.
+  Before each round the pull waits: 2 s, then double the last wait, to a
+  maximum of 30 s. Each round probes the holders again, so a provider that
+  failed before is a candidate again. Each round continues from the entry's
+  `.partial`, so no byte is paid for twice. A pool exhaustion moves to the
+  next candidate in a pass, but it does not start a new round: every
+  provider refuses the same deposit.
 - **Output** files are written under `-o <dir>` at each entry's relative
   path, resolved with the § Path-safety rules above (`..`, absolute, and
   escaping paths rejected). Writes are atomic (temp-then-rename after the

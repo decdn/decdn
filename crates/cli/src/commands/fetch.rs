@@ -3206,7 +3206,7 @@ fn wants_stdout(output: &Path) -> bool {
 /// `--output` (no post-finalize rename), and its `.partial` sits beside the
 /// destination exactly like `<output>.partial`, so promotion is a
 /// same-filesystem atomic rename.
-fn ranged_store_location(output: &Path) -> anyhow::Result<(PathBuf, String)> {
+pub(crate) fn ranged_store_location(output: &Path) -> anyhow::Result<(PathBuf, String)> {
     let dir = match output.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -3529,7 +3529,7 @@ where
         chain.max_approve,
         // The store this fetch writes was opened from `chain.data_dir`, and it
         // signs with `chain.keystore`; the verdict covers both.
-        ChainAdoption::for_buy(&chain.data_dir, &chain.keystore),
+        ChainAdoption::for_buy(&chain.data_dir, &chain.keystore)?,
     )
     .await?;
     attach_client_binding(ctx, chain, endpoint, signer)

@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
+
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 
 /// Which buyer store a resolved `data_dir` belongs to.
@@ -100,15 +102,24 @@ impl ChainAdoption {
     /// This recognises a key that lives in a node's data dir. It cannot
     /// recognise one copied out of it, or a wallet two clients share — nothing
     /// local distinguishes those from a wallet with one buyer.
-    pub(crate) fn for_buy(data_dir: &Path, keystore: &Path) -> Self {
-        let node_owned =
-            |dir: &Path| matches!(classify_buyer_store(dir), BuyerStoreOwner::Node { .. });
+    ///
+    /// # Errors
+    ///
+    /// Errors when either directory's owner cannot be told, because a stat of
+    /// one of its daemon markers failed for a reason other than `NotFound`.
+    pub(crate) fn for_buy(data_dir: &Path, keystore: &Path) -> anyhow::Result<Self> {
+        let node_owned = |dir: &Path| -> anyhow::Result<bool> {
+            Ok(matches!(
+                classify_buyer_store(dir)?,
+                BuyerStoreOwner::Node { .. }
+            ))
+        };
         let key_dir = keystore.parent().unwrap_or(Path::new(""));
-        if node_owned(data_dir) || node_owned(key_dir) {
+        Ok(if node_owned(data_dir)? || node_owned(key_dir)? {
             Self::Refused
         } else {
             Self::Allowed
-        }
+        })
     }
 }
 
@@ -124,8 +135,20 @@ impl ChainAdoption {
 /// is recovering from it.
 ///
 /// `node.secret` is deliberately not a marker — a client keygen writes one too.
-pub(crate) fn classify_buyer_store(data_dir: &Path) -> BuyerStoreOwner {
-    match decdn_common::data_dir::daemon_marker(data_dir) {
+///
+/// # Errors
+///
+/// Errors when a daemon marker's stat fails for a reason other than `NotFound`.
+/// The owner is then unknown, and every guard built on this verdict refuses
+/// rather than treating the directory as a client's (#2086).
+pub(crate) fn classify_buyer_store(data_dir: &Path) -> anyhow::Result<BuyerStoreOwner> {
+    let marker = decdn_common::data_dir::daemon_marker(data_dir).with_context(|| {
+        format!(
+            "cannot tell whether {} belongs to a decdn-node daemon",
+            data_dir.display()
+        )
+    })?;
+    Ok(match marker {
         Some(marker) => BuyerStoreOwner::Node {
             data_dir: data_dir.to_path_buf(),
             marker,
@@ -133,7 +156,7 @@ pub(crate) fn classify_buyer_store(data_dir: &Path) -> BuyerStoreOwner {
         None => BuyerStoreOwner::Client {
             data_dir: data_dir.to_path_buf(),
         },
-    }
+    })
 }
 
 impl BuyerStoreOwner {
@@ -265,13 +288,13 @@ impl BuyerStoreOwner {
 ///
 /// # Errors
 ///
-/// Errors when `data_dir` belongs to a daemon, or when the client store will
-/// not open.
+/// Errors when `data_dir` belongs to a daemon or its owner cannot be told, or
+/// when the client store will not open.
 pub(crate) fn open_client_store_for_escrow(
     data_dir: &Path,
     verb: &str,
 ) -> anyhow::Result<RedbBuyerPoolStore> {
-    let owner = classify_buyer_store(data_dir);
+    let owner = classify_buyer_store(data_dir)?;
     owner.refuse_escrow(verb)?;
     owner
         .open_for_write()?
@@ -286,13 +309,13 @@ pub(crate) fn open_client_store_for_escrow(
 /// # Errors
 ///
 /// Errors when `data_dir` belongs to a daemon and was not named on the command
-/// line, or when the client store will not open.
+/// line, when its owner cannot be told, or when the client store will not open.
 pub(crate) fn open_client_store_for_buy(
     data_dir: &Path,
     source: DataDirSource,
     verb: &str,
 ) -> anyhow::Result<RedbBuyerPoolStore> {
-    let owner = classify_buyer_store(data_dir);
+    let owner = classify_buyer_store(data_dir)?;
     owner.refuse_implicit_node_dir(verb, source)?;
     // A named node dir is the operator's call, so the buy proceeds there — the
     // one place a `Node` verdict still opens a client store.
@@ -316,15 +339,15 @@ mod tests {
         let client = || BuyerStoreOwner::Client {
             data_dir: dir.path().to_path_buf(),
         };
-        assert_eq!(classify_buyer_store(dir.path()), client());
+        assert_eq!(classify_buyer_store(dir.path()).unwrap(), client());
 
         // The client's own store does not make it a node data dir.
         std::fs::write(dir.path().join("buyer-pools.redb"), b"x").unwrap();
-        assert_eq!(classify_buyer_store(dir.path()), client());
+        assert_eq!(classify_buyer_store(dir.path()).unwrap(), client());
 
         std::fs::write(dir.path().join("buyer.redb"), b"x").unwrap();
         assert_eq!(
-            classify_buyer_store(dir.path()),
+            classify_buyer_store(dir.path()).unwrap(),
             BuyerStoreOwner::Node {
                 data_dir: dir.path().to_path_buf(),
                 marker: decdn_common::data_dir::NODE_BUYER_DB_FILE,
@@ -344,7 +367,7 @@ mod tests {
         let client = tempfile::tempdir().unwrap();
         let client_key = client.path().join("keystore.json");
         assert_eq!(
-            ChainAdoption::for_buy(client.path(), &client_key),
+            ChainAdoption::for_buy(client.path(), &client_key).unwrap(),
             ChainAdoption::Allowed
         );
 
@@ -352,7 +375,7 @@ mod tests {
         std::fs::write(node.path().join("lanes.redb"), b"x").unwrap();
         assert!(!node.path().join("buyer.redb").exists());
         assert_eq!(
-            ChainAdoption::for_buy(node.path(), &node.path().join("keystore.json")),
+            ChainAdoption::for_buy(node.path(), &node.path().join("keystore.json")).unwrap(),
             ChainAdoption::Refused,
             "a node dir must refuse adoption even with its buyer store gone"
         );
@@ -369,7 +392,7 @@ mod tests {
         let node = tempfile::tempdir().unwrap();
         std::fs::write(node.path().join("lanes.redb"), b"x").unwrap();
         assert_eq!(
-            ChainAdoption::for_buy(client.path(), &node.path().join("keystore.json")),
+            ChainAdoption::for_buy(client.path(), &node.path().join("keystore.json")).unwrap(),
             ChainAdoption::Refused,
             "a client dir must not adopt the daemon's pool through its operator key"
         );
@@ -392,7 +415,7 @@ mod tests {
         // No `buyer.redb` — it was deleted to force re-adoption.
         assert!(!dir.path().join("buyer.redb").exists());
 
-        let owner = classify_buyer_store(dir.path());
+        let owner = classify_buyer_store(dir.path()).unwrap();
         assert!(
             matches!(owner, BuyerStoreOwner::Node { .. }),
             "a data dir with daemon stores but no buyer.redb must not be a client's"
@@ -512,5 +535,26 @@ mod tests {
             !dir.path().join("buyer-pools.redb").exists(),
             "a refused open must not manufacture the client store"
         );
+    }
+
+    /// An owner that cannot be told refuses every guarded open instead of
+    /// passing as a client dir (#2086). A regular file in place of the data dir
+    /// makes each marker stat fail with `NotADirectory`, not `NotFound`.
+    #[test]
+    fn an_unknown_owner_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("data");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+
+        let err = classify_buyer_store(&not_a_dir).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cannot tell whether"),
+            "{err:#}"
+        );
+        assert!(open_client_store_for_escrow(&not_a_dir, "open a pool").is_err());
+        assert!(
+            open_client_store_for_buy(&not_a_dir, DataDirSource::Flag, "fetch content").is_err()
+        );
+        assert!(ChainAdoption::for_buy(dir.path(), &not_a_dir.join("keystore.json")).is_err());
     }
 }

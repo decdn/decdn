@@ -34,6 +34,7 @@
 //! callback `None` — when stderr is not a terminal or the run is `--json`, so
 //! piped and scripted output is byte-for-byte what it was before per-file bars.
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,6 +80,12 @@ struct Inner {
     /// the run's rate/ETA; per-file bars insert before it. `None` when the manifest
     /// declares no sizes, in which case only per-file bars render.
     total: Option<TotalBar>,
+    /// How many of each file's download bytes the total bar already holds, by bar
+    /// label. A retry round builds a new bar for a file whose earlier bar already
+    /// folded its landed prefix into the total, and its first callback reports
+    /// that same prefix again as it resumes; the new bar picks up the old
+    /// high-water mark so those bytes are not counted twice.
+    folded: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
 /// The bottom total bar plus the rate meter behind its `{msg}`. Every downloaded
@@ -190,7 +197,11 @@ impl PullProgress {
             .filter(|n| *n > 0)
             .map(|len| Self::add_total_bar(&mp, len));
         Self {
-            inner: Some(Inner { mp, total }),
+            inner: Some(Inner {
+                mp,
+                total,
+                folded: Mutex::new(HashMap::new()),
+            }),
         }
     }
 
@@ -273,7 +284,10 @@ impl PullProgress {
         // cap is 0, so it displays progress from `expected` but adds nothing).
         let total = i.total.clone();
         let cb_phase = phase.clone();
-        let prev = AtomicU64::new(0);
+        let prev = i.folded.lock().map_or_else(
+            |_| Arc::new(AtomicU64::new(0)),
+            |mut map| Arc::clone(map.entry(label.to_string()).or_default()),
+        );
         let cb = move |received: u64, expected: u64| {
             cb_phase.download(received, expected);
             if let Some(t) = &total {
@@ -504,6 +518,7 @@ mod tests {
             inner: Some(Inner {
                 mp,
                 total: Some(total.clone()),
+                folded: Mutex::new(HashMap::new()),
             }),
         };
         (pp, total)
@@ -524,6 +539,33 @@ mod tests {
         // Delivery past the download size (should not happen, but be safe) does not
         // push the total past the download denominator.
         cb(1200, 9999);
+        assert_eq!(total.position(), 1000);
+    }
+
+    /// A retry round builds a fresh bar for the same file, and its resumed drive
+    /// reports the already-landed prefix again. The total must count that prefix
+    /// once, and still count the bytes the retry adds.
+    #[test]
+    fn a_retried_file_bar_does_not_recount_its_landed_prefix() {
+        let (pp, total) = hidden_pp(1000);
+        let first = pp.file_bar("m", 1000, 0);
+        first.callback().expect("enabled")(600, 1000);
+        first.finish();
+        assert_eq!(total.position(), 600);
+
+        let retry = pp.file_bar("m", 1000, 0);
+        let cb = retry.callback().expect("enabled");
+        cb(600, 1000);
+        assert_eq!(
+            total.position(),
+            600,
+            "the resumed prefix is already counted"
+        );
+        cb(1000, 1000);
+        assert_eq!(total.position(), 1000);
+
+        // A different file keeps its own mark.
+        pp.file_bar("other", 1000, 0).callback().expect("enabled")(0, 1000);
         assert_eq!(total.position(), 1000);
     }
 
