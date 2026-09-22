@@ -11,11 +11,15 @@
 //! [`content_paid_frontier`] maps a paid WIRE-byte watermark back to the
 //! content-byte frontier it covers, for the resume-at-paid-frontier gate.
 //!
-//! The output side of a fetch lives here too (#1848): [`ByteSink`] is where the
-//! engine writes verified content bytes (a file for the `Downloader`), and
+//! The output side of a fetch lives here too (#1848): [`ByteSink`] is the seam
+//! for writing a fetch's verified content bytes to a caller destination, and
 //! [`BlobCache`] is the injected `(hash, range)` cache the `Streamer` consults
 //! and fills. Both are pure — they name no blob store — which is what keeps
 //! `client-pull` `iroh-blobs`-free; the default cache is the no-op [`NoCache`].
+//! The [`Streamer`](crate::Streamer) drives [`BlobCache`]; [`ByteSink`] has no
+//! production consumer yet — the [`Downloader`](crate::Downloader) writes through
+//! a [`ClientRangedStore`](crate::ClientRangedStore) instead — so its only
+//! implementor is a test double.
 
 use bao_tree::io::DecodeError;
 use bytes::{Bytes, BytesMut};
@@ -261,12 +265,17 @@ pub type SinkFuture<'a, T> =
 
 /// Where a fetched blob's VERIFIED content bytes are written.
 ///
-/// The engine calls [`write_at`](ByteSink::write_at) only with content that has
-/// already passed bao verification against the blob's root, at its absolute
-/// offset in the blob — so an out-of-order multi-source fetch lands each range at
-/// its position. The `Downloader` backs this with a file; a test backs it with a
-/// `Vec`. Pure: the trait names no blob store, so it does not pull client-pull
-/// back toward `iroh-blobs`.
+/// A caller implements it to receive [`write_at`](ByteSink::write_at) calls only
+/// with content that has already passed bao verification against the blob's root,
+/// at its absolute offset in the blob — so an out-of-order multi-source fetch
+/// lands each range at its position. Pure: the trait names no blob store, so it
+/// does not pull client-pull back toward `iroh-blobs`.
+///
+/// This is an output seam with no production consumer today: the
+/// [`Downloader`](crate::Downloader) writes its output through a
+/// [`ClientRangedStore`](crate::ClientRangedStore) — which promotes the verified
+/// `.partial` to the final file on `finalize` — rather than a `ByteSink`, so the
+/// trait's only implementor is a test `Vec`.
 pub trait ByteSink: Send + Sync {
     /// Write verified content `bytes` at absolute `offset` in the blob. Writes at
     /// distinct offsets are independent, so a caller may issue them concurrently.
