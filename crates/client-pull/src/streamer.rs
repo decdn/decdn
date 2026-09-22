@@ -257,11 +257,15 @@ impl<'a, S, F> Streamer<'a, S, F> {
 
 impl<S, F> Streamer<'_, S, F>
 where
-    S: BlobSource + 'static,
-    F: Funder + 'static,
+    S: BlobSource,
+    F: Funder,
 {
     /// Open a consumption-paced stream over `hash` (whose content length is
     /// `total_bytes`), returning the [`VerifiedReader`] the caller drains.
+    ///
+    /// The returned reader borrows `'a` from its sources — a real `PeerSource`
+    /// over a borrowed `Endpoint` is not `'static`, so the caller keeps the
+    /// endpoint (and candidates) alive for as long as it drains the reader.
     ///
     /// On a REVISIT — `cache` already holds the whole blob — the reader serves
     /// straight from the cache and the network is never touched. Otherwise the
@@ -278,13 +282,17 @@ where
     /// A cache read fault at open, or a fill-store open/create I/O error. Faults
     /// DURING the fetch (a refused or stalled pull, a verification failure)
     /// surface later, from the reader.
-    pub async fn open(
+    pub async fn open<'a>(
         self,
         hash: [u8; 32],
         total_bytes: u64,
         config: &PullConfig,
         cache: Arc<dyn BlobCache>,
-    ) -> anyhow::Result<VerifiedReader> {
+    ) -> anyhow::Result<VerifiedReader<'a>>
+    where
+        S: 'a,
+        F: 'a,
+    {
         if let Some(cached) = cache.get(hash, 0, total_bytes).await?
             && u64::try_from(cached.len()).is_ok_and(|len| len == total_bytes)
         {
@@ -328,7 +336,7 @@ where
 /// An [`AsyncRead`] over a blob's verified contiguous front, clamped to the
 /// verified frontier by construction (it only reads bytes the engine has already
 /// bao-verified), consumption-paced (the fetch advances only as it is read).
-pub enum VerifiedReader {
+pub enum VerifiedReader<'a> {
     /// A whole-blob cache hit: served straight from memory, no fetch.
     Cached {
         /// The cached blob.
@@ -338,20 +346,25 @@ pub enum VerifiedReader {
     },
     /// A live fetch: the reader cooperatively drives the fetch and reads the
     /// verified prefix from the fill store.
-    Live(LiveReader),
+    Live(LiveReader<'a>),
 }
 
 /// The live half of a [`VerifiedReader`]: it owns the drive future, polls it
 /// forward as the consumer reads, and hands out the verified prefix.
-pub struct LiveReader {
+///
+/// The `'a` is the fetch future's borrow — a real source (a `PeerSource` over a
+/// borrowed `Endpoint`) is not `'static`, so the reader borrows for as long as
+/// its sources do rather than forcing a `'static` bound.
+pub struct LiveReader<'a> {
     state: Arc<StreamState>,
     /// The streaming fetch. `None` once it has finished (cleanly or with an
-    /// error parked in `drive_err`).
-    drive: Option<Pin<Box<dyn Future<Output = anyhow::Result<()>>>>>,
+    /// error parked in `drive_err`). Borrows `'a` from its sources.
+    drive: Option<Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>>,
     /// The fetch's terminal error, surfaced to the consumer once the verified
     /// prefix before it is drained.
     drive_err: Option<anyhow::Error>,
-    /// An in-flight store read for the current verified prefix span.
+    /// An in-flight store read for the current verified prefix span. It captures
+    /// an `Arc<StreamState>`, so it needs no borrow of `'a`.
     read: Option<Pin<Box<dyn Future<Output = io::Result<Bytes>>>>>,
     /// Verified bytes read from the store, not yet handed to the consumer.
     buffered: Bytes,
@@ -380,7 +393,7 @@ async fn present_frontier(store: &ClientRangedStore, total: u64) -> anyhow::Resu
     )
 }
 
-impl std::fmt::Debug for LiveReader {
+impl std::fmt::Debug for LiveReader<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LiveReader")
             .field("cursor", &self.state.cursor.load(Ordering::SeqCst))
@@ -391,7 +404,7 @@ impl std::fmt::Debug for LiveReader {
     }
 }
 
-impl std::fmt::Debug for VerifiedReader {
+impl std::fmt::Debug for VerifiedReader<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cached { data, pos } => f
@@ -406,7 +419,7 @@ impl std::fmt::Debug for VerifiedReader {
     }
 }
 
-impl LiveReader {
+impl LiveReader<'_> {
     /// Issue a read of the verified prefix `[cursor, present_frontier)` if none is
     /// in flight. The read future itself queries the store's present frontier, so
     /// it reads exactly what the store has durably admitted (never the decoder's
@@ -513,7 +526,7 @@ impl LiveReader {
     }
 }
 
-impl AsyncRead for VerifiedReader {
+impl AsyncRead for VerifiedReader<'_> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
