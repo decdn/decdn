@@ -399,8 +399,9 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// against `H` before the full blob has finished pulling through).
     /// `outboard_max_bytes` caps the read — the engine derives it from the
     /// blob size (an outboard is `O(blob/256)`), and an oversize outboard is
-    /// malformed/foreign. A range pull reads the outboard exactly once, then
-    /// fetches the span window by window through [`Self::fetch_range_data`].
+    /// malformed/foreign. The engine reads the outboard once per hash and caches
+    /// it across range pulls; each pull fetches its span window by window
+    /// through [`Self::fetch_range_data`].
     ///
     /// The default implementation returns [`OutboardFetch::Unsupported`], which
     /// also disables range pulls (see [`Self::fetch_range_data`]). The three

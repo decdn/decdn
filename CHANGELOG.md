@@ -825,6 +825,30 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Node: a cold multi-GB cache miss streams at bandwidth, not one round trip
+  per chunk (#2061).** The two-leg serve-miss spine re-read the whole
+  `{H}.obao4` outboard (blob / 256 bytes) from the origin on every draw, and
+  opened a new upstream request for each small piece of room a voucher
+  released — often one chunk. A proxy-warmed bundle pull fell from 40–60 MiB/s
+  to 1–8 MiB/s once it reached content only one node could fill.
+  - The cache engine keeps each outboard, tagged with the origin that served
+    it, in a 256 MiB memory cache. The serviceability probe and every draw read
+    it from there. Each draw takes the outboard and the data from the same
+    origin, and a verify fault evicts the copy the draw used. An outboard over
+    256 MiB (a blob over 64 GiB) is read on each draw.
+  - Once the ramped window reaches four pull-window floors, the pull leg waits
+    until half of it is open before it draws, except for a serve-demand draw or
+    the end of a gap. The exposure bound is unchanged. The new counter
+    `decdn_node_pull_through_min_draw_waits_total` meters these waits apart
+    from `decdn_node_pull_through_window_paused_total`.
+  - Each origin read on this path (an outboard fetch or one data window of at
+    most 4 MiB) has a time budget of `cache.node_pull_stall_window_sec` plus
+    the read size at `cache.node_pull_min_throughput_bps`. A read past it fails
+    as an origin fault and bumps `decdn_cache_origin_range_timeouts_total`.
+    `node_pull_min_throughput_bps = 0` leaves these reads unbounded.
+  - `decdn_cache_pull_through_bytes_total` counts each outboard the origin
+    serves once, including wrong-length copies.
+
 - **CLI: `decdn fetch` and `decdn bundle pull` adopt the pool the wallet
   already owns on chain, instead of opening a second one.** The client decided
   whether it owned a pool from its local store alone, so a lost row read as "no

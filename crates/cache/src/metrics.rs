@@ -142,7 +142,9 @@ pub struct CacheMetrics {
     /// Bytes fetched from origin during pull-through (#418). Counted
     /// the moment bytes are received from origin, regardless of whether
     /// they pass BLAKE3 verification or land in the store — origin
-    /// egress is paid either way. Distinguishes 'serving from cache'
+    /// egress is paid either way. On the range-pull path this includes each
+    /// `{H}.obao4` outboard the origin serves, wrong-length copies too; a
+    /// cached outboard is not re-counted. Distinguishes 'serving from cache'
     /// vs. 'paying origin egress' when paired with `bytes_returned`.
     pub pull_through_bytes: Counter,
     /// iroh-blobs GC sweep cycles observed (#518). Bumped once per
@@ -400,4 +402,17 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_held_corruption_quarantined_total`.
     pub held_corruption_quarantined: Counter,
+    /// Origin reads on the range-pull path (an `{H}.obao4` fetch or one data
+    /// window) that ran past their time budget (ADR 037). The budget is
+    /// `cache.node_pull_stall_window_sec` plus the read size at
+    /// `cache.node_pull_min_throughput_bps`. Each timeout is also an origin
+    /// transport fault, so it advances the origin chain or fails the fill.
+    ///
+    /// Operator-actionable: a nonzero rate means an origin that stalls or
+    /// sustains less than the throughput floor. Check the origin, or lower
+    /// the floor for a slow origin.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_origin_range_timeouts_total`.
+    pub origin_range_timeouts: Counter,
 }

@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod origin;
 pub mod origin_probe;
 pub mod origin_range;
+mod outboard_cache;
 pub mod policy;
 pub mod probe_hold;
 pub mod range_pull;

@@ -49,7 +49,7 @@ use decdn_client_pull::driver::DriveConfig;
 use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
     CoveredRun, DownstreamFrontier, HashMismatch as ClientPullHashMismatch, PacingWait, PeerSource,
-    PoolExhausted, RampPacer, RetryDisposition, SharedPool, drive, retry_disposition,
+    PoolExhausted, RampPacer, RetryDisposition, SharedPool, WaitReason, drive, retry_disposition,
 };
 use decdn_incentive::DepositOutcome;
 
@@ -101,7 +101,7 @@ pub(crate) struct PullLegTarget {
     candidates: Vec<Candidate>,
 }
 
-/// The injected wait for [`RampPacer`]'s `Wait`: resolve once the serve leg's paid
+/// The injected wait for [`RampPacer`]'s `Wait` and `WaitForMinDraw`: resolve once the serve leg's paid
 /// frontier or demand frontier moves past what the decision read
 /// ([`DownstreamWatch::past`], which owns the #1673 arm-then-recheck). Also the
 /// reader `drive` paces against, so the decision and the wait always read the same
@@ -109,9 +109,10 @@ pub(crate) struct PullLegTarget {
 struct DownstreamWait {
     /// The session's downstream frontiers.
     watch: DownstreamWatch,
-    /// Bumps `node_pull_through_window_paused` on each pause — the pull hit its ADR
-    /// 037 window and is waiting for downstream payment to clear or a serve leg to
-    /// park at its frontier.
+    /// Bumps `node_pull_through_window_paused` on each window-full pause — the pull
+    /// hit its ADR 037 window and is waiting for downstream payment to clear or a
+    /// serve leg to park at its frontier — and `node_pull_through_min_draw_waits` on
+    /// each pause for the minimum draw.
     metrics: Arc<crate::metrics::Metrics>,
 }
 
@@ -134,10 +135,17 @@ impl DownstreamWait {
 }
 
 impl PacingWait for DownstreamWait {
-    fn wait(&self, observed: DownstreamFrontier) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        // The pull hit its ADR 037 window: count the pause (the decision was `Wait`),
-        // independent of whether we then park or short-circuit on a raced advance.
-        self.metrics.node_pull_through_window_paused();
+    fn wait(
+        &self,
+        observed: DownstreamFrontier,
+        reason: WaitReason,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        // Count the pause by its reason, independent of whether we then park or
+        // short-circuit on a raced advance.
+        match reason {
+            WaitReason::WindowFull => self.metrics.node_pull_through_window_paused(),
+            WaitReason::MinDraw => self.metrics.node_pull_through_min_draw_waits(),
+        }
         Box::pin(self.watch.past(observed.served_paid, observed.serve_demand))
     }
 }
@@ -1494,13 +1502,39 @@ mod downstream_wait_tests {
 
     use super::DownstreamWait;
     use crate::metrics::Metrics;
-    use decdn_client_pull::{DownstreamFrontier, PacingWait};
+    use decdn_client_pull::{DownstreamFrontier, PacingWait, WaitReason};
 
     /// A standalone session and a wait over its downstream frontiers.
     fn session_and_hook() -> (Arc<FillSession>, DownstreamWait) {
         let session = FillSession::new(bao_tree::blake3::Hash::from([7; 32]), 1 << 20);
         let hook = DownstreamWait::for_session(&session, Arc::new(Metrics::new()));
         (session, hook)
+    }
+
+    /// Each pause reason bumps its own counter, so a minimum-draw pause does not
+    /// read as the window binding.
+    #[tokio::test]
+    async fn each_wait_reason_bumps_its_own_counter() {
+        fn count(metrics: &Metrics, name: &str) -> u64 {
+            let text = metrics.encode().unwrap();
+            text.lines()
+                .find_map(|l| l.strip_prefix(name)?.trim().parse().ok())
+                .unwrap_or(0)
+        }
+        const MIN_DRAW: &str = "decdn_node_pull_through_min_draw_waits_total ";
+        const PAUSED: &str = "decdn_node_pull_through_window_paused_total ";
+        let session = FillSession::new(bao_tree::blake3::Hash::from([7; 32]), 1 << 20);
+        let metrics = Arc::new(Metrics::new());
+        let hook = DownstreamWait::for_session(&session, Arc::clone(&metrics));
+        // A demand past the observed frontier returns the wait at once.
+        session.demand_up_to(64 * 1024);
+        hook.wait(DownstreamFrontier::default(), WaitReason::MinDraw)
+            .await;
+        assert_eq!(count(&metrics, MIN_DRAW), 1);
+        assert_eq!(count(&metrics, PAUSED), 0);
+        hook.wait(DownstreamFrontier::default(), WaitReason::WindowFull)
+            .await;
+        assert_eq!(count(&metrics, PAUSED), 1);
     }
 
     /// The #1673 race on the demand frontier: a serve encoder parks and raises the
@@ -1515,7 +1549,7 @@ mod downstream_wait_tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            hook.wait(DownstreamFrontier::default()),
+            hook.wait(DownstreamFrontier::default(), WaitReason::WindowFull),
         )
         .await
         .expect("wait must observe the raced demand advance, not wedge on a lost notify");
@@ -1531,7 +1565,7 @@ mod downstream_wait_tests {
         session.demand_up_to(64 * 1024);
         let observed = hook.frontier();
 
-        let wait = hook.wait(observed);
+        let wait = hook.wait(observed, WaitReason::WindowFull);
         tokio::pin!(wait);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), wait.as_mut())
@@ -1568,7 +1602,7 @@ mod downstream_wait_tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            hook.wait(DownstreamFrontier::default()),
+            hook.wait(DownstreamFrontier::default(), WaitReason::WindowFull),
         )
         .await
         .expect("wait must observe the raced advance, not wedge on a lost notify");
@@ -1589,7 +1623,7 @@ mod downstream_wait_tests {
             async {
                 tokio::time::timeout(
                     Duration::from_secs(5),
-                    hook.wait(DownstreamFrontier::default()),
+                    hook.wait(DownstreamFrontier::default(), WaitReason::WindowFull),
                 )
                 .await
                 .expect("a later advance must wake the parked wait");
