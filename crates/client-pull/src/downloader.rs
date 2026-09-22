@@ -210,7 +210,8 @@ where
         let mut written = Vec::with_capacity(targets.len());
         for target in targets {
             let (dir, stem) = dest_store_location(target.dest)?;
-            std::fs::create_dir_all(&dir)
+            tokio::fs::create_dir_all(&dir)
+                .await
                 .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", dir.display()))?;
             let store =
                 ClientRangedStore::open_or_create(&dir, &stem, target.hash, target.total_bytes)

@@ -39,8 +39,10 @@ pub struct PullConfig {
     /// AHEAD of the consumer's read cursor. Because every fetched byte is paid,
     /// this read-ahead bound is also the outstanding-spend bound for a stream the
     /// consumer abandons early — fetch a two-hour movie's first `read_ahead_bytes`
-    /// only, not the whole thing, for a viewer who stops after five minutes. The
-    /// `Downloader` ignores it and fetches the whole blob at full throughput.
+    /// only, not the whole thing, for a viewer who stops after five minutes. A
+    /// value below [`crate::pacer::PULL_WINDOW_FLOOR`] is raised to it: a smaller
+    /// window cannot keep a paid leg moving. The `Downloader` ignores it and
+    /// fetches the whole blob at full throughput.
     pub read_ahead_bytes: u64,
     /// The `Streamer`'s provider-lane cap: how many discovered holders it fetches
     /// the front across at once (the multi-source `max_sources`). Small by design
