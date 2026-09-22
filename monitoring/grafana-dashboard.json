@@ -251,7 +251,7 @@
       },
       "title": "Oldest watcher tick",
       "type": "stat",
-      "description": "Age of the least recently ticked chain-event watcher, across all five watchers and every node. Red at 180s matches DecdnBlacklistWatcherStalled — a stalled blacklist watcher is a slash risk, not a cosmetic lag.",
+      "description": "Age of the least recently ticked chain-event watcher, across all five watchers and every node. Red at 180s matches DecdnBlacklistWatcherStalled \u2014 a stalled blacklist watcher is a slash risk, not a cosmetic lag.",
       "targets": [
         {
           "datasource": {
@@ -656,9 +656,9 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "title": "Throughput — served vs origin pull-through",
+      "title": "Throughput \u2014 served vs origin pull-through",
       "type": "timeseries",
-      "description": "Payload bytes this fleet wrote to paying clients, against the origin bytes it had to buy to do it. Their ratio is the origin-egress amplification factor: 1.0 while the fleet is a pure pass-through, trending to 0 as content gets re-served from cache. Served reads decdn_bytes_served_total (the wire write on the serve leg), NOT decdn_cache_bytes_returned_total — that counter is scoped to CacheEngine::get, which the paid serve path never calls, so it holds at zero under full production load.",
+      "description": "Payload bytes this fleet wrote to paying clients, against the origin bytes it had to buy to do it. Their ratio is the origin-egress amplification factor: 1.0 while the fleet is a pure pass-through, trending to 0 as content gets re-served from cache. Served reads decdn_bytes_served_total (the wire write on the serve leg), NOT decdn_cache_bytes_returned_total \u2014 that counter is scoped to CacheEngine::get, which the paid serve path never calls, so it holds at zero under full production load.",
       "targets": [
         {
           "datasource": {
@@ -762,7 +762,7 @@
       },
       "title": "Serve hit ratio",
       "type": "timeseries",
-      "description": "Serve-path hit rate: (hit + partial hit) / (hit + partial hit + miss), decided at the blob-availability gate before any fill tier or load-shed admission. This is NOT decdn_cache_hits_total — that one meters CacheEngine::get, the whole-blob buffered read the paid serve path never calls, so it sits at zero on a node that only serves paying clients however full its store is. Deliberately unguarded division: an idle node renders a gap rather than a fabricated 0%.",
+      "description": "Serve-path hit rate: (hit + partial hit) / (hit + partial hit + miss), decided at the blob-availability gate before any fill tier or load-shed admission. This is NOT decdn_cache_hits_total \u2014 that one meters CacheEngine::get, the whole-blob buffered read the paid serve path never calls, so it sits at zero on a node that only serves paying clients however full its store is. Deliberately unguarded division: an idle node renders a gap rather than a fabricated 0%.",
       "targets": [
         {
           "datasource": {
@@ -864,7 +864,7 @@
       },
       "title": "Serve refusals by reason",
       "type": "timeseries",
-      "description": "Every refusal reason the serve leg records. The payment-class reasons and cache miss all collapse to the same NotFound wire code, so a client cannot tell them apart — these counters are the only place the cause survives.",
+      "description": "Every refusal reason the serve leg records. The payment-class reasons and cache miss all collapse to the same NotFound wire code, so a client cannot tell them apart \u2014 these counters are the only place the cause survives.",
       "targets": [
         {
           "datasource": {
@@ -1026,7 +1026,7 @@
           },
           "expr": "sum(rate(decdn_serve_economics_refused_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "R",
-          "legendFormat": "economics — upstream buy refused (buyer leg)"
+          "legendFormat": "economics \u2014 upstream buy refused (buyer leg)"
         },
         {
           "datasource": {
@@ -1538,7 +1538,7 @@
       },
       "title": "Probe-hold saturation",
       "type": "timeseries",
-      "description": "clamp_min is correct here — the denominator is an integer capacity gauge, not a rate.",
+      "description": "clamp_min is correct here \u2014 the denominator is an integer capacity gauge, not a rate.",
       "targets": [
         {
           "datasource": {
@@ -1636,7 +1636,7 @@
       },
       "title": "Blacklist enforcement failures",
       "type": "timeseries",
-      "description": "Hashes a batched re-scope could not re-verify or evict. Non-zero means the deny-set is not fully enforced and a blacklisted blob may still be servable — directly slashable.",
+      "description": "Hashes a batched re-scope could not re-verify or evict. Non-zero means the deny-set is not fully enforced and a blacklisted blob may still be servable \u2014 directly slashable.",
       "targets": [
         {
           "datasource": {
@@ -1869,7 +1869,7 @@
       },
       "title": "Log events by level",
       "type": "timeseries",
-      "description": "Parsed out of the JSON body. The Loki level stream label is journald's syslog priority, which is info for every line the daemon writes to stdout regardless of its real severity — do not group by it.",
+      "description": "Parsed out of the JSON body. The Loki level stream label is journald's syslog priority, which is info for every line the daemon writes to stdout regardless of its real severity \u2014 do not group by it.",
       "targets": [
         {
           "datasource": {
@@ -2295,7 +2295,7 @@
       },
       "title": "Unattributed stream failures",
       "type": "timeseries",
-      "description": "Seller-leg stream failures that no reason counter claims: rate(decdn_streams_failed_total{direction=\"inbound\"}) minus the 22 siblings that each end exactly one inbound stream — every serve_stream_rejected_* reason, the two midstream exhaustion stops, the node fault and the takedown termination. decdn_serve_economics_refused_total is deliberately NOT subtracted: it is a buyer-leg gate that declines to buy from a candidate upstream, and ends no inbound stream. A standing positive floor is expected and healthy — a client that closes early, a peer-attributable stream error, and the free header handshake a downstream node's miss pull opens and closes after the response all count as failures by design and have no reason counter. Read the SHAPE, not the level: a step change means a failure mode arrived that no counter names, and the refusal breakdown will not show it. Goes negative only if a reason counter fires without ending a stream.",
+      "description": "Seller-leg stream failures that no reason counter claims: rate(decdn_streams_failed_total{direction=\"inbound\"}) minus the 22 siblings that each end exactly one inbound stream \u2014 every serve_stream_rejected_* reason, the two midstream exhaustion stops, the node fault and the takedown termination. decdn_serve_economics_refused_total is deliberately NOT subtracted: it is a buyer-leg gate that declines to buy from a candidate upstream, and ends no inbound stream. A standing positive floor is expected and healthy \u2014 a client that closes early, a peer-attributable stream error, and the free header handshake a downstream node's miss pull opens and closes after the response all count as failures by design and have no reason counter. Read the SHAPE, not the level: a step change means a failure mode arrived that no counter names, and the refusal breakdown will not show it. Goes negative only if a reason counter fires without ending a stream.",
       "targets": [
         {
           "datasource": {
@@ -2381,6 +2381,340 @@
         "y": 31
       },
       "id": 9002
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      },
+      "id": 9003,
+      "panels": [],
+      "title": "Refuse-to-serve & load-shedding (ADR 041)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Serve-economics buy refusals",
+      "type": "timeseries",
+      "description": "ADR 041 cache-miss buy-ceiling refusals, split by regime (see the delivery dashboard for detail). A rising `amortized` line is the operator-actionable one: this node's sell rate or margin config is too tight.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_serve_economics_refused_warming_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "warming (market too hot)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_serve_economics_refused_amortized_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "amortized (economics too tight)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 71
+      },
+      "id": 9004
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Load-shed refusals by reason",
+      "type": "timeseries",
+      "description": "Fleet-wide new serves shed under overload, split by cause. See the delivery dashboard for per-reason remedies.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_load_shed_refused_node_at_capacity_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "node at capacity"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_load_shed_refused_egress_saturated_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "egress saturated"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_load_shed_refused_client_at_capacity_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "client at capacity"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 71
+      },
+      "id": 9005
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Warming sources blocked",
+      "type": "timeseries",
+      "description": "Upstream sources whose ADR 041 warming allowance is currently spent, fleet-wide, beside the rate of speculative buys downgraded to the amortized floor.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(decdn_warming_sources_blocked{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"})",
+          "refId": "A",
+          "legendFormat": "sources blocked"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_warming_speculative_blocked_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "buys downgraded /s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 71
+      },
+      "id": 9006
     }
   ],
   "preload": false,
@@ -2532,7 +2866,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "deCDN — fleet overview",
+  "title": "deCDN \u2014 fleet overview",
   "uid": "decdn-poc-overview",
   "version": 1,
   "weekStart": ""

@@ -93,7 +93,7 @@
       },
       "id": 1,
       "panels": [],
-      "title": "Serve leg — this node as the seller",
+      "title": "Serve leg \u2014 this node as the seller",
       "type": "row"
     },
     {
@@ -406,7 +406,7 @@
       },
       "title": "Serve refusals by reason",
       "type": "timeseries",
-      "description": "All of these collapse to one NotFound wire code on the client side. insufficient deposit is fed by three separate guards (the pre-spend miss floor, the window tier's ceiling and the direct-serve ceiling) and cannot attribute a spike to one — the node's throttled warn! line does. Sustained insufficient deposit means either clients running dry, or this node's chain watcher lagging an on-chain top-up and turning funded clients away.",
+      "description": "All of these collapse to one NotFound wire code on the client side. insufficient deposit is fed by three separate guards (the pre-spend miss floor, the window tier's ceiling and the direct-serve ceiling) and cannot attribute a spike to one \u2014 the node's throttled warn! line does. Sustained insufficient deposit means either clients running dry, or this node's chain watcher lagging an on-chain top-up and turning funded clients away.",
       "targets": [
         {
           "datasource": {
@@ -653,7 +653,7 @@
       },
       "title": "Stream outcomes by direction",
       "type": "timeseries",
-      "description": "Every ended paid stream counts once as completed or failed. inbound is this node serving; outbound is a stream this node opened to an upstream candidate, or one assembled range on the streaming miss path. failed includes routine outcomes — a cache-miss refusal, a client that closes early, and the free header handshake a downstream node opens and closes — so read the refusal and pull-outcome panels for health. Mid-stream stops name the funding cause.",
+      "description": "Every ended paid stream counts once as completed or failed. inbound is this node serving; outbound is a stream this node opened to an upstream candidate, or one assembled range on the streaming miss path. failed includes routine outcomes \u2014 a cache-miss refusal, a client that closes early, and the free header handshake a downstream node opens and closes \u2014 so read the refusal and pull-outcome panels for health. Mid-stream stops name the funding cause.",
       "targets": [
         {
           "datasource": {
@@ -770,7 +770,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "title": "Node-side faults — every one of these costs a delivery",
+      "title": "Node-side faults \u2014 every one of these costs a delivery",
       "type": "timeseries",
       "description": "The first two are latent-bug reports, not degradation: the node's own byte accounting or encoder refused to proceed. Alert on > 0 and file it. Takedown terminations are correct behaviour, shown here so they are not mistaken for faults.",
       "targets": [
@@ -1036,7 +1036,7 @@
       },
       "id": 8,
       "panels": [],
-      "title": "Pull leg — this node as the paying client",
+      "title": "Pull leg \u2014 this node as the paying client",
       "type": "row"
     },
     {
@@ -1932,7 +1932,7 @@
       },
       "title": "Serve hit ratio",
       "type": "timeseries",
-      "description": "Serve-path hit rate: (hit + partial hit) / (hit + partial hit + miss), decided at the blob-availability gate before any fill tier or load-shed admission. This is NOT decdn_cache_hits_total — that one meters CacheEngine::get, the whole-blob buffered read the paid serve path never calls, so it sits at zero on a node that only serves paying clients however full its store is. Deliberately unguarded division: an idle node renders a gap rather than a fabricated 0%.",
+      "description": "Serve-path hit rate: (hit + partial hit) / (hit + partial hit + miss), decided at the blob-availability gate before any fill tier or load-shed admission. This is NOT decdn_cache_hits_total \u2014 that one meters CacheEngine::get, the whole-blob buffered read the paid serve path never calls, so it sits at zero on a node that only serves paying clients however full its store is. Deliberately unguarded division: an idle node renders a gap rather than a fabricated 0%.",
       "targets": [
         {
           "datasource": {
@@ -1950,7 +1950,7 @@
           },
           "expr": "sum by (instance) (rate(decdn_serve_cache_partial_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n/\n(\n  sum by (instance) (rate(decdn_serve_cache_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  + sum by (instance) (rate(decdn_serve_cache_partial_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  + sum by (instance) (rate(decdn_serve_cache_miss_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n)",
           "refId": "B",
-          "legendFormat": "{{instance}} — partial share"
+          "legendFormat": "{{instance}} \u2014 partial share"
         }
       ],
       "fieldConfig": {
@@ -2261,9 +2261,9 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "title": "Cache integrity — non-zero needs a human",
+      "title": "Cache integrity \u2014 non-zero needs a human",
       "type": "timeseries",
-      "description": "A quarantined hash means disk rot or tampering. A tag-drop failure leaves bytes GC-protected and is not retried. A poisoned mutex is process-local and does not clear on its own — see the runbook before restarting.",
+      "description": "A quarantined hash means disk rot or tampering. A tag-drop failure leaves bytes GC-protected and is not retried. A poisoned mutex is process-local and does not clear on its own \u2014 see the runbook before restarting.",
       "targets": [
         {
           "datasource": {
@@ -2646,7 +2646,7 @@
       },
       "title": "Stream-while-store and warming credits",
       "type": "timeseries",
-      "description": "Dropped credits never reached the allowance ledger — the queue was full or the aggregator was gone. Always conservative, never over-credits.",
+      "description": "Dropped credits never reached the allowance ledger \u2014 the queue was full or the aggregator was gone. Always conservative, never over-credits.",
       "targets": [
         {
           "datasource": {
@@ -2911,7 +2911,7 @@
       },
       "title": "Unattributed stream failures",
       "type": "timeseries",
-      "description": "Seller-leg stream failures that no reason counter claims: rate(decdn_streams_failed_total{direction=\"inbound\"}) minus the 22 siblings that each end exactly one inbound stream — every serve_stream_rejected_* reason, the two midstream exhaustion stops, the node fault and the takedown termination. decdn_serve_economics_refused_total is deliberately NOT subtracted: it is a buyer-leg gate that declines to buy from a candidate upstream, and ends no inbound stream. A standing positive floor is expected and healthy — a client that closes early, a peer-attributable stream error, and the free header handshake a downstream node's miss pull opens and closes after the response all count as failures by design and have no reason counter. Read the SHAPE, not the level: a step change means a failure mode arrived that no counter names, and the refusal breakdown will not show it. Goes negative only if a reason counter fires without ending a stream.",
+      "description": "Seller-leg stream failures that no reason counter claims: rate(decdn_streams_failed_total{direction=\"inbound\"}) minus the 22 siblings that each end exactly one inbound stream \u2014 every serve_stream_rejected_* reason, the two midstream exhaustion stops, the node fault and the takedown termination. decdn_serve_economics_refused_total is deliberately NOT subtracted: it is a buyer-leg gate that declines to buy from a candidate upstream, and ends no inbound stream. A standing positive floor is expected and healthy \u2014 a client that closes early, a peer-attributable stream error, and the free header handshake a downstream node's miss pull opens and closes after the response all count as failures by design and have no reason counter. Read the SHAPE, not the level: a step change means a failure mode arrived that no counter names, and the refusal breakdown will not show it. Goes negative only if a reason counter fires without ending a stream.",
       "targets": [
         {
           "datasource": {
@@ -2995,6 +2995,432 @@
         "y": 79
       },
       "id": 9003
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 87
+      },
+      "id": 9004,
+      "panels": [],
+      "title": "Refuse-to-serve & load-shedding (ADR 041)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Serve-economics buy refusals",
+      "type": "timeseries",
+      "description": "ADR 041 buy-ceiling refusals on the cache-miss leg, split by regime. `warming` = the source still had allowance so the ceiling was the market price max(sell, amortized) and the market is above it (no local fix). `amortized` = the source's warming allowance is spent (or warming is off) so the ceiling is the grief-proof floor and this node's sell rate / margin config is too tight. The refusal signs the client NotFound, so it never reaches the wire and is visible only here.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_serve_economics_refused_warming_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "warming (market too hot)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_serve_economics_refused_amortized_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "amortized (economics too tight)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 88
+      },
+      "id": 9005
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Warming allowance blocking",
+      "type": "timeseries",
+      "description": "ADR 041 per-source warming allowance being griefed down. `sources blocked` is how many upstream sources currently hold no allowance (gauge). `buys downgraded /s` is the rate of above-floor speculative buys forced to the amortized floor because a source's allowance was spent. Both stay at zero when warming is unconstrained; a sustained rate with a rising blocked count is real per-source loss, not a bug.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max(decdn_warming_sources_blocked{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"})",
+          "refId": "A",
+          "legendFormat": "sources blocked"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_warming_speculative_blocked_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "buys downgraded /s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 88
+      },
+      "id": 9006
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Load-shed refusals by reason",
+      "type": "timeseries",
+      "description": "New serves shed under overload, split by cause \u2014 each has a different remedy. `node at capacity` = concurrency above the high-water mark (add capacity / raise max_concurrent_serves_high). `egress saturated` = measured egress hit the budget (raise egress_budget_mbps / add bandwidth). `client at capacity` = one client held its fair share while pressured (fairness working as designed). Orthogonal to the hit/miss split in the Serve refusals panel.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_load_shed_refused_node_at_capacity_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "node at capacity"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_load_shed_refused_egress_saturated_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "egress saturated"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_load_shed_refused_client_at_capacity_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "client at capacity"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 88
+      },
+      "id": 9007
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Load-shed concurrency & pressure",
+      "type": "timeseries",
+      "description": "`streams in flight` is node-wide serves in flight, sampled from the shed controller \u2014 read against max_concurrent_serves_high for headroom. `pressure active` is 1 while the policy considers the node pressured. The refusal counters above only fire once a request is actually shed; this panel shows the approach.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max(decdn_load_shed_streams_in_flight{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"})",
+          "refId": "A",
+          "legendFormat": "streams in flight"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max(decdn_load_shed_pressure_active{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"})",
+          "refId": "B",
+          "legendFormat": "pressure active (0/1)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 95
+      },
+      "id": 9008
     }
   ],
   "preload": false,
@@ -3127,7 +3553,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "deCDN — delivery and cache",
+  "title": "deCDN \u2014 delivery and cache",
   "uid": "decdn-delivery",
   "version": 1,
   "weekStart": ""
