@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::driver::DriveConfig;
+use crate::ledgers::LaneLedgers;
 use crate::pacer::BudgetPacer;
 use crate::scheduler::{MultiSourceConfig, multi_source_fetch};
 use crate::source::{BlobSource, Funder};
@@ -151,7 +152,8 @@ where
                 dest,
             })
             .collect();
-        self.fetch_to_paths(&targets, config, on_progress).await
+        self.fetch_to_paths(&targets, config, None, on_progress)
+            .await
     }
 
     /// Fetch every [`DownloadTarget`] to its own `dest` path, returning the
@@ -178,6 +180,12 @@ where
     /// progress for the target CURRENTLY fetching — `(position, total_bytes)`,
     /// both content bytes, resetting to that target's own total at each new one.
     ///
+    /// `ledgers`, when set, is a shared voucher-ledger registry (a bundle run's
+    /// `LaneLedgers`): the core reads and credits EVERY lane registered across the
+    /// run for its deposit-solvency view, so concurrent entries sharing one
+    /// on-chain pool cannot jointly over-draw it. `None` folds only this fetch's
+    /// own lanes, the right view for a solo download.
+    ///
     /// # Errors
     ///
     /// A `dest` with no file name, a store open/create/finalize I/O error, or any
@@ -189,6 +197,7 @@ where
         &self,
         targets: &[DownloadTarget<'_>],
         config: &PullConfig,
+        ledgers: Option<&LaneLedgers>,
         on_progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<Vec<PathBuf>> {
         // Fail early and clearly on an empty candidate set, rather than deep inside
@@ -231,7 +240,7 @@ where
                 &self.drive_config,
                 &ms,
                 on_progress,
-                None,
+                ledgers,
                 // No consumption pacing: a download runs at full throughput.
                 None,
             )
@@ -455,6 +464,7 @@ mod tests {
                 }],
                 &PullConfig::default(),
                 None,
+                None,
             )
             .await?;
 
@@ -468,6 +478,45 @@ mod tests {
             blake3::hash(&got).as_bytes() == &root,
             "written file is BLAKE3-identical to the entry hash"
         );
+        Ok(())
+    }
+
+    /// `fetch_to_paths` threads a shared `LaneLedgers` registry (a bundle run's
+    /// pool-wide committed view) into the core and still fetches byte-identically
+    /// (#1848 4a). The registry lets concurrent entries share one solvency view
+    /// of the deposit; here it just proves the parameter is wired through.
+    #[tokio::test]
+    async fn fetch_to_paths_threads_a_shared_ledger_registry() -> anyhow::Result<()> {
+        let blob = payload(1_500_000);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
+        let root = source.root();
+        let total = u64::try_from(blob.len())?;
+
+        let downloader = Downloader::new(
+            vec![candidate(source, ledger, 0xA1)],
+            funder(),
+            drive_config(),
+        );
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("shared-ledger.bin");
+        let registry = crate::LaneLedgers::new();
+
+        let paths = downloader
+            .fetch_to_paths(
+                &[DownloadTarget {
+                    hash: root,
+                    total_bytes: total,
+                    dest: &dest,
+                }],
+                &PullConfig::default(),
+                Some(&registry),
+                None,
+            )
+            .await?;
+
+        anyhow::ensure!(paths == vec![dest.clone()]);
+        anyhow::ensure!(std::fs::read(&dest)? == blob);
         Ok(())
     }
 
