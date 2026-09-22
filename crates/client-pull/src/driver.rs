@@ -258,8 +258,8 @@ pub const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
 pub const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
 
 /// How often a fetch's single flush owner persists the `.ranges` present record
-/// while sources are still delivering. `ClientRangedStore::checkpoint` fsyncs
-/// data and outboard every ~4 MiB but no longer writes the record, so this
+/// while sources are still delivering. The ranged store's ingest `checkpoint`
+/// fsyncs data and outboard every ~4 MiB but never writes the record, so this
 /// interval bounds crash-loss of resume progress to at most one interval (spec
 /// §5.5): a killed fetch resumes from the last flushed frontier instead of
 /// refetching — and re-paying for — the whole in-flight download. 5 seconds
@@ -271,7 +271,7 @@ pub(crate) const PRESENT_RECORD_FLUSH_INTERVAL: Duration = Duration::from_secs(5
 /// so a crash mid-fetch costs at most one `interval` of resume progress (spec
 /// §5.5). `fut` is the SOLE work driver and this loop is the SOLE periodic flush
 /// owner — nothing inside `fut` flushes — which preserves the single-writer
-/// property `ClientRangedStore::checkpoint` relies on. Returns once `fut`
+/// property the ranged store's ingest `checkpoint` relies on. Returns once `fut`
 /// resolves; the caller does the final flush.
 ///
 /// `tokio::time::interval`'s first tick fires immediately, so it is consumed
@@ -443,8 +443,8 @@ where
     let gaps = contiguous_byte_ranges(&missing, total_bytes);
 
     // Fill every gap while a single periodic tick flushes the `.ranges` present
-    // record (spec §5.5, single-writer flush point). `ClientRangedStore::checkpoint`
-    // no longer persists the record per checkpoint, so without this interval flush
+    // record (spec §5.5, single-writer flush point). The ranged store's ingest
+    // `checkpoint` never persists the record, so without this interval flush
     // a crash mid-fetch would leave `.ranges` at pre-session state and re-download
     // (and re-pay for) the whole in-flight range on resume; the interval bounds
     // that loss to one `PRESENT_RECORD_FLUSH_INTERVAL`. This loop is the

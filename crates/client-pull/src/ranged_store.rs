@@ -6,11 +6,12 @@
 //! (#578).
 //!
 //! Construction plus the query methods (`total_bytes`, `present_ranges`,
-//! `missing_ranges`, `read`, `is_complete`) query the record. `admit` and
-//! `finalize` provide the write path against the same
+//! `missing_ranges`, `read`, `is_complete`) query the record. `admit`,
+//! `ingest_stream` and `finalize` provide the write path against the same
 //! `data_path` / `present` fields: `admit` verifies an interleaved bao range
 //! against the root with `bao_tree::io::sync::decode_ranges` (a positioned,
-//! sparse write plus outboard accumulation), and `finalize` runs one
+//! sparse write plus outboard accumulation), `ingest_stream` does the same
+//! for a streamed range in durable checkpoint batches, and `finalize` runs one
 //! `valid_ranges` sweep over the whole blob to either promote the `.partial`
 //! file to its final path or surgically shrink `present` to the groups that
 //! still verify.
@@ -27,12 +28,13 @@ use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context as _;
 use bao_tree::io::BaoContentItem;
 use bao_tree::io::DecodeError;
 use bao_tree::io::fsm::{ResponseDecoder, ResponseDecoderNext};
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::sync::{OutboardMut, ReadAt, WriteAt, decode_ranges, valid_ranges};
-use bao_tree::{BaoTree, ChunkNum, ChunkRanges};
+use bao_tree::{BaoTree, ChunkNum, ChunkRanges, TreeNode};
 use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, RangedFuture, RangedStore, RangedStoreError};
 
@@ -42,9 +44,10 @@ use crate::sink::{StashedFault, classify_decode_error};
 /// pre-order outboard, and a persisted `.partial.ranges` present-range
 /// record, all for one blob `(root, total_bytes)`.
 ///
-/// `present` and `data_path` are held behind `Arc<Mutex<..>>` so `admit` and
-/// `finalize` can move clones of them into `tokio::task::spawn_blocking`
-/// closures without borrowing `self` across an await point.
+/// `present` and `data_path` are held behind `Arc<Mutex<..>>` so `admit`,
+/// `finalize` and the `ingest_stream` flushes can move clones of them into
+/// `tokio::task::spawn_blocking` closures without borrowing `self` across an
+/// await point.
 ///
 /// Concurrency: a single `ClientRangedStore` expects at most one in-flight
 /// write operation at a time — do not call [`RangedStore::admit`] /
@@ -54,6 +57,10 @@ use crate::sink::{StashedFault, classify_decode_error};
 /// direction — the missing range is simply re-fetched on the next resume)
 /// and, worse, an `admit` racing a `finalize` promote is undefined. Reads are
 /// safe to interleave. The driver drives one write op per blob at a time.
+/// [`ClientRangedStore::ingest_stream`] is the exception: the multi-source
+/// scheduler runs it concurrently on disjoint ranges of one store, which is
+/// safe because its checkpoints only union into `present` under the mutex and
+/// never write the record.
 pub struct ClientRangedStore {
     /// BLAKE3 content root this store verifies against.
     root: [u8; 32],
@@ -68,8 +75,13 @@ pub struct ClientRangedStore {
     /// Present-range record sidecar (`{stem}.partial.ranges`).
     ranges_path: PathBuf,
     /// Chunk ranges verified present, trusted from the record (loaded once at
-    /// construction, updated in-memory + persisted by `admit`/`finalize`).
+    /// construction, updated in memory by `admit`/`ingest_stream`/`finalize`,
+    /// persisted by `admit`/`finalize`/`flush_present_record`).
     present: Arc<Mutex<ChunkRanges>>,
+    /// Test-only stall injected into each ingest flush before its writes and
+    /// fsync, to model a slow disk.
+    #[cfg(test)]
+    flush_delay: std::time::Duration,
 }
 
 impl std::fmt::Debug for ClientRangedStore {
@@ -248,6 +260,8 @@ impl ClientRangedStore {
             obao_path,
             ranges_path,
             present: Arc::new(Mutex::new(present)),
+            #[cfg(test)]
+            flush_delay: std::time::Duration::ZERO,
         })
     }
 
@@ -306,6 +320,8 @@ impl ClientRangedStore {
                 obao_path,
                 ranges_path,
                 present: Arc::new(Mutex::new(present)),
+                #[cfg(test)]
+                flush_delay: std::time::Duration::ZERO,
             });
         }
 
@@ -319,14 +335,17 @@ impl ClientRangedStore {
             obao_path,
             ranges_path,
             present: Arc::new(Mutex::new(present)),
+            #[cfg(test)]
+            flush_delay: std::time::Duration::ZERO,
         })
     }
 
     /// Reopen an existing `.partial` store for `(root, total_bytes)` if one is
     /// on disk, otherwise [`create`](Self::create) a fresh one. The presence of
-    /// the `.partial.ranges` record is the resume signal: it is written
-    /// atomically alongside every `admit`/`ingest_stream` checkpoint, so a store
-    /// with a record is resumable and one without is not.
+    /// the `.partial.ranges` record is the resume signal: `create` writes it,
+    /// and `admit`, `finalize` and `flush_present_record` rewrite it
+    /// atomically, so a store with a record is resumable and one without is
+    /// not.
     ///
     /// Keyed on the `.ranges` record alone, NOT on the promoted final file:
     /// once `finalize` promotes and deletes the sidecars, a re-fetch of the same
@@ -442,41 +461,49 @@ impl ClientRangedStore {
         Ok(guard.clone())
     }
 
-    /// Durably checkpoint present-ranges no more than this many received
-    /// content bytes apart, during [`Self::ingest_stream`]. Fsync'ing the
-    /// data/outboard files and rewriting the `.ranges` record on every single
-    /// 16 KiB chunk group would serialize the whole ingest on disk latency
-    /// (thousands of fsyncs for a large gap); checkpointing only every 4 MiB
-    /// (256 groups) amortizes that cost.
+    /// Flush the verified batch to disk no more than this many received
+    /// content bytes apart, during [`Self::ingest_stream`]. An fsync per 16 KiB
+    /// chunk group would cost thousands of fsyncs for a large gap; batching
+    /// 4 MiB (256 groups) amortizes that cost and lets the decode loop run
+    /// ahead of the disk.
     ///
-    /// Checkpoint cadence for durable present-range persistence. On a mid-gap
-    /// fault, content received since the last checkpoint is re-pulled and
-    /// **re-paid** on resume — so this bounds the per-fault re-pay window to
-    /// under one checkpoint interval, times at most `MAX_RESUME_ATTEMPTS`.
+    /// It also bounds the re-pay window. Content received since the last
+    /// durable checkpoint is re-pulled and **re-paid** on resume. On a stream
+    /// fault the call waits for the flush in flight, so a fault re-pays less
+    /// than one interval, times at most `MAX_RESUME_ATTEMPTS`. On a crash, or
+    /// when the caller drops the future (a scheduler steal or stall), the flush
+    /// in flight can also miss the resume read, so less than two intervals.
     /// Checkpointed (durably-recorded) bytes are never re-paid.
     ///
     /// It is a fsync-amortization knob, not a payment one: it sits four payment
     /// quanta (`decdn_protocol::client::CHUNK_BYTES`) wide, so a fault can
-    /// re-pay up to four chunks. Narrowing it toward one chunk would tighten
-    /// that window at four times the fsync rate, which is a storage tradeoff
-    /// rather than a payment-correctness one — the payer re-pays only what it
-    /// genuinely re-pulls either way.
+    /// re-pay up to four chunks (eight on a crash or dropped future). Narrowing
+    /// it toward one chunk would tighten that window at four times the fsync
+    /// rate, which is a storage tradeoff rather than a payment-correctness one
+    /// — the payer re-pays only what it genuinely re-pulls either way.
     pub(crate) const INGEST_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
 
     /// Stream the raw bao encoding of `range` (from `reader`) into the store:
     /// verify each chunk group against the root as
-    /// [`bao_tree::io::fsm::ResponseDecoder`] decodes it, positioned-write
-    /// each verified leaf into the `.partial` data file, accumulate each
-    /// parent proof pair into the `.obao4` outboard, and durably checkpoint
-    /// `present` (fsync data+outboard, then persist the `.ranges` record) at
-    /// roughly `INGEST_CHECKPOINT_BYTES` intervals plus once more at
-    /// completion.
+    /// [`bao_tree::io::fsm::ResponseDecoder`] decodes it, collect the verified
+    /// leaves and parent proof pairs into a batch, and flush each batch of
+    /// roughly `INGEST_CHECKPOINT_BYTES` (plus the remainder at completion) as
+    /// one durable checkpoint: positioned-write the leaves into the `.partial`
+    /// data file, save the parents into the `.obao4` outboard, fsync both, then
+    /// union the received prefix into `present`.
+    ///
+    /// Every file operation runs on `tokio::task::spawn_blocking`, never on a
+    /// runtime worker. The paid pull pays from inside this decode loop, so a
+    /// worker parked in an fsync would stop voucher sends on every stream that
+    /// shares the runtime. At most one flush is in flight: the loop decodes
+    /// the next batch while the previous one writes, and waits for that flush
+    /// only when the next batch is full. Memory per call is bounded by two
+    /// batches (about `2 * INGEST_CHECKPOINT_BYTES`).
     ///
     /// This is the streaming sibling of [`RangedStore::admit`]: `admit` takes
     /// a whole range's bao bytes already assembled in memory, while
-    /// `ingest_stream` consumes them incrementally at O(chunk-group) memory
-    /// (one leaf's ~16 KiB plus one parent's 64 bytes live at a time) — the
-    /// gap driver's fetch of a range too large to buffer whole.
+    /// `ingest_stream` consumes them incrementally — the gap driver's fetch of
+    /// a range too large to buffer whole.
     ///
     /// On success, returns `reader` so the caller can hand it to
     /// `BlobSource::finish` to drain the underlying pull to its stream end and
@@ -484,8 +511,8 @@ impl ClientRangedStore {
     ///
     /// `on_progress`, when set, is called with the CONTENT bytes received so far
     /// on THIS range (`received_end - range.fetch_start()`) after each verified
-    /// leaf lands — the byte-progress hook the CLI's delivery bar drives (the
-    /// driver offsets it by the already-present base to report whole-blob
+    /// leaf is received — the byte-progress hook the CLI's delivery bar drives
+    /// (the driver offsets it by the already-present base to report whole-blob
     /// progress). It runs in the hot receive loop, so it must not block or panic.
     ///
     /// # Durability contract
@@ -493,14 +520,19 @@ impl ClientRangedStore {
     /// The same fsync-before-record invariant `write_ranges_record`'s
     /// callers already establish: a checkpoint never lets `present` (and
     /// therefore the persisted `.ranges` record) claim bytes that are not yet
-    /// durable on disk. A crash or peer fault between two checkpoints loses
-    /// only the un-checkpointed tail — strictly less than one
+    /// durable on disk. On a peer fault the call waits for the flush in flight,
+    /// so it loses only the unflushed tail — strictly less than one
     /// `INGEST_CHECKPOINT_BYTES` interval of received content — which
     /// the next `missing_ranges`/resume call simply re-fetches AND re-pays
     /// for (those bytes were already voucher-paid on the fault-side pull; see
-    /// `INGEST_CHECKPOINT_BYTES`'s doc for the re-pay-window bound). It never
-    /// loses (or re-claims) a byte that a prior checkpoint already made
-    /// durable, and it never claims a byte that was not actually fsync'd.
+    /// `INGEST_CHECKPOINT_BYTES`'s doc for the re-pay-window bound). A crash
+    /// loses the flush in flight too, so less than two intervals. Dropping the
+    /// future detaches the flush in flight rather than cancelling it: the flush
+    /// still writes the same verified bytes, fsyncs, and unions into `present`,
+    /// but possibly after the caller's next `missing_ranges` read, so that span
+    /// can be re-fetched as well. It never loses (or re-claims) a byte that a
+    /// prior checkpoint already made durable, and it never claims a byte that
+    /// was not actually fsync'd.
     ///
     /// # Errors
     ///
@@ -509,8 +541,9 @@ impl ClientRangedStore {
     /// - Otherwise the bao decode failure, classified by
     ///   `sink::classify_decode_error`: [`crate::HashMismatch`] for a
     ///   verification failure, a truncation error for a short stream.
-    /// - Any I/O failure opening or writing the `.partial`/`.obao4` files, or
-    ///   persisting the `.ranges` record.
+    /// - Any I/O failure opening, writing or fsyncing the `.partial`/`.obao4`
+    ///   files, or a flush task that panics. A stashed fault still takes
+    ///   precedence over a flush failure.
     pub async fn ingest_stream<R>(
         &self,
         range: &AlignedRange,
@@ -520,120 +553,72 @@ impl ClientRangedStore {
     where
         R: iroh_io::AsyncStreamReader + StashedFault + Send,
     {
-        let path = {
-            let guard = self
-                .data_path
-                .lock()
-                .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("data_path")))?;
-            guard.clone()
-        };
-        let mut data_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        let obao_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.obao_path)?;
-        let mut outboard = PreOrderOutboard {
-            root: bao_tree::blake3::Hash::from(self.root),
-            tree: self.tree,
-            data: obao_file,
-        };
+        let mut flusher = IngestFlusher::open(self).await?;
 
         let root = bao_tree::blake3::Hash::from(self.root);
         let ranges = range.chunk_ranges().clone();
         let mut decoder = ResponseDecoder::new(root, ranges, self.tree, reader);
 
-        // The contiguous prefix of `range`, in bytes, whose leaf writes and
-        // parent saves have landed in this ingest call so far (not yet
-        // necessarily checkpointed — see `checkpointed_end` below).
+        // The contiguous prefix of `range`, in bytes, whose leaves have been
+        // received and verified so far (not yet necessarily flushed — see
+        // `batch_start` below).
         let mut received_end = range.fetch_start();
-        // The prefix already durably checkpointed (fsync'd + present + record
-        // persisted). Only the span `[checkpointed_end, received_end)` is at
-        // risk on a crash/fault.
-        let mut checkpointed_end = range.fetch_start();
+        // The prefix already handed to a flush. Only the span
+        // `[batch_start, received_end)` sits in `batch`.
+        let mut batch_start = range.fetch_start();
+        let mut batch = FlushBatch::default();
 
         loop {
             match decoder.next().await {
                 ResponseDecoderNext::More((rest, Ok(BaoContentItem::Leaf(leaf)))) => {
-                    data_file.write_all_at(leaf.offset, &leaf.data)?;
                     received_end =
                         received_end
                             .max(leaf.offset.saturating_add(
                                 u64::try_from(leaf.data.len()).unwrap_or(u64::MAX),
                             ));
+                    batch.leaves.push((leaf.offset, leaf.data));
                     if let Some(cb) = on_progress {
                         cb(received_end.saturating_sub(range.fetch_start()));
                     }
-                    if received_end.saturating_sub(checkpointed_end)
-                        >= Self::INGEST_CHECKPOINT_BYTES
-                    {
-                        self.checkpoint(&mut data_file, &mut outboard, range, received_end)?;
-                        checkpointed_end = received_end;
+                    if received_end.saturating_sub(batch_start) >= Self::INGEST_CHECKPOINT_BYTES {
+                        flusher
+                            .start(self, std::mem::take(&mut batch), range, received_end)
+                            .await?;
+                        batch_start = received_end;
                     }
                     decoder = rest;
                 }
                 ResponseDecoderNext::More((rest, Ok(BaoContentItem::Parent(parent)))) => {
-                    outboard.save(parent.node, &parent.pair)?;
+                    batch.parents.push((parent.node, parent.pair));
                     decoder = rest;
                 }
                 ResponseDecoderNext::More((rest, Err(decode_err))) => {
                     let mut r = rest.finish();
+                    // Land the flush in flight so its prefix is not re-paid on
+                    // resume. The fault is the error that matters here.
+                    if let Err(flush_err) = flusher.reclaim().await {
+                        warn_flush_failed_on_fault(&flush_err, range, received_end);
+                    }
                     if let Some(fault) = r.take_fault() {
                         return Err(fault);
                     }
                     return Err(classify_decode_error(decode_err));
                 }
                 ResponseDecoderNext::Done(mut r) => {
-                    if received_end > checkpointed_end {
-                        self.checkpoint(&mut data_file, &mut outboard, range, received_end)?;
-                    }
+                    let flush_result = flusher.finish(self, batch, range, received_end).await;
+                    // A stashed fault outranks a local flush failure: it says
+                    // what the peer did, which decides retry and blame.
                     if let Some(fault) = r.take_fault() {
+                        if let Err(flush_err) = flush_result {
+                            warn_flush_failed_on_fault(&flush_err, range, received_end);
+                        }
                         return Err(fault);
                     }
+                    flush_result?;
                     return Ok(r);
                 }
             }
         }
-    }
-
-    /// Durably checkpoint the prefix `[range.fetch_start(), received_end)` of
-    /// an in-progress [`Self::ingest_stream`]: fsync the data and outboard
-    /// files, THEN union the corresponding chunk ranges into `present`. The
-    /// fsync-before-union ordering is load-bearing — see the durability
-    /// contract on [`Self::ingest_stream`].
-    ///
-    /// Does NOT persist the `.ranges` record — that is
-    /// [`Self::flush_present_record`]'s job. Several `ingest_stream` calls can
-    /// run concurrently on one store (the multi-source scheduler), so writing
-    /// the record here, per checkpoint, out of the `present` lock would both
-    /// race the record's write-and-rename across sources and serialize every
-    /// source on the record's fsync. `present` only ever grows and is unioned
-    /// under the mutex AFTER the data/outboard fsync, so whenever the record
-    /// is next flushed it never claims a range that is not durably on disk.
-    fn checkpoint(
-        &self,
-        data_file: &mut std::fs::File,
-        outboard: &mut PreOrderOutboard<std::fs::File>,
-        range: &AlignedRange,
-        received_end: u64,
-    ) -> anyhow::Result<()> {
-        data_file.sync_all()?;
-        outboard.data.sync_all()?;
-
-        let received = decdn_bao_range::align_range(
-            range.fetch_start(),
-            received_end.saturating_sub(range.fetch_start()),
-            self.total_bytes,
-        )?;
-
-        let mut guard = self
-            .present
-            .lock()
-            .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("present")))?;
-        *guard |= received.chunk_ranges().clone();
-        Ok(())
     }
 
     /// Persist the current in-memory `present` snapshot to the `.ranges`
@@ -659,6 +644,212 @@ impl ClientRangedStore {
         };
         write_ranges_record(&self.ranges_path, &snapshot)
     }
+}
+
+/// The open `.partial` data file and `.obao4` outboard of one
+/// [`ClientRangedStore::ingest_stream`] call. It moves into each flush's
+/// blocking task and comes back when the flush completes.
+struct IngestFiles {
+    data: File,
+    outboard: PreOrderOutboard<File>,
+}
+
+/// The verified bao items one ingest checkpoint writes: leaves as
+/// `(byte offset, data)` and parent proof pairs as `(node, pair)`.
+#[derive(Default)]
+struct FlushBatch {
+    leaves: Vec<(u64, Bytes)>,
+    parents: Vec<(TreeNode, (bao_tree::blake3::Hash, bao_tree::blake3::Hash))>,
+}
+
+impl FlushBatch {
+    const fn is_empty(&self) -> bool {
+        self.leaves.is_empty() && self.parents.is_empty()
+    }
+}
+
+/// Runs the checkpoints of one [`ClientRangedStore::ingest_stream`] call on
+/// `spawn_blocking`, one at a time. `files` is `Some` while no flush is in
+/// flight; `in_flight` holds the flush that currently owns them. A failed
+/// flush consumes the files, so after one both are `None` and the caller
+/// returns that error rather than flushing again.
+struct IngestFlusher {
+    files: Option<IngestFiles>,
+    in_flight: Option<tokio::task::JoinHandle<anyhow::Result<IngestFiles>>>,
+}
+
+impl IngestFlusher {
+    /// Open `store`'s `.partial` data file and `.obao4` outboard for writing,
+    /// on `spawn_blocking`.
+    async fn open(store: &ClientRangedStore) -> anyhow::Result<Self> {
+        let path = store
+            .data_path
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("data_path")))?
+            .clone();
+        let obao_path = store.obao_path.clone();
+        let root = bao_tree::blake3::Hash::from(store.root);
+        let tree = store.tree;
+        let files = tokio::task::spawn_blocking(move || -> io::Result<IngestFiles> {
+            let data = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            let obao_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&obao_path)?;
+            Ok(IngestFiles {
+                data,
+                outboard: PreOrderOutboard {
+                    root,
+                    tree,
+                    data: obao_file,
+                },
+            })
+        })
+        .await??;
+        Ok(Self {
+            files: Some(files),
+            in_flight: None,
+        })
+    }
+
+    /// Flush the final `batch`, if it holds anything, and wait until every
+    /// flush has landed.
+    async fn finish(
+        &mut self,
+        store: &ClientRangedStore,
+        batch: FlushBatch,
+        range: &AlignedRange,
+        received_end: u64,
+    ) -> anyhow::Result<()> {
+        if !batch.is_empty() {
+            self.start(store, batch, range, received_end).await?;
+        }
+        self.reclaim().await
+    }
+
+    /// Wait for the flush in flight, if any, and take the files back.
+    async fn reclaim(&mut self) -> anyhow::Result<()> {
+        if let Some(handle) = self.in_flight.take() {
+            let files = handle
+                .await
+                .map_err(|e| anyhow::anyhow!("ingest checkpoint task failed: {e}"))??;
+            self.files = Some(files);
+        }
+        Ok(())
+    }
+
+    /// Wait for the previous flush, then start a flush of `batch` that
+    /// checkpoints the prefix `[range.fetch_start(), received_end)`.
+    async fn start(
+        &mut self,
+        store: &ClientRangedStore,
+        batch: FlushBatch,
+        range: &AlignedRange,
+        received_end: u64,
+    ) -> anyhow::Result<()> {
+        self.reclaim().await?;
+        let mut files = self.files.take().ok_or_else(|| {
+            anyhow::anyhow!("ingest flusher has no files: a prior flush error was ignored")
+        })?;
+        let present = Arc::clone(&store.present);
+        let total_bytes = store.total_bytes;
+        let range = range.clone();
+        #[cfg(test)]
+        let flush_delay = store.flush_delay;
+        self.in_flight = Some(tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            std::thread::sleep(flush_delay);
+            // Log here as well as returning the error: when the caller drops
+            // `ingest_stream`, nobody awaits this task, and the error would
+            // otherwise vanish.
+            let res = checkpoint(
+                &mut files,
+                &batch,
+                &present,
+                total_bytes,
+                &range,
+                received_end,
+            );
+            if let Err(e) = &res {
+                tracing::warn!(
+                    error = %e,
+                    fetch_start = range.fetch_start(),
+                    received_end,
+                    "ingest checkpoint failed"
+                );
+            }
+            res.map(|()| files)
+        }));
+        Ok(())
+    }
+}
+
+/// Log a flush failure that a stream fault outranks, so it is not lost.
+fn warn_flush_failed_on_fault(err: &anyhow::Error, range: &AlignedRange, received_end: u64) {
+    tracing::warn!(
+        error = %err,
+        fetch_start = range.fetch_start(),
+        received_end,
+        "ingest checkpoint failed while handling a stream fault"
+    );
+}
+
+/// Durably checkpoint the prefix `[range.fetch_start(), received_end)` of
+/// an in-progress [`ClientRangedStore::ingest_stream`]: write `batch`'s leaves
+/// and parents, fsync the data and outboard files, THEN union the
+/// corresponding chunk ranges into `present`. The fsync-before-union ordering
+/// is load-bearing — see the durability contract on
+/// [`ClientRangedStore::ingest_stream`].
+///
+/// Does NOT persist the `.ranges` record — that is
+/// [`ClientRangedStore::flush_present_record`]'s job. Several `ingest_stream`
+/// calls can run concurrently on one store (the multi-source scheduler), so
+/// writing the record here, per checkpoint, out of the `present` lock would
+/// both race the record's write-and-rename across sources and serialize every
+/// source on the record's fsync. `present` only ever grows and is unioned
+/// under the mutex AFTER the data/outboard fsync, so whenever the record is
+/// next flushed it never claims a range that is not durably on disk.
+fn checkpoint(
+    files: &mut IngestFiles,
+    batch: &FlushBatch,
+    present: &Mutex<ChunkRanges>,
+    total_bytes: u64,
+    range: &AlignedRange,
+    received_end: u64,
+) -> anyhow::Result<()> {
+    for (offset, data) in &batch.leaves {
+        files
+            .data
+            .write_all_at(*offset, data)
+            .with_context(|| format!("writing .partial data at offset {offset}"))?;
+    }
+    for (node, pair) in &batch.parents {
+        files
+            .outboard
+            .save(*node, pair)
+            .context("writing .obao4 outboard")?;
+    }
+    files.data.sync_all().context("fsyncing .partial data")?;
+    files
+        .outboard
+        .data
+        .sync_all()
+        .context("fsyncing .obao4 outboard")?;
+
+    let received = decdn_bao_range::align_range(
+        range.fetch_start(),
+        received_end.saturating_sub(range.fetch_start()),
+        total_bytes,
+    )?;
+
+    let mut guard = present
+        .lock()
+        .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("present")))?;
+    *guard |= received.chunk_ranges().clone();
+    Ok(())
 }
 
 impl RangedStore for ClientRangedStore {
@@ -976,6 +1167,8 @@ impl crate::source::IngestStore for ClientRangedStore {
 )] // tests
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     fn tmp_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tmp dir")
@@ -1605,7 +1798,10 @@ mod tests {
             });
         let root = source.root();
         let store_dir = tmp_dir();
-        let store = ClientRangedStore::create(store_dir.path(), "blob", root, total)?;
+        let mut store = ClientRangedStore::create(store_dir.path(), "blob", root, total)?;
+        // Hold the 4 MiB flush in flight past the fault at 5 MiB, so the
+        // checkpointed prefix below exists only if the fault path waits for it.
+        store.flush_delay = Duration::from_millis(300);
 
         let aligned = decdn_bao_range::align_range(0, 0, total)?;
         let (_header, reader) = {
@@ -1771,6 +1967,65 @@ mod tests {
             "presence must be unchanged past the last (nonexistent) checkpoint"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn ingest_stream_slow_flush_does_not_block_the_runtime() -> anyhow::Result<()> {
+        // The paid pull pays from its read/decode loop, so a worker thread
+        // parked in a checkpoint fsync stops voucher sends on every lane that
+        // shares the runtime (#2117). With a single worker, a stalled flush
+        // must still leave that worker free to run other tasks.
+        const FLUSH_DELAY: Duration = Duration::from_secs(3);
+        const MAX_GAP: Duration = Duration::from_millis(1500);
+
+        let dir = tempfile::tempdir()?;
+        let data = blob(8 * 1024 * 1024); // two checkpoint intervals
+        let total = data.len() as u64;
+        let (root, _) = bao_root_and_outboard(&data);
+        let mut store = ClientRangedStore::create(dir.path(), "b", root, total)?;
+        store.flush_delay = FLUSH_DELAY;
+        let store = Arc::new(store);
+        let aligned = decdn_bao_range::align_range(0, 0, total)?;
+        let wire = scripted_reader_for(&data, &aligned)?;
+
+        // Largest gap, in ms, between consecutive wakeups of a 20 ms ticker
+        // sharing the one worker with the ingest.
+        let max_gap_ms = Arc::new(AtomicU64::new(0));
+        let ticker = tokio::spawn({
+            let max_gap_ms = Arc::clone(&max_gap_ms);
+            async move {
+                let mut last = std::time::Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let now = std::time::Instant::now();
+                    let gap =
+                        u64::try_from(now.duration_since(last).as_millis()).unwrap_or(u64::MAX);
+                    max_gap_ms.fetch_max(gap, Ordering::Relaxed);
+                    last = now;
+                }
+            }
+        });
+        let ingest = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { store.ingest_stream(&aligned, wire, None).await.map(drop) }
+        });
+
+        ingest.await??;
+        // Let the ticker wake once more, so a stall at the very end is recorded.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        ticker.abort();
+        let max_gap = Duration::from_millis(max_gap_ms.load(Ordering::Relaxed));
+        assert!(
+            max_gap < MAX_GAP,
+            "a slow flush blocked the runtime worker for {max_gap:?}"
+        );
+
+        let present = store.present_ranges().await?;
+        assert_eq!(
+            &present,
+            decdn_bao_range::align_range(0, 0, total)?.chunk_ranges()
+        );
         Ok(())
     }
 }
