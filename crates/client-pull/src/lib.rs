@@ -111,7 +111,7 @@ pub mod sink;
 /// seam), plus scripted test doubles.
 pub mod source;
 
-pub use config::{DEFAULT_READ_AHEAD_BYTES, PullConfig};
+pub use config::{DEFAULT_READ_AHEAD_BYTES, DEFAULT_STREAMER_LANE_CAP, PullConfig};
 pub use connection::WarmConnection;
 pub use coverage_plan::{
     CoveredRun, SourceCoverage, covering_sources, plan_covered_runs, spread_segments,
@@ -134,7 +134,7 @@ pub use retry::{RetryDisposition, retry_disposition};
 pub use scheduler::{ConsumptionPacing, MultiSourceConfig, SourceLane, multi_source_fetch};
 pub use sink::{BlobCache, ByteSink, NoCache, SinkFuture};
 pub use source::{BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource};
-pub use streamer::{Streamer, VerifiedReader};
+pub use streamer::{StreamCandidate, Streamer, VerifiedReader};
 
 #[cfg(any(test, feature = "test-util"))]
 pub use sink::{MemoryBlobCache, VecByteSink};

@@ -25,13 +25,17 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Notify;
 
-use crate::driver::{DriveConfig, PacingWait, drive};
+use decdn_protocol::{Coverage, num_blocks};
+
+use crate::driver::{DriveConfig, PacingWait};
 use crate::pacer::{DownstreamFrontier, WindowPacer};
+use crate::scheduler::{ConsumptionPacing, MultiSourceConfig, SourceLane, multi_source_fetch};
 use crate::sink::BlobCache;
 use crate::source::{BlobSource, Funder};
 use crate::{ClientRangedStore, PoolContext, PoolLedger, PullConfig, RangedStore};
@@ -80,17 +84,46 @@ impl PacingWait for ConsumedWait {
     }
 }
 
-/// Run the streaming fetch: drive the whole blob into the store with a read-ahead
-/// window bounded by `read_ahead` and gated on the consumer's cursor, then (on a
-/// clean finish) tee the whole verified blob to `cache` for revisits.
+/// A candidate provider the `Streamer` may fetch from: the paid source plus the
+/// `(ctx, ledger)` that pays it.
+///
+/// The `Streamer` fetches the front across up to
+/// [`PullConfig::streamer_lane_cap`] candidates at once and fails over between
+/// them — a candidate that faults mid-stream is dropped and its remainder
+/// continues from another, resuming from the store's verified frontier so no
+/// delivered byte is re-pulled or re-paid. Every candidate must name a distinct
+/// on-chain provider (one voucher stream per `(signer, provider)` lane).
+pub struct StreamCandidate<S> {
+    /// The paid source — one provider's `cdn/client/v1` requester.
+    pub source: S,
+    /// The buyer context paying this candidate's provider (shared behind
+    /// interior mutability so a mid-stream top-up is visible to its next open).
+    pub ctx: Arc<Mutex<PoolContext>>,
+    /// This candidate's per-`(signer, provider)` voucher ledger.
+    pub ledger: Arc<PoolLedger>,
+}
+
+impl<S> std::fmt::Debug for StreamCandidate<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamCandidate").finish_non_exhaustive()
+    }
+}
+
+/// Run the streaming fetch across `candidates` into the store, bounded to one
+/// read-ahead window ahead of the consumer's cursor and capped to `lane_cap`
+/// concurrent lanes, then (on a clean finish) tee the whole verified blob to
+/// `cache` for revisits.
+///
+/// A candidate that faults is dropped and its remainder reassigned to another
+/// (shared-pool free failover, #1174), resuming from the store's verified
+/// frontier so no delivered byte is re-pulled or re-paid.
 #[allow(clippy::too_many_arguments)]
 async fn run_drive<S, F>(
     state: Arc<StreamState>,
-    source: S,
+    candidates: Vec<StreamCandidate<S>>,
     read_ahead: u64,
+    lane_cap: usize,
     funder: F,
-    ctx: Arc<Mutex<PoolContext>>,
-    ledger: Arc<PoolLedger>,
     drive_config: DriveConfig,
     cache: Arc<dyn BlobCache>,
     hash: [u8; 32],
@@ -120,28 +153,55 @@ where
     let wait = ConsumedWait {
         state: Arc::clone(&state),
     };
-    let result = drive(
+    let pacing = ConsumptionPacing {
+        downstream: &downstream,
+        pacing_wait: &wait,
+    };
+    // Every candidate holds the whole blob — discovery yields blob holders, and a
+    // partial-coverage holder is the Downloader's concern (#1506), not the
+    // single-blob Streamer's.
+    let coverage = Coverage::full(num_blocks(state.total));
+    let lanes: Vec<SourceLane<'_, S>> = candidates
+        .iter()
+        .map(|c| SourceLane {
+            source: &c.source,
+            ctx: Arc::clone(&c.ctx),
+            ledger: Arc::clone(&c.ledger),
+            coverage: coverage.clone(),
+        })
+        .collect();
+    let ms = MultiSourceConfig {
+        // Small, bounded front parallelism: a paced stream wants a little
+        // same-region fan-out and free failover, not a full download's striping.
+        max_sources: lane_cap.max(1),
+        // The Streamer parks lanes on the consumer cursor — a full read-ahead
+        // window is not a stall — so the no-verified-progress watchdog is off. A
+        // genuinely silent source instead trips its own per-stream throughput
+        // floor mid-read and is reassigned that way.
+        unit_deadline: Duration::ZERO,
+    };
+    let result = multi_source_fetch(
         &state.store,
-        &source,
+        &lanes,
         &pacer,
         &funder,
-        &ctx,
-        &ledger,
         hash,
         0,
-        0,
+        state.total,
         &drive_config,
+        &ms,
         Some(&on_progress),
-        Some(&wait),
-        Some(&downstream),
         None,
+        Some(&pacing),
     )
     .await;
     if result.is_ok() {
         state.frontier.store(state.total, Ordering::SeqCst);
         // Tee the whole verified blob to the cache for a revisit. Best-effort:
-        // a cache write failure never fails the delivered stream.
-        if let Ok(whole) = state.store.read(0, 0).await {
+        // a cache write failure never fails the delivered stream. The store is
+        // left at `.partial` (a stream is not kept as a file), and reading its
+        // fully-present content needs no finalize.
+        if let Ok(whole) = state.store.read(0, state.total).await {
             let _ = cache.put(hash, 0, whole).await;
         }
     }
@@ -150,14 +210,14 @@ where
 
 /// Stream a single blob's verified front to a consumer, paced by consumption.
 ///
-/// Holds the injected pull machinery — one `source`, `funder`, `ctx`, and
-/// `ledger` — and a scratch directory for the fill store. [`Streamer::open`]
-/// consumes it to start one stream.
+/// Holds the injected pull machinery — a set of provider `candidates` (each a
+/// source + its paying `(ctx, ledger)`) and one `funder` — plus a scratch
+/// directory for the fill store. The front is fetched across a small, bounded
+/// set of candidates with free failover between them. [`Streamer::open`] consumes
+/// it to start one stream.
 pub struct Streamer<'a, S, F> {
-    source: S,
+    candidates: Vec<StreamCandidate<S>>,
     funder: F,
-    ctx: Arc<Mutex<PoolContext>>,
-    ledger: Arc<PoolLedger>,
     drive_config: DriveConfig,
     /// A scratch directory the fill store's `.partial` lives in for the stream's
     /// lifetime. The caller owns it (and its cleanup); a streamed blob is not
@@ -168,6 +228,7 @@ pub struct Streamer<'a, S, F> {
 impl<S, F> std::fmt::Debug for Streamer<'_, S, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Streamer")
+            .field("candidates", &self.candidates.len())
             .field("drive_config", &self.drive_config)
             .field("scratch", &self.scratch)
             .finish_non_exhaustive()
@@ -176,20 +237,18 @@ impl<S, F> std::fmt::Debug for Streamer<'_, S, F> {
 
 impl<'a, S, F> Streamer<'a, S, F> {
     /// Build a streamer over the injected pull machinery, filling into `scratch`.
+    /// `candidates` are the discovered blob holders to fetch across and fail over
+    /// between; each must name a distinct on-chain provider.
     #[must_use]
     pub const fn new(
-        source: S,
+        candidates: Vec<StreamCandidate<S>>,
         funder: F,
-        ctx: Arc<Mutex<PoolContext>>,
-        ledger: Arc<PoolLedger>,
         drive_config: DriveConfig,
         scratch: &'a Path,
     ) -> Self {
         Self {
-            source,
+            candidates,
             funder,
-            ctx,
-            ledger,
             drive_config,
             scratch,
         }
@@ -248,11 +307,10 @@ where
         });
         let drive = Box::pin(run_drive(
             Arc::clone(&state),
-            self.source,
+            self.candidates,
             config.read_ahead_bytes,
+            config.streamer_lane_cap,
             self.funder,
-            self.ctx,
-            self.ledger,
             self.drive_config,
             cache,
             hash,
@@ -492,7 +550,7 @@ mod tests {
     use decdn_incentive::DepositOutcome;
     use tokio::io::AsyncReadExt;
 
-    use super::{Streamer, VerifiedReader};
+    use super::{StreamCandidate, Streamer, VerifiedReader};
     use crate::driver::DriveConfig;
     use crate::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
     use crate::{
@@ -512,6 +570,22 @@ mod tests {
             client_binding: None,
             capability: None,
         }
+    }
+
+    /// One provider candidate paying `provider` out of `ledger`. Distinct
+    /// `provider` bytes give the one-lane-per-provider set the scheduler requires.
+    fn candidate<S>(source: S, ledger: Arc<PoolLedger>, provider: u8) -> StreamCandidate<S> {
+        let mut ctx = healthy_ctx();
+        ctx.provider = Address::repeat_byte(provider);
+        StreamCandidate {
+            source,
+            ctx: Arc::new(Mutex::new(ctx)),
+            ledger,
+        }
+    }
+
+    fn funder() -> FakeFunder {
+        FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)))
     }
 
     fn drive_config() -> DriveConfig {
@@ -553,10 +627,8 @@ mod tests {
         let total = source.total_bytes();
         let scratch = tempfile::tempdir()?;
         let streamer = Streamer::new(
-            source,
-            FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX))),
-            Arc::new(Mutex::new(healthy_ctx())),
-            ledger,
+            vec![candidate(source, ledger, 0xA1)],
+            funder(),
             drive_config(),
             scratch.path(),
         );
@@ -598,10 +670,8 @@ mod tests {
 
         let scratch = tempfile::tempdir()?;
         let streamer = Streamer::new(
-            source,
-            FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX))),
-            Arc::new(Mutex::new(healthy_ctx())),
-            ledger,
+            vec![candidate(source, ledger, 0xA1)],
+            funder(),
             drive_config(),
             scratch.path(),
         );
@@ -635,10 +705,8 @@ mod tests {
         let scratch = tempfile::tempdir()?;
         let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let streamer = Streamer::new(
-            source,
-            FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX))),
-            Arc::new(Mutex::new(healthy_ctx())),
-            ledger,
+            vec![candidate(source, ledger, 0xA1)],
+            funder(),
             drive_config(),
             scratch.path(),
         );
@@ -664,6 +732,55 @@ mod tests {
         Ok(())
     }
 
+    /// A candidate that faults mid-stream fails over to another: the faulty
+    /// candidate delivers a prefix, faults (a retryable transport reset), and the
+    /// healthy candidate covers the remainder — so the drained stream is still
+    /// BLAKE3-identical. The verified prefix the faulty lane delivered is never
+    /// re-pulled (the store resumes from `missing_ranges`).
+    #[tokio::test]
+    async fn a_faulting_candidate_fails_over_and_the_stream_completes() -> anyhow::Result<()> {
+        let blob = payload(400_000);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        // The faulty candidate delivers ~100 KiB of wire, then parks a retryable
+        // fault; the healthy candidate holds the whole blob.
+        let faulty = ScriptedSource::new(blob.clone())?
+            .paying(Arc::clone(&ledger_a))
+            .with_fault_after(100_000, || anyhow::anyhow!("simulated transport reset"));
+        let healthy = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger_b));
+        let root = healthy.root();
+        let total = healthy.total_bytes();
+        // A probe on the faulty source proves it delivered a prefix before failing
+        // over (mid-stream failover, not "never started").
+        let faulty_probe = faulty.clone();
+
+        let scratch = tempfile::tempdir()?;
+        let streamer = Streamer::new(
+            vec![
+                candidate(faulty, ledger_a, 0xA1),
+                candidate(healthy, ledger_b, 0xB2),
+            ],
+            funder(),
+            drive_config(),
+            scratch.path(),
+        );
+        let mut reader = streamer
+            .open(root, total, &PullConfig::default(), Arc::new(NoCache))
+            .await?;
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await?;
+
+        anyhow::ensure!(
+            out == blob,
+            "the stream must complete byte-identical despite a mid-stream candidate fault"
+        );
+        anyhow::ensure!(
+            faulty_probe.delivered_bytes() > 0,
+            "the faulty candidate must have delivered a prefix before failing over"
+        );
+        Ok(())
+    }
+
     /// A slow consumer keeps the fetch within one read-ahead window of its read
     /// cursor: the store never holds more than `read_ahead` (+ chunk-group slack)
     /// ahead of what the consumer has taken — that bound IS the outstanding-spend
@@ -683,14 +800,13 @@ mod tests {
         let read_ahead = 4 * CHUNK_GROUP_BYTES;
         let config = PullConfig {
             read_ahead_bytes: read_ahead,
+            ..PullConfig::default()
         };
 
         let scratch = tempfile::tempdir()?;
         let streamer = Streamer::new(
-            source,
-            FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX))),
-            Arc::new(Mutex::new(healthy_ctx())),
-            ledger,
+            vec![candidate(source, ledger, 0xA1)],
+            funder(),
             drive_config(),
             scratch.path(),
         );

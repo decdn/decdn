@@ -15,6 +15,12 @@
 /// fetching (and paying for) far past where it might stop reading.
 pub const DEFAULT_READ_AHEAD_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Default [`PullConfig::streamer_lane_cap`]: two. A `Streamer` keeps a small,
+/// bounded set of provider lanes on the front — enough for same-region fan-out
+/// and free failover, without the wide fan-out a full download wants. The
+/// `Downloader` uncaps this.
+pub const DEFAULT_STREAMER_LANE_CAP: usize = 2;
+
 /// Zero-config tunables shared by the consumption faces.
 ///
 /// Overrides are opt-in: [`PullConfig::default`] is the whole configuration a
@@ -29,6 +35,12 @@ pub struct PullConfig {
     /// only, not the whole thing, for a viewer who stops after five minutes. The
     /// `Downloader` ignores it and fetches the whole blob at full throughput.
     pub read_ahead_bytes: u64,
+    /// The `Streamer`'s provider-lane cap: how many discovered holders it fetches
+    /// the front across at once (the multi-source `max_sources`). Small by design
+    /// — a paced stream wants a little same-region parallelism and free failover
+    /// on the front, not the wide striping a full download does. The `Downloader`
+    /// uncaps it.
+    pub streamer_lane_cap: usize,
 }
 
 impl PullConfig {
@@ -38,6 +50,7 @@ impl PullConfig {
     pub const fn new() -> Self {
         Self {
             read_ahead_bytes: DEFAULT_READ_AHEAD_BYTES,
+            streamer_lane_cap: DEFAULT_STREAMER_LANE_CAP,
         }
     }
 }
