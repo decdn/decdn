@@ -26,7 +26,7 @@ use crate::pacer::BudgetPacer;
 use crate::scheduler::{MultiSourceConfig, multi_source_fetch};
 use crate::source::{BlobSource, Funder};
 use crate::streamer::{StreamCandidate, source_lanes};
-use crate::{ClientRangedStore, PullConfig, RangedStore};
+use crate::{ClientRangedStore, ProgressCallback, PullConfig, RangedStore};
 
 /// A downloading lane that makes no verified progress for this long is reassigned
 /// to another holder (the multi-source stall watchdog). A full-throughput
@@ -105,6 +105,12 @@ where
     /// is the bao root every ingested byte is verified against: a wrong size or
     /// hash surfaces as a verification failure, never as silent corruption.
     ///
+    /// `on_progress`, when set, is called with the core's verified CONTENT
+    /// progress for the entry CURRENTLY fetching — `(position, total_bytes)`, both
+    /// in content bytes, resetting to that entry's own total at each new entry. A
+    /// multi-entry caller drawing one bar accumulates the completed entries' totals
+    /// itself; a single-entry download can use it directly.
+    ///
     /// # Errors
     ///
     /// A store open/create/finalize I/O error, or any fault `multi_source_fetch`
@@ -120,6 +126,7 @@ where
         // changes that yet. Taken for API symmetry with the `Streamer` and so a
         // future per-download tunable has a home.
         config: &PullConfig,
+        on_progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<Vec<PathBuf>> {
         let _ = config;
         // Fail early and clearly on an empty candidate set, rather than deep inside
@@ -158,7 +165,7 @@ where
                 total_bytes,
                 &self.drive_config,
                 &ms,
-                None,
+                on_progress,
                 None,
                 // No consumption pacing: a download runs at full throughput.
                 None,
@@ -260,7 +267,7 @@ mod tests {
         );
         let dir = tempfile::tempdir()?;
         let paths = downloader
-            .fetch_to_dir(&[(root, total)], dir.path(), &PullConfig::default())
+            .fetch_to_dir(&[(root, total)], dir.path(), &PullConfig::default(), None)
             .await?;
 
         anyhow::ensure!(
@@ -289,6 +296,55 @@ mod tests {
         Ok(())
     }
 
+    /// `fetch_to_dir` forwards the core's per-blob content progress to the
+    /// caller's callback, and the final report reaches the blob's total — the
+    /// signal a CLI draws its download bar from.
+    #[tokio::test]
+    async fn fetch_to_dir_reports_progress_up_to_the_blobs_total() -> anyhow::Result<()> {
+        let blob = payload(1_500_000);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
+        let root = source.root();
+        let total = u64::try_from(blob.len())?;
+
+        let downloader = Downloader::new(
+            vec![candidate(source, ledger, 0xA1)],
+            funder(),
+            drive_config(),
+        );
+        let dir = tempfile::tempdir()?;
+
+        let max_pos = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let saw_blob_total = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mp = Arc::clone(&max_pos);
+        let sbt = Arc::clone(&saw_blob_total);
+        let on_progress = move |pos: u64, tot: u64| {
+            mp.fetch_max(pos, std::sync::atomic::Ordering::SeqCst);
+            if tot == total {
+                sbt.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+
+        downloader
+            .fetch_to_dir(
+                &[(root, total)],
+                dir.path(),
+                &PullConfig::default(),
+                Some(&on_progress),
+            )
+            .await?;
+
+        anyhow::ensure!(
+            saw_blob_total.load(std::sync::atomic::Ordering::SeqCst),
+            "progress must report the blob's content total in the total slot"
+        );
+        anyhow::ensure!(
+            max_pos.load(std::sync::atomic::Ordering::SeqCst) == total,
+            "final progress must reach the blob's total content bytes"
+        );
+        Ok(())
+    }
+
     /// Two candidates stripe one blob in parallel: the promoted file is
     /// BLAKE3-identical and both holders contributed (the multi-source fan-out).
     #[tokio::test]
@@ -313,7 +369,7 @@ mod tests {
         );
         let dir = tempfile::tempdir()?;
         let paths = downloader
-            .fetch_to_dir(&[(root, total)], dir.path(), &PullConfig::default())
+            .fetch_to_dir(&[(root, total)], dir.path(), &PullConfig::default(), None)
             .await?;
 
         let path = paths
@@ -361,7 +417,7 @@ mod tests {
             drive_config(),
         );
         let paths = downloader
-            .fetch_to_dir(&[(root, total)], dir.path(), &PullConfig::default())
+            .fetch_to_dir(&[(root, total)], dir.path(), &PullConfig::default(), None)
             .await?;
 
         let path = paths
@@ -395,7 +451,7 @@ mod tests {
             Downloader::<ScriptedSource, FakeFunder>::new(Vec::new(), funder(), drive_config());
         let dir = tempfile::tempdir()?;
         let Err(err) = downloader
-            .fetch_to_dir(&[([0u8; 32], 1)], dir.path(), &PullConfig::default())
+            .fetch_to_dir(&[([0u8; 32], 1)], dir.path(), &PullConfig::default(), None)
             .await
         else {
             anyhow::bail!("an empty candidate set must be rejected");
