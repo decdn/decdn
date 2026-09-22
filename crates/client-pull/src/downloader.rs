@@ -19,16 +19,13 @@
 //! a bundle of one.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
-
-use decdn_protocol::{Coverage, num_blocks};
 
 use crate::driver::DriveConfig;
 use crate::pacer::BudgetPacer;
-use crate::scheduler::{MultiSourceConfig, SourceLane, multi_source_fetch};
+use crate::scheduler::{MultiSourceConfig, multi_source_fetch};
 use crate::source::{BlobSource, Funder};
-use crate::streamer::StreamCandidate;
+use crate::streamer::{StreamCandidate, source_lanes};
 use crate::{ClientRangedStore, PullConfig, RangedStore};
 
 /// A downloading lane that makes no verified progress for this long is reassigned
@@ -139,19 +136,12 @@ where
             let stem = blake3::Hash::from_bytes(hash).to_hex();
             let store = ClientRangedStore::open_or_create(dir, stem.as_str(), hash, total_bytes)
                 .map_err(|e| anyhow::anyhow!("open ranged store for {stem}: {e}"))?;
-            // Every candidate holds the whole blob (a partial-coverage holder is a
-            // #1506 refinement); build one lane per provider over the shared set.
-            let coverage = Coverage::full(num_blocks(total_bytes));
-            let lanes: Vec<SourceLane<'_, S>> = self
-                .candidates
-                .iter()
-                .map(|c| SourceLane {
-                    source: &c.source,
-                    ctx: Arc::clone(&c.ctx),
-                    ledger: Arc::clone(&c.ledger),
-                    coverage: coverage.clone(),
-                })
-                .collect();
+            // One lane per provider, each carrying its candidate's measured
+            // coverage (a `None` candidate is a full holder), so a partial holder
+            // (#1506) is never assigned a range it does not hold. For a multi-blob
+            // download, a candidate that does not fully cover every entry must be
+            // fetched per blob with per-blob coverage.
+            let lanes = source_lanes(&self.candidates, total_bytes);
             let ms = MultiSourceConfig {
                 // Uncapped fan-out — a download wants every holder striping in
                 // parallel, unlike the Streamer's small bounded front.
@@ -221,6 +211,7 @@ mod tests {
             source,
             ctx: Arc::new(Mutex::new(ctx_for(provider))),
             ledger,
+            coverage: None,
         }
     }
 

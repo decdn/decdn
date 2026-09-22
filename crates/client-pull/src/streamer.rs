@@ -101,6 +101,35 @@ pub struct StreamCandidate<S> {
     pub ctx: Arc<Mutex<PoolContext>>,
     /// This candidate's per-`(signer, provider)` voucher ledger.
     pub ledger: Arc<PoolLedger>,
+    /// This candidate's measured block coverage for the blob being fetched
+    /// (#1506), or `None` to treat it as a full holder. A partial holder MUST
+    /// set this so the scheduler never assigns it — and it never steals — a
+    /// range it does not hold; `None` maps to [`Coverage::full`] sized to the
+    /// blob, the right default for the common case that discovery yields whole-
+    /// blob holders.
+    pub coverage: Option<Coverage>,
+}
+
+/// Build the per-provider [`SourceLane`] set for one blob, threading each
+/// candidate's measured coverage (or [`Coverage::full`] for a `None` candidate,
+/// sized to this blob's block count). Both faces build their lanes here so a
+/// partial holder is treated identically whether it is streamed or downloaded.
+pub(crate) fn source_lanes<S>(
+    candidates: &[StreamCandidate<S>],
+    total: u64,
+) -> Vec<SourceLane<'_, S>> {
+    candidates
+        .iter()
+        .map(|c| SourceLane {
+            source: &c.source,
+            ctx: Arc::clone(&c.ctx),
+            ledger: Arc::clone(&c.ledger),
+            coverage: c
+                .coverage
+                .clone()
+                .unwrap_or_else(|| Coverage::full(num_blocks(total))),
+        })
+        .collect()
 }
 
 impl<S> std::fmt::Debug for StreamCandidate<S> {
@@ -157,19 +186,10 @@ where
         downstream: &downstream,
         pacing_wait: &wait,
     };
-    // Every candidate holds the whole blob — discovery yields blob holders, and a
-    // partial-coverage holder is the Downloader's concern (#1506), not the
-    // single-blob Streamer's.
-    let coverage = Coverage::full(num_blocks(state.total));
-    let lanes: Vec<SourceLane<'_, S>> = candidates
-        .iter()
-        .map(|c| SourceLane {
-            source: &c.source,
-            ctx: Arc::clone(&c.ctx),
-            ledger: Arc::clone(&c.ledger),
-            coverage: coverage.clone(),
-        })
-        .collect();
+    // Each lane carries its candidate's measured coverage (a `None` candidate is
+    // a full holder), so a partial holder (#1506) is never assigned a range it
+    // does not hold.
+    let lanes = source_lanes(&candidates, state.total);
     let ms = MultiSourceConfig {
         // Small, bounded front parallelism: a paced stream wants a little
         // same-region fan-out and free failover, not a full download's striping.
@@ -594,7 +614,42 @@ mod tests {
             source,
             ctx: Arc::new(Mutex::new(ctx)),
             ledger,
+            coverage: None,
         }
+    }
+
+    #[test]
+    fn a_candidates_measured_coverage_reaches_its_lane() {
+        // A partial holder's measured coverage (#1506) must reach its SourceLane
+        // so the scheduler never assigns it a range it does not hold; a candidate
+        // with no measured coverage (`None`) falls back to a full holder.
+        let total: u64 = 500 * 1024 * 1024;
+        let nb = decdn_protocol::num_blocks(total);
+        assert!(
+            nb >= 2,
+            "test needs a multi-block blob to tell partial from full"
+        );
+        let partial = decdn_protocol::Coverage::from_block_indices(nb, [0].into_iter());
+        let led = Arc::new(PoolLedger::new(Cumulative::default()));
+
+        let mut c0 = candidate((), Arc::clone(&led), 1);
+        c0.coverage = Some(partial.clone());
+        let c1 = candidate((), Arc::clone(&led), 2);
+        let candidates = vec![c0, c1];
+
+        let built = super::source_lanes(&candidates, total);
+        let [partial_lane, full_lane] = built.as_slice() else {
+            unreachable!("source_lanes yields one lane per candidate");
+        };
+        assert_eq!(
+            partial_lane.coverage, partial,
+            "a partial holder's measured coverage must reach its lane",
+        );
+        assert_eq!(
+            full_lane.coverage,
+            decdn_protocol::Coverage::full(nb),
+            "a `None` candidate is a full holder",
+        );
     }
 
     fn funder() -> FakeFunder {
