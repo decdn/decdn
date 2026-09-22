@@ -8,6 +8,7 @@
 pub mod appeal;
 pub mod bond;
 pub mod bundle;
+pub mod bundle_cache;
 pub mod bundle_manifest;
 pub mod bundle_pull;
 pub(crate) mod buyer_store;

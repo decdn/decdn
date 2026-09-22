@@ -17,6 +17,14 @@ updates:
       prefix: chore
       include: scope
     groups:
+      # The opentelemetry crates share traits across their boundaries and must
+      # bump together. This group precedes `rust-dependencies` so it claims them
+      # first, and omits `update-types` so the major-for-0.x 0.32 -> 0.33 bump is
+      # not filtered back out into per-crate PRs.
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
       rust-dependencies:
         patterns: ["*"]
         update-types: ["minor", "patch"]

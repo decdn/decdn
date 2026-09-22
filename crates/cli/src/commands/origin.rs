@@ -23,7 +23,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail};
-use decdn_bao_range::{EncodedOutboard, encode_outboard};
+use decdn_bao_range::{EncodedOutboard, encode_outboard, shard_prefix};
 use decdn_common::cli::{OriginArgs, OriginCommand, OriginImportArgs};
 use serde::Serialize;
 
@@ -217,16 +217,6 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
     {
         bail!("--chunk-avg/--chunk-min/--chunk-max require --optimize");
     }
-    // `--optimize` streams the source file twice — once to write the
-    // whole-file blob, once to compute chunk hints. `--move` would rename the
-    // source away after the first pass, leaving nothing for the second to
-    // re-open.
-    if args.optimize && args.move_source {
-        bail!(
-            "--move is incompatible with --optimize (the chunk-hint pass needs to \
-             re-open the source file after the whole-file blob is written)"
-        );
-    }
     // The 4 MiB avg default lives here, not in clap, so an explicit `--chunk-avg`
     // without `--optimize` stays detectable as `Some` above.
     let avg = args.chunk_avg.unwrap_or(4 * 1024 * 1024);
@@ -397,13 +387,15 @@ fn import_directory(
 /// with a second, no-op-sink streaming pass over the same bytes. Returns the
 /// whole-file `(hex hash, size, chunk hints)`.
 ///
-/// The file is necessarily streamed twice — once to write the whole-file blob
-/// (`import_one_file`), once to content-defined-chunk it (`chunk_file`) — an
-/// accepted one-off import-time cost. When both are computed, their BLAKE3
-/// hash and size must agree (both are BLAKE3 of the same file); a mismatch
-/// means the file changed between the two passes (a read race) and is
-/// reported as an error rather than silently producing a manifest whose
-/// hints don't describe the stored blob.
+/// The chunk pass reads the just-written **stored object** at its
+/// content-addressed path, not the source. The store copy always exists after
+/// `import_one_file` — a `--move` renames the source into the store, a copy
+/// stages it there — so `--optimize` composes with `--move` for free, and
+/// chunking the immutable stored bytes rules out any read race between the two
+/// passes. Re-chunking those bytes must reproduce the whole-file hash and size;
+/// a mismatch would mean the stored object was corrupted between the write and
+/// the chunk pass, and is reported rather than emitting hints that don't
+/// describe the stored blob.
 fn import_optimized_file(
     ctx: &ImportCtx,
     path: &Path,
@@ -416,15 +408,16 @@ fn import_optimized_file(
             .ok_or_else(|| anyhow!("internal: write without a base"))?;
         let blob = import_one_file(base, path, ctx.move_source, ctx.force)?;
 
-        let file = File::open(path).map_err(|e| anyhow!("re-open {}: {e}", path.display()))?;
+        let stored = base.join(shard_prefix(&blob.hash_hex)).join(&blob.hash_hex);
+        let file = File::open(&stored)
+            .map_err(|e| anyhow!("open stored object {}: {e}", stored.display()))?;
         let cf = chunk_file(file, sizes, |_chash, _data| Ok(()))?;
 
         if cf.whole_hash.to_hex().as_str() != blob.hash_hex || cf.total_size != blob.size {
             bail!(
-                "{} changed while being imported: whole-file pass saw {} bytes at {}, \
-                 chunk pass saw {} bytes at {} — this indicates a read race, not a \
-                 stable source file",
-                path.display(),
+                "stored object {} is corrupt: whole-file pass wrote {} bytes at {}, \
+                 chunk pass read {} bytes at {}",
+                stored.display(),
                 blob.size,
                 blob.hash_hex,
                 cf.total_size,
@@ -565,11 +558,8 @@ fn emit_manifest(
         origin: ctx.origin_label.clone(),
         files,
         bundle_hash,
-        // A dry run writes nothing, so it never actually moved a source, and
-        // `--optimize --move` is rejected up front in `origin_import`, so
-        // `ctx.write` alone would already be correct here, but gating on both
-        // keeps this line self-evidently truthful without relying on that
-        // earlier guard.
+        // A dry run writes nothing, so it never actually moved a source;
+        // gating on `ctx.write` keeps this line self-evidently truthful.
         moved: ctx.move_source && ctx.write,
         optimized,
         chunks_total,

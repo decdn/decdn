@@ -622,6 +622,11 @@ pub struct CacheConfig {
     /// "Longer" is multiplied, not added. A silent candidate costs one full window of this,
     /// and the derived outer deadline budgets that for EVERY candidate, so a second here is
     /// ~3 seconds of worst-case client wait on a total miss (167.5 s at defaults).
+    ///
+    /// It also sets the head start of the time budget for each own-origin range-pull read
+    /// (ADR 037): one `{H}.obao4` fetch or one data window of at most 4 MiB. That budget is
+    /// this window plus the read size at [`Self::node_pull_min_throughput_bps`], so it
+    /// scales with the read and never caps the blob size.
     pub node_pull_stall_window_sec: Option<u64>,
     /// Minimum sustained upstream throughput in bytes per second over
     /// [`Self::node_pull_stall_window_sec`] (#1797). Absent =>
@@ -630,6 +635,12 @@ pub struct CacheConfig {
     /// wedged upstream (throughput to zero) and a slow drip (a trickle that never trips a
     /// bare idle timeout). `0` disables the throughput test and leaves pure idle detection:
     /// at least one byte per window.
+    ///
+    /// It also sets the average throughput each own-origin range-pull read must sustain
+    /// after the [`Self::node_pull_stall_window_sec`] head start (ADR 037). A read past that
+    /// budget fails as an origin fault and bumps `decdn_cache_origin_range_timeouts_total`.
+    /// Such a read returns the whole body at once, so it has no idle form: `0` leaves
+    /// those reads unbounded.
     pub node_pull_min_throughput_bps: Option<u64>,
     /// Cache eviction policy selector (ADR 040). Absent =>
     /// [`crate::config::DEFAULT_EVICTION_POLICY`] (`"lru"`). Must be `"lru"` or

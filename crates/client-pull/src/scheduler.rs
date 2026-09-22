@@ -3502,7 +3502,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         use super::ConsumptionPacing;
-        use crate::driver::PacingWait;
+        use crate::driver::{PacingWait, WaitReason};
         use crate::pacer::{DownstreamFrontier, WindowPacer};
 
         /// Stands in for the consumer reading one window's worth: it bumps the
@@ -3517,6 +3517,7 @@ mod tests {
             fn wait(
                 &self,
                 _observed: DownstreamFrontier,
+                _reason: WaitReason,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
                 self.cursor.fetch_add(self.by, Ordering::SeqCst);
                 Box::pin(async {})

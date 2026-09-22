@@ -33,7 +33,7 @@ use tokio::sync::Notify;
 
 use decdn_protocol::{Coverage, num_blocks};
 
-use crate::driver::{DriveConfig, PacingWait};
+use crate::driver::{DriveConfig, PacingWait, WaitReason};
 use crate::pacer::{DownstreamFrontier, WindowPacer};
 use crate::scheduler::{ConsumptionPacing, MultiSourceConfig, SourceLane, multi_source_fetch};
 use crate::sink::BlobCache;
@@ -69,7 +69,11 @@ struct ConsumedWait {
 }
 
 impl PacingWait for ConsumedWait {
-    fn wait(&self, observed: DownstreamFrontier) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn wait(
+        &self,
+        observed: DownstreamFrontier,
+        _reason: WaitReason,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             loop {
                 // Register interest BEFORE the check, so a consume between the

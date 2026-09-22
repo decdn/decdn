@@ -738,12 +738,12 @@ fn optimize_single_file_emits_one_entry_manifest() {
     }
 }
 
-// `--optimize` streams the source file twice: once to write the whole-file
-// blob, once to compute chunk hints. `--move` renames the source away after
-// the first pass, leaving nothing for the second pass to re-open, so the
-// combo is rejected up front, before any filesystem work happens.
+// `--optimize` composes with `--move`: the source is renamed into the store as
+// the whole-file blob, and the chunk-hint pass reads that stored object rather
+// than the (now gone) source. The source disappears, the whole-file blob lands
+// at its content address, and the manifest carries chunk hints.
 #[test]
-fn optimize_and_move_are_rejected_together() {
+fn optimize_and_move_compose() {
     let src = TempDir::new().unwrap();
     let origin = TempDir::new().unwrap();
     let file = src.path().join("blob.bin");
@@ -758,18 +758,39 @@ fn optimize_and_move_are_rejected_together() {
         &origin.path().display().to_string(),
         "--optimize",
         "--move",
+        "--json",
     ]);
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("--move is incompatible with --optimize"),
-        "stderr was: {stderr}"
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    // Nothing should have been written or moved.
-    assert!(file.exists(), "source must be left untouched");
+    // The source is gone — it was moved into the store.
+    assert!(!file.exists(), "source must be moved away");
+
+    let report: serde_json::Value = serde_json::from_slice(out.stdout.trim_ascii_end()).unwrap();
+    assert_eq!(report["moved"], serde_json::json!(true));
+    assert_eq!(report["optimized"], serde_json::json!(true));
     assert!(
-        fs::read_dir(origin.path()).unwrap().next().is_none(),
-        "origin dir must stay empty"
+        report["chunks_total"].as_u64().unwrap() > 0,
+        "optimize must produce chunk hints"
+    );
+
+    // The whole-file blob is stored at its content address and carries chunk hints.
+    let bundle_hex = report["bundle_hash"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("b3:")
+        .unwrap();
+    let manifest_bytes = fs::read(data_object_path(origin.path(), bundle_hex)).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    let entry = &manifest["entries"].as_array().unwrap()[0];
+    let whole_hex = entry["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
+    let stored = fs::read(data_object_path(origin.path(), whole_hex)).unwrap();
+    assert_eq!(blake3::hash(&stored).to_hex().as_str(), whole_hex);
+    assert!(
+        !entry["chunks"].as_array().unwrap().is_empty(),
+        "manifest entry must carry chunk hints"
     );
 }
 

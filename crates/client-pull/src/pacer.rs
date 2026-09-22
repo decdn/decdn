@@ -135,6 +135,11 @@ pub struct PaceState {
     /// `BudgetPacer`, never `WindowPacer`) this field is inert; callers may set it
     /// to `0` or to the already-computed delivered frontier — either is safe.
     pub pulled_frontier: u64,
+    /// Content bytes of the current gap not yet pulled: from
+    /// [`pulled_frontier`](Self::pulled_frontier) to the gap's end. [`WindowPacer`]
+    /// clamps its minimum draw to this, so the last short piece of a gap still
+    /// draws; `0` turns the minimum off. [`BudgetPacer`] never reads it.
+    pub gap_remaining: u64,
     /// The downstream serve leg's paid and demand frontiers. Ignored by
     /// [`BudgetPacer`]; on the client path the driver fills in the leg's own paid
     /// frontier and a `0` demand, both inert.
@@ -166,6 +171,12 @@ pub enum PaceDecision {
     /// [`BudgetPacer`] never returns this — only a window-bounded pacer does, so it
     /// only appears on the node's pull leg, never on the client path.
     Wait,
+    /// The window has room, but less than [`WindowPacer`]'s minimum draw, and no
+    /// serve leg is parked at the pull's frontier: pause and re-decide once
+    /// either [`PaceState::downstream`] frontier advances, as for
+    /// [`Self::Wait`]. A separate variant so the caller can meter the two
+    /// pauses apart. Like `Wait`, only a window-bounded pacer returns it.
+    WaitForMinDraw,
 }
 
 /// The pacing policy handed to the gap-driven driver. Pure: no I/O, no async.
@@ -242,6 +253,20 @@ impl Pacer for BudgetPacer {
 /// at the pull's frontier. When the window is already full and no serve leg is
 /// parked there, wait instead of drawing zero bytes.
 ///
+/// Each draw opens a new upstream request, so a window that reopens a chunk at
+/// a time would cost one request round trip per chunk. A window of at least
+/// [`MIN_DRAW_WINDOW`] therefore waits ([`PaceDecision::WaitForMinDraw`]) until
+/// half of it is open (the minimum draw) and then draws the open room, while
+/// the serve leg drains what it already holds. Three cases draw below the
+/// minimum, so the rule never stalls the pull:
+/// - a window below [`MIN_DRAW_WINDOW`], where half the window may be more
+///   room than the payments are sure to release;
+/// - a serve leg parked at the pull's frontier (the serve-demand floor);
+/// - the end of the gap, where less than the minimum is left to pull.
+///
+/// The minimum only turns some draws into waits. It never widens the room, so
+/// the exposure bound is the same.
+///
 /// Composition, not reimplementation: `WindowPacer::decide` calls
 /// `BudgetPacer::decide` and only touches the `Draw` arm. `Done` / `TopUp` /
 /// `Refuse` pass through unchanged, so the two pacers can never disagree about
@@ -252,6 +277,15 @@ pub struct WindowPacer {
     /// frontier before the pacer waits.
     window_bytes: u64,
 }
+
+/// Smallest window on which [`WindowPacer`] enforces its minimum draw of half
+/// the window. Half the window must stay clear of the lag between the pull and
+/// the downstream paid frontier — one chunk plus two group roundings (see
+/// [`PULL_WINDOW_FLOOR`]) — or the minimum could wait on room the payments
+/// never release. That holds from about two floors; four floors keeps half the
+/// window about a chunk clear of the lag, including the serve leg's one-group
+/// prefetch.
+pub const MIN_DRAW_WINDOW: u64 = 4 * PULL_WINDOW_FLOOR;
 
 impl WindowPacer {
     /// Construct a window pacer bounded to `window_bytes`.
@@ -298,9 +332,26 @@ impl Pacer for WindowPacer {
                 } else {
                     0
                 };
+                // The minimum draw (see the type docs): with no parked serve leg,
+                // wait until half the window is open, or until what the gap still
+                // lacks, whichever is smaller. Rounded up to whole groups, like the
+                // draw's end, so a sub-group gap tail still meets it.
+                let min_draw = if self.window_bytes >= MIN_DRAW_WINDOW {
+                    let half = self.window_bytes / 2;
+                    half - half % CHUNK_GROUP_BYTES
+                } else {
+                    0
+                };
+                let gap_left = s
+                    .gap_remaining
+                    .div_ceil(CHUNK_GROUP_BYTES)
+                    .saturating_mul(CHUNK_GROUP_BYTES);
+                let below_min_draw = demanded == 0 && room < min_draw.min(gap_left);
                 let room = room.max(demanded);
                 if room == 0 {
                     PaceDecision::Wait
+                } else if below_min_draw {
+                    PaceDecision::WaitForMinDraw
                 } else {
                     PaceDecision::Draw {
                         up_to_bytes: up_to_bytes.min(room),
@@ -353,8 +404,8 @@ impl Pacer for RampPacer {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
 mod tests {
     use super::{
-        BudgetPacer, CHUNK_BYTES, CHUNK_GROUP_BYTES, DownstreamFrontier, PULL_WINDOW_FLOOR,
-        PaceDecision, PaceState, Pacer, RampPacer, WindowPacer,
+        BudgetPacer, CHUNK_BYTES, CHUNK_GROUP_BYTES, DownstreamFrontier, MIN_DRAW_WINDOW,
+        PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer,
     };
     use alloy::primitives::U256;
 
@@ -372,6 +423,7 @@ mod tests {
             max_topups: 3,
             exhaustion_confirmed: false,
             pulled_frontier: 0,
+            gap_remaining: 1_000_000,
             downstream: DownstreamFrontier::default(),
         }
     }
@@ -566,6 +618,113 @@ mod tests {
                 up_to_bytes: CHUNK_GROUP_BYTES
             }
         );
+    }
+
+    /// A 64 MiB window with a large gap and no demand: the snapshot is
+    /// `pulled - served_paid = ahead`, and `requested` is far past the window.
+    fn big_window_state(ahead: u64) -> (WindowPacer, PaceState) {
+        const WINDOW: u64 = 64 * 1024 * 1024;
+        let mut s = healthy();
+        s.requested_bytes = 1 << 40;
+        s.gap_remaining = 1 << 40;
+        s.pulled_frontier = 100 * CHUNK_BYTES + ahead;
+        s.downstream.served_paid = 100 * CHUNK_BYTES;
+        (WindowPacer::new(WINDOW), s)
+    }
+
+    #[test]
+    fn a_ramped_window_waits_until_half_the_window_opens() {
+        const WINDOW: u64 = 64 * 1024 * 1024;
+        // Room of a few groups on a 64 MiB window: without the minimum this would
+        // open one upstream request per payment. Wait instead.
+        let (pacer, s) = big_window_state(WINDOW - 4 * CHUNK_GROUP_BYTES);
+        assert_eq!(pacer.decide(&s), PaceDecision::WaitForMinDraw);
+        // One group short of half open: still wait.
+        let (pacer, s) = big_window_state(WINDOW / 2 + CHUNK_GROUP_BYTES);
+        assert_eq!(pacer.decide(&s), PaceDecision::WaitForMinDraw);
+        // Exactly half open: draw the half.
+        let (pacer, s) = big_window_state(WINDOW / 2);
+        assert_eq!(
+            pacer.decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: WINDOW / 2
+            }
+        );
+    }
+
+    #[test]
+    fn min_draw_is_clamped_to_the_gap_remainder() {
+        // Two groups and a bit left in the gap, and three groups of room: the
+        // minimum shrinks to the (group-rounded) remainder, so the tail draws.
+        let (pacer, mut s) = big_window_state(64 * 1024 * 1024 - 3 * CHUNK_GROUP_BYTES);
+        s.gap_remaining = 2 * CHUNK_GROUP_BYTES + 100;
+        assert!(matches!(pacer.decide(&s), PaceDecision::Draw { .. }));
+        // Two groups of room for the same remainder is below it: wait.
+        let (pacer, mut s) = big_window_state(64 * 1024 * 1024 - 2 * CHUNK_GROUP_BYTES);
+        s.gap_remaining = 2 * CHUNK_GROUP_BYTES + 100;
+        assert_eq!(pacer.decide(&s), PaceDecision::WaitForMinDraw);
+    }
+
+    #[test]
+    fn serve_demand_bypasses_the_min_draw() {
+        // A serve leg parked at the pull's frontier gets its floor at once, even
+        // with the window nearly full.
+        let (pacer, mut s) = big_window_state(64 * 1024 * 1024 - 2 * CHUNK_GROUP_BYTES);
+        s.downstream.serve_demand = s.pulled_frontier + 1;
+        assert_eq!(
+            pacer.decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: PULL_WINDOW_FLOOR
+            }
+        );
+    }
+
+    #[test]
+    fn min_draw_is_off_below_the_min_draw_window() {
+        // A window just below `MIN_DRAW_WINDOW` keeps drawing whatever room opens.
+        let window = MIN_DRAW_WINDOW - CHUNK_GROUP_BYTES;
+        let mut s = healthy();
+        s.requested_bytes = 1 << 40;
+        s.gap_remaining = 1 << 40;
+        s.pulled_frontier = 100 * CHUNK_BYTES + window - CHUNK_GROUP_BYTES;
+        s.downstream.served_paid = 100 * CHUNK_BYTES;
+        assert_eq!(
+            WindowPacer::new(window).decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: CHUNK_GROUP_BYTES
+            }
+        );
+        // At `MIN_DRAW_WINDOW` itself the same one-group room waits.
+        s.pulled_frontier = 100 * CHUNK_BYTES + MIN_DRAW_WINDOW - CHUNK_GROUP_BYTES;
+        assert_eq!(
+            WindowPacer::new(MIN_DRAW_WINDOW).decide(&s),
+            PaceDecision::WaitForMinDraw
+        );
+    }
+
+    #[test]
+    fn half_the_window_always_opens_once_the_client_catches_up() {
+        // A caught-up, paying client leaves the pull at most one chunk plus two
+        // group roundings ahead of the paid frontier (see `PULL_WINDOW_FLOOR`).
+        // At every window from `MIN_DRAW_WINDOW` up, that lag must leave the
+        // minimum draw open, or the minimum could wait on room that never comes.
+        let lag = CHUNK_BYTES + 2 * CHUNK_GROUP_BYTES;
+        let mut window = MIN_DRAW_WINDOW;
+        while window <= 64 * 1024 * 1024 {
+            let mut s = healthy();
+            s.requested_bytes = 1 << 40;
+            s.gap_remaining = 1 << 40;
+            s.pulled_frontier = 100 * CHUNK_BYTES + lag;
+            s.downstream.served_paid = 100 * CHUNK_BYTES;
+            assert!(
+                matches!(
+                    WindowPacer::new(window).decide(&s),
+                    PaceDecision::Draw { .. }
+                ),
+                "window {window} must draw with a caught-up client"
+            );
+            window += CHUNK_GROUP_BYTES;
+        }
     }
 
     #[test]
