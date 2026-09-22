@@ -117,6 +117,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
+            proof_generation: None,
         });
         assert_eq!(retry_disposition(&err), RetryDisposition::Terminal);
     }

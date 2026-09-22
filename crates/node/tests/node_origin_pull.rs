@@ -196,6 +196,7 @@ impl PoolOpener for StubOpener {
         pool_id: B256,
         bytes_delivered: U256,
         amount: U256,
+        _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
     ) -> Result<()> {
         // The orchestrator must persist progress against the pool it pulled
         // on — i.e. the id from the `PoolContext` it just opened/reused.
@@ -302,6 +303,7 @@ impl PoolOpener for WedgedOpener {
         _pool_id: B256,
         _bytes_delivered: U256,
         _amount: U256,
+        _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
     ) -> Result<()> {
         Ok(())
     }
@@ -333,6 +335,7 @@ impl PoolOpener for FailingRecordOpener {
         _pool_id: B256,
         _bytes_delivered: U256,
         _amount: U256,
+        _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
     ) -> Result<()> {
         anyhow::bail!("simulated buyer-pool store write failure")
     }
@@ -9223,14 +9226,15 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
 }
 
 /// A leaf that takes the first interval of bytes, then signs and sends a voucher
-/// that *underpays* (a token amount well below the rate floor) instead of paying.
-/// Drives B's `collect_voucher` to `VoucherOutcome::Rejected` mid-window. Returns
-/// once it observes B's `StreamError` rejection (or the stream drops).
+/// that *underpays* (a token amount well below the quoted rate) instead of paying.
+/// B answers with an `Underpaid` rejection mid-window. Returns once it observes
+/// B's `StreamError` rejection (or the stream drops).
 async fn leaf_underpays_first_voucher(
     leaf_ep: &iroh::Endpoint,
     target: EndpointAddr,
     leaf_node_id: B256,
     leaf_eth: &Arc<PrivateKeySigner>,
+    provider: Address,
     pool_id: B256,
     hash: Hash,
 ) -> Result<()> {
@@ -9292,8 +9296,8 @@ async fn leaf_underpays_first_voucher(
     let signed = Voucher {
         pool_id,
         signer: leaf_eth.address(),
-        provider: leaf_eth.address(),
-        amount: U256::from(1u64), // far below the rate floor for one interval
+        provider,
+        amount: U256::from(1u64), // far below the quoted rate for one interval
         bytes_delivered: U256::from(cumulative),
         chain_root: B256::ZERO,
         chunk_price: U256::ZERO,
@@ -9306,18 +9310,21 @@ async fn leaf_underpays_first_voucher(
     )
     .await?;
 
-    // B must reject the underpayment. A StreamError (the explicit rejection) or a
-    // dropped stream (EOF) both signal the refusal.
-    match read_client(&mut recv).await {
-        Ok(ClientMessage::StreamError(_)) | Err(_) => Ok(()),
-        Ok(other) => anyhow::bail!("expected a StreamError for the underpayment, got {other:?}"),
+    // B must reject the underpayment in band, as `Underpaid`: a dropped stream
+    // would leave the payer no reason to act on.
+    match read_client(&mut recv).await? {
+        ClientMessage::StreamError(StreamError::VoucherRejected {
+            reason: VoucherRejectReason::Underpaid,
+            ..
+        }) => Ok(()),
+        other => anyhow::bail!("expected an Underpaid rejection, got {other:?}"),
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> {
     // #856: a leaf that underpays a mid-window voucher must be cleanly rejected
-    // (VoucherOutcome::Rejected), B must abandon the partial fill (nothing cached),
+    // (`Underpaid`), B must abandon the partial fill (nothing cached),
     // its upstream spend stays bounded to ~one window, and the client-abandoned
     // counter fires. The payload exceeds one voucher accounting interval
     // (`CHUNK_BYTES`), so the leaf actually reaches an interval boundary
@@ -9333,7 +9340,7 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x7F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, _b_operator) =
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
@@ -9357,6 +9364,7 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
         b_target,
         leaf_node_id,
         &leaf_eth,
+        b_operator,
         leaf_channel_id,
         hash,
     )
@@ -11603,6 +11611,7 @@ impl PoolOpener for FundingOpener {
         pool_id: B256,
         bytes_delivered: U256,
         amount: U256,
+        _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
     ) -> Result<()> {
         anyhow::ensure!(
             pool_id == self.pool_id,

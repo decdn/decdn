@@ -227,6 +227,30 @@ struct Pipeline {
     /// [`PoolLedger::issue`], a matching [`PoolLedger::confirm_armed`] or
     /// [`PoolLedger::resolve_reject`], or a [`PoolLedger::reseed`].
     armed: Option<Armed>,
+    /// How many times [`PoolLedger::rebase`] has moved this ledger DOWN to a
+    /// node's watermark. Every voucher is stamped with the generation it was
+    /// signed under ([`StreamProof::Voucher`]), so an `Underpaid` rejection of a
+    /// voucher signed before the latest rebase is recognisably stale.
+    generation: u64,
+    /// The watermark the latest [`PoolLedger::rebase`] moved down to, until the
+    /// caller records it ([`PoolLedger::take_unsaved_rebase`]). A monotone
+    /// advance refuses a lower watermark, so the next persist overwrites the
+    /// lane record with this anchor once, then advances from it.
+    unsaved_rebase: Option<Cumulative>,
+}
+
+impl Pipeline {
+    /// Overwrite the committed watermark with `cum` and clear everything that
+    /// was relative to the old one: accrual, rewind, and the armed voucher. The
+    /// node has just told us its authoritative watermark, so none of it holds.
+    fn overwrite(&mut self, cum: Cumulative) {
+        self.committed = cum;
+        self.accrued = Cumulative::default();
+        self.prev = None;
+        self.prev_accrued = Cumulative::default();
+        self.armed = None;
+        self.last_proof = None;
+    }
 }
 
 /// A voucher whose send did not confirm, together with the accrual it folded.
@@ -285,6 +309,8 @@ pub enum StreamProof {
     Voucher {
         /// The `amount` the voucher was signed over.
         amount: U256,
+        /// The ledger generation it was signed under ([`PoolLedger::generation`]).
+        generation: u64,
     },
     /// A preimage released at this depth on this chain.
     Reveal {
@@ -293,6 +319,21 @@ pub enum StreamProof {
         /// The depth released.
         index: u8,
     },
+}
+
+/// What [`PoolLedger::rebase`] did with a node's watermark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rebase {
+    /// The committed watermark moved down to the node's, from `from`.
+    Rebased {
+        /// The committed-plus-accrued watermark the ledger held before.
+        from: Cumulative,
+    },
+    /// The rejected voucher was signed before the latest rebase, so its
+    /// rejection says nothing about the healed anchor. Nothing moved.
+    Stale,
+    /// The watermark is not below the ledger's. Nothing moved.
+    Refused,
 }
 
 /// What a voucher should do with the lane's hash chain.
@@ -458,6 +499,8 @@ impl PoolLedger {
                 accrued: Cumulative::default(),
                 prev_accrued: Cumulative::default(),
                 last_proof: None,
+                generation: 0,
+                unsaved_rebase: None,
             }),
             epoch: std::sync::Mutex::new(None),
             retired: std::sync::Mutex::new(Displaced::Nothing),
@@ -562,6 +605,29 @@ impl PoolLedger {
         F: FnOnce(Cumulative, ChainCommit) -> Fut,
         Fut: Future<Output = anyhow::Result<()>>,
     {
+        self.issue_stamped(delta_bytes, rate_per_mb, epoch, exchange)
+            .await
+            .map(|(next, _generation)| next)
+    }
+
+    /// [`Self::issue`], also returning the ledger generation the voucher was
+    /// signed under. Read under the issuance lock, which [`Self::rebase`] also
+    /// takes, so the generation cannot move between signing and reporting it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::issue`].
+    pub async fn issue_stamped<F, Fut>(
+        &self,
+        delta_bytes: u64,
+        rate_per_mb: u64,
+        epoch: EpochAction,
+        exchange: F,
+    ) -> anyhow::Result<(Cumulative, u64)>
+    where
+        F: FnOnce(Cumulative, ChainCommit) -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
         // Serialize issuance. Held across the send below.
         let _issuing = self.issuance.lock().await;
 
@@ -610,7 +676,7 @@ impl PoolLedger {
         // into the signed anchor, so it resets to zero — and the previous pair
         // is remembered so a later `resolve_reject` can un-commit exactly this
         // voucher, both halves together.
-        {
+        let generation = {
             let mut pipeline = self.pipeline();
             pipeline.prev = Some(pipeline.committed);
             pipeline.prev_accrued = pipeline.accrued;
@@ -620,8 +686,9 @@ impl PoolLedger {
             pipeline.last_proof = Some(LastProof::Voucher {
                 amount: next.amount,
             });
-        }
-        Ok(next)
+            pipeline.generation
+        };
+        Ok((next, generation))
     }
 
     /// Commit the armed voucher signing `amount` as if its send had confirmed.
@@ -650,6 +717,16 @@ impl PoolLedger {
     /// a sibling's voucher replaced it. The ledger is then left untouched, and
     /// [`Self::settlement`] still settles high on whatever is armed.
     pub async fn confirm_armed(&self, amount: U256) -> Option<Cumulative> {
+        self.confirm_armed_stamped(amount)
+            .await
+            .map(|(confirmed, _generation)| confirmed)
+    }
+
+    /// [`Self::confirm_armed`], also returning the ledger generation the
+    /// confirmed voucher was signed under. A [`Self::rebase`] clears the armed
+    /// voucher, so one that is still armed here was signed under the current
+    /// generation.
+    pub async fn confirm_armed_stamped(&self, amount: U256) -> Option<(Cumulative, u64)> {
         let _issuing = self.issuance.lock().await;
         let mut pipeline = self.pipeline();
         let armed = pipeline
@@ -661,7 +738,7 @@ impl PoolLedger {
         pipeline.committed = armed.voucher;
         pipeline.accrued = pipeline.accrued.minus(armed.folded);
         pipeline.last_proof = Some(LastProof::Voucher { amount });
-        Some(armed.voucher)
+        Some((armed.voucher, pipeline.generation))
     }
 
     /// Re-state the lane's signed anchor under the live root, so a stream that
@@ -882,13 +959,82 @@ impl PoolLedger {
             if cum.amount <= pipeline.committed.plus(pipeline.accrued).amount {
                 return false;
             }
-            pipeline.committed = cum;
-            pipeline.accrued = Cumulative::default();
-            pipeline.prev = None;
-            pipeline.prev_accrued = Cumulative::default();
-            pipeline.armed = None;
-            pipeline.last_proof = None;
+            pipeline.overwrite(cum);
         }
+        self.retire_chain();
+        true
+    }
+
+    /// Move the committed watermark DOWN to `cum` — the node's last-accepted
+    /// watermark from a [`WatermarkBundle`] on an `Underpaid` rejection.
+    ///
+    /// An `Underpaid` rejection says this ledger has run AHEAD of the node: it
+    /// holds vouchers the node never accepted (a send that committed
+    /// optimistically, then persisted across a restart), so every voucher it
+    /// signs measures a span the node sees as short, and the lane wedges.
+    /// Rebasing to the node's watermark is the only way out.
+    ///
+    /// Moving down is safe for the payer. The bundle is the node's accepted
+    /// state, and the caller admits it only after `resumable_watermark` proves
+    /// the anchor against our own signature. Redemption is cumulative and pays
+    /// the highest voucher it is shown, so re-signing from a lower anchor can
+    /// never make the payer pay more than it has already signed for.
+    ///
+    /// `proof_generation` is the generation the rejected voucher was signed
+    /// under. A voucher signed before the latest rebase draws a stale `Underpaid`
+    /// — it measured its span from the anchor this ledger has already left — so
+    /// that rejection is [`Rebase::Stale`] and moves nothing. Rebasing on it
+    /// would re-sign amounts the node has since accepted from the healed anchor,
+    /// with different bytes, which the node refuses as a terminal
+    /// `BytesRegression`. A rejection of a voucher from the current generation
+    /// is a fresh divergence, and rebases again. `None` means the generation is
+    /// unknown, and counts as current.
+    ///
+    /// Holds the issuance lock, so no voucher is mid-send across the rebase: a
+    /// send in flight completes first, and nothing signed from the old anchor
+    /// can commit over the new one.
+    ///
+    /// Returns [`Rebase::Refused`] — leaving the ledger untouched — when `cum`
+    /// is not BELOW the committed watermark's `amount` (that is
+    /// [`Self::reseed`]'s case).
+    pub async fn rebase(&self, cum: Cumulative, proof_generation: Option<u64>) -> Rebase {
+        let _issuing = self.issuance.lock().await;
+        let from = {
+            let mut pipeline = self.pipeline();
+            if proof_generation.is_some_and(|g| g < pipeline.generation) {
+                return Rebase::Stale;
+            }
+            let from = pipeline.committed.plus(pipeline.accrued);
+            if cum.amount >= from.amount {
+                return Rebase::Refused;
+            }
+            pipeline.overwrite(cum);
+            pipeline.generation = pipeline.generation.saturating_add(1);
+            pipeline.unsaved_rebase = Some(cum);
+            from
+        };
+        self.retire_chain();
+        Rebase::Rebased { from }
+    }
+
+    /// The generation vouchers are currently signed under: how many times
+    /// [`Self::rebase`] has moved this ledger down.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.pipeline().generation
+    }
+
+    /// Take the watermark the latest [`Self::rebase`] moved down to, if no
+    /// persist has recorded it yet. The caller overwrites the lane record with it
+    /// once and advances from there; every later persist is a monotone advance
+    /// again. Taking it clears it, so a second persist sees `None`.
+    #[must_use]
+    pub fn take_unsaved_rebase(&self) -> Option<Cumulative> {
+        self.pipeline().unsaved_rebase.take()
+    }
+
+    /// Drop the live chain after an overwrite of the committed watermark.
+    fn retire_chain(&self) {
         // Retire the live chain, for the same reason a folding voucher must roll:
         // `cum` came from a bundle and therefore already folds that bundle's
         // `verified_index` into its amount. Keeping the epoch would leave the next
@@ -903,7 +1049,6 @@ impl PoolLedger {
         // hold without reasoning about order.
         *self.epoch() = None;
         *self.retired() = Displaced::Nothing;
-        true
     }
 
     /// Resolve `rejected` — the proof this stream just read a `VoucherRejected`
@@ -985,7 +1130,7 @@ impl PoolLedger {
                 true
             }
             (
-                StreamProof::Voucher { amount },
+                StreamProof::Voucher { amount, .. },
                 Some(LastProof::Voucher {
                     amount: last_amount,
                 }),
@@ -1028,7 +1173,7 @@ impl PoolLedger {
             }
             // The refused voucher never committed: its send was ambiguous, so the
             // anchor never advanced and disarming IS the whole rewind.
-            (StreamProof::Voucher { amount }, _)
+            (StreamProof::Voucher { amount, .. }, _)
                 if pipeline
                     .armed
                     .is_some_and(|armed| armed.voucher.amount == amount) =>
@@ -1338,6 +1483,7 @@ mod tests {
     fn voucher_proof(sent: Cumulative) -> StreamProof {
         StreamProof::Voucher {
             amount: sent.amount,
+            generation: 0,
         }
     }
 
@@ -1724,6 +1870,183 @@ mod tests {
         Ok(())
     }
 
+    /// An `Underpaid` rejection says the ledger ran AHEAD of the node. `rebase`
+    /// moves the committed watermark DOWN to the node's, retires the live chain,
+    /// bumps the generation, and the next voucher builds on the node's anchor.
+    #[tokio::test]
+    async fn rebase_moves_the_watermark_down_to_the_nodes() -> anyhow::Result<()> {
+        let ledger = metered_ledger(Cumulative {
+            bytes: U256::from(9_000u64),
+            amount: U256::from(90u64),
+        });
+        ledger
+            .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
+            .await?;
+        assert!(ledger.chain_root().is_some());
+        let before = ledger.settlement();
+
+        let node = Cumulative {
+            bytes: U256::from(5_000u64),
+            amount: U256::from(60u64),
+        };
+        assert_eq!(
+            ledger.rebase(node, Some(0)).await,
+            Rebase::Rebased { from: before }
+        );
+        assert_eq!(ledger.generation(), 1);
+        assert_eq!(ledger.committed(), node);
+        assert_eq!(
+            ledger.settlement(),
+            node,
+            "nothing stays armed above the node"
+        );
+        assert_eq!(ledger.chain_root(), None, "the old chain must not survive");
+
+        let (next, generation) = ledger
+            .issue_stamped(1_000, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
+            .await?;
+        assert_eq!(
+            generation, 1,
+            "vouchers after the rebase carry the new generation"
+        );
+        assert_eq!(next.bytes, U256::from(6_000u64));
+        assert_eq!(next.amount, node.amount + min_payment_for(1_000, 10));
+        Ok(())
+    }
+
+    /// `rebase` refuses a bundle at or above the committed watermark (that is
+    /// `reseed`'s case), treats an `Underpaid` for a voucher signed before the
+    /// latest rebase as stale, and rebases again on a fresh divergence.
+    #[tokio::test]
+    async fn rebase_skips_stale_rejections_and_heals_fresh_ones() -> anyhow::Result<()> {
+        let seed = Cumulative {
+            bytes: U256::from(9_000u64),
+            amount: U256::from(90u64),
+        };
+        let ledger = PoolLedger::new(seed);
+        assert_eq!(ledger.rebase(seed, None).await, Rebase::Refused, "an echo");
+        let ahead = Cumulative {
+            bytes: U256::from(10_000u64),
+            amount: U256::from(100u64),
+        };
+        assert_eq!(
+            ledger.rebase(ahead, None).await,
+            Rebase::Refused,
+            "reseed's case"
+        );
+        assert_eq!(ledger.generation(), 0);
+        assert_eq!(ledger.committed(), seed);
+
+        let node = Cumulative {
+            bytes: U256::from(5_000u64),
+            amount: U256::from(60u64),
+        };
+        assert!(matches!(
+            ledger.rebase(node, Some(0)).await,
+            Rebase::Rebased { .. }
+        ));
+        let healed = ledger
+            .issue(1_000, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
+            .await?;
+
+        // A sibling's voucher signed under generation 0 is stale.
+        let stale = Cumulative {
+            bytes: U256::from(4_000u64),
+            amount: U256::from(50u64),
+        };
+        assert_eq!(ledger.rebase(stale, Some(0)).await, Rebase::Stale);
+        assert_eq!(
+            ledger.committed(),
+            healed,
+            "a stale rejection moves nothing"
+        );
+
+        // A voucher signed under generation 1 that still underpays is a fresh
+        // divergence, and heals again.
+        assert!(matches!(
+            ledger.rebase(stale, Some(1)).await,
+            Rebase::Rebased { .. }
+        ));
+        assert_eq!(ledger.committed(), stale);
+        assert_eq!(ledger.generation(), 2);
+        Ok(())
+    }
+
+    /// A rebase waits for a voucher already mid-send, so nothing signed from the
+    /// old anchor can commit over the healed one.
+    #[tokio::test]
+    async fn rebase_waits_for_an_in_flight_voucher() -> anyhow::Result<()> {
+        let ledger = std::sync::Arc::new(PoolLedger::new(Cumulative {
+            bytes: U256::from(9_000u64),
+            amount: U256::from(90u64),
+        }));
+        let (release, parked) = tokio::sync::oneshot::channel::<()>();
+        let (entered_tx, entered) = tokio::sync::oneshot::channel::<()>();
+        let sender = {
+            let ledger = std::sync::Arc::clone(&ledger);
+            tokio::spawn(async move {
+                ledger
+                    .issue(1_000, 10, EpochAction::Keep, |_n, _c| async move {
+                        let _ = entered_tx.send(());
+                        let _ = parked.await;
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        entered.await?;
+
+        let node = Cumulative {
+            bytes: U256::from(5_000u64),
+            amount: U256::from(60u64),
+        };
+        let rebase = {
+            let ledger = std::sync::Arc::clone(&ledger);
+            tokio::spawn(async move { ledger.rebase(node, None).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!rebase.is_finished(), "the rebase must wait for the send");
+
+        let _ = release.send(());
+        let stale = sender.await??;
+        assert!(matches!(rebase.await?, Rebase::Rebased { .. }));
+        assert!(stale.amount > node.amount);
+        assert_eq!(
+            ledger.committed(),
+            node,
+            "the healed anchor holds; the in-flight voucher did not commit over it"
+        );
+        Ok(())
+    }
+
+    /// The watermark a rebase moved down to is handed out exactly once, for the
+    /// persist that records it with an overwrite.
+    #[tokio::test]
+    async fn the_unsaved_rebase_is_taken_once() {
+        let ledger = PoolLedger::new(Cumulative {
+            bytes: U256::from(9_000u64),
+            amount: U256::from(90u64),
+        });
+        assert_eq!(ledger.take_unsaved_rebase(), None);
+        let node = Cumulative {
+            bytes: U256::from(5_000u64),
+            amount: U256::from(60u64),
+        };
+        assert!(matches!(
+            ledger.rebase(node, None).await,
+            Rebase::Rebased { .. }
+        ));
+        assert_eq!(ledger.take_unsaved_rebase(), Some(node));
+        assert_eq!(ledger.take_unsaved_rebase(), None);
+    }
+
+    /// The per-voucher price `next_voucher` charges for `bytes` at `rate`.
+    fn min_payment_for(bytes: u64, rate: u64) -> U256 {
+        U256::from(bytes)
+            .saturating_mul(U256::from(rate))
+            .div_ceil(U256::from(MB_BYTES))
+    }
+
     /// `SpendingCapExhausted` with NO bundle (a genuinely exhausted capability, nothing to
     /// resume from) must not be treated as self-healable — a caller checking
     /// `bundle.is_none()` sees the "give up / top up" signal. This pins the
@@ -1733,6 +2056,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
+            proof_generation: None,
         });
         let upstream = err
             .downcast_ref::<UpstreamVoucherRejected>()

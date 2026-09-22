@@ -28,6 +28,31 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **An underpaying voucher gets an `Underpaid` rejection carrying the node's
+  watermark, and a diverged payer lane heals itself.** Wire-breaking:
+  `VoucherRejectReason::Underpaid` is appended as discriminant 14 and is
+  watermark-gated. A node used to answer a voucher that underpaid its span by
+  dropping the stream with no frame, so the payer saw
+  `frame I/O error: early eof`. The payer had already counted that voucher as
+  paid, because a voucher is committed once its send succeeds, and it saved
+  it. After that, every later voucher looked short to the node and the lane
+  was stuck for good, across restarts. The node now sends
+  `VoucherRejected { Underpaid, bundle }` with its last-accepted watermark.
+  The payer checks the bundle against its own signature and moves its ledger
+  down to it with `PoolLedger::rebase`, which waits for any voucher still
+  being sent. Each rebase starts a new ledger generation, and every voucher
+  proof carries the generation it was signed under
+  (`StreamProof::Voucher { generation }`,
+  `UpstreamVoucherRejected::proof_generation`). A rejection of a voucher from
+  an older generation is stale: the payer retries without moving again. A
+  rejection from the current generation rebases again. The payer saves the
+  rebased watermark once, through the new `BuyerPoolStore::rebase_progress`
+  (overwrite down to that watermark, then advance). Every later save is a
+  monotone advance again. The node does the same for the pools it pays from:
+  `record_progress` takes the rebase point. A bundle-less `Underpaid` on the
+  node's pull leg is ruled `OurLocalFault` rather than a dead lane. ADR 003 §
+  Voucher withholding and ADR 005 § `VoucherRejected` semantics describe the
+  behaviour.
 - **Buyer pool rows are scoped to their `PaymentPool` deployment, and the
   buyer table moves to `_v4` (#2087).** `PaymentPool.openPool` derives
   `poolId = keccak256(owner, ownerPoolNonce)` — no contract address, no chain

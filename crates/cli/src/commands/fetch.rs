@@ -51,7 +51,9 @@ use decdn_client_pull::{
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
-use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore, DepositOutcome};
+use decdn_incentive::buyer_pool::{
+    AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, DepositOutcome,
+};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
 use decdn_incentive::payment_pool::{PaymentPool, newest_solvent_owned_pool};
@@ -1236,24 +1238,55 @@ fn persist_watermark(
     lane: LaneKey,
     progress: &VoucherProgress,
 ) {
-    let Some((bytes_delivered, amount)) = progress.advanced() else {
-        return;
+    // A ledger that rebased DOWN to the node's authenticated watermark records it
+    // once with an overwrite, which a monotone advance refuses; the next run then
+    // starts in step with the node. Every other persist is a monotone advance.
+    let (write, outcome) = if let Some(anchor) = progress.rebase_anchor() {
+        let (bytes_delivered, amount) = progress.totals();
+        let outcome = store.rebase_progress(
+            owner,
+            pool_id,
+            lane,
+            BuyerLaneProgress {
+                last_amount: anchor.amount,
+                last_bytes: anchor.bytes,
+            },
+            BuyerLaneProgress {
+                last_amount: amount,
+                last_bytes: bytes_delivered,
+            },
+        );
+        ("rebased", outcome)
+    } else {
+        let Some((bytes_delivered, amount)) = progress.advanced() else {
+            return;
+        };
+        let outcome = store.advance_progress(owner, pool_id, lane, bytes_delivered, amount);
+        ("advanced", outcome)
     };
     // A non-`Advanced` outcome (unknown pool / replaced owner slot / regression)
     // means the watermark did NOT move — same hazard as a backend error — so
-    // surface it too rather than dropping it on the floor.
-    match store.advance_progress(owner, pool_id, lane, bytes_delivered, amount) {
+    // surface it too rather than dropping it on the floor. A lost rebase write
+    // heals itself: the next run signs from the old anchor, draws `Underpaid`
+    // again, and rebases again.
+    let (bytes_delivered, amount) = progress.totals();
+    match outcome {
         Ok(AdvanceOutcome::Advanced) => {}
         Ok(other) => tracing::warn!(
-            "voucher watermark not persisted for pool {pool_id} (provider {}): \
+            write,
+            %bytes_delivered,
+            %amount,
+            "{write} voucher watermark not persisted for pool {pool_id} (provider {}): \
              {other:?}; the next reuse may re-sign a stale watermark, which that provider \
-             rejects — close and reopen the pool if reuse starts failing",
+             rejects",
             lane.provider
         ),
         Err(e) => tracing::warn!(
-            "failed to persist voucher watermark for pool {pool_id} (provider {}): {e}; \
-             the next reuse may re-sign a stale watermark, which that provider rejects — close \
-             and reopen the pool if reuse starts failing",
+            write,
+            %bytes_delivered,
+            %amount,
+            "failed to persist {write} voucher watermark for pool {pool_id} (provider {}): \
+             {e}; the next reuse may re-sign a stale watermark, which that provider rejects",
             lane.provider
         ),
     }
@@ -1624,7 +1657,8 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
 /// Reconnect a delegated fetch's terminal owner-remedy voucher rejection
 /// (`SpendingCapExhausted`, `CapabilityExpired`, `PoolExhausted`) to the
 /// owner-side remedy: the delegate holds no wallet on this pool, so it cannot
-/// `topUp`, raise its own cap, or mint itself a fresh capability. Any other
+/// `topUp`, raise its own cap, or mint itself a fresh capability. A terminal
+/// `Underpaid` — the resync budget ran out — gets its own next step. Any other
 /// error passes through verbatim (a stall, a transport fault, or a `NotFound`
 /// already annotated by [`annotate_unbound_cache_miss`] inside `drive_fetch`).
 pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error {
@@ -1640,11 +1674,20 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
                     | VoucherRejectReason::PoolExhausted
             )
         });
+    let underpaid = err
+        .downcast_ref::<UpstreamVoucherRejected>()
+        .is_some_and(|rejected| rejected.reason == VoucherRejectReason::Underpaid);
     if needs_owner {
         err.context(
             "capability cap exhausted, capability expired, or pool balance exhausted — ask the \
              pool owner to top up the pool or issue a fresh, higher-cap capability (a delegated \
              client cannot top up a pool it does not own)",
+        )
+    } else if underpaid {
+        err.context(
+            "the node kept refusing this lane's vouchers as underpaid after the resync attempts \
+             ran out — retry the fetch; a lane with no accepted voucher yet means the signed \
+             price is below the node's quote",
         )
     } else {
         err
@@ -1779,6 +1822,7 @@ fn select_watermark(
     committed: Cumulative,
     settlement: Cumulative,
     prior_amount: U256,
+    rebase_anchor: Option<Cumulative>,
 ) -> VoucherProgress {
     let cum = match outcome {
         Ok(()) => committed,
@@ -1788,7 +1832,7 @@ fn select_watermark(
         // settle HIGH so a reuse never re-signs a spent lane state.
         Err(_) => settlement,
     };
-    VoucherProgress::from_cumulative(cum, prior_amount)
+    VoucherProgress::from_cumulative(cum, prior_amount).with_rebase_anchor(rebase_anchor)
 }
 
 /// The lane's shared ledger + context: from the run registry when bundle pull
@@ -2147,11 +2191,15 @@ where
     // voucher rejection the acked (committed) watermark is safe; on an ambiguous
     // failure settle HIGH (`settlement`) so a reuse never re-signs a spent lane
     // state.
+    // Take the rebase anchor before reading the totals: every read after it is
+    // at or above it.
+    let rebase_anchor = prelude.ledger.take_unsaved_rebase();
     let vprogress = select_watermark(
         &drive_result,
         prelude.ledger.committed(),
         prelude.ledger.settlement(),
         prelude.prior_amount,
+        rebase_anchor,
     );
     persist_watermark(deps.store, deps.self_address, pool_id, lane, &vprogress);
 
@@ -2249,11 +2297,15 @@ where
     // rule `drive_fetch` applies: the committed cumulative on success or an
     // explicit voucher rejection, the armed settlement (HIGH) on any other
     // failure so a reuse never re-signs a spent lane state.
+    // Take the rebase anchor before reading the totals: every read after it is
+    // at or above it.
+    let rebase_anchor = prelude.ledger.take_unsaved_rebase();
     let vprogress = select_watermark(
         &drive_result,
         prelude.ledger.committed(),
         prelude.ledger.settlement(),
         prelude.prior_amount,
+        rebase_anchor,
     );
     persist_watermark(deps.store, deps.self_address, pool_id, lane, &vprogress);
 
@@ -2715,6 +2767,8 @@ struct LaneWatermark {
     /// The lane's ARMED cumulative: what the lane owes if every voucher it put
     /// on the wire was received.
     settlement: Cumulative,
+    /// The watermark the lane's ledger rebased down to and has not persisted.
+    rebase_anchor: Option<Cumulative>,
 }
 
 /// Snapshot each lane's watermark inputs.
@@ -2725,6 +2779,8 @@ fn lane_watermarks(lanes: &[MultiLane<'_>]) -> Vec<LaneWatermark> {
             pool_id: l.pool_id,
             provider: l.provider,
             prior_amount: l.prior_amount,
+            // Taken before the settlement read, so the settlement is at or above it.
+            rebase_anchor: l.ledger.take_unsaved_rebase(),
             settlement: l.ledger.settlement(),
         })
         .collect()
@@ -2759,7 +2815,8 @@ fn multi_lane_watermarks(
                     signer,
                     provider: l.provider,
                 },
-                VoucherProgress::from_cumulative(l.settlement, l.prior_amount),
+                VoucherProgress::from_cumulative(l.settlement, l.prior_amount)
+                    .with_rebase_anchor(l.rebase_anchor),
             )
         })
         .collect()
@@ -4234,6 +4291,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
+            proof_generation: None,
         });
         let annotated = super::annotate_delegated_exhaustion(err);
         assert!(
@@ -4259,6 +4317,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: decdn_protocol::client::VoucherRejectReason::CapabilityExpired,
             bundle: None,
+            proof_generation: None,
         });
         let annotated = super::annotate_delegated_exhaustion(err);
         assert!(
@@ -4274,6 +4333,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: decdn_protocol::client::VoucherRejectReason::PoolExhausted,
             bundle: None,
+            proof_generation: None,
         });
         let annotated = super::annotate_delegated_exhaustion(err);
         assert!(
@@ -4399,7 +4459,7 @@ mod tests {
             bytes: U256::from(30u64),
             amount: U256::from(40u64),
         };
-        let progress = select_watermark(&Ok(()), committed, settlement, U256::ZERO);
+        let progress = select_watermark(&Ok(()), committed, settlement, U256::ZERO, None);
         assert_eq!(
             progress.advanced(),
             Some((committed.bytes, committed.amount))
@@ -4417,11 +4477,129 @@ mod tests {
             amount: U256::from(40u64),
         };
         let err = Err(anyhow::anyhow!("stall"));
-        let progress = select_watermark(&err, committed, settlement, U256::ZERO);
+        let progress = select_watermark(&err, committed, settlement, U256::ZERO, None);
         assert_eq!(
             progress.advanced(),
             Some((settlement.bytes, settlement.amount))
         );
+    }
+
+    /// `select_watermark` carries a rebase anchor through to the persist, and a
+    /// watermark that did not advance past its seed still reports its totals.
+    #[test]
+    fn select_watermark_carries_the_rebase_anchor() {
+        let committed = Cumulative {
+            bytes: U256::from(10u64),
+            amount: U256::from(20u64),
+        };
+        let anchor = Cumulative {
+            bytes: U256::from(5u64),
+            amount: U256::from(15u64),
+        };
+        let progress = select_watermark(
+            &Ok(()),
+            committed,
+            committed,
+            U256::from(50u64),
+            Some(anchor),
+        );
+        assert_eq!(progress.rebase_anchor(), Some(anchor));
+        assert_eq!(progress.advanced(), None, "below the seed: not an advance");
+        assert_eq!(progress.totals(), (committed.bytes, committed.amount));
+    }
+
+    fn rebase_store_fixture() -> anyhow::Result<(
+        tempfile::TempDir,
+        RedbBuyerPoolStore,
+        Address,
+        PoolId,
+        LaneKey,
+    )> {
+        let dir = tempfile::tempdir()?;
+        // A fresh subpath so the store's `ensure_data_dir` creates it at 0o700.
+        let store = RedbBuyerPoolStore::open(&dir.path().join("data"))?;
+        let owner = Address::repeat_byte(0x0A);
+        let pool_id = PoolId::repeat_byte(0x01);
+        let lane = LaneKey {
+            pool_id,
+            signer: owner,
+            provider: Address::repeat_byte(0xB0),
+        };
+        let mut state = BuyerPoolState::new(
+            pool_id,
+            Address::repeat_byte(0x7B),
+            owner,
+            Address::repeat_byte(0x7C),
+            U256::from(1_000u64),
+        );
+        state
+            .advance_lane(lane, U256::from(500u64), U256::from(90u64))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        store.record(&state)?;
+        Ok((dir, store, owner, pool_id, lane))
+    }
+
+    fn lane_record(
+        store: &RedbBuyerPoolStore,
+        pool_id: PoolId,
+        lane: LaneKey,
+    ) -> anyhow::Result<BuyerLaneProgress> {
+        store
+            .get_by_pool_id(pool_id)?
+            .and_then(|s| s.lane_progress(lane))
+            .ok_or_else(|| anyhow::anyhow!("lane record missing"))
+    }
+
+    /// `persist_watermark` overwrites the lane record down to a rebase anchor and
+    /// advances it to the ledger's totals, even below what the record holds. A
+    /// persist without an anchor is a monotone advance again, so a lower totals
+    /// snapshot cannot move the record down.
+    #[test]
+    fn persist_watermark_overwrites_once_on_a_rebase() -> anyhow::Result<()> {
+        let (_dir, store, owner, pool_id, lane) = rebase_store_fixture()?;
+        let anchor = Cumulative {
+            bytes: U256::from(100u64),
+            amount: U256::from(60u64),
+        };
+        let totals = Cumulative {
+            bytes: U256::from(200u64),
+            amount: U256::from(70u64),
+        };
+        let progress = select_watermark(&Ok(()), totals, totals, U256::from(90u64), Some(anchor));
+        persist_watermark(&store, owner, pool_id, lane, &progress);
+        let got = lane_record(&store, pool_id, lane)?;
+        assert_eq!(
+            (got.last_bytes, got.last_amount),
+            (totals.bytes, totals.amount)
+        );
+
+        let lower = Cumulative {
+            bytes: U256::from(150u64),
+            amount: U256::from(65u64),
+        };
+        let progress = select_watermark(&Ok(()), lower, lower, U256::ZERO, None);
+        persist_watermark(&store, owner, pool_id, lane, &progress);
+        let got = lane_record(&store, pool_id, lane)?;
+        assert_eq!(
+            (got.last_bytes, got.last_amount),
+            (totals.bytes, totals.amount),
+            "without an anchor the persist is monotone"
+        );
+        Ok(())
+    }
+
+    /// The multi-source path carries each lane's own rebase anchor.
+    #[test]
+    fn multi_lane_watermarks_carry_the_rebase_anchor() {
+        let anchor = Cumulative {
+            bytes: U256::from(50u64),
+            amount: U256::from(60u64),
+        };
+        let mut lane = lane_wm(1, 0xA1, 200, 100, 70);
+        lane.rebase_anchor = Some(anchor);
+        let out = super::multi_lane_watermarks(Address::repeat_byte(0x5E), &[lane]);
+        assert_eq!(out[0].1.rebase_anchor(), Some(anchor));
+        assert_eq!(out[0].1.totals(), (U256::from(100u64), U256::from(70u64)));
     }
 
     // ---- per-lane watermarks on the multi-source path ----
@@ -4435,6 +4613,7 @@ mod tests {
                 bytes: U256::from(bytes),
                 amount: U256::from(amount),
             },
+            rebase_anchor: None,
         }
     }
 

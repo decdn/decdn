@@ -282,6 +282,7 @@ mod tests {
             _pool_id: PoolId,
             _bytes_delivered: U256,
             _amount: U256,
+            _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
         ) -> Result<()> {
             unreachable!("not exercised by NodeFunder tests")
         }

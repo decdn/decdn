@@ -1189,7 +1189,9 @@ impl StreamError {
 /// pool's remaining deposit can no longer fund further credit; and the four
 /// hash-chain reasons ([`Self::BadPreimage`], [`Self::ChainIndexZero`],
 /// [`Self::UnanchoredPreimage`], [`Self::ChunkPriceMismatch`]) are raised where
-/// the handler holds the per-stream chain anchor a validation enum cannot see.
+/// the handler holds the per-stream chain anchor a validation enum cannot see;
+/// [`Self::Underpaid`] fires when the span a voucher adds over the lane's
+/// accepted watermark pays below the quoted `rate_per_mb`.
 /// Variant order is frozen — new handler-direct reasons append at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
@@ -1279,27 +1281,44 @@ pub enum VoucherRejectReason {
     /// Cadence). A payer bug: re-read `rate_per_mb` from the `StreamResponse`
     /// and re-sign; do not retry with the same price.
     ChunkPriceMismatch,
+    /// The voucher advances the lane, but the span it adds over the node's
+    /// last-accepted watermark pays below the quoted `rate_per_mb` (ADR 003
+    /// §Voucher withholding). The node stops delivery and credits nothing.
+    ///
+    /// An honest payer reaches this only when its local watermark has diverged
+    /// from the node's: its cumulative carries bytes the node never accepted a
+    /// voucher for, so every later span looks short. The reject therefore carries
+    /// the node's [`WatermarkBundle`]. Recovery: the payer verifies the bundle
+    /// against its own key, rebases its lane to it once, and retries (ADR 005
+    /// §`VoucherRejected` semantics).
+    Underpaid,
 }
 
 impl VoucherRejectReason {
     /// Whether a [`StreamError::VoucherRejected`] carrying this reason is
-    /// eligible for a [`WatermarkBundle`] (issue #1481 §5): exactly the three
-    /// regression/exhaustion reasons a wallet-less client cannot distinguish
-    /// from chain, since its local watermark is the only thing that could be
-    /// wrong. Every handler-direct reason (`CapabilityExpired` / `PoolExhausted`,
-    /// plus the signer/pool/provider mismatches) is never eligible — a bundle
-    /// would not help there, since the fix is not "resync the watermark".
+    /// eligible for a [`WatermarkBundle`] (issue #1481 §5): exactly four
+    /// reasons. The three regression/exhaustion reasons are ones a wallet-less
+    /// client cannot distinguish from chain, since its local watermark is the
+    /// only thing that could be wrong. [`Self::Underpaid`] is the fourth: an
+    /// honest payer reaches it only through that same watermark divergence.
+    /// Every other handler-direct reason (`CapabilityExpired`, `PoolExhausted`,
+    /// `SignerCapExhausted`, the chain reasons) and the signer/pool/provider
+    /// mismatches are never eligible — a bundle would not help there, since the
+    /// fix is not "resync the watermark".
     ///
     /// Single source of truth for the gate: the node checks this before
     /// attaching a bundle (`crates/node/src/handlers/client/voucher.rs`) and
     /// the client checks it again before trusting one enough to self-heal
     /// (`crates/client-pull/src/lib.rs`) — both call this rather than each
-    /// keeping their own copy of the three-way match.
+    /// keeping their own copy of the match.
     #[must_use]
     pub const fn is_watermark_gated(self) -> bool {
         matches!(
             self,
-            Self::SpendingCapExhausted | Self::AmountRegression | Self::BytesRegression
+            Self::SpendingCapExhausted
+                | Self::AmountRegression
+                | Self::BytesRegression
+                | Self::Underpaid
         )
     }
 }
@@ -1693,6 +1712,7 @@ mod tests {
             VoucherRejectReason::ChainIndexZero,
             VoucherRejectReason::UnanchoredPreimage,
             VoucherRejectReason::ChunkPriceMismatch,
+            VoucherRejectReason::Underpaid,
         ]
         .into_iter()
         .enumerate()
@@ -1706,6 +1726,37 @@ mod tests {
             assert_eq!(decoded, r);
         }
         Ok(())
+    }
+
+    /// Exactly the reasons a watermark resync can repair carry a bundle.
+    /// `Underpaid` is one: an honest payer reaches it only when its local
+    /// watermark ran ahead of the node's.
+    #[test]
+    fn watermark_gated_reasons_are_the_resyncable_ones() {
+        use VoucherRejectReason as R;
+        for r in [
+            R::AmountRegression,
+            R::BytesRegression,
+            R::SpendingCapExhausted,
+            R::Underpaid,
+        ] {
+            assert!(r.is_watermark_gated(), "{r:?} must be watermark-gated");
+        }
+        for r in [
+            R::BadSignature,
+            R::WrongSigner,
+            R::WrongPool,
+            R::WrongProvider,
+            R::CapabilityExpired,
+            R::PoolExhausted,
+            R::SignerCapExhausted,
+            R::BadPreimage,
+            R::ChainIndexZero,
+            R::UnanchoredPreimage,
+            R::ChunkPriceMismatch,
+        ] {
+            assert!(!r.is_watermark_gated(), "{r:?} must not be watermark-gated");
+        }
     }
 
     #[test]

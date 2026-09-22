@@ -2092,11 +2092,27 @@ fn persist_buyer_progress(
     pool_id: B256,
     progress: &VoucherProgress,
 ) {
-    if let Some((bytes_delivered, amount)) = progress.advanced()
-        && let Err(err) =
-            deps.buyer
-                .record_progress(provider_addr, pool_id, bytes_delivered, amount)
-    {
+    // A pending rebase anchor is recorded even when the totals did not advance
+    // past the seed: the whole point is to move the record down.
+    let rebase_anchor = progress
+        .rebase_anchor()
+        .map(|anchor| decdn_incentive::BuyerLaneProgress {
+            last_amount: anchor.amount,
+            last_bytes: anchor.bytes,
+        });
+    let totals = match (progress.advanced(), rebase_anchor) {
+        (Some(advanced), _) => advanced,
+        (None, Some(_)) => progress.totals(),
+        (None, None) => return,
+    };
+    let (bytes_delivered, amount) = totals;
+    if let Err(err) = deps.buyer.record_progress(
+        provider_addr,
+        pool_id,
+        bytes_delivered,
+        amount,
+        rebase_anchor,
+    ) {
         deps.metrics.node_pull_progress_persist_failure();
         warn!(%provider_addr, error = %err, "node-origin: failed to persist buyer voucher progress");
     }
@@ -2390,7 +2406,8 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 ///   retry rather than suppress a healthy peer.
 ///
 /// Wallet-less resume: this classifier does NOT special-case a bundled
-/// `SpendingCapExhausted`/`AmountRegression`/`BytesRegression`, and it does not need to.
+/// `SpendingCapExhausted`/`AmountRegression`/`BytesRegression`/`Underpaid`, and it does not
+/// need to.
 /// The gap-driven `decdn_client_pull::drive` loop (this node's own cache-miss buyer leg)
 /// already retries a resumable rejection in its own loop before it can ever surface here: it
 /// reseeds the pool's ledger and reopens the pull, transparently, and this classifier sees
@@ -2402,8 +2419,14 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 /// attempts were exhausted. `OurDeadLane` remains the correct verdict for every lane-terminal
 /// reason in that case — the lane really is unusable, and the deposit worth keeping the pool
 /// row for is not what needs reclaiming.
-const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
+const fn voucher_verdict(reason: VoucherRejectReason, has_bundle: bool) -> PullVerdict {
     match reason {
+        // An `Underpaid` with no watermark comes from a lane that has accepted no
+        // voucher yet, so no watermark can have diverged: our own pricing is below
+        // the quote, and every candidate refuses it the same way. Suppressing the
+        // peer would blame the wrong party.
+        VoucherRejectReason::Underpaid if !has_bundle => PullVerdict::OurLocalFault,
+
         // Our own signing or metering is broken, and it hits every candidate.
         // `BadPreimage` and `ChainIndexZero` belong here for the same reason
         // a bad signature does: both mean this node released a proof no upstream
@@ -2435,8 +2458,8 @@ const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
         // cap is spent — either the upstream's voucher-amount check
         // (`SpendingCapExhausted`) or its mid-stream cross-provider cap-headroom
         // re-check (`SignerCapExhausted`) — or its capability expired
-        // (`CapabilityExpired`), our accounting drifted
-        // (`AmountRegression`/`BytesRegression`), or the voucher named the wrong pool or a
+        // (`CapabilityExpired`), our accounting drifted and the resync budget ran out
+        // (`AmountRegression`/`BytesRegression`/a bundled `Underpaid`), or the voucher named the wrong pool or a
         // different provider (`WrongPool`/`WrongProvider`). None of these has surrendered
         // the pool row's value outright — a mis-addressed or drifted voucher spends
         // nothing, and an exhausted cap or expired capability means too little for THIS
@@ -2445,6 +2468,7 @@ const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
         | VoucherRejectReason::WrongProvider
         | VoucherRejectReason::AmountRegression
         | VoucherRejectReason::BytesRegression
+        | VoucherRejectReason::Underpaid
         | VoucherRejectReason::SpendingCapExhausted
         | VoucherRejectReason::SignerCapExhausted
         | VoucherRejectReason::CapabilityExpired => PullVerdict::OurDeadLane(reason),
@@ -2484,7 +2508,7 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
         return PullVerdict::RateLimited;
     }
     if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {
-        return voucher_verdict(rejected.reason);
+        return voucher_verdict(rejected.reason, rejected.bundle.is_some());
     }
     // Ahead of `UpstreamRefused` and the catch-all, deliberately: a local signing or encode
     // fault surfaces while we are talking to a peer, and every arm below this one blames
@@ -2510,8 +2534,8 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
         // Unwrap it here rather than in `classify_refusal`, because the answer is not a
         // refusal verdict at all: it is a statement about our CHANNEL, and `voucher_verdict`
         // is the one place that decides what a rejected voucher costs.
-        if let StreamError::VoucherRejected { reason, .. } = refused.error() {
-            return voucher_verdict(*reason);
+        if let StreamError::VoucherRejected { reason, bundle } = refused.error() {
+            return voucher_verdict(*reason, bundle.is_some());
         }
         return PullVerdict::Refused(classify_refusal(refused.error()));
     }
@@ -3094,6 +3118,7 @@ mod tests {
         let rejected: anyhow::Error = anyhow::Error::new(UpstreamVoucherRejected {
             reason: decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
+            proof_generation: None,
         });
         assert!(rejected.downcast_ref::<UpstreamVoucherRejected>().is_some());
         assert!(rejected.downcast_ref::<PullTimeout>().is_none());
@@ -3175,6 +3200,22 @@ mod tests {
         );
     }
 
+    /// An `Underpaid` with a watermark means our lane drifted and the resync budget
+    /// ran out: this lane is dead, the peer kept. Without a watermark the lane had
+    /// accepted nothing, so our own pricing is at fault on every candidate, and
+    /// the peer must not be suppressed for it.
+    #[test]
+    fn an_underpaid_rejection_blames_the_lane_or_our_pricing() {
+        assert_eq!(
+            voucher_verdict(VoucherRejectReason::Underpaid, true),
+            PullVerdict::OurDeadLane(VoucherRejectReason::Underpaid)
+        );
+        assert_eq!(
+            voucher_verdict(VoucherRejectReason::Underpaid, false),
+            PullVerdict::OurLocalFault
+        );
+    }
+
     /// A `PoolExhausted` rejection is a statement about OUR buyer pool, not the peer:
     /// the deposit we fund the upstream from can no longer cover further credit. The
     /// peer did nothing wrong, so this must be judged retryable with the peer KEPT —
@@ -3184,7 +3225,7 @@ mod tests {
     #[test]
     fn a_pool_exhaustion_is_a_retryable_topup_not_a_dead_channel() {
         assert_eq!(
-            voucher_verdict(VoucherRejectReason::PoolExhausted),
+            voucher_verdict(VoucherRejectReason::PoolExhausted, false),
             PullVerdict::OurVoucherRetryable(VoucherRejectReason::PoolExhausted),
             "our own drained pool keeps the healthy peer and retries after a top-up"
         );

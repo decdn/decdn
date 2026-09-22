@@ -190,6 +190,25 @@ impl BuyerPoolState {
         self.lanes.len()
     }
 
+    /// Overwrite `lane`'s progress with `anchor`, then advance it to `totals`,
+    /// with no monotonicity check against the recorded progress. Only for a
+    /// payer whose ledger rebased DOWN to the node's authenticated watermark
+    /// (`PoolLedger::rebase` in `decdn-client-pull`): the recorded progress
+    /// holds vouchers the node never accepted, and [`Self::advance_lane`] would
+    /// refuse to leave it. `totals` is what the ledger has paid since the rebase;
+    /// a `totals` below `anchor` on either axis records `anchor` alone.
+    pub fn rebase_lane(
+        &mut self,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) {
+        let advanced =
+            totals.last_amount >= anchor.last_amount && totals.last_bytes >= anchor.last_bytes;
+        self.lanes
+            .insert(lane, if advanced { totals } else { anchor });
+    }
+
     /// Advance `lane`'s cumulative totals to the reported values, enforcing
     /// monotonicity (vouchers are cumulative over a lane's lifetime, so
     /// totals may stay equal — an idempotent re-record — or rise, never
@@ -425,6 +444,25 @@ pub trait BuyerPoolStore: Send + Sync {
         amount: U256,
     ) -> Result<AdvanceOutcome, StoreError>;
 
+    /// Atomically overwrite the committed progress for `lane` inside `owner`'s
+    /// pool with `anchor` and advance it to `totals`
+    /// ([`BuyerPoolState::rebase_lane`]) — the same owner-index and `pool_id`
+    /// checks and the same single durable write transaction as
+    /// [`Self::advance_progress`], without the monotonicity check against the
+    /// recorded progress. Never returns [`AdvanceOutcome::Regressed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] only on a backend/codec fault.
+    fn rebase_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError>;
+
     /// Atomically add `additional` to the committed deposit for `owner`'s
     /// pool.
     ///
@@ -576,6 +614,31 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
             Ok(()) => Ok(AdvanceOutcome::Advanced),
             Err(err) => Ok(AdvanceOutcome::Regressed(err)),
         }
+    }
+
+    fn rebase_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        let Some(mapped) = guard.owner_index.get(&owner).copied() else {
+            return Ok(AdvanceOutcome::UnknownPool);
+        };
+        if mapped != pool_id {
+            return Ok(AdvanceOutcome::PoolMismatch);
+        }
+        let Some(state) = guard.pools.get_mut(&pool_id) else {
+            return Ok(AdvanceOutcome::UnknownPool);
+        };
+        state.rebase_lane(lane, anchor, totals);
+        Ok(AdvanceOutcome::Advanced)
     }
 
     fn add_deposit(

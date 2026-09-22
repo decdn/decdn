@@ -1634,6 +1634,7 @@ mod run_fault_terminal_tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
+            proof_generation: None,
         });
         assert!(run_fault_is_terminal(&err));
     }
