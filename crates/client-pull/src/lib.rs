@@ -34,6 +34,10 @@
 /// Buyer-side `PaymentPool` open kernel (#940), shared by the node service
 /// and the CLI.
 pub mod buyer_pool;
+/// Zero-config tunables for the consumption faces over the paid pull engine
+/// ([`config::PullConfig`], #1848): every knob defaults, so a caller overrides
+/// only what it must, and construction needs no network or chain access.
+pub mod config;
 /// A caller-owned QUIC connection kept warm across many hash fetches
 /// ([`connection::WarmConnection`]): one dial amortized over every hash, one
 /// bi-stream per hash (no wire change), closed once on the handle's own `Drop`.
@@ -97,6 +101,7 @@ pub mod sink;
 /// seam), plus scripted test doubles.
 pub mod source;
 
+pub use config::{DEFAULT_READ_AHEAD_BYTES, PullConfig};
 pub use connection::WarmConnection;
 pub use coverage_plan::{
     CoveredRun, SourceCoverage, covering_sources, plan_covered_runs, spread_segments,
