@@ -134,6 +134,7 @@ mod tests {
     #[test]
     fn resource_pressure_sheds_miss_when_node_full() {
         let c = LoadShedController::from_config(&cfg(LoadShedPolicyKind::ResourcePressure));
+        assert_eq!(c.node_in_flight(), 0);
         // Hold two slots to reach the high-water mark of 2.
         let _s1 = c
             .try_admit(RequestClass::CacheHit, client(1))
@@ -141,6 +142,8 @@ mod tests {
         let _s2 = c
             .try_admit(RequestClass::CacheHit, client(1))
             .expect("second admit");
+        // The gauge accessor reflects the two held slots.
+        assert_eq!(c.node_in_flight(), 2);
         // A new miss is shed; a new hit is still admitted.
         assert_eq!(
             c.try_admit(RequestClass::CacheMiss, client(2)).err(),
