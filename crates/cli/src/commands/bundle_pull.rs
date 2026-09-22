@@ -65,6 +65,7 @@
 //! above.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::IsTerminal as _;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,6 +87,7 @@ use futures_util::StreamExt as _;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 
+use super::bundle_cache;
 use super::bundle_manifest::{self, SavedManifest, SavedMtime};
 use super::buyer_store::{ChainAdoption, open_client_store_for_buy};
 use super::chain_ctx;
@@ -665,6 +667,190 @@ impl EntryFilter {
     }
 }
 
+/// Header written above the file list in the `--select` editor buffer. Explains
+/// the git-rebase-style convention: commented or deleted lines are skipped.
+const SELECT_HEADER: &str = "\
+# decdn bundle pull --select — choose which files to pull.
+#
+# Comment out (prefix with #) or delete any line to SKIP that file.
+# Save and exit to pull every file still listed below; delete them all to pull
+# nothing. Reordering has no effect, and you cannot add files here.
+#
+# Each line is  <path>\t<size>  — only the path (before the tab) is read.
+";
+
+/// Render the `--select` editor buffer: the header, then one line per entry as
+/// `<path>\t<human size>`. The size is a right-hand annotation for context only;
+/// [`parse_selection`] reads just the path before the first tab.
+fn render_selection(entries: &[ManifestEntry]) -> String {
+    let mut out = String::from(SELECT_HEADER);
+    for e in entries {
+        let size = e.size.map_or_else(|| "?".to_string(), human_bytes);
+        out.push_str(&e.path);
+        out.push('\t');
+        out.push_str(&size);
+        out.push('\n');
+    }
+    out
+}
+
+/// Reject a bundle whose paths cannot round-trip through the `--select` editor
+/// buffer: a path that starts with `#` (indistinguishable from a comment) or
+/// contains a tab, newline, or carriage return (which would split or break its
+/// line). Such paths are pathological for a POSIX relative filename; `--select`
+/// refuses them loudly rather than silently dropping a file the user meant to
+/// keep. `--include`/`--exclude` still handle these bundles.
+fn check_selectable(entries: &[ManifestEntry]) -> anyhow::Result<()> {
+    if let Some(bad) = entries
+        .iter()
+        .find(|e| e.path.starts_with('#') || e.path.contains(['\t', '\n', '\r']))
+    {
+        bail!(
+            "--select cannot represent the path {:?} (paths starting with '#' or \
+             containing a tab/newline are unsupported); use --include/--exclude instead",
+            bad.path
+        );
+    }
+    Ok(())
+}
+
+/// Apply the edited `--select` buffer back onto the entry list: keep only entries
+/// whose path still appears on a non-comment, non-blank line, preserving the
+/// original manifest order. A kept line whose path matches no bundle entry is a
+/// hard error — the editor only removes files, so an unmatched line is a typo,
+/// not an addition, and silently dropping it would be worse than failing.
+fn parse_selection(
+    edited: &str,
+    entries: Vec<ManifestEntry>,
+) -> anyhow::Result<Vec<ManifestEntry>> {
+    let known: HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    let mut kept: HashSet<String> = HashSet::new();
+    let mut unknown: Vec<&str> = Vec::new();
+    for line in edited.lines() {
+        if line.trim_start().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        // The path is the text before the size annotation (first tab), trimmed.
+        let path = line.split_once('\t').map_or(line, |(p, _)| p).trim();
+        if path.is_empty() {
+            continue;
+        }
+        if known.contains(path) {
+            kept.insert(path.to_string());
+        } else {
+            unknown.push(path);
+        }
+    }
+    if !unknown.is_empty() {
+        bail!(
+            "--select: these lines match no bundle entry (editing only removes files, \
+             it cannot add them): {}",
+            unknown.join(", ")
+        );
+    }
+    Ok(entries
+        .into_iter()
+        .filter(|e| kept.contains(&e.path))
+        .collect())
+}
+
+/// Apply the interactive `--select` step to a finalized manifest, or pass it
+/// through unchanged when `--select` is off. `Ok(None)` means the user deselected
+/// every file: [`report_nothing_to_fetch`] was already called, so the run is done.
+fn maybe_select(args: &BundlePullArgs, mut manifest: Manifest) -> anyhow::Result<Option<Manifest>> {
+    if args.select {
+        manifest.entries = select_entries(manifest.entries)?;
+        if manifest.entries.is_empty() {
+            report_nothing_to_fetch(NothingReason::Deselected);
+            return Ok(None);
+        }
+    }
+    Ok(Some(manifest))
+}
+
+/// Reject a `--select` invocation that cannot work: it opens an editor, so it
+/// needs an interactive terminal (both stdin and stdout) and is incompatible with
+/// the non-interactive `--json` and `--dry-run` modes. A no-op when `--select` is
+/// not set.
+fn check_select_flags(args: &BundlePullArgs) -> anyhow::Result<()> {
+    if !args.select {
+        return Ok(());
+    }
+    if args.json {
+        bail!("--select cannot be combined with --json (it needs an interactive editor)");
+    }
+    if args.dry_run {
+        bail!("--select cannot be combined with --dry-run (it needs an interactive editor)");
+    }
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        bail!("--select needs an interactive terminal; use --include/--exclude instead");
+    }
+    Ok(())
+}
+
+/// Run the interactive `--select` step: render the entry list, open it in the
+/// user's editor, and apply the edited buffer back. All decision logic lives in
+/// the tested [`render_selection`]/[`parse_selection`]/[`check_selectable`]; this
+/// only wires them to the editor. The caller has already verified an interactive
+/// terminal and that `--json`/`--dry-run` are not set.
+fn select_entries(entries: Vec<ManifestEntry>) -> anyhow::Result<Vec<ManifestEntry>> {
+    check_selectable(&entries)?;
+    let edited = edit_in_editor(&render_selection(&entries))?;
+    parse_selection(&edited, entries)
+}
+
+/// Resolve the editor command from `$VISUAL`/`$EDITOR` into program + arguments,
+/// falling back to `vi`. `$VISUAL` wins over `$EDITOR`; a missing or
+/// blank/whitespace-only value is treated as unset. The value may carry arguments
+/// (`code --wait`), split on whitespace like `git` does; the scratch file path is
+/// appended by the caller, not here. Never empty — the fallback guarantees at
+/// least `["vi"]`.
+fn editor_command(visual: Option<&str>, editor: Option<&str>) -> Vec<String> {
+    let chosen = [visual, editor]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or("vi");
+    chosen.split_whitespace().map(String::from).collect()
+}
+
+/// Open `buffer` in the user's editor and return the saved contents. The editor
+/// is `$VISUAL`, then `$EDITOR`, then `vi`; the value may carry arguments
+/// (`code --wait`), split on whitespace like `git` does. The buffer is staged in
+/// a temporary file that is removed when this returns.
+fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
+    let mut file = tempfile::Builder::new()
+        .prefix("decdn-select-")
+        .suffix(".txt")
+        .tempfile()
+        .context("create --select scratch file")?;
+    std::io::Write::write_all(file.as_file_mut(), buffer.as_bytes())
+        .context("write --select scratch file")?;
+    file.as_file()
+        .sync_all()
+        .context("sync --select scratch file")?;
+
+    let command = editor_command(
+        std::env::var("VISUAL").ok().as_deref(),
+        std::env::var("EDITOR").ok().as_deref(),
+    );
+    let (program, rest) = command
+        .split_first()
+        .ok_or_else(|| anyhow!("empty editor command"))?;
+
+    let status = std::process::Command::new(program)
+        .args(rest)
+        .arg(file.path())
+        .status()
+        .with_context(|| format!("launch editor {program:?}"))?;
+    if !status.success() {
+        bail!("editor {program:?} exited with {status}; aborting --select");
+    }
+
+    std::fs::read_to_string(file.path()).context("read back --select scratch file")
+}
+
 /// A group of manifest entries that all name the same blob `hash` — one file
 /// published at two (or more) bundle paths. Non-empty by construction; the
 /// shared `hash` is carried explicitly so consumers never re-derive it from an
@@ -910,6 +1096,11 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     let filter = EntryFilter::compile(&args.include, &args.exclude)?;
     let filters_given = !args.include.is_empty() || !args.exclude.is_empty();
 
+    // `--select` opens an editor: reject an incompatible combo or a non-terminal
+    // up front — before any network, chain, or keystore work — so it fails fast
+    // rather than after paying to fetch the manifest.
+    check_select_flags(args)?;
+
     // Dry-run short-circuits before any network/chain/keystore activity.
     if args.dry_run {
         return dry_run(args, &filter, filters_given);
@@ -924,7 +1115,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
             let raw_empty = m.entries.is_empty();
             m.entries = filter.apply(m.entries);
             if m.entries.is_empty() {
-                report_nothing_to_fetch(filters_given && !raw_empty);
+                report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
                 return Ok(());
             }
             Some(m)
@@ -1007,11 +1198,16 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     };
 
     // Obtain the manifest: the pre-read local one, or the `--hash` bundle blob
-    // fetched and filtered here. `None` means it filtered down to empty (already
-    // reported), so the run is done.
+    // fetched and filtered here. `None` => filtered to empty (already reported).
     let Some(manifest) =
         obtain_manifest(&ctx, args, &filter, filters_given, local_manifest).await?
     else {
+        return Ok(());
+    };
+
+    // `--select`: let the user trim the (already glob-filtered) list in their
+    // editor. Everything deselected ends the run (reported) like an empty filter.
+    let Some(manifest) = maybe_select(args, manifest)? else {
         return Ok(());
     };
 
@@ -1066,15 +1262,29 @@ async fn obtain_manifest<P: Provider + Clone>(
         .as_deref()
         .ok_or_else(|| anyhow!("no bundle source (expected -i or --hash)"))?;
     let hash = fetch::parse_hash(raw)?;
-    let bytes = ctx
-        .fetch_to_memory(hash, &args.output)
-        .await
-        .context("fetch bundle manifest blob")?;
+    // "Don't pay again": a prior pull of this bundle into the same output dir
+    // cached the manifest blob, keyed by its hash and self-verifying on read, so a
+    // repeat run skips the paid `cdn/client/v1` fetch. `--overwrite` forces a fresh
+    // fetch, consistent with how it bypasses the file skip-cache.
+    let cached = (!args.overwrite)
+        .then(|| bundle_cache::load(&args.output, hash))
+        .flatten();
+    let bytes = if let Some(cached) = cached {
+        cached
+    } else {
+        let fetched = ctx
+            .fetch_to_memory(hash, &args.output)
+            .await
+            .context("fetch bundle manifest blob")?;
+        // Advisory: a write failure is logged, never fatal.
+        bundle_cache::store(&args.output, hash, &fetched);
+        fetched
+    };
     let mut m = parse_manifest(&bytes)?;
     let raw_empty = m.entries.is_empty();
     m.entries = filter.apply(m.entries);
     if m.entries.is_empty() {
-        report_nothing_to_fetch(filters_given && !raw_empty);
+        report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
         return Ok(None);
     }
     Ok(Some(m))
@@ -3515,12 +3725,42 @@ async fn flush_now(out_root: &Path, acc: &SavedManifest) -> bool {
 /// Report an empty would-fetch set. `by_filter` is true only when a non-empty
 /// bundle was emptied by `--include`/`--exclude`, so the operator learns their
 /// globs matched nothing rather than mistaking it for an empty bundle.
-fn report_nothing_to_fetch(by_filter: bool) {
-    if by_filter {
-        println!("no bundle entries match the include/exclude filters; nothing to fetch");
-    } else {
-        println!("bundle has no entries; nothing to fetch");
+/// Why a pull ended with no entries to fetch — picks the message
+/// [`report_nothing_to_fetch`] prints.
+#[derive(Clone, Copy)]
+enum NothingReason {
+    /// The bundle manifest itself is empty.
+    EmptyBundle,
+    /// `--include`/`--exclude` removed every entry.
+    Filtered,
+    /// The user deselected every entry in the `--select` editor.
+    Deselected,
+}
+
+impl NothingReason {
+    /// The reason for an empty result of a filter pass: [`Filtered`] when a filter
+    /// was given and the bundle was non-empty before it, else [`EmptyBundle`].
+    ///
+    /// [`Filtered`]: NothingReason::Filtered
+    /// [`EmptyBundle`]: NothingReason::EmptyBundle
+    const fn from_filter(filters_given: bool, raw_empty: bool) -> Self {
+        if filters_given && !raw_empty {
+            Self::Filtered
+        } else {
+            Self::EmptyBundle
+        }
     }
+}
+
+fn report_nothing_to_fetch(reason: NothingReason) {
+    let msg = match reason {
+        NothingReason::EmptyBundle => "bundle has no entries; nothing to fetch",
+        NothingReason::Filtered => {
+            "no bundle entries match the include/exclude filters; nothing to fetch"
+        }
+        NothingReason::Deselected => "every file was deselected; nothing to fetch",
+    };
+    println!("{msg}");
 }
 
 /// Print the would-fetch plan and exit (no network/chain/keystore activity).
@@ -3550,7 +3790,7 @@ fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> 
                 // Match the real run's empty-result message rather than printing a
                 // "would fetch 0 entr(ies)" plan, so `--dry-run` and a live pull
                 // agree on what an emptied set looks like.
-                report_nothing_to_fetch(filters_given && !raw_empty);
+                report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
             } else {
                 println!(
                     "would fetch {} entr(ies) into {out}:",
@@ -3958,6 +4198,101 @@ mod tests {
         );
         drop(tx);
         handle.await.expect("flush task join");
+    }
+
+    /// Minimal `ManifestEntry` for the `--select` tests: path + size, no chunks.
+    fn sel_entry(path: &str, size: u64) -> ManifestEntry {
+        ManifestEntry {
+            path: path.into(),
+            hash: "b3:00".into(),
+            size: Some(size),
+            chunks: None,
+        }
+    }
+
+    #[test]
+    fn parse_selection_drops_commented_and_deleted_lines() {
+        let entries = vec![
+            sel_entry("a.bin", 1),
+            sel_entry("b.bin", 2),
+            sel_entry("c.bin", 3),
+        ];
+        // "a.bin" kept, "b.bin" commented out, "c.bin" deleted entirely.
+        let edited = "# header\na.bin\t1 B\n#b.bin\t2 B\n";
+        let kept = parse_selection(edited, entries).expect("parse");
+        let paths: Vec<&str> = kept.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.bin"]);
+    }
+
+    #[test]
+    fn parse_selection_preserves_manifest_order_regardless_of_edit_order() {
+        let entries = vec![sel_entry("a.bin", 1), sel_entry("b.bin", 2)];
+        // User reordered the lines; output still follows manifest order.
+        let edited = "b.bin\nb.bin is not a path\n".replace("b.bin is not a path", "a.bin");
+        let kept = parse_selection(&edited, entries).expect("parse");
+        let paths: Vec<&str> = kept.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.bin", "b.bin"]);
+    }
+
+    #[test]
+    fn parse_selection_empty_when_everything_removed() {
+        let entries = vec![sel_entry("a.bin", 1)];
+        let kept = parse_selection("# all gone\n", entries).expect("parse");
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn parse_selection_rejects_unknown_path() {
+        let entries = vec![sel_entry("a.bin", 1)];
+        let err = parse_selection("a.bin\ntypo.bin\n", entries).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("typo.bin"), "{msg}");
+    }
+
+    #[test]
+    fn parse_selection_ignores_the_size_annotation_after_the_tab() {
+        let entries = vec![sel_entry("weights.bin", 1500)];
+        // The size column is arbitrary human text; only the path is read.
+        let kept = parse_selection("weights.bin\t1.5 KB\n", entries).expect("parse");
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn render_then_parse_unedited_keeps_every_entry() {
+        let entries = vec![sel_entry("a.bin", 1), sel_entry("dir/b.bin", 2000)];
+        let buffer = render_selection(&entries);
+        let kept = parse_selection(&buffer, entries).expect("parse");
+        let paths: Vec<&str> = kept.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.bin", "dir/b.bin"]);
+    }
+
+    #[test]
+    fn editor_command_prefers_visual_then_editor_then_vi() {
+        assert_eq!(editor_command(Some("nano"), Some("vim")), vec!["nano"]);
+        assert_eq!(editor_command(None, Some("vim")), vec!["vim"]);
+        assert_eq!(editor_command(None, None), vec!["vi"]);
+    }
+
+    #[test]
+    fn editor_command_treats_blank_as_unset() {
+        // A blank/whitespace-only $VISUAL falls through to $EDITOR.
+        assert_eq!(editor_command(Some("   "), Some("vim")), vec!["vim"]);
+        assert_eq!(editor_command(Some(""), None), vec!["vi"]);
+    }
+
+    #[test]
+    fn editor_command_splits_arguments() {
+        assert_eq!(
+            editor_command(Some("code --wait"), None),
+            vec!["code", "--wait"]
+        );
+    }
+
+    #[test]
+    fn check_selectable_rejects_hash_leading_and_tabbed_paths() {
+        assert!(check_selectable(&[sel_entry("#weird.bin", 1)]).is_err());
+        assert!(check_selectable(&[sel_entry("has\ttab.bin", 1)]).is_err());
+        assert!(check_selectable(&[sel_entry("fine/name.bin", 1)]).is_ok());
     }
 
     #[test]

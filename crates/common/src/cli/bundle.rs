@@ -50,6 +50,10 @@ pub enum BundleCommand {
 /// namespace's authorized origins.
 #[derive(Args, Debug)]
 #[command(group(ArgGroup::new("bundle_source").required(true).args(["input", "hash"])))]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent CLI flags (--overwrite/--dry-run/--json/--select), not a state machine"
+)]
 pub struct BundlePullArgs {
     /// Local bundle manifest file to pull. Mutually exclusive with `--hash`.
     #[arg(short = 'i', long, value_name = "FILE")]
@@ -98,6 +102,15 @@ pub struct BundlePullArgs {
     /// skipped. Same gitignore glob semantics as `--include`.
     #[arg(long = "exclude", value_name = "GLOB", action = clap::ArgAction::Append)]
     pub exclude: Vec<String>,
+
+    /// Choose which files to pull interactively: open the (post-`--include`/
+    /// `--exclude`) file list in `$VISUAL`/`$EDITOR`, one `path` per line. Comment
+    /// out (prefix `#`) or delete any line to skip that file; save and exit to pull
+    /// the rest. Useful when you don't know a bundle's contents up front — the list
+    /// is what the manifest actually holds. Requires an interactive terminal;
+    /// incompatible with `--json` and `--dry-run`.
+    #[arg(long)]
+    pub select: bool,
 
     /// Re-fetch and overwrite entries whose destination file already exists.
     /// Default is skip-existing (resume-friendly): a path skips when its saved
