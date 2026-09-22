@@ -1386,8 +1386,9 @@ async fn bounded_unaligned_offset_own_origin_miss_streams_the_exact_bytes() -> a
     Ok(())
 }
 
-/// The CLI's multi-source sequence on a cold miss: a throwaway `(0, 0)` open dropped as soon
-/// as the header lands, then the real `(0, total)` open — against a MULTI-DRAW blob
+/// A header-only `(0, 0)` open dropped as soon as the header lands (the CLI's
+/// multi-source size probe, or a resumed whole-blob fetch), then a second open
+/// of the same blob, here `(0, total)` — against a MULTI-DRAW blob
 /// with a slow origin, so the throwaway's fill is still live when the real open
 /// arrives. Observed ordering: the real open's `serve_audit` parks on the store's
 /// per-hash slot until the throwaway's current draw is admitted, then probes the

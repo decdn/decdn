@@ -610,8 +610,13 @@ async fn run_scattered_complement() -> anyhow::Result<()> {
     args.push("4".into());
 
     let before = billed_bytes(client_dir.path(), provider_addr)?;
+    let opens_before = node.scrape_metric("decdn_serve_cache_hit_total").await?;
     run_bundle_pull_until_ready(client_dir.path(), &args).await?;
     let paid = billed_bytes(client_dir.path(), provider_addr)?.saturating_sub(before);
+    let opens = node
+        .scrape_metric("decdn_serve_cache_hit_total")
+        .await?
+        .saturating_sub(opens_before);
 
     let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin")?;
     let got_b = std::fs::read(out_dir.join("b.bin")).context("read b.bin")?;
@@ -640,6 +645,15 @@ async fn run_scattered_complement() -> anyhow::Result<()> {
         "the lane must bill a's whole file plus exactly b's {} complement ranges \
          ({expected} wire bytes), got {paid}",
         complement.len()
+    );
+    // Every open the node served was a paid leg (#2063): one whole-blob open for
+    // `a`, whose prelude is its drive's first leg, and one per complement range
+    // of `b`, whose session opens its first range for the drive. A size-only
+    // open thrown away would add one per entry, and a prelude per drive more.
+    let legs = 1 + complement.len() as u64;
+    anyhow::ensure!(
+        opens == legs,
+        "the node must serve exactly the {legs} paid legs, served {opens} opens"
     );
 
     drop(node);
@@ -1687,9 +1701,9 @@ fn whole_blob_wire_bytes(total: u64) -> u64 {
 
 /// The exact wire bytes a driven `[offset, offset + len)` range of a
 /// `total`-byte blob vouchers for — the same quantity `bundle_pull`'s range
-/// session pays for one complement run. Mirrors `plan_dedup`/`drive`'s per-run
-/// accounting: each `(offset, len)` complement run is driven (and billed) as
-/// its own `align_range`.
+/// session pays for one complement run. Mirrors `plan_reassembly`'s complement
+/// runs: they are disjoint and non-adjacent, so `drive_range_set` opens (and
+/// bills) each as its own `align_range`.
 fn range_wire_bytes(offset: u64, len: u64, total: u64) -> anyhow::Result<u64> {
     let aligned = align_range(offset, len, total)
         .map_err(|e| anyhow::anyhow!("align_range({offset}, {len}, {total}): {e}"))?;

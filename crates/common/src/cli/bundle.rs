@@ -88,13 +88,14 @@ pub struct BundlePullArgs {
     #[arg(long, value_name = "N", default_value_t = 4)]
     pub max_lane_streams: usize,
 
-    /// Re-run each entry that failed with a retryable error up to N more times
-    /// after the first pass over the bundle. Each re-run probes the holders
-    /// again, so a provider that failed earlier is a candidate again, and it
-    /// resumes from the entry's `.partial`, so no byte already paid for is paid
-    /// again. The rounds back off (2 s, doubling, capped at 30 s). A terminal
-    /// failure (a refused origin, an oversized blob, a spent pool) is never
-    /// re-run. `0` turns the retry off.
+    /// Give each entry whose fetch failed in a way another round can fix up to
+    /// N more rounds after the first pass over the bundle. Each round probes the
+    /// holders again, so a provider that failed earlier is a candidate again,
+    /// and resumes from the entry's `.partial`, so no byte already paid for is
+    /// paid again. The rounds back off (2 s, doubling, capped at 30 s). A
+    /// failure every provider repeats (a rejected voucher, a blacklisted funder,
+    /// an oversized blob, a spent pool, a manifest size no provider signs) and a
+    /// local disk fault are never re-run. `0` turns the retry off.
     #[arg(long, value_name = "N", default_value_t = 2)]
     pub entry_retries: u32,
 

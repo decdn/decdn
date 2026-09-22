@@ -1209,8 +1209,9 @@ impl FillRegistry {
                     // starts AHEAD of that frontier would park on it too, and an
                     // observer's payments extend a fill's paid prefix only once the
                     // prefix reaches the observer's start (`extend_served_from`).
-                    // With the owner not paying — the CLI's throwaway open, or a
-                    // stalled client — the observer starves until its own stall
+                    // With the owner not paying — a header-only open (the CLI's
+                    // multi-source size probe), or a stalled client — the
+                    // observer starves until its own stall
                     // budget expires. So such a request is not coalesced: it OWNS
                     // its own span, and the two fills coexist under the hash. A
                     // request at or behind the frontier attaches; its payments
@@ -2012,9 +2013,9 @@ mod fill_registry_tests {
 
     #[test]
     fn claim_ahead_of_a_live_owners_paid_frontier_owns_its_own_span() {
-        // A whole-blob owner whose client has paid nothing (the CLI's throwaway
-        // open) has its paid frontier at 0. A request that starts at 4 groups is
-        // AHEAD of that frontier: attaching would park it on a pull that only
+        // A whole-blob owner whose client has paid nothing (a header-only open,
+        // such as the CLI's multi-source size probe) has its paid frontier at 0.
+        // A request that starts at 4 groups is AHEAD of that frontier: attaching would park it on a pull that only
         // advances as the owner pays, and the owner never will. It must OWN its
         // own span instead. Both sessions stay live under the hash.
         let total = 8 * G;
@@ -2061,7 +2062,7 @@ mod fill_registry_tests {
 
     #[test]
     fn claim_after_last_out_release_owns_a_fresh_session() {
-        // The CLI's throwaway open: claim, then the ONLY observer leaves. The
+        // A header-only open: claim, then the ONLY observer leaves. The
         // registry cancels and unmaps that session under the lock. The real open's
         // claim must then OWN a fresh session — never attach to the cancelled one.
         let total = 8 * G;

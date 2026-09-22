@@ -551,10 +551,18 @@ mod tests {
             format!("{err:#}").contains("cannot tell whether"),
             "{err:#}"
         );
-        assert!(open_client_store_for_escrow(&not_a_dir, "open a pool").is_err());
-        assert!(
-            open_client_store_for_buy(&not_a_dir, DataDirSource::Flag, "fetch content").is_err()
-        );
+        // The refusal must come from the classification, not from a store open
+        // that happens to fail on the same path.
+        for err in [
+            open_client_store_for_escrow(&not_a_dir, "open a pool").unwrap_err(),
+            open_client_store_for_buy(&not_a_dir, DataDirSource::Flag, "fetch content")
+                .unwrap_err(),
+        ] {
+            assert!(
+                format!("{err:#}").contains("cannot tell whether"),
+                "{err:#}"
+            );
+        }
         assert!(ChainAdoption::for_buy(dir.path(), &not_a_dir.join("keystore.json")).is_err());
     }
 }

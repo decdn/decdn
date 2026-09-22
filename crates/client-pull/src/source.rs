@@ -232,12 +232,14 @@ fn micros_now() -> u64 {
 /// while this source also reads it to open each pull. A `&'a PoolContext`
 /// borrow would freeze it for the whole fetch and forbid the driver's `&mut`;
 /// the `Arc<Mutex<..>>` lets both see one state. `open` locks it only to CLONE
-/// the context out (single-writer per fetch — the driver never opens a pull
-/// concurrently with a top-up), then drops the guard before awaiting, so no
-/// lock is ever held across an `.await`. Concurrent opens (a range set driven
-/// several gaps at a time) each take their own snapshot; a snapshot that misses a
-/// top-up landing at the same moment only under-states the deposit, and the
-/// driver's post-top-up settle wait already covers a refusal on that.
+/// the context out, then drops the guard before awaiting, so no lock is ever
+/// held across an `.await`. A range set driven several gaps at a time opens
+/// concurrently with a sibling gap's top-up, so an open's snapshot can predate
+/// a deposit that is about to land: it under-states the deposit, never
+/// over-states it. The gap that topped up waits out the node's view of the new
+/// deposit; a sibling refused on the stale view takes its own fund-and-retry
+/// path, and the pool's top-up lock ([`crate::SharedPool::topup_lock`]) makes
+/// it re-read the raised deposit instead of escrowing again.
 ///
 /// By default every open dials its own connection. A source built
 /// [`with_warm_connection`](Self::with_warm_connection) dials once and opens
@@ -350,6 +352,10 @@ impl<'a> PeerSource<'a> {
     /// needs one keeps the per-open dial.
     #[must_use]
     pub fn with_warm_connection(mut self) -> Self {
+        debug_assert!(
+            self.on_connect.is_none(),
+            "a warm connection is not reported to a dial observer"
+        );
         self.warm = Some(tokio::sync::Mutex::new(None));
         self
     }
@@ -410,7 +416,13 @@ impl<'a> PeerSource<'a> {
         };
         let conn = self.warm_connection(slot).await?;
         match self.open_on(&conn, &ctx, hash, byte_offset, byte_len).await {
-            Err(_) if conn.is_closed() => {
+            // The connection closed under the open (an idle timeout, a peer
+            // restart): the open never reached a decision, so dial again once.
+            // A refusal the peer did send is its answer, and is not asked twice.
+            Err(err)
+                if conn.is_closed() && err.downcast_ref::<crate::UpstreamRefused>().is_none() =>
+            {
+                tracing::debug!("warm connection closed under an open ({err:#}); redialling once");
                 let conn = self.warm_connection(slot).await?;
                 self.open_on(&conn, &ctx, hash, byte_offset, byte_len).await
             }
@@ -491,7 +503,8 @@ impl BlobSource for PeerSource<'_> {
     }
 }
 
-/// How long a primed pull may wait for its adopting open. A pull opened ahead of
+/// How long a primed pull may wait for its adopting open. [`PrimedSource`]'s
+/// doc states the same value; keep the two in step. A pull opened ahead of
 /// its drive is only worth adopting straight away: an idle one is a stream the
 /// peer is holding bytes on, and a peer that sees no voucher for long enough
 /// drops it. A primed pull older than this is dropped and the open goes to the
@@ -531,7 +544,7 @@ pub struct PrimedSource<S: BlobSource> {
 
 impl<S: BlobSource> std::fmt::Debug for PrimedSource<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let primed = self.primed.lock().is_ok_and(|p| p.is_some());
+        let primed = self.slot().is_some();
         f.debug_struct("PrimedSource")
             .field("primed", &primed)
             .finish_non_exhaustive()
@@ -539,6 +552,14 @@ impl<S: BlobSource> std::fmt::Debug for PrimedSource<S> {
 }
 
 impl<S: BlobSource> PrimedSource<S> {
+    /// The parked-pull slot. The slot is a plain swap with no invariant a panic
+    /// could break, so a poisoned lock is used as is.
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<Primed<S::Reader>>> {
+        self.primed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Wrap `inner` with nothing primed.
     #[must_use]
     pub const fn new(inner: S) -> Self {
@@ -564,15 +585,17 @@ impl<S: BlobSource> PrimedSource<S> {
             reader,
             at: tokio::time::Instant::now(),
         };
-        if let Ok(mut slot) = self.primed.lock() {
-            *slot = Some(parked);
+        let replaced = self.slot().replace(parked);
+        if replaced.is_some() {
+            tracing::debug!("a primed pull no open took is replaced and closed");
         }
     }
 
     /// Close a parked pull that no open took.
     pub fn clear(&self) {
-        let parked = self.primed.lock().ok().and_then(|mut slot| slot.take());
-        drop(parked);
+        if self.slot().take().is_some() {
+            tracing::debug!("a primed pull no open took is closed");
+        }
     }
 
     /// The wrapped source.
@@ -588,9 +611,10 @@ impl<S: BlobSource> PrimedSource<S> {
         hash: [u8; 32],
         range: &AlignedRange,
     ) -> Option<(UpstreamPullHeader, S::Reader)> {
-        let mut slot = self.primed.lock().ok()?;
+        let mut slot = self.slot();
         let parked = slot.take()?;
         if parked.at.elapsed() > PRIMED_MAX_IDLE {
+            tracing::debug!("a primed pull went stale before its open and is closed");
             return None;
         }
         if parked.hash == hash && parked.range == *range {

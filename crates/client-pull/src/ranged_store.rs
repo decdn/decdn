@@ -357,7 +357,9 @@ impl ClientRangedStore {
     ///
     /// # Errors
     ///
-    /// Any I/O failure from the chosen [`open`](Self::open) / [`create`](Self::create).
+    /// Any I/O failure from the chosen [`open`](Self::open) / [`create`](Self::create),
+    /// or a stat of the `.ranges` record that fails for a reason other than
+    /// `NotFound` (the store is then neither opened nor created).
     pub fn open_or_create(
         dir: &Path,
         stem: &str,
@@ -365,7 +367,10 @@ impl ClientRangedStore {
         total_bytes: u64,
     ) -> io::Result<Self> {
         let (_data_path, _obao_path, ranges_path) = sidecar_paths(dir, stem);
-        if ranges_path.exists() {
+        // `try_exists`, not `exists`: a stat that fails for any reason but
+        // `NotFound` must not read as "no record", because `create` truncates the
+        // `.partial` and every byte already paid for in it.
+        if ranges_path.try_exists()? {
             Self::open(dir, stem, root, total_bytes)
         } else {
             Self::create(dir, stem, root, total_bytes)
@@ -1197,6 +1202,23 @@ mod tests {
 
     fn tmp_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tmp dir")
+    }
+
+    /// A `.ranges` record whose stat fails (here a symlink loop, `ELOOP`) is not
+    /// read as "no record": `open_or_create` errors instead of creating, which
+    /// would truncate the `.partial` and the bytes already paid for in it.
+    #[cfg(unix)]
+    #[test]
+    fn open_or_create_does_not_truncate_on_a_failed_record_stat() {
+        let dir = tmp_dir();
+        let data = dir.path().join("blob.partial");
+        std::fs::write(&data, b"paid bytes").expect("write partial");
+        let ranges = dir.path().join("blob.partial.ranges");
+        std::os::unix::fs::symlink(&ranges, &ranges).expect("self-referential symlink");
+
+        let opened = ClientRangedStore::open_or_create(dir.path(), "blob", [0; 32], 10);
+        assert!(opened.is_err(), "a failed stat must not create a store");
+        assert_eq!(std::fs::read(&data).expect("read partial"), b"paid bytes");
     }
 
     // --- record codec round-trip ---
