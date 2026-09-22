@@ -1189,7 +1189,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
                     .with_context(|| {
                         format!(
                             "rebase buyer pool lane progress down to the upstream watermark \
-                             ({} / {} bytes), then to {amount} / {bytes_delivered} bytes",
+                             (amount {}, bytes {}), then to (amount {amount}, bytes \
+                             {bytes_delivered})",
                             anchor.last_amount, anchor.last_bytes
                         )
                     })
@@ -1199,7 +1200,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
                 .advance_progress(self.owner, pool_id, lane, bytes_delivered, amount)
                 .with_context(|| {
                     format!(
-                        "advance buyer pool lane progress to {amount} / {bytes_delivered} bytes"
+                        "advance buyer pool lane progress to (amount {amount}, bytes \
+                         {bytes_delivered})"
                     )
                 }),
         };

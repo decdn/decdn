@@ -995,8 +995,9 @@ impl PoolLedger {
     /// can commit over the new one.
     ///
     /// Returns [`Rebase::Refused`] — leaving the ledger untouched — when `cum`
-    /// is not BELOW the committed watermark's `amount` (that is
-    /// [`Self::reseed`]'s case).
+    /// is ahead of the committed watermark's `amount` (that is
+    /// [`Self::reseed`]'s case) or equal to the committed watermark (an echo).
+    /// A `cum` equal on `amount` but behind on `bytes` rebases.
     pub async fn rebase(&self, cum: Cumulative, proof_generation: Option<u64>) -> Rebase {
         let _issuing = self.issuance.lock().await;
         let from = {
@@ -1005,7 +1006,11 @@ impl PoolLedger {
                 return Rebase::Stale;
             }
             let from = pipeline.committed.plus(pipeline.accrued);
-            if cum.amount >= from.amount {
+            // A watermark ahead on `amount` is `reseed`'s case, and one equal to
+            // ours is an echo that proves nothing. Anything else is the node's
+            // accepted state behind ours — including one equal on `amount` but
+            // behind on `bytes`, which still makes every span we sign underpay.
+            if cum.amount > from.amount || cum == from {
                 return Rebase::Refused;
             }
             pipeline.overwrite(cum);
@@ -1969,6 +1974,32 @@ mod tests {
         ));
         assert_eq!(ledger.committed(), stale);
         assert_eq!(ledger.generation(), 2);
+        Ok(())
+    }
+
+    /// A node watermark equal on `amount` but behind on `bytes` is still behind:
+    /// every span signed from ours looks short to the node. It rebases, and the
+    /// next voucher signs above that amount, so no equal-amount divergence
+    /// follows.
+    #[tokio::test]
+    async fn rebase_heals_a_watermark_behind_only_on_bytes() -> anyhow::Result<()> {
+        let ledger = PoolLedger::new(Cumulative {
+            bytes: U256::from(9_000u64),
+            amount: U256::from(90u64),
+        });
+        let node = Cumulative {
+            bytes: U256::from(5_000u64),
+            amount: U256::from(90u64),
+        };
+        assert!(matches!(
+            ledger.rebase(node, None).await,
+            Rebase::Rebased { .. }
+        ));
+        assert_eq!(ledger.committed(), node);
+        let next = ledger
+            .issue(1_000, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
+            .await?;
+        assert!(next.amount > node.amount);
         Ok(())
     }
 
