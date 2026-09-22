@@ -50,6 +50,11 @@ pub mod coverage_plan;
 /// Client-side node discovery (#936): read + select the active node set from
 /// `CapacityBond.getRegisteredNodes`, then rank probed blob-holders.
 pub mod discovery;
+/// The `Downloader` consumption face (#1848 T4): fetch a set of content-addressed
+/// blobs (a bundle, or a single blob) to files in a directory, out-of-order and
+/// at full throughput, reusing [`ClientRangedStore`] + [`driver::drive`] so every
+/// byte is bao-verified and a resumed fetch re-pulls only the missing ranges.
+pub mod downloader;
 /// The #1608 gap-driven fetch driver: [`driver::drive`] fills only the
 /// [`missing_ranges`](decdn_bao_range::RangedStore::missing_ranges) of a request,
 /// paying the minimum, by folding the resume / top-up / settle-wait / reseed loop
@@ -107,6 +112,7 @@ pub use coverage_plan::{
     CoveredRun, SourceCoverage, covering_sources, plan_covered_runs, spread_segments,
 };
 pub use decdn_bao_range::RangedStore;
+pub use downloader::Downloader;
 pub use driver::{PacingWait, PoolExhausted, SharedPool, drive};
 pub use ledger::{
     ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released, StreamProof,
