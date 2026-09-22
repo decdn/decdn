@@ -95,10 +95,12 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::coverage_plan::{SourceCoverage, covers_byte_range, spread_segments};
 use crate::driver::{
-    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PoolExhausted, SharedPool,
-    contiguous_byte_ranges, drive_with_interval_flush, fill_gap, ranges_content_len,
+    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, PoolExhausted,
+    SharedPool, WaitReason, contiguous_byte_ranges, drive_with_interval_flush, fill_gap,
+    ranges_content_len,
 };
 use crate::ledgers::LaneLedgers;
+use crate::pacer::DownstreamFrontier;
 use crate::retry::{RetryDisposition, retry_disposition};
 use crate::segment::{split_evenly, steal_split};
 use crate::source::{BlobSource, Funder, IngestStore};
@@ -345,6 +347,11 @@ struct Work {
     /// [`Work::retire`]) — never coming back to `pick` again, whether because
     /// it ran out of coverable work or because it faulted.
     alive: Vec<bool>,
+    /// Pick the lowest-offset pending segment first, not the oldest. Set for a
+    /// consumption-paced fetch ([`ConsumptionPacing`]): the consumer reads in
+    /// offset order, so the earliest missing range is always the one it waits
+    /// on.
+    front_first: bool,
 }
 
 impl Work {
@@ -399,9 +406,19 @@ impl Work {
             Some(unit) => *unit = unit.wrapping_add(1),
             None => anyhow::bail!("worker index {i} out of range for unit counters"),
         }
-        let coverable = self.pending.iter().position(|seg| {
+        let covered = |seg: &AlignedRange| {
             covers_byte_range(coverage, seg.fetch_start(), seg.fetch_len(), total_bytes)
-        });
+        };
+        let coverable = if self.front_first {
+            self.pending
+                .iter()
+                .enumerate()
+                .filter(|(_, seg)| covered(seg))
+                .min_by_key(|(_, seg)| seg.fetch_start())
+                .map(|(pos, _)| pos)
+        } else {
+            self.pending.iter().position(covered)
+        };
         if let Some(pos) = coverable {
             // `pos` came from this same deque's `position`, so it is always
             // in range; `VecDeque::remove` returns `Option`, never panics.
@@ -494,6 +511,20 @@ impl Work {
         }
     }
 
+    /// Whether a pending segment worker `i` can serve starts before the range
+    /// `i` holds now. A consumption-paced worker parked on its window checks
+    /// this to hand its range back and take the earlier one (see
+    /// [`yield_to_front`]).
+    fn earlier_pending(&self, i: usize, coverage: &Coverage, total_bytes: u64) -> bool {
+        let Some(Some((start, _))) = self.in_flight.get(i) else {
+            return false;
+        };
+        self.pending.iter().any(|seg| {
+            seg.fetch_start() < *start
+                && covers_byte_range(coverage, seg.fetch_start(), seg.fetch_len(), total_bytes)
+        })
+    }
+
     /// Release worker `i`'s lane once its `fill_gap` returns, so a peer's steal
     /// computation stops counting the finished range and this source can be
     /// re-picked for more work.
@@ -570,6 +601,78 @@ where
     Ok(())
 }
 
+/// A worker's [`PacingWait`] under consumption pacing: the shared consumer wait,
+/// plus a flag that says this worker is parked on it. [`yield_to_front`] reads
+/// the flag, because a parked worker holds no open leg and can drop its range
+/// without losing a paid byte.
+struct ParkedWait<'a> {
+    /// The consumer wait every lane shares.
+    inner: &'a dyn PacingWait,
+    /// `true` while this worker is parked in `inner`.
+    parked: &'a AtomicBool,
+    /// Woken when this worker parks.
+    parked_wake: &'a Notify,
+}
+
+/// Clears a worker's parked flag when its wait ends or is dropped.
+struct Unpark<'a>(&'a AtomicBool);
+
+impl Drop for Unpark<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl PacingWait for ParkedWait<'_> {
+    fn wait(
+        &self,
+        observed: DownstreamFrontier,
+        reason: WaitReason,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            self.parked.store(true, Ordering::Release);
+            let _unpark = Unpark(self.parked);
+            self.parked_wake.notify_waiters();
+            self.inner.wait(observed, reason).await;
+        })
+    }
+}
+
+/// Resolve once worker `i` is parked on the consumer AND a range it can serve
+/// waits in `pending` ahead of its own. That happens when a lane nearer the
+/// consumer faults and its remainder is re-queued: the consumer cannot read
+/// past that gap, so this worker's own wait never ends, and unless it gives its
+/// range back to take the earlier one, the fetch hangs.
+async fn yield_to_front(
+    work: &AsyncMutex<Work>,
+    i: usize,
+    coverage: &Coverage,
+    total_bytes: u64,
+    parked: &AtomicBool,
+    parked_wake: &Notify,
+    progress_wake: &Notify,
+) {
+    loop {
+        // Register for both wakeups BEFORE the check, so a park or a re-queue
+        // between the check and the await is not lost.
+        let on_park = parked_wake.notified();
+        let on_work = progress_wake.notified();
+        tokio::pin!(on_park);
+        tokio::pin!(on_work);
+        on_park.as_mut().enable();
+        on_work.as_mut().enable();
+        if parked.load(Ordering::Acquire)
+            && work.lock().await.earlier_pending(i, coverage, total_bytes)
+        {
+            return;
+        }
+        tokio::select! {
+            () = on_park => {}
+            () = on_work => {}
+        }
+    }
+}
+
 /// One worker future per source: loop picking a range and driving `fill_gap`
 /// over it, under a cancel/stall [`tokio::select!`], until the fan-out has no
 /// work left or the source is dropped. Exactly one outstanding range at a time
@@ -606,6 +709,7 @@ async fn run_worker<St, S, P, F>(
     unit_deadline: Duration,
     pool: &SharedPool<'_>,
     lane_coverage: &[Coverage],
+    pacing: Option<&ConsumptionPacing<'_>>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -635,6 +739,15 @@ where
     let mut counters = DriveCounters::new();
     // Wake every parked peer: this worker changed the work state.
     let wake = || progress_wake.notify_waiters();
+    // Under consumption pacing, this worker's wait records when it is parked, so
+    // `yield_to_front` can move it to an earlier re-queued range.
+    let lane_parked = AtomicBool::new(false);
+    let lane_parked_wake = Notify::new();
+    let lane_wait = pacing.map(|p| ParkedWait {
+        inner: p.pacing_wait,
+        parked: &lane_parked,
+        parked_wake: &lane_parked_wake,
+    });
     loop {
         // Register for the peer-progress wakeup BEFORE reading the work state, so
         // a peer that changes it between this read and the park below cannot slip
@@ -713,8 +826,12 @@ where
                     // The shared whole-blob delivered counter: every lane folds its
                     // own leg deltas in, so the bar reads one monotonic position.
                     Some(progress_agg),
-                    None,
-                    None,
+                    // Consumption pacing (#1848): with a `WindowPacer`, gate this
+                    // lane against the shared consumer cursor so it never runs more
+                    // than one read-ahead window ahead of what the consumer read.
+                    // `None` keeps the eager, unbounded fan-out.
+                    lane_wait.as_ref().map(|w| w as &dyn PacingWait),
+                    pacing.map(|p| p.downstream),
                     // Everything this lane must not treat as its own: the
                     // aggregate spend the deposit gate subtracts, the fetch-wide
                     // top-up budget, and the credit path that shows a landed
@@ -756,6 +873,18 @@ where
                         }
                     },
                     () = cancelled(&handle) => UnitOutcome::Cancelled,
+                    // Parked on the consumer with an earlier range waiting: give
+                    // this range back (it re-queues like a steal) and take that
+                    // one. Only under consumption pacing.
+                    () = yield_to_front(
+                        work,
+                        i,
+                        my_coverage,
+                        total_bytes,
+                        &lane_parked,
+                        &lane_parked_wake,
+                        progress_wake,
+                    ), if pacing.is_some() => UnitOutcome::Cancelled,
                     // A watchdog trip carries no error by construction — the
                     // source simply stopped making verified progress.
                     () = watchdog(store, g_start, g_len, unit_deadline) => {
@@ -813,10 +942,44 @@ where
     Ok(())
 }
 
+/// The consumption-pacing seam for a bounded, consumer-driven multi-source fetch
+/// (#1848): the downstream read cursor every lane's [`WindowPacer`] gates against,
+/// and the wait hook a lane parks on when its read-ahead window is full.
+///
+/// `None` (every non-streaming caller) is the eager, unbounded fetch — the pacer
+/// caps only on budget, and a lane never parks on the consumer. `Some` (the
+/// `Streamer`) bounds each lane to one read-ahead window ahead of the consumer's
+/// cursor: a lane whose own delivered frontier runs a window past `downstream`
+/// waits until the consumer reads more. Pass a [`WindowPacer`] as the fetch's
+/// `pacer` to make the bound bite; a [`BudgetPacer`] ignores `downstream`, so the
+/// seam is inert without one.
+///
+/// [`WindowPacer`]: crate::pacer::WindowPacer
+/// [`BudgetPacer`]: crate::pacer::BudgetPacer
+pub struct ConsumptionPacing<'a> {
+    /// The downstream frontier — for the `Streamer`, the consumer's read cursor as
+    /// `served_paid` — each lane's `WindowPacer` measures its outstanding bytes
+    /// against.
+    pub downstream: &'a (dyn Fn() -> DownstreamFrontier + Send + Sync),
+    /// The wait hook a lane parks on when its read-ahead window is full, resolved
+    /// once the consumer's cursor advances.
+    pub pacing_wait: &'a dyn PacingWait,
+}
+
+impl std::fmt::Debug for ConsumptionPacing<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumptionPacing").finish_non_exhaustive()
+    }
+}
+
 /// Fetch `hash`'s request `[offset, offset+len)` by fanning it out across
 /// `lanes`, all writing into the one shared `store` (spec §5.3). Splits the
 /// gap-set into bao-aligned segments, drives one worker per lane, and lets a
 /// freed lane steal the tail of the largest range still in flight.
+///
+/// `pacing` bounds the fetch to a read-ahead window ahead of a live consumer
+/// (the `Streamer`, #1848): `None` is the eager unbounded fan-out every other
+/// caller wants. See [`ConsumptionPacing`].
 ///
 /// # Per-source payment (ADR 039 § Payment)
 ///
@@ -872,6 +1035,7 @@ pub async fn multi_source_fetch<St, S, P, F>(
     ms: &MultiSourceConfig,
     on_progress: Option<&ProgressCallback>,
     ledgers: Option<&LaneLedgers>,
+    pacing: Option<&ConsumptionPacing<'_>>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -1002,6 +1166,7 @@ where
             .collect(),
         alive: vec![true; lanes.len()],
         units: vec![0; lanes.len()],
+        front_first: pacing.is_some(),
     });
     // Wakes workers parked because nothing was pickable, whenever a peer frees,
     // re-queues, or leaves the set.
@@ -1092,6 +1257,7 @@ where
             ms.unit_deadline,
             &pool,
             &lane_coverage,
+            pacing,
         )
     });
     // Drive every worker to completion while a single periodic tick flushes the
@@ -1298,6 +1464,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await?;
 
@@ -1377,6 +1544,7 @@ mod tests {
                 unit_deadline: Duration::from_secs(10),
             },
             Some(&on_progress),
+            None,
             None,
         )
         .await?;
@@ -1480,6 +1648,7 @@ mod tests {
             },
             Some(&on_progress),
             None,
+            None,
         )
         .await?;
 
@@ -1540,6 +1709,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
             None,
         )
@@ -1621,6 +1791,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await?;
 
@@ -1697,6 +1868,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
             None,
         )
@@ -1781,6 +1953,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await?;
 
@@ -1839,6 +2012,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
             None,
         )
@@ -1904,6 +2078,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
             None,
         )
@@ -1986,6 +2161,7 @@ mod tests {
             cancel: vec![Arc::new(CancelHandle::new()), Arc::new(CancelHandle::new())],
             alive: vec![true, true],
             units: vec![0, 0],
+            front_first: false,
         };
 
         // Source 0 faults out. Its block-0 entry has no surviving coverer and must
@@ -2038,6 +2214,7 @@ mod tests {
             cancel: (0..3).map(|_| Arc::new(CancelHandle::new())).collect(),
             alive: vec![true, true, true],
             units: vec![1, 0, 0],
+            front_first: false,
         };
         let victim_flag = |w: &Work| {
             w.cancel
@@ -2159,6 +2336,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await?;
 
@@ -2248,6 +2426,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await?;
 
@@ -2328,6 +2507,7 @@ mod tests {
                 },
                 None,
                 None,
+                None,
             ),
         )
         .await;
@@ -2405,6 +2585,7 @@ mod tests {
                     max_sources: 2,
                     unit_deadline: Duration::from_secs(30),
                 },
+                None,
                 None,
                 None,
             ),
@@ -2518,6 +2699,7 @@ mod tests {
                     max_sources: 2,
                     unit_deadline: Duration::from_secs(30),
                 },
+                None,
                 None,
                 None,
             ),
@@ -2661,6 +2843,7 @@ mod tests {
                 },
                 None,
                 Some(&reg),
+                None,
             ),
         )
         .await
@@ -2744,6 +2927,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
             None,
         )
@@ -2857,6 +3041,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
             None,
         )
@@ -2990,6 +3175,7 @@ mod tests {
                     max_sources: 2,
                     unit_deadline: Duration::from_secs(30),
                 },
+                None,
                 None,
                 None,
             ),
@@ -3289,6 +3475,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await;
         // A healthy single lane with nothing to reassign to, so the only
@@ -3374,6 +3561,7 @@ mod tests {
                 },
                 None,
                 None,
+                None,
             ),
         )
         .await
@@ -3440,6 +3628,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
             None,
         )
@@ -3510,6 +3699,7 @@ mod tests {
                 max_sources: 4,
                 unit_deadline: Duration::from_secs(10),
             },
+            None,
             None,
             None,
         )
@@ -3586,6 +3776,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await?;
 
@@ -3594,6 +3785,105 @@ mod tests {
             std::fs::read(dir.path().join("b"))?,
             data,
             "the parked worker covered the faulted peer's remainder"
+        );
+        Ok(())
+    }
+
+    /// A `WindowPacer` + `ConsumptionPacing` bounds a lane to one read-ahead
+    /// window ahead of an injected consumer cursor: the fetch parks when the
+    /// window fills and only proceeds as the cursor advances via the pacing hook.
+    /// This proves the `pacing` seam is threaded all the way to the lane workers —
+    /// on the `None` path the pull runs unbounded and the hook never fires.
+    #[tokio::test]
+    async fn window_pacing_gates_a_lane_on_the_consumer_cursor() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use super::ConsumptionPacing;
+        use crate::driver::{PacingWait, WaitReason};
+        use crate::pacer::{DownstreamFrontier, WindowPacer};
+
+        /// Stands in for the consumer reading one window's worth: it bumps the
+        /// shared cursor and resolves immediately, so the test is deterministic.
+        /// The same cursor backs the downstream reader, so this hook is the ONLY
+        /// thing that can unstick a full window.
+        struct BumpConsumer {
+            cursor: Arc<AtomicU64>,
+            by: u64,
+        }
+        impl PacingWait for BumpConsumer {
+            fn wait(
+                &self,
+                _observed: DownstreamFrontier,
+                _reason: WaitReason,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+                self.cursor.fetch_add(self.by, Ordering::SeqCst);
+                Box::pin(async {})
+            }
+        }
+
+        let data = blob(4 * 1024 * 1024); // several windows long
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger));
+        let root = src.root();
+        let total = src.total_bytes();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+
+        let window = 1024 * 1024;
+        let pacer = WindowPacer::new(window);
+        let cursor = Arc::new(AtomicU64::new(0));
+        let reader = {
+            let cursor = Arc::clone(&cursor);
+            move || DownstreamFrontier {
+                served_paid: cursor.load(Ordering::SeqCst),
+                serve_demand: 0,
+            }
+        };
+        let hook = BumpConsumer {
+            cursor: Arc::clone(&cursor),
+            by: window,
+        };
+        let pacing = ConsumptionPacing {
+            downstream: &reader,
+            pacing_wait: &hook,
+        };
+
+        let lanes = vec![lane(&src, Arc::clone(&ledger), 0xA1)];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 1,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+            None,
+            Some(&pacing),
+        )
+        .await?;
+        store.finalize().await?;
+
+        assert_eq!(
+            std::fs::read(dir.path().join("b"))?,
+            data,
+            "byte-identical under window pacing"
+        );
+        assert!(
+            cursor.load(Ordering::SeqCst) >= 2 * window,
+            "the window must have parked the lane and been unstuck by the consumer \
+             hook (cursor={})",
+            cursor.load(Ordering::SeqCst)
         );
         Ok(())
     }

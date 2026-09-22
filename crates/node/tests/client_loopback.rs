@@ -57,9 +57,9 @@ use decdn_incentive::{
 };
 use decdn_node::client_requester::{
     BlobTooLarge, Cumulative, HashMismatch, PoolContext, PoolLedger, PullDeadlines,
-    RateAboveCeiling, UpstreamVoucherRejected, VoucherProgress, open_progressive_pull,
-    sign_client_binding, stream_fetch, stream_fetch_shared, stream_fetch_tracked,
-    stream_fetch_tracked_with_progress,
+    RateAboveCeiling, UpstreamVoucherRejected, VoucherProgress, WarmConnection,
+    open_progressive_pull, sign_client_binding, stream_fetch, stream_fetch_on, stream_fetch_shared,
+    stream_fetch_tracked, stream_fetch_tracked_with_progress,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
@@ -82,7 +82,7 @@ use support::{
     BlockingReceiptLog, FailingReceiptLog, HandlerDomains, VecReceiptLog, build_handler_full,
     build_handler_full_configured, build_handler_full_with_receipts, build_handler_full_with_sink,
     cache_with_blob, empty_cache, fresh_key, local_endpoint, permissive_limiter, read_client_msg,
-    read_stream_response, shutdown, spawn_server, write_client_msg,
+    read_stream_response, shutdown, spawn_server, spawn_server_counting, write_client_msg,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -410,6 +410,100 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
         span.fields.get("peer").map(String::as_str) == Some(client_ep.id().to_string().as_str()),
         "peer: {span:?}"
     );
+    Ok(())
+}
+
+/// Two different hashes fetched back-to-back over ONE [`WarmConnection`] reuse the
+/// single dialed connection: the server accepts exactly one connection and serves
+/// both hashes as separate bi-streams. A pull that closed the connection on
+/// `finish` would force the second fetch to fail (or silently re-dial), so this
+/// pins connection reuse across hashes.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
+    let payload_a = vec![0x11u8; 400_000];
+    let payload_b = vec![0x22u8; 500_000];
+    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(50_000_000u64);
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        client_signer.address(),
+        operator_addr(),
+        deposit,
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let (server_task, accepted) = spawn_server_counting(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+
+    let warm = WarmConnection::connect(&client_ep, target, Duration::from_secs(20)).await?;
+
+    let got_a = stream_fetch_on(
+        &warm,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash_a.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got_a.as_ref() == payload_a.as_slice(),
+        "hash A bytes mismatch"
+    );
+
+    let got_b = stream_fetch_on(
+        &warm,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash_b.as_bytes(),
+        0,
+        0x00c0_ffef,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got_b.as_ref() == payload_b.as_slice(),
+        "hash B bytes mismatch"
+    );
+
+    let dialed = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    anyhow::ensure!(
+        dialed == 1,
+        "expected exactly one accepted connection across two hash fetches, got {dialed}"
+    );
+
+    drop(warm);
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 

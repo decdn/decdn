@@ -34,6 +34,14 @@
 /// Buyer-side `PaymentPool` open kernel (#940), shared by the node service
 /// and the CLI.
 pub mod buyer_pool;
+/// Zero-config tunables for the consumption faces over the paid pull engine
+/// ([`config::PullConfig`], #1848): every knob defaults, so a caller overrides
+/// only what it must, and construction needs no network or chain access.
+pub mod config;
+/// A caller-owned QUIC connection kept warm across many hash fetches
+/// ([`connection::WarmConnection`]): one dial amortized over every hash, one
+/// bi-stream per hash (no wire change), closed once on the handle's own `Drop`.
+pub mod connection;
 /// Range-keyed discovery coverage-map primitive plus the two
 /// objective-specific planners over it (#1506): [`coverage_plan::plan_covered_runs`]
 /// (node — concentrate + sticky) and [`coverage_plan::spread_segments`] (client —
@@ -42,6 +50,11 @@ pub mod coverage_plan;
 /// Client-side node discovery (#936): read + select the active node set from
 /// `CapacityBond.getRegisteredNodes`, then rank probed blob-holders.
 pub mod discovery;
+/// The `Downloader` consumption face (#1848 T4): fetch a set of content-addressed
+/// blobs (a bundle, or a single blob) to files in a directory, out-of-order and
+/// at full throughput, reusing [`ClientRangedStore`] + [`driver::drive`] so every
+/// byte is bao-verified and a resumed fetch re-pulls only the missing ranges.
+pub mod downloader;
 /// The #1608 gap-driven fetch driver: [`driver::drive`] fills only the
 /// [`missing_ranges`](decdn_bao_range::RangedStore::missing_ranges) of a request,
 /// paying the minimum, by folding the resume / top-up / settle-wait / reseed loop
@@ -83,6 +96,11 @@ mod scheduler;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
 /// (spec §5.3): no I/O, no async.
 mod segment;
+/// The `Streamer` consumption face (#1848 T6): stream one blob's verified,
+/// contiguous front to a consumer as it arrives, paced by consumption and bounded
+/// to one read-ahead window ahead of the read cursor. A fetch-like single-blob
+/// face over the same engine, with no chunk dedup.
+pub mod streamer;
 // Docs live in `sink.rs` as `//!`. Deliberately NOT documented here as well:
 // rustdoc resolves intra-doc links on a `mod` item in THIS file's scope, so the
 // module's own links (`content_paid_frontier`, …) would go unresolved
@@ -93,10 +111,15 @@ pub mod sink;
 /// seam), plus scripted test doubles.
 pub mod source;
 
+pub use config::{
+    DEFAULT_DOWNLOAD_UNIT_DEADLINE, DEFAULT_READ_AHEAD_BYTES, DEFAULT_STREAMER_LANE_CAP, PullConfig,
+};
+pub use connection::WarmConnection;
 pub use coverage_plan::{
     CoveredRun, SourceCoverage, covering_sources, plan_covered_runs, spread_segments,
 };
 pub use decdn_bao_range::RangedStore;
+pub use downloader::{DownloadTarget, Downloader};
 pub use driver::{PacingWait, PoolExhausted, SharedPool, WaitReason, drive};
 pub use ledger::{
     ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released, StreamProof,
@@ -110,9 +133,13 @@ pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
 pub use ranged_store::ClientRangedStore;
 pub use rate_limited::{UpstreamRateLimited, rate_limit_shed};
 pub use retry::{RetryDisposition, retry_disposition};
-pub use scheduler::{MultiSourceConfig, SourceLane, multi_source_fetch};
+pub use scheduler::{ConsumptionPacing, MultiSourceConfig, SourceLane, multi_source_fetch};
+pub use sink::{BlobCache, ByteSink, NoCache, SinkFuture};
 pub use source::{BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource, SourceFuture};
+pub use streamer::{StreamCandidate, StreamDrive, Streamer, VerifiedReader};
 
+#[cfg(any(test, feature = "test-util"))]
+pub use sink::{MemoryBlobCache, VecByteSink};
 #[cfg(any(test, feature = "test-util"))]
 pub use source::{FakeFunder, ScriptedReader, ScriptedSource};
 
@@ -1381,6 +1408,50 @@ pub async fn stream_fetch(
     .await
 }
 
+/// Like [`stream_fetch`], but drives the fetch over a caller-owned
+/// [`WarmConnection`] instead of dialling a fresh connection (#1848 T1). Two
+/// calls with the same `warm` reuse one dialled connection — one bi-stream per
+/// hash — which is exactly what the connection-reuse test asserts.
+///
+/// TEST-ONLY, like the rest of the `stream_fetch*` family. Runs a single attempt
+/// against a one-shot [`PoolLedger`] seeded from `ctx.prior_*` (the loopback
+/// blobs it serves never trigger the wallet-less resume loop).
+///
+/// # Errors
+///
+/// The same set as [`stream_fetch`].
+#[cfg(any(test, feature = "test-util"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_fetch_on(
+    warm: &WarmConnection,
+    ctx: &PoolContext,
+    slash_domain: &Eip712Domain,
+    expected_signer: Address,
+    hash: [u8; 32],
+    byte_offset: u64,
+    timestamp_us: u64,
+    timeout: Duration,
+) -> anyhow::Result<Bytes> {
+    let ledger = Arc::new(ctx.new_ledger());
+    fetch_in_memory_once_on(
+        warm,
+        ctx,
+        ledger,
+        slash_domain,
+        expected_signer,
+        hash,
+        // Models a node-to-node pull, matching `stream_fetch`.
+        decdn_protocol::client::NO_NAMESPACE,
+        byte_offset,
+        timestamp_us,
+        0,
+        0,
+        PullDeadlines::whole_transfer(timeout),
+        None,
+    )
+    .await
+}
+
 /// Like `stream_fetch`, but reports the channel's acked voucher watermark via
 /// the `progress` out-param so the caller can persist what it paid (#852).
 ///
@@ -1604,11 +1675,24 @@ pub async fn stream_fetch_shared(
 /// publisher CLI, one long-lived runtime) passes `None` and pays nothing.
 pub type DialObserver<'a> = dyn Fn(iroh::endpoint::WeakConnectionHandle) + Send + Sync + 'a;
 
+/// Where an [`open_stream`] gets its QUIC connection.
+enum ConnSource<'a> {
+    /// Dial a fresh one-shot connection to `target`. The pull owns it and closes
+    /// it on its terminal method (`finish`/`abort`/drop).
+    Dial {
+        endpoint: &'a Endpoint,
+        target: EndpointAddr,
+    },
+    /// Reuse a caller-owned [`WarmConnection`]'s connection. The pull borrows it
+    /// and leaves it open for the next hash; the [`WarmConnection`] closes it once.
+    Reuse(&'a iroh::endpoint::Connection),
+}
+
 /// The OPEN stage of a `cdn/client/v1` pull, the single request site behind
-/// [`open_progressive_pull`]: dial, open the bi-stream, send the
-/// [`StreamRequest`], and read + verify the signed [`StreamResponse`]. Returns the
-/// live connection, its streams, and the verified response for the caller to
-/// stream from.
+/// [`open_progressive_pull`]: get the connection from `source` (dial a fresh one,
+/// or reuse a warm one), open the bi-stream, send the [`StreamRequest`], then read
+/// and verify the signed [`StreamResponse`]. Returns the live connection, its
+/// streams, and the verified response for the caller to stream from.
 ///
 /// **Bounded as a whole by `open`** (#1134), and that bound lives HERE rather than
 /// in the caller for a reason worth stating: the production pull paths run with no
@@ -1628,8 +1712,7 @@ pub type DialObserver<'a> = dyn Fn(iroh::endpoint::WeakConnectionHandle) + Send 
 /// only the caller knows how to classify it.
 #[allow(clippy::too_many_arguments)]
 async fn open_stream(
-    endpoint: &Endpoint,
-    target: EndpointAddr,
+    source: ConnSource<'_>,
     ctx: &PoolContext,
     slash_domain: &Eip712Domain,
     expected_signer: Address,
@@ -1648,10 +1731,15 @@ async fn open_stream(
     StreamResponseExt,
 )> {
     tokio::time::timeout(open, async move {
-        let conn = endpoint
-            .connect(target, ALPN_CLIENT)
-            .await
-            .map_err(|e| rate_limited::transport_error("connect failed", e))?;
+        let conn = match source {
+            ConnSource::Dial { endpoint, target } => endpoint
+                .connect(target, ALPN_CLIENT)
+                .await
+                .map_err(|e| rate_limited::transport_error("connect failed", e))?,
+            // Already dialled and warm — reuse the handle. A fresh `open_bi` below
+            // gives this hash its own stream.
+            ConnSource::Reuse(conn) => conn.clone(),
+        };
         // Hand the caller its handle HERE, before the handshake — every step below
         // can fail with the connection already dialled and its driver already on
         // this runtime, and a caller that must observe the drain needs those too.
@@ -1923,6 +2011,69 @@ async fn fetch_in_memory_once(
     // trim back to the caller's requested span. Guard the bound explicitly:
     // `Bytes::slice` panics out of range, and a short decode must surface as a
     // clean error.
+    let lead = usize::try_from(byte_offset.saturating_sub(aligned.fetch_start()))?;
+    let bytes = Bytes::from(plaintext);
+    if lead > bytes.len() {
+        anyhow::bail!("decoded range shorter than requested span");
+    }
+    Ok(bytes.slice(lead..))
+}
+
+/// Like [`fetch_in_memory_once`], but opens the pull on a caller-owned
+/// [`WarmConnection`] so the in-memory `stream_fetch_on` wrapper can prove
+/// connection reuse across hashes (#1848 T1).
+///
+/// # Errors
+///
+/// The same set as [`fetch_in_memory_once`].
+#[cfg(any(test, feature = "test-util"))]
+#[allow(clippy::too_many_arguments)]
+async fn fetch_in_memory_once_on(
+    warm: &WarmConnection,
+    ctx: &PoolContext,
+    ledger: Arc<PoolLedger>,
+    slash_domain: &Eip712Domain,
+    expected_signer: Address,
+    hash: [u8; 32],
+    namespace_id: [u8; 32],
+    byte_offset: u64,
+    timestamp_us: u64,
+    max_blob_size_bytes: u64,
+    max_rate_per_mb: u64,
+    deadlines: PullDeadlines,
+    on_progress: Option<&ProgressCallback>,
+) -> anyhow::Result<Bytes> {
+    let (header, pull) = open_progressive_pull_on(
+        warm,
+        ctx,
+        ledger,
+        slash_domain,
+        expected_signer,
+        hash,
+        namespace_id,
+        byte_offset,
+        timestamp_us,
+        max_blob_size_bytes,
+        max_rate_per_mb,
+        deadlines,
+        // Whole tail: the in-memory wrapper has no store to compute gaps against.
+        0,
+        // One long-lived test runtime: nothing to strand, so no dial observer.
+        None,
+    )
+    .await?;
+    let total_bytes = header.total_bytes;
+    if total_bytes == 0 {
+        reject_empty_claim_for_nonempty_root(total_bytes, hash)?;
+        pull.finish().await?;
+        return Ok(Bytes::new());
+    }
+    let aligned = align_range(byte_offset, 0, total_bytes)
+        .map_err(|e| anyhow::anyhow!("range alignment: {e}").context(LocalPullFault))?;
+    let reader = PullReader::new(pull);
+    let (plaintext, reader) =
+        decode_to_vec(hash, total_bytes, &aligned, reader, on_progress).await?;
+    reader.into_inner().finish().await?;
     let lead = usize::try_from(byte_offset.saturating_sub(aligned.fetch_start()))?;
     let bytes = Bytes::from(plaintext);
     if lead > bytes.len() {
@@ -2408,6 +2559,10 @@ pub struct UpstreamPullHeader {
 /// indifferent to size and link speed, and frame-size-independent.
 pub struct UpstreamPull {
     conn: iroh::endpoint::Connection,
+    /// Whether this pull OWNS its connection (a one-shot dial, closed on the
+    /// pull's terminal method) or merely BORROWS a [`WarmConnection`]'s (left open
+    /// for the next hash, closed once by the warm connection's own `Drop`).
+    owns_conn: bool,
     send: SendStream,
     recv: RecvStream,
     ctx: PoolContext,
@@ -2525,6 +2680,112 @@ pub async fn open_progressive_pull(
     max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
+    byte_len: u64,
+    on_connect: Option<&DialObserver<'_>>,
+) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+    open_progressive_pull_impl(
+        ConnSource::Dial { endpoint, target },
+        // One-shot dial: the pull owns this connection and closes it on teardown.
+        true,
+        ctx,
+        ledger,
+        slash_domain,
+        expected_signer,
+        hash,
+        namespace_id,
+        byte_offset,
+        timestamp_us,
+        max_blob_size_bytes,
+        max_rate_per_mb,
+        deadlines,
+        byte_len,
+        on_connect,
+    )
+    .await
+}
+
+/// Like [`open_progressive_pull`], but opens the pull on a caller-owned
+/// [`WarmConnection`] instead of dialling a fresh connection (#1848). The warm
+/// connection is reused across many hashes — one dial, a fresh bi-stream per hash
+/// (one stream = one hash, no wire change) — and stays open when this pull ends,
+/// so the pull borrows the connection and never closes it. The [`WarmConnection`]
+/// closes it once, on its own `Drop`.
+///
+/// Every other argument behaves exactly as on [`open_progressive_pull`]; see its
+/// docs. There is no `endpoint`/`target` pair — the warm connection already names
+/// its peer.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "open_progressive_pull",
+    skip_all,
+    fields(
+        error = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        otel.kind = "client",
+        peer = %warm.connection().remote_id(),
+        hash = %decdn_protocol::ContentHash::from_bytes(hash),
+        pool_id = %ctx.pool_id,
+        byte_offset = byte_offset,
+        byte_len = byte_len,
+    )
+)]
+pub async fn open_progressive_pull_on(
+    warm: &WarmConnection,
+    ctx: &PoolContext,
+    ledger: Arc<PoolLedger>,
+    slash_domain: &Eip712Domain,
+    expected_signer: Address,
+    hash: [u8; 32],
+    namespace_id: [u8; 32],
+    byte_offset: u64,
+    timestamp_us: u64,
+    max_blob_size_bytes: u64,
+    max_rate_per_mb: u64,
+    deadlines: PullDeadlines,
+    byte_len: u64,
+    on_connect: Option<&DialObserver<'_>>,
+) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+    open_progressive_pull_impl(
+        ConnSource::Reuse(warm.connection()),
+        // Borrowed warm connection: leave it open for the next hash.
+        false,
+        ctx,
+        ledger,
+        slash_domain,
+        expected_signer,
+        hash,
+        namespace_id,
+        byte_offset,
+        timestamp_us,
+        max_blob_size_bytes,
+        max_rate_per_mb,
+        deadlines,
+        byte_len,
+        on_connect,
+    )
+    .await
+}
+
+/// The shared body behind [`open_progressive_pull`] (dial) and
+/// [`open_progressive_pull_on`] (reuse). `owns_conn` records which one opened it,
+/// so the returned [`UpstreamPull`] knows whether its terminal method closes the
+/// connection (owned, one-shot) or leaves it open for the next hash (borrowed,
+/// warm).
+#[allow(clippy::too_many_arguments)]
+async fn open_progressive_pull_impl(
+    source: ConnSource<'_>,
+    owns_conn: bool,
+    ctx: &PoolContext,
+    ledger: Arc<PoolLedger>,
+    slash_domain: &Eip712Domain,
+    expected_signer: Address,
+    hash: [u8; 32],
+    namespace_id: [u8; 32],
+    byte_offset: u64,
+    timestamp_us: u64,
+    max_blob_size_bytes: u64,
+    max_rate_per_mb: u64,
+    deadlines: PullDeadlines,
     // Upper bound on the requested range: `[byte_offset, byte_offset + byte_len)`.
     // `0` means "to end" (the pre-#1608 whole-tail behavior, unchanged for every
     // existing caller). A gap-driven caller (`source::PeerSource`, #1608) passes
@@ -2547,8 +2808,7 @@ pub async fn open_progressive_pull(
         // paid-stream handshake this fetch actually pays for.
         let started = std::time::Instant::now();
         let (conn, send, recv, resp, resp_ext) = open_stream(
-            endpoint,
-            target,
+            source,
             ctx,
             slash_domain,
             expected_signer,
@@ -2640,6 +2900,7 @@ pub async fn open_progressive_pull(
             floor,
             sampler,
             conn,
+            owns_conn,
             send,
             recv,
             ctx: ctx.clone(),
@@ -2991,14 +3252,14 @@ impl UpstreamPull {
         // wire bytes than promised) can't be decoded, so require the full
         // promised wire size as the completeness signal.
         if self.cumulative < self.expected_wire_bytes {
-            self.conn.close(0u32.into(), b"short-delivery");
+            self.close_transport(0, b"short-delivery");
             anyhow::bail!(
                 "server sent {} of {} promised wire bytes before StreamEnd",
                 self.cumulative,
                 self.expected_wire_bytes
             );
         }
-        self.conn.close(0u32.into(), b"done");
+        self.close_transport(0, b"done");
         Ok(self.progress())
     }
 
@@ -3006,28 +3267,51 @@ impl UpstreamPull {
     /// and paying). Closes the connection and returns the acked watermark so the
     /// caller can still persist what it paid (#852).
     #[must_use]
-    pub fn abort(self) -> VoucherProgress {
-        self.conn.close(0u32.into(), b"client-abandoned");
+    pub fn abort(mut self) -> VoucherProgress {
+        self.close_transport(0, b"client-abandoned");
         self.progress()
+    }
+
+    /// Tear down this pull's transport on any exit.
+    ///
+    /// An OWNED connection (a one-shot dial) is closed, which ends the QUIC
+    /// connection so the upstream's serve task stops and the paid stream does not
+    /// linger half-open. A BORROWED connection (a [`WarmConnection`] reused across
+    /// hashes) is left open for the next hash — only THIS stream is torn down: the
+    /// send half is finished (a clean FIN) and the recv half is stopped. The warm
+    /// connection's own `Drop` closes the connection once, later.
+    ///
+    /// `Connection::close`, `SendStream::finish`, and `RecvStream::stop` are all
+    /// first-wins / idempotent, so an explicit terminal method (`finish`/`abort`)
+    /// keeps its richer reason and the `Drop` safety net becomes a no-op.
+    fn close_transport(&mut self, code: u32, reason: &[u8]) {
+        if self.owns_conn {
+            self.conn.close(code.into(), reason);
+        } else {
+            let _ = self.send.finish();
+            let _ = self.recv.stop(code.into());
+        }
     }
 }
 
 impl Drop for UpstreamPull {
     /// Safety net for the "call a terminal method on every exit" contract: if a
-    /// caller returns or panics without `finish`/`abort`, still close the upstream
-    /// connection so the QUIC stream and the upstream's server-side serve task
-    /// don't linger and keep that paid stream half-open. `Connection::close` is
-    /// first-wins and idempotent, so an explicit close in `finish`/`abort` keeps
-    /// its richer reason and this is a no-op when one of them ran; it only takes
-    /// effect on a dropped-without-finalize path.
+    /// caller returns or panics without `finish`/`abort`, still tear this pull's
+    /// transport down through `close_transport` so the QUIC stream and the
+    /// upstream's server-side serve task don't linger and keep that paid stream
+    /// half-open. `Connection::close` / `SendStream::finish` / `RecvStream::stop`
+    /// are all first-wins and idempotent, so an explicit teardown in
+    /// `finish`/`abort` keeps its richer reason and this is a no-op when one of
+    /// them ran; it only takes effect on a dropped-without-finalize path.
     ///
-    /// It closes the connection and nothing else, and that is sufficient: the acked
-    /// watermark lives in the channel's [`PoolLedger`], which OUTLIVES the pull (it
-    /// is shared with the other pulls on the channel), not in a field of this struct. A
-    /// dropped pull's caller reads it with [`PoolLedger::settlement`] and persists it —
-    /// `node_origin` does exactly that from its own `Drop` guard (#1145 review).
+    /// It tears down the transport and nothing else, and that is sufficient: the
+    /// acked watermark lives in the channel's [`PoolLedger`], which OUTLIVES the
+    /// pull (it is shared with the other pulls on the channel), not in a field of
+    /// this struct. A dropped pull's caller reads it with [`PoolLedger::settlement`]
+    /// and persists it — `node_origin` does exactly that from its own `Drop` guard
+    /// (#1145 review).
     fn drop(&mut self) {
-        self.conn.close(0u32.into(), b"upstream-pull-dropped");
+        self.close_transport(0, b"upstream-pull-dropped");
     }
 }
 
