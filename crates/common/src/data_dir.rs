@@ -10,6 +10,7 @@
 //! Naming them here rather than in each crate is what lets an operator tool
 //! tell the two apart before it writes to the wrong one (#2078).
 
+use std::io;
 use std::path::Path;
 
 /// The daemon's buyer-pool store: buyer pool state and its owner index.
@@ -47,12 +48,32 @@ pub const DAEMON_STORE_FILES: &[&str] = &[
 /// `buyer.redb` is gone but whose `lanes.redb` remains is still a node's, and
 /// treating it as a client's is how a second deposit gets escrowed into a store
 /// the daemon never reads.
-#[must_use]
-pub fn daemon_marker(data_dir: &Path) -> Option<&'static str> {
-    DAEMON_STORE_FILES
-        .iter()
-        .copied()
-        .find(|name| data_dir.join(name).exists())
+///
+/// Each file is checked with `symlink_metadata`, not [`Path::exists`], which
+/// collapses every stat error to `false`. Only `NotFound` reads as "absent". Any
+/// other stat error (a permission denial, a loop, a transient I/O fault) leaves
+/// the owner unknown, and this returns it: the callers gate refusals that move
+/// USDC on this answer, so an unknown owner must refuse rather than pass as a
+/// client's directory (#2086).
+///
+/// # Errors
+///
+/// The first stat error other than `NotFound`, with the path it concerns.
+pub fn daemon_marker(data_dir: &Path) -> io::Result<Option<&'static str>> {
+    for name in DAEMON_STORE_FILES.iter().copied() {
+        let path = data_dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(Some(name)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("failed to stat {}: {e}", path.display()),
+                ));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -63,7 +84,7 @@ mod tests {
     #[test]
     fn an_empty_dir_has_no_daemon_marker() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(daemon_marker(dir.path()), None);
+        assert_eq!(daemon_marker(dir.path()).unwrap(), None);
     }
 
     /// The client's own store is not a daemon marker — otherwise every client
@@ -72,7 +93,7 @@ mod tests {
     fn the_client_store_is_not_a_daemon_marker() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(CLIENT_BUYER_DB_FILE), b"x").unwrap();
-        assert_eq!(daemon_marker(dir.path()), None);
+        assert_eq!(daemon_marker(dir.path()).unwrap(), None);
     }
 
     /// The reset case this exists for: `buyer.redb` deleted, the rest of the
@@ -82,7 +103,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(NODE_LANES_DB_FILE), b"x").unwrap();
         std::fs::write(dir.path().join(NODE_SETTLE_DB_FILE), b"x").unwrap();
-        assert_eq!(daemon_marker(dir.path()), Some(NODE_LANES_DB_FILE));
+        assert_eq!(daemon_marker(dir.path()).unwrap(), Some(NODE_LANES_DB_FILE));
     }
 
     #[test]
@@ -90,7 +111,22 @@ mod tests {
         for name in DAEMON_STORE_FILES {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join(name), b"x").unwrap();
-            assert_eq!(daemon_marker(dir.path()), Some(*name), "{name}");
+            assert_eq!(daemon_marker(dir.path()).unwrap(), Some(*name), "{name}");
         }
+    }
+
+    /// A stat that fails for any reason but `NotFound` leaves the owner unknown,
+    /// so it surfaces as an error instead of reading as "not a node". A regular
+    /// file in place of the directory makes every child stat fail with
+    /// `NotADirectory`, which holds under any uid (a mode-`000` directory would
+    /// not stop root).
+    #[test]
+    fn a_stat_error_is_not_read_as_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("data");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let err = daemon_marker(&not_a_dir).unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("failed to stat"), "{err}");
     }
 }

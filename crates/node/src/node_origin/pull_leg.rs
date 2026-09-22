@@ -574,6 +574,7 @@ pub(crate) async fn run_pull_leg(
         config: &config,
         pacing_wait: &pacing_wait,
         topups_used: AtomicU32::new(0),
+        topup_lock: tokio::sync::Mutex::new(()),
         cancel: &cancel,
     };
 
@@ -632,6 +633,9 @@ struct PeerRunSink<'a> {
     /// miss escrow K on-chain `topUp` txs for one serve. Built once here and
     /// shared into every run's [`SharedPool`].
     topups_used: AtomicU32,
+    /// Serializes the runs' reactive top-ups on the one deposit
+    /// ([`SharedPool::topup_lock`]).
+    topup_lock: tokio::sync::Mutex<()>,
     cancel: &'a CancellationToken,
 }
 
@@ -811,6 +815,7 @@ impl RunSink for PeerRunSink<'_> {
             spent: &spent,
             topups_used: &self.topups_used,
             credit: &credit,
+            topup_lock: &self.topup_lock,
         };
 
         let started = Instant::now();

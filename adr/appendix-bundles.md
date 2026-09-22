@@ -256,14 +256,36 @@ as `decdn fetch`):
   triggers no fetch of its own (the group still fetches once if any
   sibling path needs bytes).
 - **Concurrency** is bounded by `--jobs` (over distinct blobs). Fetches share a
-  `LaneLedger` per `(pool, signer, provider)` lane, and `--max-lane-streams`
-  (default 1) caps how many of them run at once on one lane: the shared
+  `LaneLedger` per `(pool, signer, provider)` lane. `--max-lane-streams`
+  (default 4) caps how many streams run at once on one lane. The shared
   ledger keeps voucher issuance monotonic across concurrent streams on a
-  lane, but a fast stream still advances the lane's one cumulative
-  watermark ahead of a slow co-stream and starves it, so the default keeps
-  one stream per lane. Distinct lanes proceed in parallel. A blob that
-  clears the multi-source gate fans out to its admitted holders per
+  lane. The serving node credits each stream's delivered bytes from the
+  lane's one cumulative watermark, so a fast stream does not starve a slow
+  co-stream. Distinct lanes proceed in parallel. A range-dedup entry pays for
+  its ranges through one session per provider. The session opens one
+  connection and reuses it for every range of the entry. It fills up to
+  `--max-lane-streams` ranges at once, within the lane permits that are free.
+  Concurrent ranges top up the one deposit one at a time. A blob that clears
+  the multi-source gate fans out to its admitted holders per
   [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1).
+- **Failover and retry.** Each entry tries its probed candidates in order. A
+  retryable failure moves to the next candidate. A terminal failure stops
+  the entry. A stall is a retryable failure. A stream stalls when it stays
+  below `--min-throughput-bps` for `--stall-timeout-ms`. A drive stalls when
+  its delivered bytes, counted across all of its legs and the waits between
+  them, stay below the same floor for `--stall-timeout-ms`. The drive's clock
+  stops while the entry waits on its own top-up. The clock does not run
+  during the local check of a complete blob. When the last candidate fails,
+  the entry's error says that every candidate failed. After the first pass
+  over the bundle, `--entry-retries N` (default 2) gives each entry that
+  failed retryably up to N more rounds. Before each round the pull waits:
+  2 s, then double the last wait, to a maximum of 30 s. Each round probes the
+  holders again, so a provider that failed before is a candidate again. Each
+  round continues from the entry's `.partial`, so no byte is paid for twice.
+  A pool exhaustion moves to the next candidate in a pass, but it does not
+  start a new round: every provider refuses the same deposit. A size that
+  disagrees with the manifest and a local disk fault do not start a new
+  round either.
 - **Output** files are written under `-o <dir>` at each entry's relative
   path, resolved with the § Path-safety rules above (`..`, absolute, and
   escaping paths rejected). Writes are atomic (temp-then-rename after the

@@ -1211,10 +1211,14 @@ where
         }),
     };
     let topups_used = AtomicU32::new(0);
+    // With a run registry every fetch of the run tops up the one deposit, so
+    // they share the run's lock; a solo fetch serializes only its own lanes.
+    let own_topup_lock = tokio::sync::Mutex::new(());
     let pool = SharedPool {
         spent: &*spent,
         topups_used: &topups_used,
         credit: &*credit,
+        topup_lock: ledgers.map_or(&own_topup_lock, LaneLedgers::topup_lock),
     };
 
     // ONE monotonic whole-blob delivered-byte counter behind the progress bar,

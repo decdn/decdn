@@ -31,6 +31,10 @@ pub struct LaneHandle {
 #[derive(Default, Debug)]
 pub struct LaneLedgers {
     map: Mutex<HashMap<LaneKey, LaneHandle>>,
+    /// Serializes the run's reactive top-ups: every lane draws on one deposit,
+    /// so two concurrent top-ups would each escrow the whole shortfall (see
+    /// [`crate::SharedPool::topup_lock`]).
+    topup_lock: tokio::sync::Mutex<()>,
 }
 
 impl LaneLedgers {
@@ -62,6 +66,13 @@ impl LaneLedgers {
         map.values()
             .map(|h| h.ledger.committed().amount)
             .fold(U256::ZERO, U256::saturating_add)
+    }
+
+    /// The lock every lane of the run takes around a reactive top-up, for the
+    /// run's [`crate::SharedPool::topup_lock`].
+    #[must_use]
+    pub const fn topup_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.topup_lock
     }
 
     /// Write `new_deposit` onto every registered lane's pool context so no lane

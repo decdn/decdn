@@ -483,6 +483,210 @@ async fn run_self_heal() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A recipient that interleaves many donor chunks with small unique runs pays
+/// for its complement as many scattered ranges — one or two chunk groups at
+/// every seam (#2119). The range session drives them over one warm connection,
+/// up to `--max-lane-streams` at once, so this proves the concurrent range set
+/// still assembles byte-exact and bills exactly the complement's wire bytes:
+/// no range paid twice, none skipped.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_bundle_pull_drives_a_scattered_complement_concurrently() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_scattered_complement()))
+        .await
+        .context("scattered-complement e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey: fixture, pull, and the billing check read \
+              top to bottom, and splitting them would only thread the fixture through helpers"
+)]
+async fn run_scattered_complement() -> anyhow::Result<()> {
+    const CHUNKS: u64 = 24;
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+    ensure_decdn_cli_built()?;
+    let chain = ChainFixture::launch().await?;
+
+    // `a.bin` is the donor: the shared chunks back to back. `b.bin` puts a
+    // small unique tail after each shared chunk, so no seam lands on a chunk
+    // group boundary and every seam leaves a complement range to pay for.
+    let shared: Vec<Vec<u8>> = (0..CHUNKS)
+        .map(|i| {
+            deterministic_bytes(
+                5 * CHUNK_GROUP + 3001,
+                0xC0DE_0000 + u32::try_from(i).unwrap(),
+            )
+        })
+        .collect();
+    let tails: Vec<Vec<u8>> = (0..CHUNKS)
+        .map(|i| deterministic_bytes(2000 + 37 * i, 0x7A11_0000 + u32::try_from(i).unwrap()))
+        .collect();
+    let file_a: Vec<u8> = shared.concat();
+    let file_b: Vec<u8> = shared
+        .iter()
+        .zip(&tails)
+        .flat_map(|(s, t)| s.iter().chain(t).copied())
+        .collect();
+    let whole_a = Hash::new(&file_a);
+    let whole_b = Hash::new(&file_b);
+
+    let chunk_json = |parts: &[&Vec<u8>]| {
+        parts
+            .iter()
+            .map(|p| {
+                format!(
+                    r#"{{"hash":"b3:{}","size":{}}}"#,
+                    Hash::new(p).to_hex(),
+                    p.len()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let a_chunks: Vec<&Vec<u8>> = shared.iter().collect();
+    let b_chunks: Vec<&Vec<u8>> = shared
+        .iter()
+        .zip(&tails)
+        .flat_map(|(s, t)| [s, t])
+        .collect();
+    let manifest = format!(
+        r#"{{"version":1,"entries":[{{"path":"a.bin","hash":"b3:{}","size":{},"chunks":[{}]}},{{"path":"b.bin","hash":"b3:{}","size":{},"chunks":[{}]}}]}}"#,
+        whole_a.to_hex(),
+        file_a.len(),
+        chunk_json(&a_chunks),
+        whole_b.to_hex(),
+        file_b.len(),
+        chunk_json(&b_chunks),
+    );
+
+    let (node, hashes) =
+        NodeFixture::launch_with_blobs(&chain, "US", &[file_a.as_slice(), file_b.as_slice()])
+            .await?;
+    anyhow::ensure!(
+        hashes == vec![whole_a, whole_b],
+        "seeded blob hashes mismatch"
+    );
+    let provider_addr = node.operator_addr();
+
+    let client_dir = tempfile::tempdir().context("client tempdir")?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        client_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .context("chmod client dir 0o700")?;
+    eth_identity::generate_and_persist(client_dir.path(), KEYSTORE_PASSWORD, false)
+        .context("generate buyer keystore")?;
+    let keystore = eth_identity::keystore_path(client_dir.path());
+    let buyer = eth_identity::load_signer(&keystore, KEYSTORE_PASSWORD).context("load buyer")?;
+    chain.fund_eth(buyer.address(), 100).await?;
+    chain
+        .mint_usdc(
+            buyer.address(),
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(6u64),
+        )
+        .await
+        .context("mint buyer USDC")?;
+
+    let manifest_path = client_dir.path().join("scattered.json");
+    std::fs::write(&manifest_path, manifest).context("write manifest")?;
+    let out_dir = client_dir.path().join("out");
+    // `--jobs 1`: `a` lands and registers its chunks before `b` plans, so every
+    // shared chunk is a donor for `b`. `--max-lane-streams 4` lets `b`'s
+    // complement ranges run four at a time on the one lane.
+    let mut args = bundle_pull_argv(
+        &chain,
+        &node,
+        &manifest_path,
+        &out_dir,
+        client_dir.path(),
+        &keystore,
+        1,
+    );
+    args.push("--max-lane-streams".into());
+    args.push("4".into());
+
+    let before = billed_bytes(client_dir.path(), provider_addr)?;
+    let opens_before = node.scrape_metric("decdn_serve_cache_hit_total").await?;
+    run_bundle_pull_until_ready(client_dir.path(), &args).await?;
+    let paid = billed_bytes(client_dir.path(), provider_addr)?.saturating_sub(before);
+    let opens = node
+        .scrape_metric("decdn_serve_cache_hit_total")
+        .await?
+        .saturating_sub(opens_before);
+
+    let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin")?;
+    let got_b = std::fs::read(out_dir.join("b.bin")).context("read b.bin")?;
+    anyhow::ensure!(got_a == file_a, "a.bin mismatch");
+    anyhow::ensure!(got_b == file_b, "b.bin mismatch");
+
+    let total_b = file_b.len() as u64;
+    let complement = interleaved_complement(
+        shared
+            .iter()
+            .zip(&tails)
+            .map(|(s, t)| (s.len() as u64, t.len() as u64)),
+        total_b,
+    );
+    anyhow::ensure!(
+        complement.len() as u64 > CHUNKS / 2,
+        "the fixture must scatter the complement: {} ranges",
+        complement.len()
+    );
+    let mut expected = whole_blob_wire_bytes(file_a.len() as u64);
+    for (start, len) in &complement {
+        expected += range_wire_bytes(*start, *len, total_b)?;
+    }
+    anyhow::ensure!(
+        paid == expected,
+        "the lane must bill a's whole file plus exactly b's {} complement ranges \
+         ({expected} wire bytes), got {paid}",
+        complement.len()
+    );
+    // Every open the node served was a paid leg (#2063): one whole-blob open for
+    // `a`, whose prelude is its drive's first leg, and one per complement range
+    // of `b`, whose session opens its first range for the drive. A size-only
+    // open thrown away would add one per entry, and a prelude per drive more.
+    let legs = 1 + complement.len() as u64;
+    anyhow::ensure!(
+        opens == legs,
+        "the node must serve exactly the {legs} paid legs, served {opens} opens"
+    );
+
+    drop(node);
+    Ok(())
+}
+
+/// The 16 KiB bao chunk group the dedup planner aligns donor interiors to.
+const CHUNK_GROUP: u64 = 16 * 1024;
+
+/// The complement ranges a recipient of `(shared, tail)` pairs pays for when
+/// every shared chunk is a donor: everything outside each shared chunk's
+/// group-aligned interior, as the planner computes it.
+fn interleaved_complement(pairs: impl Iterator<Item = (u64, u64)>, total: u64) -> Vec<(u64, u64)> {
+    let mut complement = Vec::new();
+    let (mut offset, mut cursor) = (0u64, 0u64);
+    for (shared, tail) in pairs {
+        let end = offset + shared;
+        let start = offset.div_ceil(CHUNK_GROUP) * CHUNK_GROUP;
+        let stop = end / CHUNK_GROUP * CHUNK_GROUP;
+        if start < stop {
+            if start > cursor {
+                complement.push((cursor, start - cursor));
+            }
+            cursor = stop;
+        }
+        offset = end + tail;
+    }
+    if cursor < total {
+        complement.push((cursor, total - cursor));
+    }
+    complement
+}
+
 /// End-to-end proof that raising `--max-lane-streams` above 1 is safe: two
 /// multi-chunk entries pinned to ONE provider (so they share ONE
 /// `(pool, signer, provider)` lane) are pulled CONCURRENTLY, and both complete
@@ -1496,10 +1700,10 @@ fn whole_blob_wire_bytes(total: u64) -> u64 {
 }
 
 /// The exact wire bytes a driven `[offset, offset + len)` range of a
-/// `total`-byte blob vouchers for — the same quantity `bundle_pull`'s
-/// `drive_ranges_ordered` pays for one complement run. Mirrors
-/// `plan_dedup`/`drive`'s per-run accounting: each `(offset, len)` complement
-/// run is driven (and billed) independently via its own `align_range`.
+/// `total`-byte blob vouchers for — the same quantity `bundle_pull`'s range
+/// session pays for one complement run. Mirrors `plan_reassembly`'s complement
+/// runs: they are disjoint and non-adjacent, so `drive_range_set` opens (and
+/// bills) each as its own `align_range`.
 fn range_wire_bytes(offset: u64, len: u64, total: u64) -> anyhow::Result<u64> {
     let aligned = align_range(offset, len, total)
         .map_err(|e| anyhow::anyhow!("align_range({offset}, {len}, {total}): {e}"))?;

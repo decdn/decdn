@@ -507,6 +507,137 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Drive a scattered range set, then the rest of the blob, through one
+/// `PeerSource` against a live handler, and return how many connections the
+/// server accepted. `warm` builds the source with a warm connection (#2119).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture: a paid handler, a lane, and the two drives it serves"
+)]
+async fn drive_scattered_through_peer_source(warm: bool) -> anyhow::Result<usize> {
+    use decdn_node::client_requester::driver::{DriveConfig, drive_range_set};
+    use decdn_node::client_requester::{
+        BudgetPacer, ClientRangedStore, FakeFunder, PeerSource, SharedPool,
+    };
+
+    const GROUP: u64 = 16 * 1024;
+    let payload: Vec<u8> = (0..32 * GROUP).map(|i| (i % 251) as u8).collect();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let total = u64::try_from(payload.len())?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(50_000_000u64);
+    let pool_store = Arc::new(MemoryPoolStateStore::new());
+    pool_store.record(&LaneState::hydrate(
+        pool_id(),
+        client_signer.address(),
+        operator_addr(),
+        deposit,
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn PoolStateStore> = pool_store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let (server_task, accepted) = spawn_server_counting(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ledger = Arc::new(ctx.new_ledger());
+    let ctx = Arc::new(std::sync::Mutex::new(ctx));
+    let slash = slash_domain();
+    let source = PeerSource::new(
+        &client_ep,
+        target,
+        Arc::clone(&ctx),
+        Arc::clone(&ledger),
+        &slash,
+        server_eth.address(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        u64::MAX,
+        PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
+    );
+    let source = if warm {
+        source.with_warm_connection()
+    } else {
+        source
+    };
+    let store_dir = tempfile::tempdir()?;
+    let store = ClientRangedStore::create(store_dir.path(), "blob", *hash.as_bytes(), total)?;
+
+    let spent_ledger = Arc::clone(&ledger);
+    let spent = move || spent_ledger.committed().amount;
+    let credit = |_: U256| Ok(());
+    let topups = std::sync::atomic::AtomicU32::new(0);
+    let topup_lock = tokio::sync::Mutex::new(());
+    let pool = SharedPool {
+        spent: &spent,
+        topups_used: &topups,
+        credit: &credit,
+        topup_lock: &topup_lock,
+    };
+    let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);
+    let config = DriveConfig::cli(U256::ZERO);
+    let scattered: Vec<(u64, u64)> = (0..32).step_by(2).map(|g| (g * GROUP, GROUP)).collect();
+    for ranges in [scattered.as_slice(), &[(0, 0)]] {
+        drive_range_set(
+            &store,
+            &source,
+            &BudgetPacer::new(),
+            &funder,
+            &ctx,
+            &ledger,
+            *hash.as_bytes(),
+            ranges,
+            std::num::NonZeroUsize::MIN.saturating_add(3),
+            &config,
+            None,
+            Some(&pool),
+            std::future::pending(),
+        )
+        .await?;
+    }
+    anyhow::ensure!(
+        std::fs::read(store_dir.path().join("blob"))? == payload,
+        "the range set and the rest assemble the blob byte-exact"
+    );
+    drop(source);
+    let dialed = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(dialed)
+}
+
+/// A warm `PeerSource` drives a whole scattered range set, four gaps at a time,
+/// and then the rest of the blob, on ONE connection: concurrent first opens
+/// share one dial, and later drives reuse it (#2119). Without the warm
+/// connection every leg dials its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_warm_peer_source_drives_a_range_set_on_one_connection() -> anyhow::Result<()> {
+    let warm = Box::pin(drive_scattered_through_peer_source(true)).await?;
+    anyhow::ensure!(warm == 1, "a warm source dials once, dialled {warm}");
+    let cold = Box::pin(drive_scattered_through_peer_source(false)).await?;
+    anyhow::ensure!(cold > 1, "a cold source dials per leg, dialled {cold}");
+    Ok(())
+}
+
 /// The stream-outcome family counts one completed inbound stream and no failed
 /// one, with the `vouchers` it accepted and a non-zero byte count.
 fn assert_one_completed_inbound_stream(metrics: &Metrics, vouchers: u64) -> anyhow::Result<()> {
