@@ -96,7 +96,8 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::coverage_plan::{SourceCoverage, covers_byte_range, spread_segments};
 use crate::driver::{
     DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, PoolExhausted,
-    SharedPool, contiguous_byte_ranges, drive_with_interval_flush, fill_gap, ranges_content_len,
+    SharedPool, WaitReason, contiguous_byte_ranges, drive_with_interval_flush, fill_gap,
+    ranges_content_len,
 };
 use crate::ledgers::LaneLedgers;
 use crate::pacer::DownstreamFrontier;
@@ -346,6 +347,11 @@ struct Work {
     /// [`Work::retire`]) — never coming back to `pick` again, whether because
     /// it ran out of coverable work or because it faulted.
     alive: Vec<bool>,
+    /// Pick the lowest-offset pending segment first, not the oldest. Set for a
+    /// consumption-paced fetch ([`ConsumptionPacing`]): the consumer reads in
+    /// offset order, so the earliest missing range is always the one it waits
+    /// on.
+    front_first: bool,
 }
 
 impl Work {
@@ -400,9 +406,19 @@ impl Work {
             Some(unit) => *unit = unit.wrapping_add(1),
             None => anyhow::bail!("worker index {i} out of range for unit counters"),
         }
-        let coverable = self.pending.iter().position(|seg| {
+        let covered = |seg: &AlignedRange| {
             covers_byte_range(coverage, seg.fetch_start(), seg.fetch_len(), total_bytes)
-        });
+        };
+        let coverable = if self.front_first {
+            self.pending
+                .iter()
+                .enumerate()
+                .filter(|(_, seg)| covered(seg))
+                .min_by_key(|(_, seg)| seg.fetch_start())
+                .map(|(pos, _)| pos)
+        } else {
+            self.pending.iter().position(covered)
+        };
         if let Some(pos) = coverable {
             // `pos` came from this same deque's `position`, so it is always
             // in range; `VecDeque::remove` returns `Option`, never panics.
@@ -495,6 +511,20 @@ impl Work {
         }
     }
 
+    /// Whether a pending segment worker `i` can serve starts before the range
+    /// `i` holds now. A consumption-paced worker parked on its window checks
+    /// this to hand its range back and take the earlier one (see
+    /// [`yield_to_front`]).
+    fn earlier_pending(&self, i: usize, coverage: &Coverage, total_bytes: u64) -> bool {
+        let Some(Some((start, _))) = self.in_flight.get(i) else {
+            return false;
+        };
+        self.pending.iter().any(|seg| {
+            seg.fetch_start() < *start
+                && covers_byte_range(coverage, seg.fetch_start(), seg.fetch_len(), total_bytes)
+        })
+    }
+
     /// Release worker `i`'s lane once its `fill_gap` returns, so a peer's steal
     /// computation stops counting the finished range and this source can be
     /// re-picked for more work.
@@ -571,6 +601,78 @@ where
     Ok(())
 }
 
+/// A worker's [`PacingWait`] under consumption pacing: the shared consumer wait,
+/// plus a flag that says this worker is parked on it. [`yield_to_front`] reads
+/// the flag, because a parked worker holds no open leg and can drop its range
+/// without losing a paid byte.
+struct ParkedWait<'a> {
+    /// The consumer wait every lane shares.
+    inner: &'a dyn PacingWait,
+    /// `true` while this worker is parked in `inner`.
+    parked: &'a AtomicBool,
+    /// Woken when this worker parks.
+    parked_wake: &'a Notify,
+}
+
+/// Clears a worker's parked flag when its wait ends or is dropped.
+struct Unpark<'a>(&'a AtomicBool);
+
+impl Drop for Unpark<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl PacingWait for ParkedWait<'_> {
+    fn wait(
+        &self,
+        observed: DownstreamFrontier,
+        reason: WaitReason,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            self.parked.store(true, Ordering::Release);
+            let _unpark = Unpark(self.parked);
+            self.parked_wake.notify_waiters();
+            self.inner.wait(observed, reason).await;
+        })
+    }
+}
+
+/// Resolve once worker `i` is parked on the consumer AND a range it can serve
+/// waits in `pending` ahead of its own. That happens when a lane nearer the
+/// consumer faults and its remainder is re-queued: the consumer cannot read
+/// past that gap, so this worker's own wait never ends, and unless it gives its
+/// range back to take the earlier one, the fetch hangs.
+async fn yield_to_front(
+    work: &AsyncMutex<Work>,
+    i: usize,
+    coverage: &Coverage,
+    total_bytes: u64,
+    parked: &AtomicBool,
+    parked_wake: &Notify,
+    progress_wake: &Notify,
+) {
+    loop {
+        // Register for both wakeups BEFORE the check, so a park or a re-queue
+        // between the check and the await is not lost.
+        let on_park = parked_wake.notified();
+        let on_work = progress_wake.notified();
+        tokio::pin!(on_park);
+        tokio::pin!(on_work);
+        on_park.as_mut().enable();
+        on_work.as_mut().enable();
+        if parked.load(Ordering::Acquire)
+            && work.lock().await.earlier_pending(i, coverage, total_bytes)
+        {
+            return;
+        }
+        tokio::select! {
+            () = on_park => {}
+            () = on_work => {}
+        }
+    }
+}
+
 /// One worker future per source: loop picking a range and driving `fill_gap`
 /// over it, under a cancel/stall [`tokio::select!`], until the fan-out has no
 /// work left or the source is dropped. Exactly one outstanding range at a time
@@ -637,6 +739,15 @@ where
     let mut counters = DriveCounters::new();
     // Wake every parked peer: this worker changed the work state.
     let wake = || progress_wake.notify_waiters();
+    // Under consumption pacing, this worker's wait records when it is parked, so
+    // `yield_to_front` can move it to an earlier re-queued range.
+    let lane_parked = AtomicBool::new(false);
+    let lane_parked_wake = Notify::new();
+    let lane_wait = pacing.map(|p| ParkedWait {
+        inner: p.pacing_wait,
+        parked: &lane_parked,
+        parked_wake: &lane_parked_wake,
+    });
     loop {
         // Register for the peer-progress wakeup BEFORE reading the work state, so
         // a peer that changes it between this read and the park below cannot slip
@@ -719,7 +830,7 @@ where
                     // lane against the shared consumer cursor so it never runs more
                     // than one read-ahead window ahead of what the consumer read.
                     // `None` keeps the eager, unbounded fan-out.
-                    pacing.map(|p| p.pacing_wait),
+                    lane_wait.as_ref().map(|w| w as &dyn PacingWait),
                     pacing.map(|p| p.downstream),
                     // Everything this lane must not treat as its own: the
                     // aggregate spend the deposit gate subtracts, the fetch-wide
@@ -762,6 +873,18 @@ where
                         }
                     },
                     () = cancelled(&handle) => UnitOutcome::Cancelled,
+                    // Parked on the consumer with an earlier range waiting: give
+                    // this range back (it re-queues like a steal) and take that
+                    // one. Only under consumption pacing.
+                    () = yield_to_front(
+                        work,
+                        i,
+                        my_coverage,
+                        total_bytes,
+                        &lane_parked,
+                        &lane_parked_wake,
+                        progress_wake,
+                    ), if pacing.is_some() => UnitOutcome::Cancelled,
                     // A watchdog trip carries no error by construction — the
                     // source simply stopped making verified progress.
                     () = watchdog(store, g_start, g_len, unit_deadline) => {
@@ -1043,6 +1166,7 @@ where
             .collect(),
         alive: vec![true; lanes.len()],
         units: vec![0; lanes.len()],
+        front_first: pacing.is_some(),
     });
     // Wakes workers parked because nothing was pickable, whenever a peer frees,
     // re-queues, or leaves the set.
@@ -2037,6 +2161,7 @@ mod tests {
             cancel: vec![Arc::new(CancelHandle::new()), Arc::new(CancelHandle::new())],
             alive: vec![true, true],
             units: vec![0, 0],
+            front_first: false,
         };
 
         // Source 0 faults out. Its block-0 entry has no surviving coverer and must
@@ -2089,6 +2214,7 @@ mod tests {
             cancel: (0..3).map(|_| Arc::new(CancelHandle::new())).collect(),
             alive: vec![true, true, true],
             units: vec![1, 0, 0],
+            front_first: false,
         };
         let victim_flag = |w: &Work| {
             w.cancel
