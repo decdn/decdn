@@ -301,14 +301,25 @@ pub struct LiveReader {
 
 /// The end of the store's contiguous verified-present run from offset 0 — the
 /// frontier the reader may read up to. The fetch is single-source and in-order,
-/// so the present set is one leading `[0, f)` run; anything else reads as `0`
+/// so the present set is one leading `[0, f)` run; anything else means `0`
 /// (nothing contiguously readable yet).
-async fn present_frontier(store: &ClientRangedStore, total: u64) -> u64 {
-    let present = store.present_ranges().await.unwrap_or_default();
-    match crate::driver::contiguous_byte_ranges(&present, total).first() {
-        Some(&(0, len)) => len,
-        _ => 0,
-    }
+///
+/// # Errors
+///
+/// A store fault reading its present ranges (I/O, a poisoned lock). Surfaced to
+/// the reader rather than masked as "nothing present", so a real fault does not
+/// look like an empty stream that stalls or ends early.
+async fn present_frontier(store: &ClientRangedStore, total: u64) -> anyhow::Result<u64> {
+    let present = store
+        .present_ranges()
+        .await
+        .map_err(|e| anyhow::anyhow!("read present ranges: {e}"))?;
+    Ok(
+        match crate::driver::contiguous_byte_ranges(&present, total).first() {
+            Some(&(0, len)) => len,
+            _ => 0,
+        },
+    )
 }
 
 impl std::fmt::Debug for LiveReader {
@@ -349,7 +360,9 @@ impl LiveReader {
         let state = Arc::clone(&self.state);
         let cursor = self.state.cursor.load(Ordering::SeqCst);
         self.read = Some(Box::pin(async move {
-            let frontier = present_frontier(&state.store, state.total).await;
+            let frontier = present_frontier(&state.store, state.total)
+                .await
+                .map_err(|e| io::Error::other(format!("present frontier: {e:#}")))?;
             if frontier <= cursor {
                 return Ok(Bytes::new());
             }
@@ -372,9 +385,14 @@ impl LiveReader {
                 if n == 0 {
                     return Poll::Ready(Ok(()));
                 }
+                // Convert BEFORE handing out any bytes, so a (practically
+                // impossible) failure surfaces as an error rather than
+                // desynchronizing the cursor from bytes already delivered.
+                let Ok(taken) = u64::try_from(n) else {
+                    return Poll::Ready(Err(io::Error::other("read length does not fit u64")));
+                };
                 let chunk = self.buffered.split_to(n);
                 buf.put_slice(&chunk);
-                let taken = u64::try_from(n).unwrap_or(0);
                 self.state.cursor.fetch_add(taken, Ordering::SeqCst);
                 // Unpark a pull parked on a full read-ahead window.
                 self.state.consumed.notify_waiters();
@@ -693,7 +711,7 @@ mod tests {
             let consumed = u64::try_from(out.len())?;
             let ahead = match &reader {
                 VerifiedReader::Live(live) => {
-                    let present = super::present_frontier(&live.state.store, total).await;
+                    let present = super::present_frontier(&live.state.store, total).await?;
                     present.saturating_sub(consumed)
                 }
                 VerifiedReader::Cached { .. } => 0,

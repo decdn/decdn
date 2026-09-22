@@ -285,9 +285,14 @@ pub trait ByteSink: Send + Sync {
 /// ABOVE this crate and is injected. The default is the no-op [`NoCache`] (never
 /// hits, never stores), so a caller that wants no revisit-reuse pays nothing.
 ///
-/// On a revisit the `Streamer` asks [`get`](BlobCache::get) for a range and
-/// fetches only the complement of what comes back; as verified bytes arrive it
-/// tees them to [`put`](BlobCache::put).
+/// On a clean finish the `Streamer` tees the whole verified blob to
+/// [`put`](BlobCache::put). On a revisit it asks [`get`](BlobCache::get) for the
+/// whole blob: a whole-blob hit is served straight from the cache with no fetch,
+/// and anything less is treated as a miss and refetched in full — the store's
+/// gap-driven resume, not the cache, is what avoids re-pulling a partial prefix
+/// today. (Serving a cached PARTIAL prefix and fetching only the complement is a
+/// planned enhancement; [`get`](BlobCache::get) already reports a partial hold as
+/// a miss so an implementer need not stitch fragments.)
 pub trait BlobCache: Send + Sync {
     /// Return cached content bytes for exactly `[offset, offset + len)` of
     /// `hash`, or `None` on a miss. A partial hold is a miss — the caller fetches
