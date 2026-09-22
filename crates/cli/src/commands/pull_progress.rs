@@ -265,16 +265,17 @@ impl PullProgress {
             download_total,
             reconstruct_total,
         };
-        phase.render(0, "");
+        phase.render(0, download_total, "");
         // The delivery callback advances this file's download and folds the same
         // downloaded bytes into the total bar's download meter (capped at the file's
         // download size — a dedup entry's driver never delivers past its pay-now
-        // ranges, but the cap keeps the total honest regardless).
+        // ranges, but the cap keeps the total honest regardless; an unsized entry's
+        // cap is 0, so it displays progress from `expected` but adds nothing).
         let total = i.total.clone();
         let cb_phase = phase.clone();
         let prev = AtomicU64::new(0);
-        let cb = move |received: u64, _expected: u64| {
-            cb_phase.download(received);
+        let cb = move |received: u64, expected: u64| {
+            cb_phase.download(received, expected);
             if let Some(t) = &total {
                 let capped = received.min(cb_phase.download_total);
                 let last = prev.fetch_max(capped, Ordering::Relaxed);
@@ -313,15 +314,22 @@ struct FilePhase {
 }
 
 impl FilePhase {
-    /// Set the message to `downloaded/download-total[ (reconstructed)][ word]`, in
-    /// human byte units. `word` is a phase hint (`pending siblings…`,
-    /// `reconstructing…`, `discovering…`) or empty during a plain download.
-    fn render(&self, downloaded: u64, word: &str) {
-        let counts = format!(
-            "{}/{}",
-            indicatif::HumanBytes(downloaded.min(self.download_total)),
-            indicatif::HumanBytes(self.download_total),
-        );
+    /// Set the message to `downloaded/display-total[ (reconstructed)][ word]`, in
+    /// human byte units. `display_total` is the denominator to show — the download
+    /// total for a sized entry, or `0` for an entry with no known size yet, in which
+    /// case only the delivered count renders. `word` is a phase hint
+    /// (`pending siblings…`, `reconstructing…`, `discovering…`) or empty during a
+    /// plain download.
+    fn render(&self, downloaded: u64, display_total: u64, word: &str) {
+        let counts = if display_total > 0 {
+            format!(
+                "{}/{}",
+                indicatif::HumanBytes(downloaded.min(display_total)),
+                indicatif::HumanBytes(display_total),
+            )
+        } else {
+            indicatif::HumanBytes(downloaded).to_string()
+        };
         let recon = if self.reconstruct_total > 0 {
             format!(" ({})", indicatif::HumanBytes(self.reconstruct_total))
         } else {
@@ -335,24 +343,41 @@ impl FilePhase {
         self.bar.set_message(format!("{counts}{recon}{tail} "));
     }
 
-    /// Advance the download: bar length stays the download total, position tracks the
-    /// delivered bytes, and the counts re-render.
-    fn download(&self, received: u64) {
-        self.bar.set_length(self.download_total);
-        self.bar.set_position(received.min(self.download_total));
-        self.render(received, "");
+    /// Advance the download: position tracks the delivered bytes and the counts
+    /// re-render. A sized entry meters against its download total; an entry with no
+    /// declared size (allowed by the manifest) has no download total, so it borrows
+    /// the stream's `expected` length for display only — it still contributes
+    /// nothing to the total bar (the fold is capped at the download total, which is
+    /// `0` here).
+    fn download(&self, received: u64, expected: u64) {
+        let display_total = if self.download_total > 0 {
+            self.download_total
+        } else {
+            expected
+        };
+        if display_total > 0 {
+            self.bar.set_length(display_total);
+            self.bar.set_position(received.min(display_total));
+        } else {
+            self.bar.set_position(received);
+        }
+        self.render(received, display_total, "");
     }
 
     /// Enter the `pending siblings…` wait: the download is done (bar full), and the
     /// blob is now waiting for a sibling to register a deferred chunk.
     fn pending(&self) {
         self.bar.set_position(self.download_total);
-        self.render(self.download_total, "pending siblings…");
+        self.render(
+            self.download_total,
+            self.download_total,
+            "pending siblings…",
+        );
     }
 
     /// Enter the `discovering…` phase: probing holders before any byte arrives.
     fn discovering(&self) {
-        self.render(0, "discovering…");
+        self.render(0, self.download_total, "discovering…");
     }
 
     /// Enter the `reconstructing…` verify: the bar now spans the whole blob size
@@ -361,7 +386,7 @@ impl FilePhase {
         self.bar
             .set_length(self.download_total.saturating_add(self.reconstruct_total));
         self.bar.set_position(0);
-        self.render(self.download_total, "reconstructing…");
+        self.render(self.download_total, self.download_total, "reconstructing…");
     }
 }
 
@@ -500,6 +525,28 @@ mod tests {
         // push the total past the download denominator.
         cb(1200, 9999);
         assert_eq!(total.position(), 1000);
+    }
+
+    #[test]
+    fn unsized_file_bar_shows_stream_length_but_adds_nothing_to_the_total() {
+        // An entry the manifest declares no size for has download_total 0. Its bar
+        // borrows the stream's `expected` for display so the row still moves, but it
+        // contributes nothing to the total bar's download meter.
+        let (pp, total) = hidden_pp(1000);
+        let fb = pp.file_bar("m", 0, 0);
+        let cb = fb.callback().expect("enabled");
+        cb(500, 2000);
+        let bar = &fb.phase.as_ref().expect("enabled").bar;
+        assert_eq!(bar.length(), Some(2000), "borrows the stream length");
+        assert_eq!(bar.position(), 500);
+        assert_eq!(
+            total.position(),
+            0,
+            "an unsized entry adds nothing to the total"
+        );
+        cb(1500, 2000);
+        assert_eq!(bar.position(), 1500);
+        assert_eq!(total.position(), 0);
     }
 
     #[test]
