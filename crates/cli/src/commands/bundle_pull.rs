@@ -2644,9 +2644,11 @@ trait RangeDriver {
 /// the entry, not one per drive or per range (#2119). A drive that fails drops
 /// the session and fails over to the next candidate, and the entry never goes
 /// back to a provider that failed it; a retry round (`--entry-retries`) starts
-/// a new driver over a fresh probe. The session drives up to
+/// a new driver over a fresh probe. Each drive fills up to
 /// `--max-lane-streams` gaps at once, using the permits for its provider that
-/// are free when it opens beyond the one the entry already holds.
+/// are free when the drive starts beyond the one the entry already holds. It
+/// returns those extra permits when the drive ends: the entry keeps waiting on
+/// siblings between drives, and a sibling it waits on may need them.
 struct CtxRangeDriver<'a, P: Provider + Clone> {
     ctx: &'a PullCtx<'a, P>,
     targets: &'a RangeTargets,
@@ -2661,15 +2663,11 @@ struct CtxRangeDriver<'a, P: Provider + Clone> {
     next: std::sync::atomic::AtomicUsize,
 }
 
-/// A [`CtxRangeDriver`]'s open session and what it may use.
+/// A [`CtxRangeDriver`]'s open session.
 struct ActiveRangeSession<'a, P> {
     /// The session's candidate, as an index into the entry's failover order.
     candidate: usize,
     session: fetch::RangeSession<'a, P>,
-    /// How many gaps a drive may fill at once: the entry's one lane permit plus
-    /// the extra ones held here.
-    concurrency: std::num::NonZeroUsize,
-    _extra_permits: Vec<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl<'a, P: Provider + Clone> CtxRangeDriver<'a, P> {
@@ -2720,26 +2718,27 @@ impl<'a, P: Provider + Clone> CtxRangeDriver<'a, P> {
                         ranges,
                     )
                     .await?;
-                let extra = self
-                    .ctx
-                    .lane_cap
-                    .try_extra(target.1, self.ctx.lane_cap.n.saturating_sub(1))
-                    .await;
-                let concurrency = std::num::NonZeroUsize::new(1 + extra.len())
-                    .unwrap_or(std::num::NonZeroUsize::MIN);
                 *slot = Some(ActiveRangeSession {
                     candidate: index,
                     session,
-                    concurrency,
-                    _extra_permits: extra,
                 });
             }
             let open = slot
                 .as_ref()
                 .ok_or_else(|| anyhow!("range session missing after open"))?;
-            open.session
-                .drive(ranges, open.concurrency, self.progress)
-                .await
+            // Held for this drive only, never across the entry's waits on a
+            // sibling (`reconcile_deferred`): a donor this entry waits on may be
+            // blocked on the same provider's permits.
+            let extra = self
+                .ctx
+                .lane_cap
+                .try_extra(target.1, self.ctx.lane_cap.n.saturating_sub(1))
+                .await;
+            let concurrency =
+                std::num::NonZeroUsize::new(1 + extra.len()).unwrap_or(std::num::NonZeroUsize::MIN);
+            let driven = open.session.drive(ranges, concurrency, self.progress).await;
+            drop(extra);
+            driven
         }
         .await;
         let Err(err) = driven else {
@@ -5248,6 +5247,40 @@ mod tests {
         assert!(plan.donor.is_empty());
         // The drive is the complement of c1's interior — the c2 region.
         assert_eq!(plan.drive, vec![(3 * GROUP, 50_000)]);
+    }
+
+    /// A donor that failed the first pass and runs again in an `--entry-retries`
+    /// round splices a chunk it was assigned but a recipient has since paid for
+    /// and registered, instead of paying for it a second time: a registered
+    /// chunk is a donor whoever the fetch plan assigned it to.
+    #[test]
+    fn plan_reassembly_splices_its_own_assigned_chunk_once_a_sibling_registered_it() {
+        let a = mentry(0x0a, 3 * GROUP, &[(3 * GROUP, 0x01)]);
+        let fetch_plan = build_fetch_plan(&[
+            mentry(0x0a, 3 * GROUP, &[(3 * GROUP, 0x01)]),
+            mentry(
+                0x0b,
+                3 * GROUP + 50_000,
+                &[(3 * GROUP, 0x01), (50_000, 0x02)],
+            ),
+        ]);
+        assert_eq!(fetch_plan.assigned.get(&[0x01; 32]), Some(&[0x0a; 32]));
+        let registered = HashMap::from([(
+            [0x01; 32],
+            MaterializedRange {
+                source: PathBuf::from("b"),
+                offset: 0,
+                len: 3 * GROUP,
+            },
+        )]);
+        let hints = hints_of(&a).expect("valid hints");
+        let plan = plan_reassembly(&hints, &registered, &fetch_plan, [0x0a; 32], 3 * GROUP);
+        assert_eq!(plan.donor.len(), 1);
+        assert!(
+            plan.drive.is_empty(),
+            "nothing is paid twice: {:?}",
+            plan.drive
+        );
     }
 
     /// A shared chunk with no group-aligned interior cannot be spliced, so it is

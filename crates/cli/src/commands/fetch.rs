@@ -1993,10 +1993,10 @@ impl std::fmt::Display for EntryStalled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "delivery stayed below {} B/s for {}s, counted across every leg ({} of {} bytes \
+            "delivery stayed below {} B/s for {:.1}s, counted across every leg ({} of {} bytes \
              present)",
             self.floor_bps,
-            self.window.as_secs(),
+            self.window.as_secs_f64(),
             self.landed,
             self.total,
         )
@@ -2017,15 +2017,23 @@ struct EntryWatch {
     /// The highest whole-blob position the drive has reported.
     landed: Arc<std::sync::atomic::AtomicU64>,
     /// Set while the drive waits on its own top-up: from the `topUp` until the
-    /// next byte lands, which also covers the wait for the node to see it.
+    /// next byte lands after every top-up has returned, which also covers the
+    /// wait for the node to see it.
     paused: std::sync::atomic::AtomicBool,
+    /// Top-ups still waiting on chain. Concurrent gaps can each start one, so a
+    /// byte from one gap must not end the pause while another gap's top-up is
+    /// still pending.
+    topups_in_flight: std::sync::atomic::AtomicU32,
 }
 
 impl EntryWatch {
-    /// Record a reported position. Progress past the last one ends a pause.
+    /// Record a reported position. Progress past the last one ends a pause,
+    /// unless a top-up is still in flight.
     fn observe(&self, position: u64) {
         use std::sync::atomic::Ordering;
-        if self.landed.fetch_max(position, Ordering::Relaxed) < position {
+        if self.landed.fetch_max(position, Ordering::Relaxed) < position
+            && self.topups_in_flight.load(Ordering::Acquire) == 0
+        {
             self.paused.store(false, Ordering::Release);
         }
     }
@@ -2039,7 +2047,20 @@ impl EntryWatch {
 /// drive spends escrowing more USDC is not read as the provider stalling.
 struct PausingFunder<'w, F> {
     inner: &'w F,
-    paused: &'w std::sync::atomic::AtomicBool,
+    watch: &'w EntryWatch,
+}
+
+/// Counts one top-up as in flight until it returns or is dropped.
+struct TopUpInFlight<'w>(&'w EntryWatch);
+
+impl Drop for TopUpInFlight<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.0.topups_in_flight.fetch_sub(1, Ordering::AcqRel);
+        // The node may not see the new deposit yet: stay paused until the next
+        // byte, even if a byte from another gap cleared the flag meanwhile.
+        self.0.paused.store(true, Ordering::Release);
+    }
 }
 
 impl<F: Funder> Funder for PausingFunder<'_, F> {
@@ -2048,9 +2069,15 @@ impl<F: Funder> Funder for PausingFunder<'_, F> {
     }
 
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
-        self.paused
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.inner.top_up(additional)
+        use std::sync::atomic::Ordering;
+        self.watch.topups_in_flight.fetch_add(1, Ordering::AcqRel);
+        self.watch.paused.store(true, Ordering::Release);
+        let in_flight = TopUpInFlight(self.watch);
+        Box::pin(async move {
+            let credited = self.inner.top_up(additional).await;
+            drop(in_flight);
+            credited
+        })
     }
 }
 
@@ -2368,7 +2395,7 @@ where
     };
     let funder = PausingFunder {
         inner: &prelude.funder,
-        paused: &watch.paused,
+        watch: &watch,
     };
 
     // The gap-driven fetch: `drive` pulls ONLY `missing_ranges(0, 0)` — the whole
@@ -2554,7 +2581,7 @@ where
         };
         let funder = PausingFunder {
             inner: &prelude.funder,
-            paused: &watch.paused,
+            watch: &watch,
         };
         let driven = watched_drive(
             self.deadlines,
@@ -5372,13 +5399,54 @@ mod tests {
         let inner = CountingFunder(std::sync::atomic::AtomicU32::new(0));
         let funder = PausingFunder {
             inner: &inner,
-            paused: &watch.paused,
+            watch: &watch,
         };
         assert_eq!(funder.max_topups(), 7);
         let credited = funder.top_up(U256::from(5u8)).await.expect("top up");
         assert!(matches!(credited, DepositOutcome::Added(_)));
         assert_eq!(inner.0.load(Ordering::Relaxed), 1);
         assert!(watch.paused.load(Ordering::Acquire));
+        assert_eq!(watch.topups_in_flight.load(Ordering::Acquire), 0);
+    }
+
+    /// A funder whose top-up never returns, as one stuck waiting on chain.
+    struct PendingFunder;
+
+    impl Funder for PendingFunder {
+        fn max_topups(&self) -> u32 {
+            1
+        }
+
+        fn top_up(&self, _: U256) -> SourceFuture<'_, DepositOutcome> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Bytes from one gap do not end the pause while another gap's top-up is
+    /// still on chain; they do once it returns and a byte lands after it.
+    #[tokio::test]
+    async fn a_pending_top_up_keeps_the_watch_paused_through_other_progress() {
+        use std::sync::atomic::Ordering;
+        let watch = EntryWatch::default();
+        let pending = PendingFunder;
+        let funder = PausingFunder {
+            inner: &pending,
+            watch: &watch,
+        };
+        let stuck = funder.top_up(U256::from(1u8));
+        watch.observe(10);
+        assert!(
+            watch.paused.load(Ordering::Acquire),
+            "a top-up is still in flight"
+        );
+        drop(stuck);
+        assert_eq!(watch.topups_in_flight.load(Ordering::Acquire), 0);
+        assert!(
+            watch.paused.load(Ordering::Acquire),
+            "paused until the next byte"
+        );
+        watch.observe(20);
+        assert!(!watch.paused.load(Ordering::Acquire));
     }
 
     fn floor_deadlines() -> PullDeadlines {
