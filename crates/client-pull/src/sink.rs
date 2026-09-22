@@ -303,6 +303,14 @@ pub trait ByteSink: Send + Sync {
 /// planned enhancement; [`get`](BlobCache::get) already reports a partial hold as
 /// a miss so an implementer need not stitch fragments.)
 pub trait BlobCache: Send + Sync {
+    /// Whether this cache actually stores what it is given. A caller that would
+    /// have to materialize the whole blob just to tee it here (the `Streamer`'s
+    /// revisit tee) skips that work — and the memory it costs — when this is
+    /// `false`. Defaults to `true`; a no-op cache overrides it.
+    fn caches(&self) -> bool {
+        true
+    }
+
     /// Return cached content bytes for exactly `[offset, offset + len)` of
     /// `hash`, or `None` on a miss. A partial hold is a miss — the caller fetches
     /// the whole range rather than stitching a fragment.
@@ -329,6 +337,10 @@ pub trait BlobCache: Send + Sync {
 pub struct NoCache;
 
 impl BlobCache for NoCache {
+    fn caches(&self) -> bool {
+        false
+    }
+
     fn get(&self, _hash: [u8; 32], _offset: u64, _len: u64) -> SinkFuture<'_, Option<Bytes>> {
         Box::pin(async { Ok(None) })
     }
