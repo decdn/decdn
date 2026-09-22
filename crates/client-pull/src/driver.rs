@@ -155,7 +155,20 @@ impl std::fmt::Debug for SharedPool<'_> {
     }
 }
 
-/// The injected wait signal for [`PaceDecision::Wait`] (ADR 037): the
+/// Why a window-bounded pacer paused the pull, handed to [`PacingWait::wait`]
+/// so the caller can meter the two pauses apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitReason {
+    /// [`PaceDecision::Wait`]: the pull has run its full window ahead of the
+    /// downstream paid frontier.
+    WindowFull,
+    /// [`PaceDecision::WaitForMinDraw`]: the window has room, but less than the
+    /// minimum draw.
+    MinDraw,
+}
+
+/// The injected wait signal for [`PaceDecision::Wait`] and
+/// [`PaceDecision::WaitForMinDraw`] (ADR 037): the
 /// node hands in an implementor that resolves once its serve leg's paid frontier
 /// or demand frontier has advanced (so a re-decide has a chance of finding room);
 /// the client path never needs one, since `BudgetPacer` never returns `Wait`.
@@ -170,7 +183,14 @@ pub trait PacingWait: Send + Sync {
     /// immediately if either already moved past `observed` — otherwise an advance
     /// that races between the decision and the park is lost and the caller wedges
     /// forever (#1673).
-    fn wait(&self, observed: DownstreamFrontier) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    ///
+    /// `reason` says which pause the decision was, for metering only; the wait
+    /// itself is the same for both.
+    fn wait(
+        &self,
+        observed: DownstreamFrontier,
+        reason: WaitReason,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Read the channel context's current deposit through the shared handle. A tiny
@@ -663,6 +683,7 @@ where
             // THIS leg's delivery progress, never the downstream client's. No
             // seam needed.
             pulled_frontier: delivered_frontier,
+            gap_remaining: gap_end.saturating_sub(delivered_frontier),
             // `downstream.served_paid` is NOT this leg's own state — it is the
             // DOWNSTREAM client's paid frontier, which only the node's serve leg
             // advances (`FillSession::advance_served`). On the client path
@@ -680,13 +701,18 @@ where
 
         match pacer.decide(&state) {
             PaceDecision::Done => return Ok(()),
-            PaceDecision::Wait => {
+            decision @ (PaceDecision::Wait | PaceDecision::WaitForMinDraw) => {
                 if let Some(hook) = pacing_wait {
+                    let reason = if decision == PaceDecision::Wait {
+                        WaitReason::WindowFull
+                    } else {
+                        WaitReason::MinDraw
+                    };
                     // Hand the hook the frontiers THIS decision read, so it can
                     // register its wakeup then re-check for an advance that raced the
                     // decision — closing the lost-wakeup that wedged the window-paused
                     // pull under CI scheduling gaps (#1673).
-                    hook.wait(downstream_now).await;
+                    hook.wait(downstream_now, reason).await;
                     continue;
                 }
                 anyhow::bail!(
@@ -2270,6 +2296,7 @@ mod tests {
         fn wait(
             &self,
             _observed: super::DownstreamFrontier,
+            _reason: super::WaitReason,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async {})
@@ -2357,6 +2384,7 @@ mod tests {
         fn wait(
             &self,
             _observed: super::DownstreamFrontier,
+            _reason: super::WaitReason,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             self.served_paid
                 .fetch_add(self.bump_bytes, std::sync::atomic::Ordering::SeqCst);
@@ -2435,6 +2463,139 @@ mod tests {
         );
     }
 
+    /// A [`PacingWait`] hook that models a caught-up, paying downstream client:
+    /// each wait clears one more chunk of payment, up to the pull frontier less
+    /// the one chunk and two group roundings that always sit between delivery
+    /// and the paid frontier. With `demand`, a serve leg that has drained to the
+    /// pull frontier also raises a serve demand one byte past it.
+    struct CatchingUpWait<'a> {
+        source: &'a crate::source::ScriptedSource,
+        served_paid: Arc<std::sync::atomic::AtomicU64>,
+        serve_demand: Arc<std::sync::atomic::AtomicU64>,
+        demand: bool,
+    }
+
+    impl CatchingUpWait<'_> {
+        fn pulled(&self) -> u64 {
+            self.source
+                .opened_ranges()
+                .iter()
+                .map(|&(start, len)| start + len)
+                .max()
+                .unwrap_or(0)
+        }
+    }
+
+    impl super::PacingWait for CatchingUpWait<'_> {
+        fn wait(
+            &self,
+            _observed: super::DownstreamFrontier,
+            _reason: super::WaitReason,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let pulled = self.pulled();
+            let chunk = decdn_protocol::client::CHUNK_BYTES;
+            let cap = pulled.saturating_sub(chunk + 2 * GROUP);
+            let paid = self.served_paid.load(SeqCst);
+            if paid < cap {
+                self.served_paid.store((paid + chunk).min(cap), SeqCst);
+            } else if self.demand {
+                self.serve_demand.store(pulled + 1, SeqCst);
+            }
+            Box::pin(async {})
+        }
+    }
+
+    /// With a ramped window past [`crate::MIN_DRAW_WINDOW`], a caught-up client
+    /// sees the pull draw at least half the window per upstream open, except the
+    /// last piece of the gap, and the drive completes: the minimum draw batches
+    /// the room without stalling the pull. The variant with a parked serve leg
+    /// raising demand draws just as large, so the demand floor does not
+    /// collapse draws back to about one chunk.
+    #[tokio::test(start_paused = true)]
+    async fn a_large_window_draws_at_least_half_per_open_and_completes() {
+        use crate::pacer::{PULL_WINDOW_FLOOR, RampPacer};
+
+        for demand in [false, true] {
+            let window = 8 * PULL_WINDOW_FLOOR;
+            assert!(
+                window >= crate::MIN_DRAW_WINDOW,
+                "premise: the minimum is on"
+            );
+            let total = 24 * PULL_WINDOW_FLOOR + 5 * GROUP;
+            let (root, plaintext, _outboard) = synth_blob(usize::try_from(total).unwrap());
+            let store = fresh_store(root, total);
+            let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+            let source = ScriptedSource::new(plaintext.clone())
+                .expect("source")
+                .paying(Arc::clone(&ledger));
+            let pacer = RampPacer {
+                divisor: 0,
+                floor: PULL_WINDOW_FLOOR,
+                credit_max: window,
+                paid_base: 0,
+            };
+            let served_paid = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let serve_demand = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let wait_hook = CatchingUpWait {
+                source: &source,
+                served_paid: Arc::clone(&served_paid),
+                serve_demand: Arc::clone(&serve_demand),
+                demand,
+            };
+            let reader = {
+                let (paid, dem) = (Arc::clone(&served_paid), Arc::clone(&serve_demand));
+                move || super::DownstreamFrontier {
+                    served_paid: paid.load(std::sync::atomic::Ordering::SeqCst),
+                    serve_demand: dem.load(std::sync::atomic::Ordering::SeqCst),
+                }
+            };
+            let funder = healthy_funder();
+            let ctx = Arc::new(Mutex::new(healthy_ctx()));
+
+            tokio::time::timeout(
+                std::time::Duration::from_mins(1),
+                drive(
+                    &store,
+                    &source,
+                    &pacer,
+                    &funder,
+                    &ctx,
+                    &ledger,
+                    root,
+                    0,
+                    0,
+                    &config(),
+                    None,
+                    Some(&wait_hook),
+                    Some(&reader),
+                    None,
+                ),
+            )
+            .await
+            .expect("the drive must not wedge on the minimum draw")
+            .expect("drive completes");
+
+            assert!(store.is_complete().await.expect("is_complete"));
+            let opened = source.opened_ranges();
+            let (last, rest) = opened.split_last().expect("at least one open");
+            assert!(
+                rest.iter().all(|&(_, len)| len >= window / 2),
+                "demand={demand}: every open but the last draws at least half the \
+                 window ({}): {opened:?}",
+                window / 2
+            );
+            assert!(last.1 > 0);
+            assert!(
+                opened.len() as u64 <= total.div_ceil(window / 2) + 1,
+                "demand={demand}: the open count is bounded by total / (window / 2): \
+                 {opened:?}"
+            );
+            let got = store.read(0, 0).await.expect("read whole blob");
+            assert_eq!(got.as_ref(), plaintext.as_slice());
+        }
+    }
+
     /// A [`BlobSource`] whose upstream payment trails its delivery: each clean
     /// leg commits only half of the leg's wire, so the paid frontier the driver
     /// opens at stays behind the delivered frontier the pacer measures. Opens past
@@ -2496,6 +2657,7 @@ mod tests {
         fn wait(
             &self,
             _observed: super::DownstreamFrontier,
+            _reason: super::WaitReason,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(std::future::pending())

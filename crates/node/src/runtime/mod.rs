@@ -3260,6 +3260,15 @@ async fn build_cache(
     // `cache.*` is restart-required (not hot-reloaded), so applying the
     // probe-hold budget once here is sufficient (ADR 005 §Hold budget, #318).
     engine.set_max_probe_holds(cfg.cache.max_probe_holds);
+    // One origin read on the range-pull path (an outboard fetch or one data
+    // window) gets the streaming stage's throughput floor: the stall window as a
+    // head start, plus the read size at the minimum throughput. The budget
+    // scales with the read, so it never caps the blob size, and a stuck origin
+    // ends the fill rather than parking it until the client gives up (ADR 037).
+    engine.set_origin_read_budget(
+        std::time::Duration::from_secs(cfg.cache.node_pull_stall_window_sec),
+        cfg.cache.node_pull_min_throughput_bps,
+    );
     // Live-origin probe memo (#1130 pt3) — likewise restart-configured once.
     engine.set_origin_probe_config(decdn_cache::origin_probe::OriginProbePolicy {
         positive_ttl: std::time::Duration::from_secs(cfg.cache.origin_probe_ttl_sec),
@@ -4111,6 +4120,31 @@ mod tests {
         let _engine = build_cache(&cfg, metrics_handle, None)
             .await
             .expect("S3 origin with static credentials must construct without I/O");
+    }
+
+    /// `build_cache` hands the cache engine the own-origin range-pull read
+    /// budget from `cache.node_pull_stall_window_sec` and
+    /// `cache.node_pull_min_throughput_bps` (ADR 037), and a zero throughput
+    /// floor leaves those reads unbounded.
+    #[tokio::test]
+    async fn build_cache_wires_the_origin_read_budget() {
+        let (_tmp, mut cfg) = cfg_with_origin(None);
+        cfg.cache.node_pull_stall_window_sec = 7;
+        cfg.cache.node_pull_min_throughput_bps = 12_345;
+        let cache = build_cache(&cfg, Arc::new(metrics::Metrics::new()), None)
+            .await
+            .expect("cache must construct");
+        assert_eq!(
+            cache.origin_read_budget_parts(),
+            Some((std::time::Duration::from_secs(7), 12_345))
+        );
+
+        let (_tmp, mut cfg) = cfg_with_origin(None);
+        cfg.cache.node_pull_min_throughput_bps = 0;
+        let cache = build_cache(&cfg, Arc::new(metrics::Metrics::new()), None)
+            .await
+            .expect("cache must construct");
+        assert_eq!(cache.origin_read_budget_parts(), None);
     }
 
     /// ADR 041 estimator decoupling: `cache.serve_economics.policy = "margin"`
