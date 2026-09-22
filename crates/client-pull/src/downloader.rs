@@ -125,6 +125,12 @@ where
         config: &PullConfig,
     ) -> anyhow::Result<Vec<PathBuf>> {
         let _ = config;
+        // Fail early and clearly on an empty candidate set, rather than deep inside
+        // `multi_source_fetch` on the first entry with a less obvious message.
+        anyhow::ensure!(
+            !self.candidates.is_empty(),
+            "a Downloader needs at least one provider candidate to fetch from"
+        );
         std::fs::create_dir_all(dir)
             .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", dir.display()))?;
         let pacer = BudgetPacer::new();
@@ -386,6 +392,26 @@ mod tests {
             probe.opened_bytes() < total,
             "a dedup'd download must fetch fewer than the whole blob's bytes ({} of {total})",
             probe.opened_bytes()
+        );
+        Ok(())
+    }
+
+    /// An empty candidate set fails early with a clear message, not deep inside the
+    /// scheduler.
+    #[tokio::test]
+    async fn an_empty_candidate_set_is_a_clear_error() -> anyhow::Result<()> {
+        let downloader =
+            Downloader::<ScriptedSource, FakeFunder>::new(Vec::new(), funder(), drive_config());
+        let dir = tempfile::tempdir()?;
+        let Err(err) = downloader
+            .fetch_to_dir(&[([0u8; 32], 1)], dir.path(), &PullConfig::default())
+            .await
+        else {
+            anyhow::bail!("an empty candidate set must be rejected");
+        };
+        anyhow::ensure!(
+            err.to_string().contains("at least one provider candidate"),
+            "the error must name the empty candidate set, got: {err}"
         );
         Ok(())
     }
