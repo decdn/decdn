@@ -80,9 +80,9 @@ use decdn_incentive::DepositOutcome;
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{
-    Cumulative, MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, ProgressCallback,
-    UpstreamPullHeader, genuine_exhaustion, is_insufficient_deposit,
-    reject_empty_claim_for_nonempty_root, resumable_watermark, resume_may_be_stale,
+    MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, ProgressCallback, UpstreamPullHeader,
+    genuine_exhaustion, heal_watermark_desync, is_insufficient_deposit,
+    reject_empty_claim_for_nonempty_root, rejection_watermark, resume_may_be_stale,
 };
 
 /// The shared pool cannot fund the next voucher: its remaining deposit is below
@@ -886,46 +886,60 @@ where
                         continue;
                     }
 
-                    // 2 & 3 both read the shared context. Neither `resumable_watermark`
-                    // nor `genuine_exhaustion` awaits, so the guard is held only
-                    // across these synchronous predicate calls (never an `.await`).
-                    let classify = {
+                    // 2 & 3 both read the shared context. The guard is held only
+                    // across synchronous reads, never across the heal's `.await`.
+                    let watermark = {
+                        let guard = ctx
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?;
+                        rejection_watermark(&err, &guard)
+                    };
+
+                    // 2. Desync heal (driver-owned, NOT a PaceDecision): an
+                    //    authenticated bundle that ADVANCES our committed
+                    //    watermark means the node holds a voucher we lost, and
+                    //    an `Underpaid` bundle BEHIND it means we hold vouchers
+                    //    the node never took — heal the ledger and retry.
+                    let desync = match watermark {
+                        Some(watermark) if counters.resume_attempts < MAX_RESUME_ATTEMPTS => {
+                            heal_watermark_desync(&err, watermark, ledger)
+                                .await
+                                .is_some()
+                        }
+                        _ => false,
+                    };
+
+                    // 3. Genuine exhaustion (corroborated against our OWN
+                    //    ledger): let the pacer fund it on the next pass. The
+                    //    store already checkpointed the paid prefix, so the
+                    //    retry re-opens only the un-checkpointed tail.
+                    let exhausted = !desync && {
                         let guard = ctx
                             .lock()
                             .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?;
                         let remaining = guard.deposit.saturating_sub(spent(committed.amount));
-
-                        // 2. Desync heal (driver-owned, NOT a PaceDecision): an
-                        //    authenticated bundle that ADVANCES our committed
-                        //    watermark means the node holds a voucher we lost —
-                        //    reseed and retry.
-                        let desync = counters.resume_attempts < MAX_RESUME_ATTEMPTS
-                            && resumable_watermark(&err, &guard)
-                                .is_some_and(|bundle| ledger.reseed(Cumulative::from(bundle)));
-
-                        // 3. Genuine exhaustion (corroborated against our OWN
-                        //    ledger): let the pacer fund it on the next pass. The
-                        //    store already checkpointed the paid prefix, so the
-                        //    retry re-opens only the un-checkpointed tail.
-                        let exhausted = !desync
-                            && genuine_exhaustion(
-                                &err,
-                                &guard,
-                                committed,
-                                remaining,
-                                counters.next_voucher_cost,
-                            );
-                        (desync, exhausted)
+                        genuine_exhaustion(
+                            &err,
+                            &guard,
+                            committed,
+                            remaining,
+                            counters.next_voucher_cost,
+                        )
                     };
+                    let classify = (desync, exhausted);
 
                     if classify.0 {
                         counters.resume_attempts = counters.resume_attempts.saturating_add(1);
                         // A reseed means the node HOLDS vouchers for content it
                         // already delivered that our record had lost — so the
-                        // delivered frontier is paid. Re-anchor the leg there with the
+                        // delivered frontier is paid. A rebase means the node took
+                        // none of the vouchers above its watermark, so the span
+                        // between is delivered and unpaid; the node already chose to
+                        // stop there, and the healed ledger pays only for what it
+                        // delivers next. Either way, re-anchor the leg there with the
                         // healed committed baseline, so the next pass prices this
                         // gap's paid frontier AT the delivered frontier (`paid_wire
-                        // delta == 0`): no re-delivery of already-paid bytes, and the
+                        // delta == 0`): no re-delivery of bytes already delivered, and the
                         // reseed's jump is not mistaken for this leg's own spend
                         // (which would map past the true frontier and under-pay).
                         // `delivered_frontier` is this pass's pre-ingest snapshot
@@ -1554,6 +1568,7 @@ mod tests {
                     let fault = UpstreamVoucherRejected {
                         reason: VoucherRejectReason::SpendingCapExhausted,
                         bundle: None,
+                        proof_generation: None,
                     };
                     return Ok((
                         header,
@@ -1573,6 +1588,209 @@ mod tests {
                 }
             })
         }
+    }
+
+    /// A source whose first opens park the queued faults, one per open — the rest
+    /// delegate to `inner`. Counts every open.
+    struct FaultingOpens {
+        inner: ScriptedSource,
+        faults: std::sync::Mutex<std::collections::VecDeque<anyhow::Error>>,
+        opens: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FaultingOpens {
+        fn new(inner: ScriptedSource, faults: Vec<anyhow::Error>) -> Self {
+            Self {
+                inner,
+                faults: std::sync::Mutex::new(faults.into()),
+                opens: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl BlobSource for FaultingOpens {
+        type Reader = MaybeFaultReader;
+
+        fn open(
+            &self,
+            hash: [u8; 32],
+            range: AlignedRange,
+        ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
+            self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let fault = self.faults.lock().ok().and_then(|mut f| f.pop_front());
+            Box::pin(async move {
+                if let Some(fault) = fault {
+                    let header = UpstreamPullHeader {
+                        total_bytes: self.inner.total_bytes(),
+                        rate_per_mb: 1,
+                        interval_bytes: 1024 * 1024,
+                        ttfb_ms: 0.0,
+                    };
+                    return Ok((header, MaybeFaultReader::Fault(Some(fault))));
+                }
+                let (header, reader) = self.inner.open(hash, range).await?;
+                Ok((header, MaybeFaultReader::Real(reader)))
+            })
+        }
+
+        fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async move {
+                match reader {
+                    MaybeFaultReader::Fault(_) => Ok(VoucherProgress::default()),
+                    MaybeFaultReader::Real(r) => self.inner.finish(r).await,
+                }
+            })
+        }
+    }
+
+    /// An `Underpaid` rejection carrying the node's watermark `(amount, bytes)`,
+    /// signed by `ctx`'s own key, for a voucher signed under `proof_generation`.
+    fn underpaid(
+        ctx: &PoolContext,
+        (amount, bytes): (u64, u64),
+        proof_generation: Option<u64>,
+    ) -> anyhow::Error {
+        let signed = decdn_incentive::Voucher {
+            pool_id: ctx.pool_id,
+            signer: ctx.client_signer.address(),
+            provider: ctx.provider,
+            amount: U256::from(amount),
+            bytes_delivered: U256::from(bytes),
+            chain_root: B256::ZERO,
+            chunk_price: U256::ZERO,
+        }
+        .sign(&ctx.client_signer, &ctx.voucher_domain)
+        .expect("sign the node's watermark");
+        anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::Underpaid,
+            bundle: Some(decdn_protocol::client::WatermarkBundle {
+                amount,
+                bytes_delivered: bytes,
+                chain_root: [0u8; 32],
+                verified_index: 0,
+                tip: [0u8; 32],
+                chunk_price: 0,
+                last_signature: signed.signature.as_bytes().to_vec(),
+            }),
+            proof_generation,
+        })
+    }
+
+    /// A ledger AHEAD of the node: it committed vouchers the node refused.
+    fn ledger_ahead_of_the_node() -> Arc<PoolLedger> {
+        Arc::new(PoolLedger::new(Cumulative {
+            bytes: U256::from(9_000u64),
+            amount: U256::from(90u64),
+        }))
+    }
+
+    /// Drive a two-group blob through `faults` then the scripted source, paying on
+    /// `ledger`. Returns the drive result, the store and the open count.
+    async fn drive_through_faults(
+        ctx: PoolContext,
+        ledger: &Arc<PoolLedger>,
+        faults: impl FnOnce(&PoolContext) -> Vec<anyhow::Error>,
+    ) -> (anyhow::Result<()>, ClientRangedStore, usize) {
+        let total = 2 * GROUP;
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+        let inner = ScriptedSource::new(plaintext)
+            .expect("source")
+            .paying(Arc::clone(ledger));
+        let root = inner.root();
+        let source = FaultingOpens::new(inner, faults(&ctx));
+        let result = drive(
+            &store,
+            &source,
+            &BudgetPacer::new(),
+            &healthy_funder(),
+            &Arc::new(Mutex::new(ctx)),
+            ledger,
+            root,
+            0,
+            0,
+            &config(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let opens = source.opens.load(std::sync::atomic::Ordering::SeqCst);
+        (result, store, opens)
+    }
+
+    /// A lane whose ledger ran AHEAD of the node draws an `Underpaid` rejection
+    /// carrying the node's watermark, signed by our own key. The driver rebases the
+    /// ledger down to it and completes the fetch instead of failing it.
+    #[tokio::test]
+    async fn an_underpaid_rejection_rebases_the_ledger_and_the_fetch_completes() {
+        let ledger = ledger_ahead_of_the_node();
+        let (result, store, _) = drive_through_faults(healthy_ctx(), &ledger, |ctx| {
+            vec![underpaid(ctx, (60, 5_000), Some(0))]
+        })
+        .await;
+        result.expect("the rebased lane completes the fetch");
+
+        assert!(store.is_complete().await.expect("is_complete"));
+        assert_eq!(ledger.generation(), 1, "the ledger rebased down once");
+        let committed = ledger.committed();
+        assert!(
+            committed.amount > U256::from(60u64) && committed.amount < U256::from(90u64),
+            "the healed ledger builds on the node's anchor, not its own: {committed:?}"
+        );
+    }
+
+    /// A second `Underpaid` for a voucher signed before the rebase — a sibling's
+    /// stale rejection — retries the leg without moving the ledger again, and the
+    /// fetch completes.
+    #[tokio::test]
+    async fn a_stale_underpaid_after_a_rebase_retries_without_rebasing() {
+        let ledger = ledger_ahead_of_the_node();
+        let (result, store, opens) = drive_through_faults(healthy_ctx(), &ledger, |ctx| {
+            vec![
+                underpaid(ctx, (60, 5_000), Some(0)),
+                underpaid(ctx, (55, 4_500), Some(0)),
+            ]
+        })
+        .await;
+        result.expect("the stale rejection retries and the fetch completes");
+        assert!(store.is_complete().await.expect("is_complete"));
+        assert_eq!(
+            ledger.generation(),
+            1,
+            "the stale rejection must not rebase"
+        );
+        assert!(
+            opens >= 3,
+            "both faulted opens plus the healthy one, got {opens}"
+        );
+        assert!(ledger.committed().amount > U256::from(60u64));
+    }
+
+    /// Retrying stale `Underpaid` rejections is bounded by `MAX_RESUME_ATTEMPTS`:
+    /// the driver gives up with the rejection itself rather than spinning.
+    #[tokio::test]
+    async fn repeated_underpaid_rejections_are_bounded() {
+        let ledger = ledger_ahead_of_the_node();
+        let (result, _store, opens) = drive_through_faults(healthy_ctx(), &ledger, |ctx| {
+            (0..8)
+                .map(|_| underpaid(ctx, (60, 5_000), Some(0)))
+                .collect()
+        })
+        .await;
+        let err = result.expect_err("an endless stream of rejections must end the fetch");
+        assert!(
+            err.downcast_ref::<UpstreamVoucherRejected>()
+                .is_some_and(|r| r.reason == VoucherRejectReason::Underpaid),
+            "the terminal error is the rejection itself: {err:#}"
+        );
+        let budget = usize::try_from(crate::MAX_RESUME_ATTEMPTS).unwrap_or(usize::MAX);
+        assert_eq!(
+            opens,
+            budget + 1,
+            "one open per resume attempt, plus the first"
+        );
     }
 
     #[tokio::test(start_paused = true)]

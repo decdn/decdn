@@ -29,8 +29,8 @@
 //! serve loop by hand — [`stall_delivery_at_closing_voucher`] is the honest half
 //! the payment-fault tests extend, and [`serve_lying_stream`] is the hostile
 //! server the client-side detection tests drive the real [`stream_fetch`]
-//! against. Covered here: an underpaying closing voucher fails the stream and
-//! advances no watermark; a `BadSignature` and a watermark-regression
+//! against. Covered here: an underpaying voucher draws `Underpaid` (carrying the
+//! accepted watermark once there is one) and advances no watermark; a `BadSignature` and a watermark-regression
 //! (`BytesRegression`) proof arriving *after* an accepted voucher are both
 //! rejected in band while the accepted watermark survives; the per-connection
 //! stream-cap sheds an over-cap stream with a bare QUIC reset and no signed
@@ -3543,6 +3543,118 @@ async fn client_restart_with_stale_watermark_heals_and_resumes() -> anyhow::Resu
         "restarted client must recover the full blob, got {} of {} bytes",
         got2.len(),
         payload.len()
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The mirror of [`client_restart_with_stale_watermark_heals_and_resumes`]: the
+/// client's persisted watermark is AHEAD of the node's lane, carrying bytes the
+/// node never accepted a voucher for (a voucher committed optimistically on send
+/// and then refused). Every span the client signs then pays below the quoted
+/// rate over the node's watermark, so the node answers `Underpaid` with that
+/// watermark. The client verifies it against its own signature, rebases down to
+/// it, and completes — against a real handler, whose bundle carries the lane's
+/// real chain state.
+///
+/// The 8s budget is below the node's 10s `VOUCHER_READ_TIMEOUT`, so the heal must
+/// fire on the rejection itself, not on a read timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_ahead_of_the_node_rebases_and_resumes() -> anyhow::Result<()> {
+    let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(1_000_000_000u64);
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        client_signer.address(),
+        operator_addr(),
+        deposit,
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Stream 1: a healthy fetch that gives the node's lane an accepted watermark.
+    let ctx1 = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let got1 = stream_fetch(
+        &client_ep,
+        target.clone(),
+        &ctx1,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x3333,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(got1.as_ref() == payload.as_slice());
+    let node_lane = store
+        .load_all()?
+        .first()
+        .map(|l| (l.last_amount(), l.last_bytes_delivered()))
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane"))?;
+
+    // Stream 2: the client believes it paid one base unit more for many more
+    // bytes than the node accepted — every span it signs from there underpays.
+    let mut ctx2 = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    ctx2.prior_amount = node_lane.0 + U256::from(1u64);
+    ctx2.prior_bytes_delivered = node_lane.1 + U256::from(64u64 * 1024 * 1024);
+    let got2 = stream_fetch(
+        &client_ep,
+        target,
+        &ctx2,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x4444,
+        Duration::from_secs(8),
+    )
+    .await?;
+    anyhow::ensure!(
+        got2.as_ref() == payload.as_slice(),
+        "the client ahead of the node must rebase and recover the full blob, got {} of {} \
+         bytes",
+        got2.len(),
+        payload.len()
+    );
+    let healed = store
+        .load_all()?
+        .first()
+        .map(|l| (l.last_amount(), l.last_bytes_delivered()))
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane"))?;
+    anyhow::ensure!(
+        healed.0 > node_lane.0 && healed.1 > node_lane.1,
+        "the node must credit the healed stream from its own watermark: {node_lane:?} -> \
+         {healed:?}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -9493,11 +9605,11 @@ async fn assert_stream_reset(recv: &mut RecvStream, code: u32) -> anyhow::Result
 }
 
 /// An underpaying closing voucher (correct cumulative bytes, an amount far below
-/// the quoted-rate minimum) is a buyer withholding, not a protocol reject: the
-/// node bails the serve loop with no in-band `StreamError` (ADR 003 §Voucher
-/// withholding), so the stream ends in a reset with no `StreamEnd`, and — the
-/// money half — the lane watermark never advances, so the underpaid bytes are
-/// never credited.
+/// the quoted-rate minimum) stops delivery with a clean `Underpaid` rejection
+/// (ADR 003 §Voucher withholding). The lane has accepted no voucher yet, so there
+/// is no watermark to hand back and the rejection carries no bundle. The money
+/// half: the lane watermark never advances, so the underpaid bytes are never
+/// credited.
 #[tokio::test(flavor = "multi_thread")]
 async fn underpaying_closing_voucher_fails_the_stream_and_credits_nothing() -> anyhow::Result<()> {
     // Under one credit-window floor (1 chunk) so the delivery has exactly one
@@ -9529,12 +9641,18 @@ async fn underpaying_closing_voucher_fails_the_stream_and_credits_nothing() -> a
         owed > U256::from(1u64),
         "fixture must owe more than one base unit for the underpay to be unambiguous"
     );
-    let outcome = stalled
+    let reply = stalled
         .send_cumulative_voucher(&fx.client_signer, blob.wire_bytes, U256::from(1u64))
-        .await;
+        .await?;
     anyhow::ensure!(
-        outcome.is_err(),
-        "an underpaying voucher must bail the stream (a reset, no in-band reject frame), got {outcome:?}"
+        matches!(
+            reply,
+            ClientMessage::StreamError(StreamError::VoucherRejected {
+                reason: VoucherRejectReason::Underpaid,
+                bundle: None,
+            })
+        ),
+        "an underpaying voucher on a fresh lane must draw a bundle-less Underpaid, got {reply:?}"
     );
 
     // The withholding is not merely refused — nothing is credited. The lane
@@ -9694,6 +9812,60 @@ async fn regressing_voucher_after_an_accepted_voucher_is_rejected() -> anyhow::R
     anyhow::ensure!(
         lane.last_bytes_delivered() == U256::from(HARNESS_INTERVAL_BYTES),
         "the accepted watermark must not move on a regression reject, got {}",
+        lane.last_bytes_delivered()
+    );
+
+    fx.conn.close(0u32.into(), b"done");
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
+/// An underpaying voucher after an accepted one draws `Underpaid` carrying the
+/// accepted watermark, so a payer whose local watermark ran ahead of the node's
+/// can rebase to it instead of wedging the lane. The watermark does not move.
+#[tokio::test(flavor = "multi_thread")]
+async fn underpaying_voucher_after_an_accepted_voucher_returns_the_watermark() -> anyhow::Result<()>
+{
+    let mut fx = drive_to_second_interval_awaiting_voucher().await?;
+
+    // Interval 2's bytes for one extra base unit: the span over the accepted
+    // watermark pays far below the quoted rate.
+    let accepted_amount = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    send_signed_voucher(
+        &mut fx.send,
+        &fx.signer,
+        2 * HARNESS_INTERVAL_BYTES,
+        accepted_amount + U256::from(1u64),
+    )
+    .await?;
+    let bundle = loop {
+        let msg = tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut fx.recv))
+            .await
+            .map_err(|_| anyhow::anyhow!("node never answered with a rejection"))??;
+        match msg {
+            ClientMessage::ChunkData(_) => {}
+            ClientMessage::StreamError(StreamError::VoucherRejected {
+                reason: VoucherRejectReason::Underpaid,
+                bundle: Some(bundle),
+            }) => break bundle,
+            other => anyhow::bail!("expected Underpaid carrying the watermark, got {other:?}"),
+        }
+    };
+    anyhow::ensure!(
+        U256::from(bundle.amount) == accepted_amount
+            && bundle.bytes_delivered == HARNESS_INTERVAL_BYTES,
+        "the bundle must report the accepted watermark, got ({}, {})",
+        bundle.amount,
+        bundle.bytes_delivered
+    );
+
+    let persisted = fx.store.load_all()?;
+    let lane = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane after an accepted voucher"))?;
+    anyhow::ensure!(
+        lane.last_bytes_delivered() == U256::from(HARNESS_INTERVAL_BYTES),
+        "the accepted watermark must not move on an underpay, got {}",
         lane.last_bytes_delivered()
     );
 

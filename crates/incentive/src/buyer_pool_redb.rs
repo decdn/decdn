@@ -23,7 +23,7 @@ use alloy::primitives::{Address, U256};
 use redb::{Database, ReadOnlyDatabase};
 
 use crate::buyer_pool::{
-    AdvanceOutcome, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome,
+    AdvanceOutcome, BuyerLaneProgress, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome,
 };
 use crate::buyer_pool_table::{BuyerPoolTable, load_all_from};
 use crate::lane::{LaneKey, PoolId};
@@ -237,6 +237,18 @@ impl BuyerPoolStore for RedbBuyerPoolStore {
     ) -> Result<AdvanceOutcome, StoreError> {
         self.table()
             .advance_progress(owner, pool_id, lane, bytes, amount)
+    }
+
+    fn rebase_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.table()
+            .rebase_progress(owner, pool_id, lane, anchor, totals)
     }
 
     fn add_deposit(

@@ -99,7 +99,7 @@ pub use coverage_plan::{
 pub use decdn_bao_range::RangedStore;
 pub use driver::{PacingWait, PoolExhausted, SharedPool, drive};
 pub use ledger::{
-    ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Released, StreamProof,
+    ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released, StreamProof,
 };
 pub use ledgers::{LaneHandle, LaneLedgers};
 pub use pacer::{
@@ -393,6 +393,11 @@ pub struct VoucherProgress {
     amount: U256,
     /// Whether the watermark moved past the lane's seed on this stream.
     advanced: bool,
+    /// The node's watermark the lane's ledger rebased DOWN to
+    /// ([`PoolLedger::rebase`]) and no persist has recorded yet. The caller
+    /// overwrites the lane record with it once, then advances to the totals
+    /// above.
+    rebase_anchor: Option<Cumulative>,
 }
 
 impl VoucherProgress {
@@ -411,7 +416,25 @@ impl VoucherProgress {
             bytes_delivered: cum.bytes,
             amount: cum.amount,
             advanced: cum.amount > prior_amount,
+            rebase_anchor: None,
         }
+    }
+
+    /// Attach the watermark the ledger rebased DOWN to and has not persisted
+    /// yet ([`PoolLedger::take_unsaved_rebase`]).
+    #[must_use]
+    pub const fn with_rebase_anchor(mut self, anchor: Option<Cumulative>) -> Self {
+        self.rebase_anchor = anchor;
+        self
+    }
+
+    /// The watermark to overwrite the lane record with before advancing, when
+    /// the ledger rebased down to the node's and no persist has recorded it
+    /// yet. A monotone advance refuses a lower watermark, so without the
+    /// overwrite the next run would sign from the anchor the node refused.
+    #[must_use]
+    pub const fn rebase_anchor(&self) -> Option<Cumulative> {
+        self.rebase_anchor
     }
 
     /// The same watermark, read from a live ledger.
@@ -419,9 +442,14 @@ impl VoucherProgress {
     /// Prefer this wherever a ledger is in hand: it reads
     /// [`PoolLedger::settlement`] rather than a copied-back cumulative, so a
     /// voucher left armed by an ambiguous send is still reported as owed.
+    ///
+    /// It also TAKES the ledger's unsaved rebase anchor, so call it only where
+    /// the result is persisted: the anchor is handed out once.
     #[must_use]
     pub fn from_ledger(ledger: &PoolLedger, prior_amount: U256) -> Self {
-        Self::from_cumulative(ledger.settlement(), prior_amount)
+        // Take the anchor first: every settlement read after it is at or above it.
+        let anchor = ledger.take_unsaved_rebase();
+        Self::from_cumulative(ledger.settlement(), prior_amount).with_rebase_anchor(anchor)
     }
 
     /// The cumulative `(bytes_delivered, amount)` to persist via the lane record,
@@ -429,6 +457,13 @@ impl VoucherProgress {
     #[must_use]
     pub fn advanced(&self) -> Option<(U256, U256)> {
         self.advanced.then_some((self.bytes_delivered, self.amount))
+    }
+
+    /// The cumulative `(bytes_delivered, amount)` this watermark carries,
+    /// whether or not it advanced past the seed.
+    #[must_use]
+    pub const fn totals(&self) -> (U256, U256) {
+        (self.bytes_delivered, self.amount)
     }
 }
 
@@ -742,6 +777,11 @@ pub struct UpstreamVoucherRejected {
     /// can resync its cumulative state and retry. `None` means there is
     /// nothing to resync from and the caller must surface the failure.
     pub bundle: Option<WatermarkBundle>,
+    /// The ledger generation the rejected voucher was signed under
+    /// ([`StreamProof::Voucher`]), when the stream knows it. `None` for a
+    /// rejected reveal, or a rejection read before this stream claimed
+    /// anything; [`PoolLedger::rebase`] treats it as current.
+    pub proof_generation: Option<u64>,
 }
 
 impl std::fmt::Display for UpstreamVoucherRejected {
@@ -1780,23 +1820,22 @@ async fn fetch_inner(
         if attempt == MAX_RESUME_ATTEMPTS {
             return Err(e);
         }
-        match resumable_watermark(&e, ctx) {
-            // A bundle that does not ADVANCE our committed watermark is not a
-            // desync: the node attaches one to every watermark-gated rejection once
-            // any voucher has been accepted, so an exhausted channel echoes our own
-            // watermark straight back. Retrying against it is futile — and applying
-            // it would regress the ledger — so surface the real error instead of
-            // spending the resume budget on it.
-            Some(bundle) if ledger.reseed(Cumulative::from(bundle)) => {
-                tracing::debug!(
-                    attempt,
-                    byte_offset,
-                    "voucher rejection carried an authenticated watermark bundle; reseeded and \
-                     retrying at the same byte_offset"
-                );
-            }
-            Some(_) | None => return Err(e),
-        }
+        // A bundle that proves no desync (see `heal_watermark_desync`) is not worth
+        // the resume budget: surface the real error instead.
+        let healed = match rejection_watermark(&e, ctx) {
+            Some(watermark) => heal_watermark_desync(&e, watermark, ledger).await,
+            None => None,
+        };
+        let Some(healed) = healed else {
+            return Err(e);
+        };
+        tracing::debug!(
+            attempt,
+            byte_offset,
+            ?healed,
+            "voucher rejection carried an authenticated watermark bundle; retrying at the same \
+             byte_offset"
+        );
     }
     // Unreachable: the loop above always returns on both the `Ok` and every `Err`
     // branch (either directly or after `attempt == MAX_RESUME_ATTEMPTS`
@@ -2047,6 +2086,89 @@ pub fn resumable_watermark<'a>(
         return None;
     }
     frontier_is_proved(bundle).then_some(bundle)
+}
+
+/// How [`heal_watermark_desync`] resolved a rejection's authenticated watermark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Healed {
+    /// The bundle was AHEAD of our committed watermark: the node holds a voucher
+    /// we lost. [`PoolLedger::reseed`] moved us up to it.
+    Reseeded,
+    /// An `Underpaid` bundle was BEHIND our committed watermark: we hold vouchers
+    /// the node never accepted. [`PoolLedger::rebase`] moved us down to it.
+    Rebased,
+    /// An `Underpaid` for a voucher signed before the latest rebase. The ledger
+    /// has already healed; nothing moved, and the pull retries from the healed
+    /// anchor.
+    Stale,
+}
+
+/// The authenticated watermark a voucher rejection carries, as the cumulative a
+/// ledger re-anchors to, or `None` when [`resumable_watermark`] refuses it.
+#[must_use]
+pub fn rejection_watermark(err: &anyhow::Error, ctx: &PoolContext) -> Option<Cumulative> {
+    resumable_watermark(err, ctx).map(Cumulative::from)
+}
+
+/// Heal the watermark desync a voucher rejection reports, from `watermark` — the
+/// authenticated bundle [`rejection_watermark`] extracted — and say how, or
+/// `None` when it proves no desync and the caller must surface the real error.
+///
+/// A bundle ahead of our committed watermark reseeds, whatever the reason. A
+/// bundle behind it heals only on [`VoucherRejectReason::Underpaid`], and only
+/// for a voucher signed under the ledger's current generation; see
+/// [`PoolLedger::rebase`]. A bundle that merely echoes our own watermark proves
+/// no desync: the node attaches one to every watermark-gated rejection once a
+/// voucher is accepted, so an exhausted lane echoes it straight back.
+pub async fn heal_watermark_desync(
+    err: &anyhow::Error,
+    watermark: Cumulative,
+    ledger: &PoolLedger,
+) -> Option<Healed> {
+    if ledger.reseed(watermark) {
+        tracing::debug!(
+            amount = %watermark.amount,
+            bytes = %watermark.bytes,
+            "voucher rejection carried a watermark ahead of ours; reseeded"
+        );
+        return Some(Healed::Reseeded);
+    }
+    let rejected = err.downcast_ref::<UpstreamVoucherRejected>()?;
+    if rejected.reason != VoucherRejectReason::Underpaid {
+        return None;
+    }
+    let outcome = ledger.rebase(watermark, rejected.proof_generation).await;
+    rebase_outcome(outcome, watermark, rejected.proof_generation)
+}
+
+/// Log what a [`PoolLedger::rebase`] did and say how the heal resolved.
+fn rebase_outcome(
+    outcome: Rebase,
+    watermark: Cumulative,
+    proof_generation: Option<u64>,
+) -> Option<Healed> {
+    match outcome {
+        Rebase::Rebased { from } => {
+            tracing::warn!(
+                from_amount = %from.amount,
+                from_bytes = %from.bytes,
+                to_amount = %watermark.amount,
+                to_bytes = %watermark.bytes,
+                "upstream refused our vouchers as underpaid: our lane watermark was ahead of \
+                 the one it accepted; rebased down to it"
+            );
+            Some(Healed::Rebased)
+        }
+        Rebase::Stale => {
+            tracing::debug!(
+                ?proof_generation,
+                "underpaid rejection of a voucher signed before the latest rebase; retrying \
+                 from the healed anchor"
+            );
+            Some(Healed::Stale)
+        }
+        Rebase::Refused => None,
+    }
 }
 
 /// Whether the bundle's `tip` proves the `verified_index` it reports:
@@ -2785,10 +2907,10 @@ impl UpstreamPull {
                     .downcast_ref::<UnconfirmedVoucher>()
                     .map(|voucher| voucher.amount);
                 let confirmed = match attempted {
-                    Some(amount) => self.ledger.confirm_armed(amount).await,
+                    Some(amount) => self.ledger.confirm_armed_stamped(amount).await,
                     None => None,
                 };
-                if let Some(confirmed) = confirmed {
+                if let Some((confirmed, generation)) = confirmed {
                     tracing::debug!(
                         amount = %confirmed.amount,
                         error = %format_args!("{write_err:#}"),
@@ -2797,6 +2919,7 @@ impl UpstreamPull {
                     );
                     self.meter.last_proof = Some(StreamProof::Voucher {
                         amount: confirmed.amount,
+                        generation,
                     });
                     self.meter.anchored_root = self.ledger.chain_root();
                     Ok(true)
@@ -2927,6 +3050,9 @@ impl Drop for UpstreamPull {
 /// still reports it (settle high — the upstream persists a voucher before it would
 /// reject it, ADR 003). The client never pays ahead of what it received (vouchers
 /// are cumulative over delivered bytes).
+///
+/// Returns the sent voucher as the [`StreamProof`] the stream records, stamped
+/// with the ledger generation it was signed under.
 async fn send_voucher(
     send: &mut SendStream,
     ctx: &PoolContext,
@@ -2934,7 +3060,7 @@ async fn send_voucher(
     rate_per_mb: u64,
     delta_bytes: u64,
     epoch: EpochAction,
-) -> anyhow::Result<Cumulative> {
+) -> anyhow::Result<StreamProof> {
     if ctx.provider.is_zero() {
         return Err(anyhow::anyhow!(
             "voucher provider is not pinned (Address::ZERO) — call PoolContext::with_provider \
@@ -2944,15 +3070,20 @@ async fn send_voucher(
     }
     let mut attempted = None;
     let issued = ledger
-        .issue(delta_bytes, rate_per_mb, epoch, |next, chain| {
+        .issue_stamped(delta_bytes, rate_per_mb, epoch, |next, chain| {
             attempted = Some(next.amount);
             sign_and_write_voucher(send, ctx, next, chain)
         })
         .await;
-    issued.map_err(|err| match attempted {
-        Some(amount) => err.context(UnconfirmedVoucher { amount }),
-        None => err,
-    })
+    issued
+        .map(|(next, generation)| StreamProof::Voucher {
+            amount: next.amount,
+            generation,
+        })
+        .map_err(|err| match attempted {
+            Some(amount) => err.context(UnconfirmedVoucher { amount }),
+            None => err,
+        })
 }
 
 /// Names the voucher a failed [`send_voucher`] left armed, so a terminal
@@ -3048,11 +3179,8 @@ impl StreamMeter {
         rate_per_mb: u64,
     ) -> anyhow::Result<()> {
         if ledger.chain_root().is_none() {
-            self.last_proof = Some(StreamProof::Voucher {
-                amount: send_voucher(send, ctx, ledger, rate_per_mb, 0, EpochAction::Open)
-                    .await?
-                    .amount,
-            });
+            self.last_proof =
+                Some(send_voucher(send, ctx, ledger, rate_per_mb, 0, EpochAction::Open).await?);
             // Re-read rather than reuse the pre-send `None`: the send is what
             // opened the chain, so only the ledger knows which one.
             self.anchored_root = ledger.chain_root();
@@ -3129,18 +3257,10 @@ impl StreamMeter {
                     // chain's frontier — every reveal advanced the committed
                     // cumulative as it went — so the fold is the frontier
                     // actually reached, never a flat 255 (ADR 003 §Rollover).
-                    self.last_proof = Some(StreamProof::Voucher {
-                        amount: send_voucher(
-                            &mut *send,
-                            ctx,
-                            ledger,
-                            rate_per_mb,
-                            0,
-                            EpochAction::Roll,
-                        )
-                        .await?
-                        .amount,
-                    });
+                    self.last_proof = Some(
+                        send_voucher(&mut *send, ctx, ledger, rate_per_mb, 0, EpochAction::Roll)
+                            .await?,
+                    );
                     self.anchored_root = ledger.chain_root();
                 }
                 Metered::Exhausted => {
@@ -3181,8 +3301,8 @@ impl StreamMeter {
         rate_per_mb: u64,
         residual_bytes: u64,
     ) -> anyhow::Result<()> {
-        self.last_proof = Some(StreamProof::Voucher {
-            amount: send_voucher(
+        self.last_proof = Some(
+            send_voucher(
                 send,
                 ctx,
                 ledger,
@@ -3190,9 +3310,8 @@ impl StreamMeter {
                 residual_bytes,
                 EpochAction::Keep,
             )
-            .await?
-            .amount,
-        });
+            .await?,
+        );
         self.anchored_root = ledger.chain_root();
         Ok(())
     }
@@ -3250,7 +3369,15 @@ fn voucher_rejection(
             if let Some(proof) = meter.last_proof {
                 ledger.resolve_reject(proof);
             }
-            anyhow::Error::new(UpstreamVoucherRejected { reason, bundle })
+            let proof_generation = match meter.last_proof {
+                Some(StreamProof::Voucher { generation, .. }) => Some(generation),
+                Some(StreamProof::Reveal { .. }) | None => None,
+            };
+            anyhow::Error::new(UpstreamVoucherRejected {
+                reason,
+                bundle,
+                proof_generation,
+            })
         }
         other => anyhow::Error::new(UpstreamRefused::mid_stream(other)),
     }
@@ -3373,9 +3500,10 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        Cumulative, HashMismatch, LocalPullFault, PoolContext, U256, UpstreamVoucherRejected,
-        Voucher, VoucherRejectReason, WatermarkBundle, aligned_wire_len, decode_to_vec,
-        genuine_exhaustion, resumable_watermark,
+        Cumulative, HashMismatch, Healed, LocalPullFault, PoolContext, PoolLedger, U256,
+        UpstreamVoucherRejected, Voucher, VoucherRejectReason, WatermarkBundle, aligned_wire_len,
+        decode_to_vec, genuine_exhaustion, heal_watermark_desync, rejection_watermark,
+        resumable_watermark,
     };
 
     /// The `LocalPullFault` marker must ride out on the errors the range helpers ACTUALLY
@@ -3738,6 +3866,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::AmountRegression,
             bundle: Some(bundle),
+            proof_generation: None,
         });
 
         anyhow::ensure!(
@@ -3772,6 +3901,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::AmountRegression,
             bundle: Some(bundle),
+            proof_generation: None,
         });
 
         let got = resumable_watermark(&err, &ctx)
@@ -3814,6 +3944,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::AmountRegression,
             bundle: Some(bundle),
+            proof_generation: None,
         });
 
         anyhow::ensure!(
@@ -3853,6 +3984,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::AmountRegression,
             bundle: Some(bundle),
+            proof_generation: None,
         });
 
         anyhow::ensure!(
@@ -3889,6 +4021,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::AmountRegression,
             bundle: Some(bundle),
+            proof_generation: None,
         });
 
         let got = resumable_watermark(&err, &ctx).ok_or_else(|| {
@@ -3897,6 +4030,137 @@ mod tests {
             )
         })?;
         assert_eq!(got.bytes_delivered, expected_bytes);
+        Ok(())
+    }
+
+    /// Build an `UpstreamVoucherRejected` carrying a bundle genuinely signed by
+    /// `signer` at `(amount, bytes)`, for a voucher signed under `proof_generation`.
+    fn rejected_with_bundle(
+        reason: VoucherRejectReason,
+        ctx: &PoolContext,
+        signer: &alloy::signers::local::PrivateKeySigner,
+        (amount, bytes): (u64, u64),
+        proof_generation: Option<u64>,
+    ) -> anyhow::Result<anyhow::Error> {
+        let bundle = signed_bundle(
+            ctx.pool_id,
+            ctx.provider,
+            signer,
+            &ctx.voucher_domain,
+            U256::from(amount),
+            U256::from(bytes),
+        )?;
+        Ok(anyhow::Error::new(UpstreamVoucherRejected {
+            reason,
+            bundle: Some(bundle),
+            proof_generation,
+        }))
+    }
+
+    fn heal_test_ctx() -> (
+        PoolContext,
+        std::sync::Arc<alloy::signers::local::PrivateKeySigner>,
+    ) {
+        use alloy::primitives::{Address, B256};
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let signer = std::sync::Arc::new(alloy::signers::local::PrivateKeySigner::random());
+        let ctx = resume_test_ctx(
+            B256::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            &signer,
+            &domain,
+        );
+        (ctx, signer)
+    }
+
+    /// Extract the rejection's watermark and heal from it, the way both resume
+    /// loops do.
+    async fn heal(err: &anyhow::Error, ctx: &PoolContext, ledger: &PoolLedger) -> Option<Healed> {
+        let watermark = rejection_watermark(err, ctx)?;
+        heal_watermark_desync(err, watermark, ledger).await
+    }
+
+    /// An authenticated `Underpaid` bundle BEHIND the ledger rebases it down to the
+    /// node's watermark. A later `Underpaid` for a voucher signed before that
+    /// rebase is stale: it retries and leaves the ledger alone.
+    #[tokio::test]
+    async fn heal_rebases_on_an_underpaid_bundle_behind_the_ledger() -> anyhow::Result<()> {
+        let (ctx, signer) = heal_test_ctx();
+        let ledger = PoolLedger::new(Cumulative {
+            bytes: U256::from(9_000u64),
+            amount: U256::from(90u64),
+        });
+        let err = rejected_with_bundle(
+            VoucherRejectReason::Underpaid,
+            &ctx,
+            &signer,
+            (60, 5_000),
+            Some(0),
+        )?;
+        assert_eq!(heal(&err, &ctx, &ledger).await, Some(Healed::Rebased));
+        assert_eq!(
+            ledger.committed(),
+            Cumulative {
+                bytes: U256::from(5_000u64),
+                amount: U256::from(60u64),
+            }
+        );
+
+        let stale = rejected_with_bundle(
+            VoucherRejectReason::Underpaid,
+            &ctx,
+            &signer,
+            (50, 4_000),
+            Some(0),
+        )?;
+        assert_eq!(heal(&stale, &ctx, &ledger).await, Some(Healed::Stale));
+        assert_eq!(ledger.committed().amount, U256::from(60u64));
+        Ok(())
+    }
+
+    /// Only `Underpaid` rebases down. An `AmountRegression` echo behind the ledger
+    /// proves no desync, so the caller surfaces the real error.
+    #[tokio::test]
+    async fn heal_does_not_rebase_on_other_reasons() -> anyhow::Result<()> {
+        let (ctx, signer) = heal_test_ctx();
+        let seed = Cumulative {
+            bytes: U256::from(9_000u64),
+            amount: U256::from(90u64),
+        };
+        let ledger = PoolLedger::new(seed);
+        let err = rejected_with_bundle(
+            VoucherRejectReason::AmountRegression,
+            &ctx,
+            &signer,
+            (60, 5_000),
+            Some(0),
+        )?;
+        assert_eq!(heal(&err, &ctx, &ledger).await, None);
+        assert_eq!(ledger.generation(), 0);
+        assert_eq!(ledger.committed(), seed);
+        Ok(())
+    }
+
+    /// A bundle not signed by our own key heals nothing, even on `Underpaid`: a
+    /// node cannot talk the payer's ledger down to a watermark it never signed.
+    #[tokio::test]
+    async fn heal_refuses_an_underpaid_bundle_we_did_not_sign() -> anyhow::Result<()> {
+        let (ctx, _signer) = heal_test_ctx();
+        let stranger = alloy::signers::local::PrivateKeySigner::random();
+        let seed = Cumulative {
+            bytes: U256::from(9_000u64),
+            amount: U256::from(90u64),
+        };
+        let ledger = PoolLedger::new(seed);
+        let err = rejected_with_bundle(
+            VoucherRejectReason::Underpaid,
+            &ctx,
+            &stranger,
+            (60, 5_000),
+            Some(0),
+        )?;
+        assert_eq!(heal(&err, &ctx, &ledger).await, None);
+        assert_eq!(ledger.committed(), seed);
         Ok(())
     }
 
@@ -3916,6 +4180,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
+            proof_generation: None,
         });
         // remaining 10 µUSDC, next voucher needs 1000 -> truly out.
         assert!(genuine_exhaustion(
@@ -3944,6 +4209,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
+            proof_generation: None,
         });
         assert!(!genuine_exhaustion(
             &err,
@@ -3970,6 +4236,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::AmountRegression,
             bundle: None,
+            proof_generation: None,
         });
         assert!(!genuine_exhaustion(
             &err,
@@ -4014,6 +4281,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: Some(bundle),
+            proof_generation: None,
         });
 
         // Sanity: this bundle IS the healable-desync case `resumable_watermark` resolves, and
@@ -4071,6 +4339,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: Some(bundle),
+            proof_generation: None,
         });
 
         // Sanity: the bundle is still authenticated (resumable_watermark resolves it) — the

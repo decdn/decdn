@@ -43,6 +43,7 @@ pub decdn_protocol::client::VoucherRejectReason::PoolExhausted
 pub decdn_protocol::client::VoucherRejectReason::SignerCapExhausted
 pub decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted
 pub decdn_protocol::client::VoucherRejectReason::UnanchoredPreimage
+pub decdn_protocol::client::VoucherRejectReason::Underpaid
 pub decdn_protocol::client::VoucherRejectReason::WrongPool
 pub decdn_protocol::client::VoucherRejectReason::WrongProvider
 pub decdn_protocol::client::VoucherRejectReason::WrongSigner
@@ -401,6 +402,7 @@ pub decdn_protocol::VoucherRejectReason::PoolExhausted
 pub decdn_protocol::VoucherRejectReason::SignerCapExhausted
 pub decdn_protocol::VoucherRejectReason::SpendingCapExhausted
 pub decdn_protocol::VoucherRejectReason::UnanchoredPreimage
+pub decdn_protocol::VoucherRejectReason::Underpaid
 pub decdn_protocol::VoucherRejectReason::WrongPool
 pub decdn_protocol::VoucherRejectReason::WrongProvider
 pub decdn_protocol::VoucherRejectReason::WrongSigner

@@ -83,8 +83,8 @@ use decdn_incentive::store::{
     StoreError,
 };
 use decdn_incentive::{
-    AdvanceOutcome, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome, LaneChain, LaneKey,
-    LaneState, PoolId,
+    AdvanceOutcome, BuyerLaneProgress, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome,
+    LaneChain, LaneKey, LaneState, PoolId,
 };
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -1191,6 +1191,18 @@ impl BuyerPoolStore for BuyerPoolStoreHandle {
     ) -> Result<AdvanceOutcome, StoreError> {
         self.table()
             .advance_progress(owner, pool_id, lane, bytes, amount)
+    }
+
+    fn rebase_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.table()
+            .rebase_progress(owner, pool_id, lane, anchor, totals)
     }
 
     fn add_deposit(

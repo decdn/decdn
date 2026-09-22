@@ -71,13 +71,15 @@ struct VerifiedVoucher {
 enum VerifyStop {
     /// Reject cleanly with this wire reason, then finish the stream (#751).
     /// The optional [`WatermarkBundle`] rides the wallet-less-resume path
-    /// (#1481 §5): it is `Some` only for a watermark-gated regression/exhaustion
-    /// reason whose rejected voucher recovers to the lane's pinned `signer`, and
-    /// carries the node's true watermark so an authorized funder can re-seed and
+    /// (#1481 §5): it is `Some` only for a watermark-gated reason
+    /// ([`VoucherRejectReason::is_watermark_gated`]) whose rejected voucher
+    /// recovers to the lane's pinned `signer`, and carries the node's true
+    /// watermark so the payer can re-seed (or, on `Underpaid`, rebase) and
     /// resume. Every other reason carries `None`.
     Reject(VoucherRejectReason, Option<WatermarkBundle>),
-    /// Fail the stream — there is no wire reason for this fault (a buyer
-    /// underpayment), and delivery simply stops (ADR 003 §Voucher withholding).
+    /// Fail the stream with no wire reason, and delivery simply stops: a voucher
+    /// that fails the rate check with zero bytes or an overflow, or a broken node
+    /// invariant.
     ///
     /// The error carries its own attribution: a client-attributable stop is
     /// marked [`ClientPaymentFault`](super::wire::ClientPaymentFault), and a
@@ -256,6 +258,11 @@ impl ClientHandler {
             Ok(v) => v,
             Err(VerifyStop::Reject(reason, bundle)) => {
                 drop(guard);
+                tracing::debug!(
+                    ?reason,
+                    with_watermark = bundle.is_some(),
+                    "rejecting voucher"
+                );
                 self.write_reject(send, reason, bundle).await?;
                 return Ok(VoucherStop::Rejected);
             }
@@ -538,8 +545,10 @@ impl ClientHandler {
     /// watermark); the per-span **advertised-rate** check then runs on the advance
     /// path against the aggregate span (`applied.amount_delta()` /
     /// `applied.bytes_delta()`), which is order-independent because it is measured
-    /// against the lane watermark, and bails on a genuine underpayment (no wire
-    /// reason; delivery just stops). There is no cumulative rate-floor check: the
+    /// against the lane watermark, and rejects an underpayment as
+    /// [`VoucherRejectReason::Underpaid`] carrying the lane's last-accepted
+    /// watermark, so a payer whose local watermark diverged can rebase to it.
+    /// Delivery stops either way. There is no cumulative rate-floor check: the
     /// delivery floor is a soft floor that `PaymentPool.redeem` enforces by
     /// clamping credited bytes, not by rejecting, so a sub-floor cumulative never
     /// stops the stream here.
@@ -589,9 +598,14 @@ impl ClientHandler {
                 ) {
                     Ok(()) => {}
                     Err(RateError::Underpayment { .. }) => {
-                        return Err(VerifyStop::Bail(
-                            anyhow::Error::new(super::wire::ClientPaymentFault)
-                                .context("voucher underpays for its delivered-byte span"),
+                        // `state` is the pre-advance lane, so the bundle reports the
+                        // last voucher this node ACCEPTED. An honest payer only gets
+                        // here when its own watermark diverged from ours; the bundle
+                        // is what lets it rebase instead of wedging the lane.
+                        let reason = VoucherRejectReason::Underpaid;
+                        return Err(VerifyStop::Reject(
+                            reason,
+                            Self::watermark_bundle_for_reject(reason, state),
                         ));
                     }
                     Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {

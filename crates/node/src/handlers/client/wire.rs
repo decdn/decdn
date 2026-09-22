@@ -383,12 +383,12 @@ impl std::fmt::Display for PeerFault {
 impl std::error::Error for PeerFault {}
 
 /// Marker for a serve-stream error that is a client-attributable payment fault:
-/// a voucher that underpays for its delivered-byte span, one that fails the
-/// advertised-rate check, or a payer that spends its per-chunk proof budget
-/// without settling anything.
+/// a voucher that fails the advertised-rate check with zero bytes or an overflow,
+/// or a payer that spends its per-chunk proof budget without settling anything.
+/// An underpaying voucher is not here: it is a clean `Underpaid` wire reject.
 ///
 /// The dispatch sink files an unmarked error under "node-side fault" at
-/// `error!`. A client's underpayment is neither a node bug nor a disconnect, and
+/// `error!`. A client's payment fault is neither a node bug nor a disconnect, and
 /// under a misbehaving client it is noisy, so it carries its own marker and lands
 /// at `debug!`. Attach it with [`anyhow::Error::context`] and recover it with
 /// `anyhow::Error::is`.
@@ -583,7 +583,7 @@ mod tests {
     fn an_unmarked_error_is_a_node_fault() {
         assert!(!is_peer_attributable(&anyhow::anyhow!("store read failed")));
         assert!(is_peer_attributable(
-            &anyhow::Error::new(ClientPaymentFault).context("voucher underpays")
+            &anyhow::Error::new(ClientPaymentFault).context("voucher fails rate check")
         ));
     }
 

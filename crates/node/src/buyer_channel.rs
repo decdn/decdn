@@ -37,7 +37,8 @@ use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
 use decdn_incentive::{
-    AdvanceOutcome, BuyerPoolState, BuyerPoolStore, LaneKey, PoolId, PoolOpenFailureReason,
+    AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, LaneKey, PoolId,
+    PoolOpenFailureReason,
 };
 use futures_util::FutureExt;
 use tracing::{debug, error, info, warn};
@@ -1149,6 +1150,11 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// cumulative `bytes` / `amount`. The buyer prices `cumulative = bytes × rate`
     /// from its own BLAKE3-verified bytes, so there is no nonce to track.
     ///
+    /// `rebase_anchor` is the upstream's authenticated watermark the lane's
+    /// ledger moved DOWN to (`PoolLedger::rebase`) and no persist has recorded
+    /// yet. The record is then overwritten with it and advanced to the totals,
+    /// since the monotone advance refuses a lower total.
+    ///
     /// # Errors
     ///
     /// Errors on a store write fault. A stale write (the owner's pool was replaced
@@ -1161,17 +1167,45 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         pool_id: PoolId,
         bytes_delivered: U256,
         amount: U256,
+        rebase_anchor: Option<BuyerLaneProgress>,
     ) -> Result<()> {
         let lane = LaneKey {
             pool_id,
             signer: self.signer.address(),
             provider: provider_addr,
         };
-        match self
-            .store
-            .advance_progress(self.owner, pool_id, lane, bytes_delivered, amount)
-            .context("advance buyer pool lane progress")?
-        {
+        // A ledger that rebased DOWN to the upstream's authenticated watermark
+        // records it once with an overwrite: the monotone advance would refuse it,
+        // and the next reuse would sign from the anchor the upstream already
+        // refused. Every other persist is a monotone advance.
+        let outcome = match rebase_anchor {
+            Some(anchor) => {
+                let totals = BuyerLaneProgress {
+                    last_amount: amount,
+                    last_bytes: bytes_delivered,
+                };
+                self.store
+                    .rebase_progress(self.owner, pool_id, lane, anchor, totals)
+                    .with_context(|| {
+                        format!(
+                            "rebase buyer pool lane progress down to the upstream watermark \
+                             (amount {}, bytes {}), then to (amount {amount}, bytes \
+                             {bytes_delivered})",
+                            anchor.last_amount, anchor.last_bytes
+                        )
+                    })
+            }
+            None => self
+                .store
+                .advance_progress(self.owner, pool_id, lane, bytes_delivered, amount)
+                .with_context(|| {
+                    format!(
+                        "advance buyer pool lane progress to (amount {amount}, bytes \
+                         {bytes_delivered})"
+                    )
+                }),
+        };
+        match outcome? {
             AdvanceOutcome::Advanced => Ok(()),
             AdvanceOutcome::UnknownPool => {
                 anyhow::bail!("record_progress for unknown pool {pool_id}")
@@ -1300,7 +1334,8 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
     ) -> Result<PoolContext>;
 
     /// Persist the cumulative voucher totals paid on the `(signer, provider)` lane
-    /// of `pool_id`. See [`BuyerPoolService::record_progress`].
+    /// of `pool_id`, overwriting the record down to `rebase_anchor` first when the
+    /// lane's ledger rebased. See [`BuyerPoolService::record_progress`].
     ///
     /// # Errors
     ///
@@ -1311,6 +1346,7 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
         pool_id: PoolId,
         bytes_delivered: U256,
         amount: U256,
+        rebase_anchor: Option<BuyerLaneProgress>,
     ) -> Result<()>;
 
     /// Fund `additional` of new headroom in the node's pool, returning its NEW total
@@ -1350,8 +1386,16 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
         pool_id: PoolId,
         bytes_delivered: U256,
         amount: U256,
+        rebase_anchor: Option<BuyerLaneProgress>,
     ) -> Result<()> {
-        BuyerPoolService::record_progress(self, provider_addr, pool_id, bytes_delivered, amount)
+        BuyerPoolService::record_progress(
+            self,
+            provider_addr,
+            pool_id,
+            bytes_delivered,
+            amount,
+            rebase_anchor,
+        )
     }
 
     async fn top_up_pool_by(&self, additional: U256) -> Result<TopUpLanded> {
@@ -2809,6 +2853,77 @@ mod tests {
         }
     }
 
+    /// `record_progress` with a rebase anchor overwrites the lane record DOWN to
+    /// the upstream's watermark and advances it to the totals; without an anchor
+    /// the same lower totals are a superseded write that leaves the record alone.
+    #[tokio::test]
+    async fn record_progress_overwrites_down_only_with_a_rebase_anchor() {
+        let owner = Address::repeat_byte(1);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let pool_id = PoolId::from([0x5A; 32]);
+        let provider = Address::repeat_byte(0xB0);
+        let lane = LaneKey {
+            pool_id,
+            signer: signer.address(),
+            provider,
+        };
+        let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+        let mut state = BuyerPoolState::new(
+            pool_id,
+            Address::ZERO,
+            owner,
+            Address::repeat_byte(2),
+            U256::from(10_000_000u64),
+        );
+        state
+            .advance_lane(lane, U256::from(900u64), U256::from(90u64))
+            .expect("seed the lane");
+        store.record(&state).expect("record the pool");
+        let svc = mocked_service(Vec::new(), Arc::clone(&store), Arc::clone(&signer), owner);
+        let lane_record = || {
+            store
+                .get_by_owner(owner)
+                .expect("read")
+                .and_then(|s| s.lane_progress(lane))
+                .expect("lane record")
+        };
+
+        svc.record_progress(
+            provider,
+            pool_id,
+            U256::from(600u64),
+            U256::from(65u64),
+            None,
+        )
+        .expect("a superseded write is not an error");
+        assert_eq!(
+            lane_record().last_amount,
+            U256::from(90u64),
+            "without an anchor the write is monotone"
+        );
+
+        let anchor = BuyerLaneProgress {
+            last_amount: U256::from(60u64),
+            last_bytes: U256::from(500u64),
+        };
+        svc.record_progress(
+            provider,
+            pool_id,
+            U256::from(600u64),
+            U256::from(65u64),
+            Some(anchor),
+        )
+        .expect("the rebase write lands");
+        assert_eq!(
+            lane_record(),
+            BuyerLaneProgress {
+                last_amount: U256::from(65u64),
+                last_bytes: U256::from(600u64),
+            },
+            "overwritten down to the anchor, then advanced to the totals"
+        );
+    }
+
     /// The pull hot path refuses a foreign row on its own, without relying on
     /// bootstrap having cleaned up.
     ///
@@ -3087,6 +3202,16 @@ mod tests {
         ) -> std::result::Result<AdvanceOutcome, StoreError> {
             Err(StoreError::Backend("advance_progress faulted".into()))
         }
+        fn rebase_progress(
+            &self,
+            _owner: Address,
+            _pool_id: PoolId,
+            _lane: LaneKey,
+            _anchor: BuyerLaneProgress,
+            _totals: BuyerLaneProgress,
+        ) -> std::result::Result<AdvanceOutcome, StoreError> {
+            Err(StoreError::Backend("rebase_progress faulted".into()))
+        }
         fn add_deposit(
             &self,
             _owner: Address,
@@ -3203,6 +3328,16 @@ mod tests {
         ) -> std::result::Result<AdvanceOutcome, StoreError> {
             self.0.advance_progress(owner, pool_id, lane, bytes, amount)
         }
+        fn rebase_progress(
+            &self,
+            owner: Address,
+            pool_id: PoolId,
+            lane: LaneKey,
+            anchor: BuyerLaneProgress,
+            totals: BuyerLaneProgress,
+        ) -> std::result::Result<AdvanceOutcome, StoreError> {
+            self.0.rebase_progress(owner, pool_id, lane, anchor, totals)
+        }
         fn add_deposit(
             &self,
             owner: Address,
@@ -3255,6 +3390,16 @@ mod tests {
             amount: U256,
         ) -> std::result::Result<AdvanceOutcome, StoreError> {
             self.0.advance_progress(owner, pool_id, lane, bytes, amount)
+        }
+        fn rebase_progress(
+            &self,
+            owner: Address,
+            pool_id: PoolId,
+            lane: LaneKey,
+            anchor: BuyerLaneProgress,
+            totals: BuyerLaneProgress,
+        ) -> std::result::Result<AdvanceOutcome, StoreError> {
+            self.0.rebase_progress(owner, pool_id, lane, anchor, totals)
         }
         fn add_deposit(
             &self,

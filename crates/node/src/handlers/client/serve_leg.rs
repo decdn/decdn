@@ -84,8 +84,8 @@ impl ClientHandler {
     ///
     /// # Errors
     ///
-    /// A client disconnect (the write / voucher-collect surfaces it), an
-    /// underpayment bail, an `encode_range` fault, an offset at or past the blob
+    /// A client disconnect (the write / voucher-collect surfaces it), a rate-check
+    /// bail, an `encode_range` fault, an offset at or past the blob
     /// end, or a gap the pull leg could not fill. On any error the caller drops the
     /// pull leg, which stops the upstream spend and persists the buyer watermark.
     /// The peer-attributable errors carry
@@ -296,7 +296,7 @@ impl ClientHandler {
                     {
                         Ok(stop) => stop,
                         Err(e) => {
-                            // Transport drop or underpayment bail (#856/#857): meter the
+                            // Transport drop or rate-check bail (#856/#857): meter the
                             // abandon, then propagate so the caller drops the pull leg.
                             self.metrics.node_pull_through_client_abandoned();
                             return Err(e);

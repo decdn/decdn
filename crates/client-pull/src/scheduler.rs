@@ -2201,6 +2201,7 @@ mod tests {
                 anyhow::Error::new(crate::UpstreamVoucherRejected {
                     reason: VoucherRejectReason::CapabilityExpired,
                     bundle: None,
+                    proof_generation: None,
                 })
             })
             .paying(Arc::clone(&ledger_terminal));

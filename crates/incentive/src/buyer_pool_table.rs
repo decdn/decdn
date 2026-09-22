@@ -29,7 +29,8 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 use serde::{Deserialize, Serialize};
 
 use crate::buyer_pool::{
-    AdvanceOutcome, BuyerLaneProgress, BuyerLoad, BuyerPoolState, DepositOutcome,
+    AdvanceOutcome, BuyerLaneProgress, BuyerLoad, BuyerPoolState, BuyerProgressError,
+    DepositOutcome,
 };
 use crate::lane::{LaneKey, PoolId};
 use crate::store::StoreError;
@@ -592,6 +593,42 @@ impl<'a> BuyerPoolTable<'a> {
         bytes: U256,
         amount: U256,
     ) -> Result<AdvanceOutcome, StoreError> {
+        self.write_lane(owner, pool_id, |state| {
+            state.advance_lane(lane, bytes, amount)
+        })
+    }
+
+    /// Atomically overwrite `lane`'s committed progress in `owner`'s pool
+    /// ([`BuyerPoolState::rebase_lane`]), inside the same single write
+    /// transaction and owner-index CAS as [`Self::advance_progress`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] / [`StoreError::Codec`] on I/O or codec
+    /// failure.
+    pub fn rebase_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.write_lane(owner, pool_id, |state| {
+            state.rebase_lane(lane, anchor, totals);
+            Ok(())
+        })
+    }
+
+    /// The shared body of [`Self::advance_progress`] and
+    /// [`Self::rebase_progress`]: owner-index CAS, then `apply` to the
+    /// committed row and write it back, all in one durable write transaction.
+    fn write_lane(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        apply: impl FnOnce(&mut BuyerPoolState) -> Result<(), BuyerProgressError>,
+    ) -> Result<AdvanceOutcome, StoreError> {
         let index_key: [u8; 20] = owner.into();
         let primary_key: [u8; 32] = pool_id.into();
         let write_txn = self.begin_durable_write()?;
@@ -628,7 +665,7 @@ impl<'a> BuyerPoolTable<'a> {
             // Drop the borrow of `table` held by `value_guard` before
             // mutating.
             drop(value_guard);
-            if let Err(err) = state.advance_lane(lane, bytes, amount) {
+            if let Err(err) = apply(&mut state) {
                 return Ok(AdvanceOutcome::Regressed(err));
             }
             let encoded = encode_record(&state)?;
@@ -1236,6 +1273,71 @@ mod tests {
             stored.lane_progress(lane) == Some(progress),
             "committed watermark regressed"
         );
+        Ok(())
+    }
+
+    /// A rebase overwrites the committed watermark DOWN (the ledger moved to the
+    /// node's watermark), and keeps the same pool-id guard as an advance: it
+    /// never clobbers a row replaced by a newer open.
+    #[test]
+    fn rebase_progress_overwrites_down_and_guards_the_pool() -> anyhow::Result<()> {
+        let (_d, db) = db()?;
+        let s = state(8);
+        tbl(&db).record(&s)?;
+        let lane = s
+            .lanes()
+            .next()
+            .map(|(k, _)| k)
+            .ok_or_else(|| anyhow::anyhow!("fixture has no lane"))?;
+        let progress = s
+            .lane_progress(lane)
+            .ok_or_else(|| anyhow::anyhow!("missing progress"))?;
+        let anchor = BuyerLaneProgress {
+            last_amount: progress.last_amount - U256::from(10u64),
+            last_bytes: progress.last_bytes - U256::from(10u64),
+        };
+        let totals = BuyerLaneProgress {
+            last_amount: anchor.last_amount + U256::from(3u64),
+            last_bytes: anchor.last_bytes + U256::from(3u64),
+        };
+
+        let wrong_pool = PoolId::repeat_byte(0xEE);
+        let outcome = tbl(&db).rebase_progress(s.owner, wrong_pool, lane, anchor, totals)?;
+        anyhow::ensure!(
+            matches!(outcome, AdvanceOutcome::PoolMismatch),
+            "a rebase against a replaced pool must not write, got {outcome:?}"
+        );
+
+        let outcome = tbl(&db).rebase_progress(s.owner, s.pool_id, lane, anchor, totals)?;
+        anyhow::ensure!(
+            matches!(outcome, AdvanceOutcome::Advanced),
+            "a rebase must write, got {outcome:?}"
+        );
+        let stored = tbl(&db)
+            .get_by_owner(s.owner)?
+            .and_then(|row| row.lane_progress(lane))
+            .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
+        anyhow::ensure!(
+            stored == totals,
+            "the rebase must overwrite down to the anchor and advance to the totals, got \
+             {stored:?}"
+        );
+
+        // Totals below the anchor record the anchor alone.
+        let low = BuyerLaneProgress {
+            last_amount: anchor.last_amount - U256::from(1u64),
+            last_bytes: anchor.last_bytes,
+        };
+        let outcome = tbl(&db).rebase_progress(s.owner, s.pool_id, lane, anchor, low)?;
+        anyhow::ensure!(
+            matches!(outcome, AdvanceOutcome::Advanced),
+            "got {outcome:?}"
+        );
+        let stored = tbl(&db)
+            .get_by_owner(s.owner)?
+            .and_then(|row| row.lane_progress(lane))
+            .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
+        anyhow::ensure!(stored == anchor, "got {stored:?}");
         Ok(())
     }
 
