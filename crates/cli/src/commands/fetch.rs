@@ -2965,20 +2965,6 @@ impl SpeedState {
         self.last = Some((now, received));
         self.ewma_bps.unwrap_or(0.0)
     }
-
-    /// Move the cumulative baseline forward by `bytes` that were not transferred
-    /// (already on disk), so the next sample's delta excludes them and the rate
-    /// stays a transfer rate. A no-op before the first sample: the first
-    /// [`observe`](Self::observe) then seeds from whatever position it sees and
-    /// computes no rate from it.
-    pub(crate) const fn shift(&mut self, bytes: u64) {
-        if let Some((at, pos)) = self.last {
-            self.last = Some((at, pos.saturating_add(bytes)));
-        }
-        if let Some((at, pos)) = self.started {
-            self.started = Some((at, pos.saturating_add(bytes)));
-        }
-    }
 }
 
 /// Widen a byte count to `f64` for rate arithmetic. A single transfer never
@@ -3062,26 +3048,6 @@ fn delivery_progress() -> (
     // same bar the caller clears.
     let (on_progress, meter) = bar_callback(bar.clone());
     (bar, on_progress, meter)
-}
-
-/// The style of a `bundle pull` per-file bar: the [`new_progress_bar`] layout with
-/// the leading spinner replaced by a `{prefix}` file label and no rate/ETA
-/// `{msg}`. A per-file rate in a concurrent pull is one lane's share of the link
-/// and its ETA reads as stuck whenever another file has the bandwidth, so
-/// `bundle pull` shows one rate and ETA on its total bar instead, where they
-/// describe the whole download.
-///
-/// This is a style, not a bar: `bundle pull` builds each bar inside its
-/// `MultiProgress` (`mp.insert_before(.., ProgressBar::new(0))`) and applies the
-/// style afterwards. A bar styled, labeled, or sized before it joins the container
-/// draws itself straight to stderr, and the container never accounts for that
-/// orphan line, so every later redraw scrolls instead of overwriting it.
-pub(crate) fn labeled_delivery_style() -> indicatif::ProgressStyle {
-    indicatif::ProgressStyle::with_template(
-        "{prefix:.bold} {bytes}/{total_bytes} [{wide_bar:.cyan/blue}]",
-    )
-    .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
-    .progress_chars("=>-")
 }
 
 /// Build the callback that drives `bar` — setting its length to the blob's
