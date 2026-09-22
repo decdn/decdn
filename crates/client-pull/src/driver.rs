@@ -78,7 +78,7 @@ use decdn_bao_range::{CHUNK_GROUP_BYTES, align_range};
 use decdn_incentive::DepositOutcome;
 
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
-use crate::source::{BlobSource, Funder, IngestStore};
+use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
 use crate::{
     MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, ProgressCallback, UpstreamPullHeader,
     genuine_exhaustion, heal_watermark_desync, is_insufficient_deposit,
@@ -258,8 +258,8 @@ pub const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
 pub const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
 
 /// How often a fetch's single flush owner persists the `.ranges` present record
-/// while sources are still delivering. `ClientRangedStore::checkpoint` fsyncs
-/// data and outboard every ~4 MiB but no longer writes the record, so this
+/// while sources are still delivering. The ranged store's ingest `checkpoint`
+/// fsyncs data and outboard every ~4 MiB but never writes the record, so this
 /// interval bounds crash-loss of resume progress to at most one interval (spec
 /// §5.5): a killed fetch resumes from the last flushed frontier instead of
 /// refetching — and re-paying for — the whole in-flight download. 5 seconds
@@ -271,7 +271,7 @@ pub(crate) const PRESENT_RECORD_FLUSH_INTERVAL: Duration = Duration::from_secs(5
 /// so a crash mid-fetch costs at most one `interval` of resume progress (spec
 /// §5.5). `fut` is the SOLE work driver and this loop is the SOLE periodic flush
 /// owner — nothing inside `fut` flushes — which preserves the single-writer
-/// property `ClientRangedStore::checkpoint` relies on. Returns once `fut`
+/// property the ranged store's ingest `checkpoint` relies on. Returns once `fut`
 /// resolves; the caller does the final flush.
 ///
 /// `tokio::time::interval`'s first tick fires immediately, so it is consumed
@@ -288,14 +288,44 @@ where
     tokio::pin!(fut);
     let mut tick = tokio::time::interval(interval);
     tick.tick().await; // consume the immediate first tick
+    // The record write in flight, if any. It runs beside `fut`, never instead
+    // of it: `fut` carries every lane's pay loop, so pausing it for a record
+    // fsync would stall voucher sends. A tick that finds a write still in
+    // flight skips, which keeps this the single record writer.
+    let mut flush: Option<SourceFuture<'_, ()>> = None;
     loop {
         tokio::select! {
             // Prefer completion: if the work is done, finish rather than flush —
-            // the caller's final flush persists the terminal snapshot.
+            // the caller's final flush persists the terminal snapshot. Land the
+            // write in flight first, so it cannot rename an older snapshot over
+            // the caller's final one.
             biased;
-            res = &mut fut => return res,
-            _ = tick.tick() => store.flush_present_record()?,
+            res = &mut fut => {
+                if let Some(pending) = flush.take() {
+                    let flushed = pending.await;
+                    res?;
+                    return flushed;
+                }
+                return res;
+            }
+            flushed = await_flush(&mut flush), if flush.is_some() => {
+                flush = None;
+                flushed?;
+            }
+            _ = tick.tick() => {
+                if flush.is_none() {
+                    flush = Some(store.flush_present_record());
+                }
+            }
         }
+    }
+}
+
+/// Await the record write in `flush`. Only polled while one is in flight.
+async fn await_flush(flush: &mut Option<SourceFuture<'_, ()>>) -> anyhow::Result<()> {
+    match flush {
+        Some(pending) => pending.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -443,8 +473,8 @@ where
     let gaps = contiguous_byte_ranges(&missing, total_bytes);
 
     // Fill every gap while a single periodic tick flushes the `.ranges` present
-    // record (spec §5.5, single-writer flush point). `ClientRangedStore::checkpoint`
-    // no longer persists the record per checkpoint, so without this interval flush
+    // record (spec §5.5, single-writer flush point). The ranged store's ingest
+    // `checkpoint` never persists the record, so without this interval flush
     // a crash mid-fetch would leave `.ranges` at pre-session state and re-download
     // (and re-pay for) the whole in-flight range on resume; the interval bounds
     // that loss to one `PRESENT_RECORD_FLUSH_INTERVAL`. This loop is the
@@ -492,7 +522,7 @@ where
     // already-bought resume progress the next invocation would have to re-pay
     // for. The drive's own error is the more informative one, so it wins when
     // both fail; a flush failure alone still surfaces.
-    let flushed = store.flush_present_record();
+    let flushed = store.flush_present_record().await;
     outcome?;
     flushed?;
 
@@ -2791,9 +2821,12 @@ mod tests {
     /// An [`IngestStore`] wrapper that counts `flush_present_record` calls and
     /// delegates every real operation to an inner [`ClientRangedStore`]. It lets
     /// a test observe the interval flush firing during a still-running fetch.
+    /// `flush_delay` makes each flush take that long before it writes, to model
+    /// a record fsync under writeback pressure.
     struct FlushCountingStore {
         inner: ClientRangedStore,
         flushes: Arc<std::sync::atomic::AtomicUsize>,
+        flush_delay: std::time::Duration,
     }
 
     impl RangedStore for FlushCountingStore {
@@ -2845,10 +2878,15 @@ mod tests {
             Box::pin(self.inner.ingest_stream(range, reader, on_progress))
         }
 
-        fn flush_present_record(&self) -> std::io::Result<()> {
+        fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
             self.flushes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.flush_present_record()
+            let write = crate::source::IngestStore::flush_present_record(&self.inner);
+            let delay = self.flush_delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                write.await
+            })
         }
     }
 
@@ -2878,7 +2916,7 @@ mod tests {
         let inner = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
         // Durably checkpoint a real, verified 4 MiB prefix into the store — the
         // resume progress the interval flush must persist — without yet writing
-        // the `.ranges` record (checkpoint no longer does, spec §5.5).
+        // the `.ranges` record (checkpoint never does, spec §5.5).
         let prefix = align_range(0, 4 * 1024 * 1024, total).expect("align prefix");
         preadmit(&inner, &plaintext, &outboard, &prefix).await;
 
@@ -2886,6 +2924,7 @@ mod tests {
         let store = FlushCountingStore {
             inner,
             flushes: Arc::clone(&flushes),
+            flush_delay: std::time::Duration::ZERO,
         };
 
         // A work future that stays pending across several 20 ms intervals, so the
@@ -2920,6 +2959,63 @@ mod tests {
             present,
             prefix.chunk_ranges().clone(),
             "the interval-flushed record must persist the checkpointed prefix"
+        );
+    }
+
+    /// A slow record write never pauses the fetch. `fut` carries every lane's
+    /// pay loop, so the interval owner runs each flush beside it rather than
+    /// instead of it. Here each flush takes 50 ms against a 20 ms interval, and
+    /// the work is 13 sequential 10 ms steps. Run beside the work, the flushes
+    /// leave it finishing at 130 ms of virtual time. Awaited inline, every tick
+    /// would stall the work by 50 ms.
+    #[tokio::test(start_paused = true)]
+    async fn interval_flush_runs_beside_the_fetch() {
+        let total = 8 * 1024 * 1024;
+        let (root, _plaintext, _outboard) = synth_blob(total as usize);
+        let dir = tmp_dir();
+        let inner = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
+        let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = FlushCountingStore {
+            inner,
+            flushes: Arc::clone(&flushes),
+            flush_delay: std::time::Duration::from_millis(50),
+        };
+
+        let started = tokio::time::Instant::now();
+        let work = async move {
+            for _ in 0..13 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Ok::<_, anyhow::Error>(started.elapsed())
+        };
+        let work_elapsed = Arc::new(std::sync::Mutex::new(None));
+        let record = Arc::clone(&work_elapsed);
+        super::drive_with_interval_flush(
+            &store,
+            std::time::Duration::from_millis(20),
+            async move {
+                let elapsed = work.await?;
+                if let Ok(mut slot) = record.lock() {
+                    *slot = Some(elapsed);
+                }
+                Ok(())
+            },
+        )
+        .await
+        .expect("interval-flush wrapper completes");
+
+        let elapsed = work_elapsed
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .expect("the work recorded its elapsed time");
+        assert!(
+            elapsed < std::time::Duration::from_millis(140),
+            "a slow record flush must not pause the fetch: the work took {elapsed:?}"
+        );
+        assert!(
+            flushes.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the interval owner must still flush during the fetch"
         );
     }
 

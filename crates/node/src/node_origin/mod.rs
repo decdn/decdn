@@ -1455,6 +1455,30 @@ fn economic_ceiling(
     let sell = deps.config.sell_rate_base;
     let operator_bps = deps.config.operator_shares.bps();
     let warm = deps.config.warming.available(source);
+    // A short, stable identifier for the upstream source, computed only in the
+    // cold telemetry branches below (not on every candidate).
+    let source_hex = || -> String {
+        use std::fmt::Write as _;
+        source
+            .as_bytes()
+            .iter()
+            .take(8)
+            .fold(String::with_capacity(16), |mut acc, b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
+    };
+    // A spent per-source allowance downgrades this source from the market-price
+    // (warming) ceiling to the amortized floor. Count it only when warming is
+    // configured, so a node that runs warming off does not report every source
+    // as griefed down.
+    if !warm && deps.config.warming.enabled() {
+        deps.metrics.warming_speculative_blocked();
+        debug!(
+            source = %source_hex(),
+            "node-origin: warming allowance spent for source; buying at amortized floor only"
+        );
+    }
     let mk = |warming_available| crate::serve_economics::ServeEconomicsCtx {
         sell_rate_per_mb: sell,
         operator_bps,
@@ -1473,7 +1497,20 @@ fn economic_ceiling(
             speculative: false,
         },
         Some(max_buy) if candidate_rate > max_buy => {
-            deps.metrics.serve_economics_refused();
+            let regime = if warm {
+                crate::metrics::ServeEconomicsRegime::Warming
+            } else {
+                crate::metrics::ServeEconomicsRegime::Amortized
+            };
+            deps.metrics.serve_economics_refused(regime);
+            debug!(
+                source = %source_hex(),
+                candidate_rate,
+                max_buy,
+                ?regime,
+                heat,
+                "node-origin: candidate rate above serve-economics ceiling; declining relay"
+            );
             EconGate::Skip
         }
         Some(max_buy) => {
