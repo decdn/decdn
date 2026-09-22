@@ -116,15 +116,15 @@ impl BlobSource for BackendSource {
             }
             // Stream + verify + encode the range out of our own origin. A fault
             // found up front (a wrong-length outboard or first window, a transport
-            // fault) surfaces here via `?`; a decline (no origin serves it any
-            // more) is `None`.
+            // fault, a read past its time budget) surfaces here via `?`; a clean
+            // decline (no origin serves the outboard or the range) is `None`.
             let Some(wire) = self
                 .engine
                 .origin_range_wire(Hash::from(hash), &range)
                 .await?
             else {
                 anyhow::bail!(
-                    "backend origin no longer serves range for {}",
+                    "no configured origin serves the outboard or the range for {}",
                     Hash::from(hash)
                 );
             };

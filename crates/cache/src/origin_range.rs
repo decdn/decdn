@@ -1,7 +1,8 @@
-//! Windowed origin range pulls (#2065): an origin's `{H}.obao4` outboard is read
-//! once, and the requested span is fetched in bounded windows of
-//! [`RANGE_PULL_WINDOW_BYTES`], so a range pull holds `O(window + outboard)`
-//! bytes whatever its length.
+//! Windowed origin range pulls (#2065): the requested span is fetched in bounded
+//! windows of [`RANGE_PULL_WINDOW_BYTES`] against an `{H}.obao4` outboard that
+//! the engine caches per hash, so a range pull holds `O(window + outboard)`
+//! bytes whatever its length. Each origin read runs under a time budget
+//! (see [`crate::CacheEngine::set_origin_read_budget`]).
 //!
 //! [`crate::CacheEngine::origin_range_wire`] (the own-origin serve-miss spine's
 //! pull leg) builds on the `OriginRangeCursor` here. It needs ONE coherent
@@ -11,8 +12,10 @@
 //! that pulls the cursor's windows in order, and streams the output through a
 //! bounded channel ([`OriginRangeWire`]).
 
+use std::future::Future;
 use std::io;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use bao_tree::io::EncodeError;
 use bao_tree::io::fsm::encode_ranges_validated;
@@ -25,7 +28,31 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 use crate::error::{CacheError, CacheResult};
 use crate::metrics::CacheMetrics;
-use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
+use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest};
+use crate::outboard_cache::OutboardCache;
+
+/// The time budget for one origin read of the range-pull path — an outboard
+/// fetch or one data window. A read of `len` bytes gets
+/// `head_start + len / min_bps`, so the budget scales with the read and never
+/// caps the blob size (see [`crate::CacheEngine::set_origin_read_budget`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OriginReadBudget {
+    /// Fixed allowance for the connection and the first byte.
+    pub(crate) head_start: Duration,
+    /// Average throughput, in bytes per second, the rest of the read must
+    /// sustain. Never zero.
+    pub(crate) min_bps: u64,
+}
+
+impl OriginReadBudget {
+    /// The budget for a read of `len` bytes.
+    pub(crate) fn for_len(self, len: u64) -> Duration {
+        let nanos = (u128::from(len) * 1_000_000_000).div_ceil(u128::from(self.min_bps.max(1)));
+        self.head_start.saturating_add(Duration::from_nanos(
+            u64::try_from(nanos).unwrap_or(u64::MAX),
+        ))
+    }
+}
 use crate::range_pull::{AlignedRange, IROH_BLOCK_SIZE};
 
 /// Largest data span one [`Origin::fetch_range_data`] call fetches. A multiple
@@ -44,6 +71,42 @@ pub const MAX_CONCURRENT_RANGE_PULLS: usize = 4;
 /// parks. The encoder writes one parent pair or one chunk group per item, so the
 /// channel holds at most this many chunk groups.
 const WIRE_CHANNEL_CAP: usize = 8;
+
+/// Run one origin read `fut` of `len` bytes of `hash`'s range-pull path under
+/// `budget`. A read past its budget is an origin transport fault
+/// ([`CacheError::OriginError`]), so the caller advances the origin chain or
+/// fails the fill as for any other transport fault; it also bumps
+/// `origin_range_timeouts`. `None` runs `fut` unbounded.
+///
+/// # Errors
+///
+/// [`CacheError::OriginError`] when `fut` does not finish within its budget.
+pub(crate) async fn within_origin_timeout<F: Future>(
+    budget: Option<OriginReadBudget>,
+    len: u64,
+    hash: Hash,
+    what: &'static str,
+    metrics: Option<&CacheMetrics>,
+    fut: F,
+) -> CacheResult<F::Output> {
+    let Some(budget) = budget else {
+        return Ok(fut.await);
+    };
+    let limit = budget.for_len(len);
+    tokio::time::timeout(limit, fut).await.map_err(|_| {
+        if let Some(m) = metrics {
+            m.origin_range_timeouts.inc();
+        }
+        CacheError::OriginError {
+            hash,
+            source: anyhow::anyhow!(
+                "origin {what} of {len} bytes took longer than its {limit:?} budget \
+                 (cache.node_pull_stall_window_sec plus the size at \
+                 cache.node_pull_min_throughput_bps)"
+            ),
+        }
+    })
+}
 
 /// The window spans `[start, end)` that cover an [`AlignedRange`], in order.
 /// Each is at most [`RANGE_PULL_WINDOW_BYTES`] long and starts on a chunk-group
@@ -102,13 +165,15 @@ pub(crate) enum WindowFetch {
     WrongLength { start: u64, end: u64, got: usize },
 }
 
-/// One origin that serves the outboard for `hash`, walking the windows of the
-/// span it was opened for, in order. The outboard is UNTRUSTED until a window
-/// verifies against the root `H`.
+/// One origin serving the data of `hash`, walking the windows of the span it was
+/// opened for, in order. The outboard is UNTRUSTED until a window verifies
+/// against the root `H`.
 pub(crate) struct OriginRangeCursor {
     origin: Arc<dyn Origin>,
     hash: Hash,
     outboard: Bytes,
+    /// Time budget for each window fetch; `None` is unbounded.
+    budget: Option<OriginReadBudget>,
     metrics: Option<Arc<CacheMetrics>>,
     spans: WindowSpans,
     /// The first window, fetched by [`Self::open`] and not yet handed out.
@@ -116,41 +181,33 @@ pub(crate) struct OriginRangeCursor {
 }
 
 impl OriginRangeCursor {
-    /// Open a cursor on `origin` for `aligned`: read the outboard once, then
-    /// fetch the first window. `Ok(None)` when this origin declines (no
-    /// outboard, or it declines the first window), so the caller can advance
-    /// the origin chain before it commits to this origin.
+    /// Open a cursor on `origin` for `aligned` against the already-read
+    /// `outboard`, and fetch the first window. `Ok(None)` when this origin
+    /// declines the first window, so the caller can advance the origin chain
+    /// before it commits to this origin. Each window fetch runs under `budget`
+    /// ([`within_origin_timeout`]).
     ///
-    /// Meters the outboard and every fetched window as `pull_through_bytes`.
+    /// Meters every fetched window as `pull_through_bytes`. The outboard read
+    /// is metered where it happens, in
+    /// [`crate::CacheEngine::origin_fetch_outboard_bytes`].
     ///
     /// # Errors
     ///
-    /// [`CacheError::OriginError`] for an origin transport fault.
+    /// [`CacheError::OriginError`] for an origin transport fault or a window
+    /// fetch past its budget.
     pub(crate) async fn open(
         origin: Arc<dyn Origin>,
         hash: Hash,
         aligned: &AlignedRange,
-        outboard_max: u64,
+        outboard: Bytes,
+        budget: Option<OriginReadBudget>,
         metrics: Option<Arc<CacheMetrics>>,
     ) -> CacheResult<Option<Self>> {
-        let outboard = match origin
-            .fetch_outboard(hash, outboard_max)
-            .await
-            .map_err(|e| CacheError::OriginError {
-                hash,
-                source: e.into_inner(),
-            })? {
-            OutboardFetch::Found(ob) => ob,
-            OutboardFetch::NotFound | OutboardFetch::Unsupported => return Ok(None),
-        };
-        if let Some(m) = &metrics {
-            m.pull_through_bytes
-                .inc_by(u64::try_from(outboard.len()).unwrap_or(u64::MAX));
-        }
         let mut cursor = Self {
             origin,
             hash,
             outboard,
+            budget,
             metrics,
             spans: WindowSpans::new(aligned),
             pending: None,
@@ -164,7 +221,7 @@ impl OriginRangeCursor {
         }
     }
 
-    /// The untrusted pre-order outboard this cursor read on open.
+    /// The untrusted pre-order outboard this cursor was opened with.
     pub(crate) fn outboard(&self) -> Bytes {
         self.outboard.clone()
     }
@@ -200,14 +257,19 @@ impl OriginRangeCursor {
             fetch_start: start,
             fetch_end: end,
         };
-        let data = match self
-            .origin
-            .fetch_range_data(self.hash, req)
-            .await
-            .map_err(|e| CacheError::OriginError {
-                hash: self.hash,
-                source: e.into_inner(),
-            })? {
+        let data = match within_origin_timeout(
+            self.budget,
+            end - start,
+            self.hash,
+            "range window fetch",
+            self.metrics.as_deref(),
+            self.origin.fetch_range_data(self.hash, req),
+        )
+        .await?
+        .map_err(|e| CacheError::OriginError {
+            hash: self.hash,
+            source: e.into_inner(),
+        })? {
             OriginRangeFetch::Ranged { data } => data,
             OriginRangeFetch::Unsupported | OriginRangeFetch::NotFound => {
                 return Ok(Some(WindowFetch::Declined { start, end }));
@@ -486,11 +548,16 @@ impl std::fmt::Debug for OriginRangeWire {
 impl OriginRangeWire {
     /// Start the encode of `aligned` over `cursor`. Checks the outboard and
     /// first-window lengths up front: either wrong length cannot verify, so it
-    /// is [`CacheError::VerifyFailed`] at once, before any wire.
+    /// is [`CacheError::VerifyFailed`] at once, before any wire. A wrong-length
+    /// outboard or a failed bao verification evicts the cursor's outboard from
+    /// `outboards`, so the next draw reads it from the origin again instead of
+    /// reusing a copy that may be the bad half. A wrong-length first window
+    /// blames the data and keeps the outboard.
     pub(crate) fn spawn(
         cursor: OriginRangeCursor,
         aligned: &AlignedRange,
         permit: OwnedSemaphorePermit,
+        outboards: OutboardCache,
     ) -> CacheResult<Self> {
         let hash = cursor.hash;
         let kind = cursor.origin_kind();
@@ -502,9 +569,10 @@ impl OriginRangeWire {
                 ?kind,
                 expected = tree.outboard_size(),
                 got = outboard.len(),
-                "own origin served a wrong-length outboard; hard local-origin fault \
+                "outboard length does not match the blob size; hard local-origin fault \
                  (no degrade — committed to serving under H)",
             );
+            outboards.evict_if_same(hash, &outboard);
             return Err(CacheError::VerifyFailed { expected: hash });
         }
         if cursor.first_is_wrong_length() {
@@ -516,6 +584,9 @@ impl OriginRangeWire {
             );
             return Err(CacheError::VerifyFailed { expected: hash });
         }
+        // A verify fault does not say whether the outboard or the data was bad,
+        // so the encode task evicts the outboard copy it used.
+        let used_outboard = outboard.clone();
         let ob = PreOrderMemOutboard {
             root: bao_tree::blake3::Hash::from(*hash.as_bytes()),
             tree,
@@ -555,6 +626,7 @@ impl OriginRangeWire {
                         "own origin served a range that failed bao verification against H; \
                          hard local-origin fault (no degrade — committed to serving under H)",
                     );
+                    outboards.evict_if_same(hash, &used_outboard);
                     park_fault(&guard.slot, CacheError::VerifyFailed { expected: hash });
                 }
                 // A reader-side io error has already parked its typed cause, and
@@ -619,13 +691,12 @@ impl Drop for OriginRangeWire {
     reason = "tests"
 )]
 mod tests {
-    use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::error::OriginPullError;
-    use crate::origin::OriginFetch;
+    use crate::origin::{OriginFetch, OutboardFetch};
     use crate::range_pull::align_range;
 
     #[test]
@@ -710,7 +781,8 @@ mod tests {
             Arc::clone(&origin) as Arc<dyn Origin>,
             hash,
             &aligned,
-            u64::MAX,
+            Bytes::new(),
+            None,
             None,
         )
         .await

@@ -966,9 +966,11 @@ impl ClientHandler {
                 // chunk groups, so a bounded request costs exactly its aligned span
                 // in origin egress.
                 //
-                // Serviceability is confirmed by `origin_size` +
-                // `origin_fetch_outboard_bytes` (an origin publishes the outboard) —
-                // NOT by proving a Range/206 `fetch_range_data` works. All three shipped
+                // Serviceability is confirmed by `origin_size` (a live probe of the
+                // data object) + `origin_fetch_outboard_bytes` (an origin publishes the
+                // outboard; a cached copy answers without an origin read, and a draw
+                // that the origin then declines fails the signed stream) — NOT by
+                // proving a Range/206 `fetch_range_data` works. All three shipped
                 // adapters (fs/http/s3) support Range whenever they publish an
                 // outboard, so this holds in practice; a custom Origin that publishes
                 // an outboard but refuses Range would sign `ok:true` then fail the

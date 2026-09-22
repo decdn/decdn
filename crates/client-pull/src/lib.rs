@@ -120,14 +120,14 @@ pub use coverage_plan::{
 };
 pub use decdn_bao_range::RangedStore;
 pub use downloader::{DownloadTarget, Downloader};
-pub use driver::{PacingWait, PoolExhausted, SharedPool, drive};
+pub use driver::{PacingWait, PoolExhausted, SharedPool, WaitReason, drive};
 pub use ledger::{
     ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released, StreamProof,
 };
 pub use ledgers::{LaneHandle, LaneLedgers};
 pub use pacer::{
-    BudgetPacer, DownstreamFrontier, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer,
-    WindowPacer,
+    BudgetPacer, DownstreamFrontier, MIN_DRAW_WINDOW, PULL_WINDOW_FLOOR, PaceDecision, PaceState,
+    Pacer, RampPacer, WindowPacer,
 };
 pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
 pub use ranged_store::ClientRangedStore;

@@ -1080,8 +1080,8 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
         )
         .mount(&server)
         .await;
-    // (2) sibling outboard GET: the dispatch serviceability outboard probe AND the
-    //     pull leg's range-encode outboard fetch (may be hit more than once).
+    // (2) sibling outboard GET: the dispatch serviceability outboard probe. The
+    //     pull leg's draws reuse the copy that probe cached (#2061).
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -1155,6 +1155,16 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
         counter_value(&metrics, "serve_cache_miss_total")? == 1
             && counter_value(&metrics, "serve_cache_hit_total")? == 0,
         "a serve that ran a fill tier must be classified a miss, not a hit"
+    );
+    // The outboard is read from the origin once per hash: the serviceability
+    // probe caches it and every draw reuses it (#2061).
+    let obao_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET" && r.url.path() == format!("/{hex}.obao4")
+    })
+    .await?;
+    anyhow::ensure!(
+        obao_gets == 1,
+        "the outboard must be read from the origin once, read {obao_gets} times"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;

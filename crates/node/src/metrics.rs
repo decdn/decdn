@@ -1163,6 +1163,13 @@ pub struct DecdnMetrics {
     /// doing its job pacing speculation); a flat zero under real pull-through
     /// traffic means the window never binds.
     pub node_pull_through_window_paused: Counter,
+    /// `decdn_node_pull_through_min_draw_waits_total` (#2061): times the
+    /// window-paced serve loop paused the upstream pull because the ramped
+    /// window had room, but less than the minimum draw of half the window, and
+    /// no serve leg was parked at the pull's frontier. Each draw opens a new
+    /// upstream request, so the pause batches the room into fewer, larger draws.
+    /// A high rate is benign; it grows with the number of vouchers per draw.
+    pub node_pull_through_min_draw_waits: Counter,
     /// `decdn_node_pull_through_client_abandoned_total` (#856): window-paced
     /// serves the requesting client dropped or underpaid mid-pull, so the node
     /// aborted the upstream pull and abandoned the partial fill. The per-request
@@ -2518,6 +2525,10 @@ recorders! {
     /// The window-paced serve loop paused the upstream pull at the ramped credit
     /// window to wait for the downstream voucher to clear (#856, #1669).
     node_pull_through_window_paused => node_pull_through_window_paused.inc();
+
+    /// The window-paced serve loop paused the upstream pull until the ramped
+    /// window opened to the minimum draw (#2061).
+    node_pull_through_min_draw_waits => node_pull_through_min_draw_waits.inc();
 
     /// A window-paced serve was abandoned because the requesting client dropped
     /// or underpaid mid-pull (#856).

@@ -347,11 +347,14 @@ pub struct ResolvedCache {
     /// Throughput-floor window (seconds) on the streaming stage of an upstream pull; bytes
     /// are counted off the QUIC stream sub-frame, so it trips only when throughput falls
     /// below the floor, never on a large blob (#1797). Default
-    /// [`crate::config::DEFAULT_NODE_PULL_STALL_WINDOW_SEC`].
+    /// [`crate::config::DEFAULT_NODE_PULL_STALL_WINDOW_SEC`]. Also the head start of each
+    /// own-origin range-pull read's time budget (ADR 037).
     pub node_pull_stall_window_sec: u64,
     /// Minimum sustained upstream throughput (bytes/sec) over `node_pull_stall_window_sec`;
     /// `0` = idle detection only (#1797). Default
-    /// [`crate::config::DEFAULT_NODE_PULL_MIN_THROUGHPUT_BPS`].
+    /// [`crate::config::DEFAULT_NODE_PULL_MIN_THROUGHPUT_BPS`]. Also the average throughput
+    /// each own-origin range-pull read must sustain after the head start; `0` leaves those
+    /// reads unbounded (ADR 037).
     pub node_pull_min_throughput_bps: u64,
     /// Cache eviction policy selector (ADR 040). `"lru"` or `"tinylfu"`.
     /// Default [`crate::config::DEFAULT_EVICTION_POLICY`].
