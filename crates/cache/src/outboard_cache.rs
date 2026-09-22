@@ -26,6 +26,11 @@ use iroh_blobs::Hash;
 /// blob reads it from the origin.
 pub(crate) const OUTBOARD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Entries the cache holds, whatever their bytes. Small blobs have tiny
+/// outboards, so the byte budget alone would let the entry count, and the
+/// `O(n)` eviction scan, grow very large.
+pub(crate) const OUTBOARD_CACHE_ENTRIES: usize = 4096;
+
 /// A cached outboard and the index, in the engine's origin chain, of the origin
 /// that served it.
 #[derive(Debug, Clone)]
@@ -46,8 +51,7 @@ pub(crate) struct OutboardCache {
 /// The cache state behind the handle's mutex.
 ///
 /// Eviction scans every entry for the least recent one. That is `O(n)` under
-/// the lock, and `n` stays small because outboards are large: the byte budget
-/// holds tens to low hundreds of multi-GB blobs' outboards.
+/// the lock, and `n` is at most `max_entries`.
 #[derive(Debug)]
 struct State {
     /// Each entry is the outboard and the tick of its last use.
@@ -56,6 +60,8 @@ struct State {
     bytes: u64,
     /// Largest `bytes` the cache holds.
     budget: u64,
+    /// Largest entry count the cache holds.
+    max_entries: usize,
     /// Use counter. A larger tick is a more recent use.
     tick: u64,
 }
@@ -74,13 +80,15 @@ impl State {
 }
 
 impl OutboardCache {
-    /// An empty cache that holds at most `budget` outboard bytes.
-    pub(crate) fn new(budget: u64) -> Self {
+    /// An empty cache that holds at most `budget` outboard bytes in at most
+    /// `max_entries` entries.
+    pub(crate) fn new(budget: u64, max_entries: usize) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
                 entries: HashMap::new(),
                 bytes: 0,
                 budget,
+                max_entries,
                 tick: 0,
             })),
         }
@@ -109,16 +117,24 @@ impl OutboardCache {
     }
 
     /// Cache `bytes` for `hash` as served by origin `origin_ix`, evicting the
-    /// least recently used entries until it fits. Returns `false`, caching
-    /// nothing, for an outboard larger than the whole budget.
+    /// least recently used entries until it fits in both the byte budget and
+    /// the entry count. Returns `false`, caching nothing, for an outboard
+    /// larger than the whole budget. An empty outboard (a blob of one chunk
+    /// group has no interior nodes) costs no origin read to repeat, so it is
+    /// not cached and returns `true`.
     pub(crate) fn insert(&self, hash: Hash, bytes: Bytes, origin_ix: usize) -> bool {
         let len = len64(&bytes);
+        if len == 0 {
+            return true;
+        }
         let mut state = self.lock();
-        if len > state.budget {
+        if len > state.budget || state.max_entries == 0 {
             return false;
         }
         state.remove(hash);
-        while state.bytes.saturating_add(len) > state.budget {
+        while state.bytes.saturating_add(len) > state.budget
+            || state.entries.len() >= state.max_entries
+        {
             let Some(oldest) = state
                 .entries
                 .iter()
@@ -169,7 +185,7 @@ mod tests {
 
     #[test]
     fn a_cached_outboard_is_returned_with_its_origin() {
-        let cache = OutboardCache::new(100);
+        let cache = OutboardCache::new(100, 16);
         let h = Hash::new(b"a");
         assert!(cache.get(h, 10).is_none());
         assert!(cache.insert(h, ob(10), 2));
@@ -180,7 +196,7 @@ mod tests {
 
     #[test]
     fn a_hit_of_another_length_is_a_miss_and_drops_the_entry() {
-        let cache = OutboardCache::new(100);
+        let cache = OutboardCache::new(100, 16);
         let h = Hash::new(b"a");
         cache.insert(h, ob(10), 0);
         assert!(cache.get(h, 11).is_none());
@@ -190,7 +206,7 @@ mod tests {
 
     #[test]
     fn an_insert_past_the_budget_evicts_the_least_recently_used() {
-        let cache = OutboardCache::new(100);
+        let cache = OutboardCache::new(100, 16);
         let (a, b, c) = (Hash::new(b"a"), Hash::new(b"b"), Hash::new(b"c"));
         cache.insert(a, ob(40), 0);
         cache.insert(b, ob(40), 0);
@@ -208,7 +224,7 @@ mod tests {
 
     #[test]
     fn an_insert_evicts_as_many_entries_as_it_needs() {
-        let cache = OutboardCache::new(100);
+        let cache = OutboardCache::new(100, 16);
         let hashes: Vec<Hash> = (0u8..4).map(|i| Hash::new([i])).collect();
         for h in &hashes {
             cache.insert(*h, ob(25), 0);
@@ -223,8 +239,28 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_outboard_is_not_cached() {
+        let cache = OutboardCache::new(100, 16);
+        let h = Hash::new(b"a");
+        assert!(cache.insert(h, Bytes::new(), 0));
+        assert!(cache.get(h, 0).is_none());
+    }
+
+    #[test]
+    fn the_entry_count_is_bounded() {
+        let cache = OutboardCache::new(1_000, 2);
+        let (a, b, c) = (Hash::new(b"a"), Hash::new(b"b"), Hash::new(b"c"));
+        cache.insert(a, ob(1), 0);
+        cache.insert(b, ob(1), 0);
+        cache.insert(c, ob(1), 0);
+        assert!(cache.get(a, 1).is_none(), "the oldest entry goes");
+        assert!(cache.get(b, 1).is_some() && cache.get(c, 1).is_some());
+        assert_eq!(cache.bytes(), 2);
+    }
+
+    #[test]
     fn an_outboard_larger_than_the_budget_is_not_cached() {
-        let cache = OutboardCache::new(100);
+        let cache = OutboardCache::new(100, 16);
         let (a, big) = (Hash::new(b"a"), Hash::new(b"big"));
         cache.insert(a, ob(40), 0);
         assert!(!cache.insert(big, ob(101), 0));
@@ -237,7 +273,7 @@ mod tests {
 
     #[test]
     fn a_reinsert_replaces_without_double_counting() {
-        let cache = OutboardCache::new(100);
+        let cache = OutboardCache::new(100, 16);
         let h = Hash::new(b"a");
         cache.insert(h, ob(40), 0);
         cache.insert(h, ob(30), 1);
@@ -247,7 +283,7 @@ mod tests {
 
     #[test]
     fn evict_if_same_drops_only_the_copy_that_failed() {
-        let cache = OutboardCache::new(100);
+        let cache = OutboardCache::new(100, 16);
         let h = Hash::new(b"a");
         let first = ob(40);
         cache.insert(h, first.clone(), 0);

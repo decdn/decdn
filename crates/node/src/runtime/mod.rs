@@ -4122,6 +4122,31 @@ mod tests {
             .expect("S3 origin with static credentials must construct without I/O");
     }
 
+    /// `build_cache` hands the cache engine the own-origin range-pull read
+    /// budget from `cache.node_pull_stall_window_sec` and
+    /// `cache.node_pull_min_throughput_bps` (ADR 037), and a zero throughput
+    /// floor leaves those reads unbounded.
+    #[tokio::test]
+    async fn build_cache_wires_the_origin_read_budget() {
+        let (_tmp, mut cfg) = cfg_with_origin(None);
+        cfg.cache.node_pull_stall_window_sec = 7;
+        cfg.cache.node_pull_min_throughput_bps = 12_345;
+        let cache = build_cache(&cfg, Arc::new(metrics::Metrics::new()), None)
+            .await
+            .expect("cache must construct");
+        assert_eq!(
+            cache.origin_read_budget_parts(),
+            Some((std::time::Duration::from_secs(7), 12_345))
+        );
+
+        let (_tmp, mut cfg) = cfg_with_origin(None);
+        cfg.cache.node_pull_min_throughput_bps = 0;
+        let cache = build_cache(&cfg, Arc::new(metrics::Metrics::new()), None)
+            .await
+            .expect("cache must construct");
+        assert_eq!(cache.origin_read_budget_parts(), None);
+    }
+
     /// ADR 041 estimator decoupling: `cache.serve_economics.policy = "margin"`
     /// must build and wire the shared frequency estimator even when neither
     /// `cache.eviction_policy` nor `cache.admission_policy` is `"tinylfu"` —

@@ -834,8 +834,9 @@ since project inception and will roll into the first tagged release.
   - The cache engine keeps each outboard, tagged with the origin that served
     it, in a 256 MiB memory cache. The serviceability probe and every draw read
     it from there. Each draw takes the outboard and the data from the same
-    origin, and a verify fault evicts the copy the draw used. An outboard over
-    256 MiB (a blob over 64 GiB) is read on each draw.
+    origin, and a verify fault evicts the copy the draw used. Concurrent cold
+    misses of one hash wait for one origin read. An outboard over 256 MiB (a
+    blob over 64 GiB) is read on each draw.
   - Once the ramped window reaches four pull-window floors, the pull leg waits
     until half of it is open before it draws, except for a serve-demand draw or
     the end of a gap. The exposure bound is unchanged. The new counter

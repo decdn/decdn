@@ -39,7 +39,7 @@ use crate::origin_range::{
     MAX_CONCURRENT_RANGE_PULLS, OriginRangeCursor, OriginRangeWire, OriginReadBudget,
     within_origin_timeout,
 };
-use crate::outboard_cache::{OUTBOARD_CACHE_BYTES, OutboardCache};
+use crate::outboard_cache::{OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES, OutboardCache};
 use crate::probe_hold::ProbeHoldOutcome;
 use crate::range_pull::{AlignedRange, align_range};
 use crate::retry::{
@@ -486,6 +486,12 @@ struct Inner {
     /// [`OriginRangeWire`] holds a handle and evicts the copy it used when the
     /// range fails bao verification.
     outboards: OutboardCache,
+    /// One async lock per hash whose outboard an origin read is fetching, so
+    /// concurrent cold misses of one hash wait for the first read and reuse its
+    /// cached copy instead of each downloading it. Held as `Weak`: an entry
+    /// lives while a fetch holds its lock, and dead entries are pruned on the
+    /// next lookup.
+    outboard_flights: Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>,
     /// Head start, in milliseconds, of the time budget for one origin read of
     /// the range-pull path. `0` means no budget. Set once at bring-up by
     /// [`CacheEngine::set_origin_read_budget`].
@@ -1385,7 +1391,8 @@ impl CacheEngine {
                 own_origin_range_pulls: Arc::new(tokio::sync::Semaphore::new(
                     MAX_CONCURRENT_RANGE_PULLS,
                 )),
-                outboards: OutboardCache::new(OUTBOARD_CACHE_BYTES),
+                outboards: OutboardCache::new(OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES),
+                outboard_flights: Mutex::new(HashMap::new()),
                 origin_read_head_start_ms: AtomicU64::new(0),
                 origin_read_min_bps: AtomicU64::new(0),
             }),
@@ -2877,6 +2884,52 @@ impl CacheEngine {
             .map(|c| c.bytes)
     }
 
+    /// The async lock that serializes origin outboard reads of `hash`
+    /// ([`Inner::outboard_flights`]). The caller locks it, re-checks the cache,
+    /// and only then reads from the origin.
+    fn outboard_flight(&self, hash: Hash) -> Arc<tokio::sync::Mutex<()>> {
+        let mut flights = self
+            .inner
+            .outboard_flights
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(live) = flights.get(&hash).and_then(Weak::upgrade) {
+            return live;
+        }
+        flights.retain(|_, w| w.strong_count() > 0);
+        let flight = Arc::new(tokio::sync::Mutex::new(()));
+        flights.insert(hash, Arc::downgrade(&flight));
+        flight
+    }
+
+    /// The origin read budget as `(head_start, min_bps)`, or `None` when
+    /// [`Self::set_origin_read_budget`] left the reads unbounded. For the
+    /// runtime's wiring tests.
+    #[must_use]
+    pub fn origin_read_budget_parts(&self) -> Option<(Duration, u64)> {
+        self.origin_read_budget().map(|b| (b.head_start, b.min_bps))
+    }
+
+    /// [`Self::fetch_gated_outboard`] under `hash`'s flight lock: a concurrent
+    /// draw that already cached this origin's copy answers from the cache.
+    async fn flighted_outboard(
+        &self,
+        origin_ix: usize,
+        origin: &Arc<dyn Origin>,
+        hash: Hash,
+        expected_len: u64,
+    ) -> CacheResult<GatedOutboard> {
+        let flight = self.outboard_flight(hash);
+        let _reading = flight.lock().await;
+        match self.inner.outboards.get(hash, expected_len) {
+            Some(c) if c.origin_ix == origin_ix => Ok(GatedOutboard::Found(c.bytes)),
+            _ => {
+                self.fetch_gated_outboard(origin_ix, origin, hash, expected_len)
+                    .await
+            }
+        }
+    }
+
     /// Read `hash`'s outboard from the origin at `origin_ix` under the read
     /// budget and gate it on `expected_len`. A copy of that exact length is
     /// cached, tagged with `origin_ix`. Meters every outboard byte the origin
@@ -3444,6 +3497,13 @@ impl CacheEngine {
         if let Some(cached) = self.inner.outboards.get(hash, expected_len) {
             return Ok(Some(cached.bytes));
         }
+        // A concurrent cold miss of this hash may be reading the outboard now:
+        // wait for it, then take its cached copy.
+        let flight = self.outboard_flight(hash);
+        let _reading = flight.lock().await;
+        if let Some(cached) = self.inner.outboards.get(hash, expected_len) {
+            return Ok(Some(cached.bytes));
+        }
         // A genuine transport fault on an origin (as opposed to a clean
         // `NotFound`/`Unsupported` decline) is remembered so it can be surfaced when
         // NO origin serves the outboard. The serviceability caller latches this into
@@ -3529,10 +3589,7 @@ impl CacheEngine {
             };
             let outboard = match &cached {
                 Some(c) if c.origin_ix == ix => c.bytes.clone(),
-                _ => match self
-                    .fetch_gated_outboard(ix, origin, hash, expected_len)
-                    .await
-                {
+                _ => match self.flighted_outboard(ix, origin, hash, expected_len).await {
                     Ok(GatedOutboard::Found(ob)) => ob,
                     Ok(GatedOutboard::Declined) => continue,
                     Ok(GatedOutboard::WrongLength) => {
@@ -9582,6 +9639,39 @@ mod tests {
         anyhow::ensure!(
             origin.outboard_fetches.load(Ordering::SeqCst) == 1,
             "the probe and three draws must read the outboard once, read {}",
+            origin.outboard_fetches.load(Ordering::SeqCst)
+        );
+        Ok(())
+    }
+
+    /// Concurrent cold misses of one hash read the outboard from the origin
+    /// once: the later probes wait for the first read and take its cached copy.
+    #[tokio::test]
+    async fn concurrent_cold_probes_read_the_outboard_once() -> anyhow::Result<()> {
+        let (data, hash, mut origin, _) = multi_window_stub();
+        origin.gate_outboard = true;
+        let origin = Arc::new(origin);
+        let gate = Arc::clone(&origin.gate);
+        let tmp = tempfile::tempdir()?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::clone(&origin) as Arc<dyn Origin>], 64).await?;
+        let total = u64::try_from(data.len())?;
+        let probes: Vec<_> = (0..8)
+            .map(|_| {
+                let engine = engine.clone();
+                tokio::spawn(async move { engine.origin_fetch_outboard_bytes(hash, total).await })
+            })
+            .collect();
+        // Let every probe reach the origin read or the flight lock, then open
+        // the gate for the one read in flight.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.add_permits(64);
+        for probe in probes {
+            anyhow::ensure!(probe.await??.is_some(), "every probe gets the outboard");
+        }
+        anyhow::ensure!(
+            origin.outboard_fetches.load(Ordering::SeqCst) == 1,
+            "eight concurrent probes must read the outboard once, read {}",
             origin.outboard_fetches.load(Ordering::SeqCst)
         );
         Ok(())
