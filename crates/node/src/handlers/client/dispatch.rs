@@ -705,6 +705,7 @@ impl ClientHandler {
             {
                 Ok(slot) => shed_slot = Some(slot),
                 Err(reason) => {
+                    self.metrics.load_shed_refused(reason);
                     tracing::debug!(
                         ?reason,
                         %hash,
@@ -757,6 +758,7 @@ impl ClientHandler {
                 {
                     Ok(slot) => shed_slot = Some(slot),
                     Err(reason) => {
+                        self.metrics.load_shed_refused(reason);
                         tracing::debug!(
                             ?reason,
                             %hash,
@@ -797,6 +799,7 @@ impl ClientHandler {
                 {
                     Ok(slot) => shed_slot = Some(slot),
                     Err(reason) => {
+                        self.metrics.load_shed_refused(reason);
                         tracing::debug!(
                             ?reason,
                             %hash,

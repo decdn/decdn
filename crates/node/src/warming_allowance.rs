@@ -190,7 +190,18 @@ impl WarmingAllowance {
     /// source with no recorded activity holds the full budget and is
     /// available; an existing ledger is available only while its allowance is
     /// still positive.
+    ///
+    /// A zero budget disables warming ([`Self::enabled`]): every source reads as
+    /// unavailable, including never-seen ones, so `economic_ceiling` never
+    /// selects the warming regime and no speculative buy is authorized. Without
+    /// this short-circuit a fresh source would read available (`None => true`)
+    /// even with warming off, and buy at the market price for its first hash —
+    /// the "zero budget disables warming" semantics would hold only after each
+    /// source's first buy created its bucket.
     pub fn available(&self, source: SourceId) -> bool {
+        if !self.enabled() {
+            return false;
+        }
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match state.buckets.get_mut(&source) {
             Some(bucket) => {
@@ -199,6 +210,49 @@ impl WarmingAllowance {
             }
             None => true,
         }
+    }
+
+    /// Whether speculative warming is configured at all. A zero budget disables
+    /// it: every above-floor buy is refused and no source ever has a positive
+    /// allowance to spend. Callers gate the "source blocked" telemetry on this
+    /// so a node with warming deliberately off does not report every source as
+    /// griefed down.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.budget > 0
+    }
+
+    /// How many sources currently hold no warming allowance — a spent ledger at
+    /// or below zero once its time refill is projected forward. Read-only: it
+    /// projects each bucket's refill without persisting it (unlike
+    /// [`Self::available`], which refills in place), so a metrics scrape never
+    /// mutates the ledger. Sampled onto `decdn_warming_sources_blocked`.
+    ///
+    /// Reads zero when warming is disabled ([`Self::enabled`]), even if buckets
+    /// linger from a config that previously ran warming on: with the budget at
+    /// zero no source is being griefed down, so the gauge stays at zero across
+    /// the reload rather than reporting every spent ledger as blocked.
+    #[must_use]
+    pub fn blocked_source_count(&self) -> usize {
+        if !self.enabled() {
+            return 0;
+        }
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .buckets
+            .values()
+            .filter(|bucket| self.projected_remaining(bucket) <= 0)
+            .count()
+    }
+
+    /// `bucket.remaining` with its time refill projected forward to now, capped
+    /// at `+budget`, without writing it back. The read-only twin of the refill
+    /// [`Self::available`] applies in place.
+    fn projected_remaining(&self, bucket: &Bucket) -> i64 {
+        let elapsed_secs = bucket.last.elapsed().as_secs();
+        let refill = self.refill_per_sec.saturating_mul(elapsed_secs);
+        let refill = i64::try_from(refill).unwrap_or(i64::MAX);
+        bucket.remaining.saturating_add(refill).min(self.budget)
     }
 
     /// Debits `source`'s ledger for a speculative buy of `hash` and tags the
@@ -827,6 +881,44 @@ mod tests {
             l.split_once(' ')
                 .is_some_and(|(k, v)| k == name && v.trim() != "0")
         })
+    }
+
+    #[test]
+    fn enabled_tracks_a_nonzero_budget() {
+        assert!(WarmingAllowance::new(1000, 0).enabled());
+        assert!(!WarmingAllowance::new(0, 0).enabled());
+    }
+
+    #[test]
+    fn a_zero_budget_disables_warming_for_every_source() {
+        // Budget 0 means warming is off. A never-seen source must read as
+        // unavailable (not `None => true`), so `economic_ceiling` never picks the
+        // warming regime, and the blocked-source gauge stays at zero even if a
+        // spent bucket lingers from a prior config.
+        let a = WarmingAllowance::new(0, 0);
+        assert!(
+            !a.available(S1),
+            "a fresh source is not available with warming off"
+        );
+        a.debit_speculative(S1, H1, 10); // a lingering bucket from a prior config
+        assert!(!a.available(S1));
+        assert_eq!(
+            a.blocked_source_count(),
+            0,
+            "warming off reports no griefing, even with a spent bucket present"
+        );
+    }
+
+    #[test]
+    fn blocked_source_count_tracks_spent_ledgers() {
+        let a = WarmingAllowance::new(1000, 0); // no time refill
+        assert_eq!(a.blocked_source_count(), 0, "no ledger entries yet");
+        a.debit_speculative(S1, H1, 1000); // spends S1's whole budget
+        assert_eq!(a.blocked_source_count(), 1, "S1 is now blocked");
+        a.debit_speculative(S2, H2, 1); // S2 still has headroom
+        assert_eq!(a.blocked_source_count(), 1, "only S1 is blocked");
+        a.credit_serve(H1, 1); // S1 back above zero
+        assert_eq!(a.blocked_source_count(), 0, "S1 recovered");
     }
 
     #[test]

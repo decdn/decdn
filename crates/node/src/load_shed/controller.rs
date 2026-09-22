@@ -95,6 +95,14 @@ impl LoadShedController {
         self.policy.load().pressure_active()
     }
 
+    /// Node-wide serves in flight, for the `decdn_load_shed_streams_in_flight`
+    /// gauge. Reads the same live counter `try_admit` feeds into the pressure
+    /// snapshot, so the gauge tracks exactly what the policy decides against.
+    #[must_use]
+    pub fn node_in_flight(&self) -> u32 {
+        self.state.node_in_flight()
+    }
+
     /// Swap in a policy rebuilt from a new resolved config. Live counters and
     /// the egress meter are preserved; only the decision policy changes.
     pub fn reload(&self, cfg: &ResolvedLoadShed) {
@@ -126,6 +134,7 @@ mod tests {
     #[test]
     fn resource_pressure_sheds_miss_when_node_full() {
         let c = LoadShedController::from_config(&cfg(LoadShedPolicyKind::ResourcePressure));
+        assert_eq!(c.node_in_flight(), 0);
         // Hold two slots to reach the high-water mark of 2.
         let _s1 = c
             .try_admit(RequestClass::CacheHit, client(1))
@@ -133,6 +142,8 @@ mod tests {
         let _s2 = c
             .try_admit(RequestClass::CacheHit, client(1))
             .expect("second admit");
+        // The gauge accessor reflects the two held slots.
+        assert_eq!(c.node_in_flight(), 2);
         // A new miss is shed; a new hit is still admitted.
         assert_eq!(
             c.try_admit(RequestClass::CacheMiss, client(2)).err(),
