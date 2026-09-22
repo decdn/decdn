@@ -17,18 +17,10 @@ updates:
       prefix: chore
       include: scope
     groups:
-      # The opentelemetry crates move as a set. `opentelemetry`,
-      # `opentelemetry_sdk`, `opentelemetry-otlp` and the `tracing-opentelemetry`
-      # bridge share traits across their crate boundaries, so a lone bump leaves
-      # a 0.x mismatch that fails to compile (e.g. an `SdkTracer` from a newer
-      # `opentelemetry_sdk` no longer satisfies the older `opentelemetry::Tracer`
-      # the bridge expects). This group must precede `rust-dependencies`: a
-      # dependency lands in the first group it matches, and the `["*"]` group
-      # below would otherwise claim them. It carries no `update-types` filter on
-      # purpose — for a pre-1.0 crate Dependabot classifies a 0.32 -> 0.33 bump
-      # as major, which the minor/patch-only group below excludes, so the family
-      # would split into one PR per crate (#2100, #2101, #2102). One PR bumps
-      # the whole family together, or none of it does.
+      # The opentelemetry crates share traits across their boundaries and must
+      # bump together. This group precedes `rust-dependencies` so it claims them
+      # first, and omits `update-types` so the major-for-0.x 0.32 -> 0.33 bump is
+      # not filtered back out into per-crate PRs.
       opentelemetry:
         patterns:
           - "opentelemetry*"
