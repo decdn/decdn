@@ -542,8 +542,11 @@ impl ClientRangedStore {
     ///   `sink::classify_decode_error`: [`crate::HashMismatch`] for a
     ///   verification failure, a truncation error for a short stream.
     /// - Any I/O failure opening, writing or fsyncing the `.partial`/`.obao4`
-    ///   files, or a flush task that panics. A stashed fault still takes
-    ///   precedence over a flush failure.
+    ///   files, or a flush task that panics. When the stream itself failed, the
+    ///   stashed fault or decode failure outranks a flush failure, which is
+    ///   logged instead: it says what the peer did, which decides retry and
+    ///   blame, and a local disk error does not make a bad or truncated stream
+    ///   good.
     pub async fn ingest_stream<R>(
         &self,
         range: &AlignedRange,
@@ -618,6 +621,26 @@ impl ClientRangedStore {
                     return Ok(r);
                 }
             }
+        }
+    }
+
+    /// Snapshot `present` now and return a future that writes that snapshot to
+    /// the `.ranges` record on `spawn_blocking`, off the runtime workers. The
+    /// snapshot is taken at the call, not when the future is first polled.
+    fn write_present_record_blocking(
+        &self,
+    ) -> impl std::future::Future<Output = io::Result<()>> + Send + 'static {
+        let snapshot = self
+            .present
+            .lock()
+            .map(|guard| guard.clone())
+            .map_err(|_| io::Error::other(lock_poisoned("present")));
+        let ranges_path = self.ranges_path.clone();
+        async move {
+            let snapshot = snapshot?;
+            tokio::task::spawn_blocking(move || write_ranges_record(&ranges_path, &snapshot))
+                .await
+                .map_err(io::Error::other)?
         }
     }
 
@@ -1026,13 +1049,14 @@ impl RangedStore for ClientRangedStore {
             }
 
             // Flush the in-memory `present` snapshot to the `.ranges` record
-            // before the verify sweep: checkpoints during ingest no longer
-            // persist the record themselves (see `checkpoint`), so this is
+            // before the verify sweep: ingest checkpoints never persist the
+            // record themselves (see `checkpoint`), so this is
             // the single-writer point that makes the on-disk record current.
             // A crash right after this and before promotion still leaves an
             // accurate record to resume from.
-            self.flush_present_record()
-                .map_err(|e| RangedStoreError::Backend(Box::new(e)))?;
+            self.write_present_record_blocking()
+                .await
+                .map_err(backend)?;
 
             let root = self.root;
             let tree = self.tree;
@@ -1153,8 +1177,9 @@ impl crate::source::IngestStore for ClientRangedStore {
         Box::pin(self.ingest_stream(range, reader, on_progress))
     }
 
-    fn flush_present_record(&self) -> std::io::Result<()> {
-        self.flush_present_record()
+    fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
+        let write = self.write_present_record_blocking();
+        Box::pin(async move { Ok(write.await?) })
     }
 }
 

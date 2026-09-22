@@ -916,7 +916,7 @@ where
     if gaps.is_empty() {
         // Already fully held: persist the present record and return (the caller
         // finalizes).
-        store.flush_present_record()?;
+        store.flush_present_record().await?;
         return Ok(());
     }
 
@@ -1113,7 +1113,7 @@ where
     // off the per-checkpoint hot path. This runs on the FAILURE path too: the
     // bytes the fan-out did deliver are paid for, and dropping the record here
     // makes the next invocation re-fetch and re-pay for them.
-    let flushed = store.flush_present_record();
+    let flushed = store.flush_present_record().await;
     outcome?;
     flushed?;
 
@@ -3142,8 +3142,8 @@ mod tests {
             Box::pin(async { Err(anyhow::anyhow!("unsupported on ScriptedMissing")) })
         }
 
-        fn flush_present_record(&self) -> std::io::Result<()> {
-            Ok(())
+        fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
         }
     }
 

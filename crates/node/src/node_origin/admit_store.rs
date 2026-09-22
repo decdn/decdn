@@ -131,8 +131,8 @@ impl IngestStore for NodeAdmitStore {
     /// `.ranges` sidecar, this store's presence is derived live from
     /// [`CacheEngine`]'s own admitted-range bookkeeping — there is no
     /// separate present-range record to flush.
-    fn flush_present_record(&self) -> std::io::Result<()> {
-        Ok(())
+    fn flush_present_record(&self) -> decdn_client_pull::SourceFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
     }
 
     fn ingest_stream<'a, R>(

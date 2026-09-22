@@ -111,7 +111,7 @@ pub use ranged_store::ClientRangedStore;
 pub use rate_limited::{UpstreamRateLimited, rate_limit_shed};
 pub use retry::{RetryDisposition, retry_disposition};
 pub use scheduler::{MultiSourceConfig, SourceLane, multi_source_fetch};
-pub use source::{BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource};
+pub use source::{BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource, SourceFuture};
 
 #[cfg(any(test, feature = "test-util"))]
 pub use source::{FakeFunder, ScriptedReader, ScriptedSource};
