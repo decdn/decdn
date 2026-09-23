@@ -333,7 +333,7 @@ pub struct ClientFetchArgs {
 impl ClientFetchArgs {
     /// Throughput-floor window for the streaming stage — the primary timeout (#1797).
     ///
-    /// Returned as its own value (rather than a `decdn_client_pull::PullDeadlines`)
+    /// Returned as its own value (rather than a `decdn_client::PullDeadlines`)
     /// because `decdn-common` is upstream of the pull crate in the dependency flow;
     /// the CLI assembles the halves into a `PullDeadlines`.
     #[must_use]
@@ -406,7 +406,7 @@ impl ClientFetchArgs {
     /// A `--timeout-ms` at or below `2 × --stall-timeout-ms` is almost certainly a
     /// misconfiguration, so it is rejected at argument-parse time — naming the flags the
     /// user typed — rather than surfacing several frames into a fetch. `decdn-common` sits
-    /// UPSTREAM of `decdn-client-pull` in the dependency flow and cannot name the delivery
+    /// UPSTREAM of `decdn-client` in the dependency flow and cannot name the delivery
     /// deadline type, so the relationship is stated here rather than imported.
     ///
     /// # Errors

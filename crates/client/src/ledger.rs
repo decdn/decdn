@@ -209,7 +209,7 @@ struct Pipeline {
     /// The highest voucher whose send SUCCEEDED — presumed accepted, because
     /// continued delivery IS acceptance (ADR 005: only rejection is signalled).
     /// Advanced optimistically on each successful [`PoolLedger::issue`] and on a
-    /// [`PoolLedger::confirm_armed`], rewound one step by
+    /// [`PoolLedger::confirm_armed_stamped`], rewound one step by
     /// [`PoolLedger::resolve_reject`], and hard-set by [`PoolLedger::reseed`].
     committed: Cumulative,
     /// The committed watermark BEFORE the most-recent successful voucher, so a
@@ -224,12 +224,12 @@ struct Pipeline {
     /// [`PoolLedger::settlement`] reports it (settle high — the upstream persists
     /// before it would reject, ADR 003), so a pull dropped inside the send still
     /// persists what the upstream may hold. Cleared on the next successful
-    /// [`PoolLedger::issue`], a matching [`PoolLedger::confirm_armed`] or
+    /// [`PoolLedger::issue`], a matching [`PoolLedger::confirm_armed_stamped`] or
     /// [`PoolLedger::resolve_reject`], or a [`PoolLedger::reseed`].
     armed: Option<Armed>,
     /// How many times [`PoolLedger::rebase`] has moved this ledger DOWN to a
     /// node's watermark. Every voucher is stamped with the generation it was
-    /// signed under ([`StreamProof::Voucher`]), so an `Underpaid` rejection of a
+    /// signed under (`StreamProof::Voucher`), so an `Underpaid` rejection of a
     /// voucher signed before the latest rebase is recognisably stale.
     generation: u64,
     /// The watermark the latest [`PoolLedger::rebase`] moved down to, until the
@@ -304,7 +304,7 @@ enum LastProof {
 /// That is what lets the ledger tell "the proof I am being told about is still
 /// the last thing this lane did" from "a sibling has moved on since".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamProof {
+pub(crate) enum StreamProof {
     /// A signed voucher claiming this cumulative amount.
     Voucher {
         /// The `amount` the voucher was signed over.
@@ -418,7 +418,7 @@ pub enum Metered {
 /// cumulative order — and released the instant the send returns, because there
 /// is no ack to wait for (implicit acceptance, ADR 005). The committed watermark
 /// advances the moment a send succeeds; a mid-stream `VoucherRejected` rewinds
-/// it through [`Self::resolve_reject`].
+/// it through `resolve_reject`.
 #[derive(Debug)]
 pub struct PoolLedger {
     /// Serializes issuance (compute the next cumulative → sign → send). Its
@@ -508,11 +508,12 @@ impl PoolLedger {
         }
     }
 
+    #[cfg(test)]
     /// Override the per-send voucher-send deadline. Used by tests to exercise
     /// the timeout without waiting the production ceiling; production ledgers
     /// keep `VOUCHER_SEND_DEADLINE`.
     #[must_use]
-    pub const fn with_send_deadline(mut self, send_deadline: Duration) -> Self {
+    pub(crate) const fn with_send_deadline(mut self, send_deadline: Duration) -> Self {
         self.send_deadline = send_deadline;
         self
     }
@@ -548,7 +549,7 @@ impl PoolLedger {
     /// Read the committed cumulative WITHOUT awaiting — the drop-safe reader, and
     /// the only one a `Drop` impl can call. It is the highest voucher whose send
     /// succeeded (implicit acceptance) or that a terminal `StreamEnd` confirmed
-    /// ([`Self::confirm_armed`]), plus the accrual since, so it is exactly what a
+    /// (`confirm_armed_stamped`), plus the accrual since, so it is exactly what a
     /// *completed* pull persists.
     #[must_use]
     pub fn committed(&self) -> Cumulative {
@@ -566,7 +567,7 @@ impl PoolLedger {
     /// upstream persists a voucher before it would reject it, so an ambiguous
     /// failure may leave the upstream holding it — under-reporting would strand
     /// the deposit. A voucher the upstream explicitly REJECTED is never here —
-    /// [`Self::resolve_reject`] clears `armed` and rewinds `committed` — so this
+    /// `resolve_reject` clears `armed` and rewinds `committed` — so this
     /// cannot inflate our cumulative for bytes the upstream declined.
     #[must_use]
     pub fn settlement(&self) -> Cumulative {
@@ -617,7 +618,7 @@ impl PoolLedger {
     /// # Errors
     ///
     /// As [`Self::issue`].
-    pub async fn issue_stamped<F, Fut>(
+    pub(crate) async fn issue_stamped<F, Fut>(
         &self,
         delta_bytes: u64,
         rate_per_mb: u64,
@@ -691,6 +692,14 @@ impl PoolLedger {
         Ok((next, generation))
     }
 
+    #[cfg(test)]
+    /// [`Self::confirm_armed_stamped`] without the generation.
+    pub(crate) async fn confirm_armed(&self, amount: U256) -> Option<Cumulative> {
+        self.confirm_armed_stamped(amount)
+            .await
+            .map(|(confirmed, _generation)| confirmed)
+    }
+
     /// Commit the armed voucher signing `amount` as if its send had confirmed.
     ///
     /// For when the upstream's terminal `StreamEnd` arrives after this stream's
@@ -712,21 +721,14 @@ impl PoolLedger {
     ///   stream: a sibling's failed voucher may have been armed on top of this
     ///   one. A `StreamEnd` read on this stream says nothing about that voucher.
     ///
-    /// Returns the confirmed cumulative, or `None` when the armed voucher does not
-    /// sign `amount`: a later issue, reject, or reseed has already cleared it, or
+    /// Returns the confirmed cumulative and the ledger generation the voucher was
+    /// signed under, or `None` when the armed voucher does not sign `amount`: a later issue, reject, or reseed has already cleared it, or
     /// a sibling's voucher replaced it. The ledger is then left untouched, and
     /// [`Self::settlement`] still settles high on whatever is armed.
-    pub async fn confirm_armed(&self, amount: U256) -> Option<Cumulative> {
-        self.confirm_armed_stamped(amount)
-            .await
-            .map(|(confirmed, _generation)| confirmed)
-    }
-
-    /// [`Self::confirm_armed`], also returning the ledger generation the
-    /// confirmed voucher was signed under. A [`Self::rebase`] clears the armed
-    /// voucher, so one that is still armed here was signed under the current
-    /// generation.
-    pub async fn confirm_armed_stamped(&self, amount: U256) -> Option<(Cumulative, u64)> {
+    ///
+    /// A [`Self::rebase`] clears the armed voucher, so one that is still armed
+    /// here was signed under the current generation.
+    pub(crate) async fn confirm_armed_stamped(&self, amount: U256) -> Option<(Cumulative, u64)> {
         let _issuing = self.issuance.lock().await;
         let mut pipeline = self.pipeline();
         let armed = pipeline
@@ -766,7 +768,7 @@ impl PoolLedger {
     /// Holds the issuance lock across read → send, so the root it states is the
     /// root that was live when it was sent: a sibling rolling concurrently either
     /// precedes this voucher entirely or follows it.
-    pub async fn reanchor<F, Fut>(&self, exchange: F) -> anyhow::Result<Option<B256>>
+    pub(crate) async fn reanchor<F, Fut>(&self, exchange: F) -> anyhow::Result<Option<B256>>
     where
         F: FnOnce(Cumulative, ChainCommit) -> Fut,
         Fut: Future<Output = anyhow::Result<()>>,
@@ -826,23 +828,6 @@ impl PoolLedger {
         self.retired
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// The chain this lane is currently metering against, or
-    /// [`ChainCommit::SEALED`] if it holds none.
-    ///
-    /// Read by a stream that needs to know whether it has already carried the
-    /// current epoch's root voucher: on each stream, the epoch's `chain_root`
-    /// voucher MUST precede that stream's own preimages for that epoch, or the
-    /// node cannot name the chain a bare reveal belongs to.
-    #[must_use]
-    pub fn chain_commit(&self) -> ChainCommit {
-        self.epoch()
-            .as_ref()
-            .map_or(ChainCommit::SEALED, |live| ChainCommit {
-                chain_root: live.root(),
-                chunk_price: live.chunk_price,
-            })
     }
 
     /// The root of the live chain, or `None` on a lane metering nothing. A stream
@@ -1104,7 +1089,7 @@ impl PoolLedger {
     /// the node prices the gap, the payer never accrued it, and the two diverge by
     /// exactly one chunk from then on. Re-releasing the rewound depth is safe: the
     /// node refused it, so it holds no preimage at that index.
-    pub fn resolve_reject(&self, rejected: StreamProof) -> bool {
+    pub(crate) fn resolve_reject(&self, rejected: StreamProof) -> bool {
         let mut pipeline = self.pipeline();
         match (rejected, pipeline.last_proof) {
             (

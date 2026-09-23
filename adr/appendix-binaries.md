@@ -116,6 +116,7 @@ and would silently miss data on a prefix rename.
   removed by extracting `decdn-config-types`; `decdn` no
   longer links the blob store or AWS SDK at all (`reqwest`/`iroh`
   remain, via `alloy` and the direct `iroh` dep — not the cache).
-  Regression guard: `cargo tree -p decdn-cli -e normal -i iroh-blobs`
-  and `-i aws-sdk-s3` must be empty (dev-deps still pull them for the
-  integration tests; that does not affect the release binary).
+  Regression guard: `.github/scripts/check_crate_edges.py` fails CI when
+  the normal or build closure of `decdn-cli` or of the `decdn-client` SDK
+  contains `iroh-blobs` or an AWS SDK crate. Dev-dependencies still pull
+  them for the integration tests. That does not affect the release binary.

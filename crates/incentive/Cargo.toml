@@ -38,7 +38,7 @@ redb = ["buyer-store-core"]
 # out of the shipped API, but NOT `#[cfg(test)]`: a cross-crate `cfg(test)` does
 # not propagate, and `decdn-node`'s `insert_raw_buyer_record` seam (its #763
 # reconciliation e2e) has to reach it. Enabled from downstream
-# `[dev-dependencies]` — same pattern as `decdn-client-pull`'s `test-util`.
+# `[dev-dependencies]` — same pattern as `decdn-client`'s `test-util`.
 test-util = []
 
 [dependencies]

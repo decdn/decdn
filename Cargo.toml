@@ -16,7 +16,7 @@ members = [
     "crates/incentive",
     "crates/reputation",
     "crates/common",
-    "crates/client-pull",
+    "crates/client",
     "crates/cli",
     "crates/e2e",
 ]
@@ -64,7 +64,7 @@ decdn-cache = { path = "crates/cache", version = "0.0.0" }
 decdn-incentive = { path = "crates/incentive", version = "0.0.0" }
 decdn-reputation = { path = "crates/reputation", version = "0.0.0" }
 decdn-common = { path = "crates/common", version = "0.0.0" }
-decdn-client-pull = { path = "crates/client-pull", version = "0.0.0" }
+decdn-client = { path = "crates/client", version = "0.0.0" }
 decdn-node = { path = "crates/node", version = "0.0.0" }
 # No `decdn-cli` entry: it is a bin crate and a workspace *member*, but nothing
 # in the workspace depends on it, so it needs no `[workspace.dependencies]`

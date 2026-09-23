@@ -19,11 +19,15 @@ and `cargo install decdn-cli --features x` would still link it):
   Dev-dependencies are not constrained; the design accepts dev-only cycles
   (`cli` tests the daemon it is shipped beside). A member with no row fails,
   and a row for a member that does not exist fails too.
-* **Closure.** `decdn-cli`'s transitive normal and build dependencies must
-  not include the blob store or the AWS SDK (CLI_MUST_NOT_LINK). The direct
-  table cannot see this: `cli → common` is allowed, so `common` quietly growing
-  an `iroh-blobs` edge would pass the first pass and still put the blob store
-  in the CLI. A walk that visits nothing is a failure, not a clean closure.
+* **Closure.** The transitive normal and build dependencies of each
+  FOOTPRINT_GUARDED crate — the `decdn-cli` binary and the `decdn-client` SDK
+  it builds on — must not include the blob store or the AWS SDK
+  (MUST_NOT_LINK). The direct table cannot see this: `client → common` is
+  allowed, so `common` quietly growing an `iroh-blobs` edge would pass the
+  first pass and still put the blob store in the SDK and the CLI. The SDK is
+  guarded on its own, not only through the CLI, because a third party links it
+  without the CLI. A walk that visits nothing is a failure, not a clean
+  closure.
 
 The table is the actual graph, transcribed. Changing it is a design change and
 CLAUDE.md's Dependency flow paragraph moves with it.
@@ -49,14 +53,14 @@ ALLOWED: dict[str, frozenset[str]] = {
     "decdn-reputation": frozenset({"decdn-protocol"}),
     "decdn-incentive": frozenset({"decdn-common", "decdn-protocol"}),
     "decdn-cache": frozenset({"decdn-bao-range", "decdn-config-types", "decdn-protocol"}),
-    "decdn-client-pull": frozenset(
+    "decdn-client": frozenset(
         {"decdn-bao-range", "decdn-common", "decdn-incentive", "decdn-protocol"}
     ),
     "decdn-node": frozenset(
         {
             "decdn-bao-range",
             "decdn-cache",
-            "decdn-client-pull",
+            "decdn-client",
             "decdn-common",
             "decdn-incentive",
             "decdn-protocol",
@@ -66,7 +70,7 @@ ALLOWED: dict[str, frozenset[str]] = {
     "decdn-cli": frozenset(
         {
             "decdn-bao-range",
-            "decdn-client-pull",
+            "decdn-client",
             "decdn-common",
             "decdn-config-types",
             "decdn-incentive",
@@ -77,23 +81,24 @@ ALLOWED: dict[str, frozenset[str]] = {
 }
 # Nothing may depend on these, dev-deps aside.
 SINKS = frozenset({"decdn-cli", "decdn-e2e"})
-# The publisher CLI is iroh-blobs-free and AWS-free (#578): it links no blob
-# store and no S3 SDK, so `cargo install decdn-cli` builds no such thing.
-CLI = "decdn-cli"
-CLI_MUST_NOT_LINK = frozenset(
+# The publisher CLI and the client SDK are iroh-blobs-free and AWS-free (#578,
+# #1150): neither links a blob store or an S3 SDK, so `cargo install decdn-cli`
+# builds no such thing and a crate built on `decdn-client` inherits none.
+FOOTPRINT_GUARDED = ("decdn-cli", "decdn-client")
+MUST_NOT_LINK = frozenset(
     {"iroh-blobs", "aws-config", "aws-credential-types", "aws-runtime", "aws-types", "aws-sigv4"}
 )
 # The SDK's service and smithy crates by prefix. Not a bare `aws-` prefix:
 # `aws-lc-rs` is rustls's crypto provider and legitimately in the CLI tree.
-CLI_MUST_NOT_LINK_PREFIXES = ("aws-sdk-", "aws-smithy-")
+MUST_NOT_LINK_PREFIXES = ("aws-sdk-", "aws-smithy-")
 # A build script compiles the crate too, so a build-dependency is an edge the
 # design has to allow; only dev-dependencies are exempt.
 EDGE_KINDS = frozenset({None, "build"})
 METADATA_ARGS = ("cargo", "metadata", "--format-version", "1", "--locked", "--all-features")
 
 
-def is_forbidden_for_cli(name: str) -> bool:
-    return name in CLI_MUST_NOT_LINK or name.startswith(CLI_MUST_NOT_LINK_PREFIXES)
+def is_forbidden(name: str) -> bool:
+    return name in MUST_NOT_LINK or name.startswith(MUST_NOT_LINK_PREFIXES)
 
 
 def is_edge(dep_kinds: list[dict]) -> bool:
@@ -145,36 +150,44 @@ def check(metadata: dict) -> list[str]:
                     "§ Crate Structure)"
                 )
 
-    # --- cli closure --------------------------------------------------------
-    cli = members.get(CLI)
-    if cli is not None:
-        nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
-        parent: dict[str, str | None] = {cli["id"]: None}
-        queue = deque([cli["id"]])
-        while queue:
-            current = queue.popleft()
-            for dep in nodes.get(current, {}).get("deps", []):
-                if not is_edge(dep["dep_kinds"]) or dep["pkg"] in parent:
-                    continue
-                parent[dep["pkg"]] = current
-                queue.append(dep["pkg"])
-        if len(parent) <= 1:
-            errors.append(
-                f"{CLI} has no dependencies in the resolve graph — the closure walk "
-                "inspected nothing"
-            )
-        for pkg_id, via in sorted(parent.items()):
-            name = by_id[pkg_id]["name"]
-            if is_forbidden_for_cli(name):
-                path = [name]
-                while via is not None:
-                    path.append(by_id[via]["name"])
-                    via = parent[via]
-                errors.append(
-                    f"{CLI} links {name} via " + " ← ".join(path) + " — the publisher CLI is "
-                    "iroh-blobs-free and AWS-free (#578); the edge that introduced it must go"
-                )
+    # --- footprint closures -------------------------------------------------
+    for root in FOOTPRINT_GUARDED:
+        pkg = members.get(root)
+        if pkg is not None:
+            errors.extend(check_closure(metadata, by_id, root, pkg["id"]))
 
+    return errors
+
+
+def check_closure(metadata: dict, by_id: dict, root: str, root_id: str) -> list[str]:
+    """Walk `root`'s normal and build closure; report every forbidden crate in it."""
+    errors: list[str] = []
+    nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
+    parent: dict[str, str | None] = {root_id: None}
+    queue = deque([root_id])
+    while queue:
+        current = queue.popleft()
+        for dep in nodes.get(current, {}).get("deps", []):
+            if not is_edge(dep["dep_kinds"]) or dep["pkg"] in parent:
+                continue
+            parent[dep["pkg"]] = current
+            queue.append(dep["pkg"])
+    if len(parent) <= 1:
+        errors.append(
+            f"{root} has no dependencies in the resolve graph — the closure walk inspected nothing"
+        )
+    for pkg_id, via in sorted(parent.items()):
+        name = by_id[pkg_id]["name"]
+        if is_forbidden(name):
+            path = [name]
+            while via is not None:
+                path.append(by_id[via]["name"])
+                via = parent[via]
+            errors.append(
+                f"{root} links {name} via " + " ← ".join(path) + " — the publisher CLI and "
+                "the client SDK are iroh-blobs-free and AWS-free (#578); the edge that "
+                "introduced it must go"
+            )
     return errors
 
 
@@ -202,7 +215,8 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"crate edges OK ({len(ALLOWED)} members, {CLI} closure clean)")  # noqa: E501
+    guarded = ", ".join(FOOTPRINT_GUARDED)
+    print(f"crate edges OK ({len(ALLOWED)} members; {guarded} closures clean)")
     return 0
 
 

@@ -136,7 +136,7 @@ crates/
   config-types/ — config-vocabulary value types shared by cache + common (leaf crate)
   bao-range/    — iroh-blobs-free bao verified-range helpers: chunk-group alignment, range encode/verify, origin-store layout (leaf crate, ADR 038)
   cache/        — cache engine wrapping iroh-blobs + origin pull-through
-  client-pull/  — reusable `cdn/client/v1` paid-pull requester and buyer-side channel open, shared by node and cli
+  client/       — reusable `cdn/client/v1` paid-pull requester and buyer-side channel open, shared by node and cli
   incentive/    — shared payment pools, staking, vouchers (alloy for Ethereum)
   reputation/   — local per-peer reputation scoring (ADR 008)
   e2e/          — test-only cross-layer Rust↔contract fixtures (anvil + the production deploy script)
@@ -144,7 +144,7 @@ contracts/      — Solidity contracts + Foundry (repo root, excluded from works
 ```
 
 The daemon is itself a paying client on its upstream cache-miss leg, which is why `node`
-depends on `client-pull` like any other consumer. Three leaf crates — `protocol`,
+depends on `client` like any other consumer. Three leaf crates — `protocol`,
 `config-types`, and `bao-range` — keep the publisher CLI free of any blob store or AWS
 SDK; `.github/scripts/check_crate_edges.py` enforces that boundary in CI.
 

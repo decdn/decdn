@@ -1,7 +1,7 @@
 //! The gap-driven, range-minimized **pull leg** of the node serve-miss (ADR 037).
 //!
 //! This module drives the shared
-//! [`decdn_client_pull::drive`] loop over a node sink, so a serve-miss pulls and
+//! [`decdn_client::drive`] loop over a node sink, so a serve-miss pulls and
 //! pays UPSTREAM for only the ranges the cache is missing — held ranges are read
 //! locally, never re-pulled or re-paid. It is the buyer half of the two concurrent
 //! legs the orchestration (`serve_via_window_pull_through`) runs on the one serve
@@ -18,7 +18,7 @@
 //!   walks candidates until one answers.
 //! - [`run_pull_leg`] — assembles the blob across the partial holders via the
 //!   ranged-drive loop (#1506): it plans the missing range into runs by coverage
-//!   ([`decdn_client_pull::plan_covered_runs`]) and drives them in offset order,
+//!   ([`decdn_client::plan_covered_runs`]) and drives them in offset order,
 //!   opening ONE payment lane ([`NodeAdmitStore`] sink, [`PeerSource`],
 //!   [`RampPacer`], [`NodeFunder`]) per run and re-planning a non-terminal run
 //!   fault onto the survivors. It scores each provider as its run ends and records
@@ -45,11 +45,11 @@ use alloy::signers::local::PrivateKeySigner;
 use bao_tree::ChunkRanges;
 use decdn_bao_range::RangedStore;
 use decdn_cache::{CacheEngine, CacheError, DownstreamWatch, FillError, FillSession, Hash};
-use decdn_client_pull::driver::DriveConfig;
-use decdn_client_pull::source::{Funder, SourceFuture};
-use decdn_client_pull::{
+use decdn_client::driver::DriveConfig;
+use decdn_client::source::{Funder, SourceFuture};
+use decdn_client::{
     CoveredRun, DownstreamFrontier, HashMismatch as ClientPullHashMismatch, PacingWait, PeerSource,
-    PoolExhausted, RampPacer, RetryDisposition, SharedPool, WaitReason, drive, retry_disposition,
+    RampPacer, RetryDisposition, SharedPool, WaitReason, drive, shared_pool_disposition,
 };
 use decdn_incentive::DepositOutcome;
 
@@ -70,12 +70,12 @@ use super::{
     heat_of, lane_ledger, mb_of, now_micros, probe_and_rank, record_outcome,
     record_pool_open_failure,
 };
-use crate::client_requester::{
-    PoolContext, PullDeadlines, open_progressive_pull as open_progressive_upstream,
-};
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::NodeId as DhtNodeId;
 use crate::selection::{CHANNEL_OPEN_CALLER_BUDGET, Candidate, MAX_PROVIDER_ATTEMPTS};
+use decdn_client::{
+    PoolContext, PullDeadlines, open_progressive_pull as open_progressive_upstream,
+};
 
 /// Bytes per [`bao_tree::ChunkNum`] — a 1 KiB bao chunk. A chunk-range's byte span
 /// is its boundaries scaled by this (twin of the driver's private constant).
@@ -96,7 +96,7 @@ pub(crate) struct PullLegTarget {
     namespace_id: [u8; 32],
     /// The ranked candidates (best-first), each with its probe-confirmed
     /// `coverage`. The loop plans the missing range across these
-    /// ([`decdn_client_pull::plan_covered_runs`]) and opens one payment lane per
+    /// ([`decdn_client::plan_covered_runs`]) and opens one payment lane per
     /// run.
     candidates: Vec<Candidate>,
 }
@@ -181,10 +181,10 @@ fn content_len(ranges: &ChunkRanges, total: u64) -> u64 {
 /// - [`CacheError::VerifyFailed`] / [`CacheError::HashMismatch`] — the node's cache
 ///   decoder ([`NodeAdmitStore`] → `admit_bao_stream`) rejected a chunk group or
 ///   the whole-blob root. This is how a wire-complete lie surfaces.
-/// - [`decdn_client_pull::HashMismatch`] — the client-pull decoder's typed
+/// - [`decdn_client::HashMismatch`] — the `decdn-client` decoder's typed
 ///   content-addressing sentinel, matched defensively for the paths that surface it
 ///   directly (it is also what [`super::pull_verdict`] downcasts to).
-/// - The client-pull streaming OVER-DELIVERY guards — the upstream sent more wire
+/// - The `decdn-client` streaming OVER-DELIVERY guards — the upstream sent more wire
 ///   than the signed `total_bytes` promised ("… more than the … promised", "… after
 ///   the promised total"). An honest upstream sends exactly the promised wire then
 ///   `StreamEnd`, so over-delivery is unambiguous provider misbehaviour; a corrupt
@@ -452,7 +452,7 @@ impl NodeOrigin {
 /// A blob can live spread across nodes — one holds discovery block 0, another
 /// block 1. The loop derives the still-missing gap from the shared
 /// [`NodeAdmitStore`], plans it into contiguous runs by each candidate's
-/// probe-fresh coverage ([`decdn_client_pull::plan_covered_runs`], concentrate +
+/// probe-fresh coverage ([`decdn_client::plan_covered_runs`], concentrate +
 /// sticky), and drives the runs in offset order. Each run opens ONE buyer lane to
 /// its source — one `(signer, provider)` payment lane — and runs are SEQUENTIAL,
 /// so two lanes never pay at once. The [`NodeAdmitStore`], [`RampPacer`], the
@@ -461,7 +461,7 @@ impl NodeOrigin {
 /// paid frontier, not on the run, and a later run's lane still `Wait`s on the same
 /// frontier the earlier one did.
 ///
-/// A run whose `drive` returns a NON-terminal fault ([`decdn_client_pull::retry_disposition`]
+/// A run whose `drive` returns a NON-terminal fault ([`decdn_client::retry_disposition`]
 /// `== RetryElsewhere`) drops that source and re-plans the still-missing remainder
 /// against the survivors — the loop-level reassign-only tail. The store keeps the
 /// verified bytes, so the replacement lane resumes at the gap and re-pays nothing
@@ -484,7 +484,7 @@ impl NodeOrigin {
 /// # Off the accept task, on its own runtime
 ///
 /// This is a FREE function, not a `NodeOrigin` method: `drive`'s future is
-/// non-`Send` (its [`decdn_client_pull::IngestStore`] fill is deliberately
+/// non-`Send` (its [`decdn_client::IngestStore`] fill is deliberately
 /// non-`Send`), which the iroh `ProtocolHandler::accept` bound forbids on
 /// the serve task. So the orchestration spawns a dedicated OS thread with its OWN
 /// current-thread tokio runtime and `block_on`s this. All inputs are therefore
@@ -907,7 +907,7 @@ impl RunSink for PeerRunSink<'_> {
                 // origin blacklist, over-cap blob) cannot be fixed by another lane;
                 // anything else is a property of THIS source's delivery — drop it
                 // and re-plan.
-                if run_fault_is_terminal(&err) {
+                if shared_pool_disposition(&err) == RetryDisposition::Terminal {
                     RunOutcome::Terminal(FillError::new(format!("{err:#}")))
                 } else {
                     RunOutcome::Reassign
@@ -924,23 +924,6 @@ fn whole_range_chunks(offset: u64, len: u64) -> ChunkRanges {
     let start = offset / CHUNK_BYTES;
     let end = offset.saturating_add(len).div_ceil(CHUNK_BYTES);
     ChunkRanges::from(bao_tree::ChunkNum(start)..bao_tree::ChunkNum(end))
-}
-
-/// Whether a run's [`drive`] error ends the whole assembly rather than reassigning
-/// its range to another holder.
-///
-/// It is the shared [`retry_disposition`] verdict, PLUS one node-specific override:
-/// a [`PoolExhausted`] is terminal here even though `retry_disposition` calls it
-/// `RetryElsewhere`. The classifier keeps pool exhaustion retryable for the
-/// single-source failover, where a cheaper provider's next voucher may fit a
-/// deposit the current one's did not. The node's ranged loop is the opposite case:
-/// every lane draws the ONE shared buyer pool (ADR 003), so no surviving holder can
-/// pay from a dry pool — reassigning would only churn each remaining candidate
-/// (a fresh dial + a first-voucher attempt) before the same failure. This mirrors
-/// the multi-source scheduler, which special-cases exactly [`PoolExhausted`].
-fn run_fault_is_terminal(err: &anyhow::Error) -> bool {
-    retry_disposition(err) == RetryDisposition::Terminal
-        || err.downcast_ref::<PoolExhausted>().is_some()
 }
 
 // ===========================================================================
@@ -1034,7 +1017,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// the ledger's committed `bytes` reach the gap end. An unpaid source that never
 /// advanced a ledger would leave that frontier at zero and the gap loop would
 /// re-draw forever. So the [`BackendSource`] carries a LOCAL bookkeeping
-/// [`PoolLedger`](decdn_client_pull::PoolLedger) and, on `finish`, advances its `bytes` by exactly the leg's
+/// [`PoolLedger`](decdn_client::PoolLedger) and, on `finish`, advances its `bytes` by exactly the leg's
 /// drained wire (at amount 0). We hand `drive` that SAME ledger ([`BackendSource::ledger`])
 /// plus a benign [`local_bookkeeping_ctx`] and a [`NullFunder`], so the completion
 /// counter the source moves is the one the gap loop reads. This is NOT payment — no
@@ -1181,7 +1164,7 @@ mod local_pull_leg_tests {
         CacheEngine, FillError, FillSession, Hash, Origin, OriginFetch, OriginKind,
         OriginPullError, OriginRangeFetch, OriginRangeRequest, OutboardFetch,
     };
-    use decdn_client_pull::{Cumulative, PoolLedger};
+    use decdn_client::{Cumulative, PoolLedger};
     use tokio_util::sync::CancellationToken;
 
     use super::BackendSource;
@@ -1507,7 +1490,7 @@ mod downstream_wait_tests {
 
     use super::DownstreamWait;
     use crate::metrics::Metrics;
-    use decdn_client_pull::{DownstreamFrontier, PacingWait, WaitReason};
+    use decdn_client::{DownstreamFrontier, PacingWait, WaitReason};
 
     /// A standalone session and a wait over its downstream frontiers.
     fn session_and_hook() -> (Arc<FillSession>, DownstreamWait) {
@@ -1634,58 +1617,6 @@ mod downstream_wait_tests {
                 .expect("a later advance must wake the parked wait");
             },
             advance,
-        );
-    }
-}
-
-/// The ranged-drive loop's run-fault terminal classification (#1506): a
-/// shared-pool exhaustion must STOP the assembly, not reassign the range to
-/// another holder that draws the same dry pool.
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
-mod run_fault_terminal_tests {
-    use decdn_client_pull::PoolExhausted;
-    use decdn_protocol::client::VoucherRejectReason;
-
-    use super::run_fault_is_terminal;
-    use crate::client_requester::UpstreamVoucherRejected;
-
-    /// A `PoolExhausted` is TERMINAL in the node loop even though the shared
-    /// `retry_disposition` classifier calls it `RetryElsewhere`: the node draws one
-    /// shared buyer pool, so no surviving holder can pay from a dry pool. Without
-    /// this override the loop churns every remaining candidate before giving up.
-    #[test]
-    fn pool_exhaustion_is_terminal_in_the_node_loop() {
-        let err = anyhow::Error::new(PoolExhausted {
-            gap_start: 0,
-            gap_len: 1 << 20,
-        });
-        assert!(
-            run_fault_is_terminal(&err),
-            "a dry shared pool must fail fast, not reassign onto another lane"
-        );
-    }
-
-    /// The classifier's own `Terminal` verdicts still flow through: a shared-pool
-    /// voucher rejection ends the assembly.
-    #[test]
-    fn voucher_rejection_stays_terminal() {
-        let err = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: VoucherRejectReason::SpendingCapExhausted,
-            bundle: None,
-            proof_generation: None,
-        });
-        assert!(run_fault_is_terminal(&err));
-    }
-
-    /// An ordinary delivery fault (a stall, a transport reset) is NOT terminal —
-    /// it faults one source and reassigns the range to another holder.
-    #[test]
-    fn a_transport_fault_reassigns() {
-        let err = anyhow::anyhow!("connect failed: timed out");
-        assert!(
-            !run_fault_is_terminal(&err),
-            "a per-source delivery fault must reassign, not stop the assembly"
         );
     }
 }

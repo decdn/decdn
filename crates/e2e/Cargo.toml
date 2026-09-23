@@ -47,7 +47,7 @@ decdn-common = { workspace = true }
 # unification makes the feature visible to every member of a `--workspace`
 # build; the shipped binaries build per package, which is where the "a production
 # caller cannot name them" guard matters.
-decdn-client-pull = { workspace = true, features = ["test-util"] }
+decdn-client = { workspace = true, features = ["test-util"] }
 decdn-protocol = { workspace = true }
 decdn-config-types = { workspace = true }
 # Outboard construction for `seed_origin_blob_with_outboard`: seeds the sibling

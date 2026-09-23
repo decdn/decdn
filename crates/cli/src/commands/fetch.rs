@@ -4,8 +4,8 @@
 //! Turnkey paying sibling of [`super::probe`]: dial a node by explicit
 //! `--node-id`/`--addr`/`--relay-url` (or auto-discover one, #936),
 //! **auto-open-or-reuse** the caller's own `PaymentPool` deposit, run one
-//! delivery exchange through the gap-driven [`decdn_client_pull::drive`] core
-//! over a [`decdn_client_pull::PeerSource`] (signing cumulative vouchers,
+//! delivery exchange through the gap-driven [`decdn_client::drive`] core
+//! over a [`decdn_client::PeerSource`] (signing cumulative vouchers,
 //! resuming the pool lane's persisted watermark), verify the `slash_sig`
 //! recovers to the provider
 //! (ADR 014 §1), BLAKE3-check the whole blob, persist the new watermark, and
@@ -16,7 +16,7 @@
 //! resumed) — and auto-refilled on-chain via `topUp` when its remaining
 //! deposit has run low, so a sustained series of fetches isn't stranded;
 //! otherwise one is opened on-chain (USDC `approve` if needed → `openPool`) via
-//! the shared [`decdn_client_pull::buyer_pool::open_pool`] kernel and recorded.
+//! the shared [`decdn_client::buyer_pool::open_pool`] kernel and recorded.
 //! One pool fans out to every provider the caller pays (ADR 003) — there is no
 //! per-provider open. The chain coordinates resolve flag >
 //! `[blockchain]`/`[identity]` config > default.
@@ -36,15 +36,14 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_bao_range::align_range;
-use decdn_client_pull::buyer_pool::{
-    LOW_WATER_DIVISOR, SELF_CAPABILITY_CAP, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
-    grade_deposit_credit, issue_self_capability, open_pool, refill_amount, top_up,
-    topped_up_effect,
+use decdn_client::buyer_pool::{
+    LOW_WATER_DIVISOR, ProgressWrite, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
+    grade_deposit_credit, open_pool, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
 };
-use decdn_client_pull::driver::{DriveConfig, drive_range_set, first_leg};
-use decdn_client_pull::sink::PullReader;
-use decdn_client_pull::source::{BlobSource as _, Funder, PrimedSource, SourceFuture};
-use decdn_client_pull::{
+use decdn_client::driver::{DriveConfig, drive_range_set, first_leg};
+use decdn_client::sink::PullReader;
+use decdn_client::source::{BlobSource as _, Funder, PrimedSource, SourceFuture};
+use decdn_client::{
     BudgetPacer, ClientRangedStore, Cumulative, DownloadTarget, Downloader, LaneHandle,
     LaneLedgers, NoCache, PeerSource, PoolContext, PoolExhausted, PoolLedger, ProgressCallback,
     PullConfig, PullDeadlines, RetryDisposition, SharedPool, StreamCandidate, Streamer,
@@ -53,9 +52,7 @@ use decdn_client_pull::{
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
-use decdn_incentive::buyer_pool::{
-    AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, DepositOutcome,
-};
+use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore, DepositOutcome};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
 use decdn_incentive::payment_pool::{PaymentPool, newest_solvent_owned_pool};
@@ -68,10 +65,10 @@ use decdn_incentive::{
 use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
-use decdn_client_pull::discovery::{self, NodeCandidate};
-use decdn_client_pull::endpoint as client_endpoint;
-use decdn_client_pull::probe::probe_once;
-use decdn_client_pull::provider;
+use decdn_client::discovery::{self, NodeCandidate};
+use decdn_client::endpoint as client_endpoint;
+use decdn_client::probe::probe_once;
+use decdn_client::provider;
 
 use super::buyer_store::{ChainAdoption, DataDirSource, open_client_store_for_buy};
 
@@ -79,14 +76,6 @@ use super::buyer_store::{ChainAdoption, DataDirSource, open_client_store_for_buy
 /// concurrently, so this bounds selection latency rather than the overall fetch
 /// (`--timeout-ms`); a dead candidate falls out of selection after this.
 const SELECT_PROBE_TIMEOUT_MS: u64 = 5_000;
-
-/// Expiry stamped on the self-owned capability [`open_or_reuse_pool`] signs.
-/// The CLI fetcher owns its own pool (owner == signer), so there is no
-/// delegation to time-box — `u64::MAX` means "never expires", and the pool's
-/// own grace-window close is the only lifecycle gate (there is no pool
-/// expiry, ADR 003). Mirrors `decdn_client_pull::buyer_pool`'s own (private)
-/// `SELF_CAPABILITY_EXPIRY`.
-const SELF_CAPABILITY_EXPIRY: u64 = u64::MAX;
 
 /// Parse a user-supplied BLAKE3 hash: 64 hex chars, optionally `0x`- or
 /// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).
@@ -119,7 +108,7 @@ pub(crate) fn micros_now() -> u64 {
 /// so a piped/redirected fetch emits no bar. A steady tick animates the spinner
 /// during the pre-byte connect/handshake so the command never looks hung. The
 /// bar counts verified **content** bytes against the blob's `total_bytes` — the
-/// unit the [`decdn_client_pull::ProgressCallback`] reports — so length and
+/// unit the [`decdn_client::ProgressCallback`] reports — so length and
 /// position share one unit and the bar fills to exactly 100%. On a single-source fetch the
 /// driver reports this lane's `base_present + received`; a multi-source fetch
 /// instead reports one monotonic total the lanes fold their per-leg deltas into,
@@ -505,7 +494,7 @@ pub(crate) async fn probe_and_order(
         // Verify BEFORE the response can influence the order (ADR 014 §1). A
         // failure is requester-local policy — drop it and move on, no reputation
         // effect, because an unrecovered signature attributes nothing to anyone.
-        if let Err(e) = decdn_client_pull::probe::verify_probe_response(
+        if let Err(e) = decdn_client::probe::verify_probe_response(
             &resp,
             cand.eth_address,
             slash_domain,
@@ -742,8 +731,8 @@ async fn discover_provider(
     // by the store's own EWMA latency. Falls through to today's bootstrap +
     // probe path whenever the store can't back a full candidate set — never a
     // new failure mode, only a possible extra probe round.
-    let peer_store = decdn_client_pull::PeerStore::open(&chain.data_dir);
-    let store_cfg = decdn_client_pull::StoreConfig::default();
+    let peer_store = decdn_client::PeerStore::open(&chain.data_dir);
+    let store_cfg = decdn_client::StoreConfig::default();
     if !args.rediscover
         && let Some(targets) =
             store_fast_path(&peer_store, &store_cfg, args.max_sources, now_secs_cli())
@@ -803,7 +792,7 @@ async fn discover_provider(
     // by region risks starving the fetch entirely over data that is already
     // possibly stale.
     let is_live_registry = matches!(bootstrap, discovery::Bootstrap::Live { .. });
-    // `client-pull` returns the provenance rather than logging it itself; a
+    // `decdn-client` returns the provenance rather than logging it itself; a
     // silently stale peer list is exactly what the operator needs told, so
     // surface it here at `warn`.
     if let Some(warning) = bootstrap.warning() {
@@ -848,7 +837,7 @@ async fn discover_provider(
 }
 
 /// Build a probe-less [`ResolvedTargets`] straight from the peer store: rank
-/// every [`decdn_client_pull::PeerRecord::selectable`] record by its
+/// every [`decdn_client::PeerRecord::selectable`] record by its
 /// EWMA `latency_ms` (ascending, `None` sorts last), project each back to a
 /// [`NodeCandidate`], and admit per-operator via
 /// [`discovery::admit_sources`]. Returns `None` when fewer than
@@ -857,8 +846,8 @@ async fn discover_provider(
 /// probe path unchanged. Takes no [`Endpoint`], so it structurally issues no
 /// network probe.
 fn store_fast_path(
-    store: &decdn_client_pull::PeerStore,
-    cfg: &decdn_client_pull::StoreConfig,
+    store: &decdn_client::PeerStore,
+    cfg: &decdn_client::StoreConfig,
     max_sources: usize,
     now_secs: u64,
 ) -> Option<ResolvedTargets> {
@@ -883,7 +872,7 @@ fn store_fast_path(
     });
     let ordered: Vec<NodeCandidate> = fresh
         .iter()
-        .map(decdn_client_pull::PeerRecord::as_candidate)
+        .map(decdn_client::PeerRecord::as_candidate)
         .collect();
     let candidates = discovery::admit_sources(ordered, max_sources);
     if candidates.len() < cfg.min_fresh_candidates {
@@ -902,7 +891,7 @@ fn store_fast_path(
 
 /// Gather the cached peers whose identity is fresh enough to build a candidate
 /// set from without re-reading the registry: identity confirmed within
-/// [`decdn_client_pull::StoreConfig::identity_refresh_secs`], not
+/// [`decdn_client::StoreConfig::identity_refresh_secs`], not
 /// failure-suppressed, and not past the prune horizon. Latency freshness is NOT
 /// required — this is exactly the identity-fresh/latency-stale case that
 /// [`store_fast_path`] rejects; the caller re-probes these records for a fresh
@@ -910,8 +899,8 @@ fn store_fast_path(
 /// them); empty when none qualify, letting the caller fall through to the
 /// registry read.
 fn identity_fresh_candidates(
-    store: &decdn_client_pull::PeerStore,
-    cfg: &decdn_client_pull::StoreConfig,
+    store: &decdn_client::PeerStore,
+    cfg: &decdn_client::StoreConfig,
     now_secs: u64,
 ) -> Vec<NodeCandidate> {
     store
@@ -957,7 +946,7 @@ fn select_with_widening(
     candidates: Vec<NodeCandidate>,
     region: Option<&str>,
     allow: &[decdn_protocol::Region],
-    cfg: &decdn_client_pull::StoreConfig,
+    cfg: &decdn_client::StoreConfig,
 ) -> Vec<NodeCandidate> {
     // Only a non-empty allowlist can trigger the widening re-run, so keep the
     // unfiltered copy only in that case — the common empty-allowlist path (no
@@ -985,8 +974,8 @@ pub(crate) fn spawn_harvest(
 ) -> tokio::task::JoinHandle<()> {
     let dir = data_dir.to_path_buf();
     tokio::spawn(async move {
-        let store = decdn_client_pull::PeerStore::open(&dir);
-        let cfg = decdn_client_pull::StoreConfig::default();
+        let store = decdn_client::PeerStore::open(&dir);
+        let cfg = decdn_client::StoreConfig::default();
         let now = now_secs_cli();
         for cand in &registry {
             let _ = store.upsert_identity(cand, now);
@@ -1239,32 +1228,14 @@ fn persist_watermark(
     lane: LaneKey,
     progress: &VoucherProgress,
 ) {
-    // A ledger that rebased DOWN to the node's authenticated watermark records it
-    // once with an overwrite, which a monotone advance refuses; the next run then
-    // starts in step with the node. Every other persist is a monotone advance.
-    let (write, outcome) = if let Some(anchor) = progress.rebase_anchor() {
-        let (bytes_delivered, amount) = progress.totals();
-        let outcome = store.rebase_progress(
-            owner,
-            pool_id,
-            lane,
-            BuyerLaneProgress {
-                last_amount: anchor.amount,
-                last_bytes: anchor.bytes,
-            },
-            BuyerLaneProgress {
-                last_amount: amount,
-                last_bytes: bytes_delivered,
-            },
-        );
-        ("rebased", outcome)
-    } else {
-        let Some((bytes_delivered, amount)) = progress.advanced() else {
-            return;
-        };
-        let outcome = store.advance_progress(owner, pool_id, lane, bytes_delivered, amount);
-        ("advanced", outcome)
+    let Some(write) = ProgressWrite::of(progress) else {
+        return;
     };
+    let label = match write {
+        ProgressWrite::Rebase { .. } => "rebased",
+        ProgressWrite::Advance { .. } => "advanced",
+    };
+    let outcome = write.apply(store, owner, pool_id, lane);
     // A non-`Advanced` outcome (unknown pool / replaced owner slot / regression)
     // means the watermark did NOT move — same hazard as a backend error — so
     // surface it too rather than dropping it on the floor. A lost rebase write
@@ -1274,19 +1245,19 @@ fn persist_watermark(
     match outcome {
         Ok(AdvanceOutcome::Advanced) => {}
         Ok(other) => tracing::warn!(
-            write,
+            write = label,
             %bytes_delivered,
             %amount,
-            "{write} voucher watermark not persisted for pool {pool_id} (provider {}): \
+            "{label} voucher watermark not persisted for pool {pool_id} (provider {}): \
              {other:?}; the next reuse may re-sign a stale watermark, which that provider \
              rejects",
             lane.provider
         ),
         Err(e) => tracing::warn!(
-            write,
+            write = label,
             %bytes_delivered,
             %amount,
-            "failed to persist {write} voucher watermark for pool {pool_id} (provider {}): \
+            "failed to persist {label} voucher watermark for pool {pool_id} (provider {}): \
              {e}; the next reuse may re-sign a stale watermark, which that provider rejects",
             lane.provider
         ),
@@ -1715,7 +1686,7 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
 }
 
 /// The multi-source engagement gate (ADR 039): whether a fetch should fan out
-/// across several holders via [`decdn_client_pull::multi_source_fetch`] rather
+/// across several holders via [`decdn_client::multi_source_fetch`] rather
 /// than the single-source failover loop above.
 ///
 /// All three conditions must hold: the kill switch (`--multi-source`) is on,
@@ -1794,7 +1765,7 @@ pub(crate) fn multi_source_gate_declines(
 }
 
 // Failover classification (`retry_disposition` / `RetryDisposition`) is shared
-// with the multi-source scheduler, so it lives in `decdn_client_pull::retry` and
+// with the multi-source scheduler, so it lives in `decdn_client::retry` and
 // is imported above — the single-source loop below and the scheduler classify
 // failures identically.
 
@@ -1929,7 +1900,7 @@ struct FetchPrelude<'a, P> {
     /// The key the peer store's stream-derived sample/failure is filed under
     /// (#1906-series), captured before `target` moved into `PeerSource::new`.
     node_id: PublicKey,
-    peer_store: decdn_client_pull::PeerStore,
+    peer_store: decdn_client::PeerStore,
     /// Reactive top-ups this fetch has spent, across every lane a shared pool
     /// (`ledgers: Some`) tracks. Zeroed here; `drive` advances it.
     topups_used: std::sync::atomic::AtomicU32,
@@ -2103,7 +2074,7 @@ async fn drive_floor(
     total: u64,
     watch: &EntryWatch,
 ) -> anyhow::Error {
-    let floor = decdn_client_pull::throughput_watchdog(
+    let floor = decdn_client::throughput_watchdog(
         Arc::clone(&watch.landed),
         deadlines.window(),
         deadlines.floor_bps(),
@@ -2145,8 +2116,7 @@ async fn drive_floor(
 /// pool running dry, or a node's floor above our deposit, is not the peer's
 /// fault.
 fn blames_the_peer(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<PoolExhausted>().is_none()
-        && !decdn_client_pull::is_insufficient_deposit(err)
+    err.downcast_ref::<PoolExhausted>().is_none() && !decdn_client::is_insufficient_deposit(err)
 }
 
 impl<P> FetchPrelude<'_, P>
@@ -2346,8 +2316,8 @@ where
     // Captured before `target` moves into `PeerSource::new` below — the key the
     // peer store's stream-derived sample/failure is filed under (#1906-series).
     let node_id = target.id;
-    let peer_store = decdn_client_pull::PeerStore::open(&deps.chain.data_dir);
-    let peer_store_cfg = decdn_client_pull::StoreConfig::default();
+    let peer_store = decdn_client::PeerStore::open(&deps.chain.data_dir);
+    let peer_store_cfg = decdn_client::StoreConfig::default();
 
     // The context is already shared behind interior mutability (from
     // `lane_ledger`): the source clones it to open each gap's pull, and the
@@ -2396,7 +2366,7 @@ where
             Ok((header, reader))
         }
         Err(err) => {
-            if !decdn_client_pull::is_insufficient_deposit(&err)
+            if !decdn_client::is_insufficient_deposit(&err)
                 && let Err(e) = peer_store.record_failure(&node_id, now_secs_cli())
             {
                 tracing::debug!("could not record a failed open in the peer store: {e:#}");
@@ -2859,7 +2829,7 @@ fn stream_lane_watermarks(lanes: &[StreamLane]) -> Vec<LaneWatermark> {
         .collect()
 }
 
-/// Copy a [`decdn_client_pull::VerifiedReader`]'s verified bytes to `sink`,
+/// Copy a [`decdn_client::VerifiedReader`]'s verified bytes to `sink`,
 /// feeding `on_progress` the cumulative content bytes drained. Returns the total
 /// drained. Only bao-verified bytes ever leave the reader, so `sink` (stdout) is
 /// safe to pipe.
@@ -2940,8 +2910,8 @@ async fn probe_admitted_total<'a, P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let peer_store = decdn_client_pull::PeerStore::open(&deps.chain.data_dir);
-    let peer_store_cfg = decdn_client_pull::StoreConfig::default();
+    let peer_store = decdn_client::PeerStore::open(&deps.chain.data_dir);
+    let peer_store_cfg = decdn_client::StoreConfig::default();
     let mut lanes = Vec::with_capacity(admitted.len());
     let mut total_bytes = None;
     let mut last_probe_err = None;
@@ -2994,7 +2964,7 @@ where
                 total_bytes = Some(header.total_bytes);
             }
             Err(err) => {
-                if !decdn_client_pull::is_insufficient_deposit(&err) {
+                if !decdn_client::is_insufficient_deposit(&err) {
                     let _ = peer_store.record_failure(&lane.node_id, now_secs_cli());
                 }
                 last_probe_err = Some(match lane.ctx.lock() {
@@ -3498,7 +3468,7 @@ where
     P: alloy::providers::Provider + Clone,
 {
     fn max_topups(&self) -> u32 {
-        decdn_client_pull::MAX_TOPUP_ATTEMPTS
+        decdn_client::MAX_TOPUP_ATTEMPTS
     }
 
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
@@ -3574,7 +3544,7 @@ const RATE_SMOOTHING_TAU_SECS: f64 = 3.0;
 /// the rate there is whole-download throughput rather than one file's.
 ///
 /// The bar's positions are cumulative verified **content** bytes — what the
-/// [`decdn_client_pull::ProgressCallback`] reports — so the rate is content
+/// [`decdn_client::ProgressCallback`] reports — so the rate is content
 /// throughput (the interleaved bao proof nodes the wire also carries are not
 /// counted).
 ///
@@ -3713,7 +3683,7 @@ fn delivery_progress() -> (
 /// after the bar finishes.
 ///
 /// The callback's `received`/`expected` are content bytes, per
-/// [`decdn_client_pull::ProgressCallback`]. Both the bar length and its position
+/// [`decdn_client::ProgressCallback`]. Both the bar length and its position
 /// are therefore in the same unit, so the bar fills to exactly 100% and never
 /// overshoots.
 fn bar_callback(bar: indicatif::ProgressBar) -> (impl Fn(u64, u64) + 'static, DeliveryMeter) {
@@ -4241,28 +4211,13 @@ where
                 .get_by_pool_id(state.pool_id)?
                 .ok_or_else(|| escrowed_but_untracked(&effect, tx, "the credited row vanished"))?
         };
-        // Effectively uncapped: a self-owned capability delegates spend to the
-        // owner's own key, so the pool deposit — not the capability cap — is the
-        // real spending bound. Capping at `state.deposit` here would freeze the
-        // on-chain cap at the pre-top-up deposit (`_registerCapability` is
-        // idempotent past first redemption) and reject spend past it. The cap is
-        // `SELF_CAPABILITY_CAP` (`u64::MAX` µUSDC, ~$18.4T), NOT `U256::MAX`: the
-        // `PaymentPool`'s `spendingCap` is a `uint64`, so a `U256::MAX` cap hashes
-        // to a word the contract can never reconstruct and every redemption of this
-        // lane's vouchers reverts, silently stranding the node's earnings (and,
-        // because the node's exhaustion gate keys on `deposit − totalRedeemed`,
-        // starving the reactive top-up path). Matches `open_pool`'s self-capability.
-        let capability = issue_self_capability(
-            signer.as_ref(),
-            state.pool_id,
-            SELF_CAPABILITY_CAP,
-            SELF_CAPABILITY_EXPIRY,
+        return self_owned_lane_ctx(
+            &state,
+            signer,
             voucher_domain,
-        )?;
-        return Ok(
-            PoolContext::for_pool(&state, Arc::clone(signer), voucher_domain.clone())
-                .with_provider(provider, prior_bytes, prior_amount)
-                .with_capability(capability),
+            provider,
+            prior_bytes,
+            prior_amount,
         );
     }
 
@@ -4320,6 +4275,7 @@ pub(crate) fn temp_in_parent(target: &Path) -> std::io::Result<tempfile::NamedTe
 )]
 mod tests {
     use super::*;
+    use decdn_incentive::buyer_pool::BuyerLaneProgress;
 
     fn common() -> cli::ClientFetchArgs {
         cli::ClientFetchArgs {
@@ -4462,7 +4418,7 @@ mod tests {
         let handle = spawn_harvest(dir.path(), regs, probed);
         handle.await.expect("harvest task join");
 
-        let store = decdn_client_pull::PeerStore::open(dir.path());
+        let store = decdn_client::PeerStore::open(dir.path());
         assert!(store.get(&harvest_key(2)).is_some());
         let r = store.get(&harvest_key(1)).expect("probed peer persisted");
         assert_eq!(r.latency_ms, Some(42.0));
@@ -4474,7 +4430,7 @@ mod tests {
     /// the fetch; an empty allowlist filters nothing.
     #[test]
     fn select_with_widening_widens_when_allowlist_starves() {
-        let cfg = decdn_client_pull::StoreConfig::default();
+        let cfg = decdn_client::StoreConfig::default();
         let de = decdn_protocol::Region::parse("DE");
         let cands: Vec<NodeCandidate> = (1u8..=4)
             .map(|b| NodeCandidate {
@@ -4544,9 +4500,9 @@ mod tests {
     /// latency freshness — the set the registry-read-skip path re-probes.
     #[test]
     fn identity_fresh_candidates_gathers_latency_stale_peers() -> anyhow::Result<()> {
-        let cfg = decdn_client_pull::StoreConfig::default();
+        let cfg = decdn_client::StoreConfig::default();
         let dir = tempfile::tempdir()?;
-        let store = decdn_client_pull::PeerStore::open(dir.path());
+        let store = decdn_client::PeerStore::open(dir.path());
         let now = 1_000_000;
 
         // Three identity-fresh peers whose latency is STALE (sampled long ago):
@@ -4580,9 +4536,9 @@ mod tests {
     /// without one.
     #[test]
     fn fast_path_needs_min_fresh_and_ranks_by_latency() -> anyhow::Result<()> {
-        let cfg = decdn_client_pull::StoreConfig::default();
+        let cfg = decdn_client::StoreConfig::default();
         let dir = tempfile::tempdir()?;
-        let store = decdn_client_pull::PeerStore::open(dir.path());
+        let store = decdn_client::PeerStore::open(dir.path());
         let now = 10_000;
         for (b, lat) in [(1u8, 80.0), (2, 20.0), (3, 50.0)] {
             store.upsert_identity(&harvest_candidate(b), now)?;
@@ -4611,7 +4567,7 @@ mod tests {
 
         // Only two selectable records -> below min_fresh_candidates -> None.
         let dir2 = tempfile::tempdir()?;
-        let s2 = decdn_client_pull::PeerStore::open(dir2.path());
+        let s2 = decdn_client::PeerStore::open(dir2.path());
         for b in [1u8, 2] {
             s2.upsert_identity(&harvest_candidate(b), now)?;
             s2.record_sample(&harvest_key(b), 30.0, 1, now, &cfg)?;
@@ -4723,7 +4679,7 @@ mod tests {
     }
 
     // `retry_disposition` classification is unit-tested at its home in
-    // `decdn_client_pull::retry`; the CLI reuses that exact function, so the
+    // `decdn_client::retry`; the CLI reuses that exact function, so the
     // failover loop and the multi-source scheduler share one classifier.
 
     fn node_key(seed: u8) -> PublicKey {

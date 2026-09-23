@@ -167,7 +167,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     //      local node id for the register-divergence guard below. ----
     let signer = chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
     let operator = signer.address();
-    let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
+    let provider = decdn_client::provider::build_provider(&resolved.rpc_url, &signer)?;
     let bond_contract = CapacityBond::new(cb_addr, &provider);
     let node_secret = identity::load_or_generate(&resolved.data_dir).with_context(|| {
         format!(

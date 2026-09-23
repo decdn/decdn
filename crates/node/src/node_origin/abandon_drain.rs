@@ -28,7 +28,7 @@
 //!
 //! # What gets recorded
 //!
-//! Every connection the pull leg's own [`decdn_client_pull::source::PeerSource`]
+//! Every connection the pull leg's own [`decdn_client::source::PeerSource`]
 //! dials, observed at the
 //! DIAL rather than on the returned reader. A handshake that fails after the
 //! connect — a refusal, an over-ceiling rate or size, a resume offset past the
@@ -52,7 +52,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use alloy::primitives::Address;
-use decdn_client_pull::DialObserver;
+use decdn_client::DialObserver;
 use iroh::endpoint::WeakConnectionHandle;
 
 /// The ceiling on an abandoned pull leg's drain wait.
@@ -82,7 +82,7 @@ pub(super) struct ConnDrain(Mutex<Vec<WeakConnectionHandle>>);
 
 impl ConnDrain {
     /// A [`DialObserver`] that records into this set, to hand to
-    /// [`decdn_client_pull::source::PeerSource::with_dial_observer`].
+    /// [`decdn_client::source::PeerSource::with_dial_observer`].
     pub(super) fn observer(&self) -> impl Fn(WeakConnectionHandle) + Send + Sync + '_ {
         move |handle| self.record(handle)
     }
@@ -170,8 +170,8 @@ pub(super) async fn drain_abandoned(
 /// [`ConnDrain::observer`] returns is a temporary — this names it so a caller can
 /// hold it beside the source.
 ///
-/// [`PeerSource`]: decdn_client_pull::source::PeerSource
-/// [`PeerSource::with_dial_observer`]: decdn_client_pull::source::PeerSource::with_dial_observer
+/// [`PeerSource`]: decdn_client::source::PeerSource
+/// [`PeerSource::with_dial_observer`]: decdn_client::source::PeerSource::with_dial_observer
 pub(super) fn as_observer<'a>(
     f: &'a (impl Fn(WeakConnectionHandle) + Send + Sync + 'a),
 ) -> &'a DialObserver<'a> {

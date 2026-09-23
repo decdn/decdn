@@ -13,20 +13,21 @@
 /// Default [`PullConfig::read_ahead_bytes`]: 16 MiB — sixteen 1 MiB payment
 /// intervals of buffering. Enough to keep a consumer's buffer full without
 /// fetching (and paying for) far past where it might stop reading.
-pub const DEFAULT_READ_AHEAD_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const DEFAULT_READ_AHEAD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Default [`PullConfig::streamer_lane_cap`]: two. A `Streamer` keeps a small,
 /// bounded set of provider lanes on the front — enough for same-region fan-out
 /// and free failover, without the wide fan-out a full download wants. The
 /// `Downloader` uncaps this.
-pub const DEFAULT_STREAMER_LANE_CAP: usize = 2;
+pub(crate) const DEFAULT_STREAMER_LANE_CAP: usize = 2;
 
 /// Default [`PullConfig::download_unit_deadline`]: 30 seconds. A downloading lane
 /// that makes no verified progress for this long is reassigned to another holder
 /// (the multi-source stall watchdog). A full-throughput download has no consumer
 /// to pace against, so the watchdog — not consumption backpressure — is what
 /// fails a silently-stalled source over.
-pub const DEFAULT_DOWNLOAD_UNIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const DEFAULT_DOWNLOAD_UNIT_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 /// Zero-config tunables shared by the consumption faces.
 ///

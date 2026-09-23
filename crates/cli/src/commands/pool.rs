@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context as _;
-use decdn_client_pull::buyer_pool::{
+use decdn_client::buyer_pool::{
     ToppedUpPool, ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool,
     top_up, topped_up_effect,
 };
@@ -31,7 +31,7 @@ use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
 use decdn_incentive::{Capability, CapabilityGrant, PoolId, voucher_domain};
 use serde::Serialize;
 
-use decdn_client_pull::provider;
+use decdn_client::provider;
 
 use super::buyer_store::{
     BuyerStoreOwner, classify_buyer_store, client_buyer_db, node_buyer_db,

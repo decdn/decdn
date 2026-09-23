@@ -9,7 +9,7 @@ origin pull-through, range admission, partial-blob retention across GC, and prew
 
 Independent of the payment layer by design — the cache works with no payment logic wired in,
 which keeps it usable for local development and testing. The paid fetch path lives in
-`decdn-client-pull` instead.
+`decdn-client` instead.
 
 ## License
 

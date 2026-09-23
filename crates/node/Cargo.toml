@@ -43,7 +43,7 @@ test-support = ["decdn-protocol/test-support"]
 [dependencies]
 decdn-protocol = { workspace = true }
 decdn-cache = { workspace = true }
-decdn-client-pull = { workspace = true }
+decdn-client = { workspace = true }
 # `NodeAdmitStore` (`src/node_origin/admit_store.rs`, #1621 Task 10) implements
 # `decdn_bao_range::RangedStore` directly (delegating to `NodeRangedStore`), so
 # the trait/types must be named here rather than borrowed through a re-export.
@@ -106,16 +106,16 @@ tracing-opentelemetry = { workspace = true }
 # does not propagate, so the feature — not `cfg(test)` — is what exposes them
 # here; same shape as the `test-util` dev-deps below.
 decdn-node = { path = ".", features = ["test-support"] }
-# Enable the client-pull test helpers (the in-memory `stream_fetch*` wrappers,
+# Enable the `decdn-client` test helpers (the in-memory `stream_fetch*` wrappers,
 # `PullDeadlines::whole_transfer`) for the loopback/e2e suites. Dev-only, so a normal
 # `cargo build -p decdn-node` never sees them and a production caller cannot reach the
 # zero-stall/uncapped deadline shape (#1145 review).
-decdn-client-pull = { workspace = true, features = ["test-util"] }
+decdn-client = { workspace = true, features = ["test-util"] }
 # `insert_raw_buyer_record` (`#[cfg(any(test, feature = "anvil-e2e"))]`) delegates
 # to `BuyerChannelTable::insert_raw`, which is `test-util`-gated so a corruption
 # seeder stays out of the shipped API. A cross-crate `cfg(test)` doesn't
 # propagate, so the lib's own test build needs the feature via a dev-dep — same
-# shape as `decdn-client-pull` above.
+# shape as `decdn-client` above.
 decdn-incentive = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 # Property-based tests for the DHT routing table (`src/dht/routing.rs`):

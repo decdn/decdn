@@ -7,9 +7,9 @@
 //! source flip costs a fresh lane and a mid-stream serve pause), while the
 //! client's multi-source scheduler wants to SPREAD across every admitted
 //! source so all lanes run concurrently. [`plan_covered_runs`] and
-//! [`spread_segments`] are the two assigners: the node's sticky
+//! `spread_segments` are the two assigners: the node's sticky
 //! [`plan_covered_runs`] builds on the shared best-ranked lookup
-//! [`covering_sources`], while [`spread_segments`] needs every covering
+//! `covering_sources`, while `spread_segments` needs every covering
 //! source per block (not just the best-ranked one) and so runs its own
 //! per-block candidate scan.
 //!
@@ -165,7 +165,11 @@ pub(crate) fn covers_byte_range(
 /// `rank` lists source indices best-first (the existing unified selection
 /// score, ADR 001) — this never re-derives a ranking of its own.
 #[must_use]
-pub fn covering_sources(block: u32, sources: &[SourceCoverage], rank: &[usize]) -> Option<usize> {
+pub(crate) fn covering_sources(
+    block: u32,
+    sources: &[SourceCoverage],
+    rank: &[usize],
+) -> Option<usize> {
     rank.iter().copied().find(|&ix| {
         sources
             .iter()
@@ -180,7 +184,7 @@ pub fn covering_sources(block: u32, sources: &[SourceCoverage], rank: &[usize]) 
 /// considering only blocks that intersect `gap`. For each such block, the
 /// CURRENT run's source is kept if it still covers this block — sticky, no
 /// flip — even when a higher-ranked source also covers it; only when the
-/// current source's coverage ends does [`covering_sources`] pick a
+/// current source's coverage ends does `covering_sources` pick a
 /// replacement. Contiguous same-source blocks coalesce into one
 /// [`CoveredRun`]; a block no source covers breaks the run (if any) and its
 /// gap-intersecting chunks land in the returned `uncovered` set.
@@ -265,7 +269,7 @@ pub fn plan_covered_runs(
 /// one span per holder. A gap smaller than the source count still spreads across
 /// as many lanes as it has blocks.
 #[must_use]
-pub fn spread_segments(
+pub(crate) fn spread_segments(
     gap: &ChunkRanges,
     total_bytes: u64,
     sources: &[SourceCoverage],

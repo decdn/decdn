@@ -719,10 +719,11 @@ mod tests {
     use super::{StreamCandidate, Streamer, VerifiedReader};
     use crate::driver::DriveConfig;
     use crate::pacer::PULL_WINDOW_FLOOR;
+    use crate::sink::MemoryBlobCache;
     use crate::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
     use crate::{
-        BlobCache, Cumulative, MemoryBlobCache, NoCache, PoolContext, PoolLedger, PullConfig,
-        UpstreamPullHeader, VoucherProgress,
+        BlobCache, Cumulative, NoCache, PoolContext, PoolLedger, PullConfig, UpstreamPullHeader,
+        VoucherProgress,
     };
 
     fn healthy_ctx() -> PoolContext {
@@ -876,7 +877,7 @@ mod tests {
                 _hash: [u8; 32],
                 _offset: u64,
                 _len: u64,
-            ) -> crate::SinkFuture<'_, Option<Bytes>> {
+            ) -> crate::sink::SinkFuture<'_, Option<Bytes>> {
                 Box::pin(async { Ok(None) })
             }
             fn put(
@@ -884,7 +885,7 @@ mod tests {
                 _hash: [u8; 32],
                 _offset: u64,
                 _bytes: Bytes,
-            ) -> crate::SinkFuture<'_, ()> {
+            ) -> crate::sink::SinkFuture<'_, ()> {
                 self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async { Ok(()) })
             }

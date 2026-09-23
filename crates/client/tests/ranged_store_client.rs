@@ -22,13 +22,13 @@
 
 use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, IROH_BLOCK_SIZE, RangedStore};
-use decdn_client_pull::ClientRangedStore;
+use decdn_client::ClientRangedStore;
 
 const GROUP: u64 = CHUNK_GROUP_BYTES;
 
 /// Deterministic blob of `len` bytes plus its bao root and full pre-order
 /// outboard. Mirrors `crates/cache/tests/range_pull.rs::make_blob` /
-/// `crates/client-pull/src/ranged_store.rs::tests::synth_blob` — an xorshift
+/// `crates/client/src/ranged_store.rs::tests::synth_blob` — an xorshift
 /// fill, not random, so runs are reproducible.
 fn synth_blob(len: usize) -> ([u8; 32], Vec<u8>, Bytes) {
     let mut plaintext = vec![0u8; len];

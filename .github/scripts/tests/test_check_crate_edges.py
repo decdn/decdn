@@ -36,7 +36,7 @@ GRAPH: dict[str, list[str]] = {
     "decdn-reputation": ["decdn-protocol"],
     "decdn-incentive": ["decdn-common", "decdn-protocol"],
     "decdn-cache": ["decdn-bao-range", "decdn-config-types", "decdn-protocol"],
-    "decdn-client-pull": [
+    "decdn-client": [
         "decdn-bao-range",
         "decdn-common",
         "decdn-incentive",
@@ -45,7 +45,7 @@ GRAPH: dict[str, list[str]] = {
     "decdn-node": [
         "decdn-bao-range",
         "decdn-cache",
-        "decdn-client-pull",
+        "decdn-client",
         "decdn-common",
         "decdn-incentive",
         "decdn-protocol",
@@ -53,7 +53,7 @@ GRAPH: dict[str, list[str]] = {
     ],
     "decdn-cli": [
         "decdn-bao-range",
-        "decdn-client-pull",
+        "decdn-client",
         "decdn-common",
         "decdn-config-types",
         "decdn-incentive",
@@ -62,7 +62,7 @@ GRAPH: dict[str, list[str]] = {
     "decdn-e2e": [
         "decdn-bao-range",
         "decdn-cache",
-        "decdn-client-pull",
+        "decdn-client",
         "decdn-common",
         "decdn-config-types",
         "decdn-incentive",
@@ -73,7 +73,7 @@ GRAPH: dict[str, list[str]] = {
 
 DEV: dict[str, list[str]] = {
     "decdn-cli": ["decdn-cache", "decdn-incentive", "decdn-node"],
-    "decdn-node": ["decdn-client-pull", "decdn-incentive"],
+    "decdn-node": ["decdn-client", "decdn-incentive"],
 }
 
 # External crates and what they pull, enough to exercise the closure walk.
@@ -186,14 +186,44 @@ def test_dev_dependencies_are_not_edges():
     assert cce.check(metadata(dev=dev)) == []
 
 
-def test_cli_closure_must_not_reach_the_blob_store():
+def test_closure_must_not_reach_the_blob_store():
+    """A leak below the SDK reaches both guarded crates; each gets its own error."""
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-common"].append("iroh-blobs")
     errors = cce.check(metadata(external_edges=ext))
+    assert len(errors) == 2, errors
+    assert [e.split()[0] for e in errors] == ["decdn-cli", "decdn-client"], errors
+    for e in errors:
+        assert "iroh-blobs" in e
+        assert "decdn-common" in e, "the path should name the crate that introduced it"
+
+
+def test_client_sdk_edge_to_the_blob_store_is_an_error():
+    ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
+    ext["decdn-client"] = ["iroh-blobs"]
+    errors = cce.check(metadata(external_edges=ext))
+    assert any(
+        e.startswith("decdn-client links iroh-blobs via iroh-blobs ← decdn-client") for e in errors
+    ), errors
+
+
+def test_client_sdk_is_guarded_without_the_cli():
+    """A third party links the SDK without the CLI, so its closure is walked on its own."""
+    graph = {k: list(v) for k, v in GRAPH.items()}
+    graph["decdn-cli"].remove("decdn-client")
+    ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
+    ext["decdn-client"] = ["aws-sdk-s3"]
+    errors = [e for e in cce.check(metadata(graph, external_edges=ext)) if " links " in e]
     assert len(errors) == 1, errors
-    assert "decdn-cli" in errors[0]
-    assert "iroh-blobs" in errors[0]
-    assert "decdn-common" in errors[0], "the path should name the crate that introduced it"
+    assert errors[0].startswith("decdn-client links aws-sdk-s3"), errors[0]
+
+
+def test_cli_only_leak_does_not_blame_the_sdk():
+    ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
+    ext["decdn-cli"].append("iroh-blobs")
+    errors = cce.check(metadata(external_edges=ext))
+    assert len(errors) == 1, errors
+    assert errors[0].startswith("decdn-cli links iroh-blobs"), errors[0]
 
 
 def test_cli_closure_ignores_dev_only_routes():
@@ -221,8 +251,9 @@ def test_cli_closure_leak_two_hops_through_an_external_crate(forbidden):
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-incentive"] = ["origin-sdk"]
     errors = cce.check(metadata(external_edges=ext, external=external))
-    assert len(errors) == 1, errors
+    assert len(errors) == 2, errors
     assert f"{forbidden} ← origin-sdk ← decdn-incentive ← decdn-cli" in errors[0], errors[0]
+    assert f"{forbidden} ← origin-sdk ← decdn-incentive ← decdn-client" in errors[1], errors[1]
 
 
 def test_aws_lc_rs_is_not_the_aws_sdk():
@@ -237,8 +268,8 @@ def test_empty_resolve_graph_is_a_failure_not_a_pass():
     m = metadata()
     m["resolve"]["nodes"] = []
     errors = cce.check(m)
-    assert len(errors) == 1, errors
-    assert "inspected nothing" in errors[0]
+    assert len(errors) == 2, errors
+    assert all("inspected nothing" in e for e in errors), errors
 
 
 def test_table_row_with_slack_is_an_error():

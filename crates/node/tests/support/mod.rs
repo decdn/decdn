@@ -702,7 +702,7 @@ pub(crate) fn build_handler_full_configured(
 }
 
 /// Read one length-framed [`ClientMessage`] from `recv`. Mirrors the requester's
-/// private `client_requester::read_client_message`, exposed for the raw fake
+/// private `decdn_client::read_client_message`, exposed for the raw fake
 /// clients/servers the `cdn/client/v1` integration binaries hand-roll.
 pub(crate) async fn read_client_msg(recv: &mut RecvStream) -> anyhow::Result<ClientMessage> {
     let frame = read_frame(recv)

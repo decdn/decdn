@@ -127,7 +127,7 @@ repos:
 
       # Cargo enforces acyclicity only. The dependency flow in CLAUDE.md
       # § Crate Structure (three leaves, cli/e2e as sinks, an iroh-blobs-free
-      # CLI) is held by the table in check_crate_edges.py. Needs cargo. The
+      # CLI and client SDK) is held by the table in check_crate_edges.py. Needs cargo. The
       # `packaging` CI job is authoritative.
       - id: crate-edges
         name: crate dependency direction matches CLAUDE.md

@@ -30,14 +30,14 @@ use decdn_cache::origin::{FilesystemOrigin, Origin, OriginFetch};
 use decdn_cache::{
     CacheEngine, CacheMetrics, CircuitBreakerPolicy, Hash, PinnedHashes, RetryPolicy,
 };
+use decdn_client::PoolContext;
+use decdn_client::probe::probe_once;
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
     ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash,
     min_payment, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::{PoolOpenPending, PoolOpener, TopUpLanded};
-use decdn_node::client_requester::PoolContext;
-use decdn_node::client_requester::probe::probe_once;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
     ConfigStakerSet, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
@@ -194,10 +194,10 @@ impl PoolOpener for StubOpener {
         &self,
         provider_addr: Address,
         pool_id: B256,
-        bytes_delivered: U256,
-        amount: U256,
-        _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
+        write: decdn_client::buyer_pool::ProgressWrite,
     ) -> Result<()> {
+        let totals = write.totals();
+        let (bytes_delivered, amount) = (totals.last_bytes, totals.last_amount);
         // The orchestrator must persist progress against the pool it pulled
         // on — i.e. the id from the `PoolContext` it just opened/reused.
         // Asserts the `ctx.pool_id` plumbing at the pull call site (#838).
@@ -301,9 +301,7 @@ impl PoolOpener for WedgedOpener {
         &self,
         _provider_addr: Address,
         _pool_id: B256,
-        _bytes_delivered: U256,
-        _amount: U256,
-        _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
+        _write: decdn_client::buyer_pool::ProgressWrite,
     ) -> Result<()> {
         Ok(())
     }
@@ -333,9 +331,7 @@ impl PoolOpener for FailingRecordOpener {
         &self,
         _provider_addr: Address,
         _pool_id: B256,
-        _bytes_delivered: U256,
-        _amount: U256,
-        _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
+        _write: decdn_client::buyer_pool::ProgressWrite,
     ) -> Result<()> {
         anyhow::bail!("simulated buyer-pool store write failure")
     }
@@ -7344,7 +7340,7 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     // is what sets the span boundary: the pull leg paces in CONTENT while the
     // client pays in WIRE, so its floor clears a chunk by both group roundings that
     // separate the two.
-    let window = decdn_node::client_requester::PULL_WINDOW_FLOOR;
+    let window = decdn_client::PULL_WINDOW_FLOOR;
     let payload_len = usize::try_from(window.saturating_mul(3) / 2).unwrap_or(usize::MAX);
     let payload = vec![0xCDu8; payload_len];
     let hash = Hash::new(&payload);
@@ -8646,7 +8642,7 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
 
     // Content never exceeds its wire, and the ramp only widens with payment, so
     // taking the paid wire as the paid content over-states the window.
-    let pull_floor = decdn_client_pull::PULL_WINDOW_FLOOR;
+    let pull_floor = decdn_client::PULL_WINDOW_FLOOR;
     let ramped = decdn_incentive::ramped_credit_window(
         decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
         pull_floor,
@@ -9398,7 +9394,7 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
     // groups on top of one voucher interval so the two group-sized roundings between
     // paid wire and drawable content cannot park the pull short of the chunk the
     // client must complete to pay — so the floor is NOT one bare interval.
-    let one_window = decdn_client_pull::PULL_WINDOW_FLOOR;
+    let one_window = decdn_client::PULL_WINDOW_FLOOR;
     // The window bounds CONTENT bytes; the upstream watermark meters WIRE bytes (bao
     // content plus interleaved proof, ADR 038). Convert rather than adding slack: the
     // bound is then exact, and a pull that draws one group past the window fails here
@@ -11609,10 +11605,10 @@ impl PoolOpener for FundingOpener {
         &self,
         provider_addr: Address,
         pool_id: B256,
-        bytes_delivered: U256,
-        amount: U256,
-        _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
+        write: decdn_client::buyer_pool::ProgressWrite,
     ) -> Result<()> {
+        let totals = write.totals();
+        let (bytes_delivered, amount) = (totals.last_bytes, totals.last_amount);
         anyhow::ensure!(
             pool_id == self.pool_id,
             "record_progress pool_id {pool_id} != opened pool {}",
@@ -12526,7 +12522,7 @@ async fn a_zero_working_deposit_never_funds_a_pull() -> Result<()> {
 /// pull exhausts first — but with the clamp both orderings succeed, and without it
 /// the overshoot ordering corrupts, which is what a regression run trips on. This is
 /// the deterministic pin of the `delivered_frontier` clamp in
-/// `decdn_client_pull::driver::drive`.
+/// `decdn_client::driver::drive`.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Result<()> {
     // Four chunks of content per blob: large enough that each stream's ramped
@@ -12621,8 +12617,8 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Res
 /// The reactive top-up is bounded at ONE per pull, over the wire (#1600 review).
 ///
 /// The pure policy — refusing once `topups_used == max_topups` — is pinned in
-/// `decdn_client_pull::pacer`'s own unit tests; this pins the WIRING — the
-/// `topups_used` increment [`decdn_client_pull::driver::drive`] performs after a
+/// `decdn_client::pacer`'s own unit tests; this pins the WIRING — the
+/// `topups_used` increment [`decdn_client::driver::drive`] performs after a
 /// landed top-up. Removing that increment is currently invisible to every other
 /// test, because the funding double is idempotent against its target (a second call
 /// at the same target adds nothing, so the funder reports no headroom and the loop
@@ -12968,7 +12964,7 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
     let client_id = client_sk.public();
     let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
     let target_b = EndpointAddr::new(b_id).with_ip_addr(addr_b);
-    let binding = decdn_node::client_requester::sign_client_binding(
+    let binding = decdn_client::sign_client_binding(
         &client_signer,
         B256::from(*client_id.as_bytes()),
         &binding_dom(),
@@ -12984,7 +12980,7 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         client_binding: Some(binding),
         capability: None,
     };
-    let got = decdn_node::client_requester::stream_fetch(
+    let got = decdn_client::stream_fetch(
         &client_ep,
         target_b,
         &ctx_client_to_b,
@@ -13222,7 +13218,7 @@ async fn attack_b_attempt(
             let client_id = client_sk.public();
             let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
             let target_b = EndpointAddr::new(b_id).with_ip_addr(addr_b);
-            let binding = decdn_node::client_requester::sign_client_binding(
+            let binding = decdn_client::sign_client_binding(
                 &client_signer,
                 B256::from(*client_id.as_bytes()),
                 &binding_dom(),
@@ -13238,7 +13234,7 @@ async fn attack_b_attempt(
                 client_binding: Some(binding),
                 capability: None,
             };
-            let got = decdn_node::client_requester::stream_fetch(
+            let got = decdn_client::stream_fetch(
                 &client_ep,
                 target_b,
                 &ctx,

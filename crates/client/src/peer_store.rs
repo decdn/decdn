@@ -98,7 +98,7 @@ pub struct PeerRecord {
 impl PeerRecord {
     /// A latency sample exists and is younger than the TTL.
     #[must_use]
-    pub const fn latency_fresh(&self, now_secs: u64, cfg: &StoreConfig) -> bool {
+    pub(crate) const fn latency_fresh(&self, now_secs: u64, cfg: &StoreConfig) -> bool {
         match self.last_sampled_at_secs {
             Some(t) => now_secs.saturating_sub(t) <= cfg.latency_ttl_secs,
             None => false,
@@ -122,7 +122,7 @@ impl PeerRecord {
 
     /// Identity was confirmed against the registry within the refresh horizon, so
     /// the cached membership is fresh enough to build a candidate set from without
-    /// re-reading the registry. Distinct from [`Self::latency_fresh`]: identity and
+    /// re-reading the registry. Distinct from `latency_fresh`: identity and
     /// latency age on separate clocks, so a peer can be identity-fresh yet
     /// latency-stale — the case the registry-read-skip path serves by re-probing.
     #[must_use]
@@ -153,7 +153,7 @@ impl PeerRecord {
     }
 
     /// Fold a new latency sample into the EWMA (first sample sets the value directly).
-    pub fn fold_latency(&mut self, sample_ms: f64, alpha: f64) {
+    pub(crate) fn fold_latency(&mut self, sample_ms: f64, alpha: f64) {
         self.latency_ms = Some(match self.latency_ms {
             Some(prev) => (1.0 - alpha) * prev + alpha * sample_ms,
             None => sample_ms,

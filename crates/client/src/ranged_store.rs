@@ -1,7 +1,7 @@
 //! [`ClientRangedStore`]: the client-side [`RangedStore`](decdn_bao_range::RangedStore) backend
 //! (#1621) — a `.partial` data file plus a `.partial.obao4` outboard and a
 //! persisted `.partial.ranges` present-range record, built on `bao-tree` /
-//! `decdn-bao-range` only. No `iroh-blobs` dependency: `client-pull` must
+//! `decdn-bao-range` only. No `iroh-blobs` dependency: `decdn-client` must
 //! stay iroh-blobs-free so the CLI's pull path links no blob store / AWS SDK
 //! (#578).
 //!
@@ -449,15 +449,10 @@ impl ClientRangedStore {
         self.tree
     }
 
-    /// The outboard sidecar path, used by `admit`/`finalize`.
-    #[must_use]
-    pub fn obao_path(&self) -> &Path {
-        &self.obao_path
-    }
-
+    #[cfg(test)]
     /// The present-range record path, used by `admit`/`finalize`.
     #[must_use]
-    pub fn ranges_path(&self) -> &Path {
+    pub(crate) fn ranges_path(&self) -> &Path {
         &self.ranges_path
     }
 

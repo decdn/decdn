@@ -14,7 +14,7 @@
 //! # Where the error classification lives
 //!
 //! The reactive exhaustion predicates that need the typed pull error —
-//! [`crate::genuine_exhaustion`] and [`crate::resumable_watermark`] — stay at the
+//! [`crate::genuine_exhaustion`] and `resumable_watermark` — stay at the
 //! DRIVER boundary, not inside `decide`: the driver runs
 //! [`crate::genuine_exhaustion`] against the error and feeds its boolean result in
 //! as [`PaceState::exhaustion_confirmed`], and owns the reseed (desync) path
@@ -73,14 +73,6 @@ pub struct DownstreamFrontier {
     /// even with its window full, or neither leg moves again. A demand further out
     /// is ignored. `0` on the client path.
     pub serve_demand: u64,
-}
-
-impl DownstreamFrontier {
-    /// Whether either frontier in `self` moved past `observed`.
-    #[must_use]
-    pub const fn advanced_past(self, observed: Self) -> bool {
-        self.served_paid > observed.served_paid || self.serve_demand > observed.serve_demand
-    }
 }
 
 /// A snapshot of one fetch's budget state at a gap boundary, everything a

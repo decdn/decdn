@@ -93,7 +93,7 @@ pub(crate) async fn run(
     let old_signer =
         chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
     let old_operator = old_signer.address();
-    let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &old_signer)?;
+    let provider = decdn_client::provider::build_provider(&resolved.rpc_url, &old_signer)?;
 
     let plan = build_plan(&provider, cb_addr, resolved.chain_id, old_operator, args).await?;
     let json = args.chain.common.json;
@@ -591,7 +591,7 @@ async fn reonboard(
     )
     .await
     .context("failed to load the new keystore")?;
-    let new_provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &new_signer)?;
+    let new_provider = decdn_client::provider::build_provider(&resolved.rpc_url, &new_signer)?;
     let bond_contract = CapacityBond::new(cb_addr, &new_provider);
     let new_operator = new_signer.address();
 

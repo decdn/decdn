@@ -55,7 +55,7 @@ pub async fn run(args: &cli::DeregisterArgs, global_config: Option<&Path>) -> an
 
     let signer = chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
     let operator = signer.address();
-    let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
+    let provider = decdn_client::provider::build_provider(&resolved.rpc_url, &signer)?;
     let bond = CapacityBond::new(cb_addr, &provider);
 
     let plan = build_plan(&bond, operator, cb_addr).await?;

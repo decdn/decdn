@@ -6,7 +6,7 @@
 //! ever says "overloaded". The code and its layer label are the only evidence
 //! the requester gets, and they arrive buried in a `ConnectionError`, a
 //! `ReadError`, or a `WriteError` nested inside whichever transport call failed
-//! first. [`rate_limit_shed`] digs that out and [`UpstreamRateLimited`] carries
+//! first. `rate_limit_shed` digs that out and [`UpstreamRateLimited`] carries
 //! it as a typed sentinel the pull orchestrator can `downcast_ref`, so a shed
 //! reads as what it is — a reachable peer refusing work — rather than as a dead
 //! peer.
@@ -27,7 +27,7 @@ use iroh::endpoint::{ApplicationClose, ConnectionError, ReadError, VarInt, Write
 /// slashable; ADR 013 says a peer receiving `0x10` MUST NOT treat it as a
 /// protocol error).
 ///
-/// Built only by [`rate_limit_shed`]; the fields are public so a consumer can
+/// Built only by `rate_limit_shed`; the fields are public so a consumer can
 /// log which layer shed and a test can assert on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamRateLimited {
@@ -69,7 +69,9 @@ impl std::error::Error for UpstreamRateLimited {}
 ///
 /// Any other code, and any chain with no transport error in it, is `None`.
 #[must_use]
-pub fn rate_limit_shed(err: &(dyn std::error::Error + 'static)) -> Option<UpstreamRateLimited> {
+pub(crate) fn rate_limit_shed(
+    err: &(dyn std::error::Error + 'static),
+) -> Option<UpstreamRateLimited> {
     let mut cursor: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = cursor {
         if let Some(hit) = shed_at(e) {

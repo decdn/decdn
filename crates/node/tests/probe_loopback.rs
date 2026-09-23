@@ -1038,8 +1038,8 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
 /// carrying the wrong label fails at once.
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_once_types_a_rate_limit_close_as_upstream_rate_limited() -> anyhow::Result<()> {
-    use decdn_client_pull::UpstreamRateLimited;
-    use decdn_client_pull::probe::probe_once;
+    use decdn_client::UpstreamRateLimited;
+    use decdn_client::probe::probe_once;
 
     const MAX_ATTEMPTS: usize = 8;
 

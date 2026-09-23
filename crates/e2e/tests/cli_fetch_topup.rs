@@ -2,7 +2,7 @@
 //! (issue #1103). The mirror of `crates/node/tests/anvil_settlement_e2e.rs:937`
 //! (which asserts the *node* buyer's `top_up` raises the on-chain deposit and
 //! persists it) but for the CLI fetch buyer's stack: the shared
-//! [`decdn_client_pull::buyer_pool::top_up`] kernel driving the same
+//! [`decdn_client::buyer_pool::top_up`] kernel driving the same
 //! persistent [`RedbBuyerPoolStore`] the CLI fetch path uses.
 //!
 //! Shape: deploy the protocol, have a buyer open a pool and record it in a redb
@@ -38,7 +38,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_bao_range::align_range;
 use decdn_cache::Hash;
-use decdn_client_pull::buyer_pool::{ensure_allowance, open_pool, top_up};
+use decdn_client::buyer_pool::{ensure_allowance, open_pool, top_up};
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;
@@ -302,7 +302,7 @@ fn topup_fetch_argv_with_deposits(
 // several whole chunks get delivered AND ACCEPTED first, and only the
 // NEXT one exhausts the deposit.
 //
-// Reaching the top-up path here depends on `genuine_exhaustion` (client-pull's
+// Reaching the top-up path here depends on `genuine_exhaustion` (`decdn-client`'s
 // advancement-based bundle check): once any voucher has been accepted, the node
 // attaches a `WatermarkBundle` to every subsequent watermark-gated rejection it
 // can (`watermark_bundle_for_reject`), including a perfectly ordinary exhaustion.
@@ -683,7 +683,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 // cannot be forced deterministically here, this test asserts no top-up count. The
 // per-leg `content_paid_frontier` re-anchoring invariant — that a second delivery
 // leg prices its paid frontier against its own leg's wire spend, not the fetch's
-// summed spend — is unit-tested directly in `client-pull`'s `sink.rs`
+// summed spend — is unit-tested directly in `decdn-client`'s `sink.rs`
 // (`summed_multi_leg_wire_over_maps_which_is_why_baselines_are_per_leg`).
 
 const DEPOSIT_SHORT_RATE_PER_MB: u64 = 1000; // 0.001 USDC/MB — at the wire cap MAX_RATE_PER_MB
