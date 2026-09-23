@@ -57,7 +57,7 @@ pre-commit run --all-files        # run all hooks manually
 
 Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo doc`, `cargo deny`, adr-book-list, adr-ref-hygiene, package-embeds, deployment-manifest-mirror, toolchain-pin, workspace-manifests, crate-edges, forge-fmt, solhint, forge-build, forge-test, slither, aderyn.
 
-The repo-shape hooks (package-embeds, toolchain-pin, workspace-manifests, crate-edges) are stdlib-Python guards under `.github/scripts/`, each with a thin `.sh` wrapper and a pytest suite under `.github/scripts/tests/`; deployment-manifest-mirror is plain bash. They mirror the `packaging` CI job, which is authoritative. The pytest suites run in the `coverage tooling tests` job, which is not part of the `CI success` gate, so a failing guard test does not block a merge — the guards themselves do. A new guard follows the same shape: a `check(...)` function the tests can drive on a fixture, a module docstring saying what breaks silently without it, a `repo: local` hook with a scoped `files:` regex, and a named step in `packaging`.
+The repo-shape hooks (package-embeds, toolchain-pin, workspace-manifests, crate-edges) are stdlib-Python guards under `.github/scripts/`, each with a thin `.sh` wrapper and a pytest suite under `.github/scripts/tests/`; deployment-manifest-mirror is plain bash. They mirror the `packaging` CI job, which is authoritative. The pytest suites run in the `CI tooling tests` job, which is not part of the `CI success` gate, so a failing guard test does not block a merge — the guards themselves do. A new guard follows the same shape: a `check(...)` function the tests can drive on a fixture, a module docstring saying what breaks silently without it, a `repo: local` hook with a scoped `files:` regex, and a named step in `packaging`.
 
 ## Build and Test
 
@@ -123,7 +123,7 @@ forge build --sizes --deny warnings     # build + report sizes; fail on warnings
 forge test                              # default profile: 256 fuzz, 32-depth invariants
 FOUNDRY_PROFILE=ci forge test           # 1024 fuzz, 256/50-depth (matches CI)
 FOUNDRY_PROFILE=fuzz forge test         # 10k fuzz, 1024/100-depth (nightly/manual)
-FOUNDRY_PROFILE=coverage forge coverage --report lcov
+FOUNDRY_PROFILE=coverage forge coverage --report lcov --no-match-coverage 'test/'
 FOUNDRY_PROFILE=ci forge snapshot --diff .gas-snapshot   # current gas vs committed baseline
 ```
 
@@ -171,7 +171,7 @@ pass (empty) and fail (the drifted entries).
 - **Slither** fails CI on medium-and-above findings (`fail_on: medium` in `slither.config.json`, also passed as `fail-on: medium` to `crytic/slither-action`); detailed output lives in the job log. SARIF upload to code-scanning is **commented out** in `ci.yml` because the repo does not have GitHub Advanced Security enabled; re-enable the step (and the matching `security-events: write` + `actions: read` permissions) when GHAS is turned on or the repo flips public. For true positives, fix the contract. For confirmed false positives, suppress *inline* (`// slither-disable-next-line <detector>` with a comment justifying the suppression) — never expand `detectors_to_exclude` in `slither.config.json`. Detectors currently excluded globally: `naming-convention` (overlaps with solhint's name-mixedcase rules), `solc-version` and `pragma` (satisfied by the explicit `solc_version` pin in `foundry.toml`).
 - **Aderyn** runs via `Cyfrin/aderyn-ci@v0.0.10` with `fail-on: high`; output lives in the job log under the action's summary.
 - **Solhint** failures point at code; fix the code rather than disabling the rule. Rule changes require a separate PR with rationale. Solhint lints `contracts/src/`, `contracts/testnet/`, and `contracts/script/` (per the `lint` script in `contracts/package.json`); test files (Foundry's `test_xxx_yyy` convention) are out of scope by design.
-- **Coverage** posts a sticky PR comment with total line coverage + delta vs `main` (the `solidity-coverage` job uploads an LCOV baseline on push-to-main and downloads it on PRs). The comment script is `.github/scripts/contracts-coverage-comment.sh`; the Rust side uses the analogous `coverage-diff.py`.
+- **Coverage** goes to GitHub Code Quality, which posts the PR coverage comment and per-file deltas against `main`. The `solidity-coverage` job converts forge's LCOV with `.github/scripts/lcov_to_cobertura.py`, because Code Quality reads Cobertura XML only; the `test` job uploads the Rust report that `cargo llvm-cov --cobertura` writes. Both uploads are best-effort and need Code Quality enabled in the repository settings.
 
 **CI gotchas (subtler than local `forge test`):**
 
