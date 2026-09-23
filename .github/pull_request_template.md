@@ -19,7 +19,7 @@ Closes #
 - [ ] `cargo fmt -- --check`
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [ ] `cargo nextest run`
-- [ ] `contracts/` changed: `forge fmt --check`, `FOUNDRY_PROFILE=ci forge build --sizes --deny warnings`, `forge test`, and `.gas-snapshot` regenerated
+- [ ] `contracts/` changed: `(cd contracts && forge fmt --check && FOUNDRY_PROFILE=ci forge build --sizes --deny warnings && forge test)`, and `.gas-snapshot` regenerated with `(cd contracts && FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot)`
 - [ ] User-visible change: `CHANGELOG.md` entry added
 - [ ] Design change: ADR in `adr/` added or updated
-- [ ] PR title follows Conventional Commits with a lowercase subject (the `pr-title` check gates merge)
+- [ ] PR title uses a type the `pr-title` check allows (feat, fix, docs, chore, refactor, perf, test, build, ci, revert), and the subject does not start with an uppercase letter. The check gates merge and does not re-run on a title edit: push, or re-run the job.

@@ -27,7 +27,7 @@ body:
     id: version
     attributes:
       label: Version
-      description: Output of `decdn --version`, or the commit SHA you built from.
+      description: The Docker image tag, or the commit SHA you built from (`git rev-parse --short HEAD`).
     validations:
       required: true
   - type: input
@@ -39,9 +39,9 @@ body:
     id: reproduce
     attributes:
       label: Steps to reproduce
-      description: The exact commands and config. Remove private keys and keystore passwords.
+      description: The exact commands and config. Remove private keys, keystore passwords, RPC URLs that carry API keys, and origin credentials. `decdn config validate --config <path>` prints the config with `rpc_url` and `otlp_endpoint` redacted.
       placeholder: |
-        1. decdn node start --config ...
+        1. decdn-node run --config ...
         2. decdn fetch ...
     validations:
       required: true
@@ -61,5 +61,5 @@ body:
     id: logs
     attributes:
       label: Logs
-      description: Relevant log output. Set `RUST_LOG=debug` for more detail.
+      description: Relevant log output, with the same secrets removed. For more detail, set `RUST_LOG=info,decdn_node=debug` on `decdn-node`, or pass `-vv` to `decdn`.
       render: shell
