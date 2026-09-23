@@ -181,6 +181,27 @@ fn order_groups_smallest_first(mut groups: Vec<HashGroup<'_>>) -> Vec<HashGroup<
     groups
 }
 
+/// Run blocking file work `f` on tokio's blocking pool and return its result.
+/// Every group of a bundle pull is a future polled by ONE task, so a blocking
+/// call on that task stops every other group's streams from reading or paying —
+/// a serving node then ends them at its voucher-read timeout. `what` names the
+/// work in a join error.
+async fn off_runtime<T, F>(what: &'static str, f: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| anyhow!("{what} task: {e}"))?
+}
+
+/// [`link_or_copy_atomic`] on the blocking pool: its copy fallback moves a whole
+/// blob.
+async fn link_off_runtime(src: PathBuf, dest: PathBuf) -> anyhow::Result<()> {
+    off_runtime("link", move || link_or_copy_atomic(&src, &dest)).await
+}
+
 /// Materialize `src`'s content at `dest` without re-reading it over the network:
 /// a hard link where the filesystem allows it, else a full copy (cross-device
 /// `EXDEV`, or a filesystem that can't link). Staged in `dest`'s parent and
@@ -446,16 +467,19 @@ fn plan_slots<'a>(
 /// re-fetch), so one bad path can't doom the group.
 ///
 /// Parameterized over the two operations so the fetch-once / link-rest invariant
-/// — the core of #1306 — is unit-testable without a live endpoint or pool.
-async fn materialize_group<MF, MFut, LF>(
+/// — the core of #1306 — is unit-testable without a live endpoint or pool. Both
+/// are futures: a copy of a multi-GB blob must run off the runtime (see
+/// [`off_runtime`]), because every group of a run shares one task.
+async fn materialize_group<MF, MFut, LF, LFut>(
     slots: Vec<Slot<'_>>,
     mut materialize: MF,
-    link: LF,
+    mut link: LF,
 ) -> Vec<EntryOutcome>
 where
     MF: FnMut(PathBuf) -> MFut,
     MFut: std::future::Future<Output = anyhow::Result<u64>>,
-    LF: Fn(&Path, &Path) -> anyhow::Result<()>,
+    LF: FnMut(PathBuf, PathBuf) -> LFut,
+    LFut: std::future::Future<Output = anyhow::Result<()>>,
 {
     let mut canonical: Option<PathBuf> = None;
     let mut outcomes = Vec::with_capacity(slots.len());
@@ -464,7 +488,7 @@ where
             Slot::Failed(o) => o,
             Slot::Skip => EntryOutcome::Skipped,
             Slot::Write { label, dest } => match &canonical {
-                Some(src) => match link(src, &dest) {
+                Some(src) => match link(src.clone(), dest).await {
                     Ok(()) => EntryOutcome::Linked,
                     Err(e) => EntryOutcome::failed(label, &e),
                 },
@@ -482,6 +506,24 @@ where
     outcomes
 }
 
+/// Re-hash an on-disk whole-file `donor` candidate against `hash` on the
+/// blocking pool and, on a match, return its on-disk length — the authoritative
+/// size of what is about to be linked, rather than the manifest's optional
+/// `size` (absent on the wire for some bundles). `None` covers a hash mismatch,
+/// a read or metadata failure, and a failed join.
+async fn verified_donor_len(donor: &Path, hash: [u8; 32]) -> Option<u64> {
+    let target = donor.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let got = hash_partial(&target).ok()?;
+        (got == hash)
+            .then(|| std::fs::metadata(&target).ok())
+            .flatten()
+            .map(|m| m.len())
+    })
+    .await
+    .unwrap_or(None)
+}
+
 /// Materialize every write slot from an on-disk whole-file `donor` (a byte-
 /// identical file already in the root), by link/copy — no fetch, no payment.
 /// The first write is [`EntryOutcome::Deduped`] (the reused blob, counted once);
@@ -495,8 +537,11 @@ async fn materialize_from_donor(
 ) -> Vec<EntryOutcome> {
     materialize_group(
         slots,
-        |dest| std::future::ready(link_or_copy_atomic(donor, &dest).map(|()| size)),
-        link_or_copy_atomic,
+        |dest| {
+            let donor = donor.to_path_buf();
+            async move { link_off_runtime(donor, dest).await.map(|()| size) }
+        },
+        link_off_runtime,
     )
     .await
     .into_iter()
@@ -918,6 +963,9 @@ enum EntryOutcome {
 struct GroupRun {
     /// One outcome per entry in the group, in order.
     outcomes: Vec<EntryOutcome>,
+    /// The content bytes this round paid for, when its blob fetch landed
+    /// ([`PullCtx::pull_entry_untimed`]). `None` when the round fetched nothing.
+    paid: Option<u64>,
     /// The group's fetch failed with an error a later `--entry-retries` round
     /// may cure ([`entry_retryable`]). Only a failed blob fetch sets it; a
     /// materialize failure keeps its paid staging blob for the next run instead.
@@ -929,6 +977,18 @@ impl GroupRun {
     const fn done(outcomes: Vec<EntryOutcome>) -> Self {
         Self {
             outcomes,
+            paid: None,
+            retry: false,
+        }
+    }
+
+    /// The group's blob fetch landed, paying for `paid` content bytes, and
+    /// `outcomes` is how each destination then materialized. No later round can
+    /// change it.
+    const fn landed(outcomes: Vec<EntryOutcome>, paid: u64) -> Self {
+        Self {
+            outcomes,
+            paid: Some(paid),
             retry: false,
         }
     }
@@ -940,19 +1000,20 @@ impl GroupRun {
         Self {
             retry: entry_retryable(err),
             outcomes: fail_all(slots, err),
+            paid: None,
         }
     }
 }
 
 /// One-line `--json` summary. `fetched`/`linked`/`skipped`/`failed` are entry
-/// counts; `downloaded` is the whole-file content bytes of each distinct blob
-/// fetched (a blob shared across several paths counts once, #1306) and
-/// `reconstructed` is the total bytes written to disk this run — they diverge
-/// when one blob is materialized to several paths. `downloaded` is a content-size
-/// tally, not an exact on-wire measurement: it excludes bao proof overhead, counts
-/// a chunk served from an existing staging file on a resumed run, and counts a
-/// blob's whole size even when range-dedup paid for only its complement — so it
-/// equals `reconstructed` per single-path blob and does not report chunk savings.
+/// counts; `downloaded` is the content bytes paid for across the distinct blobs
+/// fetched (a blob shared across several paths counts once, #1306; a range-dedup
+/// blob counts only the bytes it did not splice from disk) and `reconstructed` is
+/// the total bytes written to disk this run — they diverge when one blob is
+/// materialized to several paths or when range-dedup spliced part of a blob.
+/// `downloaded` is a content-size tally, not an exact on-wire measurement: it
+/// excludes bao proof overhead, and it counts a `.partial` prefix resumed from an
+/// earlier run.
 ///
 /// `deduped` and `reused_bytes` report the whole-file dedup outcome, counted per
 /// distinct blob exactly as `fetched`/`downloaded` are (a blob reused at several
@@ -1018,15 +1079,12 @@ struct DedupStats {
     hints_ignored: AtomicU64,
 }
 
-/// A pull's byte accounting: `downloaded` is the whole-file content bytes of each
-/// distinct blob fetched (a blob materialized to several paths counts once, #1306);
+/// A pull's byte accounting: `downloaded` is the content bytes paid for across the
+/// distinct blobs fetched (a blob materialized to several paths counts once, #1306;
+/// a range-dedup blob counts only the bytes it did not splice from disk);
 /// `reconstructed` is the total bytes written to disk (every materialized copy).
-/// The two are equal unless one blob serves several paths. `downloaded` sums whole
-/// content lengths, not exact on-wire bytes: it omits bao proof overhead, still
-/// counts a chunk resumed from staging, and counts a blob's whole size even when
-/// range-dedup paid for only its complement — it tracks distinct blobs fetched, not
-/// the bytes range-dedup saved, so it does not fall below `reconstructed` on a
-/// single-path blob whose chunks were spliced from a sibling.
+/// `downloaded` is content bytes, not exact on-wire bytes: it omits bao proof
+/// overhead and still counts a `.partial` prefix resumed from an earlier run.
 #[derive(Clone, Copy, Default)]
 struct Transfer {
     downloaded: u64,
@@ -1194,14 +1252,46 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // operator named it (#2082).
     let store = open_client_store_for_buy(&chain.data_dir, chain.data_dir_source, "pull")?;
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
+    // The body runs in `pull_over`, so the endpoint closes on every exit —
+    // success, an early return, or an error — and its open connections end
+    // cleanly instead of being aborted on drop.
+    let result = pull_over(
+        args,
+        &chain,
+        grant,
+        &store,
+        &endpoint,
+        &relays,
+        (&filter, filters_given),
+        local_manifest,
+    )
+    .await;
+    endpoint.close().await;
+    result
+}
 
+/// The part of [`bundle_pull`] that runs over its open `endpoint`: resolve the
+/// providers and the buyer signer, obtain the manifest, and pull it. `filter` is
+/// the compiled `--include`/`--exclude` filter and whether either flag was given.
+#[allow(clippy::too_many_arguments)]
+async fn pull_over(
+    args: &BundlePullArgs,
+    chain: &fetch::ResolvedChain,
+    grant: Option<decdn_incentive::CapabilityGrant>,
+    store: &RedbBuyerPoolStore,
+    endpoint: &Endpoint,
+    relays: &[RelayUrl],
+    (filter, filters_given): (&EntryFilter, bool),
+    local_manifest: Option<Manifest>,
+) -> anyhow::Result<()> {
+    let common = &args.common;
     // Selection + the buyer signer, resolved per path (see `resolve_selection`).
     let Selection {
         explicit,
         candidates,
         signer,
         self_address,
-    } = resolve_selection(common, &chain).await?;
+    } = resolve_selection(common, chain).await?;
 
     // Chain plumbing for the pull loop, built once from the resolved signer.
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
@@ -1218,9 +1308,9 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // (best-effort cache/DHT). Same conversion as `decdn fetch`.
     let namespace_id = namespace_id(args.namespace);
 
-    let mut ctx = PullCtx {
-        endpoint: &endpoint,
-        store: &store,
+    let ctx = PullCtx {
+        endpoint,
+        store,
         contract: &contract,
         rpc: &rpc,
         signer: &signer,
@@ -1228,8 +1318,8 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         token,
         voucher_dom: &voucher_dom,
         slash_dom: &slash_dom,
-        chain: &chain,
-        relays: &relays,
+        chain,
+        relays,
         explicit,
         candidates,
         common,
@@ -1247,10 +1337,21 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         progress: PullProgress::disabled(),
     };
 
+    pull_manifest(ctx, args, filter, filters_given, local_manifest).await
+}
+
+/// Obtain the bundle manifest through `ctx`, pull every kept entry, and print the
+/// run summary.
+async fn pull_manifest<P: Provider + Clone>(
+    mut ctx: PullCtx<'_, P>,
+    args: &BundlePullArgs,
+    filter: &EntryFilter,
+    filters_given: bool,
+    local_manifest: Option<Manifest>,
+) -> anyhow::Result<()> {
     // Obtain the manifest: the pre-read local one, or the `--hash` bundle blob
     // fetched and filtered here. `None` => filtered to empty (already reported).
-    let Some(manifest) =
-        obtain_manifest(&ctx, args, &filter, filters_given, local_manifest).await?
+    let Some(manifest) = obtain_manifest(&ctx, args, filter, filters_given, local_manifest).await?
     else {
         return Ok(());
     };
@@ -1355,7 +1456,7 @@ async fn obtain_manifest<P: Provider + Clone>(
 /// Each failed entry that does is logged with its error, so a first-round
 /// failure is visible before a later round replaces it.
 fn settle_group_run(
-    groups: &mut [Vec<EntryOutcome>],
+    groups: &mut [SettledGroup],
     flush_tx: &tokio::sync::mpsc::UnboundedSender<FlushBatch>,
     i: usize,
     run: GroupRun,
@@ -1389,9 +1490,21 @@ fn settle_group_run(
         }
     }
     if let Some(slot) = groups.get_mut(i) {
-        *slot = run.outcomes;
+        *slot = SettledGroup {
+            outcomes: run.outcomes,
+            paid: run.paid,
+        };
     }
     run.retry
+}
+
+/// A hash-group's latest-round result, kept for the run summary: its per-entry
+/// outcomes and the content bytes its landed fetch paid for (see
+/// [`GroupRun::paid`]).
+#[derive(Clone, Default)]
+struct SettledGroup {
+    outcomes: Vec<EntryOutcome>,
+    paid: Option<u64>,
 }
 
 /// Walk one entry's ordered candidates with single-source failover (#1174,
@@ -2111,7 +2224,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         self.fetch_to_staging(hash, &staging, None).await?;
         let bytes =
             std::fs::read(&staging).with_context(|| format!("read {}", staging.display()))?;
-        remove_staging(&staging);
+        remove_staging_off_runtime(&staging).await;
         Ok(bytes)
     }
 
@@ -2177,13 +2290,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // materialize, so the finalized `<hex>` is the resume prefix a rerun needs
         // (deleting it would force a full re-fetch and re-payment).
         //
-        // Disk cost: `materialize` copies rather than hard-links, so every
-        // hint-carrying entry keeps its finalized staging blob here until this
-        // sweep, on top of the materialized output. Peak disk for an optimized
-        // bundle is therefore about output + staging (~2× the bundle size). A
-        // follow-up can hard-link the first materialize so the staging blob
-        // shares storage with its output.
-        sweep_donor_sources(&index);
+        // Disk cost: a donor's first destination is a hard link to its staging
+        // blob, so the two share storage until this sweep drops the staging name
+        // (a copy only when the destination is on another filesystem).
+        sweep_donor_sources(&index).await;
         (outcomes, transfer)
     }
 
@@ -2220,7 +2330,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // the flush task and keep its outcomes for the run summary; a retry
         // round's outcomes replace the round before.
         let drive = async {
-            let mut groups: Vec<Vec<EntryOutcome>> = vec![Vec::new(); groups_by_hash.len()];
+            let mut groups: Vec<SettledGroup> = vec![SettledGroup::default(); groups_by_hash.len()];
             let run = |group: HashGroup<'e>| {
                 // Cheap clone of the group's entry refs so `fetch_group` can consume
                 // `group` while we still correlate outcomes to entries.
@@ -2287,15 +2397,16 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // so sum it before flattening away the group boundaries.
         let transfer = groups
             .iter()
-            .map(|g| group_transfer(g))
+            .map(|g| group_transfer(&g.outcomes, g.paid))
             .fold(Transfer::default(), Transfer::add);
-        let outcomes = groups.into_iter().flatten().collect();
+        let outcomes = groups.into_iter().flat_map(|g| g.outcomes).collect();
         (outcomes, transfer)
     }
 
     /// Run [`Self::pull_entry_untimed`] and, when the entry lands, log one `-v`
     /// line with its size, the time the whole entry took, and its effective rate
-    /// (#2120).
+    /// (#2120). Returns the content bytes the entry paid for (see
+    /// [`Self::pull_entry_untimed`]).
     #[allow(clippy::too_many_arguments)]
     async fn pull_entry(
         &self,
@@ -2306,11 +2417,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         index: &ChunkIndex,
         fetch_plan: &FetchPlan,
         file: Option<&pull_progress::FileBar>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         let started = std::time::Instant::now();
         self.pull_entry_untimed(hash, hints, total, staging, index, fetch_plan, file)
             .await
-            .inspect(|()| log_entry_done(hash, staging, started.elapsed()))
+            .inspect(|_| log_entry_done(hash, staging, started.elapsed()))
     }
 
     /// Reconstruct one entry's blob into `staging` (the finalized per-hash staging
@@ -2332,7 +2443,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     ///   chunk) the whole blob is re-driven and re-verified before the entry fails.
     ///
     /// On success the entry's chunks are registered into `index` so later entries
-    /// can splice from this blob.
+    /// can splice from this blob, and the content bytes the entry paid for are
+    /// returned: the whole blob on the plain path, the blob less its spliced bytes
+    /// on the dedup path, and 0 for an already-finalized staging blob. It is a
+    /// content count — bao proof overhead is not in it, and a `.partial` prefix
+    /// resumed from an earlier run counts again.
     #[allow(clippy::too_many_arguments)]
     async fn pull_entry_untimed(
         &self,
@@ -2343,7 +2458,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         index: &ChunkIndex,
         fetch_plan: &FetchPlan,
         file: Option<&pull_progress::FileBar>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         // The byte-delivery callback drives the file bar's download and the total
         // bar's download meter; the `file` handle also carries the phase transitions
         // (discovering / pending / reconstructing) the byte callback cannot express.
@@ -2369,9 +2484,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                     cb(total, total);
                 }
                 index.register(hints, staging);
-                return Ok(());
+                return Ok(0);
             }
-            remove_staging(staging);
+            remove_staging_off_runtime(staging).await;
         }
 
         // Until the first byte lands, the entry is discovering holders — surfaced so
@@ -2405,7 +2520,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // register its chunks so a *later* entry can dedup against it.
             self.fetch_to_staging(hash, staging, progress).await?;
             index.register(hints, staging);
-            return Ok(());
+            let paid = match total {
+                Some(n) => n,
+                None => std::fs::metadata(staging).map_or(0, |m| m.len()),
+            };
+            return Ok(paid);
         };
 
         // Dedup path. Hold one fetch permit across the complement drive, the donor
@@ -2458,7 +2577,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         self.dedup_stats
             .hints_ignored
             .fetch_add(outcome.hints_ignored, Ordering::Relaxed);
-        Ok(())
+        Ok(total.saturating_sub(outcome.spliced_bytes))
     }
 
     /// Fetch the blob shared by one hash-group and write it under `out_root` at
@@ -2544,27 +2663,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // `materialize_from_donor`) already passes a `Slot::Failed` through as its
         // own failure and a `Slot::Skip` through as `Skipped`, so handing it the
         // whole `slots` vector — not just the `Write` entries — is correct.
-        if let Some(candidate) = disk.whole_file.get(&hash) {
-            let donor = candidate.clone();
-            let verify_target = donor.clone();
-            // On a hash match, return the donor's actual on-disk length — the
-            // authoritative size of what is about to be linked — rather than the
-            // manifest's optional `size` (absent on the wire for some bundles).
-            // `None` covers both a hash mismatch and a metadata-read failure.
-            let verified_len: Option<u64> = tokio::task::spawn_blocking(move || {
-                let got = hash_partial(&verify_target).ok()?;
-                (got == hash)
-                    .then(|| std::fs::metadata(&verify_target).ok())
-                    .flatten()
-                    .map(|m| m.len())
-            })
-            .await
-            .unwrap_or(None);
-            if let Some(len) = verified_len {
-                // A whole-file link downloads nothing, so it adds nothing to the
-                // total bar's download meter.
-                return GroupRun::done(materialize_from_donor(slots, &donor, len).await);
-            }
+        if let Some(donor) = disk.whole_file.get(&hash)
+            && let Some(len) = verified_donor_len(donor, hash).await
+        {
+            // A whole-file link downloads nothing, so it adds nothing to the
+            // total bar's download meter.
+            return GroupRun::done(materialize_from_donor(slots, donor, len).await);
         }
 
         // Staged once per group: `drive_fetch` finalizes to
@@ -2604,22 +2708,31 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             )
             .await;
         file_bar.finish();
-        if let Err(e) = fetched {
-            // `pull_entry` (whole-file or dedup) leaves the `<hex>.partial` +
-            // `.obao4`/`.ranges` sidecars in place on error — they are what the
-            // next run resumes from rather than re-paying for bytes already landed
-            // (same contract as `fetch`'s `<output>.partial` store). A retryable
-            // failure goes into the next `--entry-retries` round, which resumes
-            // from them.
-            return GroupRun::fetch_failed(slots, &e);
-        }
+        let paid = match fetched {
+            Ok(paid) => paid,
+            Err(e) => {
+                // `pull_entry` (whole-file or dedup) leaves the `<hex>.partial` +
+                // `.obao4`/`.ranges` sidecars in place on error — they are what the
+                // next run resumes from rather than re-paying for bytes already landed
+                // (same contract as `fetch`'s `<output>.partial` store). A retryable
+                // failure goes into the next `--entry-retries` round, which resumes
+                // from them.
+                return GroupRun::fetch_failed(slots, &e);
+            }
+        };
 
-        // `materialize` reads `staging` (not moved), so a retry after a failed
-        // first write may call it again for the next writable path.
+        // A failed first write leaves `staging` in place, so the next writable
+        // path retries from it. Off the runtime: a multi-GB copy on this task
+        // would stall every other group's streams.
         let outcomes = materialize_group(
             slots,
-            |dest| std::future::ready(materialize(&staging, &dest)),
-            link_or_copy_atomic,
+            |dest| {
+                let staging = staging.clone();
+                off_runtime("materialize", move || {
+                    first_write(&staging, &dest, is_donor)
+                })
+            },
+            link_off_runtime,
         )
         .await;
 
@@ -2631,7 +2744,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // none), never the whole blob. Deleting staging here would force a full
         // re-fetch — and re-payment — of an unrefunded blob in *every* case;
         // `fetch`'s single-blob path gets this free from its own ranged store, so
-        // the copy-based fan-out must gate it.
+        // the copy-based fan-out must gate it. A blob that moved into its first
+        // destination leaves no staging blob behind; that destination is recorded
+        // for the skip cache, so a rerun reuses it as a whole-file donor.
         //
         // A donor blob (`is_donor`) is a splice source a later entry may still
         // read, so it is kept here regardless and swept once at run end by
@@ -2641,10 +2756,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .any(|o| matches!(o, EntryOutcome::Failed { .. }));
         if !is_donor && !any_failed {
             // A non-donor whose every destination landed: its content is safely on
-            // disk, so drop the staging blob now. A failed non-donor keeps its
-            // `.partial` resume prefix; a donor is kept for splicing and swept at
-            // run end.
-            remove_staging(&staging);
+            // disk (the blob itself usually moved there), so drop what is left of
+            // staging now. A failed non-donor keeps its `.partial` resume prefix; a
+            // donor is kept for splicing and swept at run end.
+            remove_staging_off_runtime(&staging).await;
         } else if is_donor && any_failed {
             // A donor whose blob is fully fetched and paid for but whose
             // materialize failed: retain its finalized `<hex>` from the run-end
@@ -2652,7 +2767,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             index.mark_retained(&staging);
         }
 
-        GroupRun::done(outcomes)
+        GroupRun::landed(outcomes, paid)
     }
 }
 
@@ -3292,11 +3407,21 @@ async fn reconcile_deferred(
 /// source EXCEPT one [`ChunkIndex::mark_retained`] flagged (its blob is paid for
 /// but a destination failed to materialize, so its finalized `<hex>` is the resume
 /// prefix a rerun needs — deleting it would force a full re-fetch and re-payment).
-fn sweep_donor_sources(index: &ChunkIndex) {
-    for source in index.sources() {
-        if !index.retained(&source) {
-            remove_staging(&source);
+/// The removal runs on the blocking pool (see [`remove_staging_off_runtime`]).
+async fn sweep_donor_sources(index: &ChunkIndex) {
+    let doomed: Vec<PathBuf> = index
+        .sources()
+        .into_iter()
+        .filter(|source| !index.retained(source))
+        .collect();
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        for source in &doomed {
+            remove_staging(source);
         }
+    })
+    .await
+    {
+        tracing::warn!("donor staging sweep task: {e}");
     }
 }
 
@@ -3325,6 +3450,40 @@ fn materialize(staging: &Path, dest: &Path) -> anyhow::Result<u64> {
         .map_err(|e| e.error)
         .with_context(|| format!("write {}", dest.display()))?;
     Ok(written)
+}
+
+/// Land a group's finalized `staging` blob at its first destination, returning
+/// its byte count: a non-donor moves ([`move_into_place`]); a donor — a splice
+/// source the run-end sweep still owns — is hard-linked (a copy only across
+/// filesystems), so its staging name survives for later recipients.
+fn first_write(staging: &Path, dest: &Path, is_donor: bool) -> anyhow::Result<u64> {
+    if !is_donor {
+        return move_into_place(staging, dest);
+    }
+    let len = std::fs::metadata(staging)
+        .with_context(|| format!("stat {}", staging.display()))?
+        .len();
+    link_or_copy_atomic(staging, dest).map(|()| len)
+}
+
+/// Move the finalized `staging` blob to `dest`, returning its byte count. A
+/// non-donor blob has no reader after its first destination lands, so a rename
+/// replaces the full copy [`materialize`] makes — no second write of the blob and
+/// no second copy on disk. `staging` is already durable: the ranged store's
+/// finalize, and the dedup splice before promotion, sync it. A rename that fails
+/// (a destination on another filesystem, `EXDEV`) falls back to [`materialize`],
+/// which leaves `staging` in place for the next writable path.
+fn move_into_place(staging: &Path, dest: &Path) -> anyhow::Result<u64> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let len = std::fs::metadata(staging)
+        .with_context(|| format!("stat {}", staging.display()))?
+        .len();
+    match std::fs::rename(staging, dest) {
+        Ok(()) => Ok(len),
+        Err(_) => materialize(staging, dest),
+    }
 }
 
 /// One chunk of a hint-carrying entry, resolved to an absolute byte placement in
@@ -3949,6 +4108,16 @@ pub(crate) fn complement_runs(donor_aligned: &[(u64, u64)], total: u64) -> Vec<(
     gaps
 }
 
+/// [`remove_staging`] on the blocking pool: unlinking a multi-GB blob can take
+/// long enough on some filesystems to stall the task every group shares. A
+/// failed join only leaves harmless clutter, the same as a failed removal.
+async fn remove_staging_off_runtime(staging: &Path) {
+    let staging = staging.to_path_buf();
+    if let Err(e) = tokio::task::spawn_blocking(move || remove_staging(&staging)).await {
+        tracing::warn!("staging removal task: {e}");
+    }
+}
+
 /// Best-effort cleanup of a finalized staging blob whose content is safely
 /// elsewhere (materialized to disk, or read into memory) and so has nothing left
 /// to resume. Removes the plain `<hex>` finalized blob itself and, best-effort,
@@ -4443,14 +4612,14 @@ fn transfer_line(t: Transfer) -> String {
 }
 
 /// The [`Transfer`] for one whole-file hash-group: the blob is either paid for
-/// once (`downloaded` = its size, taken from the single `Fetched`) or reused
-/// from an on-disk donor with no download (`Deduped`, contributing 0 to
-/// `downloaded`) — a group never mixes the two, since [`PullCtx::fetch_group`] takes one
-/// path or the other. Every materialized copy — the canonical (`Fetched` or
-/// `Deduped`) plus each `Linked` duplicate path — is a full file on disk
-/// (`reconstructed` = size × copies). A group with nothing written (all skipped
-/// or failed) contributes nothing.
-fn group_transfer(outcomes: &[EntryOutcome]) -> Transfer {
+/// once (`downloaded` = `paid`, the content bytes its fetch paid for, else the
+/// size of the single `Fetched`) or reused from an on-disk donor with no download
+/// (`Deduped`, contributing 0 to `downloaded`) — a group never mixes the two,
+/// since [`PullCtx::fetch_group`] takes one path or the other. Every materialized
+/// copy — the canonical (`Fetched` or `Deduped`) plus each `Linked` duplicate
+/// path — is a full file on disk (`reconstructed` = size × copies). A group with
+/// nothing written (all skipped or failed) contributes nothing.
+fn group_transfer(outcomes: &[EntryOutcome], paid: Option<u64>) -> Transfer {
     let paid_size = outcomes.iter().find_map(|o| match o {
         EntryOutcome::Fetched(n) => Some(*n),
         _ => None,
@@ -4472,7 +4641,7 @@ fn group_transfer(outcomes: &[EntryOutcome]) -> Transfer {
                 .count();
             let copies = u64::try_from(copies).unwrap_or(u64::MAX);
             Transfer {
-                downloaded: paid_size.unwrap_or(0),
+                downloaded: paid_size.map_or(0, |size| paid.unwrap_or(size)),
                 reconstructed: n.saturating_mul(copies),
             }
         }
@@ -5837,8 +6006,8 @@ mod tests {
     /// blob but KEEPS one `mark_retained` flagged (its group failed to
     /// materialize), so a rerun resumes from the finalized `<hex>` instead of
     /// re-paying the whole blob.
-    #[test]
-    fn run_end_sweep_keeps_a_retained_donor_and_removes_a_normal_one() {
+    #[tokio::test]
+    async fn run_end_sweep_keeps_a_retained_donor_and_removes_a_normal_one() {
         let tmp = tempfile::tempdir().expect("tmp");
         let normal = tmp.path().join("normal");
         let retained = tmp.path().join("retained");
@@ -5865,7 +6034,7 @@ mod tests {
         // The retained donor's blob is paid for but its materialize failed.
         index.mark_retained(&retained);
 
-        sweep_donor_sources(&index);
+        sweep_donor_sources(&index).await;
 
         assert!(
             !normal.exists(),
@@ -6171,15 +6340,31 @@ mod tests {
             EntryOutcome::Linked,
             EntryOutcome::Linked,
         ];
-        let t = group_transfer(&outcomes);
+        let t = group_transfer(&outcomes, Some(100));
         assert_eq!(t.downloaded, 100);
         assert_eq!(t.reconstructed, 300);
+    }
+
+    /// A range-dedup fetch pays only for the bytes it did not splice from disk,
+    /// so `downloaded` is its paid tally, not the blob size — while every copy on
+    /// disk is still a whole file.
+    #[test]
+    fn group_transfer_downloads_only_the_paid_bytes_of_a_spliced_blob() {
+        let outcomes = vec![EntryOutcome::Fetched(100), EntryOutcome::Linked];
+        let t = group_transfer(&outcomes, Some(30));
+        assert_eq!(t.downloaded, 30);
+        assert_eq!(t.reconstructed, 200);
+
+        // A blob already finalized in staging by an earlier run pays nothing.
+        let t = group_transfer(&[EntryOutcome::Fetched(100)], Some(0));
+        assert_eq!(t.downloaded, 0);
+        assert_eq!(t.reconstructed, 100);
     }
 
     #[test]
     fn group_transfer_skips_and_fails_contribute_nothing() {
         let outcomes = vec![EntryOutcome::Fetched(100), EntryOutcome::Skipped];
-        let t = group_transfer(&outcomes);
+        let t = group_transfer(&outcomes, None);
         assert_eq!(t.downloaded, 100);
         assert_eq!(t.reconstructed, 100);
 
@@ -6187,7 +6372,7 @@ mod tests {
             path: "x".into(),
             err: "boom".into(),
         }];
-        let t = group_transfer(&none);
+        let t = group_transfer(&none, None);
         assert_eq!(t.downloaded, 0);
         assert_eq!(t.reconstructed, 0);
     }
@@ -6831,6 +7016,47 @@ mod tests {
         assert_eq!(std::fs::read(&staging).unwrap(), b"new-content");
     }
 
+    /// A non-donor blob's first write moves staging into place — no second copy
+    /// of the blob — and replaces a stale destination atomically.
+    #[test]
+    fn first_write_moves_a_non_donor_blob_into_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("blob");
+        std::fs::write(&staging, b"new-content").unwrap();
+        let dest = dir.path().join("sub").join("out.bin");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"stale-old").unwrap();
+
+        let n = first_write(&staging, &dest, false).unwrap();
+
+        assert_eq!(n, b"new-content".len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new-content");
+        assert!(!staging.exists(), "the blob moved, it was not copied");
+    }
+
+    /// A donor blob's first write keeps its staging name — later recipients
+    /// still splice from it — and shares its storage with the destination.
+    #[cfg(unix)]
+    #[test]
+    fn first_write_links_a_donor_blob_and_keeps_staging() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("blob");
+        std::fs::write(&staging, b"donor-bytes").unwrap();
+        let dest = dir.path().join("out.bin");
+
+        let n = first_write(&staging, &dest, true).unwrap();
+
+        assert_eq!(n, b"donor-bytes".len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"donor-bytes");
+        assert!(staging.exists(), "a donor's staging name survives");
+        assert_eq!(
+            std::fs::metadata(&staging).unwrap().ino(),
+            std::fs::metadata(&dest).unwrap().ino(),
+            "the first destination is a hard link, not a copy"
+        );
+    }
+
     /// The headline #1306 invariant, testable without a live endpoint: two
     /// destinations for one blob → the paid `materialize` runs **once**, the second
     /// is a free `link`, and outcomes are `[Fetched, Linked]` (never `Fetched`
@@ -6859,7 +7085,7 @@ mod tests {
             },
             |_src, _dest| {
                 link_calls.set(link_calls.get() + 1);
-                Ok(())
+                async { Ok(()) }
             },
         )
         .await;
@@ -6908,7 +7134,7 @@ mod tests {
             },
             |_src, _dest| {
                 link_calls.set(link_calls.get() + 1);
-                Ok(())
+                async { Ok(()) }
             },
         )
         .await;
@@ -7216,7 +7442,7 @@ mod tests {
     #[test]
     fn settle_group_run_replaces_the_earlier_round() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut groups = vec![Vec::new(), Vec::new()];
+        let mut groups = vec![SettledGroup::default(), SettledGroup::default()];
         let failed = GroupRun::fetch_failed(
             vec![Slot::Write {
                 label: "a.bin",
@@ -7233,9 +7459,10 @@ mod tests {
             BTreeMap::new()
         ));
         assert!(matches!(
-            groups[1].as_slice(),
+            groups[1].outcomes.as_slice(),
             [EntryOutcome::Failed { .. }]
         ));
+        assert_eq!(groups[1].paid, None, "a failed round paid for nothing");
         assert!(rx.try_recv().is_err(), "nothing recorded, nothing flushed");
 
         let mut updates = BTreeMap::new();
@@ -7248,9 +7475,17 @@ mod tests {
                 chunks: None,
             },
         );
-        let landed = GroupRun::done(vec![EntryOutcome::Fetched(3)]);
+        let landed = GroupRun::landed(vec![EntryOutcome::Fetched(3)], 2);
         assert!(!settle_group_run(&mut groups, &tx, 1, landed, updates));
-        assert!(matches!(groups[1].as_slice(), [EntryOutcome::Fetched(3)]));
+        assert!(matches!(
+            groups[1].outcomes.as_slice(),
+            [EntryOutcome::Fetched(3)]
+        ));
+        assert_eq!(
+            groups[1].paid,
+            Some(2),
+            "the landed round's paid tally is kept"
+        );
         assert_eq!(rx.try_recv().expect("a flush batch").fetched_bytes, 3);
     }
 

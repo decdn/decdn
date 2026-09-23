@@ -1278,11 +1278,6 @@ fn persist_watermark(
 // itself (multi-source, per-candidate failover, one-shot rediscovery), each arm
 // carrying a `tracing` diagnostic. Kept as one flat orchestrator rather than
 // split across helpers that would only pass the shared loop state back and forth.
-#[allow(clippy::too_many_lines)]
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "flat failover ladder; the branches are the fallback arms, not nesting"
-)]
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
@@ -1312,11 +1307,35 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
 
     // One discovery-enabled endpoint, reused for probing and the delivery dial.
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
+    // The body runs in `fetch_over`, so the endpoint closes on every exit —
+    // success, an early return, or an error — and its open connections end
+    // cleanly instead of being aborted on drop.
+    let result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint).await;
+    endpoint.close().await;
+    result
+}
 
+/// The part of [`fetch`] that runs over its open `endpoint`: resolve the
+/// providers, then pay and fetch with failover.
+#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "flat failover ladder; the branches are the fallback arms, not nesting"
+)]
+async fn fetch_over(
+    args: &cli::FetchArgs,
+    hash: [u8; 32],
+    relays: &[RelayUrl],
+    chain: &ResolvedChain,
+    grant: Option<CapabilityGrant>,
+    store: &RedbBuyerPoolStore,
+    endpoint: &Endpoint,
+) -> anyhow::Result<()> {
+    let common = &args.common;
     // Resolve the ordered failover list: explicit `--node-id`, or auto-discover.
     // These are `mut` so the store-fast-path rediscovery fallback below can
     // replace them with a freshly discovered set within this same fetch.
-    let targets = resolve_target_node(common, &chain, &endpoint, &relays, hash).await?;
+    let targets = resolve_target_node(common, chain, endpoint, relays, hash).await?;
     let mut candidates = targets.candidates;
     let mut coverage_by_node = targets.coverage_by_node;
     let mut size_hint = targets.size_hint;
@@ -1345,7 +1364,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // the eth_call; only a first-ever pool (no row) pays the `usdc()` round-trip.
     // The reuse branch of `open_or_reuse_pool` already trusts this same
     // `state.token`, so this only makes the top-level value consistent with it.
-    let token = match cached_pool_token(&store, self_address, chain.payment_pool)? {
+    let token = match cached_pool_token(store, self_address, chain.payment_pool)? {
         Some(token) => token,
         None => contract
             .usdc()
@@ -1380,14 +1399,14 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // Every field is provider-independent, so it is built once and reused across
     // every failover candidate (the provider is passed to `drive_fetch` per-try).
     let deps = DriveFetchDeps {
-        endpoint: &endpoint,
-        store: &store,
+        endpoint,
+        store,
         contract: &contract,
         rpc: &rpc,
         slash_dom: &slash_dom,
         self_address,
         token,
-        chain: &chain,
+        chain,
         namespace_id,
         max_rate_per_mb: common.max_rate_per_mb,
         max_blob_bytes,
@@ -1407,7 +1426,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             &voucher_dom,
             &candidates,
             &coverage_by_node,
-            &relays,
+            relays,
             hash,
         )
         .await?;
@@ -1442,7 +1461,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
                 &voucher_dom,
                 &candidates,
                 &coverage_by_node,
-                &relays,
+                relays,
                 hash,
                 &args.output,
                 size_hint,
@@ -1508,15 +1527,15 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             // per-provider.
             let ctx = build_ctx_for_fetch(
                 grant.as_ref(),
-                &store,
+                store,
                 &contract,
                 &rpc,
                 &signer,
                 &voucher_dom,
                 provider,
                 self_address,
-                &chain,
-                &endpoint,
+                chain,
+                endpoint,
             )
             .await?;
 
@@ -1631,7 +1650,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             // and identity/stats harvest still runs on the discovery path.
             let mut disc_args = common.clone();
             disc_args.rediscover = true;
-            let fresh = resolve_target_node(&disc_args, &chain, &endpoint, &relays, hash).await?;
+            let fresh = resolve_target_node(&disc_args, chain, endpoint, relays, hash).await?;
             candidates = fresh.candidates;
             coverage_by_node = fresh.coverage_by_node;
             size_hint = fresh.size_hint;
