@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/decdn/decdn/blob/main/SECURITY.md
+    about: Email security@decdn.org. Do not open a public issue for a vulnerability.
+  - name: Ask a question
+    url: https://github.com/decdn/decdn/discussions
+    about: Use GitHub Discussions for questions and ideas that are not yet a concrete request.
