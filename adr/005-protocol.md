@@ -111,7 +111,7 @@ sequenceDiagram
             D->>P: ChunkData {bytes} (sender-sized frames)
             P->>D: ChunkPreimage {preimage, index}
         end
-        P->>D: Voucher {sig, amt, chain_root: 0, chunk_price} (closing amount-voucher)
+        P->>D: Voucher {sig, amt, chain_root', chunk_price} (closing amount-voucher: folds the chain, rolls to a fresh root)
         P->>D: StreamEnd
     end
 ```
@@ -248,20 +248,20 @@ sequenceDiagram
         N->>C: StreamResponse + ChunkData…
     end
 
-    Note over C: Aggregate byte counter crosses a chunk_bytes boundary
-    C->>N: ChunkPreimage {preimage, index} (sent on any active stream)
+    Note over C: Stream 1 delivers a whole chunk_bytes chunk
+    C->>N: ChunkPreimage {preimage, index} (sent on stream 1)
 ```
 
-The payer maintains **one aggregate byte counter, one `chain_root`, and one chain index per `(signer, provider)` lane** — the streams from one signer to one node. When the counter crosses the next chunk boundary (1 MiB, `CHUNK_BYTES`), it releases the next preimage on any active stream sharing that lane. A stream that joins a live lane continues the running chain and MUST NOT open a second root ([ADR 003 § One chain per lane](003-payments.md#one-chain-per-lane)). The delivering node tracks total bytes sent across all streams on the lane and **pauses all of them** once the unpaid balance reaches its [credit window](003-payments.md#credit-window) — the self-enforcing threshold is applied collectively, not per-stream. (The window is at least one chunk, so this generalizes the per-chunk pause rather than replacing it: a node running stop-and-wait pauses at one chunk of deficit.)
+The payer maintains **one `chain_root` and one chain index per `(signer, provider)` lane** — the streams from one signer to one node. The payer releases one preimage on a stream for each whole chunk (1 MiB, `CHUNK_BYTES`) that it receives on that stream. Each preimage is the next index of the lane's one chain. A stream that joins a live lane continues the running chain and MUST NOT open a second root ([ADR 003 § One chain per lane](003-payments.md#one-chain-per-lane)). The delivering node tracks total bytes sent across all streams on the lane and **pauses all of them** once the unpaid balance reaches its [credit window](003-payments.md#credit-window) — the self-enforcing threshold is applied collectively, not per-stream. (The window is at least one chunk, so this generalizes the per-chunk pause rather than replacing it: a node running stop-and-wait pauses at one chunk of deficit.)
 
 **Routing differs by proof type.** A `Voucher` is self-describing: it carries a cumulative `amount`, so a higher one supersedes a lower one and arrival order across streams does not matter. That is what makes "sent on any active stream" safe for vouchers. A `ChunkPreimage` carries no amount — its worth is its depth in the chain — so it is placed by its `index`, not by when it arrives. Two rules make cross-stream interleaving safe, and [ADR 003 § Concurrent Streams](003-payments.md#concurrent-streams) states them in full:
 
-1. **Each stream anchors itself.** A bare preimage does not name its chain, so each stream carries its own `(anchor voucher, chain_root, verified, tip)`, seeded from the `chain_root` voucher that opens it (`verified = 0`, `tip = chain_root`). The epoch's root voucher MUST precede that stream's preimages for that epoch. At a rollover the payer sends the new-root voucher on **every** active stream, not on one and hoping the node propagates it: QUIC orders within a stream, so each stream reads its old-chain preimages against its own old root before its own roll voucher arrives, and a fast stream that has adopted `R₂` cannot strand a sibling still finishing `R₁`. A preimage on a stream with no anchor is rejected `UnanchoredPreimage`. Re-sending a voucher the node already holds is free — an at-or-below-watermark voucher is treated as already-satisfied, not rejected.
+1. **Each stream anchors itself.** A bare preimage does not name its chain, so each stream carries its own `(anchor voucher, chain_root, verified, tip)`, seeded from the `chain_root` voucher that opens it (`verified = 0`, `tip = chain_root`). The epoch's root voucher MUST precede that stream's preimages for that epoch. At a rollover the payer sends the new-root voucher on **every** active stream, not on one and hoping the node propagates it: QUIC orders within a stream, so each stream reads its old-chain preimages against its own old root before its own roll voucher arrives, and a fast stream that has adopted `R₂` cannot strand a sibling still finishing `R₁`. A preimage on a stream with no anchor is rejected `UnanchoredPreimage`. Re-sending a voucher the node already holds is free — an at-or-below-watermark voucher is treated as already-satisfied, not rejected. It pays no whole chunk ([ADR 003 § Concurrent Streams](003-payments.md#concurrent-streams)).
 2. **The deepest preimage wins, per stream.** The node ignores `index ≤ verified` without hashing, and otherwise accepts when `keccak^(index − verified)(preimage)` reaches that stream's `tip`. There is no over-long-index check: `index` is a `u8` and `MAX_CHAIN_LENGTH` is 255, so a larger index cannot be encoded and the 255-hash bound holds by type. A fast stream may skip indexes a slower one has not reached.
 
 The lane's claim is the **maximum** of the highest signed `amount` and each stream's `anchor amount + verified × chunk_price` — never a sum, because a rollover voucher already folds the retired chain into its own `amount`.
 
-Implementation constraint: the payer must have a single voucher-signing and chain-advancing task per lane, aggregating byte counts from all its streams, not independent per-stream payment logic. It serializes the chain index and the rollover decision under a local lock while bytes stream concurrently. Per-stream anchoring places preimages; it does not shard the money.
+Implementation constraint: the payer must have a single voucher-signing and chain-advancing task per lane that all its streams share, not an independent chain per stream. It serializes the chain index and the rollover decision under a local lock while bytes stream concurrently. Per-stream anchoring places preimages; it does not shard the money.
 
 #### Connection lifetime
 
@@ -442,7 +442,7 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 - A node under load can respond to probes quickly but deliver slowly — probe RTT is necessary but not sufficient. Reputation (a separate system) provides the longer-term signal.
 - Wire frame size is a node-local choice, so two nodes serving the same blob can frame it differently. This is sound because the bao codec verifies chunk groups independently of frame boundaries ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)) and the payment meter counts bytes, not frames. The cost is that a serve path must buffer to its target size before it can emit a frame
 - `ChunkPreimage` is a new `ClientMessage` variant, so adding it renumbers the variant tail. Pre-deployment this is a straight in-place change with no compatibility shim ([ADR 013](013-schema-evolution.md#adr-013-schema-evolution)); after the first deployment the same change would be Tier-3 and require `cdn/client/v2`
-- Concurrent streams sharing a `pool_id` require the payer to maintain a single aggregate byte counter, one hash chain, and one signing task per lane; per-stream independence is lost for payment tracking
+- Concurrent streams sharing a `pool_id` require the payer to maintain one hash chain and one signing task per lane; per-stream independence is lost for payment tracking
 - The delivering node enforces the credit-window threshold across all streams collectively — a slow proof on one stream pauses all streams on that lane
 - Each stream must carry the current `chain_root` voucher before its first preimage of an epoch. That is one extra signed message per stream per rollover, and it is the price of keeping one chain per lane instead of one per stream
 - Different ALPNs require separate QUIC connections; probing via `cdn/probe/v1` then fetching via `cdn/client/v1` incurs two handshake costs to the same peer. Two connections per node interaction is acceptable at a smaller scale. **Future optimization:** investigate iroh ALPN multiplexing (negotiating multiple ALPNs on a single connection) or a unified `cdn/v2` ALPN combining probe and delivery as sub-protocols within one connection. The overhead is ~1 additional RTT per node interaction — significant for latency-sensitive clients but not a correctness issue

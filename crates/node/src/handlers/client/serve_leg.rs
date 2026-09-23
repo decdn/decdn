@@ -272,7 +272,8 @@ impl ClientHandler {
             //
             // The delta stays queued until something actually credits it: the
             // payer may send this stream's root voucher, or a rollover voucher,
-            // ahead of the reveal that pays, and neither credits anything.
+            // ahead of the reveal that pays, and a metering voucher credits no
+            // whole chunk.
             // `MAX_PROOFS_PER_CHUNK` bounds that — see the twin loop in
             // `deliver` for the full reasoning.
             let collected_any = !pending.is_empty();
@@ -299,7 +300,12 @@ impl ClientHandler {
                             // Transport drop or rate-check bail (#856/#857): meter the
                             // abandon, then propagate so the caller drops the pull leg.
                             self.metrics.node_pull_through_client_abandoned();
-                            return Err(e);
+                            return Err(e.context(format!(
+                                "proof {} of at most {MAX_PROOFS_PER_CHUNK} for a {delta}-byte \
+                                 chunk ({} pending)",
+                                attempts.saturating_add(1),
+                                pending.len()
+                            )));
                         }
                     };
                     match stop {

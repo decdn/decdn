@@ -368,14 +368,14 @@ impl ClientHandler {
             // background flush persists it (ADR 003 §Off-chain voucher state
             // persistence). ---
             //
-            // A chunk is paid by one reveal, but the payer may send housekeeping
-            // vouchers ahead of it — this stream's first root voucher for an
-            // epoch, or a rollover voucher when the chain is spent. Those
-            // re-assert a cumulative the node already holds, so they credit
-            // nothing, and the chunk they precede is still outstanding. Hence
-            // the delta stays queued until something actually credits it, and
-            // `MAX_PROOFS_PER_CHUNK` bounds how long a payer may keep answering
-            // with proofs that pay nothing.
+            // A whole chunk is paid by one reveal, but the payer may send
+            // metering vouchers ahead of it — this stream's first root voucher
+            // for an epoch, or a rollover voucher when the chain is spent. A
+            // metering voucher credits no whole chunk, even when a rollover
+            // advances the watermark, so the chunk it precedes is still
+            // outstanding. Hence the delta stays queued until something actually
+            // credits it, and `MAX_PROOFS_PER_CHUNK` bounds how long a payer may
+            // keep answering with proofs that pay nothing.
             let collected_any = !pending.is_empty();
             while let Some(&delta) = pending.front() {
                 let mut attempts = 0u32;
@@ -393,7 +393,15 @@ impl ClientHandler {
                             rate_per_mb,
                             delta,
                         )
-                        .await?;
+                        .await
+                        .map_err(|e| {
+                            e.context(format!(
+                                "proof {} of at most {MAX_PROOFS_PER_CHUNK} for a {delta}-byte \
+                                 chunk ({} pending)",
+                                attempts.saturating_add(1),
+                                pending.len()
+                            ))
+                        })?;
                     match stop {
                         // Advance `paid` by the watermark-capped credit (rule #1),
                         // not the raw delivered delta: a benign already-satisfied
