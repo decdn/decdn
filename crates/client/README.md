@@ -13,10 +13,15 @@ from a USDC payment pool, and verify every byte as it arrives. Two entry points 
   read-ahead window.
 
 The crate documentation has the setup sequence, the guarantees, and the mistakes to avoid. The
-`download` and `stream` examples run the whole sequence end to end:
+`download` and `stream` examples run the whole sequence end to end against a live deployment.
+They read the deployment and the buyer from environment variables: `DECDN_RPC_URL`,
+`DECDN_CHAIN_ID`, `DECDN_PAYMENT_POOL`, `DECDN_SLASH_JUDGE`, `DECDN_CAPACITY_BOND`,
+`DECDN_KEYSTORE`, `DECDN_KEYSTORE_PASSWORD`, `DECDN_DATA_DIR`, and `DECDN_DEPOSIT` (the pool
+deposit in USDC base units, used only when the buyer has no pool yet). The hash argument is the
+blob's BLAKE3 hash as 64 hex characters:
 
 ```bash
-cargo run -p decdn-client --example download -- <blake3-hash> <output-path>
+cargo run -p decdn-client --example download -- <blake3-hash-hex> <output-path>
 ```
 
 The `decdn` CLI's `fetch` and `bundle pull` are built on this crate, and so is a node's own
