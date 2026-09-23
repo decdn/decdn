@@ -3,7 +3,7 @@
 
 use decdn_common::cli;
 
-use decdn_client_pull::probe::probe_once;
+use decdn_client::probe::probe_once;
 
 /// Parse a user-supplied BLAKE3 hash (64 hex chars, optional `0x` prefix —
 /// the same form `cache.pinned_hashes` accepts) into raw bytes.
@@ -30,7 +30,7 @@ pub async fn probe(
 
     use iroh::{EndpointAddr, PublicKey};
 
-    use decdn_client_pull::endpoint as client_endpoint;
+    use decdn_client::endpoint as client_endpoint;
 
     let node_id = PublicKey::from_str(&args.node_id)
         .map_err(|e| anyhow::anyhow!("invalid --node-id {:?}: {e}", args.node_id))?;

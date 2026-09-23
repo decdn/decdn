@@ -66,7 +66,7 @@ reviews:
         included in Debug/Display output, serialized, or sent over the wire.
         Question any hand-rolled crypto or downgraded primitives.
 
-    - path: "**/crates/{incentive,client-pull}/**/*.rs"
+    - path: "**/crates/{incentive,client}/**/*.rs"
       instructions: >
         Off-chain USDC payment-channel logic — funds at risk. Check signature
         verification on channel updates, monotonic nonce/sequence handling to

@@ -288,7 +288,7 @@ async fn ranged_paid_pull(
 /// Decode the header-less bao verified-stream `wire` for `[byte_offset,
 /// byte_offset+byte_len)` (`byte_len == 0` ⇒ to end), verifying every chunk
 /// group against `hash`, and trim the group-aligned superset back to the exact
-/// requested span. Mirrors the production receiver (`client-pull`).
+/// requested span. Mirrors the production receiver (`decdn-client`).
 fn decode_bao_range(
     hash: Hash,
     total_bytes: u64,

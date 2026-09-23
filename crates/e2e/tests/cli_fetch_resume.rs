@@ -3,7 +3,7 @@
 //! real node over a real paid `cdn/client/v1` stream.
 //!
 //! Why the whole binary rather than a unit test: the driver/store unit tests in
-//! `decdn-client-pull` already prove the gap-driven fetch verifies every byte,
+//! `decdn-client` already prove the gap-driven fetch verifies every byte,
 //! checkpoints as it goes, and re-opens only the missing gap. What they cannot
 //! reach is the part that actually costs money — that a resumed fetch pulls only
 //! `missing_ranges` and therefore **pays only for the gap**. That is the whole
@@ -78,7 +78,7 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use anyhow::Context;
 use decdn_cache::Hash;
-use decdn_client_pull::ClientRangedStore;
+use decdn_client::ClientRangedStore;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;

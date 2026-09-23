@@ -1,5 +1,5 @@
 //! Runs the shared decdn-bao-range conformance suite against
-//! `decdn_client_pull::ClientRangedStore` — proving the client backend meets the
+//! `decdn_client::ClientRangedStore` — proving the client backend meets the
 //! same cross-backend contract as the node backend (#1621).
 #![allow(
     clippy::unwrap_used,
@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use decdn_bao_range::conformance::{ConformanceFactory, run_all};
-use decdn_client_pull::ClientRangedStore;
+use decdn_client::ClientRangedStore;
 use tempfile::TempDir;
 
 struct ClientFactory {

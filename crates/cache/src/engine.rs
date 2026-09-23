@@ -3535,7 +3535,7 @@ impl CacheEngine {
     /// `aligned`'s span out of the configured origins, verified against the
     /// root `H` — the raw-fetch half of a range pull WITHOUT the import (the
     /// node's `NodeAdmitStore` sink admits, fed by
-    /// `decdn_client_pull::BlobSource`).
+    /// `decdn_client::BlobSource`).
     ///
     /// Each origin serves both halves of its own attempt: the outboard and the
     /// data. The origin whose outboard is cached goes first and reuses that copy,
@@ -3695,7 +3695,7 @@ impl CacheEngine {
     /// buyer-side `LocalPullFault`) — that parked fault is the real reason the
     /// stream stopped, and it beats the generic truncated-feed `CacheError` the
     /// decoder sees. This crate does not read the fault itself (it must not
-    /// depend on `client-pull`); it only returns the reader so the node ingest
+    /// depend on `decdn-client`); it only returns the reader so the node ingest
     /// path can.
     pub async fn admit_bao_stream<R>(
         &self,

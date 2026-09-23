@@ -4,12 +4,13 @@
 //! The genuinely duplication-prone part — the `openPool` transaction, the
 //! authoritative `PoolOpened`-from-receipt decode, the self-owned capability the
 //! single-user buyer signs for its own key, and the [`BuyerPoolState`] /
-//! [`PoolContext`] construction — lives here. Pool *reuse* and watermark
-//! *recording* are thin compositions over [`decdn_incentive::BuyerPoolStore`]
-//! (`get_by_owner`, `advance_progress`) that each caller does directly: a
-//! one-shot CLI fetch needs neither the node service's per-owner concurrency
-//! guard nor its background reclaim/reconcile machinery, so only the open kernel
-//! is shared.
+//! [`PoolContext`] construction for a self-owned lane
+//! ([`self_owned_lane_ctx`](crate::buyer_pool::self_owned_lane_ctx)) —
+//! lives here, with the rule that picks a lane's progress write
+//! ([`ProgressWrite`](crate::buyer_pool::ProgressWrite)). Pool *reuse* is a thin
+//! composition over [`decdn_incentive::BuyerPoolStore::get_by_owner`] that each
+//! caller does directly: a one-shot CLI fetch needs neither the node service's
+//! per-owner concurrency guard nor its background reclaim/reconcile machinery.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,11 +23,12 @@ use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::{
-    BuyerPoolState, Capability, DepositOutcome, PoolOpenFailureReason, SignedCapability, StoreError,
+    AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, Capability, DepositOutcome,
+    LaneKey, PoolId, PoolOpenFailureReason, SignedCapability, StoreError,
 };
 use tracing::{debug, error, info, warn};
 
-use crate::PoolContext;
+use crate::{PoolContext, VoucherProgress};
 
 /// Re-approve the `PaymentPool` spender for the *unlimited* case when the
 /// standing USDC allowance has fallen below this floor. Half of `U256::MAX` so
@@ -206,6 +208,133 @@ pub fn issue_self_capability(
     }
     .sign(owner_signer, voucher_domain)
     .map_err(|e| anyhow::anyhow!("sign self capability: {e}"))
+}
+
+/// The [`PoolContext`] one lane of a self-owned pool signs under: `signer` pays
+/// `provider` from `state`'s pool, resuming at the lane's prior cumulative
+/// `(prior_bytes, prior_amount)`.
+///
+/// The context carries a freshly issued self-owned capability. The capability
+/// is node-agnostic (valid at every provider this pool pays) and cheap to
+/// regenerate, so a fresh open and a reused pool both present one without a
+/// stored copy. An upstream registers the signer from it on the first on-chain
+/// redemption.
+///
+/// The cap is [`SELF_CAPABILITY_CAP`], not the deposit. The delegate IS the
+/// owner, so the pool deposit is the real spending bound. A cap at the deposit
+/// would freeze the on-chain cap at the opening deposit (`_registerCapability` is
+/// idempotent past the first redemption) and reject spend past a later `topUp`.
+/// It is not `U256::MAX` either: the pool's `spendingCap` is a `uint64`, so a
+/// wider cap hashes to a word the contract cannot reconstruct and every
+/// redemption on the lane reverts.
+///
+/// The provider pin is mandatory: a voucher signed with `provider ==
+/// Address::ZERO` fails at signing, so a context left at
+/// [`PoolContext::for_pool`]'s zero provider cannot pay.
+///
+/// # Errors
+///
+/// Propagates a signing error from `signer` while issuing the capability.
+pub fn self_owned_lane_ctx(
+    state: &BuyerPoolState,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_domain: &Eip712Domain,
+    provider: Address,
+    prior_bytes: U256,
+    prior_amount: U256,
+) -> Result<PoolContext> {
+    let capability = issue_self_capability(
+        signer.as_ref(),
+        state.pool_id,
+        SELF_CAPABILITY_CAP,
+        SELF_CAPABILITY_EXPIRY,
+        voucher_domain,
+    )?;
+    Ok(
+        PoolContext::for_pool(state, Arc::clone(signer), voucher_domain.clone())
+            .with_provider(provider, prior_bytes, prior_amount)
+            .with_capability(capability),
+    )
+}
+
+/// The buyer-store write that records one lane's [`VoucherProgress`], so a later
+/// reuse or a restart resumes the lane at the right cumulative `bytes` /
+/// `amount`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressWrite {
+    /// The lane's ledger rebased DOWN to the upstream's authenticated watermark
+    /// `anchor` (`PoolLedger::rebase`), and no write has recorded it yet. The
+    /// record is overwritten with `anchor` and then advanced to `totals`. A
+    /// monotone advance refuses a lower total, and the next reuse would then sign
+    /// from the anchor the upstream already refused.
+    Rebase {
+        /// The upstream watermark the ledger rebased to.
+        anchor: BuyerLaneProgress,
+        /// The lane's cumulative totals after the rebase.
+        totals: BuyerLaneProgress,
+    },
+    /// A monotone advance to `totals`.
+    Advance {
+        /// The lane's new cumulative totals.
+        totals: BuyerLaneProgress,
+    },
+}
+
+impl ProgressWrite {
+    /// The write `progress` calls for, or `None` when it neither advanced past
+    /// its seed nor carries a rebase anchor. A pending anchor is written even
+    /// when the totals did not advance: the write exists to move the record
+    /// down.
+    #[must_use]
+    pub fn of(progress: &VoucherProgress) -> Option<Self> {
+        let (last_bytes, last_amount) = progress.totals();
+        let totals = BuyerLaneProgress {
+            last_amount,
+            last_bytes,
+        };
+        match progress.rebase_anchor() {
+            Some(anchor) => Some(Self::Rebase {
+                anchor: BuyerLaneProgress {
+                    last_amount: anchor.amount,
+                    last_bytes: anchor.bytes,
+                },
+                totals,
+            }),
+            None => progress.advanced().map(|_| Self::Advance { totals }),
+        }
+    }
+
+    /// The lane's cumulative totals after this write.
+    #[must_use]
+    pub const fn totals(&self) -> BuyerLaneProgress {
+        match self {
+            Self::Rebase { totals, .. } | Self::Advance { totals } => *totals,
+        }
+    }
+
+    /// Apply this write to `lane` inside `owner`'s pool `pool_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] only on a backend or codec fault. A write the
+    /// store declines (an unknown or replaced pool, a regression) is the `Ok`
+    /// [`AdvanceOutcome`].
+    pub fn apply<S: BuyerPoolStore + ?Sized>(
+        &self,
+        store: &S,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        match *self {
+            Self::Rebase { anchor, totals } => {
+                store.rebase_progress(owner, pool_id, lane, anchor, totals)
+            }
+            Self::Advance { totals } => {
+                store.advance_progress(owner, pool_id, lane, totals.last_bytes, totals.last_amount)
+            }
+        }
+    }
 }
 
 /// Ensure `owner` holds a sufficient USDC allowance for the `PaymentPool`
@@ -878,5 +1007,54 @@ mod tests {
                 "each channel must keep its own diagnosis, not collapse to one string: {msg}"
             );
         }
+    }
+
+    fn cum(bytes: u64, amount: u64) -> crate::Cumulative {
+        crate::Cumulative {
+            bytes: U256::from(bytes),
+            amount: U256::from(amount),
+        }
+    }
+
+    fn lane_progress(bytes: u64, amount: u64) -> decdn_incentive::BuyerLaneProgress {
+        decdn_incentive::BuyerLaneProgress {
+            last_amount: U256::from(amount),
+            last_bytes: U256::from(bytes),
+        }
+    }
+
+    /// Progress that neither advanced past its seed nor rebased has nothing to
+    /// write.
+    #[test]
+    fn progress_write_is_none_without_an_advance_or_an_anchor() {
+        let progress = crate::VoucherProgress::from_cumulative(cum(500, 50), U256::from(50u64));
+        assert_eq!(super::ProgressWrite::of(&progress), None);
+    }
+
+    /// An advance past the seed is a monotone advance to the totals.
+    #[test]
+    fn progress_write_advances_past_the_seed() {
+        let progress = crate::VoucherProgress::from_cumulative(cum(600, 65), U256::from(50u64));
+        assert_eq!(
+            super::ProgressWrite::of(&progress),
+            Some(super::ProgressWrite::Advance {
+                totals: lane_progress(600, 65)
+            })
+        );
+    }
+
+    /// A pending anchor is written as a rebase even when the totals did not
+    /// advance: the write exists to move the record down.
+    #[test]
+    fn progress_write_rebases_a_pending_anchor_without_an_advance() {
+        let progress = crate::VoucherProgress::from_cumulative(cum(500, 50), U256::from(50u64))
+            .with_rebase_anchor(Some(cum(400, 40)));
+        assert_eq!(
+            super::ProgressWrite::of(&progress),
+            Some(super::ProgressWrite::Rebase {
+                anchor: lane_progress(400, 40),
+                totals: lane_progress(500, 50),
+            })
+        );
     }
 }

@@ -76,8 +76,9 @@ use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use anyhow::Context;
-use decdn_client_pull::buyer_pool::{SELF_CAPABILITY_CAP, issue_self_capability};
-use decdn_client_pull::sign_client_binding;
+use decdn_client::buyer_pool::{SELF_CAPABILITY_CAP, issue_self_capability};
+use decdn_client::sign_client_binding;
+use decdn_client::{PoolContext, stream_fetch};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
     BuyerPoolStore, KeyedCheckpointStore, MemoryBuyerPoolStore, PoolStateStore,
@@ -86,7 +87,6 @@ use decdn_incentive::{
 use decdn_node::buyer_channel::BuyerPoolService;
 use decdn_node::chain_events::shared_head::{HeadSource, SharedHead};
 use decdn_node::channel_store::PersistentPoolStateStore;
-use decdn_node::client_requester::{PoolContext, stream_fetch};
 use decdn_node::metrics::Metrics;
 use decdn_node::payment_settlement::PoolSettlementService;
 use decdn_protocol::ALPN_CLIENT;

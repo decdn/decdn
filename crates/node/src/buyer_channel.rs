@@ -4,7 +4,7 @@
 //! cache miss (ADR 003 §node→node). It owns one `PaymentPool` and signs vouchers
 //! against per-`(signer, provider)` lanes of that single pool: the deposit fans
 //! out across every upstream it pays. This service owns the on-chain half of that
-//! path that the off-chain voucher signer in [`crate::client_requester`] leaves
+//! path that the off-chain voucher signer in [`decdn_client`] leaves
 //! open:
 //!
 //! - **One-time USDC approval.** `openPool` escrows the deposit via
@@ -37,19 +37,18 @@ use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
 use decdn_incentive::{
-    AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, LaneKey, PoolId,
-    PoolOpenFailureReason,
+    AdvanceOutcome, BuyerPoolState, BuyerPoolStore, LaneKey, PoolId, PoolOpenFailureReason,
 };
 use futures_util::FutureExt;
 use tracing::{debug, error, info, warn};
 
 use crate::chain_events::AbortOnDrop;
-use crate::client_requester::buyer_pool::{
-    LOW_WATER_DIVISOR, SELF_CAPABILITY_CAP, ToppedUpPool, ensure_allowance, grade_deposit_credit,
-    issue_self_capability, open_pool, refill_amount, top_up as pool_top_up, topped_up_effect,
-};
-use crate::client_requester::{LocalPullFault, PoolContext};
 use crate::metrics::Metrics;
+use decdn_client::buyer_pool::{
+    LOW_WATER_DIVISOR, ProgressWrite, ToppedUpPool, ensure_allowance, grade_deposit_credit,
+    open_pool, refill_amount, self_owned_lane_ctx, top_up as pool_top_up, topped_up_effect,
+};
+use decdn_client::{LocalPullFault, PoolContext};
 
 /// How often the reclaim sweep scans the node's pool for a completed close.
 /// Pool lifetimes are long, so an hourly scan is ample — it matches the seller
@@ -57,12 +56,6 @@ use crate::metrics::Metrics;
 const RECLAIM_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
 
 /// Expiry stamped on the self-owned capability the buyer signs for its own key.
-/// The single-user buyer owns both keys, so there is nothing to time-box —
-/// `u64::MAX` means "never expires", and the pool's grace-window close is the
-/// only lifecycle gate (there is no pool expiry, ADR 003). Matches the expiry
-/// [`open_pool`] stamps, so the reuse-path capability recovers to the same grant.
-const SELF_CAPABILITY_EXPIRY: u64 = u64::MAX;
-
 /// Typed sentinel: the caller's `open_or_reuse_pool` budget elapsed while the
 /// pool open is still in flight. The open **keeps going** in a detached task; the
 /// caller retries the next candidate and a later miss reuses the pool once it
@@ -385,7 +378,7 @@ struct FundingHandles<P: Provider + Clone + 'static> {
 }
 
 /// Run `attempt` (a `topUp`), and only if it fails with an
-/// [`AllowanceShortfall`](crate::client_requester::buyer_pool::AllowanceShortfall)
+/// [`AllowanceShortfall`](decdn_client::buyer_pool::AllowanceShortfall)
 /// run `recover_allowance` (a just-in-time `approve`) and retry `attempt`
 /// exactly once. Any other error — and any error from the recovery or the
 /// retry — returns as-is. Generic over the two async effects so the retry
@@ -412,7 +405,7 @@ where
         Ok(out) => Ok(out),
         Err(err)
             if err
-                .downcast_ref::<crate::client_requester::buyer_pool::AllowanceShortfall>()
+                .downcast_ref::<decdn_client::buyer_pool::AllowanceShortfall>()
                 .is_some() =>
         {
             // The standing approval was revoked or never granted; do the
@@ -531,14 +524,8 @@ fn committed_amount(state: &BuyerPoolState) -> U256 {
         .fold(U256::ZERO, |acc, (_, p)| acc.saturating_add(p.last_amount))
 }
 
-/// Build the [`PoolContext`] paying `provider_addr` from this pool's state: pin
-/// the provider (`with_provider`) with the lane's prior cumulative totals, and
-/// attach the node's self-issued capability (`with_capability`) so an upstream
-/// registers the signer on its first on-chain redemption.
-///
-/// The provider pin is MANDATORY: a voucher signed with `provider == Address::ZERO`
-/// hard-fails at signing, so a context left at `for_pool`'s ZERO provider cannot
-/// pay a cache-miss pull.
+/// Build the [`PoolContext`] paying `provider_addr` from this pool's state,
+/// resuming the lane at its recorded cumulative totals ([`self_owned_lane_ctx`]).
 ///
 /// # Errors
 ///
@@ -557,24 +544,13 @@ fn pin_ctx(
     let (prior_bytes, prior_amount) = state
         .lane_progress(lane)
         .map_or((U256::ZERO, U256::ZERO), |p| (p.last_bytes, p.last_amount));
-    // Re-issue the self-owned capability from the owner key: it is node-agnostic
-    // (valid at every provider this pool pays) and cheap to regenerate, so both
-    // the fresh-open and the reused-pool paths present one without a stored copy.
-    // Uncapped: the delegate IS the owner, so the pool deposit — not the
-    // capability cap — is the real spending bound; a finite cap here would pin
-    // the on-chain cap below a later `topUp` (`_registerCapability` is
-    // idempotent past first redemption) and reject spend past it.
-    let capability = issue_self_capability(
-        signer.as_ref(),
-        state.pool_id,
-        SELF_CAPABILITY_CAP,
-        SELF_CAPABILITY_EXPIRY,
+    self_owned_lane_ctx(
+        state,
+        signer,
         voucher_domain,
-    )?;
-    Ok(
-        PoolContext::for_pool(state, Arc::clone(signer), voucher_domain.clone())
-            .with_provider(provider_addr, prior_bytes, prior_amount)
-            .with_capability(capability),
+        provider_addr,
+        prior_bytes,
+        prior_amount,
     )
 }
 
@@ -1145,15 +1121,11 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         shared
     }
 
-    /// Persist the cumulative voucher totals after a delivery exchange so a later
+    /// Persist one lane's voucher progress after a delivery exchange so a later
     /// reuse (or a restart) resumes the `(signer, provider)` lane at the right
     /// cumulative `bytes` / `amount`. The buyer prices `cumulative = bytes × rate`
     /// from its own BLAKE3-verified bytes, so there is no nonce to track.
-    ///
-    /// `rebase_anchor` is the upstream's authenticated watermark the lane's
-    /// ledger moved DOWN to (`PoolLedger::rebase`) and no persist has recorded
-    /// yet. The record is then overwritten with it and advanced to the totals,
-    /// since the monotone advance refuses a lower total.
+    /// [`ProgressWrite`] says whether the write rebases the record down first.
     ///
     /// # Errors
     ///
@@ -1165,46 +1137,27 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         &self,
         provider_addr: Address,
         pool_id: PoolId,
-        bytes_delivered: U256,
-        amount: U256,
-        rebase_anchor: Option<BuyerLaneProgress>,
+        write: ProgressWrite,
     ) -> Result<()> {
         let lane = LaneKey {
             pool_id,
             signer: self.signer.address(),
             provider: provider_addr,
         };
-        // A ledger that rebased DOWN to the upstream's authenticated watermark
-        // records it once with an overwrite: the monotone advance would refuse it,
-        // and the next reuse would sign from the anchor the upstream already
-        // refused. Every other persist is a monotone advance.
-        let outcome = match rebase_anchor {
-            Some(anchor) => {
-                let totals = BuyerLaneProgress {
-                    last_amount: amount,
-                    last_bytes: bytes_delivered,
-                };
-                self.store
-                    .rebase_progress(self.owner, pool_id, lane, anchor, totals)
-                    .with_context(|| {
-                        format!(
-                            "rebase buyer pool lane progress down to the upstream watermark \
-                             (amount {}, bytes {}), then to (amount {amount}, bytes \
-                             {bytes_delivered})",
-                            anchor.last_amount, anchor.last_bytes
-                        )
-                    })
-            }
-            None => self
-                .store
-                .advance_progress(self.owner, pool_id, lane, bytes_delivered, amount)
-                .with_context(|| {
-                    format!(
-                        "advance buyer pool lane progress to (amount {amount}, bytes \
-                         {bytes_delivered})"
-                    )
-                }),
-        };
+        let totals = write.totals();
+        let outcome = write
+            .apply(self.store.as_ref(), self.owner, pool_id, lane)
+            .with_context(|| match write {
+                ProgressWrite::Rebase { anchor, .. } => format!(
+                    "rebase buyer pool lane progress down to the upstream watermark \
+                     (amount {}, bytes {}), then to (amount {}, bytes {})",
+                    anchor.last_amount, anchor.last_bytes, totals.last_amount, totals.last_bytes
+                ),
+                ProgressWrite::Advance { .. } => format!(
+                    "advance buyer pool lane progress to (amount {}, bytes {})",
+                    totals.last_amount, totals.last_bytes
+                ),
+            });
         match outcome? {
             AdvanceOutcome::Advanced => Ok(()),
             AdvanceOutcome::UnknownPool => {
@@ -1333,9 +1286,8 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
         budget: Duration,
     ) -> Result<PoolContext>;
 
-    /// Persist the cumulative voucher totals paid on the `(signer, provider)` lane
-    /// of `pool_id`, overwriting the record down to `rebase_anchor` first when the
-    /// lane's ledger rebased. See [`BuyerPoolService::record_progress`].
+    /// Persist one lane's voucher progress on the `(signer, provider)` lane of
+    /// `pool_id`. See [`BuyerPoolService::record_progress`].
     ///
     /// # Errors
     ///
@@ -1344,9 +1296,7 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
         &self,
         provider_addr: Address,
         pool_id: PoolId,
-        bytes_delivered: U256,
-        amount: U256,
-        rebase_anchor: Option<BuyerLaneProgress>,
+        write: ProgressWrite,
     ) -> Result<()>;
 
     /// Fund `additional` of new headroom in the node's pool, returning its NEW total
@@ -1384,18 +1334,9 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
         &self,
         provider_addr: Address,
         pool_id: PoolId,
-        bytes_delivered: U256,
-        amount: U256,
-        rebase_anchor: Option<BuyerLaneProgress>,
+        write: ProgressWrite,
     ) -> Result<()> {
-        BuyerPoolService::record_progress(
-            self,
-            provider_addr,
-            pool_id,
-            bytes_delivered,
-            amount,
-            rebase_anchor,
-        )
+        BuyerPoolService::record_progress(self, provider_addr, pool_id, write)
     }
 
     async fn top_up_pool_by(&self, additional: U256) -> Result<TopUpLanded> {
@@ -2145,7 +2086,7 @@ async fn reclaim_once<P: Provider + Clone>(
 #[cfg(test)]
 mod tests {
     use decdn_incentive::store::StoreError;
-    use decdn_incentive::{BuyerPoolState, LaneKey, MemoryBuyerPoolStore};
+    use decdn_incentive::{BuyerLaneProgress, BuyerPoolState, LaneKey, MemoryBuyerPoolStore};
 
     use super::*;
 
@@ -2888,14 +2829,12 @@ mod tests {
                 .expect("lane record")
         };
 
-        svc.record_progress(
-            provider,
-            pool_id,
-            U256::from(600u64),
-            U256::from(65u64),
-            None,
-        )
-        .expect("a superseded write is not an error");
+        let totals = BuyerLaneProgress {
+            last_amount: U256::from(65u64),
+            last_bytes: U256::from(600u64),
+        };
+        svc.record_progress(provider, pool_id, ProgressWrite::Advance { totals })
+            .expect("a superseded write is not an error");
         assert_eq!(
             lane_record().last_amount,
             U256::from(90u64),
@@ -2906,14 +2845,8 @@ mod tests {
             last_amount: U256::from(60u64),
             last_bytes: U256::from(500u64),
         };
-        svc.record_progress(
-            provider,
-            pool_id,
-            U256::from(600u64),
-            U256::from(65u64),
-            Some(anchor),
-        )
-        .expect("the rebase write lands");
+        svc.record_progress(provider, pool_id, ProgressWrite::Rebase { anchor, totals })
+            .expect("the rebase write lands");
         assert_eq!(
             lane_record(),
             BuyerLaneProgress {
@@ -3962,7 +3895,7 @@ mod tests {
                 async move {
                     if n == 0 {
                         Err(anyhow::Error::new(
-                            crate::client_requester::buyer_pool::AllowanceShortfall,
+                            decdn_client::buyer_pool::AllowanceShortfall,
                         ))
                     } else {
                         Ok(U256::from(700u64))
@@ -4020,7 +3953,7 @@ mod tests {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async {
                     Err(anyhow::Error::new(
-                        crate::client_requester::buyer_pool::AllowanceShortfall,
+                        decdn_client::buyer_pool::AllowanceShortfall,
                     ))
                 }
             },

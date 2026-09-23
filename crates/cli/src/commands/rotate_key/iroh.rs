@@ -77,7 +77,7 @@ pub(crate) async fn run(
     let cb_addr = resolved.capacity_bond_address;
 
     let signer = chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
-    let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
+    let provider = decdn_client::provider::build_provider(&resolved.rpc_url, &signer)?;
 
     // Stage (or load, or preview-in-memory) the key BEFORE the nonce reads:
     // `registrationNonce` is keyed on the id being bound, so the id has to

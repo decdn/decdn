@@ -33,7 +33,7 @@ const OTLP_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const EXPORTED_TARGETS: &[&str] = &[
     "decdn_node",
     "decdn_cache",
-    "decdn_client_pull",
+    "decdn_client",
     "decdn_incentive",
     "decdn_reputation",
     "decdn_common",
@@ -373,7 +373,7 @@ mod tests {
             tracing::info_span!(target: "iroh::endpoint", "iroh_span").in_scope(|| {});
             tracing::debug_span!(target: "decdn_node::runtime", "debug_span").in_scope(|| {});
             tracing::info_span!(target: "decdn_node::runtime", "app_span").in_scope(|| {});
-            tracing::info_span!(target: "decdn_client_pull", "client_span").in_scope(|| {
+            tracing::info_span!(target: "decdn_client", "client_span").in_scope(|| {
                 // A dependency's WARN lands on the deCDN span; its INFO and the
                 // OTLP transport's ERROR do not.
                 tracing::warn!(target: "alloy::rpc", "dependency warning");

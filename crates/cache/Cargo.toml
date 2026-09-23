@@ -15,14 +15,14 @@ categories.workspace = true
 decdn-protocol = { workspace = true }
 decdn-config-types = { workspace = true }
 # Iroh-blobs-free bao verified-range helpers (alignment / encoded-size / verify),
-# shared with decdn-client-pull (#578, #915). Re-exported via `crate::range_pull`.
+# shared with decdn-client (#578, #915). Re-exported via `crate::range_pull`.
 decdn-bao-range = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
 iroh-metrics = { workspace = true }
 # `AsyncStreamReader` bound for `CacheEngine::admit_bao_stream`: the upstream
 # reader driving a range admit, kept independent of
-# any client-pull type so `cache` stays leaf w.r.t. `client-pull` (#578).
+# any `decdn-client` type so `cache` stays leaf w.r.t. `decdn-client` (#578).
 iroh-io = { workspace = true }
 # bao verified-range codec for origin range-pull verification (#823): turn a
 # raw origin range `[a, b)` + the published `{H}.obao4` outboard into a

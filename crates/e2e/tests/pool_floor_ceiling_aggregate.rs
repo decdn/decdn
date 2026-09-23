@@ -54,7 +54,7 @@
 //! opens a FRESH pool self-owned by its one signer, so it cannot express "many
 //! distinct signers spending against one shared pool" — the exact shape this
 //! property needs. The lower-level pieces used here
-//! (`decdn_client_pull::buyer_pool::open_pool`, `PoolContext`,
+//! (`decdn_client::buyer_pool::open_pool`, `PoolContext`,
 //! `decdn_incentive::Capability::sign`, and the raw `write_frame`/`read_frame`
 //! wire helpers) are the same ones the fixture itself is built from.
 //!
@@ -85,8 +85,8 @@ use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
-use decdn_client_pull::buyer_pool::open_pool;
-use decdn_client_pull::{PoolContext, sign_client_binding};
+use decdn_client::buyer_pool::open_pool;
+use decdn_client::{PoolContext, sign_client_binding};
 use decdn_common::config::DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::client::ClientFixture;

@@ -169,7 +169,7 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 |--------|------|------|--------|-------------|
 | `decdn_lanes_open` | Gauge | M | live | Currently open inbound serve lanes — distinct `(pool, signer, provider)` keys with unredeemed vouchers. |
 | `decdn_pool_redemptions_total` | Counter | M | live | Lane claims this node redeemed on-chain in a landed `redeemMany`. Each lane redeems one cumulative voucher, however many vouchers the lane accepted. |
-| `decdn_onchain_tx_landed_total` | Counter | R | live | Settlement transactions (`redeemMany`) that mined and succeeded. The `decdn_onchain_tx_*` family counts every transaction the node sends through its settlement path. Buyer-side pool transactions go through client-pull and do not count. |
+| `decdn_onchain_tx_landed_total` | Counter | R | live | Settlement transactions (`redeemMany`) that mined and succeeded. The `decdn_onchain_tx_*` family counts every transaction the node sends through its settlement path. Buyer-side pool transactions go through `decdn-client` and do not count. |
 | `decdn_onchain_tx_reverted_total` | Counter | R | live | Node transactions that mined and reverted. |
 | `decdn_onchain_tx_send_failed_total` | Counter | R | live | Node transactions the RPC refused at `send`. No transaction was issued. An oversize `redeemMany` that the redeemer then halves and retries counts here once. |
 | `decdn_onchain_tx_receipt_failed_total` | Counter | R | live | Issued node transactions whose receipt wait failed. The transaction can still mine; its hash is in the `warn!` line. |

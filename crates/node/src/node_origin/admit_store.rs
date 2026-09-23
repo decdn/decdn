@@ -1,4 +1,4 @@
-//! `NodeAdmitStore` — the node's pull-leg [`decdn_client_pull::IngestStore`]
+//! `NodeAdmitStore` — the node's pull-leg [`decdn_client::IngestStore`]
 //! over [`decdn_cache::CacheEngine::admit_bao_stream`] (#1621).
 //!
 //! `drive()`'s gap-driven pull loop needs a store that both answers
@@ -10,8 +10,8 @@
 //! partial held against GC by its `decdn-partial-` protecting tag, without
 //! buffering the whole gap in memory.
 //!
-//! This has to live in `node`, not `cache` or `client-pull`: it names both
-//! `decdn_cache`'s store and `decdn_client_pull`'s [`IngestStore`] trait, and
+//! This has to live in `node`, not `cache` or `decdn-client`: it names both
+//! `decdn_cache`'s store and `decdn_client`'s [`IngestStore`] trait, and
 //! #578 forbids either of those crates depending on the other. `node` is the
 //! one crate that already depends on both.
 
@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use decdn_bao_range::{AlignedRange, RangedFuture, RangedStore};
 use decdn_cache::{CacheEngine, FillSession, Hash, NodeRangedStore};
-use decdn_client_pull::{BaoRangeReader, IngestStore};
+use decdn_client::{BaoRangeReader, IngestStore};
 
 use crate::metrics::Metrics;
 
@@ -118,7 +118,7 @@ impl IngestStore for NodeAdmitStore {
     /// Send`) satisfies `admit_bao_stream`'s `R: AsyncStreamReader + Send`, so
     /// `reader` passes straight through — the drained reader `admit_bao_stream`
     /// returns is handed back as-is, preserving its `StashedFault` for the
-    /// caller's [`decdn_client_pull::BlobSource::finish`].
+    /// caller's [`decdn_client::BlobSource::finish`].
     ///
     /// On the admit ERROR path this recovers the reader's parked typed peer
     /// fault. `admit_bao_stream` hands the reader back on both arms; when it
@@ -128,11 +128,11 @@ impl IngestStore for NodeAdmitStore {
     /// only sees the resulting truncation as a generic `CacheError`. Surfacing
     /// the parked fault verbatim keeps `pull_verdict` fault classification,
     /// reputation, channel remedies, and reactive top-up (`SpendingCapExhausted`) working.
-    /// No-op: unlike [`decdn_client_pull::ClientRangedStore`]'s `.partial` +
+    /// No-op: unlike [`decdn_client::ClientRangedStore`]'s `.partial` +
     /// `.ranges` sidecar, this store's presence is derived live from
     /// [`CacheEngine`]'s own admitted-range bookkeeping — there is no
     /// separate present-range record to flush.
-    fn flush_present_record(&self) -> decdn_client_pull::SourceFuture<'_, ()> {
+    fn flush_present_record(&self) -> decdn_client::SourceFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
 
@@ -192,7 +192,7 @@ impl IngestStore for NodeAdmitStore {
                         decdn_cache::CacheError::VerifyFailed { .. }
                             | decdn_cache::CacheError::HashMismatch { .. }
                     ) {
-                        return Err(anyhow::Error::new(decdn_client_pull::HashMismatch));
+                        return Err(anyhow::Error::new(decdn_client::HashMismatch));
                     }
                     Err(anyhow::Error::from(cache_err))
                 }
@@ -213,8 +213,8 @@ mod tests {
     use bytes::Bytes;
     use decdn_bao_range::{IROH_BLOCK_SIZE, RangedStore, align_range, encode_verified_range};
     use decdn_cache::CacheEngine;
-    use decdn_client_pull::IngestStore;
-    use decdn_client_pull::sink::StashedFault;
+    use decdn_client::IngestStore;
+    use decdn_client::sink::StashedFault;
     use iroh_io::AsyncStreamReader;
 
     use super::NodeAdmitStore;
@@ -234,10 +234,10 @@ mod tests {
         (*ob.root.as_bytes(), plaintext, Bytes::from(ob.data))
     }
 
-    /// A minimal in-memory [`decdn_client_pull::BaoRangeReader`]: an
+    /// A minimal in-memory [`decdn_client::BaoRangeReader`]: an
     /// [`AsyncStreamReader`] over a `Bytes` cursor plus a trivial
     /// [`StashedFault`] that never parks anything (mirrors the shape of
-    /// `crates/client-pull/src/source.rs`'s `ScriptedReader` test double).
+    /// `crates/client/src/source.rs`'s `ScriptedReader` test double).
     struct MemReader {
         wire: Bytes,
     }

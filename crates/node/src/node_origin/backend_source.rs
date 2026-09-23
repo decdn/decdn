@@ -1,8 +1,8 @@
-//! `BackendSource` — the node's UNPAID [`decdn_client_pull::BlobSource`] over its
+//! `BackendSource` — the node's UNPAID [`decdn_client::BlobSource`] over its
 //! own configured origin (fs/http/s3), for the own-origin serve-miss.
 //!
 //! The peer serve-miss path pulls a cold blob from another node over a paid
-//! `cdn/client/v1` channel ([`decdn_client_pull::PeerSource`]). The own-origin
+//! `cdn/client/v1` channel ([`decdn_client::PeerSource`]). The own-origin
 //! serve-miss flow is the LOCAL twin: the bytes are already reachable through this
 //! node's own origin, so
 //! there is no counterparty, no channel, and no payment — but the driver, sink,
@@ -27,7 +27,7 @@
 //!
 //! # The self-payment counter (THE CRUX)
 //!
-//! [`decdn_client_pull::drive`]'s per-gap completion is PAID-frontier gated: a gap
+//! [`decdn_client::drive`]'s per-gap completion is PAID-frontier gated: a gap
 //! is `Done` only once the ledger's committed `bytes` reach the gap end. An unpaid
 //! source whose `finish` never advanced a ledger would leave that frontier at zero
 //! and the gap loop would re-draw forever. So this source carries a fresh, LOCAL
@@ -45,9 +45,9 @@ use alloy::primitives::U256;
 use bytes::Bytes;
 use decdn_bao_range::AlignedRange;
 use decdn_cache::{CacheEngine, CacheError, CacheResult, Hash, OriginRangeWire};
-use decdn_client_pull::sink::StashedFault;
-use decdn_client_pull::source::SourceFuture;
-use decdn_client_pull::{BlobSource, PoolLedger, UpstreamPullHeader, VoucherProgress};
+use decdn_client::sink::StashedFault;
+use decdn_client::source::SourceFuture;
+use decdn_client::{BlobSource, PoolLedger, UpstreamPullHeader, VoucherProgress};
 use iroh_io::AsyncStreamReader;
 
 /// The node's unpaid [`BlobSource`] for the own-origin serve-miss flow.
@@ -85,7 +85,7 @@ impl BackendSource {
 
     /// The LOCAL completion-counter ledger this source advances on
     /// [`BlobSource::finish`]. The pull leg MUST hand this SAME `Arc` to
-    /// [`decdn_client_pull::drive`] as its `ledger`, so the paid-frontier the gap
+    /// [`decdn_client::drive`] as its `ledger`, so the paid-frontier the gap
     /// loop reads for completion is the one `finish` moves — the whole point of THE
     /// CRUX in the module docs. Returned as a fresh handle onto the shared ledger,
     /// never a second ledger.
@@ -157,7 +157,7 @@ impl BlobSource for BackendSource {
                         0,
                         // No chain on the unpaid leg: `Keep` on a lane that has
                         // opened none commits a sealed section and opens nothing.
-                        decdn_client_pull::EpochAction::Keep,
+                        decdn_client::EpochAction::Keep,
                         |_next, _chain| async { Ok(()) },
                     )
                     .await?;
@@ -306,7 +306,7 @@ mod tests {
         CacheEngine, Hash, Origin, OriginFetch, OriginKind, OriginPullError, OriginRangeFetch,
         OriginRangeRequest, OutboardFetch,
     };
-    use decdn_client_pull::{BlobSource, Cumulative, IngestStore, PoolLedger, VoucherProgress};
+    use decdn_client::{BlobSource, Cumulative, IngestStore, PoolLedger, VoucherProgress};
     use iroh_io::AsyncStreamReader;
 
     use super::{BackendReader, BackendSource, WireChunks};
@@ -612,7 +612,7 @@ mod tests {
     /// `take_fault`.
     #[tokio::test]
     async fn backend_reader_keeps_the_terminal_fault() {
-        use decdn_client_pull::sink::StashedFault;
+        use decdn_client::sink::StashedFault;
 
         let hash = Hash::new(b"fault");
         let mut reader = reader_over(vec![

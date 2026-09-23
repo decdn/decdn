@@ -137,7 +137,7 @@ impl ClientHandler {
         // `PULL_WINDOW_FLOOR`). Its window therefore floors one chunk HIGHER than
         // the reservation and the serve loop, which both meter in wire and need no
         // such allowance.
-        let pacing_floor = credit_floor.max(decdn_client_pull::PULL_WINDOW_FLOOR);
+        let pacing_floor = credit_floor.max(decdn_client::PULL_WINDOW_FLOOR);
 
         // Pre-flight floor-M guard (shared-payment-pool model) — the pull-through
         // twin of the `dispatch.rs` direct-serve gate. Refuse the speculative pull
@@ -551,7 +551,7 @@ impl ClientHandler {
         // `PULL_WINDOW_FLOOR`). Its window therefore floors one chunk HIGHER than
         // the reservation and the serve loop, which both meter in wire and need no
         // such allowance.
-        let pacing_floor = credit_floor.max(decdn_client_pull::PULL_WINDOW_FLOOR);
+        let pacing_floor = credit_floor.max(decdn_client::PULL_WINDOW_FLOOR);
 
         // Pre-flight floor-M guard (shared-payment-pool model) — the own-origin
         // twin of the peer path and of `dispatch.rs`. Refuse the serve when the
@@ -697,8 +697,8 @@ impl ClientHandler {
             let credit_max = self.credit_max;
             // The unpaid local-origin leg: a throwaway ledger that never signs
             // and never meters, because `BackendSource` quotes rate 0.
-            let ledger = Arc::new(decdn_client_pull::PoolLedger::new(
-                decdn_client_pull::Cumulative::default(),
+            let ledger = Arc::new(decdn_client::PoolLedger::new(
+                decdn_client::Cumulative::default(),
             ));
             let source = crate::node_origin::BackendSource::new(
                 engine.clone(),

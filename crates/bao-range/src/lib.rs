@@ -1,5 +1,5 @@
 //! Iroh-blobs-free bao verified-range helpers (#823, #915), shared by
-//! `decdn-cache` (origin range import + client serve) and `decdn-client-pull`
+//! `decdn-cache` (origin range import + client serve) and `decdn-client`
 //! (client receive). Depends only on `bao-tree`, so linking it from the CLI's
 //! pull path keeps the iroh-blobs-free invariant (#578).
 //!

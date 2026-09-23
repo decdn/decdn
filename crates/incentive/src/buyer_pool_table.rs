@@ -749,7 +749,7 @@ impl<'a> BuyerPoolTable<'a> {
     /// cross-crate `cfg(test)` does not propagate: node's seam could not
     /// reach a `cfg(test)`-only method here. The feature keeps a
     /// corruption-seeding writer out of the shipped API; enable it from
-    /// `[dev-dependencies]` (the same pattern `decdn-client-pull`'s
+    /// `[dev-dependencies]` (the same pattern `decdn-client`'s
     /// `test-util` uses).
     ///
     /// # Errors

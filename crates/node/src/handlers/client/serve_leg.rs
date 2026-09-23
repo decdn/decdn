@@ -45,7 +45,7 @@
 //! completion (or error) ends the serve and drops the pull leg.
 
 use decdn_cache::{FillSession, NodeRangedStore};
-use decdn_client_pull::sink::content_paid_frontier;
+use decdn_client::sink::content_paid_frontier;
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};

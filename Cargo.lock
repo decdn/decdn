@@ -2747,7 +2747,7 @@ dependencies = [
  "clap",
  "decdn-bao-range",
  "decdn-cache",
- "decdn-client-pull",
+ "decdn-client",
  "decdn-common",
  "decdn-config-types",
  "decdn-incentive",
@@ -2775,7 +2775,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "decdn-client-pull"
+name = "decdn-client"
 version = "0.0.0"
 dependencies = [
  "alloy",
@@ -2788,9 +2788,12 @@ dependencies = [
  "decdn-incentive",
  "decdn-protocol",
  "futures-util",
+ "insta",
  "iroh",
  "iroh-io",
+ "public-api",
  "rand 0.10.2",
+ "rustdoc-json",
  "serde",
  "serde_json",
  "tempfile",
@@ -2840,7 +2843,7 @@ dependencies = [
  "bao-tree",
  "decdn-bao-range",
  "decdn-cache",
- "decdn-client-pull",
+ "decdn-client",
  "decdn-common",
  "decdn-config-types",
  "decdn-incentive",
@@ -2899,7 +2902,7 @@ dependencies = [
  "dashmap",
  "decdn-bao-range",
  "decdn-cache",
- "decdn-client-pull",
+ "decdn-client",
  "decdn-common",
  "decdn-incentive",
  "decdn-node",

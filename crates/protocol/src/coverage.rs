@@ -133,7 +133,7 @@ mod test_block_size {
 ///
 /// While the guard is held, [`discovery_block_bytes`] and [`num_blocks`] report
 /// `bytes` instead of [`DISCOVERY_BLOCK_BYTES`], so the block-spanning planner
-/// (`decdn_client_pull::plan_covered_runs`) and the node's coverage-union probe
+/// (`decdn_client::plan_covered_runs`) and the node's coverage-union probe
 /// gather split a tiny blob into several blocks. Dropping the guard restores the
 /// production default.
 ///

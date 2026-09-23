@@ -59,10 +59,8 @@ pub enum RetryDisposition {
 /// [`PaceDecision::Refuse`](crate::PaceDecision)) is deliberately **NOT** terminal
 /// here — it is `RetryElsewhere`. Single-source failover (#1174) intends to try
 /// another provider on a budget refusal: provider A's rate-priced next voucher may
-/// not fit the remaining deposit while a cheaper provider B's does. Only the
-/// multi-source scheduler treats pool exhaustion as terminal (all its lanes draw
-/// the ONE pool, so no lane can fix it), and it applies that rule itself rather
-/// than folding it into this shared classifier.
+/// not fit the remaining deposit while a cheaper provider B's does. A caller whose
+/// every lane draws the ONE pool asks [`shared_pool_disposition`] instead.
 #[must_use]
 pub fn retry_disposition(err: &anyhow::Error) -> RetryDisposition {
     use RetryDisposition::{RetryElsewhere, Terminal};
@@ -95,9 +93,25 @@ pub fn retry_disposition(err: &anyhow::Error) -> RetryDisposition {
     RetryElsewhere
 }
 
+/// [`retry_disposition`] for a caller whose lanes all draw the ONE shared pool:
+/// the same verdict, except that a shared-pool exhaustion
+/// ([`crate::PoolExhausted`]) is `Terminal`.
+///
+/// No lane can fund a dry pool, so reassigning the range only churns each
+/// remaining candidate (a fresh dial and a first-voucher attempt) before the same
+/// failure. The multi-source scheduler, a node's ranged assembly across partial
+/// holders, and a bundle pull's retry rounds each ask this question.
+#[must_use]
+pub fn shared_pool_disposition(err: &anyhow::Error) -> RetryDisposition {
+    if err.downcast_ref::<crate::PoolExhausted>().is_some() {
+        return RetryDisposition::Terminal;
+    }
+    retry_disposition(err)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RetryDisposition, retry_disposition};
+    use super::{RetryDisposition, retry_disposition, shared_pool_disposition};
     use crate::driver::PoolExhausted;
     use crate::{BlobTooLarge, UpstreamRefused, UpstreamVoucherRejected};
     use decdn_protocol::client::StreamError;
@@ -184,5 +198,37 @@ mod tests {
     fn untyped_delivery_failures_fail_over() {
         let err = anyhow::anyhow!("connect failed: timed out");
         assert_eq!(retry_disposition(&err), RetryDisposition::RetryElsewhere);
+    }
+
+    /// A dry shared pool is `Terminal` for a shared-pool caller, though the
+    /// single-source classifier fails it over: no lane can pay from it.
+    #[test]
+    fn shared_pool_exhaustion_is_terminal_for_a_shared_pool_caller() {
+        let err = anyhow::Error::new(PoolExhausted {
+            gap_start: 0,
+            gap_len: 1 << 20,
+        });
+        assert_eq!(retry_disposition(&err), RetryDisposition::RetryElsewhere);
+        assert_eq!(shared_pool_disposition(&err), RetryDisposition::Terminal);
+    }
+
+    /// The single-source classifier's own verdicts flow through unchanged: a
+    /// voucher rejection stays terminal and a transport fault still fails over.
+    #[test]
+    fn shared_pool_disposition_keeps_the_base_verdicts() {
+        let rejected = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted,
+            bundle: None,
+            proof_generation: None,
+        });
+        assert_eq!(
+            shared_pool_disposition(&rejected),
+            RetryDisposition::Terminal
+        );
+        let transport = anyhow::anyhow!("connect failed: timed out");
+        assert_eq!(
+            shared_pool_disposition(&transport),
+            RetryDisposition::RetryElsewhere
+        );
     }
 }

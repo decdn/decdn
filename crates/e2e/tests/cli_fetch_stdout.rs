@@ -1,10 +1,10 @@
 //! Live anvil-backed e2e for `decdn fetch -o -` (#1848 4b): the CLI's STDOUT
-//! streaming path over the `decdn_client_pull::Streamer` consumption face,
+//! streaming path over the `decdn_client::Streamer` consumption face,
 //! driving the shipped `decdn` binary against a real node over a real paid
 //! `cdn/client/v1` stream.
 //!
 //! Why the whole binary rather than a unit test: the `Streamer` /
-//! `VerifiedReader` unit tests in `decdn-client-pull` already prove verified,
+//! `VerifiedReader` unit tests in `decdn-client` already prove verified,
 //! consumption-paced streaming against a `ScriptedSource`. What only exists on
 //! the real wire is that the CLI routes `-o -` to `stream_to_stdout`, opens a
 //! real `(signer, provider)` payment lane, streams the bao-verified bytes to the

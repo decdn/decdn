@@ -3,7 +3,7 @@
 //! [`WarmConnection`] dials once and stays open, so a caller fetching many hashes
 //! from one provider pays the dial + NAT-traversal cost a single time and opens a
 //! fresh bi-stream per hash instead. The wire is unchanged — one stream still
-//! carries exactly one hash ([`crate::open_progressive_pull_on`] opens the
+//! carries exactly one hash (`open_progressive_pull_on` opens the
 //! bi-stream); only the client-side teardown differs, because a per-hash pull
 //! leaves the connection open for the next one rather than closing it.
 
@@ -21,7 +21,7 @@ use crate::{PullTimeout, rate_limited};
 /// Each fetch opens a new bi-stream on the SAME connection (one stream = one
 /// hash, no multiplexing), amortizing the dial over every hash. The connection is
 /// closed exactly once, on this handle's own [`Drop`]; a per-hash pull that
-/// borrows the connection ([`crate::open_progressive_pull_on`]) tears down only
+/// borrows the connection (`open_progressive_pull_on`) tears down only
 /// its own stream and leaves the connection open for the next hash.
 #[derive(Debug)]
 pub struct WarmConnection {

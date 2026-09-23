@@ -193,7 +193,7 @@ impl BuyerPoolState {
     /// Overwrite `lane`'s progress with `anchor`, then advance it to `totals`,
     /// with no monotonicity check against the recorded progress. Only for a
     /// payer whose ledger rebased DOWN to the node's authenticated watermark
-    /// (`PoolLedger::rebase` in `decdn-client-pull`): the recorded progress
+    /// (`PoolLedger::rebase` in `decdn-client`): the recorded progress
     /// holds vouchers the node never accepted, and [`Self::advance_lane`] would
     /// refuse to leave it. `totals` is what the ledger has paid since the rebase;
     /// a `totals` below `anchor` on either axis records `anchor` alone.

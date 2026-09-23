@@ -14,7 +14,7 @@
 //!    local+network reputation score ([`crate::selection::rank_candidates`]),
 //! 3. opens (or reuses) a buyer payment channel to the best candidate and streams
 //!    the whole blob straight into the local cache via the gap-driven
-//!    [`decdn_client_pull::drive`] loop (#1682 — resumable, so a channel that
+//!    [`decdn_client::drive`] loop (#1682 — resumable, so a channel that
 //!    runs dry mid-blob is topped up and the pull continues at the paid frontier;
 //!    no whole-blob buffer is ever held in RAM), falling back through up to
 //!    [`crate::selection::MAX_PROVIDER_ATTEMPTS`] providers,
@@ -69,8 +69,8 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{Hash, OriginKind, OriginPullError};
-use decdn_client_pull::driver::DriveConfig;
-use decdn_client_pull::{BudgetPacer, PeerSource, drive};
+use decdn_client::driver::DriveConfig;
+use decdn_client::{BudgetPacer, PeerSource, drive};
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tokio_util::sync::CancellationToken;
@@ -83,13 +83,6 @@ use decdn_protocol::client::NO_NAMESPACE;
 
 use crate::buyer_channel::{OpenReported, PoolOpenPending, PoolOpener};
 use crate::buyer_ledgers::BuyerLedgers;
-use crate::client_requester::probe::probe_once;
-use crate::client_requester::{
-    BlobTooLarge, Cumulative, HashMismatch, LocalPullFault, PoolContext, PoolLedger, PullDeadlines,
-    PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd, UpstreamRateLimited,
-    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
-    open_progressive_pull as open_progressive_upstream, sign_client_binding,
-};
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use crate::dht::{
@@ -99,6 +92,14 @@ use crate::dht::{
 use crate::metrics::Metrics;
 use crate::selection::{
     Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_EARLY_EXIT_CANDIDATES, PROBE_TIMEOUT, rank_candidates,
+};
+use decdn_client::buyer_pool::ProgressWrite;
+use decdn_client::probe::probe_once;
+use decdn_client::{
+    BlobTooLarge, Cumulative, HashMismatch, LocalPullFault, PoolContext, PoolLedger, PullDeadlines,
+    PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd, UpstreamRateLimited,
+    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
+    open_progressive_pull as open_progressive_upstream, sign_client_binding,
 };
 
 /// How a probe round decides it has collected enough holders (#1506).
@@ -360,7 +361,7 @@ pub struct NodeOriginConfig {
     ///
     /// `U256::ZERO` disables the reactive top-up entirely. Config never resolves
     /// to zero (the resolver rejects it), but the value flows into the paid leg's
-    /// [`decdn_client_pull::driver::DriveConfig`], where zero switches the
+    /// [`decdn_client::driver::DriveConfig`], where zero switches the
     /// pacer's reactive arm off.
     pub working_deposit: U256,
     /// This node's estimate of an upstream's refundable floor `M` (ADR 003 § Pool
@@ -1064,7 +1065,7 @@ async fn probe_candidate(
         debug!("node-origin: probed peer has no resolvable operator address; skipping");
         return None;
     };
-    if let Err(err) = crate::client_requester::probe::verify_probe_response(
+    if let Err(err) = decdn_client::probe::verify_probe_response(
         &resp,
         provider_addr,
         &deps.slash_domain,
@@ -1821,7 +1822,7 @@ async fn pull_from_candidate_in_span(
     // (`node_origin::pull_leg::run_pull_leg`). `drive`'s future is non-`Send`
     // categorically — `IngestStore::ingest_stream` is a
     // return-position-impl-trait-in-trait with no `Send` bound, for any
-    // `R: BaoRangeReader` (see `decdn_client_pull::source::IngestStore`'s docs) — which
+    // `R: BaoRangeReader` (see `decdn_client::source::IngestStore`'s docs) — which
     // `Origin::fetch`'s `+ Send` trait bound forbids inline. Every axis is therefore
     // captured OWNED: no `FillSession` (no serve leg reads beside a populate) and no
     // window/leech pacer (this tier has no downstream paid frontier to pace against, so
@@ -2121,27 +2122,10 @@ fn persist_buyer_progress(
     pool_id: B256,
     progress: &VoucherProgress,
 ) {
-    // A pending rebase anchor is recorded even when the totals did not advance
-    // past the seed: the whole point is to move the record down.
-    let rebase_anchor = progress
-        .rebase_anchor()
-        .map(|anchor| decdn_incentive::BuyerLaneProgress {
-            last_amount: anchor.amount,
-            last_bytes: anchor.bytes,
-        });
-    let totals = match (progress.advanced(), rebase_anchor) {
-        (Some(advanced), _) => advanced,
-        (None, Some(_)) => progress.totals(),
-        (None, None) => return,
+    let Some(write) = ProgressWrite::of(progress) else {
+        return;
     };
-    let (bytes_delivered, amount) = totals;
-    if let Err(err) = deps.buyer.record_progress(
-        provider_addr,
-        pool_id,
-        bytes_delivered,
-        amount,
-        rebase_anchor,
-    ) {
+    if let Err(err) = deps.buyer.record_progress(provider_addr, pool_id, write) {
         deps.metrics.node_pull_progress_persist_failure();
         warn!(%provider_addr, error = %err, "node-origin: failed to persist buyer voucher progress");
     }
@@ -2437,7 +2421,7 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 /// Wallet-less resume: this classifier does NOT special-case a bundled
 /// `SpendingCapExhausted`/`AmountRegression`/`BytesRegression`/`Underpaid`, and it does not
 /// need to.
-/// The gap-driven `decdn_client_pull::drive` loop (this node's own cache-miss buyer leg)
+/// The gap-driven `decdn_client::drive` loop (this node's own cache-miss buyer leg)
 /// already retries a resumable rejection in its own loop before it can ever surface here: it
 /// reseeds the pool's ledger and reopens the pull, transparently, and this classifier sees
 /// only the FINAL outcome. The loop also answers a genuine `SpendingCapExhausted` with an
@@ -3339,7 +3323,7 @@ mod tests {
     /// by construction, unfailable, and green even with every marker stripped from the crate.
     ///
     /// The wiring is guarded where the wiring lives:
-    /// - `the_range_helpers_mark_their_own_faults_as_local` (in `decdn-client-pull`) drives
+    /// - `the_range_helpers_mark_their_own_faults_as_local` (in `decdn-client`) drives
     ///   the REAL `aligned_wire_len` into its REAL error and asserts the marker is on it,
     ///   never attaching it itself.
     /// - `node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one` drives a

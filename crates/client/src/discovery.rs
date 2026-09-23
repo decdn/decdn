@@ -756,7 +756,7 @@ pub struct WarmingCandidate {
     /// probe issued for this request**.
     ///
     /// The persisted peer knowledge base (ADR 037 § RTT source,
-    /// `decdn_client_pull::peer_store`) does not track which peers hold which
+    /// `decdn_client::peer_store`) does not track which peers hold which
     /// blobs, only identity, latency, and price — it cannot tell a non-holder
     /// from a holder for this hash. So this warming candidate pool still comes
     /// only from nodes this request actually probed (`has_blob: false`

@@ -34,7 +34,7 @@ pub async fn run(args: &cli::AppealSlashArgs, global_config: Option<&Path>) -> a
 
     let signer = chain_ctx::load_operator_signer(&args.chain, &resolved.keystore).await?;
     let operator = signer.address();
-    let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
+    let provider = decdn_client::provider::build_provider(&resolved.rpc_url, &signer)?;
     let appeal = SlashAppeal::new(sa_addr, &provider);
 
     let plan = build_plan(&appeal, operator, slash_id, evidence, sa_addr).await?;

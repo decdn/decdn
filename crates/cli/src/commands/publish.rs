@@ -103,7 +103,7 @@ async fn signer_and_provider(
 ) -> anyhow::Result<(PrivateKeySigner, impl Provider + Clone)> {
     preflight_chain_id(&resolved.rpc_url, resolved.chain_id).await?;
     let signer = chain_ctx::load_operator_signer(&chain.common, &resolved.keystore).await?;
-    let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
+    let provider = decdn_client::provider::build_provider(&resolved.rpc_url, &signer)?;
     Ok((signer, provider))
 }
 
@@ -150,7 +150,7 @@ async fn ensure_rpc_chain_id<P: alloy::providers::Provider>(
 /// provider, *before* any keystore decryption — so a mis-pointed `--rpc-url`
 /// fails fast without an interactive password prompt or the scrypt KDF. The
 /// `rpc_url` value is never echoed into the parse error (it commonly carries an
-/// API key), matching [`decdn_client_pull::provider::build_provider`].
+/// API key), matching [`decdn_client::provider::build_provider`].
 async fn preflight_chain_id(rpc_url: &str, expected: u64) -> anyhow::Result<()> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse().with_context(|| {
         format!(

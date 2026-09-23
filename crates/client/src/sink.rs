@@ -11,15 +11,10 @@
 //! [`content_paid_frontier`] maps a paid WIRE-byte watermark back to the
 //! content-byte frontier it covers, for the resume-at-paid-frontier gate.
 //!
-//! The output side of a fetch lives here too (#1848): [`ByteSink`] is the seam
-//! for writing a fetch's verified content bytes to a caller destination, and
-//! [`BlobCache`] is the injected `(hash, range)` cache the `Streamer` consults
-//! and fills. Both are pure — they name no blob store — which is what keeps
-//! `client-pull` `iroh-blobs`-free; the default cache is the no-op [`NoCache`].
-//! The [`Streamer`](crate::Streamer) drives [`BlobCache`]; [`ByteSink`] has no
-//! production consumer yet — the [`Downloader`](crate::Downloader) writes through
-//! a [`ClientRangedStore`](crate::ClientRangedStore) instead — so its only
-//! implementor is a test double.
+//! [`BlobCache`] is the injected `(hash, range)` cache the
+//! [`Streamer`](crate::Streamer) consults and fills. It is pure — it names no
+//! blob store — which is what keeps `decdn-client` `iroh-blobs`-free; the
+//! default cache is the no-op [`NoCache`].
 
 use bao_tree::io::DecodeError;
 use bytes::{Bytes, BytesMut};
@@ -263,34 +258,11 @@ pub fn content_paid_frontier(fetch_start: u64, total_bytes: u64, paid_wire: u64)
 pub type SinkFuture<'a, T> =
     core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
 
-/// Where a fetched blob's VERIFIED content bytes are written.
-///
-/// A caller implements it to receive [`write_at`](ByteSink::write_at) calls only
-/// with content that has already passed bao verification against the blob's root,
-/// at its absolute offset in the blob — so an out-of-order multi-source fetch
-/// lands each range at its position. Pure: the trait names no blob store, so it
-/// does not pull client-pull back toward `iroh-blobs`.
-///
-/// This is an output seam with no production consumer today: the
-/// [`Downloader`](crate::Downloader) writes its output through a
-/// [`ClientRangedStore`](crate::ClientRangedStore) — which promotes the verified
-/// `.partial` to the final file on `finalize` — rather than a `ByteSink`, so the
-/// trait's only implementor is a test `Vec`.
-pub trait ByteSink: Send + Sync {
-    /// Write verified content `bytes` at absolute `offset` in the blob. Writes at
-    /// distinct offsets are independent, so a caller may issue them concurrently.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the backing store raises (an I/O error for a file sink).
-    fn write_at(&self, offset: u64, bytes: Bytes) -> SinkFuture<'_, ()>;
-}
-
 /// An injected content cache the `Streamer` consults and fills, keyed by
 /// `(hash, offset)` over content bytes.
 ///
 /// Pure by design: the trait names no blob store, which is what keeps
-/// `client-pull` `iroh-blobs`-free — a blob-store-backed implementation lives
+/// `decdn-client` `iroh-blobs`-free — a blob-store-backed implementation lives
 /// ABOVE this crate and is injected. The default is the no-op [`NoCache`] (never
 /// hits, never stores), so a caller that wants no revisit-reuse pays nothing.
 ///
@@ -332,7 +304,7 @@ pub trait BlobCache: Send + Sync {
 /// The default [`BlobCache`]: never caches. Every [`get`](BlobCache::get) misses
 /// and every [`put`](BlobCache::put) discards, so a `Streamer` built with it
 /// always fetches the whole range and stores nothing. A caller that wants
-/// revisit-reuse injects a real cache above `client-pull`.
+/// revisit-reuse injects a real cache above `decdn-client`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoCache;
 
@@ -351,86 +323,32 @@ impl BlobCache for NoCache {
 }
 
 // ---------------------------------------------------------------------------
-// Test doubles: an in-memory ByteSink + an in-memory BlobCache. Feature-gated so
-// a production caller cannot name them, but compiled outside `cfg(test)` under
-// `test-util` (the `Streamer` suites reuse them), so they must stay anti-panic
-// clean.
+// Test double: an in-memory BlobCache for the `Streamer` and cache unit tests.
 // ---------------------------------------------------------------------------
 
-/// A [`ByteSink`] backed by an in-memory buffer that grows to cover the highest
-/// written offset, zero-filling any gap. Used by tests that assert the engine
-/// wrote the right bytes at the right positions.
-#[cfg(any(test, feature = "test-util"))]
-#[derive(Debug, Default)]
-pub struct VecByteSink {
-    buf: std::sync::Mutex<Vec<u8>>,
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl VecByteSink {
-    /// An empty sink.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The bytes written so far, with any unwritten gap left zero.
-    #[must_use]
-    pub fn contents(&self) -> Bytes {
-        self.buf
-            .lock()
-            .map_or_else(|_| Bytes::new(), |b| Bytes::copy_from_slice(&b))
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl ByteSink for VecByteSink {
-    fn write_at(&self, offset: u64, bytes: Bytes) -> SinkFuture<'_, ()> {
-        Box::pin(async move {
-            let start = usize::try_from(offset)
-                .map_err(|_| anyhow::anyhow!("offset {offset} exceeds addressable memory"))?;
-            let end = start
-                .checked_add(bytes.len())
-                .ok_or_else(|| anyhow::anyhow!("write at {offset} overflows"))?;
-            let mut buf = self
-                .buf
-                .lock()
-                .map_err(|_| anyhow::anyhow!("byte sink buffer lock poisoned"))?;
-            if buf.len() < end {
-                buf.resize(end, 0);
-            }
-            let slot = buf
-                .get_mut(start..end)
-                .ok_or_else(|| anyhow::anyhow!("write slice out of range"))?;
-            slot.copy_from_slice(&bytes);
-            Ok(())
-        })
-    }
-}
-
 /// The exact key an in-memory [`BlobCache`] entry hits on: `(hash, offset, len)`.
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 type CacheKey = ([u8; 32], u64, u64);
 
 /// An in-memory [`BlobCache`] that stores each `put` under its exact
 /// `(hash, offset, len)` key and hits only on an identical key. The minimum a
 /// `Streamer` cache test needs to prove complement-only fetching.
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 #[derive(Debug, Default)]
-pub struct MemoryBlobCache {
+pub(crate) struct MemoryBlobCache {
     entries: std::sync::Mutex<std::collections::HashMap<CacheKey, Bytes>>,
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 impl MemoryBlobCache {
     /// An empty cache.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 impl BlobCache for MemoryBlobCache {
     fn get(&self, hash: [u8; 32], offset: u64, len: u64) -> SinkFuture<'_, Option<Bytes>> {
         Box::pin(async move {
@@ -610,7 +528,7 @@ mod tests {
 
     use bytes::Bytes;
 
-    use super::{BlobCache, ByteSink, MemoryBlobCache, NoCache, VecByteSink};
+    use super::{BlobCache, MemoryBlobCache, NoCache};
 
     /// The default [`NoCache`] never hits and discards every `put`, so a caller
     /// that injects no cache always fetches the whole range.
@@ -649,21 +567,6 @@ mod tests {
         anyhow::ensure!(
             cache.get(hash, 16, 2).await?.is_none(),
             "wrong length misses"
-        );
-        Ok(())
-    }
-
-    /// A [`ByteSink`] lands out-of-order writes at their absolute offsets — the
-    /// multi-source Downloader writes each range at its position.
-    #[tokio::test]
-    async fn byte_sink_writes_land_at_absolute_offsets() -> anyhow::Result<()> {
-        let sink = VecByteSink::new();
-        sink.write_at(4, Bytes::from_static(b"cd")).await?;
-        sink.write_at(0, Bytes::from_static(b"ab")).await?;
-        anyhow::ensure!(
-            sink.contents().as_ref() == b"ab\0\0cd",
-            "out-of-order writes must land at their offsets, got {:?}",
-            sink.contents()
         );
         Ok(())
     }

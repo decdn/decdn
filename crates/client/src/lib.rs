@@ -44,9 +44,9 @@ pub mod config;
 pub mod connection;
 /// Range-keyed discovery coverage-map primitive plus the two
 /// objective-specific planners over it (#1506): [`coverage_plan::plan_covered_runs`]
-/// (node — concentrate + sticky) and [`coverage_plan::spread_segments`] (client —
+/// (node — concentrate + sticky) and `coverage_plan::spread_segments` (client —
 /// spread for parallelism). Pure, no I/O.
-pub mod coverage_plan;
+pub(crate) mod coverage_plan;
 /// Client-side node discovery (#936): read + select the active node set from
 /// `CapacityBond.getRegisteredNodes`, then rank probed blob-holders.
 pub mod discovery;
@@ -87,7 +87,7 @@ pub mod provider;
 pub mod ranged_store;
 /// The `APP_ERR_RATE_LIMITED` (`0x10`) transport shed, typed for the pull
 /// orchestrator (ADR 013 §Application Error Codes).
-pub mod rate_limited;
+pub(crate) mod rate_limited;
 /// Failover classification (#1174, ADR 037 § Fallback): decide whether a fetch
 /// failure is terminal or worth retrying against another provider/lane. Shared by
 /// the CLI single-source loop and the multi-source scheduler.
@@ -111,21 +111,15 @@ pub mod sink;
 /// seam), plus scripted test doubles.
 pub mod source;
 
-pub use config::{
-    DEFAULT_DOWNLOAD_UNIT_DEADLINE, DEFAULT_READ_AHEAD_BYTES, DEFAULT_STREAMER_LANE_CAP, PullConfig,
-};
+pub use config::PullConfig;
 pub use connection::WarmConnection;
-pub use coverage_plan::{
-    CoveredRun, SourceCoverage, covering_sources, plan_covered_runs, spread_segments,
-};
+pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 pub use decdn_bao_range::RangedStore;
 pub use downloader::{DownloadTarget, Downloader};
 pub use driver::{
     PacingWait, PoolExhausted, SharedPool, WaitReason, drive, drive_range_set, first_leg,
 };
-pub use ledger::{
-    ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released, StreamProof,
-};
+pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released};
 pub use ledgers::{LaneHandle, LaneLedgers};
 pub use pacer::{
     BudgetPacer, DownstreamFrontier, MIN_DRAW_WINDOW, PULL_WINDOW_FLOOR, PaceDecision, PaceState,
@@ -134,17 +128,17 @@ pub use pacer::{
 pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
 pub use progress::throughput_watchdog;
 pub use ranged_store::ClientRangedStore;
-pub use rate_limited::{UpstreamRateLimited, rate_limit_shed};
-pub use retry::{RetryDisposition, retry_disposition};
+pub use rate_limited::UpstreamRateLimited;
+pub use retry::{RetryDisposition, retry_disposition, shared_pool_disposition};
 pub use scheduler::{ConsumptionPacing, MultiSourceConfig, SourceLane, multi_source_fetch};
-pub use sink::{BlobCache, ByteSink, NoCache, SinkFuture};
+pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
     BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource, PrimedSource, SourceFuture,
 };
-pub use streamer::{StreamCandidate, StreamDrive, Streamer, VerifiedReader};
+pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};
 
-#[cfg(any(test, feature = "test-util"))]
-pub use sink::{MemoryBlobCache, VecByteSink};
+pub(crate) use ledger::StreamProof;
+
 #[cfg(any(test, feature = "test-util"))]
 pub use source::{FakeFunder, ScriptedReader, ScriptedSource};
 
@@ -810,7 +804,7 @@ pub struct UpstreamVoucherRejected {
     /// nothing to resync from and the caller must surface the failure.
     pub bundle: Option<WatermarkBundle>,
     /// The ledger generation the rejected voucher was signed under
-    /// ([`StreamProof::Voucher`]), when the stream knows it. `None` for a
+    /// (`StreamProof::Voucher`), when the stream knows it. `None` for a
     /// rejected reveal, or a rejection read before this stream claimed
     /// anything; [`PoolLedger::rebase`] treats it as current.
     pub proof_generation: Option<u64>,
@@ -2182,7 +2176,7 @@ where
 /// the action commits another. Taking the whole [`Voucher`] rather than its fields loose is what
 /// lets a caller verify and then act on *the same value*.
 #[must_use]
-pub fn voucher_signed_by(
+pub(crate) fn voucher_signed_by(
     voucher: &Voucher,
     signature: &[u8],
     expected: Address,
@@ -2212,7 +2206,7 @@ pub fn voucher_signed_by(
 /// for why acting on an unverified watermark is a channel-draining hole rather than a robustness
 /// nicety). The chain half carries no signature at all, which is what makes the tip check the
 /// only thing standing between an inflated `verified_index` and a client that signs it.
-pub fn resumable_watermark<'a>(
+pub(crate) fn resumable_watermark<'a>(
     err: &'a anyhow::Error,
     ctx: &PoolContext,
 ) -> Option<&'a WatermarkBundle> {
@@ -2246,7 +2240,7 @@ pub fn resumable_watermark<'a>(
 
 /// How [`heal_watermark_desync`] resolved a rejection's authenticated watermark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Healed {
+pub(crate) enum Healed {
     /// The bundle was AHEAD of our committed watermark: the node holds a voucher
     /// we lost. [`PoolLedger::reseed`] moved us up to it.
     Reseeded,
@@ -2262,7 +2256,7 @@ pub enum Healed {
 /// The authenticated watermark a voucher rejection carries, as the cumulative a
 /// ledger re-anchors to, or `None` when [`resumable_watermark`] refuses it.
 #[must_use]
-pub fn rejection_watermark(err: &anyhow::Error, ctx: &PoolContext) -> Option<Cumulative> {
+pub(crate) fn rejection_watermark(err: &anyhow::Error, ctx: &PoolContext) -> Option<Cumulative> {
     resumable_watermark(err, ctx).map(Cumulative::from)
 }
 
@@ -2276,7 +2270,7 @@ pub fn rejection_watermark(err: &anyhow::Error, ctx: &PoolContext) -> Option<Cum
 /// [`PoolLedger::rebase`]. A bundle that merely echoes our own watermark proves
 /// no desync: the node attaches one to every watermark-gated rejection once a
 /// voucher is accepted, so an exhausted lane echoes it straight back.
-pub async fn heal_watermark_desync(
+pub(crate) async fn heal_watermark_desync(
     err: &anyhow::Error,
     watermark: Cumulative,
     ledger: &PoolLedger,
@@ -2734,7 +2728,7 @@ pub async fn open_progressive_pull(
         byte_len = byte_len,
     )
 )]
-pub async fn open_progressive_pull_on(
+pub(crate) async fn open_progressive_pull_on(
     warm: &WarmConnection,
     ctx: &PoolContext,
     ledger: Arc<PoolLedger>,
@@ -3377,7 +3371,7 @@ async fn send_voucher(
 
 /// Names the voucher a failed [`send_voucher`] left armed, so a terminal
 /// `StreamEnd` read afterwards confirms that voucher and no other
-/// ([`PoolLedger::confirm_armed`]). Carried as error context: it composes with,
+/// ([`PoolLedger::confirm_armed_stamped`]). Carried as error context: it composes with,
 /// and still downcasts through, the send error it wraps.
 #[derive(Debug)]
 struct UnconfirmedVoucher {

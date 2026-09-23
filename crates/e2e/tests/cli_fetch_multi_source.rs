@@ -3,7 +3,7 @@
 //! nodes over real paid `cdn/client/v1` streams.
 //!
 //! Why the whole binary rather than a unit test: the scheduler/segmentation
-//! unit tests in `decdn-client-pull` already prove tail-stealing, reassembly,
+//! unit tests in `decdn-client` already prove tail-stealing, reassembly,
 //! and per-lane pacing work against `ScriptedSource` — a source built to
 //! deterministically prove the payee binding BY CONSTRUCTION. What they cannot
 //! reach is the part that only exists on the real wire: that the CLI's
@@ -19,7 +19,7 @@
 //! auto-discovers both via the on-chain `CapacityBond` registry, probes them,
 //! and — the blob cleared past a (test-lowered) `--multi-source-min-bytes`
 //! floor and two admissible holders found — engages
-//! `decdn_client_pull::multi_source_fetch` (`try_multi_source_fetch` in
+//! `decdn_client::multi_source_fetch` (`try_multi_source_fetch` in
 //! `crates/cli/src/commands/fetch.rs`) instead of the single-source
 //! failover loop.
 //!

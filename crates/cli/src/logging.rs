@@ -3,7 +3,7 @@
 //! The CLI is a terminal UI: by default it installs no tracing subscriber, so
 //! its output is only the command's own stdout result and the stderr progress
 //! bar. That keeps the common case clean, but it also means every
-//! `tracing::debug!/info!/warn!` in `decdn-client-pull`, `decdn-incentive`, and
+//! `tracing::debug!/info!/warn!` in `decdn-client`, `decdn-incentive`, and
 //! `iroh` goes to a no-op collector — a stalled `decdn fetch` is silent on the
 //! side that is actually failing.
 //!
@@ -197,8 +197,8 @@ mod tests {
     #[test]
     fn rust_log_wins_over_log_level() {
         assert_eq!(
-            filter_directive(Some("decdn_client_pull=debug"), Some(LogLevel::Warn)),
-            Some("decdn_client_pull=debug".to_string())
+            filter_directive(Some("decdn_client=debug"), Some(LogLevel::Warn)),
+            Some("decdn_client=debug".to_string())
         );
     }
 

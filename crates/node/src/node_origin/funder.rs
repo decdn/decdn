@@ -1,6 +1,6 @@
 //! `NodeFunder` — the node's [`Funder`] adapter over [`PoolOpener::top_up_pool_by`].
 //!
-//! [`client-pull`](decdn_client_pull)'s gap-driven `drive()` reactively tops up
+//! [`decdn-client`](decdn_client)'s gap-driven `drive()` reactively tops up
 //! the buyer deposit through the injected [`Funder`] seam (`source.rs`) rather
 //! than naming a chain handle directly, so the node's upstream cache-miss pull
 //! leg shares that driver instead of running its own copy of the top-up
@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use alloy::primitives::U256;
 use async_trait::async_trait;
-use decdn_client_pull::source::SourceFuture;
-use decdn_client_pull::{Funder, LocalPullFault, PoolContext};
+use decdn_client::source::SourceFuture;
+use decdn_client::{Funder, LocalPullFault, PoolContext};
 use decdn_incentive::DepositOutcome;
 use tracing::warn;
 
@@ -44,7 +44,7 @@ use crate::buyer_channel::PoolOpener;
 /// problem no amount of funding fixes; each extra attempt costs a transaction plus
 /// a settle wait, both of which land on a client that is waiting.
 ///
-/// [`MAX_TOPUP_ATTEMPTS`]: decdn_client_pull::MAX_TOPUP_ATTEMPTS
+/// [`MAX_TOPUP_ATTEMPTS`]: decdn_client::MAX_TOPUP_ATTEMPTS
 ///
 /// Reported through [`Funder::max_topups`] below, so [`NodeFunder`] is the one
 /// source of the node's reactive-top-up budget.
@@ -54,7 +54,7 @@ pub(crate) const MAX_REACTIVE_TOPUPS: u32 = 1;
 /// (the upstream's watcher was already close to its next poll) costs little.
 ///
 /// `pub(crate)` so the gap-driven pull leg ([`super::pull_leg::run_pull_leg`]) and
-/// the node origin's own [`decdn_client_pull::driver::DriveConfig`] reuse it as
+/// the node origin's own [`decdn_client::driver::DriveConfig`] reuse it as
 /// `settle_backoff`, keeping one source of the node's settle cadence.
 pub(crate) const SETTLE_POLL_STEP: Duration = Duration::from_millis(500);
 
@@ -280,9 +280,7 @@ mod tests {
             &self,
             _provider_addr: Address,
             _pool_id: PoolId,
-            _bytes_delivered: U256,
-            _amount: U256,
-            _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
+            _write: decdn_client::buyer_pool::ProgressWrite,
         ) -> Result<()> {
             unreachable!("not exercised by NodeFunder tests")
         }

@@ -261,10 +261,10 @@ impl DriveConfig {
 /// The single source of truth for [`drive`]'s settle-wait budget (via
 /// [`DriveConfig::cli`]); the CLI `fetch` command and `bundle_pull` both run
 /// `drive`, so they share one settle-wait policy.
-pub const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
+pub(crate) const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
 /// Backoff between resume-open retries while waiting for the node's chain watcher
 /// to observe a just-landed top-up (see [`MAX_TOPUP_SETTLE_WAITS`]).
-pub const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
+pub(crate) const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
 
 /// How often a fetch's single flush owner persists the `.ranges` present record
 /// while sources are still delivering. The ranged store's ingest `checkpoint`
@@ -3442,7 +3442,7 @@ mod tests {
         }
     }
 
-    /// With a ramped window past [`crate::MIN_DRAW_WINDOW`], a caught-up client
+    /// With a ramped window past [`crate::pacer::MIN_DRAW_WINDOW`], a caught-up client
     /// sees the pull draw at least half the window per upstream open, except the
     /// last piece of the gap, and the drive completes: the minimum draw batches
     /// the room without stalling the pull. The variant with a parked serve leg
@@ -3455,7 +3455,7 @@ mod tests {
         for demand in [false, true] {
             let window = 8 * PULL_WINDOW_FLOOR;
             assert!(
-                window >= crate::MIN_DRAW_WINDOW,
+                window >= crate::pacer::MIN_DRAW_WINDOW,
                 "premise: the minimum is on"
             );
             let total = 24 * PULL_WINDOW_FLOOR + 5 * GROUP;

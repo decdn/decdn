@@ -15,9 +15,9 @@ use jsonrpsee::core::client::Error as JsonRpcClientError;
 use jsonrpsee::http_client::HttpClientBuilder;
 use serde::{Deserialize, Serialize};
 
-use decdn_client_pull::discovery::{self, NodeCandidate, SELECT_K, select_candidates};
-use decdn_client_pull::endpoint as client_endpoint;
-use decdn_client_pull::probe::probe_once;
+use decdn_client::discovery::{self, NodeCandidate, SELECT_K, select_candidates};
+use decdn_client::endpoint as client_endpoint;
+use decdn_client::probe::probe_once;
 use decdn_common::admin::{
     AdminRpcClient, BindingStatus, BuyerPoolsResponse, DrainRequest, DrainResponse, EvictRequest,
     EvictResponse, HealthResponse, LaneSnapshot, LanesResponse, ReloadResponse, SlashesResponse,
@@ -2341,8 +2341,8 @@ mod tests {
 
     /// `filter_candidates` (#1481): network-free filtering behind `decdn node
     /// lookup`, unit-tested without a chain or network per the task brief.
-    fn lookup_candidate(seed: u8, region: &str) -> decdn_client_pull::discovery::NodeCandidate {
-        decdn_client_pull::discovery::NodeCandidate {
+    fn lookup_candidate(seed: u8, region: &str) -> decdn_client::discovery::NodeCandidate {
+        decdn_client::discovery::NodeCandidate {
             node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
             eth_address: alloy::primitives::Address::repeat_byte(seed),
             region_hint: decdn_protocol::Region::parse(region),
