@@ -1,5 +1,5 @@
 //! Live anvil-backed e2e for the persisted [`decdn_client::PeerStore`]
-//! (#1906-series, Task 10): proves `decdn fetch` populates the store on a
+//! (#1906): proves `decdn fetch` populates the store on a
 //! normal auto-discovered fetch, and that a second fetch against the same
 //! `data_dir` can be served straight from the store without a fresh
 //! `CapacityBond` registry read or a `cdn/probe/v1` probe round.
@@ -36,7 +36,7 @@
 //!    probe-count metric on the wire or the admin surface to assert against
 //!    directly (checked: `decdn_common::admin` exposes no such counter), so
 //!    this journey backs the "no probe" half with `store_fast_path`'s own
-//!    Task 7 unit tests plus the structural fact above, and asserts the
+//!    unit tests plus the structural fact above, and asserts the
 //!    outcome that IS observable end to end: the second fetch succeeds and
 //!    delivers correct bytes without ever touching the registry.
 //! 2. **Cross-process persistence.** The two `decdn fetch` invocations above
@@ -45,7 +45,7 @@
 //!    journey additionally asserts the peer record files are present both
 //!    right after fetch #1 and still present after fetch #2.
 //!
-//! **Registry-outage fallback (item 3 of the task brief) is NOT covered here —
+//! **Registry-outage fallback is NOT covered here —
 //! documented limitation, not a faked test.** `decdn fetch`'s CLI surface has
 //! no way to break the `CapacityBond` registry read in isolation:
 //! `--capacity-bond-address` is also the ADR 005 client-binding EIP-712
@@ -65,7 +65,7 @@
 //! existing pool has ample deposit and would otherwise need no on-chain read
 //! to be reused. Simulating the outage by pausing the fixture's own anvil
 //! process hits the same wall — that same unconditional `usdc()` read would
-//! also fail. Item 3 needs either a way to point discovery's registry read at
+//! also fail. Covering the fallback needs either a way to point discovery's registry read at
 //! a different RPC/contract than the payment path uses, or a fixture seam
 //! that fails `CapacityBond.getRegisteredNodes` in isolation (e.g. a
 //! `NodeFixture`/`ChainFixture` hook to revert just that call) — neither

@@ -3475,7 +3475,7 @@ impl CacheEngine {
     /// [`Self::set_origin_read_budget`]'s budget. A per-origin decline, wrong
     /// length, transport fault or timeout advances the chain.
     ///
-    /// This is the Flow A serviceability probe: the node's own-origin serve-miss
+    /// This is the own-origin serviceability probe: the node's own-origin serve-miss
     /// path confirms an origin can furnish the outboard for `H` before it signs a
     /// `StreamResponse` and spins up the two-leg driver, so a blob no origin can
     /// prove is never advertised as serviceable. A cached copy answers without an
@@ -6724,7 +6724,7 @@ mod tests {
         let mut rx = engine.subscribe_inserts();
 
         // Successful pull-through must announce the hash to the
-        // subscriber. The DHT republish scheduler (PR 4 of #320)
+        // subscriber. The DHT republish scheduler (#320)
         // consumes this stream to drive `Store` fan-out to the K+3
         // closest peers.
         let _ = engine.get(hash).await?;
@@ -9012,10 +9012,10 @@ mod tests {
         (0..size).map(|i| (i % 251) as u8).collect()
     }
 
-    // -- FA.1a: origin_range_wire / origin_fetch_outboard_bytes (Flow A) --
+    // -- origin_range_wire / origin_fetch_outboard_bytes --
 
     /// A test origin that serves chunk-group-aligned ranges plus a configurable
-    /// `{H}.obao4` outboard, so the Flow A raw fetch+encode surface can be
+    /// `{H}.obao4` outboard, so the raw origin fetch+encode surface can be
     /// exercised without an HTTP/S3/fs backend. `data`/`outboard`/`size` are held
     /// independently so a test can serve bytes that do NOT hash to `hash` (a
     /// corrupt / misconfigured OWN origin, the local-origin-fault case).
@@ -9209,7 +9209,7 @@ mod tests {
         (0..size).map(|i| (i % 251) as u8).collect()
     }
 
-    /// Drain a Flow A wire to its end: the bytes, and the fault it ended on.
+    /// Drain an origin-range wire to its end: the bytes, and the fault it ended on.
     async fn drain_wire(mut wire: OriginRangeWire) -> (Vec<u8>, Option<CacheError>) {
         let mut out = Vec::new();
         while let Some(item) = wire.next_chunk().await {
@@ -10300,8 +10300,8 @@ mod tests {
         assert!(!cov.covers(1), "block 1's middle group is missing");
     }
 
-    // -- #1506 Task 0 spike: does the observe() bitfield know the full size --
-    // -- of a front-prefix partial before status() does? --
+    // -- On a front-prefix partial, the observe() bitfield knows the full --
+    // -- blob size while status() still reports it unknown (#1506). --
 
     #[tokio::test]
     async fn spike_bitfield_size_known_before_status_size_on_front_partial() {
@@ -10386,16 +10386,13 @@ mod tests {
 
     /// Advertise (`coverage`) and serve (`partial_hit_size`, mirrored here via
     /// `present_ranges` + `missing_ranges` — the exact sequence it now runs)
-    /// must AGREE on a front-prefix partial (#1506 C3).
+    /// must AGREE on a front-prefix partial (#1506).
     ///
-    /// Before the fix, `partial_hit_size` sized the blob from `inspect`'s
-    /// `status()`-derived `size_bytes`, which iroh-blobs leaves `None` for a
-    /// `Partial` blob until its FINAL chunk validates — so on a front-prefix
-    /// partial (block 0 present, no tail) it returned `None` and the serve
-    /// gate declined, even though `coverage` (sized from the `observe()`
-    /// bitfield) had already advertised block 0 as covered. This test fails
-    /// before the fix: `coverage` covers block 0 but the size source used by
-    /// serve is `0`/unknown, so no size agreement is possible.
+    /// Both size the blob from the `observe()` bitfield. `inspect`'s
+    /// `status()`-derived `size_bytes` is not usable here: iroh-blobs leaves it
+    /// `None` for a `Partial` blob until its FINAL chunk validates, so on a
+    /// front-prefix partial (block 0 present, no tail) a `status()`-sized serve
+    /// gate declines a block that `coverage` already advertises as covered.
     #[tokio::test]
     async fn partial_hit_size_source_agrees_with_coverage_on_front_partial() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10740,7 +10737,7 @@ mod tests {
         assert_eq!(
             count_tags_for(&engine, hash).await,
             1,
-            "the partial carries its B0 protecting tag"
+            "the partial carries its protecting tag"
         );
 
         // The exact wire each serve leg must deliver, captured before the evict.
@@ -10769,7 +10766,7 @@ mod tests {
         assert_eq!(
             count_tags_for(&engine, hash).await,
             0,
-            "evict drops the B0 protecting tag"
+            "evict drops the protecting tag"
         );
         assert!(
             !engine.has(hash).await.unwrap(),

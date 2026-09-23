@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn client_transport_windows_are_sized_and_ordered() {
-        // Pin the sizes this PR sets: the per-stream window matches a default
+        // Pin the configured sizes: the per-stream window matches a default
         // node's `credit_max` ceiling, and the connection window sits above it.
         assert_eq!(CLIENT_STREAM_RECEIVE_WINDOW, 64 * 1024 * 1024);
         assert_eq!(CLIENT_RECEIVE_WINDOW, 128 * 1024 * 1024);

@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn chunk_avg_is_none_by_default() {
-        // No clap default: `None` = unset, so the wiring (Task 6) can reject
+        // No clap default: `None` = unset, so `decdn origin import` can reject
         // `--chunk-avg` given without `--optimize`. The 4 MiB default is applied
         // downstream, not by clap.
         let w = Wrap::try_parse_from(["x", "-i", "d", "--to", "/o"]).unwrap();

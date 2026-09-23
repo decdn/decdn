@@ -1047,8 +1047,8 @@ fn parse_byte_range(h: &str) -> Option<(u64, u64)> {
 }
 
 /// A WHOLE-BLOB cold miss whose own origin publishes the `{H}.obao4` outboard is
-/// served through the Flow A own-origin two-leg path (`serve_via_backend_origin`,
-/// FA.3a): dispatch confirms serviceability (origin size + published outboard),
+/// served through the own-origin two-leg path (`serve_via_backend_origin`):
+/// dispatch confirms serviceability (origin size + published outboard),
 /// signs `ok:true`, and runs the local pull leg (fill the cache from origin)
 /// beside the serve leg (stream the filling cache to the paying client). This
 /// asserts the dispatch selection reaches `serve_via_backend_origin` — the
@@ -2318,7 +2318,7 @@ fn large_blob_with_outboard() -> (Vec<u8>, Vec<u8>, Hash) {
     (blob, ob.data, hash)
 }
 
-/// INTERIOR-HOLD own-origin serve-miss (Flow A). The node already holds an aligned
+/// INTERIOR-HOLD own-origin serve-miss. The node already holds an aligned
 /// INTERIOR range of the blob before the whole-blob request arrives; the local pull
 /// leg must draw ONLY the surrounding gaps from origin (never the held interior),
 /// the serve leg's coherent whole-range encoder must seed the shared outboard from
@@ -2328,7 +2328,7 @@ fn large_blob_with_outboard() -> (Vec<u8>, Vec<u8>, Hash) {
 ///
 /// This is the key new coverage: it proves the range-minimized pull + the
 /// shared-outboard held-range SEED (`window.rs` `outboard_pairs` pre-seed) both work
-/// together, which the full-miss FA.3a test cannot exercise (a full miss holds
+/// together, which the full-miss own-origin test cannot exercise (a full miss holds
 /// nothing, so the seed is a no-op and every byte is pulled).
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
@@ -2535,8 +2535,8 @@ async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<(
 ///
 /// The whole `ranged_paid_pull` is wrapped in a hard `timeout`, so a genuine hang
 /// (the failure this test guards against) surfaces as a test failure rather than a
-/// stuck run. This is the integration-level twin of FA.2's `run_local_pull_leg`
-/// unit no-hang proof: it shows the pull-leg terminal signal propagates all the way
+/// stuck run. This is the integration-level twin of `run_local_pull_leg`'s unit
+/// no-hang proof: it shows the pull-leg terminal signal propagates all the way
 /// through `serve_leg` to the paying client.
 #[tokio::test(flavor = "multi_thread")]
 async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Result<()> {
@@ -2722,16 +2722,16 @@ async fn handler_two_channels_over_http_origin(
 }
 
 /// TWO concurrent whole-blob own-origin misses for the SAME hash COALESCE to a
-/// single origin ranged GET (#1621 B3, `CacheEngine::claim_fill`). Both requests
-/// enter `serve_via_backend_origin`; under one registry lock the first OWNS the
-/// local origin pull and the second ATTACHES as an observer, streaming the SAME
-/// filling cache to its own client. So the node eats the S3 egress ONCE — the
-/// headline own-origin saving — while running TWO live serve legs (DECISION-A:
-/// "one S3 fetch + two live serve legs", replacing the old sequential
-/// park-and-wait). The proof is on the ORIGIN side: exactly ONE ranged `206` data
-/// GET reaches the backend (not two), and BOTH clients receive the whole blob
-/// byte-exact on their own channels. The own-origin serve tier therefore fires
-/// TWICE now (both legs genuinely serve via the backend-origin path), not once.
+/// single origin ranged GET (#1621, `CacheEngine::claim_fill`). Both requests enter
+/// `serve_via_backend_origin`; under one registry lock the first OWNS the local
+/// origin pull and the second ATTACHES as an observer, streaming the SAME filling
+/// cache to its own client. So the node eats the S3 egress ONCE — the headline
+/// own-origin saving — while running TWO live serve legs rather than parking the
+/// second request until the first completes. The proof is on the ORIGIN side:
+/// exactly ONE ranged `206` data GET reaches the backend (not two), and BOTH
+/// clients receive the whole blob byte-exact on their own channels. The own-origin
+/// serve tier therefore fires TWICE (both legs genuinely serve via the
+/// backend-origin path), not once.
 ///
 /// The race is forced deterministically: the origin's ranged data GET is delayed,
 /// so the owner holds the fill across a wide window; the second is launched after a

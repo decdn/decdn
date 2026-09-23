@@ -56,7 +56,6 @@ use iroh_io::AsyncStreamReader;
 /// `total_bytes`-byte blob) out of `engine`'s configured origins. `self_pay` is a
 /// LOCAL completion counter only — see the module docs and
 /// [`BlobSource::finish`].
-#[allow(dead_code, reason = "wired by FA.2/FA.3 orchestration")]
 pub(crate) struct BackendSource {
     engine: CacheEngine,
     root: [u8; 32],
@@ -65,7 +64,6 @@ pub(crate) struct BackendSource {
     self_pay: Arc<PoolLedger>,
 }
 
-#[allow(dead_code, reason = "wired by FA.2/FA.3 orchestration")]
 impl BackendSource {
     /// Build an unpaid own-origin source for `root` (a `total_bytes`-byte blob)
     /// over `engine`, whose `self_pay` ledger the caller also drives the
@@ -190,7 +188,6 @@ impl WireChunks for OriginRangeWire {
 /// verification against `H`, or an origin that stops serving mid-stream — fails
 /// the read and is kept for [`StashedFault::take_fault`], so the sink reports
 /// that typed [`CacheError`] rather than a bare truncation.
-#[allow(dead_code, reason = "wired by FA.2/FA.3 orchestration")]
 pub(crate) struct BackendReader<W = OriginRangeWire> {
     wire: W,
     /// The unread rest of the last chunk the wire yielded.

@@ -177,7 +177,7 @@ contract PaymentPoolTest is Test {
     uint256 internal constant BYTES_PER_MB = 1_048_576;
     uint64 internal constant SPENDING_CAP = 500e6;
     uint64 internal expiry; // far-future capability expiry, set in setUp
-    /// Vouchers-per-call for the Task 7 marginal-gas benchmark pair
+    /// Vouchers-per-call for the marginal-gas benchmark pair
     /// (`test_redeemMany_gas_NVouchers` / `test_redeemMany_gas_NPlus1Vouchers`).
     uint256 internal constant REDEEM_MANY_GAS_BENCHMARK_N = 10;
 
@@ -2262,7 +2262,7 @@ contract PaymentPoolTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // redeemMany — marginal per-voucher gas (Task 7 chunk-size validation)
+    // redeemMany — marginal per-voucher gas (batch-size validation)
     // -----------------------------------------------------------------
 
     /// @dev Registers `count` distinct signer capabilities on `id` ahead of
@@ -2361,7 +2361,7 @@ contract PaymentPoolTest is Test {
         return vm.snapshotGasLastCall("PaymentPool", snapshotName);
     }
 
-    /// @notice Task 7: pins the on-chain gas of a `redeemMany` call redeeming
+    /// @notice Pins the on-chain gas of a `redeemMany` call redeeming
     ///         N already-registered-capability vouchers, to validate
     ///         `DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX` (300,
     ///         `crates/common/src/config/mod.rs`) against the block gas

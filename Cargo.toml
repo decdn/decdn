@@ -180,7 +180,7 @@ fastcdc = "5"
 # HTTP client (used by cache-origin backend)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 
-# AWS SDK (used by the S3 cache-origin backend, #437 PR2). All four crates carry
+# AWS SDK (used by the S3 cache-origin backend, #437). All four crates carry
 # `default-features = false` so the workspace stays on one TLS implementation
 # (rustls 0.23 + aws-lc-rs); the SDK's stock rustls 0.21 + ring path is
 # fully suppressed by these flags. Cargo.lock confirms only one `rustls` and
@@ -279,7 +279,7 @@ alloy-json-rpc = "2"
 public-api = "0.52"
 rustdoc-json = "0.9"
 insta = "1"
-# Operation-level S3 mocks for the S3 origin tests (#437 PR2). The `mock!`
+# Operation-level S3 mocks for the S3 origin tests (#437). The `mock!`
 # / `mock_client!` macros take the SDK through its full middleware chain
 # (signing, retry, body framing) but stub the network — exactly the
 # granularity we need to validate `OriginPullError` classification without
@@ -421,8 +421,8 @@ codegen-units = 1
 # `strip = "debuginfo"`, not `"symbols"`: the symbol table stays in the shipped
 # binary, so a `RUST_BACKTRACE` panic from an operator's node symbolizes to
 # function names (`decdn_node::receipt_log::…::record`) instead of bare
-# addresses. Measured cost on `decdn-node`: 35.6 MB → 41.3 MB, still well under
-# the 47.4 MB we shipped before this profile change.
+# addresses. Measured cost on `decdn-node`: 35.6 MB fully stripped → 41.3 MB with
+# symbols kept.
 #
 # `file:line` is deliberately NOT bought here — it needs `strip = "none"`, which
 # takes `decdn-node` to 91.8 MB, and it cannot be moved to a sidecar: under

@@ -230,7 +230,7 @@ pub trait RateLimitMetricsSink: Send + Sync {
 #[allow(missing_debug_implementations)]
 pub struct ThreeLayerRateLimiter {
     /// `None` when the layer is disabled. Built once at construction; not
-    /// hot-reloadable in this PR (operators can restart). When made
+    /// hot-reloadable (operators restart to change it). To make it
     /// reloadable, follow the `ConnectionLimiter` pattern of `ArcSwap` on
     /// the inner limiter.
     global: Option<Arc<DefaultDirectRateLimiter>>,

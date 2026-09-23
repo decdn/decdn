@@ -242,7 +242,7 @@ contract CapacityBondTest is Test {
         assertTrue(bond.ejected(operator));
     }
 
-    /// Directly exercise the C2 defensive remainder-clip in
+    /// Directly exercise the defensive remainder-clip in
     /// `BondMath.reduceAtTier` (the math behind `_reduceBondAtTier`). It is
     /// unreachable through `slash()` — the clip fires only when
     /// `slashAmount > totalAtRisk`, i.e. `tierBps > 10_000` (>100%), and the

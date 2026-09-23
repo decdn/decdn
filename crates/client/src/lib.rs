@@ -50,7 +50,7 @@ pub(crate) mod coverage_plan;
 /// Client-side node discovery (#936): read + select the active node set from
 /// `CapacityBond.getRegisteredNodes`, then rank probed blob-holders.
 pub mod discovery;
-/// The `Downloader` consumption face (#1848 T4): fetch a set of content-addressed
+/// The `Downloader` consumption face (#1848): fetch a set of content-addressed
 /// blobs (a bundle, or a single blob) to files in a directory, out-of-order and
 /// at full throughput, reusing [`ClientRangedStore`] + [`driver::drive`] so every
 /// byte is bao-verified and a resumed fetch re-pulls only the missing ranges.
@@ -96,7 +96,7 @@ mod scheduler;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
 /// (spec §5.3): no I/O, no async.
 mod segment;
-/// The `Streamer` consumption face (#1848 T6): stream one blob's verified,
+/// The `Streamer` consumption face (#1848): stream one blob's verified,
 /// contiguous front to a consumer as it arrives, paced by consumption and bounded
 /// to one read-ahead window ahead of the read cursor. A fetch-like single-blob
 /// face over the same engine, with no chunk dedup.
@@ -217,7 +217,7 @@ pub struct PoolContext {
     /// `capacity_bond` on the client, or an on-chain/registered requester).
     pub client_binding: Option<ClientBinding>,
     /// Optional pool owner capability delegating spend to `client_signer`
-    /// (ADR 003 §Capability delegation, D3 `issue_self_capability` /
+    /// (ADR 003 §Capability delegation, `issue_self_capability` /
     /// `buyer_pool::open_pool`). Attached to every `cdn/client/v1` request's
     /// `ext` alongside `client_binding` so the serving node can register the
     /// signer on that signer's first on-chain redemption. Node-agnostic — the
@@ -1408,7 +1408,7 @@ pub async fn stream_fetch(
 }
 
 /// Like [`stream_fetch`], but drives the fetch over a caller-owned
-/// [`WarmConnection`] instead of dialling a fresh connection (#1848 T1). Two
+/// [`WarmConnection`] instead of dialling a fresh connection (#1848). Two
 /// calls with the same `warm` reuse one dialled connection — one bi-stream per
 /// hash — which is exactly what the connection-reuse test asserts.
 ///
@@ -2020,7 +2020,7 @@ async fn fetch_in_memory_once(
 
 /// Like [`fetch_in_memory_once`], but opens the pull on a caller-owned
 /// [`WarmConnection`] so the in-memory `stream_fetch_on` wrapper can prove
-/// connection reuse across hashes (#1848 T1).
+/// connection reuse across hashes (#1848).
 ///
 /// # Errors
 ///

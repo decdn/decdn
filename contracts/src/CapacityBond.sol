@@ -1094,7 +1094,7 @@ contract CapacityBond is
     /// @dev Reduce active + unbonding bond at `tierBps` (active first, then
     ///      unbonding, per ADR 003), writing back the balances `BondMath`
     ///      derives. The arithmetic — including the defensive clip that caps a
-    ///      >100%-of-at-risk tier (C2 fix; the current ladder maxes at 50%) —
+    ///      >100%-of-at-risk tier (the current ladder maxes at 50%) —
     ///      lives in [`BondMath.reduceAtTier`](BondMath.sol) so it can be
     ///      unit-tested without a full-contract harness.
     function _reduceBondAtTier(address operator, uint256 tierBps) internal returns (uint256 slashAmount) {

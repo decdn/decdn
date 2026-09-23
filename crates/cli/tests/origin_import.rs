@@ -380,7 +380,7 @@ fn hash_from_hex(hex: &str) -> (Hash, String) {
     (Hash::from_bytes(raw), hex.to_string())
 }
 
-// --- `--optimize` / `--dry-run` wiring (Task 6) ------------------------------
+// --- `--optimize` / `--dry-run` wiring ---------------------------------------
 //
 // These drive the real `decdn` binary so the actual process stdout/stderr and
 // exit code are observed — the dry-run contract is "the canonical manifest

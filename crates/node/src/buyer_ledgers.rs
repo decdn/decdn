@@ -236,9 +236,9 @@ mod tests {
         assert!(!Arc::ptr_eq(&a, &b));
     }
 
-    /// The C1 accounting the node's ranged-drive loop gates on (#1506): the spend
-    /// a later run subtracts from the shared deposit is the WHOLE pool's committed
-    /// amount, summed across every provider's lane — not this one lane's.
+    /// The pool-wide accounting the node's ranged-drive loop gates on (#1506): the
+    /// spend a later run subtracts from the shared deposit is the WHOLE pool's
+    /// committed amount, summed across every provider's lane — not this one lane's.
     ///
     /// Run 1 pays provider A (its lane committed 700). Run 2 opens a FRESH lane to
     /// provider B, whose own committed is 0. If run 2 gated on B's ledger alone it

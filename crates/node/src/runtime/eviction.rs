@@ -494,7 +494,7 @@ mod tests {
 
     /// Write `payload` into an `Origin`-shaped on-disk layout (`<origin_dir>/<2-hex
     /// shard>/<full-hex hash>`) so a [`decdn_cache::FilesystemOrigin`] pointed at
-    /// `origin_dir` can serve it. Shared by the Task 10 end-to-end policy tests
+    /// `origin_dir` can serve it. Shared by the ADR 040 end-to-end policy tests
     /// below — each needs several distinct one-off blobs.
     fn write_origin_blob(
         origin_dir: &std::path::Path,
@@ -806,7 +806,7 @@ mod tests {
         Ok(())
     }
 
-    /// Task 10 (ADR 040 end-to-end coverage): `tinylfu` admission + eviction,
+    /// ADR 040 end-to-end coverage: `tinylfu` admission + eviction,
     /// wired the way `crates/node/src/runtime/mod.rs` wires them — one shared
     /// [`decdn_cache::policy::TinyLfuEstimator`] feeding both a
     /// [`decdn_cache::policy::ProbationAdmission`] and the
@@ -923,7 +923,7 @@ mod tests {
         Ok(())
     }
 
-    /// Task 10: a hot blob primed with many requests must survive a sweep that
+    /// A hot blob primed with many requests must survive a sweep that
     /// clears a whole burst of one-hit cold blobs, driven through the real
     /// engine + [`sweep`] with `tinylfu` eviction (frequency-ranked, not
     /// recency-ranked — an LRU policy would have evicted the hot blob here
@@ -1010,11 +1010,10 @@ mod tests {
         Ok(())
     }
 
-    /// Task 10: with the config defaults (`always` admission + `lru` eviction,
-    /// no `tinylfu` estimator wired at all) a real engine's sweep still matches
-    /// a golden least-recently-used sequence — the end-to-end guard that
-    /// selecting `tinylfu` elsewhere in this test module left the default path
-    /// behaviorally untouched (Stage A neutrality).
+    /// With the config defaults (`always` admission + `lru` eviction, no
+    /// `tinylfu` estimator wired at all) a real engine's sweep matches a golden
+    /// least-recently-used sequence — the end-to-end guard that the default
+    /// path stays plain LRU, independent of the `tinylfu` wiring.
     #[tokio::test]
     async fn lru_default_unchanged() -> anyhow::Result<()> {
         let origin_dir = tempfile::tempdir()?;

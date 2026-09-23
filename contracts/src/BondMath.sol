@@ -45,7 +45,7 @@ library BondMath {
 
     /// @dev Reduce active + unbonding bond at `tierBps`. Active first, then
     ///      unbonding (prevents slash-then-run per ADR 003). The defensive
-    ///      `min(remainder, unbonding)` cap (C2 fix) guards against a future
+    ///      `min(remainder, unbonding)` cap guards against a future
     ///      tier above 100% of at-risk bond (`tierBps > BPS_DENOMINATOR`)
     ///      silently underflowing the unbonding subtraction; the current ladder
     ///      maxes at 50% so the clip is dead defensive code today. When the cap

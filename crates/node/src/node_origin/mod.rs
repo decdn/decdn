@@ -53,17 +53,9 @@ use abandon_drain::{ConnDrain, as_observer, drain_abandoned};
 #[doc(hidden)]
 pub use abandon_drain::ABANDON_DRAIN_CAP;
 pub(crate) use admit_store::NodeAdmitStore;
-#[allow(
-    unused_imports,
-    reason = "wired by the own-origin serve-miss orchestration"
-)]
 pub(crate) use backend_source::BackendSource;
 pub(crate) use funder::NodeFunder;
 use funder::{SETTLE_POLL_STEP, settle_wait_budget};
-#[allow(
-    unused_imports,
-    reason = "wired by the own-origin serve-miss orchestration"
-)]
 pub(crate) use pull_leg::{PullLegTarget, run_local_pull_leg, run_pull_leg};
 
 use std::collections::HashMap;
@@ -639,7 +631,7 @@ impl NodeOrigin {
     }
 
     /// A clone of the write-once dependency handle, for the off-task serve-miss pull
-    /// leg (#1621 B2 part 2): the pull runs on its OWN current-thread runtime (its
+    /// leg (#1621): the pull runs on its OWN current-thread runtime (its
     /// `drive` is non-`Send`, which the iroh `ProtocolHandler::accept` bound forbids
     /// on the serve task), so it cannot borrow `&self`. It captures this `Arc` and
     /// reads the deps via `get()` on the pull thread — the same handle
@@ -2646,8 +2638,8 @@ fn classify_pull_failure(
         // valid `StreamResponse`, and then sends NOTHING lands here — our deadline fired, so
         // it is `OurDeadline`. It was then neither scored nor suppressed, so it stayed
         // top-ranked and burned a full budget on EVERY subsequent miss, for every hash,
-        // forever, at zero cost to itself. That is precisely the hole this PR closed for
-        // refusals ("a peer that advertises everything and serves nothing burned a candidate
+        // forever, at zero cost to itself. Refusal suppression above closes exactly that hole
+        // for refusals ("a peer that advertises everything and serves nothing burned a candidate
         // slot on every miss forever"), left open one stage over for a peer that does not
         // even bother to answer.
         //

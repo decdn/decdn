@@ -335,7 +335,7 @@ async fn find_value_with_empty_store_returns_no_providers_but_closer_nodes() -> 
     assert_eq!(resp.hash, req.hash);
     assert!(
         resp.providers.is_empty(),
-        "PR-2 FindValue returns no providers (record store lands in PR 3)"
+        "FindValue for a hash nobody stored returns no providers"
     );
     assert!(
         resp.closer_nodes
@@ -810,11 +810,9 @@ mod adr_013_error_codes {
 }
 
 // ADR 022 §STORE Flow + §FIND_VALUE Flow — real record-store admission.
-// PR 3 of #320 replaces the previous "always reject" placeholder with
-// the spec-conformant `(holder == authenticated NodeId) + active-staker
-// filter + per-publisher quota + global LRU + receiver-anchored TTL`
-// pipeline. These tests pin the boundary conditions a future refactor
-// could regress.
+// Admission runs the spec-conformant `(holder == authenticated NodeId) +
+// active-staker filter + per-publisher quota + global LRU + receiver-anchored
+// TTL` pipeline (#320). These tests pin its boundary conditions.
 
 mod store_admission {
     use super::*;

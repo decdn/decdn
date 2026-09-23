@@ -129,7 +129,7 @@ pub struct SourceLane<'a, S> {
     /// This lane's voucher ledger, seeded from its persisted cumulative — the
     /// per-`(signer, provider)` watermark, never shared with another lane.
     pub ledger: Arc<PoolLedger>,
-    /// Which discovery blocks this source actually holds (#1506, B1's
+    /// Which discovery blocks this source actually holds (#1506, from
     /// `Probed::coverage`). Drives both the initial coverage-aware spread
     /// (`spread_segments`) and the scheduler's internal coverage-filtered
     /// steal — this lane is never assigned, and never steals, a range
@@ -1081,7 +1081,7 @@ where
     }
 
     // Coverage-aware spread (client planner, #1506): every admitted lane's
-    // `Probed` coverage (B1) becomes its `SourceCoverage`; `rank` is simply
+    // `Probed` coverage becomes its `SourceCoverage`; `rank` is simply
     // lane order, since `lanes` already arrives in the caller's admission /
     // selection-score order (`admit_sources` — ADR 001) with no re-ranking
     // done here. `spread_segments` assigns each `gap`-intersecting discovery
@@ -1746,7 +1746,7 @@ mod tests {
         Coverage::from_block_indices(n, blocks.iter().copied())
     }
 
-    /// Disjoint coverage (#1506, task B2): source A holds only discovery block
+    /// Disjoint coverage (#1506): source A holds only discovery block
     /// 0, source B holds only block 1, over a whole-blob fetch spanning exactly
     /// those two blocks. Every byte range A opens must fall inside block 0 and
     /// every range B opens must fall inside block 1 — neither is EVER handed
@@ -1826,7 +1826,7 @@ mod tests {
     }
 
     /// A third, all-ones holder serves the one block neither of the two
-    /// partial holders covers (#1506, task B2). A holds only block 0, B holds
+    /// partial holders covers (#1506). A holds only block 0, B holds
     /// only block 1, and only O (full coverage) can serve block 2 — so O, and
     /// only O, must open bytes in block 2.
     #[tokio::test]
@@ -1903,7 +1903,7 @@ mod tests {
         Ok(())
     }
 
-    /// Coverage-constrained steal (#1506, task B2): a fast source that covers
+    /// Coverage-constrained steal (#1506): a fast source that covers
     /// ONLY block 0 finishes its own segment quickly, while the block-1-only
     /// holder is slow to start. With `pending` empty the fast source tries to
     /// steal — but the only range left in flight (block 1) is outside its own

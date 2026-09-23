@@ -650,7 +650,7 @@ contract SlashJudgeTest is Test {
         // posture is a conscious one. NOTE: this slash is via the CURRENT-region leg,
         // which `scopedRegions` never gates on the window, so this test is
         // independent of the responseTs-vs-block.timestamp anchor — it passes under
-        // both and guards the posture, not this PR's change specifically.
+        // either anchor and guards the accepted-residual posture itself.
         uint64 nowSec = uint64(block.timestamp);
         uint64 responseTsSec = nowSec - 2 hours; // served 2h ago, while in us-east
         uint64 effective = nowSec - 1 hours; // relocated to eu-west AFTER the serve

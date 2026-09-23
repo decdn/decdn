@@ -5138,9 +5138,8 @@ usdc_address = \"0xUsdc\"
     fn resolve_cache_accepts_duplicate_origins_without_erroring() -> anyhow::Result<()> {
         // A duplicate records a notice but must not fail config
         // resolution — operators legitimately use duplicates for
-        // connection-pool sharding. Pinning the non-erroring contract
-        // here protects against a future PR promoting the notice to a
-        // hard error.
+        // connection-pool sharding. This test pins the non-erroring
+        // contract so the notice cannot become a hard error unnoticed.
         let cli = empty_cache_args();
         let toml = types::CacheConfig {
             origins: Some(vec![
@@ -6417,8 +6416,8 @@ usdc_address = \"0xUsdc\"
     #[test]
     fn validate_bucket_rejects_leading_hyphen() -> anyhow::Result<()> {
         // Documented AWS rule: "Bucket names must begin and end with a
-        // letter or number." Pre-#437-PR1-review the validator only
-        // checked dots; the hyphen-edge case slipped through.
+        // letter or number." The validator checks the hyphen edge case,
+        // not only dots.
         assert_s3_rejects(s3_cfg("-mybucket"), &["begin"])
     }
 
@@ -10977,10 +10976,10 @@ bind_port = 12345
     // --- resolve_dht: keyspace caps (#645) -----------------------------------
     //
     // Mirrors the `resolve_security_max_tracked_sources_*` triple: each of
-    // the two new `[dht.rate_limit]` knobs gets a file-override, a
+    // the two `[dht.rate_limit]` knobs gets a file-override, a
     // default-when-absent, and a zero-as-unbounded test. A typo of the
     // shape `unwrap_or(0)` instead of `unwrap_or(DEFAULT_DHT_MAX_TRACKED_PER_*)`
-    // would silently re-introduce the unbounded-keyspace DoS this PR fixes —
+    // would silently re-introduce the unbounded-keyspace DoS these caps close —
     // these tests are the resolver-layer regression guard.
 
     fn dht_rl_with(mutate: impl FnOnce(&mut types::DhtRateLimitConfig)) -> types::DhtConfig {

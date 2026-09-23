@@ -3,7 +3,7 @@
 //! [`decdn-client`](decdn_client)'s gap-driven `drive()` reactively tops up
 //! the buyer deposit through the injected [`Funder`] seam (`source.rs`) rather
 //! than naming a chain handle directly, so the node's upstream cache-miss pull
-//! leg (B2) shares that driver instead of running its own copy of the top-up
+//! leg shares that driver instead of running its own copy of the top-up
 //! loop. `NodeFunder` is the bridge.
 //!
 //! `Funder::top_up(additional)` asks to add `additional` to the deposit — the same

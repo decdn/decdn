@@ -337,7 +337,7 @@ impl ClientHandler {
                             // above its group floor `fetch_start`, so the guard is a no-op and
                             // N whole-range observers advance the SHARED frontier with the
                             // pull's `WindowPacer` binding on the MAX-over-observers paid
-                            // frontier (DECISION-B). An observer ATTACHED at an offset the
+                            // frontier. An observer ATTACHED at an offset the
                             // owner's paid prefix has not reached yet must not lift that
                             // prefix past bytes nobody paid for; its payment extends the
                             // frontier once the prefix reaches it

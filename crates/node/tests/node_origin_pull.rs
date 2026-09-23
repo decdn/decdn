@@ -1747,14 +1747,14 @@ async fn serve_gated_correct_bytes(
     received: &tokio::sync::Notify,
     release: &tokio::sync::Notify,
 ) -> Result<()> {
-    // The DECOUPLED serve-miss (#1621 B2 part 2) reuses ONE upstream connection for
-    // TWO bi-streams: first a FREE header handshake — a whole-tail open
+    // The DECOUPLED serve-miss (#1621) reuses ONE upstream connection for TWO
+    // bi-streams: first a FREE header handshake — a whole-tail open
     // (`byte_offset == 0 && byte_len == 0`) that the buyer ABORTS right after reading
     // `total_bytes`, so it pulls no chunk, pays no voucher, and records NO watermark —
     // then the real `PeerSource` range pull (`byte_len > 0`) on a SECOND bi-stream of
-    // the same connection. The fused path did a single open; modelling that here (one
-    // `accept_bi`, one gate) made the free handshake swallow the test's single
-    // `release`, so the real pull blocked forever → 20s stall → `early eof`.
+    // the same connection. A single-open model here (one `accept_bi`, one gate) lets
+    // the free handshake swallow the test's single `release`, so the real pull blocks
+    // forever → 20s stall → `early eof`.
     //
     // Fix: loop over the connection's bi-streams. Gate ONLY the real pull — answer the
     // handshake immediately (never touching `release`) and never signal `received` for
@@ -3571,9 +3571,9 @@ async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> 
 }
 
 // ---------------------------------------------------------------------------
-// #1088 / #1134 / #1144 — the wire fixtures whose failure shapes the four
-// bounds/classification fixes in this PR exist for. Each of the tests below
-// FAILS if its production change is reverted; the fixtures are the reason.
+// #1088 / #1134 / #1144 — wire fixtures for the failure shapes the pull leg's
+// bounds and failure classification guard against. Each test below FAILS if the
+// production bound or classification it pins is removed.
 // ---------------------------------------------------------------------------
 
 /// Read the buyer's opening `StreamRequest` off a freshly-accepted client
@@ -4815,17 +4815,17 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
     Ok(())
 }
 
-/// #1145 review (4th `{e:?}` site) — a non-`VoucherRejected` `StreamError` arriving in reply
-/// to the CLOSING VOUCHER lands in the receive loop's voucher-slot handler
-/// (`resolve_voucher_slot`, once the optimistic loop of #1484). Round 2 typed the three
-/// mid-stream receive sites but left this one stringifying the wire code, so an honest
-/// `Overloaded`/`NotFound` fell through every downcast to the `Unreachable` catch-all —
-/// scoring a reachable, honestly-answering peer as a dead node.
+/// #1145 — a non-`VoucherRejected` `StreamError` arriving in reply to the CLOSING VOUCHER
+/// lands in the receive loop's voucher-slot handler (`resolve_voucher_slot`, the optimistic
+/// loop of #1484). That handler must keep the typed wire code like the three mid-stream
+/// receive sites do: stringifying it lets an honest `Overloaded`/`NotFound` fall through
+/// every downcast to the `Unreachable` catch-all — scoring a reachable, honestly-answering
+/// peer as a dead node.
 ///
 /// Driven through the REAL path (the server delivers the whole payload, reads the closing
 /// voucher, then replies `Overloaded`), because — as the mid-stream sibling spells out — an
 /// assertion against `classify_pull_failure`'s ladder would pass with the `bail!("{e:?}")`
-/// restored: the classifier was never the thing that broke. `node_pull_refused_total` is
+/// restored: the classifier is not where the fault lies. `node_pull_refused_total` is
 /// reachable only if the voucher-slot handler kept the wire code as `UpstreamRefused`.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
@@ -7407,16 +7407,15 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         cache_b.has(hash).await?,
         "B must promote the teed blob on a complete delivery"
     );
-    // B's buyer channel to A advanced under the DECOUPLED window-paced cadence
-    // (#1621 B2 part 2), which differs from the fused path's single-open shape: the
-    // pull leg opens the blob in more than one span, because the window pause at
-    // the frontier (proven above) forces a second upstream open, each with its OWN
-    // voucher accounting starting fresh at that open (#856) rather than continuing
-    // the cumulative total. The wire total re-emits the span boundary's bao parent
-    // once more than a single-span encoding would (ADR 038 meters WIRE: content +
-    // interleaved proof), and each leg's own wire is chunked and ceiling-rounded
-    // independently, so the two legs' summed payment is more than a single
-    // cumulative ceiling over the whole wire would be.
+    // B's buyer channel to A advanced under the DECOUPLED window-paced cadence (#1621),
+    // which is not a single-open shape: the pull leg opens the blob in more than one
+    // span, because the window pause at the frontier (proven above) forces a second
+    // upstream open, each with its OWN voucher accounting starting fresh at that open
+    // (#856) rather than continuing the cumulative total. The wire total re-emits the
+    // span boundary's bao parent once more than a single-span encoding would (ADR 038
+    // meters WIRE: content + interleaved proof), and each leg's own wire is chunked and
+    // ceiling-rounded independently, so the two legs' summed payment is more than a
+    // single cumulative ceiling over the whole wire would be.
     let leg1_wire =
         u64::try_from(honest_bao_wire_range(&payload, 0, window)?.len()).unwrap_or(u64::MAX);
     let leg2_wire =
@@ -8492,14 +8491,12 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
     // Give B a moment to observe the drop and persist its bounded watermark.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // The headline #856 bound under the DECOUPLED pull leg (#1621 B2 part 2). The
-    // fused loop bounded the TOTAL bytes pulled to ~one window; the decoupled leg
-    // paces on the CONTENT frontier (`WindowPacer`, ADR 037) and keeps at most one
-    // window of UNPAID content in flight, so once the leaf's single paid interval
-    // sits within a window of the blob's end the leg finishes the whole sub-2-window
-    // blob. The maintainer decision below allows that, so the real invariant is on
-    // the UNRECOUPED lead, not the total pulled: `upstream_bytes - paid <= window +
-    // group`.
+    // The headline #856 bound under the DECOUPLED pull leg (#1621). The leg paces
+    // on the CONTENT frontier (`WindowPacer`, ADR 037) and keeps at most one window
+    // of UNPAID content in flight, so once the leaf's single paid interval sits
+    // within a window of the blob's end the leg finishes the whole sub-2-window
+    // blob. The invariant is therefore on the UNRECOUPED lead, not the total
+    // pulled: `upstream_bytes - paid <= window + group`.
     let log = progress_log(&recorded)?;
     let upstream_bytes: u64 = log
         .last()
@@ -8513,14 +8510,14 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
     let one_window = MB_BYTES;
     // `upstream_bytes` is the bao WIRE (content + interleaved proof, ADR 038); one
     // chunk group of slack absorbs the boundary chunk group plus the proof overhead
-    // over the window. This is the #1644-review bound the anvil proof (Task 14) uses.
+    // over the window.
     let group = decdn_cache::CHUNK_GROUP_BYTES;
     anyhow::ensure!(
         upstream_bytes.saturating_sub(paid) <= one_window + group,
         "B's UNRECOUPED upstream lead ({upstream_bytes} pulled - {paid} paid) must be bounded to \
          ~one window ({one_window}), not run open-ended against the {total_bytes}-byte blob"
     );
-    // Caching a fully-pulled sub-2-window blob is now ALLOWED: the #856 spend bound
+    // Caching a fully-pulled sub-2-window blob is ALLOWED: the #856 spend bound
     // holds as bounded UNRECOUPED lead (above), not as total-pulled, so a leaf that
     // paid one interval of a 1.5-window blob may still leave B holding the finished
     // fill. No promotion assertion either way — this test polices spend, not caching.
@@ -12668,7 +12665,7 @@ async fn a_working_deposit_that_still_cannot_cover_the_blob_funds_exactly_once()
 }
 
 // ===========================================================================
-// ADR 041 — buy-side serve-economics gate + warming allowance (Task 8).
+// ADR 041 — buy-side serve-economics gate + warming allowance.
 // ===========================================================================
 
 /// Provision B's `NodeOrigin` exactly like [`build_origin_with_probe_caches`] but
@@ -12676,7 +12673,7 @@ async fn a_working_deposit_that_still_cannot_cover_the_blob_funds_exactly_once()
 /// sell rate, and a SHARED [`decdn_node::warming_allowance::WarmingAllowance`] the
 /// test seeds/spends before the miss. Live probe + fresh caches, single provider.
 /// `frequency_estimator` lets a test pin the `margin` policy's heat input
-/// directly (standing in for HC-1's real observe-on-serve signal) instead of
+/// directly (standing in for the real observe-on-serve heat signal) instead of
 /// driving real traffic to raise it; `None` reads cold (heat 0) like production
 /// with no admission/eviction policy consuming an estimator.
 #[allow(clippy::too_many_arguments, clippy::expect_used)]
@@ -12745,14 +12742,14 @@ async fn build_origin_economics(
 }
 
 // ===========================================================================
-// ADR 041 — integration + adversarial coverage (Task 9).
+// ADR 041 — integration + adversarial coverage.
 // ===========================================================================
 
 /// A frequency estimator pinned to one fixed value, so a test can drive the
 /// `margin` policy's heat input directly (`N̂ = clamp(round(discount·heat), 1,
 /// n_max)`) rather than having to generate enough real observe-on-serve traffic
-/// (HC-1) to earn it. Standing in for "heat is already this high", not a
-/// production shortcut — HC-1 itself (heat rises only from real serves) is
+/// to earn it. Standing in for "heat is already this high", not a production
+/// shortcut — the production rule (heat rises only from real serves) is
 /// untouched by this fixture.
 #[derive(Debug)]
 struct FixedHeat(u32);
@@ -12767,7 +12764,7 @@ impl decdn_cache::FrequencyEstimator for FixedHeat {
 
 /// Attack A (over-market loss bound): a malicious upstream quotes AT the
 /// `margin` policy's amortized ceiling itself, with `heat` pinned (via
-/// [`FixedHeat`], standing in for HC-1's real observe-on-serve signal) so `N̂ =
+/// [`FixedHeat`], standing in for the real observe-on-serve heat signal) so `N̂ =
 /// n_max`. At exactly that price the buy is NOT flagged speculative — the quote
 /// sits AT the amortized floor, not above it — so the warming allowance is
 /// never touched by this buy at all. That untracked zone is exactly what this
@@ -13432,8 +13429,8 @@ async fn attack_b_dud_flood_is_bounded_and_vindication_works() -> Result<()> {
 // lane). This one drives the PAID half: node S serve-misses a blob held only as
 // A:{block 0} + B:{block 1}, so `run_pull_leg`'s `PeerRunSink` opens a real
 // buyer lane to EACH holder in turn — voucher payment, settle/watermark
-// hand-off, and cross-run shared-pool solvency — the surface where #1506's
-// C1 (shared-pool accounting), C2 (run clamp), and cancel bugs live. The blob is
+// hand-off, and cross-run shared-pool solvency — the surface where shared-pool
+// accounting, per-run range clamping, and run cancel can go wrong (#1506). The blob is
 // two DISCOVERY-block-sized slices; the block size is overridden to 16 KiB
 // (`override_discovery_block_bytes_for_test`) so "two blocks" is a 32 KiB blob,
 // not the 128 MiB a real two-block blob would need — the whole point of the
@@ -13802,7 +13799,7 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
         .last_bytes_delivered();
 
     // Each holder is paid ONLY for its own block's wire: A the [0, block) range,
-    // B the [block, total) range — never the whole blob (#1506 C1/C2). Bao meters
+    // B the [block, total) range — never the whole blob (#1506). Bao meters
     // WIRE (content + interleaved proof), so compare against each range's own
     // verified-stream encoding.
     let a_wire =
@@ -13826,7 +13823,7 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
     );
 
     // S's buyer side persisted a watermark for BOTH providers on the one shared
-    // pool (#852 + #1506 C1): two distinct providers, each recorded.
+    // pool (#852, #1506): two distinct providers, each recorded.
     let paid_providers: std::collections::HashSet<Address> = progress_log(&recorded)?
         .into_iter()
         .map(|(p, ..)| p)

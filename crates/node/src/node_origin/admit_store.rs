@@ -6,8 +6,9 @@
 //! finalize) and can ingest a gap's raw bao wire. [`NodeRangedStore`]
 //! already answers the queries over the cache; this type adds the ingest half
 //! by wrapping a `NodeRangedStore` and streaming each gap straight into
-//! [`decdn_cache::CacheEngine::admit_bao_stream`], which admits the
-//! bytes as a B0-tagged partial without buffering the whole gap in memory.
+//! [`decdn_cache::CacheEngine::admit_bao_stream`], which admits the bytes as a
+//! partial held against GC by its `decdn-partial-` protecting tag, without
+//! buffering the whole gap in memory.
 //!
 //! This has to live in `node`, not `cache` or `decdn-client`: it names both
 //! `decdn_cache`'s store and `decdn_client`'s [`IngestStore`] trait, and
@@ -28,7 +29,7 @@ use crate::metrics::Metrics;
 /// [`NodeRangedStore`], and [`IngestStore::ingest_stream`] admits each gap via
 /// [`CacheEngine::admit_bao_stream`]. When a [`FillSession`] is present, the cache's
 /// admit path captures each admitted range's proof nodes into the serve leg's shared
-/// outboard (#1621 B3, ADR 038) so the serve leg can drive a coherent whole-range
+/// outboard (#1621, ADR 038) so the serve leg can drive a coherent whole-range
 /// encode while the pull fills incrementally — the node just threads the session in.
 pub(crate) struct NodeAdmitStore {
     inner: NodeRangedStore,
@@ -105,7 +106,7 @@ impl IngestStore for NodeAdmitStore {
     /// Streams `reader`'s raw bao wire for `range` straight into the cache via
     /// [`CacheEngine::admit_bao_stream`], which verifies each chunk group
     /// against the store's rooted hash as it lands and admits the range as a
-    /// B0-tagged partial.
+    /// partial held against GC by its `decdn-partial-` protecting tag.
     ///
     /// `on_progress` is accepted for the trait but unused on this path: the
     /// node's progress metering happens at the SERVE leg, which
@@ -355,8 +356,8 @@ mod tests {
         );
     }
 
-    /// The capture invariant the coherent serve encoder relies on (#1621 B2 part 2,
-    /// ADR 038): admitting a blob feeds the shared outboard exactly the blob's true
+    /// The capture invariant the coherent serve encoder relies on (#1621, ADR 038):
+    /// admitting a blob feeds the shared outboard exactly the blob's true
     /// pre-order outboard. Every interior node the encoder will `load` must match
     /// `bao_tree`'s own outboard for the same content, so the re-encoded downstream
     /// wire is byte-identical to a single whole-blob encode.

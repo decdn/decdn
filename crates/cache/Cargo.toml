@@ -57,7 +57,7 @@ dashmap = { workspace = true }
 # Jitter for the origin retry/backoff loop (#285). Uses `rand::random::<f64>()`
 # only; no per-call state, so no RNG instance is held.
 rand = { workspace = true }
-# AWS SDK pieces for the S3 origin (#437 PR2). See the workspace
+# AWS SDK pieces for the S3 origin (#437). See the workspace
 # `[workspace.dependencies]` block for the rationale on each
 # `default-features = false` choice and the hyper-1 + aws-lc-rs binding.
 aws-config = { workspace = true }
@@ -74,12 +74,12 @@ decdn-bao-range = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
 # Test fixtures construct gzipped / zstd response bodies for the
-# HttpOrigin decompression tests. The runtime decoders moved to
-# `async-compression` in #271 PR3 — these crates remain only on the
-# encoder side for tests.
+# HttpOrigin decompression tests. The runtime decoders are
+# `async-compression` (#271); these crates are only the test-side
+# encoders.
 flate2 = "1"
 zstd = "0.14"
-# Operation-level S3 mocks (#437 PR2). The `mock_client!` macro builds an
+# Operation-level S3 mocks (#437). The `mock_client!` macro builds an
 # `aws_sdk_s3::Client` whose dispatcher returns canned responses, so
 # `S3Origin` can be exercised end-to-end without standing up MinIO.
 aws-smithy-mocks = { workspace = true }

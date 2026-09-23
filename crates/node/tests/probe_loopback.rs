@@ -1400,7 +1400,7 @@ async fn probe_has_blob_false_when_chain_stale() -> anyhow::Result<()> {
 async fn probe_has_blob_true_and_partial_coverage_for_cached_partial_holder() -> anyhow::Result<()>
 {
     let (cache, hash, _cache_tmp) = cache_with_partial_two_block_blob().await?;
-    // Cross-check against the cache's own derivation directly (Task 1) so
+    // Cross-check against the cache's own derivation (`CacheEngine::coverage`) so
     // this test also catches the handler quietly diverging from it.
     let direct_coverage = cache.coverage(hash).await?;
     anyhow::ensure!(direct_coverage.covers(0) && !direct_coverage.covers(1));

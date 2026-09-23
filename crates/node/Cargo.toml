@@ -44,7 +44,7 @@ test-support = ["decdn-protocol/test-support"]
 decdn-protocol = { workspace = true }
 decdn-cache = { workspace = true }
 decdn-client = { workspace = true }
-# `NodeAdmitStore` (`src/node_origin/admit_store.rs`, #1621 Task 10) implements
+# `NodeAdmitStore` (`src/node_origin/admit_store.rs`, #1621) implements
 # `decdn_bao_range::RangedStore` directly (delegating to `NodeRangedStore`), so
 # the trait/types must be named here rather than borrowed through a re-export.
 decdn-bao-range = { workspace = true }
@@ -139,8 +139,8 @@ alloy-json-rpc = { workspace = true }
 # `tests/origin_range_pull.rs` builds the `{H}.obao4` pre-order outboard a
 # range-pull origin must publish, so the e2e test can verify the cold ranged
 # cdn/client/v1 path (#823/#990). Matches the cache crate's outboard codec.
-# (Promoted to a normal dependency above, #1621 Task 10 — kept documented here
-# since this suite is still the reason it needs to be workspace-versioned.)
+# (It is a normal dependency above; this suite is one more reason it is
+# workspace-versioned.)
 # `tests/dht_bootstrap.rs` drives `dht::publish::run_republish` (which takes a
 # `CancellationToken`) directly to pin the ADR 022 republish schedule.
 # Integration-test crates don't inherit the lib's normal deps, so it is also a

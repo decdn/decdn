@@ -1,4 +1,4 @@
-//! The `Downloader` consumption face (#1848 T4): fetch a set of content-addressed
+//! The `Downloader` consumption face (#1848): fetch a set of content-addressed
 //! blobs — a bundle, or a single blob — to files in a directory.
 //!
 //! A `Downloader` is an OUTPUT + SCHEDULING adapter over the ONE shared

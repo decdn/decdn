@@ -10,7 +10,7 @@
 //! promotes the blob to the node's cache exactly once.
 //!
 //! This is an **own-origin** coalescing proof: the node's single upstream fill is
-//! its own configured fs origin (the DECISION-A own-origin case — the node eats
+//! its own configured fs origin (the own-origin case — the node eats
 //! the origin egress once, a real dollar saving), not a paid upstream peer. The
 //! node-to-node *paid* upstream variant is not expressible in this harness: a
 //! `NodeFixture` is funded only for its seller/operator role (a TOKEN capacity
