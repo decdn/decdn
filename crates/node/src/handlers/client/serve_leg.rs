@@ -300,7 +300,13 @@ impl ClientHandler {
                         Err(e) => {
                             // Transport drop or rate-check bail (#856/#857): meter the
                             // abandon, then propagate so the caller drops the pull leg.
-                            self.metrics.node_pull_through_client_abandoned();
+                            // A node-side fault (a lane-store failure, a broken
+                            // invariant) carries no peer marker. The dispatch sink
+                            // meters it on `decdn_serve_stream_node_fault_total`
+                            // instead.
+                            if super::wire::is_peer_attributable(&e) {
+                                self.metrics.node_pull_through_client_abandoned();
+                            }
                             return Err(e.context(format!(
                                 "proof {attempts} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
                                  chunk ({} bytes owed, {} more queued)",

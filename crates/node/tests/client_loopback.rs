@@ -79,10 +79,11 @@ use iroh::{Endpoint, EndpointAddr};
 mod support;
 use decdn_node::receipt_log::{DownloadReceipt, spawn_receipt_writer};
 use support::{
-    BlockingReceiptLog, FailingReceiptLog, HandlerDomains, VecReceiptLog, build_handler_full,
-    build_handler_full_configured, build_handler_full_with_receipts, build_handler_full_with_sink,
-    cache_with_blob, empty_cache, fresh_key, local_endpoint, permissive_limiter, read_client_msg,
-    read_stream_response, shutdown, spawn_server, spawn_server_counting, write_client_msg,
+    BlockingReceiptLog, FailingReceiptLog, FailingRecordStore, HandlerDomains, VecReceiptLog,
+    build_handler_full, build_handler_full_configured, build_handler_full_with_receipts,
+    build_handler_full_with_sink, cache_with_blob, empty_cache, fresh_key, local_endpoint,
+    permissive_limiter, read_client_msg, read_stream_response, shutdown, spawn_server,
+    spawn_server_counting, write_client_msg,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -4877,34 +4878,6 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
-}
-
-/// A `PoolStateStore` that hydrates its seeded channels (so vouchers reach
-/// the apply path) but fails every `record` — exercises the store-record
-/// failure path in [`ClientHandler::commit_one_proof`].
-#[derive(Debug)]
-struct FailingRecordStore {
-    inner: MemoryPoolStateStore,
-}
-
-impl PoolStateStore for FailingRecordStore {
-    fn load_all(&self) -> Result<Vec<LaneState>, decdn_incentive::StoreError> {
-        self.inner.load_all()
-    }
-
-    fn record(&self, _state: &LaneState) -> Result<(), decdn_incentive::StoreError> {
-        Err(decdn_incentive::StoreError::Io(std::io::Error::other(
-            "injected transient store failure",
-        )))
-    }
-
-    fn forget(&self, pool_id: LaneKey) -> Result<(), decdn_incentive::StoreError> {
-        self.inner.forget(pool_id)
-    }
-
-    fn get(&self, pool_id: LaneKey) -> Result<Option<LaneState>, decdn_incentive::StoreError> {
-        self.inner.get(pool_id)
-    }
 }
 
 /// A `record` failure is now a hard serve fault, not a clean in-band rejection:
