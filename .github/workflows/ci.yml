@@ -1510,7 +1510,8 @@ jobs:
 
       # Cargo enforces acyclicity and nothing more. The dependency flow in
       # CLAUDE.md § Crate Structure — three leaves, cli/e2e as sinks, an
-      # iroh-blobs-free CLI — is held by the table in check_crate_edges.py.
+      # iroh-blobs-free CLI and client SDK — is held by the table in
+      # check_crate_edges.py.
       # Needs `cargo metadata`, hence after the toolchain step.
       - name: Crate dependency direction matches CLAUDE.md
         run: .github/scripts/check-crate-edges.sh
