@@ -2517,13 +2517,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
         let Some((plan, total)) = plan else {
             // No donor overlap and nothing deferred — pay for the whole file, then
-            // register its chunks so a *later* entry can dedup against it.
+            // register its chunks so a *later* entry can dedup against it. The paid
+            // count is the verified blob's length, not the manifest's optional
+            // `size`: this path never checks `size`, so a wrong one still fetches.
             self.fetch_to_staging(hash, staging, progress).await?;
             index.register(hints, staging);
-            let paid = match total {
-                Some(n) => n,
-                None => std::fs::metadata(staging).map_or(0, |m| m.len()),
-            };
+            let paid = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
             return Ok(paid);
         };
 
