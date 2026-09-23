@@ -9,7 +9,7 @@ use futures_util::{Stream, StreamExt};
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
-use super::voucher::StreamAnchor;
+use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, FloorReservation,
@@ -259,10 +259,12 @@ impl ClientHandler {
         let mut delivered: u64 = 0;
         let mut paid: u64 = 0;
         // Bytes forwarded since the last COMPLETED interval (the sub-interval
-        // remainder), and the completed-but-unpaid interval deltas awaiting
-        // collection — together they are exactly `delivered − paid`.
+        // remainder), and the completed intervals whose payment is still owed —
+        // together they are exactly `delivered − paid`. A proof that pays part of
+        // an interval leaves its remainder owed in `pending`, so the two sides of
+        // that equation stay equal.
         let mut unvouchered: u64 = 0;
-        let mut pending: VecDeque<u64> = VecDeque::new();
+        let mut pending: VecDeque<OwedChunk> = VecDeque::new();
         // One buffered voucher reader for the whole stream: it buffers a
         // pipelined voucher across recoup calls, so every voucher read MUST go
         // through it — a second reader would lose bytes it read ahead.
@@ -308,6 +310,10 @@ impl ClientHandler {
         };
 
         loop {
+            // Progress trackers for the no-progress guard at the bottom of the loop.
+            let delivered_at_iter_start = delivered;
+            let paid_at_iter_start = paid;
+
             // The ramped window for the payment confirmed so far (ADR 003 §Credit
             // window). Recomputed each iteration: as `paid` advances in the recoup
             // phase the window widens, so a paying stream ramps toward `credit_max`
@@ -341,7 +347,7 @@ impl ClientHandler {
                 self.metrics.bytes_served(len);
                 unvouchered = unvouchered.saturating_add(len);
                 if unvouchered >= chunk_bytes {
-                    pending.push_back(unvouchered);
+                    pending.push_back(OwedChunk::new(unvouchered));
                     unvouchered = 0;
                 }
                 // Prefetched one pass ahead of the window check above, so size it
@@ -356,10 +362,10 @@ impl ClientHandler {
             let done_delivering = next_chunk.is_none();
 
             // Once the whole blob is on the wire, fold the closing sub-interval
-            // remainder into `pending` as a final delta so the recoup batch drains
-            // it uniformly with the completed intervals.
+            // remainder into `pending` as a final owed chunk so the recoup batch
+            // drains it uniformly with the completed intervals.
             if done_delivering && unvouchered > 0 {
-                pending.push_back(unvouchered);
+                pending.push_back(OwedChunk::new(unvouchered));
                 unvouchered = 0;
             }
 
@@ -373,13 +379,16 @@ impl ClientHandler {
             // for an epoch, or a rollover voucher when the chain is spent. A
             // metering voucher credits no whole chunk, even when a rollover
             // advances the watermark, so the chunk it precedes is still
-            // outstanding. Hence the delta stays queued until something actually
-            // credits it, and `MAX_PROOFS_PER_CHUNK` bounds how long a payer may
-            // keep answering with proofs that pay nothing.
+            // outstanding. A proof can also pay only part of a chunk: it credits
+            // at most the lane headroom it finds, and a sliver voucher moves the
+            // watermark by a sliver. Hence the loop reads proofs for a chunk until
+            // they have credited all of it, and `MAX_PROOFS_PER_CHUNK` bounds how
+            // many proofs a payer may send without settling it.
             let collected_any = !pending.is_empty();
-            while let Some(&delta) = pending.front() {
+            while let Some(mut owed) = pending.pop_front() {
                 let mut attempts = 0u32;
                 loop {
+                    attempts = attempts.saturating_add(1);
                     let stop = self
                         .commit_one_proof(
                             send,
@@ -391,37 +400,38 @@ impl ClientHandler {
                             lane,
                             client_node_id,
                             rate_per_mb,
-                            delta,
+                            owed,
                         )
                         .await
                         .map_err(|e| {
                             e.context(format!(
-                                "proof {} of at most {MAX_PROOFS_PER_CHUNK} for a {delta}-byte \
-                                 chunk ({} pending)",
-                                attempts.saturating_add(1),
+                                "proof {attempts} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
+                                 chunk ({} bytes owed, {} more queued)",
+                                owed.len(),
+                                owed.remaining(),
                                 pending.len()
                             ))
                         })?;
                     match stop {
                         // Advance `paid` by the watermark-capped credit (rule #1),
-                        // not the raw delivered delta: a benign already-satisfied
+                        // not the raw delivered chunk: a benign already-satisfied
                         // voucher credits nothing and cannot reopen the credit
                         // window for unsettled bytes.
-                        VoucherStop::Continue { credited_bytes } if credited_bytes > 0 => {
+                        VoucherStop::Continue { credited_bytes } => {
                             paid = paid.saturating_add(credited_bytes);
-                            pending.pop_front();
-                            break;
-                        }
-                        VoucherStop::Continue { .. } => {
-                            attempts = attempts.saturating_add(1);
+                            if owed.settle(credited_bytes)? {
+                                break;
+                            }
                             if attempts >= MAX_PROOFS_PER_CHUNK {
                                 // A payer that spends its per-chunk proof budget
-                                // without settling anything is a client payment
+                                // without settling the chunk is a client payment
                                 // fault, not a node bug.
                                 return Err(anyhow::Error::new(super::wire::ClientPaymentFault)
                                     .context(format!(
-                                        "payer sent {attempts} proofs that credited nothing for \
-                                         one outstanding chunk"
+                                        "payer sent {attempts} proofs without settling one \
+                                         {}-byte chunk ({} bytes still owed)",
+                                        owed.len(),
+                                        owed.remaining()
                                     )));
                             }
                         }
@@ -434,6 +444,7 @@ impl ClientHandler {
                     }
                 }
             }
+            ensure_unpaid_bytes_tracked(delivered, paid, unvouchered)?;
 
             // Reconcile the pool floor reservation against this stream's live
             // balance (ADR 003 §Pool solvency). `paid` and `delivered` are BYTE
@@ -569,6 +580,22 @@ impl ClientHandler {
 
             if done {
                 break;
+            }
+
+            // No-progress guard: an iteration that delivered no byte and credited
+            // no byte cannot change what the next one sees, so it would repeat
+            // forever without awaiting — one runtime worker lost per stream. The
+            // accounting above cannot reach this state. The recoup phase pays every
+            // owed chunk before the loop repeats, so each iteration starts with
+            // `delivered − paid` below one chunk, and the window is never smaller
+            // than one chunk: the deliver phase sends a frame unless the blob is
+            // done. Reaching it means that accounting broke, so the stream fails as
+            // a node fault instead of spinning.
+            if delivered == delivered_at_iter_start && paid == paid_at_iter_start {
+                return Err(anyhow::anyhow!(
+                    "serve loop made no progress: {delivered} bytes delivered, {paid} paid, \
+                     window {window}, blob fully delivered: {done_delivering}"
+                ));
             }
         }
 

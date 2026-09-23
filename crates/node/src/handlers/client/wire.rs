@@ -384,7 +384,7 @@ impl std::error::Error for PeerFault {}
 
 /// Marker for a serve-stream error that is a client-attributable payment fault:
 /// a voucher that fails the advertised-rate check with zero bytes or an overflow,
-/// or a payer that spends its per-chunk proof budget without settling anything.
+/// or a payer that spends its per-chunk proof budget without settling the chunk.
 /// An underpaying voucher is not here: it is a clean `Underpaid` wire reject.
 ///
 /// The dispatch sink files an unmarked error under "node-side fault" at

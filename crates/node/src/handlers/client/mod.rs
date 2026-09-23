@@ -2476,6 +2476,12 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
 /// How many proofs the recoup phase will read for ONE outstanding chunk before
 /// it gives up.
 ///
+/// The budget counts every proof that leaves the chunk unsettled. That includes
+/// a proof that credits nothing and a proof that pays only part of the chunk.
+/// A proof pays part of a chunk when the lane headroom it finds is short — for
+/// example, a sealed voucher that moves the watermark by less than the chunk. The
+/// remainder stays owed, and the next proof answers it.
+///
 /// A whole chunk is paid by exactly one reveal, but the payer may legitimately
 /// send metering vouchers ahead of it — the epoch's root voucher when this
 /// stream has not carried it yet, and a rollover voucher when the chain is

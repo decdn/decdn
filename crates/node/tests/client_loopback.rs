@@ -480,9 +480,20 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
         "hash A bytes mismatch"
     );
 
+    // Hash B pays on the same lane, so its vouchers continue the lane's
+    // cumulative totals where hash A left them.
+    let after_a = store.load_all()?;
+    let lane_a = after_a
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane after hash A"))?;
+    let ctx_b = PoolContext {
+        prior_bytes_delivered: lane_a.last_bytes_delivered(),
+        prior_amount: lane_a.last_amount(),
+        ..ctx
+    };
     let got_b = stream_fetch_on(
         &warm,
-        &ctx,
+        &ctx_b,
         &slash_domain(),
         server_eth.address(),
         *hash_b.as_bytes(),
@@ -686,6 +697,24 @@ async fn spawn_pipelined_server(
     Endpoint,
     tokio::task::JoinHandle<()>,
 )> {
+    let (target, server_eth, server_ep, server_task, _metrics) =
+        spawn_pipelined_server_with_metrics(cache, store, credit_max, credit_ramp_divisor).await?;
+    Ok((target, server_eth, server_ep, server_task))
+}
+
+/// As [`spawn_pipelined_server`], but also returns the server's `Arc<Metrics>`.
+async fn spawn_pipelined_server_with_metrics(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+    credit_max: u64,
+    credit_ramp_divisor: u64,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Arc<PrivateKeySigner>,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = operator_signer();
@@ -709,7 +738,7 @@ async fn spawn_pipelined_server(
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, server_eth, server_ep, server_task))
+    Ok((target, server_eth, server_ep, server_task, metrics))
 }
 
 /// Open a paid `cdn/client/v1` stream and read past its signed `StreamResponse`,
@@ -7267,6 +7296,85 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A stream shorter than one chunk pays with exactly one voucher, its closing
+/// voucher, even on a lane that already meters a live chain (#2132).
+///
+/// The node keeps a chunk owed until proofs pay all of it, and it lets a metering
+/// voucher pay a closing partial. So after a stream's last reveal, or on a stream
+/// that makes none, the payer must send only the closing voucher: no open,
+/// re-anchor, or roll voucher. An anchor or re-anchor sent before a sub-chunk
+/// stream's closing voucher would be read while only the partial is owed. It would take lane headroom that belongs to a sibling's unread proof,
+/// and that sibling would then fail at the proof-read timeout. The payer anchors a
+/// stream only before its first reveal, and a sub-chunk stream makes none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sub_chunk_stream_on_a_live_chain_sends_only_its_closing_voucher() -> anyhow::Result<()> {
+    // Several whole chunks, so the first stream opens a chain and reveals on it,
+    // and a closing remainder, so it ends by rolling to a fresh live root.
+    let big = vec![0x3Cu8; 3 * 1024 * 1024 + 512 * 1024];
+    let small = vec![0x4Du8; 400_000];
+    let (cache, big_hash, small_hash, _cache_tmp) = cache_with_two_blobs(&big, &small).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let sd = slash_domain();
+    let fetch = |hash: decdn_cache::Hash, request_id: u64| {
+        stream_fetch_shared(
+            &client_ep,
+            target.clone(),
+            &ctx,
+            &ledger,
+            &sd,
+            server_eth.address(),
+            *hash.as_bytes(),
+            0,
+            request_id,
+            PullDeadlines::whole_transfer(Duration::from_secs(30)),
+            0,
+            0,
+        )
+    };
+
+    let got = fetch(big_hash, 0x2132_0001)
+        .await
+        .map_err(|e| anyhow::anyhow!("multi-chunk pull failed: {e:?}"))?;
+    anyhow::ensure!(got.as_ref() == big.as_slice(), "multi-chunk blob mismatch");
+    anyhow::ensure!(
+        ledger.chain_root().is_some(),
+        "the multi-chunk stream must leave the lane on a live chain"
+    );
+
+    let before = counter(&metrics, "decdn_vouchers_received_total")?;
+    let got = fetch(small_hash, 0x2132_0002)
+        .await
+        .map_err(|e| anyhow::anyhow!("sub-chunk pull failed: {e:?}"))?;
+    anyhow::ensure!(got.as_ref() == small.as_slice(), "sub-chunk blob mismatch");
+    let sent = counter(&metrics, "decdn_vouchers_received_total")? - before;
+    anyhow::ensure!(
+        sent == 1,
+        "a sub-chunk stream must pay with its closing voucher alone, sent {sent} vouchers"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The value of the unlabelled counter `name` in the node's metrics.
+fn counter(metrics: &Metrics, name: &str) -> anyhow::Result<u64> {
+    let encoded = metrics.encode()?;
+    let prefix = format!("{name} ");
+    encoded
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("no {name} sample"))?
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parse {name}: {e}"))
+}
+
 /// A node without the blob answers `ok: false` with `NotFound`; the requester
 /// surfaces the refusal without paying.
 #[tokio::test(flavor = "multi_thread")]
@@ -10048,6 +10156,7 @@ struct MidStreamAfterAccept {
     recv: RecvStream,
     signer: Arc<PrivateKeySigner>,
     store: Arc<dyn PoolStateStore>,
+    metrics: Arc<Metrics>,
     conn: Connection,
     client_ep: Endpoint,
     server_ep: Endpoint,
@@ -10066,8 +10175,8 @@ async fn drive_to_second_interval_awaiting_voucher() -> anyhow::Result<MidStream
     // Divisor 2 keeps the window pinned at the one-interval floor after the first
     // interval is paid (`paid / 2 < floor`), so the server parks after each
     // interval — a deterministic voucher rendezvous.
-    let (target, _server_eth, server_ep, server_task) =
-        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_pipelined_server_with_metrics(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let conn = client_ep
@@ -10093,6 +10202,7 @@ async fn drive_to_second_interval_awaiting_voucher() -> anyhow::Result<MidStream
         recv,
         signer,
         store,
+        metrics,
         conn,
         client_ep,
         server_ep,
@@ -10232,6 +10342,119 @@ async fn underpaying_voucher_after_an_accepted_voucher_returns_the_watermark() -
         "the accepted watermark must not move on an underpay, got {}",
         lane.last_bytes_delivered()
     );
+
+    fx.conn.close(0u32.into(), b"done");
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
+/// A sealed voucher settles part of an outstanding chunk. It moves the watermark
+/// less than one interval.
+const SLIVER_BYTES: u64 = 64 * 1024;
+
+/// A proof that pays part of an outstanding chunk leaves the rest owed (#2132).
+///
+/// The node credits a proof only up to the watermark it moves. A sealed voucher
+/// that moves the watermark by a sliver pays a sliver of the chunk. The node must
+/// keep the remainder outstanding and wait for the proof that pays it. It must not
+/// treat the sliver as paying the chunk and reopen the credit window. A node that
+/// drops the remainder sends more bytes here, and once `delivered − paid` fills
+/// the window with nothing left to collect, its serve loop has no proof to wait
+/// for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sliver_voucher_leaves_the_rest_of_the_chunk_owed() -> anyhow::Result<()> {
+    let mut fx = drive_to_second_interval_awaiting_voucher().await?;
+
+    // Pay interval 2 by a sliver only. The voucher pays the quoted rate for the
+    // span it adds, so the node accepts it and credits exactly the sliver.
+    let mut amount = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    amount += min_payment(SLIVER_BYTES, RATE_PER_MB);
+    send_signed_voucher(
+        &mut fx.send,
+        &fx.signer,
+        HARNESS_INTERVAL_BYTES + SLIVER_BYTES,
+        amount,
+    )
+    .await?;
+
+    // The rest of interval 2 is still owed, so the window stays shut.
+    assert_parked_awaiting_voucher(&mut fx.recv).await?;
+
+    // Paying the remainder settles interval 2 and opens the window for interval 3.
+    amount += min_payment(HARNESS_INTERVAL_BYTES - SLIVER_BYTES, RATE_PER_MB);
+    send_signed_voucher(&mut fx.send, &fx.signer, 2 * HARNESS_INTERVAL_BYTES, amount).await?;
+    read_exact_chunks(&mut fx.recv, HARNESS_INTERVAL_BYTES).await?;
+
+    fx.conn.close(0u32.into(), b"done");
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
+/// A payer that answers one chunk with sliver after sliver hits the per-chunk
+/// proof budget (#2132). Each sliver credits something, but none settles the
+/// chunk. The budget counts every proof that leaves the chunk unsettled, so the
+/// node ends the stream instead of holding it open one sliver at a time.
+#[tokio::test(flavor = "multi_thread")]
+async fn sliver_vouchers_exhaust_the_per_chunk_proof_budget() -> anyhow::Result<()> {
+    // The node's private `MAX_PROOFS_PER_CHUNK`; keep the two in step.
+    const PROOF_BUDGET: u64 = 8;
+    anyhow::ensure!(
+        PROOF_BUDGET * SLIVER_BYTES < HARNESS_INTERVAL_BYTES,
+        "the slivers must not add up to a whole interval"
+    );
+    let mut fx = drive_to_second_interval_awaiting_voucher().await?;
+
+    // Each voucher pays the quoted rate for the sliver it adds, so the node
+    // accepts every one of them and credits each sliver.
+    let mut amount = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    for n in 1..=PROOF_BUDGET {
+        amount += min_payment(SLIVER_BYTES, RATE_PER_MB);
+        let bytes = HARNESS_INTERVAL_BYTES + n * SLIVER_BYTES;
+        send_signed_voucher(&mut fx.send, &fx.signer, bytes, amount).await?;
+    }
+
+    // The stream ends with a payment fault: no further byte and no `StreamEnd`.
+    match tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut fx.recv)).await {
+        Err(_elapsed) => anyhow::bail!("the node kept the stream open past the proof budget"),
+        Ok(Ok(ClientMessage::ChunkData(chunk))) => anyhow::bail!(
+            "the node delivered {} more wire bytes on a chunk that is still owed",
+            chunk.bytes().len()
+        ),
+        Ok(Ok(other)) => anyhow::bail!("expected the stream to fail, got {other:?}"),
+        Ok(Err(_)) => {}
+    }
+    // The fault is the payer's, not the node's.
+    anyhow::ensure!(
+        counter(&fx.metrics, "decdn_serve_stream_node_fault_total")? == 0,
+        "a spent proof budget is a client payment fault, not a node fault"
+    );
+
+    fx.conn.close(0u32.into(), b"done");
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
+/// A proof that settles a chunk on the last proof of its budget still settles it
+/// (#2132). The budget bounds the proofs that leave a chunk unsettled, so a payer
+/// may send `MAX_PROOFS_PER_CHUNK − 1` slivers and then pay the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chunk_settled_by_the_last_proof_of_its_budget_is_paid() -> anyhow::Result<()> {
+    // The node's private `MAX_PROOFS_PER_CHUNK`; keep the two in step.
+    const PROOF_BUDGET: u64 = 8;
+    let mut fx = drive_to_second_interval_awaiting_voucher().await?;
+
+    let mut amount = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    for n in 1..PROOF_BUDGET {
+        amount += min_payment(SLIVER_BYTES, RATE_PER_MB);
+        let bytes = HARNESS_INTERVAL_BYTES + n * SLIVER_BYTES;
+        send_signed_voucher(&mut fx.send, &fx.signer, bytes, amount).await?;
+    }
+    let slivers = (PROOF_BUDGET - 1) * SLIVER_BYTES;
+    amount += min_payment(HARNESS_INTERVAL_BYTES - slivers, RATE_PER_MB);
+    send_signed_voucher(&mut fx.send, &fx.signer, 2 * HARNESS_INTERVAL_BYTES, amount).await?;
+
+    // Interval 2 is paid, so interval 3 arrives.
+    read_exact_chunks(&mut fx.recv, HARNESS_INTERVAL_BYTES).await?;
 
     fx.conn.close(0u32.into(), b"done");
     shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
