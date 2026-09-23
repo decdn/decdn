@@ -19,8 +19,8 @@
 //! computed up front from the whole manifest by `build_fetch_plan` — and only
 //! that entry pays to fetch it. Groups are scheduled smallest-first, so a holder
 //! starts before the larger entries that share its chunks. Each entry drives its
-//! own ranges (unique chunks, chunks assigned to it, un-splice-able edges) up
-//! front and defers the rest; at its tail it splices each deferred range as the
+//! own ranges (unique chunks, chunks assigned to it, and the partial groups at
+//! the two ends of each spliced run) up front and defers the rest; at its tail it splices each deferred range as the
 //! assigned holder registers it, waiting on the holder — not a clock — and driving
 //! a deferred range itself only if that holder finishes without producing it.
 //!
@@ -3166,14 +3166,10 @@ async fn reassemble_dedup(
 ) -> anyhow::Result<DedupOutcome> {
     let hash = driver.hash();
     let staging = driver.staging();
-    let donor_total = plan
-        .donor
-        .iter()
-        .map(|d| d.aligned.1)
-        .fold(0u64, u64::saturating_add);
 
     // Pay only for the pay-now ranges (this entry's unique + self-assigned chunks
-    // and any un-splice-able edges); donors are spliced and deferred ranges wait.
+    // and the partial groups at spliced-run ends); donors are spliced and deferred
+    // ranges wait.
     // An entry with nothing to drive (every chunk is a donor or deferred) skips the
     // drive entirely and splices into a freshly-sized `.partial`.
     if !plan.drive.is_empty() {
@@ -3195,16 +3191,8 @@ async fn reassemble_dedup(
     // Verify + splice each initially-available donor range off the executor. A donor
     // whose chunk no longer hashes to its hint (a lying donor hint, or a short read)
     // is re-fetched normally rather than trusted.
-    let donors = plan.donor.clone();
-    let partial_for_splice = partial.clone();
-    let refetch: Vec<(u64, u64)> =
-        tokio::task::spawn_blocking(move || splice_donors(&partial_for_splice, &donors))
-            .await
-            .map_err(|e| anyhow!("donor splice task: {e}"))??;
-    // Bytes served from a verified donor splice are `donor_total` minus what had to
-    // be re-fetched; each re-fetched donor is a dropped hint.
-    let refetch_total = refetch.iter().map(|r| r.1).fold(0u64, u64::saturating_add);
-    let mut spliced_bytes = donor_total.saturating_sub(refetch_total);
+    // Each re-fetched donor is a dropped hint.
+    let (mut spliced_bytes, refetch) = splice_off_runtime(&partial, plan.donor.clone()).await?;
     let mut hints_ignored = u64::try_from(refetch.len()).unwrap_or(u64::MAX);
     if !refetch.is_empty() {
         driver.drive(&refetch).await?;
@@ -3307,18 +3295,19 @@ async fn reassemble_dedup(
 /// signal between scans rather than polling on a clock. A deferred chunk whose
 /// assigned fetcher FINISHES without registering it (a failed fetcher, or one with
 /// no recorded assignee) — or one registered under a length that disagrees with the
-/// hint — is driven and paid here instead, so the entry always completes and the run
-/// never hangs. Returns `(spliced_bytes, hints_ignored)`: bytes served from a splice,
-/// and deferred chunks that fell back to a paid drive.
+/// hint — is driven and paid here instead, over the whole groups its span touches,
+/// so the entry always completes and the run never hangs. Returns `(spliced_bytes,
+/// hints_ignored)`: bytes served from a splice, and deferred chunks that fell back to
+/// a paid drive.
 async fn reconcile_deferred(
     driver: &dyn RangeDriver,
     partial: &Path,
-    deferred: &[Hint],
+    deferred: &[DeferredChunk],
     index: &ChunkIndex,
     fetch_plan: &FetchPlan,
     file: Option<&pull_progress::FileBar>,
 ) -> anyhow::Result<(u64, u64)> {
-    let mut waiting: Vec<Hint> = deferred.to_vec();
+    let mut waiting: Vec<DeferredChunk> = deferred.to_vec();
     let mut spliced_bytes = 0u64;
     let mut ignored = 0u64;
     if waiting.is_empty() {
@@ -3333,13 +3322,15 @@ async fn reconcile_deferred(
 
         let mut ready: Vec<DonorRange> = Vec::new();
         let mut fallback: Vec<(u64, u64)> = Vec::new();
-        let mut still: Vec<Hint> = Vec::new();
+        let mut still: Vec<DeferredChunk> = Vec::new();
         {
             let guard = index.map.lock().unwrap_or_else(PoisonError::into_inner);
-            for h in &waiting {
+            for c in &waiting {
+                let h = &c.hint;
                 // A trustworthy donor for this chunk is available now — splice it.
-                if let Some(d) = guard.get(&h.hash).and_then(|m| donor_for(h, m)) {
-                    ready.push(d);
+                // A registered length that disagrees with the hint is untrusted.
+                if let Some(m) = guard.get(&h.hash).filter(|m| m.len == h.len) {
+                    ready.push(DonorRange::new(h, m, c.dst, c.refetch));
                     continue;
                 }
                 // Otherwise keep waiting ONLY while the assigned fetcher is still
@@ -3354,26 +3345,17 @@ async fn reconcile_deferred(
                     .copied()
                     .is_some_and(|a| !index.is_finished(a));
                 if fetcher_running && !present_but_untrusted {
-                    still.push(*h);
-                } else if let Some(iv) = aligned_interior(h) {
-                    fallback.push(iv);
+                    still.push(*c);
+                } else {
+                    fallback.push(c.refetch);
                     ignored = ignored.saturating_add(1);
                 }
             }
         }
 
         if !ready.is_empty() {
-            let ready_total: u64 = ready
-                .iter()
-                .map(|d| d.aligned.1)
-                .fold(0, u64::saturating_add);
-            let partial_c = partial.to_path_buf();
-            let refetch: Vec<(u64, u64)> =
-                tokio::task::spawn_blocking(move || splice_donors(&partial_c, &ready))
-                    .await
-                    .map_err(|e| anyhow!("deferred splice task: {e}"))??;
-            let refetch_total: u64 = refetch.iter().map(|r| r.1).fold(0, u64::saturating_add);
-            spliced_bytes = spliced_bytes.saturating_add(ready_total.saturating_sub(refetch_total));
+            let (spliced, refetch) = splice_off_runtime(partial, ready).await?;
+            spliced_bytes = spliced_bytes.saturating_add(spliced);
             ignored = ignored.saturating_add(u64::try_from(refetch.len()).unwrap_or(u64::MAX));
             fallback.extend(refetch);
         }
@@ -3652,19 +3634,26 @@ impl ChunkIndex {
     }
 }
 
-/// One splice source for the dedup path: a chunk-group-aligned run of the
-/// recipient blob whose bytes a materialized donor already holds.
+/// One splice source for the dedup path: the part of one chunk of the recipient
+/// blob that its spliced run covers, and the materialized donor that holds it.
 #[derive(Debug, Clone)]
 struct DonorRange {
-    /// `(offset, len)` in the recipient blob to write — chunk-group-aligned, so
-    /// the ranged store's complement (fetched on group boundaries) and this
-    /// splice tile the blob without overlap.
-    aligned: (u64, u64),
+    /// `(offset, len)` in the recipient blob to write: the chunk's span inside its
+    /// spliced run ([`plan_reassembly`]). It need not sit on chunk-group
+    /// boundaries — adjacent spliced chunks tile a run whose ends do, so the runs
+    /// and the ranged store's complement (fetched on group boundaries) tile the
+    /// blob without overlap.
+    dst: (u64, u64),
+    /// The whole chunk groups `dst` touches, capped at the blob end — what a paid
+    /// re-fetch drives when this donor cannot be trusted. It may take in a
+    /// neighbour's bytes of a shared boundary group; the drive writes verified
+    /// bytes over them.
+    refetch: (u64, u64),
     /// The donor blob to read from.
     source: PathBuf,
-    /// Source offset of the aligned subset within `source`.
+    /// Source offset of the `dst` span within `source`.
     src_offset: u64,
-    /// The whole chunk's hash — the aligned subset is trusted only after the
+    /// The whole chunk's hash — the `dst` span is trusted only after the
     /// whole chunk at `[chunk_src_offset, chunk_src_offset + chunk_len)` in
     /// `source` re-hashes to this.
     chunk_hash: [u8; 32],
@@ -3705,39 +3694,44 @@ fn hints_of(entry: &ManifestEntry) -> Option<Vec<Hint>> {
     Some(hints)
 }
 
-/// Resolve one placed hint against a materialized donor into a splice-able
-/// [`DonorRange`], or `None` when the chunk cannot be trusted or has no
-/// group-aligned interior to splice:
-///
-/// - A donor whose claimed chunk length disagrees with the hint (`m.len != h.len`)
-///   is one side's manifest lying about the chunk — dropped, so the range stays a
-///   paid, bao-verified fetch rather than a placement that runs past the donor's
-///   real chunk end.
-/// - Inward group alignment: the first group boundary at or after the hint's
-///   offset to the last boundary at or before its end. A chunk with no whole group
-///   inside its span (`g_start >= g_end`) yields `None`; its partial edge groups
-///   are left to the paid complement.
-fn donor_for(h: &Hint, m: &MaterializedRange) -> Option<DonorRange> {
+impl DonorRange {
+    /// The splice of chunk `h`'s span `dst` from the materialized donor `m`,
+    /// which holds the whole chunk at `m.offset`; `refetch` is `dst`'s
+    /// [`outward_groups`].
+    fn new(h: &Hint, m: &MaterializedRange, dst: (u64, u64), refetch: (u64, u64)) -> Self {
+        Self {
+            dst,
+            refetch,
+            source: m.source.clone(),
+            src_offset: m.offset.saturating_add(dst.0.saturating_sub(h.offset)),
+            chunk_hash: h.hash,
+            chunk_src_offset: m.offset,
+            chunk_len: m.len,
+        }
+    }
+}
+
+/// A deferred chunk of a [`ReassemblePlan`]: a chunk this run assigns to another
+/// entry, spliced over `dst` once that entry registers it, or driven over
+/// `refetch` (see [`DonorRange`]) if it never does.
+#[derive(Debug, Clone, Copy)]
+struct DeferredChunk {
+    hint: Hint,
+    dst: (u64, u64),
+    refetch: (u64, u64),
+}
+
+/// The whole chunk groups the byte span `(offset, len)` touches, as
+/// `(offset, len)`, capped at `total`.
+fn outward_groups((offset, len): (u64, u64), total: u64) -> (u64, u64) {
     let group = CHUNK_GROUP_BYTES;
-    if m.len != h.len {
-        return None;
-    }
-    let hint_end = h.offset.saturating_add(h.len);
-    let g_start = h.offset.div_ceil(group).saturating_mul(group);
-    let g_end = (hint_end / group) * group;
-    if g_start >= g_end {
-        return None;
-    }
-    let alen = g_end - g_start;
-    let src_offset = m.offset.saturating_add(g_start - h.offset);
-    Some(DonorRange {
-        aligned: (g_start, alen),
-        source: m.source.clone(),
-        src_offset,
-        chunk_hash: h.hash,
-        chunk_src_offset: m.offset,
-        chunk_len: m.len,
-    })
+    let start = (offset / group).saturating_mul(group);
+    let end = offset
+        .saturating_add(len)
+        .div_ceil(group)
+        .saturating_mul(group)
+        .min(total);
+    (start, end.saturating_sub(start))
 }
 
 /// The run-level shared-chunk fetch plan: which entry pays to fetch each chunk that
@@ -3800,18 +3794,6 @@ fn build_fetch_plan(entries: &[ManifestEntry]) -> FetchPlan {
     FetchPlan { assigned }
 }
 
-/// Whether a chunk hint has a non-empty group-aligned interior — the only part a
-/// splice can cover. A chunk with no whole group inside its span cannot be
-/// deferred (its bytes must be driven and paid), matching [`donor_for`]'s inward
-/// alignment. Returns the aligned `(offset, len)` when one exists.
-fn aligned_interior(h: &Hint) -> Option<(u64, u64)> {
-    let group = CHUNK_GROUP_BYTES;
-    let hint_end = h.offset.saturating_add(h.len);
-    let g_start = h.offset.div_ceil(group).saturating_mul(group);
-    let g_end = (hint_end / group) * group;
-    (g_start < g_end).then_some((g_start, g_end - g_start))
-}
-
 /// One entry's reassembly plan, computed from the live [`ChunkIndex`] snapshot and
 /// the run-level [`FetchPlan`]. The three range sets tile the blob:
 ///
@@ -3821,22 +3803,29 @@ fn aligned_interior(h: &Hint) -> Option<(u64, u64)> {
 ///   waited for and spliced at the tail once the assigned fetcher registers them
 ///   (or driven as a fallback if that fetcher finishes without producing them).
 /// - `drive`: everything else — this entry's unique and self-assigned chunks, plus
-///   any un-splice-able edge groups — driven and paid for now. It is the complement
-///   of the donor and deferred interiors within the whole-file size.
+///   the partial chunk groups at the edges of each spliced run — driven and paid
+///   for now.
+///
+/// Donor and deferred chunks that touch form one spliced run, and only the run's
+/// two ends round inward to chunk-group boundaries. A boundary between two
+/// spliced chunks therefore costs nothing, wherever it falls: its group is
+/// spliced from both sides rather than driven as a separate 16 KiB request.
 ///
 /// With an empty [`FetchPlan`] (no shared chunks) `deferred` is empty and the plan
-/// reduces to today's donor/complement split.
+/// reduces to a donor/complement split.
 struct ReassemblePlan {
     donor: Vec<DonorRange>,
-    deferred: Vec<Hint>,
+    deferred: Vec<DeferredChunk>,
     drive: Vec<(u64, u64)>,
 }
 
 /// Build an entry's [`ReassemblePlan`] for the entry whose whole-file hash is
-/// `whole`. A chunk currently in `index` becomes a `donor` (spliced now); a chunk
-/// the [`FetchPlan`] assigns to another entry, not yet available, with a
-/// splice-able interior becomes `deferred`; the rest is driven. `total` is the
-/// entry's whole-file size.
+/// `whole`. A chunk currently in `index` under its hinted length becomes a
+/// `donor` (spliced now); a chunk the [`FetchPlan`] assigns to another entry, not
+/// yet available, becomes `deferred`. Their spans merge into runs
+/// ([`spliced_runs`]); a chunk with no bytes inside a run is dropped to the
+/// drive, and everything outside the runs is driven. `total` is the entry's
+/// whole-file size.
 fn plan_reassembly(
     hints: &[Hint],
     index: &HashMap<[u8; 32], MaterializedRange>,
@@ -3844,31 +3833,80 @@ fn plan_reassembly(
     whole: [u8; 32],
     total: u64,
 ) -> ReassemblePlan {
-    let mut donor = Vec::new();
-    let mut deferred = Vec::new();
-    let mut covered: Vec<(u64, u64)> = Vec::new();
+    // Each candidate chunk, with its donor when one is materialized now.
+    let mut candidates: Vec<(&Hint, Option<&MaterializedRange>)> = Vec::new();
     for h in hints {
-        if let Some(m) = index.get(&h.hash)
-            && let Some(d) = donor_for(h, m)
-        {
-            covered.push(d.aligned);
-            donor.push(d);
-            continue;
-        }
-        let assigned_elsewhere = fetch_plan
-            .assigned
-            .get(&h.hash)
-            .is_some_and(|owner| *owner != whole);
-        if assigned_elsewhere && let Some(interior) = aligned_interior(h) {
-            deferred.push(*h);
-            covered.push(interior);
+        match index.get(&h.hash) {
+            // A donor whose claimed chunk length disagrees with the hint is one
+            // side's manifest lying about the chunk — never spliced from.
+            Some(m) if m.len == h.len => candidates.push((h, Some(m))),
+            _ => {
+                let assigned_elsewhere = fetch_plan
+                    .assigned
+                    .get(&h.hash)
+                    .is_some_and(|owner| *owner != whole);
+                if assigned_elsewhere {
+                    candidates.push((h, None));
+                }
+            }
         }
     }
+    let spans: Vec<(u64, u64)> = candidates.iter().map(|(h, _)| (h.offset, h.len)).collect();
+    let runs = spliced_runs(&spans, total);
+
+    let mut donor = Vec::new();
+    let mut deferred = Vec::new();
+    for (h, m) in candidates {
+        let Some(dst) = span_in_runs(&runs, h.offset, h.len) else {
+            continue;
+        };
+        match m {
+            Some(m) => donor.push(DonorRange::new(h, m, dst, outward_groups(dst, total))),
+            None => deferred.push(DeferredChunk {
+                hint: *h,
+                dst,
+                refetch: outward_groups(dst, total),
+            }),
+        }
+    }
+    let covered: Vec<(u64, u64)> = runs.iter().map(|&(s, e)| (s, e - s)).collect();
     ReassemblePlan {
         drive: complement_runs(&covered, total),
         donor,
         deferred,
     }
+}
+
+/// Merge the spliceable chunk spans `(offset, len)` into sorted, disjoint
+/// `(start, end)` runs — spans that overlap or touch join one run — then round
+/// each run inward to chunk-group boundaries, the blob end counting as one. A
+/// run with no whole group left is dropped. The ranged store fetches whole
+/// groups, so only a run's two ends can leave a partial group to drive.
+fn spliced_runs(spans: &[(u64, u64)], total: u64) -> Vec<(u64, u64)> {
+    let group = CHUNK_GROUP_BYTES;
+    coalesce_runs(spans, total)
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let start = start.div_ceil(group).saturating_mul(group);
+            let end = if end == total {
+                end
+            } else {
+                (end / group).saturating_mul(group)
+            };
+            (start < end).then_some((start, end))
+        })
+        .collect()
+}
+
+/// The part of the span `(offset, len)` inside the sorted, disjoint `runs`, as
+/// `(offset, len)`, or `None` when no run covers any of it. A span from the same
+/// set the runs were built from meets at most one run.
+fn span_in_runs(runs: &[(u64, u64)], offset: u64, len: u64) -> Option<(u64, u64)> {
+    let end = offset.saturating_add(len);
+    let i = runs.partition_point(|&(_, run_end)| run_end <= offset);
+    let &(run_start, run_end) = runs.get(i)?;
+    let (start, end) = (offset.max(run_start), end.min(run_end));
+    (start < end).then_some((start, end - start))
 }
 
 /// The `.partial` data file the ranged store keeps beside a finalized `staging`
@@ -3878,16 +3916,20 @@ fn partial_path(staging: &Path) -> PathBuf {
     staging.with_extension("partial")
 }
 
-/// Verify and splice every donor range into `partial`, returning the aligned
-/// ranges that could NOT be trusted (a donor whose chunk no longer hashes to its
-/// hint, or an unreadable source) and so must be re-fetched and paid for.
+/// Verify and splice every donor range into `partial`, returning the donors that
+/// could NOT be trusted (a donor whose chunk no longer hashes to its hint, or an
+/// unreadable source): the caller re-fetches and pays for each one's
+/// [`DonorRange::refetch`] span.
 ///
 /// A donor's bytes are trusted only after the WHOLE chunk at its recorded source
 /// offset re-hashes to the chunk hash — a donor's own chunk placement is an
-/// unverified manifest claim until then. The trusted group-aligned subset is then
-/// written at the recipient offset; the whole-file BLAKE3 the caller runs next is
-/// the authoritative backstop against a lying recipient placement.
-fn splice_donors(partial: &Path, donors: &[DonorRange]) -> anyhow::Result<Vec<(u64, u64)>> {
+/// unverified manifest claim until then. The trusted `dst` span is then written
+/// at the recipient offset; the whole-file BLAKE3 the caller runs next is the
+/// authoritative backstop against a lying recipient placement. A span that lands
+/// in a group the ranged store already holds (a resumed run, or a neighbour's
+/// re-fetch) writes the same verified bytes; if a lying placement wrote others,
+/// the store's finalize verify drops that group and a drive fetches it again.
+fn splice_donors(partial: &Path, donors: &[DonorRange]) -> anyhow::Result<Vec<DonorRange>> {
     use std::io::{Seek, SeekFrom};
 
     let mut refetch = Vec::new();
@@ -3896,34 +3938,50 @@ fn splice_donors(partial: &Path, donors: &[DonorRange]) -> anyhow::Result<Vec<(u
         .open(partial)
         .with_context(|| format!("open {}", partial.display()))?;
     for d in donors {
-        let (dst_offset, len) = d.aligned;
+        let (dst_offset, len) = d.dst;
         // An unreadable donor source is not trusted — pay to fetch it.
         let Ok(mut src) = std::fs::File::open(&d.source) else {
-            refetch.push(d.aligned);
+            refetch.push(d.clone());
             continue;
         };
         if !chunk_verified(&mut src, d.chunk_src_offset, d.chunk_len, d.chunk_hash) {
-            refetch.push(d.aligned);
+            refetch.push(d.clone());
             continue;
         }
-        // The chunk is confirmed present at `chunk_src_offset`; copy its
-        // group-aligned subset into the recipient's `.partial`. A seek/copy error
-        // here (a truncated or racing donor file, an I/O fault) is not fatal: the
-        // donor bytes are simply not trusted, so queue the aligned range for a
-        // paid, bao-verified re-fetch that overwrites exactly it — nothing torn by
-        // a partial copy survives, and the whole-file BLAKE3 the caller runs next
-        // is the authoritative backstop.
+        // The chunk is confirmed present at `chunk_src_offset`; copy its `dst`
+        // span into the recipient's `.partial`. A seek/copy error here (a
+        // truncated or racing donor file, an I/O fault) is not fatal: the donor
+        // bytes are simply not trusted, so queue the donor for a paid,
+        // bao-verified re-fetch that overwrites every group it touches — nothing
+        // torn by a partial copy survives, and the whole-file BLAKE3 the caller
+        // runs next is the authoritative backstop.
         let copied = src
             .seek(SeekFrom::Start(d.src_offset))
             .and_then(|_| out.seek(SeekFrom::Start(dst_offset)))
             .and_then(|_| copy_exact(&mut src, &mut out, len));
         if copied.is_err() {
-            refetch.push(d.aligned);
+            refetch.push(d.clone());
         }
     }
     out.sync_all()
         .with_context(|| format!("sync {}", partial.display()))?;
     Ok(refetch)
+}
+
+/// [`splice_donors`] on the blocking pool. Returns the bytes spliced — the
+/// donors' `dst` spans less those of the donors that could not be trusted — and
+/// the [`DonorRange::refetch`] span of each untrusted donor, which the caller
+/// drives and pays for.
+async fn splice_off_runtime(
+    partial: &Path,
+    donors: Vec<DonorRange>,
+) -> anyhow::Result<(u64, Vec<(u64, u64)>)> {
+    let span_total = |ds: &[DonorRange]| ds.iter().map(|d| d.dst.1).fold(0u64, u64::saturating_add);
+    let planned = span_total(&donors);
+    let partial = partial.to_path_buf();
+    let failed = off_runtime("donor splice", move || splice_donors(&partial, &donors)).await?;
+    let spliced = planned.saturating_sub(span_total(&failed));
+    Ok((spliced, failed.iter().map(|d| d.refetch).collect()))
 }
 
 /// Whether the `len` bytes at `offset` in `src` hash to `expected`. Any read
@@ -4069,10 +4127,31 @@ pub(crate) fn complement_runs(donor_aligned: &[(u64, u64)], total: u64) -> Vec<(
     if total == 0 {
         return Vec::new();
     }
+    let coalesced = coalesce_runs(donor_aligned, total);
 
-    // Clamp each donor range to `[0, total)` and drop empty/out-of-range ones,
-    // then sort by start so overlapping/adjacent runs coalesce in one pass.
-    let mut runs: Vec<(u64, u64)> = donor_aligned
+    // Walk the coalesced donor runs, emitting the gap before each one and,
+    // at the end, the gap after the last one up to `total`.
+    let mut gaps = Vec::with_capacity(coalesced.len() + 1);
+    let mut cursor = 0u64;
+    for (start, end) in coalesced {
+        if start > cursor {
+            gaps.push((cursor, start - cursor));
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < total {
+        gaps.push((cursor, total - cursor));
+    }
+    gaps
+}
+
+/// Sort and coalesce `(offset, len)` byte ranges into disjoint `(start, end)`
+/// runs, clamped to `[0, total)`: ranges that overlap or touch join one run, and
+/// an empty or out-of-range one is dropped.
+fn coalesce_runs(ranges: &[(u64, u64)], total: u64) -> Vec<(u64, u64)> {
+    // Clamp each range to `[0, total)` and drop empty/out-of-range ones, then
+    // sort by start so overlapping/adjacent runs coalesce in one pass.
+    let mut runs: Vec<(u64, u64)> = ranges
         .iter()
         .filter_map(|&(offset, len)| {
             let start = offset.min(total);
@@ -4091,21 +4170,7 @@ pub(crate) fn complement_runs(donor_aligned: &[(u64, u64)], total: u64) -> Vec<(
             _ => coalesced.push((start, end)),
         }
     }
-
-    // Walk the coalesced donor runs, emitting the gap before each one and,
-    // at the end, the gap after the last one up to `total`.
-    let mut gaps = Vec::with_capacity(coalesced.len() + 1);
-    let mut cursor = 0u64;
-    for (start, end) in coalesced {
-        if start > cursor {
-            gaps.push((cursor, start - cursor));
-        }
-        cursor = cursor.max(end);
-    }
-    if cursor < total {
-        gaps.push((cursor, total - cursor));
-    }
-    gaps
+    coalesced
 }
 
 /// [`remove_staging`] on the blocking pool: unlinking a multi-GB blob can take
@@ -5289,7 +5354,7 @@ mod tests {
 
         assert_eq!(plan.donor.len(), 1);
         let d = &plan.donor[0];
-        assert_eq!(d.aligned, (GROUP, GROUP));
+        assert_eq!(d.dst, (GROUP, GROUP));
         assert_eq!(d.source, PathBuf::from("/tmp/donorA"));
         assert_eq!(d.src_offset, 0);
         assert_eq!(d.chunk_hash, h);
@@ -5327,7 +5392,7 @@ mod tests {
         // The span [100, 100 + 2*GROUP + 500) straddles boundaries GROUP and
         // 2*GROUP, so exactly ONE whole group — [GROUP, 2*GROUP) — is inside it;
         // the sub-group head and tail fall into the complement.
-        assert_eq!(d.aligned, (GROUP, GROUP));
+        assert_eq!(d.dst, (GROUP, GROUP));
         // Source offset shifts by (GROUP - 100) from the chunk's donor start.
         assert_eq!(d.src_offset, 5000 + (GROUP - 100));
         assert_eq!(plan.drive, vec![(0, GROUP), (2 * GROUP, 2 * GROUP)]);
@@ -5440,7 +5505,8 @@ mod tests {
         let donor = DonorRange {
             // Aligned span of TWO groups, but only one group is readable at
             // `src_offset` — the copy hits EOF.
-            aligned: (GROUP, 2 * GROUP),
+            dst: (GROUP, 2 * GROUP),
+            refetch: (GROUP, 2 * GROUP),
             source: donor_path,
             src_offset: 0,
             chunk_hash,
@@ -5448,8 +5514,9 @@ mod tests {
             chunk_len: GROUP,
         };
 
-        let refetch = splice_donors(&partial, std::slice::from_ref(&donor))
+        let failed = splice_donors(&partial, std::slice::from_ref(&donor))
             .expect("a copy that EOFs must not fail the splice");
+        let refetch: Vec<(u64, u64)> = failed.iter().map(|d| d.refetch).collect();
         assert_eq!(refetch, vec![(GROUP, 2 * GROUP)]);
 
         // Nothing was written into `.partial` for the untrusted donor — the whole
@@ -5509,7 +5576,8 @@ mod tests {
         // returns before any splice) and nothing deferred.
         let plan = ReassemblePlan {
             donor: vec![DonorRange {
-                aligned: (GROUP, GROUP),
+                dst: (GROUP, GROUP),
+                refetch: (GROUP, GROUP),
                 source: tmp.path().join("donor-never-read"),
                 src_offset: 0,
                 chunk_hash: [0x11; 32],
@@ -5541,6 +5609,16 @@ mod tests {
         );
         assert_eq!(driver.drives.get(), 1, "only the pay-now drive ran");
         assert!(staging.try_exists().expect("stat staging"));
+    }
+
+    /// A deferred chunk whose whole span is spliced: `dst` is the hint's span
+    /// and `refetch` the groups it touches.
+    fn whole_deferred(hint: Hint) -> DeferredChunk {
+        DeferredChunk {
+            hint,
+            dst: (hint.offset, hint.len),
+            refetch: outward_groups((hint.offset, hint.len), u64::MAX),
+        }
     }
 
     /// A chunked entry, built from `(chunk_size, chunk_hash_byte)` pairs whose sizes
@@ -5597,7 +5675,7 @@ mod tests {
         let plan = plan_reassembly(&hints, &HashMap::new(), &fetch_plan, [0x0b; 32], total);
         // c1 (assigned to the smaller a) is deferred; nothing is a donor yet.
         assert_eq!(plan.deferred.len(), 1);
-        assert_eq!(plan.deferred[0].hash, [0x01; 32]);
+        assert_eq!(plan.deferred[0].hint.hash, [0x01; 32]);
         assert!(plan.donor.is_empty());
         // The drive is the complement of c1's interior — the c2 region.
         assert_eq!(plan.drive, vec![(3 * GROUP, 50_000)]);
@@ -5814,18 +5892,19 @@ mod tests {
         };
         let plan = ReassemblePlan {
             donor: vec![DonorRange {
-                aligned: (0, 2 * GROUP),
+                dst: (0, 2 * GROUP),
+                refetch: (0, 2 * GROUP),
                 source: donor_path,
                 src_offset: 0,
                 chunk_hash: donor_hash,
                 chunk_src_offset: 0,
                 chunk_len: 2 * GROUP,
             }],
-            deferred: vec![Hint {
+            deferred: vec![whole_deferred(Hint {
                 hash: deferred_hash,
                 offset: 2 * GROUP,
                 len: 2 * GROUP,
-            }],
+            })],
             drive: Vec::new(),
         };
         let index = ChunkIndex::default();
@@ -5852,6 +5931,296 @@ mod tests {
             "only the deferred half is paid for; no self-heal re-drive"
         );
         assert_eq!(outcome.spliced_bytes, 2 * GROUP);
+    }
+
+    /// Two donor chunks of a blob, `[0, cut)` and `[cut, 4*GROUP)`, each written
+    /// to its own donor file, with the index entries a plan resolves them by.
+    /// `cut` is not a chunk-group boundary.
+    fn two_donor_fixture(
+        dir: &Path,
+        content: &[u8],
+        cut: u64,
+    ) -> (Vec<Hint>, HashMap<[u8; 32], MaterializedRange>) {
+        let c = usize::try_from(cut).expect("fits usize");
+        let total = u64::try_from(content.len()).expect("fits u64");
+        let mut hints = Vec::new();
+        let mut index = HashMap::new();
+        for (name, bytes, offset) in [("a", &content[..c], 0), ("b", &content[c..], cut)] {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).expect("write donor");
+            let hash = *blake3::hash(bytes).as_bytes();
+            let len = u64::try_from(bytes.len()).expect("fits u64");
+            hints.push(Hint { hash, offset, len });
+            index.insert(
+                hash,
+                MaterializedRange {
+                    source: path,
+                    offset: 0,
+                    len,
+                },
+            );
+        }
+        assert_eq!(hints.iter().map(|h| h.len).sum::<u64>(), total);
+        (hints, index)
+    }
+
+    /// Two adjacent donor chunks that meet inside a chunk group form one spliced
+    /// run: the boundary group is spliced from both sides, so nothing is driven.
+    #[test]
+    fn plan_dedup_adjacent_donors_at_an_unaligned_boundary_leave_no_drive_gap() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let total = 4 * GROUP;
+        let content = vec![7u8; usize::try_from(total).expect("fits usize")];
+        let cut = GROUP + 5000;
+        let (hints, index) = two_donor_fixture(tmp.path(), &content, cut);
+
+        let plan = plan_reassembly(&hints, &index, &FetchPlan::default(), [0; 32], total);
+
+        assert!(plan.drive.is_empty(), "drive: {:?}", plan.drive);
+        let dsts: Vec<(u64, u64)> = plan.donor.iter().map(|d| d.dst).collect();
+        assert_eq!(dsts, vec![(0, cut), (cut, total - cut)]);
+        assert!(plan.donor.iter().all(|d| d.src_offset == 0));
+        assert_eq!(plan.donor[1].refetch, (GROUP, total - GROUP));
+    }
+
+    /// A donor next to a chunk that must be driven splices only up to the last
+    /// group boundary inside it: the shared group is driven once, with the
+    /// driven chunk.
+    #[test]
+    fn plan_dedup_donor_next_to_a_driven_chunk_drives_the_shared_group_once() {
+        let total = 3 * GROUP;
+        let cut = GROUP + 5000;
+        let donor_hash = [0x44; 32];
+        let mut index = HashMap::new();
+        index.insert(
+            donor_hash,
+            MaterializedRange {
+                source: PathBuf::from("/tmp/donor"),
+                offset: 0,
+                len: cut,
+            },
+        );
+        let hints = [
+            Hint {
+                hash: donor_hash,
+                offset: 0,
+                len: cut,
+            },
+            Hint {
+                hash: [0x45; 32],
+                offset: cut,
+                len: total - cut,
+            },
+        ];
+
+        let plan = plan_reassembly(&hints, &index, &FetchPlan::default(), [0; 32], total);
+
+        let dsts: Vec<(u64, u64)> = plan.donor.iter().map(|d| d.dst).collect();
+        assert_eq!(dsts, vec![(0, GROUP)]);
+        assert_eq!(plan.drive, vec![(GROUP, 2 * GROUP)]);
+    }
+
+    /// A donor chunk that meets a deferred chunk inside a group also forms one
+    /// run with it: neither side's partial group is driven.
+    #[test]
+    fn plan_dedup_donor_meeting_a_deferred_chunk_leaves_no_drive_gap() {
+        let total = 3 * GROUP;
+        let cut = GROUP + 5000;
+        let (donor_hash, deferred_hash) = ([0x46; 32], [0x47; 32]);
+        let mut index = HashMap::new();
+        index.insert(
+            donor_hash,
+            MaterializedRange {
+                source: PathBuf::from("/tmp/donor"),
+                offset: 0,
+                len: cut,
+            },
+        );
+        let mut fetch_plan = FetchPlan::default();
+        fetch_plan.assigned.insert(deferred_hash, [0xaa; 32]);
+        let hints = [
+            Hint {
+                hash: donor_hash,
+                offset: 0,
+                len: cut,
+            },
+            Hint {
+                hash: deferred_hash,
+                offset: cut,
+                len: total - cut,
+            },
+        ];
+
+        let plan = plan_reassembly(&hints, &index, &fetch_plan, [0x0b; 32], total);
+
+        assert!(plan.drive.is_empty(), "drive: {:?}", plan.drive);
+        assert_eq!(plan.donor[0].dst, (0, cut));
+        assert_eq!(plan.deferred[0].dst, (cut, total - cut));
+        assert_eq!(plan.deferred[0].refetch, (GROUP, 2 * GROUP));
+    }
+
+    #[test]
+    fn spliced_runs_merge_touching_spans_and_round_only_the_run_ends_inward() {
+        let total = 10 * GROUP;
+        // Two touching spans that meet mid-group, and one apart from them.
+        let spans = [
+            (100, GROUP),
+            (GROUP + 100, 2 * GROUP),
+            (5 * GROUP + 1, 2 * GROUP),
+        ];
+        assert_eq!(
+            spliced_runs(&spans, total),
+            vec![(GROUP, 3 * GROUP), (6 * GROUP, 7 * GROUP)]
+        );
+        // A run with no whole group inside it is dropped.
+        assert!(spliced_runs(&[(1, GROUP)], total).is_empty());
+    }
+
+    /// The blob end counts as a group boundary: a run that reaches it keeps its
+    /// final partial group.
+    #[test]
+    fn spliced_runs_keep_the_blob_end() {
+        let total = 2 * GROUP + 700;
+        assert_eq!(
+            spliced_runs(&[(GROUP, GROUP + 700)], total),
+            vec![(GROUP, total)]
+        );
+    }
+
+    /// Adjacent donors meeting mid-group reassemble the blob with nothing paid for.
+    #[tokio::test]
+    async fn reassemble_dedup_splices_a_boundary_group_from_two_donors() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let total = 4 * GROUP;
+        let content: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let whole = *blake3::hash(&content).as_bytes();
+        let (hints, map) = two_donor_fixture(tmp.path(), &content, GROUP + 5000);
+        let plan = plan_reassembly(&hints, &map, &FetchPlan::default(), whole, total);
+        let staging = tmp.path().join("blob");
+        let driver = RecordingDriver {
+            hash: whole,
+            staging: staging.clone(),
+            content: content.clone(),
+            driven: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let outcome = reassemble_dedup(
+            &driver,
+            &plan,
+            total,
+            None,
+            &ChunkIndex::default(),
+            &FetchPlan::default(),
+            None,
+            &|| {},
+        )
+        .await
+        .expect("reassembly must succeed");
+
+        assert_eq!(std::fs::read(&staging).expect("read staging"), content);
+        assert!(driver.driven.lock().expect("driven lock").is_empty());
+        assert_eq!(outcome.spliced_bytes, total);
+    }
+
+    /// A donor that fails its verification re-hash is fetched again over every
+    /// group its span touches — including the boundary group it shares with a
+    /// good neighbour — and the blob still reassembles byte-exact.
+    #[tokio::test]
+    async fn reassemble_dedup_refetches_the_outward_group_span_of_a_failed_donor() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let total = 4 * GROUP;
+        let content: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let whole = *blake3::hash(&content).as_bytes();
+        let cut = GROUP + 5000;
+        let (hints, map) = two_donor_fixture(tmp.path(), &content, cut);
+        let plan = plan_reassembly(&hints, &map, &FetchPlan::default(), whole, total);
+        // Corrupt donor B on disk after planning: its chunk no longer re-hashes.
+        std::fs::write(tmp.path().join("b"), vec![0u8; 16]).expect("corrupt donor b");
+        let staging = tmp.path().join("blob");
+        let driver = RecordingDriver {
+            hash: whole,
+            staging: staging.clone(),
+            content: content.clone(),
+            driven: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let outcome = reassemble_dedup(
+            &driver,
+            &plan,
+            total,
+            None,
+            &ChunkIndex::default(),
+            &FetchPlan::default(),
+            None,
+            &|| {},
+        )
+        .await
+        .expect("reassembly must succeed");
+
+        assert_eq!(std::fs::read(&staging).expect("read staging"), content);
+        assert_eq!(
+            driver.driven.lock().expect("driven lock").clone(),
+            vec![(GROUP, total - GROUP)],
+            "the failed donor's whole groups are driven, boundary group included"
+        );
+        assert_eq!(outcome.spliced_bytes, cut);
+        assert_eq!(outcome.hints_ignored, 1);
+    }
+
+    /// A deferred chunk whose fetcher finishes without producing it is driven
+    /// over every group its span touches, so the boundary group it shares with a
+    /// spliced donor ends up whole.
+    #[tokio::test]
+    async fn reconcile_deferred_falls_back_to_the_outward_group_span() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let total = 4 * GROUP;
+        let content: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let whole = *blake3::hash(&content).as_bytes();
+        let cut = GROUP + 5000;
+        let (hints, mut map) = two_donor_fixture(tmp.path(), &content, cut);
+        // Chunk b is not materialized: it is assigned to a sibling that has
+        // already finished without registering it.
+        let b_hash = hints[1].hash;
+        map.remove(&b_hash);
+        let mut fetch_plan = FetchPlan::default();
+        fetch_plan.assigned.insert(b_hash, [0xaa; 32]);
+        let index = ChunkIndex::default();
+        index.mark_finished([0xaa; 32]);
+        let plan = plan_reassembly(&hints, &map, &fetch_plan, whole, total);
+        assert!(plan.drive.is_empty(), "drive: {:?}", plan.drive);
+        let staging = tmp.path().join("blob");
+        let driver = RecordingDriver {
+            hash: whole,
+            staging: staging.clone(),
+            content: content.clone(),
+            driven: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let outcome = reassemble_dedup(
+            &driver,
+            &plan,
+            total,
+            None,
+            &index,
+            &fetch_plan,
+            None,
+            &|| {},
+        )
+        .await
+        .expect("reassembly must succeed");
+
+        assert_eq!(std::fs::read(&staging).expect("read staging"), content);
+        assert_eq!(
+            driver.driven.lock().expect("driven lock").clone(),
+            vec![(GROUP, total - GROUP)]
+        );
+        assert_eq!(outcome.spliced_bytes, cut);
     }
 
     /// A deferred chunk whose assigned fetcher registers its donor only AFTER the
@@ -5881,11 +6250,11 @@ mod tests {
         };
         let plan = ReassemblePlan {
             donor: Vec::new(),
-            deferred: vec![Hint {
+            deferred: vec![whole_deferred(Hint {
                 hash: chunk_hash,
                 offset: 0,
                 len: deferred_len,
-            }],
+            })],
             drive: vec![(deferred_len, 2 * GROUP)],
         };
         let index = std::sync::Arc::new(ChunkIndex::default());
@@ -5960,11 +6329,11 @@ mod tests {
         };
         let plan = ReassemblePlan {
             donor: Vec::new(),
-            deferred: vec![Hint {
+            deferred: vec![whole_deferred(Hint {
                 hash: chunk_hash,
                 offset: 0,
                 len: deferred_len,
-            }],
+            })],
             drive: vec![(deferred_len, 2 * GROUP)],
         };
         let index = std::sync::Arc::new(ChunkIndex::default());
@@ -6094,7 +6463,8 @@ mod tests {
             .expect("presize partial");
 
         let donor = DonorRange {
-            aligned: (GROUP, GROUP),
+            dst: (GROUP, GROUP),
+            refetch: (GROUP, GROUP),
             source: donor_path,
             src_offset: u64::try_from(pad_before).expect("pad_before fits in u64"),
             chunk_hash,
@@ -6142,7 +6512,8 @@ mod tests {
             .expect("presize partial");
 
         let donor = DonorRange {
-            aligned: (GROUP, GROUP),
+            dst: (GROUP, GROUP),
+            refetch: (GROUP, GROUP),
             source: donor_path,
             src_offset: 0,
             chunk_hash,
@@ -6150,8 +6521,9 @@ mod tests {
             chunk_len: GROUP,
         };
 
-        let refetch = splice_donors(&partial, std::slice::from_ref(&donor)).expect("splice");
-        assert_eq!(refetch, vec![donor.aligned]);
+        let failed = splice_donors(&partial, std::slice::from_ref(&donor)).expect("splice");
+        let refetch: Vec<(u64, u64)> = failed.iter().map(|d| d.refetch).collect();
+        assert_eq!(refetch, vec![donor.refetch]);
 
         // No (wrong) bytes were written for the untrusted donor: the recipient
         // range stays at its pre-sized zero value.
