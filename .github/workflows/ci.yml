@@ -331,6 +331,8 @@ jobs:
       contents: read
       pull-requests: write
       actions: read
+      # `Upload code coverage` posts the Cobertura report to GitHub Code Quality.
+      code-quality: write
     # RUSTFLAGS lives at the JOB level (not step level) so the
     # Swatinem/rust-cache step that runs early in this job sees it. That
     # action hashes CARGO_*/RUST_* env vars into its cache key, so this
@@ -440,6 +442,25 @@ jobs:
       - name: Report disk usage
         if: always()
         run: df -h /
+
+      # GitHub Code Quality coverage reads Cobertura XML only. `report` re-exports
+      # the profile data the `Run tests` step already collected; it does not
+      # rebuild or rerun anything. Both steps are best-effort, like the rest of
+      # the coverage post-processing: a failure never blocks the PR. The upload
+      # action skips fork PRs by itself (their token is read-only).
+      - name: Export Cobertura coverage
+        continue-on-error: true
+        run: cargo llvm-cov report --cobertura --output-path cobertura.xml
+
+      - name: Upload code coverage
+        if: hashFiles('cobertura.xml') != ''
+        continue-on-error: true
+        uses: actions/upload-code-coverage@v1
+        with:
+          file: cobertura.xml
+          language: Rust
+          label: code-coverage/cargo-llvm-cov
+          fail-on-error: false
 
       # Doctests are NOT run here. `cargo llvm-cov nextest` does not execute
       # them, and a bare `cargo test --doc` appended to this job cannot reuse
