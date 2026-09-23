@@ -129,6 +129,30 @@ fn credit_advance(
     Ok((new_credited, credited_bytes))
 }
 
+/// The share of an outstanding chunk a voucher may take from lane headroom
+/// (ADR 003 §Concurrent Streams).
+///
+/// A **metering** voucher — one that carries a live `chain_root` — never pays a
+/// whole chunk. The payer pays every whole chunk with a reveal and sends a
+/// metering voucher only to open, re-anchor, or roll a chain. Those vouchers can
+/// fold a reveal that a sibling stream carries and this node has not read yet.
+/// If such a voucher took the chunk from headroom, the sibling's reveal would
+/// then find no headroom left, and the sibling would wait for a proof the payer
+/// never sends. So a metering voucher credits nothing against a whole chunk: it
+/// advances the watermark and anchors its stream, and the stream waits for its
+/// reveal.
+///
+/// A sealed voucher (`chain_root == 0`) and a voucher that settles a partial
+/// closing chunk (`delta_bytes < CHUNK_BYTES`) keep the full delta: each is the
+/// payment for the bytes it answers.
+fn voucher_credit_delta(wire: &decdn_protocol::client::Voucher, delta_bytes: u64) -> u64 {
+    if wire.chain_root != [0u8; 32] && delta_bytes >= super::CHUNK_BYTES {
+        0
+    } else {
+        delta_bytes
+    }
+}
+
 impl ClientHandler {
     /// Read ONE cumulative voucher, verify it under the per-lane lock, and — on
     /// success — advance the in-memory lane watermark and record it to the pool
@@ -286,14 +310,19 @@ impl ClientHandler {
         // bare reveal arriving on it afterwards is placeable. A sealed voucher
         // clears the anchor instead — it opens no chain to reveal against.
         anchor.adopt(B256::from(wire.chain_root));
-        // Rule #1 cap: credit paid headroom by at most the amount the watermark
-        // advanced. `paid_credited` is monotone and bounded by the settled
-        // watermark, so a benign already-satisfied voucher (watermark unchanged)
-        // credits nothing and cannot reopen the credit window for bytes no voucher
-        // settled. Computed under the guard so the read of `paid_credited` and its
-        // store cannot interleave with another voucher.
-        let (new_credited, credited_bytes) =
-            credit_advance(guard.paid_credited, delta_bytes, verified.new_bytes)?;
+        // Rule #1 cap: credit this stream from lane headroom — proved bytes no
+        // stream has claimed yet. `paid_credited` is monotone and bounded by the
+        // settled watermark, so a voucher can never reopen the credit window for
+        // bytes no proof settled. A metering voucher takes no whole chunk from
+        // that headroom (`voucher_credit_delta`): the reveal it precedes, or a
+        // sibling's reveal it folded, pays the chunk. Computed under the guard so
+        // the read of `paid_credited` and its store cannot interleave with
+        // another proof.
+        let (new_credited, credited_bytes) = credit_advance(
+            guard.paid_credited,
+            voucher_credit_delta(&wire, delta_bytes),
+            verified.new_bytes,
+        )?;
         guard.paid_credited = new_credited;
         if let Err(e) = self.channel_state_store.record(&guard.state) {
             drop(guard);
@@ -331,9 +360,9 @@ impl ClientHandler {
         //
         // Only a proof that actually CREDITED bytes gets a receipt. Under
         // `PayWord` a stream sends an anchor voucher before its first reveal of
-        // an epoch, and that voucher re-asserts a cumulative the lane already
-        // holds — it is already-satisfied, it credits nothing, and logging it
-        // would put a payment in the audit log that never happened.
+        // an epoch. That voucher is a metering voucher against a whole chunk, so
+        // it credits nothing, and logging it would put a payment in the audit
+        // log that this stream never took.
         if credited_bytes > 0 {
             self.record_receipt(hash, credited_bytes, client_node_id, verified.amount);
         }
@@ -449,15 +478,20 @@ impl ClientHandler {
         // A reveal that advanced nothing — at or below the frontier, or naming a
         // superseded epoch — advances the lane's claim by nothing, so nothing is
         // recorded and no redeem hint fires. But this stream still DELIVERED
-        // `delta_bytes`, and a concurrent same-lane sibling that raced the shared
-        // chain index ahead has ALREADY paid the lane for them. So credit this
-        // stream from that lane headroom rather than throttling it to a
-        // `MAX_PROOFS_PER_CHUNK` stall — the same fungible-credit rule the benign
-        // already-satisfied VOUCHER path applies (`verify_voucher`'s
-        // `AmountRegression` arm). Without it, cross-stream reveal reordering
-        // starves the slower stream: its reveals keep landing below the frontier,
-        // credit nothing, and its unpaid frontier is throttled into a
+        // `delta_bytes`, and the lane already holds the money for them: a
+        // concurrent same-lane sibling raced the shared chain index ahead, or a
+        // sibling's rollover voucher folded this very reveal into the watermark.
+        // So credit this stream from that lane headroom rather than throttling it
+        // to a `MAX_PROOFS_PER_CHUNK` stall. Without it, cross-stream reveal
+        // reordering starves the slower stream: its reveals keep landing below the
+        // frontier, credit nothing, and its unpaid frontier is throttled into a
         // `ClientPaymentFault` (the concurrent same-lane voucher-starvation bug).
+        //
+        // The headroom is this reveal's to take because no metering voucher takes
+        // a whole chunk from it (`voucher_credit_delta`). A sibling's rollover
+        // that folds this reveal advances the watermark and credits its own
+        // stream nothing, so the headroom it opens waits here for the reveal the
+        // payer did send.
         //
         // The credit is bounded by the lane's proven `owed_bytes`, and
         // `paid_credited` is monotone, so total credit across every same-lane
@@ -918,6 +952,61 @@ mod tests {
         assert_eq!(
             credited, 0,
             "an already fully credited watermark credits nothing further"
+        );
+    }
+
+    /// A wire voucher naming `chain_root`, for the credit-share tests. Only the
+    /// root matters to [`super::voucher_credit_delta`]; the other fields are
+    /// placeholders.
+    fn wire_voucher_with_root(chain_root: [u8; 32]) -> decdn_protocol::client::Voucher {
+        decdn_protocol::client::Voucher {
+            signature: vec![0u8; 65],
+            amount: 0,
+            bytes_delivered: 0,
+            chain_root,
+            chunk_price: 0,
+        }
+    }
+
+    /// A metering voucher (live root) takes no whole chunk from lane headroom,
+    /// even when the headroom covers it: the reveal it precedes, or a sibling's
+    /// reveal it folded, pays that chunk.
+    #[test]
+    fn a_metering_voucher_credits_no_whole_chunk() {
+        let chunk = super::super::CHUNK_BYTES;
+        let wire = wire_voucher_with_root([0x5E; 32]);
+        let delta = super::voucher_credit_delta(&wire, chunk);
+        assert_eq!(delta, 0, "a metering voucher pays no whole chunk");
+        let (new_credited, credited) =
+            super::credit_advance(U256::ZERO, delta, U256::from(4 * chunk))
+                .expect("credit_advance is infallible for in-range values");
+        assert_eq!(new_credited, U256::ZERO, "the headroom stays unclaimed");
+        assert_eq!(credited, 0);
+    }
+
+    /// A metering voucher that settles a partial closing chunk is the payment
+    /// for those bytes, so it keeps its full delta.
+    #[test]
+    fn a_metering_voucher_settles_a_closing_partial() {
+        let partial = super::super::CHUNK_BYTES - 1;
+        let wire = wire_voucher_with_root([0x5E; 32]);
+        assert_eq!(
+            super::voucher_credit_delta(&wire, partial),
+            partial,
+            "a closing residual under one chunk credits in full"
+        );
+    }
+
+    /// A sealed voucher (zero root) meters no chain, so nothing else can pay the
+    /// chunk it answers: it keeps the full delta.
+    #[test]
+    fn a_sealed_voucher_credits_a_whole_chunk() {
+        let chunk = super::super::CHUNK_BYTES;
+        let wire = wire_voucher_with_root([0u8; 32]);
+        assert_eq!(
+            super::voucher_credit_delta(&wire, chunk),
+            chunk,
+            "a sealed voucher pays its whole chunk"
         );
     }
 

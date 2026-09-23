@@ -314,8 +314,11 @@ independently fetched chunk.
 The run schedules entries smallest whole-file first, so a shared chunk's
 assigned holder starts — and finishes — before the larger entries that
 splice from it. Each entry drives and pays for its own ranges up front (its
-unique chunks, the chunks assigned to it, and any un-splice-able edge
-groups); it does not drive the ranges it defers to a sibling. It reconciles
+unique chunks, the chunks assigned to it, and the partial chunk groups at
+the edges of each spliced run); it does not drive the ranges it defers to a
+sibling. Adjacent spliced chunks form one run, so a boundary between two
+spliced chunks costs no fetch. A spliced chunk that fails its hash check is
+fetched again over the whole chunk groups that it touches. It reconciles
 those deferred ranges at its tail: it splices each one as the assigned
 holder registers it, and waits on the holder rather than a clock, because
 the deferred bytes are exactly what that holder is still downloading. A

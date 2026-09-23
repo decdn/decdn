@@ -183,7 +183,10 @@ jobs:
     # the PR. Runs on the same pinned stable toolchain as everything else (the
     # test sets RUSTC_BOOTSTRAP=1 to emit rustdoc JSON without nightly). Kept a
     # separate job (clean env, no coverage instrumentation / mold) so it never
-    # perturbs the required `test` job.
+    # perturbs the required `test` job. Each step runs only the `public_api`
+    # target: the `test` job owns every other test in both crates, and running
+    # them here beside the rustdoc render starves `decdn-client`'s
+    # timing-sensitive scheduler tests.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -195,8 +198,8 @@ jobs:
       - uses: taiki-e/install-action@v2.87.16
         with:
           tool: cargo-nextest
-      - run: cargo nextest run -p decdn-protocol --features public-api-test
-      - run: cargo nextest run -p decdn-client --features public-api-test
+      - run: cargo nextest run -p decdn-protocol --features public-api-test --test public_api
+      - run: cargo nextest run -p decdn-client --features public-api-test --test public_api
 
   changes:
     name: detect changes

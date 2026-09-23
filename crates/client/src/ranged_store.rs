@@ -45,7 +45,7 @@ use crate::sink::{StashedFault, classify_decode_error};
 /// record, all for one blob `(root, total_bytes)`.
 ///
 /// `present` and `data_path` are held behind `Arc<Mutex<..>>` so `admit`,
-/// `finalize` and the `ingest_stream` flushes can move clones of them into
+/// `finalize` and the `ingest_stream` checkpoint worker can move clones of them into
 /// `tokio::task::spawn_blocking` closures without borrowing `self` across an
 /// await point.
 ///
@@ -78,10 +78,14 @@ pub struct ClientRangedStore {
     /// construction, updated in memory by `admit`/`ingest_stream`/`finalize`,
     /// persisted by `admit`/`finalize`/`flush_present_record`).
     present: Arc<Mutex<ChunkRanges>>,
-    /// Test-only stall injected into each ingest flush before its writes and
-    /// fsync, to model a slow disk.
+    /// Test-only stall injected before each ingest checkpoint fsync, to model
+    /// a slow disk.
     #[cfg(test)]
-    flush_delay: std::time::Duration,
+    fsync_delay: std::time::Duration,
+    /// Test-only count of the ingest checkpoint fsyncs across every
+    /// `ingest_stream` call on this store.
+    #[cfg(test)]
+    fsyncs: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl std::fmt::Debug for ClientRangedStore {
@@ -261,7 +265,9 @@ impl ClientRangedStore {
             ranges_path,
             present: Arc::new(Mutex::new(present)),
             #[cfg(test)]
-            flush_delay: std::time::Duration::ZERO,
+            fsync_delay: std::time::Duration::ZERO,
+            #[cfg(test)]
+            fsyncs: Arc::default(),
         })
     }
 
@@ -321,7 +327,9 @@ impl ClientRangedStore {
                 ranges_path,
                 present: Arc::new(Mutex::new(present)),
                 #[cfg(test)]
-                flush_delay: std::time::Duration::ZERO,
+                fsync_delay: std::time::Duration::ZERO,
+                #[cfg(test)]
+                fsyncs: Arc::default(),
             });
         }
 
@@ -336,7 +344,9 @@ impl ClientRangedStore {
             ranges_path,
             present: Arc::new(Mutex::new(present)),
             #[cfg(test)]
-            flush_delay: std::time::Duration::ZERO,
+            fsync_delay: std::time::Duration::ZERO,
+            #[cfg(test)]
+            fsyncs: Arc::default(),
         })
     }
 
@@ -469,36 +479,61 @@ impl ClientRangedStore {
     ///
     /// It also bounds the re-pay window. Content received since the last
     /// durable checkpoint is re-pulled and **re-paid** on resume. On a stream
-    /// fault the call waits for the flush in flight, so a fault re-pays less
-    /// than one interval, times at most `MAX_RESUME_ATTEMPTS`. On a crash, or
-    /// when the caller drops the future (a scheduler steal or stall), the flush
-    /// in flight can also miss the resume read, so less than two intervals.
-    /// Checkpointed (durably-recorded) bytes are never re-paid.
+    /// fault the call checkpoints every verified leaf before it returns, so a
+    /// fault re-pays only the bytes past the last verified chunk group (unless
+    /// a checkpoint itself fails). On a crash, or when the caller drops the
+    /// future (a scheduler steal or stall), the unflushed batch is lost and
+    /// the queued checkpoints can miss the resume read, so the re-pay is at
+    /// most `INGEST_MAX_QUEUED_CHECKPOINTS + 1` intervals. Checkpointed
+    /// (durably-recorded) bytes are never re-paid.
     ///
     /// It is a fsync-amortization knob, not a payment one: it sits four payment
-    /// quanta (`decdn_protocol::client::CHUNK_BYTES`) wide, so a fault can
-    /// re-pay up to four chunks (eight on a crash or dropped future). Narrowing
-    /// it toward one chunk would tighten that window at four times the fsync
-    /// rate, which is a storage tradeoff rather than a payment-correctness one
-    /// — the payer re-pays only what it genuinely re-pulls either way.
+    /// quanta (`decdn_protocol::client::CHUNK_BYTES`) wide, so a crash or a
+    /// dropped future can re-pay up to `4 * (INGEST_MAX_QUEUED_CHECKPOINTS + 1)`
+    /// chunks. Narrowing it toward one chunk would tighten that window at four
+    /// times the fsync rate, which is a storage tradeoff rather than a
+    /// payment-correctness one — the payer re-pays only what it genuinely
+    /// re-pulls either way.
     pub(crate) const INGEST_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
+
+    /// The most checkpoints one [`Self::ingest_stream`] call holds between the
+    /// decode loop and durability: queued for the fsync worker, or written by
+    /// it and not yet fsynced. The loop hands a full batch to the worker and
+    /// keeps decoding. It waits only when this many checkpoints are not yet
+    /// durable, so a slow fsync stalls payment only after the loop has run
+    /// this many intervals ahead of the disk.
+    ///
+    /// Three checkpoints let one slow fsync overlap 12 MiB of further decode
+    /// and payment. The bound caps both the undurable window (the crash and
+    /// dropped-future re-pay bound on `INGEST_CHECKPOINT_BYTES`) and the
+    /// memory per call, at `INGEST_MAX_QUEUED_CHECKPOINTS + 1` intervals. It
+    /// also caps how many queued checkpoints the worker folds into one fsync,
+    /// so a producer that never slows cannot defer every fsync forever.
+    pub(crate) const INGEST_MAX_QUEUED_CHECKPOINTS: usize = 3;
 
     /// Stream the raw bao encoding of `range` (from `reader`) into the store:
     /// verify each chunk group against the root as
     /// [`bao_tree::io::fsm::ResponseDecoder`] decodes it, collect the verified
-    /// leaves and parent proof pairs into a batch, and flush each batch of
-    /// roughly `INGEST_CHECKPOINT_BYTES` (plus the remainder at completion) as
-    /// one durable checkpoint: positioned-write the leaves into the `.partial`
-    /// data file, save the parents into the `.obao4` outboard, fsync both, then
-    /// union the received prefix into `present`.
+    /// leaves and parent proof pairs into a batch, and hand each batch of
+    /// roughly `INGEST_CHECKPOINT_BYTES` (plus the remainder at completion) to
+    /// a checkpoint worker as one durable checkpoint: positioned-write the
+    /// leaves into the `.partial` data file, save the parents into the `.obao4`
+    /// outboard, fsync both, then union the received prefix into `present`.
     ///
-    /// Every file operation runs on `tokio::task::spawn_blocking`, never on a
-    /// runtime worker. The paid pull pays from inside this decode loop, so a
-    /// worker parked in an fsync would stop voucher sends on every stream that
-    /// shares the runtime. At most one flush is in flight: the loop decodes
-    /// the next batch while the previous one writes, and waits for that flush
-    /// only when the next batch is full. Memory per call is bounded by two
-    /// batches (about `2 * INGEST_CHECKPOINT_BYTES`).
+    /// Every file operation runs on a `tokio::task::spawn_blocking` worker,
+    /// never on a runtime worker. The paid pull pays from inside this decode
+    /// loop, so a runtime worker parked in an fsync would stop voucher sends
+    /// on every stream that shares the runtime, and a decode loop that waits
+    /// for each fsync would stop its own. The loop therefore queues each full
+    /// batch and keeps decoding; it waits only when
+    /// `INGEST_MAX_QUEUED_CHECKPOINTS` checkpoints are not yet durable. One
+    /// worker at a time takes the checkpoints in order, writes each one, folds
+    /// the checkpoints already queued behind it into the same fsync (up to
+    /// `INGEST_MAX_QUEUED_CHECKPOINTS` per fsync), and only then extends
+    /// `present`. The in-order worker keeps `present` a contiguous prefix and
+    /// writes the outboard parents of an earlier batch before a later one. It
+    /// runs only while checkpoints are queued. Memory per call is bounded by
+    /// `INGEST_MAX_QUEUED_CHECKPOINTS + 1` batches.
     ///
     /// This is the streaming sibling of [`RangedStore::admit`]: `admit` takes
     /// a whole range's bao bytes already assembled in memory, while
@@ -520,19 +555,19 @@ impl ClientRangedStore {
     /// The same fsync-before-record invariant `write_ranges_record`'s
     /// callers already establish: a checkpoint never lets `present` (and
     /// therefore the persisted `.ranges` record) claim bytes that are not yet
-    /// durable on disk. On a peer fault the call waits for the flush in flight,
-    /// so it loses only the unflushed tail — strictly less than one
-    /// `INGEST_CHECKPOINT_BYTES` interval of received content — which
-    /// the next `missing_ranges`/resume call simply re-fetches AND re-pays
-    /// for (those bytes were already voucher-paid on the fault-side pull; see
+    /// durable on disk. On a peer fault the call checkpoints the verified
+    /// batch it holds and waits for every queued checkpoint, so it loses no
+    /// verified leaf; the next `missing_ranges`/resume call re-fetches AND
+    /// re-pays only the bytes past the last verified chunk group (see
     /// `INGEST_CHECKPOINT_BYTES`'s doc for the re-pay-window bound). A crash
-    /// loses the flush in flight too, so less than two intervals. Dropping the
-    /// future detaches the flush in flight rather than cancelling it: the flush
-    /// still writes the same verified bytes, fsyncs, and unions into `present`,
-    /// but possibly after the caller's next `missing_ranges` read, so that span
-    /// can be re-fetched as well. It never loses (or re-claims) a byte that a
-    /// prior checkpoint already made durable, and it never claims a byte that
-    /// was not actually fsync'd.
+    /// loses the unflushed batch and every queued checkpoint, so at most
+    /// `INGEST_MAX_QUEUED_CHECKPOINTS + 1` intervals. Dropping the future
+    /// loses the unflushed batch and detaches the queued checkpoints rather
+    /// than cancelling them: the worker still writes the same verified bytes,
+    /// fsyncs, and unions them into `present`, but possibly after the caller's
+    /// next `missing_ranges` read, so that span can be re-fetched as well. It
+    /// never loses (or re-claims) a byte that a prior checkpoint already made
+    /// durable, and it never claims a byte that was not actually fsync'd.
     ///
     /// # Errors
     ///
@@ -542,11 +577,11 @@ impl ClientRangedStore {
     ///   `sink::classify_decode_error`: [`crate::HashMismatch`] for a
     ///   verification failure, a truncation error for a short stream.
     /// - Any I/O failure opening, writing or fsyncing the `.partial`/`.obao4`
-    ///   files, or a flush task that panics. When the stream itself failed, the
-    ///   stashed fault or decode failure outranks a flush failure, which is
-    ///   logged instead: it says what the peer did, which decides retry and
-    ///   blame, and a local disk error does not make a bad or truncated stream
-    ///   good.
+    ///   files, or a checkpoint worker that panics. When the stream itself
+    ///   failed, the stashed fault or decode failure outranks a checkpoint
+    ///   failure, which is logged instead: it says what the peer did, which
+    ///   decides retry and blame, and a local disk error does not make a bad
+    ///   or truncated stream good.
     pub async fn ingest_stream<R>(
         &self,
         range: &AlignedRange,
@@ -556,7 +591,7 @@ impl ClientRangedStore {
     where
         R: iroh_io::AsyncStreamReader + StashedFault + Send,
     {
-        let mut flusher = IngestFlusher::open(self).await?;
+        let mut flusher = IngestFlusher::open(self, range).await?;
 
         let root = bao_tree::blake3::Hash::from(self.root);
         let ranges = range.chunk_ranges().clone();
@@ -566,7 +601,7 @@ impl ClientRangedStore {
         // received and verified so far (not yet necessarily flushed — see
         // `batch_start` below).
         let mut received_end = range.fetch_start();
-        // The prefix already handed to a flush. Only the span
+        // The prefix already handed to the checkpoint worker. Only the span
         // `[batch_start, received_end)` sits in `batch`.
         let mut batch_start = range.fetch_start();
         let mut batch = FlushBatch::default();
@@ -585,7 +620,7 @@ impl ClientRangedStore {
                     }
                     if received_end.saturating_sub(batch_start) >= Self::INGEST_CHECKPOINT_BYTES {
                         flusher
-                            .start(self, std::mem::take(&mut batch), range, received_end)
+                            .start(std::mem::take(&mut batch), received_end)
                             .await?;
                         batch_start = received_end;
                     }
@@ -597,9 +632,14 @@ impl ClientRangedStore {
                 }
                 ResponseDecoderNext::More((rest, Err(decode_err))) => {
                     let mut r = rest.finish();
-                    // Land the flush in flight so its prefix is not re-paid on
-                    // resume. The fault is the error that matters here.
-                    if let Err(flush_err) = flusher.reclaim().await {
+                    // The decoder yields a leaf or parent only once it
+                    // verifies, and yields the leaves of the one contiguous
+                    // `range` in order, so `batch` holds verified items and
+                    // `[fetch_start, received_end)` is a received prefix.
+                    // Checkpoint it with the queued ones so the prefix is not
+                    // re-paid on resume. The fault is the error that matters
+                    // here.
+                    if let Err(flush_err) = flusher.finish(batch, received_end).await {
                         warn_flush_failed_on_fault(&flush_err, range, received_end);
                     }
                     if let Some(fault) = r.take_fault() {
@@ -608,7 +648,7 @@ impl ClientRangedStore {
                     return Err(classify_decode_error(decode_err));
                 }
                 ResponseDecoderNext::Done(mut r) => {
-                    let flush_result = flusher.finish(self, batch, range, received_end).await;
+                    let flush_result = flusher.finish(batch, received_end).await;
                     // A stashed fault outranks a local flush failure: it says
                     // what the peer did, which decides retry and blame.
                     if let Some(fault) = r.take_fault() {
@@ -649,7 +689,7 @@ impl ClientRangedStore {
     /// scheduler's flush owner for multi-source fetches, and `finalize`, and
     /// the end of single-source `drive`) invoke this so no two writers race
     /// the record file. `present` only ever grows and is unioned under the
-    /// mutex AFTER data/outboard fsync (the `checkpoint` helper's ordering),
+    /// mutex AFTER data/outboard fsync (the `sync_and_union` helper's ordering),
     /// so the persisted record never claims a range that is not durably on
     /// disk.
     ///
@@ -670,8 +710,7 @@ impl ClientRangedStore {
 }
 
 /// The open `.partial` data file and `.obao4` outboard of one
-/// [`ClientRangedStore::ingest_stream`] call. It moves into each flush's
-/// blocking task and comes back when the flush completes.
+/// [`ClientRangedStore::ingest_stream`] call, held by its [`IngestPipeline`].
 struct IngestFiles {
     data: File,
     outboard: PreOrderOutboard<File>,
@@ -691,20 +730,40 @@ impl FlushBatch {
     }
 }
 
-/// Runs the checkpoints of one [`ClientRangedStore::ingest_stream`] call on
-/// `spawn_blocking`, one at a time. `files` is `Some` while no flush is in
-/// flight; `in_flight` holds the flush that currently owns them. A failed
-/// flush consumes the files, so after one both are `None` and the caller
-/// returns that error rather than flushing again.
+/// One verified batch on its way to durability: it checkpoints the prefix
+/// `[range.fetch_start(), received_end)` and holds one of the
+/// `INGEST_MAX_QUEUED_CHECKPOINTS` pipeline slots until that prefix is
+/// fsynced.
+struct Checkpoint {
+    batch: FlushBatch,
+    received_end: u64,
+    slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// The decode-loop side of one [`ClientRangedStore::ingest_stream`] call's
+/// checkpoint pipeline. It queues each full batch on the shared
+/// [`IngestPipeline`] and waits only for a free slot, never for an fsync.
+///
+/// A slot is taken before a checkpoint is queued and freed only once a
+/// worker has made it durable, so at most `INGEST_MAX_QUEUED_CHECKPOINTS`
+/// checkpoints are queued or unsynced at once.
+///
+/// Dropping the flusher stops the queueing. A running worker still drains
+/// what is queued, fsyncs it and unions it into `present`, then exits
+/// detached.
 struct IngestFlusher {
-    files: Option<IngestFiles>,
-    in_flight: Option<tokio::task::JoinHandle<anyhow::Result<IngestFiles>>>,
+    pipeline: Arc<IngestPipeline>,
+    slots: Arc<tokio::sync::Semaphore>,
+    /// The worker this flusher started last. Only this flusher starts
+    /// workers, and a worker exits only once the queue is empty or it has
+    /// failed, so this is the one worker that can still run or that failed.
+    worker: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
 impl IngestFlusher {
     /// Open `store`'s `.partial` data file and `.obao4` outboard for writing,
-    /// on `spawn_blocking`.
-    async fn open(store: &ClientRangedStore) -> anyhow::Result<Self> {
+    /// on `spawn_blocking`, for the ingest of `range`.
+    async fn open(store: &ClientRangedStore, range: &AlignedRange) -> anyhow::Result<Self> {
         let path = store
             .data_path
             .lock()
@@ -732,82 +791,252 @@ impl IngestFlusher {
             })
         })
         .await??;
+        let pipeline = IngestPipeline {
+            state: Mutex::new(PipelineState::default()),
+            files: Mutex::new(files),
+            present: Arc::clone(&store.present),
+            total_bytes: store.total_bytes,
+            range: range.clone(),
+            #[cfg(test)]
+            fsync_delay: store.fsync_delay,
+            #[cfg(test)]
+            fsyncs: Arc::clone(&store.fsyncs),
+        };
         Ok(Self {
-            files: Some(files),
-            in_flight: None,
+            pipeline: Arc::new(pipeline),
+            slots: Arc::new(tokio::sync::Semaphore::new(
+                ClientRangedStore::INGEST_MAX_QUEUED_CHECKPOINTS,
+            )),
+            worker: None,
         })
     }
 
-    /// Flush the final `batch`, if it holds anything, and wait until every
-    /// flush has landed.
-    async fn finish(
-        &mut self,
-        store: &ClientRangedStore,
-        batch: FlushBatch,
-        range: &AlignedRange,
-        received_end: u64,
-    ) -> anyhow::Result<()> {
-        if !batch.is_empty() {
-            self.start(store, batch, range, received_end).await?;
-        }
-        self.reclaim().await
-    }
-
-    /// Wait for the flush in flight, if any, and take the files back.
-    async fn reclaim(&mut self) -> anyhow::Result<()> {
-        if let Some(handle) = self.in_flight.take() {
-            let files = handle
-                .await
-                .map_err(|e| anyhow::anyhow!("ingest checkpoint task failed: {e}"))??;
-            self.files = Some(files);
-        }
-        Ok(())
-    }
-
-    /// Wait for the previous flush, then start a flush of `batch` that
-    /// checkpoints the prefix `[range.fetch_start(), received_end)`.
-    async fn start(
-        &mut self,
-        store: &ClientRangedStore,
-        batch: FlushBatch,
-        range: &AlignedRange,
-        received_end: u64,
-    ) -> anyhow::Result<()> {
-        self.reclaim().await?;
-        let mut files = self.files.take().ok_or_else(|| {
-            anyhow::anyhow!("ingest flusher has no files: a prior flush error was ignored")
-        })?;
-        let present = Arc::clone(&store.present);
-        let total_bytes = store.total_bytes;
-        let range = range.clone();
-        #[cfg(test)]
-        let flush_delay = store.flush_delay;
-        self.in_flight = Some(tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            std::thread::sleep(flush_delay);
-            // Log here as well as returning the error: when the caller drops
-            // `ingest_stream`, nobody awaits this task, and the error would
-            // otherwise vanish.
-            let res = checkpoint(
-                &mut files,
-                &batch,
-                &present,
-                total_bytes,
-                &range,
-                received_end,
-            );
-            if let Err(e) = &res {
-                tracing::warn!(
-                    error = %e,
-                    fetch_start = range.fetch_start(),
+    /// Queue `batch` as the checkpoint of the prefix
+    /// `[range.fetch_start(), received_end)`, and start a worker if none is
+    /// running. Waits only while every slot holds a checkpoint that is not yet
+    /// durable.
+    ///
+    /// # Errors
+    ///
+    /// The worker's own error (or panic) when a checkpoint failed.
+    async fn start(&mut self, batch: FlushBatch, received_end: u64) -> anyhow::Result<()> {
+        let slot = Arc::clone(&self.slots)
+            .acquire_owned()
+            .await
+            .map_err(|e| anyhow::anyhow!("ingest checkpoint slots closed: {e}"))?;
+        let start_worker = {
+            let mut state = self.pipeline.lock_state()?;
+            if state.failed {
+                None
+            } else {
+                state.queue.push_back(Checkpoint {
+                    batch,
                     received_end,
-                    "ingest checkpoint failed"
-                );
+                    slot,
+                });
+                Some(!std::mem::replace(&mut state.worker_running, true))
             }
-            res.map(|()| files)
-        }));
+        };
+        match start_worker {
+            Some(true) => {
+                let pipeline = Arc::clone(&self.pipeline);
+                self.worker = Some(tokio::task::spawn_blocking(move || pipeline.run()));
+                Ok(())
+            }
+            Some(false) => Ok(()),
+            None => match self.join().await {
+                Err(e) => Err(e),
+                Ok(()) => Err(anyhow::anyhow!("ingest checkpoint worker failed")),
+            },
+        }
+    }
+
+    /// Queue the final `batch`, if it holds anything, and wait until every
+    /// checkpoint is durable.
+    async fn finish(mut self, batch: FlushBatch, received_end: u64) -> anyhow::Result<()> {
+        if !batch.is_empty() {
+            self.start(batch, received_end).await?;
+        }
+        self.join().await
+    }
+
+    /// Wait for the last worker to exit and surface its result.
+    async fn join(&mut self) -> anyhow::Result<()> {
+        match self.worker.take() {
+            Some(handle) => handle
+                .await
+                .map_err(|e| anyhow::anyhow!("ingest checkpoint worker failed: {e}"))?,
+            None => Ok(()),
+        }
+    }
+}
+
+/// The checkpoint queue and open files of one
+/// [`ClientRangedStore::ingest_stream`] call, shared by its decode loop and
+/// its checkpoint worker.
+///
+/// A worker runs on `spawn_blocking` only while checkpoints are queued. It
+/// takes them in order and exits when the queue is empty; the next queued
+/// checkpoint starts a new one. The queue and the running flag share one
+/// lock, so a checkpoint is never left queued with no worker to take it, and
+/// at most one worker runs at a time. That keeps `present` a contiguous
+/// prefix of `range` and writes an earlier batch's outboard parents first. A
+/// worker that stays parked for the whole stream would instead hold a
+/// blocking-pool thread per ingest and stop a paused test clock from
+/// advancing.
+struct IngestPipeline {
+    state: Mutex<PipelineState>,
+    /// Locked by the running worker for its whole run; never by the decode
+    /// loop.
+    files: Mutex<IngestFiles>,
+    present: Arc<Mutex<ChunkRanges>>,
+    total_bytes: u64,
+    range: AlignedRange,
+    /// Test-only stall before each fsync, to model a slow disk.
+    #[cfg(test)]
+    fsync_delay: std::time::Duration,
+    /// Test-only count of the fsyncs the workers run.
+    #[cfg(test)]
+    fsyncs: Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// The queue side of an [`IngestPipeline`], under its lock.
+#[derive(Default)]
+struct PipelineState {
+    queue: std::collections::VecDeque<Checkpoint>,
+    /// A worker is taking checkpoints from `queue`.
+    worker_running: bool,
+    /// A worker failed or panicked. No new checkpoint is queued.
+    failed: bool,
+}
+
+impl IngestPipeline {
+    fn lock_state(&self) -> anyhow::Result<std::sync::MutexGuard<'_, PipelineState>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("ingest pipeline")))
+    }
+
+    /// The worker body: checkpoint every queued batch until the queue is
+    /// empty, or stop at the first failure. A failure (or a panic) marks the
+    /// pipeline failed and drops the queued checkpoints, which frees their
+    /// slots so the decode loop cannot wait on a slot that no worker will
+    /// free.
+    fn run(self: Arc<Self>) -> anyhow::Result<()> {
+        let mut exit = WorkerExit {
+            pipeline: &self,
+            clean: false,
+        };
+        let res = self.drain();
+        match &res {
+            Ok(()) => exit.clean = true,
+            // Log here as well as returning the error: when the caller drops
+            // `ingest_stream`, nobody awaits this worker, and the error would
+            // otherwise vanish.
+            Err(e) => tracing::warn!(
+                error = %e,
+                fetch_start = self.range.fetch_start(),
+                fetch_end = self.range.fetch_end(),
+                "ingest checkpoint failed"
+            ),
+        }
+        drop(exit);
+        res
+    }
+
+    /// Take the next checkpoint, write it, write the checkpoints queued
+    /// behind it (up to `INGEST_MAX_QUEUED_CHECKPOINTS` per group), then
+    /// fsync the group once and union its prefix into `present`.
+    ///
+    /// The group cap bounds how long a producer that never slows can defer
+    /// an fsync. Every checkpoint holds a slot, so the slots already imply
+    /// the cap; the loop states it locally. Every slot in the group frees only
+    /// after the fsync, so the slots bound the bytes that are received but
+    /// not yet durable.
+    fn drain(&self) -> anyhow::Result<()> {
+        let cap = ClientRangedStore::INGEST_MAX_QUEUED_CHECKPOINTS;
+        let mut files = self
+            .files
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("ingest files")))?;
+        let mut slots = Vec::with_capacity(cap);
+        while let Some(first) = self.pop(true)? {
+            let mut received_end = write_checkpoint(&mut files, first, &mut slots)?;
+            while slots.len() < cap {
+                let Some(next) = self.pop(false)? else {
+                    break;
+                };
+                received_end = received_end.max(write_checkpoint(&mut files, next, &mut slots)?);
+            }
+            #[cfg(test)]
+            {
+                std::thread::sleep(self.fsync_delay);
+                self.fsyncs
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            sync_and_union(
+                &files,
+                &self.present,
+                self.total_bytes,
+                &self.range,
+                received_end,
+            )?;
+            slots.clear();
+        }
         Ok(())
     }
+
+    /// Pop the next queued checkpoint. On an empty queue with `retire` set,
+    /// clear `worker_running` under the same lock the decode loop queues
+    /// under, so the next checkpoint starts a new worker.
+    fn pop(&self, retire: bool) -> anyhow::Result<Option<Checkpoint>> {
+        let mut state = self.lock_state()?;
+        let next = state.queue.pop_front();
+        if next.is_none() && retire {
+            state.worker_running = false;
+        }
+        Ok(next)
+    }
+}
+
+/// Marks the [`IngestPipeline`] failed when a worker exits on an error or a
+/// panic.
+struct WorkerExit<'a> {
+    pipeline: &'a IngestPipeline,
+    clean: bool,
+}
+
+impl Drop for WorkerExit<'_> {
+    fn drop(&mut self) {
+        if self.clean {
+            return;
+        }
+        let mut state = self
+            .pipeline
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.failed = true;
+        state.worker_running = false;
+        state.queue.clear();
+    }
+}
+
+/// Write `checkpoint`'s batch, free its memory, and keep its slot in `slots`
+/// until the group fsyncs. Returns the prefix end it checkpoints.
+fn write_checkpoint(
+    files: &mut IngestFiles,
+    checkpoint: Checkpoint,
+    slots: &mut Vec<tokio::sync::OwnedSemaphorePermit>,
+) -> anyhow::Result<u64> {
+    let Checkpoint {
+        batch,
+        received_end,
+        slot,
+    } = checkpoint;
+    write_batch(files, &batch)?;
+    slots.push(slot);
+    Ok(received_end)
 }
 
 /// Log a flush failure that a stream fault outranks, so it is not lost.
@@ -820,29 +1049,10 @@ fn warn_flush_failed_on_fault(err: &anyhow::Error, range: &AlignedRange, receive
     );
 }
 
-/// Durably checkpoint the prefix `[range.fetch_start(), received_end)` of
-/// an in-progress [`ClientRangedStore::ingest_stream`]: write `batch`'s leaves
-/// and parents, fsync the data and outboard files, THEN union the
-/// corresponding chunk ranges into `present`. The fsync-before-union ordering
-/// is load-bearing — see the durability contract on
-/// [`ClientRangedStore::ingest_stream`].
-///
-/// Does NOT persist the `.ranges` record — that is
-/// [`ClientRangedStore::flush_present_record`]'s job. Several `ingest_stream`
-/// calls can run concurrently on one store (the multi-source scheduler), so
-/// writing the record here, per checkpoint, out of the `present` lock would
-/// both race the record's write-and-rename across sources and serialize every
-/// source on the record's fsync. `present` only ever grows and is unioned
-/// under the mutex AFTER the data/outboard fsync, so whenever the record is
-/// next flushed it never claims a range that is not durably on disk.
-fn checkpoint(
-    files: &mut IngestFiles,
-    batch: &FlushBatch,
-    present: &Mutex<ChunkRanges>,
-    total_bytes: u64,
-    range: &AlignedRange,
-    received_end: u64,
-) -> anyhow::Result<()> {
+/// Write `batch`'s verified leaves into the `.partial` data file at their
+/// offsets and its parent proof pairs into the `.obao4` outboard. Nothing is
+/// durable, and `present` is unchanged, until [`sync_and_union`] runs.
+fn write_batch(files: &mut IngestFiles, batch: &FlushBatch) -> anyhow::Result<()> {
     for (offset, data) in &batch.leaves {
         files
             .data
@@ -855,11 +1065,41 @@ fn checkpoint(
             .save(*node, pair)
             .context("writing .obao4 outboard")?;
     }
-    files.data.sync_all().context("fsyncing .partial data")?;
+    Ok(())
+}
+
+/// Durably checkpoint the prefix `[range.fetch_start(), received_end)` of
+/// an in-progress [`ClientRangedStore::ingest_stream`] whose batches
+/// [`write_batch`] has written: fsync the data and outboard files, THEN union
+/// the corresponding chunk ranges into `present`. The fsync-before-union
+/// ordering is load-bearing — see the durability contract on
+/// [`ClientRangedStore::ingest_stream`].
+///
+/// `sync_data` (fdatasync) is enough: it persists the written blocks and
+/// every metadata change needed to read them back, including the block
+/// allocation of a sparse write and the size growth of the `.partial` file.
+/// It skips only timestamps, which nothing here reads.
+///
+/// Does NOT persist the `.ranges` record — that is
+/// [`ClientRangedStore::flush_present_record`]'s job. Several `ingest_stream`
+/// calls can run concurrently on one store (the multi-source scheduler), so
+/// writing the record here, per checkpoint, out of the `present` lock would
+/// both race the record's write-and-rename across sources and serialize every
+/// source on the record's fsync. `present` only ever grows and is unioned
+/// under the mutex AFTER the data/outboard fsync, so whenever the record is
+/// next flushed it never claims a range that is not durably on disk.
+fn sync_and_union(
+    files: &IngestFiles,
+    present: &Mutex<ChunkRanges>,
+    total_bytes: u64,
+    range: &AlignedRange,
+    received_end: u64,
+) -> anyhow::Result<()> {
+    files.data.sync_data().context("fsyncing .partial data")?;
     files
         .outboard
         .data
-        .sync_all()
+        .sync_data()
         .context("fsyncing .obao4 outboard")?;
 
     let received = decdn_bao_range::align_range(
@@ -1841,9 +2081,9 @@ mod tests {
         let root = source.root();
         let store_dir = tmp_dir();
         let mut store = ClientRangedStore::create(store_dir.path(), "blob", root, total)?;
-        // Hold the 4 MiB flush in flight past the fault at 5 MiB, so the
+        // Hold the 4 MiB checkpoint's fsync past the fault at 5 MiB, so the
         // checkpointed prefix below exists only if the fault path waits for it.
-        store.flush_delay = Duration::from_millis(300);
+        store.fsync_delay = Duration::from_millis(300);
 
         let aligned = decdn_bao_range::align_range(0, 0, total)?;
         let (_header, reader) = {
@@ -1871,9 +2111,10 @@ mod tests {
 
         // Re-open the store fresh (simulating a resumed process) and inspect
         // the persisted record: it must reflect the checkpointed prefix —
-        // more than one checkpoint interval's worth (proving a checkpoint
-        // fired), but strictly less than the whole gap (proving the
-        // un-checkpointed tail was NOT claimed).
+        // more than one checkpoint interval's worth (proving the fault path
+        // checkpointed its verified batch on top of the interval checkpoint),
+        // but strictly less than the whole gap (proving the bytes past the
+        // fault were NOT claimed).
         let reopened = ClientRangedStore::open(store_dir.path(), "blob", root, total)?;
         let present = reopened.present_ranges().await?;
         let present_bytes = ranges_byte_len(&present);
@@ -1883,8 +2124,9 @@ mod tests {
             "a mid-gap fault must not lose the whole gap: present is empty"
         );
         assert!(
-            present_bytes >= ClientRangedStore::INGEST_CHECKPOINT_BYTES,
-            "at least one checkpoint interval must have been durably recorded, got {present_bytes} bytes"
+            present_bytes > ClientRangedStore::INGEST_CHECKPOINT_BYTES,
+            "the fault must checkpoint the verified batch past the first interval too, \
+             got {present_bytes} bytes"
         );
         assert!(
             present_bytes < total,
@@ -2001,12 +2243,21 @@ mod tests {
             "corruption must surface as the typed HashMismatch, got: {err}"
         );
 
-        // Well below one checkpoint interval, so no checkpoint ever fired:
-        // presence must remain exactly what it started as (empty).
+        // The flipped byte sits in the second group's leaf, so the first
+        // group verified before the fault. The fault path checkpoints that
+        // verified prefix and nothing past it: the corrupt group is never
+        // claimed, and the claimed group reads back byte-exact.
+        let first_group = decdn_bao_range::align_range(0, GROUP, total)?;
         let present = store.present_ranges().await?;
-        assert!(
-            present.is_empty(),
-            "presence must be unchanged past the last (nonexistent) checkpoint"
+        assert_eq!(
+            &present,
+            first_group.chunk_ranges(),
+            "presence must be exactly the verified prefix before the corrupt group"
+        );
+        let got = store.read(0, GROUP).await?;
+        assert_eq!(
+            got.as_ref(),
+            plaintext.get(..usize::try_from(GROUP)?).expect("slice")
         );
 
         Ok(())
@@ -2026,7 +2277,7 @@ mod tests {
         let total = data.len() as u64;
         let (root, _) = bao_root_and_outboard(&data);
         let mut store = ClientRangedStore::create(dir.path(), "b", root, total)?;
-        store.flush_delay = FLUSH_DELAY;
+        store.fsync_delay = FLUSH_DELAY;
         let store = Arc::new(store);
         let aligned = decdn_bao_range::align_range(0, 0, total)?;
         let wire = scripted_reader_for(&data, &aligned)?;
@@ -2068,6 +2319,135 @@ mod tests {
             &present,
             decdn_bao_range::align_range(0, 0, total)?.chunk_ranges()
         );
+        Ok(())
+    }
+
+    /// A store over `dir` for `data`, with every ingest fsync stalled by
+    /// `fsync_delay`, plus the header-less wire of the whole blob.
+    fn slow_fsync_store(
+        dir: &Path,
+        data: &[u8],
+        fsync_delay: Duration,
+    ) -> anyhow::Result<(ClientRangedStore, AlignedRange, Bytes)> {
+        let total = u64::try_from(data.len())?;
+        let (root, _) = bao_root_and_outboard(data);
+        let mut store = ClientRangedStore::create(dir, "b", root, total)?;
+        store.fsync_delay = fsync_delay;
+        let aligned = decdn_bao_range::align_range(0, 0, total)?;
+        let wire = scripted_reader_for(data, &aligned)?;
+        Ok((store, aligned, wire))
+    }
+
+    /// `INGEST_CHECKPOINT_BYTES` times `n`, as a `usize` blob length.
+    fn checkpoints(n: u64) -> anyhow::Result<usize> {
+        Ok(usize::try_from(
+            n * ClientRangedStore::INGEST_CHECKPOINT_BYTES,
+        )?)
+    }
+
+    /// The decode loop, and so the payment it drives, runs past a checkpoint
+    /// whose fsync stalls: four checkpoints fit the pipeline slots, so the
+    /// whole blob is received before the first fsync lands. `present` extends
+    /// only after the fsync.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_stream_decodes_past_a_slow_fsync() -> anyhow::Result<()> {
+        const FSYNC_DELAY: Duration = Duration::from_secs(3);
+
+        let dir = tempfile::tempdir()?;
+        let data = blob(checkpoints(4)?);
+        let total = u64::try_from(data.len())?;
+        let (store, aligned, wire) = slow_fsync_store(dir.path(), &data, FSYNC_DELAY)?;
+
+        // When progress first reached `total`: the elapsed time, and whether
+        // `present` was still empty then.
+        let at_total: Mutex<Option<(Duration, bool)>> = Mutex::new(None);
+        let started = std::time::Instant::now();
+        let on_progress = |received: u64| {
+            if received == total {
+                let empty = store.present.lock().is_ok_and(|p| p.is_empty());
+                if let Ok(mut slot) = at_total.lock() {
+                    slot.get_or_insert((started.elapsed(), empty));
+                }
+            }
+        };
+        store
+            .ingest_stream(&aligned, wire, Some(&on_progress))
+            .await?;
+
+        let (elapsed, empty) = at_total
+            .lock()
+            .map_err(|_| anyhow::anyhow!("progress lock poisoned"))?
+            .ok_or_else(|| anyhow::anyhow!("progress never reached the total"))?;
+        assert!(
+            elapsed < FSYNC_DELAY,
+            "the decode loop waited for a slow fsync: whole blob received after {elapsed:?}"
+        );
+        assert!(
+            empty,
+            "present must not extend before the first fsync lands"
+        );
+        assert_eq!(&store.present_ranges().await?, aligned.chunk_ranges());
+        Ok(())
+    }
+
+    /// The bytes received but not yet durable never exceed the pipeline
+    /// slots plus the batch the loop is building:
+    /// `(INGEST_MAX_QUEUED_CHECKPOINTS + 1) * INGEST_CHECKPOINT_BYTES`. That
+    /// is the crash and dropped-future re-pay bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_stream_bounds_undurable_bytes() -> anyhow::Result<()> {
+        let slots = u64::try_from(ClientRangedStore::INGEST_MAX_QUEUED_CHECKPOINTS)?;
+        let bound = (slots + 1) * ClientRangedStore::INGEST_CHECKPOINT_BYTES;
+
+        let dir = tempfile::tempdir()?;
+        let data = blob(checkpoints(slots + 4)?);
+        let (store, aligned, wire) = slow_fsync_store(dir.path(), &data, Duration::from_secs(1))?;
+
+        let max_undurable = AtomicU64::new(0);
+        let on_progress = |received: u64| {
+            let durable = store.present.lock().map_or(0, |p| ranges_byte_len(&p));
+            max_undurable.fetch_max(received.saturating_sub(durable), Ordering::Relaxed);
+        };
+        store
+            .ingest_stream(&aligned, wire, Some(&on_progress))
+            .await?;
+
+        let max_undurable = max_undurable.load(Ordering::Relaxed);
+        assert!(
+            max_undurable <= bound,
+            "{max_undurable} bytes were received but not durable, over the {bound}-byte bound"
+        );
+        // The loop did run ahead of the stalled fsyncs, so the bound was
+        // exercised rather than trivially met.
+        assert!(
+            max_undurable > 2 * ClientRangedStore::INGEST_CHECKPOINT_BYTES,
+            "the loop never ran ahead of the disk: max undurable {max_undurable} bytes"
+        );
+        assert_eq!(&store.present_ranges().await?, aligned.chunk_ranges());
+        Ok(())
+    }
+
+    /// Checkpoints that queue behind a slow fsync share the next fsync. Three
+    /// checkpoints fit the pipeline slots, so the loop queues all three
+    /// without waiting. The first fsync holds at least the first one; the
+    /// rest queue during its stall and the worker folds them into one second
+    /// fsync. One fsync per checkpoint would be three.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_stream_coalesces_queued_checkpoints() -> anyhow::Result<()> {
+        let slots = u64::try_from(ClientRangedStore::INGEST_MAX_QUEUED_CHECKPOINTS)?;
+
+        let dir = tempfile::tempdir()?;
+        let data = blob(checkpoints(slots)?);
+        let (store, aligned, wire) = slow_fsync_store(dir.path(), &data, Duration::from_secs(1))?;
+
+        store.ingest_stream(&aligned, wire, None).await?;
+
+        let fsyncs = store.fsyncs.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            (1..=2).contains(&fsyncs),
+            "{slots} queued checkpoints took {fsyncs} fsyncs, want at most 2"
+        );
+        assert_eq!(&store.present_ranges().await?, aligned.chunk_ranges());
         Ok(())
     }
 }

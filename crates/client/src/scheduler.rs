@@ -38,9 +38,9 @@
 //! dropping the `fill_gap` future keeps every checkpointed prefix in the store —
 //! [`RangedStore::missing_ranges`](decdn_bao_range::RangedStore::missing_ranges)
 //! then reports only the un-checkpointed remainder. A cancel re-fetches at most
-//! the unflushed batch plus a detached flush that lands after the requeue (less
-//! than two intervals), never a byte an earlier checkpoint made durable. Two
-//! triggers drive one cancellation mechanism:
+//! the unflushed batch plus the detached checkpoints that land after the requeue
+//! (`INGEST_MAX_QUEUED_CHECKPOINTS + 1` intervals), never a byte an earlier
+//! checkpoint made durable. Two triggers drive one cancellation mechanism:
 //!
 //! - **Steal.** When a freed worker steals a busy victim's tail `[mid, end)`,
 //!   `Work::pick` trims the victim's assignment to `[start, mid)`. Once the
@@ -230,10 +230,11 @@ where
 /// watchdog.
 ///
 /// `missing_bytes` progress is checkpoint-granular — it advances only every 4
-/// MiB `INGEST_CHECKPOINT_BYTES` interval, when that batch's flush lands — so
-/// `unit_deadline` must sit comfortably above `4 MiB / min-expected-throughput`
-/// plus one flush's disk latency, to avoid falsely reassigning a
-/// healthy-but-slow source mid-checkpoint.
+/// MiB `INGEST_CHECKPOINT_BYTES` interval, when the fsync that covers that
+/// batch lands — so `unit_deadline` must sit comfortably above
+/// `4 MiB / min-expected-throughput` plus two fsyncs' disk latency (the fsync
+/// in progress when the batch queues, then the one that covers it), to avoid
+/// falsely reassigning a healthy-but-slow source mid-checkpoint.
 async fn watchdog<St>(store: &St, start: u64, len: u64, deadline: Duration)
 where
     St: IngestStore,
@@ -906,8 +907,9 @@ where
             // Stolen: re-queue the trimmed remainder and stay live. The
             // credit-window tail [paid_frontier, checkpointed_frontier) is NOT
             // re-billed here — resume is checkpoint-frontier via `missing_ranges`,
-            // a bounded (<= credit window + two 4 MiB INGEST_CHECKPOINT_BYTES
-            // intervals: the dropped batch plus a flush still in flight),
+            // a bounded (<= credit window + INGEST_MAX_QUEUED_CHECKPOINTS + 1
+            // 4 MiB INGEST_CHECKPOINT_BYTES intervals: the dropped batch plus
+            // the checkpoints still queued),
             // client-favorable gap identical to the existing single-source
             // cross-invocation resume, deliberately NOT the single-source
             // same-leg re-bill contract.

@@ -818,12 +818,20 @@ async fn pay_cumulative(
 }
 
 /// The payer's per-lane seed for the `PayWord` tests. A real seed is derived per
-/// `(pool_id, signer, provider)` lane from the payer's key; one is enough here,
-/// because every test drives a single lane.
+/// `(pool_id, signer, provider)` lane and epoch from the payer's key; every test
+/// here drives a single lane, so one seed covers each epoch it opens.
 const CHAIN_SEED: B256 = B256::repeat_byte(0x5E);
+
+/// The seed of the epoch a rollover opens, for the tests that roll the lane
+/// off [`CHAIN_SEED`]'s chain.
+const ROLLED_SEED: B256 = B256::repeat_byte(0x6E);
 
 fn chain_root() -> B256 {
     decdn_incentive::root_from_seed(CHAIN_SEED)
+}
+
+fn rolled_root() -> B256 {
+    decdn_incentive::root_from_seed(ROLLED_SEED)
 }
 
 /// Sign a **metering** voucher: it opens (or re-asserts) a chain at `root`, and
@@ -855,13 +863,18 @@ async fn open_chain(
     .await
 }
 
-/// Release the preimage at `index` — the one-message, no-signature tick that
-/// pays for one whole chunk.
+/// Release the preimage at `index` on [`CHAIN_SEED`]'s chain — the one-message,
+/// no-signature tick that pays for one whole chunk.
 async fn release(send: &mut SendStream, index: u8) -> anyhow::Result<()> {
+    release_from(send, CHAIN_SEED, index).await
+}
+
+/// Release the preimage at `index` on the chain `chain_seed` derives.
+async fn release_from(send: &mut SendStream, chain_seed: B256, index: u8) -> anyhow::Result<()> {
     write_client_msg(
         send,
         &ClientMessage::ChunkPreimage(decdn_protocol::client::ChunkPreimage {
-            preimage: decdn_incentive::preimage_at(CHAIN_SEED, index).into(),
+            preimage: decdn_incentive::preimage_at(chain_seed, index).into(),
             index,
         }),
     )
@@ -1220,11 +1233,10 @@ async fn two_streams_on_one_lane_converge_on_the_deepest_index() -> anyhow::Resu
 ///
 /// The construction isolates the reveal-credit path. Stream A skips ahead to
 /// index 5 and reads its chunk, so the lane is paid several chunks ahead. Stream
-/// B then anchors — its anchor is a benign already-satisfied voucher, which
-/// credits B's first delivered chunk from that headroom (the voucher path), so B
-/// reads a second chunk. B pays for THAT chunk with a below-frontier reveal, its
-/// sole proof: the node must credit it from the remaining headroom, or B never
-/// reads its third chunk.
+/// B then anchors. Its anchor is a metering voucher, and a metering voucher pays
+/// no whole chunk, so B stays parked even with headroom on the lane. B then pays
+/// each delivered chunk with a below-frontier reveal: the node must credit each
+/// one from the remaining headroom, or B never reads its next chunk.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_below_frontier_reveal_is_credited_from_lane_headroom() -> anyhow::Result<()> {
     const CREDIT_MAX: u64 = 64 * 1024 * 1024;
@@ -1264,8 +1276,9 @@ async fn a_below_frontier_reveal_is_credited_from_lane_headroom() -> anyhow::Res
     release(&mut send_a, 5).await?;
     read_exact_chunks(&mut recv_a, HARNESS_INTERVAL_BYTES).await?;
 
-    // B anchors: a benign already-satisfied voucher that credits B's first chunk
-    // from the lane headroom the sibling's reveal opened, so B reads a second.
+    // B anchors. The anchor is a metering voucher, so it takes none of the
+    // headroom the sibling's reveal opened, and B stays parked on its first
+    // chunk.
     open_chain(
         &mut send_b,
         &signer,
@@ -1275,13 +1288,14 @@ async fn a_below_frontier_reveal_is_credited_from_lane_headroom() -> anyhow::Res
         0,
     )
     .await?;
-    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv_b).await?;
 
-    // B pays for that second chunk with a BELOW-frontier reveal — its only proof.
-    // It folds nothing, but the lane has been paid for these bytes, so the node
-    // must credit it and reopen the window. Pre-fix it credits zero and B stalls,
-    // so this read times out; post-fix B reads its third chunk.
+    // B pays each chunk with a BELOW-frontier reveal. Each folds nothing, but
+    // the lane has been paid for these bytes, so the node must credit it and
+    // reopen the window: B reads its second chunk, then its third.
     release(&mut send_b, 3).await?;
+    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+    release(&mut send_b, 4).await?;
     read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
 
     // Billing is a MAXIMUM over the streams, never a sum: the deepest index wins,
@@ -1296,7 +1310,134 @@ async fn a_below_frontier_reveal_is_credited_from_lane_headroom() -> anyhow::Res
     );
     anyhow::ensure!(
         lane.owed() == U256::from(5 * RATE_PER_MB),
-        "the below-frontier reveal must take no new money: {}",
+        "the below-frontier reveals must take no new money: {}",
+        lane.owed()
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// A sibling's rollover must not take the credit that a reveal on a retired
+/// root is owed.
+///
+/// A payer rolls the lane when the chain is spent, and the rollover voucher
+/// folds every reveal the payer released — including one that a sibling stream
+/// carries and the node has not read yet. That reveal then lands under a
+/// retired root: it folds nothing, and the node can only pay its stream from
+/// lane headroom. If the rollover voucher took that headroom for its own
+/// stream's outstanding chunk, the sibling would wait for a proof the payer
+/// never sends, and its stream would die on the proof-read timeout.
+///
+/// Stream X anchors the first chain and pays one chunk with index 1. Stream Y
+/// anchors the same chain. X then rolls to a second chain with a voucher that
+/// folds index 2, which only Y carries. X must stay parked: the rollover is a
+/// metering voucher and pays no whole chunk. Y's index 2 then lands on the
+/// retired root and must credit Y at once, and X pays its own chunk with index 1
+/// on the new chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sibling_roll_does_not_take_a_retired_reveals_credit() -> anyhow::Result<()> {
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
+    let payload = vec![0x4Cu8; 8 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    let (mut send_x, mut recv_x) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    let (mut send_y, mut recv_y) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    read_exact_chunks(&mut recv_x, HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv_y, HARNESS_INTERVAL_BYTES).await?;
+
+    // X anchors the first chain and pays its chunk with index 1.
+    open_chain(
+        &mut send_x,
+        &signer,
+        chain_root(),
+        RATE_PER_MB,
+        U256::ZERO,
+        0,
+    )
+    .await?;
+    release(&mut send_x, 1).await?;
+    read_exact_chunks(&mut recv_x, HARNESS_INTERVAL_BYTES).await?;
+
+    // Y anchors the same chain. The lane holds no headroom, so Y stays parked.
+    open_chain(
+        &mut send_y,
+        &signer,
+        chain_root(),
+        RATE_PER_MB,
+        U256::ZERO,
+        0,
+    )
+    .await?;
+    assert_parked_awaiting_voucher(&mut recv_y).await?;
+
+    // X rolls to the second chain. The rollover folds index 2 of the first
+    // chain — the reveal Y is about to send — so the lane watermark reaches two
+    // chunks. The rollover pays no whole chunk, so X stays parked.
+    open_chain(
+        &mut send_x,
+        &signer,
+        rolled_root(),
+        RATE_PER_MB,
+        min_payment(2 * HARNESS_INTERVAL_BYTES, RATE_PER_MB),
+        2 * HARNESS_INTERVAL_BYTES,
+    )
+    .await?;
+    assert_parked_awaiting_voucher(&mut recv_x).await?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let lane = store
+            .get(lane_key(signer.address()))?
+            .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
+        if lane.chain().chain_root == rolled_root() {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the lane never adopted the rolled root"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Y sends index 2 on the retired root. It folds nothing, but the rollover
+    // already put its money on the lane, so the node must credit Y from that
+    // headroom at once — well inside the node's proof-read timeout.
+    release(&mut send_y, 2).await?;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        read_exact_chunks(&mut recv_y, HARNESS_INTERVAL_BYTES),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Y's retired reveal was not credited"))??;
+
+    // X pays its own chunk with index 1 on the new chain.
+    release_from(&mut send_x, ROLLED_SEED, 1).await?;
+    read_exact_chunks(&mut recv_x, HARNESS_INTERVAL_BYTES).await?;
+
+    // The lane is owed the two folded chunks plus one reveal on the new chain.
+    let lane = store
+        .get(lane_key(signer.address()))?
+        .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
+    anyhow::ensure!(
+        lane.chain().chain_root == rolled_root() && lane.chain().verified_index == 1,
+        "the lane meters the rolled chain at index 1"
+    );
+    anyhow::ensure!(
+        lane.owed() == U256::from(3 * RATE_PER_MB),
+        "three chunks at the quoted rate: {}",
         lane.owed()
     );
 

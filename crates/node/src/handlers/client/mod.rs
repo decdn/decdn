@@ -2476,15 +2476,17 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
 /// How many proofs the recoup phase will read for ONE outstanding chunk before
 /// it gives up.
 ///
-/// A chunk is paid by exactly one reveal, but the payer may legitimately send
-/// housekeeping vouchers ahead of it — the epoch's root voucher when this stream
-/// has not carried it yet, and a rollover voucher when the chain is spent. Both
-/// advance the lane's claim by nothing (they re-assert a cumulative the node
-/// already holds), so they credit nothing, and the outstanding chunk stays
-/// outstanding. Three messages is the real worst case for a well-behaved payer
-/// (re-anchor, roll, reveal); the rest is slack for a duplicate or out-of-order
-/// reveal, which is ordinary once several streams share one lane and which also
-/// credits nothing.
+/// A whole chunk is paid by exactly one reveal, but the payer may legitimately
+/// send metering vouchers ahead of it — the epoch's root voucher when this
+/// stream has not carried it yet, and a rollover voucher when the chain is
+/// spent. A metering voucher never credits a whole chunk, even when its
+/// rollover advances the lane's watermark, so the outstanding chunk stays
+/// outstanding until its reveal lands (see `voucher_credit_delta`). Three
+/// messages is the real worst case for a well-behaved payer: two zero-credit
+/// vouchers (re-anchor, roll) and then the reveal. The rest of the budget of 8
+/// is slack for a duplicate or out-of-order reveal, which is ordinary once
+/// several streams share one lane and which credits nothing when the lane holds
+/// no headroom for it.
 ///
 /// The bound matters because without it a payer could hold a stream open
 /// indefinitely with a run of zero-credit vouchers, each one refreshing the read
