@@ -37,9 +37,8 @@ use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_bao_range::align_range;
 use decdn_client::buyer_pool::{
-    LOW_WATER_DIVISOR, SELF_CAPABILITY_CAP, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
-    grade_deposit_credit, issue_self_capability, open_pool, refill_amount, top_up,
-    topped_up_effect,
+    LOW_WATER_DIVISOR, ProgressWrite, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
+    grade_deposit_credit, open_pool, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
 };
 use decdn_client::driver::{DriveConfig, drive_range_set, first_leg};
 use decdn_client::sink::PullReader;
@@ -53,9 +52,7 @@ use decdn_client::{
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
-use decdn_incentive::buyer_pool::{
-    AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, DepositOutcome,
-};
+use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore, DepositOutcome};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
 use decdn_incentive::payment_pool::{PaymentPool, newest_solvent_owned_pool};
@@ -79,14 +76,6 @@ use super::buyer_store::{ChainAdoption, DataDirSource, open_client_store_for_buy
 /// concurrently, so this bounds selection latency rather than the overall fetch
 /// (`--timeout-ms`); a dead candidate falls out of selection after this.
 const SELECT_PROBE_TIMEOUT_MS: u64 = 5_000;
-
-/// Expiry stamped on the self-owned capability [`open_or_reuse_pool`] signs.
-/// The CLI fetcher owns its own pool (owner == signer), so there is no
-/// delegation to time-box — `u64::MAX` means "never expires", and the pool's
-/// own grace-window close is the only lifecycle gate (there is no pool
-/// expiry, ADR 003). Mirrors `decdn_client::buyer_pool`'s own (private)
-/// `SELF_CAPABILITY_EXPIRY`.
-const SELF_CAPABILITY_EXPIRY: u64 = u64::MAX;
 
 /// Parse a user-supplied BLAKE3 hash: 64 hex chars, optionally `0x`- or
 /// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).
@@ -1239,32 +1228,14 @@ fn persist_watermark(
     lane: LaneKey,
     progress: &VoucherProgress,
 ) {
-    // A ledger that rebased DOWN to the node's authenticated watermark records it
-    // once with an overwrite, which a monotone advance refuses; the next run then
-    // starts in step with the node. Every other persist is a monotone advance.
-    let (write, outcome) = if let Some(anchor) = progress.rebase_anchor() {
-        let (bytes_delivered, amount) = progress.totals();
-        let outcome = store.rebase_progress(
-            owner,
-            pool_id,
-            lane,
-            BuyerLaneProgress {
-                last_amount: anchor.amount,
-                last_bytes: anchor.bytes,
-            },
-            BuyerLaneProgress {
-                last_amount: amount,
-                last_bytes: bytes_delivered,
-            },
-        );
-        ("rebased", outcome)
-    } else {
-        let Some((bytes_delivered, amount)) = progress.advanced() else {
-            return;
-        };
-        let outcome = store.advance_progress(owner, pool_id, lane, bytes_delivered, amount);
-        ("advanced", outcome)
+    let Some(write) = ProgressWrite::of(progress) else {
+        return;
     };
+    let label = match write {
+        ProgressWrite::Rebase { .. } => "rebased",
+        ProgressWrite::Advance { .. } => "advanced",
+    };
+    let outcome = write.apply(store, owner, pool_id, lane);
     // A non-`Advanced` outcome (unknown pool / replaced owner slot / regression)
     // means the watermark did NOT move — same hazard as a backend error — so
     // surface it too rather than dropping it on the floor. A lost rebase write
@@ -1274,19 +1245,19 @@ fn persist_watermark(
     match outcome {
         Ok(AdvanceOutcome::Advanced) => {}
         Ok(other) => tracing::warn!(
-            write,
+            write = label,
             %bytes_delivered,
             %amount,
-            "{write} voucher watermark not persisted for pool {pool_id} (provider {}): \
+            "{label} voucher watermark not persisted for pool {pool_id} (provider {}): \
              {other:?}; the next reuse may re-sign a stale watermark, which that provider \
              rejects",
             lane.provider
         ),
         Err(e) => tracing::warn!(
-            write,
+            write = label,
             %bytes_delivered,
             %amount,
-            "failed to persist {write} voucher watermark for pool {pool_id} (provider {}): \
+            "failed to persist {label} voucher watermark for pool {pool_id} (provider {}): \
              {e}; the next reuse may re-sign a stale watermark, which that provider rejects",
             lane.provider
         ),
@@ -4240,28 +4211,13 @@ where
                 .get_by_pool_id(state.pool_id)?
                 .ok_or_else(|| escrowed_but_untracked(&effect, tx, "the credited row vanished"))?
         };
-        // Effectively uncapped: a self-owned capability delegates spend to the
-        // owner's own key, so the pool deposit — not the capability cap — is the
-        // real spending bound. Capping at `state.deposit` here would freeze the
-        // on-chain cap at the pre-top-up deposit (`_registerCapability` is
-        // idempotent past first redemption) and reject spend past it. The cap is
-        // `SELF_CAPABILITY_CAP` (`u64::MAX` µUSDC, ~$18.4T), NOT `U256::MAX`: the
-        // `PaymentPool`'s `spendingCap` is a `uint64`, so a `U256::MAX` cap hashes
-        // to a word the contract can never reconstruct and every redemption of this
-        // lane's vouchers reverts, silently stranding the node's earnings (and,
-        // because the node's exhaustion gate keys on `deposit − totalRedeemed`,
-        // starving the reactive top-up path). Matches `open_pool`'s self-capability.
-        let capability = issue_self_capability(
-            signer.as_ref(),
-            state.pool_id,
-            SELF_CAPABILITY_CAP,
-            SELF_CAPABILITY_EXPIRY,
+        return self_owned_lane_ctx(
+            &state,
+            signer,
             voucher_domain,
-        )?;
-        return Ok(
-            PoolContext::for_pool(&state, Arc::clone(signer), voucher_domain.clone())
-                .with_provider(provider, prior_bytes, prior_amount)
-                .with_capability(capability),
+            provider,
+            prior_bytes,
+            prior_amount,
         );
     }
 
@@ -4319,6 +4275,7 @@ pub(crate) fn temp_in_parent(target: &Path) -> std::io::Result<tempfile::NamedTe
 )]
 mod tests {
     use super::*;
+    use decdn_incentive::buyer_pool::BuyerLaneProgress;
 
     fn common() -> cli::ClientFetchArgs {
         cli::ClientFetchArgs {

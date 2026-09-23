@@ -194,10 +194,10 @@ impl PoolOpener for StubOpener {
         &self,
         provider_addr: Address,
         pool_id: B256,
-        bytes_delivered: U256,
-        amount: U256,
-        _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
+        write: decdn_client::buyer_pool::ProgressWrite,
     ) -> Result<()> {
+        let totals = write.totals();
+        let (bytes_delivered, amount) = (totals.last_bytes, totals.last_amount);
         // The orchestrator must persist progress against the pool it pulled
         // on — i.e. the id from the `PoolContext` it just opened/reused.
         // Asserts the `ctx.pool_id` plumbing at the pull call site (#838).
@@ -301,9 +301,7 @@ impl PoolOpener for WedgedOpener {
         &self,
         _provider_addr: Address,
         _pool_id: B256,
-        _bytes_delivered: U256,
-        _amount: U256,
-        _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
+        _write: decdn_client::buyer_pool::ProgressWrite,
     ) -> Result<()> {
         Ok(())
     }
@@ -333,9 +331,7 @@ impl PoolOpener for FailingRecordOpener {
         &self,
         _provider_addr: Address,
         _pool_id: B256,
-        _bytes_delivered: U256,
-        _amount: U256,
-        _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
+        _write: decdn_client::buyer_pool::ProgressWrite,
     ) -> Result<()> {
         anyhow::bail!("simulated buyer-pool store write failure")
     }
@@ -11609,10 +11605,10 @@ impl PoolOpener for FundingOpener {
         &self,
         provider_addr: Address,
         pool_id: B256,
-        bytes_delivered: U256,
-        amount: U256,
-        _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
+        write: decdn_client::buyer_pool::ProgressWrite,
     ) -> Result<()> {
+        let totals = write.totals();
+        let (bytes_delivered, amount) = (totals.last_bytes, totals.last_amount);
         anyhow::ensure!(
             pool_id == self.pool_id,
             "record_progress pool_id {pool_id} != opened pool {}",

@@ -5,6 +5,16 @@ expression: public_api.to_string()
 pub mod decdn_client
 pub use decdn_client::RangedStore
 pub mod decdn_client::buyer_pool
+pub enum decdn_client::buyer_pool::ProgressWrite
+pub decdn_client::buyer_pool::ProgressWrite::Advance
+pub decdn_client::buyer_pool::ProgressWrite::Advance::totals: decdn_incentive::buyer_pool::BuyerLaneProgress
+pub decdn_client::buyer_pool::ProgressWrite::Rebase
+pub decdn_client::buyer_pool::ProgressWrite::Rebase::anchor: decdn_incentive::buyer_pool::BuyerLaneProgress
+pub decdn_client::buyer_pool::ProgressWrite::Rebase::totals: decdn_incentive::buyer_pool::BuyerLaneProgress
+impl decdn_client::buyer_pool::ProgressWrite
+pub fn decdn_client::buyer_pool::ProgressWrite::apply<S: decdn_incentive::buyer_pool::BuyerPoolStore + ?core::marker::Sized>(&self, &S, alloy_primitives::bits::address::Address, decdn_incentive::lane::PoolId, decdn_incentive::lane::LaneKey) -> anyhow::Result<decdn_incentive::buyer_pool::AdvanceOutcome, decdn_incentive::store::StoreError>
+pub fn decdn_client::buyer_pool::ProgressWrite::of(&decdn_client::VoucherProgress) -> core::option::Option<Self>
+pub const fn decdn_client::buyer_pool::ProgressWrite::totals(&self) -> decdn_incentive::buyer_pool::BuyerLaneProgress
 pub struct decdn_client::buyer_pool::AllowanceShortfall
 impl core::error::Error for decdn_client::buyer_pool::AllowanceShortfall
 impl core::fmt::Display for decdn_client::buyer_pool::AllowanceShortfall
@@ -25,6 +35,7 @@ pub fn decdn_client::buyer_pool::grade_deposit_credit(anyhow::Result<decdn_incen
 pub fn decdn_client::buyer_pool::issue_self_capability(&alloy_signer_local::PrivateKeySigner, alloy_primitives::aliases::B256, u64, u64, &alloy_sol_types::eip712::Eip712Domain) -> anyhow::Result<decdn_incentive::capability::SignedCapability>
 pub async fn decdn_client::buyer_pool::open_pool<P: alloy_provider::provider::trait::Provider + core::clone::Clone>(&decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, &alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::buyer_pool::OpenedPool>
 pub fn decdn_client::buyer_pool::refill_amount(alloy_primitives::aliases::U256, alloy_primitives::aliases::U256, alloy_primitives::aliases::U256, alloy_primitives::aliases::U256) -> alloy_primitives::aliases::U256
+pub fn decdn_client::buyer_pool::self_owned_lane_ctx(&decdn_incentive::buyer_pool::BuyerPoolState, &alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, &alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::PoolContext>
 pub async fn decdn_client::buyer_pool::top_up<P: alloy_provider::provider::trait::Provider + core::clone::Clone>(&decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>, alloy_primitives::aliases::B256, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::buyer_pool::ToppedUpPool>
 pub fn decdn_client::buyer_pool::topped_up_effect(alloy_primitives::aliases::B256, alloy_primitives::aliases::U256) -> alloc::string::String
 pub mod decdn_client::config
@@ -266,6 +277,7 @@ pub enum decdn_client::retry::RetryDisposition
 pub decdn_client::retry::RetryDisposition::RetryElsewhere
 pub decdn_client::retry::RetryDisposition::Terminal
 pub fn decdn_client::retry::retry_disposition(&anyhow::Error) -> decdn_client::retry::RetryDisposition
+pub fn decdn_client::retry::shared_pool_disposition(&anyhow::Error) -> decdn_client::retry::RetryDisposition
 pub mod decdn_client::sink
 pub struct decdn_client::sink::NoCache
 impl decdn_client::sink::BlobCache for decdn_client::sink::NoCache
@@ -844,6 +856,7 @@ pub async fn decdn_client::open_progressive_pull(&iroh::endpoint::Endpoint, iroh
 pub fn decdn_client::plan_covered_runs(&bao_tree::ChunkRanges, u64, &[decdn_client::SourceCoverage], &[usize]) -> (alloc::vec::Vec<decdn_client::CoveredRun>, bao_tree::ChunkRanges)
 pub fn decdn_client::resume_may_be_stale(&anyhow::Error) -> bool
 pub fn decdn_client::retry_disposition(&anyhow::Error) -> decdn_client::retry::RetryDisposition
+pub fn decdn_client::shared_pool_disposition(&anyhow::Error) -> decdn_client::retry::RetryDisposition
 pub fn decdn_client::sign_client_binding(&alloy_signer_local::PrivateKeySigner, alloy_primitives::aliases::B256, &alloy_sol_types::eip712::Eip712Domain) -> anyhow::Result<decdn_protocol::client::ClientBinding>
 pub async fn decdn_client::throughput_watchdog(alloc::sync::Arc<core::sync::atomic::AtomicU64>, core::time::Duration, u64, &core::sync::atomic::AtomicBool)
 pub type decdn_client::DialObserver<'a> = (dyn core::ops::function::Fn(iroh::endpoint::connection::WeakConnectionHandle) + core::marker::Send + core::marker::Sync + 'a)

@@ -280,9 +280,7 @@ mod tests {
             &self,
             _provider_addr: Address,
             _pool_id: PoolId,
-            _bytes_delivered: U256,
-            _amount: U256,
-            _rebase_anchor: Option<decdn_incentive::BuyerLaneProgress>,
+            _write: decdn_client::buyer_pool::ProgressWrite,
         ) -> Result<()> {
             unreachable!("not exercised by NodeFunder tests")
         }

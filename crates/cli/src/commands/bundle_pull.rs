@@ -100,7 +100,7 @@ use decdn_client::endpoint as client_endpoint;
 use decdn_client::provider;
 use decdn_client::{
     ClientRangedStore, LaneLedgers, PoolContext, PoolExhausted, ProgressCallback, PullDeadlines,
-    RetryDisposition, retry_disposition,
+    RetryDisposition, retry_disposition, shared_pool_disposition,
 };
 
 type FetchTarget = (PublicKey, Address);
@@ -1449,8 +1449,9 @@ where
 /// A [`RetryDisposition::RetryElsewhere`] failure is a property of the
 /// providers the entry tried, so a later round, which probes again and
 /// re-admits every provider, can succeed. A [`PoolExhausted`] is excluded even
-/// though it fails over within a pass: every provider already refused the
-/// deposit, and another round would only repeat the refusal.
+/// though it fails over within a pass ([`shared_pool_disposition`]): every
+/// provider already refused the deposit, and another round would only repeat
+/// the refusal.
 ///
 /// Two more failures fail over within a pass but never start a round: a size
 /// that disagrees with the manifest ([`fetch::ManifestSizeMismatch`]), which
@@ -1458,8 +1459,7 @@ where
 /// or read-only disk, a path that is not a directory), which no provider can
 /// fix.
 fn entry_retryable(err: &anyhow::Error) -> bool {
-    retry_disposition(err) == RetryDisposition::RetryElsewhere
-        && err.downcast_ref::<PoolExhausted>().is_none()
+    shared_pool_disposition(err) == RetryDisposition::RetryElsewhere
         && err.downcast_ref::<fetch::ManifestSizeMismatch>().is_none()
         && !is_local_disk_fault(err)
 }

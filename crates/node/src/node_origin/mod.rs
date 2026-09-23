@@ -101,6 +101,7 @@ use crate::metrics::Metrics;
 use crate::selection::{
     Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_EARLY_EXIT_CANDIDATES, PROBE_TIMEOUT, rank_candidates,
 };
+use decdn_client::buyer_pool::ProgressWrite;
 use decdn_client::probe::probe_once;
 use decdn_client::{
     BlobTooLarge, Cumulative, HashMismatch, LocalPullFault, PoolContext, PoolLedger, PullDeadlines,
@@ -2129,27 +2130,10 @@ fn persist_buyer_progress(
     pool_id: B256,
     progress: &VoucherProgress,
 ) {
-    // A pending rebase anchor is recorded even when the totals did not advance
-    // past the seed: the whole point is to move the record down.
-    let rebase_anchor = progress
-        .rebase_anchor()
-        .map(|anchor| decdn_incentive::BuyerLaneProgress {
-            last_amount: anchor.amount,
-            last_bytes: anchor.bytes,
-        });
-    let totals = match (progress.advanced(), rebase_anchor) {
-        (Some(advanced), _) => advanced,
-        (None, Some(_)) => progress.totals(),
-        (None, None) => return,
+    let Some(write) = ProgressWrite::of(progress) else {
+        return;
     };
-    let (bytes_delivered, amount) = totals;
-    if let Err(err) = deps.buyer.record_progress(
-        provider_addr,
-        pool_id,
-        bytes_delivered,
-        amount,
-        rebase_anchor,
-    ) {
+    if let Err(err) = deps.buyer.record_progress(provider_addr, pool_id, write) {
         deps.metrics.node_pull_progress_persist_failure();
         warn!(%provider_addr, error = %err, "node-origin: failed to persist buyer voucher progress");
     }

@@ -49,7 +49,7 @@ use decdn_client::driver::DriveConfig;
 use decdn_client::source::{Funder, SourceFuture};
 use decdn_client::{
     CoveredRun, DownstreamFrontier, HashMismatch as ClientPullHashMismatch, PacingWait, PeerSource,
-    PoolExhausted, RampPacer, RetryDisposition, SharedPool, WaitReason, drive, retry_disposition,
+    RampPacer, RetryDisposition, SharedPool, WaitReason, drive, shared_pool_disposition,
 };
 use decdn_incentive::DepositOutcome;
 
@@ -907,7 +907,7 @@ impl RunSink for PeerRunSink<'_> {
                 // origin blacklist, over-cap blob) cannot be fixed by another lane;
                 // anything else is a property of THIS source's delivery — drop it
                 // and re-plan.
-                if run_fault_is_terminal(&err) {
+                if shared_pool_disposition(&err) == RetryDisposition::Terminal {
                     RunOutcome::Terminal(FillError::new(format!("{err:#}")))
                 } else {
                     RunOutcome::Reassign
@@ -924,23 +924,6 @@ fn whole_range_chunks(offset: u64, len: u64) -> ChunkRanges {
     let start = offset / CHUNK_BYTES;
     let end = offset.saturating_add(len).div_ceil(CHUNK_BYTES);
     ChunkRanges::from(bao_tree::ChunkNum(start)..bao_tree::ChunkNum(end))
-}
-
-/// Whether a run's [`drive`] error ends the whole assembly rather than reassigning
-/// its range to another holder.
-///
-/// It is the shared [`retry_disposition`] verdict, PLUS one node-specific override:
-/// a [`PoolExhausted`] is terminal here even though `retry_disposition` calls it
-/// `RetryElsewhere`. The classifier keeps pool exhaustion retryable for the
-/// single-source failover, where a cheaper provider's next voucher may fit a
-/// deposit the current one's did not. The node's ranged loop is the opposite case:
-/// every lane draws the ONE shared buyer pool (ADR 003), so no surviving holder can
-/// pay from a dry pool — reassigning would only churn each remaining candidate
-/// (a fresh dial + a first-voucher attempt) before the same failure. This mirrors
-/// the multi-source scheduler, which special-cases exactly [`PoolExhausted`].
-fn run_fault_is_terminal(err: &anyhow::Error) -> bool {
-    retry_disposition(err) == RetryDisposition::Terminal
-        || err.downcast_ref::<PoolExhausted>().is_some()
 }
 
 // ===========================================================================
@@ -1634,58 +1617,6 @@ mod downstream_wait_tests {
                 .expect("a later advance must wake the parked wait");
             },
             advance,
-        );
-    }
-}
-
-/// The ranged-drive loop's run-fault terminal classification (#1506): a
-/// shared-pool exhaustion must STOP the assembly, not reassign the range to
-/// another holder that draws the same dry pool.
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
-mod run_fault_terminal_tests {
-    use decdn_client::PoolExhausted;
-    use decdn_protocol::client::VoucherRejectReason;
-
-    use super::run_fault_is_terminal;
-    use decdn_client::UpstreamVoucherRejected;
-
-    /// A `PoolExhausted` is TERMINAL in the node loop even though the shared
-    /// `retry_disposition` classifier calls it `RetryElsewhere`: the node draws one
-    /// shared buyer pool, so no surviving holder can pay from a dry pool. Without
-    /// this override the loop churns every remaining candidate before giving up.
-    #[test]
-    fn pool_exhaustion_is_terminal_in_the_node_loop() {
-        let err = anyhow::Error::new(PoolExhausted {
-            gap_start: 0,
-            gap_len: 1 << 20,
-        });
-        assert!(
-            run_fault_is_terminal(&err),
-            "a dry shared pool must fail fast, not reassign onto another lane"
-        );
-    }
-
-    /// The classifier's own `Terminal` verdicts still flow through: a shared-pool
-    /// voucher rejection ends the assembly.
-    #[test]
-    fn voucher_rejection_stays_terminal() {
-        let err = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: VoucherRejectReason::SpendingCapExhausted,
-            bundle: None,
-            proof_generation: None,
-        });
-        assert!(run_fault_is_terminal(&err));
-    }
-
-    /// An ordinary delivery fault (a stall, a transport reset) is NOT terminal —
-    /// it faults one source and reassigns the range to another holder.
-    #[test]
-    fn a_transport_fault_reassigns() {
-        let err = anyhow::anyhow!("connect failed: timed out");
-        assert!(
-            !run_fault_is_terminal(&err),
-            "a per-source delivery fault must reassign, not stop the assembly"
         );
     }
 }

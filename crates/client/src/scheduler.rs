@@ -69,11 +69,11 @@
 //!   a payment-layer voucher rejection, an origin blacklist, or an over-cap blob —
 //!   which is terminal on the single-source path too.
 //! - A shared-pool exhaustion ([`crate::PoolExhausted`], the pacer's `Refuse`).
-//!   This is terminal ONLY for this scheduler: every lane draws the ONE shared
-//!   pool, so no lane can fund it. The single-source path instead fails over on a
-//!   budget refusal (a cheaper provider may fit), so the shared classifier keeps
-//!   `PoolExhausted` retryable and this scheduler applies the pool-scope rule
-//!   itself.
+//!   This is terminal ONLY for a shared-pool caller such as this scheduler: every
+//!   lane draws the ONE shared pool, so no lane can fund it. The single-source
+//!   path instead fails over on a budget refusal (a cheaper provider may fit), so
+//!   [`crate::retry_disposition`] keeps `PoolExhausted` retryable and this
+//!   scheduler asks [`crate::shared_pool_disposition`].
 //!
 //! Either way the worker propagates THAT typed error out of the set, which cancels
 //! the peer workers and fails `multi_source_fetch` with it — the CLI inspects the
@@ -95,13 +95,12 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::coverage_plan::{SourceCoverage, covers_byte_range, spread_segments};
 use crate::driver::{
-    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, PoolExhausted,
-    SharedPool, WaitReason, contiguous_byte_ranges, drive_with_interval_flush, fill_gap,
-    ranges_content_len,
+    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, SharedPool, WaitReason,
+    contiguous_byte_ranges, drive_with_interval_flush, fill_gap, ranges_content_len,
 };
 use crate::ledgers::LaneLedgers;
 use crate::pacer::DownstreamFrontier;
-use crate::retry::{RetryDisposition, retry_disposition};
+use crate::retry::{RetryDisposition, shared_pool_disposition};
 use crate::segment::{split_evenly, steal_split};
 use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{Pacer, PoolContext, PoolLedger, ProgressCallback};
@@ -848,13 +847,12 @@ where
                         // - The SHARED classifier rules it terminal — a
                         //   payment-layer voucher rejection, an origin blacklist, or
                         //   an over-cap blob — which no provider or lane can fix.
-                        // - It is a shared-pool exhaustion ([`PoolExhausted`], the
-                        //   pacer's `Refuse`). This is terminal ONLY here, not in
-                        //   the shared classifier: single-source failover tries a
-                        //   cheaper provider on a budget refusal, but every lane of
-                        //   THIS scheduler draws the ONE pool, so reassigning cannot
-                        //   fund it. Keeping this test in the scheduler preserves
-                        //   single-source failover-on-refusal (#1174).
+                        // - It is a shared-pool exhaustion (`PoolExhausted`, the
+                        //   pacer's `Refuse`). Every lane of THIS scheduler draws
+                        //   the ONE pool, so reassigning cannot fund it
+                        //   (`shared_pool_disposition`). Single-source failover
+                        //   still tries a cheaper provider on a budget refusal
+                        //   (#1174).
                         //
                         // `try_join_all` cancels the peer workers, so the failed
                         // source's range is NOT reassigned. A RETRYABLE fault (a
@@ -864,9 +862,7 @@ where
                         // and the error is KEPT so a fetch that runs out of lanes
                         // can say what each one did.
                         Err(e) => {
-                            let terminal = retry_disposition(&e) == RetryDisposition::Terminal
-                                || e.downcast_ref::<PoolExhausted>().is_some();
-                            if terminal {
+                            if shared_pool_disposition(&e) == RetryDisposition::Terminal {
                                 return Err(e);
                             }
                             UnitOutcome::Faulted(Some(e))
