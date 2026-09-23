@@ -49,6 +49,7 @@ use decdn_protocol::client::{
     StreamResponseBody,
 };
 use decdn_protocol::{ALPN_CLIENT, encode_stream_request, write_frame};
+use iroh::endpoint::{Connection, ConnectionError};
 use iroh::{Endpoint, EndpointAddr};
 
 mod support;
@@ -603,9 +604,15 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
 
 /// A protocol-correct but **dishonest** `cdn/client/v1` upstream: it signs a
 /// valid response for the requested hash, streams `served` (whose hash differs),
-/// reads and acks the closing voucher, and ends the stream cleanly — yet the
-/// bytes are wrong. This drives the requester all the way to its whole-blob
-/// integrity check. Handles exactly one connection, then returns.
+/// and then reads the closing voucher and ends the stream cleanly if the
+/// requester pays — yet the bytes are wrong. This drives the requester all the
+/// way to its integrity check. Handles exactly one connection, then returns.
+///
+/// The requester verifies each bao chunk group as it lands (ADR 038), so it may
+/// reject the bytes and close the connection before it pays the closing voucher,
+/// or between the voucher and `StreamEnd`. Both orders are legal, and the
+/// rejection is the unit under test. A peer close after the bytes are on the wire
+/// therefore ends the liar with `Ok`; every other error still fails it.
 async fn lying_upstream(
     ep: &Endpoint,
     eth: &Arc<PrivateKeySigner>,
@@ -663,19 +670,32 @@ async fn lying_upstream(
     // upstream sends no explicit reply and moves straight to `StreamEnd`, letting
     // the requester proceed to the integrity check (the unit under test) rather
     // than bailing early on a rejected voucher.
-    match read_client_msg(&mut recv).await? {
-        ClientMessage::Voucher(_) => {}
-        _ => anyhow::bail!("lying upstream: expected a Voucher"),
+    let msg = match read_client_msg(&mut recv).await {
+        Err(_) if peer_closed(&conn) => return Ok(()),
+        msg => msg?,
+    };
+    let ClientMessage::Voucher(_) = msg else {
+        anyhow::bail!("lying upstream: expected a Voucher");
+    };
+    match write_client_msg(&mut send, &ClientMessage::StreamEnd).await {
+        Err(_) if peer_closed(&conn) => return Ok(()),
+        written => written?,
     }
-    write_client_msg(&mut send, &ClientMessage::StreamEnd).await?;
     let _ = send.finish();
-    // Hold the connection open until the requester has read `StreamEnd` and
-    // closed (it drops the pull, closing with `upstream-pull-dropped`, once a bao
-    // chunk group fails to verify against the content root). Returning here would drop `conn` and
-    // abort the still-in-flight `StreamEnd` before it lands, surfacing a spurious
-    // "connection lost" instead.
+    // Hold the connection open until the requester closes it. Returning here
+    // would drop `conn` and abort the still-in-flight `StreamEnd` before it
+    // lands.
     conn.closed().await;
     Ok(())
+}
+
+/// Whether the peer closed `conn` itself. A local close, a timeout, or a reset
+/// is not a peer close.
+fn peer_closed(conn: &Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(ConnectionError::ApplicationClosed(_))
+    )
 }
 
 /// Sad path: the upstream returns bytes that don't match the requested hash
@@ -684,12 +704,12 @@ async fn lying_upstream(
 /// Content is BLAKE3-addressed and the requester verifies every bao chunk group
 /// against the content root (ADR 038) — but that defense had no node-to-node
 /// test. Here a malicious / buggy upstream plays the protocol perfectly (valid
-/// signed response, a paid and
-/// ack'd voucher, a clean `StreamEnd`) while serving content that hashes to the
-/// wrong value. The downstream requester MUST reject the delivery and return an
-/// `Err`, never surfacing the corrupt bytes to its caller. This guards the
-/// content-addressing invariant across a *paid* hop: a peer cannot substitute
-/// content for a hash, even after being paid for it.
+/// signed response, and a clean `StreamEnd` once it is paid) while serving
+/// content that hashes to the wrong value. The downstream requester MUST reject
+/// the delivery and return an `Err`, never surfacing the corrupt bytes to its
+/// caller. This guards the content-addressing invariant across a *paid* hop: a
+/// peer cannot substitute content for a hash, even when the requester pays for
+/// the bytes before it rejects them.
 #[tokio::test(flavor = "multi_thread")]
 async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
     // What the downstream asks for...
@@ -746,8 +766,8 @@ async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
     );
 
     shutdown([], [&ep_b]).await?;
-    // The liar reached `StreamEnd` before the requester bailed; surface any panic
-    // or protocol error it hit, bounded so a hang fails loudly rather than stalls.
+    // Surface any panic or protocol error the liar hit, bounded so a hang fails
+    // loudly rather than stalls.
     match tokio::time::timeout(Duration::from_secs(5), liar).await {
         Ok(joined) => {
             joined.map_err(|e| anyhow::anyhow!("lying upstream task panicked: {e}"))??;
