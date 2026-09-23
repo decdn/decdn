@@ -1,4 +1,4 @@
-//! S3-compatible origin backend (#437 PR2).
+//! S3-compatible origin backend (#437).
 //!
 //! Fetches blobs from `{prefix?}{hex[0..2]}/{hex}` keys in an S3 bucket via
 //! the official AWS SDK. The sharded key layout mirrors

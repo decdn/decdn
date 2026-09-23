@@ -1,4 +1,4 @@
-//! The `Streamer` consumption face (#1848 T6): stream one blob's verified,
+//! The `Streamer` consumption face (#1848): stream one blob's verified,
 //! contiguous front to a consumer AS IT ARRIVES, paced by how fast the consumer
 //! reads — a fetch-like, single-blob face (no chunk dedup, unlike the
 //! `Downloader`).

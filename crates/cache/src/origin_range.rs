@@ -67,7 +67,7 @@ pub const RANGE_PULL_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 /// is a whole-blob origin pull — more egress, not less.
 pub const MAX_CONCURRENT_RANGE_PULLS: usize = 4;
 
-/// Encoded chunks the Flow A encoder buffers ahead of its consumer before it
+/// Encoded chunks the origin-range encoder buffers ahead of its consumer before it
 /// parks. The encoder writes one parent pair or one chunk group per item, so the
 /// channel holds at most this many chunk groups.
 const WIRE_CHANNEL_CAP: usize = 8;
@@ -154,7 +154,7 @@ pub(crate) struct OriginWindow {
 
 /// What an origin answered for one window. A wrong-length answer is kept apart
 /// from a decline because the two paths judge it differently: the range pull
-/// degrades, and Flow A reports [`CacheError::VerifyFailed`].
+/// degrades, and the origin-range wire reports [`CacheError::VerifyFailed`].
 #[derive(Debug)]
 pub(crate) enum WindowFetch {
     /// The origin served the window at its exact length.
@@ -290,7 +290,7 @@ impl OriginRangeCursor {
     }
 }
 
-/// The typed fault a Flow A encode stopped on, shared between the encode task
+/// The typed fault an origin-range encode stopped on, shared between the encode task
 /// and its data reader. Only [`park_fault`] writes it; only
 /// [`OriginRangeWire::next_chunk`] reads it.
 type FaultSlot = Arc<Mutex<Option<CacheError>>>;

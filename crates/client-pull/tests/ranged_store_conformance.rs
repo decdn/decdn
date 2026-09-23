@@ -1,6 +1,6 @@
 //! Runs the shared decdn-bao-range conformance suite against
 //! `decdn_client_pull::ClientRangedStore` — proving the client backend meets the
-//! same cross-backend contract as the node backend (#1621 P2).
+//! same cross-backend contract as the node backend (#1621).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

@@ -118,7 +118,7 @@ pub trait BlobSource: Send + Sync {
 
 /// The store/sink capability the gap-driven [`crate::drive`] needs beyond
 /// [`decdn_bao_range::RangedStore`]'s queries: ingest one gap's raw bao. The
-/// client backend writes `.partial`/`.obao4`; a node backend (B2) admits to
+/// client backend writes `.partial`/`.obao4`; a node backend admits to
 /// the cache and tees to its downstream client. Kept a generic method (not
 /// `dyn`) so an impl can stream any [`BaoRangeReader`]; `drive` is already
 /// fully generic.

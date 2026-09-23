@@ -220,7 +220,7 @@ impl ClientHandler {
     /// range here too, matching what it already advertises as covered.
     /// Sizing serve and advertise from the same source matters: two different
     /// sources here would let the node advertise a block it then refuses to
-    /// serve (#1506 C3).
+    /// serve (#1506).
     ///
     /// Reuses [`CacheEngine::missing_ranges`](super::CacheEngine::missing_ranges)'s
     /// own size contract — the same `blob_size` the own-origin spine resolves

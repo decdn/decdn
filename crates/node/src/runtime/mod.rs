@@ -383,9 +383,9 @@ struct Infra {
 
 /// Front bring-up phase: RPC preflight, identity/keystore load, voucher-state
 /// and receipt stores, cache + origin chain, iroh endpoint, and the
-/// connection limiter. Extracted verbatim from [`run`]; the two `reload_state`
-/// attach side effects stay inline at their original positions so a SIGHUP
-/// delivered mid-bring-up still finds a target.
+/// connection limiter. The two `reload_state` attach side effects run inline,
+/// at their points in the bring-up order, so a SIGHUP delivered mid-bring-up
+/// still finds a target.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn build_infra(
     cfg: &ResolvedConfig,
@@ -654,12 +654,12 @@ struct ServeInputs {
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
 }
 
-/// Serve phase extracted verbatim from the tail of [`run`] (issue #1253 PR3):
-/// build the paid-delivery router behind the fail-closed blacklist gate, install
-/// the signal + SIGHUP streams, and run the select loop until a shutdown signal
-/// arrives. Returns the live [`Router`] and the observed [`ShutdownSignal`] so
-/// [`run`] can drive the teardown sequence. `drain_trigger` is borrowed, not
-/// consumed, because [`run`] still passes it to [`shutdown`] afterwards.
+/// Serve phase of [`run`] (#1253): build the paid-delivery router behind the
+/// fail-closed blacklist gate, install the signal + SIGHUP streams, and run the
+/// select loop until a shutdown signal arrives. Returns the live [`Router`] and
+/// the observed [`ShutdownSignal`] so [`run`] can drive the teardown sequence.
+/// `drain_trigger` is borrowed, not consumed, because [`run`] still passes it to
+/// [`shutdown`] afterwards.
 #[allow(clippy::cognitive_complexity)]
 async fn serve_until_shutdown(
     reload_state: &RuntimeReloadState,
@@ -732,11 +732,11 @@ async fn serve_until_shutdown(
 }
 
 /// Chain providers, event watchers, and paid-delivery handlers built during the
-/// middle phase of [`run`] (issue #1253 PR4). A by-value bundle of the
-/// long-lived handles the background-task, serve, and shutdown phases consume,
-/// mirroring [`Infra`]. Generic over the seller-wallet provider `P` (an opaque
-/// `impl Provider` threaded through [`PoolSettlementService`]); [`run`] infers
-/// `P` at the call site and hands it to [`ShutdownHandles`].
+/// middle phase of [`run`] (#1253). A by-value bundle of the long-lived handles
+/// the background-task, serve, and shutdown phases consume, mirroring [`Infra`].
+/// Generic over the seller-wallet provider `P` (an opaque `impl Provider`
+/// threaded through [`PoolSettlementService`]); [`run`] infers `P` at the call
+/// site and hands it to [`ShutdownHandles`].
 struct ChainHandlers<P: Provider + Clone + 'static> {
     rpc_url: HttpUrl,
     event_poll_interval: Duration,
@@ -796,12 +796,12 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     warming_creditor: StopHandle,
 }
 
-/// Middle phase extracted verbatim from [`run`] (issue #1253 PR4): parse the
-/// chain contract addresses and EIP-712 domains, bootstrap the `CapacityBond`
-/// registry / slash / origin watchers, and construct the probe, client, and DHT
-/// handlers plus the seller-side [`PoolSettlementService`]. Borrows [`Infra`];
-/// the buyer-side provider/store construction and the background tasks stay in
-/// [`run`]. Returns [`ChainHandlers`], whose seller-wallet provider `P` [`run`]
+/// Middle phase of [`run`] (#1253): parse the chain contract addresses and
+/// EIP-712 domains, bootstrap the `CapacityBond` registry / slash / origin
+/// watchers, and construct the probe, client, and DHT handlers plus the
+/// seller-side [`PoolSettlementService`]. Borrows [`Infra`]; the buyer-side
+/// provider/store construction and the background tasks belong to
+/// `spawn_background_tasks`. Returns [`ChainHandlers`], whose seller-wallet provider `P` [`run`]
 /// infers and threads into [`ShutdownHandles`].
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn build_chain_and_handlers(
@@ -997,10 +997,10 @@ async fn build_chain_and_handlers(
         Some(chain_freshness.clone()),
     ));
 
-    // `cdn/dht/v1` handler (ADR 022 / #320). FindNode + FindValue +
-    // Store all wired up; iterative requester-side lookup and the
-    // republish scheduler land in PR 4 of #320. Three-layer rate limiter
-    // operates at the full ADR 022 spec.
+    // `cdn/dht/v1` handler (ADR 022 / #320): serves FindNode, FindValue, and
+    // Store. Bootstrap, bucket refresh, and the republish scheduler run as
+    // background tasks below. Three-layer rate limiter operates at the full
+    // ADR 022 spec.
     let dht_rate_limiter = Arc::new(DhtRateLimiter::from_resolved(
         &cfg.dht,
         Arc::clone(&infra.node_metrics),
@@ -1530,15 +1530,12 @@ struct Background {
     tasks: JoinSet<()>,
 }
 
-/// Background-tasks phase extracted verbatim from the middle of [`run`] (issue
-/// #1253 PR5): construct the buyer-side provider/stores, spawn every periodic
-/// GC / DHT / metrics / admin task, and emit the startup
-/// banner. Borrows [`Infra`] and [`ChainHandlers`]; the by-value `ch` moves the
-/// region performed on owned locals (`rpc_url` and the three EIP-712 domains)
-/// become `.clone()`s here since they are read through a shared reference — each
-/// field is consumed exactly once and never read again, so the clone is
-/// behavior-identical. Returns the [`Background`] handles [`run`]
-/// threads into the serve call and [`ShutdownHandles`].
+/// Background-tasks phase of [`run`] (#1253): construct the buyer-side
+/// provider/stores, spawn every periodic GC / DHT / metrics / admin task, and
+/// emit the startup banner. Borrows [`Infra`] and [`ChainHandlers`]; `rpc_url`
+/// and the three EIP-712 domains are cloned out of the shared `ch` reference,
+/// and each clone is consumed exactly once. Returns the [`Background`] handles
+/// [`run`] threads into the serve call and [`ShutdownHandles`].
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     cfg: &ResolvedConfig,
@@ -2426,12 +2423,11 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     tasks: JoinSet<()>,
 }
 
-/// Graceful teardown extracted verbatim from the tail of [`run`] (issue #1253
-/// PR1). Consumes every field of [`ShutdownHandles`] via an exhaustive
-/// destructure — see that type's docs for why the `..`-free binding is
-/// load-bearing. The teardown ordering here is itself load-bearing (metrics
-/// accept-loop stop first; the multiplexed `poller` stops after
-/// `router.shutdown`) and must not be reordered.
+/// Graceful teardown of [`run`] (#1253). Consumes every field of
+/// [`ShutdownHandles`] via an exhaustive destructure — see that type's docs for
+/// why the `..`-free binding is load-bearing. The teardown ordering here is
+/// itself load-bearing (metrics accept-loop stop first; the multiplexed `poller`
+/// stops after `router.shutdown`) and must not be reordered.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn shutdown<P: Provider + Clone + 'static>(
     handles: ShutdownHandles<P>,
@@ -3230,11 +3226,10 @@ async fn build_cache(
                     format!("failed to open filesystem origin for cache.origins[{idx}]")
                 })?)
             }
-            // S3-compatible origin (#437 PR2). Conversion from the resolved-
+            // S3-compatible origin (#437). Conversion from the resolved-
             // config form to the cache-crate's runtime form happens here
             // because `decdn-cache` deliberately doesn't depend on
-            // `decdn-common` (the dependency direction is `common -> cache`,
-            // and reversing it would be circular).
+            // `decdn-common` (#578); `node` is the crate that sees both.
             ResolvedOrigin::S3(s3_cfg) => Arc::new(
                 S3Origin::new(&s3_origin_config_from_resolved(s3_cfg))
                     .await

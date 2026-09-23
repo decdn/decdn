@@ -610,7 +610,7 @@ struct FailoverOrder {
     /// for the whole set. An overstated one costs nothing — the real header
     /// governs once the fan-out engages.
     size_hint: Option<u64>,
-    /// Each probed holder's measured [`decdn_protocol::Coverage`] (#1506's B1),
+    /// Each probed holder's measured [`decdn_protocol::Coverage`] (#1506),
     /// keyed by `node_id`. Proxy-warming candidates never appear here — they
     /// are non-holders by definition, so a lookup miss on them (and on any
     /// node this map otherwise has no entry for) means "no measured
@@ -671,7 +671,7 @@ fn failover_order(
     }
     holders.sort_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms));
     // Captured before `holders` is consumed into `order` below — each probed
-    // holder's real coverage, for the multi-source lane builder (#1506's B3).
+    // holder's real coverage, for the multi-source lane builder (#1506).
     let coverage_by_node: HashMap<PublicKey, decdn_protocol::Coverage> = holders
         .iter()
         .map(|h| (h.candidate.node_id, h.coverage.clone()))
@@ -1018,7 +1018,7 @@ pub(crate) struct ResolvedTargets {
     /// pinned `--node-id` path and whenever no holder reported a size, where the
     /// gate falls back to the header open.
     pub(crate) size_hint: Option<u64>,
-    /// Each probed holder's measured [`decdn_protocol::Coverage`] (#1506's B1),
+    /// Each probed holder's measured [`decdn_protocol::Coverage`] (#1506),
     /// keyed by `node_id` — what the multi-source lane builder reads instead of
     /// assuming every admitted candidate is a full holder. Empty on the pinned
     /// `--node-id` path, where nothing was probed; a lookup miss there (as
@@ -1800,7 +1800,7 @@ pub(crate) fn multi_source_gate_declines(
 
 /// Shared pull/funding deps [`drive_fetch`] borrows for the lifetime of one
 /// fetch. Mirrors the locals `fetch()` and `bundle_pull::PullCtx` already hold so
-/// both callers drive the same gap-driven core (P4). Every field is a borrow or a
+/// both callers drive the same gap-driven core. Every field is a borrow or a
 /// `Copy` scalar; the per-fetch `ctx`, target, and output are passed to
 /// `drive_fetch` directly (the `ctx` moves, since it must be wrapped in
 /// `Arc<Mutex>`).
@@ -2485,7 +2485,7 @@ where
     })
 }
 
-/// The gap-driven driver core shared by `decdn fetch` and `bundle pull` (P4):
+/// The gap-driven driver core shared by `decdn fetch` and `bundle pull`:
 /// open the drive's first leg to read the signed `total_bytes` (a fresh fetch
 /// hands that pull to the drive through the [`PrimedSource`]; a resume drops
 /// it), open the [`ClientRangedStore`] beside `output`, drive only the missing
@@ -2691,9 +2691,9 @@ struct MultiLane<'a> {
 }
 
 /// The `SourceLane::coverage` for one multi-source lane: the REAL measured
-/// `Coverage` the `cdn/probe/v1` round trip reported for that holder (#1506's
-/// B1), looked up by `node_id` in the map [`failover_order`] built from the
-/// probed `holders`.
+/// `Coverage` the `cdn/probe/v1` round trip reported for that holder (#1506),
+/// looked up by `node_id` in the map [`failover_order`] built from the probed
+/// `holders`.
 ///
 /// A lookup miss — a source with no entry in `coverage_by_node` — gets
 /// `Coverage::full`: every source reaching a multi-source lane already passed
@@ -4884,10 +4884,10 @@ mod tests {
     }
 
     /// `failover_order`'s `coverage_by_node` carries each holder's REAL measured
-    /// coverage (#1506's B1) — not `Coverage::full` for every lane, which was
-    /// the gap this task closes: disjoint per-holder coverage {block0}/{block1}
-    /// survives into the map keyed by `node_id`, and a node that was never
-    /// probed (e.g. a proxy) has no entry at all.
+    /// coverage (#1506) — not `Coverage::full` for every lane: disjoint
+    /// per-holder coverage {block0}/{block1} survives into the map keyed by
+    /// `node_id`, and a node that was never probed (e.g. a proxy) has no entry
+    /// at all.
     #[test]
     fn failover_order_coverage_by_node_carries_each_holders_real_coverage() {
         let mut h1 = holder(1, 100.0);

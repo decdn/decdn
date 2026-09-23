@@ -955,7 +955,6 @@ fn run_fault_is_terminal(err: &anyhow::Error) -> bool {
 /// top-up decision — the only thing that would call `top_up`. It errs
 /// defensively (rather than escrow anything, which it could not do anyway) so a
 /// hypothetical future regression that reached it fails loudly instead of hanging.
-#[allow(dead_code, reason = "wired by the own-origin serve-miss orchestration")]
 struct NullFunder;
 
 impl Funder for NullFunder {
@@ -984,7 +983,6 @@ impl Funder for NullFunder {
 /// its exhaustion/top-up arm. Fresh priors — there is no prior pool state to
 /// resume. `U256::MAX` is used, not a merely-large value, so no blob size can ever
 /// bring the gap headroom below the (zero) voucher cost.
-#[allow(dead_code, reason = "wired by the own-origin serve-miss orchestration")]
 fn local_bookkeeping_ctx() -> PoolContext {
     PoolContext {
         pool_id: B256::ZERO,
@@ -1054,8 +1052,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// (the shared [`FillSession`]'s [`DownstreamWatch`]) crosses runtimes safely.
 #[allow(
     clippy::too_many_arguments,
-    dead_code,
-    reason = "wired by the own-origin serve-miss orchestration"
+    reason = "the pull leg's inputs are all owned so it can run on its own runtime"
 )]
 pub(crate) async fn run_local_pull_leg(
     metrics: Arc<crate::metrics::Metrics>,

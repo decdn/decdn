@@ -729,8 +729,8 @@ pub struct Probed {
     /// learn whether the blob clears the fan-out floor.
     pub total_bytes: Option<u64>,
     /// Which discovery blocks this holder answered `has_blob:true` for
-    /// (`decdn_protocol::coverage`), taken from the probe's `ProbeResponseExt`
-    /// (PR1). Unsigned, like `total_bytes` — a hint for the scheduler's segment
+    /// (`decdn_protocol::coverage`), taken from the probe's `ProbeResponseExt`.
+    /// Unsigned, like `total_bytes` — a hint for the scheduler's segment
     /// assignment, never a commitment. `has_blob:true` means
     /// "will serve at least one block", so this may be a proper subset of the
     /// blob rather than the whole thing — a **partial holder** is admitted here

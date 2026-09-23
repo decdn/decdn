@@ -51,7 +51,7 @@ pub struct SourceCoverage {
 /// One contiguous byte run assigned to one source. `offset`/`len` are CLAMPED to
 /// the gap being fetched intersected with the request — a run spans only bytes
 /// that are actually missing and requested, never the whole discovery block(s) it
-/// falls in (#1506 C2). It therefore starts and ends on the gap's own chunk
+/// falls in (#1506). It therefore starts and ends on the gap's own chunk
 /// boundaries, and a run reaching the blob's tail has its end clamped to
 /// `total_bytes`. A run whose block span was covered by the gap in full is exactly
 /// that block span; one covering a partial in-block slice is exactly that slice.
@@ -80,7 +80,7 @@ fn block_offset(block: u32) -> u64 {
 /// of its discovery block(s) — never the whole block. Without the clamp a `Mixed`
 /// remainder of, say, `[65 MiB, 66 MiB)` would plan a whole-block `[64 MiB, 128 MiB)`
 /// run and pull (and pay for) 63 MiB no one asked for, including bytes an attached
-/// sibling claim owns and is concurrently pulling (#1506 C2).
+/// sibling claim owns and is concurrently pulling (#1506).
 fn gap_extent(gap: &ChunkRanges, lo: u64, hi: u64) -> Option<(u64, u64)> {
     if hi <= lo {
         return None;
@@ -108,7 +108,7 @@ fn block_chunks(block: u32) -> ChunkRanges {
 
 /// Build the [`CoveredRun`] spanning discovery blocks `[start_block,
 /// last_block]` inclusive, CLAMPED to the byte extent `gap` actually misses
-/// inside that block span (#1506 C2). A block span the gap covers in full yields
+/// inside that block span (#1506). A block span the gap covers in full yields
 /// the whole block span (its end clamped to `total_bytes`); one the gap touches
 /// only partially yields exactly the in-gap slice. Every block in `[start_block,
 /// last_block]` intersects the gap by construction, so the extent is non-empty;
@@ -646,7 +646,7 @@ mod tests {
 
     /// A gap of exactly `[65 MiB, 66 MiB)` — a 1 MiB slice wholly inside block 1 —
     /// yields a run of exactly `(65 MiB, 1 MiB)` from BOTH planners, never the
-    /// whole 64 MiB block (#1506 C2). Without the clamp the node would pull and pay
+    /// whole 64 MiB block (#1506). Without the clamp the node would pull and pay
     /// for 63 MiB no one asked for, including bytes an attached sibling owns.
     fn slice_gap(from: u64, to: u64) -> ChunkRanges {
         ChunkRanges::from(ChunkNum(from / BAO_CHUNK_BYTES)..ChunkNum(to / BAO_CHUNK_BYTES))

@@ -120,8 +120,8 @@ impl DhtHandler {
     /// protocol (ADR 022).
     pub const ALPN: &'static [u8] = ALPN_DHT;
 
-    /// Construct a handler. The routing table is empty at startup; PR 4
-    /// of #320 wires bootstrap from the on-chain staker set, and the
+    /// Construct a handler. The routing table is empty at construction; the
+    /// runtime's DHT bootstrap fills it from the on-chain staker set, and the
     /// handler additionally updates the table from every incoming
     /// request's authenticated `NodeId` once it knows the peer is
     /// rate-limit admitted.
@@ -173,8 +173,8 @@ impl DhtHandler {
         }
     }
 
-    /// Shared handle to the routing table — exposed so PR 4 of #320 can
-    /// drive bucket refresh and bootstrap without re-allocating the
+    /// Shared handle to the routing table — exposed so the runtime's bootstrap
+    /// and bucket-refresh tasks drive the same table without re-allocating the
     /// `Arc<Mutex<RoutingTable>>` from outside.
     #[must_use]
     pub fn routing_table(&self) -> Arc<Mutex<RoutingTable>> {

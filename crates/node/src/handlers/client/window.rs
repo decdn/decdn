@@ -283,7 +283,7 @@ impl ClientHandler {
 
         // Resolve the claim into a uniform shape: the session to serve from, the
         // optional local pull to drive for it (byte range), the sibling frontiers to
-        // also pace (DECISION-B), and the leases to hold for the serve's lifetime.
+        // also pace, and the leases to hold for the serve's lifetime.
         // `Owner` drives a pull for the whole request; `Mixed` drives one for only the
         // remainder and attaches a sibling for the overlap; `Attach` drives none.
         let (serve_session, pull_range, also_pace, leases) = plan_serve(claim, req);
@@ -871,8 +871,9 @@ impl ClientHandler {
 
 /// The uniform serve shape [`plan_serve`] resolves a [`decdn_cache::FillClaim`] into:
 /// the session to serve `R` from, the byte range of the local pull to drive for it
-/// (`None` when purely attaching), the sibling fill frontiers to also pace
-/// (DECISION-B), and the observer leases to hold for the serve leg's lifetime.
+/// (`None` when purely attaching), the sibling fill frontiers to also pace (the
+/// pull paces on the furthest paid frontier), and the observer leases to hold
+/// for the serve leg's lifetime.
 type ServePlan = (
     Arc<decdn_cache::FillSession>,
     Option<(u64, u64)>,

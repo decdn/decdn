@@ -1,14 +1,14 @@
-//! Client-specific tests for `ClientRangedStore` (#1621 P2 Task 4): lock the
+//! Client-specific tests for `ClientRangedStore` (#1621): lock the
 //! "trust records, verify once" resume invariant that distinguishes the
 //! client backend and isn't covered by the shared conformance suite (see
 //! `ranged_store_conformance.rs`) or the `src`-local `admit`/`finalize` unit
-//! tests (#1621 P2 Task 2).
+//! tests.
 //!
 //! `ClientRangedStore::open` reconstructs `present` from the persisted
 //! `.partial.ranges` record in O(1) — it does NOT re-hash the `.partial` data
 //! against the outboard. That's the load-bearing shortcut documented on
 //! `ranged_store.rs::open`: the ONE verify pass is `finalize`'s `valid_ranges`
-//! sweep, already locked by Task 2's
+//! sweep, already locked by the unit test
 //! `finalize_shrinks_to_valid_set_on_post_admit_corruption`. These tests prove
 //! the other half — that `open` trusts the record rather than re-deriving it,
 //! and that resume continues from the persisted frontier without re-listing

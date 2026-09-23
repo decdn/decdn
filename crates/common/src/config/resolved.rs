@@ -470,7 +470,7 @@ pub enum ResolvedOrigin {
 ///
 /// Resolved-vs-wire-form differences:
 /// - `endpoint_url` is `Option<OriginUrl>` (parsed) instead of
-///   `Option<String>`, so PR2's S3 backend cannot accidentally pass
+///   `Option<String>`, so the S3 backend cannot accidentally pass
 ///   an un-normalized URL to the SDK and produce `SigV4` mismatches
 ///   between, say, `http://minio:9000` and `http://minio:9000/`.
 /// - `path_style` is `bool` (collapsed from `Option<bool>`), with

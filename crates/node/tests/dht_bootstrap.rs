@@ -1,5 +1,5 @@
-//! Bootstrap / republish loopback (PR 4 of #320, ADR 022 §Bootstrap
-//! and §STORE Flow).
+//! Bootstrap / republish loopback (#320, ADR 022 §Bootstrap and
+//! §STORE Flow).
 //!
 //! Spins up a server endpoint running the full DHT handler stack
 //! (routing table, record store, staker filter), then drives the
@@ -8,7 +8,7 @@
 //!
 //! - `client::find_node` against a live server returns a
 //!   `FindNodeResponse` and refreshes the requester into the server's
-//!   routing table (the server-side `note_peer_seen` from PR 2).
+//!   routing table (the server-side `note_peer_seen`).
 //! - `bootstrap::bootstrap` seeds the requester's routing table from
 //!   the staker set AND populates it with the seed's closer-nodes.
 //! - `client::store` against a staked publisher's server lands a
@@ -183,7 +183,7 @@ async fn client_find_node_roundtrip_via_dht_client_module() -> anyhow::Result<()
         "the freshly-refreshed client must appear as the only closer node"
     );
     // Server should have refreshed the authenticated client NodeId
-    // into its routing table (PR 2 behaviour, unchanged by PR 4).
+    // into its routing table (`note_peer_seen`).
     let in_table = {
         let t = server.routing.lock().unwrap();
         t.contains(&NodeId::from_bytes(*client_ep.id().as_bytes()))
