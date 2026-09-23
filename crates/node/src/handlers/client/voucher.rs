@@ -29,10 +29,10 @@ use decdn_incentive::{PoolError, VoucherError};
 /// A released preimage is a bare 33 bytes — it names no chain. Its worth comes
 /// entirely from the voucher whose `chain_root` it satisfies, so the node needs
 /// something per stream to place it against. This is that something, and it is
-/// deliberately **per stream** rather than lane-wide: the payer sends the new
-/// root voucher on every active stream at a rollover, so a fast stream that has
-/// already adopted the new root cannot invalidate a slower sibling still
-/// finishing the old one. QUIC orders within a stream, so each stream reads its
+/// deliberately **per stream** rather than lane-wide: after a rollover the payer
+/// sends the new root voucher on each stream immediately before that stream's
+/// next reveal, so a fast stream that has already adopted the new root cannot
+/// invalidate a slower sibling still finishing the old one. QUIC orders within a stream, so each stream reads its
 /// own old-chain reveals against its own old root.
 ///
 /// A lane-wide reading would also not be *decidable*: "has this lane been told
@@ -129,6 +129,91 @@ fn credit_advance(
     Ok((new_credited, credited_bytes))
 }
 
+/// One delivered chunk of a stream that the payer has not fully paid yet.
+///
+/// A proof credits at most the headroom the lane holds (`credit_advance`), so it
+/// can pay part of a chunk. The unpaid remainder stays owed: the recoup loop takes
+/// the chunk off its queue and reads proofs for it until [`Self::settle`] reports
+/// it paid. The serve loop's credit window rests on this. The remainders of the
+/// queued chunks and of the chunk in hand, plus the bytes not yet cut into a
+/// chunk, are exactly `delivered − paid`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OwedChunk {
+    /// The chunk's delivered wire bytes. Never zero.
+    len: u64,
+    /// The part of `len` that no proof has credited yet.
+    remaining: u64,
+}
+
+impl OwedChunk {
+    /// A delivered chunk of `len` wire bytes, with nothing paid yet. Both serve
+    /// loops cut a chunk only from bytes they delivered, so `len` is never zero.
+    pub(super) const fn new(len: u64) -> Self {
+        debug_assert!(len > 0, "an owed chunk holds at least one delivered byte");
+        Self {
+            len,
+            remaining: len,
+        }
+    }
+
+    /// The chunk's delivered wire bytes. This, not [`Self::remaining`], decides
+    /// whether it is a whole chunk (`voucher_credit_delta`).
+    pub(super) const fn len(self) -> u64 {
+        self.len
+    }
+
+    /// The bytes of the chunk that are still unpaid.
+    pub(super) const fn remaining(self) -> u64 {
+        self.remaining
+    }
+
+    /// Apply a credit of `credited` bytes and report whether the chunk is now
+    /// fully paid.
+    ///
+    /// # Errors
+    ///
+    /// A credit larger than [`Self::remaining`]. Every proof path caps its credit
+    /// at `remaining`, so this is a node accounting fault. The caller has already
+    /// added the credit to `paid`, so it must end the stream rather than let the
+    /// excess reopen the credit window.
+    pub(super) fn settle(&mut self, credited: u64) -> anyhow::Result<bool> {
+        self.remaining = self.remaining.checked_sub(credited).ok_or_else(|| {
+            anyhow::anyhow!(
+                "a proof credited {credited} bytes against a {}-byte chunk that owes {}",
+                self.len,
+                self.remaining
+            )
+        })?;
+        Ok(self.remaining == 0)
+    }
+}
+
+/// Check the serve loop's byte accounting after a recoup phase.
+///
+/// The recoup phase pays every owed chunk before it returns, so the only unpaid
+/// bytes left are the ones not yet cut into a chunk: `delivered − paid` must equal
+/// `unvouchered`. A mismatch is a node accounting fault. A shortfall would let the
+/// stream end with bytes nobody paid for, or fill the credit window with nothing
+/// left to collect. An excess would let `paid` run ahead of `delivered`.
+///
+/// # Errors
+///
+/// The accounting does not balance.
+pub(super) fn ensure_unpaid_bytes_tracked(
+    delivered: u64,
+    paid: u64,
+    unvouchered: u64,
+) -> anyhow::Result<()> {
+    if delivered.checked_sub(paid) == Some(unvouchered) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "serve accounting broke: {delivered} bytes delivered, {paid} paid, \
+             {unvouchered} not yet cut into a chunk"
+        ))
+    }
+}
+
 /// The share of an outstanding chunk a voucher may take from lane headroom
 /// (ADR 003 §Concurrent Streams).
 ///
@@ -143,13 +228,17 @@ fn credit_advance(
 /// reveal.
 ///
 /// A sealed voucher (`chain_root == 0`) and a voucher that settles a partial
-/// closing chunk (`delta_bytes < CHUNK_BYTES`) keep the full delta: each is the
-/// payment for the bytes it answers.
-fn voucher_credit_delta(wire: &decdn_protocol::client::Voucher, delta_bytes: u64) -> u64 {
-    if wire.chain_root != [0u8; 32] && delta_bytes >= super::CHUNK_BYTES {
+/// closing chunk (`len < CHUNK_BYTES`) take what the chunk still owes: each is
+/// the payment for the bytes it answers.
+///
+/// The chunk's delivered length decides which case applies, not the part still
+/// owed. A whole chunk that a proof paid in part is still a whole chunk, so its
+/// remainder waits for a reveal exactly as the whole chunk did.
+fn voucher_credit_delta(wire: &decdn_protocol::client::Voucher, owed: OwedChunk) -> u64 {
+    if wire.chain_root != [0u8; 32] && owed.len() >= super::CHUNK_BYTES {
         0
     } else {
-        delta_bytes
+        owed.remaining()
     }
 }
 
@@ -174,7 +263,7 @@ impl ClientHandler {
         lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
-        delta_bytes: u64,
+        owed: OwedChunk,
     ) -> anyhow::Result<VoucherStop> {
         // Unknown lane: `serve_stream` refuses one pre-serve, so this is a
         // defensive backstop matching the sole callers (which forward `Some`).
@@ -207,7 +296,7 @@ impl ClientHandler {
                         lane,
                         client_node_id,
                         preimage,
-                        delta_bytes,
+                        owed,
                     )
                     .await;
             }
@@ -320,7 +409,7 @@ impl ClientHandler {
         // another proof.
         let (new_credited, credited_bytes) = credit_advance(
             guard.paid_credited,
-            voucher_credit_delta(&wire, delta_bytes),
+            voucher_credit_delta(&wire, owed),
             verified.new_bytes,
         )?;
         guard.paid_credited = new_credited;
@@ -396,7 +485,7 @@ impl ClientHandler {
         lane: &Arc<Mutex<LaneDeliveryState>>,
         client_node_id: B256,
         preimage: decdn_protocol::client::ChunkPreimage,
-        delta_bytes: u64,
+        owed: OwedChunk,
     ) -> anyhow::Result<VoucherStop> {
         // Index 0 names the root and resolves to the voucher's own `amount`, so
         // it proves nothing the voucher does not already say and never travels
@@ -477,10 +566,11 @@ impl ClientHandler {
 
         // A reveal that advanced nothing — at or below the frontier, or naming a
         // superseded epoch — advances the lane's claim by nothing, so nothing is
-        // recorded and no redeem hint fires. But this stream still DELIVERED
-        // `delta_bytes`, and the lane already holds the money for them: a
-        // concurrent same-lane sibling raced the shared chain index ahead, or a
-        // sibling's rollover voucher folded this very reveal into the watermark.
+        // recorded and no redeem hint fires. But this stream still DELIVERED the
+        // bytes `owed` still names, and the lane already holds the money for
+        // them: a concurrent same-lane sibling raced the shared chain index
+        // ahead, or a sibling's rollover voucher folded this very reveal into the
+        // watermark.
         // So credit this stream from that lane headroom rather than throttling it
         // to a `MAX_PROOFS_PER_CHUNK` stall. Without it, cross-stream reveal
         // reordering starves the slower stream: its reveals keep landing below the
@@ -496,8 +586,9 @@ impl ClientHandler {
         // The credit is bounded by the lane's proven `owed_bytes`, and
         // `paid_credited` is monotone, so total credit across every same-lane
         // stream can never exceed money the node can redeem — no double-pay, no
-        // under-pay. If the payer has genuinely under-paid, there is no headroom,
-        // `credit_advance` returns zero, and the throttle correctly holds.
+        // under-pay. If the payer has genuinely under-paid, the headroom is short,
+        // `credit_advance` credits only what exists, and the rest of the chunk
+        // stays owed.
         if !applied.advanced() {
             // Frontier unchanged, so `guard.state`'s owed claim is what a sibling
             // has already paid the lane for. Read the receipt amount before the
@@ -505,7 +596,7 @@ impl ClientHandler {
             let owed_bytes = guard.state.owed_bytes();
             let amount = u64::try_from(guard.state.owed()).unwrap_or(u64::MAX);
             let (new_credited, credited_bytes) =
-                credit_advance(guard.paid_credited, delta_bytes, owed_bytes)?;
+                credit_advance(guard.paid_credited, owed.remaining(), owed_bytes)?;
             guard.paid_credited = new_credited;
             guard
                 .last_voucher_at
@@ -532,7 +623,7 @@ impl ClientHandler {
         // frontier: a reveal is what pays for these bytes, so they are as settled
         // as a signature's.
         let (new_credited, credited_bytes) =
-            credit_advance(guard.paid_credited, delta_bytes, owed_bytes)?;
+            credit_advance(guard.paid_credited, owed.remaining(), owed_bytes)?;
         guard.paid_credited = new_credited;
         if let Err(e) = self.channel_state_store.record(&guard.state) {
             drop(guard);
@@ -548,12 +639,12 @@ impl ClientHandler {
         // receipt carries, so the audit log reads uniformly across both proof
         // kinds.
         //
-        // The byte figure is `credited_bytes`, not this stream's `delta_bytes`,
+        // The byte figure is `credited_bytes`, not what this stream still owes,
         // for the same reason the voucher path logs it: the two diverge. A reveal
         // walks from the LANE's frontier, so one arriving ahead of a sibling's
-        // covers every index between and pays for more than one stream's delta,
-        // while `credit_advance` caps it below the delta whenever the watermark
-        // does not reach that far. `credited_bytes` is what the lane actually
+        // covers every index between and pays for more than one stream's chunk,
+        // while `credit_advance` caps it below what the chunk still owes whenever
+        // the watermark does not reach that far. `credited_bytes` is what the lane actually
         // charged for, which is what an audit log must say (#248/#803). Gated the
         // same way, so a reveal that advanced the frontier but credited nothing
         // against the cap logs no payment. `amount` is the lane's new total claim,
@@ -975,7 +1066,7 @@ mod tests {
     fn a_metering_voucher_credits_no_whole_chunk() {
         let chunk = super::super::CHUNK_BYTES;
         let wire = wire_voucher_with_root([0x5E; 32]);
-        let delta = super::voucher_credit_delta(&wire, chunk);
+        let delta = super::voucher_credit_delta(&wire, super::OwedChunk::new(chunk));
         assert_eq!(delta, 0, "a metering voucher pays no whole chunk");
         let (new_credited, credited) =
             super::credit_advance(U256::ZERO, delta, U256::from(4 * chunk))
@@ -985,29 +1076,106 @@ mod tests {
     }
 
     /// A metering voucher that settles a partial closing chunk is the payment
-    /// for those bytes, so it keeps its full delta.
+    /// for those bytes, so it credits what the chunk still owes.
     #[test]
     fn a_metering_voucher_settles_a_closing_partial() {
         let partial = super::super::CHUNK_BYTES - 1;
         let wire = wire_voucher_with_root([0x5E; 32]);
         assert_eq!(
-            super::voucher_credit_delta(&wire, partial),
+            super::voucher_credit_delta(&wire, super::OwedChunk::new(partial)),
             partial,
             "a closing residual under one chunk credits in full"
         );
     }
 
     /// A sealed voucher (zero root) meters no chain, so nothing else can pay the
-    /// chunk it answers: it keeps the full delta.
+    /// chunk it answers: it credits what the chunk still owes.
     #[test]
     fn a_sealed_voucher_credits_a_whole_chunk() {
         let chunk = super::super::CHUNK_BYTES;
         let wire = wire_voucher_with_root([0u8; 32]);
         assert_eq!(
-            super::voucher_credit_delta(&wire, chunk),
+            super::voucher_credit_delta(&wire, super::OwedChunk::new(chunk)),
             chunk,
             "a sealed voucher pays its whole chunk"
         );
+    }
+
+    /// A proof that pays part of a chunk leaves the rest owed, and the chunk is
+    /// settled only when its remainder reaches zero (#2132).
+    #[test]
+    fn an_owed_chunk_settles_only_when_fully_paid() -> anyhow::Result<()> {
+        let mut owed = super::OwedChunk::new(1000);
+        assert!(!owed.settle(0)?, "a zero credit settles nothing");
+        assert!(!owed.settle(400)?, "a partial credit leaves the rest owed");
+        assert_eq!(owed.remaining(), 600);
+        assert_eq!(owed.len(), 1000, "the delivered length does not change");
+        assert!(owed.settle(600)?, "paying the remainder settles the chunk");
+        assert_eq!(owed.remaining(), 0);
+        Ok(())
+    }
+
+    /// A credit larger than what the chunk still owes is a node accounting fault,
+    /// never a quiet settle: the serve loop has already added it to `paid`.
+    #[test]
+    fn an_over_credit_is_refused() {
+        let mut owed = super::OwedChunk::new(10);
+        assert!(owed.settle(11).is_err(), "an over-credit must not settle");
+    }
+
+    /// The post-recoup accounting check passes only when the unpaid bytes are
+    /// exactly the ones not yet cut into a chunk.
+    #[test]
+    fn unpaid_bytes_must_all_be_tracked() {
+        assert!(super::ensure_unpaid_bytes_tracked(1000, 900, 100).is_ok());
+        assert!(
+            super::ensure_unpaid_bytes_tracked(1000, 800, 100).is_err(),
+            "a shortfall nothing tracks is refused"
+        );
+        assert!(
+            super::ensure_unpaid_bytes_tracked(1000, 1001, 0).is_err(),
+            "paid running ahead of delivered is refused"
+        );
+    }
+
+    /// A whole chunk that a proof paid in part is still a whole chunk: a metering
+    /// voucher takes nothing from its remainder, so the remainder cannot eat the
+    /// headroom a sibling's reveal needs. A sealed voucher takes exactly the
+    /// remainder, never the chunk's full length.
+    #[test]
+    fn a_partly_paid_whole_chunk_keeps_its_whole_chunk_rule() {
+        let chunk = super::super::CHUNK_BYTES;
+        let mut owed = super::OwedChunk::new(chunk);
+        assert!(
+            !owed
+                .settle(chunk / 4)
+                .expect("a partial credit fits the chunk")
+        );
+        let remainder = chunk - chunk / 4;
+
+        let metering = wire_voucher_with_root([0x5E; 32]);
+        assert_eq!(
+            super::voucher_credit_delta(&metering, owed),
+            0,
+            "a metering voucher pays no part of a whole chunk"
+        );
+        let sealed = wire_voucher_with_root([0u8; 32]);
+        assert_eq!(
+            super::voucher_credit_delta(&sealed, owed),
+            remainder,
+            "a sealed voucher pays what the chunk still owes"
+        );
+    }
+
+    /// A partly paid closing partial chunk credits only its remainder, from any
+    /// voucher.
+    #[test]
+    fn a_partly_paid_closing_partial_credits_its_remainder() {
+        let partial = super::super::CHUNK_BYTES / 2;
+        let mut owed = super::OwedChunk::new(partial);
+        assert!(!owed.settle(100).expect("a partial credit fits the chunk"));
+        let metering = wire_voucher_with_root([0x5E; 32]);
+        assert_eq!(super::voucher_credit_delta(&metering, owed), partial - 100);
     }
 
     /// A voucher at-or-below the lane watermark — a concurrent sibling raced ahead

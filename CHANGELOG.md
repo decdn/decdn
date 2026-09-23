@@ -825,6 +825,24 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Node: a proof that pays part of a chunk no longer wedges the runtime
+  (#2132).** A proof credits at most the lane headroom it finds, so a sealed
+  voucher that moves the watermark by a sliver pays a sliver of the chunk. Both
+  serve loops added that sliver to `paid` but dropped the whole chunk from the
+  queue of owed chunks. The unpaid rest was then tracked nowhere. On a cache
+  hit, once it filled the credit window, the serve loop went around forever
+  without awaiting, and held one tokio worker per stream. Two such streams
+  stopped a 2-vCPU node: serving, watchers, logs, and `/metrics` all went
+  silent, while systemd still showed the unit `active`. Any paying client could
+  trigger it. A partly paid chunk now stays owed until proofs pay all of it.
+  `MAX_PROOFS_PER_CHUNK` counts every proof that leaves the chunk unsettled, so a
+  payer that sends sliver after sliver hits the bound. The chunk's delivered
+  length, not its unpaid rest, still decides whether a metering voucher may pay
+  it. Both serve loops now check after each recoup that `delivered − paid`
+  equals the bytes not yet cut into a chunk. When an iteration neither delivers
+  nor credits a byte, they end the stream as a node fault, logged at `error!`.
+  The miss path used to file that state as a client abandon, so
+  `ServeStop::ClientAbandoned` is gone.
 - **CLI: a range-dedup bundle entry pays its complement over one warm session,
   concurrently (#2119).** An entry that shares most of its chunks with a sibling
   pays for about one 16 KiB chunk group at each seam its donors cannot cover —

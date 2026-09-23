@@ -85,8 +85,6 @@ pub(super) enum ServeStop {
     SignerCapExhausted,
     /// A blacklist takedown landed for the hash.
     Takedown,
-    /// The client stopped paying or reading on a pull-through serve.
-    ClientAbandoned,
 }
 
 impl ServeStop {
@@ -97,7 +95,6 @@ impl ServeStop {
             Self::PoolExhausted => "pool_exhausted",
             Self::SignerCapExhausted => "signer_cap_exhausted",
             Self::Takedown => "takedown",
-            Self::ClientAbandoned => "client_abandoned",
         }
     }
 }

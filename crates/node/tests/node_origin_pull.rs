@@ -9218,19 +9218,27 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
     Ok(())
 }
 
-/// A leaf that takes the first interval of bytes, then signs and sends a voucher
-/// that *underpays* (a token amount well below the quoted rate) instead of paying.
-/// B answers with an `Underpaid` rejection mid-window. Returns once it observes
-/// B's `StreamError` rejection (or the stream drops).
-async fn leaf_underpays_first_voucher(
+/// A leaf's paid stream to B, opened and read up to the first interval
+/// boundary, where B parks for the first voucher.
+struct LeafStream {
+    /// The leaf's connection to B, which the stream lives on.
+    conn: iroh::endpoint::Connection,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+    /// Wire bytes the leaf has read.
+    delivered: u64,
+}
+
+/// Open a paid stream from the leaf to B for `hash` and read chunks until the
+/// first interval boundary.
+async fn leaf_reads_first_interval(
     leaf_ep: &iroh::Endpoint,
     target: EndpointAddr,
     leaf_node_id: B256,
     leaf_eth: &Arc<PrivateKeySigner>,
-    provider: Address,
     pool_id: B256,
     hash: Hash,
-) -> Result<()> {
+) -> Result<LeafStream> {
     let conn = leaf_ep
         .connect(target, ALPN_CLIENT)
         .await
@@ -9271,13 +9279,12 @@ async fn leaf_underpays_first_voucher(
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
     let interval_bytes = CHUNK_BYTES;
 
-    // Read chunks until the first interval boundary, then underpay it.
-    let mut cumulative: u64 = 0;
+    let mut delivered: u64 = 0;
     loop {
         match read_client(&mut recv).await? {
             ClientMessage::ChunkData(chunk) => {
-                cumulative = cumulative.saturating_add(chunk.bytes().len() as u64);
-                if cumulative >= interval_bytes {
+                delivered = delivered.saturating_add(chunk.bytes().len() as u64);
+                if delivered >= interval_bytes {
                     break;
                 }
             }
@@ -9285,27 +9292,71 @@ async fn leaf_underpays_first_voucher(
             other => anyhow::bail!("unexpected message mid-delivery: {other:?}"),
         }
     }
+    Ok(LeafStream {
+        conn,
+        send,
+        recv,
+        delivered,
+    })
+}
 
+/// Sign a sealed voucher from the leaf for `(bytes_delivered, amount)` and write
+/// it to B.
+async fn leaf_sends_voucher(
+    send: &mut iroh::endpoint::SendStream,
+    leaf_eth: &Arc<PrivateKeySigner>,
+    provider: Address,
+    pool_id: B256,
+    bytes_delivered: u64,
+    amount: U256,
+) -> Result<()> {
     let signed = Voucher {
         pool_id,
         signer: leaf_eth.address(),
         provider,
-        amount: U256::from(1u64), // far below the quoted rate for one interval
-        bytes_delivered: U256::from(cumulative),
+        amount,
+        bytes_delivered: U256::from(bytes_delivered),
         chain_root: B256::ZERO,
         chunk_price: U256::ZERO,
     }
     .sign(leaf_eth.as_ref(), &voucher_dom())
     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
     write_client(
-        &mut send,
+        send,
         &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
+    )
+    .await
+}
+
+/// A leaf that takes the first interval of bytes, then signs and sends a voucher
+/// that *underpays* (a token amount well below the quoted rate) instead of paying.
+/// B answers with an `Underpaid` rejection mid-window. Returns once it observes
+/// B's `StreamError` rejection (or the stream drops).
+async fn leaf_underpays_first_voucher(
+    leaf_ep: &iroh::Endpoint,
+    target: EndpointAddr,
+    leaf_node_id: B256,
+    leaf_eth: &Arc<PrivateKeySigner>,
+    provider: Address,
+    pool_id: B256,
+    hash: Hash,
+) -> Result<()> {
+    let mut leaf =
+        leaf_reads_first_interval(leaf_ep, target, leaf_node_id, leaf_eth, pool_id, hash).await?;
+    // Far below the quoted rate for one interval.
+    leaf_sends_voucher(
+        &mut leaf.send,
+        leaf_eth,
+        provider,
+        pool_id,
+        leaf.delivered,
+        U256::from(1u64),
     )
     .await?;
 
     // B must reject the underpayment in band, as `Underpaid`: a dropped stream
     // would leave the payer no reason to act on.
-    match read_client(&mut recv).await? {
+    match read_client(&mut leaf.recv).await? {
         ClientMessage::StreamError(StreamError::VoucherRejected {
             reason: VoucherRejectReason::Underpaid,
             ..
@@ -9408,6 +9459,210 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
     );
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
 
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
+/// A proof that pays part of an outstanding chunk leaves the rest owed on the
+/// miss path too (#2132).
+///
+/// The leaf pays the first interval by a sliver only. B must keep the rest of
+/// that interval owed and deliver nothing more until a proof pays it. If B drops
+/// the remainder, the sliver reopens the credit window for bytes nobody paid for.
+/// Once the leaf pays the rest, the stream must run to a clean, fully paid end.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()> {
+    const SLIVER_BYTES: u64 = 64 * 1024;
+    // Three intervals, so the stream is still mid-blob when the first one is paid.
+    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
+    let payload = vec![0x2Du8; payload_len];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA8);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x2E);
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, _b_metrics, _local_rep, b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let mut leaf = leaf_reads_first_interval(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+    )
+    .await?;
+
+    // Pay the first interval by a sliver. The voucher pays the quoted rate for
+    // the span it claims, so B accepts it and credits exactly the sliver.
+    let mut amount = min_payment(SLIVER_BYTES, RATE);
+    leaf_sends_voucher(
+        &mut leaf.send,
+        &leaf_eth,
+        b_operator,
+        leaf_channel_id,
+        SLIVER_BYTES,
+        amount,
+    )
+    .await?;
+
+    // The rest of the interval is still owed, so B delivers nothing more.
+    match tokio::time::timeout(Duration::from_secs(2), read_client(&mut leaf.recv)).await {
+        Err(_elapsed) => {}
+        Ok(Ok(ClientMessage::ChunkData(chunk))) => anyhow::bail!(
+            "B sent {} more wire bytes on a sliver payment instead of waiting for the rest",
+            chunk.bytes().len()
+        ),
+        Ok(other) => anyhow::bail!("expected B to wait for the rest of the payment, got {other:?}"),
+    }
+
+    // From here on the leaf pays for every byte it has read whenever B goes
+    // quiet. The first voucher settles the rest of the first interval, and the
+    // stream must run to a clean `StreamEnd`, fully paid. A quiet spell with
+    // every byte paid is B pulling from A, so the leaf just waits, within an
+    // overall deadline.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut paid = SLIVER_BYTES;
+    loop {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "B never finished the stream ({} bytes read, {paid} paid)",
+            leaf.delivered
+        );
+        match tokio::time::timeout(Duration::from_millis(500), read_client(&mut leaf.recv)).await {
+            Ok(Ok(ClientMessage::ChunkData(chunk))) => {
+                leaf.delivered = leaf.delivered.saturating_add(chunk.bytes().len() as u64);
+            }
+            Ok(Ok(ClientMessage::StreamEnd)) => break,
+            Err(_quiet) if leaf.delivered == paid => {}
+            Err(_quiet) => {
+                amount += min_payment(leaf.delivered - paid, RATE);
+                paid = leaf.delivered;
+                leaf_sends_voucher(
+                    &mut leaf.send,
+                    &leaf_eth,
+                    b_operator,
+                    leaf_channel_id,
+                    paid,
+                    amount,
+                )
+                .await?;
+            }
+            Ok(other) => anyhow::bail!("expected the stream to run to StreamEnd, got {other:?}"),
+        }
+    }
+    anyhow::ensure!(
+        paid == leaf.delivered,
+        "B ended the stream with {} unpaid bytes",
+        leaf.delivered - paid
+    );
+
+    leaf.conn.close(0u32.into(), b"done");
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
+/// A leaf that answers one chunk with sliver after sliver hits the per-chunk
+/// proof budget on the miss path too (#2132). Each sliver credits something, but
+/// none settles the chunk, so B ends the stream and meters the client abandon
+/// instead of holding the stream and its upstream pull open one sliver at a time.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Result<()> {
+    const SLIVER_BYTES: u64 = 64 * 1024;
+    // The node's private `MAX_PROOFS_PER_CHUNK`; keep the two in step.
+    const PROOF_BUDGET: u64 = 8;
+    anyhow::ensure!(
+        PROOF_BUDGET * SLIVER_BYTES < CHUNK_BYTES,
+        "the slivers must not add up to a whole interval"
+    );
+    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
+    let payload = vec![0x3Eu8; payload_len];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA9);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x3F);
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let mut leaf = leaf_reads_first_interval(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+    )
+    .await?;
+
+    let mut amount = U256::ZERO;
+    for n in 1..=PROOF_BUDGET {
+        amount += min_payment(SLIVER_BYTES, RATE);
+        leaf_sends_voucher(
+            &mut leaf.send,
+            &leaf_eth,
+            b_operator,
+            leaf_channel_id,
+            n * SLIVER_BYTES,
+            amount,
+        )
+        .await?;
+    }
+
+    // The stream ends with a payment fault: no further byte and no `StreamEnd`.
+    match tokio::time::timeout(Duration::from_secs(10), read_client(&mut leaf.recv)).await {
+        Err(_elapsed) => anyhow::bail!("B kept the stream open past the proof budget"),
+        Ok(Ok(ClientMessage::ChunkData(chunk))) => anyhow::bail!(
+            "B delivered {} more wire bytes on a chunk that is still owed",
+            chunk.bytes().len()
+        ),
+        Ok(Ok(other)) => anyhow::bail!("expected the stream to fail, got {other:?}"),
+        Ok(Err(_)) => {}
+    }
+    assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
+
+    leaf.conn.close(0u32.into(), b"done");
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
 }

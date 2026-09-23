@@ -49,7 +49,7 @@ use decdn_client::sink::content_paid_frontier;
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
-use super::voucher::StreamAnchor;
+use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::chunk_frame_bufs;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, ClientMessage,
@@ -156,10 +156,11 @@ impl ClientHandler {
         let mut delivered: u64 = 0;
         let mut paid: u64 = 0;
         // Bytes forwarded since the last COMPLETED interval (the sub-interval
-        // remainder), and the completed-but-unpaid interval deltas awaiting
-        // collection — together they are exactly `delivered − paid`.
+        // remainder), and the completed intervals whose payment is still owed —
+        // together they are exactly `delivered − paid`. A proof that pays part of
+        // an interval leaves its remainder owed in `pending`.
         let mut unvouchered: u64 = 0;
-        let mut pending: VecDeque<u64> = VecDeque::new();
+        let mut pending: VecDeque<OwedChunk> = VecDeque::new();
         // One buffered voucher reader for the whole stream: every read goes
         // through it so a pipelined voucher buffered ahead of the current one is
         // not lost.
@@ -204,9 +205,7 @@ impl ClientHandler {
         let held_signer_cap: U256 = lane.lock().await.state.cap;
 
         loop {
-            // Progress trackers for the no-progress guard below: an iteration that
-            // delivers no new byte AND clears no voucher has stalled — the client
-            // stopped paying.
+            // Progress trackers for the no-progress guard below.
             let delivered_at_iter_start = delivered;
             let mut credited_this_iter = 0u64;
 
@@ -243,7 +242,7 @@ impl ClientHandler {
                 self.metrics.bytes_served(clen_u64);
                 unvouchered = unvouchered.saturating_add(clen_u64);
                 if unvouchered >= chunk_bytes {
-                    pending.push_back(unvouchered);
+                    pending.push_back(OwedChunk::new(unvouchered));
                     unvouchered = 0;
                 }
                 // Prefetched one pass ahead of the window check; size it against what
@@ -261,7 +260,7 @@ impl ClientHandler {
             // Once the whole range is on the wire, fold the closing sub-interval
             // remainder into `pending` so the recoup batch drains it uniformly.
             if done_delivering && unvouchered > 0 {
-                pending.push_back(unvouchered);
+                pending.push_back(OwedChunk::new(unvouchered));
                 unvouchered = 0;
             }
 
@@ -270,16 +269,18 @@ impl ClientHandler {
             // background flush persists it (ADR 003 §Off-chain voucher state
             // persistence). ---
             //
-            // The delta stays queued until something actually credits it: the
-            // payer may send this stream's root voucher, or a rollover voucher,
+            // The loop reads proofs for a chunk until they have credited all of it:
+            // the payer may send this stream's root voucher, or a rollover voucher,
             // ahead of the reveal that pays, and a metering voucher credits no
-            // whole chunk.
-            // `MAX_PROOFS_PER_CHUNK` bounds that — see the twin loop in
-            // `deliver` for the full reasoning.
+            // whole chunk. A proof can also pay only part of a chunk, and the
+            // remainder stays owed. `MAX_PROOFS_PER_CHUNK` bounds how many proofs
+            // may leave a chunk unsettled — see the twin loop in `deliver` for the
+            // full reasoning.
             let collected_any = !pending.is_empty();
-            'chunk: while let Some(&delta) = pending.front() {
+            'chunk: while let Some(mut owed) = pending.pop_front() {
                 let mut attempts = 0u32;
                 loop {
+                    attempts = attempts.saturating_add(1);
                     let stop = match self
                         .commit_one_proof(
                             send,
@@ -291,7 +292,7 @@ impl ClientHandler {
                             Some(lane),
                             client_node_id,
                             rate_per_mb,
-                            delta,
+                            owed,
                         )
                         .await
                     {
@@ -301,61 +302,69 @@ impl ClientHandler {
                             // abandon, then propagate so the caller drops the pull leg.
                             self.metrics.node_pull_through_client_abandoned();
                             return Err(e.context(format!(
-                                "proof {} of at most {MAX_PROOFS_PER_CHUNK} for a {delta}-byte \
-                                 chunk ({} pending)",
-                                attempts.saturating_add(1),
+                                "proof {attempts} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
+                                 chunk ({} bytes owed, {} more queued)",
+                                owed.len(),
+                                owed.remaining(),
                                 pending.len()
                             )));
                         }
                     };
                     match stop {
-                        VoucherStop::Continue { credited_bytes: 0 } => {
-                            attempts = attempts.saturating_add(1);
+                        VoucherStop::Continue { credited_bytes } => {
+                            if credited_bytes > 0 {
+                                // Advance `paid` by the watermark-capped credit (rule
+                                // #1): a benign already-satisfied voucher raises the
+                                // watermark by nothing, so it credits nothing here and
+                                // cannot reopen the credit window for bytes the lane
+                                // has not settled.
+                                credited_this_iter =
+                                    credited_this_iter.saturating_add(credited_bytes);
+                                paid = paid.saturating_add(credited_bytes);
+                                // Publish the PAID CONTENT frontier for the pull leg's
+                                // `WindowPacer`, mapping paid WIRE back into content
+                                // space (the largest chunk-group boundary provably
+                                // inside the paid wire prefix — conservative, so the
+                                // pull never overshoots its window). One contiguous
+                                // delivery from `fetch_start`, so it is the single
+                                // fetch-start.
+                                let served = content_paid_frontier(fetch_start, total_bytes, paid);
+                                // Forward-only, and guarded on THIS leg's start: an
+                                // owning session's frontier starts at the raw
+                                // `byte_offset`, at or above its group floor
+                                // `fetch_start`, so the guard is a no-op and N
+                                // whole-range observers advance the SHARED frontier
+                                // with the pull's `WindowPacer` binding on the
+                                // MAX-over-observers paid frontier. An observer
+                                // ATTACHED at an offset the owner's paid prefix has not
+                                // reached yet must not lift that prefix past bytes
+                                // nobody paid for; its payment extends the frontier
+                                // once the prefix reaches it
+                                // (`FillSession::extend_served_from`).
+                                session.extend_served_from(fetch_start, served);
+                                // Under partial-overlap coalescing each attached sibling
+                                // pull produces the OVERLAP this leg also consumes and
+                                // bills; the same guard applies to every sibling.
+                                for extra in also_pace {
+                                    extra.extend_served_from(fetch_start, served);
+                                }
+                            }
+                            if owed.settle(credited_bytes)? {
+                                continue 'chunk;
+                            }
                             if attempts >= MAX_PROOFS_PER_CHUNK {
                                 self.metrics.node_pull_through_client_abandoned();
                                 // A payer that spends its per-chunk proof budget
-                                // without settling anything is a client payment
+                                // without settling the chunk is a client payment
                                 // fault, not a node bug.
                                 return Err(anyhow::Error::new(super::wire::ClientPaymentFault)
                                     .context(format!(
-                                        "payer sent {attempts} proofs that credited nothing for \
-                                         one outstanding chunk"
+                                        "payer sent {attempts} proofs without settling one \
+                                         {}-byte chunk ({} bytes still owed)",
+                                        owed.len(),
+                                        owed.remaining()
                                     )));
                             }
-                        }
-                        VoucherStop::Continue { credited_bytes } => {
-                            pending.pop_front();
-                            // Advance `paid` by the watermark-capped credit (rule #1): a
-                            // benign already-satisfied voucher raises the watermark by
-                            // nothing, so it credits nothing here and cannot reopen the
-                            // credit window for bytes the lane has not settled.
-                            credited_this_iter = credited_this_iter.saturating_add(credited_bytes);
-                            paid = paid.saturating_add(credited_bytes);
-                            // Publish the PAID CONTENT frontier for the pull leg's
-                            // `WindowPacer`, mapping paid WIRE back into content space (the
-                            // largest chunk-group boundary provably inside the paid wire
-                            // prefix — conservative, so the pull never overshoots its
-                            // window). One contiguous delivery from `fetch_start`, so it is
-                            // the single fetch-start.
-                            let served = content_paid_frontier(fetch_start, total_bytes, paid);
-                            // Forward-only, and guarded on THIS leg's start: an owning
-                            // session's frontier starts at the raw `byte_offset`, at or
-                            // above its group floor `fetch_start`, so the guard is a no-op and
-                            // N whole-range observers advance the SHARED frontier with the
-                            // pull's `WindowPacer` binding on the MAX-over-observers paid
-                            // frontier. An observer ATTACHED at an offset the
-                            // owner's paid prefix has not reached yet must not lift that
-                            // prefix past bytes nobody paid for; its payment extends the
-                            // frontier once the prefix reaches it
-                            // (`FillSession::extend_served_from`).
-                            session.extend_served_from(fetch_start, served);
-                            // Under partial-overlap coalescing each attached sibling pull
-                            // produces the OVERLAP this leg also consumes and bills; the
-                            // same guard applies to every sibling.
-                            for extra in also_pace {
-                                extra.extend_served_from(fetch_start, served);
-                            }
-                            continue 'chunk;
                         }
                         VoucherStop::Rejected => {
                             self.metrics.node_pull_through_client_abandoned();
@@ -367,6 +376,7 @@ impl ClientHandler {
                     }
                 }
             }
+            ensure_unpaid_bytes_tracked(delivered, paid, unvouchered)?;
 
             // Reconcile the floor reservation against this stream's live balance now
             // that `paid` has advanced (mirrors `deliver`). `paid`/`delivered` are BYTE
@@ -489,25 +499,18 @@ impl ClientHandler {
                 break;
             }
 
-            // No-progress guard: an iteration that delivered no new byte (delivery
-            // blocked on the credit window, waiting for payment) AND cleared no
-            // voucher (the client stopped paying — the voucher read timed out with
-            // nothing committed) cannot make progress. The client has abandoned
-            // (#856 drop-after-fill): stop cleanly. The caller then cancels the pull
-            // leg, which bounds the upstream spend (#1610) and persists the buyer
-            // watermark (#852). Any delivery or payment this iteration resets it, so
-            // an honest-but-slow client (patience = one voucher read timeout) is
-            // never dropped early.
-            let made_delivery_progress = delivered > delivered_at_iter_start;
-            let made_payment_progress = credited_this_iter > 0;
-            if !made_delivery_progress && !made_payment_progress {
-                // The client stopped paying (#856 drop-after-fill): meter the abandon,
-                // then stop cleanly.
-                self.metrics.node_pull_through_client_abandoned();
-                return Ok(ServeEnd::Stopped {
-                    stop: ServeStop::ClientAbandoned,
-                    bytes: delivered,
-                });
+            // No-progress guard: an iteration that delivered no byte and credited
+            // no byte cannot change what the next one sees, so it would repeat
+            // forever — see the twin guard in `deliver`. A client that stops paying
+            // never reaches it: its voucher read times out or fails, and the recoup
+            // phase returns that error. Reaching it means the accounting broke, so
+            // the stream fails as a node fault. The caller then drops the pull leg,
+            // which bounds the upstream spend.
+            if delivered == delivered_at_iter_start && credited_this_iter == 0 {
+                return Err(anyhow::anyhow!(
+                    "serve loop made no progress: {delivered} bytes delivered, {paid} paid, \
+                     window {window}, range fully delivered: {done_delivering}"
+                ));
             }
         }
 
