@@ -65,6 +65,7 @@ use decdn_incentive::{
 use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
+use decdn_client::UpstreamRateLimited;
 use decdn_client::discovery::{self, NodeCandidate};
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::probe::probe_once;
@@ -358,19 +359,20 @@ impl ProxyWarmingParams {
 
 /// The terminal "nothing can serve this blob" error for [`probe_and_order`],
 /// naming the failure that actually happened (#1911). A candidate leaves the
-/// selection loop three ways: it never answered (unreachable), it answered but
-/// its `slash_sig` did not recover (unverifiable), or it answered but was
-/// unusable — a `has_blob`/coverage mismatch that no honest responder produces.
-/// When any probe was unverifiable the cause is almost always local
-/// configuration rather than missing content, so that case gets its own message;
-/// otherwise the parenthetical accounts for the reachable-but-unanswered and the
-/// answered-but-unusable candidates separately. Reached only when there is
-/// neither a cache holder nor a reachable non-holder to pull through — a
-/// `has_blob:false` answer is a serve target, not a failure, so it never lands
-/// here.
+/// selection loop four ways: it never answered (unreachable), it kept shedding
+/// the probe with `APP_ERR_RATE_LIMITED` (rate-limited — reachable, but refusing
+/// this client's probe rate), it answered but its `slash_sig` did not recover
+/// (unverifiable), or it answered but was unusable — a `has_blob`/coverage
+/// mismatch that no honest responder produces. When any probe was unverifiable
+/// the cause is almost always local configuration rather than missing content,
+/// so that case gets its own message; otherwise the parenthetical accounts for
+/// each of the other three separately. Reached only when there is neither a
+/// cache holder nor a reachable non-holder to pull through — a `has_blob:false`
+/// answer is a serve target, not a failure, so it never lands here.
 fn no_serve_target_error(
     probe_count: usize,
     unreachable: usize,
+    rate_limited: usize,
     unverifiable: usize,
 ) -> anyhow::Error {
     if unverifiable > 0 {
@@ -382,14 +384,73 @@ fn no_serve_target_error(
              the deployment these nodes registered against"
         );
     }
-    // With no unverifiable candidate, every non-unreachable one answered but was
-    // dropped as unusable (has_blob/coverage mismatch) — name both counts so the
-    // message never implies a silent, wholly-unreachable set when some replied.
-    let unusable = probe_count.saturating_sub(unreachable);
+    // With no unverifiable candidate, every candidate that neither stayed silent
+    // nor shed the probe answered but was dropped as unusable (has_blob/coverage
+    // mismatch) — name each count so the message never implies a silent,
+    // wholly-unreachable set when some replied.
+    let unusable = probe_count
+        .saturating_sub(unreachable)
+        .saturating_sub(rate_limited);
+    let shed = if rate_limited > 0 {
+        format!(", {rate_limited} rate-limited this client's probes")
+    } else {
+        String::new()
+    };
     anyhow::anyhow!(
         "none of the {probe_count} probed node(s) could serve the blob \
-         ({unreachable} did not answer, {unusable} answered but were unusable)"
+         ({unreachable} did not answer{shed}, {unusable} answered but were unusable)"
     )
+}
+
+/// The waits between probe attempts on a candidate that sheds the probe with
+/// `APP_ERR_RATE_LIMITED`. ADR 005's per-peer limit refills one probe every
+/// 200 ms, so these clear the burst that concurrent entries of one bundle pull
+/// send at its start. A candidate that still sheds after the last wait counts
+/// as rate-limited, never as silent.
+const PROBE_SHED_BACKOFFS_MS: [u64; 3] = [250, 500, 1000];
+
+/// Probe one candidate, probing it again after each [`PROBE_SHED_BACKOFFS_MS`]
+/// wait while it sheds the probe. Any other result — an answer, a timeout, a
+/// transport failure — returns at once.
+async fn probe_candidate(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    hash: [u8; 32],
+    timestamp_us: u64,
+) -> anyhow::Result<(
+    decdn_protocol::message::ProbeResponse,
+    decdn_protocol::ProbeResponseExt,
+    f64,
+)> {
+    let mut backoffs = PROBE_SHED_BACKOFFS_MS.iter();
+    loop {
+        let res = probe_once(
+            endpoint,
+            target.clone(),
+            hash,
+            timestamp_us,
+            Duration::from_millis(SELECT_PROBE_TIMEOUT_MS),
+        )
+        .await;
+        match (&res, backoffs.next()) {
+            (Err(e), Some(&ms)) if probe_shed(e) => {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            (Err(e), None) if probe_shed(e) => {
+                tracing::info!(
+                    "{} kept rate-limiting this client's probe: {e:#}",
+                    target.id
+                );
+                return res;
+            }
+            _ => return res,
+        }
+    }
+}
+
+/// Whether a failed probe was the node shedding it with `APP_ERR_RATE_LIMITED`.
+fn probe_shed(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<UpstreamRateLimited>().is_some()
 }
 
 /// Probe `candidates` for `hash` over `endpoint` and return the ordered
@@ -447,19 +508,15 @@ pub(crate) async fn probe_and_order(
     // Probe concurrently in one task. `probe_once`'s future is `Send`, so
     // `tokio::spawn` would work too; `join_all` over a shared `&endpoint` is
     // kept because it needs no per-probe clone. `probe_once`'s internal
-    // timeout bounds each leg.
+    // timeout bounds each leg; a candidate that sheds the probe is probed again
+    // after a short wait (`probe_candidate`).
     let probes = candidates.iter().map(|cand| {
         let target = probe_target(cand, relay_hint.cloned());
         async move {
-            let res = probe_once(
-                endpoint,
-                target,
-                hash,
-                timestamp_us,
-                Duration::from_millis(SELECT_PROBE_TIMEOUT_MS),
+            (
+                cand,
+                probe_candidate(endpoint, target, hash, timestamp_us).await,
             )
-            .await;
-            (cand, res.ok())
         }
     });
     let results = futures_util::future::join_all(probes).await;
@@ -475,21 +532,30 @@ pub(crate) async fn probe_and_order(
     // node cannot serve via its own origin. Always collected, because the second
     // role does not depend on warming being on.
     let mut non_holders: Vec<discovery::WarmingCandidate> = Vec::new();
-    // Three ways a candidate drops out, counted separately: the terminal error below
+    // Four ways a candidate drops out, counted separately: the terminal error below
     // has to name the one that actually happened. A wrong `slash_judge_address` or
     // `chain_id` makes EVERY honest node fail verification, and reporting that as
     // "nobody holds the blob" sends the operator hunting for missing content instead
-    // of a local misconfiguration.
+    // of a local misconfiguration; a node shedding this client's probe rate is
+    // reachable, and reporting it as silent points at the network instead.
     let mut unreachable = 0usize;
+    let mut rate_limited = 0usize;
     let mut unverifiable = 0usize;
     // (node_id, rtt_ms, rate_per_mb) for each holder that answered a probe
     // this fetch, harvested into the peer store off the critical path
     // (spawn_harvest, called from discover_provider).
     let mut probed_samples: Vec<(PublicKey, f64, u64)> = Vec::new();
     for (cand, res) in results {
-        let Some((resp, resp_ext, rtt_ms)) = res else {
-            unreachable += 1;
-            continue;
+        let (resp, resp_ext, rtt_ms) = match res {
+            Ok(answer) => answer,
+            Err(e) if probe_shed(&e) => {
+                rate_limited += 1;
+                continue;
+            }
+            Err(_) => {
+                unreachable += 1;
+                continue;
+            }
         };
         // Verify BEFORE the response can influence the order (ADR 014 §1). A
         // failure is requester-local policy — drop it and move on, no reputation
@@ -548,6 +614,7 @@ pub(crate) async fn probe_and_order(
         return Err(no_serve_target_error(
             probe_count,
             unreachable,
+            rate_limited,
             unverifiable,
         ));
     }
@@ -4295,6 +4362,116 @@ pub(crate) fn temp_in_parent(target: &Path) -> std::io::Result<tempfile::NamedTe
 mod tests {
     use super::*;
     use decdn_incentive::buyer_pool::BuyerLaneProgress;
+
+    /// A node that sheds this client's probes is named as rate-limited, apart
+    /// from the silent ones; with none, the message keeps its two counts.
+    #[test]
+    fn no_serve_target_error_names_rate_limited_nodes_apart_from_silent_ones() {
+        let msg = no_serve_target_error(3, 1, 2, 0).to_string();
+        assert!(msg.contains("1 did not answer"), "{msg}");
+        assert!(msg.contains("2 rate-limited this client's probes"), "{msg}");
+        assert!(msg.contains("0 answered but were unusable"), "{msg}");
+
+        let msg = no_serve_target_error(3, 3, 0, 0).to_string();
+        assert!(!msg.contains("rate-limited"), "{msg}");
+        assert!(msg.contains("3 did not answer, 0 answered"), "{msg}");
+    }
+
+    /// A loopback probe server that closes every connection with `code`, and
+    /// counts the connections it saw.
+    async fn closing_probe_server(
+        code: u32,
+    ) -> (Endpoint, EndpointAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use iroh::endpoint::{RelayMode, presets};
+        let ep = Endpoint::builder(presets::Minimal)
+            .alpns(vec![decdn_protocol::ALPN_PROBE.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .bind_addr(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::LOCALHOST,
+                0,
+            ))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let port = ep
+            .bound_sockets()
+            .into_iter()
+            .find(std::net::SocketAddr::is_ipv4)
+            .unwrap()
+            .port();
+        let addr = EndpointAddr::new(ep.id()).with_ip_addr(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            port,
+        )));
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (server, count) = (ep.clone(), Arc::clone(&seen));
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                let Ok(conn) = incoming.await else { continue };
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                conn.close(code.into(), b"per_peer");
+                // Wait for the close to reach the client before the next accept,
+                // as the node's probe limiter does.
+                conn.closed().await;
+            }
+        });
+        (ep, addr, seen)
+    }
+
+    async fn client_endpoint() -> Endpoint {
+        use iroh::endpoint::{RelayMode, presets};
+        Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .bind_addr(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::LOCALHOST,
+                0,
+            ))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    /// A candidate that sheds every probe with `APP_ERR_RATE_LIMITED` is probed
+    /// once plus once after each backoff, and its error still reads as a shed —
+    /// so `probe_and_order` counts it as rate-limited, not silent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_candidate_retries_a_shedding_candidate_then_reports_the_shed() {
+        let (server, target, seen) =
+            closing_probe_server(decdn_protocol::APP_ERR_RATE_LIMITED).await;
+        let client = client_endpoint().await;
+        let started = Instant::now();
+
+        let res = probe_candidate(&client, target, [7; 32], micros_now()).await;
+
+        let err = res.expect_err("every probe was shed");
+        assert!(probe_shed(&err), "the shed survives the retries: {err:#}");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            PROBE_SHED_BACKOFFS_MS.len() + 1
+        );
+        let waited: u64 = PROBE_SHED_BACKOFFS_MS.iter().sum();
+        assert!(started.elapsed() >= Duration::from_millis(waited));
+        client.close().await;
+        server.close().await;
+    }
+
+    /// Any other failure returns at once: a node that closes with a code other
+    /// than `APP_ERR_RATE_LIMITED` is not probed again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_candidate_does_not_retry_a_failure_that_is_not_a_shed() {
+        let (server, target, seen) = closing_probe_server(0).await;
+        let client = client_endpoint().await;
+
+        let res = probe_candidate(&client, target, [7; 32], micros_now()).await;
+
+        let err = res.expect_err("the connection was closed");
+        assert!(!probe_shed(&err), "{err:#}");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        client.close().await;
+        server.close().await;
+    }
 
     fn common() -> cli::ClientFetchArgs {
         cli::ClientFetchArgs {
