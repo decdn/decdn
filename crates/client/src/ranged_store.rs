@@ -1,7 +1,7 @@
 //! [`ClientRangedStore`]: the client-side [`RangedStore`](decdn_bao_range::RangedStore) backend
 //! (#1621) — a `.partial` data file plus a `.partial.obao4` outboard and a
 //! persisted `.partial.ranges` present-range record, built on `bao-tree` /
-//! `decdn-bao-range` only. No `iroh-blobs` dependency: `client-pull` must
+//! `decdn-bao-range` only. No `iroh-blobs` dependency: `decdn-client` must
 //! stay iroh-blobs-free so the CLI's pull path links no blob store / AWS SDK
 //! (#578).
 //!

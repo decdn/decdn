@@ -219,27 +219,17 @@ async fn repeat_probes_on_a_reused_endpoint_answer_like_the_first() -> anyhow::R
     let (client, _client_addr) = local_endpoint(SecretKey::generate()).await?;
 
     // Cold: nothing cached for this peer yet.
-    let (cold, _ext, _rtt) = decdn_client_pull::probe::probe_once(
-        &client,
-        target.clone(),
-        PROBE_HASH,
-        0x1001,
-        PROBE_TIMEOUT,
-    )
-    .await?;
+    let (cold, _ext, _rtt) =
+        decdn_client::probe::probe_once(&client, target.clone(), PROBE_HASH, 0x1001, PROBE_TIMEOUT)
+            .await?;
     assert_answer(&cold, 0x1001, &signer, &domain)?;
 
     // Let the server's session ticket land so the next probes are warm.
     tokio::time::sleep(TICKET_SETTLE).await;
 
-    let (warm, _ext, _rtt) = decdn_client_pull::probe::probe_once(
-        &client,
-        target.clone(),
-        PROBE_HASH,
-        0x1002,
-        PROBE_TIMEOUT,
-    )
-    .await?;
+    let (warm, _ext, _rtt) =
+        decdn_client::probe::probe_once(&client, target.clone(), PROBE_HASH, 0x1002, PROBE_TIMEOUT)
+            .await?;
     assert_answer(&warm, 0x1002, &signer, &domain)?;
     anyhow::ensure!(
         warm.body.rate_per_mb == cold.body.rate_per_mb && warm.body.has_blob == cold.body.has_blob,
@@ -247,14 +237,9 @@ async fn repeat_probes_on_a_reused_endpoint_answer_like_the_first() -> anyhow::R
     );
 
     // The daemon-side copy of the client, on the same warm endpoint.
-    let (warm_node, _ext, _rtt) = decdn_node::client_requester::probe::probe_once(
-        &client,
-        target.clone(),
-        PROBE_HASH,
-        0x1003,
-        PROBE_TIMEOUT,
-    )
-    .await?;
+    let (warm_node, _ext, _rtt) =
+        decdn_client::probe::probe_once(&client, target.clone(), PROBE_HASH, 0x1003, PROBE_TIMEOUT)
+            .await?;
     assert_answer(&warm_node, 0x1003, &signer, &domain)?;
 
     // Shut the router down *before* scraping: the handler increments
@@ -303,8 +288,7 @@ async fn probe_survives_a_server_restart_under_the_same_identity() -> anyhow::Re
     let (client, _client_addr) = local_endpoint(SecretKey::generate()).await?;
 
     let (first, _ext, _rtt) =
-        decdn_client_pull::probe::probe_once(&client, target, PROBE_HASH, 0x2001, PROBE_TIMEOUT)
-            .await?;
+        decdn_client::probe::probe_once(&client, target, PROBE_HASH, 0x2001, PROBE_TIMEOUT).await?;
     assert_answer(&first, 0x2001, &signer, &domain)?;
 
     // The client now holds a ticket for this identity. Tear the server down.
@@ -320,7 +304,7 @@ async fn probe_survives_a_server_restart_under_the_same_identity() -> anyhow::Re
     let (router2, server_ep2, target2, signer2, domain2, _cache_tmp2) =
         spawn_probe_server(&metrics, server_sk).await?;
     let (after, _ext, _rtt) =
-        decdn_client_pull::probe::probe_once(&client, target2, PROBE_HASH, 0x2002, PROBE_TIMEOUT)
+        decdn_client::probe::probe_once(&client, target2, PROBE_HASH, 0x2002, PROBE_TIMEOUT)
             .await?;
     assert_answer(&after, 0x2002, &signer2, &domain2)?;
 

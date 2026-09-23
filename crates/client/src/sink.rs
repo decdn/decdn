@@ -15,7 +15,7 @@
 //! for writing a fetch's verified content bytes to a caller destination, and
 //! [`BlobCache`] is the injected `(hash, range)` cache the `Streamer` consults
 //! and fills. Both are pure — they name no blob store — which is what keeps
-//! `client-pull` `iroh-blobs`-free; the default cache is the no-op [`NoCache`].
+//! `decdn-client` `iroh-blobs`-free; the default cache is the no-op [`NoCache`].
 //! The [`Streamer`](crate::Streamer) drives [`BlobCache`]; [`ByteSink`] has no
 //! production consumer yet — the [`Downloader`](crate::Downloader) writes through
 //! a [`ClientRangedStore`](crate::ClientRangedStore) instead — so its only
@@ -269,7 +269,7 @@ pub type SinkFuture<'a, T> =
 /// with content that has already passed bao verification against the blob's root,
 /// at its absolute offset in the blob — so an out-of-order multi-source fetch
 /// lands each range at its position. Pure: the trait names no blob store, so it
-/// does not pull client-pull back toward `iroh-blobs`.
+/// does not pull `decdn-client` back toward `iroh-blobs`.
 ///
 /// This is an output seam with no production consumer today: the
 /// [`Downloader`](crate::Downloader) writes its output through a
@@ -290,7 +290,7 @@ pub trait ByteSink: Send + Sync {
 /// `(hash, offset)` over content bytes.
 ///
 /// Pure by design: the trait names no blob store, which is what keeps
-/// `client-pull` `iroh-blobs`-free — a blob-store-backed implementation lives
+/// `decdn-client` `iroh-blobs`-free — a blob-store-backed implementation lives
 /// ABOVE this crate and is injected. The default is the no-op [`NoCache`] (never
 /// hits, never stores), so a caller that wants no revisit-reuse pays nothing.
 ///
@@ -332,7 +332,7 @@ pub trait BlobCache: Send + Sync {
 /// The default [`BlobCache`]: never caches. Every [`get`](BlobCache::get) misses
 /// and every [`put`](BlobCache::put) discards, so a `Streamer` built with it
 /// always fetches the whole range and stores nothing. A caller that wants
-/// revisit-reuse injects a real cache above `client-pull`.
+/// revisit-reuse injects a real cache above `decdn-client`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoCache;
 

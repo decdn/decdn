@@ -26,7 +26,7 @@
 
 use bao_tree::ChunkRanges;
 use decdn_cache::FillError;
-use decdn_client_pull::{CoveredRun, SourceCoverage, plan_covered_runs};
+use decdn_client::{CoveredRun, SourceCoverage, plan_covered_runs};
 use decdn_protocol::Coverage;
 
 use crate::selection::MAX_PROVIDER_ATTEMPTS;
@@ -82,7 +82,7 @@ pub(crate) enum AssembleOutcome {
 }
 
 /// The store + per-run driver the assembly loop plans over. The real
-/// implementation opens a buyer lane and drives [`decdn_client_pull::drive`];
+/// implementation opens a buyer lane and drives [`decdn_client::drive`];
 /// tests inject a fake.
 ///
 /// The futures are deliberately NOT `Send`: the real `drive` is non-`Send`
@@ -232,7 +232,7 @@ mod tests {
     use std::cell::RefCell;
 
     use bao_tree::{ChunkNum, ChunkRanges};
-    use decdn_client_pull::CoveredRun;
+    use decdn_client::CoveredRun;
     use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
     use super::{AssembleOutcome, MAX_REASSIGN_ATTEMPTS, RunOutcome, RunSink, assemble};

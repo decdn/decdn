@@ -50,16 +50,16 @@ use async_trait::async_trait;
 use decdn_cache::{
     CacheEngine, CacheMetrics, CircuitBreakerPolicy, Hash, PinnedHashes, RetryPolicy,
 };
-use decdn_incentive::{
-    EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore, Voucher,
-    bind_node_id_domain, binding_signing_hash, min_payment, signed_to_wire_voucher,
-    slash_judge_domain, stream_sig::StreamSlashData, voucher_domain,
-};
-use decdn_node::client_requester::{
+use decdn_client::{
     BlobTooLarge, Cumulative, HashMismatch, PoolContext, PoolLedger, PullDeadlines,
     RateAboveCeiling, UpstreamVoucherRejected, VoucherProgress, WarmConnection,
     open_progressive_pull, sign_client_binding, stream_fetch, stream_fetch_on, stream_fetch_shared,
     stream_fetch_tracked, stream_fetch_tracked_with_progress,
+};
+use decdn_incentive::{
+    EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore, Voucher,
+    bind_node_id_domain, binding_signing_hash, min_payment, signed_to_wire_voucher,
+    slash_judge_domain, stream_sig::StreamSlashData, voucher_domain,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
@@ -515,10 +515,8 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
     reason = "one fixture: a paid handler, a lane, and the two drives it serves"
 )]
 async fn drive_scattered_through_peer_source(warm: bool) -> anyhow::Result<usize> {
-    use decdn_node::client_requester::driver::{DriveConfig, drive_range_set};
-    use decdn_node::client_requester::{
-        BudgetPacer, ClientRangedStore, FakeFunder, PeerSource, SharedPool,
-    };
+    use decdn_client::driver::{DriveConfig, drive_range_set};
+    use decdn_client::{BudgetPacer, ClientRangedStore, FakeFunder, PeerSource, SharedPool};
 
     const GROUP: u64 = 16 * 1024;
     let payload: Vec<u8> = (0..32 * GROUP).map(|i| (i % 251) as u8).collect();
@@ -8822,7 +8820,7 @@ async fn origin_held_serve_miss_signs_a_refusal_rather_than_dropping() -> anyhow
     // refusal carrying the operator's signed response, not a timeout on a
     // silently-dropped stream.
     let refused = err
-        .downcast_ref::<decdn_client_pull::UpstreamRefused>()
+        .downcast_ref::<decdn_client::UpstreamRefused>()
         .ok_or_else(|| anyhow::anyhow!("expected a typed UpstreamRefused, got: {err:#}"))?;
     let evidence = refused.evidence().ok_or_else(|| {
         anyhow::anyhow!("the refusal must carry the operator's signed StreamResponse")
@@ -11208,7 +11206,7 @@ struct StopSendDrive {
     accepted: usize,
     /// The bytes the ranged store promoted, if it finalized.
     promoted: Option<Vec<u8>>,
-    /// The `decdn_client_pull` events the drive emitted. The stop-send race only
+    /// The `decdn_client` events the drive emitted. The stop-send race only
     /// tests the recovery when the voucher write actually fails, and a write that
     /// wins the race leaves the ledger in the same end state. So the recovery's
     /// own event is the proof that it ran.
@@ -11237,12 +11235,12 @@ impl std::io::Write for CapturedLogs {
 /// voucher whose write failed.
 const CONFIRMED_EVENT: &str = "confirmed the voucher";
 
-/// Capture `decdn_client_pull` events on THIS thread until the guard drops.
+/// Capture `decdn_client` events on THIS thread until the guard drops.
 ///
 /// Thread-local by design: `drive` is awaited inline on the test's thread and
 /// spawns nothing on the buyer side, so every recovery event lands here. Only the
 /// upstream's serve tasks run elsewhere, and they are not asserted on.
-fn capture_client_pull_events() -> (
+fn capture_client_events() -> (
     tracing::subscriber::DefaultGuard,
     Arc<std::sync::Mutex<Vec<u8>>>,
 ) {
@@ -11258,7 +11256,7 @@ fn capture_client_pull_events() -> (
                 .with_ansi(false)
                 .with_filter(
                     tracing_subscriber::filter::Targets::new()
-                        .with_target("decdn_client_pull", tracing::Level::DEBUG),
+                        .with_target("decdn_client", tracing::Level::DEBUG),
                 ),
         )
         .set_default();
@@ -11274,8 +11272,8 @@ async fn drive_against_stop_send_server(
     stop: StopPoint,
     signal: StopThenSignal,
 ) -> anyhow::Result<StopSendDrive> {
-    use decdn_node::client_requester::driver::{DriveConfig, drive};
-    use decdn_node::client_requester::{BudgetPacer, ClientRangedStore, FakeFunder, PeerSource};
+    use decdn_client::driver::{DriveConfig, drive};
+    use decdn_client::{BudgetPacer, ClientRangedStore, FakeFunder, PeerSource};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let hash = Hash::new(&payload);
@@ -11324,7 +11322,7 @@ async fn drive_against_stop_send_server(
     let pacer = BudgetPacer::new();
     let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);
     let config = DriveConfig::cli(U256::ZERO);
-    let (log_guard, log_buf) = capture_client_pull_events();
+    let (log_guard, log_buf) = capture_client_events();
     let result = drive(
         &store,
         &source,

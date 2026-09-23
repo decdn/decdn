@@ -1,4 +1,4 @@
-//! Live anvil-backed e2e for the persisted [`decdn_client_pull::PeerStore`]
+//! Live anvil-backed e2e for the persisted [`decdn_client::PeerStore`]
 //! (#1906-series, Task 10): proves `decdn fetch` populates the store on a
 //! normal auto-discovered fetch, and that a second fetch against the same
 //! `data_dir` can be served straight from the store without a fresh
@@ -7,7 +7,7 @@
 //! Why the whole binary rather than a unit test: `store_fast_path`'s own unit
 //! tests (`crates/cli/src/commands/fetch.rs`) already prove the ranking and
 //! `min_fresh_candidates` floor in isolation, and `PeerStore`'s unit tests
-//! (`crates/client-pull/src/peer_store.rs`) prove the on-disk record shape.
+//! (`crates/client/src/peer_store.rs`) prove the on-disk record shape.
 //! What neither can reach is that a REAL `decdn fetch` subprocess — driven by
 //! `discover_provider` end to end — writes records a SEPARATE later `decdn
 //! fetch` subprocess can read back and act on, against a real `CapacityBond`
@@ -95,7 +95,7 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use anyhow::Context;
 use decdn_cache::Hash;
-use decdn_client_pull::{PeerStore, StoreConfig};
+use decdn_client::{PeerStore, StoreConfig};
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;

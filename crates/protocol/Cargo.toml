@@ -22,7 +22,7 @@ proptest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 # `Region`'s serde round-trip (#1348). Dev-only on purpose: this crate is a
 # deliberate leaf (serde + postcard + thiserror + tokio), and JSON is the
-# consumer-side format (the client-pull peer store), not one this crate speaks. `postcard`
+# consumer-side format (the `decdn-client` peer store), not one this crate speaks. `postcard`
 # would serialize a `&str` length-prefixed, which cannot assert the property
 # under test — that a `Region` encodes as the plain 2-character string.
 serde_json = { workspace = true }

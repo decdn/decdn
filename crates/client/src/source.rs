@@ -194,7 +194,7 @@ pub trait Funder: Send + Sync {
     /// If the on-chain `topUp` fails to submit, reverts, or its receipt is not
     /// obtained — the funds did not move. Also if a mined `topUp` cannot be
     /// credited locally, in which case the funds **are** escrowed and the error
-    /// names the tx (see `client_pull::buyer_pool::escrowed_but_untracked`).
+    /// names the tx (see `decdn_client::buyer_pool::escrowed_but_untracked`).
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome>;
 }
 

@@ -4,9 +4,8 @@
 //! over a plain QUIC handshake. The transport lives here rather than inline
 //! in the `decdn probe` command so the node's cache-miss probe-collection loop
 //! (DHT `FIND_VALUE` → parallel probes, [ADR 001]) can reuse it; that loop
-//! runs in `decdn_node::node_origin`, which calls this module through the
-//! `client_requester` re-export. The reused
-//! mechanism is **transport-only**:
+//! runs in `decdn_node::node_origin`. The reused mechanism is
+//! **transport-only**:
 //! echoed-field correlation (ADR 005) and `slash_sig` validation (ADR 014
 //! §1) are the caller's responsibility, not performed here — see
 //! [`probe_once`](crate::probe::probe_once).

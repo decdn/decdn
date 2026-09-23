@@ -95,10 +95,10 @@ use super::fetch;
 use super::manifest::build_glob_set;
 use super::pull_progress::{self, PullProgress};
 use decdn_bao_range::CHUNK_GROUP_BYTES;
-use decdn_client_pull::discovery::{self, NodeCandidate};
-use decdn_client_pull::endpoint as client_endpoint;
-use decdn_client_pull::provider;
-use decdn_client_pull::{
+use decdn_client::discovery::{self, NodeCandidate};
+use decdn_client::endpoint as client_endpoint;
+use decdn_client::provider;
+use decdn_client::{
     ClientRangedStore, LaneLedgers, PoolContext, PoolExhausted, ProgressCallback, PullDeadlines,
     RetryDisposition, retry_disposition,
 };
@@ -4498,7 +4498,7 @@ mod tests {
     }
 
     fn terminal() -> anyhow::Error {
-        anyhow::Error::new(decdn_client_pull::BlobTooLarge {
+        anyhow::Error::new(decdn_client::BlobTooLarge {
             received: 1 << 40,
             ceiling: 1 << 20,
         })
@@ -4537,10 +4537,7 @@ mod tests {
         .await
         .expect_err("terminal");
         assert_eq!(*tried.lock().expect("lock"), vec![1]);
-        assert!(
-            err.downcast_ref::<decdn_client_pull::BlobTooLarge>()
-                .is_some()
-        );
+        assert!(err.downcast_ref::<decdn_client::BlobTooLarge>().is_some());
         assert!(
             !format!("{err:#}").contains("candidate provider"),
             "{err:#}"

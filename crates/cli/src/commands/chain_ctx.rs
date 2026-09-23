@@ -3,7 +3,7 @@
 //! Resolves the blockchain coordinates (flag > `[blockchain]`/`[identity]`
 //! TOML config > default) and loads the operator's keystore signer. Commands
 //! then build a wallet-filled provider with
-//! [`decdn_client_pull::provider::build_provider`] and construct their
+//! [`decdn_client::provider::build_provider`] and construct their
 //! `CapacityBond` instance against it.
 
 use std::io;

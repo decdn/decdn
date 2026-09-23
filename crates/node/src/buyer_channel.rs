@@ -4,7 +4,7 @@
 //! cache miss (ADR 003 §node→node). It owns one `PaymentPool` and signs vouchers
 //! against per-`(signer, provider)` lanes of that single pool: the deposit fans
 //! out across every upstream it pays. This service owns the on-chain half of that
-//! path that the off-chain voucher signer in [`crate::client_requester`] leaves
+//! path that the off-chain voucher signer in [`decdn_client`] leaves
 //! open:
 //!
 //! - **One-time USDC approval.** `openPool` escrows the deposit via
@@ -44,12 +44,12 @@ use futures_util::FutureExt;
 use tracing::{debug, error, info, warn};
 
 use crate::chain_events::AbortOnDrop;
-use crate::client_requester::buyer_pool::{
+use crate::metrics::Metrics;
+use decdn_client::buyer_pool::{
     LOW_WATER_DIVISOR, SELF_CAPABILITY_CAP, ToppedUpPool, ensure_allowance, grade_deposit_credit,
     issue_self_capability, open_pool, refill_amount, top_up as pool_top_up, topped_up_effect,
 };
-use crate::client_requester::{LocalPullFault, PoolContext};
-use crate::metrics::Metrics;
+use decdn_client::{LocalPullFault, PoolContext};
 
 /// How often the reclaim sweep scans the node's pool for a completed close.
 /// Pool lifetimes are long, so an hourly scan is ample — it matches the seller
@@ -385,7 +385,7 @@ struct FundingHandles<P: Provider + Clone + 'static> {
 }
 
 /// Run `attempt` (a `topUp`), and only if it fails with an
-/// [`AllowanceShortfall`](crate::client_requester::buyer_pool::AllowanceShortfall)
+/// [`AllowanceShortfall`](decdn_client::buyer_pool::AllowanceShortfall)
 /// run `recover_allowance` (a just-in-time `approve`) and retry `attempt`
 /// exactly once. Any other error — and any error from the recovery or the
 /// retry — returns as-is. Generic over the two async effects so the retry
@@ -412,7 +412,7 @@ where
         Ok(out) => Ok(out),
         Err(err)
             if err
-                .downcast_ref::<crate::client_requester::buyer_pool::AllowanceShortfall>()
+                .downcast_ref::<decdn_client::buyer_pool::AllowanceShortfall>()
                 .is_some() =>
         {
             // The standing approval was revoked or never granted; do the
@@ -3962,7 +3962,7 @@ mod tests {
                 async move {
                     if n == 0 {
                         Err(anyhow::Error::new(
-                            crate::client_requester::buyer_pool::AllowanceShortfall,
+                            decdn_client::buyer_pool::AllowanceShortfall,
                         ))
                     } else {
                         Ok(U256::from(700u64))
@@ -4020,7 +4020,7 @@ mod tests {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async {
                     Err(anyhow::Error::new(
-                        crate::client_requester::buyer_pool::AllowanceShortfall,
+                        decdn_client::buyer_pool::AllowanceShortfall,
                     ))
                 }
             },

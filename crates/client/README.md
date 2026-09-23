@@ -1,4 +1,4 @@
-# decdn-client-pull
+# decdn-client
 
 Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where nodes cache and serve BLAKE3-addressed blobs over [iroh](https://iroh.computer) QUIC, and clients pay per megabyte in USDC over off-chain payment channels.
 

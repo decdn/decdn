@@ -1692,7 +1692,7 @@ pub struct DecdnMetrics {
     /// `decdn_onchain_tx_landed_total`: settlement transactions (`redeemMany`)
     /// mined and succeeded. The `onchain_tx_*` family counts every transaction
     /// sent through `send_and_await_receipt`; buyer-side pool transactions go
-    /// through client-pull and are not counted here.
+    /// through `decdn-client` and are not counted here.
     pub onchain_tx_landed: Counter,
     /// `decdn_onchain_tx_reverted_total`: node transactions mined and reverted.
     pub onchain_tx_reverted: Counter,

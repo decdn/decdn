@@ -1,6 +1,6 @@
 //! Failure-class taxonomy for the buyer-side `openPool` path (#966).
 //!
-//! The buyer `open_pool` kernel (`decdn-client-pull`) can fail three ways
+//! The buyer `open_pool` kernel (`decdn-client`) can fail three ways
 //! that an operator must triage differently:
 //!
 //! - **`InsufficientDeposit`** — a *misconfiguration*: the node's USDC balance

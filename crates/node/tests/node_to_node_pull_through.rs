@@ -38,11 +38,11 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::CacheEngine;
+use decdn_client::{PoolContext, stream_fetch};
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
     StreamSlashData, bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
 };
-use decdn_node::client_requester::{PoolContext, stream_fetch};
 use decdn_node::metrics::Metrics;
 use decdn_protocol::client::{
     ChunkData, ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, StreamResponse,
@@ -74,7 +74,7 @@ const RATE_B: u64 = 13;
 /// wire size, not the content length. The stream pays `rate` per fully crossed
 /// 1-MiB interval plus a closing voucher of `ceil(remainder * rate / MiB)` for
 /// the trailing wire bytes, mirroring the requester's per-voucher
-/// `ceil(bytes_delta * rate / MiB)` arithmetic in `client_requester::send_voucher`.
+/// `ceil(bytes_delta * rate / MiB)` arithmetic in `decdn_client::send_voucher`.
 fn expected_amount(rate: u64) -> U256 {
     const MIB: u64 = 1024 * 1024;
     let wire = support::bao_wire_len_whole(PAYLOAD_LEN as u64);
@@ -131,11 +131,7 @@ fn bound_context(
     signer: Arc<PrivateKeySigner>,
     own_node_id: B256,
 ) -> anyhow::Result<PoolContext> {
-    let binding = decdn_node::client_requester::sign_client_binding(
-        &signer,
-        own_node_id,
-        &hop_domains().binding,
-    )?;
+    let binding = decdn_client::sign_client_binding(&signer, own_node_id, &hop_domains().binding)?;
     Ok(fresh_context(pool_id, provider, signer).with_client_binding(binding))
 }
 

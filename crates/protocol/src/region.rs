@@ -89,7 +89,7 @@ pub fn is_valid_region(code: &str) -> bool {
 /// The point of the type is that the normalization is done ONCE, at the parse
 /// boundary, instead of at every comparison site. A raw `String` carrying "an
 /// ISO 3166-1 alpha-2 code" by doc comment alone leaves each consumer to
-/// re-derive that: `client-pull`'s candidate ranking was trimming and
+/// re-derive that: `decdn-client`'s candidate ranking was trimming and
 /// case-folding on every comparison because one side came normalized from
 /// config and the other raw from the chain, and structural `Eq` on the
 /// containing type was wrong as a result — `" us "` and `"US"` compared

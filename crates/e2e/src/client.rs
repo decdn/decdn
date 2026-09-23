@@ -18,8 +18,8 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
-use decdn_client_pull::buyer_pool::open_pool;
-use decdn_client_pull::{
+use decdn_client::buyer_pool::open_pool;
+use decdn_client::{
     BlobTooLarge, HashMismatch, PoolContext, PullDeadlines, UpstreamRefused,
     UpstreamVoucherRejected, VoucherProgress, sign_client_binding, stream_fetch_tracked,
 };
@@ -178,7 +178,7 @@ impl ClientFixture {
         self.signer.address()
     }
 
-    /// The buyer's voucher-signing key, for journeys that drive a `client-pull`
+    /// The buyer's voucher-signing key, for journeys that drive a `decdn-client`
     /// entry point directly rather than through [`Self::fetch`].
     #[must_use]
     pub const fn signer(&self) -> &Arc<PrivateKeySigner> {
@@ -668,7 +668,7 @@ impl ClientFixture {
         hash: Hash,
         timestamp_us: u64,
     ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
-        let (resp, _ext, _rtt) = decdn_client_pull::probe::probe_once(
+        let (resp, _ext, _rtt) = decdn_client::probe::probe_once(
             &self.endpoint,
             Self::target(node).await?,
             *hash.as_bytes(),
@@ -700,7 +700,7 @@ impl ClientFixture {
     ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
         let target = EndpointAddr::new(node_id)
             .with_ip_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
-        let (resp, _ext, _rtt) = decdn_client_pull::probe::probe_once(
+        let (resp, _ext, _rtt) = decdn_client::probe::probe_once(
             &self.endpoint,
             target,
             *hash.as_bytes(),
@@ -833,10 +833,10 @@ impl ClientFixture {
         // Uncapped, matching production self-issue: the delegate IS the pool
         // owner, so the pool deposit — not the capability cap — is the real
         // spending bound.
-        let capability = decdn_client_pull::buyer_pool::issue_self_capability(
+        let capability = decdn_client::buyer_pool::issue_self_capability(
             self.signer.as_ref(),
             pool_id,
-            decdn_client_pull::buyer_pool::SELF_CAPABILITY_CAP,
+            decdn_client::buyer_pool::SELF_CAPABILITY_CAP,
             u64::MAX,
             &voucher_dom,
         )
@@ -860,7 +860,7 @@ impl PoolSession {
     /// The trailing [`StreamRequestExt`] this session's manual-wire helpers send:
     /// the client identity binding plus the owner capability, so the node's
     /// serve/fill gates authorize the request and can register the lane. Mirrors
-    /// what `client-pull` attaches to a `StreamRequest`.
+    /// what `decdn-client` attaches to a `StreamRequest`.
     fn request_ext(&self) -> StreamRequestExt {
         StreamRequestExt {
             binding: self.ctx.client_binding.clone(),
@@ -870,7 +870,7 @@ impl PoolSession {
 }
 
 /// Lower a [`SignedCapability`] into its wire form for a manual `StreamRequestExt`
-/// (`client-pull` does the same internally when it opens a pull).
+/// (`decdn-client` does the same internally when it opens a pull).
 fn signed_to_wire_capability(signed: &SignedCapability) -> WireCapability {
     WireCapability {
         spending_cap: signed.capability.spending_cap,

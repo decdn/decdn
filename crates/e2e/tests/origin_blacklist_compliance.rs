@@ -41,7 +41,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use decdn_client_pull::UpstreamRefused;
+use decdn_client::UpstreamRefused;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;

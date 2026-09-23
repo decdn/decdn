@@ -1309,7 +1309,7 @@ impl VoucherRejectReason {
     /// Single source of truth for the gate: the node checks this before
     /// attaching a bundle (`crates/node/src/handlers/client/voucher.rs`) and
     /// the client checks it again before trusting one enough to self-heal
-    /// (`crates/client-pull/src/lib.rs`) — both call this rather than each
+    /// (`crates/client/src/lib.rs`) — both call this rather than each
     /// keeping their own copy of the match.
     #[must_use]
     pub const fn is_watermark_gated(self) -> bool {

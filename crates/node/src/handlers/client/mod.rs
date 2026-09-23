@@ -694,7 +694,7 @@ impl ServeRejectReason {
     /// mapping on the type makes an inconsistent error/reason pairing
     /// unrepresentable at the call sites.
     ///
-    /// The requester side of this mapping is `decdn_client_pull::UpstreamRefused`,
+    /// The requester side of this mapping is `decdn_client::UpstreamRefused`,
     /// which recovers the wire code — and ONLY the wire code — from a refusal
     /// (#1144). So the `NotFound` collapse is what a requester sees for the miss
     /// reasons below, and the reputation consequences it draws must hold for the
@@ -1990,7 +1990,7 @@ impl ClientHandler {
     ///
     /// **The floor is exactly one group because the pull side reserves exactly one.**
     /// On a cache miss the bytes this prefetch asks for can only come from the
-    /// upstream pull, and `decdn_client_pull::PULL_WINDOW_FLOOR` carries a third
+    /// upstream pull, and `decdn_client::PULL_WINDOW_FLOOR` carries a third
     /// chunk group for precisely this request. Raising the floor here without
     /// raising it there parks the serve leg on bytes the pull may not draw —
     /// a hang, not a failed assertion. `frame_target_room_floor_matches_the_pull_reservation`
@@ -2797,7 +2797,7 @@ mod tests {
         assert_eq!(prefetch, group, "the room floor is one bao chunk group");
 
         // What the pull side can still draw once both group roundings are spent.
-        let drawable = decdn_client_pull::PULL_WINDOW_FLOOR - 2 * group;
+        let drawable = decdn_client::PULL_WINDOW_FLOOR - 2 * group;
         assert!(
             drawable >= interval + prefetch,
             "the pull floor leaves {drawable} bytes after both roundings, but the \

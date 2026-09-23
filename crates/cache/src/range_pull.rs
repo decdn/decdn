@@ -1,5 +1,5 @@
 //! Bao verified-range helpers — re-exported from the iroh-blobs-free
-//! [`decdn_bao_range`] leaf crate (#578) so `decdn-client-pull` can share the
+//! [`decdn_bao_range`] leaf crate (#578) so `decdn-client` can share the
 //! exact same alignment / encoded-size / verify logic without linking
 //! iroh-blobs. The serve (`engine::export_bao_range`), origin range encode
 //! (`engine::origin_range_wire`), and client-receive paths therefore all agree
@@ -19,7 +19,7 @@ pub use decdn_bao_range::{
 mod lock_step {
     //! Guard the iroh-blobs-free leaf-crate constant against the real upstream
     //! value. `decdn-cache` links both crates, so this is where the two can be
-    //! compared; `decdn-bao-range` and `decdn-client-pull` cannot see iroh-blobs.
+    //! compared; `decdn-bao-range` and `decdn-client` cannot see iroh-blobs.
     #[test]
     fn leaf_block_size_matches_iroh_blobs() {
         assert_eq!(

@@ -40,7 +40,7 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     let cb_addr = resolved.capacity_bond_address;
 
     let signer = chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
-    let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
+    let provider = decdn_client::provider::build_provider(&resolved.rpc_url, &signer)?;
 
     // ADR 019 § Terms Acceptance — read the network's current terms hash, then
     // require the operator to accept the matching embedded terms before we sign.

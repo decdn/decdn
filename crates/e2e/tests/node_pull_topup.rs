@@ -9,7 +9,7 @@
 //! bytes — but by construction it cannot exercise three things that only exist
 //! against a real chain and a real upstream daemon:
 //!
-//!   1. A real on-chain `topUp` receipt. `decdn_client_pull::buyer_pool::top_up`
+//!   1. A real on-chain `topUp` receipt. `decdn_client::buyer_pool::top_up`
 //!      submits and awaits `get_receipt()`; here that transaction actually mines
 //!      and raises the pool's escrow.
 //!   2. The upstream's chain-watcher lag. The serving seeder refuses to serve the

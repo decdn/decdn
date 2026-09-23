@@ -243,7 +243,7 @@ under the `decdn` org is that owner. Confirm you are in it, then:
 ```bash
 TEAM=github:decdn:crates-io
 for crate in decdn-protocol decdn-config-types decdn-bao-range decdn-common \
-             decdn-cache decdn-incentive decdn-reputation decdn-client-pull \
+             decdn-cache decdn-incentive decdn-reputation decdn-client \
              decdn-node decdn-cli; do
   cargo owner --add "$TEAM" "$crate"
 done

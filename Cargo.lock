@@ -2747,7 +2747,7 @@ dependencies = [
  "clap",
  "decdn-bao-range",
  "decdn-cache",
- "decdn-client-pull",
+ "decdn-client",
  "decdn-common",
  "decdn-config-types",
  "decdn-incentive",
@@ -2775,7 +2775,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "decdn-client-pull"
+name = "decdn-client"
 version = "0.0.0"
 dependencies = [
  "alloy",
@@ -2840,7 +2840,7 @@ dependencies = [
  "bao-tree",
  "decdn-bao-range",
  "decdn-cache",
- "decdn-client-pull",
+ "decdn-client",
  "decdn-common",
  "decdn-config-types",
  "decdn-incentive",
@@ -2899,7 +2899,7 @@ dependencies = [
  "dashmap",
  "decdn-bao-range",
  "decdn-cache",
- "decdn-client-pull",
+ "decdn-client",
  "decdn-common",
  "decdn-incentive",
  "decdn-node",

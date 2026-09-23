@@ -15,10 +15,10 @@ pub mod chain_events;
 pub mod chain_freshness;
 pub mod channel_store;
 /// The `cdn/client/v1` paid-pull requester lives in the shared
-/// `decdn-client-pull` crate (reused by the CLI's client fetch / bundle pull),
+/// `decdn-client` crate (reused by the CLI's client fetch / bundle pull),
 /// re-exported here as `client_requester` so node call sites and the
-/// integration tests use `client_requester::…` paths.
-pub use decdn_client_pull as client_requester;
+/// integration tests use `decdn_client::…` paths.
+pub use decdn_client as client_requester;
 pub mod coarse_clock;
 pub mod commands;
 pub mod content_deny;

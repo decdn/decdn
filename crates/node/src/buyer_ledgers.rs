@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use decdn_client_pull::{Cumulative, PoolLedger};
+use decdn_client::{Cumulative, PoolLedger};
 use decdn_incentive::LaneKey;
 
 /// The voucher ledger of each lane's current pool, shared by every concurrent pull on it.

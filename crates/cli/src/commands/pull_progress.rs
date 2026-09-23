@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use decdn_client_pull::ProgressCallback;
+use decdn_client::ProgressCallback;
 
 use super::fetch;
 

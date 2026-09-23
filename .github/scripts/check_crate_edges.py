@@ -49,14 +49,14 @@ ALLOWED: dict[str, frozenset[str]] = {
     "decdn-reputation": frozenset({"decdn-protocol"}),
     "decdn-incentive": frozenset({"decdn-common", "decdn-protocol"}),
     "decdn-cache": frozenset({"decdn-bao-range", "decdn-config-types", "decdn-protocol"}),
-    "decdn-client-pull": frozenset(
+    "decdn-client": frozenset(
         {"decdn-bao-range", "decdn-common", "decdn-incentive", "decdn-protocol"}
     ),
     "decdn-node": frozenset(
         {
             "decdn-bao-range",
             "decdn-cache",
-            "decdn-client-pull",
+            "decdn-client",
             "decdn-common",
             "decdn-incentive",
             "decdn-protocol",
@@ -66,7 +66,7 @@ ALLOWED: dict[str, frozenset[str]] = {
     "decdn-cli": frozenset(
         {
             "decdn-bao-range",
-            "decdn-client-pull",
+            "decdn-client",
             "decdn-common",
             "decdn-config-types",
             "decdn-incentive",

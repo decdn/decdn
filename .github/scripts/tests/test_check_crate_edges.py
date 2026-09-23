@@ -36,7 +36,7 @@ GRAPH: dict[str, list[str]] = {
     "decdn-reputation": ["decdn-protocol"],
     "decdn-incentive": ["decdn-common", "decdn-protocol"],
     "decdn-cache": ["decdn-bao-range", "decdn-config-types", "decdn-protocol"],
-    "decdn-client-pull": [
+    "decdn-client": [
         "decdn-bao-range",
         "decdn-common",
         "decdn-incentive",
@@ -45,7 +45,7 @@ GRAPH: dict[str, list[str]] = {
     "decdn-node": [
         "decdn-bao-range",
         "decdn-cache",
-        "decdn-client-pull",
+        "decdn-client",
         "decdn-common",
         "decdn-incentive",
         "decdn-protocol",
@@ -53,7 +53,7 @@ GRAPH: dict[str, list[str]] = {
     ],
     "decdn-cli": [
         "decdn-bao-range",
-        "decdn-client-pull",
+        "decdn-client",
         "decdn-common",
         "decdn-config-types",
         "decdn-incentive",
@@ -62,7 +62,7 @@ GRAPH: dict[str, list[str]] = {
     "decdn-e2e": [
         "decdn-bao-range",
         "decdn-cache",
-        "decdn-client-pull",
+        "decdn-client",
         "decdn-common",
         "decdn-config-types",
         "decdn-incentive",
@@ -73,7 +73,7 @@ GRAPH: dict[str, list[str]] = {
 
 DEV: dict[str, list[str]] = {
     "decdn-cli": ["decdn-cache", "decdn-incentive", "decdn-node"],
-    "decdn-node": ["decdn-client-pull", "decdn-incentive"],
+    "decdn-node": ["decdn-client", "decdn-incentive"],
 }
 
 # External crates and what they pull, enough to exercise the closure walk.
