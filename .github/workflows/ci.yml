@@ -74,11 +74,12 @@ jobs:
           --features buyer-store-core -- -D warnings
       # A feature that no dev-dependency turns on is invisible to the
       # `--workspace --all-targets` run above: `anvil-e2e` (all 15
-      # `crates/e2e/tests/*` + the two gated `decdn-node` tests) and
-      # `decdn-protocol/public-api-test`. No anvil job ever invokes
-      # clippy — settlement builds only the two `--test` targets it names,
-      # journeys only `decdn-e2e`'s — so the gated targets sat outside the lint
-      # wall every other target obeys and drifted into failing it (#1551).
+      # `crates/e2e/tests/*` + the two gated `decdn-node` tests),
+      # `decdn-protocol/public-api-test`, and `decdn-client/public-api-test`. No
+      # anvil job ever invokes clippy — settlement builds only the two `--test`
+      # targets it names, journeys only `decdn-e2e`'s — so the gated targets sat
+      # outside the lint wall every other target obeys and drifted into failing
+      # it (#1551).
       #
       # `--all-features` rather than a hand-listed `-p A -p B --features F`: the
       # curated `--test` list at the settlement job below is how
@@ -175,7 +176,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
-    # Guards `decdn-protocol`'s exported surface (issue #304). The
+    # Guards the exported surface of `decdn-protocol` (issue #304) and of the
+    # `decdn-client` SDK (#1150). The
     # `public-api-test` feature-gated test renders the public API from rustdoc
     # JSON and `insta`-snapshots it; an unintended diff fails here and blocks
     # the PR. Runs on the same pinned stable toolchain as everything else (the
@@ -194,6 +196,7 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo nextest run -p decdn-protocol --features public-api-test
+      - run: cargo nextest run -p decdn-client --features public-api-test
 
   changes:
     name: detect changes

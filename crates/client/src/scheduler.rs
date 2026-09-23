@@ -132,7 +132,7 @@ pub struct SourceLane<'a, S> {
     pub ledger: Arc<PoolLedger>,
     /// Which discovery blocks this source actually holds (#1506, B1's
     /// `Probed::coverage`). Drives both the initial coverage-aware spread
-    /// ([`spread_segments`]) and the scheduler's internal coverage-filtered
+    /// (`spread_segments`) and the scheduler's internal coverage-filtered
     /// steal — this lane is never assigned, and never steals, a range
     /// outside what this says it can serve.
     pub coverage: Coverage,

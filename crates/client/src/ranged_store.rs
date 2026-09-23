@@ -449,15 +449,10 @@ impl ClientRangedStore {
         self.tree
     }
 
-    /// The outboard sidecar path, used by `admit`/`finalize`.
-    #[must_use]
-    pub fn obao_path(&self) -> &Path {
-        &self.obao_path
-    }
-
+    #[cfg(test)]
     /// The present-range record path, used by `admit`/`finalize`.
     #[must_use]
-    pub fn ranges_path(&self) -> &Path {
+    pub(crate) fn ranges_path(&self) -> &Path {
         &self.ranges_path
     }
 

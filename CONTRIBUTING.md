@@ -85,15 +85,17 @@ before pushing a change that touches gated code, or the first thing that tells y
 
 ### Public API snapshot
 
-`decdn-protocol` carries a [`public_api`](https://crates.io/crates/public_api) +
-[`insta`](https://crates.io/crates/insta) snapshot test that guards its exported surface
-(wire types, ALPN definitions) against unintended changes — see [issue #304]. It is
+`decdn-protocol` and `decdn-client` each carry a [`public_api`](https://crates.io/crates/public_api) +
+[`insta`](https://crates.io/crates/insta) snapshot test that guards the exported surface
+against unintended changes: the wire types and ALPN definitions ([issue #304]), and the
+client SDK ([issue #1150]). Each is
 feature-gated and **not** part of `cargo nextest run --workspace`. The dedicated `public-api`
 CI job runs it and **blocks the PR** on any diff.
 
 ```bash
 # Run (and update) the snapshot. Required when you intentionally change the public API:
 INSTA_UPDATE=always cargo nextest run -p decdn-protocol --features public-api-test
+INSTA_UPDATE=always cargo nextest run -p decdn-client --features public-api-test
 # or, to review interactively:
 cargo insta review
 ```
@@ -107,6 +109,7 @@ cargo insta review
   `crates/protocol/tests/public_api.rs`).
 
 [issue #304]: https://github.com/decdn/decdn/issues/304
+[issue #1150]: https://github.com/decdn/decdn/issues/1150
 
 ## Solidity development
 

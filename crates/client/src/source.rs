@@ -773,23 +773,26 @@ mod doubles {
             })
         }
 
+        #[cfg(test)]
         /// The most legs this source ever had open and unfinished at once. A
         /// driver that runs its gaps one at a time reads `1`.
         #[must_use]
-        pub fn peak_in_flight(&self) -> u64 {
+        pub(crate) fn peak_in_flight(&self) -> u64 {
             self.peak_in_flight.load(Ordering::SeqCst)
         }
 
+        #[cfg(test)]
         /// Delay every `finish` by `stall` after its range is fully delivered,
         /// holding the completed range in the scheduler's `in_flight` so a peer's
         /// steal of an already-present range fires deterministically (see
         /// `finish_stall`).
         #[must_use]
-        pub const fn slow_finish(mut self, stall: Duration) -> Self {
+        pub(crate) const fn slow_finish(mut self, stall: Duration) -> Self {
             self.finish_stall = Some(stall);
             self
         }
 
+        #[cfg(test)]
         /// Wedge every reader once it has delivered `after_bytes`: the next read
         /// sleeps for `stall` rather than returning bytes, so the source stops
         /// making verified progress without ever erroring (see
@@ -797,26 +800,28 @@ mod doubles {
         /// scheduler's `unit_deadline` with a checkpoint-crossing `after_bytes`
         /// to trip the stall watchdog deterministically.
         #[must_use]
-        pub const fn stall_after(mut self, after_bytes: u64, stall: Duration) -> Self {
+        pub(crate) const fn stall_after(mut self, after_bytes: u64, stall: Duration) -> Self {
             self.stall_after = Some((after_bytes, stall));
             self
         }
 
+        #[cfg(test)]
         /// Inject a one-time `stall` on the first read of every reader this
         /// source yields, so a competing fast source finishes first and steals
         /// this one's tail — the deterministic trigger the no-double-pay test
         /// needs.
         #[must_use]
-        pub const fn slow_to_start(mut self, stall: Duration) -> Self {
+        pub(crate) const fn slow_to_start(mut self, stall: Duration) -> Self {
             self.first_read_stall = Some(stall);
             self
         }
 
+        #[cfg(test)]
         /// Total WIRE bytes actually delivered across every reader (see
         /// `delivered`). The honest "fetched and paid" proxy
         /// the no-double-pay assertion reads.
         #[must_use]
-        pub fn delivered_bytes(&self) -> u64 {
+        pub(crate) fn delivered_bytes(&self) -> u64 {
             self.delivered.load(Ordering::SeqCst)
         }
 
@@ -848,24 +853,26 @@ mod doubles {
         /// equals exactly the contiguous gaps of `missing_ranges` — no held
         /// range is ever opened, so no held byte is ever re-pulled or re-paid.
         #[must_use]
-        pub fn opened_ranges(&self) -> Vec<(u64, u64)> {
+        pub(crate) fn opened_ranges(&self) -> Vec<(u64, u64)> {
             self.opened.lock().map(|o| o.clone()).unwrap_or_default()
         }
 
+        #[cfg(test)]
         /// Total content bytes opened across every `open` call (the sum of each
         /// opened range's `fetch_len`). Equals the gap bytes, NOT the whole blob,
         /// when the driver skips held ranges.
         #[must_use]
-        pub fn opened_bytes(&self) -> u64 {
+        pub(crate) fn opened_bytes(&self) -> u64 {
             self.opened
                 .lock()
                 .map_or(0, |o| o.iter().map(|(_, len)| *len).sum())
         }
 
+        #[cfg(test)]
         /// After `wire_bytes` of a range's wire, truncate it and park the fault
         /// `make` produces — the exact shape a stalled/refusing peer leaves.
         #[must_use]
-        pub fn with_fault_after(
+        pub(crate) fn with_fault_after(
             mut self,
             wire_bytes: usize,
             make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
@@ -995,7 +1002,7 @@ mod doubles {
         /// instant it happens.
         delivered: Arc<AtomicU64>,
         /// A one-time stall consumed on the first `read_bytes` (see
-        /// [`ScriptedSource::slow_to_start`]); `None` after it fires once.
+        /// `ScriptedSource::slow_to_start`); `None` after it fires once.
         first_read_stall: Option<Duration>,
         /// Wedge this reader once it has delivered the byte threshold (see
         /// [`ScriptedSource::stall_after`]); `None` after it fires once.
