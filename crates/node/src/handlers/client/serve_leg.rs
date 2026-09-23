@@ -360,6 +360,7 @@ impl ClientHandler {
                             }
                             if attempts >= MAX_PROOFS_PER_CHUNK {
                                 self.metrics.node_pull_through_client_abandoned();
+                                self.metrics.serve_stream_proof_budget_exhausted();
                                 // A payer that spends its per-chunk proof budget
                                 // without settling the chunk is a client payment
                                 // fault, not a node bug.

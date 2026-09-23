@@ -9705,6 +9705,7 @@ async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Resul
         Ok(Err(_)) => {}
     }
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 1)?;
 
     leaf.conn.close(0u32.into(), b"done");
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;

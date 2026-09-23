@@ -10401,6 +10401,13 @@ async fn sliver_vouchers_exhaust_the_per_chunk_proof_budget() -> anyhow::Result<
         counter(&fx.metrics, "decdn_serve_stream_node_fault_total")? == 0,
         "a spent proof budget is a client payment fault, not a node fault"
     );
+    anyhow::ensure!(
+        counter(
+            &fx.metrics,
+            "decdn_serve_stream_proof_budget_exhausted_total"
+        )? == 1,
+        "a spent proof budget must be counted"
+    );
 
     fx.conn.close(0u32.into(), b"done");
     shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
