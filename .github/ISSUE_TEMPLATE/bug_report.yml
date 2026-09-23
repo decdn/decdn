@@ -1,0 +1,65 @@
+name: Bug report
+description: Something in decdn-node, the decdn CLI, the client SDK, or the contracts does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities here. Email security@decdn.org instead (see [SECURITY.md](https://github.com/decdn/decdn/blob/main/SECURITY.md)).
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - node (decdn-node daemon)
+        - cli (decdn binary)
+        - client (decdn-client SDK)
+        - cache
+        - incentive (pools, vouchers, staking)
+        - reputation
+        - protocol (wire format, ALPNs)
+        - contracts (Solidity)
+        - docs / ADRs
+        - other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The Docker image tag, or the commit SHA you built from (`git rev-parse --short HEAD`).
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: e.g. Ubuntu 24.04 x86_64, macOS 15 arm64, Docker image tag
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands and config. Remove private keys, keystore passwords, RPC URLs that carry API keys, and origin credentials. `decdn config validate --config <path>` prints the config with `rpc_url` and `otlp_endpoint` redacted.
+      placeholder: |
+        1. decdn-node run --config ...
+        2. decdn fetch ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant log output, with the same secrets removed. For more detail, set `RUST_LOG=info,decdn_node=debug` on `decdn-node`, or pass `-vv` to `decdn`.
+      render: shell
