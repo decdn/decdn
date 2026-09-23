@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Posts (or updates) a sticky PR comment with the forge gas-snapshot diff.
-# Mirrors the coverage-comment sticky pattern in ci.yml; pinned by marker.
+# The comment is found again on later pushes by its marker.
 set -euo pipefail
 
 MARKER="<!-- decdn-gas-snapshot-comment -->"

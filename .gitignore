@@ -11,6 +11,8 @@
 
 # Rust / Cargo
 /target/
+# `cargo llvm-cov nextest --cobertura` output (the CI `test` job's command)
+/cobertura.xml
 
 # Foundry
 /contracts/out/

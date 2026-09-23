@@ -256,8 +256,6 @@ jobs:
               # validates it — letting a stale/incorrect baseline merge.
               - '**/*.snap'
               - '.github/workflows/ci.yml'
-              - '.github/scripts/coverage-diff.py'
-              - '.github/scripts/tests/**'
             adr:
               - 'adr/**/*.md'
               - 'adr/Makefile'
@@ -277,13 +275,13 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/actions/**'
               - '.github/scripts/post-gas-snapshot-comment.sh'
-              - '.github/scripts/contracts-coverage-comment.sh'
+              - '.github/scripts/lcov_to_cobertura.py'
             markdown:
               - '**/*.md'
               - '.markdownlint.yaml'
               - '.github/workflows/ci.yml'
             scripts:
-              # Gates `coverage-tooling-tests` (the pytest suite under
+              # Gates `ci-tooling-tests` (the pytest suite under
               # .github/scripts/tests). The helpers and their regression tests
               # live under .github/scripts/; a PR that touches no scripts has
               # nothing for that job to verify.
@@ -320,17 +318,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
-    # Merged test+coverage job: the `Run tests` step (instrumented nextest) is
-    # the required signal feeding ci-success. Every coverage post-processing
-    # step below it carries `continue-on-error: true` so flaky LCOV/diff/comment
-    # tooling never blocks PRs — preserving the prior `coverage`-job semantics.
+    # The `Run tests` step (instrumented nextest) is the required signal feeding
+    # ci-success. The coverage upload after it carries `continue-on-error: true`
+    # so a GitHub API failure never blocks a PR.
     # Doc-only PRs skip this job via the `changes` gate; alls-green is
     # configured with `allowed-skips` (see ci-success below) so the skip
     # is accepted as success.
     permissions:
       contents: read
-      pull-requests: write
-      actions: read
       # `Upload code coverage` posts the Cobertura report to GitHub Code Quality.
       code-quality: write
     # RUSTFLAGS lives at the JOB level (not step level) so the
@@ -364,11 +359,7 @@ jobs:
       # recommends disabling it.
       CARGO_INCREMENTAL: "0"
     steps:
-      # fetch-depth: 0 is required: coverage-diff.py runs
-      # `git diff origin/<base>...HEAD` and needs full history.
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       # Reclaim ~20 GB of preinstalled toolchains this job never uses (see the
       # settlement e2e job for the full ENOSPC rationale). This job's load is
       # the instrumented target — a partial rust-cache restore plus a rebuild
@@ -412,15 +403,6 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
-      # Python is needed downstream by `Generate coverage diff` to invoke
-      # coverage-diff.py. The helper's own pytest suite lives in the separate
-      # non-blocking `coverage-tooling-tests` job so a regression in the
-      # helper surfaces as a red X without blocking PRs.
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-
       # REQUIRED step. cargo llvm-cov nextest runs the workspace test suite
       # with LLVM instrumentation; non-zero exit on any test failure fails
       # this job and (via ci-success.needs) blocks the PR. No continue-on-error.
@@ -434,8 +416,10 @@ jobs:
       # invocation by default, which would wipe the instrumented artifacts
       # rust-cache just restored. This flag suppresses that cleanup so the
       # cache restore is actually useful.
+      #
+      # --cobertura: GitHub Code Quality reads Cobertura XML only.
       - name: Run tests (with coverage instrumentation)
-        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass --no-clean
+        run: cargo llvm-cov nextest --workspace --cobertura --output-path cobertura.xml --no-tests=pass --no-clean
 
       # Disk headroom after the profraw merge, logged even when the tests fail,
       # so an ENOSPC regression shows up as a number rather than a guess.
@@ -443,15 +427,10 @@ jobs:
         if: always()
         run: df -h /
 
-      # GitHub Code Quality coverage reads Cobertura XML only. `report` re-exports
-      # the profile data the `Run tests` step already collected; it does not
-      # rebuild or rerun anything. Both steps are best-effort, like the rest of
-      # the coverage post-processing: a failure never blocks the PR. The upload
-      # action skips fork PRs by itself (their token is read-only).
-      - name: Export Cobertura coverage
-        continue-on-error: true
-        run: cargo llvm-cov report --cobertura --output-path cobertura.xml
-
+      # Posts the Rust coverage to GitHub Code Quality, which comments the PR
+      # coverage and per-file deltas against `main`. Best-effort: a failure
+      # never blocks the PR. The action skips fork PRs by itself (their token
+      # is read-only).
       - name: Upload code coverage
         if: hashFiles('cobertura.xml') != ''
         continue-on-error: true
@@ -470,206 +449,6 @@ jobs:
       # non-instrumented against its own warm cache partition and runs in
       # parallel, off this job's critical path. See that job for the #864
       # rationale.
-
-      # No continue-on-error: this only runs on push to main (post-merge), so
-      # a failure paints main CI red rather than blocking a PR. Silent
-      # degradation is worse than a visible red on main — a persistent upload
-      # failure would silently freeze the coverage baseline that all PR diffs
-      # are computed against.
-      - name: Upload coverage baseline
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage-lcov
-          path: lcov.info
-          retention-days: 90
-
-      # The official actions/download-artifact needs an explicit run-id to fetch
-      # from a different workflow run (it cannot auto-resolve "latest successful
-      # run of ci.yml on main" the way dawidd6 did). Resolve that run-id here
-      # via the workflow-runs API, then hand it to the download step below.
-      # It also confirms the artifact exists in that run: the official action
-      # FAILS when the named artifact is absent (no `if_no_artifact_found:
-      # warn` like dawidd6), so without this check an expired (90-day
-      # retention) or deleted baseline would fail the download step on every
-      # PR. A resolution failure (no successful main run yet) or a missing
-      # artifact leaves run_id empty and the download step skips — same
-      # graceful "no baseline" outcome as before.
-      - name: Resolve latest coverage baseline run
-        id: resolve
-        if: github.event_name == 'pull_request'
-        continue-on-error: true
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const { data } = await github.rest.actions.listWorkflowRuns({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'ci.yml',
-              branch: 'main',
-              status: 'success',
-              per_page: 1,
-            });
-            const run = data.workflow_runs[0];
-            if (!run) {
-              core.setOutput('run_id', '');
-              return;
-            }
-            const arts = await github.rest.actions.listWorkflowRunArtifacts({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: run.id,
-              per_page: 100,
-            });
-            const has = arts.data.artifacts.some(a => a.name === 'coverage-lcov');
-            core.setOutput('run_id', has ? String(run.id) : '');
-
-      - name: Download coverage baseline
-        if: github.event_name == 'pull_request' && steps.resolve.outputs.run_id != ''
-        continue-on-error: true
-        uses: actions/download-artifact@v8
-        with:
-          name: coverage-lcov
-          path: baseline/
-          repository: ${{ github.repository }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ steps.resolve.outputs.run_id }}
-
-      # Read the existing sticky comment (if any) so coverage-diff.py can
-      # extract the prior per-commit history block and append a new row.
-      # Without this step the comment would still update in place but the
-      # history would reset to a single row on every push.
-      # On a transient API failure (5xx, rate limit) the catch falls back to
-      # an empty file so coverage-diff.py treats it as "no prior" rather
-      # than failing the job. The visible degraded mode is "history resets
-      # this push" — same as a deleted comment.
-      - name: Fetch prior coverage comment
-        if: github.event_name == 'pull_request'
-        continue-on-error: true
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const fs = require('fs');
-            // Must match MARKER in .github/scripts/coverage-diff.py.
-            const marker = '<!-- decdn-coverage-comment -->';
-            try {
-              const comments = await github.paginate(github.rest.issues.listComments, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                per_page: 100,
-              });
-              // Filter by author too: anyone who can comment on the PR could
-              // post a body containing the marker and hijack the sticky-comment
-              // selection. Bot author + marker is the unambiguous identifier.
-              const existing = comments.find(c =>
-                c.user?.login === 'github-actions[bot]'
-                && c.body
-                && c.body.includes(marker)
-              );
-              fs.writeFileSync('prior-comment.md', existing ? existing.body : '');
-            } catch (e) {
-              core.warning(`Failed to fetch prior coverage comment: ${e.message} — history will reset this push.`);
-              fs.writeFileSync('prior-comment.md', '');
-            }
-
-      - name: Generate coverage diff
-        id: gendiff
-        if: github.event_name == 'pull_request'
-        continue-on-error: true
-        # The script writes the truncated comment to stdout (captured here for the
-        # PR comment) and the full per-file table directly to $GITHUB_STEP_SUMMARY.
-        # DECDN_HEAD_SHA must be the PR head, not GITHUB_SHA (which is the merge SHA).
-        # Atomic write on success: stdout to .tmp, then rename. On failure,
-        # write a marker-bearing fallback comment so the Post step updates the
-        # sticky to a "diff failed" indicator rather than leaving stale data
-        # from a prior push. The marker must match MARKER in coverage-diff.py.
-        env:
-          DECDN_COVERAGE_PRIOR_BODY: prior-comment.md
-          DECDN_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          if python3 .github/scripts/coverage-diff.py lcov.info baseline/lcov.info \
-               > coverage-comment.md.tmp; then
-            mv coverage-comment.md.tmp coverage-comment.md
-          else
-            rc=$?
-            rm -f coverage-comment.md.tmp
-            run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            printf '%s\n' \
-              '<!-- decdn-coverage-comment -->' \
-              '## Coverage report' \
-              '' \
-              ":warning: Coverage diff generation failed for commit \`${DECDN_HEAD_SHA}\`." \
-              "See the [workflow run logs](${run_url}) for details." \
-              > coverage-comment.md
-            exit $rc
-          fi
-
-      # always(): post the comment even when the required `Run tests` step fails
-      # (without it, success() would be false and this step would skip on red PRs).
-      # On a coverage-diff.py crash, Generate coverage diff writes a marker-
-      # bearing fallback so this step still updates the sticky to a "diff
-      # failed" indicator instead of leaving stale data. The hashFiles guard
-      # only excludes the case where Generate coverage diff was itself skipped
-      # (e.g. Run tests failed and the implicit success() gate skipped the
-      # rest of the chain — in that case the failed-tests signal on the
-      # required job is the unambiguous indicator). Skip on fork PRs:
-      # GITHUB_TOKEN is read-only there and createComment would 403.
-      - name: Post coverage comment
-        if: |
-          always()
-          && github.event_name == 'pull_request'
-          && github.event.pull_request.head.repo.full_name == github.repository
-          && hashFiles('coverage-comment.md') != ''
-        continue-on-error: true
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('coverage-comment.md', 'utf8');
-            // Must match MARKER in .github/scripts/coverage-diff.py.
-            const marker = '<!-- decdn-coverage-comment -->';
-            // try/catch + core.warning: continue-on-error keeps API errors
-            // (5xx, rate limit, permissions drift) from blocking the PR, but
-            // a sustained outage would otherwise be invisible. The warning
-            // adds a searchable entry to the run summary so a stopped-posting
-            // regression is noticeable beyond just a yellow step.
-            try {
-              const comments = await github.paginate(github.rest.issues.listComments, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                per_page: 100,
-              });
-              // Filter by bot author + marker: a non-bot comment containing
-              // the marker would otherwise get picked as `existing`, and the
-              // updateComment call below would 403 (caller != author), leaving
-              // the bot's actual comment unmaintained.
-              const existing = comments.find(c =>
-                c.user?.login === 'github-actions[bot]'
-                && c.body
-                && c.body.includes(marker)
-              );
-              if (existing) {
-                await github.rest.issues.updateComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  comment_id: existing.id,
-                  body,
-                });
-              } else {
-                await github.rest.issues.createComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: context.issue.number,
-                  body,
-                });
-              }
-            } catch (e) {
-              core.warning(`Failed to post coverage comment: ${e.message}`);
-              throw e;
-            }
 
   # Live anvil-backed on-chain e2e (issue #745). Gated behind the `anvil-e2e`
   # cargo feature so the default `test` job stays fast and needs no Foundry. Split
@@ -1060,7 +839,7 @@ jobs:
       # Post (or update) the sticky gas-snapshot diff comment. PR-only; skipped
       # on fork PRs (read-only GITHUB_TOKEN would 403). continue-on-error so a
       # transient GitHub API hiccup in this best-effort tooling never blocks the
-      # required gate — mirrors the coverage-comment steps in the `test` job.
+      # required gate.
       # `if: always() && steps.gas.outcome in (success, failure)`: post the
       # comment WHETHER OR NOT the snapshot gate passed — a stale-gas failure is
       # exactly when the author needs to see which entries drifted (the gate
@@ -1149,12 +928,8 @@ jobs:
     if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
-      pull-requests: write
-      # dawidd6/action-download-artifact calls the workflow_runs API to
-      # find the latest successful main run; without actions: read it
-      # 403s and the step (continue-on-error) silently produces no
-      # baseline — every PR would render "no baseline available".
-      actions: read
+      # `Upload code coverage` posts the Cobertura report to GitHub Code Quality.
+      code-quality: write
     defaults:
       run:
         working-directory: contracts
@@ -1173,116 +948,25 @@ jobs:
       - name: forge coverage
         run: forge coverage --report lcov --report summary
 
-      # Push to main: publish the LCOV as a baseline artifact for PRs to
-      # diff against. Mirrors the Rust coverage flow (test job).
-      - name: Upload coverage baseline
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v7
-        with:
-          name: contracts-coverage-lcov
-          path: contracts/lcov.info
-          retention-days: 90
-
-      # PR: download the baseline so the comment script can render a delta.
-      # The official actions/download-artifact needs an explicit run-id to fetch
-      # from a different workflow run, so resolve the latest successful
-      # ci.yml run on main first. It also confirms the artifact exists in that
-      # run: the official action FAILS when the named artifact is absent (it has
-      # no `if_no_artifact_found: warn` like dawidd6), so without this check an
-      # expired (90-day retention) or deleted baseline would be misreported as a
-      # download failure rather than "no baseline". A resolution failure (no
-      # successful main run yet) or a missing artifact leaves run_id empty and
-      # the download step skips — the "Tag baseline status" step below then
-      # records it as not-found, keeping the job green on a first-ever PR or
-      # after an artifact has expired.
-      - name: Resolve latest coverage baseline run
-        id: resolve
-        if: github.event_name == 'pull_request'
+      # GitHub Code Quality reads Cobertura XML only and forge writes LCOV
+      # only. Forge's paths are relative to contracts/; --path-prefix makes
+      # them repo-relative so the report lands on the real files. Both steps
+      # are best-effort: a failure never blocks the PR. The upload action
+      # skips fork PRs by itself (their token is read-only).
+      - name: Convert coverage to Cobertura
         continue-on-error: true
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const { data } = await github.rest.actions.listWorkflowRuns({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'ci.yml',
-              branch: 'main',
-              status: 'success',
-              per_page: 1,
-            });
-            const run = data.workflow_runs[0];
-            if (!run) {
-              core.setOutput('run_id', '');
-              return;
-            }
-            const arts = await github.rest.actions.listWorkflowRunArtifacts({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: run.id,
-              per_page: 100,
-            });
-            const has = arts.data.artifacts.some(a => a.name === 'contracts-coverage-lcov');
-            core.setOutput('run_id', has ? String(run.id) : '');
+        run: python3 ../.github/scripts/lcov_to_cobertura.py lcov.info cobertura.xml --path-prefix contracts
 
-      - name: Download coverage baseline
-        id: dl_baseline
-        if: github.event_name == 'pull_request' && steps.resolve.outputs.run_id != ''
+      - name: Upload code coverage
+        if: hashFiles('contracts/cobertura.xml') != ''
         continue-on-error: true
-        uses: actions/download-artifact@v8
+        uses: actions/upload-code-coverage@v1
         with:
-          name: contracts-coverage-lcov
-          # actions/download-artifact resolves `path:` relative to
-          # GITHUB_WORKSPACE, not the job-default working-directory,
-          # so this lands the file at contracts/baseline/lcov.info.
-          path: contracts/baseline/
-          repository: ${{ github.repository }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ steps.resolve.outputs.run_id }}
-
-      # Record WHY the baseline is absent so the comment script can
-      # distinguish "first PR / artifact expired" from "download failed
-      # with the artifact available" — otherwise an artifact-API outage
-      # looks identical to a legitimate first PR. A skipped download
-      # (no successful main run, or the artifact is absent from it) is
-      # the same as not-found; a download that ran and failed against a
-      # present artifact, or a resolve step that itself hit an API
-      # outage, is a real download-failed.
-      - name: Tag baseline status
-        if: github.event_name == 'pull_request'
-        run: |
-          mkdir -p baseline
-          if [[ -s baseline/lcov.info ]]; then
-            rm -f baseline/.absent-reason
-          elif [[ "${{ steps.resolve.outcome }}" == "failure" ]]; then
-            printf 'download-failed\n' > baseline/.absent-reason
-          elif [[ "${{ steps.dl_baseline.outcome }}" == "success" || "${{ steps.dl_baseline.outcome }}" == "skipped" ]]; then
-            printf 'not-found\n' > baseline/.absent-reason
-          else
-            printf 'download-failed\n' > baseline/.absent-reason
-          fi
-
-      # Post (or update) the sticky PR comment with total line coverage and
-      # delta vs main. Mirrors the existing coverage-diff.py sticky-comment
-      # pattern but contracts-scoped (distinct marker, distinct script).
-      # Skips on fork PRs — GITHUB_TOKEN is read-only there.
-      - name: Post coverage comment
-        if: |
-          github.event_name == 'pull_request'
-          && github.event.pull_request.head.repo.full_name == github.repository
-        continue-on-error: true
-        env:
-          GH_PR_NUMBER: ${{ github.event.pull_request.number }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # CWD is contracts/ via the job-level defaults.run.working-directory.
-        # lcov.info lives here (from forge coverage); baseline/lcov.info was
-        # written by the prior step (action-download-artifact uses
-        # GITHUB_WORKSPACE-relative paths, so its `path: contracts/baseline/`
-        # lands the file at <ws>/contracts/baseline/lcov.info, which is
-        # ./baseline/lcov.info from here).
-        run: |
-          base="baseline/lcov.info"
-          if [[ ! -s "$base" ]]; then base=""; fi
-          ../.github/scripts/contracts-coverage-comment.sh lcov.info "$base" baseline/.absent-reason
+          # `uses:` steps ignore defaults.run, so the path is workspace-relative.
+          file: contracts/cobertura.xml
+          language: Solidity
+          label: code-coverage/forge
+          fail-on-error: false
 
   solidity-solhint:
     name: solidity solhint
@@ -1468,8 +1152,8 @@ jobs:
   # as a red X (visible in the checks list) without blocking PRs. Lives in its
   # own job so the signal stays distinct from yellow continue-on-error steps
   # in the required `test` job.
-  coverage-tooling-tests:
-    name: coverage tooling tests
+  ci-tooling-tests:
+    name: CI tooling tests
     runs-on: ubuntu-latest
     needs: changes
     # Gated on the `scripts` filter: this only exercises .github/scripts/, so a
@@ -1554,12 +1238,6 @@ jobs:
       - name: Every crate still packages
         run: cargo package --workspace --no-verify --locked
 
-  # Single gate for branch protection. Point required-checks at this one job
-  # so adding/renaming jobs above doesn't require updating branch rules.
-  # The `test` job carries coverage post-processing (LCOV diff, sticky PR
-  # comment via .github/scripts/coverage-diff.py) as best-effort steps; those
-  # steps' `continue-on-error: true` keeps coverage tooling non-blocking even
-  # though the job itself is required.
   # Nothing validated the Dockerfile until a release tag was cut, which is how
   # `EXPOSE 4433 9090  # comment` — a hard parse error, since Dockerfile `#`
   # only starts a comment at the beginning of a line — survived in the tree.
@@ -1593,6 +1271,8 @@ jobs:
           [ "$out" = "placeholder" ] || {
             echo "::error::entrypoint did not run the copied binary (got: $out)"; exit 1; }
 
+  # Single gate for branch protection. Point required-checks at this one job
+  # so adding/renaming jobs above doesn't require updating branch rules.
   ci-success:
     name: CI success
     if: always()

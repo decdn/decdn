@@ -4,7 +4,7 @@ aderyn-report.md
 aderyn-report.json
 aderyn-report.sarif
 lcov.info
-baseline/
+cobertura.xml
 
 # vm.snapshotGasLastCall / vm.startSnapshotGas output. Local scratch for
 # reading a named gas value during development; the repo's pinned gas
