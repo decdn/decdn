@@ -32,8 +32,20 @@ pub(crate) const DEFAULT_DOWNLOAD_UNIT_DEADLINE: std::time::Duration =
 /// Zero-config tunables shared by the consumption faces.
 ///
 /// Overrides are opt-in: [`PullConfig::default`] is the whole configuration a
-/// caller needs. Fields are added as the faces grow to consume them (#1848); the
-/// first is the `Streamer`'s read-ahead bound.
+/// caller needs. Override a field with struct-update syntax:
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use decdn_client::PullConfig;
+///
+/// // Fail a silent download lane over after 10 s instead of the default.
+/// let config = PullConfig {
+///     download_unit_deadline: Duration::from_secs(10),
+///     ..PullConfig::new()
+/// };
+/// assert_eq!(config.read_ahead_bytes, PullConfig::new().read_ahead_bytes);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PullConfig {
     /// The `Streamer`'s bounded read-ahead: the maximum number of bytes fetched

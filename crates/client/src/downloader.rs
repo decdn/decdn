@@ -57,6 +57,33 @@ pub struct DownloadTarget<'a> {
 /// the hash). A candidate that faults is failed over to another (shared-pool
 /// failover, #1174); a resumed download (an existing `.partial`, e.g. a bundle
 /// layer's chunk-hint dedup) re-pulls only its missing ranges.
+///
+/// The faces do not write the buyer store: record each lane's payment after the
+/// fetch, whatever its outcome (see the crate docs, and the `download` example
+/// for the whole sequence).
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// use decdn_client::driver::DriveConfig;
+/// use decdn_client::source::{BlobSource, Funder};
+/// use decdn_client::{DownloadTarget, Downloader, PullConfig, StreamCandidate};
+///
+/// async fn download<S: BlobSource, F: Funder>(
+///     candidates: Vec<StreamCandidate<S>>,
+///     funder: F,
+///     hash: [u8; 32],
+///     total_bytes: u64,
+///     dest: &Path,
+/// ) -> anyhow::Result<()> {
+///     let downloader = Downloader::new(candidates, funder, DriveConfig::cli(Default::default()));
+///     let target = DownloadTarget { hash, total_bytes, dest };
+///     downloader
+///         .fetch_to_paths(&[target], &PullConfig::new(), None, None)
+///         .await?;
+///     Ok(())
+/// }
+/// ```
 pub struct Downloader<S, F> {
     /// The provider candidates every entry is fetched across.
     candidates: Vec<StreamCandidate<S>>,

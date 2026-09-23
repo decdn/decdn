@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Shared client-side paid-pull machinery used by both the node (node-to-node miss pulls) and the CLI (client fetch / bundle pull): the cdn/client/v1 requester and the buyer PaymentPool open kernel"
+description = "The deCDN client SDK: fetch content-addressed blobs from deCDN nodes, pay per megabyte from a USDC payment pool, and verify every byte as it arrives"
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
@@ -70,6 +70,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 decdn-bao-range = { workspace = true, features = ["test-util"] }
+# The examples keep the buyer's pool and lane records in the same redb store
+# `decdn fetch` uses, and print their warnings through a subscriber.
+decdn-incentive = { workspace = true, features = ["redb"] }
+tracing-subscriber = { workspace = true }
 # Public-API stability snapshot (#1150). Only exercised by the `public_api` test
 # target below, which is gated behind `public-api-test`.
 public-api = { workspace = true }

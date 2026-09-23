@@ -1,35 +1,122 @@
-//! Reusable `cdn/client/v1` paid-pull requester, shared by the node
-//! (node-to-node miss pulls, #317) and the CLI (client fetch / bundle pull).
+//! The deCDN client: fetch content-addressed blobs from deCDN nodes, pay for
+//! them per megabyte from a USDC payment pool, and verify every byte against
+//! its BLAKE3 hash as it arrives.
 //!
-//! [`open_progressive_pull`] performs the open stage of one delivery exchange
-//! against a remote node — it sends a [`StreamRequest`] and validates and
-//! verifies the signed [`StreamResponse`] — and hands back a live
-//! [`UpstreamPull`], the ONE receive loop: it reads `ChunkData` while releasing
-//! one hash-chain preimage per delivered `CHUNK_BYTES` chunk (plus a signed
-//! voucher to open a chain, to roll one, and to settle a sub-chunk residual) and
-//! yields each chunk to its caller. It is the receive-side call site for the #252
-//! rule (reject a `rate_per_mb == 0` response) and the `slash_sig` verification
-//! obligation (ADR 014 §1). The gap-driven [`driver::drive`] (via
-//! [`PeerSource`]) is how the node's cache-miss leg and the CLI's `fetch` /
-//! `bundle pull` consume it; the `test-util` `stream_fetch*` wrappers consume it
-//! into memory for suites that want the decoded bytes back.
+//! The `decdn` CLI's `fetch` and `bundle pull` are built on this crate. So is
+//! the node's own cache-miss pull: a node that misses in its cache is a paying
+//! client of the node upstream of it.
 //!
-//! Mirrors [`probe::probe_once`] in spirit, but for the paid path: it signs
-//! vouchers, so it needs the incentive layer and a signer.
+//! # Choose an entry point
 //!
-//! # Bao verified-range decoding (ADR 038)
+//! | You want to | Use |
+//! |---|---|
+//! | Save one blob, or a set of blobs, to files as fast as possible, and resume a partial download | [`Downloader`] |
+//! | Read one blob in order, and pay only for what your reader reaches | [`Streamer`] |
+//! | Drive the pull loop yourself (a node, or a custom scheduler) | [`driver::drive`], [`multi_source_fetch`], [`open_progressive_pull`] |
+//!
+//! Most callers want one of the two faces. The [`Downloader`] stripes a blob
+//! across every holder at once, and writes each verified range at its offset in
+//! a `.partial` file beside the destination. A rerun fetches only the ranges
+//! that file does not hold yet. The [`Streamer`] fetches at most one read-ahead
+//! window ([`PullConfig::read_ahead_bytes`]) ahead of its reader, so a reader
+//! that stops early stops the spend within that window.
+//!
+//! # Before you fetch
+//!
+//! A fetch needs a funded payment pool, an iroh endpoint, and one paid lane per
+//! node that holds the blob. The `download` and `stream` examples in this
+//! crate's `examples/` directory run the whole sequence:
+//!
+//! 1. **Load the buyer key.** Vouchers and pool transactions are signed with a
+//!    [`PrivateKeySigner`].
+//! 2. **Reuse or open a pool.** Read the pool the buyer store already records
+//!    ([`decdn_incentive::BuyerPoolStore::get_by_owner`]). If there is none,
+//!    approve the deposit ([`buyer_pool::ensure_allowance`]), open a pool
+//!    ([`buyer_pool::open_pool`]), and record the returned state at once: the
+//!    deposit is escrowed from the moment `open_pool` returns.
+//! 3. **Bring up an endpoint** with [`endpoint::client_endpoint`].
+//! 4. **Find the holders.** Read the registered nodes
+//!    ([`discovery::bootstrap_nodes`]), pick a sample
+//!    ([`discovery::select_candidates`]), and probe each one
+//!    ([`probe::probe_once`]). Verify every answer
+//!    ([`probe::verify_probe_response`]) before it counts, and drop an answer
+//!    whose `has_blob` and coverage disagree. A verified answer also gives the
+//!    blob's size.
+//! 5. **Build one lane per holder.** Pin a [`PoolContext`] to the holder's
+//!    provider address with [`buyer_pool::self_owned_lane_ctx`], resuming at
+//!    what the lane has already paid. Create its ledger with
+//!    [`PoolContext::new_ledger`], and wrap both in a [`PeerSource`] inside a
+//!    [`StreamCandidate`]. Cap the lane's rate at the rate the node signed in
+//!    its probe answer ([`effective_rate_ceiling`]).
+//! 6. **Fetch** with [`Downloader::fetch_to_paths`] or [`Streamer::open`].
+//! 7. **Record what each lane paid**, whatever the outcome: build a
+//!    [`VoucherProgress`] from the ledger's settlement, and apply the
+//!    [`buyer_pool::ProgressWrite`] it calls for to the buyer store.
+//!
+//! # What the crate guarantees
+//!
+//! - **Every byte is verified.** Delivery is BLAKE3/bao verified streaming.
+//!   The decoder checks each chunk group against the hash as it lands, so a
+//!   corrupt range aborts the pull at that group. Nothing unverified reaches a
+//!   [`VerifiedReader`] or a finished file.
+//! - **A dishonest node's bill is bounded.** You pay per chunk as it arrives.
+//!   What a lying node can charge you is at most one framed message plus one
+//!   payment interval ([`decdn_protocol::CHUNK_BYTES`]), never the size it
+//!   claimed.
+//! - **Quotes are checked against your ceiling.** A stream response whose
+//!   signed rate exceeds the `max_rate_per_mb` given to [`PeerSource::new`] is
+//!   refused before any payment ([`RateAboveCeiling`]).
+//! - **Failover is free.** Every lane draws on one shared pool, so a holder that
+//!   stalls or refuses is dropped and its range goes to another holder. No
+//!   delivered byte is fetched or paid for twice.
+//!
+//! # What stays yours
+//!
+//! - **Persistence.** The faces never write the buyer store. Record every
+//!   lane's payment after each fetch (step 7). A lane you do not record resumes
+//!   from a stale watermark next time, and its provider rejects the vouchers.
+//! - **Funding policy.** A [`source::Funder`] decides whether a fetch that runs
+//!   the pool low tops it up. One whose [`max_topups`](source::Funder::max_topups)
+//!   is `0` never does. The fetch then fails with a [`PoolExhausted`], and
+//!   [`shared_pool_disposition`] classifies that as terminal.
+//! - **Which holders to use.** Discovery gives candidates; ordering and
+//!   admission ([`discovery::admit_sources`]) are the caller's choice.
+//!
+//! # Mistakes to avoid
+//!
+//! - **One candidate per provider.** Each [`StreamCandidate`] pays one
+//!   `(signer, provider)` lane. Two candidates for one provider sign competing
+//!   vouchers on the same lane.
+//! - **Always set a rate ceiling.** A `max_rate_per_mb` of `0` means no
+//!   ceiling, so a node can quote low on the probe and high on the stream.
+//!   Pass [`effective_rate_ceiling`] of the probed rate and any absolute cap you
+//!   hold.
+//! - **Never resume a lane below its on-chain watermark.** A voucher at or below
+//!   the watermark redeems nothing, so the provider streams bytes it can never
+//!   cash. A lane the buyer store has not seen resumes from the chain's
+//!   `getWatermark`.
+//! - **Keep the stream drive running.** [`Streamer::open`] returns a reader and
+//!   a [`StreamDrive`]. Run your read inside [`StreamDrive::alongside`]: the
+//!   drive pays and drains open legs, and it must not wait behind a blocked
+//!   consumer.
+//! - **Progress is in content bytes.** A [`ProgressCallback`] on the faces
+//!   reports verified content bytes against the blob's size.
+//!
+//! # How delivery works
+//!
+//! [`open_progressive_pull`] sends a [`StreamRequest`], verifies the signed
+//! [`StreamResponse`], and returns an [`UpstreamPull`]: the one receive loop.
+//! It reads `ChunkData` and pays as it goes. It releases one hash-chain preimage
+//! per delivered `CHUNK_BYTES` chunk, and signs a voucher to open a chain, to
+//! roll one, and to settle a residual shorter than a chunk.
 //!
 //! The `ChunkData` payload is bao's interleaved verified-stream encoding, not
-//! raw bytes. Every consumer feeds the stream to a `bao-tree` verifying decoder
-//! AS IT ARRIVES — the ranged store's [`ClientRangedStore::ingest_stream`], the
-//! cache's `admit_bao_stream`, or the in-memory wrapper's decoder — through a
-//! [`sink::PullReader`] over the live pull. The decoder checks every chunk group
-//! against the requested content-hash root, so a range fetched at any
-//! `byte_offset > 0` self-verifies (a corrupt tail is rejected) with no dependency
-//! on earlier bytes, and a corrupt group aborts the pull at that group rather than
-//! at finalization: a reveal pays for received-but-unverified wire bytes, so what a
-//! lying peer can bill is bounded by one framed message plus one metering
-//! interval, never by its `total_bytes` claim.
+//! raw bytes. Every consumer feeds it to a `bao-tree` verifying decoder as it
+//! arrives, through a [`sink::PullReader`] over the live pull: the ranged
+//! store's [`ClientRangedStore::ingest_stream`], the node's cache admit, or the
+//! `test-util` in-memory decoder. The decoder checks every chunk group against
+//! the requested root. A range fetched from any offset therefore verifies on
+//! its own, with no dependency on earlier bytes (ADR 038).
 
 /// Buyer-side `PaymentPool` open kernel (#940), shared by the node service
 /// and the CLI.

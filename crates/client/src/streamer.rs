@@ -291,6 +291,35 @@ where
 /// directory for the fill store. The front is fetched across a small, bounded
 /// set of candidates with free failover between them. [`Streamer::open`] consumes
 /// it to start one stream.
+///
+/// Read inside [`StreamDrive::alongside`], so the drive keeps paying and
+/// draining open legs while the reader waits on its consumer. See the `stream`
+/// example for the whole sequence.
+///
+/// ```no_run
+/// use std::path::Path;
+/// use std::sync::Arc;
+///
+/// use decdn_client::driver::DriveConfig;
+/// use decdn_client::source::{BlobSource, Funder};
+/// use decdn_client::{NoCache, PullConfig, StreamCandidate, Streamer};
+///
+/// async fn stream<S: BlobSource, F: Funder>(
+///     candidates: Vec<StreamCandidate<S>>,
+///     funder: F,
+///     hash: [u8; 32],
+///     total_bytes: u64,
+///     scratch: &Path,
+/// ) -> anyhow::Result<()> {
+///     let streamer = Streamer::new(candidates, funder, DriveConfig::cli(Default::default()), scratch);
+///     let (mut reader, mut drive) = streamer
+///         .open(hash, total_bytes, &PullConfig::new(), Arc::new(NoCache))
+///         .await?;
+///     let mut out = tokio::io::stdout();
+///     drive.alongside(tokio::io::copy(&mut reader, &mut out)).await?;
+///     Ok(())
+/// }
+/// ```
 pub struct Streamer<'a, S, F> {
     candidates: Vec<StreamCandidate<S>>,
     funder: F,
