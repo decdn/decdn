@@ -1,0 +1,54 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, Wednesdays at 04:17 UTC — off the Monday Security run.
+    - cron: "17 4 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A re-pushed PR supersedes its own in-flight analysis. Pushes to main are
+# never cancelled: each one is the baseline that PR alerts are diffed against.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # `build-mode: none` extracts Rust from source, so no toolchain or
+        # cargo build runs here, and `paths-ignore` in the config file applies.
+        language: [actions, rust]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4.38.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4.38.1
+        with:
+          # Same category as GitHub's default setup, so alerts carry over
+          # instead of being duplicated under a new analysis.
+          category: "/language:${{ matrix.language }}"
