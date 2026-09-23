@@ -944,9 +944,10 @@ jobs:
           cache-profile: coverage
       # The coverage profile disables optimizer + via_ir for accurate source
       # mapping. If forge coverage hits "stack too deep" as more contracts
-      # land, add --ir-minimum here.
+      # land, add --ir-minimum here. --no-match-coverage drops test/ (suites
+      # and mocks), so the report measures src/, testnet/ and script/.
       - name: forge coverage
-        run: forge coverage --report lcov --report summary
+        run: forge coverage --report lcov --report summary --no-match-coverage 'test/'
 
       # GitHub Code Quality reads Cobertura XML only and forge writes LCOV
       # only. Forge's paths are relative to contracts/; --path-prefix makes

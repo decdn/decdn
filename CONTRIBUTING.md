@@ -123,7 +123,7 @@ forge build --sizes --deny warnings     # build + report sizes; fail on warnings
 forge test                              # default profile: 256 fuzz, 32-depth invariants
 FOUNDRY_PROFILE=ci forge test           # 1024 fuzz, 256/50-depth (matches CI)
 FOUNDRY_PROFILE=fuzz forge test         # 10k fuzz, 1024/100-depth (nightly/manual)
-FOUNDRY_PROFILE=coverage forge coverage --report lcov
+FOUNDRY_PROFILE=coverage forge coverage --report lcov --no-match-coverage 'test/'
 FOUNDRY_PROFILE=ci forge snapshot --diff .gas-snapshot   # current gas vs committed baseline
 ```
 
