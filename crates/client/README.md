@@ -4,12 +4,30 @@ Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where no
 
 > **Status: early implementation.** deCDN is pre-launch — no network is deployed. Wire formats, APIs and on-chain interfaces change without compatibility shims.
 
-The reusable `cdn/client/v1` paid-pull requester and the buyer-side channel open: signs the
-request, verifies the signed `StreamResponse`, pays a cumulative voucher at each interval, and
-assembles the blob.
+The deCDN client SDK: fetch BLAKE3-addressed blobs from deCDN nodes, pay for them per megabyte
+from a USDC payment pool, and verify every byte as it arrives. Two entry points cover most uses:
 
-Shared by both sides of the protocol, because a node serving a cache miss is itself a paying
-client on its upstream leg — `decdn-node` depends on this crate and re-exports it.
+- `Downloader` saves a blob, or a set of blobs, to files at full throughput across every holder,
+  and resumes a partial download.
+- `Streamer` reads one blob in order, and pays only for what the reader reaches plus one
+  read-ahead window.
+
+The crate documentation has the setup sequence, the guarantees, and the mistakes to avoid. The
+`download` and `stream` examples run the whole sequence end to end against a live deployment.
+They read the deployment and the buyer from environment variables: `DECDN_RPC_URL`,
+`DECDN_CHAIN_ID`, `DECDN_PAYMENT_POOL`, `DECDN_SLASH_JUDGE`, `DECDN_CAPACITY_BOND`,
+`DECDN_KEYSTORE`, `DECDN_KEYSTORE_PASSWORD`, `DECDN_DATA_DIR`, and `DECDN_DEPOSIT` (the pool
+deposit in USDC base units, used only when the buyer has no pool yet). The hash argument is the
+blob's BLAKE3 hash as 64 hex characters:
+
+```bash
+cargo run -p decdn-client --example download -- <blake3-hash-hex> <output-path>
+```
+
+The `decdn` CLI's `fetch` and `bundle pull` are built on this crate, and so is a node's own
+cache-miss pull: a node that misses in its cache is a paying client of the node upstream of it.
+The crate links no blob store and no AWS SDK, and CI checks that its dependencies stay that way.
+Its public API is snapshot-tested in CI.
 
 ## License
 
