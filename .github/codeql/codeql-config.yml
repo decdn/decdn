@@ -1,0 +1,10 @@
+name: decdn CodeQL config
+
+# Integration-test targets and the `decdn-e2e` fixture crate hold fixture
+# passwords, salts and nonces by design, and every alert they raise is noise.
+# Rust runs with `build-mode: none`, which honours `paths-ignore`. Inline
+# `#[cfg(test)]` modules in `src/` are still analysed; their alerts are
+# dismissed as "used in tests".
+paths-ignore:
+  - crates/*/tests/**
+  - crates/e2e/**
