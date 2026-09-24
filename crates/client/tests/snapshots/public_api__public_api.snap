@@ -122,6 +122,18 @@ pub decdn_client::driver::PoolExhausted::gap_start: u64
 impl core::error::Error for decdn_client::driver::PoolExhausted
 impl core::fmt::Display for decdn_client::driver::PoolExhausted
 pub fn decdn_client::driver::PoolExhausted::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::driver::RangeLane<'a, S>
+pub decdn_client::driver::RangeLane::ctx: &'a alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
+pub decdn_client::driver::RangeLane::ledger: &'a alloc::sync::Arc<decdn_client::PoolLedger>
+pub decdn_client::driver::RangeLane::source: &'a S
+pub decdn_client::driver::RangeLane::takes_first: bool
+pub decdn_client::driver::RangeLane::width: core::num::nonzero::NonZeroUsize
+pub struct decdn_client::driver::RangeSetOutcome
+impl decdn_client::driver::RangeSetOutcome
+pub const fn decdn_client::driver::RangeSetOutcome::drive_error(&self) -> core::option::Option<&anyhow::Error>
+pub fn decdn_client::driver::RangeSetOutcome::into_result(self) -> anyhow::Result<()>
+pub fn decdn_client::driver::RangeSetOutcome::lane_fault(&self, usize) -> core::option::Option<&anyhow::Error>
+pub const fn decdn_client::driver::RangeSetOutcome::succeeded(&self) -> bool
 pub struct decdn_client::driver::SharedPool<'a>
 pub decdn_client::driver::SharedPool::credit: &'a (dyn core::ops::function::Fn(alloy_primitives::aliases::U256) -> anyhow::Result<()> + core::marker::Send + core::marker::Sync)
 pub decdn_client::driver::SharedPool::spent: &'a (dyn core::ops::function::Fn() -> alloy_primitives::aliases::U256 + core::marker::Send + core::marker::Sync)
@@ -132,6 +144,7 @@ pub fn decdn_client::driver::SharedPool<'_>::fmt(&self, &mut core::fmt::Formatte
 pub trait decdn_client::driver::PacingWait: core::marker::Send + core::marker::Sync
 pub fn decdn_client::driver::PacingWait::wait(&self, decdn_client::pacer::DownstreamFrontier, decdn_client::driver::WaitReason) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + '_)>>
 pub async fn decdn_client::driver::drive<St, S, P, F>(&St, &S, &P, &F, &alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, &alloc::sync::Arc<decdn_client::PoolLedger>, [u8; 32], u64, u64, &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&dyn decdn_client::driver::PacingWait>, core::option::Option<&(dyn core::ops::function::Fn() -> decdn_client::pacer::DownstreamFrontier + core::marker::Send + core::marker::Sync)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>) -> anyhow::Result<()> where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
+pub async fn decdn_client::driver::drive_range_lanes<St, S, P, F>(&St, &[decdn_client::driver::RangeLane<'_, S>], &P, &F, [u8; 32], &[(u64, u64)], &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>, impl core::future::future::Future<Output = anyhow::Error>) -> decdn_client::driver::RangeSetOutcome where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
 pub async fn decdn_client::driver::drive_range_set<St, S, P, F>(&St, &S, &P, &F, &alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, &alloc::sync::Arc<decdn_client::PoolLedger>, [u8; 32], &[(u64, u64)], core::num::nonzero::NonZeroUsize, &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>, impl core::future::future::Future<Output = anyhow::Error>) -> anyhow::Result<()> where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
 pub async fn decdn_client::driver::first_leg<St: decdn_bao_range::ranged_store::RangedStore + ?core::marker::Sized>(&St, &[(u64, u64)], u64, u64) -> anyhow::Result<core::option::Option<decdn_bao_range::AlignedRange>>
 pub mod decdn_client::endpoint
@@ -678,6 +691,18 @@ pub decdn_client::RampPacer::floor: u64
 pub decdn_client::RampPacer::paid_base: u64
 impl decdn_client::pacer::Pacer for decdn_client::pacer::RampPacer
 pub fn decdn_client::pacer::RampPacer::decide(&self, &decdn_client::pacer::PaceState) -> decdn_client::pacer::PaceDecision
+pub struct decdn_client::RangeLane<'a, S>
+pub decdn_client::RangeLane::ctx: &'a alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
+pub decdn_client::RangeLane::ledger: &'a alloc::sync::Arc<decdn_client::PoolLedger>
+pub decdn_client::RangeLane::source: &'a S
+pub decdn_client::RangeLane::takes_first: bool
+pub decdn_client::RangeLane::width: core::num::nonzero::NonZeroUsize
+pub struct decdn_client::RangeSetOutcome
+impl decdn_client::driver::RangeSetOutcome
+pub const fn decdn_client::driver::RangeSetOutcome::drive_error(&self) -> core::option::Option<&anyhow::Error>
+pub fn decdn_client::driver::RangeSetOutcome::into_result(self) -> anyhow::Result<()>
+pub fn decdn_client::driver::RangeSetOutcome::lane_fault(&self, usize) -> core::option::Option<&anyhow::Error>
+pub const fn decdn_client::driver::RangeSetOutcome::succeeded(&self) -> bool
 pub struct decdn_client::RateAboveCeiling
 impl decdn_client::RateAboveCeiling
 pub const fn decdn_client::RateAboveCeiling::ceiling_rate_per_mb(&self) -> u64
@@ -705,6 +730,12 @@ pub decdn_client::SharedPool::topup_lock: &'a tokio::sync::mutex::Mutex<()>
 pub decdn_client::SharedPool::topups_used: &'a core::sync::atomic::AtomicU32
 impl core::fmt::Debug for decdn_client::driver::SharedPool<'_>
 pub fn decdn_client::driver::SharedPool<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::SignedSizeMismatch
+pub decdn_client::SignedSizeMismatch::expected: u64
+pub decdn_client::SignedSizeMismatch::signed: u64
+impl core::error::Error for decdn_client::SignedSizeMismatch
+impl core::fmt::Display for decdn_client::SignedSizeMismatch
+pub fn decdn_client::SignedSizeMismatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::SourceCoverage
 pub decdn_client::SourceCoverage::coverage: decdn_protocol::coverage::Coverage
 pub decdn_client::SourceCoverage::source_ix: usize
@@ -858,6 +889,7 @@ pub trait decdn_client::PacingWait: core::marker::Send + core::marker::Sync
 pub fn decdn_client::PacingWait::wait(&self, decdn_client::pacer::DownstreamFrontier, decdn_client::driver::WaitReason) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + '_)>>
 pub fn decdn_client::download_first_unit(u64, usize) -> anyhow::Result<decdn_bao_range::AlignedRange>
 pub async fn decdn_client::drive<St, S, P, F>(&St, &S, &P, &F, &alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, &alloc::sync::Arc<decdn_client::PoolLedger>, [u8; 32], u64, u64, &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&dyn decdn_client::driver::PacingWait>, core::option::Option<&(dyn core::ops::function::Fn() -> decdn_client::pacer::DownstreamFrontier + core::marker::Send + core::marker::Sync)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>) -> anyhow::Result<()> where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
+pub async fn decdn_client::drive_range_lanes<St, S, P, F>(&St, &[decdn_client::driver::RangeLane<'_, S>], &P, &F, [u8; 32], &[(u64, u64)], &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>, impl core::future::future::Future<Output = anyhow::Error>) -> decdn_client::driver::RangeSetOutcome where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
 pub async fn decdn_client::drive_range_set<St, S, P, F>(&St, &S, &P, &F, &alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, &alloc::sync::Arc<decdn_client::PoolLedger>, [u8; 32], &[(u64, u64)], core::num::nonzero::NonZeroUsize, &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>, impl core::future::future::Future<Output = anyhow::Error>) -> anyhow::Result<()> where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
 pub const fn decdn_client::effective_rate_ceiling(u64, u64) -> u64
 pub async fn decdn_client::first_leg<St: decdn_bao_range::ranged_store::RangedStore + ?core::marker::Sized>(&St, &[(u64, u64)], u64, u64) -> anyhow::Result<core::option::Option<decdn_bao_range::AlignedRange>>

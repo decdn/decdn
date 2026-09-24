@@ -204,7 +204,8 @@ pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 pub use decdn_bao_range::RangedStore;
 pub use downloader::{DownloadTarget, Downloader, download_first_unit};
 pub use driver::{
-    PacingWait, PoolExhausted, SharedPool, WaitReason, drive, drive_range_set, first_leg,
+    PacingWait, PoolExhausted, RangeLane, RangeSetOutcome, SharedPool, WaitReason, drive,
+    drive_range_lanes, drive_range_set, first_leg,
 };
 pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released};
 pub use ledgers::{LaneHandle, LaneLedgers};
@@ -661,6 +662,34 @@ pub struct BlobTooLarge {
     /// The ceiling `received` crossed, in the same unit as `received`.
     pub ceiling: u64,
 }
+
+/// A pull's signed `total_bytes` disagrees with the size the caller's store is
+/// keyed by.
+///
+/// The size is fixed by the content under the hash, so every honest provider
+/// signs the same one. A leg that disagrees would verify against the wrong
+/// tree, so the driver refuses it before it reads a byte. When the caller took
+/// the size from an unsigned source (a bundle manifest), that source is the
+/// likelier fault, and every provider will refuse the same way.
+#[derive(Debug)]
+pub struct SignedSizeMismatch {
+    /// The size the provider signed.
+    pub signed: u64,
+    /// The size the store is keyed by.
+    pub expected: u64,
+}
+
+impl std::fmt::Display for SignedSizeMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the provider signs a size of {} bytes, but the store is keyed by {}",
+            self.signed, self.expected
+        )
+    }
+}
+
+impl std::error::Error for SignedSizeMismatch {}
 
 /// The requested `byte_offset` is at or past the blob's end, so no resume can be
 /// served from it (#1120).

@@ -262,10 +262,17 @@ as `decdn fetch`):
   lane. The serving node credits each stream's delivered bytes from the
   lane's one cumulative watermark, so a fast stream does not starve a slow
   co-stream. Distinct lanes proceed in parallel. A range-dedup entry pays for
-  its ranges through one session per provider. The session opens one
-  connection and reuses it for every range of the entry. It fills up to
-  `--max-lane-streams` ranges at once, within the lane permits that are free.
-  Concurrent ranges top up the one deposit one at a time. A blob that clears
+  its ranges through one session per provider. A session opens one
+  connection and reuses it for every range of the entry. The entry stripes
+  its ranges across its admitted full holders: one holder per operator, at
+  most `--max-sources`, with multi-source on. A partial holder and a
+  proxy-warming non-holder do not join the stripe. Each lane takes ranges
+  from one shared queue and fills up to `--max-lane-streams` of them at once,
+  within the lane permits that are free. A lane that faults leaves the stripe,
+  and the other lanes fill the ranges it left. When no striped lane is left,
+  the entry fails over to its other candidates one at a time. All lanes write
+  into one ranged store. Concurrent ranges top up the one deposit one at a
+  time, from one top-up budget for the entry. A blob that clears
   the multi-source gate fans out to its admitted holders per
   [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1).
 - **Failover and retry.** Each entry tries its probed candidates in order. A

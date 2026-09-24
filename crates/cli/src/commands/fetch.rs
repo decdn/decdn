@@ -40,7 +40,7 @@ use decdn_client::buyer_pool::{
     LOW_WATER_DIVISOR, ProgressWrite, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
     grade_deposit_credit, open_pool, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
 };
-use decdn_client::driver::{DriveConfig, drive_range_set, first_leg};
+use decdn_client::driver::{DriveConfig, RangeLane, RangeSetOutcome, drive_range_lanes, first_leg};
 use decdn_client::sink::PullReader;
 use decdn_client::source::{BlobSource as _, Funder, PrimedSource, SourceFuture};
 use decdn_client::{
@@ -1952,10 +1952,11 @@ type SpentFn<'a> = Box<dyn Fn() -> U256 + Send + Sync + 'a>;
 /// closes over.
 type CreditFn<'a> = Box<dyn Fn(U256) -> anyhow::Result<()> + Send + Sync + 'a>;
 
-/// Everything [`drive_fetch`] and [`RangeSession`] need before they can drive:
-/// the blob's `total_bytes`, the opened [`ClientRangedStore`] beside the
-/// caller's file, and the payment plumbing (source/pacer/funder/ledger/ctx)
-/// both callers hand to the driver.
+/// Everything [`drive_fetch`] and [`RangeSession`] need before they can drive
+/// one provider's lane: the blob's `total_bytes` and the payment plumbing
+/// (source/pacer/funder/ledger/ctx) both callers hand to the driver. The
+/// [`ClientRangedStore`] the drive writes into is the caller's, so several
+/// lanes can fill one store.
 ///
 /// Owns the pool-wide `spent`/`credit` closures and the per-fetch top-up
 /// counter [`SharedPool`] borrows from, so a caller builds its `Option<SharedPool>`
@@ -1968,9 +1969,6 @@ struct FetchPrelude<'a, P> {
     /// (checked against the signed header when a first leg opens).
     /// `ClientRangedStore` keys on it.
     total_bytes: u64,
-    /// Opened (or resumed) beside the caller's file; `drive` ingests into this
-    /// and — only once the WHOLE blob is present — finalizes it itself.
-    ranged_store: ClientRangedStore,
     /// The lane's source, holding the prelude's first pull until the drive's
     /// first open takes it. Cleared once the drive returns.
     peer_source: PrimedSource<PeerSource<'a>>,
@@ -2012,10 +2010,19 @@ impl<P> FetchPrelude<'_, P> {
     /// EVERY lane the registry holds, this fetch's concurrent siblings on the
     /// same deposit included.
     fn pool(&self) -> Option<SharedPool<'_>> {
+        self.pool_with(&self.topups_used)
+    }
+
+    /// [`Self::pool`] with a caller's top-up counter, so every lane of one
+    /// striped drive spends one top-up budget.
+    fn pool_with<'s>(
+        &'s self,
+        topups_used: &'s std::sync::atomic::AtomicU32,
+    ) -> Option<SharedPool<'s>> {
         match (&self.spent, &self.credit, self.topup_lock) {
             (Some(spent), Some(credit), Some(topup_lock)) => Some(SharedPool {
                 spent: &**spent,
-                topups_used: &self.topups_used,
+                topups_used,
                 credit: &**credit,
                 topup_lock,
             }),
@@ -2216,57 +2223,114 @@ async fn drive_floor(
     }
 }
 
+/// One lane of a [`FetchPrelude::drive_watched`] drive: its open prelude, how
+/// many gaps it runs at once, and whether it takes the drive's first gap (the
+/// lane whose source holds the primed first leg).
+struct WatchedLane<'p, 'a, P> {
+    prelude: &'p FetchPrelude<'a, P>,
+    width: std::num::NonZeroUsize,
+    takes_first: bool,
+}
+
 /// Whether a failed drive counts against the peer in the peer store. Our own
 /// pool running dry, or a node's floor above our deposit, is not the peer's
-/// fault.
+/// fault. Nor is a signed size that disagrees with the store's
+/// ([`decdn_client::SignedSizeMismatch`]): the store's size came from an
+/// unsigned manifest, the likelier fault.
 fn blames_the_peer(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<PoolExhausted>().is_none() && !decdn_client::is_insufficient_deposit(err)
+    err.downcast_ref::<PoolExhausted>().is_none()
+        && err
+            .downcast_ref::<decdn_client::SignedSizeMismatch>()
+            .is_none()
+        && !decdn_client::is_insufficient_deposit(err)
 }
 
 impl<P> FetchPrelude<'_, P>
 where
     P: alloy::providers::Provider + Clone,
 {
-    /// Fill `ranges` of the blob (`(0, 0)` is the whole of it), up to
-    /// `concurrency` gaps at a time, under the drive-level throughput floor
-    /// ([`drive_floor`]). The floor races only the gap work
-    /// ([`drive_range_set`]'s `stop`), so the store's pending record write lands
+    /// Fill `ranges` of the blob (`(0, 0)` is the whole of it) into `store`
+    /// across `lanes` ([`drive_range_lanes`]), under the drive-level throughput
+    /// floor ([`drive_floor`]) judged on the position across every lane. The
+    /// floor races only the gap work, so the store's pending record write lands
     /// and its final flush runs on a trip too, and a complete blob's local
-    /// verify is never cut off. The prelude's parked first pull is closed once
-    /// the drive returns.
+    /// verify is never cut off. `self` is the lead lane: its funder, pacer and
+    /// drive config serve every lane, because every lane pays from one pool.
+    /// Each lane's parked first pull is closed once the drive returns.
+    #[allow(clippy::too_many_arguments)]
     async fn drive_watched(
         &self,
+        store: &ClientRangedStore,
+        lanes: &[WatchedLane<'_, '_, P>],
+        pool: Option<&SharedPool<'_>>,
         hash: [u8; 32],
         ranges: &[(u64, u64)],
-        concurrency: std::num::NonZeroUsize,
         progress: Option<&ProgressCallback>,
         deadlines: PullDeadlines,
-    ) -> anyhow::Result<()> {
-        let pool = self.pool();
+    ) -> RangeSetOutcome {
         let watch = EntryWatch::default();
         let watched = watch.observing(progress);
         let funder = PausingFunder {
             inner: &self.funder,
             watch: &watch,
         };
-        let driven = Box::pin(drive_range_set(
-            &self.ranged_store,
-            &self.peer_source,
+        let range_lanes: Vec<RangeLane<'_, PrimedSource<PeerSource<'_>>>> = lanes
+            .iter()
+            .map(|l| RangeLane {
+                source: &l.prelude.peer_source,
+                ctx: &l.prelude.ctx,
+                ledger: &l.prelude.ledger,
+                width: l.width,
+                takes_first: l.takes_first,
+            })
+            .collect();
+        let driven = Box::pin(drive_range_lanes(
+            store,
+            &range_lanes,
             &self.pacer,
             &funder,
-            &self.ctx,
-            &self.ledger,
             hash,
             ranges,
-            concurrency,
             &self.drive_config,
             Some(&watched),
-            pool.as_ref(),
+            pool,
             drive_floor(deadlines, hash, self.total_bytes, &watch),
         ))
         .await;
-        self.peer_source.clear();
+        for lane in lanes {
+            lane.prelude.peer_source.clear();
+        }
         driven
+    }
+
+    /// Settle one lane of a striped drive: stamp the peer when the drive
+    /// blames it, then persist the lane's voucher watermark.
+    ///
+    /// A lane that served every gap it took, in a drive that filled every
+    /// range, settles at the committed cumulative: each of its legs ran to
+    /// stream end. Any other lane settles at the armed settlement (HIGH), as
+    /// on the multi-source path ([`multi_lane_watermarks`]): its gap can be
+    /// dropped inside its voucher exchange by the floor or by a sibling's
+    /// terminal fault, and another of its gaps can still hold an armed voucher
+    /// after one gap's voucher was rejected. With nothing armed the two are
+    /// equal.
+    fn settle_lane(&self, store: &RedbBuyerPoolStore, lane: LaneKey, blamed: bool, clean: bool) {
+        if blamed
+            && let Err(e) = self
+                .peer_store
+                .record_failure(&self.node_id, now_secs_cli())
+        {
+            tracing::debug!("could not record a failed drive in the peer store: {e:#}");
+        }
+        let rebase_anchor = self.ledger.take_unsaved_rebase();
+        let cum = if clean {
+            self.ledger.committed()
+        } else {
+            self.ledger.settlement()
+        };
+        let vprogress = VoucherProgress::from_cumulative(cum, self.prior_amount)
+            .with_rebase_anchor(rebase_anchor);
+        persist_watermark(store, lane.signer, lane.pool_id, lane, &vprogress);
     }
 
     /// Settle a drive: stamp a failure the peer caused on the peer store, then
@@ -2340,19 +2404,21 @@ enum PreludeLeg<'r> {
     /// The whole blob, size unknown (`decdn fetch`, a whole-file bundle entry):
     /// open `[0, to end)` and read the signed `total_bytes` off the response.
     WholeBlob,
-    /// A blob of known size whose drive fills `ranges` (a range-dedup bundle
-    /// entry, sized by its manifest): open exactly the drive's first leg, or
-    /// nothing when every byte of `ranges` is already present.
+    /// A blob of known size, whose drive fills `ranges` into the caller's
+    /// `store` (a range-dedup bundle entry, sized by its manifest): open
+    /// exactly the drive's first leg, or nothing when `ranges` is empty or
+    /// every byte of them is already present.
     Known {
-        total: u64,
+        store: &'r ClientRangedStore,
         ranges: &'r [(u64, u64)],
     },
 }
 
 /// Open the shared prelude both `drive_fetch` and [`RangeSession`] need: open
-/// the pull the drive starts with (see [`PreludeLeg`]), open the
-/// [`ClientRangedStore`] beside `entry_path`, and build the lane's
-/// source/pacer/funder/ledger/ctx.
+/// the pull the drive starts with (see [`PreludeLeg`]) and build the lane's
+/// source/pacer/funder/ledger/ctx. A whole-blob prelude also opens the
+/// [`ClientRangedStore`] beside `entry_path` and returns it, since only the
+/// signed size can key it; a known-size prelude works against the caller's.
 ///
 /// The pull opened here is also the drive's first leg (#2063).
 /// The node treats every open as real: it signs, claims a fill, and on a miss
@@ -2367,11 +2433,11 @@ enum PreludeLeg<'r> {
 /// `warm` keeps one connection to the provider for every open (#2119), for a
 /// caller that drives many small ranges.
 ///
-/// The store sits beside `entry_path`, keyed by its file name, so its
-/// eventually-promoted path IS `entry_path` (no post-finalize rename) and its
-/// `.partial` matches the `<entry_path>.partial` placement. A prior
-/// `.partial.ranges` record resumes; only the still-missing bytes are ever
-/// re-pulled and no already-held byte is re-paid.
+/// A whole-blob prelude's store sits beside `entry_path`, keyed by its file
+/// name, so its eventually-promoted path IS `entry_path` (no post-finalize
+/// rename) and its `.partial` matches the `<entry_path>.partial` placement. A
+/// prior `.partial.ranges` record resumes; only the still-missing bytes are
+/// ever re-pulled and no already-held byte is re-paid.
 ///
 /// The first open is also the observed-TTFB boundary the peer store wants
 /// (#1906-series): a source that cannot complete it is stamped as a failure,
@@ -2390,7 +2456,7 @@ async fn open_fetch_prelude<'a, P>(
     entry_path: &Path,
     ledgers: Option<&'a LaneLedgers>,
     first: PreludeLeg<'_>,
-) -> anyhow::Result<FetchPrelude<'a, P>>
+) -> anyhow::Result<(FetchPrelude<'a, P>, Option<ClientRangedStore>)>
 where
     P: alloy::providers::Provider + Clone,
 {
@@ -2441,11 +2507,7 @@ where
     } else {
         peer
     });
-    let (store_dir, stem) = ranged_store_location(entry_path)?;
-    let open_store = |total_bytes: u64| {
-        ClientRangedStore::open_or_create(&store_dir, &stem, hash, total_bytes)
-            .map_err(|e| anyhow::anyhow!("open ranged store for {}: {e}", entry_path.display()))
-    };
+    let open_store = |total_bytes: u64| open_entry_store(entry_path, hash, total_bytes);
     // Score the first open: a refusal or fault stamps the peer (except an
     // `InsufficientDeposit` refusal (option 2 / #2013), which is OUR pool falling
     // short of this node's floor `M`, not a fault of the peer), and a success
@@ -2478,7 +2540,7 @@ where
     };
 
     let max_blob = peer_source.max_blob_size_bytes();
-    let (total_bytes, ranged_store) = match first {
+    let (total_bytes, opened_store) = match first {
         PreludeLeg::WholeBlob => {
             let (header, reader) = scored(peer_source.inner().open_whole(hash).await)?;
             let opened_at = tokio::time::Instant::now();
@@ -2489,11 +2551,16 @@ where
             {
                 peer_source.prime(hash, whole, header, reader, opened_at);
             }
-            (total_bytes, ranged_store)
+            (total_bytes, Some(ranged_store))
         }
-        PreludeLeg::Known { total, ranges } => {
-            let ranged_store = open_store(total)?;
-            if let Some(leg) = first_leg(&ranged_store, ranges, u64::MAX, max_blob).await? {
+        PreludeLeg::Known { store, ranges } => {
+            let total = decdn_bao_range::RangedStore::total_bytes(store);
+            let leg = if ranges.is_empty() {
+                None
+            } else {
+                first_leg(store, ranges, u64::MAX, max_blob).await?
+            };
+            if let Some(leg) = leg {
                 let (header, reader) = scored(peer_source.inner().open(hash, leg.clone()).await)?;
                 let opened_at = tokio::time::Instant::now();
                 if header.total_bytes != total {
@@ -2505,7 +2572,7 @@ where
                 }
                 peer_source.prime(hash, leg, header, reader, opened_at);
             }
-            (total, ranged_store)
+            (total, None)
         }
     };
 
@@ -2538,9 +2605,8 @@ where
         None => (None, None),
     };
 
-    Ok(FetchPrelude {
+    let prelude = FetchPrelude {
         total_bytes,
-        ranged_store,
         peer_source,
         pacer,
         funder,
@@ -2554,7 +2620,24 @@ where
         spent,
         credit,
         topup_lock: ledgers.map(LaneLedgers::topup_lock),
-    })
+    };
+    Ok((prelude, opened_store))
+}
+
+/// Open (or resume) the ranged store beside `entry_path`, keyed by its file
+/// name, for a `total`-byte blob.
+///
+/// # Errors
+///
+/// The store failing to open or create.
+pub(crate) fn open_entry_store(
+    entry_path: &Path,
+    hash: [u8; 32],
+    total: u64,
+) -> anyhow::Result<ClientRangedStore> {
+    let (store_dir, stem) = ranged_store_location(entry_path)?;
+    ClientRangedStore::open_or_create(&store_dir, &stem, hash, total)
+        .map_err(|e| anyhow::anyhow!("open ranged store for {}: {e}", entry_path.display()))
 }
 
 /// The gap-driven driver core shared by `decdn fetch` and `bundle pull`:
@@ -2596,7 +2679,7 @@ where
         signer: deps.self_address,
         provider,
     };
-    let prelude = open_fetch_prelude(
+    let (prelude, store) = open_fetch_prelude(
         deps,
         ctx,
         target,
@@ -2608,6 +2691,7 @@ where
         PreludeLeg::WholeBlob,
     )
     .await?;
+    let store = store.ok_or_else(|| anyhow::anyhow!("a whole-blob prelude opens its store"))?;
 
     // The gap-driven fetch pulls ONLY `missing_ranges(0, 0)` — the whole blob on
     // a fresh fetch, just the gap on a resume — into the ranged store, which
@@ -2615,15 +2699,23 @@ where
     // `output` on `finalize`. One gap at a time: the whole blob is one gap on a
     // fresh fetch, and a solo `decdn fetch` keeps no shared pool to run
     // concurrent gaps against.
+    let lane_set = [WatchedLane {
+        prelude: &prelude,
+        width: std::num::NonZeroUsize::MIN,
+        takes_first: true,
+    }];
     let driven = prelude
         .drive_watched(
+            &store,
+            &lane_set,
+            prelude.pool().as_ref(),
             hash,
             &[(0, 0)],
-            std::num::NonZeroUsize::MIN,
             progress,
             deps.deadlines,
         )
-        .await;
+        .await
+        .into_result();
 
     // Finalize the progress bar (or run the caller's no-op, for `bundle pull`)
     // now that the transfer has settled, before persisting the watermark.
@@ -2636,22 +2728,15 @@ where
     Ok(prelude.total_bytes)
 }
 
-/// One range-dedup entry's paid drives against one provider (#2119): the
-/// lane, the ranged store beside the entry's staging path, and one warm
-/// connection, opened once and reused by every drive of the entry — the
-/// pay-now complement, a donor re-fetch, each deferred fallback, and the
-/// self-heal re-drive.
+/// One provider's lane for a range-dedup entry's paid drives (#2119): the
+/// lane's payment plumbing and one warm connection, opened once and reused by
+/// every drive of the entry — the pay-now complement, a donor re-fetch, each
+/// deferred fallback, and the self-heal re-drive.
 ///
-/// Each drive fills its ranges concurrently ([`drive_range_set`]) and, like
-/// [`drive_fetch`], finalizes the blob — renaming `.partial` to the staging
-/// path — as soon as the store holds the whole of it; otherwise `.partial` is
-/// left in place for the caller to keep splicing or to drive further. Each
-/// drive persists the lane's voucher watermark once, after its ranges: on
-/// success at the committed cumulative, and on an ambiguous failure HIGH
-/// (`settlement`), so a failed or resumed range-dedup pull never re-pays a
-/// byte already bought. The `.partial` and its sidecars are left in place on
-/// error — the resume prefix a retry inherits. A session whose drive failed is
-/// not used again; the caller opens a new one against the next provider.
+/// A session holds no store. The entry's one [`ClientRangedStore`] is the
+/// caller's, and a striped drive ([`drive_stripe`]) fills it across several
+/// sessions at once (#2123). A session whose lane faulted is not used again;
+/// the caller opens a new one against another provider.
 pub(crate) struct RangeSession<'a, P> {
     prelude: FetchPrelude<'a, P>,
     store: &'a RedbBuyerPoolStore,
@@ -2664,19 +2749,18 @@ impl<'a, P> RangeSession<'a, P>
 where
     P: alloy::providers::Provider + Clone,
 {
-    /// Open a session for `hash` (`total` bytes, from the manifest) against
-    /// `target`/`provider`, with its store beside `staging`. `first_ranges` are
-    /// the ranges the first [`drive`](Self::drive) will fill: the session opens
-    /// that drive's first leg now and hands it to the drive (#2063), and opens
-    /// nothing when every byte of them is already present. `ledgers` is the
-    /// run's lane registry: its shared pool is what lets a drive fill several
-    /// gaps at once.
+    /// Open a session for `hash` against `target`/`provider`, for the entry
+    /// whose ranged store is `entry_store`. `first_ranges` are the ranges the
+    /// first drive fills: the session opens that drive's first leg now and
+    /// hands it to the drive (#2063). It opens nothing when `first_ranges` is
+    /// empty or every byte of them is already present. `ledgers` is the run's
+    /// lane registry: its shared pool is what lets a drive fill several gaps at
+    /// once.
     ///
     /// # Errors
     ///
     /// The first leg's open failing (annotated as [`drive_fetch`] annotates
-    /// it), a provider whose signed size disagrees with `total`, or the store
-    /// failing to open.
+    /// it), or a provider whose signed size disagrees with the store's.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open(
         deps: &DriveFetchDeps<'a, P>,
@@ -2686,7 +2770,7 @@ where
         pool_id: PoolId,
         hash: [u8; 32],
         staging: &Path,
-        total: u64,
+        entry_store: &ClientRangedStore,
         first_ranges: &[(u64, u64)],
         ledgers: &'a LaneLedgers,
     ) -> anyhow::Result<Self> {
@@ -2695,7 +2779,7 @@ where
             signer: deps.self_address,
             provider,
         };
-        let prelude = open_fetch_prelude(
+        let (prelude, _) = open_fetch_prelude(
             deps,
             ctx,
             target,
@@ -2705,7 +2789,7 @@ where
             staging,
             Some(ledgers),
             PreludeLeg::Known {
-                total,
+                store: entry_store,
                 ranges: first_ranges,
             },
         )
@@ -2718,28 +2802,105 @@ where
             deadlines: deps.deadlines,
         })
     }
+}
 
-    /// Fill `ranges` of the blob, up to `concurrency` gaps at a time, then
-    /// persist the lane's watermark. The drive runs under the drive-level
-    /// throughput floor ([`drive_floor`]), because its many short legs each
-    /// clear the per-stream floor however slowly the drive as a whole advances.
-    ///
-    /// # Errors
-    ///
-    /// The decisive gap fault (see [`drive_range_set`]), annotated for an
-    /// unbound or underfunded cache miss, or [`EntryStalled`].
-    pub(crate) async fn drive(
-        &self,
-        ranges: &[(u64, u64)],
-        concurrency: std::num::NonZeroUsize,
-        progress: Option<&ProgressCallback>,
-    ) -> anyhow::Result<()> {
-        let driven = self
-            .prelude
-            .drive_watched(self.hash, ranges, concurrency, progress, self.deadlines)
-            .await;
-        self.prelude.settle_drive(self.store, self.lane, driven)
-    }
+/// One session of a [`drive_stripe`] drive, how many gaps it runs at once,
+/// and whether it takes the drive's first gap (the session that opened with
+/// the drive's first leg).
+pub(crate) struct StripeLane<'s, 'a, P> {
+    pub(crate) session: &'s RangeSession<'a, P>,
+    pub(crate) width: std::num::NonZeroUsize,
+    pub(crate) takes_first: bool,
+}
+
+/// How a [`drive_stripe`] drive ended: which lanes faulted, and the drive's
+/// result.
+pub(crate) struct StripeDriven {
+    /// Per lane, in order: whether the lane faulted and retired. The caller
+    /// does not use a faulted session again.
+    pub(crate) faulted: Vec<bool>,
+    /// The drive's result ([`RangeSetOutcome::into_result`]), annotated for an
+    /// unbound or underfunded cache miss.
+    pub(crate) result: anyhow::Result<()>,
+}
+
+/// Fill `ranges` of one range-dedup entry into `store`, striped across
+/// `lanes`, one session per provider (#2123), then settle every lane.
+///
+/// The gaps of `ranges` spread over every lane ([`drive_range_lanes`]). A
+/// lane that faults retires, and the other lanes fill what it left. The drive
+/// runs under one drive-level throughput floor ([`drive_floor`]) across every
+/// lane, because its many short legs each clear the per-stream floor however
+/// slowly the entry as a whole advances. Every lane pays from one pool, and
+/// `topups_used` is the one top-up budget they share.
+///
+/// Afterwards each lane persists its voucher watermark
+/// ([`FetchPrelude::settle_lane`]) and, when the drive blames it, stamps its
+/// peer in the peer store. A lane is blamed for its own fault, or, when no
+/// lane faulted, for a failure of the drive as a whole (a floor trip), except
+/// where our own pool ran dry or the signed size disagrees with the store's
+/// ([`blames_the_peer`]).
+pub(crate) async fn drive_stripe<P>(
+    store: &ClientRangedStore,
+    lanes: &[StripeLane<'_, '_, P>],
+    ranges: &[(u64, u64)],
+    progress: Option<&ProgressCallback>,
+    topups_used: &std::sync::atomic::AtomicU32,
+) -> StripeDriven
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let Some(lead) = lanes.first().map(|l| l.session) else {
+        return StripeDriven {
+            faulted: Vec::new(),
+            result: Err(anyhow::anyhow!(
+                "a striped drive needs at least one session"
+            )),
+        };
+    };
+    let watched: Vec<WatchedLane<'_, '_, P>> = lanes
+        .iter()
+        .map(|l| WatchedLane {
+            prelude: &l.session.prelude,
+            width: l.width,
+            takes_first: l.takes_first,
+        })
+        .collect();
+    let pool = lead.prelude.pool_with(topups_used);
+    let outcome = lead
+        .prelude
+        .drive_watched(
+            store,
+            &watched,
+            pool.as_ref(),
+            lead.hash,
+            ranges,
+            progress,
+            lead.deadlines,
+        )
+        .await;
+    let succeeded = outcome.succeeded();
+    let collective = outcome.drive_error().is_some_and(blames_the_peer)
+        && (0..lanes.len()).all(|i| outcome.lane_fault(i).is_none());
+    let faulted: Vec<bool> = lanes
+        .iter()
+        .enumerate()
+        .map(|(i, lane)| {
+            let fault = outcome.lane_fault(i);
+            let blamed = collective || fault.is_some_and(blames_the_peer);
+            let clean = succeeded && fault.is_none();
+            let s = lane.session;
+            s.prelude.settle_lane(s.store, s.lane, blamed, clean);
+            fault.is_some()
+        })
+        .collect();
+    let result = outcome
+        .into_result()
+        .map_err(|err| match lead.prelude.ctx.lock() {
+            Ok(guard) => annotate_unbound_cache_miss(err, &guard),
+            Err(_) => err,
+        });
+    StripeDriven { faulted, result }
 }
 
 /// One built payment lane for a multi-source fetch: the per-provider
@@ -6132,6 +6293,12 @@ mod tests {
             gap_start: 0,
             gap_len: 1,
         })));
+        assert!(!blames_the_peer(&anyhow::Error::new(
+            decdn_client::SignedSizeMismatch {
+                signed: 2,
+                expected: 1,
+            }
+        )));
     }
 
     /// ETA divides remaining bytes by the smoothed rate; below a usable rate it
