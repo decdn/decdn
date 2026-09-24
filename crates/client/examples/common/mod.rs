@@ -255,6 +255,7 @@ impl Buyer {
                 ctx,
                 ledger,
                 coverage: Some(holder.coverage),
+                first_unit: None,
             });
         }
         Ok((candidates, lanes))

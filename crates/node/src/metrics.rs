@@ -1678,8 +1678,10 @@ pub struct DecdnMetrics {
     /// `decdn_streams_failed_total{direction}`: paid streams that ended without
     /// delivering the whole request — refused, stopped mid-stream, reset,
     /// panicked, or ended on an error. Routine outcomes count here too: a cache
-    /// miss refusal, a client that closes early, and the free header handshake a
-    /// downstream node's miss pull opens and closes after the response. So read
+    /// miss refusal, a client that closes early, and a header-handshake pull a
+    /// downstream node's miss pull closes without adopting: the whole-blob open
+    /// it makes when it has no size hint, or a first-leg pull its pull leg does
+    /// not adopt. So read
     /// the reason siblings, not a raw ratio, for health. See `streams_completed`.
     streams_failed: Family<StreamLabels, Counter>,
     /// `decdn_bytes_served_total`: payload bytes this node wrote to clients and

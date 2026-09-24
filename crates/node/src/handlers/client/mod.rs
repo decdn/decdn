@@ -3775,7 +3775,7 @@ mod tests {
 
     /// A serve REFUSED before the serve loop ran — [`FloorReservation::release_unspent`]
     /// called on the pre-spend refusal paths (the floor-`M` gate, the size gate, an
-    /// upstream that refused the free header handshake) — frees the live reservation at
+    /// upstream that refused the header handshake) — frees the live reservation at
     /// once. It fronted no USDC and delivered no byte, so the pool's floor headroom is
     /// fully restored and the signer row is pruned.
     #[test]

@@ -22,6 +22,8 @@
 
 use std::path::{Path, PathBuf};
 
+use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, align_range};
+
 use crate::driver::DriveConfig;
 use crate::ledgers::LaneLedgers;
 use crate::pacer::BudgetPacer;
@@ -100,6 +102,31 @@ impl<S, F> std::fmt::Debug for Downloader<S, F> {
             .field("drive_config", &self.drive_config)
             .finish_non_exhaustive()
     }
+}
+
+/// The range a [`Downloader`] of a fresh `total_bytes`-byte blob across
+/// `lanes` candidates opens first on the lane that holds it: offset 0, one
+/// even share of the blob, rounded up to whole chunk groups.
+///
+/// A caller that opens a pull before the download (to read the signed
+/// `total_bytes`, or to learn whether the peer serves) opens exactly this range
+/// and parks the pull in a [`crate::PrimedSource`], and sets it as that
+/// candidate's [`StreamCandidate::first_unit`]; the lane's first open then
+/// adopts the pull (#2063). The download's pacer draws a whole unit, so the
+/// unit is the lane's first leg.
+/// An empty blob yields the empty range, which no scheduler reserves, so a
+/// pull primed at it is never adopted.
+///
+/// # Errors
+///
+/// [`align_range`]'s bounds check. It does not fire: the unit starts at 0 and
+/// ends inside the blob.
+pub fn download_first_unit(total_bytes: u64, lanes: usize) -> anyhow::Result<AlignedRange> {
+    let share = total_bytes.div_ceil(u64::try_from(lanes.max(1)).unwrap_or(u64::MAX));
+    let share = share
+        .div_ceil(CHUNK_GROUP_BYTES)
+        .saturating_mul(CHUNK_GROUP_BYTES);
+    Ok(align_range(0, share.min(total_bytes), total_bytes)?)
 }
 
 impl<S, F> Downloader<S, F> {
@@ -338,6 +365,7 @@ mod tests {
             ctx: Arc::new(Mutex::new(ctx_for(provider))),
             ledger,
             coverage: None,
+            first_unit: None,
         }
     }
 
@@ -587,6 +615,74 @@ mod tests {
             "both candidates must have contributed (a={}, b={})",
             probe_a.delivered_bytes(),
             probe_b.delivered_bytes()
+        );
+        Ok(())
+    }
+
+    /// `download_first_unit` is the range the Downloader opens first on the
+    /// lane that holds it: a pull primed at it is adopted, so only the priming
+    /// open ever starts there (#2063).
+    #[tokio::test]
+    async fn a_primed_first_unit_is_adopted() -> anyhow::Result<()> {
+        use crate::PrimedSource;
+        use crate::source::BlobSource as _;
+
+        let blob = payload(4 * 1024 * 1024);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let total = src_a.total_bytes();
+        let probe_a = src_a.clone();
+        let probe_b = src_b.clone();
+
+        let unit = super::download_first_unit(total, 2)?;
+        let primed_b = PrimedSource::new(src_b);
+        let (header, reader) = primed_b.inner().open(root, unit.clone()).await?;
+        primed_b.prime(
+            root,
+            unit.clone(),
+            header,
+            reader,
+            tokio::time::Instant::now(),
+        );
+        let mut cand_b = candidate(primed_b, ledger_b, 0xB2);
+        cand_b.first_unit = Some(unit.clone());
+
+        let downloader = Downloader::new(
+            vec![candidate(PrimedSource::new(src_a), ledger_a, 0xA1), cand_b],
+            funder(),
+            drive_config(),
+        );
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("blob");
+        downloader
+            .fetch_to_paths(
+                &[DownloadTarget {
+                    hash: root,
+                    total_bytes: total,
+                    dest: &dest,
+                }],
+                &PullConfig::default(),
+                None,
+                None,
+            )
+            .await?;
+        anyhow::ensure!(std::fs::read(&dest)? == blob, "the file must be identical");
+
+        let opens: Vec<(u64, u64)> = probe_a
+            .opened_ranges()
+            .into_iter()
+            .chain(probe_b.opened_ranges())
+            .collect();
+        anyhow::ensure!(
+            opens
+                .iter()
+                .filter(|&&(start, _)| start == unit.fetch_start())
+                .count()
+                == 1,
+            "only the priming open starts at the unit: {opens:?}"
         );
         Ok(())
     }

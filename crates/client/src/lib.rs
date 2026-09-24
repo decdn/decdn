@@ -202,7 +202,7 @@ pub use config::PullConfig;
 pub use connection::WarmConnection;
 pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 pub use decdn_bao_range::RangedStore;
-pub use downloader::{DownloadTarget, Downloader};
+pub use downloader::{DownloadTarget, Downloader, download_first_unit};
 pub use driver::{
     PacingWait, PoolExhausted, SharedPool, WaitReason, drive, drive_range_set, first_leg,
 };
@@ -220,9 +220,12 @@ pub use retry::{RetryDisposition, retry_disposition, shared_pool_disposition};
 pub use scheduler::{ConsumptionPacing, MultiSourceConfig, SourceLane, multi_source_fetch};
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
-    BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource, PrimedSource, SourceFuture,
+    BaoRangeReader, BlobSource, Funder, IngestStore, PRIMED_MAX_IDLE, PeerSource, PrimedSource,
+    SourceFuture,
 };
-pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};
+pub use streamer::{
+    LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader, stream_first_unit,
+};
 
 pub(crate) use ledger::StreamProof;
 
@@ -2549,6 +2552,33 @@ pub fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
         })
 }
 
+/// Whether a failed open of a bounded range could mean only that the range runs
+/// past the blob's end: the size it was cut from was wrong.
+///
+/// A holder refuses such a range before it signs (`RangeNotSatisfiable`, which
+/// reaches the wire as [`StreamError::NotFound`]). A relay signs its own size
+/// instead, and the range then fails to align against it here
+/// ([`decdn_bao_range::RangeVerifyError::RangeOutOfBounds`] or
+/// [`ResumeOffsetPastEnd`]). A caller that cut the range from an unsigned size
+/// asks for the whole blob on these, and treats every other failure as the
+/// open's own outcome (#2063).
+#[must_use]
+pub fn is_range_past_end(err: &anyhow::Error) -> bool {
+    let refused_not_found = err
+        .downcast_ref::<UpstreamRefused>()
+        .is_some_and(|refused| {
+            matches!(refused.error(), StreamError::NotFound) && refused.evidence().is_some()
+        });
+    refused_not_found
+        || err.downcast_ref::<ResumeOffsetPastEnd>().is_some()
+        || err.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<decdn_bao_range::RangeVerifyError>(),
+                Some(decdn_bao_range::RangeVerifyError::RangeOutOfBounds { .. })
+            )
+        })
+}
+
 /// The wire-byte bound for a fetch of `[byte_offset, byte_offset + byte_len)`
 /// (`byte_len == 0` meaning "to end") of a `total_bytes` blob: the bao-encoded
 /// size of the chunk-group-aligned range (content plus interleaved proof, ADR
@@ -2558,8 +2588,11 @@ pub fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
 /// reproduce that, keeping encoder and receiver in lock-step. The one site every
 /// pull derives its wire bound (and its received-byte ceiling) through.
 fn aligned_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow::Result<u64> {
-    let aligned = align_range(byte_offset, byte_len, total_bytes)
-        .map_err(|e| anyhow::anyhow!("range alignment: {e}").context(LocalPullFault))?;
+    let aligned = align_range(byte_offset, byte_len, total_bytes).map_err(|e| {
+        anyhow::Error::new(e)
+            .context("range alignment")
+            .context(LocalPullFault)
+    })?;
     Ok(aligned.wire_len())
 }
 
@@ -4028,6 +4061,21 @@ mod tests {
              without the marker it falls through every downcast to the catch-all and \
              scores the peer as unreachable. Got: {aligned:?}"
         );
+        // The same fault names a range past the blob's end, so a caller that cut
+        // the range from an unsigned size can tell it from any other failure.
+        assert!(aligned.as_ref().is_some_and(super::is_range_past_end));
+        assert!(super::is_range_past_end(&anyhow::Error::new(
+            super::ResumeOffsetPastEnd {
+                total_bytes: 4096,
+                byte_offset: 8192,
+            }
+        )));
+        assert!(!super::is_range_past_end(&anyhow::Error::new(
+            super::UpstreamRefused::mid_stream(decdn_protocol::client::StreamError::NotFound)
+        )));
+        assert!(!super::is_range_past_end(
+            &anyhow::anyhow!("dial timed out").context(LocalPullFault)
+        ));
     }
 
     /// `client_binding_ext` maps an unbound context to `None` (so

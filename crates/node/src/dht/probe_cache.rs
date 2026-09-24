@@ -99,6 +99,11 @@ pub struct ProbedProvider {
     /// range-planned against this ≤15s-fresh value rather than reading as
     /// covering nothing.
     pub coverage: Coverage,
+    /// The blob size the provider reported on that probe
+    /// (`ProbeResponseExt.total_bytes`), when it knew it. UNSIGNED, like
+    /// `coverage`, so it carries no slashable author either: a sizing hint the
+    /// pull leg cuts its first upstream open from.
+    pub total_bytes_hint: Option<u64>,
 }
 
 // The guard against retaining slashable evidence is the exhaustive struct
@@ -317,6 +322,7 @@ mod tests {
             // A distinct one-block coverage per provider, so a round-trip that
             // dropped or aliased the field fails the `PartialEq` assertions.
             coverage: Coverage::from_block_indices(8, std::iter::once(u32::from(byte % 8))),
+            total_bytes_hint: Some(u64::from(byte)),
         }
     }
 
