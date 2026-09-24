@@ -1,5 +1,5 @@
 //! Source guard: the daemon replays config-resolve notices *after* it installs
-//! a `tracing` subscriber.
+//! a `tracing` subscriber, and it logs its node key the same way.
 //!
 //! `resolve_config` records notices instead of emitting them precisely because
 //! it runs before `init_tracing`, so nothing at that point has a sink. The
@@ -12,6 +12,13 @@
 //! stream has to install its own subscriber first, which is the very thing
 //! whose absence is under test. So the guard reads the source and checks the
 //! order of the two calls.
+//!
+//! The node key has the same shape. `load_or_create` runs before
+//! `init_tracing` so the JSON formatter can stamp `node_id` on every event, and
+//! `log_node_key` logs its outcome afterwards. `log_node_key` above
+//! `init_tracing` drops the "generated new node secret key" line. The OTLP
+//! provider, the one fallible step of tracing bring-up, runs before the key
+//! load, so a bad endpoint cannot fail the start after a first key is written.
 
 use std::path::PathBuf;
 
@@ -48,6 +55,43 @@ fn notices_are_replayed_after_the_subscriber_exists() -> anyhow::Result<()> {
         "{RUN_PATH} replays config notices at byte {emit}, before init_tracing at \
          byte {init}: with no subscriber installed yet the events are discarded and \
          the operator is told nothing"
+    );
+    Ok(())
+}
+
+/// The node key is loaded after the OTLP provider and before `init_tracing`,
+/// and logged after `init_tracing`. The same plain-text caveat as above
+/// applies to all four needles.
+#[test]
+fn node_key_is_loaded_before_and_logged_after_the_subscriber() -> anyhow::Result<()> {
+    let path = workspace_root().join(RUN_PATH);
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let call_of = |name: &str| {
+        text.find(&format!("{name}("))
+            .ok_or_else(|| anyhow::anyhow!("no {name} call in {RUN_PATH}"))
+    };
+
+    let otlp = call_of("init_otlp_provider")?;
+    let load = call_of("load_or_create")?;
+    let init = call_of("init_tracing")?;
+    let log = call_of("log_node_key")?;
+
+    anyhow::ensure!(
+        otlp < load,
+        "{RUN_PATH} builds the OTLP provider at byte {otlp}, after the key load at \
+         byte {load}: a bad endpoint then fails a first start after the key is \
+         written, and the \"generated\" line is never logged"
+    );
+    anyhow::ensure!(
+        load < init,
+        "{RUN_PATH} loads the node key at byte {load}, after init_tracing at byte \
+         {init}: the JSON formatter has no node_id for its events"
+    );
+    anyhow::ensure!(
+        log > init,
+        "{RUN_PATH} logs the node key at byte {log}, before init_tracing at byte \
+         {init}: with no subscriber installed yet the lines are discarded"
     );
     Ok(())
 }

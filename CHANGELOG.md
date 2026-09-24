@@ -825,6 +825,20 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Runtime: every JSON log event carries `node_id` (#2050).** ADR
+  appendix-observability lists `node_id` as a mandatory log field, but only
+  the identity line and the startup banner carried it, so a log line in the
+  aggregator could not be joined to the NodeId that peers and the chain see.
+  The JSON formatter now writes `node_id` (lowercase hex) as a top-level key
+  beside `timestamp`, `level`, `target` and `fields`. The daemon loads its
+  node key before the tracing subscriber starts, so the first event of the
+  process already has it. The start order is now: OTLP exporter, node key,
+  subscriber, RPC preflight. So a key-load error prints to stderr as a plain
+  `Error:` line, like a config error, and is not a JSON event or an OTLP
+  span. A first start writes `node.secret` even when the RPC is unreachable.
+  The `pretty` format is unchanged. ADR appendix-observability now names the
+  JSON keys as written (`timestamp`, not `ts`) and records which OTLP
+  resource attributes the node sets and which the collector adds.
 - **Client: a fault before a range's first leaf no longer marks the rest of
   the blob present.** A leg that faults after its bao parents and before its
   first leaf checkpoints the parents with an empty received prefix. The

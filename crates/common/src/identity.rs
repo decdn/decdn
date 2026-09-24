@@ -46,7 +46,7 @@ pub fn key_path(data_dir: &Path) -> PathBuf {
 /// absent — the read-only counterpart of [`load_or_generate`], used by
 /// `decdn whoami` to report the existing identity without minting a new key.
 ///
-/// Applies the same validation as [`load_or_generate`]'s load path: `data_dir`
+/// Applies the same validation as [`load_or_create`]'s load path: `data_dir`
 /// must be a secure directory and `node.secret` a secure 32-byte regular file.
 ///
 /// # Errors
@@ -99,6 +99,37 @@ pub fn load(data_dir: &Path) -> anyhow::Result<SecretKey> {
 
 /// Load the node's `SecretKey` from disk, generating and persisting one if absent.
 ///
+/// Logs the key path at `INFO` when it generates a key. [`load_or_create`] is
+/// the same load without the log, for a caller with no subscriber yet.
+///
+/// # Errors
+///
+/// As [`load_or_create`].
+pub fn load_or_generate(data_dir: &Path) -> anyhow::Result<SecretKey> {
+    let loaded = load_or_create(data_dir)?;
+    if loaded.generated {
+        tracing::info!(path = %key_path(data_dir).display(), "generated new node secret key");
+    }
+    Ok(loaded.key)
+}
+
+/// A node key from [`load_or_create`], and whether that call created it.
+#[derive(Debug)]
+pub struct LoadedKey {
+    /// The node's iroh secret key.
+    pub key: SecretKey,
+    /// `true` when the call generated and persisted `key`; `false` when it
+    /// read an existing key.
+    pub generated: bool,
+}
+
+/// Load the node's `SecretKey` from disk, generating and persisting one if
+/// absent, and report which of the two happened.
+///
+/// Emits no log, so a caller can run it before its tracing subscriber exists
+/// and log [`LoadedKey::generated`] itself. The daemon does this so that its
+/// JSON formatter can write `node_id` on every event.
+///
 /// # Errors
 ///
 /// Returns an error if the file exists but is a symlink or other non-regular
@@ -106,7 +137,7 @@ pub fn load(data_dir: &Path) -> anyhow::Result<SecretKey> {
 /// not a directory or has insecure permissions; if the key path can't be
 /// stat'd for reasons other than non-existence; if the directory cannot be
 /// created; or if reading/writing fails.
-pub fn load_or_generate(data_dir: &Path) -> anyhow::Result<SecretKey> {
+pub fn load_or_create(data_dir: &Path) -> anyhow::Result<LoadedKey> {
     let path = key_path(data_dir);
 
     // Check `data_dir` first so a clear "invalid data_dir" error beats a
@@ -134,7 +165,10 @@ pub fn load_or_generate(data_dir: &Path) -> anyhow::Result<SecretKey> {
         match fs::symlink_metadata(&path) {
             Ok(_) => {
                 validate_key_file(&path)?;
-                return load_from(&path);
+                return Ok(LoadedKey {
+                    key: load_from(&path)?,
+                    generated: false,
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -152,8 +186,10 @@ pub fn load_or_generate(data_dir: &Path) -> anyhow::Result<SecretKey> {
 
     let key = fresh_secret_key();
     write_atomic(&path, &key.to_bytes())?;
-    tracing::info!(path = %path.display(), "generated new node secret key");
-    Ok(key)
+    Ok(LoadedKey {
+        key,
+        generated: true,
+    })
 }
 
 /// Validate (or create+validate) `data_dir` with `0o700` semantics: if it
@@ -371,7 +407,7 @@ impl StagedNodeKey {
     /// may instead have failed.
     ///
     /// So the key is parked under a name that is deliberately *not*
-    /// `node.secret`: no daemon will load it (`load_or_generate` reads exactly
+    /// `node.secret`: no daemon will load it (`load_or_create` reads exactly
     /// `<data_dir>/node.secret`), and the operator can install it once they have
     /// checked whether the transaction confirmed.
     ///
@@ -421,10 +457,10 @@ impl Drop for StagedNodeKey {
 
 /// Generate a fresh node key and write it to a temp file in `data_dir` (mode
 /// `0o600` on Unix) **without** touching `node.secret`. Validates or securely
-/// creates `data_dir` with the same `0o700` semantics as [`load_or_generate`].
+/// creates `data_dir` with the same `0o700` semantics as [`load_or_create`].
 ///
 /// The returned [`StagedNodeKey`] is committed via [`StagedNodeKey::commit`].
-/// This is the staged counterpart of [`load_or_generate`]'s generate path, used
+/// This is the staged counterpart of [`load_or_create`]'s generate path, used
 /// by `decdn key-gen` so the node key and the eth keystore are both generated
 /// before either canonical file is replaced (#844).
 ///
@@ -815,6 +851,17 @@ mod tests {
         let k1 = load_or_generate(dir.path())?;
         let k2 = load_or_generate(dir.path())?;
         assert_eq!(k1.to_bytes(), k2.to_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn load_or_create_reports_whether_it_generated() -> anyhow::Result<()> {
+        let dir = secure_tempdir()?;
+        let first = load_or_create(dir.path())?;
+        let second = load_or_create(dir.path())?;
+        assert!(first.generated, "an empty data_dir generates a key");
+        assert!(!second.generated, "an existing key is read, not replaced");
+        assert_eq!(first.key.to_bytes(), second.key.to_bytes());
         Ok(())
     }
 

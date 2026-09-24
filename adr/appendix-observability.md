@@ -331,12 +331,15 @@ Metrics cover aggregates; structured logs cover per-event detail. Logs complemen
   - `INFO` — significant lifecycle events (node ready, pool opened/redeemed, registry active-set change, config reloaded).
   - `DEBUG` — per-stream and per-probe events. Not for high-volume production.
 
-**Mandatory log fields** on every event:
+**Mandatory log fields.** Every JSON event is one object with these top-level keys:
 
-- `node_id` — iroh NodeId (hex)
-- `ts` — RFC 3339 timestamp
-- `level` — log level
-- `target` — Rust module path
+- `node_id` — this node's iroh NodeId, as lowercase hex. It is on every event, from the first event of the process.
+- `timestamp` — RFC 3339 timestamp.
+- `level` — log level.
+- `target` — Rust module path.
+- `fields` — the event fields. `fields.message` is the log message, when the event has one.
+
+An event inside a span also has `span` and `spans`. `span` is the current span. `spans` is the list of spans from the root. Use the `pretty` format in a terminal. It has no `node_id` key. The startup banner (`event = "startup_banner"`) has a `node_id` field in both formats.
 
 **Field names.** One concept has one field name on every event:
 
@@ -350,6 +353,8 @@ Metrics cover aggregates; structured logs cover per-event detail. Logs complemen
 ### Trace Spans
 
 The node exports spans over OTLP when `observability.otlp_endpoint` is set. The export filter is separate from the log filter, so a change to `log_level` does not change the traces. The filter admits `INFO` spans and events from the deCDN crates. From other crates it admits `WARN` and `ERROR` events only, so a dependency failure lands on the deCDN span it happened in. The OTLP transport crates are always off. A span covers one stream, pull, lookup, or transaction. No span covers a single frame.
+
+The node sets `service.name = "decdn"` and `service.version` on the OTLP resource. The OpenTelemetry SDK also adds the `telemetry.sdk.*` attributes and each pair in `OTEL_RESOURCE_ATTRIBUTES`. The node does not set host identity by default. The collector of the reference Grafana stack adds `service.instance.id`, `region`, and `deployment.environment`. It also sets `service.name` to `decdn-node`. The dashboards query that name. A deployment without this collector must add the three host attributes itself, in its collector or in `OTEL_RESOURCE_ATTRIBUTES`. Only a collector can change `service.name`, because the value of the node replaces the value from the environment. The iroh NodeId of the node is the `local_node_id` field on the spans that need it.
 
 | Span | Covers | Fields |
 |------|--------|--------|

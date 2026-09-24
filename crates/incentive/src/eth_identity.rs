@@ -307,7 +307,7 @@ impl Drop for StagedKeystore {
 /// Generate a fresh secp256k1 keypair and encrypt it into a temp keystore file
 /// in `data_dir` (mode `0o600` on Unix) **without** touching `keystore.json`.
 /// Validates or securely creates `data_dir` with the same `0o700` semantics as
-/// [`decdn_common::identity::load_or_generate`].
+/// [`decdn_common::identity::load_or_create`].
 ///
 /// The returned [`StagedKeystore`] is committed via [`StagedKeystore::commit`].
 /// Used by `decdn key-gen` so the keystore and the node key are both generated
@@ -320,7 +320,7 @@ impl Drop for StagedKeystore {
 /// path; partial writes never accumulate in `data_dir`.
 pub fn stage_keystore(data_dir: &Path, password: &str) -> anyhow::Result<StagedKeystore> {
     // Validate (or create+validate) `data_dir` with the same semantics as
-    // `identity::load_or_generate`: shared via the public helper so the
+    // `identity::load_or_create`: shared via the public helper so the
     // node.secret and keystore.json paths stay in lock-step.
     decdn_common::identity::ensure_data_dir(data_dir)?;
 
