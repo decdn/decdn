@@ -332,7 +332,8 @@ jobs:
             binary: decdn-node.exe
             archive_name: decdn-node
             archive: zip
-          # decdn (user CLI) — same five targets, same glibc reasoning.
+          # decdn (user CLI) — the same five targets, same glibc reasoning,
+          # plus Windows on ARM64, which the walletless on-ramp installs.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             package: decdn-cli
@@ -360,6 +361,13 @@ jobs:
             archive_name: decdn
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            package: decdn-cli
+            binary: decdn.exe
+            archive_name: decdn
+            archive: zip
+          # Cross-compiled on the x64 runner with the MSVC ARM64 toolchain.
+          - target: aarch64-pc-windows-msvc
             runner: windows-latest
             package: decdn-cli
             binary: decdn.exe
@@ -459,7 +467,7 @@ jobs:
         working-directory: artifacts
         shell: bash
         env:
-          EXPECTED_ARCHIVES: "10"
+          EXPECTED_ARCHIVES: "11"
         run: |
           archives=( ./*.tar.gz ./*.zip )
           for a in "${archives[@]}"; do

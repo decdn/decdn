@@ -518,11 +518,21 @@ pub(crate) fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::missing_const_for_fn,
+    reason = "matches the fallible Unix variant's signature at the shared call sites"
+)]
 pub(crate) fn validate_data_dir(_data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::missing_const_for_fn,
+    reason = "matches the fallible Unix variant's signature at the shared call sites"
+)]
 fn validate_key_file(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
