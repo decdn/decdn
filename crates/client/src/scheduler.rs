@@ -104,7 +104,7 @@ use crate::pacer::DownstreamFrontier;
 use crate::retry::{RetryDisposition, shared_pool_disposition};
 use crate::segment::{split_evenly, steal_split};
 use crate::source::{BlobSource, Funder, IngestStore};
-use crate::{Pacer, PoolContext, PoolLedger, ProgressCallback};
+use crate::{Pacer, PoolContext, PoolLedger};
 
 /// One paid delivery lane in a multi-source fetch: a source paired with the
 /// `(ctx, ledger)` that pays IT — never shared across sources.
@@ -730,7 +730,7 @@ async fn run_worker<St, S, P, F>(
     work: &AsyncMutex<Work>,
     progress_wake: &Notify,
     faults: &Mutex<Vec<LaneFault>>,
-    on_progress: Option<&ProgressCallback>,
+    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     progress_agg: &AtomicU64,
     unit_deadline: Duration,
     pool: &SharedPool<'_>,
@@ -1089,9 +1089,6 @@ fn reserve_first_units<S>(
 /// faults with the request still incomplete, an error naming what each lane did,
 /// wrapping the last real one so a caller can still downcast it.
 #[allow(clippy::too_many_arguments)]
-// Linear set-up (precondition check, segmentation, the shared-pool view) then
-// one drive and one failure report. Flat, not complex.
-#[allow(clippy::too_many_lines)]
 pub async fn multi_source_fetch<St, S, P, F>(
     store: &St,
     lanes: &[SourceLane<'_, S>],
@@ -1102,9 +1099,67 @@ pub async fn multi_source_fetch<St, S, P, F>(
     len: u64,
     drive: &DriveConfig,
     ms: &MultiSourceConfig,
-    on_progress: Option<&ProgressCallback>,
+    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     ledgers: Option<&LaneLedgers>,
     pacing: Option<&ConsumptionPacing<'_>>,
+) -> anyhow::Result<()>
+where
+    St: IngestStore,
+    S: BlobSource,
+    P: Pacer,
+    F: Funder,
+{
+    multi_source_fetch_until(
+        store,
+        lanes,
+        pacer,
+        funder,
+        hash,
+        offset,
+        len,
+        drive,
+        ms,
+        on_progress,
+        ledgers,
+        pacing,
+        std::future::pending(),
+    )
+    .await
+}
+
+/// [`multi_source_fetch`] under a caller's `stop`: when `stop` resolves first,
+/// every worker is dropped and the fetch returns `stop`'s error as it is, not
+/// wrapped in the every-lane summary.
+///
+/// `stop` races only the workers, as in [`crate::drive_range_set`]. A pending
+/// interval write of the present record lands and the final flush runs, so the
+/// bytes that landed stay recorded for a resume. A caller uses it for a
+/// fetch-wide throughput floor, which the per-lane unit watchdog cannot see:
+/// every lane can move a little inside its deadline while the fetch as a whole
+/// crawls.
+///
+/// # Errors
+///
+/// `stop`'s error when it resolves first, or any error
+/// [`multi_source_fetch`] returns.
+#[allow(clippy::too_many_arguments)]
+// Linear set-up (precondition check, segmentation, the shared-pool view) then
+// one drive and one failure report. Flat, not complex.
+#[allow(clippy::too_many_lines)]
+pub async fn multi_source_fetch_until<St, S, P, F>(
+    store: &St,
+    lanes: &[SourceLane<'_, S>],
+    pacer: &P,
+    funder: &F,
+    hash: [u8; 32],
+    offset: u64,
+    len: u64,
+    drive: &DriveConfig,
+    ms: &MultiSourceConfig,
+    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
+    ledgers: Option<&LaneLedgers>,
+    pacing: Option<&ConsumptionPacing<'_>>,
+    stop: impl Future<Output = anyhow::Error>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -1347,8 +1402,11 @@ where
     // `PRESENT_RECORD_FLUSH_INTERVAL`.
     let workers = futures_util::future::try_join_all(workers);
     let outcome = drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async move {
-        workers.await?;
-        Ok(())
+        tokio::select! {
+            biased;
+            joined = workers => joined.map(|_| ()),
+            stopped = stop => Err(stopped),
+        }
     })
     .await;
 
@@ -1425,9 +1483,9 @@ mod tests {
     use decdn_incentive::{DepositOutcome, LaneKey};
     use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
-    use super::{MultiSourceConfig, SourceLane, multi_source_fetch};
-    use crate::driver::DriveConfig;
+    use super::{MultiSourceConfig, SourceLane, multi_source_fetch, multi_source_fetch_until};
     use crate::driver::PoolExhausted;
+    use crate::driver::{DriveConfig, ranges_content_len};
     use crate::ledgers::{LaneHandle, LaneLedgers};
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState, Pacer};
     use crate::source::{FakeFunder, ScriptedSource};
@@ -1726,7 +1784,7 @@ mod tests {
 
         let samples: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
         let cb_samples = Arc::clone(&samples);
-        let on_progress: Box<super::ProgressCallback> = Box::new(move |received, expected| {
+        let on_progress: Box<crate::ProgressCallback> = Box::new(move |received, expected| {
             if let Ok(mut s) = cb_samples.lock() {
                 s.push((received, expected));
             }
@@ -1827,7 +1885,7 @@ mod tests {
 
         let samples: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
         let cb_samples = Arc::clone(&samples);
-        let on_progress: Box<super::ProgressCallback> = Box::new(move |received, expected| {
+        let on_progress: Box<crate::ProgressCallback> = Box::new(move |received, expected| {
             if let Ok(mut s) = cb_samples.lock() {
                 s.push((received, expected));
             }
@@ -3804,6 +3862,73 @@ mod tests {
             "the wedged source must not have delivered its whole segment: {}",
             src_a.delivered_bytes()
         );
+        Ok(())
+    }
+
+    /// A `stop` that fires while every lane crawls ends the fetch with the stop's
+    /// own error, not the every-lane summary. The bytes that landed are in the
+    /// durable present record: the final flush runs after a stop too.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_ends_the_fetch_and_keeps_the_landed_bytes_recorded() -> anyhow::Result<()> {
+        let data = blob(32 * 1024 * 1024);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        // Each lane delivers one ingest checkpoint of its half, then sleeps.
+        let src_a = ScriptedSource::new(data.clone())?
+            .stall_after(4 * 1024 * 1024, Duration::from_hours(1))
+            .paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?
+            .stall_after(4 * 1024 * 1024, Duration::from_hours(1))
+            .paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let total = src_a.total_bytes();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+        let lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+        ];
+        let stop = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            anyhow::anyhow!("stopped by the floor")
+        };
+        let err = multi_source_fetch_until(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            // The unit watchdog is off, so only the stop can end the crawl.
+            &MultiSourceConfig {
+                max_sources: 2,
+                unit_deadline: Duration::ZERO,
+            },
+            None,
+            None,
+            None,
+            stop,
+        )
+        .await
+        .expect_err("the stop ends the fetch");
+        assert_eq!(format!("{err:#}"), "stopped by the floor");
+        drop(store);
+
+        let reopened = ClientRangedStore::open(dir.path(), "b", root, total)?;
+        let recorded = ranges_content_len(&reopened.present_ranges().await?, total);
+        assert!(
+            recorded >= 8 * 1024 * 1024,
+            "both lanes' landed checkpoints are recorded: {recorded}"
+        );
+        assert!(recorded < total);
         Ok(())
     }
 

@@ -2097,6 +2097,21 @@ impl EntryWatch {
         }
     }
 
+    /// A progress callback that records each position on the watch, then
+    /// forwards it to `progress`. A drive installs it whether or not `progress`
+    /// is set, so the floor sees every byte.
+    fn observing<'a>(
+        &'a self,
+        progress: Option<&'a ProgressCallback>,
+    ) -> impl Fn(u64, u64) + Send + Sync + 'a {
+        move |position, total| {
+            self.observe(position);
+            if let Some(cb) = progress {
+                cb(position, total);
+            }
+        }
+    }
+
     fn landed(&self) -> u64 {
         self.landed.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -2229,12 +2244,7 @@ where
     ) -> anyhow::Result<()> {
         let pool = self.pool();
         let watch = EntryWatch::default();
-        let watched = |position: u64, total: u64| {
-            watch.observe(position);
-            if let Some(cb) = progress {
-                cb(position, total);
-            }
-        };
+        let watched = watch.observing(progress);
         let funder = PausingFunder {
             inner: &self.funder,
             watch: &watch,
@@ -3708,6 +3718,10 @@ where
 /// watermark is persisted after — the face does not persist, so this thin CLI
 /// layer does. `open_lock` and `ledgers` thread `bundle pull`'s shared pool lock
 /// and ledger registry through; a solo `decdn fetch` passes `None`/`None`.
+///
+/// The fetch runs under the drive-level floor ([`drive_floor`]), judged on the
+/// position across every lane. A trip returns [`EntryStalled`], which is
+/// retryable, so the caller resumes the `.partial` on its single-source path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn multi_source_download<P>(
     deps: &DriveFetchDeps<'_, P>,
@@ -3802,19 +3816,29 @@ where
         ..PullConfig::new()
     };
 
+    // The drive-level floor spans every lane (#2120). The scheduler's unit
+    // watchdog judges one lane's unit at a time, so it cannot see a fetch whose
+    // lanes all crawl just inside their deadlines. The observe hook is always
+    // installed: the scheduler reports no progress without a callback.
+    let watch = EntryWatch::default();
+    let watched = watch.observing(progress);
+    let funder = PausingFunder {
+        inner: &funder,
+        watch: &watch,
+    };
     let downloader = Downloader::new(stream_candidates, funder, drive_config);
-    let result = downloader
-        .fetch_to_paths(
-            &[DownloadTarget {
-                hash,
-                total_bytes,
-                dest: output,
-            }],
-            &pull_config,
-            ledgers,
-            progress,
-        )
-        .await;
+    let result = Box::pin(downloader.fetch_to_paths_until(
+        &[DownloadTarget {
+            hash,
+            total_bytes,
+            dest: output,
+        }],
+        &pull_config,
+        ledgers,
+        Some(&watched),
+        drive_floor(deps.deadlines, hash, total_bytes, &watch),
+    ))
+    .await;
 
     // Persist every lane's watermark before surfacing an error: paid bytes are
     // paid whatever the fetch's outcome.
@@ -5938,6 +5962,22 @@ mod tests {
         assert_eq!(fmt_rate(0.4), "--");
         assert_eq!(fmt_rate(f64::NAN), "--");
         assert_eq!(fmt_rate(f64::INFINITY), "--");
+    }
+
+    /// The observing callback feeds the watch with no UI callback (bars off),
+    /// and forwards each position to one when set.
+    #[test]
+    fn observing_feeds_the_watch_with_or_without_a_ui_callback() {
+        let watch = EntryWatch::default();
+        watch.observing(None)(7, 100);
+        assert_eq!(watch.landed(), 7);
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let ui = move |position: u64, total: u64| sink.lock().unwrap().push((position, total));
+        watch.observing(Some(&ui))(9, 100);
+        assert_eq!(watch.landed(), 9);
+        assert_eq!(*seen.lock().unwrap(), vec![(9, 100)]);
     }
 
     /// The watch keeps the highest position it saw, and only forward progress
