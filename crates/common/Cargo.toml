@@ -28,7 +28,7 @@ url = { workspace = true }
 jsonrpsee = { workspace = true }
 # Free-space probing (`disk.rs`): `statvfs` on Unix, `GetDiskFreeSpaceExW` on
 # Windows, behind one safe API (the workspace forbids `unsafe`).
-fs4 = "1.1"
+fs4 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

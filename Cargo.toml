@@ -143,6 +143,8 @@ thiserror = "2"
 # Config
 toml = "1"
 dirs = "7"
+# Free-space probing in `decdn-common` (`statvfs` / `GetDiskFreeSpaceExW`).
+fs4 = "1.1"
 
 # Misc
 bytes = "1"

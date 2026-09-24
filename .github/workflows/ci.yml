@@ -1272,8 +1272,6 @@ jobs:
           [ "$out" = "placeholder" ] || {
             echo "::error::entrypoint did not run the copied binary (got: $out)"; exit 1; }
 
-  # Single gate for branch protection. Point required-checks at this one job
-  # so adding/renaming jobs above doesn't require updating branch rules.
   windows:
     # The walletless on-ramp ships `decdn.exe` for Windows x64 and ARM64. The
     # rest of CI runs on Linux, so this job is what keeps the user CLI
@@ -1322,6 +1320,8 @@ jobs:
           if (-not $who.Contains($address)) { throw "whoami does not report $address`n$who" }
           "key-gen and whoami agree on $address"
 
+  # Single gate for branch protection. Point required-checks at this one job
+  # so adding/renaming jobs above doesn't require updating branch rules.
   ci-success:
     name: CI success
     if: always()
