@@ -200,7 +200,7 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 
 **Address lifecycle:**
 
-1. On startup, `iroh::Endpoint::local_addr()` returns the local bind address (e.g., `0.0.0.0:PORT`).
+1. On startup, the node binds `network.bind_port` on both address families: `0.0.0.0:PORT` and `[::]:PORT`. The IPv4 bind is required. The IPv6 bind is optional. A host without IPv6 starts on IPv4 only and logs a warning.
 2. iroh discovers external addresses via STUN and direct connection attempts, populating `Endpoint::direct_addresses()` — the addresses peers use to connect.
 3. If hole-punching fails, iroh uses a relay server as fallback. Relay addresses are in the iroh `NodeAddr` but not registered on-chain (not stable).
 
@@ -215,7 +215,7 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 - **PoC:** No cooldown — updates can be submitted on any change (~$0.03/call).
 - **Production:** A governable cooldown prevents rapid address flipping by a compromised key ([ADR 003 § Multiaddr Update Policy](003-payments.md#multiaddr-update-policy)).
 
-**Multiaddr encoding:** `multiaddrs` is a packed `bytes` field: a sequence of `(uint16 length, bytes data)` entries. Each entry is a QUIC multiaddr string (e.g., `/ip4/203.0.113.10/udp/4433/quic-v1`). Maximum total size: 1,024 bytes (governable).
+**Multiaddr encoding:** `multiaddrs` is a packed `bytes` field: a sequence of `(uint16 length, bytes data)` entries. Each entry is a QUIC multiaddr string (e.g., `/ip4/203.0.113.10/udp/4433/quic-v1`). A dual-stack node registers one entry per family on the same port (e.g., `/ip4/203.0.113.10/udp/4433/quic-v1` and `/ip6/2001:db8::10/udp/4433/quic-v1`). Maximum total size: 1,024 bytes (governable).
 
 ### Re-Onboarding after Deregistration or Auto-Ejection
 

@@ -60,12 +60,15 @@ pub async fn run(
         log_level_setter,
     ));
 
-    let result = runtime::run(
+    // `Box::pin` the runtime future: its state machine crosses clippy's
+    // `large_futures` threshold. It runs once per process, so the heap
+    // allocation costs nothing that matters.
+    let result = Box::pin(runtime::run(
         resolved,
         config_path.map(std::path::Path::to_path_buf),
         reload_state,
         node_metrics,
-    )
+    ))
     .await;
 
     // On both exit paths: the spans around a failed run are the ones an

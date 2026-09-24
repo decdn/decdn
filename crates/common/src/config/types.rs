@@ -77,7 +77,8 @@ pub struct ClientConfig {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    /// QUIC bind port.
+    /// QUIC bind port. The node binds it on IPv4 and, when the host has IPv6,
+    /// on IPv6 too.
     pub bind_port: Option<u16>,
     /// iroh relay URLs for NAT traversal. Multiple entries give relay
     /// redundancy/failover. Reachability is probed at bring-up and logged but

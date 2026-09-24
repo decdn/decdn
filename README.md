@@ -96,7 +96,8 @@ decdn node health            # then: node status, node lanes, node top
 
 `setup` generates the node key and keystore when neither exists, shows the operator terms,
 bonds, registers the node, and prints a go/no-go summary
-([ADR 019](adr/019-node-onboarding.md)). `--region` is an ISO 3166-1 alpha-2 country code
+([ADR 019](adr/019-node-onboarding.md)). The node listens on UDP 4433 over IPv4 and IPv6, so a
+dual-stack host also passes `--multiaddr /ip6/<addr>/udp/4433/quic-v1`. `--region` is an ISO 3166-1 alpha-2 country code
 ([ADR 030](adr/030-node-region-self-attestation.md)).
 
 To serve your own content, import it into a local origin store with

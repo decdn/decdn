@@ -810,10 +810,12 @@ identity rotation, host clock skew breaking TLS.
 **Remediate:**
 
 1. Verify the configured `network.bind_port` is reachable from the public
-   internet. The node already binds `Ipv4Addr::UNSPECIFIED` (`0.0.0.0`) in
+   internet. The node binds `0.0.0.0:<bind_port>` and `[::]:<bind_port>` in
    `crates/node/src/runtime/mod.rs::build_endpoint`, so there is no
    operator-tunable bind interface; fixes here are at the firewall, NAT,
-   or port-forwarding layer.
+   or port-forwarding layer. Open UDP `bind_port` for both IPv4 and IPv6.
+   If the log shows `IPv6 bind failed`, the node is IPv4-only: enable IPv6
+   on the host or register `/ip4/` multiaddrs only.
 2. If a peer's iroh key was rotated, neighbours referring to its prior
    `NodeId` will not reconnect until they re-discover the new identity via
    gossip. The node config carries no static bootstrap-peer list
