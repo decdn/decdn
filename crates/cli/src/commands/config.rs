@@ -560,9 +560,15 @@ pub fn config_init(args: &cli::ConfigInitArgs) -> anyhow::Result<()> {
         Role::Origin(_) => "origin-node",
         Role::Client => "client",
     };
+    // A client's keystore lives in the client-scoped data dir, not `key-gen`'s
+    // node-shaped default.
+    let key_gen = match &role {
+        Role::Client => "decdn key-gen --output-dir ~/.decdn/client",
+        Role::Relay | Role::Origin(_) => "decdn key-gen",
+    };
     match chain {
         Some(c) => println!(
-            "wrote {} {role_word} config to {} (run `decdn key-gen` to create the keystore)",
+            "wrote {} {role_word} config to {} (run `{key_gen}` to create the keystore)",
             c.label,
             output.display()
         ),
@@ -675,11 +681,12 @@ fn render_client_blockchain_section(chain: &known_chains::KnownChain) -> anyhow:
          # manifest (contracts/deployments/{chain_id}.json). The client consumes the\n\
          # first block of keys; the remaining contract addresses are daemon/operator\n\
          # keys it ignores, kept active so this file also passes `decdn config\n\
-         # validate`. Ready to fetch as-is once the keystore exists (`decdn key-gen`)\n\
-         # and holds USDC. Point `rpc_url` at your own provider for production.\n\
+         # validate`. Ready to fetch as-is once the keystore exists (`decdn key-gen\n\
+         # --output-dir ~/.decdn/client`) and holds USDC. Point `rpc_url` at your own\n\
+         # provider for production.\n\
          rpc_url = \"{rpc}\"\n\
          chain_id = {chain_id}\n\
-         # eth_keystore = \"~/.decdn/keystore.json\"   # defaults to <data_dir>/keystore.json\n\
+         # eth_keystore = \"~/.decdn/client/keystore.json\"   # defaults to <data_dir>/keystore.json\n\
          payment_pool_address       = \"{payment_pool}\"\n\
          usdc_address               = \"{usdc}\"\n\
          # buyer_working_deposit_micro_usdc = 10000000  # deposit when OPENING a pool and refill target; must be > 0; default 10 USDC\n\
@@ -864,12 +871,12 @@ const CLIENT_CONFIG: &str = r#"# deCDN client configuration — fetch-only consu
 # CLI flags override values in this file.
 
 [identity]
-# data_dir = "~/.decdn"              # holds the eth keystore and the buyer-channel store
+# data_dir = "~/.decdn/client"       # holds the eth keystore and the buyer-channel store
 
 [blockchain]
 # rpc_url = ""                       # REQUIRED: JSON-RPC URL for the payment chain
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
-# eth_keystore = "~/.decdn/keystore.json"   # defaults to <data_dir>/keystore.json; create with `decdn key-gen`
+# eth_keystore = "~/.decdn/client/keystore.json"   # defaults to <data_dir>/keystore.json; create with `decdn key-gen --output-dir ~/.decdn/client`
 # payment_pool_address = ""          # REQUIRED: 0x-prefixed hex; pool the client opens payment channels through
 # usdc_address = ""                  # USDC settlement token deposits spend
 # buyer_working_deposit_micro_usdc = 10000000  # deposit when OPENING a pool and refill target; must be > 0; default 10 USDC

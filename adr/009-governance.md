@@ -129,7 +129,7 @@ The α range upper-bounds at 1.8 to prevent a concentration penalty so steep tha
 | Namespace transfer timelock | PublisherRegistry | 24 hours | 30 days |
 | Max evidence age | SlashJudge | 1 day | 30 days |
 
-There is no settlement-time fee skim or discount-stake mechanic on the payment contract. Burn is a fixed share of the `FeeRouter` split (governable within the burn-share bound above). There is no flat minimum-stake parameter; the only TOKEN-side requirement on operators is the capacity-bond curve.
+There is no settlement-time fee skim or discount-stake mechanic on the payment contract. Burn is a fixed share of the `FeeRouter` split (governable within the burn-share bound above). The only TOKEN-side requirement on operators is the capacity bond. At entry, it must meet the larger of the capacity-bond curve and the global `minBond` floor ([ADR 026 § Minimum bond is non-retroactive](026-tokenomics.md#minimum-bond-is-non-retroactive)).
 
 The 7-day voting period balances responsiveness with participation. Combined with the 1-day voting delay and the 48-hour timelock, the total governance delay is ~10 days minimum — longer than the standard OpenZeppelin Governor defaults, reflecting operator-class participation cadence.
 

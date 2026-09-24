@@ -211,7 +211,7 @@ pub enum NodeCommand {
     UpdateRegion(UpdateRegionArgs),
     /// Unpaid client-side discovery of active nodes via
     /// `CapacityBond.getRegisteredNodes` (#1481). Maps node-ids/regions to
-    /// operator Ethereum addresses — the input `decdn pool open
+    /// operator Ethereum addresses — the input `decdn fetch
     /// --provider-address` needs — without spending anything: it builds a
     /// signer-less read-only provider and never loads a keystore, unlike
     /// every other on-chain `node` subcommand above.

@@ -1,6 +1,6 @@
 # deCDN Contracts
 
-The on-chain surface of deCDN: operator bonding, per-megabyte USDC settlement, served-bytes-weighted governance, and the slashing/appeals machinery. Built with [Foundry](https://book.getfoundry.sh). Dual-currency by design — **USDC** for payments, **TOKEN** for staking and governance.
+The on-chain surface of deCDN: operator bonding, per-megabyte USDC settlement, served-bytes-weighted governance, and the slashing/appeals machinery. Built with [Foundry](https://book.getfoundry.sh). Dual-currency by design — **USDC** for payments, **TOKEN** for operator bonds. Vote weight comes from served bytes, not from TOKEN balances ([ADR 036](../adr/036-served-bytes-voting-weight.md)).
 
 This is a standalone Foundry project at the repo root, **excluded from the Cargo workspace**. The ADRs in [`../adr/`](../adr/) are the source of truth for every protocol and economic claim; [ADR 016](../adr/016-contract-interactions.md) is the contract-interaction overview and inventory.
 
@@ -14,12 +14,14 @@ Deployable contracts in [`src/`](src/):
 | `CapacityBond` | Operator registry; custodies the TOKEN bond, executes escrow-on-slash, reports settlements to `FeeRouter` | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
 | `FeeRouter` | 60/30/10 settlement split (operator / buyback / treasury) and the canonical served-bytes accountant for vote weight | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
 | `PaymentPool` | Shared USDC payment pool with off-chain vouchers and on-chain redemption; forwards fees to `FeeRouter` rather than skimming inline | [003](../adr/003-payments.md) |
-| `SlashJudge` | On-chain adjudicator for signature-dependent slashable offenses; verifies the EIP-712 slash signature | [028](../adr/028-slashing-appeals.md) |
+| `SlashJudge` | On-chain adjudicator for signature-dependent slashable offenses; verifies the EIP-712 slash signature through a commit–reveal challenge | [014](../adr/014-on-chain-verification.md) |
 | `SlashAppeal` | Slash-appeal state machine (open → ratify/reverse) holding a per-appeal TOKEN bond | [028](../adr/028-slashing-appeals.md) |
-| `OriginAssignment` | The DAO's positive origin authority — namespace-based origin allow-lists | [011](../adr/011-content-takedown.md) |
+| `OriginAssignment` | Namespace origin sets: a vetted publisher seats and unseats bonded operators as origins for its namespaces | [011](../adr/011-content-takedown.md) |
+| `ManualVettingPolicy` | Genesis vetting policy: a `VETTER_ROLE` holder approves which publishers may seat origins | [011](../adr/011-content-takedown.md#vetting-policies) |
+| `OpenVettingPolicy` | Vetting policy that vets every publisher; for local and test deployments only | [011](../adr/011-content-takedown.md#vetting-policies) |
 | `BuybackBurner` | Swaps the 30% USDC buyback bucket for TOKEN and burns the proceeds; venue-neutral abstract base with a concrete Uniswap V3 subclass | [018](../adr/018-liquidity-strategy.md), [026](../adr/026-tokenomics.md) |
 | `ContentBlacklist` | Global + regional content-hash blacklist, operator- and origin-level blacklists | [011](../adr/011-content-takedown.md) |
-| `PublisherRegistry` | Permissionless namespace creation and append-only content claims | [002](../adr/002-content-addressing.md) |
+| `PublisherRegistry` | Permissionless namespace creation and timelocked namespace ownership transfer | [002](../adr/002-content-addressing.md) |
 | `DecdnGovernor` | Served-bytes-weighted on-chain governor with a Timelock executor | [036](../adr/036-served-bytes-voting-weight.md) |
 | `Ed25519Verifier` | RFC 8032 PureEdDSA verifier (crypto-lib EIP-6565) with strict canonicalization guards | — |
 
@@ -77,7 +79,7 @@ FOUNDRY_PROFILE=fuzz forge test         # 10k fuzz, 1024/100-depth (nightly/manu
 forge snapshot --diff .gas-snapshot     # current gas vs committed baseline
 ```
 
-For a local chain with the full suite deployed in one command, run [`./dev-deploy.sh`](dev-deploy.sh). See [`../CONTRIBUTING.md#solidity-development`](../CONTRIBUTING.md#solidity-development) for the full workflow (coverage, gas-snapshot updates, install pins) and the [local-deployment guide](../CONTRIBUTING.md#local-deployment-anvil) for what that script does step by step. `--deny warnings` under `FOUNDRY_PROFILE=ci` is stricter than local `forge test` — the common traps are documented in [`../CLAUDE.md`](../CLAUDE.md) under "Solidity CI gotchas".
+For a local chain with the full suite deployed in one command, run [`./dev-deploy.sh`](dev-deploy.sh). See [`../CONTRIBUTING.md#solidity-development`](../CONTRIBUTING.md#solidity-development) for the full workflow (coverage, gas-snapshot updates, install pins) and the [local-deployment guide](../CONTRIBUTING.md#local-deployment-anvil) for what that script does step by step. `--deny warnings` under `FOUNDRY_PROFILE=ci` is stricter than local `forge test` — the common traps are listed under "CI gotchas" in [`../CONTRIBUTING.md#solidity-development`](../CONTRIBUTING.md#solidity-development).
 
 ## Static analysis
 
