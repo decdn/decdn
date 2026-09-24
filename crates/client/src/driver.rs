@@ -1803,7 +1803,13 @@ mod tests {
             .expect("leg")
             .expect("a gap");
         let (header, reader) = primed.inner().open(root, leg.clone()).await.expect("prime");
-        primed.prime(root, leg.clone(), header, reader);
+        primed.prime(
+            root,
+            leg.clone(),
+            header,
+            reader,
+            tokio::time::Instant::now(),
+        );
 
         let spent_ledger = Arc::clone(&ledger);
         let spent = move || spent_ledger.committed().amount;
@@ -2105,7 +2111,7 @@ mod tests {
             .open(root, range.clone())
             .await
             .expect("priming open");
-        primed.prime(root, range, header, reader);
+        primed.prime(root, range, header, reader, tokio::time::Instant::now());
 
         drive(
             &store,
@@ -2153,7 +2159,7 @@ mod tests {
                     .open(root, range.clone())
                     .await
                     .expect("open");
-                primed.prime(root, range, h, r);
+                primed.prime(root, range, h, r, tokio::time::Instant::now());
             }
         };
 
@@ -2183,8 +2189,25 @@ mod tests {
 
         prime(first.clone()).await;
         tokio::time::advance(std::time::Duration::from_secs(3)).await;
-        primed.open(root, first).await.expect("stale");
+        primed.open(root, first.clone()).await.expect("stale");
         assert_eq!(primed.inner().opened_ranges().len(), 7, "stale, so opened");
+
+        // The age runs from the pull's open, not from when it was parked: a pull
+        // held past the bound before `prime` is stale on arrival.
+        let opened_at = tokio::time::Instant::now();
+        let (h, r) = primed
+            .inner()
+            .open(root, first.clone())
+            .await
+            .expect("open");
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        primed.prime(root, first.clone(), h, r, opened_at);
+        primed.open(root, first).await.expect("stale on arrival");
+        assert_eq!(
+            primed.inner().opened_ranges().len(),
+            9,
+            "stale on arrival, so opened"
+        );
     }
 
     #[tokio::test]

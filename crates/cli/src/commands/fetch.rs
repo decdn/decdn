@@ -661,10 +661,11 @@ struct FailoverOrder {
     warming_lead: Option<(PublicKey, f64, f64)>,
     /// The largest blob size any holder reported in its probe, when any did
     /// (`ProbeResponse::total_bytes`). The LARGEST rather than the first: the
-    /// field is unsigned, and this only ever DECLINES fan-out, so taking the
+    /// field is unsigned, and as a gate it only DECLINES fan-out, so taking the
     /// maximum keeps one node's understated hint from suppressing multi-source
-    /// for the whole set. An overstated one costs nothing — the real header
-    /// governs once the fan-out engages.
+    /// for the whole set. The first multi-source open is also cut from it
+    /// (#2063): an overstated one costs that open one extra round trip, and the
+    /// signed header decides the size.
     size_hint: Option<u64>,
     /// Each probed holder's measured [`decdn_protocol::Coverage`] (#1506),
     /// keyed by `node_id`. Proxy-warming candidates never appear here — they
@@ -1072,7 +1073,8 @@ pub(crate) struct ResolvedTargets {
     /// and a throwaway header stream just to learn the size — work the
     /// single-source path then repeats when the gate declines. `None` on the
     /// pinned `--node-id` path and whenever no holder reported a size, where the
-    /// gate falls back to the header open.
+    /// gate falls back to the header open. The first multi-source open is cut
+    /// from it too (#2063).
     pub(crate) size_hint: Option<u64>,
     /// Each probed holder's measured [`decdn_protocol::Coverage`] (#1506),
     /// keyed by `node_id` — what the multi-source lane builder reads instead of
@@ -2469,12 +2471,13 @@ where
     let (total_bytes, ranged_store) = match first {
         PreludeLeg::WholeBlob => {
             let (header, reader) = scored(peer_source.inner().open_whole(hash).await)?;
+            let opened_at = tokio::time::Instant::now();
             let total_bytes = header.total_bytes;
             let ranged_store = open_store(total_bytes)?;
             let whole = align_range(0, 0, total_bytes)?;
             if first_leg(&ranged_store, &[(0, 0)], u64::MAX, max_blob).await? == Some(whole.clone())
             {
-                peer_source.prime(hash, whole, header, reader);
+                peer_source.prime(hash, whole, header, reader, opened_at);
             }
             (total_bytes, ranged_store)
         }
@@ -2482,6 +2485,7 @@ where
             let ranged_store = open_store(total)?;
             if let Some(leg) = first_leg(&ranged_store, ranges, u64::MAX, max_blob).await? {
                 let (header, reader) = scored(peer_source.inner().open(hash, leg.clone()).await)?;
+                let opened_at = tokio::time::Instant::now();
                 if header.total_bytes != total {
                     return Err(anyhow::Error::new(ManifestSizeMismatch {
                         provider,
@@ -2489,7 +2493,7 @@ where
                         manifest: total,
                     }));
                 }
-                peer_source.prime(hash, leg, header, reader);
+                peer_source.prime(hash, leg, header, reader, opened_at);
             }
             (total, ranged_store)
         }
@@ -2980,10 +2984,10 @@ where
 /// declines has built no lane past it. [`build_remaining_lanes`] builds the rest.
 ///
 /// The open is dropped once its header is read. It asks for the whole blob
-/// because the size is not known before it, and no lane's first unit is the
-/// whole blob, so no leg could adopt it. A caller that knows the size before
-/// the first open calls [`prime_admitted_lanes`] instead, whose first open is a
-/// lane's first unit (#2063).
+/// because the size is not known before it, and nothing parks it for a lane. A
+/// caller that knows the size before the first open calls
+/// [`build_primed_lanes`] instead, whose first open is a lane's first unit
+/// (#2063).
 ///
 /// `open_lock` serializes each lane's pool open-or-reuse against other fetches on
 /// the same on-chain pool (`bundle pull` passes its bundle-wide lock; a solo
@@ -3104,11 +3108,43 @@ fn record_first_open(
     }
 }
 
+/// The multi-source size gate for a blob of `total_bytes` over `holders`
+/// admitted holders: below the floor a single fast holder saturates the
+/// downlink, so fan-out is pure overhead. `signed` says whether the size is the
+/// header's or an unsigned expected size, so the log never states a hint as the
+/// blob's size. Returns whether the gate declines.
+fn multi_source_declines(
+    common: &cli::ClientFetchArgs,
+    total_bytes: u64,
+    holders: usize,
+    signed: bool,
+) -> bool {
+    let declines = !should_multi_source(
+        common.multi_source_enabled(),
+        total_bytes,
+        common.multi_source_min_bytes,
+        holders,
+    );
+    if declines {
+        let (approx, source) = if signed {
+            ("", "signed")
+        } else {
+            ("~", "unsigned, expected")
+        };
+        tracing::info!(
+            "multi-source: not engaging — the blob is {approx}{total_bytes} bytes ({source}), \
+             below the {} byte fan-out floor (--multi-source-min-bytes)",
+            common.multi_source_min_bytes
+        );
+    }
+    declines
+}
+
 /// The size a download's first open is cut from: `expected`, unless the
 /// download resumes a ranged store beside `output`. A size known before the
 /// first open lets that open be a lane's first unit rather than a size probe
 /// that is dropped (#2063); a resume starts at its first gap, not at that unit,
-/// so it probes the size as before.
+/// so it reads the size with a whole-blob open ([`build_probed_lanes`]).
 fn fresh_download_size(expected: Option<u64>, output: &Path) -> anyhow::Result<Option<u64>> {
     let Some(expected) = expected else {
         return Ok(None);
@@ -3187,6 +3223,7 @@ async fn build_primed_lanes<'a, P>(
     hash: [u8; 32],
     open_lock: Option<&tokio::sync::Mutex<()>>,
     ledgers: Option<&LaneLedgers>,
+    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
     expected: u64,
     unit: impl FnOnce(usize) -> anyhow::Result<AlignedRange>,
     prime_cap: usize,
@@ -3208,9 +3245,37 @@ where
     )
     .await?;
     let unit = unit(lanes.len())?;
-    let total_bytes =
-        prime_admitted_lanes(deps, &mut lanes, hash, expected, &unit, prime_cap).await?;
+    let total_bytes = prime_admitted_lanes(
+        deps,
+        &mut lanes,
+        coverage_by_node,
+        hash,
+        expected,
+        &unit,
+        prime_cap,
+    )
+    .await?;
     Ok((lanes, total_bytes))
+}
+
+/// Whether the `ix`-th lane opens the face's first `unit` rather than the whole
+/// blob: it sits below `prime_cap` (a face's lane cap, past which the face
+/// never hands it the first unit) and its `coverage` includes every discovery
+/// block of `unit`, since the scheduler reserves a unit only on a lane that
+/// covers it.
+fn lane_opens_unit(
+    ix: usize,
+    prime_cap: usize,
+    coverage: &decdn_protocol::Coverage,
+    unit: &AlignedRange,
+) -> bool {
+    if ix >= prime_cap || unit.fetch_len() == 0 {
+        return false;
+    }
+    let block_bytes = decdn_protocol::discovery_block_bytes();
+    let first = unit.fetch_start() / block_bytes;
+    let last = (unit.fetch_end() - 1) / block_bytes;
+    (first..=last).all(|block| u32::try_from(block).is_ok_and(|block| coverage.covers(block)))
 }
 
 /// Open `unit`, the range a face hands a lane first, on each of `lanes` in
@@ -3223,11 +3288,12 @@ where
 /// `expected` is the size `unit` was cut from: the bundle manifest's `size`, or
 /// the largest probe-reported size. Neither is signed, so a provider that signs
 /// another size wins: its pull is dropped and the fetch runs at the signed size,
-/// unprimed. A bounded open that fails is asked again for the whole blob before
-/// the lane counts as failed, so a wrong `expected` (a range past the blob's
-/// end) never sinks a healthy holder. Only lanes below `prime_cap` (a face's
-/// lane cap) open `unit`; a lane past it opens the whole blob, as
-/// [`probe_admitted_total`] does, since the face never runs it.
+/// unprimed. A bounded open that fails because the range runs past the blob's
+/// end ([`decdn_client::is_range_past_end`]) is asked again for the whole blob,
+/// so a wrong `expected` never sinks a healthy holder; any other failure fails
+/// the lane at once, as it would the whole-blob open. Only a lane that
+/// [`lane_opens_unit`] opens `unit`; any other opens the whole blob, as
+/// [`probe_admitted_total`] does.
 ///
 /// Call it only once every lane is built: a pull parked longer than
 /// [`decdn_client::PRIMED_MAX_IDLE`] is dropped unadopted, and a lane's pool
@@ -3237,9 +3303,11 @@ where
 /// # Errors
 ///
 /// The last lane's open error, when no lane answers.
+#[allow(clippy::too_many_arguments)]
 async fn prime_admitted_lanes<P>(
     deps: &DriveFetchDeps<'_, P>,
     lanes: &mut [MultiLane<'_>],
+    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
     hash: [u8; 32],
     expected: u64,
     unit: &AlignedRange,
@@ -3251,42 +3319,51 @@ where
     let peer_store = decdn_client::PeerStore::open(&deps.chain.data_dir);
     let peer_store_cfg = decdn_client::StoreConfig::default();
     let mut last_err = None;
+    let num_blocks = decdn_protocol::num_blocks(expected);
     for (ix, lane) in lanes.iter_mut().enumerate() {
         let peer = lane.source.inner();
-        let bounded = if ix < prime_cap {
+        let coverage = lane_coverage(coverage_by_node, lane.node_id, num_blocks);
+        let bounded = if lane_opens_unit(ix, prime_cap, &coverage, unit) {
             match peer.open(hash, unit.clone()).await {
-                Ok(pull) => Some(pull),
-                Err(err) => {
+                Ok((header, reader)) => Ok(Some((header, reader, tokio::time::Instant::now()))),
+                // A range past the blob's end means `expected` was wrong, not the
+                // holder: ask it for the whole blob instead.
+                Err(err) if decdn_client::is_range_past_end(&err) => {
                     tracing::debug!(
-                        "a first-unit open failed ({err:#}); opening the whole blob in case \
-                         the expected size is wrong"
+                        peer = %lane.node_id,
+                        "the first unit runs past the blob's end ({err:#}); opening the whole \
+                         blob, as the expected size is wrong"
                     );
-                    None
+                    Ok(None)
                 }
+                Err(err) => Err(err),
             }
         } else {
-            None
+            Ok(None)
         };
         let opened = match bounded {
-            Some((header, reader)) => Ok((header, Some(reader))),
-            None => peer
+            Ok(Some((header, reader, opened_at))) => Ok((header, Some((reader, opened_at)))),
+            Ok(None) => peer
                 .open_whole(hash)
                 .await
                 .map(|(header, _whole)| (header, None)),
+            Err(err) => Err(err),
         };
         match opened {
-            Ok((header, reader)) => {
+            Ok((header, parked)) => {
                 record_first_open(&peer_store, &peer_store_cfg, &lane.node_id, Ok(&header));
                 let total_bytes = header.total_bytes;
-                match reader {
-                    Some(reader) if total_bytes == expected => {
-                        lane.source.prime(hash, unit.clone(), header, reader);
+                match parked {
+                    Some((reader, opened_at)) if total_bytes == expected => {
+                        lane.source
+                            .prime(hash, unit.clone(), header, reader, opened_at);
                         lane.first_unit = Some(unit.clone());
                     }
-                    Some(_) => tracing::debug!(
+                    Some(_) => tracing::warn!(
+                        peer = %lane.node_id,
                         signed = total_bytes,
                         expected,
-                        "the provider signs another size than expected; its first open is dropped"
+                        "the provider signs another size than expected; dropping its first open"
                     ),
                     None => {}
                 }
@@ -3462,6 +3539,7 @@ where
             hash,
             None,
             None,
+            coverage_by_node,
             expected,
             |_| Ok(unit),
             lane_cap,
@@ -3615,9 +3693,14 @@ where
 /// whole-file path.
 ///
 /// Returns `Ok(Some(total_bytes))` once the blob is written, `Ok(None)` when the
-/// authoritative header size gate declines (the caller runs its single-source
-/// failover loop), or `Err` when the parallel fetch fails after every candidate
-/// is exhausted — the `.partial` beside `output` is left for a later resume.
+/// size gate declines (the caller runs its single-source failover loop), or
+/// `Err` when the parallel fetch fails after every candidate is exhausted — the
+/// `.partial` beside `output` is left for a later resume. The gate runs on
+/// `expected_size` before any open, and again on the signed header size.
+///
+/// `expected_size` is the unsigned size the first open is cut from, so that
+/// open is a lane's first unit (#2063). A resume, or `None`, reads the size
+/// with a whole-blob open instead.
 ///
 /// Each admitted candidate becomes its OWN payment lane; the Downloader stripes
 /// across them, fails over between them (#1174), bao-verifies every byte, and
@@ -3647,24 +3730,11 @@ where
 {
     // Size gate: below the floor a single fast holder saturates the downlink, so
     // fan-out is pure overhead — fall through to the single-source path.
-    let declines = |total_bytes: u64| {
-        let declines = !should_multi_source(
-            common.multi_source_enabled(),
-            total_bytes,
-            common.multi_source_min_bytes,
-            admitted.len(),
-        );
-        if declines {
-            tracing::info!(
-                "multi-source: not engaging — the blob is {total_bytes} bytes, below the {} \
-                 byte fan-out floor (--multi-source-min-bytes)",
-                common.multi_source_min_bytes
-            );
-        }
-        declines
+    let declines = |total_bytes: u64, signed: bool| {
+        multi_source_declines(common, total_bytes, admitted.len(), signed)
     };
     let (lanes, total_bytes) = if let Some(expected) = fresh_download_size(expected_size, output)? {
-        if declines(expected) {
+        if declines(expected, false) {
             return Ok(None);
         }
         let (lanes, total_bytes) = build_primed_lanes(
@@ -3677,13 +3747,14 @@ where
             hash,
             open_lock,
             ledgers,
+            coverage_by_node,
             expected,
             |lanes| decdn_client::download_first_unit(expected, lanes),
             usize::MAX,
         )
         .await?;
         // The gate ran on an unsigned size; run it again on the signed one.
-        if total_bytes != expected && declines(total_bytes) {
+        if total_bytes != expected && declines(total_bytes, true) {
             return Ok(None);
         }
         (lanes, total_bytes)
@@ -3698,7 +3769,7 @@ where
             hash,
             open_lock,
             ledgers,
-            declines,
+            |total_bytes| declines(total_bytes, true),
         )
         .await?;
         let Some(probed) = probed else {
@@ -5339,6 +5410,40 @@ mod tests {
         assert_ne!(h1.coverage, h2.coverage);
         // A node that was never probed has no entry.
         assert!(!out.coverage_by_node.contains_key(&node_key(99)));
+    }
+
+    /// Only a lane below the face's lane cap whose coverage holds every block of
+    /// the unit opens it; the scheduler would refuse to reserve it on any other.
+    #[test]
+    fn only_a_capped_covering_lane_opens_the_first_unit() {
+        let block = decdn_protocol::discovery_block_bytes();
+        let total = 3 * block;
+        let blocks = decdn_protocol::num_blocks(total);
+        let full = decdn_protocol::Coverage::full(blocks);
+        let head = decdn_protocol::Coverage::from_block_indices(blocks, [0].into_iter());
+        let tail = decdn_protocol::Coverage::from_block_indices(blocks, [1, 2].into_iter());
+        let first_block = align_range(0, block, total).expect("align");
+        let two_blocks = align_range(0, 2 * block, total).expect("align");
+
+        assert!(super::lane_opens_unit(0, 1, &full, &first_block));
+        assert!(super::lane_opens_unit(0, 1, &head, &first_block));
+        assert!(
+            !super::lane_opens_unit(1, 1, &full, &first_block),
+            "past the cap"
+        );
+        assert!(
+            !super::lane_opens_unit(0, 1, &tail, &first_block),
+            "block 0 uncovered"
+        );
+        assert!(
+            !super::lane_opens_unit(0, 1, &head, &two_blocks),
+            "block 1 uncovered"
+        );
+        let empty = align_range(0, 0, 0).expect("align");
+        assert!(
+            !super::lane_opens_unit(0, 1, &full, &empty),
+            "nothing to open"
+        );
     }
 
     /// A download cuts its first open from the expected size only when it starts

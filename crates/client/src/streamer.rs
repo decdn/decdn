@@ -1113,7 +1113,13 @@ mod tests {
         let unit = super::stream_first_unit(total, &config)?;
         let primed_b = PrimedSource::new(src_b);
         let (header, reader) = primed_b.inner().open(root, unit.clone()).await?;
-        primed_b.prime(root, unit.clone(), header, reader);
+        primed_b.prime(
+            root,
+            unit.clone(),
+            header,
+            reader,
+            tokio::time::Instant::now(),
+        );
         let mut cand_b = candidate(primed_b, ledger_b, 0xB2);
         cand_b.first_unit = Some(unit.clone());
 

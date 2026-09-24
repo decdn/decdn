@@ -1868,6 +1868,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// `--jobs 3` with overlapping provider sets runs those entries'
     /// transfers concurrently; only the per-lane voucher issuance
     /// serializes, not the transfer.
+    ///
+    /// `total` is the manifest's optional `size`, which the first open is cut
+    /// from (#2063).
     async fn try_multi_source(
         &self,
         order: &fetch::ResolvedTargets,
@@ -1911,8 +1914,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             self.relays,
             hash,
             staging,
-            // The manifest's size, else the probed hint: neither is signed, so it
-            // only shapes the first open (#2063).
+            // The manifest's size, else the probed hint. Neither is signed: it
+            // cuts the first open (#2063) and can decline fan-out early, and the
+            // signed header decides the size.
             total.or(order.size_hint),
             progress,
             Some(&self.open_lock),
@@ -1934,6 +1938,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// candidate, a terminal one stops, and the last error surfaces once the list
     /// is exhausted. Every attempt draws on the ONE shared pool and resumes the
     /// entry's `.partial` beside `staging`, so a fail-over re-pays nothing.
+    ///
+    /// `total` is the manifest's optional `size`, passed to the multi-source
+    /// fan-out to cut its first open from (#2063).
     async fn fetch_to_staging(
         &self,
         hash: [u8; 32],

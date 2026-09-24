@@ -1732,13 +1732,12 @@ fn spawn_a_lying_server(
 }
 
 /// A protocol-correct upstream that serves the *right* bytes but pauses, on the
-/// client stream, between reading B's `StreamRequest` and emitting any bytes: it
-/// fires `received` once B's upstream request lands, then blocks on `release`
-/// before streaming. Because B becomes the `claim_fill` Owner *before* it dials
-/// upstream, the `received` signal proves B's owner pull is in flight and B's
-/// cache is still empty — so a test can open a second same-hash request against B
-/// while the gate is held and deterministically drive it into the `claim_fill`
-/// Attach branch (#895/#305: one upstream pull, no double spend). Modelled on
+/// client stream, between its response header and the first chunk: it answers
+/// B's `StreamRequest` header at once, fires `received`, then blocks on `release`
+/// before streaming. B claims its fill once it reads that header, so a test that
+/// waits for the claim can open a second same-hash request against B while the
+/// gate is held and deterministically drive it into the `claim_fill` Attach
+/// branch (#895/#305: one upstream pull, no double spend). Modelled on
 /// [`serve_wrong_bytes`] but honest + gated.
 async fn serve_gated_correct_bytes(
     conn: Connection,
@@ -1758,13 +1757,14 @@ async fn serve_gated_correct_bytes(
     // range pull follows on a SECOND bi-stream of the same connection.
     //
     // So loop over the connection's bi-streams, and answer every request's header
-    // at once: the buyer must read `total_bytes` to sign its own response and claim
-    // its fill before the test opens the coalescing request. Gate ONLY the chunk
-    // data of a real pull, and never signal `received` for a whole-tail handshake,
-    // so the test's `received` wait resolves on the real owner pull (the in-flight
-    // tee) landing, and the single `release` reaches the pull that actually blocks
-    // on it. A handshake records no watermark, so `upstream.len() == 1` (single
-    // SPEND) holds either way.
+    // at once: B needs the primed handshake's header to sign its response and
+    // claim its fill, so gating the header would stall it before the claim. Gate
+    // ONLY the chunk data of a real pull, and never signal `received` for a
+    // whole-tail handshake, so the test's `received` wait resolves on the real
+    // owner pull (the in-flight tee) landing, and the single `release` reaches the
+    // pull that actually blocks on it. A whole-tail handshake records no watermark,
+    // and a primed handshake is the one real pull, so `upstream.len() == 1`
+    // (single SPEND) holds either way.
     loop {
         // No further stream on this connection (the buyer finished on the handshake
         // alone, or opened the real pull on a fresh connection handled by another
@@ -8045,11 +8045,12 @@ async fn window_pull_through_serves_and_caches_empty_blob() -> Result<()> {
 /// (`engine.rs`); this pins the handler-side consequence at the layer that
 /// actually spends.
 ///
-/// Determinism: a gated upstream A parks after receiving B's (single) upstream
-/// request. Because B becomes the `claim_fill` Owner before dialing upstream, the
-/// gate signal proves the owner pull is in flight and B's cache is still empty,
-/// so the second leaf — launched while the gate is held — is expected to Attach.
-/// The no-double-spend assertions hold for every interleaving regardless.
+/// Determinism: a gated upstream A answers B's (single) upstream request's header,
+/// then holds its bytes. B's handshake is its owner pull (#2063), and B becomes
+/// the `claim_fill` Owner once it reads that header, so the test waits for that
+/// claim: B's cache is still empty and the owner pull is in flight, and the second
+/// leaf — launched while the gate is held — is expected to Attach. The
+/// no-double-spend assertions hold for every interleaving regardless.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Result<()> {
@@ -8134,6 +8135,15 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
                  before reading B's upstream StreamRequest"
             )
         })?;
+    // A answers the header before it gates the bytes, and B claims its fill only
+    // once it reads that header, so wait for the claim itself.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while cache_b.in_flight_total(hash).is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("B never claimed its fill for leaf 1"))?;
 
     // Leaf 2: the coalescing request. With the gate still held, B's cache is empty
     // and leaf 1 owns the in-flight fill as the `claim_fill` Owner, so leaf 2
@@ -11614,7 +11624,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     );
     // One logical pull to A opens ONE connection: `pull_from_candidate`'s
     // whole-blob header handshake is also the drive's first and only leg, which
-    // adopts it (#2063). One stream here means "A WAS pulled once (the hash1
+    // adopts it (#2063). One connection here means "A WAS pulled once (the hash1
     // wedge)".
     anyhow::ensure!(
         streams_a.load(Ordering::SeqCst) == 1,
@@ -11648,7 +11658,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         "fetch #3 must miss: H is offline and A is wedged"
     );
     // THE property under test, at the wire: A's only pull ever is the hash1
-    // wedge (the 1 stream above). A climb past 1 here is the hit path
+    // wedge (the 1 connection above). A climb past 1 here is the hit path
     // re-selecting the wedged provider.
     anyhow::ensure!(
         streams_a.load(Ordering::SeqCst) == 1,

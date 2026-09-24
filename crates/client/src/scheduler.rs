@@ -142,7 +142,7 @@ pub struct SourceLane<'a, S> {
     /// hands it to this lane before any other work. It is ignored, and planned
     /// like any other range, unless it aligns against this blob, lies wholly
     /// inside the still-missing request, sits inside this lane's coverage, and
-    /// overlaps no other lane's first unit.
+    /// overlaps no earlier lane's reserved first unit.
     pub first_unit: Option<AlignedRange>,
 }
 
@@ -1527,7 +1527,13 @@ mod tests {
         // lane 0 would have been planned anyway.
         let unit = crate::download_first_unit(total, 2)?;
         let (header, reader) = src_b.inner().open(root, unit.clone()).await?;
-        src_b.prime(root, unit.clone(), header, reader);
+        src_b.prime(
+            root,
+            unit.clone(),
+            header,
+            reader,
+            tokio::time::Instant::now(),
+        );
 
         let full = Coverage::full(num_blocks(total));
         let lanes = vec![

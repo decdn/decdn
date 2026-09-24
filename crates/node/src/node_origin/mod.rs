@@ -1811,6 +1811,9 @@ async fn pull_from_candidate_in_span(
             return Err(PullMiss::for_verdict(verdict));
         }
     };
+    // The drive adopts the pull only while it is fresh, measured from here: the
+    // thread and runtime below start before the drive's first open.
+    let opened_at = tokio::time::Instant::now();
     let total_bytes = header.total_bytes;
 
     // Run `drive()` on a dedicated blocking-pool thread with its own current-thread
@@ -1922,7 +1925,7 @@ async fn pull_from_candidate_in_span(
                 .flatten();
             match whole_range {
                 Some(range) if first.as_ref() == Some(&range) => {
-                    source.prime(hash_bytes, range, header, whole);
+                    source.prime(hash_bytes, range, header, whole, opened_at);
                 }
                 _ => drop((header, whole)),
             }

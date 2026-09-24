@@ -209,8 +209,9 @@ impl ClientHandler {
                 // No live fill to coalesce onto — handshake upstream to learn the
                 // geometry and secure the pull target this miss will own. ONE discovery
                 // shared by both legs, open-time candidate fallback preserved. The
-                // claim is not made yet; with no live fill it owns the whole request,
-                // so the handshake is cut for that pull.
+                // claim is not made yet; with no live fill it expects to own the whole
+                // request, so the handshake is cut for that pull (step 6a closes the
+                // prime when the claim does not own it).
                 match self
                     .open_pull_leg_bounded(
                         origin.as_ref(),

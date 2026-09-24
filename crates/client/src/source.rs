@@ -503,13 +503,12 @@ impl BlobSource for PeerSource<'_> {
     }
 }
 
-/// How long a primed pull may wait for its adopting open. [`PrimedSource`]'s
-/// doc states the same value; keep the two in step. A pull opened ahead of
+/// How long a primed pull may wait for its adopting open. A pull opened ahead of
 /// its drive is only worth adopting straight away: an idle one is a stream the
 /// peer is holding bytes on, and a peer that sees no voucher for long enough
 /// drops it. A primed pull older than this is dropped and the open goes to the
-/// wrapped source. A caller that holds a pull before it can prime one checks
-/// the pull's own age against the same bound.
+/// wrapped source. The age runs from when the pull opened, which the caller
+/// passes to [`PrimedSource::prime`].
 pub const PRIMED_MAX_IDLE: Duration = Duration::from_secs(2);
 
 /// A pull opened ahead of the drive, waiting for the open it answers.
@@ -530,8 +529,8 @@ struct Primed<R> {
 /// origin draw, so the thrown-away open costs a duplicate draw and delays the
 /// real one. [`prime`](Self::prime) parks the live pull here instead, and the
 /// drive's first [`open`](BlobSource::open) of exactly that hash and range takes
-/// it. Any other open, and an open that finds the primed pull older than two
-/// seconds, goes to the wrapped source.
+/// it. Any other open, and an open that finds the primed pull opened longer than
+/// [`PRIMED_MAX_IDLE`] ago, goes to the wrapped source.
 ///
 /// Adoption is by exact [`AlignedRange`] equality, never by containment: a
 /// pull's [`finish`](BlobSource::finish) drains and pays to its stream end, so a
@@ -570,21 +569,25 @@ impl<S: BlobSource> PrimedSource<S> {
         }
     }
 
-    /// Park a live pull of `range` of `hash` for the next open of exactly that
-    /// range. Replaces (and so closes) any pull still parked.
+    /// Park a live pull of `range` of `hash`, opened at `opened_at`, for the next
+    /// open of exactly that range. Replaces (and so closes) any pull still
+    /// parked. The pull's age runs from `opened_at`, not from this call, so a
+    /// caller that holds the pull a while before parking it cannot hand the
+    /// drive a pull the peer has stopped holding.
     pub fn prime(
         &self,
         hash: [u8; 32],
         range: AlignedRange,
         header: UpstreamPullHeader,
         reader: S::Reader,
+        opened_at: tokio::time::Instant,
     ) {
         let parked = Primed {
             hash,
             range,
             header,
             reader,
-            at: tokio::time::Instant::now(),
+            at: opened_at,
         };
         let replaced = self.slot().replace(parked);
         if replaced.is_some() {
