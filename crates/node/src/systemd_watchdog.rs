@@ -63,43 +63,55 @@ impl Heartbeat {
     }
 }
 
-/// Send one `WATCHDOG=1` datagram to `socket`.
-///
-/// # Errors
-///
-/// Fails when the socket cannot be created or the datagram cannot be sent.
+/// A datagram socket bound to the `NOTIFY_SOCKET` address, built once and
+/// reused for every heartbeat.
 #[cfg(unix)]
-pub fn notify_watchdog(socket: &std::ffi::OsStr) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::net::UnixDatagram;
+#[derive(Debug)]
+pub struct Notifier {
+    sock: std::os::unix::net::UnixDatagram,
+    addr: std::os::unix::net::SocketAddr,
+}
 
-    const MESSAGE: &[u8] = b"WATCHDOG=1";
-    let sock = UnixDatagram::unbound()?;
-    // A full receive queue must not block a runtime worker.
-    sock.set_nonblocking(true)?;
-    match socket.as_bytes().strip_prefix(b"@") {
-        Some(name) => send_abstract(&sock, name, MESSAGE),
-        None => sock.send_to(MESSAGE, socket).map(drop),
+#[cfg(unix)]
+impl Notifier {
+    /// A notifier for the `NOTIFY_SOCKET` address `socket`: a filesystem path,
+    /// or an abstract socket name that starts with `@`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the socket cannot be created or the address is invalid.
+    pub fn new(socket: &std::ffi::OsStr) -> std::io::Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+        let addr = match socket.as_bytes().strip_prefix(b"@") {
+            Some(name) => abstract_addr(name)?,
+            None => SocketAddr::from_pathname(socket)?,
+        };
+        let sock = UnixDatagram::unbound()?;
+        // A full receive queue must not block a runtime worker.
+        sock.set_nonblocking(true)?;
+        Ok(Self { sock, addr })
+    }
+
+    /// Send one `WATCHDOG=1` datagram.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the datagram cannot be sent.
+    pub fn notify(&self) -> std::io::Result<()> {
+        self.sock.send_to_addr(b"WATCHDOG=1", &self.addr).map(drop)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn send_abstract(
-    sock: &std::os::unix::net::UnixDatagram,
-    name: &[u8],
-    message: &[u8],
-) -> std::io::Result<()> {
+fn abstract_addr(name: &[u8]) -> std::io::Result<std::os::unix::net::SocketAddr> {
     use std::os::linux::net::SocketAddrExt;
-    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
-    sock.send_to_addr(message, &addr).map(drop)
+    std::os::unix::net::SocketAddr::from_abstract_name(name)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn send_abstract(
-    _sock: &std::os::unix::net::UnixDatagram,
-    _name: &[u8],
-    _message: &[u8],
-) -> std::io::Result<()> {
+fn abstract_addr(_name: &[u8]) -> std::io::Result<std::os::unix::net::SocketAddr> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "abstract NOTIFY_SOCKET names exist only on Linux",
@@ -121,10 +133,20 @@ pub fn spawn() {
 async fn run(heartbeat: Heartbeat) {
     let mut ticker = tokio::time::interval(heartbeat.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut notifier = None;
     let mut warned = false;
     loop {
         ticker.tick().await;
-        match notify_watchdog(&heartbeat.socket) {
+        // A notifier that failed to build is built again on the next tick.
+        let sent = match &notifier {
+            Some(n) => Notifier::notify(n),
+            None => Notifier::new(&heartbeat.socket).and_then(|n| {
+                let sent = n.notify();
+                notifier = Some(n);
+                sent
+            }),
+        };
+        match sent {
             Ok(()) => warned = false,
             Err(error) if !warned => {
                 warned = true;
@@ -187,14 +209,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn sends_watchdog_to_a_path_socket() -> anyhow::Result<()> {
+    fn one_notifier_sends_every_heartbeat_to_a_path_socket() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("notify");
         let listener = std::os::unix::net::UnixDatagram::bind(&path)?;
-        notify_watchdog(path.as_os_str())?;
-        let mut buf = [0u8; 64];
-        let n = listener.recv(&mut buf)?;
-        assert_eq!(buf.get(..n), Some(&b"WATCHDOG=1"[..]));
+        let notifier = Notifier::new(path.as_os_str())?;
+        for _ in 0..2 {
+            notifier.notify()?;
+            let mut buf = [0u8; 64];
+            let n = listener.recv(&mut buf)?;
+            assert_eq!(buf.get(..n), Some(&b"WATCHDOG=1"[..]));
+        }
         Ok(())
     }
 }
