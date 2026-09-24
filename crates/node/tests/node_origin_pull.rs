@@ -7131,7 +7131,7 @@ async fn build_node_b(
 /// `node_pull_deadlines` is B's own upstream `(pull_timeout, stall_timeout)`. Pass
 /// [`DEFAULT_TEST_PULL_DEADLINES`] unless the test is about the deadline gate itself — see
 /// [`provisioned_origin_with_deadlines`] for the one case that is.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn build_node_b_with_leaves(
     a_id: iroh::PublicKey,
     a_addr: std::net::SocketAddr,
@@ -7144,6 +7144,50 @@ async fn build_node_b_with_leaves(
     engine_max_blob_mb: u64,
     content_deny: Option<Arc<decdn_node::content_deny::ContentDenylist>>,
     node_pull_deadlines: (Duration, Duration),
+) -> Result<(
+    Arc<decdn_node::handlers::client::ClientHandler>,
+    EndpointAddr,
+    iroh::Endpoint,
+    Arc<Mutex<Vec<ProgressEntry>>>,
+    decdn_cache::CacheEngine,
+    Arc<Metrics>,
+    Arc<LocalReputation>,
+    Address,
+)> {
+    build_node_b_with_store(
+        a_id,
+        a_addr,
+        a_eth_addr,
+        hash,
+        ab_channel_id,
+        b_buyer,
+        leaves,
+        max_blob_size_bytes,
+        engine_max_blob_mb,
+        content_deny,
+        node_pull_deadlines,
+        |store| Arc::new(store) as Arc<dyn PoolStateStore>,
+    )
+    .await
+}
+
+/// Like [`build_node_b_with_leaves`], but `wrap_store` wraps B's seeded lane
+/// store before the handler takes it, so a test can inject a store fault on the
+/// leaf-facing lane.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn build_node_b_with_store(
+    a_id: iroh::PublicKey,
+    a_addr: std::net::SocketAddr,
+    a_eth_addr: Address,
+    hash: Hash,
+    ab_channel_id: B256,
+    b_buyer: &Arc<PrivateKeySigner>,
+    leaves: &[(B256, Address, Address, U256)],
+    max_blob_size_bytes: u64,
+    engine_max_blob_mb: u64,
+    content_deny: Option<Arc<decdn_node::content_deny::ContentDenylist>>,
+    node_pull_deadlines: (Duration, Duration),
+    wrap_store: impl FnOnce(MemoryPoolStateStore) -> Arc<dyn PoolStateStore>,
 ) -> Result<(
     Arc<decdn_node::handlers::client::ClientHandler>,
     EndpointAddr,
@@ -7195,7 +7239,7 @@ async fn build_node_b_with_leaves(
     // Leak the tempdir guard for the test's lifetime (kept alive by the returned
     // engine's open store anyway).
     std::mem::forget(cache_tmp);
-    let store_b = Arc::new(MemoryPoolStateStore::new());
+    let store_b = MemoryPoolStateStore::new();
     // Each leaf's seller-side lane is keyed by `(pool_id, voucher_signer, this
     // operator)` — B's own operator address is the provider leg (dispatch.rs
     // resolves it from `self.eth_signer`), so the seeded lane must name `b_eth`,
@@ -7239,7 +7283,7 @@ async fn build_node_b_with_leaves(
         &b_metrics,
         limiter,
         cache_b,
-        store_b as Arc<dyn PoolStateStore>,
+        wrap_store(store_b),
         RATE,
         &domains,
         16,
@@ -9458,6 +9502,7 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
          window ({one_window} content = {window_wire} wire)"
     );
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 0)?;
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
@@ -9585,8 +9630,9 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
 
 /// A leaf that answers one chunk with sliver after sliver hits the per-chunk
 /// proof budget on the miss path too (#2132). Each sliver credits something, but
-/// none settles the chunk, so B ends the stream and meters the client abandon
-/// instead of holding the stream and its upstream pull open one sliver at a time.
+/// none settles the chunk, so B ends the stream and meters both the client
+/// abandon and the spent proof budget instead of holding the stream and its
+/// upstream pull open one sliver at a time.
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Result<()> {
     const SLIVER_BYTES: u64 = 64 * 1024;
@@ -9661,8 +9707,161 @@ async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Resul
         Ok(Err(_)) => {}
     }
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 1)?;
 
     leaf.conn.close(0u32.into(), b"done");
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
+/// A lane-store fault while B recoups a proof on the miss path is B's own fault,
+/// not a client abandon (#2134). The leaf pays a valid voucher, B's `record`
+/// fails, and the stream ends. The dispatch sink meters the fault as a node
+/// fault; the client-abandon counter stays at zero.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_store_record_failure_is_a_node_fault_not_an_abandon() -> Result<()> {
+    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
+    let payload = vec![0x4Cu8; payload_len];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xAA);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x4D);
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, b_operator) =
+        build_node_b_with_store(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            &[(
+                leaf_channel_id,
+                leaf_eth.address(),
+                leaf_eth.address(),
+                U256::from(DEPOSIT_MICRO_USDC),
+            )],
+            0,
+            64,
+            None,
+            DEFAULT_TEST_PULL_DEADLINES,
+            |store| {
+                Arc::new(support::FailingRecordStore { inner: store }) as Arc<dyn PoolStateStore>
+            },
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let mut leaf = leaf_reads_first_interval(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+    )
+    .await?;
+    leaf_sends_voucher(
+        &mut leaf.send,
+        &leaf_eth,
+        b_operator,
+        leaf_channel_id,
+        CHUNK_BYTES,
+        min_payment(CHUNK_BYTES, RATE),
+    )
+    .await?;
+
+    // The stream ends on the fault: no further byte and no `StreamEnd`.
+    match tokio::time::timeout(Duration::from_secs(10), read_client(&mut leaf.recv)).await {
+        Err(_elapsed) => anyhow::bail!("B kept the stream open past a lane-store fault"),
+        Ok(Ok(msg)) => anyhow::bail!("expected the stream to fail, got {msg:?}"),
+        Ok(Err(_)) => {}
+    }
+    // The dispatch sink meters the fault after the stream's handles drop, so the
+    // leaf can see the failure first. Wait for the node-fault counter.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while assert_counter(&b_metrics, "serve_stream_node_fault_total", 1).is_err()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_counter(&b_metrics, "serve_stream_node_fault_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 0)?;
+    assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 0)?;
+
+    leaf.conn.close(0u32.into(), b"done");
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
+/// A leaf that drops while B waits for its proof is a client abandon (#2134).
+/// The proof read fails on a peer-attributable transport error, so B meters the
+/// abandon. It is neither a node fault nor a spent proof budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_leaf_drop_in_recoup_is_an_abandon() -> Result<()> {
+    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
+    let payload = vec![0x5Eu8; payload_len];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xAB);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x5F);
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, _b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let leaf = leaf_reads_first_interval(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+    )
+    .await?;
+    // B has put the first interval on the wire and waits for its proof.
+    leaf.conn.close(0u32.into(), b"gone");
+
+    // The inbound stream fails once dispatch sees the error, and dispatch
+    // meters any node fault right after that in the same task. Wait for the
+    // failure, so the node-fault check below reads a settled value.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while assert_counter(&b_metrics, "streams_failed_total{direction=\"inbound\"}", 1).is_err()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_counter(&b_metrics, "streams_failed_total{direction=\"inbound\"}", 1)?;
+    assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 0)?;
+    assert_counter(&b_metrics, "serve_stream_node_fault_total", 0)?;
+
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
 }

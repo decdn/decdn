@@ -825,6 +825,20 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Node: serve-loop payment faults are metered by cause (#2134, #2135).** The
+  miss serve loop counted every proof error and every chunk-write error as a
+  client abandon, including a lane-store `record` failure, a broken paid-frontier
+  invariant, and a write to a stream the node had already closed. Those are
+  node faults, which `decdn_serve_stream_node_fault_total` already meters, so
+  `decdn_node_pull_through_client_abandoned_total` overstated client abandons.
+  The miss serve loop now counts an abandon only when the peer caused the error,
+  in both its chunk-write and its proof-recoup phase. A payer that sends
+  `MAX_PROOFS_PER_CHUNK` proofs for one chunk without settling it now bumps
+  the new counter `decdn_serve_stream_proof_budget_exhausted_total` on both the
+  cache-hit and the miss serve loop. Before, the cache-hit exit logged only at
+  `debug!` and bumped no counter. The delivery dashboard shows the counter
+  beside the other mid-stream stops, and both "Unattributed stream failures"
+  panels subtract it.
 - **Node: a proof that pays part of a chunk no longer wedges the runtime
   (#2132).** A proof credits at most the lane headroom it finds, so a sealed
   voucher that moves the watermark by a sliver pays a sliver of the chunk. Both

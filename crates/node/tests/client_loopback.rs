@@ -79,10 +79,11 @@ use iroh::{Endpoint, EndpointAddr};
 mod support;
 use decdn_node::receipt_log::{DownloadReceipt, spawn_receipt_writer};
 use support::{
-    BlockingReceiptLog, FailingReceiptLog, HandlerDomains, VecReceiptLog, build_handler_full,
-    build_handler_full_configured, build_handler_full_with_receipts, build_handler_full_with_sink,
-    cache_with_blob, empty_cache, fresh_key, local_endpoint, permissive_limiter, read_client_msg,
-    read_stream_response, shutdown, spawn_server, spawn_server_counting, write_client_msg,
+    BlockingReceiptLog, FailingReceiptLog, FailingRecordStore, HandlerDomains, VecReceiptLog,
+    build_handler_full, build_handler_full_configured, build_handler_full_with_receipts,
+    build_handler_full_with_sink, cache_with_blob, empty_cache, fresh_key, local_endpoint,
+    permissive_limiter, read_client_msg, read_stream_response, shutdown, spawn_server,
+    spawn_server_counting, write_client_msg,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -4879,35 +4880,7 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// A `PoolStateStore` that hydrates its seeded channels (so vouchers reach
-/// the apply path) but fails every `record` — exercises the store-record
-/// failure path in [`ClientHandler::commit_one_proof`].
-#[derive(Debug)]
-struct FailingRecordStore {
-    inner: MemoryPoolStateStore,
-}
-
-impl PoolStateStore for FailingRecordStore {
-    fn load_all(&self) -> Result<Vec<LaneState>, decdn_incentive::StoreError> {
-        self.inner.load_all()
-    }
-
-    fn record(&self, _state: &LaneState) -> Result<(), decdn_incentive::StoreError> {
-        Err(decdn_incentive::StoreError::Io(std::io::Error::other(
-            "injected transient store failure",
-        )))
-    }
-
-    fn forget(&self, pool_id: LaneKey) -> Result<(), decdn_incentive::StoreError> {
-        self.inner.forget(pool_id)
-    }
-
-    fn get(&self, pool_id: LaneKey) -> Result<Option<LaneState>, decdn_incentive::StoreError> {
-        self.inner.get(pool_id)
-    }
-}
-
-/// A `record` failure is now a hard serve fault, not a clean in-band rejection:
+/// A `record` failure is a hard serve fault, not a clean in-band rejection:
 /// the buffered lane store's `record` is expected to fail only on a poisoned
 /// mutex (ADR 003 §Off-chain voucher state persistence), so `commit_one_proof`
 /// treats it as a fault and aborts the stream rather than writing a `StreamError`
@@ -10428,6 +10401,13 @@ async fn sliver_vouchers_exhaust_the_per_chunk_proof_budget() -> anyhow::Result<
         counter(&fx.metrics, "decdn_serve_stream_node_fault_total")? == 0,
         "a spent proof budget is a client payment fault, not a node fault"
     );
+    anyhow::ensure!(
+        counter(
+            &fx.metrics,
+            "decdn_serve_stream_proof_budget_exhausted_total"
+        )? == 1,
+        "a spent proof budget must be counted"
+    );
 
     fx.conn.close(0u32.into(), b"done");
     shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
@@ -10455,6 +10435,13 @@ async fn a_chunk_settled_by_the_last_proof_of_its_budget_is_paid() -> anyhow::Re
 
     // Interval 2 is paid, so interval 3 arrives.
     read_exact_chunks(&mut fx.recv, HARNESS_INTERVAL_BYTES).await?;
+    anyhow::ensure!(
+        counter(
+            &fx.metrics,
+            "decdn_serve_stream_proof_budget_exhausted_total"
+        )? == 0,
+        "a chunk the last proof of its budget settles must not count as a spent budget"
+    );
 
     fx.conn.close(0u32.into(), b"done");
     shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;

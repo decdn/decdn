@@ -1214,6 +1214,9 @@ pub struct DecdnMetrics {
     /// serves the requesting client dropped or underpaid mid-pull, so the node
     /// aborted the upstream pull and abandoned the partial fill. The per-request
     /// loss is bounded to the ramped credit window; a sustained rate flags a leech.
+    /// A node-side fault on the serve leg is not an abandon: it counts on
+    /// `decdn_serve_stream_node_fault_total` only. A spent per-chunk proof budget
+    /// counts here and on `decdn_serve_stream_proof_budget_exhausted_total`.
     pub node_pull_through_client_abandoned: Counter,
     /// `decdn_node_pull_through_upstream_verify_failed_total` (#856/#915): a
     /// serve-miss pull ingested upstream bytes that failed bao verification against
@@ -1504,6 +1507,19 @@ pub struct DecdnMetrics {
     /// superset of `decdn_serve_frame_accounting_fault_total`, which meters one of
     /// the four classes on its own.
     pub serve_stream_node_fault: Counter,
+    /// `decdn_serve_stream_proof_budget_exhausted_total`: a `cdn/client/v1`
+    /// delivery ended because the payer sent `MAX_PROOFS_PER_CHUNK` proofs for one
+    /// chunk and none of them settled it. Bumped on both the cache-hit and the
+    /// miss serve loop; on the miss loop the same exit also counts on
+    /// `decdn_node_pull_through_client_abandoned_total`.
+    ///
+    /// Each such proof credits part of the chunk or nothing, so a payer that
+    /// answers one chunk with zero-credit vouchers or partial payments ends here.
+    /// This budget is what stops such a payer from holding a stream open (#2132).
+    /// It is a client payment fault, not a node fault, so dispatch logs it only
+    /// at `debug!`; this counter is what makes the rate visible at the default log
+    /// level. Each bump ends exactly one inbound stream as failed.
+    pub serve_stream_proof_budget_exhausted: Counter,
     /// `decdn_load_shed_egress_bps`: current measured egress EWMA, bytes/sec.
     pub load_shed_egress_bps: Gauge,
     /// `decdn_load_shed_pressure_active`: 1 while the load-shed policy considers
@@ -2621,6 +2637,10 @@ recorders! {
     /// on a peer hang-up or a client payment fault. Node-side bug, never peer
     /// behaviour.
     serve_stream_node_fault => serve_stream_node_fault.inc();
+
+    /// Record a `cdn/client/v1` delivery that ended because the payer spent its
+    /// per-chunk proof budget without settling the chunk. Client payment fault.
+    serve_stream_proof_budget_exhausted => serve_stream_proof_budget_exhausted.inc();
 
     /// Record the current measured egress EWMA, bytes/sec.
     load_shed_egress_bps(bps: i64) => load_shed_egress_bps.set(bps);
@@ -4161,6 +4181,7 @@ mod tests {
             "decdn_config_reload_failures_total",
             "decdn_receipt_write_failures_total",
             "decdn_serve_stream_midstream_pool_exhausted_total",
+            "decdn_serve_stream_proof_budget_exhausted_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),

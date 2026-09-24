@@ -22,7 +22,7 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
 use decdn_common::config::ResolvedSecurity;
-use decdn_incentive::PoolStateStore;
+use decdn_incentive::{LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore};
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps, ClientProtocol};
 use decdn_node::metrics::Metrics;
@@ -897,4 +897,33 @@ pub(crate) fn capture_spans() -> SpanCapture {
             capture
         })
         .clone()
+}
+
+/// A `PoolStateStore` that hydrates its seeded channels (so vouchers reach
+/// the apply path) but fails every `record` — exercises the store-record
+/// failure path in `ClientHandler::commit_one_proof`.
+#[derive(Debug)]
+pub(crate) struct FailingRecordStore {
+    /// The seeded store every call but `record` reads through to.
+    pub(crate) inner: MemoryPoolStateStore,
+}
+
+impl PoolStateStore for FailingRecordStore {
+    fn load_all(&self) -> Result<Vec<LaneState>, decdn_incentive::StoreError> {
+        self.inner.load_all()
+    }
+
+    fn record(&self, _state: &LaneState) -> Result<(), decdn_incentive::StoreError> {
+        Err(decdn_incentive::StoreError::Io(std::io::Error::other(
+            "injected transient store failure",
+        )))
+    }
+
+    fn forget(&self, pool_id: LaneKey) -> Result<(), decdn_incentive::StoreError> {
+        self.inner.forget(pool_id)
+    }
+
+    fn get(&self, pool_id: LaneKey) -> Result<Option<LaneState>, decdn_incentive::StoreError> {
+        self.inner.get(pool_id)
+    }
 }
