@@ -648,6 +648,24 @@ async fn a_warm_peer_source_drives_a_range_set_on_one_connection() -> anyhow::Re
     Ok(())
 }
 
+/// One served stream timed its first frame, in the `class` sibling (`hit` or
+/// `miss`) and not the other. A buffered fill serves a miss through the
+/// cache-hit delivery loop, and must still record as a miss.
+fn assert_first_byte_class(metrics: &Metrics, class: &str) -> anyhow::Result<()> {
+    let encoded = metrics.encode()?;
+    for sibling in ["hit", "miss"] {
+        let line = format!(
+            "decdn_serve_first_byte_{sibling}_seconds_count {}",
+            u64::from(sibling == class)
+        );
+        anyhow::ensure!(
+            metric_line_present(&encoded, &line),
+            "missing `{line}`:\n{encoded}"
+        );
+    }
+    Ok(())
+}
+
 /// The stream-outcome family counts one completed inbound stream and no failed
 /// one, with the `vouchers` it accepted and a non-zero byte count.
 fn assert_one_completed_inbound_stream(metrics: &Metrics, vouchers: u64) -> anyhow::Result<()> {
@@ -665,6 +683,9 @@ fn assert_one_completed_inbound_stream(metrics: &Metrics, vouchers: u64) -> anyh
         "decdn_serve_cache_hit_total 1".to_string(),
         "decdn_serve_cache_partial_hit_total 0".to_string(),
         "decdn_serve_cache_miss_total 0".to_string(),
+        // The first frame of the hit records into the hit sibling only.
+        "decdn_serve_first_byte_hit_seconds_count 1".to_string(),
+        "decdn_serve_first_byte_miss_seconds_count 0".to_string(),
     ] {
         anyhow::ensure!(
             metric_line_present(&encoded, &line),
@@ -7420,6 +7441,17 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
         ),
         "cache-miss refusal must bump its reason counter"
     );
+    // A refusal writes no frame, so neither time-to-first-byte sibling records.
+    let text = metrics.encode()?;
+    for line in [
+        "decdn_serve_first_byte_hit_seconds_count 0",
+        "decdn_serve_first_byte_miss_seconds_count 0",
+    ] {
+        anyhow::ensure!(
+            metric_line_present(&text, line),
+            "missing `{line}`:\n{text}"
+        );
+    }
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
@@ -8300,7 +8332,13 @@ async fn empty_cache_with_fs_origin(
 async fn spawn_pull_through_server(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
-) -> anyhow::Result<(EndpointAddr, Address, Endpoint, tokio::task::JoinHandle<()>)> {
+) -> anyhow::Result<(
+    EndpointAddr,
+    Address,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = operator_signer();
@@ -8320,7 +8358,13 @@ async fn spawn_pull_through_server(
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, server_eth.address(), server_ep, server_task))
+    Ok((
+        target,
+        server_eth.address(),
+        server_ep,
+        server_task,
+        metrics,
+    ))
 }
 
 /// Spawn a `ClientHandler` server with `relay_foreign_namespaces = false`
@@ -8680,7 +8724,7 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
         empty_cache_with_fs_origin(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth_addr, server_ep, server_task) =
+    let (target, server_eth_addr, server_ep, server_task, metrics) =
         spawn_pull_through_server(cache, Arc::clone(&store)).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -8715,6 +8759,7 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
         "expected exactly 1 origin fetch, got {}",
         cache_metrics.origin_fetches.get()
     );
+    assert_first_byte_class(&metrics, "miss")?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
@@ -8948,7 +8993,7 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
         empty_cache_with_fs_origin(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth_addr, server_ep, server_task) =
+    let (target, server_eth_addr, server_ep, server_task, _metrics) =
         spawn_pull_through_server(cache, Arc::clone(&store)).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -9014,7 +9059,7 @@ async fn origin_held_serve_miss_signs_a_refusal_rather_than_dropping() -> anyhow
         "precondition: the hash must be indexed as origin-held"
     );
     let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth_addr, server_ep, server_task) =
+    let (target, server_eth_addr, server_ep, server_task, _metrics) =
         spawn_pull_through_server(cache, Arc::clone(&store)).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -9072,7 +9117,13 @@ async fn origin_held_serve_miss_signs_a_refusal_rather_than_dropping() -> anyhow
 async fn spawn_local_populate_server(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
-) -> anyhow::Result<(EndpointAddr, Address, Endpoint, tokio::task::JoinHandle<()>)> {
+) -> anyhow::Result<(
+    EndpointAddr,
+    Address,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = operator_signer();
@@ -9092,7 +9143,13 @@ async fn spawn_local_populate_server(
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, server_eth.address(), server_ep, server_task))
+    Ok((
+        target,
+        server_eth.address(),
+        server_ep,
+        server_task,
+        metrics,
+    ))
 }
 
 /// A server with BOTH the reactive local populate AND a node→node window origin
@@ -9140,7 +9197,7 @@ async fn local_populate_serves_own_origin_with_node_to_node_off() -> anyhow::Res
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
         empty_cache_with_fs_origin(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth_addr, server_ep, server_task) =
+    let (target, server_eth_addr, server_ep, server_task, metrics) =
         spawn_local_populate_server(cache, Arc::clone(&store)).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -9170,6 +9227,7 @@ async fn local_populate_serves_own_origin_with_node_to_node_off() -> anyhow::Res
         "expected exactly 1 local origin fetch, got {}",
         cache_metrics.origin_fetches.get()
     );
+    assert_first_byte_class(&metrics, "miss")?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
@@ -9185,7 +9243,7 @@ async fn unbound_local_populate_is_refused() -> anyhow::Result<()> {
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
         empty_cache_with_fs_origin(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth_addr, server_ep, server_task) =
+    let (target, server_eth_addr, server_ep, server_task, _metrics) =
         spawn_local_populate_server(cache, Arc::clone(&store)).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;

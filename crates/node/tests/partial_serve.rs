@@ -283,6 +283,20 @@ fn assert_serve_cache_class(
             "decdn_{name}_total should be {want} for a {expect} classification, got {got}"
         );
     }
+    // The served stream timed its first frame under the same class: a partial
+    // hit is a hit.
+    let hit = u64::from(expect != "serve_cache_miss");
+    for (sibling, want) in [("hit", hit), ("miss", 1 - hit)] {
+        let got = counter_value(
+            metrics,
+            &format!("serve_first_byte_{sibling}_seconds_count"),
+        )?;
+        anyhow::ensure!(
+            got == want,
+            "decdn_serve_first_byte_{sibling}_seconds_count should be {want} for a {expect} \
+             classification, got {got}"
+        );
+    }
     Ok(())
 }
 

@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::U256;
 use bytes::Bytes;
@@ -21,13 +21,28 @@ use hyper_util::rt::TokioIo;
 use iroh::Endpoint;
 use iroh::metrics::EndpointMetrics;
 use iroh_metrics::{
-    Counter, EncodeLabelSet, EncodeLabelValue, Family, Gauge, MetricsGroup, MetricsSource, Registry,
+    Counter, EncodeLabelSet, EncodeLabelValue, Family, Gauge, Histogram, MetricsGroup,
+    MetricsSource, Registry,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, oneshot};
 
 use crate::chain_events::resumable_watcher::WatcherHook;
+use crate::load_shed::RequestClass;
+
+/// Bucket upper bounds of `decdn_probe_collection_latency_seconds`, per the
+/// registry row in `adr/appendix-observability.md`. The collection window has a
+/// 500 ms ceiling, so the top finite bucket leaves room for a slow scheduler.
+const PROBE_COLLECTION_BUCKETS: [f64; 8] = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
+
+/// Bucket upper bounds shared by the time-to-first-byte histograms. A serve
+/// miss includes discovery and an upstream fill — the whole blob, on a buffered
+/// fill — so the top bucket reaches tens of seconds; a cache hit resolves in the
+/// low buckets.
+const FIRST_BYTE_BUCKETS: [f64; 12] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
 
 /// Cap concurrent `/metrics` connections. Prevents a trivial `DoS` where a
 /// peer opens many sockets to the operational-data endpoint and exhausts
@@ -192,8 +207,8 @@ pub(crate) fn metric_hook(metrics: &Arc<Metrics>, record: fn(&Metrics)) -> Watch
 ///
 /// The group name becomes the metric-name prefix, so fields appear as
 /// e.g. `decdn_probe_requests_total`.
-#[derive(Debug, Default, Serialize, Deserialize, MetricsGroup)]
-#[metrics(name = "decdn")]
+#[derive(Debug, Serialize, Deserialize, MetricsGroup)]
+#[metrics(default, name = "decdn")]
 pub struct DecdnMetrics {
     /// Total probe requests served.
     pub probe_requests: Counter,
@@ -793,6 +808,14 @@ pub struct DecdnMetrics {
     /// orchestrations that found ≥1 candidate provider to try. Denominator for
     /// the success/corruption/unreachable rates below.
     pub node_pull_attempts: Counter,
+    /// `decdn_node_pull_first_byte_seconds`: time to first byte of one paid
+    /// node-to-node pull leg, from the start of its open (a dial included, when
+    /// the node holds no warm connection to the peer) to the first bao bytes
+    /// read off the upstream stream. One observation per leg. An adopted header
+    /// handshake keeps the start of the handshake open, so its window includes
+    /// the handshake. A leg that reads no bytes records nothing.
+    #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
+    pub node_pull_first_byte_seconds: Histogram,
     /// `decdn_node_pull_success_total` (#831): pulls that delivered verified
     /// bytes from an upstream node.
     pub node_pull_success: Counter,
@@ -821,6 +844,13 @@ pub struct DecdnMetrics {
     /// an active staker, or otherwise unselectable) — all three cost the same
     /// network work, which is what this measures.
     pub probe_cache_misses: Counter,
+    /// `decdn_probe_collection_latency_seconds` (ADR 001 §Probe response
+    /// collection): the time from the start of the concurrent probes, dials
+    /// included, to the end of collection — the early stop once enough holders
+    /// answer, or the drain of the probe set, which `PROBE_TIMEOUT` bounds per
+    /// probe. A round that sends no probe records nothing.
+    #[default(Histogram::new(PROBE_COLLECTION_BUCKETS.to_vec()))]
+    pub probe_collection_latency_seconds: Histogram,
     /// `decdn_probe_post_eviction_failures_total` (ADR 001 §Probe cache,
     /// ADR 005 §`EvictedSinceProbe` semantics; #1165): an upstream answered
     /// `StreamError::EvictedSinceProbe` — it held the blob when it signed
@@ -1298,6 +1328,23 @@ pub struct DecdnMetrics {
     /// the conflation the `serve_audit` `Err` arm exists to avoid one branch
     /// earlier, and it bounds how clean a reading of this counter can be.
     pub serve_cache_miss: Counter,
+    /// `decdn_serve_first_byte_hit_seconds`: time to first byte of a paid serve
+    /// the availability gate classed as a hit (complete or partial), from the
+    /// decoded request to the first `ChunkData` frame written. The first frame
+    /// rides the opening credit window, so no client payment round trip is in
+    /// the window; one `getPool` chain read is, when the pool view has no entry
+    /// for the pool. A stream that ends before any frame records nothing.
+    /// Sibling of `serve_first_byte_miss_seconds` on the cache-class axis.
+    #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
+    pub serve_first_byte_hit_seconds: Histogram,
+    /// `decdn_serve_first_byte_miss_seconds`: time to first byte of a paid serve
+    /// the availability gate classed as a miss — the same window as
+    /// `serve_first_byte_hit_seconds`, which here also covers discovery and the
+    /// upstream or origin fill that produces the first frame. A window-paced
+    /// fill streams its first frame early; a buffered fill completes the whole
+    /// blob first, so on that tier the value grows with blob size.
+    #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
+    pub serve_first_byte_miss_seconds: Histogram,
     /// `decdn_origin_directory_get_origins_failures_total`: `getOrigins`
     /// lookups that failed on a cold-namespace cache miss. The directory fails
     /// closed on each (resolves no origins for that request, does not cache
@@ -2512,6 +2559,17 @@ recorders! {
     /// lookup + probe (#1165).
     probe_cache_miss => probe_cache_misses.inc();
 
+    /// One probe round's collection window ended (ADR 001 §Probe response
+    /// collection): `elapsed` runs from the start of the concurrent probes to
+    /// the end of collection.
+    probe_collection_latency(elapsed: Duration) =>
+        probe_collection_latency_seconds.observe(elapsed.as_secs_f64());
+
+    /// One node-to-node pull leg read its first bao bytes `elapsed` after its
+    /// open started.
+    node_pull_first_byte(elapsed: Duration) =>
+        node_pull_first_byte_seconds.observe(elapsed.as_secs_f64());
+
     /// An upstream refused a stream with `EvictedSinceProbe` after answering
     /// `has_blob: true` at probe (ADR 001 §Probe cache; #1165).
     probe_post_eviction_failure => probe_post_eviction_failures.inc();
@@ -3247,6 +3305,36 @@ impl Drop for ConnectionGuard<'_> {
     }
 }
 
+/// One-shot time-to-first-byte clock for one inbound paid serve.
+///
+/// The clock starts when the request is decoded and records into the
+/// `decdn_serve_first_byte_{hit,miss}_seconds` sibling that matches the
+/// [`RequestClass`] the availability gate admitted the serve under. A partial
+/// hit is a [`RequestClass::CacheHit`]. [`Self::record`] consumes the clock, so a stream
+/// records at most once. A stream that ends before its first frame drops the
+/// clock and records nothing.
+#[derive(Debug)]
+pub(crate) struct FirstByteClock {
+    started: Instant,
+    class: RequestClass,
+}
+
+impl FirstByteClock {
+    /// A clock that started at `started`, for a serve of class `class`.
+    pub(crate) const fn new(started: Instant, class: RequestClass) -> Self {
+        Self { started, class }
+    }
+
+    /// Record the time since the clock started: the first frame is written.
+    pub(crate) fn record(self, metrics: &Metrics) {
+        let secs = self.started.elapsed().as_secs_f64();
+        match self.class {
+            RequestClass::CacheHit => metrics.decdn.serve_first_byte_hit_seconds.observe(secs),
+            RequestClass::CacheMiss => metrics.decdn.serve_first_byte_miss_seconds.observe(secs),
+        }
+    }
+}
+
 /// Drop-safe accounting for a paid delivery stream in one direction.
 #[derive(Debug)]
 pub(crate) struct StreamGuard {
@@ -3293,6 +3381,77 @@ mod tests {
     fn metric_value(text: &str, name: &str) -> Option<u64> {
         text.lines()
             .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse::<u64>().ok())
+    }
+
+    /// Every latency histogram exports its full bucket set at zero from startup,
+    /// and one observation lands in the right bucket, the sum and the count.
+    /// Also proves that `exported_series` folds the histogram samples back to
+    /// the base name that a registry row names.
+    #[test]
+    fn latency_histograms_export_buckets_sum_and_count() {
+        const HISTOGRAMS: [&str; 4] = [
+            "decdn_probe_collection_latency_seconds",
+            "decdn_serve_first_byte_hit_seconds",
+            "decdn_serve_first_byte_miss_seconds",
+            "decdn_node_pull_first_byte_seconds",
+        ];
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        let exported = exported_series(&text);
+        for name in HISTOGRAMS {
+            let type_line = format!("# TYPE {name} histogram");
+            assert!(
+                text.lines().any(|l| l == type_line),
+                "missing `{type_line}`"
+            );
+            assert!(
+                has_metric_line(&text, &format!("{name}_bucket{{le=\"+Inf\"}}"), 0),
+                "{name} has no +Inf bucket at zero"
+            );
+            assert!(has_metric_line(&text, &format!("{name}_count"), 0));
+            assert!(
+                exported.contains(name),
+                "exported_series did not fold {name}"
+            );
+        }
+
+        // 40 ms: above the 0.025 bucket, inside the 0.05 bucket of both sets.
+        let elapsed = Duration::from_millis(40);
+        metrics.probe_collection_latency(elapsed);
+        metrics.node_pull_first_byte(elapsed);
+        FirstByteClock::new(Instant::now(), RequestClass::CacheHit).record(&metrics);
+        let text = metrics.encode().unwrap();
+        for name in [HISTOGRAMS[0], HISTOGRAMS[3]] {
+            assert!(has_metric_line(
+                &text,
+                &format!("{name}_bucket{{le=\"0.025\"}}"),
+                0
+            ));
+            assert!(has_metric_line(
+                &text,
+                &format!("{name}_bucket{{le=\"0.05\"}}"),
+                1
+            ));
+            assert!(has_metric_line(
+                &text,
+                &format!("{name}_bucket{{le=\"+Inf\"}}"),
+                1
+            ));
+            assert!(has_metric_line(&text, &format!("{name}_count"), 1));
+            let sum_line = format!("{name}_sum 0.04");
+            assert!(text.lines().any(|l| l == sum_line), "missing `{sum_line}`");
+        }
+        // The clock records into the sibling of its class only.
+        assert!(has_metric_line(
+            &text,
+            "decdn_serve_first_byte_hit_seconds_count",
+            1
+        ));
+        assert!(has_metric_line(
+            &text,
+            "decdn_serve_first_byte_miss_seconds_count",
+            0
+        ));
     }
 
     #[test]
@@ -3400,11 +3559,10 @@ mod tests {
     /// because it requires an exact value-bearing line.
     ///
     /// Histograms get their `_bucket`/`_sum`/`_count` samples folded back to
-    /// the base name too. There is no bare `name` sample for a histogram, so
-    /// without this the first `live` histogram row would fail the registry
-    /// gate with a message telling its author to mark a genuinely-shipping
-    /// metric `planned`. The exporter registers no histograms today; this is
-    /// here so that stays a non-event when one lands.
+    /// the base name too. A histogram has no bare `name` sample, so without
+    /// this every `live` histogram row would fail the registry gate. The raw
+    /// sample names stay in the set as well, so a dashboard selector on
+    /// `<name>_bucket` resolves.
     fn exported_series(text: &str) -> std::collections::HashSet<String> {
         text.lines()
             .filter(|l| !l.starts_with('#') && !l.is_empty())

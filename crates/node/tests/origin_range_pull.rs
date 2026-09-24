@@ -1152,9 +1152,12 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
     );
     // A tier fired at all only because the availability gate classified this as
     // a miss, so the two statements must agree.
+    // Its first frame records into the miss time-to-first-byte sibling too.
     anyhow::ensure!(
         counter_value(&metrics, "serve_cache_miss_total")? == 1
-            && counter_value(&metrics, "serve_cache_hit_total")? == 0,
+            && counter_value(&metrics, "serve_cache_hit_total")? == 0
+            && counter_value(&metrics, "serve_first_byte_miss_seconds_count")? == 1
+            && counter_value(&metrics, "serve_first_byte_hit_seconds_count")? == 0,
         "a serve that ran a fill tier must be classified a miss, not a hit"
     );
     // The outboard is read from the origin once per hash: the serviceability

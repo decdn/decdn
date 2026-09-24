@@ -69,6 +69,7 @@ use super::backend_source::BackendSource;
 use super::funder::NodeFunder;
 use super::funder::{SETTLE_POLL_STEP, settle_wait_budget};
 use super::ranged_pull::{AssembleOutcome, RunOutcome, RunSink, assemble};
+use super::timed_source::{TimedReader, TimedSource, timed_open};
 use super::{
     EconGate, NodeOrigin, NodeOriginDeps, ProbeGather, PullMiss, PullOutcome, SettleOnDrop,
     bind_upstream_ctx, cached_candidates, classify_pull_failure, discover, economic_ceiling,
@@ -246,8 +247,8 @@ pub(crate) struct PrimedHandshake {
     prime: PrimeLeg,
     /// The pull's signed response header.
     header: UpstreamPullHeader,
-    /// The live pull.
-    reader: PullReader,
+    /// The live pull, timed from the start of the handshake open.
+    reader: TimedReader<PullReader>,
 }
 
 /// The injected wait for [`RampPacer`]'s `Wait` and `WaitForMinDraw`: resolve once the serve leg's paid
@@ -593,7 +594,11 @@ impl NodeOrigin {
                 rate_ceiling,
                 deadlines,
             );
-            match source.open(hash_bytes, range.clone()).await {
+            let handshake = timed_open(
+                source.open(hash_bytes, range.clone()),
+                Arc::clone(&deps.metrics),
+            );
+            match handshake.await {
                 Ok((header, reader)) => {
                     drop(stream_guard);
                     let total_bytes = header.total_bytes;
@@ -907,7 +912,7 @@ impl PeerRunSink<'_> {
     /// either way, and closes when it does not answer.
     async fn adopt_primed(
         &self,
-        source: &PrimedSource<PeerSource<'_>>,
+        source: &PrimedSource<TimedSource<PeerSource<'_>>>,
         run: &CoveredRun,
         pool_id: B256,
         ledger: &Arc<PoolLedger>,
@@ -1129,7 +1134,10 @@ impl PeerRunSink<'_> {
             self.deadlines,
         )
         .with_dial_observer(as_observer(&observer));
-        let peer_source = PrimedSource::new(peer_source);
+        let peer_source = PrimedSource::new(TimedSource::new(
+            peer_source,
+            Arc::clone(&self.deps.metrics),
+        ));
         self.adopt_primed(&peer_source, &run, pool_id, &ledger)
             .await;
         let node_funder = NodeFunder::new(

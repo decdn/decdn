@@ -46,6 +46,7 @@ mod backend_source;
 mod funder;
 mod pull_leg;
 mod ranged_pull;
+mod timed_source;
 
 use abandon_drain::{ConnDrain, as_observer, drain_abandoned};
 // Public only so the integration-test teardown helper can pin its own deadline
@@ -74,6 +75,7 @@ use decdn_client::driver::DriveConfig;
 use decdn_client::{BudgetPacer, PeerSource, PrimedSource, drive, first_leg};
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
+use timed_source::{TimedSource, timed_open};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument as _, debug, warn};
 
@@ -878,6 +880,10 @@ async fn probe_and_rank(
     // provider is even tried. `probe_candidate`'s side effects (reputation
     // record, negative-cache insert) are all behind locks, so concurrent runs
     // are safe; ranking afterwards makes result order irrelevant.
+    //
+    // The collection window opens here: every probe, dial included, starts at once on
+    // the first poll.
+    let collection_started = Instant::now();
     let mut probes: futures_util::stream::FuturesUnordered<_> = providers
         .into_iter()
         // Drop peers already known to answer "no" for THIS hash within the TTL.
@@ -901,6 +907,8 @@ async fn probe_and_rank(
         .take(deps.config.probe_fanout)
         .map(|peer| probe_candidate(deps, peer, hash_bytes))
         .collect();
+    // A round that sends no probe has no collection window to record.
+    let sent_any = !probes.is_empty();
     // Collect answers as they arrive and stop early once enough good candidates are in
     // hand: waiting on `join_all` would pace the whole round to the SLOWEST probe — a dead
     // peer that only resolves at its `PROBE_TIMEOUT` — even when the fastest few already
@@ -953,6 +961,10 @@ async fn probe_and_rank(
     // Cancel any probes still pending: the loop has enough (or the set is drained). Their
     // reputation / negative-cache side effects simply do not run for peers we never needed.
     drop(probes);
+    if sent_any {
+        deps.metrics
+            .probe_collection_latency(collection_started.elapsed());
+    }
     let ranked = rank(candidates);
     // ADR 001 §Probe cache: retain the top 10 by selection score, so a repeat
     // miss for this hash inside the TTL skips the lookup and the probe fanout.
@@ -1802,7 +1814,11 @@ async fn pull_from_candidate_in_span(
         rate_ceiling,
         deadlines,
     );
-    let (header, whole) = match handshake_source.open_whole(hash_bytes).await {
+    let handshake = timed_open(
+        handshake_source.open_whole(hash_bytes),
+        Arc::clone(&deps.metrics),
+    );
+    let (header, whole) = match handshake.await {
         Ok(pair) => pair,
         Err(err) => {
             // No bytes pulled, no voucher paid — nothing to settle.
@@ -1915,7 +1931,7 @@ async fn pull_from_candidate_in_span(
                 deadlines,
             )
             .with_dial_observer(as_observer(&observer));
-            let source = PrimedSource::new(source);
+            let source = PrimedSource::new(TimedSource::new(source, Arc::clone(&metrics)));
             // The handshake's pull is the drive's first leg only when that leg is
             // the whole blob: this node holds none of it.
             let whole_range = align_range(0, 0, total_bytes).ok();

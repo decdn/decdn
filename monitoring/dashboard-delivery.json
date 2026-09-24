@@ -1036,12 +1036,150 @@
       "id": 7
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Serve time to first byte",
+      "type": "timeseries",
+      "description": "Fleet p50, p95 and p99 time to first byte of a paid serve, from the decoded request to the first ChunkData frame, split by the blob-availability gate class. A hit is served from held bytes. A miss also waits for discovery and the fill that produces its first frame. The first frame rides the opening credit window, so no client payment round trip is in the window. Refused and reset streams write no frame and are not in these series. The hit series and window-paced misses do not grow with blob size, so an SLO can use them. A buffered fill completes the whole blob before its first frame, so on that tier the miss series grows with blob size.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(decdn_serve_first_byte_hit_seconds_bucket{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "hit p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(decdn_serve_first_byte_hit_seconds_bucket{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])))",
+          "refId": "B",
+          "legendFormat": "hit p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(decdn_serve_first_byte_hit_seconds_bucket{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])))",
+          "refId": "C",
+          "legendFormat": "hit p99"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(decdn_serve_first_byte_miss_seconds_bucket{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])))",
+          "refId": "D",
+          "legendFormat": "miss p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(decdn_serve_first_byte_miss_seconds_bucket{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])))",
+          "refId": "E",
+          "legendFormat": "miss p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(decdn_serve_first_byte_miss_seconds_bucket{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])))",
+          "refId": "F",
+          "legendFormat": "miss p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 33
+      },
+      "id": 9009
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 33
+        "y": 41
       },
       "id": 8,
       "panels": [],
@@ -1146,7 +1284,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 34
+        "y": 42
       },
       "id": 9
     },
@@ -1348,7 +1486,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 34
+        "y": 42
       },
       "id": 10
     },
@@ -1477,7 +1615,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 42
+        "y": 50
       },
       "id": 11
     },
@@ -1606,7 +1744,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 42
+        "y": 50
       },
       "id": 12
     },
@@ -1735,9 +1873,120 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 42
+        "y": 50
       },
       "id": 13
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Pull time to first byte",
+      "type": "timeseries",
+      "description": "Fleet p50, p95 and p99 time to first byte of one paid node-to-node pull leg, from the start of its open to the first bao bytes read. The window includes a dial when the node holds no warm connection to the peer. An adopted header-handshake pull is timed from the start of the handshake open. A rising p95 with a flat serve-hit p95 points at the upstream peers or the path to them, not at the serving nodes\u2019 own stores.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(decdn_node_pull_first_byte_seconds_bucket{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "pull leg p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(decdn_node_pull_first_byte_seconds_bucket{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])))",
+          "refId": "B",
+          "legendFormat": "pull leg p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(decdn_node_pull_first_byte_seconds_bucket{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])))",
+          "refId": "C",
+          "legendFormat": "pull leg p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 57
+      },
+      "id": 9010
     },
     {
       "collapsed": false,
@@ -1745,7 +1994,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 49
+        "y": 65
       },
       "id": 14,
       "panels": [],
@@ -1828,7 +2077,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 50
+        "y": 66
       },
       "id": 15
     },
@@ -1930,7 +2179,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 50
+        "y": 66
       },
       "id": 16
     },
@@ -2041,7 +2290,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 50
+        "y": 66
       },
       "id": 17
     },
@@ -2161,7 +2410,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 57
+        "y": 73
       },
       "id": 18
     },
@@ -2261,7 +2510,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 57
+        "y": 73
       },
       "id": 19
     },
@@ -2391,7 +2640,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 57
+        "y": 73
       },
       "id": 20
     },
@@ -2401,7 +2650,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 64
+        "y": 80
       },
       "id": 21,
       "panels": [],
@@ -2533,7 +2782,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 65
+        "y": 81
       },
       "id": 22
     },
@@ -2644,7 +2893,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 65
+        "y": 81
       },
       "id": 23
     },
@@ -2756,7 +3005,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 65
+        "y": 81
       },
       "id": 24
     },
@@ -2867,7 +3116,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 72
+        "y": 88
       },
       "id": 25
     },
@@ -2909,7 +3158,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 72
+        "y": 88
       },
       "id": 26
     },
@@ -3001,7 +3250,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 79
+        "y": 95
       },
       "id": 9003
     },
@@ -3011,7 +3260,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 87
+        "y": 103
       },
       "id": 9004,
       "panels": [],
@@ -3115,7 +3364,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 88
+        "y": 104
       },
       "id": 9005
     },
@@ -3216,7 +3465,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 88
+        "y": 104
       },
       "id": 9006
     },
@@ -3326,7 +3575,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 88
+        "y": 104
       },
       "id": 9007
     },
@@ -3427,7 +3676,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 95
+        "y": 111
       },
       "id": 9008
     }

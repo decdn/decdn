@@ -18,6 +18,8 @@ use futures_util::FutureExt as _;
 use tracing::Instrument as _;
 
 use super::outcome::{ResetCause, ServeEnd};
+use crate::load_shed::RequestClass;
+use crate::metrics::FirstByteClock;
 
 /// The root span for one inbound serve stream.
 ///
@@ -297,6 +299,9 @@ impl ClientHandler {
                 return Err(err.context(super::wire::PeerFault));
             }
         };
+        // The time-to-first-byte window opens on the decoded request: the accept
+        // and the request read run at the peer's pace, so they stay outside it.
+        let request_decoded_at = std::time::Instant::now();
 
         // Stream-cap exhausted: reset the stream with no signed response.
         // Signing a `StreamResponse` per rejected request would let a request
@@ -694,15 +699,17 @@ impl ClientHandler {
         // admission guard above.
         #[allow(unused_assignments)]
         let mut shed_slot: Option<crate::load_shed::ShedSlot> = None;
+        // The gate's class. The shed gate admits under it and the first-byte clock
+        // records under it. The class is fixed here, because a buffered fill below
+        // serves a miss through the cache-hit `deliver`, and that loop cannot tell.
+        let request_class;
         if audit.is_serveable() {
+            request_class = RequestClass::CacheHit;
             // Serve-path hit rate (see `Metrics::serve_cache_hit`). Metered on the
             // availability decision itself, ahead of the shed gate below, so the
             // ratio stays a property of the store rather than of current pressure.
             self.metrics.serve_cache_hit();
-            match self
-                .shed
-                .try_admit(crate::load_shed::RequestClass::CacheHit, client_node_id)
-            {
+            match self.shed.try_admit(request_class, client_node_id) {
                 Ok(slot) => shed_slot = Some(slot),
                 Err(reason) => {
                     self.metrics.load_shed_refused(reason);
@@ -752,10 +759,8 @@ impl ClientHandler {
                 // apart so the payoff of partial-holder advertisement stays
                 // legible (see `Metrics::serve_cache_partial_hit`).
                 self.metrics.serve_cache_partial_hit();
-                match self
-                    .shed
-                    .try_admit(crate::load_shed::RequestClass::CacheHit, client_node_id)
-                {
+                request_class = RequestClass::CacheHit;
+                match self.shed.try_admit(request_class, client_node_id) {
                     Ok(slot) => shed_slot = Some(slot),
                     Err(reason) => {
                         self.metrics.load_shed_refused(reason);
@@ -793,10 +798,8 @@ impl ClientHandler {
                 // gate below, the floor reservation, and `pull_authorized` can
                 // each end the request before any fill tier runs.
                 self.metrics.serve_cache_miss();
-                match self
-                    .shed
-                    .try_admit(crate::load_shed::RequestClass::CacheMiss, client_node_id)
-                {
+                request_class = RequestClass::CacheMiss;
+                match self.shed.try_admit(request_class, client_node_id) {
                     Ok(slot) => shed_slot = Some(slot),
                     Err(reason) => {
                         self.metrics.load_shed_refused(reason);
@@ -1014,6 +1017,7 @@ impl ClientHandler {
                                             pool_status.map(|s| s.remaining),
                                             rate_per_mb,
                                             floor_reservation,
+                                            FirstByteClock::new(request_decoded_at, request_class),
                                         ))
                                         .await;
                                     }
@@ -1122,6 +1126,7 @@ impl ClientHandler {
                             fault_seen,
                             rate_per_mb,
                             floor_reservation,
+                            FirstByteClock::new(request_decoded_at, request_class),
                         ))
                         .await;
                     }
@@ -1379,6 +1384,7 @@ impl ClientHandler {
             client_node_id,
             rate_per_mb,
             floor_reservation,
+            FirstByteClock::new(request_decoded_at, request_class),
         )
         .await
     }

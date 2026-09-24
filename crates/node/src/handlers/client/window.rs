@@ -4,6 +4,7 @@ use alloy::primitives::U256;
 
 use super::dispatch::{aligned_span, range_out_of_bounds};
 
+use crate::metrics::FirstByteClock;
 use crate::node_origin::{PrimeLeg, PullLegTarget};
 
 use super::{
@@ -107,6 +108,7 @@ impl ClientHandler {
         fault_seen: bool,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
+        first_byte: FirstByteClock,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
         // The ADR 011 OPEN-TIME deny gates are already discharged on the only
         // path that reaches here: `serve_stream` refuses a denylisted hash
@@ -483,6 +485,7 @@ impl ClientHandler {
                 req.byte_len,
                 total_bytes,
                 floor_reservation.as_ref(),
+                first_byte,
             )
             .await;
 
@@ -558,6 +561,7 @@ impl ClientHandler {
         pool_remaining: Option<U256>,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
+        first_byte: FirstByteClock,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
         // Mark that the own-origin serve-miss tier fired for this request, before
         // any admission guard below — the tier-selection signal (#1130), not a
@@ -819,6 +823,7 @@ impl ClientHandler {
                 req.byte_len,
                 total_bytes,
                 floor_reservation.as_ref(),
+                first_byte,
             )
             .await;
 
