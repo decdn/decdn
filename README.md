@@ -97,8 +97,13 @@ decdn node health            # then: node status, node lanes, node top
 `setup` generates the node key and keystore when neither exists, shows the operator terms,
 bonds, registers the node, and prints a go/no-go summary
 ([ADR 019](adr/019-node-onboarding.md)). `--region` is an ISO 3166-1 alpha-2 country code
-([ADR 030](adr/030-node-region-self-attestation.md)). To serve your own content, pass
-`--origin <url>` to `config init`, and seed the origin store with `decdn origin import`.
+([ADR 030](adr/030-node-region-self-attestation.md)).
+
+To serve your own content, import it into a local origin store with
+`decdn origin import --input <path> --to <dir>`, then write the node config with
+`decdn config init --origin file://<absolute-dir>` (`--force` replaces an existing one).
+For an S3 origin, import to a local directory and `aws s3 sync` it to the bucket: the two
+layouts are identical.
 
 ### Fetch content
 
@@ -112,11 +117,14 @@ decdn key-gen --output-dir ~/.decdn/client
 decdn --config ~/.decdn/client.toml fetch --hash <blake3-hash> -o ./blob.bin
 ```
 
-`fetch` discovers a node that holds the blob and pays it from a pool you own. It reuses
-your existing pool or opens one with a 10 USDC working deposit, and it tops the pool up
-on-chain without prompting when the balance runs low. Fund the wallet with only what you
-are willing to spend. One pool pays every provider, so there is no per-provider setup.
-Use `decdn pool {…}` to inspect, close, or reclaim a pool.
+`fetch` probes bonded nodes and picks one that holds the blob. When none does, it picks a
+bonded node that pulls the blob through from a peer or its origin, so a cache miss still
+succeeds. It pays the chosen node from a pool you own.
+
+`fetch` reuses your existing pool or opens one with a 10 USDC working deposit, and it tops
+the pool up on-chain without prompting when the balance runs low. Fund the wallet with
+only what you are willing to spend. One pool pays every provider, so there is no
+per-provider setup. Use `decdn pool {…}` to inspect, close, or reclaim a pool.
 
 ### Publish content
 
@@ -182,7 +190,7 @@ deCDN ships two binaries, split like `dockerd` and `docker`
 | `bundle {pull}` | Fetch a directory bundle by manifest ([appendix](adr/appendix-bundles.md)) |
 | `pool {…}` | Client payment-pool lifecycle: `list`, `open`, `top-up`, `close`, `reclaim`, `assign` |
 | `publish {…}` | Publisher control plane: create namespaces; seat and unseat authorized origins |
-| `origin {import}` | Seed an origin store from local content, offline |
+| `origin {import}` | Write local content into a local filesystem origin store, offline and config-free |
 | `appeal {slash}` | File a slash appeal and post the appeal bond ([ADR 028](adr/028-slashing-appeals.md)) |
 
 Run `decdn <command> --help` for flags. Every chain endpoint and contract address comes
