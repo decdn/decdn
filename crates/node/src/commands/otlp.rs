@@ -21,15 +21,16 @@ const OTLP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const OTLP_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 /// The deCDN crates whose spans and events the OpenTelemetry layer exports at
-/// `INFO` and above. Every other crate exports at `WARN` and above only.
+/// `INFO` and above. Every other crate exports `WARN` and `ERROR` events only,
+/// and no spans.
 ///
 /// Fixed, not the log filter: the log level is operator-tunable and
 /// hot-reloadable, and a `log_level = "warn"` must not silently stop every
-/// trace. Dependency spans are almost all `INFO` or below, so iroh's
-/// per-packet spans stay out of the collector, while a dependency's `WARN` or
-/// `ERROR` event — an alloy RPC failure, an iroh connection error — still
-/// lands on the deCDN span it happened in. `debug_span!`s stay local to the
-/// logs.
+/// trace. A dependency's `WARN` or `ERROR` event — an alloy RPC failure, an
+/// iroh connection error — lands on the deCDN span it happened in. A
+/// dependency's own spans never export, whatever their level: iroh opens its
+/// periodic net-report spans at `WARN`, and those alone would outnumber every
+/// deCDN span. `debug_span!`s stay local to the logs.
 const EXPORTED_TARGETS: &[&str] = &[
     "decdn_node",
     "decdn_cache",
@@ -43,7 +44,7 @@ const EXPORTED_TARGETS: &[&str] = &[
 /// level their spans and events would become the next export's payload.
 const OTLP_TRANSPORT_TARGETS: &[&str] = &["h2", "hyper", "hyper_util", "tonic", "tower"];
 
-/// The export filter: [`EXPORTED_TARGETS`] at `INFO`, the OTLP transport
+/// The level filter: [`EXPORTED_TARGETS`] at `INFO`, the OTLP transport
 /// ([`OTLP_TRANSPORT_TARGETS`]) off, everything else at `WARN`.
 fn export_filter() -> tracing_subscriber::filter::Targets {
     use tracing::level_filters::LevelFilter;
@@ -62,16 +63,32 @@ fn export_filter() -> tracing_subscriber::filter::Targets {
         )
 }
 
-/// The tracing layer that exports spans through `provider`, filtered by
-/// [`export_filter`].
+/// Whether `target` names one of the [`EXPORTED_TARGETS`] crates or a module
+/// inside one, matched the way [`tracing_subscriber::filter::Targets`] matches.
+fn is_exported_target(target: &str) -> bool {
+    EXPORTED_TARGETS.iter().any(|crate_name| {
+        target
+            .strip_prefix(crate_name)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    })
+}
+
+/// The tracing layer that exports spans through `provider`: events and spans
+/// pass [`export_filter`], and a span must also come from one of the
+/// [`EXPORTED_TARGETS`].
 pub(super) fn otel_layer<S>(provider: &SdkTracerProvider) -> impl Layer<S> + use<S>
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span>,
 {
+    use tracing_subscriber::filter::FilterExt;
+
     let tracer = opentelemetry::trace::TracerProvider::tracer(provider, "decdn");
+    let spans_from_decdn_only = tracing_subscriber::filter::filter_fn(|meta| {
+        meta.is_event() || is_exported_target(meta.target())
+    });
     tracing_opentelemetry::layer()
         .with_tracer(tracer)
-        .with_filter(export_filter())
+        .with_filter(export_filter().and(spans_from_decdn_only))
 }
 
 /// Span exporter that counts failed export batches into
@@ -398,6 +415,46 @@ mod tests {
             .map_err(|_| anyhow::anyhow!("stub mutex poisoned"))?
             .clone();
         anyhow::ensure!(events == [0, 1], "event counts: {events:?}");
+        Ok(())
+    }
+
+    /// A dependency span never exports, whatever its level: iroh opens its
+    /// net-report spans at `WARN`. A dependency's `WARN` event still lands on the
+    /// deCDN span around it, and a crate named like a deCDN crate is not one.
+    #[test]
+    fn otel_layer_drops_dependency_spans_at_any_level() -> anyhow::Result<()> {
+        use tracing_subscriber::prelude::*;
+
+        let stub = StubExporter::new(false);
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(stub.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(otel_layer(&provider));
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::warn_span!(target: "iroh::net_report", "QADv4").in_scope(|| {});
+            tracing::error_span!(target: "alloy::rpc", "alloy_span").in_scope(|| {});
+            tracing::info_span!(target: "decdn_nodes", "lookalike_span").in_scope(|| {});
+            tracing::info_span!(target: "decdn_node", "app_span").in_scope(|| {
+                tracing::warn_span!(target: "iroh::net_report", "nested_dep_span").in_scope(|| {
+                    tracing::warn!(target: "iroh::net_report", "dependency warning");
+                });
+            });
+        }
+        provider.force_flush()?;
+
+        let names = stub
+            .names
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stub mutex poisoned"))?
+            .clone();
+        anyhow::ensure!(names == ["app_span"], "exported spans: {names:?}");
+        let events = stub
+            .events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stub mutex poisoned"))?
+            .clone();
+        anyhow::ensure!(events == [1], "event counts: {events:?}");
         Ok(())
     }
 

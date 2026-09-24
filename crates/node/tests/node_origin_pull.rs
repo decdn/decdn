@@ -7397,6 +7397,7 @@ async fn spawn_node_a_metered(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
+    let spans = support::capture_spans();
     // 1.5x the pacing window (which floors at `PULL_WINDOW_FLOOR`, ADR 003
     // §Credit window), so the pull crosses exactly one window boundary and pauses
     // once, with a real remainder left to resume. The window — not `CHUNK_BYTES` —
@@ -7506,6 +7507,24 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     assert_relay_counted(&b_metrics, u64::try_from(payload.len())?).await?;
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+
+    // The ranged pull runs on its own thread and runtime; each run from A is an
+    // `upstream_stream` span under the pull thread's `serve_miss_pull`, with the
+    // buffered path's join keys, and the run's legs open under it.
+    let key = hash.to_string();
+    let runs = spans.matching("upstream_stream", "hash", &key);
+    anyhow::ensure!(
+        runs.iter().any(|s| s.parent == Some("serve_miss_pull")
+            && s.fields.get("outcome").map(String::as_str) == Some("filled")
+            && s.fields.get("peer") == Some(&a_id.to_string())
+            && s.fields.get("pool_id") == Some(&ab_channel_id.to_string())),
+        "upstream_stream: {runs:?}"
+    );
+    let opens = spans.matching("open_progressive_pull", "hash", &key);
+    anyhow::ensure!(
+        opens.iter().any(|s| s.parent == Some("upstream_stream")),
+        "a leg of the run must open under upstream_stream: {opens:?}"
+    );
     Ok(())
 }
 

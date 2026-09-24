@@ -59,6 +59,18 @@ pub(crate) enum RunOutcome {
     Cancelled,
 }
 
+impl RunOutcome {
+    /// The `outcome` value the run's `upstream_stream` span records.
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Filled => "filled",
+            Self::Reassign => "reassigned",
+            Self::Terminal(_) => "terminal",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// The outcome of assembling a byte range across partial holders.
 pub(crate) enum AssembleOutcome {
     /// Every gap byte was pulled and admitted.
