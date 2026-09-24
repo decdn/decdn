@@ -974,11 +974,12 @@ impl RunSink for PeerRunSink<'_> {
             .unwrap_or_else(|_| whole_range_chunks(offset, len))
     }
 
-    /// One paid pull of `run` from one candidate, in an `upstream_stream` span:
-    /// the ranged twin of the span `pull_from_candidate` opens on the buffered
-    /// path, with the same fields in the same renderings. The span records the
-    /// run's `outcome` once, when the run ends; `pool_id` lands once the lane is
-    /// bound.
+    /// One attempt to pull `run` from one candidate, in an `upstream_stream`
+    /// span: the ranged twin of the span `pull_from_candidate` opens on the
+    /// buffered path, with the same fields in the same renderings. The span
+    /// records the run's `outcome` once, when the run ends. A run that ends
+    /// before its lane binds has no `pool_id`, and a first run that adopts the
+    /// primed handshake pull has no `open_progressive_pull` child for that leg.
     async fn drive_run(&self, run: CoveredRun) -> RunOutcome {
         let span = tracing::info_span!(
             "upstream_stream",
@@ -1006,10 +1007,10 @@ impl PeerRunSink<'_> {
     // Sequential resolve → econ-gate → open → bind → drive → classify pipeline; the
     // tracing macros and the success/failure classification inflate the
     // cognitive-complexity + line metrics past threshold, exactly as the buffered
-    // `pull_from_candidate` twin does. Splitting it would scatter one linear flow.
+    // `pull_from_candidate_in_span` twin does. Splitting it would scatter one linear flow.
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     async fn drive_run_in_span(&self, run: CoveredRun) -> RunOutcome {
-        // Cancellation before the lane open (#1506). Each run now opens its OWN lane
+        // Cancellation before the lane open (#1506). Each run opens its OWN lane
         // — `open_or_reuse_pool` can escrow a fresh `openChannel` or fire a proactive
         // `topUp`, and `bind_upstream_ctx` / `missing_ranges` run before the `drive`
         // `select!` that watches `cancel`. A serve leg that already finished (client
