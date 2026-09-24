@@ -269,10 +269,11 @@ as `decdn fetch`):
   proxy-warming non-holder do not join the stripe. Each lane takes ranges
   from one shared queue and fills up to `--max-lane-streams` of them at once,
   within the lane permits that are free. A lane that faults leaves the stripe,
-  and the other lanes fill the ranges it left. When no striped lane is left,
-  the entry fails over to its other candidates one at a time. All lanes write
-  into one ranged store. Concurrent ranges top up the one deposit one at a
-  time, from one top-up budget for the entry. A blob that clears
+  and the other lanes fill the ranges it left. A drive stall is a fault of
+  every lane, so all striped lanes leave the stripe. When no striped lane is
+  left, the entry fails over to its other candidates one at a time. All lanes
+  write into one ranged store. Concurrent ranges top up the one deposit one at
+  a time, from one top-up budget for the entry. A blob that clears
   the multi-source gate fans out to its admitted holders per
   [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1).
 - **Failover and retry.** Each entry tries its probed candidates in order. A

@@ -112,9 +112,11 @@ type FetchTarget = (PublicKey, Address);
 /// discovery order.
 enum RangeTargets {
     Pinned(FetchTarget),
-    /// The probed order. Its first `stripe` candidates are the admitted full
-    /// holders the entry's drives stripe across ([`stripe_order`]); the rest
-    /// are failover reserve.
+    /// The probed order. When `stripe` is two or more, its first `stripe`
+    /// candidates are the admitted full holders the entry's drives stripe
+    /// across ([`stripe_order`]) and the rest are failover reserve. When it is
+    /// one, the order is the plain failover order, and its first candidate
+    /// need not be a full holder.
     Discovered {
         order: Vec<NodeCandidate>,
         stripe: usize,
@@ -1625,7 +1627,7 @@ where
 ///
 /// Two more failures fail over within a pass but never start a round: a size
 /// that disagrees with the manifest ([`fetch::ManifestSizeMismatch`] at a
-/// session's first open, [`decdn_client::SignedSizeMismatch`] at a later
+/// primed first open, [`decdn_client::SignedSizeMismatch`] at any other
 /// leg), which every honest provider repeats, and a local disk fault (no permission, a full
 /// or read-only disk, a path that is not a directory), which no provider can
 /// fix.
@@ -3031,8 +3033,9 @@ trait RangeSessions {
 /// open or next in line, so one call returns only when the ranges are filled,
 /// a terminal fault stops them, or no candidate is left. The entry does not go
 /// back to a discovered provider that failed it. A pinned candidate is its own
-/// only one, so each call reopens it. The open sessions and the next candidate
-/// sit under one lock.
+/// only one, so a call reopens it after a failure dropped its session. A
+/// terminal fault or a local disk fault ends the walk at once: no provider can
+/// fix either. The open sessions and the next candidate sit under one lock.
 ///
 /// Only the last session a pass opens opens the drive's first leg, and that
 /// session takes the first gap: a pull primed early would go stale while the
@@ -3040,6 +3043,21 @@ trait RangeSessions {
 struct SessionWalk<S: RangeSessions> {
     sessions: S,
     state: tokio::sync::Mutex<WalkState<S::Session>>,
+}
+
+/// Record `err` as the walk's last error, unless the error it holds already
+/// rules out a retry round and `err` does not ([`entry_retryable`]): a later
+/// transient open failure must not turn a size mismatch or a pool exhaustion
+/// into a round that fails the same way.
+fn keep_walk_error(last: &mut Option<anyhow::Error>, err: anyhow::Error) {
+    let keep_old = last
+        .as_ref()
+        .is_some_and(|old| !entry_retryable(old) && entry_retryable(&err));
+    if keep_old {
+        tracing::debug!("bundle pull: a later candidate also failed: {err:#}");
+    } else {
+        *last = Some(err);
+    }
 }
 
 /// A [`SessionWalk`]'s open sessions and where its walk resumes.
@@ -3117,15 +3135,19 @@ impl<S: RangeSessions> SessionWalk<S> {
                 .filter(|&(_, faulted)| *faulted)
                 .map(|((index, _), _)| self.sessions.label(*index))
                 .collect();
+            // A session with no report is treated as faulted: it is never
+            // reused on a guess.
             let mut faulted = driven.faulted.iter();
             state
                 .open
-                .retain(|_| !faulted.next().copied().unwrap_or(false));
+                .retain(|_| !faulted.next().copied().unwrap_or(true));
             let err = match driven.result {
                 Ok(()) => return Ok(()),
                 Err(err) => err,
             };
-            if retry_disposition(&err) == RetryDisposition::Terminal {
+            // No provider can fix a terminal fault or a local disk fault, so
+            // neither fails over.
+            if retry_disposition(&err) == RetryDisposition::Terminal || is_local_disk_fault(&err) {
                 return Err(err);
             }
             let failed = if failed.is_empty() {
@@ -3147,7 +3169,7 @@ impl<S: RangeSessions> SessionWalk<S> {
                     failed.join(", "),
                 );
             }
-            last_err = Some(err);
+            keep_walk_error(&mut last_err, err);
         }
     }
 
@@ -3197,7 +3219,7 @@ impl<S: RangeSessions> SessionWalk<S> {
                                 self.sessions.label(index),
                             );
                         }
-                        *last_err = Some(err);
+                        keep_walk_error(last_err, err);
                     }
                 }
             }
@@ -7940,7 +7962,7 @@ mod tests {
     }
 
     /// A scripted [`RangeSessions`]: counts opens and drives per candidate and
-    /// fails the drives listed in `fail` as `(candidate, nth drive overall)`.
+    /// fails the lanes listed in `fail` as `(candidate, nth lane-drive)`.
     struct FakeSessions {
         candidates: usize,
         stripe: usize,
@@ -7949,6 +7971,8 @@ mod tests {
         fail: Vec<(usize, usize)>,
         /// Drive calls (1-based) that fail with no lane at fault: a floor trip.
         stall: Vec<usize>,
+        /// Drive calls (1-based) whose first lane faults with this error.
+        lane_error: Vec<(usize, fn() -> anyhow::Error)>,
         fail_open: Vec<usize>,
         opens: std::sync::Mutex<Vec<usize>>,
         /// Candidates that opened with a first leg.
@@ -7968,6 +7992,7 @@ mod tests {
                 pinned: false,
                 fail: Vec::new(),
                 stall: Vec::new(),
+                lane_error: Vec::new(),
                 fail_open: Vec::new(),
                 opens: std::sync::Mutex::new(Vec::new()),
                 primed_opens: std::sync::Mutex::new(Vec::new()),
@@ -8022,6 +8047,16 @@ mod tests {
                 ));
                 calls.len()
             };
+            if let Some((_, make)) = self.lane_error.iter().find(|(c, _)| *c == call) {
+                let mut faulted = vec![false; open.len()];
+                if let Some(first) = faulted.first_mut() {
+                    *first = true;
+                }
+                return LanesDriven {
+                    faulted,
+                    result: Err(make()),
+                };
+            }
             let faulted: Vec<bool> = open
                 .iter()
                 .map(|&(index, session, _)| {
@@ -8247,9 +8282,69 @@ mod tests {
         assert_eq!(calls, vec![vec![0, 1], vec![2]]);
     }
 
+    /// A terminal fault ends the walk at once, unwrapped: no reserve candidate
+    /// opens, because no provider can fix it.
+    #[tokio::test]
+    async fn session_walk_stops_on_a_terminal_fault() {
+        let mut fake = FakeSessions::new(4);
+        fake.stripe = 2;
+        fake.lane_error = vec![(1, || {
+            anyhow::Error::new(decdn_client::BlobTooLarge {
+                received: 2,
+                ceiling: 1,
+            })
+        })];
+        let walk = SessionWalk::new(fake);
+        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
+        assert!(err.downcast_ref::<decdn_client::BlobTooLarge>().is_some());
+        assert!(
+            !format!("{err:#}").contains("candidate provider(s)"),
+            "{err:#}"
+        );
+        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1]);
+    }
+
+    /// A local disk fault ends the walk too: every provider would meet it.
+    #[tokio::test]
+    async fn session_walk_stops_on_a_local_disk_fault() {
+        let mut fake = FakeSessions::new(3);
+        fake.lane_error = vec![(1, || {
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        })];
+        let walk = SessionWalk::new(fake);
+        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
+        assert!(is_local_disk_fault(&err), "{err:#}");
+        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0]);
+    }
+
+    /// The walk keeps an error that rules out a retry round over a later one
+    /// that would allow it, and otherwise keeps the latest.
+    #[test]
+    fn keep_walk_error_keeps_the_error_that_rules_out_a_round() {
+        let mismatch = || {
+            anyhow::Error::new(decdn_client::SignedSizeMismatch {
+                signed: 2,
+                expected: 1,
+            })
+        };
+        let mut last = None;
+        keep_walk_error(&mut last, anyhow!("connect refused"));
+        keep_walk_error(&mut last, mismatch());
+        keep_walk_error(&mut last, anyhow!("connect refused"));
+        assert!(
+            last.as_ref().is_some_and(|e| e
+                .downcast_ref::<decdn_client::SignedSizeMismatch>()
+                .is_some()),
+            "a transient error does not replace the size mismatch"
+        );
+        let mut last = Some(anyhow!("first"));
+        keep_walk_error(&mut last, anyhow!("second"));
+        assert_eq!(format!("{}", last.unwrap()), "second");
+    }
+
     /// A stripe member that will not open is skipped, and the stripe runs on
-    /// the rest; a lone stripe member that opens after a failed one still
-    /// opens the first leg.
+    /// the rest. When the last planned open fails, no session opens the first
+    /// leg for that drive.
     #[tokio::test]
     async fn session_walk_stripes_across_the_members_that_open() {
         let mut fake = FakeSessions::new(3);

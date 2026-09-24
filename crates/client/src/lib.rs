@@ -670,7 +670,7 @@ pub struct BlobTooLarge {
 /// signs the same one. A leg that disagrees would verify against the wrong
 /// tree, so the driver refuses it before it reads a byte. When the caller took
 /// the size from an unsigned source (a bundle manifest), that source is the
-/// likelier fault, and every provider will refuse the same way.
+/// likelier fault, and the driver refuses every provider's leg the same way.
 #[derive(Debug)]
 pub struct SignedSizeMismatch {
     /// The size the provider signed.

@@ -11,10 +11,12 @@
 //!
 //! A whole-tail pull streams one advancing `byte_offset` to the end of the blob;
 //! `drive` instead drives the same money-relevant branches per gap — it draws,
-//! funds, and resumes one missing range at a time. [`drive_range_set`] runs the
-//! same per-gap loop over a set of ranges, several gaps at once; the CLI's
-//! `decdn fetch` and `bundle pull` run it as their fetch core (via `drive_fetch`
-//! and `RangeSession` in `crates/cli/src/commands/fetch.rs`). The branches are:
+//! funds, and resumes one missing range at a time. [`drive_range_lanes`] runs
+//! the same per-gap loop over a set of ranges, several gaps at once across one
+//! or more providers' lanes, and [`drive_range_set`] is its one-lane case; the
+//! CLI's `decdn fetch` and `bundle pull` run it as their fetch core (via
+//! `drive_fetch` and `drive_stripe` in `crates/cli/src/commands/fetch.rs`). The
+//! branches are:
 //!
 //! - **Draw** (the happy path): open the gap's [`AlignedRange`](decdn_bao_range::AlignedRange), stream it through
 //!   [`crate::ClientRangedStore::ingest_stream`] (which durably checkpoints as it goes),
@@ -748,9 +750,13 @@ pub struct RangeSetOutcome {
     /// A failure of the drive itself: `stop`'s error, a store query, a flush
     /// or a finalize.
     error: Option<anyhow::Error>,
-    /// Some gap stayed missing because every lane retired, or a terminal fault
-    /// stopped the drive.
-    unfinished: bool,
+    /// The lanes did not serve the range set: a gap stayed missing (every lane
+    /// retired, or a terminal fault stopped the drive), or every lane faulted.
+    /// A drive whose every lane faulted fails even when the bytes landed: a
+    /// fault after the last byte, in the closing voucher exchange, can leave a
+    /// voucher armed, and the caller must settle it as a failure. `stop` does
+    /// not set it; `error` holds the stop.
+    failed: bool,
 }
 
 impl RangeSetOutcome {
@@ -771,7 +777,7 @@ impl RangeSetOutcome {
     /// itself did not fail.
     #[must_use]
     pub const fn succeeded(&self) -> bool {
-        self.error.is_none() && !self.unfinished
+        self.error.is_none() && !self.failed
     }
 
     /// The drive's result.
@@ -779,18 +785,21 @@ impl RangeSetOutcome {
     /// # Errors
     ///
     /// A failure of the drive itself (`stop`'s error, a store query, a flush or
-    /// a finalize) first. Otherwise, when a gap stayed missing, the decisive
-    /// lane fault: a terminal fault ([`crate::retry_disposition`]) first, then a
-    /// [`PoolExhausted`], then the first to fail. The others are logged.
+    /// a finalize) first; the lane faults are then not part of the error, so a
+    /// caller reads them with [`Self::lane_fault`] first. Otherwise, when the
+    /// lanes did not serve the set (a gap stayed missing, or every lane
+    /// faulted), the decisive lane fault: a terminal fault
+    /// ([`crate::retry_disposition`]) first, then a [`PoolExhausted`], then the
+    /// fault of the earliest lane. The others are logged.
     pub fn into_result(self) -> anyhow::Result<()> {
         if let Some(err) = self.error {
             return Err(err);
         }
-        if !self.unfinished {
+        if !self.failed {
             return Ok(());
         }
         let decisive = self.faults.into_iter().flatten().reduce(keep_decisive);
-        Err(decisive.unwrap_or_else(|| anyhow::anyhow!("the range set was left unfinished")))
+        Err(decisive.unwrap_or_else(|| anyhow::anyhow!("the range set failed with no lane fault")))
     }
 }
 
@@ -802,7 +811,8 @@ struct GapQueue {
     /// The first gap, held for the lane that takes it.
     first: Option<(u64, u64)>,
     /// Gaps a lane is filling now. A worker with nothing to take waits while
-    /// any are in flight, since a fault can put work back.
+    /// any are in flight, since a fault can put work back, and while `first`
+    /// waits for its lane.
     in_flight: usize,
 }
 
@@ -812,16 +822,17 @@ struct GapQueue {
 ///
 /// The missing gaps of every range are merged, so no two gaps overlap, and
 /// each lane takes gaps from one shared queue, up to its
-/// [`RangeLane::width`] at a time. Each gap is filled on one lane from start to
-/// end, so the gaps of one entry spread over every provider that holds it.
-/// Every lane writes into the one `store`, whose present record one interval
-/// flush owns.
+/// [`RangeLane::width`] at a time, so the gaps spread over every lane. Every leg
+/// of a gap runs on the lane that took it, because a gap's paid frontier is a
+/// fact of one ledger. Every lane writes into the one `store`, whose present
+/// record one interval flush owns.
 ///
 /// A lane that faults retires: its other gaps in flight finish, it takes no new
 /// one, and what its failed gap left missing goes back to the front of the
 /// queue for the other lanes. A terminal fault ([`crate::retry_disposition`])
 /// stops every lane from taking a new gap. The drive ends when the queue is
-/// empty and no gap is in flight, or when no lane can take the rest.
+/// empty and no gap is in flight, or when no lane can take the rest. At most
+/// one lane takes the first gap ([`RangeLane::takes_first`]).
 ///
 /// Concurrent gaps need a [`SharedPool`]: the top-up budget and the spend are
 /// facts of the pool, and each concurrent gap keeps its own per-gap counters.
@@ -858,7 +869,7 @@ where
 {
     let faults: Vec<Mutex<Option<anyhow::Error>>> =
         lanes.iter().map(|_| Mutex::new(None)).collect();
-    let unfinished = AtomicBool::new(false);
+    let failed = AtomicBool::new(false);
     let finish =
         |error: Option<anyhow::Error>, faults: Vec<Mutex<Option<anyhow::Error>>>| RangeSetOutcome {
             faults: faults
@@ -869,7 +880,7 @@ where
                 })
                 .collect(),
             error,
-            unfinished: unfinished.load(Ordering::Acquire),
+            failed: failed.load(Ordering::Acquire),
         };
     let total_bytes = store.total_bytes();
     let setup = async {
@@ -880,6 +891,10 @@ where
         anyhow::ensure!(
             pool.is_some() || lanes.len() == 1,
             "a range-set drive over several lanes needs a shared pool"
+        );
+        anyhow::ensure!(
+            lanes.iter().filter(|l| l.takes_first).count() <= 1,
+            "at most one lane of a range-set drive takes the first gap"
         );
         reject_empty_claim_for_nonempty_root(total_bytes, hash)?;
         let base_present = ranges_content_len(&store.present_ranges().await?, total_bytes);
@@ -922,7 +937,7 @@ where
                 )
                 .await;
                 if let Err(err) = filled {
-                    unfinished.store(true, Ordering::Release);
+                    failed.store(true, Ordering::Release);
                     if let Some(slot) = faults.first() {
                         *slot
                             .lock()
@@ -1067,10 +1082,19 @@ where
             .flat_map(|(index, lane)| (0..lane.width.get()).map(move |_| worker(index)));
         let joined = futures_util::future::join_all(workers).await;
         let left = lock();
-        if !left.waiting.is_empty() || left.first.is_some() {
-            unfinished.store(true, Ordering::Release);
+        let every_lane_faulted = faults.iter().all(|f| {
+            f.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+        });
+        if !left.waiting.is_empty() || left.first.is_some() || every_lane_faulted {
+            failed.store(true, Ordering::Release);
         }
-        joined.into_iter().find_map(Result::err).map_or(Ok(()), Err)
+        joined
+            .into_iter()
+            .filter_map(Result::err)
+            .reduce(keep_decisive)
+            .map_or(Ok(()), Err)
     };
     let outcome = drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async {
         tokio::select! {
@@ -1085,7 +1109,7 @@ where
     let finalized = async {
         outcome?;
         flushed?;
-        if !unfinished.load(Ordering::Acquire) && store.is_complete().await? {
+        if !failed.load(Ordering::Acquire) && store.is_complete().await? {
             store.finalize().await?;
         }
         Ok::<(), anyhow::Error>(())
@@ -2546,6 +2570,120 @@ mod tests {
         fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
             self.inner.finish(reader)
         }
+    }
+
+    /// A source that serves `inner`'s blob but faults in the closing exchange
+    /// of every leg, after every byte of it landed.
+    struct FaultOnFinish {
+        inner: ScriptedSource,
+    }
+
+    impl BlobSource for FaultOnFinish {
+        type Reader = <ScriptedSource as BlobSource>::Reader;
+
+        fn open(
+            &self,
+            hash: [u8; 32],
+            range: AlignedRange,
+        ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
+            self.inner.open(hash, range)
+        }
+
+        fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async move {
+                self.inner.finish(reader).await?;
+                anyhow::bail!("reset in the closing voucher exchange")
+            })
+        }
+    }
+
+    /// A one-lane drive on a shared pool whose leg faults after its last byte
+    /// fails: the bytes landed, but the closing exchange can leave a voucher
+    /// armed, so the caller must settle the drive as a failure. The blob is
+    /// not finalized.
+    #[tokio::test]
+    async fn a_fault_after_the_last_byte_fails_a_pooled_one_lane_drive() {
+        let total = 8 * GROUP;
+        let (root, plaintext, _) = synth_blob(total as usize);
+        let dir = tmp_dir();
+        let store = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = FaultOnFinish {
+            inner: ScriptedSource::new(plaintext)
+                .expect("source")
+                .paying(Arc::clone(&ledger)),
+        };
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+        let spent_ledger = Arc::clone(&ledger);
+        let spent = move || spent_ledger.committed().amount;
+        let credit = |_: U256| Ok(());
+        let topups = std::sync::atomic::AtomicU32::new(0);
+        let topup_lock = tokio::sync::Mutex::new(());
+        let pool = SharedPool {
+            spent: &spent,
+            topups_used: &topups,
+            credit: &credit,
+            topup_lock: &topup_lock,
+        };
+        let err = drive_range_set(
+            &store,
+            &source,
+            &BudgetPacer::new(),
+            &healthy_funder(),
+            &ctx,
+            &ledger,
+            root,
+            &[(0, 0)],
+            NonZeroUsize::MIN,
+            &config(),
+            None,
+            Some(&pool),
+            std::future::pending(),
+        )
+        .await
+        .expect_err("the lane faulted");
+        assert!(
+            format!("{err:#}").contains("closing voucher exchange"),
+            "{err:#}"
+        );
+        assert!(
+            !dir.path().join("blob").exists(),
+            "a failed drive does not finalize the blob"
+        );
+    }
+
+    /// A healthy lane that has run out of gaps waits while another lane's gap
+    /// is in flight, and wakes to fill what that lane's fault puts back.
+    #[tokio::test]
+    async fn a_parked_lane_wakes_to_fill_a_faulted_lanes_gap() {
+        let total = 64 * GROUP;
+        let ranges = scattered(total);
+        let specs = [
+            LaneSpec {
+                width: 1,
+                takes_first: true,
+                tweak: |s| {
+                    s.slow_to_start(std::time::Duration::from_millis(300))
+                        .with_fault_after(512, || anyhow::anyhow!("stream reset"))
+                },
+            },
+            LaneSpec::healthy(1),
+        ];
+        let (outcome, sources, store, plaintext) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            lanes_drive(total, &ranges, &specs),
+        )
+        .await
+        .expect("the parked lane wakes; the drive does not hang");
+        assert!(outcome.lane_fault(0).is_some());
+        outcome
+            .into_result()
+            .expect("the healthy lane fills the rest");
+        assert!(
+            sources[1].opened_ranges().contains(&ranges[0]),
+            "the healthy lane took the faulted lane's first gap after it parked"
+        );
+        assert_ranges_present(&store, &plaintext, &ranges).await;
     }
 
     /// A leg whose signed size disagrees with the store's is refused before a

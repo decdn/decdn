@@ -2306,12 +2306,12 @@ where
     /// Settle one lane of a striped drive: stamp the peer when the drive
     /// blames it, then persist the lane's voucher watermark.
     ///
-    /// A lane that served every gap it took, in a drive that filled every
-    /// range, settles at the committed cumulative: each of its legs ran to
-    /// stream end. Any other lane settles at the armed settlement (HIGH), as
-    /// on the multi-source path ([`multi_lane_watermarks`]): its gap can be
-    /// dropped inside its voucher exchange by the floor or by a sibling's
-    /// terminal fault, and another of its gaps can still hold an armed voucher
+    /// A clean lane ([`settles_clean`]) settles at the committed cumulative:
+    /// each of its legs ran to stream end. Any other lane settles at the armed
+    /// settlement (HIGH), as on the multi-source path
+    /// ([`multi_lane_watermarks`]): the floor can drop its gap inside the
+    /// voucher exchange, a fault in a leg's closing exchange can leave a
+    /// voucher armed, and another of its gaps can still hold an armed voucher
     /// after one gap's voucher was rejected. With nothing armed the two are
     /// equal.
     fn settle_lane(&self, store: &RedbBuyerPoolStore, lane: LaneKey, blamed: bool, clean: bool) {
@@ -2813,6 +2813,13 @@ pub(crate) struct StripeLane<'s, 'a, P> {
     pub(crate) takes_first: bool,
 }
 
+/// Whether a lane of a striped drive settles at its committed cumulative: it
+/// served every gap it took, in a drive that filled every range. Anything else
+/// settles at the armed settlement ([`FetchPrelude::settle_lane`]).
+const fn settles_clean(drive_succeeded: bool, lane_fault: Option<&anyhow::Error>) -> bool {
+    drive_succeeded && lane_fault.is_none()
+}
+
 /// How a [`drive_stripe`] drive ended: which lanes faulted, and the drive's
 /// result.
 pub(crate) struct StripeDriven {
@@ -2835,11 +2842,13 @@ pub(crate) struct StripeDriven {
 /// `topups_used` is the one top-up budget they share.
 ///
 /// Afterwards each lane persists its voucher watermark
-/// ([`FetchPrelude::settle_lane`]) and, when the drive blames it, stamps its
-/// peer in the peer store. A lane is blamed for its own fault, or, when no
-/// lane faulted, for a failure of the drive as a whole (a floor trip), except
-/// where our own pool ran dry or the signed size disagrees with the store's
-/// ([`blames_the_peer`]).
+/// ([`FetchPrelude::settle_lane`], clean per [`settles_clean`]) and, when the
+/// drive blames it, stamps its peer in the peer store. A lane is blamed for its
+/// own fault, except where our own pool ran dry, the node's floor exceeds our
+/// deposit, or the signed size disagrees with the store's
+/// ([`blames_the_peer`]). A floor trip ([`EntryStalled`]) blames every lane. A
+/// local fault of the drive itself blames none. Each lane fault is logged
+/// with its provider.
 pub(crate) async fn drive_stripe<P>(
     store: &ClientRangedStore,
     lanes: &[StripeLane<'_, '_, P>],
@@ -2880,17 +2889,27 @@ where
         )
         .await;
     let succeeded = outcome.succeeded();
-    let collective = outcome.drive_error().is_some_and(blames_the_peer)
-        && (0..lanes.len()).all(|i| outcome.lane_fault(i).is_none());
+    // Only the floor is a failure every lane shares. A local fault of the
+    // drive (a store query, a flush, a finalize) is no peer's.
+    let stalled = outcome
+        .drive_error()
+        .is_some_and(|e| e.downcast_ref::<EntryStalled>().is_some());
     let faulted: Vec<bool> = lanes
         .iter()
         .enumerate()
         .map(|(i, lane)| {
             let fault = outcome.lane_fault(i);
-            let blamed = collective || fault.is_some_and(blames_the_peer);
-            let clean = succeeded && fault.is_none();
             let s = lane.session;
-            s.prelude.settle_lane(s.store, s.lane, blamed, clean);
+            if let Some(fault) = fault {
+                tracing::warn!(
+                    "provider {} left the stripe for {}: {fault:#}",
+                    s.lane.provider,
+                    blake3::Hash::from_bytes(lead.hash).to_hex(),
+                );
+            }
+            let blamed = stalled || fault.is_some_and(blames_the_peer);
+            s.prelude
+                .settle_lane(s.store, s.lane, blamed, settles_clean(succeeded, fault));
             fault.is_some()
         })
         .collect();
@@ -6123,6 +6142,19 @@ mod tests {
         assert_eq!(fmt_rate(0.4), "--");
         assert_eq!(fmt_rate(f64::NAN), "--");
         assert_eq!(fmt_rate(f64::INFINITY), "--");
+    }
+
+    /// Only a lane that served every gap in a drive that filled every range
+    /// settles at its committed cumulative. A clean lane in a failed drive (the
+    /// floor dropped its gap mid-exchange) and a faulted lane in a succeeded
+    /// drive both settle at the armed settlement.
+    #[test]
+    fn only_a_clean_lane_in_a_succeeded_drive_settles_at_committed() {
+        let fault = anyhow::anyhow!("stream reset");
+        assert!(settles_clean(true, None));
+        assert!(!settles_clean(false, None));
+        assert!(!settles_clean(true, Some(&fault)));
+        assert!(!settles_clean(false, Some(&fault)));
     }
 
     /// The observing callback feeds the watch with no UI callback (bars off),

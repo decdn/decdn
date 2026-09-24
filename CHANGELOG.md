@@ -1795,9 +1795,11 @@ since project inception and will roll into the first tagged release.
   The entry now opens one warm session on each admitted full holder (one per
   operator, at most `--max-sources`, with multi-source on) and fills its ranges
   from one shared queue across all of them, up to `--max-lane-streams` per
-  lane. A lane that faults leaves the stripe and the other lanes fill what it
-  left. When no striped lane is left, the entry fails over to its other
-  candidates one at a time, as before. All lanes write into the entry's one
+  lane. A lane that faults leaves the stripe, with a warning that names its
+  provider, and the other lanes fill what it left. A drive stall is every
+  lane's fault, so the whole stripe leaves; a local disk fault or a terminal
+  fault ends the entry without failover. When no striped lane is left, the
+  entry fails over to its other candidates one at a time, as before. All lanes write into the entry's one
   ranged store, run under one drive-level floor, and spend one top-up budget.
   A lane that served every gap it took in a drive that filled every range
   settles at its committed cumulative; any other lane settles at its armed
