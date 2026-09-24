@@ -1114,6 +1114,12 @@ fn sync_and_union(
         .sync_data()
         .context("fsyncing .obao4 outboard")?;
 
+    // A checkpoint can carry parents and no leaf: a fault after the proof and
+    // before the first leaf. It adds nothing to `present`. `align_range` reads
+    // a zero length as "to the end of the blob", so it must not see one.
+    if received_end <= range.fetch_start() {
+        return Ok(());
+    }
     let received = decdn_bao_range::align_range(
         range.fetch_start(),
         received_end.saturating_sub(range.fetch_start()),
@@ -2067,6 +2073,41 @@ mod tests {
         let final_bytes = store.read(0, total).await?;
         assert_eq!(final_bytes.as_ref(), plaintext.as_slice());
 
+        Ok(())
+    }
+
+    /// A fault after a range's first parents and before its first leaf marks
+    /// nothing present. The checkpoint holds parents only, and its received
+    /// prefix is empty, not the rest of the blob.
+    #[tokio::test]
+    async fn ingest_stream_fault_before_the_first_leaf_marks_nothing_present() -> anyhow::Result<()>
+    {
+        let total: u64 = 32 * GROUP;
+        let plaintext: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        // The wire of a range deep in the tree opens with its parents: 64 bytes
+        // is one parent pair and no leaf.
+        let source = crate::source::ScriptedSource::new(plaintext)?
+            .with_fault_after(64, || anyhow::anyhow!("scripted reset"));
+        let root = source.root();
+        let store_dir = tmp_dir();
+        let store = ClientRangedStore::create(store_dir.path(), "blob", root, total)?;
+        let aligned = decdn_bao_range::align_range(4 * GROUP, 4 * GROUP, total)?;
+        let (_header, reader) = {
+            use crate::source::BlobSource;
+            source.open(root, aligned.clone()).await?
+        };
+
+        let err = store
+            .ingest_stream(&aligned, reader, None)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("the fault must surface as an error"))?;
+        assert!(format!("{err:#}").contains("scripted reset"), "{err:#}");
+        assert!(
+            store.present_ranges().await?.is_empty(),
+            "no leaf landed, so nothing is present"
+        );
+        assert!(!store.is_complete().await?);
         Ok(())
     }
 
