@@ -114,10 +114,13 @@ impl<S, F> std::fmt::Debug for Downloader<S, F> {
 /// candidate's [`StreamCandidate::first_unit`]; the lane's first open then
 /// adopts the pull (#2063). The download's pacer draws a whole unit, so the
 /// unit is the lane's first leg.
+/// An empty blob yields the empty range, which no scheduler reserves, so a
+/// pull primed at it is never adopted.
 ///
 /// # Errors
 ///
-/// A size the range does not align against (an empty blob).
+/// [`align_range`]'s bounds check. It does not fire: the unit starts at 0 and
+/// ends inside the blob.
 pub fn download_first_unit(total_bytes: u64, lanes: usize) -> anyhow::Result<AlignedRange> {
     let share = total_bytes.div_ceil(u64::try_from(lanes.max(1)).unwrap_or(u64::MAX));
     let share = share

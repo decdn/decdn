@@ -178,10 +178,13 @@ pub struct StreamCandidate<S> {
 /// candidate's [`StreamCandidate::first_unit`]; the lane's first open then
 /// adopts the pull (#2063). The unit starts at the consumer's cursor and is no
 /// longer than the window, so the window pacer draws it whole.
+/// An empty blob yields the empty range, which no scheduler reserves, so a
+/// pull primed at it is never adopted.
 ///
 /// # Errors
 ///
-/// A size the range does not align against (an empty blob).
+/// [`align_range`]'s bounds check. It does not fire: the unit starts at 0 and
+/// ends inside the blob.
 pub fn stream_first_unit(total_bytes: u64, config: &PullConfig) -> anyhow::Result<AlignedRange> {
     let window = config.read_ahead_bytes.max(PULL_WINDOW_FLOOR);
     let window = window - window % CHUNK_GROUP_BYTES;
