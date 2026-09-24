@@ -27,10 +27,10 @@ use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, align_range};
 use crate::driver::DriveConfig;
 use crate::ledgers::LaneLedgers;
 use crate::pacer::BudgetPacer;
-use crate::scheduler::{MultiSourceConfig, multi_source_fetch};
+use crate::scheduler::{MultiSourceConfig, multi_source_fetch_until};
 use crate::source::{BlobSource, Funder};
 use crate::streamer::{StreamCandidate, source_lanes};
-use crate::{ClientRangedStore, ProgressCallback, PullConfig, RangedStore};
+use crate::{ClientRangedStore, PullConfig, RangedStore};
 
 /// One blob to fetch and where to write it: the content `hash` (the bao root),
 /// its `total_bytes` (authoritative for keying the store and sizing the fetch),
@@ -188,7 +188,7 @@ where
         entries: &[([u8; 32], u64)],
         dir: &Path,
         config: &PullConfig,
-        on_progress: Option<&ProgressCallback>,
+        on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     ) -> anyhow::Result<Vec<PathBuf>> {
         // Name each blob's destination by its content-address hex under `dir`,
         // then fetch to those explicit paths. A caller that wants its own names
@@ -252,8 +252,38 @@ where
         targets: &[DownloadTarget<'_>],
         config: &PullConfig,
         ledgers: Option<&LaneLedgers>,
-        on_progress: Option<&ProgressCallback>,
+        on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     ) -> anyhow::Result<Vec<PathBuf>> {
+        self.fetch_to_paths_until(
+            targets,
+            config,
+            ledgers,
+            on_progress,
+            std::future::pending(),
+        )
+        .await
+    }
+
+    /// [`Self::fetch_to_paths`] under a caller's `stop`. When `stop` resolves
+    /// while a target is fetching, the fetch ends with `stop`'s error through
+    /// [`crate::multi_source_fetch_until`]. That target's landed bytes stay
+    /// recorded in its `.partial` for a resume, and the target is not
+    /// finalized. `stop` does not race a finalize, so the local verify of a
+    /// complete blob is never cut off.
+    ///
+    /// # Errors
+    ///
+    /// `stop`'s error when it resolves during a fetch, or any error
+    /// [`Self::fetch_to_paths`] returns.
+    pub async fn fetch_to_paths_until(
+        &self,
+        targets: &[DownloadTarget<'_>],
+        config: &PullConfig,
+        ledgers: Option<&LaneLedgers>,
+        on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
+        stop: impl Future<Output = anyhow::Error>,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        tokio::pin!(stop);
         // Fail early and clearly on an empty candidate set, rather than deep inside
         // `multi_source_fetch` on the first target with a less obvious message.
         anyhow::ensure!(
@@ -284,7 +314,7 @@ where
                 max_sources: self.candidates.len().max(1),
                 unit_deadline: config.download_unit_deadline,
             };
-            multi_source_fetch(
+            multi_source_fetch_until(
                 &store,
                 &lanes,
                 &pacer,
@@ -298,6 +328,7 @@ where
                 ledgers,
                 // No consumption pacing: a download runs at full throughput.
                 None,
+                stop.as_mut(),
             )
             .await?;
             // `multi_source_fetch` flushes the present record but does not promote;
@@ -738,6 +769,65 @@ mod tests {
             probe.opened_bytes() < total,
             "a dedup'd download must fetch fewer than the whole blob's bytes ({} of {total})",
             probe.opened_bytes()
+        );
+        Ok(())
+    }
+
+    /// A `stop` that fires mid-fetch ends the download with its own error. The
+    /// target is not promoted, and the bytes that landed stay recorded beside
+    /// `dest` for a resume.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_leaves_the_partial_for_a_resume() -> anyhow::Result<()> {
+        let blob = payload(12 * 1024 * 1024);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?
+            .stall_after(6 * 1024 * 1024, Duration::from_hours(1))
+            .paying(Arc::clone(&ledger));
+        let root = source.root();
+        let total = u64::try_from(blob.len())?;
+
+        let downloader = Downloader::new(
+            vec![candidate(source, ledger, 0xA1)],
+            funder(),
+            drive_config(),
+        );
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("model.bin");
+        let config = PullConfig {
+            download_unit_deadline: Duration::ZERO,
+            ..PullConfig::default()
+        };
+        let stop = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            anyhow::anyhow!("stopped by the floor")
+        };
+        let fetched = downloader
+            .fetch_to_paths_until(
+                &[DownloadTarget {
+                    hash: root,
+                    total_bytes: total,
+                    dest: &dest,
+                }],
+                &config,
+                None,
+                None,
+                stop,
+            )
+            .await;
+        let Err(err) = fetched else {
+            anyhow::bail!("the stop must end the download");
+        };
+        anyhow::ensure!(format!("{err:#}") == "stopped by the floor", "{err:#}");
+        anyhow::ensure!(!dest.exists(), "a stopped target is not promoted");
+
+        let partial = ClientRangedStore::open(dir.path(), "model.bin", root, total)?;
+        let recorded = crate::driver::ranges_content_len(
+            &decdn_bao_range::RangedStore::present_ranges(&partial).await?,
+            total,
+        );
+        anyhow::ensure!(
+            recorded >= 4 * 1024 * 1024 && recorded < total,
+            "the landed prefix is recorded for a resume: {recorded}"
         );
         Ok(())
     }

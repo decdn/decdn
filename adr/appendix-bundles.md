@@ -273,7 +273,8 @@ as `decdn fetch`):
   the entry. A stall is a retryable failure. A stream stalls when it stays
   below `--min-throughput-bps` for `--stall-timeout-ms`. A drive stalls when
   its delivered bytes, counted across all of its legs and the waits between
-  them, stay below the same floor for `--stall-timeout-ms`. The drive's clock
+  them, stay below the same floor for `--stall-timeout-ms`. A multi-source
+  fetch counts its delivered bytes across all of its sources. The drive's clock
   stops while the entry waits on its own top-up. The clock does not run
   during the local check of a complete blob. When the last candidate fails,
   the entry's error says that every candidate failed. After the first pass

@@ -217,7 +217,9 @@ pub use progress::throughput_watchdog;
 pub use ranged_store::ClientRangedStore;
 pub use rate_limited::UpstreamRateLimited;
 pub use retry::{RetryDisposition, retry_disposition, shared_pool_disposition};
-pub use scheduler::{ConsumptionPacing, MultiSourceConfig, SourceLane, multi_source_fetch};
+pub use scheduler::{
+    ConsumptionPacing, MultiSourceConfig, SourceLane, multi_source_fetch, multi_source_fetch_until,
+};
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
     BaoRangeReader, BlobSource, Funder, IngestStore, PRIMED_MAX_IDLE, PeerSource, PrimedSource,

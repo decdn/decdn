@@ -825,6 +825,19 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: a multi-source fetch whose lanes all crawl now stalls as a whole
+  (#2123).** The drive-level throughput floor (`--min-throughput-bps` over
+  `--stall-timeout-ms`) covered single-source and range-dedup drives only. The
+  multi-source scheduler's per-unit watchdog judges one lane's unit at a time,
+  so a fetch where every lane moved a little inside `--unit-deadline-ms` never
+  tripped anything. The floor now also runs over a multi-source fetch, measured
+  on its position across every lane. A trip falls back to single-source
+  failover, which resumes the `.partial`. The clock stops while the fetch
+  waits on its own top-up, and the present record is flushed before the
+  fallback. At `-v` the fetch logs its progress, rate and ETA every 10 s. The
+  SDK adds `multi_source_fetch_until` and `Downloader::fetch_to_paths_until`,
+  which take the same `stop` future as `drive_range_set`, and their progress
+  callbacks take a borrowed trait object.
 - **Node: serve-loop payment faults are metered by cause (#2134, #2135).** The
   miss serve loop counted every proof error and every chunk-write error as a
   client abandon, including a lane-store `record` failure, a broken paid-frontier
