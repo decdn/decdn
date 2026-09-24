@@ -48,6 +48,8 @@ enum DaemonCommand {
     reason = "process exit boundary; tracing may never have started"
 )]
 async fn main() -> std::process::ExitCode {
+    // First, so the systemd watchdog also covers bring-up and shutdown drain.
+    decdn_node::systemd_watchdog::spawn();
     let parsed = DaemonCli::parse();
     let config_path = parsed.config.map(|p| cli::common::expand_tilde(&p));
     let result = match parsed.command {

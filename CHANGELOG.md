@@ -2188,6 +2188,18 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Runtime: `decdn-node` heartbeats the systemd watchdog from its tokio
+  runtime.** When the unit sets `WatchdogSec=`, the node sends `WATCHDOG=1` to
+  `NOTIFY_SOCKET` every half period from a runtime task. A node whose runtime
+  workers are all held by work that never yields stops the heartbeat, and
+  systemd restarts it. Without the watchdog, such a node stays `active` while it
+  serves nothing, logs nothing and answers no `/metrics` scrape. The node has
+  no setting for this: `WatchdogSec=` turns it on, and without `WATCHDOG_USEC`
+  in the environment the heartbeat does not start. The unit must allow
+  `NotifyAccess=main` and `AF_UNIX`. A regression test runs the #2132
+  sliver-voucher case on a one-worker runtime and fails if a heartbeat task on
+  that runtime stops ticking.
+
 - **CLI: `decdn pool list --all` shows every pool the keystore owns on chain
   (#2077).** `pool list` read only the local buyer store, so it could not show
   a pool whose store row was gone — precisely the situation an operator runs it
