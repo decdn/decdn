@@ -45,7 +45,7 @@ VOLUME ["/home/decdn/.decdn"]
 EXPOSE 4433 9090
 
 # Container ships the daemon only. Operators wanting the user CLI
-# (`decdn pull`, `decdn node …`, `decdn key-gen`) install it from the
+# (`decdn fetch`, `decdn node …`, `decdn key-gen`) install it from the
 # `decdn-${VERSION}-${TARGET}.tar.gz` release archive.
 #
 # `CMD ["run"]` makes `docker run <image>` start the daemon by default;

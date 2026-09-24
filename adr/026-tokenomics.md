@@ -117,7 +117,7 @@ Bootstrap supply-side incentive is funded externally via $1M+ pre-seed USDC capi
 
 ### Capacity-bond curve
 
-Every operator must bond TOKEN proportional to the bandwidth capacity it declares. The bond is the only TOKEN-side requirement on operators — no separate flat minimum bond, no optional lock for additional yield.
+Every operator must bond TOKEN proportional to the bandwidth capacity it declares. The bond is the only TOKEN-side requirement on operators. There is no optional lock for additional yield. The global `minBond` entry floor also applies: entry needs a bond of at least `max(minBond, bond_required(declaredMbps))` (see [§ Minimum bond is non-retroactive](#minimum-bond-is-non-retroactive)).
 
 **Bond formula.**
 
@@ -336,7 +336,7 @@ The voting set is narrow at launch (likely <50 operators in the first 6–12 mon
 
 ### Operator economics
 
-**Bond is the only TOKEN-side requirement.** No separate flat minimum bond, no optional lock for additional yield.
+**Bond is the only TOKEN-side requirement.** There is no optional lock for additional yield. At entry, the bond must meet the larger of the curve and the global `minBond` floor (see [§ Minimum bond is non-retroactive](#minimum-bond-is-non-retroactive)).
 
 **Revenue stream.** **60% of every redemption** — direct USDC, same-tx, per-byte. There is no TOKEN-denominated operator emission or on-chain credit.
 

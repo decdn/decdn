@@ -211,7 +211,7 @@ pub enum NodeCommand {
     UpdateRegion(UpdateRegionArgs),
     /// Unpaid client-side discovery of active nodes via
     /// `CapacityBond.getRegisteredNodes` (#1481). Maps node-ids/regions to
-    /// operator Ethereum addresses — the input `decdn pool open
+    /// operator Ethereum addresses — the input `decdn fetch
     /// --provider-address` needs — without spending anything: it builds a
     /// signer-less read-only provider and never loads a keystore, unlike
     /// every other on-chain `node` subcommand above.
@@ -702,8 +702,8 @@ pub struct RotateKeyArgs {
 /// over-bonding. A precondition for `decdn node register`.
 #[derive(Args, Debug)]
 pub struct BondArgs {
-    /// Declared serving capacity in Mbps. The TOKEN bond is computed from the
-    /// on-chain `bondRequired(mbps)` curve — you do not pass a token amount.
+    /// Declared serving capacity in Mbps. The TOKEN bond is computed on-chain
+    /// as `max(minBond, bondRequired(mbps))` — you do not pass a token amount.
     /// Must fall within the governable `[minCapacityMbps, maxCapacityMbps]`
     /// band or the on-chain `declareMbps` reverts.
     #[arg(long, value_name = "MBPS")]

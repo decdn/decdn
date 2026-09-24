@@ -246,4 +246,4 @@ Splitting a large blob across multiple nodes and fetching byte ranges in paralle
 
 ## Download Resume
 
-A `decdn pull` interrupted by a crash, kill, or network drop resumes from the partial output file already on disk: the client re-hashes the bytes it has, discards any trailing unverified remainder, and continues the fetch from the last BLAKE3-verified offset via `StreamRequest{byte_offset}`. If the client's pool is still open on-chain, it reuses it — the same deposit backs the resumed fetch; only if the pool is closing or closed does the client open a new one.
+A `decdn fetch` interrupted by a crash, kill, or network drop resumes from the partial output file already on disk: the client re-hashes the bytes it has, discards any trailing unverified remainder, and continues the fetch from the last BLAKE3-verified offset via `StreamRequest{byte_offset}`. If the client's pool is still open on-chain, it reuses it — the same deposit backs the resumed fetch; only if the pool is closing or closed does the client open a new one.
