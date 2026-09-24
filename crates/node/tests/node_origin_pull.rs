@@ -7395,8 +7395,39 @@ async fn spawn_node_a_metered(
     Ok((a_id, addr_a, a_eth, ep_a, task_a, metrics))
 }
 
+/// Wait for B's ranged pull to close an `upstream_stream` span for `hash` from
+/// peer `a_id` on pool `pool_id` with `outcome`, under the pull thread's
+/// `serve_miss_pull`. The pull thread closes the span after the serve leg ends,
+/// so the test polls rather than reading once.
+async fn await_run_outcome(
+    spans: &support::SpanCapture,
+    hash: Hash,
+    outcome: &str,
+    a_id: iroh::PublicKey,
+    pool_id: B256,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let runs = spans.matching("upstream_stream", "hash", &hash.to_string());
+        if runs.iter().any(|s| {
+            s.parent == Some("serve_miss_pull")
+                && s.fields.get("outcome").map(String::as_str) == Some(outcome)
+                && s.fields.get("peer") == Some(&a_id.to_string())
+                && s.fields.get("pool_id") == Some(&pool_id.to_string())
+        }) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "no `{outcome}` upstream_stream run: {runs:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
+    let spans = support::capture_spans();
     // 1.5x the pacing window (which floors at `PULL_WINDOW_FLOOR`, ADR 003
     // §Credit window), so the pull crosses exactly one window boundary and pauses
     // once, with a real remainder left to resume. The window — not `CHUNK_BYTES` —
@@ -7506,6 +7537,26 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     assert_relay_counted(&b_metrics, u64::try_from(payload.len())?).await?;
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+
+    // The ranged pull runs on its own thread and runtime; each run from A is an
+    // `upstream_stream` span under the pull thread's `serve_miss_pull`, with the
+    // buffered path's join keys. The first leg is the primed handshake pull,
+    // opened under `serve_stream` before the pull starts; the later leg opens
+    // under the run's span.
+    await_run_outcome(&spans, hash, "filled", a_id, ab_channel_id).await?;
+    let opens = spans.matching("open_progressive_pull", "hash", &hash.to_string());
+    let leg_parent = |offset: &str| {
+        opens
+            .iter()
+            .find(|s| s.fields.get("byte_offset").map(String::as_str) == Some(offset))
+            .and_then(|s| s.parent)
+    };
+    anyhow::ensure!(
+        leg_parent("0") == Some("serve_stream")
+            && leg_parent(&window.to_string()) == Some("upstream_stream"),
+        "the handshake leg nests under serve_stream, the later leg under upstream_stream: \
+         {opens:?}"
+    );
     Ok(())
 }
 
@@ -8668,6 +8719,7 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
 #[allow(clippy::too_many_lines)]
 async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_spend() -> Result<()>
 {
+    let spans = support::capture_spans();
     // A leaf pays three vouchers, so both of B's windows ramp past their floors,
     // then stays connected and keeps reading without paying. B's unrecouped
     // upstream lead must stay within the ramped credit window plus one
@@ -8825,6 +8877,9 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
     );
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    // The leaf's close cancels the pull leg mid-run; the run's span still ends
+    // with its outcome and its lane's join keys.
+    await_run_outcome(&spans, hash, "cancelled", a_id, ab_channel_id).await?;
     Ok(())
 }
 
@@ -9250,6 +9305,7 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -> Result<()> {
+    let spans = support::capture_spans();
     // #915 review: a corrupt group MID-stream — past the first chunk,
     // with plenty of wire still to come — kills the verifying decoder while the
     // node is still forwarding, so the failure surfaces mid-stream rather than at
@@ -9353,6 +9409,8 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
     );
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    // The corrupt group drops A as a source for the rest of the range.
+    await_run_outcome(&spans, hash, "reassigned", a_id, ab_channel_id).await?;
     Ok(())
 }
 

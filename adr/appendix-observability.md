@@ -352,7 +352,7 @@ An event inside a span also has `span` and `spans`. `span` is the current span. 
 
 ### Trace Spans
 
-The node exports spans over OTLP when `observability.otlp_endpoint` is set. The export filter is separate from the log filter, so a change to `log_level` does not change the traces. The filter admits `INFO` spans and events from the deCDN crates. From other crates it admits `WARN` and `ERROR` events only, so a dependency failure lands on the deCDN span it happened in. The OTLP transport crates are always off. A span covers one stream, pull, lookup, or transaction. No span covers a single frame.
+The node exports spans over OTLP when `observability.otlp_endpoint` is set. The export filter is separate from the log filter, so a change to `log_level` does not change the traces. The filter admits `INFO` spans and events from the deCDN crates. From other crates it admits `WARN` and `ERROR` events only, so a dependency failure lands on the deCDN span it happened in. The filter admits no span from another crate at any level. iroh opens its periodic network-report spans at `WARN`. These spans are more numerous than all deCDN spans, and they are not deCDN work. The OTLP transport crates are always off. A span covers one stream, pull, lookup, or transaction. No span covers a single frame.
 
 The node sets `service.name = "decdn"` and `service.version` on the OTLP resource. The OpenTelemetry SDK also adds the `telemetry.sdk.*` attributes and each pair in `OTEL_RESOURCE_ATTRIBUTES`. The node does not set host identity by default. The collector of the reference Grafana stack adds `service.instance.id`, `region`, and `deployment.environment`. It also sets `service.name` to `decdn-node`. The dashboards query that name. A deployment without this collector must add the three host attributes itself, in its collector or in `OTEL_RESOURCE_ATTRIBUTES`. Only a collector can change `service.name`, because the value of the node replaces the value from the environment. The iroh NodeId of the node is the `local_node_id` field on the spans that need it.
 
@@ -364,7 +364,7 @@ The node sets `service.name = "decdn"` and `service.version` on the OTLP resourc
 | `origin_pull` | One walk of the origin chain | `hash`, `local_only`, `outcome`, `error` |
 | `origin_range_pull` | One ranged pull from the origin chain | `hash`, `byte_offset`, `byte_len`, `outcome`, `error` |
 | `node_pull` | One node-to-node pull, over every candidate | `hash`, `outcome` |
-| `upstream_stream` | One paid pull from one candidate | `peer`, `local_node_id`, `hash`, `pool_id`, `direction`, `outcome` |
+| `upstream_stream` | One paid pull from one candidate: the whole blob on a buffered miss, one run of the range on a streaming miss | `peer`, `local_node_id`, `hash`, `pool_id`, `direction`, `outcome` |
 | `open_progressive_pull` | The dial and handshake of one pulled range | `peer`, `local_node_id`, `hash`, `pool_id`, `byte_offset`, `byte_len`, `error` |
 | `dht_lookup` | One `FIND_VALUE` lookup | `hash`, `rounds`, `providers` |
 | `redeem_cycle` | One submission pass of the redeemer | `chunks`, `strict_flush` |
@@ -381,7 +381,9 @@ The node sets `service.name = "decdn"` and `service.version` on the OTLP resourc
 
 A failed request read, a full stream cap, and a bad binding end before the node reads the request fields, so those spans have no `hash`.
 
-A buffered miss nests as `serve_stream` → `pull_through` → `origin_pull` → `node_pull` → `upstream_stream` → `open_progressive_pull`. A streaming miss nests as `serve_stream` → `serve_miss_pull` → `open_progressive_pull`.
+`upstream_stream` records one `outcome`. On a buffered miss, the values are `filled`, `clean_miss`, `local_fault`, and `below_margin`. On a streaming miss, the values are `filled`, `reassigned`, `terminal`, and `cancelled`. `reassigned` means that the run stops and the node drops this candidate. The node then plans the missing bytes again over the other candidates. A limit applies to the number of dropped candidates.
+
+A buffered miss nests as `serve_stream` → `pull_through` → `origin_pull` → `node_pull` → `upstream_stream` → `open_progressive_pull`. A streaming miss from a peer nests as `serve_stream` → `serve_miss_pull` → `upstream_stream` → `open_progressive_pull`. Before the pull starts, the header handshake opens an `open_progressive_pull` under `serve_stream` for each candidate that it asks. When the probe reports the blob size, the pull leg adopts this pull as the first leg of its first run. That leg has no `upstream_stream` parent.
 
 **Correlation across nodes.** No trace context crosses the wire. A peer controls what it sends, so a remote trace parent would let it set this node's sampling decision. Instead, both ends of a transfer record the same fields in the same format. The requester's `open_progressive_pull` and the server's `serve_stream` share `hash`, `pool_id` and `byte_offset`, and each side's `local_node_id` is the other side's `peer`. One TraceQL query finds both spans.
 

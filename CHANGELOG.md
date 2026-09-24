@@ -825,6 +825,21 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Tracing: dependency spans no longer export, and each run of a streaming
+  miss has an `upstream_stream` span (#2048).** The OTLP export filter
+  admitted any span at `WARN` from a non-deCDN crate. iroh opens its periodic
+  network-report spans (`QADv4`, `QADv6`, `reportgen-actor`, `run-probe`,
+  `captive-portal`) at `WARN`, so they made up about 95% of the spans in
+  Tempo. The filter now exports no span from another crate at any level. A
+  dependency's `WARN` and `ERROR` events still land on the deCDN span around
+  them, as [ADR appendix-observability](adr/appendix-observability.md#trace-spans)
+  specifies. The ranged pull leg now opens an `upstream_stream` span for each
+  run it pulls from a peer, with the same `peer`, `local_node_id`, `hash` and
+  `pool_id` fields as the buffered path. Its `outcome` is `filled`,
+  `reassigned`, `terminal` or `cancelled`. A streaming miss from a peer now
+  nests as `serve_stream` → `serve_miss_pull` → `upstream_stream` →
+  `open_progressive_pull`; a first leg adopted from the header handshake
+  stays under `serve_stream`.
 - **Runtime: every JSON log event carries `node_id` (#2050).** ADR
   appendix-observability lists `node_id` as a mandatory log field, but only
   the identity line and the startup banner carried it, so a log line in the

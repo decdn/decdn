@@ -3973,7 +3973,7 @@
       },
       "title": "Span rate by operation",
       "type": "timeseries",
-      "description": "Spans per second by name. Only deCDN spans are exported; dependency crates' spans are filtered at the node. serve_stream is one inbound client stream. A buffered miss nests pull_through, origin_pull, node_pull, upstream_stream and open_progressive_pull under it; a streaming miss nests serve_miss_pull and open_progressive_pull. origin_range_pull is a ranged origin fetch; dht_lookup, redeem_cycle and onchain_tx cover discovery and settlement.",
+      "description": "Spans per second by name. Only deCDN spans are exported; dependency crates' spans are filtered at the node. serve_stream is one inbound client stream. A buffered miss nests pull_through, origin_pull, node_pull, upstream_stream and open_progressive_pull under it; a streaming miss from a peer nests serve_miss_pull, upstream_stream and open_progressive_pull. origin_range_pull is a ranged origin fetch; dht_lookup, redeem_cycle and onchain_tx cover discovery and settlement.",
       "targets": [
         {
           "datasource": {
