@@ -825,6 +825,14 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Client: a fault before a range's first leaf no longer marks the rest of
+  the blob present.** A leg that faults after its bao parents and before its
+  first leaf checkpoints the parents with an empty received prefix. The
+  checkpoint treated that zero length as "to the end of the blob" and added
+  every byte from the leg's start to the end of the blob to the present set,
+  with no data behind it. A later drive then skipped those bytes, the
+  `.ranges` record kept them, and the local verify at finalize failed. An
+  empty prefix now adds nothing.
 - **CLI: a multi-source fetch whose lanes all crawl now stalls as a whole
   (#2123).** The drive-level throughput floor (`--min-throughput-bps` over
   `--stall-timeout-ms`) covered single-source and range-dedup drives only. The
