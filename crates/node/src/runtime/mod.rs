@@ -45,7 +45,6 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::address::parse_nonzero_address;
 use decdn_common::config::ResolvedConfig;
-use decdn_common::identity;
 use decdn_common::redact::{redact_userinfo, sanitize_rpc_display};
 use decdn_incentive::PoolStateStore;
 use decdn_incentive::eth_identity;
@@ -381,7 +380,7 @@ struct Infra {
     limiter: Arc<ConnectionLimiter>,
 }
 
-/// Front bring-up phase: RPC preflight, identity/keystore load, voucher-state
+/// Front bring-up phase: RPC preflight, eth keystore load, voucher-state
 /// and receipt stores, cache + origin chain, iroh endpoint, and the
 /// connection limiter. The two `reload_state` attach side effects run inline,
 /// at their points in the bring-up order, so a SIGHUP delivered mid-bring-up
@@ -389,6 +388,7 @@ struct Infra {
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn build_infra(
     cfg: &ResolvedConfig,
+    secret_key: SecretKey,
     reload_state: &RuntimeReloadState,
     node_metrics: Arc<metrics::Metrics>,
 ) -> anyhow::Result<Infra> {
@@ -400,9 +400,6 @@ async fn build_infra(
     // Registry-mandatory `decdn_probe_hold_slots_max` (ADR
     // appendix-observability.md) — static, set once from config.
     node_metrics.probe_hold_slots_max(cfg.cache.max_probe_holds);
-
-    let secret_key = identity::load_or_generate(&cfg.identity.data_dir)?;
-    tracing::info!(node_id = %secret_key.public(), "loaded node identity");
 
     // Issue #406: load the Ethereum keystore into a live `PrivateKeySigner`
     // before the rest of startup so any password-source error (env unset,
@@ -2310,21 +2307,28 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
 /// `node_metrics` is the registry `/metrics` serves. The caller builds it
 /// so that pre-runtime components (the OTLP exporter) count into the same
 /// registry.
+///
+/// `secret_key` is the node's iroh identity. The caller loads it, so that the
+/// daemon entry point can build its JSON log formatter, which writes
+/// `node_id` on every event, before bring-up starts.
 pub async fn run(
     cfg: ResolvedConfig,
+    secret_key: SecretKey,
     config_path: Option<PathBuf>,
     reload_state: Arc<RuntimeReloadState>,
     node_metrics: Arc<metrics::Metrics>,
 ) -> anyhow::Result<()> {
     // Captured at the very top of `run()`, before any `await` or I/O,
-    // so `admin_v1_health.uptime_s` reflects the entire process lifetime
-    // — including the RPC reachability preflight below (which can spend
-    // up to its 5s timeout on flaky networks). Operators reasoning about
-    // "how long has this node been up?" want every second since `decdn
-    // run` was invoked, not just everything after the admin server bound.
+    // so `admin_v1_health.uptime_s` covers the whole runtime — including
+    // the RPC reachability preflight below (which can spend up to its 5s
+    // timeout on flaky networks). Only `commands::run`'s config resolution,
+    // node key load and tracing bring-up come before it. Operators reasoning
+    // about "how long has this node been up?" want every second since
+    // `decdn-node run` started, not just everything after the admin server
+    // bound.
     let started_at = std::time::Instant::now();
 
-    let infra = build_infra(&cfg, &reload_state, node_metrics).await?;
+    let infra = build_infra(&cfg, secret_key, &reload_state, node_metrics).await?;
 
     let ch = build_chain_and_handlers(&cfg, &reload_state, &infra).await?;
 
