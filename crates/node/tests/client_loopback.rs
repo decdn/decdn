@@ -10363,6 +10363,70 @@ async fn a_sliver_voucher_leaves_the_rest_of_the_chunk_owed() -> anyhow::Result<
     Ok(())
 }
 
+/// A sliver voucher does not starve the runtime (#2132).
+///
+/// The node, the client and a heartbeat task share one runtime worker. A serve
+/// loop that goes around without awaiting holds that worker, so the heartbeat
+/// stops ticking. One sliver at the one-interval floor is enough to reach that
+/// state in a node that drops the unpaid rest of the chunk: the deliver phase
+/// refills `delivered − paid` to the window, and the recoup phase has no chunk
+/// left to wait on. The test reads the heartbeat from its own thread, which is
+/// not a runtime worker, and leaks a starved runtime rather than drop it: the
+/// drop would wait forever for the worker to yield.
+#[test]
+fn a_sliver_voucher_does_not_starve_the_runtime() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    let ticks = Arc::new(AtomicU64::new(0));
+    let (mut fx, heartbeat) = rt.block_on(async {
+        let mut fx = drive_to_second_interval_awaiting_voucher().await?;
+        let heartbeat = tokio::spawn({
+            let ticks = Arc::clone(&ticks);
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        let mut amount = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+        amount += min_payment(SLIVER_BYTES, RATE_PER_MB);
+        send_signed_voucher(
+            &mut fx.send,
+            &fx.signer,
+            HARNESS_INTERVAL_BYTES + SLIVER_BYTES,
+            amount,
+        )
+        .await?;
+        anyhow::Ok((fx, heartbeat))
+    })?;
+
+    let before = ticks.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_secs(1));
+    let during = ticks.load(Ordering::Relaxed).saturating_sub(before);
+    if during < 10 {
+        std::mem::forget(fx);
+        std::mem::forget(rt);
+        anyhow::bail!(
+            "the runtime worker ticked {during} times in 1 s: a serve loop holds it without \
+             awaiting"
+        );
+    }
+
+    rt.block_on(async {
+        heartbeat.abort();
+        // The rest of interval 2 is still owed, so the window stays shut.
+        assert_parked_awaiting_voucher(&mut fx.recv).await?;
+        fx.conn.close(0u32.into(), b"done");
+        shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
+        Ok(())
+    })
+}
+
 /// A payer that answers one chunk with sliver after sliver hits the per-chunk
 /// proof budget (#2132). Each sliver credits something, but none settles the
 /// chunk. The budget counts every proof that leaves the chunk unsettled, so the
