@@ -89,6 +89,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
+use bao_tree::ChunkRanges;
 use decdn_bao_range::{AlignedRange, align_range};
 use decdn_protocol::Coverage;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -135,6 +136,14 @@ pub struct SourceLane<'a, S> {
     /// steal — this lane is never assigned, and never steals, a range
     /// outside what this says it can serve.
     pub coverage: Coverage,
+    /// The range this lane opens first, when its caller already opened it:
+    /// a pull parked in a [`crate::PrimedSource`] that this lane's first open
+    /// adopts (#2063). The scheduler plans the rest of the fetch around it and
+    /// hands it to this lane before any other work. It is ignored, and planned
+    /// like any other range, unless it aligns against this blob, lies wholly
+    /// inside the still-missing request, sits inside this lane's coverage, and
+    /// overlaps no other lane's first unit.
+    pub first_unit: Option<AlignedRange>,
 }
 
 impl<S> std::fmt::Debug for SourceLane<'_, S> {
@@ -332,6 +341,10 @@ struct Work {
     /// dequeuing it, so an item stays here until a covering worker is free to
     /// take it.
     pending: VecDeque<AlignedRange>,
+    /// Per-source range reserved as that source's first unit
+    /// ([`SourceLane::first_unit`]), taken on its first [`Work::pick`] before
+    /// anything in `pending`. No other worker picks or steals it until then.
+    first: Vec<Option<AlignedRange>>,
     /// Per-source current range, `None` when the source holds nothing.
     in_flight: Vec<Option<(u64, u64)>>,
     /// Per-source interrupt handles, indexed like `in_flight`.
@@ -358,7 +371,9 @@ impl Work {
     /// Every worker is free and nothing is queued: the fan-out has no work left,
     /// so a worker that cannot pick may exit rather than park.
     fn all_idle(&self) -> bool {
-        self.pending.is_empty() && self.in_flight.iter().all(Option::is_none)
+        self.pending.is_empty()
+            && self.first.iter().all(Option::is_none)
+            && self.in_flight.iter().all(Option::is_none)
     }
 
     /// Worker `i`'s in-flight slot. An out-of-range `i` is a wiring bug, not a
@@ -405,6 +420,13 @@ impl Work {
         match self.units.get_mut(i) {
             Some(unit) => *unit = unit.wrapping_add(1),
             None => anyhow::bail!("worker index {i} out of range for unit counters"),
+        }
+        if let Some(unit) = self.first.get_mut(i).and_then(Option::take) {
+            *self.slot_mut(i)? = Some((unit.fetch_start(), unit.fetch_len()));
+            return Ok(Some(Picked {
+                range: unit,
+                victim: None,
+            }));
         }
         let covered = |seg: &AlignedRange| {
             covers_byte_range(coverage, seg.fetch_start(), seg.fetch_len(), total_bytes)
@@ -558,6 +580,10 @@ impl Work {
     fn retire(&mut self, i: usize, coverage: &[Coverage], total_bytes: u64) {
         if let Some(a) = self.alive.get_mut(i) {
             *a = false;
+        }
+        // A first unit the worker never took goes back to the shared queue.
+        if let Some(unit) = self.first.get_mut(i).and_then(Option::take) {
+            self.pending.push_back(unit);
         }
         let alive = self.alive.clone();
         self.pending.retain(|seg| {
@@ -970,6 +996,51 @@ impl std::fmt::Debug for ConsumptionPacing<'_> {
     }
 }
 
+/// Whether `unit` can be reserved as a lane's first unit: it aligns against
+/// this `total_bytes`-byte blob, every chunk of it is still `missing` (so it
+/// lies inside the request and overlaps no unit reserved before it), and the
+/// lane's `coverage` includes it.
+fn honours_first_unit(
+    unit: &AlignedRange,
+    missing: &ChunkRanges,
+    coverage: &Coverage,
+    total_bytes: u64,
+) -> bool {
+    unit.blob_size() == total_bytes
+        && !unit.chunk_ranges().is_empty()
+        && (unit.chunk_ranges().clone() - missing).is_empty()
+        && covers_byte_range(coverage, unit.fetch_start(), unit.fetch_len(), total_bytes)
+}
+
+/// Reserve each lane's honoured [`SourceLane::first_unit`], in lane order, and
+/// take it out of `missing` so the planner never hands it to another lane.
+/// Returns the reservations indexed like `lanes`; a unit that is not honoured
+/// ([`honours_first_unit`]) stays in `missing` and is planned like any range.
+fn reserve_first_units<S>(
+    lanes: &[SourceLane<'_, S>],
+    missing: &mut ChunkRanges,
+    total_bytes: u64,
+) -> Vec<Option<AlignedRange>> {
+    lanes
+        .iter()
+        .map(|lane| {
+            let unit = lane.first_unit.as_ref()?;
+            if honours_first_unit(unit, missing, &lane.coverage, total_bytes) {
+                *missing = missing.clone() - unit.chunk_ranges();
+                Some(unit.clone())
+            } else {
+                tracing::debug!(
+                    fetch_start = unit.fetch_start(),
+                    fetch_len = unit.fetch_len(),
+                    "a lane's first unit is not wholly missing and coverable; \
+                     planning it like any range"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 /// Fetch `hash`'s request `[offset, offset+len)` by fanning it out across
 /// `lanes`, all writing into the one shared `store` (spec §5.3). Splits the
 /// gap-set into bao-aligned segments, drives one worker per lane, and lets a
@@ -1073,7 +1144,7 @@ where
     }
     let total_bytes = store.total_bytes();
 
-    let missing = store.missing_ranges(offset, len).await?;
+    let mut missing = store.missing_ranges(offset, len).await?;
     let gaps = contiguous_byte_ranges(&missing, total_bytes);
     if gaps.is_empty() {
         // Already fully held: persist the present record and return (the caller
@@ -1081,6 +1152,10 @@ where
         store.flush_present_record().await?;
         return Ok(());
     }
+
+    // Reserve each honoured first unit for its lane and plan only the rest, so
+    // the lane's parked pull is the one that fetches it (#2063).
+    let first = reserve_first_units(lanes, &mut missing, total_bytes);
 
     // Coverage-aware spread (client planner, #1506): every admitted lane's
     // `Probed` coverage becomes its `SourceCoverage`; `rank` is simply
@@ -1158,6 +1233,7 @@ where
 
     let work = AsyncMutex::new(Work {
         pending,
+        first,
         in_flight: vec![None; lanes.len()],
         cancel: (0..lanes.len())
             .map(|_| Arc::new(CancelHandle::new()))
@@ -1416,6 +1492,7 @@ mod tests {
             ctx: ctx_for(provider),
             ledger,
             coverage,
+            first_unit: None,
         }
     }
 
@@ -1425,6 +1502,132 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp dir");
         let store = ClientRangedStore::create(dir.path(), "b", root, total).expect("create");
         (store, dir)
+    }
+
+    /// A lane's first unit goes to that lane, whose parked pull is adopted: the
+    /// only open of the unit is the priming one, no other lane touches it, and
+    /// the blob assembles byte-identical (#2063).
+    #[tokio::test]
+    async fn a_lanes_first_unit_is_adopted_from_its_primed_pull() -> anyhow::Result<()> {
+        use crate::PrimedSource;
+        use crate::source::BlobSource as _;
+
+        let data = blob(8 * 1024 * 1024);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a =
+            PrimedSource::new(ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a)));
+        let src_b =
+            PrimedSource::new(ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b)));
+        let root = src_a.inner().root();
+        let total = src_a.inner().total_bytes();
+        let (store, dir) = fresh_store(root, total);
+
+        // The SECOND lane holds the primed pull, so the unit is not simply what
+        // lane 0 would have been planned anyway.
+        let unit = crate::download_first_unit(total, 2)?;
+        let (header, reader) = src_b.inner().open(root, unit.clone()).await?;
+        src_b.prime(root, unit.clone(), header, reader);
+
+        let full = Coverage::full(num_blocks(total));
+        let lanes = vec![
+            SourceLane {
+                source: &src_a,
+                ctx: ctx_for(0xA1),
+                ledger: Arc::clone(&ledger_a),
+                coverage: full.clone(),
+                first_unit: None,
+            },
+            SourceLane {
+                source: &src_b,
+                ctx: ctx_for(0xB2),
+                ledger: Arc::clone(&ledger_b),
+                coverage: full,
+                first_unit: Some(unit.clone()),
+            },
+        ];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &BudgetPacer::new(),
+            &FakeFunder::new(0, DepositOutcome::Added(U256::ZERO)),
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 2,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+            None,
+            None,
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        // A later steal may take the unit's second half, but only the priming
+        // open ever starts at the unit's start.
+        let opens: Vec<(u64, u64)> = src_a
+            .inner()
+            .opened_ranges()
+            .into_iter()
+            .chain(src_b.inner().opened_ranges())
+            .collect();
+        assert_eq!(
+            opens
+                .iter()
+                .filter(|&&(start, _)| start == unit.fetch_start())
+                .count(),
+            1,
+            "the unit is opened once, by the priming open: {opens:?}"
+        );
+        assert_eq!(
+            src_b.inner().opened_ranges().first().copied(),
+            Some((unit.fetch_start(), unit.fetch_len()))
+        );
+        Ok(())
+    }
+
+    /// Only a unit that aligns against this blob, is wholly missing, and sits
+    /// inside the lane's coverage is reserved; anything else is planned like any
+    /// range.
+    #[test]
+    fn a_first_unit_is_honoured_only_when_wholly_missing_and_coverable() -> anyhow::Result<()> {
+        use bao_tree::ChunkRanges;
+        use decdn_bao_range::align_range;
+
+        use super::honours_first_unit;
+
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let unit = align_range(0, 64 * 1024, total)?;
+        let all = align_range(0, 0, total)?.chunk_ranges().clone();
+        let full = cov(2, &[0, 1]);
+
+        assert!(honours_first_unit(&unit, &all, &full, total));
+        // Aligned against another size.
+        let other_size = align_range(0, 64 * 1024, total - 1)?;
+        assert!(!honours_first_unit(&other_size, &all, &full, total));
+        // Partly present already.
+        let held = align_range(0, 16 * 1024, total)?;
+        let missing = all.clone() - held.chunk_ranges();
+        assert!(!honours_first_unit(&unit, &missing, &full, total));
+        // Outside the lane's coverage.
+        assert!(!honours_first_unit(&unit, &all, &cov(2, &[1]), total));
+        // Nothing missing at all.
+        assert!(!honours_first_unit(
+            &unit,
+            &ChunkRanges::empty(),
+            &full,
+            total
+        ));
+        Ok(())
     }
 
     #[tokio::test]
@@ -2159,6 +2362,7 @@ mod tests {
 
         let mut work = Work {
             pending: VecDeque::from(vec![in_block0, in_block1]),
+            first: vec![None, None],
             in_flight: vec![None, None],
             cancel: vec![Arc::new(CancelHandle::new()), Arc::new(CancelHandle::new())],
             alive: vec![true, true],
@@ -2212,6 +2416,7 @@ mod tests {
         let coverage = cov(1, &[0]);
         let fresh_work = || Work {
             pending: VecDeque::new(),
+            first: vec![None, None, None],
             in_flight: vec![Some((0, total)), None, None],
             cancel: (0..3).map(|_| Arc::new(CancelHandle::new())).collect(),
             alive: vec![true, true, true],
@@ -2671,12 +2876,14 @@ mod tests {
                 ctx: Arc::new(Mutex::new(ctx_with(0xA1, deposit))),
                 ledger: Arc::clone(&ledger_a),
                 coverage: full.clone(),
+                first_unit: None,
             },
             SourceLane {
                 source: &src_b,
                 ctx: Arc::new(Mutex::new(ctx_with(0xB2, deposit))),
                 ledger: Arc::clone(&ledger_b),
                 coverage: full,
+                first_unit: None,
             },
         ];
         let result = tokio::time::timeout(
@@ -2813,12 +3020,14 @@ mod tests {
                 ctx: Arc::clone(&handle_a.ctx),
                 ledger: Arc::clone(&handle_a.ledger),
                 coverage: full.clone(),
+                first_unit: None,
             },
             SourceLane {
                 source: &src_b,
                 ctx: Arc::clone(&handle_b.ctx),
                 ledger: Arc::clone(&handle_b.ledger),
                 coverage: full,
+                first_unit: None,
             },
         ];
         let result = tokio::time::timeout(
@@ -3017,12 +3226,14 @@ mod tests {
                 ctx: Arc::new(Mutex::new(ctx_with(0xA1, deposit))),
                 ledger: Arc::clone(&ledger_a),
                 coverage: full.clone(),
+                first_unit: None,
             },
             SourceLane {
                 source: &src_b,
                 ctx: Arc::new(Mutex::new(ctx_with(0xB2, deposit))),
                 ledger: Arc::clone(&ledger_b),
                 coverage: full,
+                first_unit: None,
             },
         ];
         multi_source_fetch(
@@ -3149,12 +3360,14 @@ mod tests {
                 ctx: Arc::new(Mutex::new(ctx_with(0xA1, deposit))),
                 ledger: Arc::clone(&ledger_a),
                 coverage: full.clone(),
+                first_unit: None,
             },
             SourceLane {
                 source: &src_b,
                 ctx: Arc::new(Mutex::new(ctx_with(0xB2, deposit))),
                 ledger: Arc::clone(&ledger_b),
                 coverage: full,
+                first_unit: None,
             },
         ];
         let result = tokio::time::timeout(

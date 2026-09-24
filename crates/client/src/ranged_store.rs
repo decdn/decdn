@@ -350,6 +350,18 @@ impl ClientRangedStore {
         })
     }
 
+    /// Whether a `.ranges` record for `stem` exists in `dir`, so that
+    /// [`open_or_create`](Self::open_or_create) would resume it rather than
+    /// create a fresh store.
+    ///
+    /// # Errors
+    ///
+    /// A stat of the record that fails for a reason other than `NotFound`.
+    pub fn has_record(dir: &Path, stem: &str) -> io::Result<bool> {
+        let (_data_path, _obao_path, ranges_path) = sidecar_paths(dir, stem);
+        ranges_path.try_exists()
+    }
+
     /// Reopen an existing `.partial` store for `(root, total_bytes)` if one is
     /// on disk, otherwise [`create`](Self::create) a fresh one. The presence of
     /// the `.partial.ranges` record is the resume signal: `create` writes it,

@@ -908,6 +908,8 @@ async fn build_origin_seeded_ranking(
                 // Whole-blob coverage — these fixtures serve the whole blob, so a
                 // cache-hit candidate must range-plan as covering everything.
                 coverage: decdn_protocol::Coverage::full(1),
+                // No size hint: the pull leg's first open reads the size.
+                total_bytes_hint: None,
             })
             .collect(),
     );
@@ -1747,21 +1749,22 @@ async fn serve_gated_correct_bytes(
     received: &tokio::sync::Notify,
     release: &tokio::sync::Notify,
 ) -> Result<()> {
-    // The DECOUPLED serve-miss (#1621) reuses ONE upstream connection for TWO
-    // bi-streams: first a FREE header handshake — a whole-tail open
-    // (`byte_offset == 0 && byte_len == 0`) that the buyer ABORTS right after reading
-    // `total_bytes`, so it pulls no chunk, pays no voucher, and records NO watermark —
-    // then the real `PeerSource` range pull (`byte_len > 0`) on a SECOND bi-stream of
-    // the same connection. A single-open model here (one `accept_bi`, one gate) lets
-    // the free handshake swallow the test's single `release`, so the real pull blocks
-    // forever → 20s stall → `early eof`.
+    // The DECOUPLED serve-miss (#1621) opens its upstream through a header
+    // handshake. When the probe reported the size, that handshake opens the pull
+    // leg's first leg (`byte_len > 0`) and the pull leg adopts it (#2063): one
+    // bi-stream. Without a size it is a whole-tail open (`byte_offset == 0 &&
+    // byte_len == 0`) the buyer ABORTS right after reading `total_bytes` (it pulls
+    // no chunk, pays no voucher, records NO watermark), and the real `PeerSource`
+    // range pull follows on a SECOND bi-stream of the same connection.
     //
-    // Fix: loop over the connection's bi-streams. Gate ONLY the real pull — answer the
-    // handshake immediately (never touching `release`) and never signal `received` for
-    // it, so the test's `received` wait resolves on the real owner pull (the in-flight
-    // tee) landing, and the single `release` reaches the pull that actually blocks on
-    // it. The handshake records no watermark, so `upstream.len() == 1` (single SPEND)
-    // still holds.
+    // So loop over the connection's bi-streams, and answer every request's header
+    // at once: the buyer must read `total_bytes` to sign its own response and claim
+    // its fill before the test opens the coalescing request. Gate ONLY the chunk
+    // data of a real pull, and never signal `received` for a whole-tail handshake,
+    // so the test's `received` wait resolves on the real owner pull (the in-flight
+    // tee) landing, and the single `release` reaches the pull that actually blocks
+    // on it. A handshake records no watermark, so `upstream.len() == 1` (single
+    // SPEND) holds either way.
     loop {
         // No further stream on this connection (the buyer finished on the handshake
         // alone, or opened the real pull on a fresh connection handled by another
@@ -1795,23 +1798,20 @@ async fn serve_gated_correct_bytes(
             .to_vec();
         let resp = StreamResponse { body, slash_sig };
         let resp_ext = StreamResponseExt { error: None };
+        write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
+            .await
+            .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
         if req.byte_offset == 0 && req.byte_len == 0 {
-            // Free header handshake: answer without gating, then loop back to accept
-            // the real pull's bi-stream. The buyer aborts after the header, so there
-            // is no voucher exchange to await.
-            write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
-                .await
-                .map_err(|e| anyhow::anyhow!("write handshake response: {e}"))?;
+            // Whole-tail header handshake: loop back to accept the real pull's
+            // bi-stream. The buyer aborts after the header, so there is no voucher
+            // exchange to await.
             let _ = send.finish();
             continue;
         }
         // The real range pull landed (B's claim_fill Owner pull is in flight, cache still empty);
-        // hold here until the test has opened the coalescing second request.
+        // hold its bytes until the test has opened the coalescing second request.
         received.notify_one();
         release.notified().await;
-        write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
-            .await
-            .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
         for chunk in served.chunks(WIRE_FRAME) {
             write_frame(
                 &mut send,
@@ -7325,6 +7325,25 @@ async fn spawn_node_a(
     iroh::Endpoint,
     tokio::task::JoinHandle<()>,
 )> {
+    let (a_id, addr_a, a_eth, ep_a, task_a, _metrics) =
+        spawn_node_a_metered(payload, ab_channel_id, b_buyer_addr).await?;
+    Ok((a_id, addr_a, a_eth, ep_a, task_a))
+}
+
+/// [`spawn_node_a`], also returning A's metrics, so a test can count the paid
+/// streams A served.
+async fn spawn_node_a_metered(
+    payload: &[u8],
+    ab_channel_id: B256,
+    b_buyer_addr: Address,
+) -> Result<(
+    iroh::PublicKey,
+    std::net::SocketAddr,
+    Arc<PrivateKeySigner>,
+    iroh::Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
     let hash = Hash::new(payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let (cache_a, hash_a, tmp_a) = cache_with_blob(payload).await?;
@@ -7373,7 +7392,7 @@ async fn spawn_node_a(
         total_bytes,
         RATE,
     );
-    Ok((a_id, addr_a, a_eth, ep_a, task_a))
+    Ok((a_id, addr_a, a_eth, ep_a, task_a, metrics))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -7485,6 +7504,71 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     );
 
     assert_relay_counted(&b_metrics, u64::try_from(payload.len())?).await?;
+
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
+/// The serve-miss handshake is the pull leg's first leg (#2063). A's probe
+/// reports the blob's size, so B's handshake opens `[0, window)` (the first leg
+/// its paced pull draws) instead of a whole-blob open it would drop, and the pull
+/// leg adopts it. A therefore serves exactly the two paid legs, `[0, window)`
+/// and `[window, end)`, and no throwaway open.
+#[tokio::test]
+async fn window_pull_through_handshake_is_the_first_pull_leg() -> Result<()> {
+    let window = decdn_client::PULL_WINDOW_FLOOR;
+    let payload_len = usize::try_from(window.saturating_mul(3) / 2).unwrap_or(usize::MAX);
+    let payload = vec![0x5Au8; payload_len];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
+
+    let ab_channel_id = B256::repeat_byte(0xA1);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a, a_metrics) =
+        spawn_node_a_metered(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x1F);
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, _b_metrics, _local_rep, b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        b_operator,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await?;
+    anyhow::ensure!(
+        outcome.completed && outcome.hash_ok && outcome.received == total_bytes,
+        "leaf delivery must complete byte-exact: {outcome:?}"
+    );
+    let served = counter_value(&a_metrics, "serve_cache_hit_total")?;
+    anyhow::ensure!(
+        served == 2,
+        "A must serve only the two paid legs, the first of them the handshake's: served {served}"
+    );
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
@@ -11528,13 +11612,14 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         matches!(second, OriginFetch::NotFound),
         "fetch #2 must refuse: H lacks hash1 and A cannot be paid"
     );
-    // One logical pull to A opens TWO connections: `pull_from_candidate`'s free
-    // header handshake (to read `total_bytes`) plus the actual pull `drive()`
-    // opens inside it (#1675). Two streams here still means "A WAS pulled once
-    // (the hash1 wedge)", not twice.
+    // One logical pull to A opens ONE connection: `pull_from_candidate`'s
+    // whole-blob header handshake is also the drive's first and only leg, which
+    // adopts it (#2063). One stream here means "A WAS pulled once (the hash1
+    // wedge)".
     anyhow::ensure!(
-        streams_a.load(Ordering::SeqCst) == 2,
-        "A must be pulled exactly once (handshake + drive, the hash1 wedge), got {}",
+        streams_a.load(Ordering::SeqCst) == 1,
+        "A must be pulled exactly once (the handshake the drive adopts, the hash1 wedge), \
+         got {}",
         streams_a.load(Ordering::SeqCst)
     );
     assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
@@ -11563,10 +11648,10 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         "fetch #3 must miss: H is offline and A is wedged"
     );
     // THE property under test, at the wire: A's only pull ever is the hash1
-    // wedge (handshake + drive = the 2 streams above). A climb past 2 here is
-    // the hit path re-selecting the wedged provider.
+    // wedge (the 1 stream above). A climb past 1 here is the hit path
+    // re-selecting the wedged provider.
     anyhow::ensure!(
-        streams_a.load(Ordering::SeqCst) == 2,
+        streams_a.load(Ordering::SeqCst) == 1,
         "the cache hit re-streamed the WEDGED A — `cached_candidates` must filter a wedged \
          provider even when its (peer, hash) pair was never negative-cached, got {}",
         streams_a.load(Ordering::SeqCst)
@@ -11900,13 +11985,14 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         "A must be probed exactly once on the cold path, got {}",
         a_probes.load(Ordering::SeqCst)
     );
-    // One logical pull to A opens TWO connections: `pull_from_candidate`'s free
-    // header handshake (to read `total_bytes`) plus the actual pull `drive()`
-    // opens inside it (#1675). Two streams here still means "A WAS pulled once",
-    // not twice — the assertion pins the connection count, not the pull count.
+    // One logical pull to A opens ONE connection: `pull_from_candidate`'s
+    // whole-blob header handshake is also the drive's first and only leg, which
+    // adopts it (#2063). The assertion pins the connection count, so it also
+    // proves the handshake was not thrown away.
     anyhow::ensure!(
-        a_streams.load(Ordering::SeqCst) == 2,
-        "A must be pulled exactly once (handshake + drive) on the cold path, got {}",
+        a_streams.load(Ordering::SeqCst) == 1,
+        "A must be pulled exactly once (the handshake the drive adopts) on the cold path, \
+         got {}",
         a_streams.load(Ordering::SeqCst)
     );
     assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
@@ -11930,11 +12016,10 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         matches!(second, OriginFetch::NotFound),
         "second fetch must miss — the only cached provider was ejected inside the TTL"
     );
-    // Still 2 — the same two connections from fetch #1's single pull. If the hit
-    // path re-served the ejected A, this would climb by another 2 (handshake +
-    // drive), not by 1.
+    // Still 1 — the one connection from fetch #1's single pull. If the hit path
+    // re-served the ejected A, this would climb.
     anyhow::ensure!(
-        a_streams.load(Ordering::SeqCst) == 2,
+        a_streams.load(Ordering::SeqCst) == 1,
         "the hit re-served an EJECTED A — `is_active` must deny it on the hit path, got {} \
          streams",
         a_streams.load(Ordering::SeqCst)

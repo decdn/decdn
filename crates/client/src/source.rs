@@ -508,8 +508,9 @@ impl BlobSource for PeerSource<'_> {
 /// its drive is only worth adopting straight away: an idle one is a stream the
 /// peer is holding bytes on, and a peer that sees no voucher for long enough
 /// drops it. A primed pull older than this is dropped and the open goes to the
-/// wrapped source.
-const PRIMED_MAX_IDLE: Duration = Duration::from_secs(2);
+/// wrapped source. A caller that holds a pull before it can prime one checks
+/// the pull's own age against the same bound.
+pub const PRIMED_MAX_IDLE: Duration = Duration::from_secs(2);
 
 /// A pull opened ahead of the drive, waiting for the open it answers.
 struct Primed<R> {

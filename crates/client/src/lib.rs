@@ -202,7 +202,7 @@ pub use config::PullConfig;
 pub use connection::WarmConnection;
 pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 pub use decdn_bao_range::RangedStore;
-pub use downloader::{DownloadTarget, Downloader};
+pub use downloader::{DownloadTarget, Downloader, download_first_unit};
 pub use driver::{
     PacingWait, PoolExhausted, SharedPool, WaitReason, drive, drive_range_set, first_leg,
 };
@@ -220,9 +220,12 @@ pub use retry::{RetryDisposition, retry_disposition, shared_pool_disposition};
 pub use scheduler::{ConsumptionPacing, MultiSourceConfig, SourceLane, multi_source_fetch};
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
-    BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource, PrimedSource, SourceFuture,
+    BaoRangeReader, BlobSource, Funder, IngestStore, PRIMED_MAX_IDLE, PeerSource, PrimedSource,
+    SourceFuture,
 };
-pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};
+pub use streamer::{
+    LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader, stream_first_unit,
+};
 
 pub(crate) use ledger::StreamProof;
 

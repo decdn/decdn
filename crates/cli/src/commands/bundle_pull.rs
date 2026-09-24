@@ -1873,6 +1873,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         order: &fetch::ResolvedTargets,
         hash: [u8; 32],
         staging: &Path,
+        total: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<Option<()>> {
         // Admission is computed once and reused for the gate and the fan-out
@@ -1910,6 +1911,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             self.relays,
             hash,
             staging,
+            // The manifest's size, else the probed hint: neither is signed, so it
+            // only shapes the first open (#2063).
+            total.or(order.size_hint),
             progress,
             Some(&self.open_lock),
             Some(&self.ledgers),
@@ -1934,6 +1938,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         &self,
         hash: [u8; 32],
         staging: &Path,
+        total: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<()> {
         let _permit = self
@@ -1979,7 +1984,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // through to the single-source failover loop below unchanged; a
         // retryable fan-out failure does the same, resuming the entry's
         // `.partial` so nothing paid for is re-bought.
-        match self.try_multi_source(&order, hash, staging, progress).await {
+        match self
+            .try_multi_source(&order, hash, staging, total, progress)
+            .await
+        {
             Ok(Some(())) => return Ok(()),
             Ok(None) => {}
             Err(err)
@@ -2221,7 +2229,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let staging = staging_path(out_root, hash)?;
         // The manifest blob fetch is silent (no bar): `progress` is disabled here
         // anyway, and the per-file bars belong to the entries, not the manifest.
-        self.fetch_to_staging(hash, &staging, None).await?;
+        self.fetch_to_staging(hash, &staging, None, None).await?;
         let bytes =
             std::fs::read(&staging).with_context(|| format!("read {}", staging.display()))?;
         remove_staging_off_runtime(&staging).await;
@@ -2520,7 +2528,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // register its chunks so a *later* entry can dedup against it. The paid
             // count is the verified blob's length, not the manifest's optional
             // `size`: this path never checks `size`, so a wrong one still fetches.
-            self.fetch_to_staging(hash, staging, progress).await?;
+            self.fetch_to_staging(hash, staging, total, progress)
+                .await?;
             index.register(hints, staging);
             let paid = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
             return Ok(paid);

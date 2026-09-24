@@ -618,10 +618,12 @@ fn keep_decisive(kept: anyhow::Error, new: anyhow::Error) -> anyhow::Error {
 /// `total_bytes`, or to learn whether the peer will serve) opens exactly this
 /// range and hands the live pull to the drive through a [`crate::PrimedSource`],
 /// so the first open is also the drive's first leg (#2063). It is the range
-/// [`drive`] and [`drive_range_set`] open for their first gap when the caller
-/// passes a [`crate::BudgetPacer`], which draws the whole unpaid gap: a fresh
-/// drive's paid frontier starts at the gap start. `max_blob_size_bytes` is the
-/// source's received-byte ceiling ([`BlobSource::max_blob_size_bytes`]).
+/// [`drive`] and [`drive_range_set`] open for their first gap when the pacer's
+/// first decision is `Draw { up_to_bytes }`: a fresh drive's paid frontier
+/// starts at the gap start, so the leg is the gap cut to `up_to_bytes`. A
+/// [`crate::BudgetPacer`] draws the whole unpaid gap, so pass `u64::MAX` for it.
+/// `max_blob_size_bytes` is the source's received-byte ceiling
+/// ([`BlobSource::max_blob_size_bytes`]).
 ///
 /// # Errors
 ///
@@ -629,6 +631,7 @@ fn keep_decisive(kept: anyhow::Error, new: anyhow::Error) -> anyhow::Error {
 pub async fn first_leg<St: RangedStore + ?Sized>(
     store: &St,
     ranges: &[(u64, u64)],
+    up_to_bytes: u64,
     max_blob_size_bytes: u64,
 ) -> anyhow::Result<Option<AlignedRange>> {
     let gaps = range_set_gaps(store, ranges).await?;
@@ -638,7 +641,7 @@ pub async fn first_leg<St: RangedStore + ?Sized>(
     leg_range(
         start,
         start.saturating_add(len),
-        u64::MAX,
+        up_to_bytes,
         max_blob_size_bytes,
         store.total_bytes(),
     )
@@ -1795,7 +1798,7 @@ mod tests {
                 .paying(Arc::clone(&ledger)),
         );
         let ranges: Vec<(u64, u64)> = (0..32).step_by(2).map(|g| (g * GROUP, GROUP)).collect();
-        let leg = first_leg(&store, &ranges, 0)
+        let leg = first_leg(&store, &ranges, u64::MAX, 0)
             .await
             .expect("leg")
             .expect("a gap");
@@ -1969,7 +1972,9 @@ mod tests {
 
         let fresh = fresh_store(root, total);
         assert_eq!(
-            first_leg(&fresh, &[(0, 0)], 0).await.expect("first leg"),
+            first_leg(&fresh, &[(0, 0)], u64::MAX, 0)
+                .await
+                .expect("first leg"),
             Some(align_range(0, 0, total).expect("align")),
             "a fresh whole-blob drive opens the whole blob"
         );
@@ -1982,7 +1987,7 @@ mod tests {
             &align_range(0, GROUP, total).expect("align"),
         )
         .await;
-        let want = first_leg(&resumed, &[(0, 0)], 0)
+        let want = first_leg(&resumed, &[(0, 0)], u64::MAX, 0)
             .await
             .expect("first leg")
             .expect("a gap remains");
@@ -2016,7 +2021,7 @@ mod tests {
         // The received-byte ceiling caps the first leg exactly as it caps a
         // drawn leg: one chunk group past the ceiling.
         assert_eq!(
-            first_leg(&fresh, &[(0, 0)], GROUP)
+            first_leg(&fresh, &[(0, 0)], u64::MAX, GROUP)
                 .await
                 .expect("first leg"),
             Some(align_range(0, 2 * GROUP, total).expect("align"))
@@ -2030,8 +2035,54 @@ mod tests {
         )
         .await;
         assert_eq!(
-            first_leg(&full, &[(0, 0)], 0).await.expect("first leg"),
+            first_leg(&full, &[(0, 0)], u64::MAX, 0)
+                .await
+                .expect("first leg"),
             None
+        );
+    }
+
+    /// Under a windowed pacer, `first_leg` bounded by the window is the range
+    /// the drive opens first: the first decision draws one window.
+    #[tokio::test]
+    async fn a_windowed_first_leg_is_the_range_the_drive_opens_first() {
+        let total = 4 * GROUP;
+        let (root, plaintext, _) = synth_blob(total as usize);
+        let windowed = fresh_store(root, total);
+        let want = first_leg(&windowed, &[(0, 0)], 2 * GROUP, 0)
+            .await
+            .expect("first leg")
+            .expect("a gap remains");
+        assert_eq!(want, align_range(0, 2 * GROUP, total).expect("align"));
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        let downstream = || super::DownstreamFrontier {
+            served_paid: u64::MAX,
+            serve_demand: 0,
+        };
+        drive(
+            &windowed,
+            &source,
+            &crate::pacer::WindowPacer::new(2 * GROUP),
+            &healthy_funder(),
+            &Arc::new(Mutex::new(healthy_ctx())),
+            &ledger,
+            root,
+            0,
+            0,
+            &config(),
+            None,
+            None,
+            Some(&downstream),
+            None,
+        )
+        .await
+        .expect("drive");
+        assert_eq!(
+            source.opened_ranges().first().copied(),
+            Some((want.fetch_start(), want.fetch_len()))
         );
     }
 

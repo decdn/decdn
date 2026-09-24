@@ -4,7 +4,7 @@ use alloy::primitives::U256;
 
 use super::dispatch::{aligned_span, range_out_of_bounds};
 
-use crate::node_origin::PullLegTarget;
+use crate::node_origin::{PrimeLeg, PullLegTarget};
 
 use super::{
     Arc, B256, CHUNK_BYTES, ClientHandler, FillOutcome, FloorReservation, Hash, LaneDeliveryState,
@@ -14,7 +14,7 @@ use super::{
 
 /// Release a miss leg's floor reservation on a refusal taken BEFORE the serve
 /// loop runs — the pre-flight floor-`M` gate, the size gate, or an upstream that
-/// refused the free header handshake. Nothing was fronted upstream and no byte
+/// refused the header handshake. Nothing was fronted upstream and no byte
 /// was delivered, so [`FloorReservation::release_unspent`] frees the live
 /// reservation promptly and marks the guard so its `Drop` is a clean no-op
 /// (ADR 003 §Pool solvency). A no-op when no lane was known (no reservation was
@@ -191,13 +191,26 @@ impl ClientHandler {
         // `uint256` shape.
         let deadline = self.pull_through.unwrap_or(WINDOW_PULL_FALLBACK_DEADLINE);
         let namespace_id = U256::from_be_bytes(req.namespace_id);
+        // The first leg a pull of `[offset, +len)` opens, so the handshake can
+        // open that leg instead of a whole-blob open it drops (#2063).
+        let prime_for = |offset: u64, len: u64| {
+            PrimeLeg::new(
+                offset,
+                len,
+                self.credit_ramp_divisor,
+                pacing_floor,
+                self.credit_max,
+            )
+        };
         let mut target: Option<PullLegTarget> = None;
         let total_bytes = match self.cache.in_flight_total(hash) {
             Some(total) => total,
             None => {
                 // No live fill to coalesce onto — handshake upstream to learn the
                 // geometry and secure the pull target this miss will own. ONE discovery
-                // shared by both legs, open-time candidate fallback preserved.
+                // shared by both legs, open-time candidate fallback preserved. The
+                // claim is not made yet; with no live fill it owns the whole request,
+                // so the handshake is cut for that pull.
                 match self
                     .open_pull_leg_bounded(
                         origin.as_ref(),
@@ -205,6 +218,7 @@ impl ClientHandler {
                         namespace_id,
                         deadline,
                         fault_seen,
+                        Some(prime_for(req.byte_offset, req.byte_len)),
                     )
                     .await
                 {
@@ -287,6 +301,13 @@ impl ClientHandler {
         // `Owner` drives a pull for the whole request; `Mixed` drives one for only the
         // remainder and attaches a sibling for the overlap; `Attach` drives none.
         let (serve_session, pull_range, also_pace, leases) = plan_serve(claim, req);
+        // Only an owning claim pulls from a fresh frontier at its range's start; a
+        // mixed claim's remainder paces behind the attached overlap, so its first
+        // leg is not the one the handshake could predict.
+        let owns = also_pace.is_empty();
+        if let Some(target) = target.as_mut() {
+            target.keep_prime_for(owns, pull_range);
+        }
 
         // (6b) Owning-race repair: the advisory step-3 peek planned to ATTACH and
         // secured no `target`, but the peeked session retired before this claim, so the
@@ -294,8 +315,18 @@ impl ClientHandler {
         // pull leg now, BEFORE signing `ok: true` (step 7), so a no-provider / deadline
         // miss still refuses cleanly rather than committing to a stream it can't fill.
         if pull_range.is_some() && target.is_none() {
+            let prime = pull_range
+                .filter(|_| owns)
+                .map(|(offset, len)| prime_for(offset, len));
             match self
-                .open_pull_leg_bounded(origin.as_ref(), hash, namespace_id, deadline, fault_seen)
+                .open_pull_leg_bounded(
+                    origin.as_ref(),
+                    hash,
+                    namespace_id,
+                    deadline,
+                    fault_seen,
+                    prime,
+                )
                 .await
             {
                 Ok(opened) => target = Some(opened),
@@ -825,6 +856,9 @@ impl ClientHandler {
     ///   `fault_seen || miss.is_local_fault()`;
     /// - the pull-through deadline elapsing (a slow/absent upstream must not pin the
     ///   stream) — the timeout metric fires and the reason is `miss_reason(fault_seen)`.
+    ///
+    /// `prime` is the pull this miss expects to own, when it can say: the handshake
+    /// then opens that pull's first leg for the pull leg to adopt (#2063).
     async fn open_pull_leg_bounded(
         &self,
         origin: &NodeOrigin,
@@ -832,8 +866,10 @@ impl ClientHandler {
         namespace_id: U256,
         deadline: std::time::Duration,
         fault_seen: bool,
+        prime: Option<PrimeLeg>,
     ) -> Result<PullLegTarget, ServeRejectReason> {
-        match tokio::time::timeout(deadline, origin.open_pull_leg(hash, namespace_id)).await {
+        match tokio::time::timeout(deadline, origin.open_pull_leg(hash, namespace_id, prime)).await
+        {
             Ok(Ok(target)) => Ok(target),
             Ok(Err(miss)) => Err(FillOutcome::miss_reason(
                 fault_seen || miss.is_local_fault(),

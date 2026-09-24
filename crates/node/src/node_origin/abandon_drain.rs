@@ -39,6 +39,8 @@
 //! The orchestration's pre-flight handshake is deliberately NOT recorded:
 //! `NodeOrigin::open_pull_leg` and `pull_from_candidate` run it before the pull
 //! runtime exists, so its driver lives on the outer runtime, which keeps living.
+//! That holds for a handshake pull the drive adopts as its first leg (#2063)
+//! too: its connection stays on the outer runtime.
 //!
 //! # What is not covered
 //!

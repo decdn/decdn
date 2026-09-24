@@ -35,6 +35,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Notify;
 
+use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, align_range};
 use decdn_protocol::{Coverage, num_blocks};
 
 use crate::driver::{DriveConfig, PacingWait, WaitReason};
@@ -160,6 +161,31 @@ pub struct StreamCandidate<S> {
     /// given several targets applies it to each of them: set it only on a
     /// single-target fetch.
     pub coverage: Option<Coverage>,
+    /// The range this candidate opens first, when the caller already opened it
+    /// and parked the pull in a [`crate::PrimedSource`] (#2063); see
+    /// [`SourceLane::first_unit`]. [`crate::download_first_unit`] and
+    /// [`stream_first_unit`] name the range each face opens first. Like
+    /// `coverage`, it names one blob: set it only on a single-target fetch.
+    pub first_unit: Option<AlignedRange>,
+}
+
+/// The range a [`Streamer`] opens first on a fresh `total_bytes`-byte blob
+/// under `config`: offset 0, cut to one read-ahead window.
+///
+/// A caller that opens a pull before the stream (to read the signed
+/// `total_bytes`, or to learn whether the peer serves) opens exactly this range
+/// and parks the pull in a [`crate::PrimedSource`], and sets it as that
+/// candidate's [`StreamCandidate::first_unit`]; the lane's first open then
+/// adopts the pull (#2063). The unit starts at the consumer's cursor and is no
+/// longer than the window, so the window pacer draws it whole.
+///
+/// # Errors
+///
+/// A size the range does not align against (an empty blob).
+pub fn stream_first_unit(total_bytes: u64, config: &PullConfig) -> anyhow::Result<AlignedRange> {
+    let window = config.read_ahead_bytes.max(PULL_WINDOW_FLOOR);
+    let window = window - window % CHUNK_GROUP_BYTES;
+    Ok(align_range(0, window.min(total_bytes), total_bytes)?)
 }
 
 /// Build the per-provider [`SourceLane`] set for one blob, threading each
@@ -180,6 +206,7 @@ pub(crate) fn source_lanes<S>(
                 .coverage
                 .clone()
                 .unwrap_or_else(|| Coverage::full(num_blocks(total))),
+            first_unit: c.first_unit.clone(),
         })
         .collect()
 }
@@ -779,6 +806,7 @@ mod tests {
             ctx: Arc::new(Mutex::new(ctx)),
             ledger,
             coverage: None,
+            first_unit: None,
         }
     }
 
@@ -1056,6 +1084,63 @@ mod tests {
         anyhow::ensure!(
             faulty_probe.delivered_bytes() > 0,
             "the faulty candidate must have delivered a prefix before failing over"
+        );
+        Ok(())
+    }
+
+    /// `stream_first_unit` is the range the Streamer opens first: a pull primed
+    /// at it on any lane is adopted, so only the priming open ever starts at
+    /// offset 0 (#2063).
+    #[tokio::test]
+    async fn a_primed_first_unit_is_adopted() -> anyhow::Result<()> {
+        use crate::PrimedSource;
+
+        let blob = payload(4 * 1024 * 1024);
+        let (src_a, ledger_a) = paying_source(blob.clone())?;
+        let (src_b, ledger_b) = paying_source(blob.clone())?;
+        let root = src_a.root();
+        let total = src_a.total_bytes();
+        let probe_a = src_a.clone();
+        let probe_b = src_b.clone();
+        let config = PullConfig {
+            read_ahead_bytes: PULL_WINDOW_FLOOR,
+            ..PullConfig::default()
+        };
+
+        let unit = super::stream_first_unit(total, &config)?;
+        let primed_b = PrimedSource::new(src_b);
+        let (header, reader) = primed_b.inner().open(root, unit.clone()).await?;
+        primed_b.prime(root, unit.clone(), header, reader);
+        let mut cand_b = candidate(primed_b, ledger_b, 0xB2);
+        cand_b.first_unit = Some(unit.clone());
+
+        let scratch = tempfile::tempdir()?;
+        let streamer = Streamer::new(
+            vec![candidate(PrimedSource::new(src_a), ledger_a, 0xA1), cand_b],
+            funder(),
+            drive_config(),
+            scratch.path(),
+        );
+        let (mut reader, mut drive) = streamer
+            .open(root, total, &config, Arc::new(NoCache))
+            .await?;
+        let out = drive
+            .alongside(async {
+                let mut out = Vec::new();
+                reader.read_to_end(&mut out).await?;
+                Ok::<_, anyhow::Error>(out)
+            })
+            .await?;
+        anyhow::ensure!(out == blob, "the stream must be identical");
+
+        let opens: Vec<(u64, u64)> = probe_a
+            .opened_ranges()
+            .into_iter()
+            .chain(probe_b.opened_ranges())
+            .collect();
+        anyhow::ensure!(
+            opens.iter().filter(|&&(start, _)| start == 0).count() == 1,
+            "only the priming open starts at offset 0: {opens:?}"
         );
         Ok(())
     }

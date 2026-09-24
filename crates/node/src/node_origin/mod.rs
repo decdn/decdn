@@ -56,7 +56,7 @@ pub(crate) use admit_store::NodeAdmitStore;
 pub(crate) use backend_source::BackendSource;
 pub(crate) use funder::NodeFunder;
 use funder::{SETTLE_POLL_STEP, settle_wait_budget};
-pub(crate) use pull_leg::{PullLegTarget, run_local_pull_leg, run_pull_leg};
+pub(crate) use pull_leg::{PrimeLeg, PullLegTarget, run_local_pull_leg, run_pull_leg};
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -67,10 +67,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
+use decdn_bao_range::align_range;
 use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{Hash, OriginKind, OriginPullError};
 use decdn_client::driver::DriveConfig;
-use decdn_client::{BudgetPacer, PeerSource, drive};
+use decdn_client::{BudgetPacer, PeerSource, PrimedSource, drive, first_leg};
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tokio_util::sync::CancellationToken;
@@ -99,7 +100,7 @@ use decdn_client::{
     BlobTooLarge, Cumulative, HashMismatch, LocalPullFault, PoolContext, PoolLedger, PullDeadlines,
     PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd, UpstreamRateLimited,
     UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
-    open_progressive_pull as open_progressive_upstream, sign_client_binding,
+    sign_client_binding,
 };
 
 /// How a probe round decides it has collected enough holders (#1506).
@@ -918,7 +919,7 @@ async fn probe_and_rank(
     let mut union_blocks: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut target_blocks: u32 = 0;
     while let Some(result) = probes.next().await {
-        if let Some((candidate, total_bytes)) = result {
+        if let Some(candidate) = result {
             let done = match gather {
                 ProbeGather::EarlyExit => {
                     candidates.push(candidate);
@@ -928,7 +929,7 @@ async fn probe_and_rank(
                     // A holder's own reported size pins how many blocks the blob has;
                     // ignore its coverage bits past that (untrusted wire may set spurious
                     // high bits — see `Coverage`).
-                    if let Some(bytes) = total_bytes {
+                    if let Some(bytes) = candidate.total_bytes_hint {
                         let holder_blocks = decdn_protocol::num_blocks(bytes);
                         target_blocks = target_blocks.max(holder_blocks);
                         for block in candidate.coverage.covered_blocks() {
@@ -972,6 +973,7 @@ async fn probe_and_rank(
                 rate_per_mb: c.rate_per_mb,
                 rtt_ms: c.rtt_ms,
                 coverage: c.coverage.clone(),
+                total_bytes_hint: c.total_bytes_hint,
             })
             .collect(),
     );
@@ -988,10 +990,10 @@ fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
         .collect()
 }
 
-/// Probe a single provider, returning a ranked-ready [`Candidate`] paired with
-/// the holder's reported blob size (`ProbeResponseExt.total_bytes`, for the
-/// coverage-union gather) iff it responds, validates, and reports holding the
-/// blob. Side effects: a failed probe scores the provider [`Outcome::Unreachable`],
+/// Probe a single provider, returning a ranked-ready [`Candidate`], carrying
+/// the holder's reported blob size (`ProbeResponseExt.total_bytes`) as its
+/// [`Candidate::total_bytes_hint`], iff it responds, validates, and reports
+/// holding the blob. Side effects: a failed probe scores the provider [`Outcome::Unreachable`],
 /// except a probe the provider shed with `APP_ERR_RATE_LIMITED`, which suppresses
 /// the pair for [`REFUSAL_SUPPRESSION_TTL`] and scores nothing (#1986); a
 /// same-region claim answered slower than [`REGION_LATENCY_MAX_MS`] scores
@@ -1006,7 +1008,7 @@ async fn probe_candidate(
     deps: &NodeOriginDeps,
     peer: DhtNodeId,
     hash_bytes: [u8; 32],
-) -> Option<(Candidate, Option<u64>)> {
+) -> Option<Candidate> {
     let Ok(pk) = PublicKey::from_bytes(peer.as_bytes()) else {
         // A staker-filtered routing entry should always decode; a failure
         // implies upstream state corruption — skip rather than panic.
@@ -1124,33 +1126,30 @@ async fn probe_candidate(
         deps.metrics.node_region_latency_penalty();
         record_outcome(deps, pk, &Outcome::RegionLatencyMismatch);
     }
-    // The holder's reported blob size (`ProbeResponseExt.total_bytes`), read
-    // before `coverage` is moved into the candidate. The coverage-union gather
-    // (#1506) uses it to know how many discovery blocks the union must span.
-    let total_bytes = resp_ext.total_bytes;
-    Some((
-        Candidate {
-            node_id: *peer.as_bytes(),
-            rate_per_mb: resp.body.rate_per_mb,
-            rtt_ms: rtt,
-            reputation: peer_reputation(deps, pk),
-            // Drives the geo-diversity tie-break tier (selection.rs) and the
-            // latency-vs-claim penalty above.
-            region,
-            // No on-chain stake lookup is wired yet (#1470 / ADR 019). `0` is a
-            // placeholder here, not an observation — which is exactly why tier 2 is
-            // a uniform no-op until the lookup lands. When it does, a failed read
-            // must be resolved here (retry, or drop the candidate) rather than
-            // passed through as `0`; see `Candidate::stake`.
-            stake: 0,
-            // The fresh, probe-confirmed coverage (#1506) — never the stale DHT
-            // hint `discover` drops. The `consistent_with` check above already
-            // guarantees this is non-empty whenever `has_blob` is true, which is
-            // the only way execution reaches here.
-            coverage: resp_ext.coverage,
-        },
-        total_bytes,
-    ))
+    Some(Candidate {
+        node_id: *peer.as_bytes(),
+        rate_per_mb: resp.body.rate_per_mb,
+        rtt_ms: rtt,
+        reputation: peer_reputation(deps, pk),
+        // Drives the geo-diversity tie-break tier (selection.rs) and the
+        // latency-vs-claim penalty above.
+        region,
+        // No on-chain stake lookup is wired yet (#1470 / ADR 019). `0` is a
+        // placeholder here, not an observation — which is exactly why tier 2 is
+        // a uniform no-op until the lookup lands. When it does, a failed read
+        // must be resolved here (retry, or drop the candidate) rather than
+        // passed through as `0`; see `Candidate::stake`.
+        stake: 0,
+        // The fresh, probe-confirmed coverage (#1506) — never the stale DHT
+        // hint `discover` drops. The `consistent_with` check above already
+        // guarantees this is non-empty whenever `has_blob` is true, which is
+        // the only way execution reaches here.
+        coverage: resp_ext.coverage,
+        // The holder's reported blob size. The coverage-union gather (#1506)
+        // reads it to know how many discovery blocks the union must span,
+        // and the pull leg cuts its first upstream open from it.
+        total_bytes_hint: resp_ext.total_bytes,
+    })
 }
 
 /// Rebuild ranked [`Candidate`]s from a probe-cache hit (ADR 001 §Probe cache).
@@ -1232,6 +1231,7 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             // evidence-retention the cache's module doc forbids — coverage is
             // outside the `slash_sig` set and has no author to slash.
             coverage: provider.coverage.clone(),
+            total_bytes_hint: provider.total_bytes_hint,
         });
     }
     if candidates.is_empty() {
@@ -1752,7 +1752,7 @@ async fn pull_from_candidate_in_span(
     // Settling from this outer future instead would race the still-running thread and
     // persist a STALE cumulative, wedging the lane exactly as the copy-back did. So
     // nothing pre-`drive` on this outer future settles: the channel-open, bind, and
-    // free header handshake below issue no voucher.
+    // header handshake below issue no voucher.
     // As on the window path: a zero budget is our own misconfiguration, metered as ours.
     // Checked BEFORE the ledger, so a pull that cannot legally run never reaches the
     // wire and has nothing to settle.
@@ -1782,30 +1782,27 @@ async fn pull_from_candidate_in_span(
     let _stream_guard = deps.metrics.outbound_stream_guard();
     opened.store(true, Ordering::Relaxed);
 
-    // Header handshake: a free whole-tail open to read the committed `total_bytes`,
-    // then abort — no bytes pulled, no voucher. `NO_NAMESPACE`, as this hash-only
-    // populate path carries no served-client namespace. `rate_ceiling` folds the ADR
-    // 041 buy cap in (computed above with the skip decision).
-    let (header, probe) = match open_progressive_upstream(
+    // Header handshake: a whole-tail open to read the committed `total_bytes`.
+    // The drive below pulls the whole blob, so when this node holds none of it the
+    // drive's first leg is this same open, and it adopts the pull (#2063) rather
+    // than the upstream serving a throwaway open and then the same range again.
+    // `NO_NAMESPACE`, as this hash-only populate path carries no served-client
+    // namespace. `rate_ceiling` folds the ADR 041 buy cap in (computed above with
+    // the skip decision). It opens on the outer runtime: nothing to strand, so no
+    // dial observer.
+    let handshake_source = PeerSource::new(
         &deps.endpoint,
         EndpointAddr::new(pk),
-        &ctx,
+        Arc::new(Mutex::new(ctx.clone())),
         Arc::clone(&ledger),
         &deps.slash_domain,
         provider_addr,
-        hash_bytes,
         NO_NAMESPACE,
-        0,
-        now_micros(),
         deps.config.max_blob_size_bytes,
         rate_ceiling,
         deadlines,
-        0,
-        // Outer runtime: nothing to strand, so no dial observer.
-        None,
-    )
-    .await
-    {
+    );
+    let (header, whole) = match handshake_source.open_whole(hash_bytes).await {
         Ok(pair) => pair,
         Err(err) => {
             // No bytes pulled, no voucher paid — nothing to settle.
@@ -1815,7 +1812,6 @@ async fn pull_from_candidate_in_span(
         }
     };
     let total_bytes = header.total_bytes;
-    let _ = probe.abort();
 
     // Run `drive()` on a dedicated blocking-pool thread with its own current-thread
     // runtime, exactly as the window-paced serve-miss pull leg does
@@ -1916,6 +1912,20 @@ async fn pull_from_candidate_in_span(
                 deadlines,
             )
             .with_dial_observer(as_observer(&observer));
+            let source = PrimedSource::new(source);
+            // The handshake's pull is the drive's first leg only when that leg is
+            // the whole blob: this node holds none of it.
+            let whole_range = align_range(0, 0, total_bytes).ok();
+            let first = first_leg(&store, &[(0, 0)], u64::MAX, max_blob_size_bytes)
+                .await
+                .ok()
+                .flatten();
+            match whole_range {
+                Some(range) if first.as_ref() == Some(&range) => {
+                    source.prime(hash_bytes, range, header, whole);
+                }
+                _ => drop((header, whole)),
+            }
             let pacer = BudgetPacer::new();
             let funder = NodeFunder::new(
                 buyer,
@@ -1956,6 +1966,8 @@ async fn pull_from_candidate_in_span(
                     Ok(())
                 }
             };
+            // A primed pull the drive never opened closes now.
+            source.clear();
             // Wait out a stranded upstream connection on the cancel/`Err` paths only,
             // so `Endpoint::close()` cannot hang on the runtime this thread is about
             // to drop. The `_settle` guard drops AFTER this, persisting the final

@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_bao_range::align_range;
+use decdn_bao_range::{AlignedRange, align_range};
 use decdn_client::buyer_pool::{
     LOW_WATER_DIVISOR, ProgressWrite, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
     grade_deposit_credit, open_pool, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
@@ -1495,6 +1495,7 @@ async fn fetch_over(
             &coverage_by_node,
             relays,
             hash,
+            size_hint,
         )
         .await?;
         tracing::info!("streamed {streamed} verified bytes to stdout");
@@ -2471,14 +2472,15 @@ where
             let total_bytes = header.total_bytes;
             let ranged_store = open_store(total_bytes)?;
             let whole = align_range(0, 0, total_bytes)?;
-            if first_leg(&ranged_store, &[(0, 0)], max_blob).await? == Some(whole.clone()) {
+            if first_leg(&ranged_store, &[(0, 0)], u64::MAX, max_blob).await? == Some(whole.clone())
+            {
                 peer_source.prime(hash, whole, header, reader);
             }
             (total_bytes, ranged_store)
         }
         PreludeLeg::Known { total, ranges } => {
             let ranged_store = open_store(total)?;
-            if let Some(leg) = first_leg(&ranged_store, ranges, max_blob).await? {
+            if let Some(leg) = first_leg(&ranged_store, ranges, u64::MAX, max_blob).await? {
                 let (header, reader) = scored(peer_source.inner().open(hash, leg.clone()).await)?;
                 if header.total_bytes != total {
                     return Err(anyhow::Error::new(ManifestSizeMismatch {
@@ -2743,7 +2745,12 @@ struct MultiLane<'a> {
     prior_amount: U256,
     ctx: Arc<Mutex<PoolContext>>,
     ledger: Arc<PoolLedger>,
-    source: PeerSource<'a>,
+    /// The lane's source. A pull opened on it before the fetch is parked here
+    /// for the lane's first open to adopt (#2063).
+    source: PrimedSource<PeerSource<'a>>,
+    /// The range the parked pull covers, which the face hands this lane first;
+    /// `None` when nothing is parked.
+    first_unit: Option<AlignedRange>,
 }
 
 /// The `SourceLane::coverage` for one multi-source lane: the REAL measured
@@ -2863,7 +2870,7 @@ where
         ctx,
     );
     let target = multi_source_target(candidate, relays);
-    let source = PeerSource::new(
+    let source = PrimedSource::new(PeerSource::new(
         deps.endpoint,
         target,
         Arc::clone(&ctx),
@@ -2874,7 +2881,7 @@ where
         deps.max_blob_bytes,
         deps.max_rate_per_mb,
         deps.deadlines,
-    );
+    ));
     Ok(MultiLane {
         node_id: candidate.node_id,
         provider,
@@ -2883,6 +2890,7 @@ where
         ctx,
         ledger,
         source,
+        first_unit: None,
     })
 }
 
@@ -2971,10 +2979,11 @@ where
 /// one that answered, in `admitted` order — so a caller whose size gate then
 /// declines has built no lane past it. [`build_remaining_lanes`] builds the rest.
 ///
-/// The open is dropped once its header is read, unlike the prelude of a
-/// single-source drive, which hands its first open to the drive (#2063). The
-/// multi-source scheduler's first unit is a segment of the blob, never the
-/// whole-blob range this open asks for, so no leg could adopt it.
+/// The open is dropped once its header is read. It asks for the whole blob
+/// because the size is not known before it, and no lane's first unit is the
+/// whole blob, so no leg could adopt it. A caller that knows the size before
+/// the first open calls [`prime_admitted_lanes`] instead, whose first open is a
+/// lane's first unit (#2063).
 ///
 /// `open_lock` serializes each lane's pool open-or-reuse against other fetches on
 /// the same on-chain pool (`bundle pull` passes its bundle-wide lock; a solo
@@ -3040,19 +3049,11 @@ where
         {
             Ok((header, pull)) => {
                 drop(pull);
-                let _ = peer_store.record_sample(
-                    &lane.node_id,
-                    header.ttfb_ms,
-                    header.rate_per_mb,
-                    now_secs_cli(),
-                    &peer_store_cfg,
-                );
+                record_first_open(&peer_store, &peer_store_cfg, &lane.node_id, Ok(&header));
                 total_bytes = Some(header.total_bytes);
             }
             Err(err) => {
-                if !decdn_client::is_insufficient_deposit(&err) {
-                    let _ = peer_store.record_failure(&lane.node_id, now_secs_cli());
-                }
+                record_first_open(&peer_store, &peer_store_cfg, &lane.node_id, Err(&err));
                 last_probe_err = Some(match lane.ctx.lock() {
                     Ok(guard) => annotate_unbound_cache_miss(err, &guard),
                     Err(_) => err,
@@ -3073,6 +3074,239 @@ where
             )
         })),
     }
+}
+
+/// File a lane's first open in the peer store (#1906-series): a success's
+/// stream-derived latency and quoted rate, or a failure. An
+/// `InsufficientDeposit` refusal is not filed: it is our pool falling short of
+/// the node's floor, not a fault of the peer.
+fn record_first_open(
+    peer_store: &decdn_client::PeerStore,
+    cfg: &decdn_client::StoreConfig,
+    node_id: &PublicKey,
+    opened: Result<&UpstreamPullHeader, &anyhow::Error>,
+) {
+    match opened {
+        Ok(header) => {
+            let _ = peer_store.record_sample(
+                node_id,
+                header.ttfb_ms,
+                header.rate_per_mb,
+                now_secs_cli(),
+                cfg,
+            );
+        }
+        Err(err) => {
+            if !decdn_client::is_insufficient_deposit(err) {
+                let _ = peer_store.record_failure(node_id, now_secs_cli());
+            }
+        }
+    }
+}
+
+/// The size a download's first open is cut from: `expected`, unless the
+/// download resumes a ranged store beside `output`. A size known before the
+/// first open lets that open be a lane's first unit rather than a size probe
+/// that is dropped (#2063); a resume starts at its first gap, not at that unit,
+/// so it probes the size as before.
+fn fresh_download_size(expected: Option<u64>, output: &Path) -> anyhow::Result<Option<u64>> {
+    let Some(expected) = expected else {
+        return Ok(None);
+    };
+    let (dir, stem) = ranged_store_location(output)?;
+    let resumes = ClientRangedStore::has_record(&dir, &stem)
+        .with_context(|| format!("stat the ranged store for {}", output.display()))?;
+    Ok((!resumes).then_some(expected))
+}
+
+/// Learn the size with [`probe_admitted_total`], gate on it, and only then
+/// build the lanes past the one that answered, so a declined fetch builds no
+/// extra lane. `declines` is the gate on the signed size. Returns `None` when
+/// it declines.
+#[allow(clippy::too_many_arguments)]
+async fn build_probed_lanes<'a, P>(
+    deps: &DriveFetchDeps<'a, P>,
+    grant: Option<&CapabilityGrant>,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_dom: &Eip712Domain,
+    admitted: &[NodeCandidate],
+    relays: &[RelayUrl],
+    hash: [u8; 32],
+    open_lock: Option<&tokio::sync::Mutex<()>>,
+    ledgers: Option<&LaneLedgers>,
+    declines: impl FnOnce(u64) -> bool,
+) -> anyhow::Result<Option<(Vec<MultiLane<'a>>, u64)>>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let (mut lanes, total_bytes) = probe_admitted_total(
+        deps,
+        grant,
+        signer,
+        voucher_dom,
+        admitted,
+        relays,
+        hash,
+        open_lock,
+        ledgers,
+    )
+    .await?;
+    if declines(total_bytes) {
+        return Ok(None);
+    }
+    build_remaining_lanes(
+        deps,
+        grant,
+        signer,
+        voucher_dom,
+        admitted,
+        relays,
+        open_lock,
+        ledgers,
+        &mut lanes,
+    )
+    .await?;
+    Ok(Some((lanes, total_bytes)))
+}
+
+/// Build a payment lane for every admitted candidate, then prime one with the
+/// face's first unit ([`prime_admitted_lanes`]). `unit` names that unit for the
+/// number of lanes built, cut from `expected`. Returns the lanes and the
+/// signed `total_bytes`.
+///
+/// Every lane is built before the first open, so no pool open (which can wait
+/// on the chain) sits between the priming open and the face's adopting one.
+#[allow(clippy::too_many_arguments)]
+async fn build_primed_lanes<'a, P>(
+    deps: &DriveFetchDeps<'a, P>,
+    grant: Option<&CapabilityGrant>,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_dom: &Eip712Domain,
+    admitted: &[NodeCandidate],
+    relays: &[RelayUrl],
+    hash: [u8; 32],
+    open_lock: Option<&tokio::sync::Mutex<()>>,
+    ledgers: Option<&LaneLedgers>,
+    expected: u64,
+    unit: impl FnOnce(usize) -> anyhow::Result<AlignedRange>,
+    prime_cap: usize,
+) -> anyhow::Result<(Vec<MultiLane<'a>>, u64)>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let mut lanes = Vec::with_capacity(admitted.len());
+    build_remaining_lanes(
+        deps,
+        grant,
+        signer,
+        voucher_dom,
+        admitted,
+        relays,
+        open_lock,
+        ledgers,
+        &mut lanes,
+    )
+    .await?;
+    let unit = unit(lanes.len())?;
+    let total_bytes =
+        prime_admitted_lanes(deps, &mut lanes, hash, expected, &unit, prime_cap).await?;
+    Ok((lanes, total_bytes))
+}
+
+/// Open `unit`, the range a face hands a lane first, on each of `lanes` in
+/// turn until one answers, and park the answering pull on that lane with
+/// `unit` as its first unit, so the lane's first open adopts it (#2063). The
+/// node treats every open as real (it signs, claims a fill, and on a miss
+/// starts an origin draw), so this first open is also paid work rather than a
+/// size probe that is dropped. Returns the signed `total_bytes`.
+///
+/// `expected` is the size `unit` was cut from: the bundle manifest's `size`, or
+/// the largest probe-reported size. Neither is signed, so a provider that signs
+/// another size wins: its pull is dropped and the fetch runs at the signed size,
+/// unprimed. A bounded open that fails is asked again for the whole blob before
+/// the lane counts as failed, so a wrong `expected` (a range past the blob's
+/// end) never sinks a healthy holder. Only lanes below `prime_cap` (a face's
+/// lane cap) open `unit`; a lane past it opens the whole blob, as
+/// [`probe_admitted_total`] does, since the face never runs it.
+///
+/// Call it only once every lane is built: a pull parked longer than
+/// [`decdn_client::PRIMED_MAX_IDLE`] is dropped unadopted, and a lane's pool
+/// open can wait on the chain. A parked pull no open takes closes when the face
+/// drops its candidates.
+///
+/// # Errors
+///
+/// The last lane's open error, when no lane answers.
+async fn prime_admitted_lanes<P>(
+    deps: &DriveFetchDeps<'_, P>,
+    lanes: &mut [MultiLane<'_>],
+    hash: [u8; 32],
+    expected: u64,
+    unit: &AlignedRange,
+    prime_cap: usize,
+) -> anyhow::Result<u64>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let peer_store = decdn_client::PeerStore::open(&deps.chain.data_dir);
+    let peer_store_cfg = decdn_client::StoreConfig::default();
+    let mut last_err = None;
+    for (ix, lane) in lanes.iter_mut().enumerate() {
+        let peer = lane.source.inner();
+        let bounded = if ix < prime_cap {
+            match peer.open(hash, unit.clone()).await {
+                Ok(pull) => Some(pull),
+                Err(err) => {
+                    tracing::debug!(
+                        "a first-unit open failed ({err:#}); opening the whole blob in case \
+                         the expected size is wrong"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let opened = match bounded {
+            Some((header, reader)) => Ok((header, Some(reader))),
+            None => peer
+                .open_whole(hash)
+                .await
+                .map(|(header, _whole)| (header, None)),
+        };
+        match opened {
+            Ok((header, reader)) => {
+                record_first_open(&peer_store, &peer_store_cfg, &lane.node_id, Ok(&header));
+                let total_bytes = header.total_bytes;
+                match reader {
+                    Some(reader) if total_bytes == expected => {
+                        lane.source.prime(hash, unit.clone(), header, reader);
+                        lane.first_unit = Some(unit.clone());
+                    }
+                    Some(_) => tracing::debug!(
+                        signed = total_bytes,
+                        expected,
+                        "the provider signs another size than expected; its first open is dropped"
+                    ),
+                    None => {}
+                }
+                return Ok(total_bytes);
+            }
+            Err(err) => {
+                record_first_open(&peer_store, &peer_store_cfg, &lane.node_id, Err(&err));
+                last_err = Some(match lane.ctx.lock() {
+                    Ok(guard) => annotate_unbound_cache_miss(err, &guard),
+                    Err(_) => err,
+                });
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "no admitted holder answered the first open for {}",
+            blake3::Hash::from_bytes(hash).to_hex()
+        )
+    }))
 }
 
 /// Build a payment lane for every admitted candidate past the `lanes` that
@@ -3120,7 +3354,10 @@ fn split_face_lanes<'a>(
     lanes: Vec<MultiLane<'a>>,
     coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
     total_bytes: u64,
-) -> (Vec<StreamCandidate<PeerSource<'a>>>, Vec<StreamLane>) {
+) -> (
+    Vec<StreamCandidate<PrimedSource<PeerSource<'a>>>>,
+    Vec<StreamLane>,
+) {
     let num_blocks = decdn_protocol::num_blocks(total_bytes);
     let mut candidates = Vec::with_capacity(lanes.len());
     let mut handles = Vec::with_capacity(lanes.len());
@@ -3137,6 +3374,7 @@ fn split_face_lanes<'a>(
             ctx: lane.ctx,
             ledger: lane.ledger,
             coverage: Some(coverage),
+            first_unit: lane.first_unit,
         });
     }
     (candidates, handles)
@@ -3178,6 +3416,7 @@ async fn stream_to_stdout<P>(
     coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
     relays: &[RelayUrl],
     hash: [u8; 32],
+    size_hint: Option<u64>,
 ) -> anyhow::Result<u64>
 where
     P: alloy::providers::Provider + Clone,
@@ -3194,31 +3433,67 @@ where
         );
     }
 
-    // A solo stdout stream has no shared pool lock or ledger registry.
-    let (mut lanes, total_bytes) = probe_admitted_total(
-        deps,
-        grant,
-        signer,
-        voucher_dom,
-        &admitted,
-        relays,
-        hash,
-        None,
-        None,
-    )
-    .await?;
-    build_remaining_lanes(
-        deps,
-        grant,
-        signer,
-        voucher_dom,
-        &admitted,
-        relays,
-        None,
-        None,
-        &mut lanes,
-    )
-    .await?;
+    // The user's `--max-sources` is the front lane cap; read-ahead stays the
+    // default (the outstanding-spend bound for an abandoned pipe). With the
+    // multi-source kill switch off, the stream holds one lane at a time and the
+    // other holders stay failover candidates only.
+    let lane_cap = if common.multi_source_enabled() {
+        common.max_sources.max(1)
+    } else {
+        1
+    };
+    let pull_config = PullConfig {
+        streamer_lane_cap: lane_cap,
+        ..PullConfig::new()
+    };
+
+    // A solo stdout stream has no shared pool lock or ledger registry. With a
+    // size hint the first open is the stream's first unit (#2063); without one
+    // it only reads the size.
+    let (lanes, total_bytes) = if let Some(expected) = size_hint {
+        let unit = decdn_client::stream_first_unit(expected, &pull_config)?;
+        build_primed_lanes(
+            deps,
+            grant,
+            signer,
+            voucher_dom,
+            &admitted,
+            relays,
+            hash,
+            None,
+            None,
+            expected,
+            |_| Ok(unit),
+            lane_cap,
+        )
+        .await?
+    } else {
+        let (mut lanes, total_bytes) = probe_admitted_total(
+            deps,
+            grant,
+            signer,
+            voucher_dom,
+            &admitted,
+            relays,
+            hash,
+            None,
+            None,
+        )
+        .await?;
+        build_remaining_lanes(
+            deps,
+            grant,
+            signer,
+            voucher_dom,
+            &admitted,
+            relays,
+            None,
+            None,
+            &mut lanes,
+        )
+        .await?;
+        (lanes, total_bytes)
+    };
     let (stream_candidates, handles) = split_face_lanes(lanes, coverage_by_node, total_bytes);
     // Keep the first lane's ctx to annotate an unbound-namespace cache miss on
     // failure, as the file path does.
@@ -3235,19 +3510,6 @@ where
         max_approve: deps.chain.max_approve,
     };
     let drive_config = DriveConfig::cli(deps.chain.working_deposit);
-    // The user's `--max-sources` is the front lane cap; read-ahead stays the
-    // default (the outstanding-spend bound for an abandoned pipe). With the
-    // multi-source kill switch off, the stream holds one lane at a time and the
-    // other holders stay failover candidates only.
-    let lane_cap = if common.multi_source_enabled() {
-        common.max_sources.max(1)
-    } else {
-        1
-    };
-    let pull_config = PullConfig {
-        streamer_lane_cap: lane_cap,
-        ..PullConfig::new()
-    };
 
     // The fill store's `.partial` lives here for the stream's lifetime; a streamed
     // blob is not kept, so a temp dir (removed on drop) under the data dir is its
@@ -3339,6 +3601,7 @@ where
         relays,
         hash,
         output,
+        size_hint,
         progress,
         None,
         None,
@@ -3374,6 +3637,7 @@ pub(crate) async fn multi_source_download<P>(
     relays: &[RelayUrl],
     hash: [u8; 32],
     output: &Path,
+    expected_size: Option<u64>,
     progress: Option<&ProgressCallback>,
     open_lock: Option<&tokio::sync::Mutex<()>>,
     ledgers: Option<&LaneLedgers>,
@@ -3381,48 +3645,67 @@ pub(crate) async fn multi_source_download<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let (mut lanes, total_bytes) = probe_admitted_total(
-        deps,
-        grant,
-        signer,
-        voucher_dom,
-        &admitted,
-        relays,
-        hash,
-        open_lock,
-        ledgers,
-    )
-    .await?;
-
-    // Authoritative size gate on the header the holder actually served: below the
-    // floor a single fast holder saturates the downlink, so fan-out is pure
-    // overhead — fall through to the single-source path.
-    if !should_multi_source(
-        common.multi_source_enabled(),
-        total_bytes,
-        common.multi_source_min_bytes,
-        admitted.len(),
-    ) {
-        tracing::info!(
-            "multi-source: not engaging — the blob is {total_bytes} bytes, below the {} byte \
-             fan-out floor (--multi-source-min-bytes)",
-            common.multi_source_min_bytes
+    // Size gate: below the floor a single fast holder saturates the downlink, so
+    // fan-out is pure overhead — fall through to the single-source path.
+    let declines = |total_bytes: u64| {
+        let declines = !should_multi_source(
+            common.multi_source_enabled(),
+            total_bytes,
+            common.multi_source_min_bytes,
+            admitted.len(),
         );
-        return Ok(None);
-    }
-    // The gate engaged: only now build the lanes past the one that answered.
-    build_remaining_lanes(
-        deps,
-        grant,
-        signer,
-        voucher_dom,
-        &admitted,
-        relays,
-        open_lock,
-        ledgers,
-        &mut lanes,
-    )
-    .await?;
+        if declines {
+            tracing::info!(
+                "multi-source: not engaging — the blob is {total_bytes} bytes, below the {} \
+                 byte fan-out floor (--multi-source-min-bytes)",
+                common.multi_source_min_bytes
+            );
+        }
+        declines
+    };
+    let (lanes, total_bytes) = if let Some(expected) = fresh_download_size(expected_size, output)? {
+        if declines(expected) {
+            return Ok(None);
+        }
+        let (lanes, total_bytes) = build_primed_lanes(
+            deps,
+            grant,
+            signer,
+            voucher_dom,
+            &admitted,
+            relays,
+            hash,
+            open_lock,
+            ledgers,
+            expected,
+            |lanes| decdn_client::download_first_unit(expected, lanes),
+            usize::MAX,
+        )
+        .await?;
+        // The gate ran on an unsigned size; run it again on the signed one.
+        if total_bytes != expected && declines(total_bytes) {
+            return Ok(None);
+        }
+        (lanes, total_bytes)
+    } else {
+        let probed = build_probed_lanes(
+            deps,
+            grant,
+            signer,
+            voucher_dom,
+            &admitted,
+            relays,
+            hash,
+            open_lock,
+            ledgers,
+            declines,
+        )
+        .await?;
+        let Some(probed) = probed else {
+            return Ok(None);
+        };
+        probed
+    };
 
     let (stream_candidates, handles) = split_face_lanes(lanes, coverage_by_node, total_bytes);
     // Keep the first lane's ctx to annotate an unbound-namespace cache miss on
@@ -5056,6 +5339,28 @@ mod tests {
         assert_ne!(h1.coverage, h2.coverage);
         // A node that was never probed has no entry.
         assert!(!out.coverage_by_node.contains_key(&node_key(99)));
+    }
+
+    /// A download cuts its first open from the expected size only when it starts
+    /// fresh: a `.ranges` record beside the output is a resume, whose first
+    /// gap is not the first unit (#2063).
+    #[test]
+    fn a_fresh_download_uses_the_expected_size_and_a_resume_does_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = dir.path().join("blob");
+        assert_eq!(
+            super::fresh_download_size(None, &output).expect("stat"),
+            None
+        );
+        assert_eq!(
+            super::fresh_download_size(Some(42), &output).expect("stat"),
+            Some(42)
+        );
+        std::fs::write(dir.path().join("blob.partial.ranges"), b"").expect("record");
+        assert_eq!(
+            super::fresh_download_size(Some(42), &output).expect("stat"),
+            None
+        );
     }
 
     /// [`lane_coverage`] is the read side of the same map: a holder with a
