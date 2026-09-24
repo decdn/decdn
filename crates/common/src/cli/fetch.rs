@@ -192,7 +192,8 @@ pub struct ClientFetchArgs {
     /// Cap on concurrently-used holders for a multi-source fetch — the initial
     /// segment count `admit_sources` admits and `multi_source_fetch` fans out
     /// across (ADR 039). Enough to saturate typical downlinks without paying
-    /// for marginal lanes.
+    /// for marginal lanes. It also caps how many holders a `bundle pull`
+    /// range-dedup entry stripes its ranges across.
     #[arg(long, value_name = "N", default_value_t = 4)]
     pub max_sources: usize,
 

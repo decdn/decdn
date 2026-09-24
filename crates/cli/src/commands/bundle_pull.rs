@@ -109,10 +109,18 @@ type FetchTarget = (PublicKey, Address);
 /// and reused across its complement drive, donor re-fetch, and any whole-blob
 /// re-drive (so a self-heal entry probes once, not per sub-drive). `Pinned` is
 /// the `--node-id` target — its own only candidate; `Discovered` is the probed
-/// discovery order walked with single-source failover.
+/// discovery order.
 enum RangeTargets {
     Pinned(FetchTarget),
-    Discovered(Vec<NodeCandidate>),
+    /// The probed order. When `stripe` is two or more, its first `stripe`
+    /// candidates are the admitted full holders the entry's drives stripe
+    /// across ([`stripe_order`]) and the rest are failover reserve. When it is
+    /// one, the order is the plain failover order, and its first candidate
+    /// need not be a full holder.
+    Discovered {
+        order: Vec<NodeCandidate>,
+        stripe: usize,
+    },
 }
 
 impl RangeTargets {
@@ -122,7 +130,15 @@ impl RangeTargets {
     fn providers(&self) -> Vec<Address> {
         match self {
             RangeTargets::Pinned((_, provider)) => vec![*provider],
-            RangeTargets::Discovered(order) => order.iter().map(|c| c.eth_address).collect(),
+            RangeTargets::Discovered { order, .. } => order.iter().map(|c| c.eth_address).collect(),
+        }
+    }
+
+    /// How many of the first candidates a drive stripes across at once.
+    const fn stripe(&self) -> usize {
+        match self {
+            RangeTargets::Pinned(_) => 1,
+            RangeTargets::Discovered { stripe, .. } => *stripe,
         }
     }
 
@@ -131,12 +147,55 @@ impl RangeTargets {
     fn targets(&self) -> Vec<(FetchTarget, Vec<std::net::SocketAddr>)> {
         match self {
             RangeTargets::Pinned(pinned) => vec![(*pinned, Vec::new())],
-            RangeTargets::Discovered(order) => order
+            RangeTargets::Discovered { order, .. } => order
                 .iter()
                 .map(|c| ((c.node_id, c.eth_address), c.dial_addrs()))
                 .collect(),
         }
     }
+}
+
+/// A range-dedup entry's candidate order with its stripe set first (#2123),
+/// and the size of that set.
+///
+/// The stripe set is the probed holders whose coverage spans the whole blob,
+/// admitted as the multi-source fan-out admits its lanes
+/// ([`discovery::admit_sources`]): one node per operator, at most
+/// `max_sources`. A partial holder or a proxy-warming non-holder is left out,
+/// so no striped range lands on a node that lacks it. The rest of `candidates`
+/// follow in their own order as failover reserve. With multi-source off, or
+/// fewer than two admitted holders, the order is unchanged and the stripe is
+/// one: plain single-source failover.
+fn stripe_order(
+    candidates: Vec<NodeCandidate>,
+    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
+    total: u64,
+    multi_source: bool,
+    max_sources: usize,
+) -> (Vec<NodeCandidate>, usize) {
+    if !multi_source {
+        return (candidates, 1);
+    }
+    let blocks = decdn_protocol::num_blocks(total);
+    let full_holders: Vec<NodeCandidate> = candidates
+        .iter()
+        .filter(|c| {
+            coverage_by_node
+                .get(&c.node_id)
+                .is_some_and(|cov| (0..blocks).all(|b| cov.covers(b)))
+        })
+        .cloned()
+        .collect();
+    let admitted = discovery::admit_sources(full_holders, max_sources);
+    if admitted.len() < 2 {
+        return (candidates, 1);
+    }
+    let stripe = admitted.len();
+    let striped: HashSet<PublicKey> = admitted.iter().map(|a| a.node_id).collect();
+    let reserve = candidates
+        .into_iter()
+        .filter(|c| !striped.contains(&c.node_id));
+    (admitted.into_iter().chain(reserve).collect(), stripe)
 }
 
 /// Group manifest entries by their blob `hash`, preserving first-seen order both
@@ -1567,13 +1626,17 @@ where
 /// the refusal.
 ///
 /// Two more failures fail over within a pass but never start a round: a size
-/// that disagrees with the manifest ([`fetch::ManifestSizeMismatch`]), which
-/// every honest provider repeats, and a local disk fault (no permission, a full
+/// that disagrees with the manifest ([`fetch::ManifestSizeMismatch`] at a
+/// primed first open, [`decdn_client::SignedSizeMismatch`] at any other
+/// leg), which every honest provider repeats, and a local disk fault (no permission, a full
 /// or read-only disk, a path that is not a directory), which no provider can
 /// fix.
 fn entry_retryable(err: &anyhow::Error) -> bool {
     shared_pool_disposition(err) == RetryDisposition::RetryElsewhere
         && err.downcast_ref::<fetch::ManifestSizeMismatch>().is_none()
+        && err
+            .downcast_ref::<decdn_client::SignedSizeMismatch>()
+            .is_none()
         && !is_local_disk_fault(err)
 }
 
@@ -2161,12 +2224,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         }
     }
 
-    /// Open a range-drive session for `hash` against `node_id`/`provider`, with
-    /// its store beside `staging` (#2119). The ranged twin of
+    /// Open a range-drive session for `hash` against `node_id`/`provider`, for
+    /// the entry whose ranged store is `entry_store` (#2119). The ranged twin of
     /// [`Self::fetch_to_staging_from`]: it builds the same context and target,
     /// then opens a [`fetch::RangeSession`] that every range drive of the entry
     /// reuses while this provider serves it. `first_ranges` are the ranges the
-    /// session's first drive fills; the session opens that drive's first leg now.
+    /// session's first drive fills; the session opens that drive's first leg
+    /// now, and opens nothing when they are empty.
     #[allow(clippy::too_many_arguments)]
     async fn open_range_session<'s>(
         &'s self,
@@ -2174,7 +2238,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         dial_addrs: &[std::net::SocketAddr],
         hash: [u8; 32],
         staging: &Path,
-        total: u64,
+        entry_store: &ClientRangedStore,
         first_ranges: &[(u64, u64)],
     ) -> anyhow::Result<fetch::RangeSession<'s, P>> {
         let provider = fetch_target.1;
@@ -2190,7 +2254,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             pool_id,
             hash,
             staging,
-            total,
+            entry_store,
             first_ranges,
             &self.ledgers,
         )
@@ -2202,8 +2266,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// discovery candidates. [`Self::pull_entry`] resolves this before its first
     /// sub-drive and threads it into every one (the complement drive, a donor
     /// re-fetch, and any whole-blob re-drive), so a self-heal entry probes the
-    /// candidate set once rather than up to three times.
-    async fn resolve_range_targets(&self, hash: [u8; 32]) -> anyhow::Result<RangeTargets> {
+    /// candidate set once rather than up to three times. `total` is the
+    /// manifest's size, which [`stripe_order`] checks each holder's coverage
+    /// against.
+    async fn resolve_range_targets(
+        &self,
+        hash: [u8; 32],
+        total: u64,
+    ) -> anyhow::Result<RangeTargets> {
         if let Some(pinned) = self.explicit {
             return Ok(RangeTargets::Pinned(pinned));
         }
@@ -2211,7 +2281,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .candidates
             .as_deref()
             .ok_or_else(|| anyhow!("no discovery candidates available"))?;
-        let order = fetch::probe_and_order(
+        let resolved = fetch::probe_and_order(
             self.endpoint,
             candidates,
             self.relays.first(),
@@ -2219,9 +2289,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             fetch::ProxyWarmingParams::from_args(self.common),
             self.slash_dom,
         )
-        .await?
-        .candidates;
-        Ok(RangeTargets::Discovered(order))
+        .await?;
+        let (order, stripe) = stripe_order(
+            resolved.candidates,
+            &resolved.coverage_by_node,
+            total,
+            self.common.multi_source_enabled(),
+            self.common.max_sources,
+        );
+        Ok(RangeTargets::Discovered { order, stripe })
     }
 
     /// Fetch one blob fully into memory — used only for the bundle manifest
@@ -2554,7 +2630,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // Resolve the range-drive provider order ONCE for this entry and reuse it
         // across every sub-drive below (complement, donor re-fetch, whole-blob
         // re-drive) — the happy path (complement only) still probes exactly once.
-        let targets = self.resolve_range_targets(hash).await?;
+        let targets = self.resolve_range_targets(hash, total).await?;
         // Hold one lane-stream permit per provider this entry may drive from across
         // every sub-drive (complement, donor re-fetch, whole-blob re-drive) and the
         // splice between them — one logical fetch unit — so the entry always keeps
@@ -2833,17 +2909,19 @@ trait RangeDriver {
 /// probe round).
 ///
 /// Every drive of the entry — the pay-now complement, a donor re-fetch, each
-/// deferred fallback, the self-heal re-drive — reuses one [`fetch::RangeSession`]
-/// while its provider serves: one first-leg open and one warm connection for
-/// the entry, not one per drive or per range (#2119). A drive that fails drops
-/// the session and fails over to the next discovered candidate, and the entry
-/// does not go back to a discovered provider that failed it (a pinned
-/// `--node-id` is its only candidate); a retry round (`--entry-retries`) starts
-/// a new driver over a fresh probe. Each drive fills up to
-/// `--max-lane-streams` gaps at once, using the permits for its provider that
-/// are free when the drive starts beyond the one the entry already holds. It
-/// returns those extra permits when the drive ends: the entry keeps waiting on
-/// siblings between drives, and a sibling it waits on may need them.
+/// deferred fallback, the self-heal re-drive — reuses the entry's open
+/// [`fetch::RangeSession`]s while their providers serve: one warm connection
+/// per provider for the entry, not one per drive or per range (#2119). The
+/// drives stripe their ranges across the entry's admitted full holders, one
+/// session each (#2123); with one holder, or multi-source off, one session
+/// serves them. A lane that faults retires, and the entry does not go back to
+/// a discovered provider that failed it (a pinned `--node-id` is its only
+/// candidate); a retry round (`--entry-retries`) starts a new driver over a
+/// fresh probe. Each lane fills up to `--max-lane-streams` gaps at once, using
+/// the permits for its provider that are free when the drive starts beyond
+/// the one the entry already holds. It returns those extra permits when the
+/// drive ends: the entry keeps waiting on siblings between drives, and a
+/// sibling it waits on may need them.
 struct CtxRangeDriver<'a, P: Provider + Clone> {
     hash: [u8; 32],
     staging: &'a Path,
@@ -2866,11 +2944,14 @@ impl<'a, P: Provider + Clone> CtxRangeDriver<'a, P> {
             walk: SessionWalk::new(LiveSessions {
                 ctx,
                 pinned: matches!(targets, RangeTargets::Pinned(_)),
+                stripe: targets.stripe(),
                 targets: targets.targets(),
                 hash,
                 staging,
                 total,
                 progress,
+                store: std::sync::OnceLock::new(),
+                topups_used: std::sync::atomic::AtomicU32::new(0),
             }),
         }
     }
@@ -2893,6 +2974,14 @@ impl<P: Provider + Clone> RangeDriver for CtxRangeDriver<'_, P> {
     }
 }
 
+/// How a [`RangeSessions::drive`] over the open sessions ended.
+struct LanesDriven {
+    /// Per open session, in the order given: whether its lane faulted.
+    faulted: Vec<bool>,
+    /// The drive's result.
+    result: anyhow::Result<()>,
+}
+
 /// The candidates a [`SessionWalk`] drives an entry's ranges from.
 trait RangeSessions {
     /// One candidate's open session.
@@ -2900,6 +2989,11 @@ trait RangeSessions {
 
     /// How many candidates there are, in failover order.
     fn candidates(&self) -> usize;
+
+    /// How many of the first candidates a drive stripes across at once. The
+    /// rest are failover reserve, opened one at a time once no striped
+    /// session is left. `1` is plain single-source failover.
+    fn stripe(&self) -> usize;
 
     /// Whether the one candidate was pinned (`--node-id`) rather than probed.
     fn pinned(&self) -> bool;
@@ -2911,41 +3005,70 @@ trait RangeSessions {
     fn entry(&self) -> String;
 
     /// Open a session against candidate `index`, whose first drive fills
-    /// `first_ranges`.
+    /// `first_ranges`. Empty `first_ranges` open no first leg.
     async fn open(
         &self,
         index: usize,
         first_ranges: &[(u64, u64)],
     ) -> anyhow::Result<Self::Session>;
 
-    /// Drive `ranges` through candidate `index`'s open `session`.
+    /// Drive `ranges` through every open session at once. Each is
+    /// `(candidate index, session, takes the drive's first gap)`.
     async fn drive(
         &self,
-        index: usize,
-        session: &Self::Session,
+        open: &[(usize, &Self::Session, bool)],
         ranges: &[(u64, u64)],
-    ) -> anyhow::Result<()>;
+    ) -> LanesDriven;
 }
 
-/// An entry's walk over its range-drive candidates (#2119): one session per
-/// provider, reused by every drive of the entry while that provider serves.
+/// An entry's walk over its range-drive candidates (#2119, #2123): one session
+/// per provider, reused by every drive of the entry while that provider
+/// serves.
 ///
-/// A drive that fails drops the session and fails over to the next candidate,
-/// and later drives of the entry start there: the entry does not go back to a
-/// discovered provider that failed it. A pinned candidate is its own only one,
-/// so every drive goes to it. The open session and the next candidate sit
-/// under one lock.
+/// A drive runs across every open session. It opens the stripe
+/// ([`RangeSessions::stripe`]) up front and, once no striped session is left,
+/// one reserve candidate at a time. A session whose lane faults is dropped,
+/// and a failure no single lane owns (the drive-level floor) drops every open
+/// session. Whatever the drive left missing, it drives again on what is still
+/// open or next in line, so one call returns only when the ranges are filled,
+/// a terminal fault stops them, or no candidate is left. The entry does not go
+/// back to a discovered provider that failed it. A pinned candidate is its own
+/// only one, so a call reopens it after a failure dropped its session. A
+/// terminal fault or a local disk fault ends the walk at once: no provider can
+/// fix either. The open sessions and the next candidate sit under one lock.
+///
+/// Only the last session a pass opens opens the drive's first leg, and that
+/// session takes the first gap: a pull primed early would go stale while the
+/// other sessions open.
 struct SessionWalk<S: RangeSessions> {
     sessions: S,
     state: tokio::sync::Mutex<WalkState<S::Session>>,
 }
 
-/// A [`SessionWalk`]'s open session and where its walk resumes.
+/// Record `err` as the walk's last error, unless the error it holds already
+/// rules out a retry round and `err` does not ([`entry_retryable`]): a later
+/// transient open failure must not turn a size mismatch or a pool exhaustion
+/// into a round that fails the same way.
+fn keep_walk_error(last: &mut Option<anyhow::Error>, err: anyhow::Error) {
+    let keep_old = last
+        .as_ref()
+        .is_some_and(|old| !entry_retryable(old) && entry_retryable(&err));
+    if keep_old {
+        tracing::debug!("bundle pull: a later candidate also failed: {err:#}");
+    } else {
+        *last = Some(err);
+    }
+}
+
+/// A [`SessionWalk`]'s open sessions and where its walk resumes.
 struct WalkState<T> {
-    /// The open session and its candidate index.
-    open: Option<(usize, T)>,
-    /// The first candidate a drive still tries: every earlier one failed.
+    /// The open sessions and their candidate indices.
+    open: Vec<(usize, T)>,
+    /// The first candidate not yet opened: every earlier one is open or
+    /// failed.
     next: usize,
+    /// The open session whose source holds the next drive's first leg.
+    primed: Option<usize>,
 }
 
 impl<S: RangeSessions> SessionWalk<S> {
@@ -2953,72 +3076,175 @@ impl<S: RangeSessions> SessionWalk<S> {
         Self {
             sessions,
             state: tokio::sync::Mutex::new(WalkState {
-                open: None,
+                open: Vec::new(),
                 next: 0,
+                primed: None,
             }),
         }
     }
 
-    /// Drive `ranges` from the current candidate, failing over down the rest.
+    /// Drive `ranges` from the open sessions, failing over down the rest.
     async fn drive(&self, ranges: &[(u64, u64)]) -> anyhow::Result<()> {
-        if self.sessions.pinned() {
-            return self.drive_on(0, ranges).await;
+        let mut state = self.state.lock().await;
+        let n = self.sessions.candidates();
+        let pinned = self.sessions.pinned();
+        if pinned && state.open.is_empty() {
+            state.next = 0;
         }
-        let start = self.state.lock().await.next;
-        let order: Vec<usize> = (start..self.sessions.candidates()).collect();
         let entry = self.sessions.entry();
-        let what = if start == 0 {
+        let failed_before = state.next.saturating_sub(state.open.len());
+        let what = if failed_before == 0 {
             format!("the ranges of entry {entry}")
         } else {
-            format!("the ranges of entry {entry} ({start} earlier candidate(s) already failed it)")
+            format!(
+                "the ranges of entry {entry} ({failed_before} earlier candidate(s) already \
+                 failed it)"
+            )
         };
-        walk_candidates(
-            &order,
-            &what,
-            |&index| self.sessions.label(index),
-            |&index| self.drive_on(index, ranges),
-        )
-        .await
+        let mut last_err: Option<anyhow::Error> = None;
+        loop {
+            self.fill(&mut state, ranges, &what, &mut last_err).await?;
+            if state.open.is_empty() {
+                return Err(match last_err {
+                    Some(err) if pinned => err,
+                    Some(err) => {
+                        tracing::warn!(
+                            "bundle pull: no provider could deliver {what} ({err:#}); every one \
+                             of {n} candidate(s) has now failed"
+                        );
+                        err.context(format!(
+                            "all {n} candidate provider(s) failed to deliver {what}"
+                        ))
+                    }
+                    None => anyhow!("no candidate node could deliver {what}"),
+                });
+            }
+            let driven = {
+                let primed = state.primed.take();
+                let lanes: Vec<(usize, &S::Session, bool)> = state
+                    .open
+                    .iter()
+                    .map(|(index, session)| (*index, session, primed == Some(*index)))
+                    .collect();
+                self.sessions.drive(&lanes, ranges).await
+            };
+            let failed: Vec<String> = state
+                .open
+                .iter()
+                .zip(&driven.faulted)
+                .filter(|&(_, faulted)| *faulted)
+                .map(|((index, _), _)| self.sessions.label(*index))
+                .collect();
+            // A session with no report is treated as faulted: it is never
+            // reused on a guess.
+            let mut faulted = driven.faulted.iter();
+            state
+                .open
+                .retain(|_| !faulted.next().copied().unwrap_or(true));
+            let err = match driven.result {
+                Ok(()) => return Ok(()),
+                Err(err) => err,
+            };
+            // No provider can fix a terminal fault or a local disk fault, so
+            // neither fails over.
+            if retry_disposition(&err) == RetryDisposition::Terminal || is_local_disk_fault(&err) {
+                return Err(err);
+            }
+            let failed = if failed.is_empty() {
+                // No lane owns the failure: every open session failed it.
+                let every = state
+                    .open
+                    .iter()
+                    .map(|(index, _)| self.sessions.label(*index))
+                    .collect();
+                state.open.clear();
+                every
+            } else {
+                failed
+            };
+            if state.next < n || !state.open.is_empty() {
+                tracing::warn!(
+                    "bundle pull: provider(s) {} could not deliver {what} ({err:#}); failing \
+                     over to the rest of {n} candidate(s)",
+                    failed.join(", "),
+                );
+            }
+            keep_walk_error(&mut last_err, err);
+        }
     }
 
-    /// Drive `ranges` from candidate `index`, opening its session first unless
-    /// it is the one already open. A failure drops the session and moves the
-    /// walk past this candidate.
-    async fn drive_on(&self, index: usize, ranges: &[(u64, u64)]) -> anyhow::Result<()> {
-        let mut state = self.state.lock().await;
-        if state.open.as_ref().is_none_or(|(open, _)| *open != index) {
-            // Close the last provider's session (and its connection) first.
-            state.open = None;
-            match self.sessions.open(index, ranges).await {
-                Ok(session) => state.open = Some((index, session)),
-                Err(err) => {
-                    state.next = state.next.max(index.saturating_add(1));
-                    return Err(err);
+    /// Open the sessions the next drive needs: every stripe member not yet
+    /// tried, and, when none is open, the next reserve candidate. A candidate
+    /// whose session will not open is skipped for good.
+    async fn fill(
+        &self,
+        state: &mut WalkState<S::Session>,
+        ranges: &[(u64, u64)],
+        what: &str,
+        last_err: &mut Option<anyhow::Error>,
+    ) -> anyhow::Result<()> {
+        let n = self.sessions.candidates();
+        let stripe = self.sessions.stripe().max(1);
+        loop {
+            let end = if state.next < stripe {
+                stripe.min(n)
+            } else if state.open.is_empty() {
+                state.next.saturating_add(1).min(n)
+            } else {
+                state.next
+            };
+            if end <= state.next {
+                return Ok(());
+            }
+            while state.next < end {
+                let index = state.next;
+                state.next = index.saturating_add(1);
+                let primes = state.primed.is_none() && state.next == end;
+                let first: &[(u64, u64)] = if primes { ranges } else { &[] };
+                match self.sessions.open(index, first).await {
+                    Ok(session) => {
+                        if primes {
+                            state.primed = Some(index);
+                        }
+                        state.open.push((index, session));
+                    }
+                    Err(err) => {
+                        if retry_disposition(&err) == RetryDisposition::Terminal {
+                            return Err(err);
+                        }
+                        if state.next < n || !state.open.is_empty() {
+                            tracing::warn!(
+                                "bundle pull: provider {} could not deliver {what} ({err:#}); \
+                                 failing over to the rest of {n} candidate(s)",
+                                self.sessions.label(index),
+                            );
+                        }
+                        keep_walk_error(last_err, err);
+                    }
                 }
             }
         }
-        let Some((_, session)) = state.open.as_ref() else {
-            bail!("range session missing after open");
-        };
-        let driven = self.sessions.drive(index, session, ranges).await;
-        if driven.is_err() {
-            state.open = None;
-            state.next = state.next.max(index.saturating_add(1));
-        }
-        driven
     }
 }
 
 /// The live [`RangeSessions`]: paid [`fetch::RangeSession`]s against the
-/// entry's pinned or probed candidates.
+/// entry's pinned or probed candidates, all filling the entry's one ranged
+/// store.
 struct LiveSessions<'a, P: Provider + Clone> {
     ctx: &'a PullCtx<'a, P>,
     pinned: bool,
+    stripe: usize,
     targets: Vec<(FetchTarget, Vec<std::net::SocketAddr>)>,
     hash: [u8; 32],
     staging: &'a Path,
     total: u64,
     progress: Option<&'a ProgressCallback>,
+    /// The entry's ranged store beside `staging`, opened at the first session
+    /// open. Every lane of every drive writes into this one store, so one
+    /// in-memory present set and one writer own the `.ranges` record.
+    store: std::sync::OnceLock<ClientRangedStore>,
+    /// The entry's reactive top-ups, one budget across every lane.
+    topups_used: std::sync::atomic::AtomicU32,
 }
 
 impl<P: Provider + Clone> LiveSessions<'_, P> {
@@ -3027,6 +3253,15 @@ impl<P: Provider + Clone> LiveSessions<'_, P> {
         self.targets
             .get(index)
             .ok_or_else(|| anyhow!("no range-drive candidate {index}"))
+    }
+
+    /// The entry's ranged store, opened on first use.
+    fn entry_store(&self) -> anyhow::Result<&ClientRangedStore> {
+        if let Some(store) = self.store.get() {
+            return Ok(store);
+        }
+        let opened = fetch::open_entry_store(self.staging, self.hash, self.total)?;
+        Ok(self.store.get_or_init(|| opened))
     }
 
     /// On the delegated path a terminal owner-remedy reason reconnects to the
@@ -3046,6 +3281,10 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
 
     fn candidates(&self) -> usize {
         self.targets.len()
+    }
+
+    fn stripe(&self) -> usize {
+        self.stripe
     }
 
     fn pinned(&self) -> bool {
@@ -3075,7 +3314,7 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
                 dial_addrs,
                 self.hash,
                 self.staging,
-                self.total,
+                self.entry_store()?,
                 first_ranges,
             )
             .await
@@ -3084,23 +3323,52 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
 
     async fn drive(
         &self,
-        index: usize,
-        session: &Self::Session,
+        open: &[(usize, &Self::Session, bool)],
         ranges: &[(u64, u64)],
-    ) -> anyhow::Result<()> {
-        let ((_, provider), _) = self.target(index)?;
+    ) -> LanesDriven {
+        let unfaulted = |result: anyhow::Result<()>| LanesDriven {
+            faulted: vec![false; open.len()],
+            result,
+        };
+        let store = match self.entry_store() {
+            Ok(store) => store,
+            Err(err) => return unfaulted(Err(err)),
+        };
         // Held for this drive only, never across the entry's waits on a sibling
         // (`reconcile_deferred`): a donor this entry waits on may be blocked on
-        // the same provider's permits.
-        let extra = self
-            .ctx
-            .lane_cap
-            .try_extra(*provider, self.ctx.lane_cap.n.saturating_sub(1))
-            .await;
-        let concurrency = std::num::NonZeroUsize::MIN.saturating_add(extra.len());
-        let driven = Box::pin(session.drive(ranges, concurrency, self.progress)).await;
-        drop(extra);
-        driven.map_err(|err| self.annotate(err))
+        // the same providers' permits.
+        let mut extras = Vec::with_capacity(open.len());
+        let mut lanes = Vec::with_capacity(open.len());
+        for &(index, session, takes_first) in open {
+            let provider = match self.target(index) {
+                Ok(((_, provider), _)) => *provider,
+                Err(err) => return unfaulted(Err(err)),
+            };
+            let extra = self
+                .ctx
+                .lane_cap
+                .try_extra(provider, self.ctx.lane_cap.n.saturating_sub(1))
+                .await;
+            lanes.push(fetch::StripeLane {
+                session,
+                width: std::num::NonZeroUsize::MIN.saturating_add(extra.len()),
+                takes_first,
+            });
+            extras.push(extra);
+        }
+        let driven = Box::pin(fetch::drive_stripe(
+            store,
+            &lanes,
+            ranges,
+            self.progress,
+            &self.topups_used,
+        ))
+        .await;
+        drop(extras);
+        LanesDriven {
+            faulted: driven.faulted,
+            result: driven.result.map_err(|err| self.annotate(err)),
+        }
     }
 }
 
@@ -4846,6 +5114,13 @@ mod tests {
         assert!(!entry_retryable(
             &exhausted().context("all 2 candidate provider(s) failed")
         ));
+        assert!(
+            !entry_retryable(&anyhow::Error::new(decdn_client::SignedSizeMismatch {
+                signed: 2,
+                expected: 1,
+            })),
+            "every provider signs the same size, so a round would repeat it"
+        );
     }
 
     #[test]
@@ -7687,25 +7962,42 @@ mod tests {
     }
 
     /// A scripted [`RangeSessions`]: counts opens and drives per candidate and
-    /// fails the drives listed in `fail` as `(candidate, nth drive overall)`.
+    /// fails the lanes listed in `fail` as `(candidate, nth lane-drive)`.
     struct FakeSessions {
         candidates: usize,
+        stripe: usize,
         pinned: bool,
+        /// `(candidate, nth lane-drive)` pairs whose lane faults.
         fail: Vec<(usize, usize)>,
+        /// Drive calls (1-based) that fail with no lane at fault: a floor trip.
+        stall: Vec<usize>,
+        /// Drive calls (1-based) whose first lane faults with this error.
+        lane_error: Vec<(usize, fn() -> anyhow::Error)>,
         fail_open: Vec<usize>,
         opens: std::sync::Mutex<Vec<usize>>,
+        /// Candidates that opened with a first leg.
+        primed_opens: std::sync::Mutex<Vec<usize>>,
+        /// One entry per lane per drive, in drive order.
         drives: std::sync::Mutex<Vec<usize>>,
+        /// Per drive call: the candidates it ran on, and which took the first
+        /// gap.
+        calls: std::sync::Mutex<Vec<(Vec<usize>, Option<usize>)>>,
     }
 
     impl FakeSessions {
         fn new(candidates: usize) -> Self {
             Self {
                 candidates,
+                stripe: 1,
                 pinned: false,
                 fail: Vec::new(),
+                stall: Vec::new(),
+                lane_error: Vec::new(),
                 fail_open: Vec::new(),
                 opens: std::sync::Mutex::new(Vec::new()),
+                primed_opens: std::sync::Mutex::new(Vec::new()),
                 drives: std::sync::Mutex::new(Vec::new()),
+                calls: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -7715,6 +8007,10 @@ mod tests {
 
         fn candidates(&self) -> usize {
             self.candidates
+        }
+
+        fn stripe(&self) -> usize {
+            self.stripe
         }
 
         fn pinned(&self) -> bool {
@@ -7729,31 +8025,139 @@ mod tests {
             "e".into()
         }
 
-        async fn open(&self, index: usize, _: &[(u64, u64)]) -> anyhow::Result<usize> {
+        async fn open(&self, index: usize, first: &[(u64, u64)]) -> anyhow::Result<usize> {
             self.opens.lock().unwrap().push(index);
             if self.fail_open.contains(&index) {
                 bail!("open {index} refused");
             }
+            if !first.is_empty() {
+                self.primed_opens.lock().unwrap().push(index);
+            }
             Ok(index)
         }
 
-        async fn drive(
-            &self,
-            index: usize,
-            session: &usize,
-            _: &[(u64, u64)],
-        ) -> anyhow::Result<()> {
-            assert_eq!(*session, index, "a drive uses its candidate's session");
-            let nth = {
-                let mut drives = self.drives.lock().unwrap();
-                drives.push(index);
-                drives.len()
+        async fn drive(&self, open: &[(usize, &usize, bool)], _: &[(u64, u64)]) -> LanesDriven {
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push((
+                    open.iter().map(|&(i, _, _)| i).collect(),
+                    open.iter()
+                        .find(|&&(_, _, first)| first)
+                        .map(|&(i, _, _)| i),
+                ));
+                calls.len()
             };
-            if self.fail.contains(&(index, nth)) {
-                bail!("drive {nth} on {index} failed");
+            if let Some((_, make)) = self.lane_error.iter().find(|(c, _)| *c == call) {
+                let mut faulted = vec![false; open.len()];
+                if let Some(first) = faulted.first_mut() {
+                    *first = true;
+                }
+                return LanesDriven {
+                    faulted,
+                    result: Err(make()),
+                };
             }
-            Ok(())
+            let faulted: Vec<bool> = open
+                .iter()
+                .map(|&(index, session, _)| {
+                    assert_eq!(*session, index, "a drive uses its candidate's session");
+                    let nth = {
+                        let mut drives = self.drives.lock().unwrap();
+                        drives.push(index);
+                        drives.len()
+                    };
+                    self.fail.contains(&(index, nth))
+                })
+                .collect();
+            let result = if self.stall.contains(&call) {
+                Err(anyhow!("drive {call} stalled"))
+            } else if faulted.iter().all(|&f| f) {
+                Err(anyhow!("drive {call} failed on every lane"))
+            } else {
+                Ok(())
+            };
+            LanesDriven { faulted, result }
         }
+    }
+
+    /// A candidate on node `node` run by operator `operator`.
+    fn stripe_candidate(node: u8, operator: u8) -> NodeCandidate {
+        NodeCandidate {
+            node_id: iroh::SecretKey::from_bytes(&[node; 32]).public(),
+            eth_address: Address::from([operator; 20]),
+            region_hint: None,
+            multiaddrs: alloy::primitives::Bytes::new(),
+        }
+    }
+
+    /// The stripe is the full holders, one per operator and at most
+    /// `max_sources`, first in the order; every other candidate follows as
+    /// reserve in its own order.
+    #[test]
+    fn stripe_order_puts_admitted_full_holders_first() {
+        let total = 4 * decdn_protocol::DISCOVERY_BLOCK_BYTES;
+        let blocks = decdn_protocol::num_blocks(total);
+        // 1 is a proxy (no coverage), 2 and 3 full holders of one operator, 4
+        // a partial holder, 5 and 6 full holders of their own operators.
+        let order: Vec<NodeCandidate> = [(1, 1), (2, 2), (3, 2), (4, 4), (5, 5), (6, 6)]
+            .into_iter()
+            .map(|(n, o)| stripe_candidate(n, o))
+            .collect();
+        let mut coverage = HashMap::new();
+        for n in [2, 3, 5, 6] {
+            coverage.insert(
+                stripe_candidate(n, 0).node_id,
+                decdn_protocol::Coverage::full(blocks),
+            );
+        }
+        coverage.insert(
+            stripe_candidate(4, 0).node_id,
+            decdn_protocol::Coverage::from_block_indices(blocks, 0..1),
+        );
+        let ids = |o: &[NodeCandidate]| -> Vec<PublicKey> { o.iter().map(|c| c.node_id).collect() };
+        let expect = |nodes: &[u8]| -> Vec<PublicKey> {
+            nodes
+                .iter()
+                .map(|&n| stripe_candidate(n, 0).node_id)
+                .collect()
+        };
+
+        let (striped, stripe) = stripe_order(order.clone(), &coverage, total, true, 2);
+        assert_eq!(stripe, 2);
+        assert_eq!(ids(&striped), expect(&[2, 5, 1, 3, 4, 6]));
+
+        let (all, stripe) = stripe_order(order.clone(), &coverage, total, true, 8);
+        assert_eq!(stripe, 3, "one per operator: 2 and 3 share one");
+        assert_eq!(ids(&all), expect(&[2, 5, 6, 1, 3, 4]));
+    }
+
+    /// With multi-source off, or fewer than two admitted full holders, the
+    /// order is unchanged and there is no stripe.
+    #[test]
+    fn stripe_order_falls_back_to_plain_failover() {
+        let total = 4 * decdn_protocol::DISCOVERY_BLOCK_BYTES;
+        let blocks = decdn_protocol::num_blocks(total);
+        let order: Vec<NodeCandidate> = (1..=3).map(|n| stripe_candidate(n, n)).collect();
+        let mut coverage = HashMap::new();
+        for n in 1..=3 {
+            coverage.insert(
+                stripe_candidate(n, 0).node_id,
+                decdn_protocol::Coverage::full(blocks),
+            );
+        }
+        let ids: Vec<PublicKey> = order.iter().map(|c| c.node_id).collect();
+        let (same, stripe) = stripe_order(order.clone(), &coverage, total, false, 4);
+        assert_eq!(
+            (same.iter().map(|c| c.node_id).collect::<Vec<_>>(), stripe),
+            (ids.clone(), 1)
+        );
+
+        let one_holder: HashMap<_, _> = coverage.into_iter().take(1).collect();
+        let (same, stripe) = stripe_order(order, &one_holder, total, true, 4);
+        assert_eq!(
+            (same.iter().map(|c| c.node_id).collect::<Vec<_>>(), stripe),
+            (ids, 1)
+        );
     }
 
     /// Every drive of an entry reuses the one session while its provider serves.
@@ -7805,9 +8209,155 @@ mod tests {
         fake.pinned = true;
         fake.fail = vec![(0, 1)];
         let walk = SessionWalk::new(fake);
-        assert!(walk.drive(&[(0, 1)]).await.is_err());
+        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
+        assert!(
+            !format!("{err:#}").contains("candidate provider(s)"),
+            "a pinned failure is not a walk that ran out: {err:#}"
+        );
         walk.drive(&[(0, 1)]).await.unwrap();
         assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 0]);
+    }
+
+    /// A striped walk opens the whole stripe up front and drives every
+    /// session at once. Only the last session it opens opens the first leg,
+    /// and that session takes the first gap.
+    #[tokio::test]
+    async fn session_walk_opens_the_stripe_and_drives_it_at_once() {
+        let mut fake = FakeSessions::new(4);
+        fake.stripe = 3;
+        let walk = SessionWalk::new(fake);
+        walk.drive(&[(0, 1)]).await.unwrap();
+        walk.drive(&[(0, 1)]).await.unwrap();
+        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1, 2]);
+        assert_eq!(*walk.sessions.primed_opens.lock().unwrap(), vec![2]);
+        assert_eq!(
+            *walk.sessions.calls.lock().unwrap(),
+            vec![(vec![0, 1, 2], Some(2)), (vec![0, 1, 2], None)],
+            "the primed session takes only the first drive's first gap"
+        );
+    }
+
+    /// A faulted lane leaves the stripe for good while the others keep
+    /// serving, and the reserve opens only once no striped session is left.
+    #[tokio::test]
+    async fn session_walk_drops_a_faulted_lane_and_falls_back_to_the_reserve() {
+        let mut fake = FakeSessions::new(3);
+        fake.stripe = 2;
+        // Drive 1: lanes 0 and 1 (entries 1, 2); lane 0 faults. Drive 2: lane
+        // 1 alone (entry 3) faults, so the reserve opens (entry 4).
+        fake.fail = vec![(0, 1), (1, 3)];
+        let walk = SessionWalk::new(fake);
+        walk.drive(&[(0, 1)]).await.unwrap();
+        walk.drive(&[(0, 1)]).await.unwrap();
+        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1, 2]);
+        let calls: Vec<Vec<usize>> = walk
+            .sessions
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(lanes, _)| lanes.clone())
+            .collect();
+        assert_eq!(calls, vec![vec![0, 1], vec![1], vec![2]]);
+    }
+
+    /// A failure no lane owns, such as the drive-level floor, fails over every
+    /// open session.
+    #[tokio::test]
+    async fn session_walk_fails_every_lane_over_on_a_drive_level_failure() {
+        let mut fake = FakeSessions::new(3);
+        fake.stripe = 2;
+        fake.stall = vec![1];
+        let walk = SessionWalk::new(fake);
+        walk.drive(&[(0, 1)]).await.unwrap();
+        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1, 2]);
+        let calls: Vec<Vec<usize>> = walk
+            .sessions
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(lanes, _)| lanes.clone())
+            .collect();
+        assert_eq!(calls, vec![vec![0, 1], vec![2]]);
+    }
+
+    /// A terminal fault ends the walk at once, unwrapped: no reserve candidate
+    /// opens, because no provider can fix it.
+    #[tokio::test]
+    async fn session_walk_stops_on_a_terminal_fault() {
+        let mut fake = FakeSessions::new(4);
+        fake.stripe = 2;
+        fake.lane_error = vec![(1, || {
+            anyhow::Error::new(decdn_client::BlobTooLarge {
+                received: 2,
+                ceiling: 1,
+            })
+        })];
+        let walk = SessionWalk::new(fake);
+        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
+        assert!(err.downcast_ref::<decdn_client::BlobTooLarge>().is_some());
+        assert!(
+            !format!("{err:#}").contains("candidate provider(s)"),
+            "{err:#}"
+        );
+        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1]);
+    }
+
+    /// A local disk fault ends the walk too: every provider would meet it.
+    #[tokio::test]
+    async fn session_walk_stops_on_a_local_disk_fault() {
+        let mut fake = FakeSessions::new(3);
+        fake.lane_error = vec![(1, || {
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        })];
+        let walk = SessionWalk::new(fake);
+        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
+        assert!(is_local_disk_fault(&err), "{err:#}");
+        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0]);
+    }
+
+    /// The walk keeps an error that rules out a retry round over a later one
+    /// that would allow it, and otherwise keeps the latest.
+    #[test]
+    fn keep_walk_error_keeps_the_error_that_rules_out_a_round() {
+        let mismatch = || {
+            anyhow::Error::new(decdn_client::SignedSizeMismatch {
+                signed: 2,
+                expected: 1,
+            })
+        };
+        let mut last = None;
+        keep_walk_error(&mut last, anyhow!("connect refused"));
+        keep_walk_error(&mut last, mismatch());
+        keep_walk_error(&mut last, anyhow!("connect refused"));
+        assert!(
+            last.as_ref().is_some_and(|e| e
+                .downcast_ref::<decdn_client::SignedSizeMismatch>()
+                .is_some()),
+            "a transient error does not replace the size mismatch"
+        );
+        let mut last = Some(anyhow!("first"));
+        keep_walk_error(&mut last, anyhow!("second"));
+        assert_eq!(format!("{}", last.unwrap()), "second");
+    }
+
+    /// A stripe member that will not open is skipped, and the stripe runs on
+    /// the rest. When the last planned open fails, no session opens the first
+    /// leg for that drive.
+    #[tokio::test]
+    async fn session_walk_stripes_across_the_members_that_open() {
+        let mut fake = FakeSessions::new(3);
+        fake.stripe = 2;
+        fake.fail_open = vec![1];
+        let walk = SessionWalk::new(fake);
+        walk.drive(&[(0, 1)]).await.unwrap();
+        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1]);
+        assert!(
+            walk.sessions.primed_opens.lock().unwrap().is_empty(),
+            "the last planned open failed, so no first leg was opened"
+        );
+        assert_eq!(*walk.sessions.calls.lock().unwrap(), vec![(vec![0], None)]);
     }
 
     /// A group that runs again in a retry round is no longer finished until it

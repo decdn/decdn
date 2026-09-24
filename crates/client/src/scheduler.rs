@@ -1131,7 +1131,7 @@ where
 /// every worker is dropped and the fetch returns `stop`'s error as it is, not
 /// wrapped in the every-lane summary.
 ///
-/// `stop` races only the workers, as in [`crate::drive_range_set`]. A pending
+/// `stop` races only the workers, as in [`crate::drive_range_lanes`]. A pending
 /// interval write of the present record lands and the final flush runs, so the
 /// bytes that landed stay recorded for a resume. A caller uses it for a
 /// fetch-wide throughput floor, which the per-lane unit watchdog cannot see:

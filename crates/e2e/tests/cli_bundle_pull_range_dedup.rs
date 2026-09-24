@@ -660,6 +660,202 @@ async fn run_scattered_complement() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// With two holders of the recipient, its scattered complement stripes across
+/// both (#2123): each holder serves some of `b`'s complement ranges, and the
+/// two lanes together bill exactly `a`'s whole file plus `b`'s complement, so
+/// no range is paid on both lanes. Every open either node served is a paid
+/// leg: the primed first leg of the stripe is adopted, not thrown away.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_bundle_pull_stripes_a_complement_across_two_holders() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_striped_complement()))
+        .await
+        .context("striped-complement e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey: fixture, pull, and the billing check read \
+              top to bottom, and splitting them would only thread the fixture through helpers"
+)]
+async fn run_striped_complement() -> anyhow::Result<()> {
+    const CHUNKS: u64 = 24;
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+    ensure_decdn_cli_built()?;
+    let chain = ChainFixture::launch().await?;
+
+    let shared: Vec<Vec<u8>> = (0..CHUNKS)
+        .map(|i| {
+            deterministic_bytes(
+                5 * CHUNK_GROUP + 3001,
+                0x5791_0000 + u32::try_from(i).unwrap(),
+            )
+        })
+        .collect();
+    let tails: Vec<Vec<u8>> = (0..CHUNKS)
+        .map(|i| deterministic_bytes(2000 + 37 * i, 0x7A12_0000 + u32::try_from(i).unwrap()))
+        .collect();
+    let file_a: Vec<u8> = shared.concat();
+    let file_b: Vec<u8> = shared
+        .iter()
+        .zip(&tails)
+        .flat_map(|(s, t)| s.iter().chain(t).copied())
+        .collect();
+    let whole_a = Hash::new(&file_a);
+    let whole_b = Hash::new(&file_b);
+    let chunk_json = |parts: &[&Vec<u8>]| {
+        parts
+            .iter()
+            .map(|p| {
+                format!(
+                    r#"{{"hash":"b3:{}","size":{}}}"#,
+                    Hash::new(p).to_hex(),
+                    p.len()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let a_chunks: Vec<&Vec<u8>> = shared.iter().collect();
+    let b_chunks: Vec<&Vec<u8>> = shared
+        .iter()
+        .zip(&tails)
+        .flat_map(|(s, t)| [s, t])
+        .collect();
+    let manifest = format!(
+        r#"{{"version":1,"entries":[{{"path":"a.bin","hash":"b3:{}","size":{},"chunks":[{}]}},{{"path":"b.bin","hash":"b3:{}","size":{},"chunks":[{}]}}]}}"#,
+        whole_a.to_hex(),
+        file_a.len(),
+        chunk_json(&a_chunks),
+        whole_b.to_hex(),
+        file_b.len(),
+        chunk_json(&b_chunks),
+    );
+
+    // Two independently bonded holders of both files: distinct operators, so
+    // the stripe admits both.
+    let blobs = [file_a.as_slice(), file_b.as_slice()];
+    let (holder_x, hashes_x) = NodeFixture::launch_with_blobs(&chain, "US", &blobs).await?;
+    let (holder_y, hashes_y) = NodeFixture::launch_with_blobs(&chain, "US", &blobs).await?;
+    anyhow::ensure!(
+        hashes_x == vec![whole_a, whole_b] && hashes_y == hashes_x,
+        "seeded blob hashes mismatch"
+    );
+    anyhow::ensure!(
+        holder_x.operator_addr() != holder_y.operator_addr(),
+        "the two holders must be distinct operators for the stripe to admit both"
+    );
+
+    let client_dir = tempfile::tempdir().context("client tempdir")?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        client_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .context("chmod client dir 0o700")?;
+    eth_identity::generate_and_persist(client_dir.path(), KEYSTORE_PASSWORD, false)
+        .context("generate buyer keystore")?;
+    let keystore = eth_identity::keystore_path(client_dir.path());
+    let buyer = eth_identity::load_signer(&keystore, KEYSTORE_PASSWORD).context("load buyer")?;
+    chain.fund_eth(buyer.address(), 100).await?;
+    chain
+        .mint_usdc(
+            buyer.address(),
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(6u64),
+        )
+        .await
+        .context("mint buyer USDC")?;
+
+    let manifest_path = client_dir.path().join("striped.json");
+    std::fs::write(&manifest_path, manifest).context("write manifest")?;
+    let out_dir = client_dir.path().join("out");
+    // Discovered, not pinned, so `b`'s drives see both holders. `--jobs 1`
+    // lands `a` before `b` plans, and `a` stays below the multi-source floor,
+    // so it pulls whole from one holder.
+    let args = discovered_pull_argv(
+        &chain,
+        &manifest_path,
+        &out_dir,
+        client_dir.path(),
+        &keystore,
+    );
+
+    let (x_addr, y_addr) = (holder_x.operator_addr(), holder_y.operator_addr());
+    let billed_before = (
+        billed_bytes(client_dir.path(), x_addr)?,
+        billed_bytes(client_dir.path(), y_addr)?,
+    );
+    let opens_before = (
+        holder_x
+            .scrape_metric("decdn_serve_cache_hit_total")
+            .await?,
+        holder_y
+            .scrape_metric("decdn_serve_cache_hit_total")
+            .await?,
+    );
+    run_bundle_pull_until_ready(client_dir.path(), &args).await?;
+    let billed_x = billed_bytes(client_dir.path(), x_addr)?.saturating_sub(billed_before.0);
+    let billed_y = billed_bytes(client_dir.path(), y_addr)?.saturating_sub(billed_before.1);
+    let opens = holder_x
+        .scrape_metric("decdn_serve_cache_hit_total")
+        .await?
+        .saturating_sub(opens_before.0)
+        + holder_y
+            .scrape_metric("decdn_serve_cache_hit_total")
+            .await?
+            .saturating_sub(opens_before.1);
+
+    let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin")?;
+    let got_b = std::fs::read(out_dir.join("b.bin")).context("read b.bin")?;
+    anyhow::ensure!(got_a == file_a, "a.bin mismatch");
+    anyhow::ensure!(got_b == file_b, "b.bin mismatch");
+
+    let total_b = file_b.len() as u64;
+    let complement = interleaved_complement(
+        shared
+            .iter()
+            .zip(&tails)
+            .map(|(s, t)| (s.len() as u64, t.len() as u64)),
+        total_b,
+    );
+    let wire_a = whole_blob_wire_bytes(file_a.len() as u64);
+    let mut wire_complement = 0;
+    for (start, len) in &complement {
+        wire_complement += range_wire_bytes(*start, *len, total_b)?;
+    }
+    anyhow::ensure!(
+        wire_complement < wire_a,
+        "the fixture must keep b's complement below a's whole file, so only the \
+         holder that served a can bill more than a"
+    );
+    anyhow::ensure!(
+        billed_x + billed_y == wire_a + wire_complement,
+        "the two lanes must bill a's whole file plus b's {} complement ranges once \
+         ({} wire bytes), got {billed_x} + {billed_y}",
+        complement.len(),
+        wire_a + wire_complement,
+    );
+    // One holder served `a`. It billed more than `a` only if it also served
+    // some of `b`'s ranges, and the other holder billed only `b`'s ranges.
+    let (more, less) = (billed_x.max(billed_y), billed_x.min(billed_y));
+    anyhow::ensure!(
+        less > 0 && more > wire_a,
+        "both holders must serve some of b's complement: billed {billed_x} and \
+         {billed_y}, a alone is {wire_a}"
+    );
+    let legs = 1 + complement.len() as u64;
+    anyhow::ensure!(
+        opens == legs,
+        "the holders must serve exactly the {legs} paid legs between them, served {opens} opens"
+    );
+
+    drop(holder_x);
+    drop(holder_y);
+    Ok(())
+}
+
 /// The 16 KiB bao chunk group the dedup planner aligns donor interiors to.
 const CHUNK_GROUP: u64 = 16 * 1024;
 
@@ -1772,6 +1968,46 @@ async fn run_bundle_pull_until_ready(
         tracing::debug!("bundle pull not ready; retrying after serve-path catch-up:\n{stderr}");
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
+}
+
+/// The `decdn bundle pull` argv (after the `bundle pull` subcommand) to pull a
+/// local manifest through discovery: no `--node-id`, so every entry probes the
+/// active registry and sees every holder. `--jobs 1` keeps the donor ahead of
+/// its recipient, and `--max-lane-streams 4` lets each lane of a striped drive
+/// run four ranges at once.
+fn discovered_pull_argv(
+    chain: &ChainFixture,
+    manifest: &std::path::Path,
+    out_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    keystore: &std::path::Path,
+) -> Vec<String> {
+    vec![
+        "-i".into(),
+        manifest.display().to_string(),
+        "-o".into(),
+        out_dir.display().to_string(),
+        "--jobs".into(),
+        "1".into(),
+        "--max-lane-streams".into(),
+        "4".into(),
+        "--capacity-bond-address".into(),
+        format!("{}", chain.addrs().capacity_bond),
+        "--rpc-url".into(),
+        chain.rpc_url(),
+        "--payment-pool-address".into(),
+        format!("{}", chain.addrs().payment_pool),
+        "--slash-judge-address".into(),
+        format!("{}", chain.addrs().slash_judge),
+        "--chain-id".into(),
+        chain.chain_id().to_string(),
+        "--data-dir".into(),
+        data_dir.display().to_string(),
+        "--keystore".into(),
+        keystore.display().to_string(),
+        "--working-deposit-micro-usdc".into(),
+        DEPOSIT_MICRO_USDC.to_string(),
+    ]
 }
 
 /// The `decdn bundle pull` argv (after the `bundle pull` subcommand) to pull a

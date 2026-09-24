@@ -1789,6 +1789,28 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **CLI: a range-dedup entry stripes its ranges across its holders (#2123).**
+  A `bundle pull` entry that pays for many scattered complement ranges used
+  one provider's link for all of them, even when several holders were probed.
+  The entry now opens one warm session on each admitted full holder (one per
+  operator, at most `--max-sources`, with multi-source on) and fills its ranges
+  from one shared queue across all of them, up to `--max-lane-streams` per
+  lane. A lane that faults leaves the stripe, with a warning that names its
+  provider, and the other lanes fill what it left. A drive stall is every
+  lane's fault, so the whole stripe leaves; a local disk fault or a terminal
+  fault ends the entry without failover. When no striped lane is left, the
+  entry fails over to its other candidates one at a time, as before. All lanes write into the entry's one
+  ranged store, run under one drive-level floor, and spend one top-up budget.
+  A lane that served every gap it took in a drive that filled every range
+  settles at its committed cumulative; any other lane settles at its armed
+  cumulative. Only the last session opened for a drive opens its first leg, so
+  the primed pull is not left to go stale. Every leg now checks the provider's
+  signed size against the store's before it reads a byte
+  (`SignedSizeMismatch`), so a lane that never opened a first leg still
+  refuses a manifest whose size is wrong. That refusal blames no peer and
+  starts no retry round. The SDK adds `drive_range_lanes`, `RangeLane`,
+  `RangeSetOutcome` and `SignedSizeMismatch`. `drive_range_set` is the
+  one-lane case.
 - **Logging: one field name per concept, and peer-triggered warnings are
   throttled.** Every tracing event names its error field `error` (was a mix of
   `err`, `%err` and `error`); a `tracing-field-names` pre-commit hook keeps it
