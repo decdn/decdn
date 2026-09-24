@@ -16,6 +16,7 @@ use super::{
     Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VoucherRejectReason,
     VoucherStop,
 };
+use crate::metrics::FirstByteClock;
 
 /// The byte stream [`CacheEngine::export_bao_range_stream`] hands back.
 ///
@@ -205,6 +206,7 @@ impl ClientHandler {
         client_node_id: B256,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
+        first_byte: FirstByteClock,
     ) -> anyhow::Result<ServeEnd> {
         // Owned here so the pool floor reservation reconciles at every exit —
         // success, `?`, disconnect, panic — exactly like `LaneSlot`. The serve loop
@@ -258,6 +260,7 @@ impl ClientHandler {
         // Their gap `delivered − paid` is the unrecouped credit the window caps.
         let mut delivered: u64 = 0;
         let mut paid: u64 = 0;
+        let mut first_byte = Some(first_byte);
         // Bytes forwarded since the last COMPLETED interval (the sub-interval
         // remainder), and the completed intervals whose payment is still owed —
         // together they are exactly `delivered − paid`. A proof that pays part of
@@ -342,6 +345,9 @@ impl ClientHandler {
                 };
                 let len = frame.total() as u64;
                 self.write_chunk_payload_multi(send, &frame).await?;
+                if let Some(clock) = first_byte.take() {
+                    clock.record(&self.metrics);
+                }
                 delivered = delivered.saturating_add(len);
                 self.shed.record_egress(len);
                 self.metrics.bytes_served(len);

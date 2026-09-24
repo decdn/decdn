@@ -47,6 +47,8 @@
 use decdn_cache::{FillSession, NodeRangedStore};
 use decdn_client::sink::content_paid_frontier;
 
+use crate::metrics::FirstByteClock;
+
 use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
 use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
@@ -116,6 +118,7 @@ impl ClientHandler {
         len: u64,
         total_bytes: u64,
         floor_reservation: Option<&FloorReservation>,
+        first_byte: FirstByteClock,
     ) -> anyhow::Result<ServeEnd> {
         // An offset at or past the blob end has no bytes to deliver, and the
         // clamp below would fold it into the legitimate `end == offset` empty
@@ -156,6 +159,7 @@ impl ClientHandler {
         // `delivered − paid` is the unrecouped credit the window caps.
         let mut delivered: u64 = 0;
         let mut paid: u64 = 0;
+        let mut first_byte = Some(first_byte);
         // Bytes forwarded since the last COMPLETED interval (the sub-interval
         // remainder), and the completed intervals whose payment is still owed —
         // together they are exactly `delivered − paid`. A proof that pays part of
@@ -241,6 +245,9 @@ impl ClientHandler {
                         self.metrics.node_pull_through_client_abandoned();
                     }
                     return Err(e);
+                }
+                if let Some(clock) = first_byte.take() {
+                    clock.record(&self.metrics);
                 }
                 delivered = delivered.saturating_add(clen_u64);
                 self.shed.record_egress(clen_u64);

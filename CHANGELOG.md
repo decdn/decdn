@@ -2217,6 +2217,24 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Observability: the first latency histograms, so a latency SLO can be
+  written in PromQL (#2047).** Before this change the exporter had no
+  histogram, and latency came only from Tempo span durations. Those depend on
+  trace sampling, and the `serve_stream` duration grows with blob size. Four
+  histograms are now live:
+  `decdn_probe_collection_latency_seconds` (M-tier, from the start of the
+  concurrent probes to the end of collection), `decdn_serve_first_byte_hit_seconds`
+  and `decdn_serve_first_byte_miss_seconds` (from the decoded request to the
+  first `ChunkData` frame, split by the availability gate's class), and
+  `decdn_node_pull_first_byte_seconds` (from the start of each paid pull leg's
+  open, dial included, to its first bao bytes). A drive that adopts a
+  header-handshake pull keeps the start of the handshake open, so that leg's
+  time to first byte does not read as zero. On a buffered miss fill the whole
+  blob lands before the first frame, so that tier's miss latency grows with
+  blob size. The delivery dashboard gains serve and pull time-to-first-
+  byte panels, and the node dashboard gains a probe collection latency panel.
+  No alert rule reads them yet.
+
 - **Runtime: `decdn-node` heartbeats the systemd watchdog from its tokio
   runtime.** When the unit sets `WatchdogSec=`, the node sends `WATCHDOG=1` to
   `NOTIFY_SOCKET` every half period from a runtime task. A node whose runtime

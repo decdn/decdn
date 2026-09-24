@@ -1047,11 +1047,12 @@ fn assert_counter(metrics: &Arc<Metrics>, name: &str, value: u64) -> Result<()> 
     Ok(())
 }
 
-/// A relay node that pulled a `blob_len`-byte blob from upstream and served it
-/// downstream records one completed outbound stream and counts at least the
-/// blob in both byte directions. The pull thread marks its end just after the
+/// A relay node that pulled a `blob_len`-byte blob from upstream in
+/// `pull_legs` upstream opens and served it downstream records one completed
+/// outbound stream, counts at least the blob in both byte directions, and times
+/// each leg to its first byte once. The pull thread marks its end just after the
 /// last byte lands, so this waits briefly for it.
-async fn assert_relay_counted(metrics: &Arc<Metrics>, blob_len: u64) -> Result<()> {
+async fn assert_relay_counted(metrics: &Arc<Metrics>, blob_len: u64, pull_legs: u64) -> Result<()> {
     let outbound_completed = "streams_completed_total{direction=\"outbound\"}";
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while counter_value(metrics, outbound_completed)? == 0 && std::time::Instant::now() < deadline {
@@ -1067,6 +1068,10 @@ async fn assert_relay_counted(metrics: &Arc<Metrics>, blob_len: u64) -> Result<(
         counter_value(metrics, "bytes_served_total")? >= blob_len,
         "the relay must count the blob it served"
     );
+    // The relay timed each upstream leg to its first byte, and its served miss to
+    // its first frame.
+    assert_counter(metrics, "node_pull_first_byte_seconds_count", pull_legs)?;
+    assert_counter(metrics, "serve_first_byte_miss_seconds_count", 1)?;
     Ok(())
 }
 
@@ -1406,6 +1411,10 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     // Observability: the success + attempt counters moved.
     assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
+    // One probe round, and one pull leg: the drive adopts the header handshake's
+    // whole-blob pull, so the handshake and the leg record once between them.
+    assert_counter(&b_metrics, "probe_collection_latency_seconds_count", 1)?;
+    assert_counter(&b_metrics, "node_pull_first_byte_seconds_count", 1)?;
 
     // #852: the buyer persisted the channel's voucher watermark after the pull.
     // Under ADR 038 the pull meters WIRE bytes (the bao stream: content +
@@ -7534,7 +7543,9 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         progress_log(&recorded)?
     );
 
-    assert_relay_counted(&b_metrics, u64::try_from(payload.len())?).await?;
+    // Two upstream legs: the primed handshake pull, then the open after the window
+    // pause (the two-leg watermark above).
+    assert_relay_counted(&b_metrics, u64::try_from(payload.len())?, 2).await?;
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
 
@@ -10553,6 +10564,8 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
     );
     assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
     assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    // The cache hit sends no probe, so it opens no collection window.
+    assert_counter(&b_metrics, "probe_collection_latency_seconds_count", 1)?;
     // ONE orchestration per fetch, however many candidate lists it walks.
     assert_counter(&b_metrics, "node_pull_attempts_total", 2)?;
 
@@ -11474,6 +11487,9 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         "the suppressed N must not be re-probed by either phase of fetch #2, got {}",
         probes_n.load(Ordering::SeqCst)
     );
+    // Fetch #2 reaches the cold probe round, but the round sends no probe, so it
+    // opens no collection window.
+    assert_counter(&b_metrics, "probe_collection_latency_seconds_count", 1)?;
     anyhow::ensure!(
         streams_n.load(Ordering::SeqCst) == 1,
         "the suppressed N must not be re-streamed by fetch #2, got {}",

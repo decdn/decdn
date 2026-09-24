@@ -3619,12 +3619,125 @@
       "description": "Distinct peers in the local Kademlia routing table, set after bootstrap and on every bucket-refresh tick."
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "Probe collection latency",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(decdn_probe_collection_latency_seconds_bucket{instance=~\"$node\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "collection p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(decdn_probe_collection_latency_seconds_bucket{instance=~\"$node\"}[$__rate_interval])))",
+          "refId": "B",
+          "legendFormat": "collection p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(decdn_probe_collection_latency_seconds_bucket{instance=~\"$node\"}[$__rate_interval])))",
+          "refId": "C",
+          "legendFormat": "collection p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "sum"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 92
+      },
+      "id": 48,
+      "description": "p50, p95 and p99 duration of one probe collection window on the cache-miss path, from the start of the concurrent probes (dials included) to the end of collection (ADR 001 §Probe response collection). Collection stops early once enough holders answer, or when every probe resolves; the 500 ms probe timeout bounds each probe. A p95 near 0.5 s means rounds wait on a slow or unreachable peer before enough holders answer. A probe-cache hit sends no probe and is not in these series."
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 92
+        "y": 99
       },
       "id": 34,
       "panels": [],
@@ -3722,7 +3835,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 93
+        "y": 100
       },
       "id": 35
     },
@@ -3816,7 +3929,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 93
+        "y": 100
       },
       "id": 36
     },
@@ -3908,7 +4021,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 93
+        "y": 100
       },
       "id": 37
     },
@@ -3949,7 +4062,7 @@
         "h": 11,
         "w": 24,
         "x": 0,
-        "y": 100
+        "y": 107
       },
       "id": 38
     },
@@ -3959,7 +4072,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 111
+        "y": 118
       },
       "id": 39,
       "panels": [],
@@ -4057,7 +4170,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 112
+        "y": 119
       },
       "id": 40
     },
@@ -4152,7 +4265,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 120
+        "y": 127
       },
       "id": 42
     },
@@ -4185,7 +4298,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 120
+        "y": 127
       },
       "id": 43
     },
@@ -4196,7 +4309,7 @@
       },
       "title": "deCDN operation latency",
       "type": "timeseries",
-      "description": "p50 and p95 duration of each deCDN span. serve_stream covers a whole client stream, so its duration tracks blob size; upstream_stream and open_progressive_pull are the paid miss pull and its time to first byte; onchain_tx is one redeemMany from send to receipt. Filter a trace by outcome to split completed from refused or failed streams.",
+      "description": "p50 and p95 duration of each deCDN span, for drill-down. The latency SLOs read the histograms instead: probe collection latency above, and time to first byte on the delivery dashboard. serve_stream covers a whole client stream, so its duration tracks blob size; upstream_stream and open_progressive_pull are the paid miss pull and its time to first byte; onchain_tx is one redeemMany from send to receipt. Filter a trace by outcome to split completed from refused or failed streams.",
       "targets": [
         {
           "datasource": {
@@ -4280,7 +4393,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 128
+        "y": 135
       },
       "id": 44
     }
