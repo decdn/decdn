@@ -36,12 +36,14 @@ use crate::load_shed::RequestClass;
 /// 500 ms ceiling, so the top finite bucket leaves room for a slow scheduler.
 const PROBE_COLLECTION_BUCKETS: [f64; 8] = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
 
-/// Bucket upper bounds shared by the time-to-first-byte histograms. A serve
-/// miss includes discovery and an upstream fill — the whole blob, on a buffered
-/// fill — so the top bucket reaches tens of seconds; a cache hit resolves in the
-/// low buckets.
-const FIRST_BYTE_BUCKETS: [f64; 12] = [
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+/// Bucket upper bounds shared by the time-to-first-byte histograms. A cache hit
+/// resolves in the low buckets. A serve miss includes discovery and an upstream
+/// fill — the whole blob, on a buffered fill — and a pull leg includes its open
+/// and a stall window, so the top bucket reaches past the outer pull deadline at
+/// the default timeouts (`selection::outer_pull_deadline`). A value in `+Inf`
+/// alone pins `histogram_quantile` at the top finite bound.
+const FIRST_BYTE_BUCKETS: [f64; 15] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
 ];
 
 /// Cap concurrent `/metrics` connections. Prevents a trivial `DoS` where a
@@ -3452,6 +3454,25 @@ mod tests {
             "decdn_serve_first_byte_miss_seconds_count",
             0
         ));
+    }
+
+    /// A client waits on a cache miss for at most the outer pull deadline, so a
+    /// first byte at the default timeouts must land in a finite bucket.
+    #[test]
+    fn first_byte_buckets_reach_past_the_default_outer_pull_deadline() {
+        use decdn_common::config::{
+            DEFAULT_NODE_PULL_STALL_WINDOW_SEC, DEFAULT_NODE_PULL_TIMEOUT_SEC,
+        };
+        let deadline = crate::selection::outer_pull_deadline(
+            Duration::from_secs(DEFAULT_NODE_PULL_TIMEOUT_SEC),
+            Duration::from_secs(DEFAULT_NODE_PULL_STALL_WINDOW_SEC),
+        );
+        let top = FIRST_BYTE_BUCKETS.last().copied().unwrap_or_default();
+        assert!(
+            top > deadline.as_secs_f64(),
+            "top first-byte bucket {top}s does not reach the default outer pull deadline \
+             {deadline:?}"
+        );
     }
 
     #[test]
