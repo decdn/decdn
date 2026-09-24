@@ -8,7 +8,7 @@ pub use reload::{LogLevelApply, LogLevelSetter, ReloadSnapshot, RuntimeReloadSta
 
 use crate::chain_events::shared_head::{HeadSource, SharedHead};
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use decdn_cache::{
 };
 use decdn_common::config::{ResolvedDiscovery, ResolvedOrigin, ResolvedS3Credentials};
 use iroh::address_lookup::{DnsAddressLookup, MemoryLookup, PkarrPublisher};
-use iroh::endpoint::{IdleTimeout, QuicTransportConfig, VarInt, presets};
+use iroh::endpoint::{BindOpts, IdleTimeout, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
 use noq_proto::congestion::Bbr3Config;
@@ -2761,11 +2761,20 @@ async fn shutdown<P: Provider + Clone + 'static>(
     }
 }
 
-/// Build an iroh `Endpoint` bound to `bind_port`. ALPNs are set by the
-/// `Router` when it spawns. The bind address is included in the error
-/// message so a port collision surfaces as a config-level diagnostic
-/// (matching `metrics::bind` and `admin::bind`), rather than an opaque
-/// "endpoint bind failed".
+/// Build an iroh `Endpoint` bound to `bind_port` on both address families:
+/// `0.0.0.0:bind_port` and `[::]:bind_port`. ALPNs are set by the `Router`
+/// when it spawns. The bind addresses are included in the error message so a
+/// port collision surfaces as a config-level diagnostic (matching
+/// `metrics::bind` and `admin::bind`), rather than an opaque "endpoint bind
+/// failed".
+///
+/// The IPv6 bind replaces iroh's default `[::]:0` socket, so a dual-stack node
+/// listens on one stable port per family and an operator can register an
+/// `/ip6/<addr>/udp/<bind_port>/quic-v1` multiaddr. The two sockets do not
+/// collide: netwatch sets `IPV6_V6ONLY` on every IPv6 socket. The IPv4 bind is
+/// required. The IPv6 bind is not: a host without IPv6 (disabled by sysctl, or
+/// a container without a v6 stack) or with `[::]:bind_port` taken still starts
+/// on IPv4 only, and [`warn_if_no_ipv6_socket`] logs the degraded state.
 ///
 /// No transient pre-bind probe: it would introduce a TOCTOU window
 /// between the probe and the real bind, and iroh's
@@ -2779,7 +2788,8 @@ async fn build_endpoint(
     discovery: &ResolvedDiscovery,
     transport_config: QuicTransportConfig,
 ) -> anyhow::Result<Endpoint> {
-    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port);
+    let bind_v4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port);
+    let bind_v6 = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, bind_port, 0, 0);
 
     // Base preset selection is the discovery-provider seam (#818, see
     // adr/appendix-poc-production-seams.md): with no `network.discovery` keys we
@@ -2838,12 +2848,34 @@ async fn build_endpoint(
         builder = builder.relay_mode(RelayMode::Custom(RelayMap::from_iter(relays)));
     }
 
-    builder
-        .bind_addr(bind_addr)
-        .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
+    let ep = builder
+        .bind_addr(bind_v4)
+        .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_v4}: {e}"))?
+        .bind_addr_with_opts(bind_v6, BindOpts::default().set_is_required(false))
+        .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_v6}: {e}"))?
         .bind()
         .await
-        .map_err(|e| anyhow::anyhow!("endpoint bind {bind_addr} failed: {e}"))
+        .map_err(|e| anyhow::anyhow!("endpoint bind {bind_v4} + {bind_v6} failed: {e}"))?;
+    warn_if_no_ipv6_socket(&ep.bound_sockets(), bind_v6);
+    Ok(ep)
+}
+
+/// Log a warning when the endpoint holds no IPv6 socket. `build_endpoint`
+/// binds `[::]:bind_port` as optional, so iroh drops a failed IPv6 bind with
+/// only an info-level note. This warning tells the operator that the node is
+/// IPv4-only and that an `/ip6/...` multiaddr does not reach it. Returns
+/// whether an IPv6 socket is bound.
+fn warn_if_no_ipv6_socket(bound: &[SocketAddr], bind_v6: SocketAddrV6) -> bool {
+    let has_v6 = bound.iter().any(SocketAddr::is_ipv6);
+    if !has_v6 {
+        tracing::warn!(
+            %bind_v6,
+            "IPv6 bind failed; the node listens on IPv4 only — an /ip6/ multiaddr does not \
+             reach it. Enable IPv6 on the host or free the port, or register /ip4/ \
+             multiaddrs only"
+        );
+    }
+    has_v6
 }
 
 /// Compose the operator-configured `network.discovery` address-lookup legs onto
@@ -4746,6 +4778,101 @@ mod tests {
                 unprobeable: 1
             }
         );
+    }
+
+    /// Bind an `IPV6_V6ONLY` UDP socket on `[::]:port`, or return `None` when
+    /// the host has no usable IPv6 stack.
+    fn bind_v6_only_udp(port: u16) -> Option<socket2::Socket> {
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .ok()?;
+        sock.set_only_v6(true).ok()?;
+        let addr = SocketAddr::from(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
+        sock.bind(&addr.into()).ok()?;
+        Some(sock)
+    }
+
+    /// A port that is free on `0.0.0.0` and, when the host has IPv6, on `[::]`.
+    fn free_dual_stack_port() -> u16 {
+        for _ in 0..32 {
+            let v4 = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            let port = v4.local_addr().unwrap().port();
+            if bind_v6_only_udp(0).is_none() || bind_v6_only_udp(port).is_some() {
+                return port;
+            }
+        }
+        panic!("no port free on both address families");
+    }
+
+    #[tokio::test]
+    async fn build_endpoint_binds_ipv6_on_bind_port() {
+        let port = free_dual_stack_port();
+        let has_v6 = bind_v6_only_udp(0).is_some();
+        let sk = SecretKey::generate();
+        let transport = quic_transport_config().unwrap();
+        let ep = build_endpoint(&sk, port, &[], &ResolvedDiscovery::default(), transport)
+            .await
+            .expect("endpoint binds on both families");
+        let bound = ep.bound_sockets();
+        assert!(
+            bound.iter().any(|a| a.is_ipv4() && a.port() == port),
+            "no IPv4 socket on {port}: {bound:?}"
+        );
+        if has_v6 {
+            // One IPv6 socket, on the configured port — not iroh's random default.
+            let v6: Vec<_> = bound.iter().filter(|a| a.is_ipv6()).collect();
+            assert_eq!(v6.len(), 1, "expected one IPv6 socket: {bound:?}");
+            assert_eq!(v6.first().map(|a| a.port()), Some(port), "{bound:?}");
+        }
+        ep.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_endpoint_falls_back_to_ipv4_when_ipv6_bind_fails() {
+        // Holding `[::]:port` makes the endpoint's IPv6 bind fail the same way
+        // a host without IPv6 does. The node must still start on IPv4.
+        // Without an IPv6 stack every IPv6 bind fails on its own; port 0 then
+        // stands in for the configured port.
+        let (port, _v6_holder) = if bind_v6_only_udp(0).is_none() {
+            (0, None)
+        } else {
+            let (port, v6) = (0..32)
+                .find_map(|_| {
+                    let v6 = bind_v6_only_udp(0)?;
+                    let port = v6.local_addr().ok()?.as_socket()?.port();
+                    std::net::UdpSocket::bind(("0.0.0.0", port)).ok()?;
+                    Some((port, v6))
+                })
+                .expect("a port free on IPv4 whose IPv6 twin we hold");
+            (port, Some(v6))
+        };
+        let sk = SecretKey::generate();
+        let transport = quic_transport_config().unwrap();
+        let ep = build_endpoint(&sk, port, &[], &ResolvedDiscovery::default(), transport)
+            .await
+            .expect("an IPv6 bind failure does not stop the node");
+        let bound = ep.bound_sockets();
+        assert!(bound.iter().all(SocketAddr::is_ipv4), "{bound:?}");
+        assert!(
+            port == 0 || bound.iter().any(|a| a.port() == port),
+            "no IPv4 socket on {port}: {bound:?}"
+        );
+        ep.close().await;
+    }
+
+    #[test]
+    fn warn_if_no_ipv6_socket_reports_ipv6_presence() {
+        let bind_v6 = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 4433, 0, 0);
+        let v4 = SocketAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 4433));
+        assert!(!warn_if_no_ipv6_socket(&[], bind_v6));
+        assert!(!warn_if_no_ipv6_socket(&[v4], bind_v6));
+        assert!(warn_if_no_ipv6_socket(
+            &[v4, SocketAddr::from(bind_v6)],
+            bind_v6
+        ));
     }
 
     #[tokio::test]

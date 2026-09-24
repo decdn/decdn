@@ -566,7 +566,9 @@ pub struct RegisterArgs {
     pub region: String,
 
     /// QUIC multiaddr to register, e.g.
-    /// `/ip4/203.0.113.10/udp/4433/quic-v1`. Repeatable. NAT'd nodes may
+    /// `/ip4/203.0.113.10/udp/4433/quic-v1`. Repeatable. The node listens on
+    /// the same port over IPv4 and IPv6, so a dual-stack host also registers
+    /// `/ip6/2001:db8::10/udp/4433/quic-v1`. NAT'd nodes may
     /// register a relay placeholder and promote direct addresses later via
     /// `updateMultiaddrs`; omitting it entirely registers an empty set and
     /// relies on `cdn/dht/v1` discovery (ADR 022) for reachability.
@@ -811,7 +813,8 @@ pub struct DeregisterArgs {
 /// on-chain transaction rather than talking to a running node's admin RPC.
 #[derive(Args, Debug)]
 pub struct UpdateMultiaddrsArgs {
-    /// QUIC multiaddr to publish, e.g. `/ip4/203.0.113.10/udp/4433/quic-v1`.
+    /// QUIC multiaddr to publish, e.g. `/ip4/203.0.113.10/udp/4433/quic-v1`,
+    /// plus `/ip6/2001:db8::10/udp/4433/quic-v1` on a dual-stack host.
     /// Repeatable; at least one is required — the whole point of this command
     /// is to advertise a non-empty set, so clearing addresses back to empty is
     /// deliberately not offered here (it would re-create the relay-pinned

@@ -30,8 +30,10 @@ pub struct SetupArgs {
     pub region: String,
 
     /// QUIC multiaddr to register, e.g. `/ip4/203.0.113.10/udp/4433/quic-v1`.
-    /// Repeatable. Omitting it registers an empty set and relies on
-    /// `cdn/dht/v1` discovery (ADR 022) for reachability.
+    /// Repeatable. The node listens on the same port over IPv4 and IPv6, so a
+    /// dual-stack host also registers `/ip6/2001:db8::10/udp/4433/quic-v1`.
+    /// Omitting it registers an empty set and relies on `cdn/dht/v1`
+    /// discovery (ADR 022) for reachability.
     #[arg(long = "multiaddr", value_name = "MA")]
     pub multiaddrs: Vec<String>,
 
