@@ -3,7 +3,7 @@
 //! Signing touches no chain — this is the zero-tx allowance.
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::{Capability, CapabilityGrant};
 
@@ -50,7 +50,7 @@ impl Issuer {
         let expiry = now_unix.saturating_add(self.ttl_secs);
         let capability = Capability {
             signer: delegate,
-            spending_cap: U256::from(self.spending_cap),
+            spending_cap: self.spending_cap,
             pool_id: self.pool_id,
             expiry,
         };
@@ -91,7 +91,7 @@ mod tests {
         let grant = CapabilityGrant::from_token(&token).unwrap();
         assert_eq!(grant.signer, delegate);
         assert_eq!(grant.pool_id, pool_id);
-        assert_eq!(grant.spending_cap, U256::from(10_000_000u64));
+        assert_eq!(grant.spending_cap, 10_000_000u64);
         assert_eq!(grant.expiry, expiry);
         assert_eq!(grant.owner(&domain).unwrap(), owner);
     }

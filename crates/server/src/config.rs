@@ -51,8 +51,8 @@ impl ServerConfig {
             pool_id: B256::from_str(&env("SPONSOR_POOL_ID")?)?,
             capacity_bond: Address::from_str(&env("SPONSOR_CAPACITY_BOND_ADDR")?)?,
             treasury_keystore: PathBuf::from(env("SPONSOR_TREASURY_KEYSTORE")?),
-            capability_cap: MicroUsdc(env_u64("SPONSOR_CAPABILITY_CAP_MICRO_USDC", 10_000_000)?),
-            capability_ttl_secs: env_u64("SPONSOR_CAPABILITY_TTL_SECS", 2_592_000)?,
+            capability_cap: MicroUsdc(env_u64("SPONSOR_CAPABILITY_CAP_MICRO_USDC", 5_000_000)?),
+            capability_ttl_secs: env_u64("SPONSOR_CAPABILITY_TTL_SECS", 172_800)?,
             pool_low_water: MicroUsdc(env_u64("SPONSOR_POOL_LOW_WATER_MICRO_USDC", 20_000_000)?),
             pool_refill: MicroUsdc(env_u64("SPONSOR_POOL_REFILL_MICRO_USDC", 100_000_000)?),
             pool_watch_interval_secs: env_u64("SPONSOR_POOL_WATCH_INTERVAL_SECS", 3600)?,
@@ -130,8 +130,8 @@ mod tests {
         }
         let cfg = ServerConfig::from_env().unwrap();
         assert_eq!(cfg.chain_id, 421_614);
-        assert_eq!(cfg.capability_cap.0, 10_000_000);
-        assert_eq!(cfg.capability_ttl_secs, 2_592_000);
+        assert_eq!(cfg.capability_cap.0, 5_000_000);
+        assert_eq!(cfg.capability_ttl_secs, 172_800);
         assert_eq!(cfg.pool_low_water.0, 20_000_000);
     }
 }

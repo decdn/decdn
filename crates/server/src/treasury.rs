@@ -7,8 +7,8 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
-use decdn_client_pull::buyer_pool::{ensure_allowance, top_up};
-use decdn_client_pull::provider::build_provider;
+use decdn_client::buyer_pool::{ensure_allowance, top_up};
+use decdn_client::provider::build_provider;
 use decdn_incentive::payment_pool::PaymentPool;
 
 use crate::money::MicroUsdc;
@@ -94,8 +94,10 @@ impl<P: Provider + Clone + 'static> Treasury for DecdnTreasury<P> {
             Some(amount),
         )
         .await?;
-        let credited = top_up(&self.contract, pool_id, amount).await?;
-        Ok(MicroUsdc(u64::try_from(credited).unwrap_or(u64::MAX)))
+        let topped = top_up(&self.contract, pool_id, amount).await?;
+        Ok(MicroUsdc(
+            u64::try_from(topped.credited).unwrap_or(u64::MAX),
+        ))
     }
 
     async fn pool_owner(&self, pool_id: B256) -> anyhow::Result<Address> {

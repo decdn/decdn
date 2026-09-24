@@ -1,9 +1,10 @@
-//! `onramp`: the decdn-sponsor CLI wrapper. Wraps a plain `decdn` node
-//! process, buys/tops-up a payment channel on the operator's behalf, and
-//! (in later tasks) proxies requests through the sponsor's channel.
+//! `decdn-sponsored`: the walletless client for the sponsord gateway. Gives
+//! each download a throwaway key, obtains a sponsor capability for it via a
+//! browser captcha, and delegates the pull itself to the `decdn` binary.
 
 pub mod api;
 pub mod config;
 pub mod flow;
 pub mod keystore;
 pub mod runner;
+pub mod session;

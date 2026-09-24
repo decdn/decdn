@@ -2532,6 +2532,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-queue"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2746,7 +2755,7 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "decdn-bao-range"
-version = "0.1.1"
+version = "0.0.0"
 dependencies = [
  "bao-tree",
  "bytes",
@@ -2756,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-cache"
-version = "0.1.1"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2770,6 +2779,7 @@ dependencies = [
  "bao-tree",
  "bytes",
  "chacha20poly1305",
+ "dashmap",
  "decdn-bao-range",
  "decdn-config-types",
  "decdn-protocol",
@@ -2789,8 +2799,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "decdn-client-pull"
-version = "0.1.1"
+name = "decdn-client"
+version = "0.0.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2801,8 +2811,10 @@ dependencies = [
  "decdn-common",
  "decdn-incentive",
  "decdn-protocol",
+ "futures-util",
  "iroh",
  "iroh-io",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "tempfile",
@@ -2812,7 +2824,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-common"
-version = "0.1.1"
+version = "0.0.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2822,6 +2834,7 @@ dependencies = [
  "dirs",
  "iroh",
  "jsonrpsee",
+ "nix",
  "rand 0.10.2",
  "serde",
  "tokio",
@@ -2832,7 +2845,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-config-types"
-version = "0.1.1"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -2841,14 +2854,14 @@ dependencies = [
 
 [[package]]
 name = "decdn-e2e"
-version = "0.1.1"
+version = "0.0.0"
 dependencies = [
  "alloy",
  "anyhow",
  "bao-tree",
  "decdn-bao-range",
  "decdn-cache",
- "decdn-client-pull",
+ "decdn-client",
  "decdn-common",
  "decdn-config-types",
  "decdn-incentive",
@@ -2866,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-incentive"
-version = "0.1.1"
+version = "0.0.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2888,7 +2901,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-node"
-version = "0.1.1"
+version = "0.0.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2897,9 +2910,11 @@ dependencies = [
  "bao-tree",
  "bytes",
  "clap",
+ "crossbeam-queue",
+ "dashmap",
  "decdn-bao-range",
  "decdn-cache",
- "decdn-client-pull",
+ "decdn-client",
  "decdn-common",
  "decdn-incentive",
  "decdn-protocol",
@@ -2916,6 +2931,10 @@ dependencies = [
  "iroh-io",
  "iroh-metrics",
  "jsonrpsee",
+ "noq-proto",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "postcard",
  "rand 0.10.2",
  "redb",
@@ -2927,13 +2946,14 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
 ]
 
 [[package]]
 name = "decdn-protocol"
-version = "0.1.1"
+version = "0.0.0"
 dependencies = [
  "postcard",
  "serde",
@@ -2943,7 +2963,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-reputation"
-version = "0.1.1"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "decdn-protocol",
@@ -2952,6 +2972,26 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "decdn-sponsored"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "clap",
+ "decdn-incentive",
+ "getrandom 0.3.4",
+ "hex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "tokio",
+ "toml",
+ "wiremock",
 ]
 
 [[package]]
@@ -3083,9 +3123,9 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "6.0.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
 dependencies = [
  "dirs-sys",
 ]
@@ -4201,6 +4241,19 @@ dependencies = [
  "rustls-native-certs",
  "tokio",
  "tokio-rustls",
+ "tower-service",
+]
+
+[[package]]
+name = "hyper-timeout"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0"
+dependencies = [
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
+ "tokio",
  "tower-service",
 ]
 
@@ -5520,6 +5573,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5805,25 +5870,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "onramp"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "anyhow",
- "clap",
- "decdn-incentive",
- "hex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "serial_test",
- "tempfile",
- "tokio",
- "toml",
- "wiremock",
-]
-
-[[package]]
 name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5870,6 +5916,68 @@ dependencies = [
  "libc",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "opentelemetry"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "opentelemetry-otlp"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
+dependencies = [
+ "http 1.5.0",
+ "opentelemetry",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost",
+ "thiserror 2.0.19",
+ "tokio",
+ "tonic",
+ "tonic-types",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "opentelemetry",
+ "percent-encoding",
+ "portable-atomic",
+ "rand 0.9.5",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -6353,6 +6461,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+dependencies = [
+ "anyhow",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "prost-types"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
+dependencies = [
+ "prost",
+]
+
+[[package]]
 name = "quanta"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6610,9 +6750,9 @@ checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
 name = "redb"
-version = "4.1.0"
+version = "4.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
+checksum = "fb338a6c67830a61bed824b78c2bb034ab1ff401a20616bd7957524f4fdc2f22"
 dependencies = [
  "libc",
 ]
@@ -7726,7 +7866,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "decdn-client-pull",
+ "decdn-client",
  "decdn-common",
  "decdn-e2e",
  "decdn-incentive",
@@ -8223,6 +8363,54 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
+name = "tonic"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
+ "hyper",
+ "hyper-timeout",
+ "hyper-util",
+ "percent-encoding",
+ "pin-project",
+ "sync_wrapper",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "tonic-prost"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
+dependencies = [
+ "bytes",
+ "prost",
+ "tonic",
+]
+
+[[package]]
+name = "tonic-types"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73ab1b02061f83d519bba3caa167f88f261ef05720ab8ebc954ade70de3348e8"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+]
+
+[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8230,9 +8418,12 @@ checksum = "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4"
 dependencies = [
  "futures-core",
  "futures-util",
+ "indexmap 2.14.0",
  "pin-project-lite",
+ "slab",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -8310,6 +8501,22 @@ dependencies = [
  "log",
  "once_cell",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-opentelemetry"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adbc64cba7137545b8044cb1fe9814f7aacf3c6b5f9b45be8bb5db538befdb26"
+dependencies = [
+ "js-sys",
+ "opentelemetry",
+ "smallvec",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
+ "web-time",
 ]
 
 [[package]]

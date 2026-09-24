@@ -1,15 +1,15 @@
 [package]
-name = "onramp"
+name = "decdn-sponsored"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [[bin]]
-name = "onramp"
+name = "decdn-sponsored"
 path = "src/main.rs"
 
 [lib]
-name = "onramp"
+name = "decdn_sponsored"
 path = "src/lib.rs"
 
 [lints]
@@ -30,6 +30,7 @@ decdn-incentive.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hex = "0.4"
+getrandom = "0.3"
 reqwest = { version = "0.12", features = ["json"] }
 toml = "1"
 clap = { version = "4", features = ["derive"] }

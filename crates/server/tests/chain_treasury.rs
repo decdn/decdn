@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use alloy::primitives::U256;
 use alloy::signers::local::PrivateKeySigner;
-use decdn_client_pull::buyer_pool::{ensure_allowance, open_pool};
+use decdn_client::buyer_pool::{ensure_allowance, open_pool};
 use decdn_e2e::chain::ChainFixture;
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::voucher_domain;

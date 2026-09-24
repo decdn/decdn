@@ -1,39 +1,55 @@
-//! `onramp`: fetch a content-addressed blob through the decdn-sponsor
-//! gateway. Wraps `decdn fetch` with fund/poll/top-up handling — see
-//! `flow::get`.
+//! `decdn-sponsored`: download a content-addressed bundle through the
+//! sponsord gateway, with no wallet. See `flow::pull`.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
-use clap::Parser;
-use onramp::config::WrapperConfig;
-use onramp::flow;
+use clap::{Parser, Subcommand};
+use decdn_sponsored::config::WrapperConfig;
+use decdn_sponsored::flow;
 
-/// Fetch a blob through the decdn-sponsor gateway.
+/// Download from deCDN, paid for by the sponsor. You solve one captcha per
+/// download; there is no wallet, key, or password to manage.
 #[derive(Parser, Debug)]
-#[command(name = "onramp")]
+#[command(name = "decdn-sponsored")]
 struct Cli {
-    /// BLAKE3 hash of the blob to fetch.
-    hash: String,
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// Destination path for the fetched blob.
-    #[arg(short, long)]
-    output: PathBuf,
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Pull a bundle by its BLAKE3 hash.
+    Pull {
+        /// BLAKE3 hash of the bundle manifest (`b3:<hex>` or bare hex).
+        hash: String,
+
+        /// Directory the bundle's files are written under.
+        #[arg(short, long, default_value = ".")]
+        output: PathBuf,
+    },
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let cfg = match WrapperConfig::load() {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("onramp: failed to load config: {e}");
-            std::process::exit(1);
+            eprintln!("decdn-sponsored: failed to load config: {e}");
+            return ExitCode::FAILURE;
         }
     };
 
-    if let Err(e) = flow::get(&cli.hash, &cli.output, &cfg).await {
-        eprintln!("onramp: {e}");
-        std::process::exit(1);
+    let result = match &cli.command {
+        Command::Pull { hash, output } => flow::pull(hash, output, &cfg).await,
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("decdn-sponsored: {e:#}");
+            ExitCode::FAILURE
+        }
     }
 }

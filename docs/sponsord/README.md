@@ -1,6 +1,6 @@
-# sponsor
+# sponsord
 
-`sponsor` is deCDN's sponsored on-ramp: a gateway (`sponsord`) that grants a
+`sponsord` is deCDN's sponsored on-ramp: a gateway (`sponsord`) that grants a
 new client a zero-tx allowance against its own shared `PaymentPool` on the
 Arbitrum Sepolia testnet, so a new user can fetch content from the network
 without first acquiring testnet USDC, opening a channel, or setting up a
@@ -9,18 +9,17 @@ via `decdn pool open` (its id given by `SPONSOR_POOL_ID`) — the gateway never
 opens anything per user. A captcha-gated `/fund` flow issues an owner-signed
 EIP-712 capability (serialized as a `dcap1:` token) authorizing the caller's
 key to redeem against that pool up to a per-capability cap: zero on-chain
-transaction and zero locked deposit per user. A companion CLI wrapper
-(`onramp`, in `crates/wrapper`) drives the actual `decdn` fetch using a
-locally generated keystore, never handing that key to the gateway.
-It is a wrapper around `decdn`'s own paid-pull path — see `../decdn` for the
-protocol and contracts this all sits on top of.
+transaction and zero locked deposit per user. A companion CLI
+(`decdn-sponsored`, in `crates/wrapper`) gives each download a throwaway key,
+obtains a capability for it, and hands the pull to the `decdn` binary. The
+gateway never sees that key. See `../decdn` for the protocol and contracts
+this all sits on top of.
 
 Capabilities are node-agnostic: issuance doesn't involve a content hash or
 node discovery, only an allowance against the shared pool. Registration of a
 signer against the pool is set-once on-chain — once a key first redeems, its
-cap and expiry are frozen for that key. There's no per-key top-up; getting
-more allowance means generating a fresh keystore key and requesting a fresh
-capability. Anti-abuse is bounded by the captcha on `/fund`, the
+cap and expiry are frozen for that key, which is why `decdn-sponsored` uses
+one key per download. Anti-abuse is bounded by the captcha on `/fund`, the
 per-capability cap (`SPONSOR_CAPABILITY_CAP_MICRO_USDC`), and the shared
 pool's own balance — there's no per-signer monthly accumulator.
 
@@ -29,10 +28,10 @@ pool's own balance — there's no per-signer monthly accumulator.
 - `crates/server` (binary `sponsord`) — the HTTP gateway: `/healthz`,
   `/decdn.sh` (templated installer), `/fund` (captcha page + capability
   issuance), `/capability` (poll for an issued capability).
-- `crates/wrapper` (binary `onramp`) — the end-user CLI: reads
-  `~/.decdn/sponsor.toml` (written by the installer), talks to `sponsord` to
-  obtain a capability, then drives a real `decdn` paid fetch against the
-  shared pool with a local keystore.
+- `crates/wrapper` (binary `decdn-sponsored`) — the end-user CLI: reads
+  `~/.decdn/sponsor.toml` (written by the installer), obtains a capability
+  for a per-download throwaway key, then runs `decdn bundle pull` against the
+  shared pool.
 
 ## Running the server
 
@@ -71,8 +70,8 @@ pool up from the treasury whenever its remaining balance falls below
 | `SPONSOR_CAPACITY_BOND_ADDR` | **yes** | — | `CapacityBond` contract address (used for hash → node/provider discovery) |
 | `SPONSOR_TREASURY_KEYSTORE` | **yes** | — | Path to the treasury hot-wallet's encrypted keystore JSON |
 | `SPONSOR_TREASURY_PASSWORD` | **yes** | — | Password to decrypt `SPONSOR_TREASURY_KEYSTORE` (never logged, never written to disk elsewhere) |
-| `SPONSOR_CAPABILITY_CAP_MICRO_USDC` | no | `10_000_000` ($10) | Spend cap baked into each issued capability |
-| `SPONSOR_CAPABILITY_TTL_SECS` | no | `2_592_000` (30 days) | How long an issued capability remains valid |
+| `SPONSOR_CAPABILITY_CAP_MICRO_USDC` | no | `5_000_000` ($5) | Spend cap baked into each issued capability |
+| `SPONSOR_CAPABILITY_TTL_SECS` | no | `172_800` (48 hours) | How long an issued capability remains valid |
 | `SPONSOR_POOL_LOW_WATER_MICRO_USDC` | no | `20_000_000` ($20) | Balance threshold below which `pool_watch` tops the pool up from the treasury |
 | `SPONSOR_POOL_REFILL_MICRO_USDC` | no | `100_000_000` ($100) | Amount `pool_watch` tops the pool up by |
 | `SPONSOR_POOL_WATCH_INTERVAL_SECS` | no | `3600` | How often the pool-balance background task runs |
@@ -80,34 +79,43 @@ pool up from the treasury whenever its remaining balance falls below
 | `SPONSOR_TURNSTILE_SITEKEY` | **yes** | — | Cloudflare Turnstile sitekey, interpolated into the `/fund` widget page |
 | `SPONSOR_DATA_DIR` | no | `./data` | Directory for the redb store (issuance bookkeeping) |
 
-## The wrapper (`onramp`) flow
+## The `decdn-sponsored` flow
 
-1. A user runs the installer served at `GET {{gateway}}/decdn.sh` (see
-   `assets/decdn.sh`). It installs the `decdn` and `onramp` binaries,
-   writes `~/.decdn/sponsor.toml` with the gateway's contract addresses and
-   RPC URL already filled in, and generates a local client keystore
-   (`~/.decdn/client/keystore.json`) if one doesn't already exist.
-2. The user sets `DECDN_KEYSTORE_PASSWORD` and runs `onramp <hash> -o
-   out.bin`.
-3. `onramp` loads `~/.decdn/sponsor.toml` (schema: `crates/wrapper/src/config.rs`'s
-   `Profile`), reads its local signer's address, and asks the gateway for a
-   capability: it opens `GET /fund?client=<addr>` in the browser for the
-   captcha, then polls `GET /capability?client=<addr>` until it gets back a
-   `dcap1:` token (or `204` while still pending). It then drives `decdn
-   fetch --capability <dcap1:token> --payment-pool-address <addr> <hash> -o
-   out`, signing vouchers with the local keystore — the gateway never sees
-   or holds the client's private key, only its own treasury key.
+The website shows one command per model, with the model's BLAKE3 hash from
+`models.json`:
 
-There's no top-up loop: a capability's cap and expiry are fixed at issuance,
-and on-chain signer registration is set-once, so once a key's allowance is
-exhausted, the only way to get more is to request a fresh capability under a
-new keystore key.
+```bash
+curl -fsSL https://up.decdn.org/decdn.sh | sh -s -- pull b3:<hash>
+```
+
+1. The installer served at `GET /decdn.sh` (`assets/decdn.sh`) installs the
+   `decdn` and `decdn-sponsored` binaries and writes `~/.decdn/sponsor.toml`
+   with the gateway's contract addresses and RPC URL filled in. Any
+   arguments are passed on to `decdn-sponsored`. Running it again is
+   harmless, and `decdn-sponsored pull ...` works on its own once installed.
+2. `decdn-sponsored pull <hash> [-o <dir>]` (output defaults to the current
+   directory) opens the state directory for that hash, `~/.decdn/sponsored/downloads/<hash>/`, and generates a throwaway
+   voucher-signing key there with a random password stored beside it. The
+   user never sees a key, keystore, or password.
+3. It polls `GET /capability?client=<addr>` and, while that answers `204`,
+   prints (and opens in the browser) `GET /fund?client=<addr>` for the
+   captcha. The issued `dcap1:` token is saved in the state directory.
+4. It runs `decdn bundle pull --hash <hash> -o <dir> --capability-file ...
+   --keystore ... --data-dir <state dir>` with inherited stdio, so `decdn`'s
+   own progress and errors reach the user unchanged. The name-to-hash
+   mapping happens on the website; the CLI accepts only a hash, and `decdn`
+   verifies every byte against it.
+5. On success the state directory is deleted. On failure it is kept: running
+   the same command again resumes with the same key and capability (no new
+   captcha), and `bundle pull` resumes from its `.partial` files. A saved
+   capability within five minutes of expiry is replaced by a fresh key and
+   a new captcha.
 
 The `~/.decdn/sponsor.toml` schema is a hard contract between the installer
 (`assets/decdn.sh`) and the wrapper (`crates/wrapper/src/config.rs`): field
-names must match exactly. Current fields: `gateway_base`, `keystore_path`,
-`decdn_bin`, `data_dir`, `rpc_url`, `payment_pool`, `capacity_bond`
-(optional), `slash_judge` (optional), `chain_id`.
+names must match exactly. Current fields: `gateway_base`, `decdn_bin`,
+`data_dir`, `rpc_url`, `payment_pool`, `capacity_bond` (optional),
+`slash_judge` (optional), `chain_id`. Unknown fields are ignored.
 
 ## Publish seam
 
@@ -115,7 +123,7 @@ This repo currently depends on its sibling `decdn` checkout via path
 dependencies in the root `Cargo.toml`:
 
 ```toml
-decdn-client-pull = { path = "../decdn/crates/client-pull" }
+decdn-client      = { path = "../decdn/crates/client" }
 decdn-incentive   = { path = "../decdn/crates/incentive", features = ["redb"] }
 decdn-common      = { path = "../decdn/crates/common" }
 ```
@@ -124,7 +132,7 @@ Before this repo goes public, swap those to git dependencies pinned to a
 tagged `decdn` release:
 
 ```toml
-decdn-client-pull = { git = "https://github.com/decdn/decdn.git", tag = "vX.Y.Z" }
+decdn-client      = { git = "https://github.com/decdn/decdn.git", tag = "vX.Y.Z" }
 decdn-incentive   = { git = "https://github.com/decdn/decdn.git", tag = "vX.Y.Z", features = ["redb"] }
 decdn-common      = { git = "https://github.com/decdn/decdn.git", tag = "vX.Y.Z" }
 ```
