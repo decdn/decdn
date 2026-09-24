@@ -4880,7 +4880,7 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// A `record` failure is now a hard serve fault, not a clean in-band rejection:
+/// A `record` failure is a hard serve fault, not a clean in-band rejection:
 /// the buffered lane store's `record` is expected to fail only on a poisoned
 /// mutex (ADR 003 §Off-chain voucher state persistence), so `commit_one_proof`
 /// treats it as a fault and aborts the stream rather than writing a `StreamError`
@@ -10435,6 +10435,13 @@ async fn a_chunk_settled_by_the_last_proof_of_its_budget_is_paid() -> anyhow::Re
 
     // Interval 2 is paid, so interval 3 arrives.
     read_exact_chunks(&mut fx.recv, HARNESS_INTERVAL_BYTES).await?;
+    anyhow::ensure!(
+        counter(
+            &fx.metrics,
+            "decdn_serve_stream_proof_budget_exhausted_total"
+        )? == 0,
+        "a chunk the last proof of its budget settles must not count as a spent budget"
+    );
 
     fx.conn.close(0u32.into(), b"done");
     shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;

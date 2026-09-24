@@ -9502,6 +9502,7 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
          window ({one_window} content = {window_wire} wire)"
     );
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 0)?;
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
@@ -9629,8 +9630,9 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
 
 /// A leaf that answers one chunk with sliver after sliver hits the per-chunk
 /// proof budget on the miss path too (#2132). Each sliver credits something, but
-/// none settles the chunk, so B ends the stream and meters the client abandon
-/// instead of holding the stream and its upstream pull open one sliver at a time.
+/// none settles the chunk, so B ends the stream and meters both the client
+/// abandon and the spent proof budget instead of holding the stream and its
+/// upstream pull open one sliver at a time.
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Result<()> {
     const SLIVER_BYTES: u64 = 64 * 1024;
@@ -9792,8 +9794,74 @@ async fn window_pull_through_store_record_failure_is_a_node_fault_not_an_abandon
     }
     assert_counter(&b_metrics, "serve_stream_node_fault_total", 1)?;
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 0)?;
+    assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 0)?;
 
     leaf.conn.close(0u32.into(), b"done");
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
+/// A leaf that drops while B waits for its proof is a client abandon (#2134).
+/// The proof read fails on a peer-attributable transport error, so B meters the
+/// abandon. It is neither a node fault nor a spent proof budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_leaf_drop_in_recoup_is_an_abandon() -> Result<()> {
+    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
+    let payload = vec![0x5Eu8; payload_len];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xAB);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x5F);
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, _b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let leaf = leaf_reads_first_interval(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+    )
+    .await?;
+    // B has put the first interval on the wire and waits for its proof.
+    leaf.conn.close(0u32.into(), b"gone");
+
+    // The inbound stream fails once dispatch sees the error, and dispatch
+    // meters any node fault right after that in the same task. Wait for the
+    // failure, so the node-fault check below reads a settled value.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while assert_counter(&b_metrics, "streams_failed_total{direction=\"inbound\"}", 1).is_err()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_counter(&b_metrics, "streams_failed_total{direction=\"inbound\"}", 1)?;
+    assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 0)?;
+    assert_counter(&b_metrics, "serve_stream_node_fault_total", 0)?;
+
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
 }

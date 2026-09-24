@@ -217,7 +217,8 @@ impl ClientHandler {
     /// Put one already-assembled `ChunkData` frame on the wire.
     ///
     /// The frame is already assembled, so no framing bug can surface here — which
-    /// is what lets the cache-miss leg meter a failure as a client abandon (#856).
+    /// is what lets the cache-miss leg meter a peer-attributable failure as a
+    /// client abandon (#856).
     /// Build `bufs` with [`chunk_frame_bufs`] first. A write that fails because the
     /// peer went away carries [`PeerFault`]; a write against this node's own
     /// finished or reset stream does not, since that one is a node bug.

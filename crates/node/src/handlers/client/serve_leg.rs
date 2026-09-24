@@ -85,8 +85,9 @@ impl ClientHandler {
     /// # Errors
     ///
     /// A client disconnect (the write / voucher-collect surfaces it), a rate-check
-    /// bail, an `encode_range` fault, an offset at or past the blob
-    /// end, or a gap the pull leg could not fill. On any error the caller drops the
+    /// bail, a spent per-chunk proof budget, a lane-store `record` failure, an
+    /// `encode_range` fault, an offset at or past the blob end, or a gap the pull
+    /// leg could not fill. On any error the caller drops the
     /// pull leg, which stops the upstream spend and persists the buyer watermark.
     /// The peer-attributable errors carry
     /// [`PeerFault`](super::wire::PeerFault) or
@@ -230,11 +231,15 @@ impl ClientHandler {
                 // fault here is the node's own bug, and metering it as a client
                 // abandon would file it under the peer's behaviour.
                 let bufs = chunk_frame_bufs(&frame).map_err(|e| self.meter_frame_fault(e))?;
-                // A downstream drop surfaces here as `Err` (#856 client-disconnect
-                // shape); meter the client-abandon, then propagate so the caller drops
-                // the pull leg.
+                // A downstream drop surfaces here as a peer-attributable `Err` (#856
+                // client-disconnect shape) and meters the client abandon. A write to
+                // a stream this node already closed carries no marker: the dispatch
+                // sink meters it as a node fault instead. Either way, propagate so
+                // the caller drops the pull leg.
                 if let Err(e) = self.write_chunk_bufs(send, bufs).await {
-                    self.metrics.node_pull_through_client_abandoned();
+                    if super::wire::is_peer_attributable(&e) {
+                        self.metrics.node_pull_through_client_abandoned();
+                    }
                     return Err(e);
                 }
                 delivered = delivered.saturating_add(clen_u64);
@@ -298,12 +303,13 @@ impl ClientHandler {
                     {
                         Ok(stop) => stop,
                         Err(e) => {
-                            // Transport drop or rate-check bail (#856/#857): meter the
-                            // abandon, then propagate so the caller drops the pull leg.
-                            // A node-side fault (a lane-store failure, a broken
-                            // invariant) carries no peer marker. The dispatch sink
-                            // meters it on `decdn_serve_stream_node_fault_total`
-                            // instead.
+                            // A peer-attributable error (a transport drop, a proof-read
+                            // timeout, a rate-check bail — #856/#857) meters the client
+                            // abandon. A node-side fault (a lane-store failure, a
+                            // broken invariant) carries neither `PeerFault` nor
+                            // `ClientPaymentFault`: the dispatch sink meters it on
+                            // `decdn_serve_stream_node_fault_total` instead. Either
+                            // way, propagate so the caller drops the pull leg.
                             if super::wire::is_peer_attributable(&e) {
                                 self.metrics.node_pull_through_client_abandoned();
                             }

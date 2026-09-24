@@ -653,7 +653,7 @@
       },
       "title": "Stream outcomes by direction",
       "type": "timeseries",
-      "description": "Every ended paid stream counts once as completed or failed. inbound is this node serving; outbound is a stream this node opened to an upstream candidate, or one assembled range on the streaming miss path. failed includes routine outcomes \u2014 a cache-miss refusal, a client that closes early, and the free header handshake a downstream node opens and closes \u2014 so read the refusal and pull-outcome panels for health. Mid-stream stops name the cause: the pool or the signer cap can no longer fund the stream, or the payer sent its whole per-chunk proof budget without settling one chunk.",
+      "description": "Every ended paid stream counts once as completed or failed. inbound is this node serving; outbound is a stream this node opened to an upstream candidate, or one assembled range on the streaming miss path. failed includes routine outcomes \u2014 a cache-miss refusal, a client that closes early, and the free header handshake a downstream node opens and closes \u2014 so read the refusal and pull-outcome panels for health. Mid-stream stops name the cause: the pool or the signer cap can no longer fund the stream, or the payer sent its whole per-chunk proof budget for one chunk and none of the proofs settled it.",
       "targets": [
         {
           "datasource": {
