@@ -17,8 +17,8 @@ use super::node::ChainArgs;
 /// `--json` flags as `node bond` / `node register`.
 #[derive(Args, Debug)]
 pub struct SetupArgs {
-    /// Declared serving capacity in Mbps. The TOKEN bond is read from the
-    /// on-chain `bondRequired(mbps)` curve (same as `decdn node bond`); you do
+    /// Declared serving capacity in Mbps. The TOKEN bond is read on-chain as
+    /// `max(minBond, bondRequired(mbps))` (same as `decdn node bond`); you do
     /// not pass a token amount. Must fall within the governable
     /// `[minCapacityMbps, maxCapacityMbps]` band.
     #[arg(long, value_name = "MBPS")]

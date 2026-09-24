@@ -702,8 +702,8 @@ pub struct RotateKeyArgs {
 /// over-bonding. A precondition for `decdn node register`.
 #[derive(Args, Debug)]
 pub struct BondArgs {
-    /// Declared serving capacity in Mbps. The TOKEN bond is computed from the
-    /// on-chain `bondRequired(mbps)` curve — you do not pass a token amount.
+    /// Declared serving capacity in Mbps. The TOKEN bond is computed on-chain
+    /// as `max(minBond, bondRequired(mbps))` — you do not pass a token amount.
     /// Must fall within the governable `[minCapacityMbps, maxCapacityMbps]`
     /// band or the on-chain `declareMbps` reverts.
     #[arg(long, value_name = "MBPS")]
