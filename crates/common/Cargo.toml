@@ -26,7 +26,9 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 jsonrpsee = { workspace = true }
-nix = { version = "0.31", default-features = false, features = ["fs"] }
+# Free-space probing (`disk.rs`): `statvfs` on Unix, `GetDiskFreeSpaceExW` on
+# Windows, behind one safe API (the workspace forbids `unsafe`).
+fs4 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

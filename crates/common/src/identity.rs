@@ -518,11 +518,27 @@ pub(crate) fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Unix variant can fail; the shared call sites take a Result"
+)]
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "the Unix variant does filesystem I/O and cannot be const; the shared call sites are not const contexts"
+)]
 pub(crate) fn validate_data_dir(_data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Unix variant can fail; the shared call sites take a Result"
+)]
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "the Unix variant does filesystem I/O and cannot be const; the shared call sites are not const contexts"
+)]
 fn validate_key_file(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }

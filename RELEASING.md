@@ -120,8 +120,9 @@ which:
    every crate. That runs here, before the draft exists, because a packaging
    error found during the real publish has no clean recovery;
 5. creates the GitHub Release as a **draft**;
-6. builds ten archives (`decdn-node` and `decdn`, five targets each) and a
-   `SHA256SUMS` manifest, asserting all ten are present;
+6. builds eleven archives (`decdn-node` on five targets, `decdn` on six: the
+   same five plus Windows ARM64) and a
+   `SHA256SUMS` manifest, asserting all eleven are present;
 7. assembles the multi-arch image from those archives — it does not compile
    from source, so the binary in the image is byte-identical to the archived
    one — and pushes the manifest **untagged**, attaching the SBOM and

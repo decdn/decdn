@@ -1272,13 +1272,61 @@ jobs:
           [ "$out" = "placeholder" ] || {
             echo "::error::entrypoint did not run the copied binary (got: $out)"; exit 1; }
 
+  windows:
+    # The walletless on-ramp ships `decdn.exe` for Windows x64 and ARM64. The
+    # rest of CI runs on Linux, so this job is what keeps the user CLI
+    # compiling (and lint-clean) for both Windows targets. The test suites stay
+    # Linux-only: several of them drive POSIX-only surfaces (ptys, mode bits).
+    # The x64 leg also runs the built binary through key generation and
+    # `whoami`, the Windows paths the on-ramp exercises before a pull.
+    name: windows (${{ matrix.target }})
+    runs-on: windows-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy -p decdn-cli --target ${{ matrix.target }} -- -D warnings
+      - name: Smoke-run decdn.exe
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        env:
+          DECDN_KEYSTORE_PASSWORD: windows-smoke
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build -p decdn-cli --target ${{ matrix.target }}
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $exe = "target/${{ matrix.target }}/debug/decdn.exe"
+          & $exe --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $dir = Join-Path $env:RUNNER_TEMP 'decdn-smoke'
+          $generated = (& $exe key-gen --output-dir $dir | Out-String)
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $who = (& $exe whoami --output-dir $dir | Out-String)
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $address = [regex]::Match($generated, '0x[0-9a-fA-F]{40}').Value
+          if (-not $address) { throw "key-gen printed no address: $generated" }
+          if (-not $who.Contains($address)) { throw "whoami does not report $address`n$who" }
+          "key-gen and whoami agree on $address"
+
   # Single gate for branch protection. Point required-checks at this one job
   # so adding/renaming jobs above doesn't require updating branch rules.
   ci-success:
     name: CI success
     if: always()
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, changes, test, doctest, deny, doc, public-api, markdownlint, adr-book-list,
+    needs: [fmt, clippy, windows, changes, test, doctest, deny, doc, public-api, markdownlint, adr-book-list,
             pr-title, anvil-e2e-settlement, anvil-e2e-journeys,
             solidity-fmt, solidity-build-test, solidity-coverage,
             solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors,
@@ -1296,7 +1344,7 @@ jobs:
           # here. `changes` and `packaging` are intentionally omitted — both
           # always run, so a skip from either signals a misconfiguration that
           # should fail the gate.
-          allowed-skips: fmt, clippy, test, doctest, deny, doc, public-api, adr-book-list,
+          allowed-skips: fmt, clippy, windows, test, doctest, deny, doc, public-api, adr-book-list,
                          pr-title, markdownlint,
                          anvil-e2e-settlement, anvil-e2e-journeys,
                          solidity-fmt, solidity-build-test, solidity-coverage,

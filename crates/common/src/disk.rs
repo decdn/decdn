@@ -1,4 +1,5 @@
-//! Filesystem free-space probing via `statvfs`.
+//! Filesystem free-space probing: `statvfs` on Unix, `GetDiskFreeSpaceExW` on
+//! Windows, both through `fs4`.
 //!
 //! Two consumers share this: `decdn node doctor` compares the configured cache
 //! budget against the real volume advisorily, and the node's eviction driver
@@ -17,25 +18,18 @@ pub struct DiskSpace {
     pub avail: u64,
 }
 
-/// Read filesystem capacity at `path` via `statvfs`. Bytes = fragment size ×
-/// block counts (`f_frsize × f_blocks`, `f_frsize × f_bavail`).
+/// Read filesystem capacity at `path`. On Unix, bytes = fragment size × block
+/// counts (`f_frsize × f_blocks`, `f_frsize × f_bavail`); on Windows, the
+/// caller-visible totals `GetDiskFreeSpaceExW` reports.
 pub fn read_disk_space(path: &Path) -> anyhow::Result<DiskSpace> {
-    let stat = nix::sys::statvfs::statvfs(path)
-        .map_err(|e| anyhow::anyhow!("statvfs({}) failed: {e}", path.display()))?;
-    let frsize = stat.fragment_size();
-    // fsblkcnt_t is u32 on macOS (real widening) and u64 on 64-bit Linux glibc
-    // (identity); the value always fits u64 either way.
-    #[allow(clippy::useless_conversion)]
-    let blocks = u64::from(stat.blocks());
-    #[allow(clippy::useless_conversion)]
-    let blocks_available = u64::from(stat.blocks_available());
-    Ok(DiskSpace {
-        total: frsize.saturating_mul(blocks),
-        avail: frsize.saturating_mul(blocks_available),
-    })
+    let total = fs4::total_space(path)
+        .map_err(|e| anyhow::anyhow!("disk total_space({}) failed: {e}", path.display()))?;
+    let avail = fs4::available_space(path)
+        .map_err(|e| anyhow::anyhow!("disk available_space({}) failed: {e}", path.display()))?;
+    Ok(DiskSpace { total, avail })
 }
 
-/// `statvfs` the path, or the nearest existing ancestor if it does not exist
+/// Probe the path, or the nearest existing ancestor if it does not exist
 /// yet. The cache directory can be probed before it is created (pre-boot doctor)
 /// or after (the running eviction driver); walking to the nearest existing
 /// ancestor gives the right volume in both cases.
@@ -47,7 +41,7 @@ pub fn statvfs_target(path: &Path) -> anyhow::Result<DiskSpace> {
         }
         match cur.parent() {
             Some(p) => cur = p,
-            None => return read_disk_space(path), // let statvfs surface the error
+            None => return read_disk_space(path), // let the probe surface the error
         }
     }
 }
