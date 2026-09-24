@@ -237,3 +237,27 @@ async fn decdn_sh_templated_with_payment_pool() {
         "installer writes payment_pool"
     );
 }
+
+#[tokio::test]
+async fn decdn_ps1_templated_with_payment_pool() {
+    let state = test_support::app_state_with_fakes();
+    let app = sponsord::http::router(state);
+    let resp = app
+        .oneshot(Request::get("/decdn.ps1").body(Body::empty()).expect("req"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body = String::from_utf8(bytes.to_vec()).expect("utf8");
+    assert!(!body.contains("{{"), "no placeholder should remain");
+    assert!(
+        body.contains("payment_pool ="),
+        "installer writes payment_pool"
+    );
+    assert!(
+        body.contains("-windows-$Arch.exe"),
+        "installer downloads the Windows binaries"
+    );
+}

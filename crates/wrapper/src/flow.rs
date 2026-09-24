@@ -81,13 +81,22 @@ fn open_in_browser(url: &str) {
     if !std::io::stdout().is_terminal() {
         return;
     }
-    let opener = if cfg!(target_os = "macos") {
-        "open"
+    // `rundll32 url.dll,FileProtocolHandler` hands the URL to the default
+    // browser without passing it through `cmd`'s metacharacter parsing.
+    let mut command = if cfg!(windows) {
+        let mut c = std::process::Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
+        c
     } else {
-        "xdg-open"
+        let mut c = std::process::Command::new(if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        });
+        c.arg(url);
+        c
     };
-    let _ = std::process::Command::new(opener)
-        .arg(url)
+    let _ = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

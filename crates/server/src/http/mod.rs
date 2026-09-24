@@ -1,4 +1,4 @@
-//! HTTP surface: `/healthz`, `/decdn.sh`, `/fund` (captcha page + issue),
+//! HTTP surface: `/healthz`, `/decdn.sh` + `/decdn.ps1`, `/fund` (captcha page + issue),
 //! `/capability` (poll for the issued token). Handlers live in the sibling
 //! `fund`/`capability`/`installer` modules and share the helpers below.
 
@@ -20,7 +20,8 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/decdn.sh", get(installer::get))
+        .route("/decdn.sh", get(installer::sh))
+        .route("/decdn.ps1", get(installer::ps1))
         .route("/fund", get(fund::page).post(fund::submit))
         .route("/capability", get(capability::get))
         .with_state(state)

@@ -26,7 +26,8 @@ pool's own balance — there's no per-signer monthly accumulator.
 ## Crates
 
 - `crates/server` (binary `sponsord`) — the HTTP gateway: `/healthz`,
-  `/decdn.sh` (templated installer), `/fund` (captcha page + capability
+  `/decdn.sh` and `/decdn.ps1` (templated installers for macOS/Linux and
+  Windows), `/fund` (captcha page + capability
   issuance), `/capability` (poll for an issued capability).
 - `crates/wrapper` (binary `decdn-sponsored`) — the end-user CLI: reads
   `~/.decdn/sponsor.toml` (written by the installer), obtains a capability
@@ -62,7 +63,7 @@ pool up from the treasury whenever its remaining balance falls below
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `SPONSOR_BIND` | no | `127.0.0.1:8080` | Address the HTTP server listens on |
-| `SPONSOR_PUBLIC_URL` | no | `https://up.decdn.org` | This gateway's own public base URL; baked into the `/decdn.sh` installer as `{{GATEWAY_BASE}}` |
+| `SPONSOR_PUBLIC_URL` | no | `https://up.decdn.org` | This gateway's own public base URL; baked into the `/decdn.sh` and `/decdn.ps1` installers as `{{GATEWAY_BASE}}` |
 | `SPONSOR_RPC_URL` | **yes** | — | Arbitrum Sepolia RPC endpoint |
 | `SPONSOR_CHAIN_ID` | no | `421614` | Chain id (Arbitrum Sepolia) |
 | `SPONSOR_PAYMENT_POOL_ADDR` | **yes** | — | `PaymentPool` contract address |
@@ -82,13 +83,20 @@ pool up from the treasury whenever its remaining balance falls below
 ## The `decdn-sponsored` flow
 
 The website shows one command per model, with the model's BLAKE3 hash from
-`models.json`:
+`models.json`. On macOS and Linux:
 
 ```bash
 curl -fsSL https://up.decdn.org/decdn.sh | sh -s -- pull b3:<hash>
 ```
 
-1. The installer served at `GET /decdn.sh` (`assets/decdn.sh`) installs the
+On Windows (x64 and ARM64), in PowerShell:
+
+```powershell
+irm https://up.decdn.org/decdn.ps1 | iex; decdn-sponsored pull b3:<hash>
+```
+
+1. The installer served at `GET /decdn.sh` (`assets/decdn.sh`), or its
+   PowerShell twin at `GET /decdn.ps1` (`assets/decdn.ps1`), installs the
    `decdn` and `decdn-sponsored` binaries and writes `~/.decdn/sponsor.toml`
    with the gateway's contract addresses and RPC URL filled in. Any
    arguments are passed on to `decdn-sponsored`. Running it again is
@@ -112,7 +120,8 @@ curl -fsSL https://up.decdn.org/decdn.sh | sh -s -- pull b3:<hash>
    a new captcha.
 
 The `~/.decdn/sponsor.toml` schema is a hard contract between the installer
-(`assets/decdn.sh`) and the wrapper (`crates/wrapper/src/config.rs`): field
+(`assets/decdn.sh`, `assets/decdn.ps1`) and the wrapper
+(`crates/wrapper/src/config.rs`): field
 names must match exactly. Current fields: `gateway_base`, `decdn_bin`,
 `data_dir`, `rpc_url`, `payment_pool`, `capacity_bond` (optional),
 `slash_judge` (optional), `chain_id`. Unknown fields are ignored.

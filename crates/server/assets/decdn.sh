@@ -1,8 +1,10 @@
 #!/bin/sh
-# decdn-sponsored installer - served by sponsord at GET /decdn.sh, with the
+# decdn-sponsored installer for macOS/Linux - served by sponsord at
+# GET /decdn.sh, with the
 # placeholders below substituted server-side (see
 # crates/server/src/http/installer.rs) from ServerConfig, so nothing here
-# needs an environment variable to run.
+# needs an environment variable to run. The Windows twin is assets/decdn.ps1;
+# the two write the same profile.
 #
 # Arguments, when given, are passed to decdn-sponsored after installing, so
 # one line installs and downloads:
@@ -21,7 +23,11 @@ DECDN_DIR="${HOME}/.decdn"
 mkdir -p "$BINDIR" "$DECDN_DIR"
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-ARCH="$(uname -m)"
+case "$(uname -m)" in
+  x86_64 | amd64) ARCH=x86_64 ;;
+  arm64 | aarch64) ARCH=aarch64 ;;
+  *) echo "decdn: unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
 
 # 1. Install the decdn and decdn-sponsored binaries.
 #

@@ -1,6 +1,6 @@
 //! End-to-end `flow::pull` against a mock gateway and a stub `decdn` script
-//! that records its arguments and exits with a chosen status.
-#![cfg(unix)]
+//! that records its arguments and exits with a chosen status: a shell script
+//! on Unix, a `.cmd` batch file on Windows.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -8,7 +8,6 @@
     clippy::indexing_slicing
 )]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,7 +39,9 @@ fn now() -> u64 {
 }
 
 /// A stub `decdn` that appends its argv to `<dir>/calls` and exits `code`.
+#[cfg(unix)]
 fn stub_decdn(dir: &Path, code: i32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
     let bin = dir.join(format!("decdn-{code}"));
     let log = dir.join("calls");
     std::fs::write(
@@ -52,6 +53,22 @@ fn stub_decdn(dir: &Path, code: i32) -> PathBuf {
     )
     .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// A stub `decdn` that appends its argv to `<dir>/calls` and exits `code`.
+#[cfg(windows)]
+fn stub_decdn(dir: &Path, code: i32) -> PathBuf {
+    let bin = dir.join(format!("decdn-{code}.cmd"));
+    let log = dir.join("calls");
+    std::fs::write(
+        &bin,
+        format!(
+            "@echo off\r\necho %*>> \"{}\"\r\nexit /b {code}\r\n",
+            log.display()
+        ),
+    )
+    .unwrap();
     bin
 }
 

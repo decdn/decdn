@@ -39,22 +39,32 @@ pub struct WrapperConfig {
     pub chain_id: u64,
 }
 
-/// Expand a leading `~` (or `~/...`) to `$HOME`. Any other path (including
-/// one with no leading `~`) is returned unchanged.
+/// The user's home directory: `$HOME` on Unix, the profile folder
+/// (`%USERPROFILE%`) on Windows.
 ///
 /// # Errors
 ///
-/// Returns an error if the path starts with `~` but `$HOME` isn't set.
+/// Returns an error if the platform reports no home directory.
+fn home() -> anyhow::Result<PathBuf> {
+    std::env::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine the home directory"))
+}
+
+/// Expand a leading `~` (or `~/...`) to the home directory. Any other path
+/// (including one with no leading `~`) is returned unchanged.
+///
+/// # Errors
+///
+/// Returns an error if the path starts with `~` but there is no home
+/// directory.
 fn expand_home(path: &Path) -> anyhow::Result<PathBuf> {
     let Some(s) = path.to_str() else {
         return Ok(path.to_path_buf());
     };
     if s == "~" || s.starts_with("~/") {
-        let home = std::env::var("HOME")
-            .map_err(|_| anyhow::anyhow!("path {s} starts with ~ but $HOME is not set"))?;
+        let home = home()?;
         let rest = s.strip_prefix('~').unwrap_or(s);
         let rest = rest.strip_prefix('/').unwrap_or(rest);
-        return Ok(PathBuf::from(home).join(rest));
+        return Ok(home.join(rest));
     }
     Ok(path.to_path_buf())
 }
@@ -65,16 +75,12 @@ impl WrapperConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error if `$HOME` can't be resolved or the profile file
+    /// Returns an error if the home directory can't be resolved or the profile file
     /// can't be read or parsed.
     pub fn load() -> anyhow::Result<Self> {
         let profile_path = match std::env::var("DECDN_SPONSOR_PROFILE") {
             Ok(p) => PathBuf::from(p),
-            Err(_) => {
-                let home = std::env::var("HOME")
-                    .map_err(|_| anyhow::anyhow!("$HOME is not set; cannot locate sponsor.toml"))?;
-                PathBuf::from(home).join(DEFAULT_PROFILE_REL)
-            }
+            Err(_) => home()?.join(DEFAULT_PROFILE_REL),
         };
         let text = std::fs::read_to_string(&profile_path).map_err(|e| {
             anyhow::anyhow!("failed to read profile {}: {e}", profile_path.display())
@@ -107,7 +113,6 @@ impl WrapperConfig {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     const SAMPLE: &str = r#"
         gateway_base = "https://gateway.example.com"
@@ -119,24 +124,19 @@ mod tests {
         chain_id = 421614
     "#;
 
+    /// Compared against the platform's own home directory (`$HOME` on Unix,
+    /// the profile folder on Windows) rather than a faked `HOME`, which
+    /// Windows does not consult.
     #[test]
-    #[serial]
     fn parses_profile_and_expands_home() {
-        unsafe {
-            std::env::set_var("HOME", "/home/testuser");
-        }
         let cfg = WrapperConfig::from_toml_str(SAMPLE).unwrap();
         assert_eq!(cfg.gateway_base, "https://gateway.example.com");
-        assert_eq!(
-            cfg.data_dir,
-            PathBuf::from("/home/testuser/.decdn/sponsored")
-        );
+        assert_eq!(cfg.data_dir, home().unwrap().join(".decdn/sponsored"));
         assert_eq!(cfg.chain_id, 421_614);
         assert!(cfg.slash_judge.is_none());
     }
 
     #[test]
-    #[serial]
     fn ignores_unknown_fields() {
         let with_extra = format!("{SAMPLE}\nkeystore_path = \"~/.decdn/client/keystore.json\"\n");
         assert!(WrapperConfig::from_toml_str(&with_extra).is_ok());

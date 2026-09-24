@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      decdn_ref:
+        description: decdn/decdn branch, tag or SHA to build against
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# This workspace path-depends on its sibling `decdn` checkout
+# (`../decdn/crates/*`), so every job checks both repos out side by side:
+# `sponsord/` and `decdn/` under the workspace root. `decdn` is `main` unless a
+# manual run names another ref.
+jobs:
+  linux:
+    name: linux (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sponsord
+      - uses: actions/checkout@v4
+        with:
+          repository: decdn/decdn
+          ref: ${{ inputs.decdn_ref || 'main' }}
+          path: decdn
+      - uses: dtolnay/rust-toolchain@1.95
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sponsord
+      - working-directory: sponsord
+        run: cargo fmt --all --check
+      - working-directory: sponsord
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - working-directory: sponsord
+        run: cargo test --workspace
+
+  # `decdn-sponsored` is the end-user CLI, installed by `decdn.sh` on macOS and
+  # Linux and by `decdn.ps1` on Windows x64 and ARM64. The server (`sponsord`)
+  # runs only on Linux, so these legs cover the client crate alone.
+  client:
+    name: client (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            test: true
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            test: true
+          # Cross-compiled on the x64 runner, so it is linted, not run.
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            test: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sponsord
+      - uses: actions/checkout@v4
+        with:
+          repository: decdn/decdn
+          ref: ${{ inputs.decdn_ref || 'main' }}
+          path: decdn
+      - uses: dtolnay/rust-toolchain@1.95
+        with:
+          components: clippy
+      # From inside the checkout, so the target lands on the toolchain that
+      # `rust-toolchain.toml` pins rather than on the action's own.
+      - working-directory: sponsord
+        run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sponsord
+          key: ${{ matrix.target }}
+      - working-directory: sponsord
+        run: cargo clippy -p decdn-sponsored --all-targets --target ${{ matrix.target }} -- -D warnings
+      - if: matrix.test
+        working-directory: sponsord
+        run: cargo test -p decdn-sponsored --target ${{ matrix.target }}
