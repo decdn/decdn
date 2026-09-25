@@ -1706,11 +1706,12 @@ pub struct DecdnMetrics {
     /// caps `eth_getLogs`; set `blockchain.get_logs_max_block_span` to the
     /// lowest span the gauge reaches while they come, and they stop.
     pub chain_get_logs_range_rejections: Counter,
-    /// `decdn_chain_get_logs_retries_total` (#2161): `eth_getLogs` windows the
-    /// chain-event poller retried inside a tick after a transient provider
-    /// error. A retry that succeeds is not watcher downtime, so this counter is
-    /// where a flaky RPC provider shows once the watchers stay up. A window
-    /// that still fails after its retries fails the tick.
+    /// `decdn_chain_get_logs_retries_total` (#2161): in-tick retries of
+    /// `eth_getLogs` windows after a transient provider error. One window adds
+    /// up to two, including a window that fails every retry and so fails the
+    /// tick. A retry that succeeds does not count as watcher downtime, so a
+    /// provider that the retries absorb shows here and not in the watchers'
+    /// down-family. Rate limits and permanent errors are not retried.
     pub chain_get_logs_retries: Counter,
     /// `decdn_chain_boot_read_retries_total` (#2159): retries of a boot-time
     /// chain read (the registry, slash, `usdc()` self-check and blacklist
