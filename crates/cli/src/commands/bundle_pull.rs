@@ -92,6 +92,7 @@ use super::bundle_manifest::{self, SavedManifest, SavedMtime};
 use super::buyer_store::{ChainAdoption, open_client_store_for_buy};
 use super::chain_ctx;
 use super::fetch;
+use super::interrupt::{Interrupt, Interrupted};
 use super::manifest::build_glob_set;
 use super::pull_progress::{self, PullProgress};
 use decdn_bao_range::CHUNK_GROUP_BYTES;
@@ -1440,8 +1441,21 @@ async fn pull_manifest<P: Provider + Clone>(
     // rather than losing the whole index. The skip-cache is advisory, so a flush
     // failure is logged (inside the flush) and never fails the pull.
     let saved = bundle_manifest::load(&args.output);
-    let (outcomes, transfer) = ctx
-        .pull_all(&manifest.entries, &args.output, args.overwrite, saved)
+    // Watched from here on: a Ctrl-C during the pull stops it gracefully (see
+    // `pull_plain`), and the summary below still reports what landed.
+    let mut interrupt = Interrupt::watch();
+    let PullRun {
+        outcomes,
+        transfer,
+        interrupted,
+    } = ctx
+        .pull_all(
+            &manifest.entries,
+            &args.output,
+            args.overwrite,
+            saved,
+            &mut interrupt,
+        )
         .await;
     ctx.progress.finish();
 
@@ -1450,7 +1464,41 @@ async fn pull_manifest<P: Provider + Clone>(
         spliced_bytes: ctx.dedup_stats.spliced_bytes.load(Ordering::Relaxed),
         hints_ignored: ctx.dedup_stats.hints_ignored.load(Ordering::Relaxed),
     };
-    report(&outcomes, transfer, dedup, &args.output, args.json)
+    let reported = report(&outcomes, transfer, dedup, &args.output, args.json);
+    if interrupted {
+        return Err(Interrupted.into());
+    }
+    reported
+}
+
+/// Run `drive` beside `flush` until both finish, or until the first Ctrl-C.
+/// Returns whether a Ctrl-C stopped it.
+///
+/// The Ctrl-C drops `drive`: every in-flight fetch stops where it is (its drop
+/// guard records what it paid, and its `.partial` is the next run's resume
+/// prefix). The flush channel's sender drops with `drive`, so `flush` still
+/// writes every group that settled before it returns.
+async fn drive_until_interrupted(
+    drive: impl std::future::Future<Output = ()>,
+    flush: impl std::future::Future<Output = ()>,
+    interrupt: &mut Interrupt,
+) -> bool {
+    let drive = async {
+        tokio::select! {
+            () = drive => false,
+            () = interrupt.wait() => true,
+        }
+    };
+    tokio::join!(drive, flush).0
+}
+
+/// What [`PullCtx::pull_all`] hands back: every settled entry's outcome, the
+/// run's byte tally, and whether a Ctrl-C stopped it. An interrupted run leaves
+/// out the entries that had not settled.
+struct PullRun {
+    outcomes: Vec<EntryOutcome>,
+    transfer: Transfer,
+    interrupted: bool,
 }
 
 /// The bundle-level namespace id (ADR 002) every paid pull in the run carries:
@@ -2341,7 +2389,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         out_root: &Path,
         overwrite: bool,
         saved: SavedManifest,
-    ) -> (Vec<EntryOutcome>, Transfer) {
+        interrupt: &mut Interrupt,
+    ) -> PullRun {
         // Every entry declares an authoritative whole-file `hash`, so the by-hash
         // grouping path (fetch-once + link-duplicates, #1306) covers plain and
         // hint-carrying entries alike — the chunk hints only change HOW a group's
@@ -2362,7 +2411,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // `saved` moves on to seed the incremental skip-cache flush: each
         // completed group's records fold onto it and rewrite the cache as the
         // pull progresses.
-        let (outcomes, transfer) = self
+        let run = self
             .pull_plain(
                 &refs,
                 out_root,
@@ -2371,6 +2420,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 &fetch_plan,
                 &disk,
                 saved,
+                interrupt,
             )
             .await;
 
@@ -2385,7 +2435,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // blob, so the two share storage until this sweep drops the staging name
         // (a copy only when the destination is on another filesystem).
         sweep_donor_sources(&index).await;
-        (outcomes, transfer)
+        run
     }
 
     /// Fetch every distinct blob once (grouped by hash) and materialize it at each
@@ -2405,7 +2455,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         fetch_plan: &FetchPlan,
         disk: &DiskState,
         saved: SavedManifest,
-    ) -> (Vec<EntryOutcome>, Transfer) {
+        interrupt: &mut Interrupt,
+    ) -> PullRun {
         let groups_by_hash = order_groups_smallest_first(group_by_hash(entries));
         let group_count = groups_by_hash.len().max(1);
         // Completed groups' skip-cache records flow to the flush task over this
@@ -2420,8 +2471,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // recordable files (built here while the group's entries are in scope) to
         // the flush task and keep its outcomes for the run summary; a retry
         // round's outcomes replace the round before.
+        let mut groups: Vec<SettledGroup> = vec![SettledGroup::default(); groups_by_hash.len()];
         let drive = async {
-            let mut groups: Vec<SettledGroup> = vec![SettledGroup::default(); groups_by_hash.len()];
             let run = |group: HashGroup<'e>| {
                 // Cheap clone of the group's entry refs so `fetch_group` can consume
                 // `group` while we still correlate outcomes to entries.
@@ -2473,9 +2524,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .await;
             // Closing the channel tells the flush task to do its final write.
             drop(flush_tx);
-            groups
         };
-
         // The flush task: fold each batch onto the prior skip-cache and rewrite it
         // atomically at the cadence, plus a final write when the channel closes.
         // Running here (joined, not awaited inside `drive`) keeps the blocking
@@ -2483,7 +2532,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // this side awaits its write.
         let flush = flush_task(out_root, saved, flush_rx);
 
-        let (groups, ()) = tokio::join!(drive, flush);
+        let interrupted = drive_until_interrupted(drive, flush, interrupt).await;
         // Byte tally is per-group (a blob pulled once, materialized to N paths),
         // so sum it before flattening away the group boundaries.
         let transfer = groups
@@ -2491,7 +2540,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .map(|g| group_transfer(&g.outcomes, g.paid))
             .fold(Transfer::default(), Transfer::add);
         let outcomes = groups.into_iter().flat_map(|g| g.outcomes).collect();
-        (outcomes, transfer)
+        PullRun {
+            outcomes,
+            transfer,
+            interrupted,
+        }
     }
 
     /// Run [`Self::pull_entry_untimed`] and, when the entry lands, log one `-v`
@@ -5304,6 +5357,40 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert(path.to_string(), saved_file(hash, size));
         m
+    }
+
+    // A Ctrl-C mid-pull drops the drive while an entry is still in flight. The
+    // flush must still write every entry that settled before it.
+    #[tokio::test]
+    async fn an_interrupted_drive_still_flushes_the_settled_entries() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (fire, mut interrupt) = Interrupt::manual();
+        let drive = async move {
+            tx.send(FlushBatch {
+                updates: one_update("done.bin", "b3:done", 1),
+                fetched_bytes: 1,
+            })
+            .expect("send");
+            // Ctrl-C while another entry is still in flight: it never settles.
+            fire.send(()).expect("fire");
+            std::future::pending::<()>().await;
+        };
+        let flush = flush_task(tmp.path(), SavedManifest::default(), rx);
+
+        assert!(drive_until_interrupted(drive, flush, &mut interrupt).await);
+        let saved = bundle_manifest::load(tmp.path());
+        assert_eq!(saved.get("done.bin").expect("done").hash, "b3:done");
+    }
+
+    #[tokio::test]
+    async fn a_drive_that_finishes_is_not_interrupted() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<FlushBatch>();
+        let drive = async move { drop(tx) };
+        let (_fire, mut interrupt) = Interrupt::manual();
+        let flush = flush_task(tmp.path(), SavedManifest::default(), rx);
+        assert!(!drive_until_interrupted(drive, flush, &mut interrupt).await);
     }
 
     // Several sub-cadence batches, then the channel closes: the final write must

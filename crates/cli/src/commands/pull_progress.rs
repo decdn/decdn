@@ -42,14 +42,15 @@
 //! piped and scripted output is byte-for-byte what it was before per-file bars.
 
 use std::collections::HashMap;
-use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::io::IsTerminal;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use decdn_client::ProgressCallback;
 
 use super::fetch;
+use super::tab_progress::TabProgress;
 
 /// The label for a pull's bar: its first destination path, plus a `(+k more)`
 /// tail when the same blob lands at more than one path (a fetch-once hash group).
@@ -72,83 +73,12 @@ pub(crate) fn file_label(paths: &[String]) -> String {
 /// overwritten. Nothing touches a bar before the container owns it.
 const TICK: Duration = Duration::from_millis(120);
 
-/// Where [`TabProgress`] writes each OSC 9;4 sequence: stderr in production, a
-/// recorder in tests.
-type TabSink = Box<dyn Fn(anstyle_progress::TermProgress) + Send + Sync>;
-
-/// The terminal's own progress indicator (OSC 9;4), shown in the tab bar or dock
-/// by terminals that support it. It only moves forward, and it writes only when
-/// the whole-number percent changes, so a run emits at most about a hundred
-/// sequences. Dropping it removes the indicator, so an early return never leaves
-/// a stale percent in the tab.
-struct TabProgress {
-    /// The last percent sent, or [`TabProgress::CLEARED`] once removed.
-    last: AtomicU8,
-    /// The sequence writer.
-    sink: TabSink,
-}
-
-impl TabProgress {
-    /// The `last` value after the indicator is removed; no percent follows it.
-    const CLEARED: u8 = u8::MAX;
-
-    /// The indicator on stderr, or `None` when the terminal does not support
-    /// OSC 9;4. The caller has already checked that stderr is a terminal.
-    fn detect(determinate: bool) -> Option<Arc<Self>> {
-        anstyle_progress::supports_term_progress(true).then(|| {
-            Self::start(
-                determinate,
-                Box::new(|p| {
-                    // indicatif flushes each frame in one buffered write, and this
-                    // is one `write_all` under the stderr lock, so the two never
-                    // split each other's escape sequences.
-                    let _ = std::io::stderr().lock().write_all(p.to_string().as_bytes());
-                }),
-            )
-        })
-    }
-
-    /// Show the indicator through `sink`: at 0% when `determinate`, else as an
-    /// indeterminate (busy) indicator.
-    fn start(determinate: bool, sink: TabSink) -> Arc<Self> {
-        let start = anstyle_progress::TermProgress::start();
-        sink(if determinate { start.percent(0) } else { start });
-        Arc::new(Self {
-            last: AtomicU8::new(0),
-            sink,
-        })
-    }
-
-    /// Show `position` of `length` as a percent, if that is ahead of the last
-    /// percent sent and the indicator is not yet removed.
-    fn update(&self, position: u64, length: u64) {
-        let pct = (u128::from(position.min(length)) * 100)
-            .checked_div(u128::from(length))
-            .and_then(|p| u8::try_from(p).ok())
-            .unwrap_or(100);
-        let advanced = self
-            .last
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                (cur != Self::CLEARED && pct > cur).then_some(pct)
-            })
-            .is_ok();
-        if advanced {
-            (self.sink)(anstyle_progress::TermProgress::start().percent(pct));
-        }
-    }
-
-    /// Remove the indicator. Only the first call writes.
-    fn clear(&self) {
-        if self.last.swap(Self::CLEARED, Ordering::AcqRel) != Self::CLEARED {
-            (self.sink)(anstyle_progress::TermProgress::remove());
-        }
-    }
-}
-
-impl Drop for TabProgress {
-    fn drop(&mut self) {
-        self.clear();
-    }
+/// A bar of length `len` that clears its line when dropped unfinished, as the
+/// in-flight bars are when a Ctrl-C stops the run. Setting the finish mode draws
+/// nothing, so the bar is still untouched when the container takes it (see
+/// [`TICK`]).
+fn new_bar(len: u64) -> indicatif::ProgressBar {
+    indicatif::ProgressBar::new(len).with_finish(indicatif::ProgressFinish::AndClear)
 }
 
 /// The multi-bar renderer for one `bundle pull` run. Disabled variants (no inner
@@ -309,7 +239,7 @@ impl PullProgress {
         len: u64,
         tab: Option<Arc<TabProgress>>,
     ) -> TotalBar {
-        let bar = mp.add(indicatif::ProgressBar::new(len));
+        let bar = mp.add(new_bar(len));
         bar.set_style(TotalBar::style());
         bar.set_prefix("total");
         bar.enable_steady_tick(TICK);
@@ -340,10 +270,8 @@ impl PullProgress {
     /// owns it).
     fn insert_file_bar(i: &Inner, label: &str, download_total: u64) -> indicatif::ProgressBar {
         let bar = match &i.total {
-            Some(total) => {
-                i.mp.insert_before(&total.bar, indicatif::ProgressBar::new(download_total))
-            }
-            None => i.mp.add(indicatif::ProgressBar::new(download_total)),
+            Some(total) => i.mp.insert_before(&total.bar, new_bar(download_total)),
+            None => i.mp.add(new_bar(download_total)),
         };
         bar.set_style(Self::file_style());
         bar.set_prefix(label.to_string());
@@ -754,63 +682,9 @@ mod tests {
         assert!(msg.contains("ETA"), "{msg}");
     }
 
-    /// A tab indicator whose sequences land in the returned log.
-    fn recorded_tab(determinate: bool) -> (Arc<TabProgress>, Arc<Mutex<Vec<String>>>) {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let sink_log = Arc::clone(&log);
-        let tab = TabProgress::start(
-            determinate,
-            Box::new(move |p| sink_log.lock().unwrap().push(p.to_string())),
-        );
-        (tab, log)
-    }
-
-    #[test]
-    fn tab_progress_writes_each_new_percent_once_and_never_backwards() {
-        let (tab, log) = recorded_tab(true);
-        tab.update(10, 1000); // 1%
-        tab.update(19, 1000); // still 1%
-        tab.update(500, 1000); // 50%
-        tab.update(400, 1000); // behind: a racing thread's stale sample
-        tab.update(2000, 1000); // past the end caps at 100%
-        assert_eq!(
-            *log.lock().unwrap(),
-            [
-                "\x1b]9;4;1;0\x1b\\",
-                "\x1b]9;4;1;1\x1b\\",
-                "\x1b]9;4;1;50\x1b\\",
-                "\x1b]9;4;1;100\x1b\\",
-            ]
-        );
-    }
-
-    #[test]
-    fn tab_progress_clear_removes_once_and_stops_updates() {
-        let (tab, log) = recorded_tab(true);
-        tab.clear();
-        tab.update(500, 1000);
-        drop(tab);
-        assert_eq!(
-            *log.lock().unwrap(),
-            ["\x1b]9;4;1;0\x1b\\", "\x1b]9;4;0;\x1b\\"]
-        );
-    }
-
-    #[test]
-    fn dropping_tab_progress_removes_the_indicator() {
-        // An early return drops the renderer without `finish`; the tab must not
-        // keep showing a stale percent.
-        let (tab, log) = recorded_tab(false);
-        drop(tab);
-        assert_eq!(
-            *log.lock().unwrap(),
-            ["\x1b]9;4;3;\x1b\\", "\x1b]9;4;0;\x1b\\"]
-        );
-    }
-
     #[test]
     fn total_bar_inc_drives_the_tab_percent() {
-        let (tab, log) = recorded_tab(true);
+        let (tab, log) = TabProgress::recorded(true);
         let total = TotalBar::wrap(
             indicatif::ProgressBar::with_draw_target(
                 Some(1000),

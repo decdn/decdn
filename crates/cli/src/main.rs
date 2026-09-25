@@ -37,6 +37,14 @@ async fn main() -> std::process::ExitCode {
                 // The report is already printed; exit nonzero without an Error: line.
                 return std::process::ExitCode::FAILURE;
             }
+            if e.downcast_ref::<decdn_cli::commands::interrupt::Interrupted>()
+                .is_some()
+            {
+                eprintln!("interrupted; run the same command again to resume");
+                return std::process::ExitCode::from(
+                    decdn_cli::commands::interrupt::INTERRUPTED_EXIT,
+                );
+            }
             eprintln!("Error: {}", decdn_common::redact::sanitize_err_chain(&e));
             std::process::ExitCode::FAILURE
         }
