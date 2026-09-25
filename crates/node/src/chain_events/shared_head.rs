@@ -38,6 +38,7 @@ use alloy::providers::Provider;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::time::Instant;
+use tracing::info;
 
 use super::timed;
 
@@ -61,7 +62,7 @@ pub trait HeadSource: Send + Sync {
     async fn head(&self) -> Result<u64>;
 }
 
-/// How far below the reported head a boot enumeration pins its reads.
+/// How far below the reported head an enumeration snapshot pins its reads.
 ///
 /// A load-balanced RPC reports the head of its freshest upstream, then routes
 /// each call to any upstream. An `eth_call` pinned to that exact block fails on
@@ -70,19 +71,27 @@ pub trait HeadSource: Send + Sync {
 /// 256 blocks is about 64s on Arbitrum, above the 40–200 block upstream lag seen
 /// behind a hosted balancer (#2164).
 ///
-/// The margin costs no correctness: each watcher seeds its tail cursor at the
-/// snapshot block, and every sink is idempotent, so the first tail tick replays
-/// `(snapshot, head]` as a harmless overlap.
+/// The margin is a block count, sized for Arbitrum's ~250ms blocks and a
+/// provider that serves state that far back. A full node that prunes state
+/// within 256 blocks (geth keeps 128) answers every pinned read with a
+/// transient error, so a boot against one spends its retry budget.
+///
+/// The margin costs no correctness. A boot enumeration seeds its tail cursor at
+/// the snapshot block and every sink is idempotent, so the first tail tick
+/// replays `[snapshot, head]` as a harmless overlap. A periodic re-enumeration
+/// keeps every entry the tail changed after the snapshot block (see each
+/// watcher's fold).
 pub const SNAPSHOT_LAG_MARGIN_BLOCKS: u64 = 256;
 
-/// The block a boot enumeration of `contract` pins its reads to and seeds its
-/// tail cursor at: [`SNAPSHOT_LAG_MARGIN_BLOCKS`] below the head.
+/// The block an enumeration of `contract` pins its reads to:
+/// [`SNAPSHOT_LAG_MARGIN_BLOCKS`] below the head.
 ///
 /// A contract with no code at that block was deployed inside the margin — a
 /// fresh local chain, or a boot right after a deploy. Reads pinned there would
-/// decode an empty return, so the snapshot takes the head itself. A chain that
-/// young has no upstream lag worth the margin.
-pub(crate) async fn boot_snapshot_block<P: Provider>(
+/// decode an empty return, so the snapshot takes the head instead. That head pin
+/// is exposed to upstream lag again; a failed read retries, and the lagged pin
+/// returns once the chain is `SNAPSHOT_LAG_MARGIN_BLOCKS` past the deploy.
+pub(crate) async fn snapshot_block<P: Provider>(
     provider: &P,
     head: &dyn HeadSource,
     contract: Address,
@@ -97,7 +106,16 @@ pub(crate) async fn boot_snapshot_block<P: Provider>(
             .block_id(BlockId::number(lagged)),
     )
     .await?;
-    Ok(if code.is_empty() { head } else { lagged })
+    if code.is_empty() {
+        info!(
+            %contract,
+            lagged,
+            head,
+            "no contract code at the lagged snapshot block; pinning the snapshot at head"
+        );
+        return Ok(head);
+    }
+    Ok(lagged)
 }
 
 /// A cached head read plus the instant it was taken.
@@ -518,18 +536,16 @@ mod tests {
         assert_eq!(asserter.read_q().len(), 0, "one RPC, not two");
     }
 
-    /// A boot snapshot sits the lag margin below the reported head while the
+    /// A snapshot sits the lag margin below the reported head while the
     /// contract has code there.
     #[tokio::test]
-    async fn boot_snapshot_block_sits_the_margin_below_head() {
+    async fn snapshot_block_sits_the_margin_below_head() {
         let (asserter, provider) = mocked();
         asserter.push_success(&U64::from(1_000));
         asserter.push_success(&Bytes::from_static(&[0x60, 0x80]));
         let head = SharedHead::with_ttl(provider.clone(), Duration::ZERO, None);
 
-        let block = boot_snapshot_block(&provider, &head, Address::ZERO)
-            .await
-            .ok();
+        let block = snapshot_block(&provider, &head, Address::ZERO).await.ok();
 
         assert_eq!(block, Some(1_000 - SNAPSHOT_LAG_MARGIN_BLOCKS));
         assert_eq!(asserter.read_q().len(), 0);
@@ -539,7 +555,7 @@ mod tests {
     /// the snapshot takes the head — including a head below the margin, whose
     /// lagged block saturates at genesis.
     #[tokio::test]
-    async fn boot_snapshot_block_takes_the_head_when_the_contract_is_younger() {
+    async fn snapshot_block_takes_the_head_when_the_contract_is_younger() {
         let (asserter, provider) = mocked();
         asserter.push_success(&U64::from(1_000));
         asserter.push_success(&Bytes::new());
@@ -548,15 +564,11 @@ mod tests {
         let head = SharedHead::with_ttl(provider.clone(), Duration::ZERO, None);
 
         assert_eq!(
-            boot_snapshot_block(&provider, &head, Address::ZERO)
-                .await
-                .ok(),
+            snapshot_block(&provider, &head, Address::ZERO).await.ok(),
             Some(1_000)
         );
         assert_eq!(
-            boot_snapshot_block(&provider, &head, Address::ZERO)
-                .await
-                .ok(),
+            snapshot_block(&provider, &head, Address::ZERO).await.ok(),
             Some(SNAPSHOT_LAG_MARGIN_BLOCKS - 1)
         );
         assert_eq!(asserter.read_q().len(), 0);

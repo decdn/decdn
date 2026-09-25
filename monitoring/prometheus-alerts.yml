@@ -84,6 +84,23 @@ groups:
             `multiplexed poller tick error` log lines name the cause), then
             restart the daemon. See adr/011-content-takedown.md.
 
+      # The deny-set re-enumeration reports success upward on a failed read (an
+      # error would stall event pickup), so this counter is the only thing that
+      # moves when the backstop fails. The window spans several attempts.
+      - alert: DecdnBlacklistReenumerationFailing
+        expr: increase(decdn_blacklist_reenumeration_failures_total[1h]) > 0
+        for: 15m
+        labels:
+          component: blacklist
+          severity: warning
+        annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#contentblacklist-compliance"
+          summary: "Blacklist deny-set re-enumeration failing on {{ $labels.instance }}"
+          description: |
+            The periodic backstop for a lost takedown event or an unannounced
+            region/ripening transition is failing, so a gap it would repair
+            stays unenforced. Check the RPC provider's eth_call path.
+
       - alert: DecdnBlacklistEnforcementFailing
         expr: rate(decdn_blacklist_enforcement_failures_total[10m]) > 0
         for: 2m
@@ -215,6 +232,23 @@ groups:
       # has seen a slash; after a restart it re-counts only the slashes whose
       # appeal window is still open, so the alert clears once the last window
       # closes and the node restarts.
+      # The slash resync reports success upward on a failed read, so this
+      # counter is the only thing that moves when the repair fails. Attempts
+      # are 15m apart; the 1h window spans several.
+      - alert: DecdnSlashResyncFailing
+        expr: increase(decdn_slash_resync_failures_total[1h]) > 0
+        for: 15m
+        labels:
+          component: slashing
+          severity: warning
+        annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#slashing-risk"
+          summary: "Slash-watcher resync failing on {{ $labels.instance }}"
+          description: |
+            The repair for a slash whose tail event was lost is failing, so
+            such a slash stays off the admin surface while its appeal window
+            runs. Check the RPC provider's eth_call path.
+
       - alert: DecdnSlashDetected
         expr: decdn_slashes_detected_total > 0
         for: 0m

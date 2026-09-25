@@ -539,10 +539,6 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
     let usdc_addr = deploy_mock_usdc(&admin, &contracts).await?;
     run_deploy_script(&contracts, &rpc_url, usdc_addr, eth_addr).await?;
     let addrs = read_manifest(&manifest)?;
-    // The head is far below `SNAPSHOT_LAG_MARGIN_BLOCKS` here, so the lagged
-    // boot snapshot block predates the deployment. Booting anyway exercises the
-    // `eth_getCode` fallback that pins such a young contract at head — the
-    // `contracts/dev-deploy.sh` local chain.
 
     // ---- 4. Build the resolved config with explicit free listener ports.
     let admin_port = free_port();
@@ -574,7 +570,11 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
         Box::new(|_| Ok(decdn_node::runtime::LogLevelApply::Installed)) as LogLevelSetter,
     ));
 
-    // ---- 5. Boot the real runtime.
+    // ---- 5. Boot the real runtime. The head is far below
+    // `SNAPSHOT_LAG_MARGIN_BLOCKS` here, so the lagged snapshot block predates the
+    // deployment. The boot therefore runs the code-presence `eth_getCode`
+    // fallback that pins such a young contract at head. It mirrors a
+    // `contracts/dev-deploy.sh` local chain.
     let secret_key = decdn_common::identity::load_or_generate(&cfg.identity.data_dir)?;
     let handle = tokio::spawn(decdn_node::runtime::run(
         cfg,

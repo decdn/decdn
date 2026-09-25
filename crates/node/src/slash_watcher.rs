@@ -6,8 +6,9 @@
 //! directly. A counter metric (`decdn_slashes_detected_total`) mirrors it.
 //!
 //! Shape follows the `CapacityBond` registry watcher
-//! ([`crate::dht::capacity_bond_registry`]) — **enumerate at head, follow the
-//! tail, re-read periodically as the backstop** — rather than replaying logs:
+//! ([`crate::dht::capacity_bond_registry`]) — **enumerate at a snapshot block,
+//! follow the tail, re-read periodically as the backstop** — rather than
+//! replaying logs:
 //!
 //! - **Enumerate at boot.** The in-memory store is rebuilt on every start from
 //!   the authoritative `CapacityBond.operatorSlash*` enumeration (ADR 019), not
@@ -19,7 +20,7 @@
 //!   RPC failure retries on the shared boot budget, like the registry bootstrap
 //!   on the same contract; a deterministic fault or an exhausted budget fails
 //!   startup.
-//! - **Follow `SlashRecorded` at head.** The route follows `SlashRecorded` on the
+//! - **Follow `SlashRecorded` from the snapshot block.** The route follows `SlashRecorded` on the
 //!   shared multiplexed poller, seeded at the enumeration snapshot block, so there
 //!   is no historical scan on any boot. `SlashRecorded` indexes `operator` as
 //!   `topic2`, but the merged poller filter cannot scope `topic2`, so the route
@@ -29,9 +30,10 @@
 //!   `getSlashRecord`.
 //! - **Resync as the backstop.** A missed tail event (reorg at the unstable tip,
 //!   or a tick lost to RPC backoff) never self-heals otherwise, so the store is
-//!   re-enumerated every `SLASH_RESYNC_INTERVAL`; this also prunes slashes
-//!   whose appeal window has since closed. The store is deduped by `slashId`, so
-//!   the enumeration/tail overlap is harmless.
+//!   re-enumerated every `SLASH_RESYNC_INTERVAL` at the snapshot block; this
+//!   also prunes slashes whose appeal window has since closed. A slash the tail
+//!   saw above that block survives the resync (`fold_resync`). The store is
+//!   deduped by `slashId`, so the enumeration/tail overlap is harmless.
 
 use std::future::Future;
 use std::sync::{Arc, RwLock};
@@ -51,7 +53,7 @@ use decdn_common::redact::sanitize_err_chain;
 use crate::chain_events::boot_retry::BootRetry;
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
-use crate::chain_events::shared_head::{HeadSource, boot_snapshot_block};
+use crate::chain_events::shared_head::{HeadSource, snapshot_block};
 use crate::chain_events::timed;
 use crate::metrics::{Metrics, metric_hook};
 
@@ -117,6 +119,9 @@ struct SlashRecordView {
 /// inside the spawned watcher's `on_tick_complete`, whose future `tokio::spawn`
 /// requires to be `Send`. Production monomorphizes to the alloy contract impl.
 trait SlashChainReads: Send + Sync {
+    /// The block an enumeration pins its reads to
+    /// (`shared_head::snapshot_block`): the lag margin below the head.
+    fn snapshot_block(&self) -> impl Future<Output = Result<u64>> + Send;
     /// How many slashes have ever been minted against `operator`
     /// (`operatorSlashCount`).
     fn operator_slash_count(
@@ -155,12 +160,11 @@ trait SlashChainReads: Send + Sync {
 /// lands at an index past the old count (unseen here) and is picked up by the
 /// live `SlashRecorded` tail instead.
 ///
-/// Every read runs at `at`. The boot enumeration pins it to the snapshot block,
-/// so a load-balanced provider cannot answer the count from one backend and the
-/// index or record from a lagging one: a backend behind `at` answers "header not
-/// found", which retries, rather than reverting on an index it has not seen,
-/// which is deterministic and fails boot. The periodic resync reads `latest`; a
-/// failed resync keeps the current set.
+/// Every read runs at `at`, the snapshot block, so a load-balanced provider
+/// cannot answer the count from one backend and the index or record from a
+/// lagging one: a backend behind `at` answers "header not found", which retries,
+/// rather than reverting on an index it has not seen, which is deterministic and
+/// fails boot. A failed resync keeps the current set.
 async fn bootstrap_slashes<R: SlashChainReads>(
     reads: &R,
     operator: Address,
@@ -203,9 +207,15 @@ async fn bootstrap_slashes<R: SlashChainReads>(
 #[derive(Clone)]
 struct ContractReads<P: Provider + Clone> {
     bond: CapacityBond::CapacityBondInstance<P>,
+    /// The shared head source the snapshot block derives from.
+    head: Arc<dyn HeadSource>,
 }
 
 impl<P: Provider + Clone> SlashChainReads for ContractReads<P> {
+    async fn snapshot_block(&self) -> Result<u64> {
+        snapshot_block(self.bond.provider(), &*self.head, *self.bond.address()).await
+    }
+
     async fn operator_slash_count(&self, operator: Address, at: BlockId) -> Result<U256> {
         timed(
             None,
@@ -293,21 +303,21 @@ pub async fn bootstrap<P: Provider + Clone + 'static>(
     info!(%capacity_bond_addr, %self_address, "slash-detection watcher started");
     let reads = ContractReads {
         bond: CapacityBond::new(capacity_bond_addr, provider),
+        head,
     };
 
-    // Snapshot block BEFORE the enumeration, then pin every read and seed the tail
-    // cursor there. The reverse order would lose a `SlashRecorded` landing between
-    // enumeration and the head read — neither in the snapshot nor above the
-    // cursor. The block sits `SNAPSHOT_LAG_MARGIN_BLOCKS` below the reported head
-    // so every upstream behind a load-balanced RPC can serve the pinned reads;
-    // the tail replays the margin, and re-applying a snapshot event is a deduped
-    // no-op, so overlap is safe but a gap is not.
+    // Pin every read to one snapshot block and seed the tail cursor at that same
+    // block. A slash minted at or below it is in the enumeration; one above it is
+    // on the tail, which scans from the block inclusive. A slash both see is a
+    // deduped no-op, so overlap is safe but a gap is not. The block sits
+    // `SNAPSHOT_LAG_MARGIN_BLOCKS` below the reported head so every upstream
+    // behind a load-balanced RPC can serve the pinned reads.
     let (snapshot_block, initial) = boot
         .run("slash enumeration snapshot", || async {
-            let snapshot_block =
-                boot_snapshot_block(reads.bond.provider(), &*head, capacity_bond_addr)
-                    .await
-                    .context("read the slash enumeration snapshot block")?;
+            let snapshot_block = reads
+                .snapshot_block()
+                .await
+                .context("read the slash enumeration snapshot block")?;
             let initial = bootstrap_slashes(
                 &reads,
                 self_address,
@@ -413,10 +423,12 @@ impl<R: SlashChainReads> LogSink for SlashSink<R> {
     }
 
     /// Re-enumerate the operator's still-appealable slashes on the resync cadence
-    /// and replace the store wholesale (build-then-swap: a failed read keeps the
-    /// current set). This repairs any tail event lost to a reorg or RPC backoff
-    /// and prunes slashes whose appeal window has since closed. Returns `Ok` on
-    /// failure — the event tail is the primary path and is still working.
+    /// at the lagged snapshot block and fold them into the store
+    /// ([`fold_resync`]; build-then-swap: a failed read keeps the current set).
+    /// This repairs any tail event lost to a reorg or RPC backoff and prunes
+    /// slashes whose appeal window has since closed. Returns `Ok` on failure —
+    /// the event tail is the primary path and is still working — and counts it
+    /// in `decdn_slash_resync_failures_total`.
     async fn on_tick_complete(&mut self) -> Result<()> {
         let now = Instant::now();
         if self
@@ -429,16 +441,21 @@ impl<R: SlashChainReads> LogSink for SlashSink<R> {
         // read retries on the resync cadence rather than on every watcher tick.
         self.last_resync = Some(now);
 
-        let fresh = match bootstrap_slashes(
-            &self.reads,
-            self.self_address,
-            unix_now(),
-            BlockId::latest(),
-        )
-        .await
-        {
-            Ok(fresh) => fresh,
+        let read = async {
+            let at = self.reads.snapshot_block().await?;
+            let fresh = bootstrap_slashes(
+                &self.reads,
+                self.self_address,
+                unix_now(),
+                BlockId::number(at),
+            )
+            .await?;
+            anyhow::Ok((at, fresh))
+        };
+        let (at, fresh) = match read.await {
+            Ok(read) => read,
             Err(err) => {
+                self.metrics.slash_resync_failure();
                 warn!(
                     error = %sanitize_err_chain(&err),
                     "slash resync failed; keeping the current detected-slash set"
@@ -446,12 +463,13 @@ impl<R: SlashChainReads> LogSink for SlashSink<R> {
                 return Ok(());
             }
         };
-        let count = fresh.len();
         let mut guard = self
             .store
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = fresh;
+        let folded = fold_resync(&guard, fresh, at);
+        let count = folded.len();
+        *guard = folded;
         drop(guard);
         debug!(
             slash_count = count,
@@ -552,6 +570,28 @@ async fn record_recorded_log<R: SlashChainReads>(
     );
 }
 
+/// The store after a resync pinned at block `at`: the enumeration `fresh`, plus
+/// every stored slash the tail saw in a block above `at`.
+///
+/// The enumeration reads the lagged snapshot block, so a slash the tail already
+/// recorded above it is absent from `fresh`. Replacing the store wholesale
+/// would drop it until the next resync. A stored slash at or below `at` that
+/// `fresh` lacks is gone from the chain's view (a closed appeal window, or a
+/// reorged-out log), so it drops.
+fn fold_resync(
+    current: &[DetectedSlash],
+    mut fresh: Vec<DetectedSlash>,
+    at: u64,
+) -> Vec<DetectedSlash> {
+    for slash in current {
+        let newer = slash.block_number.is_some_and(|block| block > at);
+        if newer && !fresh.iter().any(|f| f.slash_id == slash.slash_id) {
+            fresh.push(slash.clone());
+        }
+    }
+    fresh
+}
+
 /// Append `slash` to the store if its `slashId` is not already present, bumping
 /// the detection metric only on a genuinely new slash (backfill/live overlap is
 /// deduped). Poison-tolerant so a panicked reader can't wedge the writer.
@@ -603,6 +643,9 @@ mod tests {
             None,
         ));
         let asserter = Asserter::new();
+        // The first read of an attempt is the snapshot block's code-presence
+        // `eth_getCode`, so the failure lands there; every boot read shares the
+        // retry path.
         asserter.push_failure(
             serde_json::from_value(serde_json::json!({
                 "code": 19,
@@ -610,7 +653,7 @@ mod tests {
             }))
             .unwrap(),
         );
-        // The retry: the deploy-floor `eth_getCode`, no slashes, then the pause
+        // The retry: the code-presence `eth_getCode`, no slashes, then the pause
         // offset.
         asserter.push_success(&alloy::primitives::Bytes::from_static(&[0x60]));
         for _ in 0..2 {
@@ -661,6 +704,88 @@ mod tests {
             matches!(start, CursorStart::Seeded { .. }),
             "must not carry a durable checkpoint"
         );
+    }
+
+    /// A resync keeps a stored slash the tail saw above its snapshot block, and
+    /// drops one at or below the block that the authoritative enumeration lacks.
+    #[test]
+    fn a_resync_keeps_tail_slashes_above_its_block() {
+        let tail_late = DetectedSlash {
+            block_number: Some(900),
+            ..slash(1)
+        };
+        let tail_early = DetectedSlash {
+            block_number: Some(700),
+            ..slash(2)
+        };
+        let enumerated = DetectedSlash {
+            block_number: None,
+            ..slash(3)
+        };
+
+        let folded = fold_resync(&[tail_late, tail_early], vec![enumerated], 800);
+
+        let mut ids: Vec<U256> = folded.iter().map(|s| s.slash_id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![U256::from(1u64), U256::from(3u64)]);
+    }
+
+    /// The sink's resync reads at the snapshot block and folds the tail on top:
+    /// a slash the tail recorded above that block survives a snapshot that lacks
+    /// it.
+    #[tokio::test]
+    async fn the_resync_folds_the_tail_over_the_snapshot() {
+        let op = Address::repeat_byte(0xAB);
+        let mut reads = StubSlashReads::new(op, Vec::new());
+        reads.snapshot_block = 800;
+        let store: SlashStore = Arc::new(RwLock::new(vec![DetectedSlash {
+            block_number: Some(900),
+            ..slash(1)
+        }]));
+        let mut sink = SlashSink {
+            reads,
+            self_address: op,
+            store: Arc::clone(&store),
+            metrics: Arc::new(Metrics::new()),
+            resync_interval: SLASH_RESYNC_INTERVAL,
+            last_resync: None,
+        };
+
+        sink.on_tick_complete().await.unwrap();
+
+        assert_eq!(store.read().unwrap().len(), 1);
+        assert!(
+            sink.reads
+                .blocks_read()
+                .iter()
+                .all(|b| *b == BlockId::number(800))
+        );
+    }
+
+    /// Every contract read is bounded by the per-call timeout, not only the
+    /// snapshot block's `eth_getCode`: a stalled `operatorSlashCount` fails
+    /// rather than wedging boot or the resync.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_contract_read_times_out() {
+        use crate::chain_events::shared_head::SharedHead;
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+
+        let provider = hanging_provider();
+        let reads = ContractReads {
+            bond: CapacityBond::new(Address::repeat_byte(0x11), provider.clone()),
+            head: Arc::new(SharedHead::with_ttl(provider, Duration::ZERO, None)),
+        };
+
+        let err = bounded(
+            "operatorSlashCount",
+            reads.operator_slash_count(Address::repeat_byte(0x22), BlockId::number(1)),
+        )
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap();
+
+        assert!(err.contains("operatorSlashCount timed out after"), "{err}");
     }
 
     /// A `DetectedSlash` distinguished only by `slash_id` (the dedup key).
@@ -754,6 +879,8 @@ mod tests {
         reads: std::sync::Mutex<Vec<U256>>,
         /// The block every read ran at, for the pinned-read assertion.
         blocks: std::sync::Mutex<Vec<BlockId>>,
+        /// What `snapshot_block` returns.
+        snapshot_block: u64,
     }
 
     impl StubSlashReads {
@@ -764,6 +891,7 @@ mod tests {
                 paused_total: 0,
                 reads: std::sync::Mutex::new(Vec::new()),
                 blocks: std::sync::Mutex::new(Vec::new()),
+                snapshot_block: 0,
             }
         }
 
@@ -782,6 +910,10 @@ mod tests {
     }
 
     impl SlashChainReads for StubSlashReads {
+        async fn snapshot_block(&self) -> Result<u64> {
+            Ok(self.snapshot_block)
+        }
+
         async fn operator_slash_count(&self, operator: Address, at: BlockId) -> Result<U256> {
             self.blocks.lock().unwrap().push(at);
             assert_eq!(operator, self.operator, "unexpected operator");
@@ -917,7 +1049,7 @@ mod tests {
         ));
         let metrics = Arc::new(Metrics::new());
 
-        bootstrap(
+        let (_store, route) = bootstrap(
             provider,
             Address::repeat_byte(0x11),
             Address::repeat_byte(0x22),
@@ -928,15 +1060,18 @@ mod tests {
         .await
         .unwrap();
 
-        // No slashes: the deploy-floor `eth_getCode`, the count and the pause
-        // offset.
+        // No slashes: the code-presence `eth_getCode`, the count and the pause
+        // offset — all at the snapshot block, which also seeds the tail cursor.
         let tags = tags.lock().unwrap().clone();
-        let pinned = format!("{:#x}", 1_000 - SNAPSHOT_LAG_MARGIN_BLOCKS);
-        assert_eq!(tags, vec![serde_json::json!(pinned); 3]);
+        let pinned = 1_000 - SNAPSHOT_LAG_MARGIN_BLOCKS;
+        assert_eq!(tags, vec![serde_json::json!(format!("{pinned:#x}")); 3]);
+        assert_eq!(route.start.seed(), Some(pinned));
     }
 
     /// A stalled provider cannot wedge boot: every read is bounded by the
-    /// per-call timeout, so the boot read fails into its budget.
+    /// per-call timeout, so the boot read fails into its budget. The first read
+    /// to stall is the snapshot block's `eth_getCode`;
+    /// `a_stalled_contract_read_times_out` covers the contract reads.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_provider_fails_the_boot_enumeration() {
         use crate::chain_events::boot_retry::BootRetry;

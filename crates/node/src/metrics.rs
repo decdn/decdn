@@ -703,6 +703,13 @@ pub struct DecdnMetrics {
     /// operator was slashed and should consider `decdn appeal slash` within the
     /// 30-day window. Operator-visible name: `decdn_slashes_detected_total`.
     pub slashes_detected: Counter,
+    /// `decdn_slash_resync_failures_total`: times the slash watcher's periodic
+    /// re-enumeration could not read chain state and kept the detected-slash
+    /// set it already had. The resync reports success upward so the event tail
+    /// keeps running, so a persistently failing repair moves nothing else.
+    /// Pairs with the `warn!` in `slash_watcher`'s `SlashSink::on_tick_complete`.
+    /// Field has no `_total` suffix because the `OpenMetrics` encoder appends it.
+    pub slash_resync_failures: Counter,
     /// `decdn_slash_watcher_restarts_total` (#1032): distinct drift windows the
     /// slash-detection watcher has entered, bumped once on the edge into the
     /// error/backoff state. Pairs with `slash_watcher_down_seconds` to tell one
@@ -1750,6 +1757,14 @@ pub struct DecdnMetrics {
     /// adds to it; the node serves only after a clean pass, so that increase does
     /// not mean a served blob. Pairs with the aggregate `warn!` in `rescan`.
     pub blacklist_enforcement_failures: Counter,
+    /// `decdn_blacklist_reenumeration_failures_total`: times the blacklist
+    /// watcher's periodic re-enumeration could not read chain state and kept the
+    /// deny-set it already had. That re-enumeration is the backstop for a lost
+    /// tail event and for a region/ripening transition, which emits no event.
+    /// It reports success upward so the event tail keeps running, so a
+    /// persistently failing backstop moves nothing else. Pairs with the `warn!`
+    /// in `blacklist_watcher`'s `BlacklistSink::on_tick_complete`.
+    pub blacklist_reenumeration_failures: Counter,
 
     // ---- Stream outcomes and volume ----
     /// `decdn_streams_completed_total{direction}`: paid streams that delivered
@@ -2586,6 +2601,9 @@ recorders! {
     /// A distinct slash against this node's operator was detected by the slash
     /// watcher (#1032). Counts each `slashId` once (backfill + live dedup).
     slash_detected => slashes_detected.inc();
+    /// A slash-watcher resync failed and the current detected-slash set was
+    /// kept. Bumps `slash_resync_failures_total`.
+    slash_resync_failure => slash_resync_failures.inc();
 
     /// A `nodeIdOf(operator)` resolution for an operator-indexed event failed,
     /// dropping the membership change (#788, [`crate::dht::chain_staker_set`]).
@@ -3079,6 +3097,9 @@ recorders! {
     /// Record `count` hashes a blacklist re-scope could not enforce this pass
     /// (#1319 — `Recheck::Failed`). One aggregated bump per pass, not per hash.
     blacklist_enforcement_failure(count: u64) => blacklist_enforcement_failures.inc_by(count);
+    /// A blacklist periodic re-enumeration failed and the current deny-set was
+    /// kept. Bumps `blacklist_reenumeration_failures_total`.
+    blacklist_reenumeration_failure => blacklist_reenumeration_failures.inc();
 
     /// Count `bytes` of payload written to a client on `cdn/client/v1`.
     bytes_served(bytes: u64) => bytes_served.inc_by(bytes);

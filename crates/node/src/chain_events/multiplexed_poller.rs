@@ -551,7 +551,7 @@ async fn demux_window_logs(poller: &mut MultiplexedPoller, logs: Vec<Log>) {
             continue; // this route re-scans the whole window next tick
         }
         // Floor gate: a route whose floor sits above this window's start (it
-        // enumerated at head, or is a sibling still ahead) ignores logs below
+        // enumerated at a later snapshot block, or is a sibling still ahead) ignores logs below
         // its own floor. A `None` block_number applies rather than being
         // silently dropped.
         if log.block_number.is_some_and(|b| b < route.tick_floor) {

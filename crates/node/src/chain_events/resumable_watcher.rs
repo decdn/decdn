@@ -69,11 +69,12 @@ pub(crate) enum CursorStart {
     /// Start at an explicit block — a bootstrap snapshot block, already covered
     /// by an out-of-band enumeration. Bypasses floor derivation entirely and
     /// never persists: a seeded projection is an ephemeral live-follow rebuilt
-    /// from its enumeration each boot (the capacity-bond staker set).
+    /// from its enumeration each boot (the capacity-bond registry, the slash
+    /// store, the blacklist deny-set).
     Seeded { at: u64 },
     /// Resume from a durable checkpoint, rewound by `reorg_margin`, persisting
     /// forward each window. This is the only start that reads a checkpoint to
-    /// derive its floor (settlement `ChannelOpened`, blacklist deny-set).
+    /// derive its floor (settlement `ChannelOpened`).
     ///
     /// What a first-ever (cold-store) boot does is the caller's choice — see
     /// [`ColdStart`]. Getting that wrong is a correctness bug, not a tuning
