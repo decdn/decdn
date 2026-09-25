@@ -36,6 +36,7 @@ use decdn_incentive::{
     bind_node_id_domain, binding_signing_hash, node_register, register_node_signing_hash,
     slash_judge_domain,
 };
+use decdn_node::chain_events::shared_head::SNAPSHOT_LAG_MARGIN_BLOCKS;
 
 use crate::bindings::{
     AccessControl, CapacityBond, ContentBlacklist, ContentBlacklistOrigin, DecdnGovernor, Erc20,
@@ -366,6 +367,12 @@ impl ChainFixture {
 
         let anvil = spawn_anvil(None).await?;
         load_state_snapshot(&anvil.admin, &shared.state_path).await?;
+        // A node pins its boot enumerations `SNAPSHOT_LAG_MARGIN_BLOCKS` below
+        // head, and anvil keeps no state at or below the loaded head. Mine past
+        // the margin so every later boot pins a block that holds the deployment.
+        crate::time::mine_blocks(&anvil.admin, SNAPSHOT_LAG_MARGIN_BLOCKS + 1)
+            .await
+            .context("mine past the boot snapshot lag margin")?;
 
         let admin_addr = admin_address()?;
         Ok(Self {

@@ -539,6 +539,15 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
     let usdc_addr = deploy_mock_usdc(&admin, &contracts).await?;
     run_deploy_script(&contracts, &rpc_url, usdc_addr, eth_addr).await?;
     let addrs = read_manifest(&manifest)?;
+    // The runtime pins its boot enumerations `SNAPSHOT_LAG_MARGIN_BLOCKS` below
+    // head. Mine past the margin so the pinned block holds the deployment.
+    let _: serde_json::Value = admin
+        .raw_request(
+            "anvil_mine".into(),
+            (decdn_node::chain_events::shared_head::SNAPSHOT_LAG_MARGIN_BLOCKS + 1,),
+        )
+        .await
+        .context("anvil_mine past the boot snapshot lag margin")?;
 
     // ---- 4. Build the resolved config with explicit free listener ports.
     let admin_port = free_port();

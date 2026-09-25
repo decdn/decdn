@@ -20,7 +20,7 @@
 //!   on the same contract; a deterministic fault or an exhausted budget fails
 //!   startup.
 //! - **Follow `SlashRecorded` at head.** The route follows `SlashRecorded` on the
-//!   shared multiplexed poller, seeded at the enumeration snapshot head, so there
+//!   shared multiplexed poller, seeded at the enumeration snapshot block, so there
 //!   is no historical scan on any boot. `SlashRecorded` indexes `operator` as
 //!   `topic2`, but the merged poller filter cannot scope `topic2`, so the route
 //!   receives every operator's `SlashRecorded` and `decode_recorded`'s
@@ -51,7 +51,7 @@ use decdn_common::redact::sanitize_err_chain;
 use crate::chain_events::boot_retry::BootRetry;
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
-use crate::chain_events::shared_head::HeadSource;
+use crate::chain_events::shared_head::{HeadSource, snapshot_block};
 use crate::chain_events::timed;
 use crate::metrics::{Metrics, metric_hook};
 
@@ -295,16 +295,18 @@ pub async fn bootstrap<P: Provider + Clone + 'static>(
         bond: CapacityBond::new(capacity_bond_addr, provider),
     };
 
-    // Head BEFORE the enumeration, then seed the tail cursor there. The reverse
-    // order would lose a `SlashRecorded` landing between enumeration and the head
-    // read — neither in the snapshot nor above the cursor. Re-applying a snapshot
-    // event is a deduped no-op, so overlap is safe but a gap is not.
+    // Snapshot block BEFORE the enumeration, then pin every read and seed the tail
+    // cursor there. The reverse order would lose a `SlashRecorded` landing between
+    // enumeration and the head read — neither in the snapshot nor above the
+    // cursor. The block sits `SNAPSHOT_LAG_MARGIN_BLOCKS` below the reported head
+    // so every upstream behind a load-balanced RPC can serve the pinned reads;
+    // the tail replays the margin, and re-applying a snapshot event is a deduped
+    // no-op, so overlap is safe but a gap is not.
     let (snapshot_block, initial) = boot
         .run("slash enumeration snapshot", || async {
-            let snapshot_block = head
-                .head()
+            let snapshot_block = snapshot_block(&*head)
                 .await
-                .context("read head block for the slash enumeration snapshot")?;
+                .context("read the slash enumeration snapshot block")?;
             let initial = bootstrap_slashes(
                 &reads,
                 self_address,
@@ -646,7 +648,7 @@ mod tests {
         );
     }
 
-    /// The slash route seeds its cursor at the enumeration snapshot head, with
+    /// The slash route seeds its cursor at the enumeration snapshot block, with
     /// no durable persistence (the store is rebuilt from enumeration each boot).
     #[test]
     fn cursor_start_seeds_at_snapshot_with_no_persistence() {
@@ -869,7 +871,7 @@ mod tests {
             let result = if body.get("method").and_then(serde_json::Value::as_str)
                 == Some("eth_blockNumber")
             {
-                serde_json::json!("0x64")
+                serde_json::json!("0x3e8")
             } else {
                 let tag = body
                     .pointer("/params/1")
@@ -884,13 +886,14 @@ mod tests {
         }
     }
 
-    /// The boot enumeration pins its reads to the snapshot head, so a lagging
+    /// The boot enumeration pins its reads to one snapshot block, so a lagging
     /// load-balanced backend cannot answer the count and the records from
-    /// different blocks.
+    /// different blocks. The pin sits the lag margin below the reported head
+    /// (1000), so an upstream behind that head can still serve it.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_boot_enumeration_reads_at_the_snapshot_block() {
         use crate::chain_events::boot_retry::BootRetry;
-        use crate::chain_events::shared_head::SharedHead;
+        use crate::chain_events::shared_head::{SNAPSHOT_LAG_MARGIN_BLOCKS, SharedHead};
         use alloy::providers::ProviderBuilder;
 
         let tags = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -923,7 +926,8 @@ mod tests {
 
         // No slashes: the count and the pause offset.
         let tags = tags.lock().unwrap().clone();
-        assert_eq!(tags, vec![serde_json::json!("0x64"); 2]);
+        let pinned = format!("{:#x}", 1_000 - SNAPSHOT_LAG_MARGIN_BLOCKS);
+        assert_eq!(tags, vec![serde_json::json!(pinned); 2]);
     }
 
     /// A stalled provider cannot wedge boot: every read is bounded by the

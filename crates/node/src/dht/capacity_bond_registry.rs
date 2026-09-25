@@ -62,7 +62,7 @@ use tracing::{debug, info, warn};
 use crate::chain_events::boot_retry::{BootFault, BootRetry};
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
-use crate::chain_events::shared_head::HeadSource;
+use crate::chain_events::shared_head::{HeadSource, snapshot_block};
 use crate::chain_events::timed;
 use crate::dht::chain_projection::{with_read, with_write};
 use crate::dht::chain_staker_set::{ChainStakerSet, StakerChange, apply_change};
@@ -590,21 +590,23 @@ where
 {
     let registry = CapacityBond::new(registry_addr, provider.clone());
 
-    // Head BEFORE the enumeration, then seed the cursor there. The reverse order
-    // would lose any event landing between the enumeration and the head read: it
-    // would be neither in the snapshot nor above the cursor. Re-applying an event
-    // the snapshot already reflects is a no-op in every arm, so overlap is safe
-    // but a gap is not. (`SharedHead`'s TTL only ever makes this cursor *older*,
-    // which widens the overlap — it cannot open a gap.)
+    // Snapshot block BEFORE the enumeration, then seed the cursor there. The
+    // reverse order would lose any event landing between the enumeration and the
+    // head read: it would be neither in the snapshot nor above the cursor.
+    // Re-applying an event the snapshot already reflects is a no-op in every arm,
+    // so overlap is safe but a gap is not. The enumeration reads `latest`, which a
+    // lagging upstream behind a load-balanced RPC resolves below the reported
+    // head, so the cursor sits `SNAPSHOT_LAG_MARGIN_BLOCKS` below it to stay at or
+    // under the block the enumeration saw. (`SharedHead`'s TTL only ever makes
+    // this cursor *older*, which widens the overlap — it cannot open a gap.)
     let (
         snapshot_block,
         (initial_active, initial_bindings, initial_operator_to_node, initial_regions),
     ) = boot
         .run("CapacityBond registry snapshot", || async {
-            let snapshot_block = head
-                .head()
+            let snapshot_block = snapshot_block(&*head)
                 .await
-                .context("read head block for CapacityBond registry snapshot")?;
+                .context("read the CapacityBond registry snapshot block")?;
             let snapshot = bootstrap_registry(&registry).await.with_context(|| {
                 format!("paginated getRegisteredNodes from CapacityBond at {registry_addr}")
             })?;
@@ -758,7 +760,7 @@ fn registry_route_topic0s() -> Vec<B256> {
 }
 
 /// The registry route's cursor start: seed the live tail from the enumeration
-/// snapshot head. The staker set is rebuilt from that enumeration each boot, so
+/// snapshot block. The staker set is rebuilt from that enumeration each boot, so
 /// there is no durable cursor to persist. Split out from [`bootstrap`] so the
 /// cursor shape is unit-testable without a provider.
 const fn registry_cursor_start(snapshot_block: u64) -> CursorStart {
@@ -902,7 +904,7 @@ mod tests {
         );
     }
 
-    /// The registry route seeds its cursor at the enumeration snapshot head,
+    /// The registry route seeds its cursor at the enumeration snapshot block,
     /// with no durable persistence (the staker set is rebuilt from enumeration
     /// each boot).
     #[test]

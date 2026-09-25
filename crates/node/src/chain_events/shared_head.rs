@@ -59,6 +59,29 @@ pub trait HeadSource: Send + Sync {
     async fn head(&self) -> Result<u64>;
 }
 
+/// How far below the reported head a boot enumeration pins its reads.
+///
+/// A load-balanced RPC reports the head of its freshest upstream, then routes
+/// each call to any upstream. An `eth_call` pinned to that exact block fails on
+/// every upstream that has not reached it yet, while an older block resolves on
+/// all of them. So the reported head is not a block every upstream can serve.
+/// 256 blocks is about 64s on Arbitrum, above the 40–200 block upstream lag seen
+/// behind a hosted balancer (#2164).
+///
+/// The margin costs no correctness: each watcher seeds its tail cursor at the
+/// snapshot block, and every sink is idempotent, so the first tail tick replays
+/// `(snapshot, head]` as a harmless overlap.
+pub const SNAPSHOT_LAG_MARGIN_BLOCKS: u64 = 256;
+
+/// The block a boot enumeration pins its reads to and seeds its tail cursor at:
+/// [`SNAPSHOT_LAG_MARGIN_BLOCKS`] below the head, saturating at genesis.
+pub(crate) async fn snapshot_block(head: &dyn HeadSource) -> Result<u64> {
+    Ok(head
+        .head()
+        .await?
+        .saturating_sub(SNAPSHOT_LAG_MARGIN_BLOCKS))
+}
+
 /// A cached head read plus the instant it was taken.
 struct CachedHead {
     at: Instant,
@@ -475,5 +498,21 @@ mod tests {
         );
         assert_eq!(cached, first, "the cached replay is the same error text");
         assert_eq!(asserter.read_q().len(), 0, "one RPC, not two");
+    }
+
+    /// A boot snapshot sits the lag margin below the reported head, and a head
+    /// inside the margin saturates at genesis rather than underflowing.
+    #[tokio::test]
+    async fn snapshot_block_sits_the_margin_below_head() {
+        let (asserter, provider) = mocked();
+        asserter.push_success(&U64::from(1_000));
+        asserter.push_success(&U64::from(SNAPSHOT_LAG_MARGIN_BLOCKS - 1));
+        let head = SharedHead::with_ttl(provider, Duration::ZERO, None);
+
+        assert_eq!(
+            snapshot_block(&head).await.ok(),
+            Some(1_000 - SNAPSHOT_LAG_MARGIN_BLOCKS)
+        );
+        assert_eq!(snapshot_block(&head).await.ok(), Some(0));
     }
 }

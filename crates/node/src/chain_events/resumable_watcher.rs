@@ -66,7 +66,7 @@ pub(crate) enum ColdStart {
 }
 
 pub(crate) enum CursorStart {
-    /// Start at an explicit block — a bootstrap snapshot head, already covered
+    /// Start at an explicit block — a bootstrap snapshot block, already covered
     /// by an out-of-band enumeration. Bypasses floor derivation entirely and
     /// never persists: a seeded projection is an ephemeral live-follow rebuilt
     /// from its enumeration each boot (the capacity-bond staker set).

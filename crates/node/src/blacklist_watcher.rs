@@ -114,7 +114,7 @@ use tracing::{debug, info, warn};
 use crate::chain_events::boot_retry::{BootFault, BootRetry};
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
-use crate::chain_events::shared_head::HeadSource;
+use crate::chain_events::shared_head::{HeadSource, snapshot_block};
 use crate::chain_events::timed;
 use crate::chain_freshness::ChainFreshness;
 use crate::content_deny::ContentDenylist;
@@ -160,9 +160,9 @@ impl InitialSyncGate {
 /// `Send`. Production monomorphizes to the alloy contract impl
 /// ([`ContractReads`]).
 trait BlacklistChainReads: Send + Sync {
-    /// Current head, the block every enumeration read is pinned to
-    /// (`get_block_number`).
-    fn block_number(&self) -> impl Future<Output = Result<u64>> + Send;
+    /// The block every enumeration read is pinned to: the lag margin below
+    /// the head (`shared_head::snapshot_block`).
+    fn snapshot_block(&self) -> impl Future<Output = Result<u64>> + Send;
     /// The one-to-three region keys in scope for `operator` right now
     /// (`getScopeRegions`, GLOBAL first).
     fn scope_regions(
@@ -222,8 +222,8 @@ struct ContractReads<P: Provider + Clone> {
 }
 
 impl<P: Provider + Clone> BlacklistChainReads for ContractReads<P> {
-    async fn block_number(&self) -> Result<u64> {
-        self.head.head().await
+    async fn snapshot_block(&self) -> Result<u64> {
+        snapshot_block(&*self.head).await
     }
 
     async fn scope_regions(&self, operator: Address, at: u64) -> Result<Vec<B256>> {
@@ -333,16 +333,17 @@ struct BootstrapSnapshot {
     known: HashSet<(B256, Hash)>,
 }
 
-/// Enumerate the current on-chain deny-set at one pinned block: read head, then
-/// page the address union and the per-region hash sets against that height.
+/// Enumerate the current on-chain deny-set at one pinned block: take the
+/// snapshot block (the lag margin below head), then page the address union and
+/// the per-region hash sets against that height.
 async fn bootstrap_snapshot<R: BlacklistChainReads>(
     reads: &R,
     operator: Address,
 ) -> Result<BootstrapSnapshot> {
     let block = reads
-        .block_number()
+        .snapshot_block()
         .await
-        .context("get_block_number for the ContentBlacklist enumeration snapshot")?;
+        .context("read the ContentBlacklist enumeration snapshot block")?;
     let origins = enumerate_address_union(reads, operator, block).await?;
     let known = enumerate_known(reads, operator, block).await?;
     Ok(BootstrapSnapshot {
@@ -1162,6 +1163,10 @@ struct BootEnforced {
 /// return the [`Route`] that follows the live tail seeded at that block on the
 /// shared multiplexed poller.
 ///
+/// The pinned block sits `SNAPSHOT_LAG_MARGIN_BLOCKS` below head, so the
+/// readiness gate opens on the deny-set as of that block. A takedown inside the
+/// margin is enforced by the first tail tick, which replays the margin.
+///
 /// One boot attempt is the enumeration plus the enforcement pass. An attempt that
 /// cannot read the chain (block or enumeration RPC error) or cannot enforce
 /// every entry retries on `boot`'s budget. `initial_sync_tx` fires once, when
@@ -1328,7 +1333,7 @@ fn blacklist_route_topic0s() -> Vec<B256> {
 }
 
 /// The blacklist route's cursor start: seed the tail at the enumeration
-/// snapshot head. No durable cursor and no historical replay — the boot
+/// snapshot block. No durable cursor and no historical replay — the boot
 /// enumeration rebuilt the whole deny-set, so the tail only follows forward
 /// from the snapshot. Split out from [`bootstrap`] so the cursor shape is
 /// unit-testable without a provider.
@@ -1369,7 +1374,7 @@ mod tests {
         );
     }
 
-    /// The blacklist route seeds its cursor at the enumeration snapshot head,
+    /// The blacklist route seeds its cursor at the enumeration snapshot block,
     /// with no durable persistence (the deny-set is rebuilt from enumeration
     /// each boot).
     #[test]
@@ -1455,7 +1460,7 @@ mod tests {
     }
 
     impl BlacklistChainReads for StubReads {
-        async fn block_number(&self) -> Result<u64> {
+        async fn snapshot_block(&self) -> Result<u64> {
             Ok(self.block)
         }
 
@@ -1622,14 +1627,15 @@ mod tests {
         assert!(format!("{err:#}").contains("read 1 of 3"), "{err:#}");
     }
 
-    /// `ContractReads::block_number` must route through the shared, TTL-cached
+    /// `ContractReads::snapshot_block` must route through the shared, TTL-cached
     /// [`SharedHead`] single-flight rather than issue its own `eth_blockNumber` —
-    /// two calls inside the TTL cost exactly one RPC. The unconsumed asserter
+    /// two calls inside the TTL cost exactly one RPC — and pin the lag margin
+    /// below the head it reads. The unconsumed asserter
     /// queue is the proof: a second direct read would have popped a response
     /// that was never pushed.
     #[tokio::test]
-    async fn contract_reads_block_number_routes_through_shared_head() -> Result<()> {
-        use crate::chain_events::shared_head::SharedHead;
+    async fn contract_reads_snapshot_block_routes_through_shared_head() -> Result<()> {
+        use crate::chain_events::shared_head::{SNAPSHOT_LAG_MARGIN_BLOCKS, SharedHead};
         use alloy::primitives::U64;
         use alloy::providers::ProviderBuilder;
         use alloy::providers::mock::Asserter;
@@ -1637,17 +1643,18 @@ mod tests {
         const TTL: Duration = Duration::from_secs(4);
 
         let asserter = Asserter::new();
-        asserter.push_success(&U64::from(100));
+        asserter.push_success(&U64::from(1_000));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(provider.clone(), TTL, None));
+        let pinned = 1_000 - SNAPSHOT_LAG_MARGIN_BLOCKS;
 
         let contract = ContentBlacklist::new(Address::ZERO, provider);
         let reads = ContractReads { contract, head };
 
-        assert_eq!(reads.block_number().await?, 100);
+        assert_eq!(reads.snapshot_block().await?, pinned);
         assert_eq!(
-            reads.block_number().await?,
-            100,
+            reads.snapshot_block().await?,
+            pinned,
             "second call is TTL-cached via SharedHead"
         );
         assert_eq!(
