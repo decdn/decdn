@@ -66,6 +66,19 @@ blacklist updates and stop being able to settle channels. Once
 [#283](https://github.com/decdn/decdn/issues/283) lands, the
 `decdn_rpc_healthy` gauge drops to 0.
 
+A provider that passes the preflight but fails intermittently delays boot
+rather than ending it: each boot-time chain read logs `boot chain read failed;
+retrying after backoff` at `WARN` and retries. The daemon exits when the next
+retry could not start before a shared 10-minute boot deadline (`gave up after
+N attempts`), or at once on a deterministic fault (`deterministic failure, not
+retried`: a wrong contract address, an ABI mismatch, a revert, a disk error
+that decides a blacklist enforcement attempt). A best-effort fee-share read
+that gives up logs the same text but falls back to the floor share instead of
+exiting; `decdn_fee_shares_watcher_unregistered` then reads `1`. The node
+serves nothing until the blacklist enumeration and enforcement complete. The
+`decdn_chain_boot_read_retries_total` counter counts the boot retries; it
+becomes scrapeable once boot completes.
+
 **Detect:**
 
 - Existing alerts in `monitoring/prometheus-alerts.yml`: a dead endpoint stalls
@@ -114,20 +127,36 @@ blacklist updates and stop being able to settle channels. Once
   about 4 blocks per second, so about 30 blocks per 7 s tick) still works, but
   each tick then costs several `eth_getLogs` requests against the provider's
   quota.
+- `decdn_chain_get_logs_retries_total` counts in-tick retries of `eth_getLogs`
+  windows after a transient provider error (dRPC `Temporary internal error`,
+  `Request timeout on the free plan`, a lagging backend, a per-call timeout).
+  Each window gets two retries, 2 s apart, before the tick fails, so one window
+  adds up to two. A retry that succeeds is not watcher downtime, so a steady
+  retry rate with healthy watchers is an unreliable provider that the poller
+  absorbs. The "eth_getLogs window span" panel plots it beside the rejections.
+  Each retry logs `eth_getLogs window failed; retrying the same window` at
+  `info` with the cause. Read the cause before you act: provider errors mean
+  an unreliable provider (change it, or accept the retries); `get_logs timed
+  out` means the windows are too wide (see below). A rate limit and a
+  permanent error are not retried: they fail the tick into the backoff at
+  once.
 - `multiplexed poller tick error` `warn!` lines on `get_logs` while
   `decdn_rpc_healthy` stays 1 mean the watchers cannot read events although
   the endpoint answers. `rejects even a one-block eth_getLogs window` means the
   provider cannot serve the watchers at all: change provider. Repeated
   `get_logs` timeouts, or a range or size error the poller does not recognise
   (it logs no shrink line), mean the windows are too wide for this provider:
-  lower `blockchain.get_logs_max_block_span` and restart.
+  lower `blockchain.get_logs_max_block_span` and restart. A timed-out window
+  is retried on the same range, so it costs three per-call timeouts plus the
+  retry sleeps (34 s at the 10 s default) before the tick fails.
 - `DecdnChainWatcherFlapping` means a node's chain watchers fail and recover
   again and again (four or more failure windows in 30 minutes, held for 45
   minutes; a single burst does not fire it). Each recovery resets the stalled
   alerts, so they stay quiet while the watchers lag head. Treat it as an
   unreliable RPC provider: read the `multiplexed poller tick error` lines for
-  the cause, and check `decdn_chain_get_logs_range_rejections_total` for an
-  `eth_getLogs` cap.
+  the cause, check `decdn_chain_get_logs_range_rejections_total` for an
+  `eth_getLogs` cap, and check `decdn_chain_get_logs_retries_total` for a
+  provider whose failures outlast the in-tick retries.
 
 - `decdn_staker_set_watcher_down_seconds` climbing (with
   `decdn_staker_set_watcher_restarts_total` advancing) is the chain-side

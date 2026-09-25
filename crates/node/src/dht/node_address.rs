@@ -26,8 +26,10 @@
 //!
 //! # Failure model
 //!
-//! Bootstrap: the bindings projection is derived from page data the (fatal,
-//! unconditional) staker-set enumeration already read, so it has no RPC of its
+//! Bootstrap: the bindings projection is derived from page data the
+//! (unconditional; fatal on a deterministic fault or once its boot retries are
+//! exhausted) staker-set
+//! enumeration already read, so it has no RPC of its
 //! own and cannot fail independently — see `capacity_bond_registry`'s
 //! §Fatality. It is simply not built when
 //! `cache.node_to_node_pull_through_enabled` is off.

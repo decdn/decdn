@@ -6,6 +6,7 @@ pub mod reload;
 pub(crate) use reload::emit_config_notices;
 pub use reload::{LogLevelApply, LogLevelSetter, ReloadSnapshot, RuntimeReloadState};
 
+use crate::chain_events::boot_retry::{BOOT_CHAIN_RETRY_BUDGET, BootRetry};
 use crate::chain_events::shared_head::{HeadSource, SharedHead};
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -139,6 +140,11 @@ const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 /// never a griefing surface.
 const FEE_ROUTER_OPERATOR_BPS_FLOOR: u16 = 4000;
 
+/// The most of the boot deadline the best-effort fee-share reads may spend on
+/// retries. It covers a short provider blip; a longer outage falls back to the
+/// floor share and leaves the rest of the deadline to the fail-closed reads.
+const FEE_SHARE_BOOT_BUDGET: Duration = Duration::from_mins(1);
+
 /// Apply an explicit client poll interval to a freshly built provider,
 /// overriding alloy's localhost-detected 250 ms default (#1011).
 ///
@@ -162,7 +168,7 @@ fn with_poll_interval<P: Provider>(provider: P, interval: Duration) -> P {
 }
 
 /// Keep every iroh ALPN listener closed until the blacklist watcher reports one
-/// clean full replay + operator-scope pass. The closure is the explicit seam
+/// clean boot enumeration + operator-scope enforcement pass. The closure is the explicit seam
 /// that makes it impossible to construct the `Router` on either pending or
 /// failed readiness.
 async fn gate_listener_on_blacklist_sync<T>(
@@ -672,18 +678,15 @@ async fn serve_until_shutdown(
         blacklist_ready_rx,
     } = serve_in;
 
-    // No Probe, Client, or DHT ALPN is registered before the mandatory
-    // first global + operator-region blacklist replay/scope pass succeeds. The
-    // gate sits here — after the metrics/admin listeners are bound and every
-    // background task is spawned — so a *slow* (still-pending) initial sync keeps
-    // the paid-delivery listeners closed while observability, the admin control
-    // surface, and the startup banner stay up. A *failed* initial sync is
-    // fail-closed the hard way: the gate returns `Err`, `run` propagates it, and
-    // the process exits (tearing those listeners down with it) rather than ever
-    // serving un-vetted content. The watcher was spawned earlier in bring-up
-    // so its initial replay runs
-    // concurrently and is often already complete by the time control reaches
-    // this gate.
+    // No Probe, Client, or DHT ALPN is registered before the mandatory first
+    // global + operator-region blacklist enumeration and enforcement pass
+    // succeeds. That pass runs inline in `build_chain_and_handlers`, before the
+    // metrics and admin listeners bind, and has always resolved by the time
+    // control reaches this gate; a boot that retries it has nothing listening
+    // yet. The gate is the structural seam: the `Router` cannot be built on a
+    // pending or failed sync. A *failed* initial sync is fail-closed the hard
+    // way: the gate returns `Err`, `run` propagates it, and the process exits
+    // rather than ever serving un-vetted content.
     let router = gate_listener_on_blacklist_sync(blacklist_ready_rx, || {
         Router::builder(ep.clone())
             .accept(ProbeHandler::ALPN, probe_handler)
@@ -795,7 +798,8 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
 
 /// The chain-event poller builder with its config-driven settings: the
 /// `eth_getLogs` block-span ceiling (`blockchain.get_logs_max_block_span`) and
-/// the span and range-rejection metrics. Routes are added by the caller.
+/// the span, range-rejection and window-retry metrics. Routes are added by the
+/// caller.
 fn chain_poller_builder(
     head: Arc<dyn HeadSource>,
     poll_interval: Duration,
@@ -809,6 +813,10 @@ fn chain_poller_builder(
         .on_range_rejection(metrics::metric_hook(
             node_metrics,
             metrics::Metrics::chain_get_logs_range_rejected,
+        ))
+        .on_window_retry(metrics::metric_hook(
+            node_metrics,
+            metrics::Metrics::chain_get_logs_retried,
         ))
 }
 
@@ -837,7 +845,9 @@ async fn build_chain_and_handlers(
     let slash_domain =
         decdn_incentive::slash_judge_domain(cfg.blockchain.chain_id, slash_judge_addr);
 
-    // Chain-backed active-staker set. Bootstrap failure is fatal: an
+    // Chain-backed active-staker set. Bootstrap failure is fatal on a
+    // deterministic fault or once its retries are exhausted (see the boot
+    // budget below): an
     // empty set silently rejects every inbound `Store`, and once the
     // iterative `FindValue` lookup filter exists it would drop every
     // responder. Built here (ahead of the probe handler) so the probe
@@ -894,18 +904,26 @@ async fn build_chain_and_handlers(
     // holds its own contract instance for its follow-up reads/writes).
     let poller_provider = ProviderFactory::read_only(rpc_url.clone(), event_poll_interval);
 
+    // One boot deadline for the four fail-closed chain bootstraps below — the
+    // registry, slash, `usdc()` self-check and blacklist reads (#2159). Each
+    // retries its reads on transient provider errors and fails only on a
+    // deterministic fault or once the shared deadline passes. The best-effort
+    // fee-share reads retry on a capped sub-budget of it and fall back to the
+    // floor share instead of failing boot; the binding check does not use it.
+    // Startup stays fail-closed: a retry delays readiness, and the ALPN router
+    // waits on the blacklist enumeration and enforcement.
+    let boot = BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&infra.node_metrics));
+
     // One CapacityBond enumeration + one route feeding both registry projections
     // (#1110). The bindings half is built only when pull-through is on; it derives
-    // from page data already read here, so — unlike when it had its own bootstrap
-    // — it has no RPC that can fail on its own. `getRegisteredNodes` failure was
-    // already fatal via this same (unconditional, first-to-run) call, so nothing
-    // that boots today loses pull-through.
+    // from page data already read here, so it has no RPC that can fail on its own.
     let registry = crate::dht::capacity_bond_registry::bootstrap(
         chain_provider,
         capacity_bond_addr,
         Arc::clone(&head),
         cfg.cache.node_to_node_pull_through_enabled,
         Arc::clone(&infra.node_metrics),
+        &boot,
     )
     .await
     .with_context(|| format!("CapacityBond registry bootstrap at {capacity_bond_addr}"))?;
@@ -924,16 +942,17 @@ async fn build_chain_and_handlers(
     // a slash surfaces over `admin_v1_slashes` (+ the `decdn_slashes_detected_total`
     // metric) and the operator can file `decdn appeal slash` in time. Read-only;
     // held to `run()`'s end so its background task lives as long as the daemon.
-    // The boot enumeration is fatal, like the CapacityBond registry bootstrap
-    // above on the same contract that already gates startup — so it adds no new
-    // failure mode; thereafter a tail blip retries and the periodic resync heals
-    // drift, so detection is never disabled for the daemon's lifetime.
+    // The boot enumeration retries on the shared boot budget, like the
+    // CapacityBond registry bootstrap above; thereafter a tail blip retries and
+    // the periodic resync heals drift, so detection is never disabled for the
+    // daemon's lifetime.
     let (slash_store, slash_route) = crate::slash_watcher::bootstrap(
         ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
         capacity_bond_addr,
         infra.eth_signer.address(),
         Arc::clone(&head),
         Arc::clone(&infra.node_metrics),
+        &boot,
     )
     .await
     .context("bootstrap the slash-detection watcher")?;
@@ -1083,67 +1102,30 @@ async fn build_chain_and_handlers(
         "blockchain.payment_pool_address",
     )?;
 
-    // Live operator fee-share seed (ADR 041 / ADR 016 § Tunable Economics).
-    // A fail-fast on-chain self-check at startup — `PaymentPool.feeRouter()`
-    // resolves the router address, then `FeeRouter.getShares()` reads the current
-    // 3-way split, narrowed to the operator's bps. Unlike the rate-bounds read,
-    // NO leg of this chain is fatal to boot: an RPC failure or an unnarrowable
-    // split falls back to `FEE_ROUTER_OPERATOR_BPS_FLOOR` and the node still comes
-    // up, because the `margin` policy is an economic optimization, not a safety
-    // invariant. When the router address itself cannot be read, there is also
-    // nothing to watch, so the `SharesUpdated` route below is only registered on
-    // the success path; a re-read failure of `getShares()` alone still registers
-    // the route, since the watcher's own periodic re-read can recover from there.
-    let fee_router_addr = decdn_incentive::payment_pool::PaymentPool::new(
-        payment_pool_addr,
+    // Live operator fee-share seed (ADR 041 / ADR 016 § Tunable Economics):
+    // `PaymentPool.feeRouter()` resolves the router address, then
+    // `FeeRouter.getShares()` reads the current 3-way split, narrowed to the
+    // operator's bps. Unlike the fail-closed reads, NO leg of this chain is fatal
+    // to boot: a failure falls back to `FEE_ROUTER_OPERATOR_BPS_FLOOR` and the
+    // node still comes up. Both reads retry transient errors; the `feeRouter()`
+    // retry matters most, because `feeRouter` is immutable and a missed read
+    // leaves the `SharesUpdated` route below unregistered until restart. They
+    // retry on a `FEE_SHARE_BOOT_BUDGET` sub-budget of the boot deadline, so a
+    // flapping provider cannot spend the time the later `usdc()` and blacklist
+    // reads need.
+    let crate::fee_shares::FeeShareSeed {
+        router: fee_router_addr,
+        operator_bps: seed_operator_bps,
+    } = crate::fee_shares::seed_from_chain(
         ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+        payment_pool_addr,
+        FEE_ROUTER_OPERATOR_BPS_FLOOR,
+        &boot.capped(FEE_SHARE_BOOT_BUDGET),
     )
-    .feeRouter()
-    .call()
-    .await
-    .inspect_err(|err| {
-        tracing::warn!(
-            error = %err,
-            fallback_bps = FEE_ROUTER_OPERATOR_BPS_FLOOR,
-            "PaymentPool.feeRouter() startup read failed; operator fee share seeded to the \
-             FeeRouter OPERATOR_BPS_FLOOR and the fee-shares watcher is not registered"
-        );
-    })
-    .ok();
-    let seed_operator_bps = match fee_router_addr {
-        Some(addr) => {
-            let fee_router_contract = decdn_incentive::payment_pool::FeeRouter::new(
-                addr,
-                ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
-            );
-            match fee_router_contract.getShares().call().await {
-                Ok(shares) => {
-                    match crate::fee_shares::operator_bps_from_shares(shares, &addr.to_string()) {
-                        Ok(bps) => bps,
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                fallback_bps = FEE_ROUTER_OPERATOR_BPS_FLOOR,
-                                "FeeRouter.getShares() startup read could not be narrowed to \
-                                 operator bps; falling back to OPERATOR_BPS_FLOOR"
-                            );
-                            FEE_ROUTER_OPERATOR_BPS_FLOOR
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        fallback_bps = FEE_ROUTER_OPERATOR_BPS_FLOOR,
-                        "FeeRouter.getShares() startup read failed; falling back to \
-                         OPERATOR_BPS_FLOOR"
-                    );
-                    FEE_ROUTER_OPERATOR_BPS_FLOOR
-                }
-            }
-        }
-        None => FEE_ROUTER_OPERATOR_BPS_FLOOR,
-    };
+    .await;
+    infra
+        .node_metrics
+        .fee_shares_watcher_unregistered(fee_router_addr.is_none());
     let operator_shares = crate::fee_shares::OperatorShares::new(seed_operator_bps);
     tracing::info!(
         bps = seed_operator_bps,
@@ -1383,6 +1365,7 @@ async fn build_chain_and_handlers(
         usize::try_from(cfg.blockchain.redeem_max_vouchers_per_tx).unwrap_or(usize::MAX),
         Duration::from_secs(cfg.blockchain.redeem_interval_secs),
         Arc::clone(&infra.node_metrics),
+        &boot,
         pool_view,
         redeem_tx,
         redeem_rx,
@@ -1416,6 +1399,7 @@ async fn build_chain_and_handlers(
         &infra.node_metrics,
         Arc::clone(&content_denylist),
         chain_freshness,
+        &boot,
     )
     .await
     .context("blacklist compliance watcher boot enumeration")?;
@@ -2538,14 +2522,13 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // flush by a poll — it just cannot report anything once cancelled.
     republish_stop.cancel();
     let _ = bucket_refresh_stop_tx.send(());
-    // The chain watchers are now one multiplexed poller with one shutdown
-    // token, so the previous staggered per-watcher stops collapse to a SINGLE
-    // `poller.shutdown()` at the LATE point below (after `router.shutdown`). The
-    // blacklist and rate-bounds routes, which used to stop here early, move to
-    // that late stop: it is harmless — neither carries a durable cursor to flush,
-    // and neither is consulted for a drain-time decision (unlike the
-    // capacity-bond route's staker set), so they only keep applying
-    // compliance/rate updates a little longer.
+    // The chain watchers are one multiplexed poller with one shutdown token, so
+    // they stop together in a SINGLE `poller.shutdown()` at the LATE point below
+    // (after `router.shutdown`). For the blacklist and rate-bounds routes the
+    // late stop is harmless — neither carries a durable cursor to flush, and
+    // neither is consulted for a drain-time decision (unlike the capacity-bond
+    // route's staker set), so they only keep applying compliance/rate updates a
+    // little longer.
     // Admin server shutdown is ordered per `admin_stop_order`:
     //
     //   - `Early` (the default, including SIGTERM/SIGINT and plain
@@ -5034,11 +5017,12 @@ mod tests {
         assert_eq!(builder.span_ceiling(), 150);
 
         // The hooks land in the exported series: `run` reports the starting
-        // span, and a range rejection bumps the counter.
+        // span, and a range rejection and a window retry bump their counters.
         let built = builder.build();
         assert!(built.is_ok(), "an empty poller builds");
         let Ok(poller) = built else { return };
         poller.fire_range_rejection_for_test();
+        poller.fire_window_retry_for_test();
         let provider = alloy::providers::ProviderBuilder::new()
             .connect_mocked_client(alloy::providers::mock::Asserter::new());
         let shutdown = CancellationToken::new();
@@ -5054,6 +5038,12 @@ mod tests {
                 .lines()
                 .any(|l| l == "decdn_chain_get_logs_range_rejections_total 1"),
             "rejection counter not wired"
+        );
+        assert!(
+            scrape
+                .lines()
+                .any(|l| l == "decdn_chain_get_logs_retries_total 1"),
+            "window-retry counter not wired"
         );
     }
 }

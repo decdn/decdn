@@ -174,7 +174,13 @@ groups:
             and events reach the node late. Check the RPC provider: the
             `multiplexed poller tick error` log lines name the cause, and a
             rising decdn_chain_get_logs_range_rejections_total means the
-            provider caps eth_getLogs.
+            provider caps eth_getLogs. The poller retries a transient
+            eth_getLogs window failure inside the tick
+            (decdn_chain_get_logs_retries_total), so such a failure fails the
+            tick only when the window fails on every retry. A tick can also
+            fail on the head read, on a checkpoint load, on a rate limit or a
+            permanent RPC error (neither is retried), or on a watcher's own
+            apply or reconcile error.
 
       # A latent-bug report, not a degradation (#1517). The engine recovers the
       # guard and clears the poison, so coalescing never stops and no restart is

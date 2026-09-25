@@ -23,10 +23,12 @@ use alloy::providers::Provider;
 use alloy::rpc::types::eth::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::Result;
+use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::payment_pool::FeeRouter;
 
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
+use crate::chain_events::timed;
 use crate::fee_shares::{OperatorShares, operator_bps_from_shares};
 
 /// Projection sink for `SharesUpdated`: decodes each event into the shared
@@ -99,7 +101,15 @@ impl<P: Provider + Clone + 'static> LogSink for FeeSharesSink<P> {
         // `getShares()` must retry on the slow cadence, not on every watcher
         // tick, which would hammer the RPC.
         self.last_poll = Some(now);
-        match self.contract.getShares().call().await {
+        // Bounded by the per-call timeout: a provider that never answers would
+        // otherwise stall this tick, and with it every route on the poller.
+        match timed(
+            None,
+            "FeeRouter.getShares()",
+            self.contract.getShares().call(),
+        )
+        .await
+        {
             Ok(shares) => {
                 self.store_shares(shares, "poll");
             }
@@ -109,7 +119,10 @@ impl<P: Provider + Clone + 'static> LogSink for FeeSharesSink<P> {
                 // off the whole watcher (which would also stall event pickup).
                 // Returning Ok keeps the cursor advancing.
                 self.metrics.fee_shares_watcher_poll_failure();
-                tracing::warn!(error = %err, "fee-shares watcher: authoritative getShares() poll failed; keeping current share");
+                tracing::warn!(
+                    error = %sanitize_err_chain(&err),
+                    "fee-shares watcher: authoritative getShares() poll failed; keeping current share"
+                );
             }
         }
         Ok(())

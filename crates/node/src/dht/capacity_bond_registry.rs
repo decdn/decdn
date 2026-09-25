@@ -37,8 +37,9 @@
 //!
 //! # Fatality
 //!
-//! The single `getRegisteredNodes` bootstrap is fatal: staker-set requires it,
-//! and its failure propagates. The bindings projection (pull-through is
+//! The single `getRegisteredNodes` bootstrap is fatal: staker-set requires it.
+//! A transient RPC failure retries on the shared boot budget; a deterministic
+//! fault or an exhausted budget propagates. The bindings projection (pull-through is
 //! opportunistic, so it would otherwise be non-fatal) has **no RPC of its own**:
 //! it is derived from page data already in hand and cannot fail independently.
 //! The same is true of regions and the reverse map. A node either boots with
@@ -58,6 +59,7 @@ use anyhow::{Context, Result};
 use decdn_protocol::Region;
 use tracing::{debug, info, warn};
 
+use crate::chain_events::boot_retry::{BootFault, BootRetry};
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
 use crate::chain_events::shared_head::HeadSource;
@@ -523,21 +525,28 @@ where
     let mut regions = HashMap::new();
     let mut offset = 0u64;
     loop {
-        let resp = registry
-            .getRegisteredNodes(U256::from(offset), U256::from(PAGE_SIZE))
-            .call()
-            .await
-            .with_context(|| format!("getRegisteredNodes(offset={offset}, limit={PAGE_SIZE})"))?;
+        let resp = timed(
+            None,
+            "getRegisteredNodes",
+            registry
+                .getRegisteredNodes(U256::from(offset), U256::from(PAGE_SIZE))
+                .call(),
+        )
+        .await
+        .with_context(|| format!("getRegisteredNodes(offset={offset}, limit={PAGE_SIZE})"))?;
         // `page` and `active` are equal-length by construction (the contract fills
         // both in one loop). A divergence is an ABI/decoder fault; the `zip` below
-        // would silently truncate and drop stakers/bindings, so fail loudly.
-        anyhow::ensure!(
-            resp.page.len() == resp.active.len(),
-            "getRegisteredNodes(offset={offset}) returned mismatched page/active \
-             lengths ({} vs {}) — ABI or decoder fault",
-            resp.page.len(),
-            resp.active.len()
-        );
+        // would silently truncate and drop stakers/bindings, so fail loudly. It is
+        // a `BootFault`, so a boot read does not retry it.
+        if resp.page.len() != resp.active.len() {
+            return Err(BootFault(format!(
+                "getRegisteredNodes(offset={offset}) returned mismatched page/active \
+                 lengths ({} vs {}) — ABI or decoder fault",
+                resp.page.len(),
+                resp.active.len()
+            ))
+            .into());
+        }
         if resp.page.is_empty() {
             break;
         }
@@ -564,6 +573,9 @@ where
 /// Enumerate `CapacityBond` once, then spawn the single watcher that keeps both
 /// projections current.
 ///
+/// The head read and the enumeration retry transient failures on `boot`'s
+/// budget; a deterministic fault or an exhausted budget fails the bootstrap.
+///
 /// `track_node_addresses` mirrors `cache.node_to_node_pull_through_enabled`.
 pub async fn bootstrap<P>(
     provider: P,
@@ -571,6 +583,7 @@ pub async fn bootstrap<P>(
     head: Arc<dyn HeadSource>,
     track_node_addresses: bool,
     metrics: Arc<Metrics>,
+    boot: &BootRetry,
 ) -> Result<RegistryHandles>
 where
     P: Provider + Clone + 'static,
@@ -583,14 +596,21 @@ where
     // the snapshot already reflects is a no-op in every arm, so overlap is safe
     // but a gap is not. (`SharedHead`'s TTL only ever makes this cursor *older*,
     // which widens the overlap — it cannot open a gap.)
-    let snapshot_block = head
-        .head()
-        .await
-        .context("read head block for CapacityBond registry snapshot")?;
-    let (initial_active, initial_bindings, initial_operator_to_node, initial_regions) =
-        bootstrap_registry(&registry).await.with_context(|| {
-            format!("paginated getRegisteredNodes from CapacityBond at {registry_addr}")
-        })?;
+    let (
+        snapshot_block,
+        (initial_active, initial_bindings, initial_operator_to_node, initial_regions),
+    ) = boot
+        .run("CapacityBond registry snapshot", || async {
+            let snapshot_block = head
+                .head()
+                .await
+                .context("read head block for CapacityBond registry snapshot")?;
+            let snapshot = bootstrap_registry(&registry).await.with_context(|| {
+                format!("paginated getRegisteredNodes from CapacityBond at {registry_addr}")
+            })?;
+            Ok((snapshot_block, snapshot))
+        })
+        .await?;
     info!(
         active_count = initial_active.len(),
         binding_count = initial_bindings.len(),
@@ -776,6 +796,109 @@ mod tests {
                 CapacityBond::EjectedByBlacklist::SIGNATURE_HASH,
                 CapacityBond::RegionUpdated::SIGNATURE_HASH,
             ]
+        );
+    }
+
+    /// A transient provider error on the registry snapshot is retried on the
+    /// boot budget, not fatal.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_boot_snapshot_error_is_retried() {
+        use crate::chain_events::boot_retry::{BOOT_CHAIN_RETRY_BUDGET, BootRetry};
+        use crate::chain_events::shared_head::SharedHead;
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+        use alloy::sol_types::SolCall;
+
+        let head_asserter = Asserter::new();
+        head_asserter.push_success(&alloy::primitives::U64::from(100));
+        let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(
+            ProviderBuilder::new().connect_mocked_client(head_asserter),
+            Duration::from_hours(1),
+            None,
+        ));
+        let asserter = Asserter::new();
+        asserter.push_failure(
+            serde_json::from_value(serde_json::json!({
+                "code": 1,
+                "message": "no available upstreams to process the request",
+            }))
+            .unwrap(),
+        );
+        let empty: (Vec<CapacityBond::NodeInfo>, Vec<bool>) = (Vec::new(), Vec::new());
+        asserter.push_success(&Bytes::from(
+            CapacityBond::getRegisteredNodesCall::abi_encode_returns_tuple(&empty),
+        ));
+        let metrics = Arc::new(Metrics::new());
+
+        let handles = bootstrap(
+            ProviderBuilder::new().connect_mocked_client(asserter.clone()),
+            Address::repeat_byte(0x11),
+            head,
+            false,
+            Arc::clone(&metrics),
+            &BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&metrics)),
+        )
+        .await
+        .unwrap();
+
+        assert!(handles.operator_to_node.read().unwrap().is_empty());
+        assert!(asserter.read_q().is_empty(), "both attempts ran");
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_chain_boot_read_retries_total 1"),
+            "{text}"
+        );
+    }
+
+    /// A stalled provider cannot wedge the snapshot: each page read is bounded
+    /// by the per-call timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_provider_fails_the_snapshot_read() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+
+        let registry = CapacityBond::new(Address::repeat_byte(0x11), hanging_provider());
+        let err = bounded("registry snapshot", bootstrap_registry(&registry))
+            .await
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap();
+
+        assert!(err.contains("getRegisteredNodes timed out after"), "{err}");
+    }
+
+    /// A page whose `active[]` length differs from its `page` length is a
+    /// decoder fault, and a boot read must not retry it.
+    #[tokio::test]
+    async fn a_page_length_mismatch_is_a_permanent_boot_fault() {
+        use alloy::sol_types::SolCall;
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        let page = vec![CapacityBond::NodeInfo {
+            nodeId: B256::repeat_byte(0x01),
+            ethAddress: Address::repeat_byte(0x02),
+            active: true,
+            lastMultiaddrUpdate: 0,
+            multiaddrs: Bytes::new(),
+            regionHint: String::new(),
+        }];
+        let active: Vec<bool> = Vec::new();
+        asserter.push_success(&Bytes::from(
+            CapacityBond::getRegisteredNodesCall::abi_encode_returns_tuple(&(page, active)),
+        ));
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let err = bootstrap_registry(&CapacityBond::new(Address::repeat_byte(0x11), provider))
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("mismatched page/active"),
+            "{err:#}"
+        );
+        assert!(
+            err.chain().any(<dyn std::error::Error>::is::<BootFault>),
+            "{err:#}"
         );
     }
 

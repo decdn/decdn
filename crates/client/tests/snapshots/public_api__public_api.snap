@@ -264,6 +264,8 @@ pub async fn decdn_client::probe::probe_once(&iroh::endpoint::Endpoint, iroh_bas
 pub fn decdn_client::probe::verify_probe_response(&decdn_protocol::message::ProbeResponse, alloy_primitives::bits::address::Address, &alloy_sol_types::eip712::Eip712Domain, [u8; 32], u64) -> anyhow::Result<()>
 pub mod decdn_client::provider
 pub fn decdn_client::provider::build_provider(&str, &alloy_signer_local::PrivateKeySigner) -> anyhow::Result<impl alloy_provider::provider::trait::Provider + core::clone::Clone + use<>>
+pub fn decdn_client::provider::is_permanent_contract_error(&alloy_contract::error::Error) -> bool
+pub fn decdn_client::provider::is_permanent_rpc_error(&alloy_transport::error::TransportError) -> bool
 pub mod decdn_client::ranged_store
 pub struct decdn_client::ranged_store::ClientRangedStore
 impl decdn_client::ranged_store::ClientRangedStore
