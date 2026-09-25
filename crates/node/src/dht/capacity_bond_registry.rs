@@ -51,6 +51,7 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
@@ -62,7 +63,7 @@ use tracing::{debug, info, warn};
 use crate::chain_events::boot_retry::{BootFault, BootRetry};
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
-use crate::chain_events::shared_head::{HeadSource, snapshot_block};
+use crate::chain_events::shared_head::{HeadSource, boot_snapshot_block};
 use crate::chain_events::timed;
 use crate::dht::chain_projection::{with_read, with_write};
 use crate::dht::chain_staker_set::{ChainStakerSet, StakerChange, apply_change};
@@ -164,7 +165,7 @@ impl<P: Provider + Clone> RegistryChainReads for ContractReads<P> {
         HashMap<Address, NodeId>,
         HashMap<NodeId, String>,
     )> {
-        bootstrap_registry(&self.registry).await
+        bootstrap_registry(&self.registry, BlockId::latest()).await
     }
 
     async fn node_id_of(&self, operator: Address) -> Result<Option<(NodeId, bool)>> {
@@ -508,8 +509,12 @@ const REGISTRY_RESYNC_INTERVAL: Duration = Duration::from_mins(15);
 /// round-trip. `operator_to_node` is the inverse of `bindings`, built from the
 /// same page with no chain call of its own; like `regions` it is unfiltered and
 /// always built.
+///
+/// Every page reads at `at`: the boot snapshot block, so the pages agree with
+/// each other and with the seeded cursor, or `latest` for the periodic resync.
 async fn bootstrap_registry<P>(
     registry: &CapacityBond::CapacityBondInstance<P>,
+    at: BlockId,
 ) -> Result<(
     HashSet<NodeId>,
     HashMap<NodeId, Address>,
@@ -530,6 +535,7 @@ where
             "getRegisteredNodes",
             registry
                 .getRegisteredNodes(U256::from(offset), U256::from(PAGE_SIZE))
+                .block(at)
                 .call(),
         )
         .await
@@ -590,26 +596,26 @@ where
 {
     let registry = CapacityBond::new(registry_addr, provider.clone());
 
-    // Snapshot block BEFORE the enumeration, then seed the cursor there. The
-    // reverse order would lose any event landing between the enumeration and the
-    // head read: it would be neither in the snapshot nor above the cursor.
-    // Re-applying an event the snapshot already reflects is a no-op in every arm,
-    // so overlap is safe but a gap is not. The enumeration reads `latest`, which a
-    // lagging upstream behind a load-balanced RPC resolves below the reported
-    // head, so the cursor sits `SNAPSHOT_LAG_MARGIN_BLOCKS` below it to stay at or
-    // under the block the enumeration saw. (`SharedHead`'s TTL only ever makes
-    // this cursor *older*, which widens the overlap — it cannot open a gap.)
+    // Snapshot block BEFORE the enumeration, then pin every page to it and seed
+    // the cursor there. The reverse order would lose any event landing between
+    // the enumeration and the head read: it would be neither in the snapshot nor
+    // above the cursor. Re-applying an event the snapshot already reflects is a
+    // no-op in every arm, so overlap is safe but a gap is not. The block sits
+    // `SNAPSHOT_LAG_MARGIN_BLOCKS` below the reported head so every upstream
+    // behind a load-balanced RPC can serve the pinned pages.
     let (
         snapshot_block,
         (initial_active, initial_bindings, initial_operator_to_node, initial_regions),
     ) = boot
         .run("CapacityBond registry snapshot", || async {
-            let snapshot_block = snapshot_block(&*head)
+            let snapshot_block = boot_snapshot_block(registry.provider(), &*head, registry_addr)
                 .await
                 .context("read the CapacityBond registry snapshot block")?;
-            let snapshot = bootstrap_registry(&registry).await.with_context(|| {
-                format!("paginated getRegisteredNodes from CapacityBond at {registry_addr}")
-            })?;
+            let snapshot = bootstrap_registry(&registry, BlockId::number(snapshot_block))
+                .await
+                .with_context(|| {
+                    format!("paginated getRegisteredNodes from CapacityBond at {registry_addr}")
+                })?;
             Ok((snapshot_block, snapshot))
         })
         .await?;
@@ -826,6 +832,8 @@ mod tests {
             }))
             .unwrap(),
         );
+        // The retry: the deploy-floor `eth_getCode`, then one empty page.
+        asserter.push_success(&Bytes::from_static(&[0x60]));
         let empty: (Vec<CapacityBond::NodeInfo>, Vec<bool>) = (Vec::new(), Vec::new());
         asserter.push_success(&Bytes::from(
             CapacityBond::getRegisteredNodesCall::abi_encode_returns_tuple(&empty),
@@ -860,11 +868,14 @@ mod tests {
         use crate::chain_events::test_support::{bounded, hanging_provider};
 
         let registry = CapacityBond::new(Address::repeat_byte(0x11), hanging_provider());
-        let err = bounded("registry snapshot", bootstrap_registry(&registry))
-            .await
-            .err()
-            .map(|e| format!("{e:#}"))
-            .unwrap();
+        let err = bounded(
+            "registry snapshot",
+            bootstrap_registry(&registry, BlockId::latest()),
+        )
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap();
 
         assert!(err.contains("getRegisteredNodes timed out after"), "{err}");
     }
@@ -890,9 +901,12 @@ mod tests {
         ));
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let err = bootstrap_registry(&CapacityBond::new(Address::repeat_byte(0x11), provider))
-            .await
-            .unwrap_err();
+        let err = bootstrap_registry(
+            &CapacityBond::new(Address::repeat_byte(0x11), provider),
+            BlockId::latest(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("mismatched page/active"),

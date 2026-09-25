@@ -51,7 +51,7 @@ use decdn_common::redact::sanitize_err_chain;
 use crate::chain_events::boot_retry::BootRetry;
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
-use crate::chain_events::shared_head::{HeadSource, snapshot_block};
+use crate::chain_events::shared_head::{HeadSource, boot_snapshot_block};
 use crate::chain_events::timed;
 use crate::metrics::{Metrics, metric_hook};
 
@@ -304,9 +304,10 @@ pub async fn bootstrap<P: Provider + Clone + 'static>(
     // no-op, so overlap is safe but a gap is not.
     let (snapshot_block, initial) = boot
         .run("slash enumeration snapshot", || async {
-            let snapshot_block = snapshot_block(&*head)
-                .await
-                .context("read the slash enumeration snapshot block")?;
+            let snapshot_block =
+                boot_snapshot_block(reads.bond.provider(), &*head, capacity_bond_addr)
+                    .await
+                    .context("read the slash enumeration snapshot block")?;
             let initial = bootstrap_slashes(
                 &reads,
                 self_address,
@@ -609,7 +610,9 @@ mod tests {
             }))
             .unwrap(),
         );
-        // The retry: no slashes, then the pause offset.
+        // The retry: the deploy-floor `eth_getCode`, no slashes, then the pause
+        // offset.
+        asserter.push_success(&alloy::primitives::Bytes::from_static(&[0x60]));
         for _ in 0..2 {
             asserter.push_success(&alloy::primitives::Bytes::from(U256::ZERO.abi_encode()));
         }
@@ -857,8 +860,9 @@ mod tests {
         );
     }
 
-    /// A JSON-RPC responder that answers `eth_blockNumber` with block 100 and
-    /// every `eth_call` with a zero word, recording each call's block tag.
+    /// A JSON-RPC responder that answers `eth_blockNumber` with block 1000 and
+    /// every other call (`eth_getCode`, `eth_call`) with a zero word, recording
+    /// each call's block tag.
     struct BlockTagRpc {
         tags: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     }
@@ -924,10 +928,11 @@ mod tests {
         .await
         .unwrap();
 
-        // No slashes: the count and the pause offset.
+        // No slashes: the deploy-floor `eth_getCode`, the count and the pause
+        // offset.
         let tags = tags.lock().unwrap().clone();
         let pinned = format!("{:#x}", 1_000 - SNAPSHOT_LAG_MARGIN_BLOCKS);
-        assert_eq!(tags, vec![serde_json::json!(pinned); 2]);
+        assert_eq!(tags, vec![serde_json::json!(pinned); 3]);
     }
 
     /// A stalled provider cannot wedge boot: every read is bounded by the
@@ -965,7 +970,7 @@ mod tests {
         .map(|e| format!("{e:#}"))
         .unwrap();
 
-        assert!(err.contains("operatorSlashCount timed out after"), "{err}");
+        assert!(err.contains("eth_getCode timed out after"), "{err}");
     }
 
     /// A deterministic head-read failure keeps its typed cause through the

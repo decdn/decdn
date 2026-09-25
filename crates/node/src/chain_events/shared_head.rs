@@ -32,6 +32,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy::eips::BlockId;
+use alloy::primitives::Address;
 use alloy::providers::Provider;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -73,13 +75,29 @@ pub trait HeadSource: Send + Sync {
 /// `(snapshot, head]` as a harmless overlap.
 pub const SNAPSHOT_LAG_MARGIN_BLOCKS: u64 = 256;
 
-/// The block a boot enumeration pins its reads to and seeds its tail cursor at:
-/// [`SNAPSHOT_LAG_MARGIN_BLOCKS`] below the head, saturating at genesis.
-pub(crate) async fn snapshot_block(head: &dyn HeadSource) -> Result<u64> {
-    Ok(head
-        .head()
-        .await?
-        .saturating_sub(SNAPSHOT_LAG_MARGIN_BLOCKS))
+/// The block a boot enumeration of `contract` pins its reads to and seeds its
+/// tail cursor at: [`SNAPSHOT_LAG_MARGIN_BLOCKS`] below the head.
+///
+/// A contract with no code at that block was deployed inside the margin — a
+/// fresh local chain, or a boot right after a deploy. Reads pinned there would
+/// decode an empty return, so the snapshot takes the head itself. A chain that
+/// young has no upstream lag worth the margin.
+pub(crate) async fn boot_snapshot_block<P: Provider>(
+    provider: &P,
+    head: &dyn HeadSource,
+    contract: Address,
+) -> Result<u64> {
+    let head = head.head().await?;
+    let lagged = head.saturating_sub(SNAPSHOT_LAG_MARGIN_BLOCKS);
+    let code = timed(
+        None,
+        "eth_getCode",
+        provider
+            .get_code_at(contract)
+            .block_id(BlockId::number(lagged)),
+    )
+    .await?;
+    Ok(if code.is_empty() { head } else { lagged })
 }
 
 /// A cached head read plus the instant it was taken.
@@ -210,7 +228,7 @@ impl<P: Provider> HeadSource for SharedHead<P> {
 )]
 mod tests {
     use super::*;
-    use alloy::primitives::U64;
+    use alloy::primitives::{Bytes, U64};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
 
@@ -500,19 +518,47 @@ mod tests {
         assert_eq!(asserter.read_q().len(), 0, "one RPC, not two");
     }
 
-    /// A boot snapshot sits the lag margin below the reported head, and a head
-    /// inside the margin saturates at genesis rather than underflowing.
+    /// A boot snapshot sits the lag margin below the reported head while the
+    /// contract has code there.
     #[tokio::test]
-    async fn snapshot_block_sits_the_margin_below_head() {
+    async fn boot_snapshot_block_sits_the_margin_below_head() {
         let (asserter, provider) = mocked();
         asserter.push_success(&U64::from(1_000));
+        asserter.push_success(&Bytes::from_static(&[0x60, 0x80]));
+        let head = SharedHead::with_ttl(provider.clone(), Duration::ZERO, None);
+
+        let block = boot_snapshot_block(&provider, &head, Address::ZERO)
+            .await
+            .ok();
+
+        assert_eq!(block, Some(1_000 - SNAPSHOT_LAG_MARGIN_BLOCKS));
+        assert_eq!(asserter.read_q().len(), 0);
+    }
+
+    /// A contract deployed inside the margin has no code at the lagged block, so
+    /// the snapshot takes the head — including a head below the margin, whose
+    /// lagged block saturates at genesis.
+    #[tokio::test]
+    async fn boot_snapshot_block_takes_the_head_when_the_contract_is_younger() {
+        let (asserter, provider) = mocked();
+        asserter.push_success(&U64::from(1_000));
+        asserter.push_success(&Bytes::new());
         asserter.push_success(&U64::from(SNAPSHOT_LAG_MARGIN_BLOCKS - 1));
-        let head = SharedHead::with_ttl(provider, Duration::ZERO, None);
+        asserter.push_success(&Bytes::new());
+        let head = SharedHead::with_ttl(provider.clone(), Duration::ZERO, None);
 
         assert_eq!(
-            snapshot_block(&head).await.ok(),
-            Some(1_000 - SNAPSHOT_LAG_MARGIN_BLOCKS)
+            boot_snapshot_block(&provider, &head, Address::ZERO)
+                .await
+                .ok(),
+            Some(1_000)
         );
-        assert_eq!(snapshot_block(&head).await.ok(), Some(0));
+        assert_eq!(
+            boot_snapshot_block(&provider, &head, Address::ZERO)
+                .await
+                .ok(),
+            Some(SNAPSHOT_LAG_MARGIN_BLOCKS - 1)
+        );
+        assert_eq!(asserter.read_q().len(), 0);
     }
 }

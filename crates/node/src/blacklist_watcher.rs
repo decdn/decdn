@@ -114,7 +114,7 @@ use tracing::{debug, info, warn};
 use crate::chain_events::boot_retry::{BootFault, BootRetry};
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
-use crate::chain_events::shared_head::{HeadSource, snapshot_block};
+use crate::chain_events::shared_head::{HeadSource, boot_snapshot_block};
 use crate::chain_events::timed;
 use crate::chain_freshness::ChainFreshness;
 use crate::content_deny::ContentDenylist;
@@ -160,9 +160,12 @@ impl InitialSyncGate {
 /// `Send`. Production monomorphizes to the alloy contract impl
 /// ([`ContractReads`]).
 trait BlacklistChainReads: Send + Sync {
-    /// The block every enumeration read is pinned to: the lag margin below
-    /// the head (`shared_head::snapshot_block`).
-    fn snapshot_block(&self) -> impl Future<Output = Result<u64>> + Send;
+    /// The current head (`eth_blockNumber`), the pin for a periodic
+    /// re-enumeration.
+    fn head(&self) -> impl Future<Output = Result<u64>> + Send;
+    /// The boot snapshot block (`shared_head::boot_snapshot_block`): the lag
+    /// margin below the head.
+    fn boot_snapshot_block(&self) -> impl Future<Output = Result<u64>> + Send;
     /// The one-to-three region keys in scope for `operator` right now
     /// (`getScopeRegions`, GLOBAL first).
     fn scope_regions(
@@ -222,8 +225,17 @@ struct ContractReads<P: Provider + Clone> {
 }
 
 impl<P: Provider + Clone> BlacklistChainReads for ContractReads<P> {
-    async fn snapshot_block(&self) -> Result<u64> {
-        snapshot_block(&*self.head).await
+    async fn head(&self) -> Result<u64> {
+        self.head.head().await
+    }
+
+    async fn boot_snapshot_block(&self) -> Result<u64> {
+        boot_snapshot_block(
+            self.contract.provider(),
+            &*self.head,
+            *self.contract.address(),
+        )
+        .await
     }
 
     async fn scope_regions(&self, operator: Address, at: u64) -> Result<Vec<B256>> {
@@ -333,17 +345,33 @@ struct BootstrapSnapshot {
     known: HashSet<(B256, Hash)>,
 }
 
-/// Enumerate the current on-chain deny-set at one pinned block: take the
-/// snapshot block (the lag margin below head), then page the address union and
-/// the per-region hash sets against that height.
+/// The block an enumeration pins its reads to.
+#[derive(Clone, Copy, Debug)]
+enum SnapshotPin {
+    /// The boot enumeration: the lag margin below head, so every upstream behind
+    /// a load-balanced RPC can serve it. The tail cursor is seeded here and
+    /// replays the margin.
+    Boot,
+    /// A periodic re-enumeration: the head. Its fold replaces the origin set
+    /// wholesale, so the snapshot must be no older than the blocks the tail has
+    /// already applied. A lagged snapshot would drop an origin the tail
+    /// blacklisted inside the margin.
+    Head,
+}
+
+/// Enumerate the current on-chain deny-set at one pinned block, chosen by
+/// `pin`, then page the address union and the per-region hash sets against
+/// that height.
 async fn bootstrap_snapshot<R: BlacklistChainReads>(
     reads: &R,
     operator: Address,
+    pin: SnapshotPin,
 ) -> Result<BootstrapSnapshot> {
-    let block = reads
-        .snapshot_block()
-        .await
-        .context("read the ContentBlacklist enumeration snapshot block")?;
+    let block = match pin {
+        SnapshotPin::Boot => reads.boot_snapshot_block().await,
+        SnapshotPin::Head => reads.head().await,
+    }
+    .context("read the ContentBlacklist enumeration snapshot block")?;
     let origins = enumerate_address_union(reads, operator, block).await?;
     let known = enumerate_known(reads, operator, block).await?;
     Ok(BootstrapSnapshot {
@@ -593,13 +621,13 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
             .is_none_or(|at| at.elapsed() >= self.rescan_interval);
 
         // The re-enumeration backstop. Rebuild the address union + in-scope hash set
-        // at a fresh pinned block and fold it into the projections: origins are
+        // pinned at head (`SnapshotPin::Head`) and fold it into the projections: origins are
         // authoritative (replace wholesale), the `known` worklist is UNIONed so an
         // out-of-scope entry the tail learned (retained for future ripening) is not
         // dropped by an in-scope-only enumeration. Build-then-fold; Ok-on-failure
         // keeps the current set. The `rescan` below then re-scopes + evicts.
         if due {
-            match bootstrap_snapshot(&self.reads, self.operator).await {
+            match bootstrap_snapshot(&self.reads, self.operator, SnapshotPin::Head).await {
                 Ok(snapshot) => self.state.fold_reenumeration(snapshot),
                 Err(err) => warn!(
                     error = %sanitize_err_chain(&err),
@@ -1107,7 +1135,7 @@ async fn enumerate_and_enforce<P>(
 where
     P: Provider + Clone,
 {
-    let snapshot = bootstrap_snapshot(reads, operator).await?;
+    let snapshot = bootstrap_snapshot(reads, operator, SnapshotPin::Boot).await?;
     denylist.set_chain_origins(snapshot.origins.clone());
     let mut state = WatcherState {
         known: snapshot.known,
@@ -1426,7 +1454,12 @@ mod tests {
     /// overrides so a test can simulate a swap-and-pop `seen != count` skew.
     struct StubReads {
         operator: Address,
+        /// The block every read must be pinned to.
         block: u64,
+        /// What `head` reports; `None` reports `block`.
+        head: Option<u64>,
+        /// What `boot_snapshot_block` reports; `None` reports `block`.
+        boot_block: Option<u64>,
         /// RAW `blacklistedAddresses` membership.
         addresses: Vec<Address>,
         /// Override for `blacklistedAddressCount` (defaults to `addresses.len()`).
@@ -1448,6 +1481,8 @@ mod tests {
             Self {
                 operator,
                 block: 42,
+                head: None,
+                boot_block: None,
                 addresses: Vec::new(),
                 address_count: None,
                 origin_live: HashSet::new(),
@@ -1460,8 +1495,12 @@ mod tests {
     }
 
     impl BlacklistChainReads for StubReads {
-        async fn snapshot_block(&self) -> Result<u64> {
-            Ok(self.block)
+        async fn head(&self) -> Result<u64> {
+            Ok(self.head.unwrap_or(self.block))
+        }
+
+        async fn boot_snapshot_block(&self) -> Result<u64> {
+            Ok(self.boot_block.unwrap_or(self.block))
         }
 
         async fn scope_regions(&self, operator: Address, at: u64) -> Result<Vec<B256>> {
@@ -1627,15 +1666,14 @@ mod tests {
         assert!(format!("{err:#}").contains("read 1 of 3"), "{err:#}");
     }
 
-    /// `ContractReads::snapshot_block` must route through the shared, TTL-cached
+    /// `ContractReads::head` must route through the shared, TTL-cached
     /// [`SharedHead`] single-flight rather than issue its own `eth_blockNumber` —
-    /// two calls inside the TTL cost exactly one RPC — and pin the lag margin
-    /// below the head it reads. The unconsumed asserter
+    /// two calls inside the TTL cost exactly one RPC. The unconsumed asserter
     /// queue is the proof: a second direct read would have popped a response
     /// that was never pushed.
     #[tokio::test]
-    async fn contract_reads_snapshot_block_routes_through_shared_head() -> Result<()> {
-        use crate::chain_events::shared_head::{SNAPSHOT_LAG_MARGIN_BLOCKS, SharedHead};
+    async fn contract_reads_head_routes_through_shared_head() -> Result<()> {
+        use crate::chain_events::shared_head::SharedHead;
         use alloy::primitives::U64;
         use alloy::providers::ProviderBuilder;
         use alloy::providers::mock::Asserter;
@@ -1643,18 +1681,17 @@ mod tests {
         const TTL: Duration = Duration::from_secs(4);
 
         let asserter = Asserter::new();
-        asserter.push_success(&U64::from(1_000));
+        asserter.push_success(&U64::from(100));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(provider.clone(), TTL, None));
-        let pinned = 1_000 - SNAPSHOT_LAG_MARGIN_BLOCKS;
 
         let contract = ContentBlacklist::new(Address::ZERO, provider);
         let reads = ContractReads { contract, head };
 
-        assert_eq!(reads.snapshot_block().await?, pinned);
+        assert_eq!(reads.head().await?, 100);
         assert_eq!(
-            reads.snapshot_block().await?,
-            pinned,
+            reads.head().await?,
+            100,
             "second call is TTL-cached via SharedHead"
         );
         assert_eq!(
@@ -1681,13 +1718,42 @@ mod tests {
         .into_iter()
         .collect();
 
-        let snapshot = bootstrap_snapshot(&stub, op).await?;
+        let snapshot = bootstrap_snapshot(&stub, op, SnapshotPin::Boot).await?;
 
         assert_eq!(snapshot.block, stub.block);
         assert_eq!(snapshot.known.len(), 3);
         assert!(snapshot.known.contains(&(global, hash(0x11))));
         assert!(snapshot.known.contains(&(US, hash(0x22))));
         assert!(snapshot.known.contains(&(US, hash(0x33))));
+        Ok(())
+    }
+
+    /// The boot enumeration pins the lagged boot snapshot block, never the head:
+    /// the stub asserts every read against `block`, so a head-pinned read fails.
+    #[tokio::test]
+    async fn the_boot_enumeration_pins_the_boot_snapshot_block() -> Result<()> {
+        let op = addr(0xF1);
+        let mut stub = StubReads::new(op);
+        stub.head = Some(stub.block + 256);
+
+        let snapshot = bootstrap_snapshot(&stub, op, SnapshotPin::Boot).await?;
+
+        assert_eq!(snapshot.block, stub.block);
+        Ok(())
+    }
+
+    /// A periodic re-enumeration pins the head, never the lagged boot block. Its
+    /// fold replaces the origin set wholesale, so a lagged snapshot would drop an
+    /// origin the tail had already blacklisted inside the margin.
+    #[tokio::test]
+    async fn a_periodic_re_enumeration_pins_the_head() -> Result<()> {
+        let op = addr(0xF2);
+        let mut stub = StubReads::new(op);
+        stub.boot_block = Some(stub.block - 16);
+
+        let snapshot = bootstrap_snapshot(&stub, op, SnapshotPin::Head).await?;
+
+        assert_eq!(snapshot.block, stub.block);
         Ok(())
     }
 
@@ -1906,10 +1972,12 @@ mod tests {
         serde_json::from_value(serde_json::json!({ "code": code, "message": message })).unwrap()
     }
 
-    /// Queue the reads of a clean enumeration: no blacklisted addresses, and
-    /// `hashes` under the one in-scope region `US`.
+    /// Queue the reads of a clean enumeration: the boot snapshot's deploy-floor
+    /// `eth_getCode`, no blacklisted addresses, and `hashes` under the one
+    /// in-scope region `US`.
     fn push_enumeration(asserter: &alloy::providers::mock::Asserter, hashes: &[B256]) {
         use alloy::sol_types::SolValue;
+        asserter.push_success(&alloy::primitives::Bytes::from_static(&[0x60]));
         asserter.push_success(&alloy::primitives::Bytes::from(U256::ZERO.abi_encode()));
         if hashes.is_empty() {
             asserter.push_success(&alloy::primitives::Bytes::from(
