@@ -4102,6 +4102,9 @@ mod tests {
             "decdn_cache_evictions_starved_total",
             "decdn_cache_size_measure_failures_total",
             "decdn_cache_evicted_operator_total",
+            // Per-partial `observe()` failures inside the size walk. The struct
+            // field is `partial_size_observe_failures`.
+            "decdn_cache_partial_size_observe_failures_total",
             // Serve-detected stored corruption. The struct field is
             // `held_corruption_quarantined`.
             "decdn_cache_held_corruption_quarantined_total",

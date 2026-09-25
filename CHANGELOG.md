@@ -825,6 +825,25 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **The cache footprint counts a partial blob's present bytes (#2157).**
+  `size_snapshot` sized a partial blob from iroh-blobs' `status()`, which
+  leaves the size unknown until the blob's last chunk arrives and then reports
+  the whole blob. A middle-range or front-range fill counted as 0 bytes, and a
+  fill that holds the tail counted as the full blob. `decdn_cache_bytes` read 0
+  on a node that held gigabytes of node-tier miss fills, and the eviction
+  driver undercounted those fills: they never pushed the cache over its
+  high-water mark, and an eviction of one counted 0 bytes freed. A partial
+  blob now counts the bytes its bitfield marks present. This fixes the gauge,
+  the eviction footprint, and GC reclaim attribution. The size walk re-reads a
+  partial's bitfield at most once per 30 s, because each read of an idle
+  partial fsyncs its store files, so a growing fill's count trails by up to
+  30 s. A partial whose bitfield read fails counts at its last known count,
+  else at `status()`'s size, and the walk goes on; each such failure ticks the
+  new `decdn_cache_partial_size_observe_failures_total` and logs the hash. A
+  partial fill is now an eviction candidate as soon as it is admitted. Before,
+  it became one only after a serve completed, so the driver never selected a
+  fill whose serve aborted or went unpaid.
+
 - **A redemption whose receipt wait fails but whose transaction mined counts
   as landed, not as a failure (#2154).** A load-balanced RPC can fail the
   receipt wait with `Unknown block` when the backend that answers has not seen

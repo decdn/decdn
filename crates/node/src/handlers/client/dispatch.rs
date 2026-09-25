@@ -1162,9 +1162,10 @@ impl ClientHandler {
         // genuinely empty blob, which audits as serveable at size 0.
         //
         // The remaining branch is a miss the fill legs above just completed, so
-        // the blob is on disk now: an `inspect` error — or a `None` size (a
-        // `Partial`/`NotFound` status) — means the fill did not land what it
-        // reported, which is a real store fault and NOT a zero-length blob.
+        // the blob is on disk now: an `inspect` error — or a `None` size
+        // (`NotFound`, or a `Partial` whose last chunk has not validated) — means
+        // the fill did not land what it reported, which is a real store fault
+        // and NOT a zero-length blob.
         // Advertising `total_bytes: 0` for a non-empty blob would sign a
         // `StreamResponse` the delivery then contradicts, and the receiver
         // (expecting 0 bytes) would abort on the first chunk. Surface the fault

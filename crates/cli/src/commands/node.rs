@@ -224,9 +224,9 @@ fn write_dry_run_human(w: &mut impl io::Write, hash: &str, resp: &EvictResponse)
     writeln!(w, "already_evicted={}", resp.preview.already_evicted)?;
     match resp.preview.size_bytes {
         Some(b) => writeln!(w, "size_bytes={b}")?,
-        // Distinct from "0" (a legitimately empty blob); operators
-        // seeing `not_stored` know the iroh-blobs status reported
-        // `NotFound`, not `Complete { size: 0 }`.
+        // Distinct from "0" (a legitimately empty blob): the iroh-blobs
+        // status reported `NotFound`, or a partial blob whose last chunk has
+        // not arrived (`Partial { size: None }`), not `Complete { size: 0 }`.
         None => writeln!(w, "size_bytes=not_stored")?,
     }
     match resp.preview.last_accessed_us_ago {

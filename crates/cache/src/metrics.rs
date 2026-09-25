@@ -345,6 +345,17 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_size_measure_failures_total`.
     pub size_measure_failures: Counter,
+    /// Partial blobs whose `observe()` failed during a cache-size walk
+    /// (`decdn_cache_partial_size_observe_failures_total`). The walk counts
+    /// such a blob at its last known present bytes, else at `status()`'s size,
+    /// and keeps going, so `bytes` stays fresh but can be off for that blob.
+    /// The walk retries a failed blob once per partial-size TTL, so a store
+    /// entry that stays broken ticks this steadily. The `warn!` beside each
+    /// tick names the hash.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_partial_size_observe_failures_total`.
+    pub partial_size_observe_failures: Counter,
     /// Times the in-flight fill-coalescing mutex was found poisoned
     /// (#1517). A poison means some earlier task panicked while holding
     /// the map guard; the workspace anti-panic policy (`unwrap_used` /

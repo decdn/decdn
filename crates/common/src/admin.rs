@@ -177,9 +177,10 @@ pub struct EvictResponse {
 pub struct EvictPreview {
     /// Bytes the iroh-blobs store reports for this hash, read straight
     /// from the underlying store regardless of evicted-log state.
-    /// `None` when the blob isn't in the store. `Partial` blobs (an
-    /// interrupted pull) report whatever size the store has so far —
-    /// operators can spot a half-finished pull while inspecting.
+    /// `None` when the blob isn't in the store. A complete blob reports its
+    /// byte length. A partial blob (an interrupted or range pull) reports
+    /// the whole blob's validated size once its last chunk has arrived, and
+    /// `None` before — not the bytes it holds on disk.
     pub size_bytes: Option<u64>,
     /// Microseconds elapsed since the last `get()` against this hash.
     /// `None` when no access has been recorded — typical for a hash

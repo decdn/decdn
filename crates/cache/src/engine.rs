@@ -215,6 +215,11 @@ struct Inner {
     /// (`DashMap`) so it never serializes the admit hot path. Starts empty each
     /// process, so the first admit after restart harmlessly re-sets the tag once.
     partial_protected: DashMap<Hash, ()>,
+    /// Present-byte count of each partial blob, shared by
+    /// [`CacheEngine::size_snapshot`] and the GC callback's walk. See
+    /// [`PARTIAL_SIZE_TTL`] for why the walks do not re-observe every
+    /// partial every time.
+    partial_sizes: Arc<PartialSizeMemo>,
     /// In-flight pull-through requests. When a pull is in progress for a hash,
     /// subsequent callers wait on the [`Notify`] rather than issuing a
     /// duplicate origin fetch (coalescing, fixes #305).
@@ -691,16 +696,21 @@ impl ServeAudit {
 /// All fields reflect the *underlying* cache state — `size_bytes` reads
 /// from the iroh-blobs store directly, so a hash that has already been
 /// logically evicted (and whose bytes are still on disk pending the
-/// follow-up GC sweep in #518) still reports its on-disk size here.
-/// That keeps dry-run honest about disk reclaim potential rather than
-/// hiding it once the operator has flipped the evicted flag.
+/// follow-up GC sweep in #518) still reports its size here. That keeps
+/// dry-run honest about disk reclaim potential rather than hiding it once
+/// the operator has flipped the evicted flag. For a complete blob the size
+/// is its byte length; for a partial blob it is the validated total (see
+/// [`Self::size_bytes`]), and [`CacheEngine::size_snapshot`] gives the bytes
+/// it holds on disk.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EvictionPreview {
     /// Bytes the iroh-blobs store reports for this hash. `None` when the
-    /// blob isn't in the store; matches `BlobStatus::NotFound`. Partial
-    /// blobs (`BlobStatus::Partial { size }`) report whatever size the
-    /// store has so far — the operator sees how much disk a partial
-    /// pull is occupying.
+    /// blob isn't in the store; matches `BlobStatus::NotFound`. A partial
+    /// blob reports `BlobStatus::Partial { size }` as is: the whole blob's
+    /// size once its last chunk validates, `None` before. That is the blob's
+    /// total, not the bytes it holds on disk — the delivery path signs it as
+    /// the blob's total and the probe path advertises it, and
+    /// [`CacheEngine::size_snapshot`] is the on-disk measure.
     pub size_bytes: Option<u64>,
     /// Microseconds elapsed since the blob was last served via
     /// [`CacheEngine::get`]. `None` when no access has been recorded —
@@ -787,6 +797,56 @@ impl PresentRanges {
         self.size
     }
 }
+
+/// Bytes of a `size`-byte blob that `ranges` marks present.
+///
+/// `ranges` counts 1 KiB chunks ([`bao_tree::ChunkNum`]). An open span ends at
+/// `size`: iroh-blobs gives a bitfield that holds the blob's last chunk an open
+/// end ([`ChunkRanges::all`] once complete). The `.min(size)` clamp bounds every
+/// other span and counts a short last chunk at its true length. iroh-blobs'
+/// `Bitfield::total_bytes` computes the same sum with unchecked subtraction,
+/// which underflows on a span that starts past `size`.
+fn present_byte_count(ranges: &ChunkRanges, size: u64) -> u64 {
+    const CHUNK_BYTES: u64 = 1024;
+    let byte = |chunk: &bao_tree::ChunkNum| chunk.0.saturating_mul(CHUNK_BYTES).min(size);
+    ranges.boundaries().chunks(2).fold(0u64, |acc, span| {
+        let start = span.first().map_or(size, byte);
+        let end = span.get(1).map_or(size, byte);
+        acc.saturating_add(end.saturating_sub(start))
+    })
+}
+
+/// Bytes of `hash` present on disk, from its `observe()` bitfield.
+///
+/// `status()` cannot size a partial blob: iroh-blobs leaves the size unknown
+/// until the last chunk validates, then reports the whole blob's size.
+/// Awaiting `observe()` returns only its first item, the current bitfield,
+/// which the store sends at once, so the call never waits on a later write. A
+/// hash that GC removes after its `status()` reads as 0 bytes.
+async fn observed_present_bytes(
+    blobs: &iroh_blobs::api::blobs::Blobs,
+    hash: Hash,
+) -> CacheResult<u64> {
+    let bitfield = blobs.observe(hash).await.map_err(|e| {
+        CacheError::Store(anyhow::Error::from(e).context(format!("observe partial {hash}")))
+    })?;
+    Ok(present_byte_count(&bitfield.ranges, bitfield.size()))
+}
+
+/// How long a partial blob's present-byte count in [`PartialSizeMemo`] stays
+/// fresh.
+///
+/// Each `observe()` of an idle partial loads its store entry, and the entry's
+/// idle shutdown fsyncs its data, outboard and sizes files and rewrites its
+/// bitfield file. The eviction driver walks the store every tick (1 s by
+/// default), so the walk re-observes a partial at most once per TTL. A growing
+/// fill reads up to one TTL of progress low.
+const PARTIAL_SIZE_TTL: Duration = Duration::from_secs(30);
+
+/// Present-byte count of each partial blob, with the instant the walk
+/// measured it. [`snapshot_blob_sizes`] reads and refreshes it; the eviction
+/// driver's walk and the GC callback's walk share one memo.
+type PartialSizeMemo = Mutex<HashMap<Hash, (u64, Instant)>>;
 
 /// Snapshot of access times for blobs that are eligible for LRU
 /// eviction — i.e. **pinned hashes are already excluded**. Returned by
@@ -1004,11 +1064,12 @@ const fn hex_digit(c: u8) -> Option<u8> {
 async fn gc_protect_callback(
     store_handle: Weak<OnceLock<FsStore>>,
     prev_pre_sweep: Arc<Mutex<HashMap<Hash, u64>>>,
+    partial_sizes: Arc<PartialSizeMemo>,
     metrics: Option<Arc<CacheMetrics>>,
 ) {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        gc_protect_inner(store_handle, prev_pre_sweep, metrics).await;
+        gc_protect_inner(store_handle, prev_pre_sweep, partial_sizes, metrics).await;
         let _ = tx.send(());
     });
     if let Err(err) = rx.await {
@@ -1022,6 +1083,7 @@ async fn gc_protect_callback(
 async fn gc_protect_inner(
     store_handle: Weak<OnceLock<FsStore>>,
     prev_pre_sweep: Arc<Mutex<HashMap<Hash, u64>>>,
+    partial_sizes: Arc<PartialSizeMemo>,
     metrics: Option<Arc<CacheMetrics>>,
 ) {
     // `Weak::upgrade` returning `None` is the post-engine-drop steady
@@ -1042,7 +1104,14 @@ async fn gc_protect_inner(
         return;
     };
 
-    let current = match snapshot_blob_sizes(store).await {
+    let current = match snapshot_blob_sizes(
+        store,
+        &partial_sizes,
+        Instant::now(),
+        metrics.as_deref(),
+    )
+    .await
+    {
         Ok(snap) => snap,
         Err(err) => {
             tracing::warn!(error = %err, "gc snapshot failed; skipping reclaim attribution this cycle");
@@ -1072,6 +1141,8 @@ async fn gc_protect_inner(
         //   is locked leaves that shard usable, and every reader and writer
         //   takes one shard at a time.
         // - `origin_probe_memo` recovers silently via `probe_memo_lock`.
+        // - `partial_sizes` recovers silently: it caches store reads, and the
+        //   next walk re-observes any entry it lost.
         // - `prev_pre_sweep` (here) is the only metrics-only one: recover
         //   + `warn!`, since the next cycle re-establishes a baseline.
         let mut guard = match prev_pre_sweep.lock() {
@@ -1097,17 +1168,33 @@ async fn gc_protect_inner(
 
 /// Snapshot the iroh-blobs blob set keyed by hash, with each entry's
 /// size in bytes. Used by [`gc_protect_callback`] to diff sweep cycles
-/// (#518). Hashes that race the snapshot (deleted between `list` and
-/// `status`) report `BlobStatus::NotFound` and are dropped — they
-/// cannot have contributed bytes either way.
+/// (#518) and by [`CacheEngine::size_snapshot`]. Hashes that race the
+/// snapshot (deleted between `list` and `status`) report
+/// `BlobStatus::NotFound` and are dropped — they cannot have contributed
+/// bytes either way.
 ///
-/// `Partial` blobs report whatever size iroh-blobs has on disk so far
-/// (`None` when the store can't tell us, treated as zero). Including
+/// A `Partial` blob reports the bytes its bitfield marks present
+/// ([`observed_present_bytes`]), not `status()`'s size. Including
 /// partials matters: the threat model that motivated #518 is exactly
 /// the partial-import case (`add_stream` errored mid-flight, the
 /// `TempTag` was dropped, but the bytes already on disk are what we
-/// want GC to reclaim).
-async fn snapshot_blob_sizes(store: &FsStore) -> CacheResult<HashMap<Hash, u64>> {
+/// want GC to reclaim). A partial that GC removes between `status` and
+/// `observe` stays in the map at 0 bytes.
+///
+/// `memo` holds each partial's last count. A count younger than
+/// [`PARTIAL_SIZE_TTL`] at `now` is reused without an `observe()`. A failed
+/// `observe()` falls back to the last count, else to `status()`'s size, and
+/// the fallback is memoized for one TTL so a dead store entry is retried and
+/// logged once per TTL, not every walk. Each failure ticks
+/// `partial_size_observe_failures`. Only a `list` or `status` failure, which
+/// is store-wide, fails the walk. The walk drops memo entries for hashes that
+/// are no longer partial.
+async fn snapshot_blob_sizes(
+    store: &FsStore,
+    memo: &PartialSizeMemo,
+    now: Instant,
+    metrics: Option<&CacheMetrics>,
+) -> CacheResult<HashMap<Hash, u64>> {
     let blobs = store.blobs();
     let mut stream = blobs
         .list()
@@ -1115,6 +1202,7 @@ async fn snapshot_blob_sizes(store: &FsStore) -> CacheResult<HashMap<Hash, u64>>
         .await
         .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
     let mut out = HashMap::new();
+    let mut partials = HashSet::new();
     while let Some(hash) = stream.next().await {
         let hash = hash.map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
         let status = blobs
@@ -1123,12 +1211,61 @@ async fn snapshot_blob_sizes(store: &FsStore) -> CacheResult<HashMap<Hash, u64>>
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
         let size = match status {
             iroh_blobs::api::blobs::BlobStatus::NotFound => continue,
-            iroh_blobs::api::blobs::BlobStatus::Partial { size } => size.unwrap_or(0),
+            iroh_blobs::api::blobs::BlobStatus::Partial { size } => {
+                partials.insert(hash);
+                partial_size(blobs, hash, size, memo, now, metrics).await
+            }
             iroh_blobs::api::blobs::BlobStatus::Complete { size } => size,
         };
         out.insert(hash, size);
     }
+    memo.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|hash, _| partials.contains(hash));
     Ok(out)
+}
+
+/// One partial blob's entry in [`snapshot_blob_sizes`]: the memoized count
+/// while fresh, else a new `observe()`, else a fallback. `status_size` is
+/// `status()`'s size for the blob. See [`snapshot_blob_sizes`] for the rules.
+async fn partial_size(
+    blobs: &iroh_blobs::api::blobs::Blobs,
+    hash: Hash,
+    status_size: Option<u64>,
+    memo: &PartialSizeMemo,
+    now: Instant,
+    metrics: Option<&CacheMetrics>,
+) -> u64 {
+    let cached = memo
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&hash)
+        .copied();
+    if let Some((bytes, at)) = cached
+        && now.saturating_duration_since(at) < PARTIAL_SIZE_TTL
+    {
+        return bytes;
+    }
+    let bytes = match observed_present_bytes(blobs, hash).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let fallback = cached.map_or_else(|| status_size.unwrap_or(0), |(bytes, _)| bytes);
+            tracing::warn!(
+                %hash,
+                error = %err,
+                fallback,
+                "partial blob size: observe failed; using the last count or the status() size"
+            );
+            if let Some(m) = metrics {
+                m.partial_size_observe_failures.inc();
+            }
+            fallback
+        }
+    };
+    memo.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(hash, (bytes, now));
+    bytes
 }
 
 /// Append `hash` to the evicted log with `fsync` before returning. The
@@ -1295,20 +1432,24 @@ impl CacheEngine {
         // First-cycle fires bump the runs counter but emit zero on
         // the reclaim counter because there is no prior snapshot.
         let prev_pre_sweep: Arc<Mutex<HashMap<Hash, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let partial_sizes: Arc<PartialSizeMemo> = Arc::new(Mutex::new(HashMap::new()));
 
         let mut options = FsStoreOptions::new(cache_dir);
         if let Some(strong) = gc_store_handle.as_ref() {
             let store_weak: Weak<OnceLock<FsStore>> = Arc::downgrade(strong);
             let prev_for_cb = Arc::clone(&prev_pre_sweep);
+            let sizes_for_cb = Arc::clone(&partial_sizes);
             let metrics_for_cb = metrics.clone();
             options.gc = Some(GcConfig {
                 interval: gc_interval,
                 add_protected: Some(Arc::new(move |_live: &mut HashSet<Hash>| {
                     let store_weak = store_weak.clone();
                     let prev_for_cb = Arc::clone(&prev_for_cb);
+                    let sizes_for_cb = Arc::clone(&sizes_for_cb);
                     let metrics_for_cb = metrics_for_cb.clone();
                     Box::pin(async move {
-                        gc_protect_callback(store_weak, prev_for_cb, metrics_for_cb).await;
+                        gc_protect_callback(store_weak, prev_for_cb, sizes_for_cb, metrics_for_cb)
+                            .await;
                         ProtectOutcome::Continue
                     })
                 })),
@@ -1353,6 +1494,7 @@ impl CacheEngine {
                 max_blob_bytes,
                 access_times: DashMap::new(),
                 partial_protected: DashMap::new(),
+                partial_sizes,
                 inflight: Mutex::new(HashMap::new()),
                 inflight_poison_logged: AtomicBool::new(false),
                 pinned: ArcSwap::from(Arc::new(
@@ -3643,7 +3785,8 @@ impl CacheEngine {
     /// Import an already-encoded interleaved bao range for `hash`, verified
     /// against the root on import (iroh-blobs `import_bao_bytes`). Thin
     /// wrapper over the store call, exposed so `NodeRangedStore::admit` need
-    /// not reach into the private store handle.
+    /// not reach into the private store handle. Records recency, like every
+    /// fill path, so the partial it leaves is an eviction candidate.
     pub async fn admit_bao(
         &self,
         hash: Hash,
@@ -3659,6 +3802,7 @@ impl CacheEngine {
                 CacheError::Store(anyhow::Error::from(e).context("admit_bao: import_bao_bytes"))
             })?;
         self.protect_partial(hash).await?;
+        self.record_access(hash);
         Ok(())
     }
 
@@ -3828,6 +3972,11 @@ impl CacheEngine {
             return Err((reader, e));
         }
         self.set_segment(hash, segment);
+        // Recency only, like every fill path: the partial becomes an eviction
+        // candidate even when no serve follows (an aborted or unpaid serve leg
+        // never reaches `observe_hit`), so the bytes `size_snapshot` counts can
+        // be released.
+        self.record_access(hash);
         // Wake parked serve legs once for the whole admit, not per node: a large
         // range carries many proof nodes, and a per-node notify storm scales the
         // wakeups with proof-node count for no gain. `pairs` is empty when no serve
@@ -4102,7 +4251,8 @@ impl CacheEngine {
     }
 
     /// Snapshot every on-disk blob keyed by hash with its byte size
-    /// (`Complete` and `Partial` alike), the public form of the internal
+    /// (`Complete` and `Partial` alike; a partial counts only its present
+    /// bytes), the public form of the internal
     /// `snapshot_blob_sizes` helper. This is the authoritative disk-usage
     /// input for the capacity-eviction driver (#1173): unlike
     /// [`Self::eviction_candidates`] — which sees only hashes *touched since
@@ -4110,10 +4260,19 @@ impl CacheEngine {
     /// disk already full measures the real usage rather than an empty
     /// access map.
     ///
-    /// Cost scales with the total blob set (one `status()` per blob); call
-    /// it on the eviction sweep cadence, not per request.
+    /// Cost scales with the total blob set: one `status()` per blob, plus one
+    /// `observe()` per partial blob whose memoized count is older than 30 s
+    /// (each `observe()` of an idle partial fsyncs its store files). A
+    /// partial's count can therefore trail its disk use by up to 30 s. Call it
+    /// on the eviction sweep cadence, not per request.
     pub async fn size_snapshot(&self) -> CacheResult<HashMap<Hash, u64>> {
-        snapshot_blob_sizes(&self.inner.store).await
+        snapshot_blob_sizes(
+            &self.inner.store,
+            &self.inner.partial_sizes,
+            Instant::now(),
+            self.inner.metrics.as_deref(),
+        )
+        .await
     }
 
     /// Total on-disk bytes across all blobs, the sum of
@@ -10122,6 +10281,10 @@ mod tests {
             1,
             "streaming admit creates exactly one protecting tag"
         );
+        assert!(
+            engine.eviction_candidates().contains_key(&hash),
+            "a streamed partial is an eviction candidate with no serve after it (#2157)"
+        );
     }
 
     #[tokio::test]
@@ -10384,15 +10547,206 @@ mod tests {
         );
     }
 
+    /// A middle-range partial (no front, no tail) leaves `status()`'s size
+    /// unknown, yet its bytes sit on disk. `size_snapshot` — the eviction
+    /// footprint and the `decdn_cache_bytes` gauge — must count them, and the
+    /// eviction driver must be able to release them (#2157).
+    #[tokio::test]
+    async fn size_snapshot_counts_middle_range_partial_by_present_bytes() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await?;
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, 2 * group, total);
+        engine.admit_bao(hash, ranges, bao).await?;
+
+        let status = engine.inner.store.blobs().status(hash).await?;
+        anyhow::ensure!(
+            matches!(
+                status,
+                iroh_blobs::api::blobs::BlobStatus::Partial { size: None }
+            ),
+            "a middle-range partial must leave status()'s size unknown, got {status:?}"
+        );
+
+        let sizes = engine.size_snapshot().await?;
+        anyhow::ensure!(
+            sizes.get(&hash).copied() == Some(2 * group),
+            "size_snapshot must count the middle partial's present bytes, got {:?}",
+            sizes.get(&hash)
+        );
+        anyhow::ensure!(
+            engine.total_bytes().await? == 2 * group,
+            "total_bytes must agree with size_snapshot"
+        );
+        anyhow::ensure!(
+            engine.eviction_candidates().contains_key(&hash),
+            "a counted partial must be an eviction candidate with no serve after it"
+        );
+        Ok(())
+    }
+
+    /// A partial that holds its tail has a validated `status()` size equal to
+    /// the whole blob, but only some of those bytes are on disk. The footprint
+    /// counts the present bytes, including the short last chunk (#2157).
+    #[tokio::test]
+    async fn size_snapshot_counts_tail_bearing_partial_by_present_bytes_not_total()
+    -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await?;
+        let group = crate::CHUNK_GROUP_BYTES;
+        let tail_start = 3 * group;
+        let tail_len = 123;
+        let total = tail_start + tail_len;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+
+        let (hash, head_ranges, head_bao) =
+            bao_for(root, &plaintext, outboard.clone(), 0, group, total);
+        engine.admit_bao(hash, head_ranges, head_bao).await?;
+        let (_, tail_ranges, tail_bao) =
+            bao_for(root, &plaintext, outboard, tail_start, tail_len, total);
+        engine.admit_bao(hash, tail_ranges, tail_bao).await?;
+
+        let status = engine.inner.store.blobs().status(hash).await?;
+        anyhow::ensure!(
+            matches!(
+                status,
+                iroh_blobs::api::blobs::BlobStatus::Partial { size: Some(s) } if s == total
+            ),
+            "the tail validates the size, got {status:?}"
+        );
+
+        let sizes = engine.size_snapshot().await?;
+        anyhow::ensure!(
+            sizes.get(&hash).copied() == Some(group + tail_len),
+            "size_snapshot must count present bytes, not the validated total {total}, got {:?}",
+            sizes.get(&hash)
+        );
+        Ok(())
+    }
+
+    /// The walk re-observes a partial only once its memoized count is a TTL
+    /// old: within the TTL it reuses the count, after it it measures the new
+    /// bytes. A hash that stops being partial leaves the memo.
+    #[tokio::test]
+    async fn snapshot_reuses_a_partial_count_within_the_ttl() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await?;
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+        let store = &engine.inner.store;
+        let memo: PartialSizeMemo = Mutex::new(HashMap::new());
+        let t0 = Instant::now();
+
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard.clone(), group, group, total);
+        engine.admit_bao(hash, ranges, bao).await?;
+        let first = snapshot_blob_sizes(store, &memo, t0, None).await?;
+        anyhow::ensure!(
+            first.get(&hash).copied() == Some(group),
+            "first walk observes"
+        );
+
+        let (_, ranges, bao) = bao_for(root, &plaintext, outboard, 2 * group, group, total);
+        engine.admit_bao(hash, ranges, bao).await?;
+        let within = snapshot_blob_sizes(store, &memo, t0 + PARTIAL_SIZE_TTL / 2, None).await?;
+        anyhow::ensure!(
+            within.get(&hash).copied() == Some(group),
+            "within the TTL the walk reuses the memoized count, got {:?}",
+            within.get(&hash)
+        );
+        let after = snapshot_blob_sizes(store, &memo, t0 + PARTIAL_SIZE_TTL, None).await?;
+        anyhow::ensure!(
+            after.get(&hash).copied() == Some(2 * group),
+            "after the TTL the walk re-observes, got {:?}",
+            after.get(&hash)
+        );
+
+        memo.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(Hash::new(b"no longer partial"), (1, t0));
+        snapshot_blob_sizes(store, &memo, t0 + PARTIAL_SIZE_TTL, None).await?;
+        let kept: Vec<Hash> = memo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect();
+        anyhow::ensure!(
+            kept == vec![hash],
+            "the walk drops non-partial memo entries, got {kept:?}"
+        );
+        Ok(())
+    }
+
+    /// A hash that GC removes between `status()` and `observe()` must read as
+    /// 0 bytes, not fail: the store answers `observe` on a missing entry with
+    /// an empty bitfield.
+    #[tokio::test]
+    async fn observed_present_bytes_of_an_absent_hash_is_zero() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await?;
+        let bytes =
+            observed_present_bytes(engine.inner.store.blobs(), Hash::new(b"absent")).await?;
+        anyhow::ensure!(bytes == 0, "an absent hash holds no bytes, got {bytes}");
+        Ok(())
+    }
+
+    #[test]
+    fn present_byte_count_clamps_to_size() {
+        use bao_tree::ChunkNum;
+        assert_eq!(present_byte_count(&ChunkRanges::empty(), 5000), 0);
+        assert_eq!(
+            present_byte_count(&ChunkRanges::all(), 5000),
+            5000,
+            "a complete bitfield counts the whole blob, short last chunk included"
+        );
+        assert_eq!(
+            present_byte_count(&ChunkRanges::from(ChunkNum(1)..ChunkNum(3)), 5000),
+            2048,
+            "a closed span counts 1 KiB per chunk"
+        );
+        assert_eq!(
+            present_byte_count(&ChunkRanges::from(ChunkNum(4)..), 5000),
+            5000 - 4096,
+            "an open tail ends at the blob size"
+        );
+        assert_eq!(
+            present_byte_count(&ChunkRanges::from(ChunkNum(4)..ChunkNum(5)), 5000),
+            904,
+            "a closed span over the short last chunk counts its true length"
+        );
+        assert_eq!(
+            present_byte_count(&ChunkRanges::from(ChunkNum(10)..ChunkNum(12)), 5000),
+            0,
+            "a span wholly past the size counts nothing"
+        );
+        assert_eq!(
+            present_byte_count(
+                &(ChunkRanges::from(ChunkNum(0)..ChunkNum(1)) | ChunkRanges::from(ChunkNum(4)..)),
+                5000
+            ),
+            1024 + 904,
+            "disjoint spans sum"
+        );
+        assert_eq!(
+            present_byte_count(&ChunkRanges::from(ChunkNum(1)..), 0),
+            0,
+            "an unknown size contributes nothing past it"
+        );
+    }
+
     /// Advertise (`coverage`) and serve (`partial_hit_size`, mirrored here via
-    /// `present_ranges` + `missing_ranges` — the exact sequence it now runs)
+    /// `present_ranges` + `missing_ranges` — the exact sequence it runs)
     /// must AGREE on a front-prefix partial (#1506).
     ///
-    /// Both size the blob from the `observe()` bitfield. `inspect`'s
-    /// `status()`-derived `size_bytes` is not usable here: iroh-blobs leaves it
-    /// `None` for a `Partial` blob until its FINAL chunk validates, so on a
-    /// front-prefix partial (block 0 present, no tail) a `status()`-sized serve
-    /// gate declines a block that `coverage` already advertises as covered.
+    /// Both size the blob from the `observe()` bitfield. `status()`'s size is
+    /// not usable here: iroh-blobs leaves it `None` for a `Partial` blob until
+    /// its FINAL chunk validates, so on a front-prefix partial (block 0
+    /// present, no tail) a `status()`-sized serve gate declines a block that
+    /// `coverage` already advertises as covered.
     #[tokio::test]
     async fn partial_hit_size_source_agrees_with_coverage_on_front_partial() {
         let tmp = tempfile::tempdir().unwrap();
