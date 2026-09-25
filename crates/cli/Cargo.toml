@@ -81,6 +81,9 @@ fastcdc = { workspace = true }
 # a piped/redirected fetch stays silent. Small dep tree (console, unicode-width),
 # unrelated to the iroh-blobs/AWS-free invariant above.
 indicatif = { workspace = true }
+# `decdn bundle pull` mirrors its total bar into the terminal's tab-bar progress
+# (OSC 9;4) where the terminal supports it. No dependencies of its own.
+anstyle-progress = { workspace = true }
 # Opt-in client-side logging (`--log-level` / `RUST_LOG`): the CLI installs no
 # subscriber by default, so verbose fetch/incentive/iroh spans are diagnosable
 # on demand without disturbing the terminal UI. The `fetch`/`bundle pull`

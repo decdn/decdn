@@ -30,13 +30,20 @@
 //! (one that survives the include/exclude filters) declares a size, the total bar is
 //! omitted and only per-file bars render.
 //!
+//! In a terminal that supports the OSC 9;4 progress sequence (iTerm2, Ghostty,
+//! `WezTerm`, Windows Terminal, and others; detected by `anstyle-progress`, as Cargo
+//! does), the total bar's percent also drives the terminal's own progress
+//! indicator in the tab bar or dock. A run with no total bar shows it as
+//! indeterminate. The indicator is removed when the run finishes or the renderer
+//! drops.
+//!
 //! The whole renderer is silent — every bar a no-op, every file's delivery
 //! callback `None` — when stderr is not a terminal or the run is `--json`, so
 //! piped and scripted output is byte-for-byte what it was before per-file bars.
 
 use std::collections::HashMap;
-use std::io::IsTerminal;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -65,6 +72,85 @@ pub(crate) fn file_label(paths: &[String]) -> String {
 /// overwritten. Nothing touches a bar before the container owns it.
 const TICK: Duration = Duration::from_millis(120);
 
+/// Where [`TabProgress`] writes each OSC 9;4 sequence: stderr in production, a
+/// recorder in tests.
+type TabSink = Box<dyn Fn(anstyle_progress::TermProgress) + Send + Sync>;
+
+/// The terminal's own progress indicator (OSC 9;4), shown in the tab bar or dock
+/// by terminals that support it. It only moves forward, and it writes only when
+/// the whole-number percent changes, so a run emits at most about a hundred
+/// sequences. Dropping it removes the indicator, so an early return never leaves
+/// a stale percent in the tab.
+struct TabProgress {
+    /// The last percent sent, or [`TabProgress::CLEARED`] once removed.
+    last: AtomicU8,
+    /// The sequence writer.
+    sink: TabSink,
+}
+
+impl TabProgress {
+    /// The `last` value after the indicator is removed; no percent follows it.
+    const CLEARED: u8 = u8::MAX;
+
+    /// The indicator on stderr, or `None` when the terminal does not support
+    /// OSC 9;4. The caller has already checked that stderr is a terminal.
+    fn detect(determinate: bool) -> Option<Arc<Self>> {
+        anstyle_progress::supports_term_progress(true).then(|| {
+            Self::start(
+                determinate,
+                Box::new(|p| {
+                    // indicatif flushes each frame in one buffered write, and this
+                    // is one `write_all` under the stderr lock, so the two never
+                    // split each other's escape sequences.
+                    let _ = std::io::stderr().lock().write_all(p.to_string().as_bytes());
+                }),
+            )
+        })
+    }
+
+    /// Show the indicator through `sink`: at 0% when `determinate`, else as an
+    /// indeterminate (busy) indicator.
+    fn start(determinate: bool, sink: TabSink) -> Arc<Self> {
+        let start = anstyle_progress::TermProgress::start();
+        sink(if determinate { start.percent(0) } else { start });
+        Arc::new(Self {
+            last: AtomicU8::new(0),
+            sink,
+        })
+    }
+
+    /// Show `position` of `length` as a percent, if that is ahead of the last
+    /// percent sent and the indicator is not yet removed.
+    fn update(&self, position: u64, length: u64) {
+        let pct = (u128::from(position.min(length)) * 100)
+            .checked_div(u128::from(length))
+            .and_then(|p| u8::try_from(p).ok())
+            .unwrap_or(100);
+        let advanced = self
+            .last
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                (cur != Self::CLEARED && pct > cur).then_some(pct)
+            })
+            .is_ok();
+        if advanced {
+            (self.sink)(anstyle_progress::TermProgress::start().percent(pct));
+        }
+    }
+
+    /// Remove the indicator. Only the first call writes.
+    fn clear(&self) {
+        if self.last.swap(Self::CLEARED, Ordering::AcqRel) != Self::CLEARED {
+            (self.sink)(anstyle_progress::TermProgress::remove());
+        }
+    }
+}
+
+impl Drop for TabProgress {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 /// The multi-bar renderer for one `bundle pull` run. Disabled variants (no inner
 /// state) make every method a no-op and every bar handle silent.
 pub(crate) struct PullProgress {
@@ -80,6 +166,8 @@ struct Inner {
     /// the run's rate/ETA; per-file bars insert before it. `None` when the manifest
     /// declares no sizes, in which case only per-file bars render.
     total: Option<TotalBar>,
+    /// The terminal's tab-bar indicator; `None` when the terminal lacks OSC 9;4.
+    tab: Option<Arc<TabProgress>>,
     /// How many of each file's download bytes the total bar already holds, by bar
     /// label. A retry round builds a new bar for a file whose earlier bar already
     /// folded its landed prefix into the total, and its first callback reports
@@ -98,6 +186,8 @@ pub(crate) struct TotalBar {
     bar: indicatif::ProgressBar,
     /// The whole-download rate estimate, sampled on every transferred increment.
     speed: Arc<Mutex<fetch::SpeedState>>,
+    /// The terminal's tab-bar indicator, fed the bar's percent on every increment.
+    tab: Option<Arc<TabProgress>>,
 }
 
 impl TotalBar {
@@ -112,19 +202,24 @@ impl TotalBar {
         .progress_chars("=>-")
     }
 
-    /// Wrap an existing bar with a fresh meter.
-    fn wrap(bar: indicatif::ProgressBar) -> Self {
+    /// Wrap an existing bar with a fresh meter, mirroring its percent into `tab`.
+    fn wrap(bar: indicatif::ProgressBar, tab: Option<Arc<TabProgress>>) -> Self {
         Self {
             bar,
             speed: Arc::new(Mutex::new(fetch::SpeedState::default())),
+            tab,
         }
     }
 
-    /// Advance the total by `bytes` of transferred content and refresh the
-    /// rate/ETA from the new position.
+    /// Advance the total by `bytes` of transferred content, refresh the
+    /// rate/ETA from the new position, and update the tab-bar percent.
     fn inc(&self, bytes: u64) {
         self.bar.inc(bytes);
         self.refresh_rate();
+        if let Some(tab) = &self.tab {
+            let position = self.bar.position();
+            tab.update(position, self.bar.length().unwrap_or(position));
+        }
     }
 
     /// Sample the meter at the bar's current position and rewrite the `{msg}` as
@@ -193,13 +288,14 @@ impl PullProgress {
             };
             let _ = mp.println(header);
         }
-        let total = download_total
-            .filter(|n| *n > 0)
-            .map(|len| Self::add_total_bar(&mp, len));
+        let download_total = download_total.filter(|n| *n > 0);
+        let tab = TabProgress::detect(download_total.is_some());
+        let total = download_total.map(|len| Self::add_total_bar(&mp, len, tab.clone()));
         Self {
             inner: Some(Inner {
                 mp,
                 total,
+                tab,
                 folded: Mutex::new(HashMap::new()),
             }),
         }
@@ -208,12 +304,16 @@ impl PullProgress {
     /// Build the bottom total bar with a fixed content-byte length inside the
     /// container, then style, label, and tick it (see [`TICK`] for why the add
     /// comes first).
-    fn add_total_bar(mp: &indicatif::MultiProgress, len: u64) -> TotalBar {
+    fn add_total_bar(
+        mp: &indicatif::MultiProgress,
+        len: u64,
+        tab: Option<Arc<TabProgress>>,
+    ) -> TotalBar {
         let bar = mp.add(indicatif::ProgressBar::new(len));
         bar.set_style(TotalBar::style());
         bar.set_prefix("total");
         bar.enable_steady_tick(TICK);
-        TotalBar::wrap(bar)
+        TotalBar::wrap(bar, tab)
     }
 
     /// A renderer that draws nothing and hands out silent bar handles.
@@ -304,13 +404,17 @@ impl PullProgress {
         }
     }
 
-    /// Clear the total bar at the end of the run; the command then prints its own
-    /// summary line. A no-op when disabled or when there is no total bar.
+    /// Clear the total bar and remove the tab-bar indicator at the end of the run;
+    /// the command then prints its own summary line. A no-op when disabled.
     pub(crate) fn finish(&self) {
-        if let Some(i) = &self.inner
-            && let Some(total) = &i.total
-        {
+        let Some(i) = &self.inner else {
+            return;
+        };
+        if let Some(total) = &i.total {
             total.finish_and_clear();
+        }
+        if let Some(tab) = &i.tab {
+            tab.clear();
         }
     }
 }
@@ -495,10 +599,13 @@ mod tests {
 
     /// A hidden total bar of fixed content length `len`, with its own rate meter.
     fn hidden_total(len: u64) -> TotalBar {
-        TotalBar::wrap(indicatif::ProgressBar::with_draw_target(
-            Some(len),
-            indicatif::ProgressDrawTarget::hidden(),
-        ))
+        TotalBar::wrap(
+            indicatif::ProgressBar::with_draw_target(
+                Some(len),
+                indicatif::ProgressDrawTarget::hidden(),
+            ),
+            None,
+        )
     }
 
     #[test]
@@ -513,11 +620,12 @@ mod tests {
     fn hidden_pp(download_total: u64) -> (PullProgress, TotalBar) {
         let mp =
             indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
-        let total = TotalBar::wrap(mp.add(indicatif::ProgressBar::new(download_total)));
+        let total = TotalBar::wrap(mp.add(indicatif::ProgressBar::new(download_total)), None);
         let pp = PullProgress {
             inner: Some(Inner {
                 mp,
                 total: Some(total.clone()),
+                tab: None,
                 folded: Mutex::new(HashMap::new()),
             }),
         };
@@ -644,5 +752,73 @@ mod tests {
         let msg = total.bar.message();
         assert!(msg.starts_with('('), "{msg}");
         assert!(msg.contains("ETA"), "{msg}");
+    }
+
+    /// A tab indicator whose sequences land in the returned log.
+    fn recorded_tab(determinate: bool) -> (Arc<TabProgress>, Arc<Mutex<Vec<String>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink_log = Arc::clone(&log);
+        let tab = TabProgress::start(
+            determinate,
+            Box::new(move |p| sink_log.lock().unwrap().push(p.to_string())),
+        );
+        (tab, log)
+    }
+
+    #[test]
+    fn tab_progress_writes_each_new_percent_once_and_never_backwards() {
+        let (tab, log) = recorded_tab(true);
+        tab.update(10, 1000); // 1%
+        tab.update(19, 1000); // still 1%
+        tab.update(500, 1000); // 50%
+        tab.update(400, 1000); // behind: a racing thread's stale sample
+        tab.update(2000, 1000); // past the end caps at 100%
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "\x1b]9;4;1;0\x1b\\",
+                "\x1b]9;4;1;1\x1b\\",
+                "\x1b]9;4;1;50\x1b\\",
+                "\x1b]9;4;1;100\x1b\\",
+            ]
+        );
+    }
+
+    #[test]
+    fn tab_progress_clear_removes_once_and_stops_updates() {
+        let (tab, log) = recorded_tab(true);
+        tab.clear();
+        tab.update(500, 1000);
+        drop(tab);
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["\x1b]9;4;1;0\x1b\\", "\x1b]9;4;0;\x1b\\"]
+        );
+    }
+
+    #[test]
+    fn dropping_tab_progress_removes_the_indicator() {
+        // An early return drops the renderer without `finish`; the tab must not
+        // keep showing a stale percent.
+        let (tab, log) = recorded_tab(false);
+        drop(tab);
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["\x1b]9;4;3;\x1b\\", "\x1b]9;4;0;\x1b\\"]
+        );
+    }
+
+    #[test]
+    fn total_bar_inc_drives_the_tab_percent() {
+        let (tab, log) = recorded_tab(true);
+        let total = TotalBar::wrap(
+            indicatif::ProgressBar::with_draw_target(
+                Some(1000),
+                indicatif::ProgressDrawTarget::hidden(),
+            ),
+            Some(tab),
+        );
+        total.inc(250);
+        assert_eq!(log.lock().unwrap().last().unwrap(), "\x1b]9;4;1;25\x1b\\");
     }
 }
