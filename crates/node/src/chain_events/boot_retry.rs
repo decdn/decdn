@@ -124,7 +124,13 @@ impl BootRetry {
     /// boot deadline. Each retry logs a `WARN`, bumps
     /// `decdn_chain_boot_read_retries_total`, and sleeps on the watcher backoff
     /// schedule (1 s doubling to 60 s). The deadline bounds the sleeps, not the
-    /// attempts: the last attempt can run past it by its own duration.
+    /// attempts: the last attempt can run past it by its own duration. That is
+    /// deliberate. A failing attempt already ends at its first failed read, and
+    /// each read is bounded by the per-call RPC timeout, so a stalled provider
+    /// cannot stretch an attempt. Only a provider that keeps answering can: a
+    /// slow but healthy read of a large deny-set, which a hard deadline would
+    /// turn into an exit. Fail-closed does not depend on the deadline — the
+    /// router opens only after a clean enforcement pass, however long it takes.
     ///
     /// # Errors
     ///

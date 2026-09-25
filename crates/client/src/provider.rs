@@ -112,6 +112,10 @@ pub fn is_permanent_rpc_error(err: &alloy::transports::TransportError) -> bool {
         RpcError::Transport(TransportErrorKind::HttpError(h)) => {
             (400..500).contains(&h.status) && !matches!(h.status, 408 | 429)
         }
+        // Everything else is transport-shaped and transient. That includes
+        // `HttpErrorWithRetryAfter`: alloy reports an HTTP error that carries a
+        // `Retry-After` header as its own variant, and a server that names when
+        // to retry expects a retry, whatever the status.
         _ => false,
     }
 }
@@ -211,6 +215,13 @@ mod tests {
         for status in [408, 429, 500, 502, 503, 504] {
             assert!(!is_permanent_rpc_error(&http(status)), "HTTP {status}");
         }
+        // A 4xx that names a retry time is retried.
+        let with_retry_after = TransportErrorKind::http_error_with_retry_after(
+            403,
+            String::new(),
+            Some(std::time::Duration::from_secs(30)),
+        );
+        assert!(!is_permanent_rpc_error(&with_retry_after));
     }
 
     #[test]
