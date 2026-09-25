@@ -1706,6 +1706,13 @@ pub struct DecdnMetrics {
     /// caps `eth_getLogs`; set `blockchain.get_logs_max_block_span` to the
     /// lowest span the gauge reaches while they come, and they stop.
     pub chain_get_logs_range_rejections: Counter,
+    /// `decdn_chain_get_logs_retries_total` (#2161): in-tick retries of
+    /// `eth_getLogs` windows after a transient provider error. One window adds
+    /// up to two, including a window that fails every retry and so fails the
+    /// tick. A retry that succeeds does not count as watcher downtime, so a
+    /// provider that the retries absorb shows here and not in the watchers'
+    /// down-family. Rate limits and permanent errors are not retried.
+    pub chain_get_logs_retries: Counter,
     /// `decdn_chain_boot_read_retries_total` (#2159): retries of a boot-time
     /// chain read (the registry, slash, `usdc()` self-check and blacklist
     /// bootstraps, and the best-effort fee-share reads) after a transient
@@ -3031,6 +3038,8 @@ recorders! {
     chain_get_logs_span(span: u64) => chain_get_logs_span.set(sat_u64(span));
     /// Count one `eth_getLogs` window the provider rejected for its range.
     chain_get_logs_range_rejected => chain_get_logs_range_rejections.inc();
+    /// Count one in-tick retry of a transiently failed `eth_getLogs` window.
+    chain_get_logs_retried => chain_get_logs_retries.inc();
     /// Count one boot-time chain read retried after a transient error.
     chain_boot_read_retried => chain_boot_read_retries.inc();
     /// Stamp the staker-set watcher's liveness gauge (#1316). See `slash_watcher_tick`.
@@ -4459,6 +4468,7 @@ mod tests {
             "decdn_onchain_tx_timeout_total",
             "decdn_onchain_tx_receipt_recovered_total",
             "decdn_chain_boot_read_retries_total",
+            "decdn_chain_get_logs_retries_total",
             "decdn_dht_findvalue_queries_total",
             "decdn_dht_lookup_round_timeouts_total",
             "decdn_dht_store_published_total",

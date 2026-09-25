@@ -825,6 +825,22 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A transient `eth_getLogs` failure no longer takes every chain watcher down
+  (#2161).** The shared chain-event poller retries a failed window on the same
+  block range up to two times, 2 s apart, before it fails the tick. A retry
+  that succeeds does not fire `on_backoff`, count a watcher restart or start
+  `*_watcher_down_seconds`. Before, the first failed window failed the whole
+  tick, the backoff grew the backlog, and the longer backlog needed more
+  windows, each one another chance to fail: on the dRPC free plan (100-block
+  cap, about 15–20 % of calls failing with code 19 or 30) every watcher showed
+  minutes of downtime although no event was lost. Range rejections keep the
+  shrink path. A rate limit (HTTP 429, `Retry-After`, or rate-limit wording)
+  and a permanent error (a revert, invalid request/method/params, an HTTP 4xx
+  other than 408/429) are not retried and fail the tick at once. Each retry
+  logs its cause at `info` and bumps the new counter
+  `decdn_chain_get_logs_retries_total` (one window adds up to two), plotted on
+  the "eth_getLogs window span" panel. A hung provider now takes up to 34 s
+  per window (three 10 s timeouts plus the sleeps) before the tick fails.
 - **A transient RPC error during a boot-time chain read no longer exits the
   daemon (#2159).** The CapacityBond registry snapshot, the slash enumeration,
   the PaymentPool `usdc()` self-check and the ContentBlacklist boot enumeration
