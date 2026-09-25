@@ -95,15 +95,17 @@ pub struct CacheMetrics {
     /// call, success or failure). Denominator for any retry-exhaustion
     /// alert.
     pub origin_fetches: Counter,
-    /// Serve-miss fill claims NOT coalesced onto a live same-hash fill because
-    /// the request starts ahead of that fill's paid frontier (#2062): attaching
-    /// would park the request on a pull that advances only as the other
-    /// client pays. The refused attach opens its own pull, so the overlap
-    /// with the live fill is fetched from origin twice — duplicate egress
-    /// (own-origin S3, or upstream USDC on the peer tier) in exchange for
-    /// liveness. Emitted name: `decdn_cache_fill_not_coalesced_total`.
+    /// Serve-miss fill claims NOT coalesced onto a live same-hash fill whose
+    /// covered range overlaps the request, because the request starts ahead of
+    /// that fill's paid frontier (#2062): attaching would park the request on a
+    /// pull that advances only as the other client pays. Counted once per claim.
+    /// The refused attach opens its own pull, and the part of the overlap not
+    /// yet in the store when that pull starts is fetched twice — duplicate
+    /// egress (own-origin S3, or upstream USDC on the peer tier) in exchange for
+    /// liveness. An overlap already in the store is never fetched again.
+    /// Emitted name: `decdn_cache_fill_not_coalesced_total`.
     /// Operator-actionable: a sustained rate means clients habitually resume
-    /// ahead of what payers have cleared (see decdn#2069 §4).
+    /// ahead of what payers have cleared.
     pub fill_not_coalesced: Counter,
     /// Origin fetches that gave up after exhausting `max_retries`
     /// (#285). Operator-actionable: any nonzero rate = user-visible
@@ -426,4 +428,17 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_origin_range_timeouts_total`.
     pub origin_range_timeouts: Counter,
+    /// Own-origin range draws that found the engine-wide pool of
+    /// `MAX_CONCURRENT_RANGE_PULLS` permits full and waited for one. Every
+    /// draw of every fill shares the pool, and a hung origin holds a permit
+    /// for a whole draw, so a starved fill shows here and not only as a client
+    /// stall. A wait past `RANGE_PULL_PERMIT_WARN_AFTER` also logs a warning.
+    ///
+    /// Operator-actionable: a sustained rate means more concurrent own-origin
+    /// fills than the pool serves, or an origin slow enough to hold permits.
+    /// Check `origin_range_timeouts` and the origin's latency.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_range_pull_permit_waits_total`.
+    pub range_pull_permit_waits: Counter,
 }

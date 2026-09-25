@@ -1158,7 +1158,7 @@ impl FillRegistry {
     /// fetch start** (a session behind that frontier is excluded — attaching to it
     /// would park this request on a pull that advances only as the OTHER client
     /// pays, #2062; the exclusion trades duplicate egress for the overlap, counted
-    /// as `fill_not_coalesced`, decdn#2069 §4), `covered_union = ⋃ covered`,
+    /// as `fill_not_coalesced`), `covered_union = ⋃ covered`,
     /// `attach = R ∩ covered_union`, `remainder = R − covered_union`:
     /// - `attach` empty → OWNER of the whole `R`.
     /// - `remainder` empty (a live pull covers all of `R`) → ATTACH to the
@@ -1194,6 +1194,7 @@ impl FillRegistry {
         if !r.is_empty() {
             let mut covered_union = ChunkRanges::empty();
             let mut best: Option<(Arc<FillSession>, ChunkRanges, u64)> = None;
+            let mut not_coalesced = false;
             if let Some(entry) = map.get(&hash) {
                 for session in &entry.sessions {
                     // Dead sessions (ended or cancelled) may never deliver, so their
@@ -1216,19 +1217,25 @@ impl FillRegistry {
                     // its own span, and the two fills coexist under the hash. A
                     // request at or behind the frontier attaches; its payments
                     // extend the shared prefix at once.
+                    //
+                    // The cost is duplicate egress on the overlap, and only on the
+                    // part of it not yet in the store: the owner's pull fills just
+                    // the gaps the store is missing when it starts, so an overlap
+                    // the live fill already landed is never fetched again. The
+                    // part still to land is at most the live fill's credit window
+                    // plus its in-flight draws, and only attaching could save it,
+                    // which is what starves. So the rule stays, and a claim that
+                    // skips an overlapping session is counted once.
                     if fetch_start > session.served_paid() {
-                        // The opt-out costs duplicate origin egress for the
-                        // overlap (decdn#2069 §4); count and log it so a
-                        // double-egress bill is diagnosable.
-                        if let Some(m) = &self.metrics {
-                            m.fill_not_coalesced.inc();
+                        if !(&r & &session.covered_ranges()).is_empty() {
+                            not_coalesced = true;
+                            tracing::debug!(
+                                %hash,
+                                fetch_start,
+                                served_paid = session.served_paid(),
+                                "fill not coalesced: request starts ahead of the live fill's paid frontier",
+                            );
                         }
-                        tracing::debug!(
-                            %hash,
-                            fetch_start,
-                            served_paid = session.served_paid(),
-                            "fill not coalesced: request starts ahead of the live fill's paid frontier",
-                        );
                         continue;
                     }
                     let covered = session.covered_ranges();
@@ -1244,6 +1251,10 @@ impl FillRegistry {
                     }
                     covered_union |= covered;
                 }
+            }
+
+            if not_coalesced && let Some(m) = &self.metrics {
+                m.fill_not_coalesced.inc();
             }
 
             let attach = &r & &covered_union;
@@ -2058,6 +2069,53 @@ mod fill_registry_tests {
             Arc::ptr_eq(&attached, &whole) || Arc::ptr_eq(&attached, &tail),
             "attaches to a live session whose paid frontier reaches it"
         );
+    }
+
+    /// `fill_not_coalesced` counts a claim that skips a live session it overlaps,
+    /// once per claim however many it skips, and never a skip of a session whose
+    /// covered range the request does not touch.
+    #[test]
+    fn fill_not_coalesced_counts_overlapping_skips_once_per_claim() {
+        let total = 8 * G;
+        let metrics = Arc::new(crate::metrics::CacheMetrics::default());
+        let reg = Arc::new(FillRegistry::with_metrics(Some(Arc::clone(&metrics))));
+
+        // Disjoint: a head fill [0, 2G) at paid frontier 0, and a tail claim at 4G
+        // ahead of it. The skip duplicates nothing.
+        let head_hash = store_hash(0xE1);
+        let FillClaim::Owner { lease: _head, .. } = reg.claim(head_hash, 0, 2 * G, total, || {
+            FillSession::new(root(0xE1), total)
+        }) else {
+            panic!("owns");
+        };
+        let FillClaim::Owner { lease: _tail, .. } = reg.claim(head_hash, 4 * G, 0, total, || {
+            FillSession::starting_at(root(0xE1), total, 4 * G)
+        }) else {
+            panic!("a disjoint claim owns");
+        };
+        assert_eq!(metrics.fill_not_coalesced.get(), 0, "a disjoint skip");
+
+        // Overlapping: a whole-blob fill at paid frontier 0.
+        let hash = store_hash(0xE2);
+        let FillClaim::Owner { lease: _whole, .. } =
+            reg.claim(hash, 0, 0, total, || FillSession::new(root(0xE2), total))
+        else {
+            panic!("owns");
+        };
+        // A tail claim at 4G skips the whole fill it overlaps.
+        let FillClaim::Owner { lease: _tail, .. } = reg.claim(hash, 4 * G, 0, total, || {
+            FillSession::starting_at(root(0xE2), total, 4 * G)
+        }) else {
+            panic!("a claim ahead of the paid frontier owns");
+        };
+        assert_eq!(metrics.fill_not_coalesced.get(), 1);
+        // A claim at 6G skips both live fills; it counts once.
+        let FillClaim::Owner { lease: _late, .. } = reg.claim(hash, 6 * G, 0, total, || {
+            FillSession::starting_at(root(0xE2), total, 6 * G)
+        }) else {
+            panic!("a claim ahead of both paid frontiers owns");
+        };
+        assert_eq!(metrics.fill_not_coalesced.get(), 2, "one claim, one count");
     }
 
     #[test]

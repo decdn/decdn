@@ -12,8 +12,10 @@
 //! that pulls the cursor's windows in order, and streams the output through a
 //! bounded channel ([`OriginRangeWire`]).
 
+use std::any::Any;
 use std::future::Future;
 use std::io;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -22,6 +24,7 @@ use bao_tree::io::fsm::encode_ranges_validated;
 use bao_tree::io::outboard::PreOrderMemOutboard;
 use bao_tree::{BaoTree, ChunkRanges};
 use bytes::{Bytes, BytesMut};
+use futures_util::FutureExt;
 use iroh_blobs::Hash;
 use iroh_io::{AsyncSliceReader, AsyncStreamWriter};
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
@@ -66,6 +69,10 @@ pub const RANGE_PULL_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 /// past the bound waits for a permit rather than degrading, because the degrade
 /// is a whole-blob origin pull — more egress, not less.
 pub const MAX_CONCURRENT_RANGE_PULLS: usize = 4;
+
+/// How long a draw waits on a full [`MAX_CONCURRENT_RANGE_PULLS`] pool before it
+/// logs a warning. It keeps waiting after the warning.
+pub(crate) const RANGE_PULL_PERMIT_WARN_AFTER: Duration = Duration::from_secs(10);
 
 /// Encoded chunks the origin-range encoder buffers ahead of its consumer before it
 /// parks. The encoder writes one parent pair or one chunk group per item, so the
@@ -305,6 +312,29 @@ fn park_fault(slot: &FaultSlot, fault: CacheError) {
     }
 }
 
+/// Log a caught encode panic as the code bug it is and park it as a local
+/// [`CacheError::Store`] that carries the panic's message, so it never reads as
+/// an origin fault.
+fn park_panic(slot: &FaultSlot, hash: Hash, kind: OriginKind, payload: &(dyn Any + Send)) {
+    let msg = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload");
+    tracing::error!(
+        %hash,
+        ?kind,
+        panic = msg,
+        "origin range encode panicked; internal fault (code bug), not an origin fault",
+    );
+    park_fault(
+        slot,
+        CacheError::Store(anyhow::anyhow!(
+            "origin range encode for {hash} panicked: {msg}"
+        )),
+    );
+}
+
 /// A fault in this module's own window bookkeeping, not the origin's. Logged
 /// and reported as a local fault so it never blames the operator's origin.
 fn internal_fault(hash: Hash, what: &str) -> CacheError {
@@ -482,9 +512,10 @@ impl AsyncStreamWriter for ChannelWriter {
     }
 }
 
-/// Parks an `OriginError` if the encode task ends without reaching its verdict —
-/// a panic unwinds through it, and a cancelled task drops it. So the channel
-/// never closes on an unfinished wire without a fault behind it.
+/// Parks an `OriginError` if the encode task is cancelled before it reaches its
+/// verdict: an abort or a runtime shutdown drops it. A panic does not reach it,
+/// because the task catches the unwind and parks a [`CacheError::Store`]. So the
+/// channel never closes on an unfinished wire without a fault behind it.
 struct UnfinishedGuard {
     slot: FaultSlot,
     hash: Hash,
@@ -507,7 +538,7 @@ impl Drop for UnfinishedGuard {
                 CacheError::OriginError {
                     hash: self.hash,
                     source: anyhow::anyhow!(
-                        "origin range encode for {} ended without completing (panic or cancel)",
+                        "origin range encode for {} was cancelled before completing",
                         self.hash
                     ),
                 },
@@ -525,8 +556,10 @@ impl Drop for UnfinishedGuard {
 /// terminal `Err` or `None`:
 /// - `Some(Err(_))` — the encode stopped: [`CacheError::VerifyFailed`] for a
 ///   window that fails verification against `H`, [`CacheError::OriginError`]
-///   for an origin that stops serving or a task that panics or is cancelled,
-///   [`CacheError::Store`] for a local reader fault. The wire is incomplete.
+///   for an origin that stops serving or a task that is cancelled,
+///   [`CacheError::Store`] for a local fault: a reader invariant break, or a
+///   panic in the encode, whose message the error carries. The wire is
+///   incomplete.
 /// - `None` with no `Err` before it — the encode completed; the wire is whole.
 ///
 /// Dropping the wire aborts the encode and releases its permit.
@@ -603,19 +636,34 @@ impl OriginRangeWire {
         };
         let task = tokio::spawn(async move {
             let _permit = permit;
-            // `writer` owns the only sender. It drops at the end of this block,
-            // after the verdict below is parked, so the consumer never sees the
-            // channel close before the fault is in place.
+            // `writer` owns the only sender. It lives outside the caught encode
+            // and drops at the end of this block, after the verdict below is
+            // parked, so the consumer never sees the channel close before the
+            // fault is in place — after a panic too.
             let mut writer = ChannelWriter { tx };
             let mut reader = reader;
             let mut ob = ob;
             // The empty range (the 0-byte blob) has an empty wire. The async
             // encoder, unlike the sync one, does not short-circuit empty ranges
             // and trips a debug assertion walking them, so skip it.
-            let result = if ranges.is_empty() {
-                Ok(())
-            } else {
-                encode_ranges_validated(&mut reader, &mut ob, ranges.as_ref(), &mut writer).await
+            let encode = async {
+                if ranges.is_empty() {
+                    Ok(())
+                } else {
+                    encode_ranges_validated(&mut reader, &mut ob, ranges.as_ref(), &mut writer)
+                        .await
+                }
+            };
+            // A panic in the encoder or the reader is a code bug, not an origin
+            // fault. Catch it so its message reaches the fault slot and the log
+            // instead of dying with the task.
+            let result = match AssertUnwindSafe(encode).catch_unwind().await {
+                Ok(result) => result,
+                Err(payload) => {
+                    park_panic(&guard.slot, hash, kind, payload.as_ref());
+                    // The verdict is parked; nothing is left to classify.
+                    Ok(())
+                }
             };
             match result {
                 Ok(()) => {}
@@ -648,6 +696,7 @@ impl OriginRangeWire {
                 ),
             }
             guard.disarm();
+            drop(writer);
         });
         Ok(Self {
             rx,

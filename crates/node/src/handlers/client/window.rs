@@ -284,8 +284,8 @@ impl ClientHandler {
         // pull (no double spend, #305) while each keeps its own per-channel voucher
         // stream; a request AHEAD of that frontier owns its own pull instead
         // (#2062 — attaching would starve it behind the other client's payments),
-        // at the cost of fetching the overlap twice (`fill_not_coalesced`,
-        // decdn#2069 §4). `make_session` builds the shared `FillSession` only on an
+        // at the cost of fetching the overlap not yet in the store twice
+        // (`fill_not_coalesced`). `make_session` builds the shared `FillSession` only on an
         // owning branch (`Owner` or `Mixed`), with its PAID content frontier at the
         // request's ABSOLUTE content start (`req.byte_offset`), so a non-zero-offset
         // request does not show a window of phantom lead and immediately `Wait`.

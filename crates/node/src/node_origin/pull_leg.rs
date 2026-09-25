@@ -40,7 +40,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
@@ -257,19 +257,32 @@ pub(crate) struct PrimedHandshake {
 /// reader `drive` paces against, so the decision and the wait always read the same
 /// frontiers.
 struct DownstreamWait {
+    /// The blob the pull fills, for the long-pause warning.
+    hash: Hash,
     /// The session's downstream frontiers.
     watch: DownstreamWatch,
     /// Bumps `node_pull_through_window_paused` on each window-full pause — the pull
     /// hit its ADR 037 window and is waiting for downstream payment to clear or a
     /// serve leg to park at its frontier — and `node_pull_through_min_draw_waits` on
-    /// each pause for the minimum draw.
+    /// each pause for the minimum draw. Records each pause's length in
+    /// `node_pull_through_wait_seconds`.
     metrics: Arc<crate::metrics::Metrics>,
 }
 
+/// How long one window-paced pause runs before [`DownstreamWait`] logs a warning.
+/// The pause keeps waiting after the warning: a payer that stalls is the serve
+/// leg's to end, not the pull's.
+const PULL_WAIT_WARN_AFTER: Duration = Duration::from_secs(30);
+
 impl DownstreamWait {
-    /// A wait over `session`'s downstream frontiers.
-    fn for_session(session: &FillSession, metrics: Arc<crate::metrics::Metrics>) -> Self {
+    /// A wait over `session`'s downstream frontiers, for a pull of `hash`.
+    fn for_session(
+        session: &FillSession,
+        hash: Hash,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Self {
         Self {
+            hash,
             watch: session.downstream_watch(),
             metrics,
         }
@@ -296,8 +309,41 @@ impl PacingWait for DownstreamWait {
             WaitReason::WindowFull => self.metrics.node_pull_through_window_paused(),
             WaitReason::MinDraw => self.metrics.node_pull_through_min_draw_waits(),
         }
-        Box::pin(self.watch.past(observed.served_paid, observed.serve_demand))
+        Box::pin(async move {
+            let started = tokio::time::Instant::now();
+            let mut past =
+                std::pin::pin!(self.watch.past(observed.served_paid, observed.serve_demand));
+            if tokio::time::timeout(PULL_WAIT_WARN_AFTER, &mut past)
+                .await
+                .is_err()
+            {
+                warn!(
+                    hash = %self.hash,
+                    ?reason,
+                    served_paid = observed.served_paid,
+                    serve_demand = observed.serve_demand,
+                    waited_secs = PULL_WAIT_WARN_AFTER.as_secs(),
+                    "pull still paused on its downstream frontiers; a stalled payer or a \
+                     pacing regression holds it",
+                );
+                past.await;
+            }
+            self.metrics.node_pull_through_wait(started.elapsed());
+        })
     }
+}
+
+/// Whether an own-origin leg's terminal error is a local store fault
+/// ([`CacheError::Store`] anywhere in its chain) rather than an origin fault.
+/// The range wire reports an encode panic and a broken reader invariant this
+/// way.
+fn is_internal_fault(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<CacheError>(),
+            Some(CacheError::Store(_))
+        )
+    })
 }
 
 /// Total content bytes a chunk-unit [`ChunkRanges`] covers, clamped to `total`.
@@ -818,7 +864,7 @@ pub(crate) async fn run_pull_leg(
     // The downstream pacing wait and frontier reader, SHARED across every run's lane
     // so the window is continuous — keyed on the session's downstream frontiers, not
     // on the run.
-    let pacing_wait = DownstreamWait::for_session(&session, Arc::clone(&deps.metrics));
+    let pacing_wait = DownstreamWait::for_session(&session, hash, Arc::clone(&deps.metrics));
     // Index-aligned with `candidates`: `SourceCoverage.source_ix` is a position here.
     let coverages: Vec<decdn_protocol::Coverage> =
         candidates.iter().map(|c| c.coverage.clone()).collect();
@@ -1449,7 +1495,7 @@ pub(crate) async fn run_local_pull_leg(
         max_settle_waits: 0,
         settle_backoff: SETTLE_POLL_STEP,
     };
-    let pacing_wait = DownstreamWait::for_session(&session, Arc::clone(&metrics));
+    let pacing_wait = DownstreamWait::for_session(&session, hash, Arc::clone(&metrics));
     let downstream_reader = || pacing_wait.frontier();
 
     // Cooperative cancellation exactly as the paid leg: the serve leg finishing
@@ -1493,13 +1539,23 @@ pub(crate) async fn run_local_pull_leg(
     // (our own origin is corrupt/misconfigured, or a transport fault reaching it):
     // meter it as a local fault and NEVER score a provider or a bao-corruption against
     // an upstream that does not exist. Skipped on cancel (nobody waits).
+    // A local store fault (an encode panic or a broken invariant) is a code bug,
+    // not the origin's: say so, so the operator does not audit a healthy origin.
     if !cancelled && let Err(err) = &result {
         metrics.node_pull_local_fault();
-        tracing::warn!(
-            %hash,
-            error = %err,
-            "own-origin pull leg failed; local-origin fault (no upstream to score)"
-        );
+        if is_internal_fault(err) {
+            tracing::error!(
+                %hash,
+                error = %format_args!("{err:#}"),
+                "own-origin pull leg failed on an internal fault (code bug), not the origin"
+            );
+        } else {
+            tracing::warn!(
+                %hash,
+                error = %err,
+                "own-origin pull leg failed; local-origin fault (no upstream to score)"
+            );
+        }
     }
 
     // Record the terminal outcome so the serve leg can decide a gap it is waiting on
@@ -1838,6 +1894,24 @@ mod local_pull_leg_tests {
         );
         Ok(())
     }
+
+    /// A `Store` fault anywhere in the chain (the range wire's encode panic) reads
+    /// as internal; an origin fault does not.
+    #[test]
+    fn a_store_fault_in_the_chain_is_internal() {
+        use decdn_cache::CacheError;
+
+        let panic = anyhow::Error::from(CacheError::Store(anyhow::anyhow!("encode panicked")))
+            .context("drive failed");
+        assert!(super::is_internal_fault(&panic));
+        let origin = anyhow::Error::from(CacheError::OriginError {
+            hash: Hash::from([1; 32]),
+            source: anyhow::anyhow!("origin stopped serving"),
+        })
+        .context("drive failed");
+        assert!(!super::is_internal_fault(&origin));
+        assert!(!super::is_internal_fault(&anyhow::anyhow!("bare")));
+    }
 }
 
 /// Regression coverage for the window-pause lost-wakeup that wedged
@@ -1851,7 +1925,7 @@ mod downstream_wait_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use decdn_cache::FillSession;
+    use decdn_cache::{FillSession, Hash};
 
     use super::DownstreamWait;
     use crate::metrics::Metrics;
@@ -1860,7 +1934,8 @@ mod downstream_wait_tests {
     /// A standalone session and a wait over its downstream frontiers.
     fn session_and_hook() -> (Arc<FillSession>, DownstreamWait) {
         let session = FillSession::new(bao_tree::blake3::Hash::from([7; 32]), 1 << 20);
-        let hook = DownstreamWait::for_session(&session, Arc::new(Metrics::new()));
+        let hook =
+            DownstreamWait::for_session(&session, Hash::from([7; 32]), Arc::new(Metrics::new()));
         (session, hook)
     }
 
@@ -1878,7 +1953,7 @@ mod downstream_wait_tests {
         const PAUSED: &str = "decdn_node_pull_through_window_paused_total ";
         let session = FillSession::new(bao_tree::blake3::Hash::from([7; 32]), 1 << 20);
         let metrics = Arc::new(Metrics::new());
-        let hook = DownstreamWait::for_session(&session, Arc::clone(&metrics));
+        let hook = DownstreamWait::for_session(&session, Hash::from([7; 32]), Arc::clone(&metrics));
         // A demand past the observed frontier returns the wait at once.
         session.demand_up_to(64 * 1024);
         hook.wait(DownstreamFrontier::default(), WaitReason::MinDraw)
@@ -1888,6 +1963,40 @@ mod downstream_wait_tests {
         hook.wait(DownstreamFrontier::default(), WaitReason::WindowFull)
             .await;
         assert_eq!(count(&metrics, PAUSED), 1);
+        assert_eq!(
+            count(&metrics, "decdn_node_pull_through_wait_seconds_count "),
+            2,
+            "each pause records its length once",
+        );
+    }
+
+    /// A pause that outlives the warning threshold keeps waiting, and records
+    /// its whole length once it ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_pause_keeps_waiting_and_records_its_length() {
+        let session = FillSession::new(bao_tree::blake3::Hash::from([7; 32]), 1 << 20);
+        let metrics = Arc::new(Metrics::new());
+        let hook = DownstreamWait::for_session(&session, Hash::from([7; 32]), Arc::clone(&metrics));
+        let pause = hook.wait(DownstreamFrontier::default(), WaitReason::WindowFull);
+        tokio::pin!(pause);
+        let early = tokio::time::timeout(super::PULL_WAIT_WARN_AFTER * 2, &mut pause).await;
+        assert!(early.is_err(), "the warning must not end the pause");
+        session.demand_up_to(64 * 1024);
+        pause.await;
+        let text = metrics.encode().unwrap();
+        let sum: f64 = text
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("decdn_node_pull_through_wait_seconds_sum ")?
+                    .trim()
+                    .parse()
+                    .ok()
+            })
+            .unwrap();
+        assert!(
+            sum >= (super::PULL_WAIT_WARN_AFTER * 2).as_secs_f64(),
+            "the recorded length spans the whole pause, got {sum}",
+        );
     }
 
     /// The #1673 race on the demand frontier: a serve encoder parks and raises the
