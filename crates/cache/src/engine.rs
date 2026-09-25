@@ -691,9 +691,12 @@ impl ServeAudit {
 /// All fields reflect the *underlying* cache state — `size_bytes` reads
 /// from the iroh-blobs store directly, so a hash that has already been
 /// logically evicted (and whose bytes are still on disk pending the
-/// follow-up GC sweep in #518) still reports its on-disk size here.
-/// That keeps dry-run honest about disk reclaim potential rather than
-/// hiding it once the operator has flipped the evicted flag.
+/// follow-up GC sweep in #518) still reports its size here. That keeps
+/// dry-run honest about disk reclaim potential rather than hiding it once
+/// the operator has flipped the evicted flag. For a complete blob the size
+/// is its on-disk footprint; for a partial blob it is the declared total
+/// (see [`Self::size_bytes`]), and [`CacheEngine::size_snapshot`] gives the
+/// bytes it holds on disk.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EvictionPreview {
     /// Bytes the iroh-blobs store reports for this hash. `None` when the
@@ -4148,8 +4151,9 @@ impl CacheEngine {
     /// disk already full measures the real usage rather than an empty
     /// access map.
     ///
-    /// Cost scales with the total blob set (one `status()` per blob); call
-    /// it on the eviction sweep cadence, not per request.
+    /// Cost scales with the total blob set (one `status()` per blob, plus one
+    /// `observe()` per partial blob); call it on the eviction sweep cadence,
+    /// not per request.
     pub async fn size_snapshot(&self) -> CacheResult<HashMap<Hash, u64>> {
         snapshot_blob_sizes(&self.inner.store).await
     }
