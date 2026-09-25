@@ -599,11 +599,15 @@ pub struct DecdnMetrics {
     /// nothing. A node serving tagged blobs must show this climbing.
     /// Operator-visible name: `decdn_warming_credits_applied_total`.
     pub warming_credits_applied: Counter,
-    /// Redemption attempts (`try_redeem`) that returned an error — a failed
-    /// `getChannel`/`withdraw` RPC or receipt wait (#751). Each is otherwise
-    /// only a single `warn!`; a sustained rate means accrued earnings are not
-    /// being withdrawn and warrants investigating the RPC / wallet. Operator-
-    /// visible name: `decdn_redemption_failures_total`.
+    /// Redemption steps that failed: a `redeemMany` chunk that reverted
+    /// on-chain or that the RPC refused at `send`, a lane whose plan failed,
+    /// or a hint-path lane that could not be read from the lane store. A
+    /// chunk whose receipt stays unconfirmed after the by-hash fetch does not
+    /// count here; it counts into `decdn_onchain_tx_receipt_failed_total` or
+    /// `decdn_onchain_tx_timeout_total`. Each failure is otherwise only a
+    /// single `warn!`; a sustained rate means accrued earnings are not being
+    /// redeemed and warrants investigating the RPC / wallet. Operator-visible
+    /// name: `decdn_redemption_failures_total`.
     pub redemption_failures: Counter,
     /// Lanes the redeemer held or dropped for the pool's chain-observed
     /// solvency (`pool_is_redeemable`, ADR 003): a drained `Open` pool is held
@@ -1774,9 +1778,12 @@ pub struct DecdnMetrics {
     /// startup is not counted.
     pub pool_grace_closes: Counter,
     /// `decdn_onchain_tx_landed_total`: settlement transactions (`redeemMany`)
-    /// mined and succeeded. The `onchain_tx_*` family counts every transaction
-    /// sent through `send_and_await_receipt`; buyer-side pool transactions go
-    /// through `decdn-client` and are not counted here.
+    /// mined and succeeded. The outcome family — `landed`, `reverted`,
+    /// `send_failed`, `receipt_failed`, `timeout` — counts every transaction
+    /// sent through `send_and_await_receipt` exactly once;
+    /// `onchain_tx_receipt_recovered` sits beside it and is not an outcome.
+    /// Buyer-side pool transactions go through `decdn-client` and are not
+    /// counted here.
     pub onchain_tx_landed: Counter,
     /// `decdn_onchain_tx_reverted_total`: node transactions mined and reverted.
     pub onchain_tx_reverted: Counter,
@@ -1785,11 +1792,19 @@ pub struct DecdnMetrics {
     /// halves and retries counts here once too.
     pub onchain_tx_send_failed: Counter,
     /// `decdn_onchain_tx_receipt_failed_total`: issued node transactions whose
-    /// receipt wait failed. The transaction may still mine.
+    /// receipt wait failed and whose receipt no by-hash fetch found. The
+    /// transaction is unconfirmed and may still mine.
     pub onchain_tx_receipt_failed: Counter,
     /// `decdn_onchain_tx_timeout_total`: issued node transactions whose receipt
-    /// did not arrive inside the caller's bound. The transaction may still mine.
+    /// did not arrive inside the caller's bound and whose receipt no by-hash
+    /// fetch found. The transaction is unconfirmed and may still mine.
     pub onchain_tx_timeout: Counter,
+    /// `decdn_onchain_tx_receipt_recovered_total`: node transactions whose
+    /// receipt wait failed or timed out but whose receipt a by-hash fetch then
+    /// found. Each one also counts once as landed or reverted, so this sits
+    /// beside the outcome family, not inside it. A steady rate points at a
+    /// lagging or load-balanced RPC provider.
+    pub onchain_tx_receipt_recovered: Counter,
 
     // ---- DHT ----
     /// `decdn_dht_findvalue_queries_total`: `FIND_VALUE` lookups this node ran
@@ -2475,8 +2490,9 @@ recorders! {
     /// from "no credits at all".
     warming_credit_applied => warming_credits_applied.inc();
 
-    /// A redemption attempt (`try_redeem`) failed with an RPC/receipt error
-    /// (#751). Pairs with the `warn!` in `redeemer_loop`.
+    /// A redemption step failed: a `redeemMany` chunk reverted or was refused
+    /// at `send`, or a lane could not be planned or loaded. Pairs with the
+    /// `warn!` at each site.
     redemption_failure => redemption_failures.inc();
 
     /// A lane was held or dropped by `pool_is_redeemable` because its pool's
@@ -3056,10 +3072,14 @@ recorders! {
     onchain_tx_reverted => onchain_tx_reverted.inc();
     /// The RPC refused a node transaction at `send`.
     onchain_tx_send_failed => onchain_tx_send_failed.inc();
-    /// An issued node transaction's receipt wait failed.
+    /// An issued node transaction's receipt wait failed and no by-hash fetch
+    /// found the receipt.
     onchain_tx_receipt_failed => onchain_tx_receipt_failed.inc();
-    /// An issued node transaction's receipt did not arrive in time.
+    /// An issued node transaction's receipt did not arrive in time and no
+    /// by-hash fetch found it.
     onchain_tx_timeout => onchain_tx_timeout.inc();
+    /// A failed or lapsed receipt wait was resolved by fetching the receipt by hash.
+    onchain_tx_receipt_recovered => onchain_tx_receipt_recovered.inc();
 
     /// A `FIND_VALUE` provider lookup started.
     dht_findvalue_query => dht_findvalue_queries.inc();
@@ -4414,6 +4434,7 @@ mod tests {
             "decdn_onchain_tx_send_failed_total",
             "decdn_onchain_tx_receipt_failed_total",
             "decdn_onchain_tx_timeout_total",
+            "decdn_onchain_tx_receipt_recovered_total",
             "decdn_dht_findvalue_queries_total",
             "decdn_dht_lookup_round_timeouts_total",
             "decdn_dht_store_published_total",

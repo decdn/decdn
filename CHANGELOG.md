@@ -825,6 +825,26 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A redemption whose receipt wait fails but whose transaction mined counts
+  as landed, not as a failure (#2154).** A load-balanced RPC can fail the
+  receipt wait with `Unknown block` when the backend that answers has not seen
+  the block yet. The node counted each such `redeemMany` in
+  `decdn_redemption_failures_total`, even though it had mined. The landed path
+  never ran, so `decdn_pool_redemptions_total` missed the vouchers and
+  `registered_until` was not saved, and a later sweep registered the signer
+  again. When a receipt wait fails or times out, the node now fetches the
+  receipt by hash up to three times, waiting 1 s, 2 s and 4 s before each
+  fetch. A receipt found this way counts as landed or reverted, the same as
+  one the wait returned, and also ticks the new
+  `decdn_onchain_tx_receipt_recovered_total`.
+  `decdn_onchain_tx_receipt_failed_total` and `decdn_onchain_tx_timeout_total`
+  now count only transactions that are still unconfirmed after those fetches,
+  and the node's warning names the last fetch's result (`last_lookup`). An
+  unconfirmed `redeemMany` is no longer a redemption failure. The
+  `DecdnOnchainTxTimeouts` alert is renamed `DecdnOnchainTxUnconfirmed` and
+  fires on both unconfirmed counters, so a node that cannot see its own
+  receipts still pages.
+
 - **Chain watchers survive an RPC that caps `eth_getLogs` ranges, and the
   stalled-watcher alerts catch a watcher that never ticked.** The chain-event
   poller scanned `[cursor, head]` in fixed 10 000-block windows and never read

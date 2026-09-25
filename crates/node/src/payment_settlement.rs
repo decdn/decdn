@@ -127,9 +127,11 @@ const SIGNER_AUTH_TTL: Duration = Duration::from_mins(1);
 const AUTH_CACHE_MAX: usize = 4096;
 
 /// Bounded receipt wait for a redemption transaction. A stuck/dropped/replaced tx
-/// must not wedge a background tick; a lapse yields [`TxOutcome::Timeout`], a
-/// non-fatal failure (the tx may still mine later; the claim is at worst deferred,
-/// never double-spent, because the on-chain lane watermark is monotone).
+/// must not wedge a background tick. A lapse first fetches the receipt by hash,
+/// which adds at most 37 s (`RESOLVE_*` in `onchain_tx`); when that finds nothing
+/// it yields [`TxOutcome::Timeout`], a non-fatal outcome (the tx may still mine
+/// later; the claim is at worst deferred, never double-spent, because the
+/// on-chain lane watermark is monotone).
 const REDEEM_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Bound on the reactive halve-and-retry when a chunk fails to send oversized.
@@ -1518,10 +1520,13 @@ async fn redeem_sweep<P: Provider + Clone>(
 
 /// Submit one chunk of planned lanes as a single `redeemMany`. On an oversize
 /// send failure (`is_oversize_send_err`) with more than one lane, halve the chunk
-/// and retry each half, bounded by `MAX_SPLIT_DEPTH`. A revert / receipt failure /
-/// timeout / non-oversize send error records one `redemption_failure` and leaves
-/// the claims for the next sweep (cumulative, monotone, retry-safe). Does NOT seed
-/// the paid cache — each paid voucher emits its own `PoolRedeemed`.
+/// and retry each half, bounded by `MAX_SPLIT_DEPTH`. A revert or a non-oversize
+/// send error records one `redemption_failure`. An unconfirmed receipt (a failed
+/// or lapsed wait that the by-hash fetch in `send_and_await_receipt` could not
+/// resolve) is not a failure: the tx may have mined, and it counts only into its
+/// `onchain_tx_*` bucket. Every non-landed outcome leaves the claims for the next
+/// sweep (cumulative, monotone, retry-safe). Does NOT seed the paid cache — each
+/// paid voucher emits its own `PoolRedeemed`.
 ///
 /// Runs inside an `onchain_tx` span that records the transaction hash (`tx`)
 /// and the `outcome`. A halved retry nests its two halves as child spans.
@@ -1554,11 +1559,12 @@ async fn submit_chunk<P: Provider + Clone>(
     let voucher_count = lanes.len();
     let pool_count = batches.len();
     let sent = contract.redeemMany(batches).send().await;
-    match send_and_await_receipt(sent, Some(REDEEM_RECEIPT_TIMEOUT), metrics).await {
+    let outcome = send_and_await_receipt(sent, Some(REDEEM_RECEIPT_TIMEOUT), metrics).await;
+    let failed = is_redemption_failure(&outcome);
+    match outcome {
         TxOutcome::Landed(receipt) => {
             span.record("tx", tracing::field::display(receipt.transaction_hash));
             span.record("outcome", "landed");
-            metrics.pool_redemptions(u64::try_from(voucher_count).unwrap_or(u64::MAX));
             info!(
                 pool_count,
                 cap_count,
@@ -1566,14 +1572,7 @@ async fn submit_chunk<P: Provider + Clone>(
                 tx = %receipt.transaction_hash,
                 "batched lane redemption landed (redeemMany)"
             );
-            for lane in &lanes {
-                if let Some(reg) = &lane.register
-                    && let Err(err) = store.set_registered_until(lane.key, reg.expiry)
-                {
-                    warn!(error = %err, pool_id = %lane.pool_id, signer = %reg.signer,
-                        "failed to persist registered_until after a landed registration");
-                }
-            }
+            record_landed_chunk(store, &lanes, metrics);
         }
         TxOutcome::SendErr(err)
             if lanes.len() >= 2
@@ -1589,26 +1588,64 @@ async fn submit_chunk<P: Provider + Clone>(
             );
             Box::pin(submit_chunk(contract, store, lanes, metrics, depth + 1)).await;
             Box::pin(submit_chunk(contract, store, right, metrics, depth + 1)).await;
+            // Each half counts its own outcome; the split itself is not a failure.
+            return;
         }
         TxOutcome::Reverted(receipt) => {
             record_tx_failure(&span, "reverted", Some(receipt.transaction_hash));
-            metrics.redemption_failure();
             warn!(voucher_count, tx = %receipt.transaction_hash, "redeemMany reverted on-chain; leaving claims for retry");
         }
         TxOutcome::SendErr(err) => {
             record_tx_failure(&span, "send_failed", None);
-            metrics.redemption_failure();
             warn!(error = %sanitize_rpc_display(&err), voucher_count, "redeemMany send failed; leaving claims for retry");
         }
-        TxOutcome::ReceiptErr { error, tx_hash } => {
+        TxOutcome::ReceiptErr {
+            error,
+            tx_hash,
+            last_lookup,
+        } => {
             record_tx_failure(&span, "receipt_failed", Some(tx_hash));
-            metrics.redemption_failure();
-            warn!(error = %sanitize_rpc_display(&error), voucher_count, tx = %tx_hash, "redeemMany receipt failed; leaving claims for retry");
+            warn!(error = %sanitize_rpc_display(&error), %last_lookup, voucher_count, tx = %tx_hash, "redeemMany receipt wait failed and the by-hash lookup missed; unconfirmed, leaving claims for retry");
         }
-        TxOutcome::Timeout { tx_hash } => {
+        TxOutcome::Timeout {
+            tx_hash,
+            last_lookup,
+        } => {
             record_tx_failure(&span, "timeout", Some(tx_hash));
-            metrics.redemption_failure();
-            warn!(voucher_count, tx = %tx_hash, timeout = ?REDEEM_RECEIPT_TIMEOUT, "redeemMany receipt timed out; leaving claims for retry");
+            warn!(%last_lookup, voucher_count, tx = %tx_hash, timeout = ?REDEEM_RECEIPT_TIMEOUT, "redeemMany receipt timed out and the by-hash lookup missed; unconfirmed, leaving claims for retry");
+        }
+    }
+    if failed {
+        metrics.redemption_failure();
+    }
+}
+
+/// Whether a `redeemMany` outcome counts into `decdn_redemption_failures_total`.
+/// A revert and a refused send are failures. A landed chunk is not, and neither
+/// is an unconfirmed one (`ReceiptErr` / `Timeout`): the by-hash lookup already
+/// resolves every transaction the RPC can see mined, so what stays unconfirmed
+/// counts into `decdn_onchain_tx_receipt_failed_total` /
+/// `decdn_onchain_tx_timeout_total`, which `DecdnOnchainTxUnconfirmed` alerts
+/// on. An oversize send that `submit_chunk` halves never reaches this count.
+const fn is_redemption_failure(outcome: &TxOutcome) -> bool {
+    match outcome {
+        TxOutcome::Reverted(_) | TxOutcome::SendErr(_) => true,
+        TxOutcome::Landed(_) | TxOutcome::ReceiptErr { .. } | TxOutcome::Timeout { .. } => false,
+    }
+}
+
+/// Record a landed `redeemMany` chunk: count its vouchers into
+/// `pool_redemptions` and persist `registered_until` for every lane whose
+/// `CapabilityReg` rode in the chunk, so the next sweep does not register it
+/// again.
+fn record_landed_chunk(store: &Arc<dyn PoolStateStore>, lanes: &[PlannedLane], metrics: &Metrics) {
+    metrics.pool_redemptions(u64::try_from(lanes.len()).unwrap_or(u64::MAX));
+    for lane in lanes {
+        if let Some(reg) = &lane.register
+            && let Err(err) = store.set_registered_until(lane.key, reg.expiry)
+        {
+            warn!(error = %err, pool_id = %lane.pool_id, signer = %reg.signer,
+                "failed to persist registered_until after a landed registration");
         }
     }
 }
@@ -2689,6 +2726,95 @@ mod tests {
             amount,
             bytesDelivered: 0,
         }
+    }
+
+    /// A landed chunk counts every lane into `pool_redemptions` and persists
+    /// `registered_until` for the lane whose `CapabilityReg` rode in it (#2154).
+    /// A failed receipt wait whose receipt a by-hash fetch found takes this path
+    /// too.
+    #[test]
+    fn landed_chunk_counts_redemptions_and_persists_registration() -> Result<()> {
+        use decdn_incentive::MemoryPoolStateStore;
+
+        let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+        let registering = signed_lane_state(7, 50, 0xEE, None);
+        let registered = signed_lane_state(7, 51, 0xEE, None);
+        store.record(&registering)?;
+        store.record(&registered)?;
+        let mut with_reg = planned(7, 50, 100, true);
+        let expiry = 1_900_000_000;
+        if let Some(reg) = with_reg.register.as_mut() {
+            reg.expiry = expiry;
+        }
+        let lanes = vec![with_reg, planned(7, 51, 100, false)];
+        let metrics = Metrics::new();
+
+        record_landed_chunk(&store, &lanes, &metrics);
+
+        let persisted = store
+            .get(registering.key())?
+            .ok_or_else(|| anyhow::anyhow!("the registering lane's row exists"))?;
+        assert_eq!(persisted.registered_until, expiry);
+        let untouched = store
+            .get(registered.key())?
+            .ok_or_else(|| anyhow::anyhow!("the second lane's row exists"))?;
+        assert_eq!(untouched.registered_until, registered.registered_until);
+        let text = metrics.encode()?;
+        anyhow::ensure!(
+            text.lines().any(|l| l == "decdn_pool_redemptions_total 2"),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    /// Only a revert and a refused send count as redemption failures (#2154).
+    /// An unconfirmed chunk may have mined, so it counts only into its
+    /// `onchain_tx_*` bucket.
+    #[test]
+    fn only_reverts_and_refused_sends_are_redemption_failures() {
+        use alloy::providers::PendingTransactionError;
+        use alloy::transports::TransportErrorKind;
+
+        let receipt = || alloy::rpc::types::TransactionReceipt {
+            inner: alloy::consensus::ReceiptEnvelope::Eip1559(alloy::consensus::ReceiptWithBloom {
+                receipt: alloy::consensus::Receipt {
+                    status: alloy::consensus::Eip658Value::Eip658(true),
+                    cumulative_gas_used: 0,
+                    logs: Vec::new(),
+                },
+                logs_bloom: alloy::primitives::Bloom::ZERO,
+            }),
+            transaction_hash: B256::ZERO,
+            transaction_index: None,
+            block_hash: None,
+            block_number: None,
+            gas_used: 0,
+            effective_gas_price: 0,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: None,
+            contract_address: None,
+        };
+        let tx_hash = B256::repeat_byte(0x17);
+        let last_lookup = || "no receipt yet".to_owned();
+
+        assert!(is_redemption_failure(&TxOutcome::Reverted(receipt())));
+        assert!(is_redemption_failure(&TxOutcome::SendErr(
+            TransportErrorKind::custom_str("rejected").into()
+        )));
+        assert!(!is_redemption_failure(&TxOutcome::Landed(receipt())));
+        assert!(!is_redemption_failure(&TxOutcome::ReceiptErr {
+            error: PendingTransactionError::TransportError(TransportErrorKind::custom_str(
+                "error code 26: Unknown block"
+            )),
+            tx_hash,
+            last_lookup: last_lookup(),
+        }));
+        assert!(!is_redemption_failure(&TxOutcome::Timeout {
+            tx_hash,
+            last_lookup: last_lookup(),
+        }));
     }
 
     /// The whole point of the pre-redeem read (#2076): a lane the chain already
